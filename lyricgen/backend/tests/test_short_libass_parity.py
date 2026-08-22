@@ -116,6 +116,59 @@ def test_fallback_alerts_sentry():
     assert "capture_message" in inspect.getsource(_p._alert_sentry)
 
 
+def test_burn_short_returns_reason_on_ffmpeg_failure(tmp_path, monkeypatch):
+    """El fallo de libass debe propagar el stderr de ffmpeg al caller para
+    adjuntarlo al evento de Sentry (diagnosticabilidad: la causa raíz viaja
+    con la alerta, sin correlacionar logs de worker por timestamp)."""
+    class _FakeProc:
+        returncode = 1
+        stderr = "Fontconfig error: Cannot load default config file\nboom libass"
+
+    monkeypatch.setattr(pipeline.subprocess, "run", lambda *a, **k: _FakeProc())
+    path, reason = pipeline._burn_short_text_ass(
+        "bg_short.mp4", SEGS, str(tmp_path), 30.0, 30.0,
+        font_path=FREDOKA, text_case="original", font_scale=1.0,
+        lyric_color="", lyric_sung_color="", text_contrast="medium",
+        lyrics_animation="none", line_transition="none",
+    )
+    assert path is None
+    assert reason is not None
+    assert "rc=1" in reason
+    assert "boom libass" in reason
+
+
+def test_burn_short_returns_reason_on_exception(tmp_path, monkeypatch):
+    """Si la pasada lanza excepción, el repr viaja en el reason (no None a
+    secas): así el evento de Sentry del fallback trae el tipo y el mensaje."""
+    def _boom(*a, **k):
+        raise RuntimeError("libass unavailable")
+
+    monkeypatch.setattr(pipeline.subprocess, "run", _boom)
+    path, reason = pipeline._burn_short_text_ass(
+        "bg_short.mp4", SEGS, str(tmp_path), 30.0, 30.0,
+        font_path=FREDOKA, text_case="original", font_scale=1.0,
+        lyric_color="", lyric_sung_color="", text_contrast="medium",
+        lyrics_animation="none", line_transition="none",
+    )
+    assert path is None
+    assert reason is not None
+    assert "RuntimeError" in reason
+    assert "libass unavailable" in reason
+
+
+def test_fallback_attaches_libass_error_to_sentry():
+    """La rama de fallback debe pasar el motivo del fallo de libass como
+    `extra` a `_alert_sentry`, y el helper debe adjuntarlo al scope con
+    set_extra ANTES de capturar el mensaje — es el propósito del fix."""
+    import inspect
+    src = inspect.getsource(pipeline.generate_short)
+    assert "libass_error" in src
+    assert "extra=" in src
+    helper_src = inspect.getsource(pipeline._alert_sentry)
+    assert "set_extra(" in helper_src
+    assert helper_src.index("set_extra(") < helper_src.index("capture_message(")
+
+
 def test_bg_ilegible_alerta_en_vez_de_degradar_en_silencio():
     """Si el fondo del short no se puede usar, el short sale con degradé
     mientras el MASTER conserva el fondo real. Eso es una divergencia

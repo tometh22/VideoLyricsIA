@@ -14574,13 +14574,18 @@ def _decodes_ok(path: str, frames: int = 1) -> bool:
 
 
 def _alert_sentry(fingerprint: str, message: str, *, job_dir: str = "",
-                  level: str = "error") -> None:
+                  level: str = "error",
+                  extra: dict | None = None) -> None:
     """Manda un aviso a Sentry con fingerprint propio. Nunca levanta.
 
     Estos caminos degradan la entrega en silencio (short sin fondo real,
     short sin la tipografía del video). Sin una alerta agrupable el que se
     entera es el cliente, que es exactamente como nos enteramos del
     incidente del 21-08.
+
+    `extra` adjunta contexto de diagnóstico (ej. el stderr de ffmpeg o el
+    repr de una excepción) para no tener que correlacionar logs de worker
+    por timestamp cuando el evento dispara.
     """
     try:
         import sentry_sdk
@@ -14588,6 +14593,8 @@ def _alert_sentry(fingerprint: str, message: str, *, job_dir: str = "",
             _scope.fingerprint = [fingerprint]
             if job_dir:
                 _scope.set_tag("job_id", os.path.basename(job_dir.rstrip("/")))
+            for key, value in (extra or {}).items():
+                _scope.set_extra(key, value)
             sentry_sdk.capture_message(message, level=level)
     except Exception:
         pass  # sin Sentry (dev/tests) el log del caller alcanza
@@ -17790,7 +17797,7 @@ def _burn_short_text_ass(
     text_contrast: str,
     lyrics_animation: str,
     line_transition: str,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """Quema la letra del short con LIBASS — el MISMO motor del video.
 
     Incidente UMG Chile 2026-06-11/12 (tercera vuelta): aunque video y
@@ -17810,9 +17817,12 @@ def _burn_short_text_ass(
     16:9) NO se trasladan al frame vertical — el short siempre centra
     (\an5), igual que el comportamiento histórico.
 
-    Devuelve el path del short con texto, o None si la pasada falla (el
-    caller cae al camino moviepy histórico — un short con texto "menos
-    idéntico" es mejor que un short sin letra)."""
+    Devuelve `(path, None)` con el short con texto, o `(None, reason)` si la
+    pasada falla (el caller cae al camino moviepy histórico — un short con
+    texto "menos idéntico" es mejor que un short sin letra). `reason` trae el
+    stderr recortado de ffmpeg o el repr de la excepción, para adjuntarlo al
+    evento de Sentry del fallback y diagnosticar la causa raíz sin tener que
+    correlacionar logs de worker por timestamp."""
     import ass_render as _ass
 
     try:
@@ -17867,7 +17877,7 @@ def _burn_short_text_ass(
                 logger.info("[SHORT] texto quemado con libass (font=%s anim=%s audio=%s)",
                             os.path.basename(font_path), lyrics_animation,
                             "copy" if audio_args[1] == "copy" else "aac-reencode")
-                return out_tmp
+                return out_tmp, None
             # stderr COMPLETO, no [-300:]. El recorte cortaba justo la línea
             # que nombra la causa ("Could not open encoder before EOF") y nos
             # dejó dos meses arreglando la capa equivocada.
@@ -17879,13 +17889,15 @@ def _burn_short_text_ass(
                 os.unlink(out_tmp)
             except OSError:
                 pass
+        reason = " || ".join(errors)
         logger.warning("[SHORT] libass text burn failed — fallback moviepy. %s",
-                       " || ".join(errors))
+                       reason)
         _log_short_bg_forensics(bg_short_path, job_dir)
-        return None
+        return None, reason
     except Exception as e:
-        logger.warning("[SHORT] libass text pass errored (%s) — fallback moviepy", e)
-        return None
+        reason = f"{type(e).__name__}: {e}"
+        logger.warning("[SHORT] libass text pass errored (%s) — fallback moviepy", reason)
+        return None, reason
 
 
 def _pick_energy_window(mp3_path: str, duration: float, window_sec: float = 30.0) -> float:
@@ -18170,7 +18182,7 @@ def generate_short(
                 f"el efecto '{effect}' dejó el fondo del short ilegible: {bg_only_path}"
             )
 
-    burned = _burn_short_text_ass(
+    burned, libass_error = _burn_short_text_ass(
         bg_only_path, window_segments, job_dir, short_dur, fps,
         font_path=font,
         text_case=text_case, font_scale=font_scale,
@@ -18192,6 +18204,10 @@ def generate_short(
             f"[SHORT-FALLBACK] {_job_tag}: la pasada libass falló — el short "
             "salió con el motor moviepy (tipografía puede diferir del video)",
             job_dir=job_dir,
+            # Motivo del fallo de libass (stderr de ffmpeg o repr de la
+            # excepción) para diagnosticar la causa raíz sin correlacionar
+            # logs de worker por timestamp.
+            extra={"libass_error": libass_error} if libass_error else None,
         )
         _do_fade = (line_transition or "none") not in ("none", "cut", "")
         text_layers = []
