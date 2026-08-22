@@ -305,6 +305,18 @@ function SingleGeneratingWithWatchdog({ heroProps, status, onReset, t, stallMs =
 }
 
 
+// Los entregables que ESTE job produjo. Un job puede terminar bien sin
+// short o sin thumbnail: desde el incidente UMG Chile 2026-08-21 el backend
+// entrega el master solo antes que perder el render entero por un accesorio.
+// Ofrecer el ícono igual daba una descarga 404 SILENCIOSA: triggerDownload
+// usa `<a download>.click()`, que no puede leer el status HTTP y siempre
+// devuelve true — el contador de fallos quedaba en 0 y el usuario creía que
+// se había bajado todo.
+function deliverableTypes(job) {
+  const f = job?.files || {};
+  return ["video", "short", "thumbnail"].filter((type) => Boolean(f[`${type}_url`]));
+}
+
 function JobRow({ job, index, t, onSelectJob }) {
   const { filename, status, current_step, progress, job_id, error,
           queue_reason, queue_retry_in_s } = job;
@@ -383,7 +395,7 @@ function JobRow({ job, index, t, onSelectJob }) {
         </div>
         {status === "done" && job_id && (
           <div className="flex gap-1.5 shrink-0">
-            {["video", "short", "thumbnail"].map((type) => (
+            {deliverableTypes(job).map((type) => (
               <button
                 key={type}
                 onClick={(e) => { e.stopPropagation(); triggerDownload(job_id, type); }}
@@ -700,7 +712,9 @@ export default function BatchProgress({ jobs, onReset, onRecoverFailed, onSingle
       let failed = 0;
       let total = 0;
       for (const job of eligible) {
-        for (const type of ["video", "short", "thumbnail"]) {
+        // Sólo lo que el job realmente produjo — si no, cada job parcial
+        // sumaba un 404 al total y el resumen mentía.
+        for (const type of deliverableTypes(job)) {
           total += 1;
           const ok = await triggerDownload(job.job_id, type);
           if (!ok) failed += 1;
