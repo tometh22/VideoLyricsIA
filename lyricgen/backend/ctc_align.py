@@ -51,6 +51,7 @@ that region.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import time
@@ -61,6 +62,15 @@ logger = logging.getLogger("uvicorn.error")
 
 MODEL_ID = os.environ.get(
     "CTC_ALIGN_MODEL", "jonatasgrosman/wav2vec2-large-xlsr-53-spanish")
+MODEL_REVISION = os.environ.get(
+    "CTC_ALIGN_MODEL_REVISION",
+    # Immutable HEAD published by the model repository. Override only with a
+    # separately benchmarked commit, never with a moving branch name.
+    "96d7e9b4e4a78af515a3c6d3cee7c0826045d276",
+).strip()
+_ALLOWED_MODEL_IDS = frozenset({
+    "jonatasgrosman/wav2vec2-large-xlsr-53-spanish",
+})
 SR = 16000
 FRAME = 320          # wav2vec2 stride: 1 emission frame per 320 samples (20 ms)
 CHUNK_S = 30.0       # encoder window
@@ -324,14 +334,21 @@ _EN_STOP = frozenset(
 
 
 def guess_text_lang(lines: list[str]) -> str:
-    """'es' / 'en' / 'unknown' by function-word voting. Pure."""
+    """'es' / 'en' / 'unknown' by exclusive function-word voting.
+
+    Shared words (notably ``no`` and ``me``) are not language evidence.
+    Counting them for both sides made Spanish live choruses with repeated
+    ``no`` look ambiguous and disabled CTC before any acoustic work.
+    """
     es = en = 0
     for line in lines:
         for w in line.lower().split():
             w = re.sub(r"[^a-záéíóúñü']", "", w)
-            if w in _ES_STOP:
+            in_es = w in _ES_STOP
+            in_en = w in _EN_STOP
+            if in_es and not in_en:
                 es += 1
-            if w in _EN_STOP:
+            elif in_en and not in_es:
                 en += 1
     total = es + en
     if total < 5:
@@ -341,6 +358,92 @@ def guess_text_lang(lines: list[str]) -> str:
     if en >= 2 * es:
         return "en"
     return "unknown"
+
+
+def short_repeated_motif_runs(
+    lines: list[str], *, min_run: int = 3,
+) -> list[tuple[int, int]]:
+    """Return inclusive index ranges for compact repeated lexical openings.
+
+    The return value intentionally contains indexes only: quality analytics can
+    route the affected audio without persisting lyric text or lexical hashes.
+    Adjacent runs with different openings remain separate so a bounded retry
+    cannot accidentally turn a whole chorus into one periodic motif.
+    """
+    generic = {"no", "oh", "ah", "uh", "eh", "yeah"}
+    runs: list[tuple[int, int]] = []
+    previous = None
+    run_start = 0
+    run = 0
+
+    def flush(end_index: int) -> None:
+        if run >= min_run:
+            runs.append((run_start, end_index))
+
+    for index, line in enumerate(lines or []):
+        tokens = [norm_word(word) for word in str(line or "").split()]
+        tokens = [token for token in tokens if token]
+        opening = tokens[0] if 1 <= len(tokens) <= 4 else None
+        if opening and opening not in generic and opening == previous:
+            run += 1
+            continue
+        flush(index - 1)
+        if opening and opening not in generic:
+            previous = opening
+            run_start = index
+            run = 1
+        else:
+            previous = None
+            run_start = index + 1
+            run = 0
+    flush(len(lines or []) - 1)
+    return runs
+
+
+def short_repeated_motif_windows(
+    segments: list[dict], *, min_run: int = 3, context_seconds: float = 4.0,
+) -> list[dict]:
+    """Build bounded, text-free quality windows for a global motif decline."""
+    indexed_rows = [
+        (index, segment) for index, segment in enumerate(segments or [])
+        if isinstance(segment, dict)
+    ]
+    rows = [segment for _index, segment in indexed_rows]
+    lines = [str(segment.get("text") or "") for segment in rows]
+    windows = []
+    context = max(0.0, min(float(context_seconds), 8.0))
+    for first, last in short_repeated_motif_runs(lines, min_run=min_run):
+        if first < 0 or last >= len(rows):
+            continue
+        try:
+            start = float(rows[first].get("start"))
+            end = float(rows[last].get("end"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            continue
+        windows.append({
+            "start": round(max(0.0, start - context), 3),
+            "end": round(end + context, 3),
+            "reason": "ctc_short_repeated_motif",
+            "segment_indices": [
+                indexed_rows[index][0] for index in range(first, last + 1)
+            ],
+        })
+    return windows
+
+
+def has_short_repeated_motif(lines: list[str], *, min_run: int = 3) -> bool:
+    """Detect a compact repeated chant that CTC must not re-time blindly.
+
+    Global CTC is excellent for lexical verses and full chorus lines, but a
+    run such as ``Real`` / ``Real`` / ``Real`` has too few phonetic anchors to
+    determine repetition cardinality.  In that case its monotonic Viterbi can
+    spread surplus rows across later crowd noise with plausible word scores.
+    Preserve the ASR timing and let the structural quality pass inspect the
+    bounded refrain instead.
+    """
+    return bool(short_repeated_motif_runs(lines, min_run=min_run))
 
 
 BRIDGE_S = 8.0  # no word lasts 8s; no intra-line silence lasts 8s
@@ -367,13 +470,27 @@ def finalize_line(seg: dict, ls: float, le: float, wlist, lr,
     new["end"] = round(float(le), 3)
     if lr is not None:
         new["ctc_lr"] = round(lr, 3)
+    review_reasons = list(new.get("review_reasons") or [])
+    if new.get("review") and not review_reasons:
+        review_reasons.append("approximate_timing")
     if skipped:
         new["ctc_skipped"] = True  # Viterbi: línea no cantada
+        if "ctc_skipped" not in review_reasons:
+            review_reasons.append("ctc_skipped")
     else:
-        new.pop("review", None)
+        # A successful retime clears only the old scaffold timing warning.
+        # Content/structure warnings (for example compressed repetitions)
+        # remain review-scoped because CTC aligned the supplied text.
+        review_reasons = [reason for reason in review_reasons
+                          if reason != "approximate_timing"]
     if recovered:
         new["ctc_recovered"] = "mix"  # M5: rescatada del mix
     if wlist:
+        ctc_scores = [float(sc) for (_w, _a, _b, sc) in wlist]
+        new["ctc_mean_score"] = round(
+            sum(ctc_scores) / len(ctc_scores), 4,
+        )
+        new["ctc_min_score"] = round(min(ctc_scores), 4)
         new["words"] = [
             {"word": w, "start": round(float(a), 3),
              "end": round(float(b), 3), "score": round(float(sc), 3)}
@@ -382,6 +499,12 @@ def finalize_line(seg: dict, ls: float, le: float, wlist, lr,
         # Interpolated line: the inherited word stamps belong to
         # the OLD timing — keeping them would break karaoke.
         new.pop("words", None)
+    if review_reasons:
+        new["review"] = True
+        new["review_reasons"] = sorted(set(review_reasons))
+    else:
+        new.pop("review", None)
+        new.pop("review_reasons", None)
     return new
 
 
@@ -697,14 +820,23 @@ def _load_model():
     global _MODEL
     if _MODEL is not None:
         return _MODEL
-    import torch
+    if MODEL_ID not in _ALLOWED_MODEL_IDS:
+        raise RuntimeError(
+            "CTC_ALIGN_MODEL is not an approved immutable model identity"
+        )
+    if not re.fullmatch(r"[0-9a-f]{40}", MODEL_REVISION):
+        raise RuntimeError("CTC_ALIGN_MODEL_REVISION must be a 40-character commit SHA")
     from transformers import AutoModelForCTC, Wav2Vec2CTCTokenizer
 
     t0 = time.time()
     # NOT AutoProcessor: the model repo ships an optional LM decoder that
     # drags in pyctcdecode; we only need raw emissions + the char vocab.
-    tok = Wav2Vec2CTCTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCTC.from_pretrained(MODEL_ID).eval()
+    load_kwargs = {
+        "revision": MODEL_REVISION or None,
+        "trust_remote_code": False,
+    }
+    tok = Wav2Vec2CTCTokenizer.from_pretrained(MODEL_ID, **load_kwargs)
+    model = AutoModelForCTC.from_pretrained(MODEL_ID, **load_kwargs).eval()
     dictionary = {k.lower(): v for k, v in tok.get_vocab().items() if len(k) == 1}
     blank_id = tok.pad_token_id
     logger.info("[CTC] model %s loaded in %.1fs", MODEL_ID, time.time() - t0)
@@ -712,7 +844,8 @@ def _load_model():
     return _MODEL
 
 
-def _emissions(model, wav, blank_id: int, star_delta: float):
+def _emissions(model, wav, blank_id: int, star_delta: float,
+               *, append_star: bool = True):
     """Full-song (T, C+1) log-prob matrix — chunked encoder, exact global
     frame indices, synthetic star appended as the last class."""
     import torch
@@ -726,10 +859,11 @@ def _emissions(model, wav, blank_id: int, star_delta: float):
             x = wav[:, a:b]
             x = (x - x.mean()) / (x.std() + 1e-7)  # do_normalize
             em = torch.log_softmax(model(x).logits[0], dim=-1)
-            nb = em.clone()
-            nb[:, blank_id] = float("-inf")
-            star = nb.max(dim=-1, keepdim=True).values - star_delta
-            em = torch.cat([em, star], dim=-1)
+            if append_star:
+                nb = em.clone()
+                nb[:, blank_id] = float("-inf")
+                star = nb.max(dim=-1, keepdim=True).values - star_delta
+                em = torch.cat([em, star], dim=-1)
             # wav2vec2's conv stack emits floor((L-400)/320)+1 frames, so
             # the LAST chunk (no right context) can come out one frame
             # short of `hi` — python slicing tolerates it; the effect is
@@ -738,6 +872,466 @@ def _emissions(model, wav, blank_id: int, star_delta: float):
             hi = lo + (end - start) // FRAME
             pieces.append(em[lo:hi].cpu())
     return torch.cat(pieces)
+
+
+def window_emissions(audio_path: str, start: float, end: float):
+    """Return one bounded CTC emission matrix plus trusted model metadata.
+
+    This is the shared primitive used by quality-v5 contrastive scoring.  It
+    performs no text alignment and therefore can be safely cached by complete
+    audio/model/window identity.  Callers must keep the 45-second bound.
+    """
+    if not is_enabled() or not audio_path or not os.path.exists(audio_path):
+        return None
+    start, end = float(start), float(end)
+    if not (0.0 <= start < end and 1.0 <= end - start <= 45.0):
+        return None
+    import torchaudio
+
+    model, dictionary, blank_id = _load_model()
+    info = torchaudio.info(audio_path)
+    source_sr = info.sample_rate or SR
+    offset = max(0, int(start * source_sr))
+    frames = max(1, int((end - start) * source_sr))
+    wav, sr = torchaudio.load(
+        audio_path, frame_offset=offset, num_frames=frames,
+    )
+    wav = wav.mean(0, keepdim=True)
+    if sr != SR:
+        wav = torchaudio.functional.resample(wav, sr, SR)
+    if wav.shape[1] < SR:
+        return None
+    # Quality evidence uses the model's real normalized vocabulary. The
+    # synthetic star class is useful for timing Viterbi but is not a valid
+    # probability distribution for contrastive content scoring.
+    emission = _emissions(
+        model, wav, blank_id, _star_delta(), append_star=False,
+    )
+    return {
+        "emission": emission,
+        "dictionary": dictionary,
+        "blank_id": int(blank_id),
+        "vocab_size": int(model.config.vocab_size),
+        "model_id": MODEL_ID,
+        "model_revision": MODEL_REVISION,
+        "frame_seconds": FRAME / SR,
+        "window": [start, end],
+    }
+
+
+def score_structural_candidates_from_emission(
+    bundle: dict, candidates: list[dict],
+) -> list[dict]:
+    """Contrastively score complete text/topology candidates in one matrix.
+
+    Candidate anchors are acoustic-event starts.  Each candidate is aligned
+    inside independent monotonic slots, preventing repeated words from
+    consuming another cycle.  The function never accepts caller confidence;
+    all returned scores are derived from the trusted CTC emissions above.
+    """
+    import math
+    import numpy as np
+
+    emission = bundle.get("emission")
+    if emission is None:
+        return []
+    emission = np.asarray(emission, dtype=np.float64)
+    dictionary = bundle["dictionary"]
+    blank_id = int(bundle["blank_id"])
+    frame_to_s = float(bundle.get("frame_seconds") or FRAME / SR)
+    start, end = (float(value) for value in bundle["window"])
+    word_sep_id = (
+        dictionary.get("|")
+        if os.environ.get("CTC_ALIGN_WORD_SEP", "1").strip().lower() in _TRUE
+        else None
+    )
+    scored = []
+    for candidate in (candidates or [])[:8]:
+        texts = [str(value or "").strip() for value in candidate.get("texts") or []]
+        anchors = [float(value) for value in candidate.get("anchors") or []]
+        if not 1 <= len(texts) == len(anchors) <= 12:
+            continue
+        if any(not text for text in texts) or any(
+            right <= left for left, right in zip(anchors, anchors[1:])
+        ):
+            continue
+        if anchors[0] < start - .5 or anchors[-1] > end + .5:
+            continue
+        gaps = [right - left for left, right in zip(anchors, anchors[1:])]
+        median_gap = sorted(gaps)[len(gaps) // 2] if gaps else max(1.2, end - start)
+        events, line_scores = [], []
+        valid = True
+        for index, (text, anchor) in enumerate(zip(texts, anchors)):
+            slot_start = max(start, anchor - min(.55, median_gap * .10))
+            slot_end = (
+                min(end, anchors[index + 1] - .18)
+                if index + 1 < len(anchors)
+                else min(end, anchor + max(1.0, median_gap * .82))
+            )
+            if slot_end - slot_start < .35:
+                valid = False
+                break
+            lo = max(0, int((slot_start - start) / frame_to_s))
+            hi = min(len(emission), int((slot_end - start) / frame_to_s))
+            local = emission[lo:hi]
+            projected = singing_scoring_projection(text)
+            target_ids = []
+            projected_words = projected.split()
+            for word_index, word in enumerate(projected_words):
+                target_ids.extend(
+                    dictionary[char] for char in norm_word(word)
+                    if char in dictionary and dictionary[char] != blank_id
+                )
+                if word_sep_id is not None and word_index < len(projected_words) - 1:
+                    target_ids.append(word_sep_id)
+            real_tokens = len(target_ids)
+            # Coverage belongs to the canonical scoring target. Repeated
+            # surface vowels encode duration (``nooooo``), not five lexical
+            # graphemes; comparing against display spelling falsely rejected
+            # the exact sustained events this verifier must handle.
+            characters = sum(
+                len(norm_word(word)) for word in projected_words
+            ) or 1
+            if (
+                real_tokens / characters < .60
+                or not len(local)
+                or len(target_ids) >= len(local)
+            ):
+                valid = False
+                break
+            from ctc_dp import blank_logprob, ctc_forward_logprob
+            target_logprob = ctc_forward_logprob(local, target_ids, blank_id)
+            null_logprob = blank_logprob(local, blank_id)
+            if not math.isfinite(target_logprob):
+                valid = False
+                break
+            # Same-frame likelihood ratio against absence. Dividing by frame
+            # count makes events of different duration comparable; calibration
+            # still remains mandatory before acceptance.
+            score = (target_logprob - null_logprob) / max(1, len(local))
+            line_scores.append(float(score))
+            events.append({
+                "start": round(slot_start, 3),
+                "end": round(slot_end, 3),
+                "text": text,
+                "scoring_projection": projected,
+                "surface_spelling_verified": (
+                    singing_scoring_projection(text)
+                    == unicodedata.normalize("NFC", str(text or "").lower())
+                ),
+                "ctc_log_likelihood_ratio_per_frame": round(float(score), 6),
+            })
+        if not valid or len(events) != len(texts):
+            continue
+        ordered_scores = sorted(line_scores)
+        scored.append({
+            "candidate_id": str(candidate.get("candidate_id") or ""),
+            "source": str(candidate.get("source") or "unknown"),
+            "family": str(candidate.get("family") or "unknown"),
+            "mean_score": round(sum(line_scores) / len(line_scores), 6),
+            "median_score": round(ordered_scores[len(ordered_scores) // 2], 6),
+            "min_score": round(min(line_scores), 6),
+            "events": events,
+        })
+    return sorted(scored, key=lambda item: item["mean_score"], reverse=True)
+
+
+def singing_scoring_projection(text: str) -> str:
+    """Canonical target for singing; display spelling remains untouched."""
+    value = unicodedata.normalize("NFC", str(text or "").lower())
+    # A held vowel is duration evidence, not repeated lexical graphemes.
+    value = re.sub(r"([aeiouáéíóúü])\1{2,}", r"\1", value)
+    words = [norm_word(word) for word in value.split()]
+    return " ".join(word for word in words if word)
+
+
+def align_structural_window(audio_path: str, texts: list[str], start: float,
+                            end: float, job_id: str = "") -> Optional[dict]:
+    """Text-conditioned CTC alignment for a bounded repeated motif.
+
+    Unlike :func:`retime_segments`, this entry point intentionally permits a
+    short repeated motif.  It is safe only as one witness in the structural
+    hybrid: cardinality must come from an independent model, and callers must
+    compare this result with a second audio representation plus acoustic
+    topology before changing rows.  It never invents or changes text.
+    """
+    try:
+        if not is_enabled() or not audio_path or not os.path.exists(audio_path):
+            return None
+        clean = [str(text or "").strip() for text in (texts or [])]
+        if not 2 <= len(clean) <= 8 or any(not text for text in clean):
+            return None
+        start, end = float(start), float(end)
+        duration = end - start
+        if not (0.0 <= start < end and 2.0 <= duration <= 45.0):
+            return None
+
+        import torch
+        import torchaudio
+        import torchaudio.functional as AF
+
+        model, dictionary, blank_id = _load_model()
+        star_id = model.config.vocab_size
+        word_sep_id = (
+            dictionary.get("|")
+            if os.environ.get("CTC_ALIGN_WORD_SEP", "1").strip().lower() in _TRUE
+            else None
+        )
+        targets, words = build_targets(
+            clean, dictionary, star_id, word_sep_id=word_sep_id,
+        )
+        real_tokens = sum(count for line, _raw, count in words if line >= 0)
+        characters = sum(len(norm_word(word)) for text in clean for word in text.split()) or 1
+        if real_tokens / characters < 0.60:
+            return None
+
+        info = torchaudio.info(audio_path)
+        source_sr = info.sample_rate or SR
+        offset = max(0, int(start * source_sr))
+        frames = max(1, int(duration * source_sr))
+        wav, sr = torchaudio.load(audio_path, frame_offset=offset, num_frames=frames)
+        wav = wav.mean(0, keepdim=True)
+        if sr != SR:
+            wav = torchaudio.functional.resample(wav, sr, SR)
+        if wav.shape[1] < 2 * SR or len(targets) >= wav.shape[1] // FRAME:
+            return None
+
+        emission = _emissions(model, wav, blank_id, _star_delta())
+        aligned, scores = AF.forced_align(
+            emission.unsqueeze(0),
+            torch.tensor(targets, dtype=torch.int32).unsqueeze(0),
+            blank=blank_id,
+        )
+        token_spans = AF.merge_tokens(
+            aligned[0], scores[0].exp(), blank=blank_id,
+        )
+        spans = [(span.start, span.end, float(span.score)) for span in token_spans]
+        line_times = spans_to_lines(spans, words, len(clean), FRAME / SR)
+        if any(line is None for line in line_times):
+            return None
+
+        events = []
+        line_scores = []
+        previous_end = start
+        for text, line in zip(clean, line_times):
+            local_start, local_end, word_spans = line
+            if not word_spans:
+                return None
+            absolute_start = start + local_start
+            absolute_end = start + local_end
+            score = sum(word[3] for word in word_spans) / len(word_spans)
+            if absolute_end <= absolute_start or absolute_start < previous_end - 0.20:
+                return None
+            previous_end = absolute_end
+            line_scores.append(score)
+            events.append({
+                "start": round(absolute_start, 3),
+                "end": round(absolute_end, 3),
+                "text": text,
+                "ctc_score": round(float(score), 4),
+                "words": [
+                    {
+                        "word": word,
+                        "start": round(start + word_start, 3),
+                        "end": round(start + word_end, 3),
+                        "score": round(float(word_score), 4),
+                    }
+                    for word, word_start, word_end, word_score in word_spans
+                ],
+            })
+        median_score = sorted(line_scores)[len(line_scores) // 2]
+        return {
+            "events": events,
+            "median_score": round(float(median_score), 4),
+            "min_score": round(float(min(line_scores)), 4),
+            "window": [round(start, 3), round(end, 3)],
+        }
+    except Exception as exc:
+        logger.warning(
+            "[CTC-STRUCTURAL] decline on error: %s (job=%s)", exc, job_id,
+        )
+        return None
+
+
+def _structural_anchor_slots(
+    anchors: list[float], start: float, end: float,
+    event_bounds: list[tuple[float, float]] | None = None,
+) -> Optional[list[tuple[float, float, float, float]]]:
+    """Plan non-overlapping CTC slots without truncating the final phrase.
+
+    Each tuple is ``slot_start, slot_end, acoustic_start, acoustic_end``.
+    Explicit acoustic bounds come from the text-independent Performance Graph;
+    otherwise the final slot deliberately reaches the bounded analysis-window
+    end and lets CTC's star token absorb trailing non-lyric audio.
+    """
+    points = [float(value) for value in (anchors or [])]
+    start, end = float(start), float(end)
+    if len(points) < 2 or end <= start or any(
+        right <= left for left, right in zip(points, points[1:])
+    ):
+        return None
+    bounds = None
+    if event_bounds is not None:
+        if len(event_bounds) != len(points):
+            return None
+        bounds = []
+        for anchor, pair in zip(points, event_bounds):
+            try:
+                acoustic_start, acoustic_end = map(float, pair)
+            except (TypeError, ValueError):
+                return None
+            if (not math.isfinite(acoustic_start)
+                    or not math.isfinite(acoustic_end)
+                    or acoustic_end <= acoustic_start
+                    or anchor < acoustic_start - 0.75
+                    or anchor > acoustic_end + 0.75):
+                return None
+            bounds.append((acoustic_start, acoustic_end))
+    gaps = [right - left for left, right in zip(points, points[1:])]
+    median_gap = float(sorted(gaps)[max(0, (len(gaps) - 1) // 2)])
+    slots = []
+    for index, anchor in enumerate(points):
+        acoustic_start, acoustic_end = (
+            bounds[index] if bounds is not None
+            else (anchor, points[index + 1] if index + 1 < len(points) else end)
+        )
+        slot_start = max(
+            start,
+            min(anchor, acoustic_start) - min(0.55, median_gap * 0.10),
+        )
+        if index + 1 < len(points):
+            slot_end = min(end, points[index + 1] - 0.18)
+            if bounds is not None:
+                slot_end = min(slot_end, acoustic_end + 0.35)
+        else:
+            # The old ``anchor + .82 * median_gap`` cap clipped sustained
+            # final phrases.  A bounded quality window is safe to consume to
+            # its end; explicit graph bounds tighten it when available.
+            slot_end = end if bounds is None else min(end, acoustic_end + 0.35)
+        if slot_end - slot_start < 1.0:
+            return None
+        slots.append((slot_start, slot_end, acoustic_start, acoustic_end))
+    return slots
+
+
+def align_structural_anchors(audio_path: str, texts: list[str],
+                             anchors: list[float], start: float, end: float,
+                             job_id: str = "", *,
+                             event_bounds: list[tuple[float, float]] | None = None,
+                             ) -> Optional[dict]:
+    """Score one text per acoustic cycle in independently bounded slots.
+
+    The slots prevent repeated identical text from consuming an earlier cycle
+    in the window.  Anchors come from waveform topology, never ASR timestamps.
+    Returned starts are still CTC-derived inside each slot.
+    """
+    try:
+        if not is_enabled() or not audio_path or not os.path.exists(audio_path):
+            return None
+        clean = [str(text or "").strip() for text in (texts or [])]
+        points = [float(value) for value in (anchors or [])]
+        if not 2 <= len(clean) == len(points) <= 8:
+            return None
+        if any(not text for text in clean) or any(
+            right <= left for left, right in zip(points, points[1:])
+        ):
+            return None
+        start, end = float(start), float(end)
+        if points[0] < start - 0.5 or points[-1] > end + 0.5:
+            return None
+
+        import torch
+        import torchaudio
+        import torchaudio.functional as AF
+
+        model, dictionary, blank_id = _load_model()
+        star_id = model.config.vocab_size
+        word_sep_id = (
+            dictionary.get("|")
+            if os.environ.get("CTC_ALIGN_WORD_SEP", "1").strip().lower() in _TRUE
+            else None
+        )
+        info = torchaudio.info(audio_path)
+        source_sr = info.sample_rate or SR
+        offset = max(0, int(start * source_sr))
+        frames = max(1, int((end - start) * source_sr))
+        wav, sr = torchaudio.load(audio_path, frame_offset=offset, num_frames=frames)
+        wav = wav.mean(0, keepdim=True)
+        if sr != SR:
+            wav = torchaudio.functional.resample(wav, sr, SR)
+        emission = _emissions(model, wav, blank_id, _star_delta())
+        frame_to_s = FRAME / SR
+        slots = _structural_anchor_slots(points, start, end, event_bounds)
+        if not slots:
+            return None
+        events, line_scores = [], []
+        for text, anchor, slot in zip(clean, points, slots):
+            slot_start, slot_end, acoustic_start, acoustic_end = slot
+            lo = max(0, int((slot_start - start) / frame_to_s))
+            hi = min(len(emission), int((slot_end - start) / frame_to_s))
+            local = emission[lo:hi]
+            targets, words = build_targets(
+                [text], dictionary, star_id, word_sep_id=word_sep_id,
+            )
+            if len(targets) >= len(local):
+                return None
+            aligned, scores = AF.forced_align(
+                local.unsqueeze(0),
+                torch.tensor(targets, dtype=torch.int32).unsqueeze(0),
+                blank=blank_id,
+            )
+            token_spans = AF.merge_tokens(
+                aligned[0], scores[0].exp(), blank=blank_id,
+            )
+            spans = [(span.start, span.end, float(span.score)) for span in token_spans]
+            (line,) = spans_to_lines(spans, words, 1, frame_to_s)
+            if line is None or not line[2]:
+                return None
+            local_start, local_end, word_spans = line
+            absolute_start = slot_start + local_start
+            absolute_end = slot_start + local_end
+            score = sum(word[3] for word in word_spans) / len(word_spans)
+            line_scores.append(score)
+            events.append({
+                "start": round(absolute_start, 3),
+                "end": round(absolute_end, 3),
+                "text": text,
+                "ctc_score": round(float(score), 4),
+                "anchor": round(anchor, 3),
+                "acoustic_start": round(acoustic_start, 3),
+                "acoustic_end": round(acoustic_end, 3),
+                "phonetic_end": round(absolute_end, 3),
+                "display_end": round(absolute_end, 3),
+                "display_end_calibrated": False,
+                "words": [
+                    {
+                        "word": word,
+                        "start": round(slot_start + word_start, 3),
+                        "end": round(slot_start + word_end, 3),
+                        "score": round(float(word_score), 4),
+                    }
+                    for word, word_start, word_end, word_score in word_spans
+                ],
+            })
+        ordered = all(
+            right["start"] >= left["end"] - 0.20
+            for left, right in zip(events, events[1:])
+        )
+        if not ordered:
+            return None
+        return {
+            "events": events,
+            "median_score": round(float(sorted(line_scores)[len(line_scores) // 2]), 4),
+            "min_score": round(float(min(line_scores)), 4),
+            "mean_score": round(float(sum(line_scores) / len(line_scores)), 4),
+            "window": [round(start, 3), round(end, 3)],
+        }
+    except Exception as exc:
+        logger.warning(
+            "[CTC-STRUCTURAL-ANCHOR] decline on error: %s (job=%s)",
+            exc, job_id,
+        )
+        return None
 
 
 # Why the last retime_segments call declined ("structural" | "other" | "").
@@ -808,6 +1402,13 @@ def retime_segments(audio_path: str, segments: list[dict],
             # model registry exists, declining is the honest move. Checked
             # BEFORE any torch import / 1.2 GB model load.
             logger.info("[CTC] decline: text language=%s (job=%s)", lang, job_id)
+            return None
+        if has_short_repeated_motif(lines):
+            last_decline_reason = "short_repeated_motif"
+            logger.info(
+                "[CTC] decline: short repeated motif lacks stable anchors "
+                "(job=%s)", job_id,
+            )
             return None
 
         import torch

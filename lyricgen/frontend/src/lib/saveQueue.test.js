@@ -99,6 +99,44 @@ describe("saveQueue", () => {
     expect(q.getStatus("job")).toEqual({ status: "error", reason: "session" });
   });
 
+  it("no reintenta un 409 legacy sin una base para mergear", async () => {
+    const persist = vi.fn()
+      .mockResolvedValueOnce({ ok: false, reason: "stale-revision", status: 409, currentRevision: 3 });
+    const q = createSaveQueue(persist);
+
+    q.flush("job", { provider: () => SEG("local") });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(persist.mock.calls[0][2].baseRevision).toBe(0);
+    expect(q.getStatus("job")).toEqual({ status: "error", reason: "stale-revision" });
+  });
+
+  it("keeps a 409 local instead of retrying it as a later edit", async () => {
+    const persist = vi
+      .fn()
+      .mockResolvedValue({
+        ok: false,
+        reason: "stale-revision",
+        status: 409,
+        currentRevision: 7,
+      });
+    const q = createSaveQueue(persist);
+
+    q.flush("job", { provider: () => SEG("first") });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(q.getStatus("job").status).toBe("error");
+
+    persist.mockResolvedValueOnce({ ok: true, revision: 8 });
+    q.flush("job", { provider: () => SEG("second") });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(persist).toHaveBeenCalledTimes(2);
+    expect(persist.mock.calls.at(-1)[1]).toEqual(SEG("second"));
+    expect(persist.mock.calls.at(-1)[2].baseRevision).toBe(0);
+    expect(q.getStatus("job")).toEqual({ status: "saved", reason: null });
+  });
+
   it("un fetch que tira (reject) cae a status=error reason=network", async () => {
     const persist = vi.fn().mockRejectedValue(new Error("boom"));
     const categorize = (r) => r.reason || "server";

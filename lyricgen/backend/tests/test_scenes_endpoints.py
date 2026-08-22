@@ -6,6 +6,8 @@ Cubren la garantía de gating/entitlement que la auditoría marcó:
 - features.scenes = admin OR SCENES_ENABLED_TENANTS.
 """
 
+from datetime import datetime, timezone
+
 
 def test_auth_me_returns_features_scenes_admin(client, admin_token):
     r = client.get("/auth/me", headers={"Authorization": f"Bearer {admin_token}"})
@@ -34,7 +36,8 @@ import uuid as _uuid
 
 
 def _make_scene_job(db, tenant_id, *, user_id=1, status="pending_review", edit_count=0,
-                    with_scene=True, input_key="in/x.mp3", youtube=None):
+                    with_scene=True, input_key="in/x.mp3", youtube=None,
+                    completed_at=None, editing_started_at=None):
     from database import Job as JobModel
     jid = _uuid.uuid4().hex[:12]
     plan = {
@@ -49,6 +52,7 @@ def _make_scene_job(db, tenant_id, *, user_id=1, status="pending_review", edit_c
         segments_json=[{"start": 0.0, "end": 1.0, "text": "x"}],
         edit_count=edit_count, scene_plan=plan, input_r2_key=input_key,
         youtube_data=youtube,
+        completed_at=completed_at, editing_started_at=editing_started_at,
     )
     db.add(job)
     db.commit()
@@ -145,6 +149,28 @@ def test_regen_scene_happy_does_not_touch_edit_count(client, admin_token, db, mo
     assert fresh.edit_count == 0 and fresh.status == "editing"
 
 
+def test_regen_scene_rejected_clears_rejection_timestamp(
+    client, admin_token, db, monkeypatch,
+):
+    from database import Job as JobModel
+    import main
+
+    monkeypatch.setattr(main, "enqueue_edit", lambda **k: "edit:fake")
+    me = client.get("/auth/me", headers=_hdr(admin_token)).json()
+    rejected_at = datetime(2026, 6, 30, tzinfo=timezone.utc)
+    jid = _make_scene_job(
+        db, me["tenant_id"], status="rejected", completed_at=rejected_at)
+    response = client.post(
+        f"/jobs/{jid}/scenes/coro_1/regenerate",
+        headers=_hdr(admin_token), json={},
+    )
+    assert response.status_code == 200, response.text
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == jid).one()
+    assert row.status == "editing"
+    assert row.completed_at is None
+
+
 def _make_retry_job(db, tenant_id, user_id, *, enable_scenes=True):
     from database import Job as JobModel
     jid = _uuid.uuid4().hex[:12]
@@ -207,6 +233,73 @@ def test_regen_scene_rollback_on_enqueue_failure(client, admin_token, db, monkey
     # Revertido: no quedó en "editing" ni con el edit consumido.
     assert fresh.status == "pending_review"
     assert fresh.edit_count == 0
+
+
+def test_regen_scene_rejected_restores_timestamp_if_enqueue_fails(
+    client, admin_token, db, monkeypatch,
+):
+    from database import Job as JobModel
+    import main
+
+    monkeypatch.setattr(
+        main, "enqueue_edit",
+        lambda **k: (_ for _ in ()).throw(RuntimeError("redis caído")),
+    )
+    me = client.get("/auth/me", headers=_hdr(admin_token)).json()
+    rejected_at = datetime(2026, 6, 30, tzinfo=timezone.utc)
+    previous_edit = datetime(2026, 6, 29, tzinfo=timezone.utc)
+    jid = _make_scene_job(
+        db, me["tenant_id"], status="rejected", completed_at=rejected_at,
+        editing_started_at=previous_edit,
+    )
+    response = client.post(
+        f"/jobs/{jid}/scenes/coro_1/regenerate",
+        headers=_hdr(admin_token), json={},
+    )
+    assert response.status_code == 503
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == jid).one()
+    assert row.status == "rejected"
+    completed_at = row.completed_at
+    editing_started_at = row.editing_started_at
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    if editing_started_at.tzinfo is None:
+        editing_started_at = editing_started_at.replace(tzinfo=timezone.utc)
+    assert completed_at == rejected_at
+    assert editing_started_at == previous_edit
+
+
+def test_regen_scene_rejected_preserves_retained_delivery(
+    client, admin_token, db, monkeypatch,
+):
+    from database import Job as JobModel
+    import main
+
+    monkeypatch.setattr(main, "enqueue_edit", lambda **k: "edit:fake")
+    me = client.get("/auth/me", headers=_hdr(admin_token)).json()
+    delivered_at = datetime(2026, 6, 28, tzinfo=timezone.utc)
+    reopened_at = datetime(2026, 6, 29, tzinfo=timezone.utc)
+    jid = _make_scene_job(
+        db,
+        me["tenant_id"],
+        status="rejected",
+        completed_at=delivered_at,
+        editing_started_at=reopened_at,
+    )
+
+    response = client.post(
+        f"/jobs/{jid}/scenes/coro_1/regenerate",
+        headers=_hdr(admin_token),
+        json={},
+    )
+    assert response.status_code == 200, response.text
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == jid).one()
+    completed_at = row.completed_at
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    assert completed_at == delivered_at
 
 
 def test_scenes_thumbs_ownership_and_shape(client, admin_token, db):

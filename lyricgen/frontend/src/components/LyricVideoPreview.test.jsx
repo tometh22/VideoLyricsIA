@@ -58,19 +58,14 @@ it("drops to the placeholder after the tail-hold window (real instrumental)", ()
   expect(screen.getByText(/Reproducí|Play|Toque/)).toBeInTheDocument();
 });
 
-it("stacks multiple overlapping lines (chorus repeat case)", () => {
-  // INCIDENT 2026-05-25: chorus with repeated lines like
-  // "Legalícenla / Oh-oh-oh" at same start time used to show only the
-  // last one. Now both are rendered, joined by a newline, so the
-  // operator sees the full overlap.
+it("uses the same single active line as the editor highlight", () => {
   const segs = [
     { _id: 0, start: 5,   end: 7, text: "Legalícenla" },
     { _id: 1, start: 5.1, end: 7, text: "Oh-oh-oh" },
   ];
   setup({ segments: segs, currentTime: 6 });
-  // Both texts are rendered in the same node (joined by \n via whitespace:pre-line)
-  const el = screen.getByText(/Legalícenla[\s\S]*Oh-oh-oh/);
-  expect(el).toBeInTheDocument();
+  expect(screen.getByText("Oh-oh-oh")).toBeInTheDocument();
+  expect(screen.queryByText("Legalícenla")).not.toBeInTheDocument();
 });
 
 it("does not show any line before the first segment starts (intro)", () => {
@@ -185,4 +180,5 @@ it("renders a <video> when backgroundUrl is set, gradient otherwise", () => {
     />
   );
   expect(container.querySelector("video")).toBeInTheDocument();
+  expect(container.querySelector("video")).toHaveAttribute("loop");
 });

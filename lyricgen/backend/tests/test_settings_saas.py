@@ -2,7 +2,25 @@
 import uuid as _uuid
 
 from tests.conftest import auth
-from database import User, LoginSession
+from database import AuditLog, EmailVerificationToken, User, LoginSession
+
+
+def _delete_users(db, user_ids):
+    """Delete PostgreSQL FK children before disposable test users."""
+    user_ids = list(user_ids)
+    if not user_ids:
+        return
+    db.query(LoginSession).filter(LoginSession.user_id.in_(user_ids)).delete(
+        synchronize_session=False,
+    )
+    db.query(AuditLog).filter(AuditLog.user_id.in_(user_ids)).delete(
+        synchronize_session=False,
+    )
+    db.query(EmailVerificationToken).filter(
+        EmailVerificationToken.user_id.in_(user_ids),
+    ).delete(synchronize_session=False)
+    db.query(User).filter(User.id.in_(user_ids)).delete(synchronize_session=False)
+    db.commit()
 
 
 def _register(client):
@@ -44,9 +62,7 @@ def test_login_creates_session(client, db):
     sessions = res.json()["sessions"]
     assert len(sessions) >= 1
     assert any(s["current"] for s in sessions)
-    db.query(LoginSession).filter(LoginSession.user_id == me["id"]).delete(synchronize_session=False)
-    db.query(User).filter(User.id == me["id"]).delete(synchronize_session=False)
-    db.commit()
+    _delete_users(db, [me["id"]])
 
 
 def test_revoke_session_blocks_token(client, db):
@@ -67,9 +83,7 @@ def test_revoke_session_blocks_token(client, db):
         # token1 sigue vivo
         assert client.get("/auth/me", headers=auth(token1)).status_code == 200
     finally:
-        db.query(LoginSession).filter(LoginSession.user_id == me["id"]).delete(synchronize_session=False)
-        db.query(User).filter(User.id == me["id"]).delete(synchronize_session=False)
-        db.commit()
+        _delete_users(db, [me["id"]])
 
 
 def test_revoke_others(client, db):
@@ -84,9 +98,7 @@ def test_revoke_others(client, db):
         assert client.get("/auth/me", headers=auth(token2)).status_code == 200
         assert client.get("/auth/me", headers=auth(token1)).status_code == 401
     finally:
-        db.query(LoginSession).filter(LoginSession.user_id == me["id"]).delete(synchronize_session=False)
-        db.query(User).filter(User.id == me["id"]).delete(synchronize_session=False)
-        db.commit()
+        _delete_users(db, [me["id"]])
 
 
 def test_sessions_require_auth(client):
@@ -114,5 +126,7 @@ def test_team_members_same_tenant(client, admin_token, db):
         assert f"team_one_{suffix}" in usernames and f"team_two_{suffix}" in usernames
         assert any(m["is_self"] for m in data["members"])
     finally:
-        db.query(User).filter(User.tenant_id == f"team_{suffix}").delete(synchronize_session=False)
-        db.commit()
+        user_ids = [row[0] for row in db.query(User.id).filter(
+            User.tenant_id == f"team_{suffix}",
+        ).all()]
+        _delete_users(db, user_ids)

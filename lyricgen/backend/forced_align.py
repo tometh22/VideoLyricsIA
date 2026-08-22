@@ -123,9 +123,22 @@ def _call_with_budget(model: str, input_factory, *,
             logger.warning("[FORCED] budget exhausted before attempt %s/%s",
                            attempt + 1, len(backoff))
             break
+        from replicate_budget import (
+            finish_replicate_provenance,
+            start_replicate_provenance,
+        )
+        recorder = None
         try:
-            return replicate.run(model, input=input_factory())
+            inputs = input_factory()
+            recorder = start_replicate_provenance(model, "FORCED", attempt + 1)
+            result = replicate.run(model, input=inputs)
+            finish_replicate_provenance(recorder, "succeeded")
+            return result
         except Exception as e:
+            finish_replicate_provenance(
+                recorder,
+                f"error: {type(e).__name__}: {str(e)[:300]}",
+            )
             last_err = e
             if _is_non_retryable(e):
                 logger.warning("[FORCED] non-retryable error on attempt %s (%s) — aborting",
@@ -245,6 +258,20 @@ def wordstamps_to_segments(
     actually STARTED + a normal tail — leaving silence instead of a frozen
     subtitle. Sung lines keep their real timing.
 
+    NO TAIL PILE-UP (incident "638" 2026-05-26, again Los Pericos "Runaway (En
+    Vivo)" 2026-08-05): when the reference has MORE content than the recording
+    (studio lyric over a radio edit / live cut), the surplus lines have nowhere
+    to anchor and the best-effort fallback below pins each of them to the same
+    end-of-stream window — the operator sees a stack of lines sharing one
+    timestamp ("17 lines at 1:50", "5 lines stuck at exactly 1:15.5"). Neither
+    guard upstream catches it: `drift_abort` is reset by the lines that DO
+    anchor, and the text gate passes because the final window genuinely sounds
+    like the repeated chorus those lines contain. So we check the geometry
+    instead: when a line fails to anchor AND lands pinned at the end of the word
+    stream, the cursor has already consumed the recording — the reference is in
+    song order, so nothing after it is sung either, and we stop. Nothing that
+    anchored is affected.
+
     Enforces monotonic, non-overlapping segments (clamp end to next start).
     """
     n_words = len(wordstamps)
@@ -305,6 +332,22 @@ def wordstamps_to_segments(
             # Alignment has lost the plot for several lines running — bail so
             # the caller falls back rather than ship a drifting transcript.
             return []
+
+        # Tail pile-up guard (see docstring). An un-anchored line pinned at the
+        # very end of the word stream means the cursor has consumed the whole
+        # recording but the reference still has lines: emitting them stacks them
+        # all onto the final timestamp. The reference is in song order, so once
+        # one line has no audio left neither does anything after it — stop here
+        # instead of letting the remainder crowd into the last seconds.
+        # `n_words > wc` keeps the degenerate "line longer than the whole
+        # transcript" case out of it.
+        if not anchored and n_words > wc and best_start >= n_words - wc:
+            logger.info(
+                "[FA] la referencia sigue pero el audio se terminó — se corta "
+                "la cola en %r en vez de apilarla en el último timestamp",
+                line[:48],
+            )
+            break
 
         if not anchored and _text_gate_enabled():
             # Gate texto-vs-audio (ANCHOR_TEXT_GATE_ENABLED, default off).

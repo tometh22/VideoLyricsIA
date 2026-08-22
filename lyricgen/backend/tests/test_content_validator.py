@@ -218,6 +218,39 @@ def test_people_opt_in_does_not_bypass_brand_gate(tmp_path, monkeypatch):
     assert any("brand:" in issue["type"] for issue in result["issues"])
 
 
+def test_image_validation_uses_single_frame_cost_key(tmp_path, monkeypatch):
+    import provenance
+
+    image = tmp_path / "frame.jpg"
+    image.write_bytes(b"jpg")
+    captured = {}
+
+    class _Recorder:
+        def finish(self, **_kwargs):
+            pass
+
+    def _record(**kwargs):
+        captured.update(kwargs)
+        return _Recorder()
+
+    monkeypatch.setattr(provenance, "record_ai_call", _record)
+    monkeypatch.setattr(
+        content_validator,
+        "_check_frame_with_gemini",
+        lambda _path: _classified(),
+    )
+
+    result = content_validator.validate_image(str(image), job_id="job-image")
+
+    assert result["passed"] is True
+    assert captured["tool_name"] == "gemini-2.5-flash-vision-image"
+    assert provenance.cost_for_record(
+        captured["tool_name"], captured["tool_provider"],
+    ) < provenance.cost_for_record(
+        "gemini-2.5-flash-vision", "google_vertex",
+    )
+
+
 def test_atmospherics_shadow_is_observed_without_blocking(tmp_path, monkeypatch):
     image = tmp_path / "frame.jpg"
     image.write_bytes(b"jpg")

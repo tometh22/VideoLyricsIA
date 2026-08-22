@@ -38,6 +38,37 @@ const BUCKET_DATE_FMT_AR = new Intl.DateTimeFormat("en-CA", {
   year: "numeric", month: "2-digit", day: "2-digit",
 });
 
+function dateKeyAR(ts) {
+  if (!ts) return null;
+  return BUCKET_DATE_FMT_AR.format(new Date(ts * 1000));
+}
+
+function matchesDateFilter(job, filterId) {
+  if (filterId === "all") return true;
+  const jobDate = dateKeyAR(job.created_at);
+  if (!jobDate) return false;
+
+  const now = new Date();
+  const today = BUCKET_DATE_FMT_AR.format(now);
+  if (filterId === "today") return jobDate === today;
+
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (filterId === "yesterday") {
+    return jobDate === BUCKET_DATE_FMT_AR.format(yesterday);
+  }
+
+  if (filterId === "week") {
+    const weekStart = new Date(now);
+    const daysSinceMonday = (weekStart.getDay() + 6) % 7;
+    weekStart.setDate(weekStart.getDate() - daysSinceMonday);
+    return jobDate >= BUCKET_DATE_FMT_AR.format(weekStart) && jobDate <= today;
+  }
+
+  if (filterId === "month") return jobDate.slice(0, 7) === today.slice(0, 7);
+  return true;
+}
+
 // 2026-05-25 PR-3 — bucketing temporal por timezone AR (no UTC). El
 // operador piensa en bloques cronológicos ("Hoy", "Esta semana") y
 // scrolea por ahí, no por una lista plana de 200 cards. Returns lista
@@ -674,6 +705,14 @@ const FILTERS = [
   { id: "failed",  label: "Fallidos",  match: (j) => j.status === "error" || j.status === "validation_failed" || j.status === "transcription_failed" || j.status === "rejected" },
 ];
 
+const DATE_FILTERS = [
+  { id: "all",       labelKey: "history.date_all" },
+  { id: "today",     labelKey: "history.today" },
+  { id: "yesterday", labelKey: "history.yesterday" },
+  { id: "week",      labelKey: "history.this_week" },
+  { id: "month",     labelKey: "history.this_month" },
+];
+
 function HistoryInspector({ job, onClose, onOpen, t }) {
   const thumbSrc = useMediaUrl(job?.job_id || "", "thumbnail", "preview");
   const closeRef = useRef(null);
@@ -746,6 +785,7 @@ export default function HistoryView({
   const locale = lang === "en" ? "en-US" : lang === "pt" ? "pt-BR" : "es-AR";
   const navigate = useNavigate();
   const [filter, setFilter] = useState("all");
+  const [dateFilter, setDateFilter] = useState("all");
   // Archivado Fase 1: ver intentos fallidos archivados (default oculto).
   const [showArchived, setShowArchived] = useState(false);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
@@ -863,9 +903,19 @@ export default function HistoryView({
     return c;
   }, [realHistory]);
 
+  const dateCounts = useMemo(() => {
+    const c = {};
+    for (const f of DATE_FILTERS) {
+      c[f.id] = realHistory.filter((job) => matchesDateFilter(job, f.id)).length;
+    }
+    return c;
+  }, [realHistory]);
+
   const visible = useMemo(() => {
     const f = FILTERS.find((x) => x.id === filter) || FILTERS[0];
-    let filtered = realHistory.filter(f.match);
+    let filtered = realHistory.filter((job) => (
+      f.match(job) && matchesDateFilter(job, dateFilter)
+    ));
     // Search query — filtra por artist + song_title + filename (case-insensitive)
     const q = query.trim().toLowerCase();
     if (q) {
@@ -877,7 +927,7 @@ export default function HistoryView({
       });
     }
     return sortJobs(filtered, sortKey);
-  }, [realHistory, filter, query, sortKey]);
+  }, [realHistory, filter, dateFilter, query, sortKey]);
   const focusedJob = useMemo(() => visible.find((job) => job.job_id === focusedId) || null, [visible, focusedId]);
   const focusForInspector = (jobId, status) => {
     if (status === "transcribed") onSelect(jobId, status);
@@ -1081,26 +1131,50 @@ export default function HistoryView({
 
       {/* ─── Filters (segmented pills) ──────────────────────────── */}
       {history.length > 0 && (
-        <div className="flex flex-wrap gap-2 mb-6">
-          {FILTERS.filter((f) => f.id === "all" || counts[f.id] > 0).map((f) => (
-            <FilterPill
-              key={f.id}
-              active={filter === f.id}
-              count={counts[f.id]}
-              onClick={() => setFilter(f.id)}
-            >
-              {f.label}
-            </FilterPill>
-          ))}
-          {archivedCount > 0 && (
-            <FilterPill
-              active={showArchived}
-              count={archivedCount}
-              onClick={() => setShowArchived((v) => !v)}
-            >
-              {t("history.archived") || "Archivados"}
-            </FilterPill>
-          )}
+        <div className="space-y-3 mb-6">
+          <div>
+            <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">
+              {t("history.status_filter") || "Estado"}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {FILTERS.filter((f) => f.id === "all" || counts[f.id] > 0).map((f) => (
+                <FilterPill
+                  key={f.id}
+                  active={filter === f.id}
+                  count={counts[f.id]}
+                  onClick={() => setFilter(f.id)}
+                >
+                  {f.label}
+                </FilterPill>
+              ))}
+              {archivedCount > 0 && (
+                <FilterPill
+                  active={showArchived}
+                  count={archivedCount}
+                  onClick={() => setShowArchived((v) => !v)}
+                >
+                  {t("history.archived") || "Archivados"}
+                </FilterPill>
+              )}
+            </div>
+          </div>
+          <div>
+            <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-2">
+              {t("history.date_filter") || "Fecha de carga"}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {DATE_FILTERS.map((f) => (
+                <FilterPill
+                  key={f.id}
+                  active={dateFilter === f.id}
+                  count={dateCounts[f.id]}
+                  onClick={() => setDateFilter(f.id)}
+                >
+                  {t(f.labelKey)}
+                </FilterPill>
+              ))}
+            </div>
+          </div>
         </div>
       )}
 

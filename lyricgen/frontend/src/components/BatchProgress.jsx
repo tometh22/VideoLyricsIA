@@ -184,11 +184,25 @@ export function SingleGeneratingHero({
 
 // Shared inline error message box. Extracted 2026-07-27 so the batch row and
 // the single-song error card render errors identically (one implementation).
+//
+// 2026-08-06: `error` used to be rendered as a raw React child. When a generate
+// path caught a 409 whose `data.detail` was an OBJECT (the editor revision
+// conflict payload {detail, server_revision, server_segments}) it set
+// job.error to that object → "Objects are not valid as a React child" crashed
+// the whole /generating tree (Sentry #33). The source paths now coerce with
+// translateBackendError, but keep this net so NO object can ever crash render.
+function coerceErrorText(error) {
+  if (error == null) return null;
+  if (typeof error === "string") return error;
+  if (typeof error === "object") return error.msg || error.detail || error.message || JSON.stringify(error);
+  return String(error);
+}
 function JobErrorMessage({ error }) {
-  if (!error) return null;
+  const text = coerceErrorText(error);
+  if (!text) return null;
   return (
     <div className="mt-2 px-3 py-2 rounded-lg bg-red-500/5 border border-red-500/10">
-      <p className="text-[11px] text-red-400/80">{error}</p>
+      <p className="text-[11px] text-red-400/80">{text}</p>
     </div>
   );
 }
@@ -229,7 +243,7 @@ function SingleDeadEndCard({ icon, title, description, error, actionLabel, onAct
   );
 }
 
-export function SingleErrorHero({ job, t, onReset }) {
+export function SingleErrorHero({ job, t, onReset, onRecoverFailed }) {
   const errorIcon = (
     <svg className="w-7 h-7 text-red-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
       <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" />
@@ -240,8 +254,10 @@ export function SingleErrorHero({ job, t, onReset }) {
       icon={errorIcon}
       title={t("hero.error_title") || "No pudimos generar tu video"}
       error={job?.error || (t("hero.error_generic") || "Ocurrió un error inesperado al generar el video.")}
-      actionLabel={t("hero.error_action") || "Volver a crear video"}
-      onAction={() => onReset?.()}
+      actionLabel={onRecoverFailed
+        ? (t("hero.error_recover_action") || "Volver a mis correcciones")
+        : (t("hero.error_action") || "Volver a crear video")}
+      onAction={() => (onRecoverFailed || onReset)?.()}
     />
   );
 }
@@ -289,10 +305,27 @@ function SingleGeneratingWithWatchdog({ heroProps, status, onReset, t, stallMs =
 }
 
 
+// Los entregables que ESTE job produjo. Un job puede terminar bien sin
+// short o sin thumbnail: desde el incidente UMG Chile 2026-08-21 el backend
+// entrega el master solo antes que perder el render entero por un accesorio.
+// Ofrecer el ícono igual daba una descarga 404 SILENCIOSA: triggerDownload
+// usa `<a download>.click()`, que no puede leer el status HTTP y siempre
+// devuelve true — el contador de fallos quedaba en 0 y el usuario creía que
+// se había bajado todo.
+function deliverableTypes(job) {
+  const f = job?.files || {};
+  return ["video", "short", "thumbnail"].filter((type) => Boolean(f[`${type}_url`]));
+}
+
 function JobRow({ job, index, t, onSelectJob }) {
   const { filename, status, current_step, progress, job_id, error,
           queue_reason, queue_retry_in_s } = job;
-  const name = filename.replace(/\.(mp3|wav)$/i, "");
+  // The filename is an upload transport detail, not the song identity. The
+  // operator may have corrected the title before rendering, so prefer the
+  // structured value and only fall back to the filename for legacy callers.
+  const name = (job.songTitle || job.song_title || filename || "")
+    .replace(/\.(mp3|wav|m4a|flac|aac|ogg)$/i, "");
+  const artist = (job.artist || "").trim();
   const isClickable = (status === "pending_review" || status === "done" || status === "editing") && job_id && onSelectJob;
 
   const STEP_LABELS = {
@@ -312,6 +345,18 @@ function JobRow({ job, index, t, onSelectJob }) {
     if (queue_reason === "rate_limit") return t("batch.queue_rate_limit") || "Subiendo… reintentamos en unos segundos";
     return null;
   })();
+  const statusLabel = status === "done" ? t("dash.completed") :
+    status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobacion") :
+    status === "validation_failed" ? (t("batch.validation_failed") || "Validacion fallida") :
+    status === "error" ? (coerceErrorText(error) || t("dash.error")) :
+    status === "editing" ? (t("batch.editing") || `Re-renderizando · ${STEP_LABELS[current_step] || current_step || "..."} ${progress || 0}%`) :
+    status === "processing" ? (
+      current_step === "uploading"
+        ? `${STEP_LABELS.uploading} ${progress || 0}%`
+        : STEP_LABELS[current_step] || current_step
+    ) :
+    queueLabel ? queueLabel :
+    t("batch.queued");
 
   return (
     <div
@@ -343,24 +388,14 @@ function JobRow({ job, index, t, onSelectJob }) {
               </svg>
             )}
           </div>
-          <p className={`text-[11px] ${queueLabel ? "text-amber-300/80" : "text-gray-500"}`}>
-            {status === "done" ? t("dash.completed") :
-             status === "pending_review" ? (t("batch.pending_review") || "Pendiente de aprobación") :
-             status === "validation_failed" ? (t("batch.validation_failed") || "Validación fallida") :
-             status === "error" ? (error || t("dash.error")) :
-             status === "editing" ? (t("batch.editing") || `Re-renderizando · ${STEP_LABELS[current_step] || current_step || "..."} ${progress || 0}%`) :
-             status === "processing" ? (
-               current_step === "uploading"
-                 ? `${STEP_LABELS.uploading} ${progress || 0}%`
-                 : STEP_LABELS[current_step] || current_step
-             ) :
-             queueLabel ? queueLabel :
-             t("batch.queued")}
+          {artist && <p className="text-[11px] text-gray-500 truncate">{artist}</p>}
+          <p className={`text-[11px] truncate ${queueLabel ? "text-amber-300/80" : "text-gray-500"}`}>
+            {statusLabel}
           </p>
         </div>
         {status === "done" && job_id && (
           <div className="flex gap-1.5 shrink-0">
-            {["video", "short", "thumbnail"].map((type) => (
+            {deliverableTypes(job).map((type) => (
               <button
                 key={type}
                 onClick={(e) => { e.stopPropagation(); triggerDownload(job_id, type); }}
@@ -619,7 +654,7 @@ function CelebrationScreen({ jobs, total, downloadable, onDownloadAll, onReset, 
 }
 
 // ─── Main component ──────────────────────────────────────────────────────────
-export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob, onBulkApprove }) {
+export default function BatchProgress({ jobs, onReset, onRecoverFailed, onSingleDone, onSelectJob, onBulkApprove }) {
   const { t } = useI18n();
   const [bulkApproving, setBulkApproving] = useState(false);
   // Per-card approving state: Set of job_ids currently being approved.
@@ -677,7 +712,9 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
       let failed = 0;
       let total = 0;
       for (const job of eligible) {
-        for (const type of ["video", "short", "thumbnail"]) {
+        // Sólo lo que el job realmente produjo — si no, cada job parcial
+        // sumaba un 404 al total y el resumen mentía.
+        for (const type of deliverableTypes(job)) {
           total += 1;
           const ok = await triggerDownload(job.job_id, type);
           if (!ok) failed += 1;
@@ -829,7 +866,7 @@ export default function BatchProgress({ jobs, onReset, onSingleDone, onSelectJob
     // 2026-07-27: a silent /generate 4xx set status="error" and the hero
     // froze forever on the optimistic "Generando el fondo" snapshot).
     if (isErrorStatus(heroJob.status)) {
-      return <SingleErrorHero job={heroJob} t={t} onReset={onReset} />;
+      return <SingleErrorHero job={heroJob} t={t} onReset={onReset} onRecoverFailed={onRecoverFailed} />;
     }
     if (isTerminalStatus(heroJob.status)) {
       // Terminal but neither success (handled by allDone/redirect above) nor

@@ -30,6 +30,7 @@ produces the stem.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import tempfile
@@ -189,17 +190,13 @@ def _download(value, dest_path: str) -> bool:
 
 
 def _audio_content_hash(audio_path: str) -> str:
-    """SHA-256 of the audio file's bytes, first 16 hex chars. Used as
-    the cache key for the R2 stem cache. Sub-64-bit space is fine — we
-    only need uniqueness within a tenant's catalog (a few thousand
-    songs)."""
-    import hashlib
+    """Complete SHA-256 of the source bytes used by the R2 stem cache."""
     h = hashlib.sha256()
     # Read in chunks to avoid loading a 60 MB WAV into RAM.
     with open(audio_path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
-    return h.hexdigest()[:16]
+    return h.hexdigest()
 
 
 def _stem_cache_key(audio_path: str) -> str:
@@ -207,7 +204,13 @@ def _stem_cache_key(audio_path: str) -> str:
     variant so different models don't share a cache entry (changing
     `DEMUCS_VARIANT` from `mdx_extra` to `htdemucs` cleanly forces a
     re-separation across the catalog)."""
-    return f"stems/{_audio_content_hash(audio_path)}_{_VARIANT}.wav"
+    identity = "|".join((
+        str(_MODEL), str(_VARIANT),
+        os.environ.get("DEMUCS_MODEL_VERSION", "unknown"),
+        os.environ.get("DEMUCS_MODEL_CHECKSUM", "unknown"),
+    ))
+    model_digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    return f"stems/{_audio_content_hash(audio_path)}_{_VARIANT}_{model_digest}.wav"
 
 
 def separate_vocals(
@@ -228,7 +231,7 @@ def separate_vocals(
 
     PR #300 R2 STEM CACHE: before paying ~60-180 s on Replicate, check
     whether the stem for this audio already lives in R2 under
-    `stems/{content_hash}_{variant}.wav`. If yes, download to a local
+    `stems/{content_hash}_{variant}_{model_digest}.wav`. If yes, download to a local
     tempfile and skip Replicate entirely. Cache misses run demucs
     normally + upload the result for future reuse. Trade-off: R2
     storage cost (~$0.015/GB-month; a 30 MB stem × 100 songs/month

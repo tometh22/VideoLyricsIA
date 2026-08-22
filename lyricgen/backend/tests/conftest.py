@@ -8,10 +8,10 @@ import pytest
 # Ensure backend modules are importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# moviepy 1.0.3 requires legacy setuptools build machinery that is not
-# available in CI / dev containers. Stub the module tree so that
-# pipeline.py can be imported without a compiled moviepy wheel.
-# Must happen before any `from main import ...` triggers pipeline.py.
+# Most unit tests do not render and intentionally use a small MoviePy import
+# double. The dedicated render gate sets GENLY_TEST_REAL_MOVIEPY=1 and imports
+# the installed dependency, so a broken/missing MoviePy can no longer receive
+# a false green from this fixture.
 def _stub_moviepy():
     _mp = types.ModuleType("moviepy")
     _mp_cfg = types.ModuleType("moviepy.config")
@@ -28,7 +28,8 @@ def _stub_moviepy():
     sys.modules.setdefault("moviepy.config", _mp_cfg)
     sys.modules.setdefault("moviepy.editor", _mp_ed)
 
-if "moviepy" not in sys.modules:
+if (os.environ.get("GENLY_TEST_REAL_MOVIEPY") != "1"
+        and "moviepy" not in sys.modules):
     _stub_moviepy()
 
 
@@ -56,6 +57,12 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///test.db")
 os.environ["JWT_SECRET"] = "test-secret-key-for-tests"
 os.environ["ADMIN_PASSWORD"] = "testadmin123"
 os.environ["RATE_LIMIT_ENABLED"] = "false"
+os.environ.setdefault("QUALITY_LEARNING_HMAC_KEY_ID", "test-v1")
+os.environ.setdefault(
+    "QUALITY_LEARNING_HMAC_KEY", "quality-test-key-0123456789-ABCDEF",
+)
+os.environ.setdefault("QUALITY_LEARNING_PROPOSALS_ENABLED", "1")
+os.environ.setdefault("QUALITY_LEARNING_ABLATIONS_ENABLED", "1")
 # CI defaults ENVIRONMENT unset → main.py sees "production" and the CORS
 # check (PR #7) raises at import because CORS_ORIGINS is also unset.
 # Tests don't make cross-origin requests, so flag the test env explicitly.
@@ -69,6 +76,15 @@ from database import Base, engine, SessionLocal, init_db
 def setup_db():
     """Create all tables once per test session."""
     init_db()
+    # Most low-level fixtures intentionally use user_id=1. SQLite does not
+    # enforce that FK, but the PostgreSQL CI gate does; provision the same
+    # default admin that application startup guarantees before any test runs.
+    from auth import ensure_default_admin
+    bootstrap_db = SessionLocal()
+    try:
+        ensure_default_admin(bootstrap_db)
+    finally:
+        bootstrap_db.close()
     yield
     # Cleanup
     Base.metadata.drop_all(bind=engine)
@@ -211,30 +227,6 @@ def pytest_collection_modifyitems(config, items):
     los ejecuta de verdad; local sin Postgres los skipea con razón
     clara.
     """
-    # Quarantine de tests pre-existentes en rojo (deuda que acumuló el CI ciego
-    # cuando conftest enmascaraba el exit code). xfail no-estricto + run=False →
-    # no se corren, no rompen el build, y quedan visibles como "xfailed" (el
-    # backlog a quemar). Lista editable en tests/quarantine.txt; sacá la entrada
-    # cuando arregles el test. NO meter tests nuevos acá: si rompés algo, arreglalo.
-    _qpath = os.path.join(os.path.dirname(__file__), "quarantine.txt")
-    _quarantined = set()
-    try:
-        with open(_qpath, encoding="utf-8") as _fh:
-            for _line in _fh:
-                _line = _line.strip()
-                if _line and not _line.startswith("#"):
-                    _quarantined.add(_line)
-    except OSError:
-        pass
-    if _quarantined:
-        _xfail = pytest.mark.xfail(
-            reason="pre-existing failure — quarantined (tests/quarantine.txt)",
-            strict=False, run=False,
-        )
-        for _item in items:
-            if _item.nodeid in _quarantined:
-                _item.add_marker(_xfail)
-
     from database import engine
     is_postgres = engine.dialect.name == "postgresql"
     if is_postgres:

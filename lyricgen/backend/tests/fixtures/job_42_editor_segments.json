@@ -1,0 +1,17 @@
+{
+  "job_id": "42dcd62d5d8a",
+  "revision": 139,
+  "segments": [
+    {"_id": 9, "start": 45.1106, "end": 45.8752, "text": "uoo no no te hice daño,"},
+    {"_id": 10, "start": 45.9252, "end": 46.5273, "text": "te alejaste de miSsi"},
+    {"_id": 11, "start": 45.1606, "end": 46.9606, "text": "Las palabras se fueron al viento y no se."},
+    {"_id": 22, "start": 114.766, "end": 115.967, "text": "¡Gracias!"},
+    {"_id": 23, "start": 45.1106, "end": 45.8752, "text": "uoo no no te hice daño,"},
+    {"_id": 24, "start": 45.9252, "end": 46.5273, "text": "te alejaste de mi"}
+  ],
+  "original_segments": [
+    {"start": 40.25, "end": 43.75, "text": "Oh no, ya no te extraño."},
+    {"start": 43.8, "end": 46.51, "text": "Si estás lejos de mí."},
+    {"start": 47.56, "end": 51.06, "text": "Oh no, no te hice daño."}
+  ]
+}

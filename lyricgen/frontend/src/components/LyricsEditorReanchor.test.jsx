@@ -92,6 +92,7 @@ describe("Re-sincronizar con IA", () => {
       <LyricsEditor {...baseProps({ onPersistSegments, onReanchor })} />,
     );
 
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
     fireEvent.click(screen.getByTestId("editor-overflow-btn"));
 
     fireEvent.click(screen.getByTestId("reanchor-btn"));
@@ -118,14 +119,17 @@ describe("Re-sincronizar con IA", () => {
       })} />,
     );
 
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
     fireEvent.click(screen.getByTestId("editor-overflow-btn"));
 
     fireEvent.click(screen.getByTestId("reanchor-btn"));
 
     await waitFor(() => expect(toastSpy).toHaveBeenCalled());
     expect(toastSpy.mock.calls[0][0].tone).toBe("error");
-    // Los segments del editor siguen siendo los originales.
-    expect(screen.getByDisplayValue("linea uno")).toBeTruthy();
+    // Los segments del editor siguen siendo los originales. Sin audio, la
+    // vista avanzada conserva su shell explícito en vez de degradar a la lista.
+    expect(screen.getByTestId("advanced-audio-unavailable")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("linea uno")).toBeNull();
   });
 
   it("excepción del callback → toast de error (nunca crashea)", async () => {
@@ -136,6 +140,7 @@ describe("Re-sincronizar con IA", () => {
         onReanchor,
       })} />,
     );
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
     fireEvent.click(screen.getByTestId("editor-overflow-btn"));
     fireEvent.click(screen.getByTestId("reanchor-btn"));
     await waitFor(() => expect(toastSpy).toHaveBeenCalled());

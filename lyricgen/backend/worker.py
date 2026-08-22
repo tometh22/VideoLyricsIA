@@ -288,12 +288,42 @@ def _resolve_queue_names() -> list:
     doesn't preempt — once all render workers are inside long renders, a short
     transcription waits the full render time; a dedicated pool fixes that.
 
-    Default = all four queues = current single-pool behavior, so shipping this
+    Default = the legacy shared queues = current single-pool behavior, so shipping this
     is a zero-behavior-change until QUEUES is set per Railway service.
     """
     raw = os.environ.get("QUEUES", _DEFAULT_QUEUES)
     names = [q.strip() for q in raw.split(",") if q.strip()]
     return names or _DEFAULT_QUEUES.split(",")
+
+
+def _schedule_worker_maintenance(queue_names: list[str]) -> dict[str, bool]:
+    """Seed only jobs this worker fleet can actually consume.
+
+    Each scheduler is isolated so one unavailable subsystem cannot suppress
+    the other recovery loops during startup.
+    """
+    scheduled: dict[str, bool] = {}
+    if "transcription_quality" in queue_names:
+        for name, import_name in (
+            ("quality_learning", "ensure_daily_quality_learning_scheduled"),
+            ("quality_pending", "ensure_quality_pending_reconciler_scheduled"),
+        ):
+            try:
+                import queue_jobs
+                getattr(queue_jobs, import_name)()
+                scheduled[name] = True
+            except Exception as exc:
+                scheduled[name] = False
+                logger.warning("[WORKER] %s scheduler unavailable: %s", name, exc)
+    if "default" in queue_names:
+        try:
+            from queue_jobs import ensure_job_outbox_reconciler_scheduled
+            ensure_job_outbox_reconciler_scheduled()
+            scheduled["job_outbox"] = True
+        except Exception as exc:
+            scheduled["job_outbox"] = False
+            logger.warning("[WORKER] job outbox scheduler unavailable: %s", exc)
+    return scheduled
 
 
 def _should_recycle(worker) -> bool:
@@ -390,6 +420,8 @@ def main():
     from observability import init_logging, init_sentry
     init_logging()
     init_sentry()
+    from database import assert_quality_attempt_id_schema_contract
+    assert_quality_attempt_id_schema_contract()
     _start_local_outputs_cleanup()
 
     from background_policy import (
@@ -452,6 +484,7 @@ def main():
     # _resolve_queue_names(). Default = all four = current behavior.
     queue_names = _resolve_queue_names()
     queues = [Queue(name, connection=conn) for name in queue_names]
+    _schedule_worker_maintenance(queue_names)
     # WarmOnlyWorker: a burst of deploys (2nd SIGTERM mid-drain) would otherwise
     # COLD-kill the in-flight render. This subclass keeps every shutdown warm so
     # the render finishes. See the class docstring.

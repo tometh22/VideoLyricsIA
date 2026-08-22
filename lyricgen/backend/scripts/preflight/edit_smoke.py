@@ -12,7 +12,8 @@ existe para cazar.
   1. Craftea un WAV PCM de 2 s con tags INFO en LATIN-1 ("Estrechez de
      Corazón", byte 0xf3) — el disparador real del UnicodeDecodeError que
      activó el 234.
-  2. Lo sube (/upload) y espera el render (pending_review).
+  2. Lo sube directo a R2 con el flujo vigente (/upload-url), lo transcribe
+     (/transcribe-uploaded), genera el video y espera pending_review.
   3. Pide un edit de metadata (/edit) — recorre run_edit_pipeline: la
      apertura moviepy del source_audio, el fallback UTF-8, el re-render y
      el re-upload de deliverables.
@@ -31,10 +32,10 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import struct
 import sys
-import tempfile
 import time
 import wave
 
@@ -71,11 +72,53 @@ def _fail(msg: str) -> int:
     return 1
 
 
+_QUALITY_GATE_CODES = {
+    "transcription_quality_unavailable",
+    "transcription_quality_analysis_incomplete",
+    "transcription_quality_review_required",
+}
+
+
+def _quality_gate_code(response) -> str | None:
+    """Return a fail-closed quality code without trusting free-form text."""
+    if getattr(response, "status_code", None) != 409:
+        return None
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = str(payload.get("code") or "")
+    return code if code in _QUALITY_GATE_CODES else None
+
+
+def _status_quality_gate_code(status_payload: dict) -> str | None:
+    error = str(status_payload.get("error") or "")
+    return next((code for code in _QUALITY_GATE_CODES if code in error), None)
+
+
+def _quality_gate_go(job_id: str, phase: str, code: str) -> int:
+    print(
+        f"[edit-smoke] GO ✅ — job {job_id}: gate v6 bloqueó el fixture "
+        f"acústicamente inválido en {phase} ({code}); "
+        "el render/edit completo se conserva para entornos sin enforcement."
+    )
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--api-url", required=True)
     p.add_argument("--render-timeout", type=int, default=900,
                    help="segundos máximos para cada fase de render")
+    p.add_argument(
+        "--allow-quality-gate-block", action="store_true",
+        help=(
+            "acepta un 409 fail-closed del gate v6 para este fixture de silencio; "
+            "staging lo usa con enforcement, producción conserva el smoke completo"
+        ),
+    )
     args = p.parse_args()
     api = args.api_url.rstrip("/")
 
@@ -91,32 +134,99 @@ def main() -> int:
         return _fail(f"login {r.status_code}: {r.text[:200]}")
     headers = {"Authorization": f"Bearer {r.json()['token']}"}
 
-    # 2. Upload del WAV acentuado. Reintenta en 5xx: este workflow corre
-    # justo después de un push a staging, y Railway puede estar swapeando
-    # el contenedor (502 "Application failed to respond" observado en la
-    # primera corrida real). El sleep del workflow amortigua; esto remata.
+    # 2. Upload vigente: API crea el job + firma una URL, luego el WAV viaja
+    # directo a R2. El endpoint multipart legado /upload fue retirado el
+    # 2026-08-01 y además sostenía una sesión DB durante todo el I/O a R2,
+    # por lo que dejó de representar el camino real del frontend.
     wav = _accented_wav_bytes()
-    r = None
-    for attempt in range(1, 4):
-        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
-            f.write(wav)
-            f.flush()
-            f.seek(0)
-            r = requests.post(
-                f"{api}/upload", headers=headers,
-                files={"file": ("estrechez_smoke.wav", f, "audio/wav")},
-                data={"artist": _ARTIST, "delivery_profile": "youtube"},
-                timeout=120,
-            )
-        if r.ok or r.status_code < 500:
+    r = requests.post(
+        f"{api}/upload-url", headers=headers,
+        json={
+            "filename": "estrechez_smoke.wav",
+            "content_type": "audio/wav",
+            "size_bytes": len(wav),
+            "artist": _ARTIST,
+            "title": _TITLE,
+        },
+        timeout=30,
+    )
+    if not r.ok:
+        return _fail(f"/upload-url {r.status_code}: {r.text[:300]}")
+    ticket = r.json()
+    if ticket.get("use_multipart") or not ticket.get("upload_url"):
+        return _fail("/upload-url devolvió multipart para el WAV mínimo")
+    job_id = ticket["job_id"]
+
+    r = requests.put(
+        ticket["upload_url"], data=wav,
+        headers={"Content-Type": "audio/wav"}, timeout=120,
+    )
+    if not r.ok:
+        return _fail(f"R2 PUT {r.status_code}: {r.text[:300]}")
+
+    r = requests.post(
+        f"{api}/transcribe-uploaded", headers=headers,
+        json={
+            "job_id": job_id,
+            "language": "es",
+            "artist": _ARTIST,
+            "title": _TITLE,
+        },
+        timeout=120,
+    )
+    if not r.ok:
+        return _fail(f"/transcribe-uploaded {r.status_code}: {r.text[:300]}")
+    print(f"[edit-smoke] job {job_id} subido — esperando transcripción…")
+
+    transcription_deadline = time.time() + args.render_timeout
+    transcription_last = ""
+    segments = []
+    while time.time() < transcription_deadline:
+        r = requests.get(
+            f"{api}/transcription-status/{job_id}", headers=headers,
+            timeout=20,
+        )
+        if not r.ok:
+            return _fail(f"/transcription-status {r.status_code}: {r.text[:300]}")
+        transcription = r.json()
+        transcription_status = transcription.get("status")
+        if transcription_status != transcription_last:
+            print(f"[edit-smoke]   transcripción: {transcription_status}")
+            transcription_last = transcription_status
+        if transcription_status == "transcribed":
+            segments = transcription.get("segments") or []
             break
-        print(f"[edit-smoke] upload intento {attempt} → {r.status_code} "
-              f"(deploy en curso?) — reintento en 45s…")
-        time.sleep(45)
-    if r is None or not r.ok:
-        return _fail(f"upload {r.status_code}: {r.text[:300]}")
-    job_id = r.json()["job_id"]
-    print(f"[edit-smoke] job {job_id} subido — esperando render inicial…")
+        if transcription_status in (
+            "error", "failed", "transcription_failed", "validation_failed",
+        ):
+            return _fail(
+                "transcripción terminó en "
+                f"{transcription_status}: {transcription.get('error')}"
+            )
+        time.sleep(10)
+    else:
+        return _fail(f"transcripción no terminó en {args.render_timeout}s")
+
+    # Generar reusando el audio ya persistido y los segmentos aprobados: es
+    # exactamente el contrato que usa el wizard después del editor de letra.
+    generate_fields = {
+        "job_id": job_id,
+        "artist": _ARTIST,
+        "song_title": _TITLE,
+        "segments_json": json.dumps(segments, ensure_ascii=False),
+        "delivery_profile": "youtube",
+    }
+    r = requests.post(
+        f"{api}/generate", headers=headers,
+        files={key: (None, value) for key, value in generate_fields.items()},
+        timeout=120,
+    )
+    if not r.ok:
+        gate_code = _quality_gate_code(r)
+        if args.allow_quality_gate_block and gate_code:
+            return _quality_gate_go(job_id, "generate", gate_code)
+        return _fail(f"/generate {r.status_code}: {r.text[:300]}")
+    print("[edit-smoke] generación aceptada — esperando render inicial…")
 
     def wait_for(target: set[str], phase: str) -> dict:
         deadline = time.time() + args.render_timeout
@@ -130,6 +240,14 @@ def main() -> int:
                 last = cur
             if st.get("status") in target:
                 return st
+            # El gate de calidad puede aceptar /generate y bloquear el render
+            # de forma asíncrona. En staging este fixture de silencio debe dar
+            # GO en ese punto, sin esperar los 15 minutos del timeout.
+            if (
+                args.allow_quality_gate_block
+                and _status_quality_gate_code(st)
+            ):
+                return st
             if st.get("status") in ("error", "failed", "upload_failed",
                                     "validation_failed", "transcription_failed"):
                 raise RuntimeError(f"{phase} terminó en {st.get('status')}: "
@@ -138,9 +256,12 @@ def main() -> int:
         raise RuntimeError(f"{phase} no terminó en {args.render_timeout}s")
 
     try:
-        wait_for({"pending_review", "done"}, "render")
+        st = wait_for({"pending_review", "done"}, "render")
     except RuntimeError as e:
         return _fail(str(e))
+    gate_code = _status_quality_gate_code(st)
+    if args.allow_quality_gate_block and gate_code:
+        return _quality_gate_go(job_id, "render", gate_code)
 
     # 2.5. Autosave del editor — el camino que los operadores reportan como
     # frágil (issue #934). GO/NO-GO: POST /jobs/{id}/save-segments con una
@@ -178,6 +299,9 @@ def main() -> int:
         return _fail(str(e))
 
     if st.get("error"):
+        gate_code = _status_quality_gate_code(st)
+        if args.allow_quality_gate_block and gate_code:
+            return _quality_gate_go(job_id, "edit", gate_code)
         return _fail(f"edit dejó error residual: {st['error']}")
     print(f"[edit-smoke] GO ✅ — job {job_id}: upload→render→edit→re-render OK")
     return 0

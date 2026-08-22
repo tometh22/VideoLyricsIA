@@ -6,7 +6,7 @@ pipeline de transcripción **antes de cualquier deploy** a staging.
 ## Por qué existe
 
 Las "mejoras de calidad AI" suenan bien sin medirse. Este harness
-toma N jobs aprobados por el operador (cuya `segments_json` es el
+toma 30–50 jobs aprobados por el operador (cuya `segments_json` es el
 ground-truth de lo que UMG considera shippable) y compara el output
 de cualquier iteración del pipeline contra ese ground-truth.
 
@@ -38,9 +38,23 @@ export GOOGLE_APPLICATION_CREDENTIALS='/path/to/vertex.json'  # Gemini
 
 ### 2. Curar el dataset
 
-Editar `scripts/benchmark_jobs.txt` con los `job_id`s (uno por línea)
-de 5-10 jobs aprobados en prod. Recomendado: variedad de canciones
-(longitud, género, "limpitas" vs "difíciles").
+Generar `scripts/benchmark_jobs.txt` con 30–50 jobs aprobados en prod,
+incluyendo una cuota explícita de grabaciones en vivo y casos difíciles:
+
+```bash
+python scripts/select_gold_jobs.py --write-list --limit 50
+```
+
+Curar `scripts/benchmark_labels.json` antes de congelar el corpus. La
+clasificación automática sólo propone candidatos; el gate estricto exige que
+cada vivo/estudio esté verificado manualmente:
+
+```json
+{
+  "job_id_1": {"is_live": true, "stratum": "live"},
+  "job_id_2": {"is_live": false, "stratum": "studio"}
+}
+```
 
 ```bash
 python scripts/build_benchmark_dataset.py
@@ -51,6 +65,11 @@ Esto crea `benchmark/dataset/<job_id>/` con:
 - `ground_truth.json` — segments_json post-aprobación (lo que el
   operador firmó como shippable)
 - `metadata.json` — artist, song_title, etc.
+
+También genera `scripts/benchmark_manifest.json`, que debe revisarse y
+versionarse: congela IDs, revisión de segmentos y hashes SHA-256 de audio,
+ground truth y metadata. `--strict` rechaza archivos faltantes, extras o
+modificados respecto de ese manifiesto.
 
 Tamaño típico: ~30-50 MB por canción, queda fuera de git
 (`benchmark/dataset/` está en `.gitignore`).
@@ -92,11 +111,24 @@ Salida: `benchmark/dataset/<job_id>/improvement_output.json`.
 python scripts/score_benchmark.py
 # o guardar:
 python scripts/score_benchmark.py --out BENCHMARK_REPORT.md
+# gate de release: además exige corpus 30–50, p50 <5 min y p90 <10 min
+python scripts/score_benchmark.py --strict --pipeline-release "$RELEASE" --out BENCHMARK_REPORT.md
 ```
 
 El reporte trae:
 - Tabla per-job: WER baseline → tier1, AOO baseline → tier1, composite
 - Agregados (medias + deltas porcentuales)
+- Mezcla vivo/estudio y ruta de timing por canción
+- Minutos reales de corrección del operador (p50/p90)
+- Conteo de correcciones de texto, timing, altas y bajas
+
+`--strict` exige que las 30–50 revisiones operativas pertenezcan a la misma
+versión indicada por `--pipeline-release`, que todas tengan tiempo activo
+(no tiempo de pared), que existan baseline+improvement para cada canción y
+que WER/AOO/recall no regresen ni globalmente ni por separado en vivos y
+estudio. También exige etiquetas vivo/estudio manuales, cobertura textual
+mínima y que el output de mejora declare el mismo release. Los tiempos históricos de otro pipeline se
+muestran como contexto, pero nunca pueden aprobar el release nuevo.
 - Veredicto automático según los thresholds del plan
 
 ### 6. Decidir

@@ -132,6 +132,7 @@ const FLAGS = {
   dashboard: "genly_tour_dashboard_done",
   upload:    "genly_tour_upload_done",
   editor:    "genly_tour_editor_done",
+  editorTiming: "genly_tour_editor_timing_v2_done",
   // jobdetail covers the approval workflow + ProRes download. Fires
   // when the user lands on a pending_review job — that's the moment
   // those affordances actually exist on screen.
@@ -337,6 +338,13 @@ export function UploadTour({ user, forceRun = false, onDone }) {
         "La IA lo genera, lo elegís de la biblioteca de fondos pre-aprobados, o subís uno tuyo.",
     },
     {
+      target: '[data-tour="upload-motion-studio"]',
+      title: t("tour.upload_motion_title") || "Movimiento y Efecto",
+      content: t("tour.upload_motion_body") ||
+        "Ahora son dos: el Movimiento de la escena y el Efecto encima. Tocá una tarjeta para abrir su estudio, elegí, y volvé con la flecha ← arriba a la izquierda. Los cambios se ven en el preview al instante.",
+      placement: "bottom",
+    },
+    {
       target: '[data-tour="upload-text-case"]',
       title: t("tour.upload_textcase_title") || "Nuevo estilo Abc",
       content: t("tour.upload_textcase_body") ||
@@ -358,59 +366,78 @@ export function UploadTour({ user, forceRun = false, onDone }) {
       target: '[data-tour="upload-cta-bar"]',
       title: t("tour.upload_cta_title") || "¿Revisar o generar directo?",
       content: t("tour.upload_cta_body") ||
-        "'Revisar lyrics' te deja editar timestamps antes del render. 'Generar directo' salta esa edición.",
+        "'Revisar letra' te deja corregir antes del render. 'Generar directo' salta esa edición.",
       placement: "top",
     },
   ], [t]);
   return <TourRunner flagKey={FLAGS.upload} steps={steps} user={user} forceRun={forceRun} onDone={onDone} />;
 }
 
+// ─── Coachmark: Motion Studio (primer uso, SIN age-gate) ─────────
+// Spotlight one-shot con el mismo tooltip de marca de los tours. Resalta que
+// (1) las tarjetas del Motion Studio se tocan para abrir su estudio y (2) una
+// vez en Movimiento se vuelve con la flecha. Se muestra a TODOS (nuevos y
+// existentes) una sola vez por tipo — `forceRun` saltea el gate de edad y el
+// flag de localStorage evita repetirlo.
+function coachSeen(key) {
+  if (typeof window === "undefined") return true;
+  try { return localStorage.getItem(key) === "1"; } catch { return true; }
+}
+
+export function MotionStudioCoach({ user, view }) {
+  const { t } = useI18n();
+  const active =
+    (!view && !coachSeen("genly_coach_motion_intro_v2")) ? "intro"
+      : (view === "movement" && !coachSeen("genly_coach_motion_back_v2")) ? "back"
+        : null;
+  const steps = useMemo(() => {
+    if (active === "intro") return [{
+      target: '[data-tour="upload-motion-studio"]',
+      title: t("upload.coach_motion_intro_title") || "Movimiento y Efecto viven acá",
+      content: t("upload.coach_motion_intro_body") ||
+        "Tocá una tarjeta para abrir su estudio y personalizarla. El preview se actualiza al instante.",
+      placement: "left",
+      disableBeacon: true,
+    }];
+    if (active === "back") return [{
+      target: '[data-tour="motion-back"]',
+      title: t("upload.coach_motion_back_title") || "¿Terminaste? Volvé para seguir",
+      content: t("upload.coach_motion_back_body") ||
+        "Usá esta flecha para volver al Motion Studio y ajustar lo demás.",
+      placement: "bottom-start",
+      disableBeacon: true,
+    }];
+    return [];
+  }, [active, t]);
+  if (!active) return null;
+  const flagKey = active === "intro" ? "genly_coach_motion_intro_v2" : "genly_coach_motion_back_v2";
+  return <TourRunner key={active} flagKey={flagKey} steps={steps} user={user} forceRun />;
+}
+
 // ─── Tour 3: Lyrics Editor ───────────────────────────────────────
-export function EditorTour({ user, forceRun = false, onDone }) {
+export function EditorTour({ user, viewMode = "basic", forceRun = false, onDone }) {
   const { t } = useI18n();
   const steps = useMemo(() => [
     {
-      target: '[data-tour="editor-playbar"]',
-      title: t("tour.editor_playbar_title") || "Reproducción",
-      content: t("tour.editor_playbar_body") ||
-        "Apretá Play para escuchar. Espacio = play/pause. Mientras suena, la línea actual se resalta.",
+      target: '[data-testid="timeline-lane"]',
+      title: "Reproducí desde cualquier punto",
+      content: "Hacé click en una zona vacía de la línea de tiempo para escuchar desde ahí.",
       disableBeacon: true,
       placement: "bottom",
     },
     {
-      target: '[data-tour="editor-list-row"]',
-      title: t("tour.editor_list_title") || "Tus líneas",
-      content: t("tour.editor_list_body") ||
-        "Click un timestamp para saltar a ese momento. Doble click para editarlo a mano.",
+      target: '[data-testid="timeline-selection-help"]',
+      title: "Pintá tu selección",
+      content: "Mantené el click y pintá varias filas. También podés usar Cmd/Ctrl+click o Shift+click.",
     },
     {
-      target: '[data-tour="editor-sync-entry"]',
-      title: t("tour.editor_sync_title") || "Modo Sync",
-      content: t("tour.editor_sync_body") ||
-        "Si necesitás ajustar los tiempos, click acá. Apretás Espacio cuando arranca cada línea y se sincronizan en vivo.",
-    },
-    {
-      target: '[data-tour="editor-row-sync"]',
-      title: t("tour.editor_row_sync_title") || "Sync desde acá",
-      content: t("tour.editor_row_sync_body") ||
-        "Hover una línea, click el target 🎯 y arrancás Sync desde ahí. Las anteriores quedan intactas.",
-    },
-    {
-      target: '[data-tour="editor-add-line"]',
-      title: t("tour.editor_add_title") || "Líneas faltantes",
-      content: t("tour.editor_add_body") ||
-        "¿Faltó una repetición del estribillo? Duplicá una línea (📋 al hover) o agregá una vacía abajo y tipeá.",
-      placement: "top",
-    },
-    {
-      target: '[data-tour="editor-approve"]',
-      title: t("tour.editor_approve_title") || "Aprobar y generar",
-      content: t("tour.editor_approve_body") ||
-        "Cuando esté listo, aprobás y se renderiza el video final. Listo para descargar.",
-      placement: "left",
+      target: '[data-testid="timeline-segment"]',
+      title: "Mové el grupo junto",
+      content: "Arrastrá cualquier bloque seleccionado. Los bordes ajustan entrada y salida con precisión.",
     },
   ], [t]);
-  return <TourRunner flagKey={FLAGS.editor} steps={steps} user={user} forceRun={forceRun} onDone={onDone} />;
+  if (viewMode !== "advanced") return null;
+  return <TourRunner flagKey={FLAGS.editorTiming} steps={steps} user={user} forceRun={forceRun} onDone={onDone} />;
 }
 
 // ─── Tour 4: Job Detail (approval + delivery) ────────────────────

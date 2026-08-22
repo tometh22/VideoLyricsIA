@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import re
+import unicodedata
 
 logger = logging.getLogger("genly.lyrics_format")
 
@@ -37,8 +38,35 @@ _SPLIT_MIN_WORDS = 8   # segments shorter than this are never split
 _SPLIT_MAX_PARTS = 3   # never more than 3 sub-lines per segment
 
 
-def _lang_name(language: str) -> str:
-    return _LANG_NAMES.get((language or "es").lower()[:3], "Spanish")
+def _lang_name(language: str | None) -> str:
+    """Human-readable prompt label without treating auto as Spanish."""
+    if not language:
+        return "the source language"
+    return _LANG_NAMES.get(language.lower()[:3], "the source language")
+
+
+def _lexical_tokens(text: str) -> list[str]:
+    """Return accent-insensitive lexical tokens for mutation safety.
+
+    This formatter is allowed to change capitalization, punctuation and
+    diacritics, but never vocabulary.  Folding accents makes legitimate
+    corrections such as ``fragil`` -> ``frágil`` compare equal while a
+    semantic rewrite such as ``Are you ready`` -> ``Estoy listo`` cannot pass.
+    Apostrophes and hyphens are separators so harmless typography changes do
+    not look like word insertions/deletions.
+    """
+    normalized = unicodedata.normalize("NFKD", str(text or "")).casefold()
+    without_marks = "".join(
+        char for char in normalized if unicodedata.category(char) != "Mn"
+    )
+    # Keep digits: changing a sung number is a semantic rewrite too (for
+    # example ``638`` -> ``780465``), not harmless typography.
+    return re.findall(r"[^\W_]+", without_marks, re.UNICODE)
+
+
+def preserves_lexical_content(original: str, candidate: str) -> bool:
+    """Whether ``candidate`` is only an orthographic rewrite of ``original``."""
+    return _lexical_tokens(original) == _lexical_tokens(candidate)
 
 
 # ── Timestamp assignment ──────────────────────────────────────────────────────
@@ -112,9 +140,13 @@ def _build_prompt(texts: list, lang: str) -> str:
     n = len(texts)
     numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
     return (
-        f"You are correcting song lyric transcription orthography for a {lang} song.\n\n"
+        "You are correcting song lyric transcription orthography. "
+        f"The primary context may be {lang}, but the song may code-switch.\n"
+        "Preserve the ORIGINAL language of EACH line independently. A line or "
+        "phrase in another language must remain in that language. NEVER "
+        "translate or paraphrase.\n\n"
         "For each numbered line:\n"
-        f"- Fix {lang} accents and diacritics (e.g. fragil→frágil, mas→más)\n"
+        "- Fix accents and diacritics appropriate for that line's own language\n"
         "- Capitalize the first word of each line\n"
         "- Fix punctuation (commas, periods, ellipsis)\n"
         "- For Spanish: add inverted opening marks (¿, ¡) where the line is a question or exclamation\n\n"
@@ -154,7 +186,7 @@ def _parse_response(raw: str, n_input: int) -> "dict | None":
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-async def format_lyrics_pass(result: dict, language: str = "es") -> dict:
+async def format_lyrics_pass(result: dict, language: str | None = None) -> dict:
     """Orthographic correction + line splitting on the final segment list.
 
     Only touches `seg["text"]`, `seg["start"]`, `seg["end"]` (and `seg["words"]`
@@ -179,10 +211,23 @@ async def format_lyrics_pass(result: dict, language: str = "es") -> dict:
 
     lang = _lang_name(language)
     prompt = _build_prompt(texts, lang)
+    recorder = None
 
     try:
         from openai import AsyncOpenAI
         client = AsyncOpenAI()
+
+        job_id = result.get("job_id")
+        if job_id:
+            from provenance import record_ai_call
+            recorder = record_ai_call(
+                job_id=job_id,
+                step="lyrics_format",
+                tool_name="gpt-4o-mini",
+                tool_provider="openai",
+                prompt=prompt,
+                input_data_types=["lyrics_text"],
+            )
 
         resp = await asyncio.wait_for(
             client.chat.completions.create(
@@ -193,6 +238,8 @@ async def format_lyrics_pass(result: dict, language: str = "es") -> dict:
             ),
             timeout=30,
         )
+        if recorder:
+            recorder.finish(response_summary="succeeded")
 
         raw = (resp.choices[0].message.content or "").strip()
         groups = _parse_response(raw, len(segs))
@@ -204,10 +251,24 @@ async def format_lyrics_pass(result: dict, language: str = "es") -> dict:
         new_segs: list = []
         n_corrected = 0
         n_split = 0
+        n_rejected = 0
 
         for i, seg in enumerate(segs):
             sub_texts = groups[i + 1]
             original_text = texts[i]
+            candidate_text = " ".join(sub_texts)
+            if not preserves_lexical_content(original_text, candidate_text):
+                # The prompt is not a security boundary.  A language model may
+                # still translate a short code-switched phrase while preserving
+                # numbering, so validate vocabulary before applying anything.
+                # Reject only this line; safe orthographic fixes on other lines
+                # remain useful.
+                logger.warning(
+                    "[FORMAT] rejected lexical rewrite at line %d; keeping source text",
+                    i + 1,
+                )
+                sub_texts = [original_text]
+                n_rejected += 1
 
             if len(sub_texts) == 1:
                 corrected = sub_texts[0]
@@ -223,8 +284,8 @@ async def format_lyrics_pass(result: dict, language: str = "es") -> dict:
                 new_segs.extend(_split_by_words(seg, sub_texts))
 
         logger.info(
-            "[FORMAT] %s: %d/%d lines corrected",
-            lang, n_corrected, len(segs),
+            "[FORMAT] %s: %d/%d lines corrected, %d lexical rewrite(s) rejected",
+            lang, n_corrected, len(segs), n_rejected,
         )
 
         result = dict(result)
@@ -232,5 +293,9 @@ async def format_lyrics_pass(result: dict, language: str = "es") -> dict:
         return result
 
     except Exception as exc:
+        if recorder:
+            recorder.finish(
+                response_summary=f"error: {type(exc).__name__}: {str(exc)[:300]}"
+            )
         logger.warning("[FORMAT] pass failed: %r — returning original", exc)
         return result

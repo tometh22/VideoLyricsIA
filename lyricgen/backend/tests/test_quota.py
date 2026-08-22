@@ -30,7 +30,9 @@ from auth import create_user, get_plan_usage
 from database import Job, SessionLocal, User
 
 _T = "tenant_quota_test"
-_USER_ID = 999_001
+# init_db always provisions the default admin. Reusing that real FK keeps the
+# quota fixtures valid on PostgreSQL; tenant scoping is supplied explicitly.
+_USER_ID = 1
 
 
 def _seed_job(
@@ -64,6 +66,22 @@ def _cleanup(db):
 def _this_month_start():
     now = datetime.now(timezone.utc)
     return datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+
+
+def _approved_this_month(hours_ago=1):
+    """An `approved_at` guaranteed to fall in the CURRENT UTC month and in
+    the past.
+
+    `now - hours_ago` reads as "approved a bit ago", but in the first
+    `hours_ago` hours of day 1 it slips into the PREVIOUS month — and
+    `get_plan_usage` filters `approved_at >= month_start`, so the seed
+    stops counting (used=0) and the test fails. This bit CI when it ran at
+    00:3x UTC on the 1st: `now - 1h` landed on the 31st of the prior month.
+    Clamp to `now` (still this month, still past) when the naive value
+    would cross the boundary, so the anchor is month-of-day robust."""
+    now = datetime.now(timezone.utc)
+    candidate = now - timedelta(hours=hours_ago)
+    return candidate if candidate >= _this_month_start() else now
 
 
 def test_pre_approval_does_not_count():
@@ -103,11 +121,11 @@ def test_approved_this_month_counts():
         _cleanup(db)
         _seed_job(
             db, job_id="approved1", status="done",
-            approved_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            approved_at=_approved_this_month(hours_ago=1),
         )
         _seed_job(
             db, job_id="approved2", status="done",
-            approved_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            approved_at=_approved_this_month(hours_ago=2),
         )
         usage = get_plan_usage(db, user_id=_USER_ID, tenant_id=_T, plan_id="250")
         assert usage["used"] == 2, (
@@ -187,11 +205,10 @@ def test_created_last_month_approved_this_month_counts_this_month():
     try:
         _cleanup(db)
         forty_days_ago = datetime.now(timezone.utc) - timedelta(days=40)  # last month
-        one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)    # this month
         _seed_job(
             db, job_id="crosser", status="done",
             created_at=forty_days_ago,
-            approved_at=one_hour_ago,
+            approved_at=_approved_this_month(),  # this month, boundary-safe
         )
         usage = get_plan_usage(db, user_id=_USER_ID, tenant_id=_T, plan_id="250")
         assert usage["used"] == 1, (
@@ -229,7 +246,7 @@ def test_other_tenant_isolation():
         created_user_ids = [our_user.id, other_user.id]
         _seed_job(
             db, job_id="our_approval", status="done",
-            approved_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            approved_at=_approved_this_month(),
             user_id=our_user.id,
         )
         # Same shape but different tenant.
@@ -239,7 +256,7 @@ def test_other_tenant_isolation():
             artist="X", filename="o.mp3", style="oscuro",
             status="done", delivery_profile="youtube",
             created_at=datetime.now(timezone.utc) - timedelta(hours=3),
-            approved_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            approved_at=_approved_this_month(),
         ))
         db.commit()
         usage = get_plan_usage(

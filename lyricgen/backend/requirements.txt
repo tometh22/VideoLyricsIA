@@ -1,12 +1,13 @@
-fastapi==0.115.6
+fastapi==0.141.1
+starlette==1.6.0
 uvicorn[standard]==0.34.0
-python-multipart==0.0.20
+python-multipart==0.0.32
 python-dotenv>=1.0.0,<2.0.0
 python-jose[cryptography]>=3.3.0,<4.0.0
 # Explicit cryptography pin para Fernet (Drive OAuth token encryption).
 # python-jose[cryptography] ya lo jala como dep transitiva, pero lo
 # declaramos también para que dependabot lo trackee.
-cryptography>=42.0.0,<46.0.0
+cryptography>=46.0.7,<51.0.0
 passlib[bcrypt]>=1.7.4,<2.0.0
 bcrypt<4.1
 openai-whisper
@@ -16,15 +17,24 @@ openai>=1.50.0,<2.0.0
 replicate>=1.0.0,<2.0.0
 moviepy==1.0.3
 librosa==0.10.2
-Pillow==11.1.0
+Pillow==12.3.0
 numpy<2
 google-genai>=1.40.0,<2.0.0
 google-api-python-client>=2.0.0,<3.0.0
 google-auth>=2.0.0,<3.0.0
 requests>=2.28.0,<3.0.0
-diffusers>=0.27.0,<1.0.0
+# transformers: lo usa ctc_align.py (AutoModelForCTC + Wav2Vec2CTCTokenizer)
+# para el alineador de timing. safetensors entra como dependencia suya y se
+# pinea acá sólo para fijar la versión.
+#
+# Sacados en ago-2026 tras verificar 0 imports en todo el repo:
+#   - diffusers: nunca se usó. Quedó de una prueba de generación de imágenes
+#     local que no llegó a producción; Imagen/Veo corren en Vertex.
+#   - accelerate: sólo hace falta para `device_map` / `low_cpu_mem_usage`, y
+#     ctc_align carga el modelo con `from_pretrained()` plano (ctc_align.py:701).
+# Entre las dos son ~200 MB de imagen que se construían y deployaban en cada
+# push sin que ningún camino de código las tocara.
 transformers>=4.38.0,<5.0.0
-accelerate>=0.27.0,<2.0.0
 safetensors>=0.4.0,<1.0.0
 # --- SaaS infrastructure ---
 sqlalchemy>=2.0.0,<3.0.0

@@ -2,6 +2,7 @@
 
 import os
 from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
@@ -16,8 +17,10 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     event,
+    inspect,
     text,
 )
 from sqlalchemy.types import TypeDecorator
@@ -40,6 +43,48 @@ class JSONB(TypeDecorator):
             return dialect.type_descriptor(_JSONB())
         return dialect.type_descriptor(JSON())
 
+
+# RQ attempt ids are persisted as concurrency tokens.  Keep enough room for
+# future queue namespaces even though v6 currently uses a compact hashed id.
+# PostgreSQL enforces VARCHAR limits while SQLite does not, so worker startup
+# validates the deployed column against this constant explicitly.
+QUALITY_ATTEMPT_ID_MAX_LENGTH = 160
+
+
+def validate_quality_attempt_id_column(
+    data_type: Optional[str], character_maximum_length: Optional[int],
+) -> None:
+    """Validate the PostgreSQL type contract for the quality CAS token."""
+    normalized = str(data_type or "").strip().lower()
+    if normalized == "text":
+        return
+    if normalized not in {"character varying", "varchar"}:
+        raise RuntimeError(
+            "jobs.active_quality_attempt_id must be TEXT or VARCHAR"
+        )
+    if int(character_maximum_length or 0) < QUALITY_ATTEMPT_ID_MAX_LENGTH:
+        raise RuntimeError(
+            "jobs.active_quality_attempt_id is too short: "
+            f"requires >= {QUALITY_ATTEMPT_ID_MAX_LENGTH} characters"
+        )
+
+
+def assert_quality_attempt_id_schema_contract() -> None:
+    """Fail worker startup when PostgreSQL still has the unsafe v6 width."""
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.connect() as connection:
+        row = connection.execute(text("""
+            SELECT data_type, character_maximum_length
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'jobs'
+              AND column_name = 'active_quality_attempt_id'
+        """)).first()
+    if row is None:
+        raise RuntimeError("jobs.active_quality_attempt_id is missing")
+    validate_quality_attempt_id_column(row[0], row[1])
+
 # ---------------------------------------------------------------------------
 # Connection
 # ---------------------------------------------------------------------------
@@ -58,20 +103,19 @@ if DATABASE_URL.startswith("postgres://"):
 #
 #   max_connections >= (api_workers + rq_workers) × (pool_size + max_overflow)
 #
-# Railway's default Postgres ships with max_connections=100. With
-# 4 API workers + 4 RQ workers = 8 processes, that leaves
-#   ceil((100 − 5_reserved_for_admin) / 8) ≈ 11 sockets per process.
-# So 5 + 5 = 10 is the most we can run *with the default DB plan*.
+# Pools are per process. The live budget must include every uvicorn worker
+# plus Worker and ShortWorker replica. With 14 DB-owning processes, a
+# 100-connection Postgres instance leaves about six sockets per process after
+# administrative headroom, so 4 + 2 is the conservative default.
 #
 # After fix/db-pool-streaming-scale: streaming endpoints (/preview,
 # /download, /backgrounds/.../preview, /jobs/.../events, /download/all)
 # release their pool slot before the file/SSE stream begins via
 # scoped_db(). That lifts the per-process concurrency ceiling from
-# "≤10 short queries + 0 streams" to "≤10 short queries, unbounded
-# concurrent streams". 6 + 4 is now a comfortable default — 6 steady
-# slots for the hot dashboard/auth/status endpoints, 4 overflow for
-# bursts (UMG batch submissions, multiple operators logging in
-# concurrently). The total is still 10 per process, fits the 100-cap.
+# "≤10 short queries + 0 streams" to short metadata queries independent of
+# stream duration. 4 + 2 provides six slots per process; burst resilience
+# belongs in bounded retries, not in letting every replica consume the full
+# Postgres connection budget.
 #
 # When (not if) you migrate to a bigger DB plan or front Postgres with
 # PgBouncer (see docs/SCALING.md), raise:
@@ -80,8 +124,8 @@ if DATABASE_URL.startswith("postgres://"):
 # and confirm max_connections still bounds the product above. The fix
 # above changes the failure shape — the cap is now real concurrent
 # short queries, not concurrent downloads.
-_DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "6"))
-_DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "4"))
+_DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "4"))
+_DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "2"))
 
 def _build_pg_connect_args() -> dict:
     """psycopg2 connect_args for Railway Postgres.
@@ -209,6 +253,72 @@ def deliveries_added_by(default_user_id):
     return default_user_id
 
 
+# ── Peer environment DB (read-only, para atribución de costos) ────────────
+# La producción gestionada para UMG corre en STAGING bajo cuentas del equipo,
+# mientras que el autoservicio de Universal corre en PROD bajo tenants
+# universal_*. Como además staging y prod comparten proyecto de GCP, bucket R2
+# y proyecto de Railway, ninguna factura se puede separar por entorno: el
+# costo real por canción SOLO sale mirando las dos bases a la vez.
+#
+# `PEER_DATABASE_URL` apunta al OTRO entorno (desde prod → staging; desde
+# staging → prod). En staging ya existe esa conexión como
+# DELIVERIES_DATABASE_URL, así que se reusa por defecto y no hay que
+# configurar nada. Sin la var, los endpoints de atribución siguen andando
+# con un solo entorno y lo dicen explícitamente — nunca reportan que el otro
+# entorno costó $0, que sería la mentira peligrosa.
+#
+# SOLO LECTURA por convención: no se corre create_all contra este engine y
+# ningún camino de escritura lo usa.
+PEER_DATABASE_URL = os.environ.get("PEER_DATABASE_URL", "").strip() or DELIVERIES_DATABASE_URL
+if PEER_DATABASE_URL.startswith("postgres://"):
+    PEER_DATABASE_URL = PEER_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+if (
+    PEER_DATABASE_URL
+    and deliveries_engine is not None
+    and PEER_DATABASE_URL == DELIVERIES_DATABASE_URL
+):
+    # Staging normally points both features at the production DB.  Reuse the
+    # existing low-volume deliveries pool instead of reserving a second pool
+    # (and up to three more sockets per API process) for cost attribution.
+    peer_engine = deliveries_engine
+    PeerSessionLocal = DeliveriesSessionLocal
+elif PEER_DATABASE_URL and PEER_DATABASE_URL == DATABASE_URL:
+    # An explicitly configured peer URL can also point at the local DB.  Keep
+    # one pool in that case; peer_session() still returns an independent
+    # short-lived Session.
+    peer_engine = engine
+    PeerSessionLocal = SessionLocal
+elif PEER_DATABASE_URL:
+    peer_engine = create_engine(
+        PEER_DATABASE_URL,
+        # Pool mínimo: cross-project por red pública y de uso esporádico
+        # (un par de consultas cuando alguien abre el panel de costos).
+        pool_size=int(os.environ.get("PEER_DB_POOL_SIZE", "1")),
+        max_overflow=int(os.environ.get("PEER_DB_MAX_OVERFLOW", "2")),
+        pool_pre_ping=True,
+        pool_recycle=120,
+        pool_reset_on_return="rollback",
+        echo=os.environ.get("SQL_ECHO", "").lower() == "true",
+        connect_args=_build_pg_connect_args(),
+    )
+    PeerSessionLocal = sessionmaker(
+        bind=peer_engine, autoflush=False, expire_on_commit=False
+    )
+else:
+    peer_engine = None
+    PeerSessionLocal = None
+
+
+def peer_session():
+    """Sesión al otro entorno, o None si no está configurado.
+
+    Devuelve None en vez de caer a la sesión local: mezclar los datos del
+    entorno propio como si fueran los del peer duplicaría el gasto y el
+    resultado se vería plausible, que es peor que no tenerlo."""
+    return PeerSessionLocal() if PeerSessionLocal else None
+
+
 from contextlib import contextmanager  # noqa: E402 — kept next to the helper it powers
 
 
@@ -238,6 +348,37 @@ def scoped_db():
         yield db
     finally:
         db.close()
+
+
+@contextmanager
+def scoped_deliveries_db():
+    """Sesión a la DB del portal, garantizada cerrada.
+
+    Sin `DELIVERIES_DATABASE_URL`, `DeliveriesSessionLocal` ES `SessionLocal`,
+    así que una fuga acá drena el pool PRINCIPAL. Y como `pool_stats()` mide
+    el pool entero, una sola sesión colgada rompe chequeos de salud y tests
+    de fuga que no tienen nada que ver con el endpoint culpable. Usar esto en
+    vez de abrir la sesión a mano."""
+    db = DeliveriesSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def scoped_peer_db():
+    """Sesión al otro entorno, o None si no está configurado.
+
+    Pensado para `with scoped_peer_db() as peer:` seguido de
+    `if peer is not None:` — el bloque corre igual cuando no hay peer, así el
+    llamador no necesita un camino de cierre aparte que se pueda olvidar."""
+    db = peer_session()
+    try:
+        yield db
+    finally:
+        if db is not None:
+            db.close()
 
 
 def pool_stats() -> dict:
@@ -416,6 +557,9 @@ class Job(Base):
     # agrupe errores sin parsear mensajes. Nullable: rows viejas se
     # clasifican a lectura con el mismo clasificador.
     error_category = Column(String(32), nullable=True)
+    # Stable machine-readable code. ``error`` is deliberately sanitized for
+    # browser delivery; full exception details remain in structured logs.
+    error_code = Column(String(64), nullable=True)
     # Which engine produced the lyric timing for this job: forced_align |
     # lrclib_synced | gemini_aligner | whisper. Observability so we can
     # answer "what timed this job?" without grepping logs that scroll.
@@ -440,6 +584,22 @@ class Job(Base):
     # browser to re-upload it (the previous flow uploaded the file twice
     # and OOMed the API container on lossless WAVs).
     input_r2_key = Column(Text, nullable=True)
+    # Immutable identity of the currently selected source audio.  Quality
+    # workers bind every result to these fields so replacing an object at the
+    # same logical job can never attach evidence from audio B to lyrics A.
+    input_audio_sha256 = Column(String(64), nullable=True)
+    input_audio_etag = Column(Text, nullable=True)
+    audio_revision = Column(
+        BigInteger, default=0, nullable=False, server_default="0",
+    )
+    active_quality_attempt_id = Column(
+        String(QUALITY_ATTEMPT_ID_MAX_LENGTH), nullable=True,
+    )
+    # Durable publication identities for the currently-authorized worker
+    # attempts. Context-bound workers are fenced in jobs.update_job so a late
+    # process from an older enqueue cannot overwrite a newer retry.
+    active_pipeline_attempt_id = Column(String(36), nullable=True)
+    active_transcription_attempt_id = Column(String(36), nullable=True)
 
     # In-flight multipart upload id while the browser is still PUTting
     # parts directly to R2. Cleared on multipart_complete (or aborted by
@@ -474,8 +634,19 @@ class Job(Base):
     # bg_r2_key_cached — R2 key for the AI-generated background so typography-only
     #   edits can re-use it without paying for Veo again.
     segments_json = Column(JSONB, nullable=True)
+    # Persisted verdict from transcription_quality.py.  Keeping the policy,
+    # metrics, retry evidence and revision-scoped acknowledgement together
+    # prevents API/editor/worker drift without adding a column per metric.
+    transcription_quality = Column(JSONB, nullable=True)
     # Server-owned optimistic concurrency version for editor writes.
     segments_revision = Column(BigInteger, default=0, nullable=False, server_default="0")
+    # Monotonic invalidation fence for asynchronous correction learning. Every
+    # later edit/change request increments it even when no observation exists
+    # yet, so a delayed quality worker cannot resurrect a rejected snapshot.
+    quality_learning_epoch = Column(
+        BigInteger, default=0, nullable=False, server_default="0",
+    )
+    quality_learning_invalidated_at = Column(DateTime(timezone=True), nullable=True)
     render_params = Column(JSONB, nullable=True)
     edit_count = Column(Integer, default=0, nullable=False, server_default="0")
     bg_r2_key_cached = Column(Text, nullable=True)
@@ -545,6 +716,14 @@ class Job(Base):
         "AIProvenance", back_populates="job", lazy="dynamic",
         cascade="all, delete-orphan",
     )
+    editor_document = relationship(
+        "EditorDocument", back_populates="job", uselist=False,
+        cascade="all, delete-orphan",
+    )
+    editor_versions = relationship(
+        "EditorVersion", back_populates="job", lazy="dynamic",
+        cascade="all, delete-orphan",
+    )
 
     def to_dict(self):
         s3 = self.s3_keys or {}
@@ -578,6 +757,7 @@ class Job(Base):
             ),
             "error": self.error,
             "error_category": self.error_category,
+            "error_code": self.error_code,
             "youtube": self.youtube_data,
             "youtube_short": self.youtube_short_data,
             "validation_result": self.validation_result,
@@ -594,6 +774,7 @@ class Job(Base):
             # then rejects with a raw English error.
             "segments_json": self.segments_json,
             "segments_revision": self.segments_revision or 0,
+            "transcription_quality": self.transcription_quality,
             "bg_r2_key_cached": self.bg_r2_key_cached,
             # Storyboard multi-escena (NULL en jobs de fondo único). El panel
             # de edición lo usa para mostrar las escenas y ofrecer "regenerar
@@ -646,6 +827,229 @@ class Job(Base):
             # pesa en jobs con Escenas; los normales llevan null.
             "scene_plan": self.scene_plan,
         }
+
+
+class EditorDocument(Base):
+    """Durable editor working copy layered over the legacy Job snapshot."""
+    __tablename__ = "editor_documents"
+
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"), primary_key=True,
+    )
+    tenant_id = Column(String(100), nullable=False, index=True)
+    current_segments = Column(JSONB, nullable=False)
+    original_segments = Column(JSONB, nullable=False)
+    revision = Column(Integer, nullable=False, default=0, server_default="0")
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    lock_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    lock_expires_at = Column(DateTime(timezone=True), nullable=True)
+    # Raw proposal text is intentionally tenant-scoped in the editor layer;
+    # analytics/quality JSON stores only hashes and aggregate diagnostics.
+    quality_proposal = Column(JSONB, nullable=True)
+
+    job = relationship("Job", back_populates="editor_document")
+
+
+class JobOutboxEvent(Base):
+    """Durable publication intent committed with the owning Job mutation."""
+    __tablename__ = "job_outbox_events"
+    __table_args__ = (
+        Index("ix_job_outbox_status_available", "status", "available_at"),
+        Index("ix_job_outbox_events_dedupe_key", "dedupe_key", unique=True),
+    )
+
+    id = Column(String(36), primary_key=True)
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    event_type = Column(String(64), nullable=False, index=True)
+    dedupe_key = Column(String(160), nullable=False)
+    payload = Column(JSONB, nullable=False)
+    status = Column(String(20), nullable=False, default="pending", server_default="pending")
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    available_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    dispatched_at = Column(DateTime(timezone=True), nullable=True)
+    processing_at = Column(DateTime(timezone=True), nullable=True)
+    processing_token = Column(String(36), nullable=True)
+    consumed_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String(160), nullable=True)
+
+
+class EditorVersion(Base):
+    """Immutable editor checkpoints; approved snapshots are never pruned."""
+    __tablename__ = "editor_versions"
+    __table_args__ = (
+        Index("ix_editor_versions_job_revision", "job_id", "revision", unique=True),
+        Index("ix_editor_versions_job_created", "job_id", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    tenant_id = Column(String(100), nullable=False, index=True)
+    revision = Column(Integer, nullable=False)
+    segments = Column(JSONB, nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    reason = Column(String(20), nullable=False, default="autosave")
+    is_approved = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Hash-only lineage for the initial machine checkpoint. No audio bytes or
+    # duplicate lyric content is stored here.
+    provenance = Column(JSONB, nullable=True)
+
+    job = relationship("Job", back_populates="editor_versions")
+
+
+class ProductEvent(Base):
+    """Privacy-safe editor telemetry; never stores lyric text or audio."""
+    __tablename__ = "product_events"
+    __table_args__ = (
+        Index("ix_product_events_tenant_created", "tenant_id", "created_at"),
+        Index("ix_product_events_name_created", "name", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    job_id = Column(String(12), nullable=True, index=True)
+    name = Column(String(80), nullable=False, index=True)
+    occurred_at = Column(DateTime(timezone=True), nullable=True)
+    properties = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class CorrectionObservation(Base):
+    """Privacy-safe delta between machine output and an approved revision.
+
+    Raw lyrics remain exclusively in ``EditorDocument``/``EditorVersion``.
+    This table contains only hashes, bounded counters and acoustic/context
+    features so observations can be aggregated across tenants safely.
+    """
+    __tablename__ = "correction_observations"
+    __table_args__ = (
+        Index("ix_correction_observations_tier_created", "label_tier", "created_at"),
+        Index("ix_correction_observations_release_created", "pipeline_release", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    identity_hash = Column(String(64), nullable=False, unique=True, index=True)
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    tenant_id = Column(String(100), nullable=False, index=True)
+    original_revision = Column(Integer, nullable=False)
+    approved_revision = Column(Integer, nullable=False)
+    approved_version_id = Column(
+        String(36), ForeignKey("editor_versions.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    original_hash = Column(String(64), nullable=False)
+    approved_hash = Column(String(64), nullable=False)
+    audio_hash = Column(String(64), nullable=True)
+    pipeline_release = Column(String(64), nullable=False, index=True)
+    pipeline_config_fingerprint = Column(String(64), nullable=False)
+    timing_source = Column(String(64), nullable=False)
+    pipeline_route = Column(String(64), nullable=False, default="unknown")
+    label_tier = Column(String(20), nullable=False, default="observed", index=True)
+    source_confidence = Column(String(24), nullable=False, default="exact")
+    operator_hmac = Column(String(64), nullable=True)
+    session_hmac = Column(String(64), nullable=True)
+    artist_hmac = Column(String(64), nullable=True)
+    song_hmac = Column(String(64), nullable=True)
+    hmac_key_id = Column(String(32), nullable=False, default="legacy-v1")
+    categories = Column(JSONB, nullable=False)
+    features = Column(JSONB, nullable=False)
+    metrics = Column(JSONB, nullable=False)
+    active_edit_ms = Column(BigInteger, nullable=True)
+    matures_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    trusted_at = Column(DateTime(timezone=True), nullable=True)
+    invalidated_at = Column(DateTime(timezone=True), nullable=True)
+    invalidation_reason = Column(String(120), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class QualityPattern(Base):
+    """Aggregated, k-anonymous association discovered from corrections."""
+    __tablename__ = "quality_patterns"
+
+    id = Column(String(36), primary_key=True)
+    fingerprint = Column(String(64), nullable=False, unique=True, index=True)
+    category = Column(String(64), nullable=False, index=True)
+    context_key = Column(String(120), nullable=False)
+    status = Column(String(24), nullable=False, default="emerging", index=True)
+    support_jobs = Column(Integer, nullable=False, default=0)
+    support_tenants = Column(Integer, nullable=False, default=0)
+    support_artists = Column(Integer, nullable=False, default=0)
+    baseline_rate = Column(Float, nullable=False, default=0.0)
+    observed_rate = Column(Float, nullable=False, default=0.0)
+    relative_risk = Column(Float, nullable=False, default=0.0)
+    ci_low = Column(Float, nullable=False, default=0.0)
+    ci_high = Column(Float, nullable=False, default=0.0)
+    impact_seconds = Column(Float, nullable=False, default=0.0)
+    evidence = Column(JSONB, nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+    first_seen_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class QualityFixProposal(Base):
+    """Human-governed candidate. Approval never mutates runtime config."""
+    __tablename__ = "quality_fix_proposals"
+    __table_args__ = (
+        Index(
+            "ix_quality_fix_proposals_idempotency",
+            "last_idempotency_key", unique=True,
+        ),
+    )
+
+    id = Column(String(36), primary_key=True)
+    pattern_id = Column(
+        String(36), ForeignKey("quality_patterns.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    proposal_type = Column(String(40), nullable=False)
+    title = Column(String(200), nullable=False)
+    hypothesis = Column(Text, nullable=False)
+    status = Column(String(32), nullable=False, default="draft", index=True)
+    version = Column(Integer, nullable=False, default=1)
+    candidate_config = Column(JSONB, nullable=False)
+    expected_impact = Column(JSONB, nullable=False)
+    validation_summary = Column(JSONB, nullable=True)
+    ready_artifact = Column(JSONB, nullable=True)
+    approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    decision_reason = Column(String(500), nullable=True)
+    last_idempotency_key = Column(String(100), nullable=True)
+    action_idempotency_keys = Column(JSONB, nullable=False, default=list)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class QualityExperimentRun(Base):
+    """Immutable record of one no-render baseline/candidate evaluation."""
+    __tablename__ = "quality_experiment_runs"
+
+    id = Column(String(36), primary_key=True)
+    proposal_id = Column(
+        String(36), ForeignKey("quality_fix_proposals.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    status = Column(String(24), nullable=False, default="queued", index=True)
+    baseline_config_hash = Column(String(64), nullable=True)
+    candidate_config_hash = Column(String(64), nullable=False)
+    benchmark_report_hash = Column(String(64), nullable=True)
+    metrics = Column(JSONB, nullable=False)
+    failure_reason = Column(String(500), nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class Delivery(Base):
@@ -1170,9 +1574,40 @@ class AIProvenance(Base):
     input_data_types = Column(JSONB, nullable=True)      # ["lyrics_text", "artist_name"]
     output_artifact = Column(String(500), nullable=True) # path to generated file
     duration_ms = Column(Integer, nullable=True)
+    # Only pre-submit Veo budget reservations use this lease. Once the worker
+    # crosses the provider POST boundary it is cleared and the row remains in
+    # the rolling ceiling as actual/ambiguous spend via response_summary.
+    reservation_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
 
     job = relationship("Job", back_populates="provenance")
+
+
+class VeoBudgetLedger(Base):
+    """Minimal spend tombstones that survive deletion of failed jobs.
+
+    The rolling Veo ceiling cannot depend solely on ``ai_provenance`` because
+    operators may hard-delete stuck/failed jobs and their provenance rows.
+    We retain no catalogue metadata or prompt here: ``scope_hash`` is a
+    one-way tenant+song identity and ``source_provenance_id`` only makes the
+    archival insert idempotent.
+    """
+    __tablename__ = "veo_budget_ledger"
+    __table_args__ = (
+        Index(
+            "ix_veo_budget_ledger_scope_call_at",
+            "scope_hash",
+            "provider_call_at",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scope_hash = Column(String(64), nullable=False)
+    source_provenance_id = Column(Integer, unique=True, nullable=False)
+    provider_call_at = Column(DateTime(timezone=True), nullable=False)
+    archived_at = Column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True,
+    )
 
 
 class LyricsCache(Base):
@@ -1238,9 +1673,66 @@ class SalesLead(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class CostSnapshot(Base):
+    """Monthly invoiced cost per provider, pulled by billing_sources.py.
+
+    Provider billing APIs only expose a rolling window (Railway shows the
+    open cycle, GitHub the current billing period, Replicate paginates
+    predictions that eventually age out), so a month that is never
+    snapshotted becomes unrecoverable. This table is the durable record:
+    one row per (period, source), refreshed by POST /admin/cost/refresh
+    and frozen after that source's post-close finalization window. Captures
+    made while usage is still accruing remain provisional.
+
+    `amount_usd` is nullable on purpose — a source that was not configured
+    yet must be distinguishable from one that genuinely cost $0, otherwise
+    a missing credential silently reads as free. See `status`.
+    """
+    __tablename__ = "cost_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    period = Column(String(7), nullable=False, index=True)   # "YYYY-MM"
+    source = Column(String(32), nullable=False)              # gcp | railway | ...
+    amount_usd = Column(Float, nullable=True)
+    status = Column(String(20), nullable=False, default="ok")
+    detail = Column(Text, nullable=True)
+    is_estimate = Column(Boolean, nullable=False, default=False)
+    breakdown = Column(JSONB, nullable=True)
+    fetched_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("period", "source", name="uq_cost_snapshot_period_source"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------
+
+def assert_runtime_schema_contract() -> None:
+    """Fail fast when Alembic has not installed the model contract.
+
+    Production-like services must never repair schema while accepting traffic:
+    startup DDL races rolling deploys and a swallowed lock timeout leaves a
+    superficially healthy process with an unusable database.
+    """
+    inspector = inspect(engine)
+    present_tables = set(inspector.get_table_names())
+    expected_tables = set(Base.metadata.tables)
+    missing_tables = sorted(expected_tables - present_tables)
+    missing_columns = []
+    for table_name in sorted(expected_tables & present_tables):
+        present = {item["name"] for item in inspector.get_columns(table_name)}
+        expected = {column.name for column in Base.metadata.tables[table_name].columns}
+        missing_columns.extend(
+            f"{table_name}.{column}" for column in sorted(expected - present)
+        )
+    if missing_tables or missing_columns:
+        detail = ", ".join(
+            [*(f"table:{name}" for name in missing_tables), *missing_columns]
+        )
+        raise RuntimeError(f"database schema is behind Alembic head: {detail}")
+
 
 def init_db():
     """Create all tables. Call once at startup.
@@ -1250,6 +1742,10 @@ def init_db():
     boot without an Alembic setup. SQLAlchemy's create_all only creates
     missing TABLES — it ignores missing COLUMNS on existing tables.
     """
+    environment = os.environ.get("ENVIRONMENT", "production").strip().lower()
+    if environment in {"prod", "production", "staging"}:
+        assert_runtime_schema_contract()
+        return
     Base.metadata.create_all(bind=engine)
     _migrate_user_columns()
 
@@ -1268,6 +1764,10 @@ def _migrate_user_columns():
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS umg_short_url VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS song_title VARCHAR(500)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_r2_key VARCHAR(500)",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_audio_sha256 VARCHAR(64)",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS input_audio_etag TEXT",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS audio_revision BIGINT DEFAULT 0 NOT NULL",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS active_quality_attempt_id VARCHAR(160)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS multipart_upload_id VARCHAR(255)",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS timing_source VARCHAR(20)",
         # Library exclusivity (UMG): tenant-owned and variation-parent references.
@@ -1276,6 +1776,7 @@ def _migrate_user_columns():
         "CREATE INDEX IF NOT EXISTS ix_background_assets_owner_tenant_id ON background_assets(owner_tenant_id)",
         # Edit-requests feature: partial re-render support at review stage.
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_json JSONB",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS transcription_quality JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS render_params JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS edit_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS bg_r2_key_cached TEXT",
@@ -1335,6 +1836,10 @@ def _migrate_user_columns():
         # this mirrors the repository's startup self-heal convention.
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER DEFAULT 0 NOT NULL",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_revision BIGINT DEFAULT 0 NOT NULL",
+        "ALTER TABLE editor_documents ADD COLUMN IF NOT EXISTS quality_proposal JSONB",
+        "ALTER TABLE job_outbox_events ADD COLUMN IF NOT EXISTS processing_at TIMESTAMPTZ",
+        "ALTER TABLE job_outbox_events ADD COLUMN IF NOT EXISTS processing_token VARCHAR(36)",
+        "ALTER TABLE job_outbox_events ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS youtube_short_data JSONB",
     ]
     # Each statement gets its own transaction. In Postgres, a failed statement
@@ -1356,6 +1861,7 @@ def _migrate_user_columns():
     # deploys (new container starts while old one still holds connections).
     _widen_column_to_text("jobs", "input_r2_key")
     _widen_column_to_text("jobs", "multipart_upload_id")
+    _widen_varchar_column("jobs", "active_quality_attempt_id", 160)
 
     # Cast JSON → JSONB so PostgreSQL equality operators work (required for
     # DISTINCT queries and index support). Safe: JSONB is a strict superset.
@@ -1393,6 +1899,36 @@ def _widen_column_to_text(table: str, column: str) -> None:
             conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE TEXT"))
     except Exception as e:  # pragma: no cover
         print(f"[init_db] widen skipped: {table}.{column} → {e}")
+
+
+def _widen_varchar_column(table: str, column: str, minimum: int) -> None:
+    """Expand an existing PostgreSQL VARCHAR without narrowing TEXT columns."""
+    if engine.dialect.name != "postgresql":
+        return
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT data_type, character_maximum_length "
+                "FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = :t AND column_name = :c"
+            ), {"t": table, "c": column}).fetchone()
+        if not row or str(row[0]).lower() == "text":
+            return
+        if (
+            str(row[0]).lower() in {"character varying", "varchar"}
+            and int(row[1] or 0) >= int(minimum)
+        ):
+            return
+        with engine.begin() as conn:
+            conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+            conn.execute(text(
+                f"ALTER TABLE {table} ALTER COLUMN {column} "
+                f"TYPE VARCHAR({int(minimum)})"
+            ))
+    except Exception as e:  # pragma: no cover
+        print(f"[init_db] varchar widen skipped: {table}.{column} → {e}")
 
 
 def _cast_json_to_jsonb(table: str, column: str) -> None:

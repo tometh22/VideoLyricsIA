@@ -346,6 +346,16 @@ def _safe_filename(filename: str) -> str:
     return cleaned[:200]
 
 
+def _safe_key_component(value: str) -> str:
+    """Sanitize an identity component without basename semantics.
+
+    Tenant and job identifiers are not filenames. Applying ``basename`` to
+    them would make ``tenant/a`` and ``a`` collide at the same object prefix.
+    """
+    cleaned = _KEY_SAFE.sub("_", str(value or "")).strip(".")
+    return (cleaned or "unknown")[:200]
+
+
 def _object_key(tenant_id: str, job_id: str, filename: str) -> str:
     return f"{_safe_filename(tenant_id)}/{_safe_filename(job_id)}/{_safe_filename(filename)}"
 
@@ -356,6 +366,19 @@ def _input_object_key(tenant_id: str, job_id: str, filename: str) -> str:
     return (
         f"inputs/{_safe_filename(tenant_id)}"
         f"/{_safe_filename(job_id)}/{_safe_filename(filename)}"
+    )
+
+
+def content_addressed_input_key(
+    tenant_id: str, job_id: str, audio_sha256: str, filename: str,
+) -> str:
+    """Immutable source-audio key bound to a validated SHA-256 identity."""
+    digest = str(audio_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("audio_sha256 must be a lowercase SHA-256 digest")
+    return (
+        f"inputs/{_safe_key_component(tenant_id)}/{_safe_key_component(job_id)}"
+        f"/sha256/{digest}/{_safe_filename(filename)}"
     )
 
 
@@ -397,6 +420,28 @@ def upload_input(local_path: str, tenant_id: str, job_id: str, filename: str) ->
     return key
 
 
+def object_status(key: str) -> str:
+    """Return ``exists``, ``missing`` or ``unavailable`` for an R2 key.
+
+    Lifecycle reconciliation must distinguish a real 404 from a transient
+    HEAD failure: deleting a database key on a timeout/403 could orphan a
+    valid multi-GB deliverable. Cache callers that only need a bool continue
+    to use :func:`object_exists` below.
+    """
+    client = _get_client()
+    if client is None:
+        return "unavailable"
+    try:
+        client.head_object(Bucket=R2_BUCKET, Key=key)
+        return "exists"
+    except Exception as exc:
+        code = (getattr(exc, "response", {}) or {}).get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey"):
+            return "missing"
+        logger.error("object_status check failed for key=%r: %s", key, exc)
+        return "unavailable"
+
+
 def object_exists(key: str) -> bool:
     """Check whether an object exists at the given key.
 
@@ -405,22 +450,20 @@ def object_exists(key: str) -> bool:
     an error and returns False — callers treat a missing object as a cache
     miss, so we degrade gracefully instead of propagating transient errors.
     """
+    return object_status(key) == "exists"
+
+
+def object_etag(key: str) -> str | None:
+    """Return the normalized object ETag, or None when unavailable."""
     client = _get_client()
-    if client is None:
-        return False
+    if client is None or not key:
+        return None
     try:
-        client.head_object(Bucket=R2_BUCKET, Key=key)
-        return True
+        value = client.head_object(Bucket=R2_BUCKET, Key=key).get("ETag")
+        return str(value or "").strip().strip('"') or None
     except Exception as exc:
-        # boto3 / botocore raises ClientError for all HTTP-level errors.
-        # 404 / NoSuchKey → object absent (expected). Anything else (403,
-        # network timeout, credential failure) is a real problem we should
-        # surface in logs rather than silently treating as "not found".
-        code = (getattr(exc, "response", {}) or {}).get("Error", {}).get("Code", "")
-        if code in ("404", "NoSuchKey"):
-            return False
-        logger.error("object_exists check failed for key=%r: %s", key, exc)
-        return False
+        logger.warning("[R2] ETag unavailable key=%r: %s", key, exc)
+        return None
 
 
 def upload_file(local_path: str, key: str) -> Optional[str]:

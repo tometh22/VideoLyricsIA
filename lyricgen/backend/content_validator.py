@@ -9,10 +9,40 @@ element from accidentally disabling the other safety gates.
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
+import time
 
 logger = logging.getLogger("genly.validator")
+
+# Vertex answers a burst of frame checks with 429 RESOURCE_EXHAUSTED (per-minute
+# quota) far more often than it answers with an actual verdict failure. Without
+# a retry that transient quota blip becomes an "incomplete verdict", which the
+# fail-closed policy converts into a hard rejection of a background the caller
+# may have already certified twice (incident 2026-08-20, job 2861e17a44d4: one
+# 429 on frame 6 of 8 discarded a Veo background the same job had passed at
+# 8/8 an hour earlier). Retry the RETRYABLE errors — quota, unavailability,
+# transport timeouts — and keep failing closed on everything else.
+_VISION_MAX_ATTEMPTS = int(os.environ.get("VALIDATOR_VISION_MAX_ATTEMPTS", "3"))
+_VISION_RETRY_BACKOFF_S = float(
+    os.environ.get("VALIDATOR_VISION_RETRY_BACKOFF_S", "3")
+)
+_RETRYABLE_VISION_ERROR_RE = re.compile(
+    r"429|RESOURCE_EXHAUSTED|rate.?limit|quota|"
+    r"503|UNAVAILABLE|500|INTERNAL|502|504|DEADLINE_EXCEEDED|timed? ?out",
+    re.IGNORECASE,
+)
+
+
+def _is_retryable_vision_error(exc: Exception) -> bool:
+    """True for infrastructure errors that a later attempt may answer.
+
+    Deliberately matched on the message: the Vertex SDK surfaces quota and
+    availability failures as generic exceptions carrying the HTTP status in
+    their text, so there is no exception class to key off.
+    """
+    return bool(_RETRYABLE_VISION_ERROR_RE.search(str(exc)))
 
 
 def _safe_ffmpeg_path(path: str) -> str:
@@ -197,22 +227,39 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             '"brand":true/false},"issues":[{"category":"people|atmospherics|brand",'
             '"reason":"specific visible evidence"}]}'
         )
-        response = _call_with_timeout(
-            lambda: client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                    _prompt_text,
-                ],
-                config=genai.types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=300,
-                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
-                ),
-            ),
-            timeout_s=45.0,
-            label="VALIDATOR",
-        )
+        response = None
+        for _attempt in range(1, max(1, _VISION_MAX_ATTEMPTS) + 1):
+            try:
+                response = _call_with_timeout(
+                    lambda: client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=[
+                            genai.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                            _prompt_text,
+                        ],
+                        config=genai.types.GenerateContentConfig(
+                            temperature=0.1,
+                            max_output_tokens=300,
+                            thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+                        ),
+                    ),
+                    timeout_s=45.0,
+                    label="VALIDATOR",
+                )
+                break
+            except Exception as _vision_error:  # noqa: BLE001
+                if (
+                    _attempt >= max(1, _VISION_MAX_ATTEMPTS)
+                    or not _is_retryable_vision_error(_vision_error)
+                ):
+                    raise
+                _delay = _VISION_RETRY_BACKOFF_S * (2 ** (_attempt - 1))
+                logger.warning(
+                    "[VALIDATION] transient Vision error on attempt %d/%d "
+                    "(%s) — retrying in %.0fs",
+                    _attempt, _VISION_MAX_ATTEMPTS, _vision_error, _delay,
+                )
+                time.sleep(_delay)
         text = response.text.strip()
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
@@ -454,6 +501,11 @@ def validate_video(
     logger.info(f"[VALIDATION] job={job_id}: {summary}")
     return {
         "passed": passed,
+        # "We could not finish looking" is NOT "we saw something forbidden".
+        # Both fail closed, but only the decisive verdict is evidence about the
+        # asset — a caller re-checking an ALREADY-certified background needs to
+        # tell them apart before it throws that background away.
+        "inconclusive": (not complete_verdict) and not decisive_policy_failure,
         "issues": all_issues,
         "frames_checked": frames_checked,
         "frames_planned": planned_frames,
@@ -482,7 +534,10 @@ def validate_image(
     recorder = record_ai_call(
         job_id=job_id or "unknown",
         step="output_validation",
-        tool_name="gemini-2.5-flash-vision",
+        # A single-image verdict is one Gemini request. Keep it distinct from
+        # the video-scan key, whose list rate represents as many as 48 frame
+        # requests, so calibration can preserve their relative cost.
+        tool_name="gemini-2.5-flash-vision-image",
         tool_provider="google_vertex",
         prompt=(
             "Classify image for people, commercial brands and atmospheric effects; "
@@ -501,6 +556,8 @@ def validate_image(
             recorder.finish(response_summary=f"passed=False, check_error={e}")
         return {
             "passed": False,
+            # No verdict was produced — see validate_video's note.
+            "inconclusive": True,
             "issues": [{
                 "frame": 0,
                 "type": (
@@ -529,6 +586,8 @@ def validate_image(
 
     return {
         "passed": passed,
+        # The classifier answered: pass or fail, the verdict is about the asset.
+        "inconclusive": False,
         "issues": issues,
         "frames_checked": 1,
         "check_errors": 0,

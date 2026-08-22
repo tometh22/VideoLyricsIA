@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main, staging, claude/*]
+  # Stacked PRs use another feature branch as their temporary base. Running
+  # CI only for main/staging left those exact heads without backend coverage.
   pull_request:
-    branches: [main, staging]
 
 jobs:
   # ─── Backend tests ───
@@ -44,7 +45,19 @@ jobs:
       # unnoticed — the 2026-05 title-card fix (overflow + floating accents)
       # is only truly gated when this burns a real MP4. ~5s on a warm runner.
       - name: Install ffmpeg (libass for the render gate)
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: |
+          # GitHub's bash uses pipefail; grep -q can close the pipe early and
+          # make ffmpeg exit with SIGPIPE, falsely forcing the apt fallback.
+          ffmpeg_filters="$(ffmpeg -hide_banner -filters 2>/dev/null || true)"
+          if command -v ffmpeg >/dev/null 2>&1 && \
+             grep -qE '[[:space:]]subtitles[[:space:]]' <<<"$ffmpeg_filters"; then
+            echo "ffmpeg with the subtitles/libass filter is already available"
+          else
+            sudo apt-get install -y ffmpeg || {
+              sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
+              sudo apt-get install -y ffmpeg
+            }
+          fi
 
       - name: Install dependencies
         run: |
@@ -69,12 +82,32 @@ jobs:
       - name: Lint — undefined names (F821, prevent NameError shipping)
         run: ruff check --select F821 .
 
+      - name: Apply migrations on real PostgreSQL
+        env:
+          DATABASE_URL: "postgresql://genly:genly@localhost:5432/genly_test"
+        run: python -m alembic upgrade head
+
       - name: Run tests
         env:
           DATABASE_URL: "postgresql://genly:genly@localhost:5432/genly_test"
           JWT_SECRET: "ci-test-secret-key"
           ADMIN_PASSWORD: "testadmin123"
         run: python -m pytest tests/ -v --tb=short
+
+      - name: Real MoviePy + libass render gates
+        env:
+          DATABASE_URL: "postgresql://genly:genly@localhost:5432/genly_test"
+          JWT_SECRET: "ci-test-secret-key"
+          ADMIN_PASSWORD: "testadmin123"
+          GENLY_TEST_REAL_MOVIEPY: "1"
+        run: >-
+          python -m pytest tests/test_ass_integration.py
+          tests/test_ass_integration_render.py -v --tb=short
+
+      - name: Dependency vulnerability gate
+        run: |
+          pip install pip-audit
+          python scripts/security_audit.py
 
       - name: Syntax check all modules
         run: |
@@ -107,8 +140,86 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Dependency vulnerability gate
+        run: npm audit --audit-level=moderate
+
+      - name: Install Chromium for browser E2E
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser E2E
+        run: npm run test:e2e
+
       - name: Build
         run: npm run build
+
+  # ─── Editor 2.0 real collaboration gate ───
+  # Runs separately from the fast mocked browser suite: two authenticated
+  # Chromium contexts share one real PostgreSQL-backed editor document.
+  editor-collaboration:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://genly:genly@127.0.0.1:5432/genly_editor_e2e
+      JWT_SECRET: editor-e2e-ci-secret
+      ADMIN_PASSWORD: testadmin123
+      ENVIRONMENT: test
+      CORS_ORIGINS: http://127.0.0.1:4173
+      RATE_LIMIT_ENABLED: "false"
+      BACKGROUND_THREADS_ENABLED: "false"
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: genly
+          POSTGRES_PASSWORD: genly
+          POSTGRES_DB: genly_editor_e2e
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: lyricgen/backend/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: lyricgen/frontend/package-lock.json
+      - name: Install backend and frontend dependencies
+        run: |
+          pip install -r lyricgen/backend/requirements.txt
+          npm ci --prefix lyricgen/frontend
+          cd lyricgen/frontend
+          npx playwright install --with-deps chromium
+      - name: Seed and start real editor API
+        run: |
+          cd lyricgen/backend
+          python scripts/seed_editor_e2e.py
+          uvicorn main:app --host 127.0.0.1 --port 8000 > /tmp/editor-api.log 2>&1 &
+          for i in {1..30}; do curl -fsS http://127.0.0.1:8000/health/live && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8000/health/live
+      - name: Run two-user Chromium collaboration flow
+        working-directory: lyricgen/frontend
+        env:
+          REAL_EDITOR_E2E: "1"
+          REAL_EDITOR_API: http://127.0.0.1:8000
+          VITE_API_URL: http://127.0.0.1:8000
+        run: npx playwright test e2e/editor-collaboration-real.spec.js
+      - name: Upload editor diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: editor-collaboration-diagnostics
+          path: |
+            /tmp/editor-api.log
+            lyricgen/frontend/test-results
 
   # ─── Sentinel security tests ───
   sentinel:
@@ -137,7 +248,7 @@ jobs:
   # ─── Docker build ───
   docker:
     runs-on: ubuntu-latest
-    needs: [backend, frontend, sentinel]
+    needs: [backend, frontend, editor-collaboration, sentinel]
 
     steps:
       - uses: actions/checkout@v4

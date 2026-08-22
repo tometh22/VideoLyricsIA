@@ -57,12 +57,21 @@ from moviepy.editor import (
     TextClip,
     VideoClip,
     VideoFileClip,
-    concatenate_videoclips,
 )
+# concatenate_videoclips sale del import de módulo a propósito: era el
+# patrón "abrir N clips del mismo archivo y concatenarlos", que filtraba un
+# proceso ffmpeg por vuelta. El único uso vivo (_apply_short_effect) lo
+# importa localmente. Que reaparecer acá cueste una línea extra.
 # Make moviepy tolerant of non-UTF-8 bytes in ffmpeg's output (accented
 # filenames / metadata — "La Vida Al Revés" → 0xe9). Without this, AudioFileClip
 # / VideoFileClip crash on any accented title. Self-applies on import.
 import moviepy_utf8_patch  # noqa: F401
+# Y que el writer de moviepy deje de tragarse los fallos de su ffmpeg: su
+# close() descarta el returncode, así que un encoder que muere en la
+# finalización (reubicación del +faststart) devuelve "éxito" con un archivo
+# roto en disco. Es lo que dejó el short_bg_only.mp4 con moov sano y cero
+# packets en el incidente UMG Chile 2026-08-21. Self-applies on import.
+import moviepy_writer_patch  # noqa: F401
 from PIL import Image, ImageDraw, ImageFont
 
 from jobs import update_job, get_job_model
@@ -83,6 +92,7 @@ from background_policy import (
 )
 from render_spec import FPS_RATIONAL, RenderSpec
 from subprocess_utils import run_checked, SubprocessExecutionError  # noqa: F401 — exported for upstream catches
+from transcription_language import resolve_transcription_language
 
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
 OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
@@ -153,6 +163,12 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
        behavior because they're lazy-regenerated on first /download.
     """
     if not storage.is_enabled():
+        if os.environ.get("ENVIRONMENT", "production").strip().lower() in {
+            "production", "prod", "staging",
+        }:
+            raise StorageUploadError(
+                "Required object storage is not configured for deliverables"
+            )
         return {}
     from jobs import merge_s3_keys, heartbeat
     # We need a SQLAlchemy session, but this function runs in the worker
@@ -514,7 +530,7 @@ def _cleanup_local_intermediates(job_dir: str) -> None:
         pass
 
 
-def _cleanup_job_dir_on_failure(job_dir: str) -> None:
+def _cleanup_job_dir_on_failure(job_dir: str, job_id: str | None = None) -> None:
     """Remove the ENTIRE local job dir when a render FAILS (Tier 4 / C5).
 
     Unlike _cleanup_local_intermediates (success path: keeps any leftover
@@ -533,10 +549,132 @@ def _cleanup_job_dir_on_failure(job_dir: str) -> None:
         return
     if not job_dir or not os.path.isdir(job_dir):
         return
+    # Última barrera antes de destruir evidencia: si el render llegó a
+    # producir un master sano, no se tira. Cubre las bombas que los
+    # try/except por paso no anticiparon (ver _rescue_master_before_cleanup).
+    if job_id:
+        try:
+            _rescue_master_before_cleanup(job_id, job_dir)
+        except Exception:
+            pass
     try:
         import shutil
         shutil.rmtree(job_dir, ignore_errors=True)
         logger.info("[PIPELINE] cleaned up failed job dir (freed disk): %s", job_dir)
+    except Exception:
+        pass
+
+
+def _rescue_master_before_cleanup(job_id: str, job_dir: str) -> bool:
+    """Sube el master a R2 si sobrevivió sano, ANTES de borrar el job dir.
+
+    Incidente UMG Chile 2026-08-21 (job d6fdeb72088e): el master estaba
+    renderizado y validado (352s, 519.5 MB) cuando el paso del short —un
+    entregable secundario— levantó un OSError. El except global marcó el
+    job 'error' y `_cleanup_job_dir_on_failure` hizo rmtree del directorio
+    con el master adentro. El cliente perdió el video dos veces.
+
+    Los try/except por paso (ver `_accessory_failed`) tapan las bombas que
+    CONOCEMOS. Esto es la red para las que no: entre el momento en que
+    `lyric_video.mp4` existe en disco y el `_upload_deliverables_to_r2`
+    que lo sube hay ~120 renglones donde el master existe en un solo lugar
+    del mundo, y cualquier excepción ahí lo borraba.
+
+    El docstring de `_cleanup_job_dir_on_failure` justifica el rmtree con
+    "an RQ retry re-downloads + re-renders". Eso es FALSO: el except
+    genérico de run_pipeline no re-lanza, así que RQ ve el work-horse
+    terminar OK y `Retry` nunca dispara. Sin este rescate el master se
+    perdía definitivamente, sin reintento.
+
+    Best-effort y silencioso ante fallos: esto corre en el camino de error,
+    jamás puede pisar la excepción original. Devuelve True si subió algo.
+    """
+    if not job_dir or not os.path.isdir(job_dir):
+        return False
+    master = os.path.join(job_dir, "lyric_video.mp4")
+    if not os.path.exists(master):
+        return False
+    try:
+        if not storage.is_enabled():
+            return False
+        # Solo rescatamos un master REPRODUCIBLE. Subir uno truncado sería
+        # peor que perderlo: quedaría publicado como entregable bueno.
+        _validate_rendered_mp4(master, 0)
+    except Exception as e:
+        logger.warning("[RESCUE] master presente pero no válido (%s) — no se sube", e)
+        return False
+    try:
+        from jobs import merge_s3_keys
+        from database import SessionLocal as _SL
+        _db = _SL()
+        try:
+            _row = get_job_model(_db, job_id)
+            tenant_id = (_row.tenant_id if _row is not None else None) or "default"
+        finally:
+            _db.close()
+        key = storage.upload_master(master, tenant_id, job_id, "lyric_video.mp4")
+        if not key:
+            raise RuntimeError("upload_master returned no key")
+        merge_s3_keys(job_id, "video", key)
+        logger.warning(
+            "[RESCUE] job=%s falló DESPUÉS de renderizar el master — "
+            "master rescatado a R2 (%s) antes de limpiar el dir", job_id, key,
+        )
+        return True
+    except Exception as e:
+        logger.warning("[RESCUE] no se pudo rescatar el master de job=%s: %s", job_id, e)
+        return False
+
+
+# Entregables SECUNDARIOS: su fallo degrada la entrega, nunca la cancela.
+_ACCESSORY_ARTIFACTS = {"short": "short.mp4", "thumbnail": "thumbnail.jpg"}
+
+
+def _accessory_failed(kind: str, job_id: str, job_dir: str, exc: BaseException) -> None:
+    """Da por perdido un entregable secundario sin matar el job.
+
+    El master es el producto; el short vertical y el thumbnail son
+    accesorios. Antes de este handler cualquier excepción en esos pasos
+    subía al except global de run_pipeline y se llevaba puesto un master
+    ya renderizado (incidente UMG Chile 2026-08-21, ver
+    `_rescue_master_before_cleanup`).
+
+    Tres cosas, en este orden:
+
+    1. `_raise_if_job_timeout` PRIMERO. Si esto es el death penalty de RQ,
+       se re-lanza: la resiliencia jamás puede neutralizarlo (si no, el
+       worker seguiría al thumbnail y a subir cientos de MB pasado el
+       deadline).
+    2. Borrar el artefacto a medio escribir. `generate_short` escribe
+       DIRECTO sobre short.mp4 (sin .tmp + rename), así que un fallo a
+       mitad deja un MP4 truncado, y `_cleanup_local_intermediates` no lo
+       barre (solo toca bg_*). Si sobrevive, `enqueue_prores_prewarm` lo
+       transcodea y publica un .mov corrupto en R2 — prores.py sólo
+       chequea `os.path.exists` del source, nunca lo valida.
+    3. Sentry con fingerprint propio. Una entrega sin short es una entrega
+       DEGRADADA, no un éxito: tiene que verse.
+    """
+    _raise_if_job_timeout(exc)
+    logger.exception(
+        "[%s] falló — el job sigue y se entrega sin ese archivo (job=%s)",
+        kind.upper(), job_id,
+    )
+    artifact = _ACCESSORY_ARTIFACTS.get(kind)
+    if artifact:
+        path = os.path.join(job_dir, artifact)
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+                logger.warning("[%s] borrado el %s a medio escribir", kind.upper(), artifact)
+        except OSError:
+            pass
+    try:
+        import sentry_sdk
+        with sentry_sdk.push_scope() as _scope:
+            _scope.fingerprint = [f"{kind}-generation-failed"]
+            _scope.set_tag("job_id", job_id)
+            _scope.set_tag("deliverable", kind)
+            sentry_sdk.capture_exception(exc)
     except Exception:
         pass
 
@@ -674,6 +812,22 @@ def _record_bg_cache_reuse(job_id, bg_cache_key, *, waited_s=None):
         )
 
 
+def _apply_film_frame_guard(video_path: str, *, job_id: str | None = None):
+    """Repair Veo's literal physical-film frame locally when confidently seen.
+
+    The detector is deliberately compound and temporal. It never requests a
+    replacement from Veo; failures preserve the original clip and remain
+    non-fatal to the render.
+    """
+    try:
+        from film_frame_guard import process_film_frame_artifact
+        return process_film_frame_artifact(video_path, job_id=job_id)
+    except Exception as exc:
+        _raise_if_job_timeout(exc)
+        logger.warning("[BG][FILM-FRAME] guard skipped (non-fatal): %s", exc)
+        return None
+
+
 def _bg_preview_wait_s() -> int:
     """Máxima espera por un preview de fondo EN VUELO antes de generar fresh.
 
@@ -758,6 +912,7 @@ def _await_inflight_bg_preview(bg_cache_key, job_dir, *, job_id):
                     job_dir, f"bg_cached_{bg_cache_key}.mp4",
                 )
                 if cache_download(bg_cache_key, cached_path):
+                    _apply_film_frame_guard(cached_path, job_id=job_id)
                     waited = _time.time() - started
                     logger.info(
                         "[BG] cache HIT tras espera de %.0fs key=%s job=%s",
@@ -890,6 +1045,27 @@ def _legacy_background_source_is_ai(
     return True
 
 
+def _transcription_quality_render_allowed(
+    job_id: str, segments: list[dict],
+) -> tuple[bool, str | None]:
+    """Single DB-backed quality decision used by every render pipeline."""
+    from database import Job as QualityJob, SessionLocal as QualitySession
+    from transcription_quality import can_render
+
+    quality_db = QualitySession()
+    try:
+        row = quality_db.query(QualityJob).filter(QualityJob.job_id == job_id).first()
+        return can_render(
+            row.transcription_quality if row else None,
+            revision=int(row.segments_revision or 0) if row else 0,
+            segments=segments,
+            job_id=job_id,
+            tenant_id=str(row.tenant_id or "") if row else "",
+        )
+    finally:
+        quality_db.close()
+
+
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  language: str = None, segments_override: list[dict] = None,
                  delivery_profile: str = "youtube", umg_spec: dict | None = None,
@@ -983,7 +1159,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  art_track: bool = False,
                  # Línea legal opcional en pantalla (art tracks): ej.
                  # "℗ 2026 Universal Music Chile". Vacía = no se dibuja.
-                 label_line: str = ""):
+                 label_line: str = "",
+                 # Canonical allowlisted batch contract. Individual fields
+                 # above remain for backwards compatibility; this object is
+                 # persisted verbatim (after API validation) for audit/retry.
+                 render_profile: dict | None = None):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -1246,6 +1426,40 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         else:
             update_job(job_id, progress=20)
 
+        # Central cost boundary. Every entry path (/generate, legacy /upload,
+        # retry and queued workers) reaches this point before background/Veo
+        # or rendering. Endpoint-only validation is insufficient because
+        # retries and legacy clients can bypass it.
+        if not art_track:
+            try:
+                _quality_ok, _quality_reason = _transcription_quality_render_allowed(
+                    job_id, segments,
+                )
+                if not _quality_ok:
+                    logger.error(
+                        "[QUALITY-GATE] render blocked reason=%s job=%s",
+                        _quality_reason, job_id,
+                    )
+                    update_job(
+                        job_id, status="transcribed_pending",
+                        current_step="quality_review",
+                        error=(
+                            "La letra requiere revisión de calidad antes de renderizar "
+                            f"({_quality_reason})."
+                        ),
+                    )
+                    return
+            except Exception as _quality_exc:
+                logger.exception("[QUALITY-GATE] central render check failed job=%s", job_id)
+                from transcription_quality import policy_mode
+                if policy_mode() == "enforce":
+                    update_job(
+                        job_id, status="transcribed_pending",
+                        current_step="quality_review",
+                        error="No se pudo verificar la calidad de la letra antes del render.",
+                    )
+                    return
+
         # Step 1.5 — Background (AI-generated or human-provided)
         update_job(job_id, current_step="background", progress=22)
         # Decide if the operator's upload is a still image they want
@@ -1351,6 +1565,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     if cache_check(bg_cache_key):
                         cached_path = os.path.join(job_dir, f"bg_cached_{bg_cache_key}.mp4")
                         if cache_download(bg_cache_key, cached_path):
+                            _apply_film_frame_guard(cached_path, job_id=job_id)
                             logger.info("[BG] cache HIT key=%s — reusando %s, skip Veo/Imagen",
                                         bg_cache_key, os.path.basename(cached_path))
                             bg_image_path = cached_path
@@ -1423,6 +1638,40 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     _scenes_active = True
                     update_job(job_id, scene_plan=_scene_plan)
                     logger.info("[SCENES] timeline multi-escena listo para job=%s", job_id)
+                except VeoAmbiguousSubmission as e:
+                    # At least one paid scene operation may exist without an
+                    # id we can poll. Skip the normal single-background path,
+                    # which would submit a duplicate, and finish with a fully
+                    # local visual instead.
+                    logger.error(
+                        "[SCENES] envío ambiguo para job=%s (%s) — "
+                        "fallback determinístico sin otro proveedor",
+                        job_id, e,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style,
+                        filename="bg_scene_ambiguous_fallback.mp4",
+                    )
+                    _background_is_ai_generated = False
+                    _background_is_deterministic_fallback = True
+                    _scenes_active = False
+                except VeoTrackingUnavailable as e:
+                    # The operator deleted/cancelled the processing job before
+                    # its pending reservation became billable. Never fall
+                    # through to the single-background provider path: it would
+                    # create a second untracked submission attempt.
+                    logger.info(
+                        "[SCENES] tracking cancelado para job=%s (%s) — "
+                        "fallback determinístico sin otro proveedor",
+                        job_id, e,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style,
+                        filename="bg_scene_cancelled_fallback.mp4",
+                    )
+                    _background_is_ai_generated = False
+                    _background_is_deterministic_fallback = True
+                    _scenes_active = False
                 except Exception as e:  # noqa: BLE001
                     _raise_if_job_timeout(e)
                     logger.error("[SCENES] multi-escena falló para job=%s (%s) — "
@@ -1524,6 +1773,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # the wizard and we persist it so retries/edits respect it.
             "title_song_break": title_song_break,
         }
+        if isinstance(render_profile, dict):
+            _new_rp["render_profile"] = dict(render_profile)
         # Only persist background_hint / bg_verbatim when this run actually
         # received them — otherwise a hint-less typography edit would null out
         # values a prior background edit had stored (merge-not-replace).
@@ -1558,6 +1809,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             logger.warning("[BG] merge_render_params failed: %s", _rp_exc)
 
         files = {}
+        # Entregables accesorios que se perdieron por el camino. Local: la
+        # señal PERSISTIDA es que job.short_url / job.thumbnail_url quedan
+        # NULL, porque update_job(files=...) sólo escribe las keys presentes
+        # en el dict (jobs.py) y /retry y /edit ya las resetean a NULL antes
+        # de re-renderizar. O sea "job done con short_url NULL" == no hay
+        # short, sin columna nueva ni migración. Esto sólo evita releer la
+        # fila para decidir el prewarm de ProRes acá mismo.
+        missing_deliverables: list[str] = []
         # La elección de tipografía se hace UNA vez acá (operador o pick
         # del pool) y fluye a video + short + persiste para re-renders.
         # Fix incidente UMG Chile 2026-06-11 — ver _pick_concrete_font.
@@ -1978,7 +2237,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 # camino de fondo humano: hasta ahora el eje entero era inerte
                 # acá (se enviaba, se persistía y nadie lo leía).
                 still_background=(
-                    _normalize_movement_style(movement_style) == "estatico"
+                    _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
                 ),
             )
             # Cinemascope opt-in: letterbox the finished YouTube master. Skipped
@@ -2008,45 +2267,57 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         if wants_youtube or wants_umg:
             update_job(job_id, current_step="short", progress=75)
             short_fps = float(umg_spec["fps"]) if wants_umg else 24
-            if art_track:
-                # Art track short: vertical (9:16) composite of the cover over
-                # a 30s high-energy window (no lyrics → pick the window by RMS
-                # energy, not chorus repetition). Same look as the master.
-                _short_spec = (
-                    RenderSpec.umg_intermediate_short(umg_spec) if wants_umg
-                    else RenderSpec.youtube_short()
-                )
-                generate_art_track_short(
-                    mp3_path, bg_source, job_dir, spec=_short_spec,
-                    artist=artist, song_title=song_title,
-                    label_line=label_line, effect=effect,
-                )
-            else:
-                generate_short(
-                    mp3_path, segments, job_dir, bg_source=bg_source,
-                    style=style, font=chosen_font, fps=short_fps,
-                    text_case=text_case, font_scale=font_scale,
-                    lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
-                    text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
-                    lyrics_animation=lyrics_animation, line_transition=line_transition,
-                )
-            files["short_url"] = f"/download/{job_id}/short"
+            # El short y el thumbnail son ACCESORIOS: a esta altura el master
+            # ya está renderizado y validado en disco, y hasta el incidente
+            # UMG Chile 2026-08-21 una excepción acá lo borraba entero (ver
+            # `_accessory_failed`). Se degrada la entrega, nunca se cancela.
+            try:
+                if art_track:
+                    # Art track short: vertical (9:16) composite of the cover over
+                    # a 30s high-energy window (no lyrics → pick the window by RMS
+                    # energy, not chorus repetition). Same look as the master.
+                    _short_spec = (
+                        RenderSpec.umg_intermediate_short(umg_spec) if wants_umg
+                        else RenderSpec.youtube_short()
+                    )
+                    generate_art_track_short(
+                        mp3_path, bg_source, job_dir, spec=_short_spec,
+                        artist=artist, song_title=song_title,
+                        label_line=label_line, effect=effect,
+                    )
+                else:
+                    generate_short(
+                        mp3_path, segments, job_dir, bg_source=bg_source,
+                        style=style, font=chosen_font, fps=short_fps,
+                        text_case=text_case, font_scale=font_scale,
+                        lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                        text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
+                        lyrics_animation=lyrics_animation, line_transition=line_transition,
+                    )
+                files["short_url"] = f"/download/{job_id}/short"
+            except Exception as _short_err:
+                _accessory_failed("short", job_id, job_dir, _short_err)
+                missing_deliverables.append("short")
             update_job(job_id, progress=85)
 
             # Step 4 — Thumbnail (art tracks reuse the composite look so the
             # thumbnail matches what plays; lyric videos keep the raw bg).
             update_job(job_id, current_step="thumbnail", progress=90)
-            if art_track:
-                generate_art_track_thumbnail(
-                    bg_source, mp3_path, job_dir, artist=artist,
-                    song_title=song_title, label_line=label_line,
-                )
-            else:
-                generate_thumbnail(
-                    artist, mp3_path, job_dir, bg_source=bg_source,
-                    song_title=song_title,
-                )
-            files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
+            try:
+                if art_track:
+                    generate_art_track_thumbnail(
+                        bg_source, mp3_path, job_dir, artist=artist,
+                        song_title=song_title, label_line=label_line,
+                    )
+                else:
+                    generate_thumbnail(
+                        artist, mp3_path, job_dir, bg_source=bg_source,
+                        song_title=song_title,
+                    )
+                files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
+            except Exception as _thumb_err:
+                _accessory_failed("thumbnail", job_id, job_dir, _thumb_err)
+                missing_deliverables.append("thumbnail")
 
         # Content validation already happened pre-render (Step 1b) so the
         # background here is guaranteed clean. No post-render check needed.
@@ -2065,15 +2336,18 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
 
         # P3: join INCONDICIONAL de la validación observe-paralela, ANTES de
         # _verify_deliverables — o sea antes del cleanup que borra el archivo
-        # que el hilo lee y antes del status final. result() re-lanza
-        # cualquier error del hilo (patrón del fan-out de escenas): un fallo
-        # de Vision produce el mismo estado terminal 'error' que hoy en
-        # secuencial. A esta altura el hilo (~65s) casi siempre ya terminó
-        # (encode+short ~180s) → costo del join ≈ 0. Timeout defensivo
-        # (audit adversarial 2026-07-17): con Vertex degradado la validación
-        # puede sumar minutos a un render EXITOSO — justo la latencia que
-        # este PR elimina, invertida. A los 180s se sigue de largo tratando
-        # el veredicto como no-concluyente (observe nunca bloquea igual).
+        # que el hilo lee y antes del status final. A esta altura el hilo
+        # (~65s) casi siempre ya terminó (encode+short ~180s) → costo ≈ 0.
+        # Timeout defensivo (audit adversarial 2026-07-17): con Vertex
+        # degradado la validación puede sumar minutos a un render EXITOSO.
+        #
+        # El except era `except _cf_join.TimeoutError` a secas, así que
+        # result() RE-LANZABA cualquier otra excepción del hilo. Ese hilo hace
+        # dos update_job + un record_ai_call contra Postgres: un pool saturado
+        # en un batch UMG mataba —y borraba— un master perfecto, en el modo
+        # que existe LITERALMENTE para no bloquear la entrega (observe nunca
+        # bloquea). Se traga todo: recolectar el veredicto es best-effort, la
+        # entrega no. El rescue join del `finally` persiste igual lo que haya.
         if _bg_validation_future is not None:
             import concurrent.futures as _cf_join
             try:
@@ -2083,9 +2357,28 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     "[VALIDATION] observe-parallel join timeout (180s) job=%s "
                     "— sigo sin veredicto (observe no bloquea)", job_id,
                 )
+            except Exception as _val_join_err:
+                _raise_if_job_timeout(_val_join_err)
+                logger.warning(
+                    "[VALIDATION] observe-parallel join falló job=%s (%s) "
+                    "— sigo: observe jamás puede costar la entrega", job_id,
+                    _val_join_err,
+                )
             _bg_validation_pool.shutdown(wait=False)
             _bg_validation_future = None
             _bg_validation_pool = None
+
+        # Guardrail "nunca degradar" (default OFF): si el fondo cayó a un
+        # fallback determinístico, no entregamos el video — levantamos
+        # BackgroundDegraded para reintentar la generación (ver el except
+        # dedicado más abajo). Se evalúa acá, con bg_image_path ya final
+        # (incluye el fallback de validación) y antes del upload.
+        _guard_against_degraded_delivery(
+            job_id,
+            bg_image_path=bg_image_path,
+            is_deterministic_fallback=_background_is_deterministic_fallback,
+            animation_degraded=_bg_animation_degraded,
+        )
 
         _verify_deliverables(job_dir, files, audio_dur_for_verify)
 
@@ -2163,7 +2456,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             try:
                 from queue_jobs import enqueue_prores_prewarm
                 enqueue_prores_prewarm(job_id, "umg_master")
-                enqueue_prores_prewarm(job_id, "umg_short")
+                # Sin short.mp4 no hay ProRes short que derivar. prores.py sólo
+                # chequea os.path.exists del source y nunca lo valida, así que
+                # encolarlo igual publicaría un .mov derivado de un archivo
+                # ausente o truncado.
+                if "short" not in missing_deliverables:
+                    enqueue_prores_prewarm(job_id, "umg_short")
             except Exception as e:  # pragma: no cover
                 logger.warning("[PIPELINE] prores prewarm enqueue skipped: %s", e)
 
@@ -2201,18 +2499,48 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             except Exception as e:  # pragma: no cover
                 _raise_if_job_timeout(e)
                 logger.warning("[WAVEFORM] precompute skipped for %s: %s", job_id, e)
+    except BackgroundDegraded as _bg_deg:
+        # Guardrail "nunca degradar". NO entregamos el video con fondo
+        # degradado. Re-lanzamos para que el Retry de RQ vuelva a intentar la
+        # generación con backoff (PIPELINE_RETRY_MAX × PIPELINE_RETRY_INTERVAL_S);
+        # run_pipeline resetea la fila en su primera línea, y como el gradiente
+        # NO se cachea en R2, un Veo recuperado produce el fondo real. Al agotar
+        # los reintentos, pipeline_failure_callback deja el job en error con
+        # "Reintentar sin re-subir" (escalamiento a humano). Nunca degrada.
+        logger.error(
+            "[NO-DEGRADE] job=%s %s — reintentando en vez de entregar el "
+            "video degradado", job_id, _bg_deg,
+        )
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _scope.set_tag("event", "pipeline.background_degraded")
+                _scope.set_tag("job_id", job_id)
+                _scope.set_tag("artist", artist or "?")
+                sentry_sdk.capture_message(str(_bg_deg), level="warning")
+        except Exception:
+            pass
+        # Liberar los intermedios pesados igual que el except general, pero
+        # conservando el input local cuando no está en R2 (el retry lo necesita).
+        if input_r2_key:
+            _cleanup_job_dir_on_failure(job_dir, job_id)
+        else:
+            _cleanup_local_intermediates(job_dir)
+        raise
+
     except Exception as exc:
         _raise_if_job_timeout(exc)
         traceback.print_exc()
-        from error_taxonomy import classify_error
+        from error_taxonomy import classify_error, public_error
         error_category = (
             "storage_upload" if isinstance(exc, StorageUploadError)
             else classify_error(str(exc))
         )
-        update_job(
-            job_id, status="error", error=str(exc),
-            error_category=error_category,
+        error_code, error_message = public_error(
+            exc, context="pipeline", category=error_category,
         )
+        update_job(job_id, status="error", error=error_message,
+                   error_category=error_category, error_code=error_code)
         # Surface render failures to Sentry. The worker runs outside
         # the FastAPI request loop so the framework's auto-capture
         # doesn't fire — without this explicit hook, ffmpeg hangs,
@@ -2230,17 +2558,23 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # Tier 4 (C5): free the disk on failure. Without this, a failed render's
         # multi-GB intermediates pile up until the disk fills and the NEXT
         # render fails mid-flush. When R2 is enabled the input can be re-fetched
-        # (input_r2_key), so rmtree the whole dir — an RQ retry re-downloads +
-        # re-renders. When it ISN'T, the input lives only locally inside job_dir,
-        # so preserve it (just free the heavy bg intermediates) — else the retry
-        # would fail for lack of its own input. (Adversarial-review guard.)
+        # (input_r2_key), so rmtree the whole dir. When it ISN'T, the input
+        # lives only locally inside job_dir, so preserve it (just free the heavy
+        # bg intermediates) — else a retry would fail for lack of its own input.
+        #
+        # OJO (corregido 2026-08-21): este comentario decía que el rmtree era
+        # seguro porque "an RQ retry re-downloads + re-renders". Es falso: este
+        # except NO re-lanza, así que RQ ve el work-horse terminar OK y el
+        # Retry(max=3) de queue_jobs nunca dispara. No hay reintento
+        # automático. Por eso pasamos job_id: el cleanup rescata a R2 un
+        # master sano antes de borrar (ver _rescue_master_before_cleanup).
         if isinstance(exc, StorageUploadError):
             logger.warning(
                 "[R2] preserving local outputs after exhausted upload retries: %s",
                 job_dir,
             )
         elif input_r2_key:
-            _cleanup_job_dir_on_failure(job_dir)
+            _cleanup_job_dir_on_failure(job_dir, job_id)
         else:
             _cleanup_local_intermediates(job_dir)
     finally:
@@ -2503,8 +2837,11 @@ def _filter_whisper_hallucinations(segments: list[dict]) -> tuple[list[dict], in
             continue
         dur = float(s.get("end", 0)) - float(s.get("start", 0))
         if _is_single_word_loop(text, seg_duration=dur):
-            logger.info("[WHISPER] dropping single-word loop (%.1fs, %.2fs/tok): %r",
-                        dur, dur / max(len(text.split()), 1), text[:60])
+            logger.info(
+                "[WHISPER] dropping single-word loop "
+                "(%.1fs, %.2fs/tok, tokens=%d)",
+                dur, dur / max(len(text.split()), 1), len(text.split()),
+            )
             continue
         out.append(s)
     return out, len(segments) - len(out)
@@ -2969,10 +3306,10 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
             continue
         # Same filters as local path so behavior matches.
         if _re.search(r'[一-鿿぀-ゟ゠-ヿ가-힯]', text):
-            logger.info("[WHISPER-API] Filtered non-latin: %s", text[:60])
+            logger.info("[WHISPER-API] Filtered non-latin (chars=%d)", len(text))
             continue
         if any(spam in text.lower() for spam in _SPAM_PATTERNS):
-            logger.info("[WHISPER-API] Filtered spam: %s", text[:60])
+            logger.info("[WHISPER-API] Filtered spam (chars=%d)", len(text))
             continue
         # Only drop segments that Whisper is VERY sure aren't speech. The
         # previous 0.7 threshold was tossing legitimate lyric lines on
@@ -2981,7 +3318,10 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         # operator can prune obvious non-lyrics in the editor; better to
         # surface borderline content than to silently drop it.
         if (seg.no_speech_prob or 0) > 0.92:
-            logger.info("[WHISPER-API] Filtered very-low-confidence: %s", text[:60])
+            logger.info(
+                "[WHISPER-API] Filtered very-low-confidence (chars=%d)",
+                len(text),
+            )
             continue
         # Segment timestamps from Whisper conventionally run until the next
         # decoder boundary, often 1-6 s after the singer stopped. When word
@@ -3635,16 +3975,19 @@ def transcribe(mp3_path: str, language: str = None,
             continue
         # Filter non-latin characters (Demucs artifacts like "Lil怎麼樣")
         if _re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]', text):
-            logger.info("[WHISPER] Filtered non-latin artifact: %s", text[:60])
+            logger.info("[WHISPER] Filtered non-latin artifact (chars=%d)", len(text))
             continue
         # Filter spam/non-lyrics
         if any(spam in text.lower() for spam in _SPAM_PATTERNS):
-            logger.info("[WHISPER] Filtered spam: %s", text[:60])
+            logger.info("[WHISPER] Filtered spam (chars=%d)", len(text))
             continue
         # Filter high no_speech_prob segments (likely hallucinations)
         if seg.get("no_speech_prob", 0) > 0.7:
-            logger.info("[WHISPER] Filtered low-confidence (no_speech=%.2f): %s",
-                        seg['no_speech_prob'], text[:60])
+            logger.info(
+                "[WHISPER] Filtered low-confidence "
+                "(no_speech=%.2f, chars=%d)",
+                seg['no_speech_prob'], len(text),
+            )
             continue
         words = seg.get("words", [])
         if words:
@@ -3730,7 +4073,10 @@ def transcribe(mp3_path: str, language: str = None,
                 logger.warning("[WHISPER] large-v3 fallback failed: %s; keeping turbo", e)
 
     for i, seg in enumerate(segments[:5]):
-        logger.info("[WHISPER] seg %s: %.2f-%.2f  %s", i, seg['start'], seg['end'], seg['text'][:60])
+        logger.info(
+            "[WHISPER] seg %s: %.2f-%.2f tokens=%d", i,
+            seg["start"], seg["end"], len(str(seg.get("text") or "").split()),
+        )
 
     GAP = 0.05
     for i in range(len(segments) - 1):
@@ -5160,17 +5506,62 @@ def _fill_gaps_with_reference(whisper_segments: list[dict],
     return output
 
 
+_AUDIO_DURATION_MAX_SANE_SECONDS = 3600  # no legit song upload runs past an hour
+# Same tolerance _verify_deliverables uses to compare rendered-vs-expected
+# duration — a header reading that disagrees with the real demux by more
+# than this is exactly what would blow up verify later, so we catch it here.
+_AUDIO_DURATION_CROSSCHECK_TOLERANCE_SECONDS = 2.0
+
+
 def _audio_duration(audio_path: str) -> float | None:
     """Best-effort audio duration in seconds. Handles both MP3 and WAV.
     For MP3 we use mutagen.mp3 (header-only, ~1 ms). For WAV we use the
-    stdlib `wave` module (also header-only). Falls back to moviepy
-    (slower, opens the full file) on any failure. Returns None if
-    everything fails."""
+    stdlib `wave` module (also header-only). Cross-checked against ffprobe
+    (real demux) before being trusted; falls back to ffprobe outright, then
+    moviepy, on any header-read failure. Returns None if everything fails.
+
+    Header-only reads are fast but blindly trust a single declared-size
+    field:
+    - WAV: some exporters (live/streaming capture tools that never
+      rewrite the header once recording stops) leave a placeholder
+      "unknown length" sentinel in the `data` chunk size (seen in
+      production: 0xFFFFFFFE). `wave.getnframes()` takes that at face
+      value, so a corrupted header can report hours of audio for a
+      4-minute song (confirmed root cause of job 878d99b8da76 /
+      51fac94587cd / 072f9646c349 — Sentry PYTHON-FASTAPI-3F).
+    - MP3: without a Xing/VBRI header, mutagen estimates duration from
+      the first frame's bitrate assuming CBR; a VBR file (or a weird
+      first frame) can throw that off by a large factor.
+
+    Since this value is only ever used as the *expected* duration in the
+    render's final verify step (and as an upper bound for lyric timing
+    elsewhere), a bogus-but-not-`None` result silently guarantees a
+    failure/misbehavior downstream — even though the audio decoded and
+    rendered correctly. An absolute plausibility bound alone isn't enough:
+    a header misread of a few hundred seconds (e.g. a VBR MP3's CBR
+    extrapolation, or a WAV header off by a smaller margin) sails under
+    any sane ceiling yet still disagrees with the real render duration by
+    more than _verify_deliverables' 2s tolerance — the exact same
+    deterministic, retry-proof failure, just with a smaller number
+    (postmortem 2026-08-11: the first version of this fix only bounded
+    the header value in isolation, never against a real decode). So every
+    header-only read is cross-checked against ffprobe before being
+    trusted; on disagreement the demuxed value wins.
+    """
     name_lower = audio_path.lower()
+    header_dur = None
     if name_lower.endswith(".mp3"):
         try:
             from mutagen.mp3 import MP3
-            return float(MP3(audio_path).info.length)
+            dur = float(MP3(audio_path).info.length)
+            if 0 < dur <= _AUDIO_DURATION_MAX_SANE_SECONDS:
+                header_dur = dur
+            else:
+                logger.warning(
+                    "[AUDIO-DURATION] %s: mutagen reports %.1fs — implausible "
+                    "for a song, likely VBR without Xing/VBRI header. Falling "
+                    "back to ffprobe.", audio_path, dur,
+                )
         except Exception:
             pass
     elif name_lower.endswith(".wav"):
@@ -5180,9 +5571,43 @@ def _audio_duration(audio_path: str) -> float | None:
                 frames = wf.getnframes()
                 rate = wf.getframerate() or 0
                 if rate > 0:
-                    return float(frames) / rate
+                    dur = float(frames) / rate
+                    if 0 < dur <= _AUDIO_DURATION_MAX_SANE_SECONDS:
+                        header_dur = dur
+                    else:
+                        logger.warning(
+                            "[AUDIO-DURATION] %s: wave header reports %.1fs "
+                            "(frames=%s, rate=%s) — implausible for a song, "
+                            "likely a corrupted/placeholder WAV header. Falling "
+                            "back to ffprobe.", audio_path, dur, frames, rate,
+                        )
         except Exception:
             pass
+
+    if header_dur is not None:
+        probed = _ffprobe_duration(audio_path)
+        if probed and 0 < probed <= _AUDIO_DURATION_MAX_SANE_SECONDS:
+            if abs(header_dur - probed) <= _AUDIO_DURATION_CROSSCHECK_TOLERANCE_SECONDS:
+                return header_dur
+            logger.warning(
+                "[AUDIO-DURATION] %s: header says %.1fs but ffprobe demux "
+                "says %.1fs (off by %.1fs, > %.0fs tolerance) — header "
+                "untrustworthy, using the demuxed value.", audio_path,
+                header_dur, probed, abs(header_dur - probed),
+                _AUDIO_DURATION_CROSSCHECK_TOLERANCE_SECONDS,
+            )
+            return probed
+        # ffprobe unavailable or itself implausible — the header at least
+        # passed its own sanity bound, better than nothing.
+        return header_dur
+
+    # No usable header-only read at all — fall back to a real decode.
+    # ffprobe demuxes the actual stream instead of trusting a single
+    # (possibly corrupted) header field, so it survives both the WAV
+    # "unknown length" sentinel and MP3 VBR-without-Xing misestimates.
+    dur = _ffprobe_duration(audio_path)
+    if dur and 0 < dur <= _AUDIO_DURATION_MAX_SANE_SECONDS:
+        return dur
     try:
         from moviepy.editor import AudioFileClip
         with AudioFileClip(audio_path) as a:
@@ -5949,12 +6374,24 @@ def _validate_background_asset_for_job(
     *,
     ai_generated: bool = True,
     failure_status: str | None = "validation_failed",
+    verdict_out: dict | None = None,
 ) -> bool:
-    """Apply the same authoritative gate to initial, edit and cache paths."""
+    """Apply the same authoritative gate to initial, edit and cache paths.
+
+    ``verdict_out``: optional dict updated in place with the raw validator
+    result. A caller that must distinguish "the classifier saw a violation"
+    from "the classifier never answered" (quota/timeout) reads
+    ``verdict_out["inconclusive"]`` — the boolean return stays fail-closed
+    for everyone else.
+    """
     policy = _background_safety_policy(job_id, operator_prompt)
     if not policy["should_validate"]:
         return True
     if not asset_path or not os.path.exists(asset_path):
+        if verdict_out is not None:
+            # Missing asset: nothing to keep, so this is NOT a recoverable
+            # inconclusive verdict even though no frame was ever checked.
+            verdict_out.update({"passed": False, "inconclusive": False})
         if failure_status:
             update_job(
                 job_id, status=failure_status,
@@ -5987,6 +6424,8 @@ def _validate_background_asset_for_job(
     result["policy_mode"] = policy["policy_mode"]
     result["allow_people"] = policy["allow_people"]
     result["allow_atmospherics"] = policy["allow_atmospherics"]
+    if verdict_out is not None:
+        verdict_out.update(result)
     update_job(job_id, validation_result=result)
     if result.get("passed") is not True:
         if _validation_observe_only():
@@ -6006,9 +6445,199 @@ def _validate_background_asset_for_job(
     return True
 
 
+# Edits that change only the FOREGROUND layer. They render over the background
+# already stored for the job — no new asset enters the pipeline — so the bytes
+# handed to the validator are the same ones a previous run certified.
+_BACKGROUND_REUSE_EDIT_TYPES = ("typography", "lyrics", "metadata")
+
+
+def _should_keep_certified_background(
+    edit_type: str,
+    *,
+    verdict: dict,
+    prior_validation_result: dict,
+    asset_path: str | None,
+    forced_fallback: bool = False,
+    reusing_certified_asset: bool = False,
+) -> bool:
+    """True when a failed re-check must NOT discard the reused background.
+
+    All four conditions are required:
+
+    1. the edit reuses the stored background (foreground-only change),
+    2. the re-check was INCONCLUSIVE — quota/timeout/extraction errors, no
+       policy finding. A decisive violation still destroys the asset, which is
+       the whole point of the gate,
+    3. this job's background already holds a ``passed`` verdict, so keeping it
+       preserves an existing certification instead of inventing one,
+    4. the asset is actually on disk to render with.
+
+    ``forced_fallback`` means the background in hand is already the safe local
+    gradient; there is nothing to preserve.
+
+    ``reusing_certified_asset`` covers the other way a certified asset ends up
+    in hand: a background/scene edit whose GENERATION failed and degraded back
+    to the previously cached asset. The edit type says "new background" but the
+    bytes are the old, already-certified ones — same rule applies.
+    """
+    if forced_fallback:
+        return False
+    if not (
+        reusing_certified_asset or edit_type in _BACKGROUND_REUSE_EDIT_TYPES
+    ):
+        return False
+    if not verdict.get("inconclusive"):
+        return False
+    if prior_validation_result.get("passed") is not True:
+        return False
+    return bool(asset_path and os.path.exists(asset_path))
+
+
+def _download_previously_certified_background(
+    job_id: str,
+    job_dir: str,
+    bg_r2_key_cached: str | None,
+    prior_validation_result: dict,
+    *,
+    filename_stem: str = "bg_prev_certified",
+) -> str | None:
+    """Local copy of the last background/timeline this job certified.
+
+    The degraded destination for a FAILED generation. Historically any
+    provider error (Veo outage, Imagen 500, breaker open) degraded to the
+    deterministic gradient — which then recached itself over
+    ``bg_r2_key_cached``, so "regenerate my background" failing at the
+    provider destroyed the background the operator already had. Degrading to
+    the previous certified asset instead means a failed regeneration is a
+    no-op the user can retry, not a loss.
+
+    Returns None when there is nothing certified to fall back to; the caller
+    then uses the gradient exactly as before.
+    """
+    if prior_validation_result.get("passed") is not True:
+        return None
+    if not bg_r2_key_cached or not storage.is_enabled():
+        return None
+    ext = os.path.splitext(bg_r2_key_cached)[1].lower() or ".mp4"
+    dest = os.path.join(job_dir, f"{filename_stem}{ext}")
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return dest
+    try:
+        if storage.download_object(bg_r2_key_cached, dest):
+            return dest
+    except Exception as _download_error:  # noqa: BLE001
+        logger.warning(
+            "[EDIT] no pude bajar el fondo certificado previo job=%s key=%s: %s",
+            job_id, bg_r2_key_cached, _download_error,
+        )
+    return None
+
+
+def _archive_and_clear_scene_plan(
+    merged: dict,
+    scene_plan: dict | None,
+    job_id: str,
+    *,
+    reason: str,
+) -> None:
+    """Drop the storyboard from the job, but keep a copy for recovery.
+
+    Clearing ``scene_plan`` is correct when the rendered background stops
+    being the storyboard's timeline — a later edit reading that plan would
+    trust false provenance. Losing it outright is not: the plan holds every
+    scene PROMPT, i.e. the creative direction the operator wrote. Stash it in
+    render_params (same write as the clear, no migration) so ops can rebuild
+    the storyboard instead of asking the customer to describe it again.
+
+    Nothing reads ``scene_plan_archived`` — it is inert recovery data, so it
+    cannot resurrect stale provenance.
+    """
+    if scene_plan:
+        merged["scene_plan_archived"] = {
+            "reason": reason,
+            "plan": scene_plan,
+        }
+        logger.error(
+            "[SCENES] storyboard descartado del job=%s (%s) — copia de "
+            "recuperación en render_params.scene_plan_archived",
+            job_id, reason,
+        )
+    return None
+
+
+_DECISIVE_SCENE_REJECTION_MARKERS = (
+    "rejected by no-human policy",
+    "content policy",
+)
+
+
+def _scene_plan_failure_is_decisive(scene_plan: dict | None) -> bool:
+    """Did a storyboard re-scan actually SEE something forbidden?
+
+    ``_generate_scene_clips`` records the outcome per scene. A decisive
+    rejection (the classifier flagged people/brand) means the persisted clips
+    are genuinely unusable and the caller must degrade to the safe gradient. A
+    cache miss, a download error or an open Veo breaker means we could not
+    look — which is not evidence, and must not cost the operator a storyboard
+    that has never failed a check.
+    """
+    for scene in (scene_plan or {}).get("scenes", []) or []:
+        validation = scene.get("validation") or {}
+        if validation.get("passed") is True:
+            continue
+        detections = validation.get("detections") or {}
+        if detections.get("people") or detections.get("brand"):
+            return True
+        blob = f"{validation.get('error') or ''} {scene.get('error') or ''}".lower()
+        if any(marker in blob for marker in _DECISIVE_SCENE_REJECTION_MARKERS):
+            return True
+    return False
+
+
+def _inherit_inconclusive_scene_verdict(
+    scene: dict,
+    *,
+    verdict: dict,
+    prior_validation: dict,
+    policy_fingerprint: str,
+    cache_only: bool,
+) -> bool:
+    """Same rule as :func:`_should_keep_certified_background`, per scene clip.
+
+    A storyboard edit re-scans every persisted clip. When a clip comes back
+    from the cache UNCHANGED (``cache_only``) and its re-scan is inconclusive
+    — quota/timeout, no policy finding — the verdict it already earned under
+    the SAME policy fingerprint is still the best evidence available about
+    those exact bytes. Without this, one 429 marks the scene failed, the
+    substitution phase cannot find a compatible replacement, the dense
+    revalidation raises, and the whole storyboard gets thrown away over a
+    transient provider error.
+
+    Mutates ``scene["validation"]`` in place and returns True when the prior
+    verdict was inherited.
+    """
+    if not cache_only or not verdict.get("inconclusive"):
+        return False
+    if prior_validation.get("passed") is not True:
+        return False
+    if prior_validation.get("policy_fingerprint") != policy_fingerprint:
+        # Policy moved since that certification: the old verdict says nothing
+        # about the rules in force now. Fail closed, as before.
+        return False
+    scene["validation"] = {
+        **prior_validation,
+        "passed": True,
+        "policy_fingerprint": policy_fingerprint,
+        "revalidation_inconclusive": True,
+        "revalidation_issues": list(verdict.get("issues") or []),
+    }
+    return True
+
+
 def _validate_segments_against_audio(audio_path: str, segments: list[dict],
                                       job_id: str | None = None,
-                                      n_samples: int = 3) -> list[dict]:
+                                      n_samples: int = 3,
+                                      language: str | None = None) -> list[dict]:
     """Sample N short audio clips, transcribe each with Whisper, and
     flag any segment whose text disagrees with what Whisper hears in
     the same window. Returns segments with `seg["flagged"] = True`
@@ -6043,6 +6672,10 @@ def _validate_segments_against_audio(audio_path: str, segments: list[dict],
     if not candidates:
         return segments
     n = min(n_samples, len(candidates))
+    validation_language = resolve_transcription_language(
+        language,
+        result={"segments": segments},
+    )
     # Spread the picks across the song so we don't sample 3 lines from
     # the same chorus repetition.
     step = max(1, len(candidates) // n)
@@ -6067,7 +6700,11 @@ def _validate_segments_against_audio(audio_path: str, segments: list[dict],
                 )
                 # Re-transcribe just this slice
                 from pipeline import transcribe as _transcribe  # self-import for testing
-                heard_segs = _transcribe(clip_path, language="es", lyrics_hint=None)
+                heard_segs = _transcribe(
+                    clip_path,
+                    language=validation_language,
+                    lyrics_hint=None,
+                )
                 heard_text = " ".join((s.get("text") or "").strip() for s in (heard_segs or [])).lower()
                 expected = (seg.get("text") or "").lower().strip()
                 if not heard_text or not expected:
@@ -6075,8 +6712,11 @@ def _validate_segments_against_audio(audio_path: str, segments: list[dict],
                 ratio = SequenceMatcher(None, expected, heard_text).ratio()
                 if ratio < 0.5:
                     flagged_ids.add(id(seg))
-                    print(f"[VALIDATE] segment at {start:.1f}s flagged: "
-                          f"expected '{expected[:40]}' vs heard '{heard_text[:40]}' (ratio {ratio:.2f})")
+                    print(
+                        f"[VALIDATE] segment at {start:.1f}s flagged: "
+                        f"expected_chars={len(expected)} heard_chars={len(heard_text)} "
+                        f"ratio={ratio:.2f}"
+                    )
             finally:
                 try:
                     os.unlink(clip_path)
@@ -6130,7 +6770,7 @@ def _polish_segments_text(segments: list[dict], artist: str = "",
     numbered = "\n".join(lines)
 
     system_prompt = (
-        "You are a Spanish lyrics proofreader. The input is a numbered list of "
+        "You are a multilingual lyrics proofreader. The input is a numbered list of "
         "lines from a Whisper auto-transcription of a song. Whisper makes "
         "predictable errors in Spanish: missing accents (se→sé, mas→más, "
         "te→té), wrong contractions ('de la amor'→'del amor', 'a el'→'al'), "
@@ -6139,6 +6779,7 @@ def _polish_segments_text(segments: list[dict], artist: str = "",
         "Return STRICT JSON: an array where each element is "
         '{"i": <line index>, "text": "<corrected text>"} ONLY for lines you '
         "actually changed. Do NOT return unchanged lines. Do NOT add new lines. "
+        "The song may code-switch: preserve the original language of EACH line. "
         "Do NOT translate or paraphrase — only fix obvious transcription errors. "
         "Preserve all original words you do not need to fix.\n\n"
         "When in doubt, leave the line as-is."
@@ -6176,12 +6817,20 @@ def _polish_segments_text(segments: list[dict], artist: str = "",
 
     # Apply corrections
     corrections = {}
+    from lyrics_format import preserves_lexical_content
     for item in parsed:
         try:
             idx = int(item["i"])
             new_text = str(item["text"]).strip()
             if 0 <= idx < len(segments) and new_text:
-                corrections[idx] = new_text
+                original_text = str(segments[idx].get("text") or "")
+                if preserves_lexical_content(original_text, new_text):
+                    corrections[idx] = new_text
+                else:
+                    logger.warning(
+                        "[POLISH] rejected lexical rewrite at line %d; keeping source text",
+                        idx + 1,
+                    )
         except (KeyError, ValueError, TypeError):
             continue
     if not corrections:
@@ -6398,6 +7047,89 @@ def _gemini_cleanup_word_overlap(cleaned: str, plain: str) -> float:
     return len(a & b) / len(a | b)
 
 
+def _lexical_words(text: str) -> list[str]:
+    """Accent-insensitive words, including stop words, for lineage checks."""
+    import unicodedata
+    normalized = unicodedata.normalize("NFKD", str(text or "")).casefold()
+    normalized = "".join(
+        char for char in normalized if not unicodedata.combining(char)
+    )
+    return re.findall(r"[^\W_]+", normalized, re.UNICODE)
+
+
+def _has_lexical_anchor(candidate: str, source: str) -> bool:
+    """Require substantial source vocabulary in an LLM rewrite.
+
+    Audio-grounded cleanup may correct a misheard word, so exact equality is
+    too restrictive here.  A full translation of a short code-switched phrase,
+    however, replaces every lexical token (``Are you ready`` -> ``Estoy
+    listo``). Short phrases must remain lexically identical; longer phrases
+    must retain at least 60% of the shorter vocabulary. This rejects
+    translations that preserve only a name while still allowing a local
+    spelling/mishear correction in a longer line.
+    """
+    from collections import Counter
+
+    candidate_sequence = _lexical_words(candidate)
+    source_sequence = _lexical_words(source)
+    candidate_words = Counter(candidate_sequence)
+    source_words = Counter(source_sequence)
+    if not candidate_words or not source_words:
+        return candidate_words == source_words
+    # Short hooks and code-switched interjections are too ambiguous to rewrite
+    # safely: one shared stop-word (``No way`` -> ``No hay``) would otherwise
+    # satisfy a percentage gate. Accent/punctuation-only edits still compare
+    # equal after normalization.
+    if min(len(candidate_sequence), len(source_sequence)) <= 3:
+        return candidate_sequence == source_sequence
+    common_count = sum((candidate_words & source_words).values())
+    return common_count / min(
+        len(candidate_sequence), len(source_sequence),
+    ) >= 0.6
+
+
+def _gemini_cleanup_lines_grounded(cleaned: str, plain: str) -> bool:
+    """Verify every rewritten source line retains lexical provenance.
+
+    The cleanup prompt asks Gemini to preserve line breaks.  For equal-sized
+    output we can therefore enforce this per line and catch a single translated
+    phrase that a song-level overlap score hides.  If cardinality changed, use
+    monotonic diff blocks and require every replaced source line to retain an
+    anchor somewhere in the corresponding candidate block. Insert-only blocks
+    remain possible for genuinely missing ad-libs; deletions fail closed.
+    """
+    from difflib import SequenceMatcher
+
+    source_lines = [line.strip() for line in plain.splitlines() if line.strip()]
+    candidate_lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not source_lines or not candidate_lines:
+        return False
+    if len(source_lines) == len(candidate_lines):
+        return all(
+            _has_lexical_anchor(candidate, source)
+            for source, candidate in zip(source_lines, candidate_lines)
+        )
+
+    source_keys = [" ".join(_lexical_words(line)) for line in source_lines]
+    candidate_keys = [" ".join(_lexical_words(line)) for line in candidate_lines]
+    matcher = SequenceMatcher(None, source_keys, candidate_keys, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal" or tag == "insert":
+            continue
+        if tag == "delete":
+            return False
+        candidate_block = candidate_lines[j1:j2]
+        if any(
+            not any(
+                _has_lexical_anchor(candidate, source)
+                for candidate in candidate_block
+            )
+            for source in source_lines[i1:i2]
+        ):
+            return False
+    return True
+
+
 def _gemini_cleanup_cache_key(audio_path: str, lrclib_plain: str):
     """Content-addressable cache key for Gemini lyrics cleanup. Same
     audio + same lrclib hint = same cleaned output (deterministic with
@@ -6516,9 +7248,11 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
         return None
 
     system_prompt = (
-        "You are a Spanish-language lyrics proofreader.\n"
+        "You are a multilingual lyrics proofreader.\n"
         "Input: (1) full audio recording of a song, (2) a community "
         "transcription with errors.\n\n"
+        "The song may alternate languages. Preserve the ORIGINAL language of "
+        "EACH line independently; never translate or paraphrase.\n\n"
         "CRITICAL: Return the FULL corrected lyrics for the ENTIRE song. "
         "The input may have 50-100+ lines — your output must cover ALL "
         "of them. Do not stop early. Do not summarize. Do not skip the "
@@ -6653,6 +7387,17 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
         )
         return None
 
+    # Defense 5: a translated minority-language line can hide inside a mostly
+    # unchanged song and still pass the global language/overlap checks above.
+    # Bind each rewrite back to its own source line (or monotonic diff block).
+    if not _gemini_cleanup_lines_grounded(cleaned, plain):
+        logger.warning(
+            "[GEMINI-CLEAN] line-level lexical provenance lost (%.1fs) — "
+            "possible translation, using lrclib raw",
+            elapsed,
+        )
+        return None
+
     logger.info(
         "[GEMINI-CLEAN] cleaned %d → %d lines, overlap=%.2f in %.1fs (audio_hash=%s)",
         len(in_lines), len(out_lines), overlap, elapsed, audio_hash,
@@ -6664,8 +7409,37 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     return cleaned
 
 
+def _target_language_instruction(language: str | None, segs: list[dict]) -> str:
+    """Tell audio LLM postpasses which language to preserve.
+
+    Auto mode is resolved from the acoustic transcript itself.  Unknown stays
+    explicit instead of silently defaulting to Spanish: the hard requirement
+    is always to preserve the input language and never translate it.
+    """
+    resolved = resolve_transcription_language(
+        language,
+        result={"segments": segs},
+    )
+    names = {
+        "es": "español", "en": "inglés", "pt": "portugués",
+        "fr": "francés", "it": "italiano", "de": "alemán",
+    }
+    if resolved:
+        return (
+            f"IDIOMA PRINCIPAL DE CONTEXTO: {names.get(resolved, resolved)} "
+            f"({resolved}). Conservá el idioma ORIGINAL de CADA frase por "
+            "separado: la canción puede alternar idiomas. No traduzcas ni "
+            "parafrasees ninguna frase en otro idioma."
+        )
+    return (
+        "IDIOMA: conservá el idioma ORIGINAL de CADA frase por separado; la "
+        "canción puede alternar idiomas. No traduzcas ni parafrasees."
+    )
+
+
 def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
-                       song: str = "", timeout_s: int = 90) -> list[dict]:
+                       song: str = "", language: str | None = None,
+                       timeout_s: int = 90) -> list[dict]:
     """Re-segment a whisperX word stream into clean phrase lines via Gemini,
     grounded in the audio. The LLM decides the LINE GROUPING + fixes orthography
     (a language task heuristics can't do); whisperX provides the exact TIMING —
@@ -6697,7 +7471,8 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
     numbered = " ".join(f"[{i}]{(w.get('word') or '').strip()}"
                         for i, w in enumerate(W))
     system_prompt = (
-        "Sos un editor profesional de lyric videos en español (estilo Rotor).\n"
+        "Sos un editor profesional de lyric videos (estilo Rotor).\n"
+        + _target_language_instruction(language, segs) + "\n"
         "Te doy: (1) el AUDIO de la canción (puede ser un vivo), (2) su "
         "transcripción palabra-por-palabra (cada palabra con su índice [n]). "
         "Agrupá las palabras en LÍNEAS de lyric video.\n\n"
@@ -6761,7 +7536,26 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
         logger.warning("[LLM-SEGMENT] no parseable lines; keeping whisperX")
         return segs
 
-    # Gate (a): the line ranges must cover ~all the words (no big drops).
+    # Gate (a): ranges must be one exact, ordered partition of the acoustic
+    # words.  Coverage alone is insufficient: reversed or overlapping ranges
+    # can still cover 100%, then ship semantic order backwards and make the
+    # editor's active-line selector jump.  Any structural ambiguity declines
+    # to the untouched WhisperX segmentation.
+    expected_start = 0
+    for i, j, _ in parsed:
+        if i != expected_start:
+            logger.warning(
+                "[LLM-SEGMENT] non-contiguous/reordered ranges; keeping whisperX"
+            )
+            return segs
+        expected_start = j + 1
+    if expected_start != len(W):
+        logger.warning(
+            "[LLM-SEGMENT] incomplete final range; keeping whisperX"
+        )
+        return segs
+
+    # Defensive metric kept for observability; exact partition implies 100%.
     cov = set()
     for i, j, _ in parsed:
         cov.update(range(i, j + 1))
@@ -6769,7 +7563,20 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
     if coverage < 0.9:
         logger.warning("[LLM-SEGMENT] coverage %.2f < 0.9; keeping whisperX", coverage)
         return segs
-    # Gate (b): anti-hallucination — the LLM text must overlap the whisperX text.
+    # Gate (b): each output line must retain a lexical anchor to the exact
+    # Whisper word range it claims. Song-level overlap alone lets a translated
+    # code-switched line hide among dozens of unchanged Spanish lines.
+    for i, j, txt in parsed:
+        source_text = " ".join(
+            (W[index].get("word") or "") for index in range(i, j + 1)
+        )
+        if not _has_lexical_anchor(txt, source_text):
+            logger.warning(
+                "[LLM-SEGMENT] line %d-%d lost lexical provenance; keeping whisperX",
+                i, j,
+            )
+            return segs
+    # Gate (c): anti-hallucination — the LLM text must overlap the whisperX text.
     wx_text = " ".join((w.get("word") or "") for w in W)
     llm_text = " ".join(t for _, _, t in parsed)
     if _gemini_cleanup_word_overlap(llm_text, wx_text) < 0.5:
@@ -6786,9 +7593,89 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
         if st is None or en is None:
             continue
         out_segs.append({"start": float(st), "end": float(en),
-                         "text": txt, "words": grp})
+                         "text": txt, "words": grp,
+                         "llm_segmented": True})
+
+    # Collapse provider-timestamp failures without throwing away the clean
+    # segmentation of the rest of the song. A run of >=3 identical singleton
+    # lines packed at sub-2s cadence is not three lyric cards; it is one
+    # repeated hook whose word alignments collapsed into the same window.
+    # Keep every acoustic word attached for observability, but expose one safe
+    # card so the independent gap witness can recover later repetitions.
+    import statistics as _statistics
+    collapsed: list[dict] = []
+    pos = 0
+    while pos < len(out_segs):
+        line = out_segs[pos]
+        tokens = re.findall(r"[^\W\d_]+", line.get("text", "").casefold(), re.UNICODE)
+        if len(tokens) != 1:
+            collapsed.append(line)
+            pos += 1
+            continue
+        end_pos = pos + 1
+        while end_pos < len(out_segs):
+            next_tokens = re.findall(
+                r"[^\W\d_]+", out_segs[end_pos].get("text", "").casefold(),
+                re.UNICODE,
+            )
+            if next_tokens != tokens:
+                break
+            end_pos += 1
+        run = out_segs[pos:end_pos]
+        gaps = [
+            float(b["start"]) - float(a["start"])
+            for a, b in zip(run, run[1:])
+        ]
+        if (len(run) >= 3 and gaps
+                and _statistics.median(gaps) < 2.0):
+            merged = dict(run[0])
+            merged["end"] = max(float(item["end"]) for item in run)
+            merged["words"] = [
+                word for item in run for word in (item.get("words") or [])
+            ]
+            merged["review"] = True
+            merged["collapsed_repetition"] = len(run)
+            merged["provider_timing_collapsed"] = True
+            merged["provider_event_count"] = len(run)
+            merged["provider_span_start"] = round(
+                min(float(item["start"]) for item in run), 3,
+            )
+            merged["provider_span_end"] = round(
+                max(float(item["end"]) for item in run), 3,
+            )
+            merged["review_reasons"] = sorted(set(
+                list(merged.get("review_reasons") or [])
+                + ["provider_timing_collapsed"]
+            ))
+            collapsed.append(merged)
+            logger.warning(
+                "[LLM-SEGMENT] collapsed %d repeated singleton lines with "
+                "provider-compressed timing", len(run),
+            )
+        else:
+            collapsed.extend(run)
+        pos = end_pos
+    out_segs = collapsed
+
     if len(out_segs) < 2:
         return segs
+    # The index partition can be perfect while the provider's repeated-word
+    # timestamps are collapsed or reversed (Los Pericos: five "Real" tokens
+    # all mapped into 60-64s). Splitting that stream would manufacture several
+    # cards at the same instant and force the final normalizer to squeeze them
+    # into fake 0.3s slots. Decline the entire LLM edit unless its mapped line
+    # windows are physically ordered and non-degenerate.
+    previous_start = None
+    for line in out_segs:
+        start = float(line["start"])
+        end = float(line["end"])
+        if end <= start or (previous_start is not None and start <= previous_start):
+            logger.warning(
+                "[LLM-SEGMENT] collapsed/non-monotonic mapped timing; "
+                "keeping whisperX"
+            )
+            return segs
+        previous_start = start
     logger.info("[LLM-SEGMENT] re-segmented %d whisperX segs → %d clean lines "
                 "(coverage %.2f)", len(segs), len(out_segs), coverage)
     return out_segs
@@ -7107,6 +7994,8 @@ def _transplant_gap(segs, gs, ge, Csync, beat_t, y=None, sr=22050,
 
 def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
                         song: str = "", canonical: str = "",
+                        language: str | None = None,
+                        prompt_reference: bool = True,
                         timeout_s: int = 60) -> list[dict]:
     """Recover lyrics whisperX DROPPED inside large gaps, by re-transcribing a
     SHORT, BOUNDED clip at the start of each gap.
@@ -7164,13 +8053,22 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
         y, _sr = librosa.load(audio_path, sr=sr, mono=True)
         audio_end = len(y) / sr
 
-        # Gaps = silences between consecutive words PLUS a trailing gap from the
-        # last word to end-of-audio. The trailing one matters because an
+        # Gaps = leading silence before the first recognized word, silences
+        # between consecutive words, PLUS a trailing gap to end-of-audio. The
+        # leading one catches a sustained or buried opening word that WhisperX
+        # failed to align (Los Pericos live: voice from ~5.5s, first stamp ~13s).
+        # The trailing one matters because an
         # upstream cleaner (LLM-segment / hallucination filter) may DROP the
         # outro shouts, so the dropped lyrics are no longer "between" two words
         # — they sit past the last surviving word.
-        gaps = [(W[i]["end"], W[i + 1]["start"]) for i in range(len(W) - 1)
-                if W[i + 1]["start"] - W[i]["end"] >= GAP_MIN]
+        gaps = []
+        if W[0]["start"] >= GAP_MIN:
+            gaps.append((0.0, W[0]["start"]))
+        gaps.extend(
+            (W[i]["end"], W[i + 1]["start"])
+            for i in range(len(W) - 1)
+            if W[i + 1]["start"] - W[i]["end"] >= GAP_MIN
+        )
         if audio_end - W[-1]["end"] >= GAP_MIN:
             gaps.append((W[-1]["end"], audio_end))
         if not gaps:
@@ -7252,8 +8150,8 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
             buf = io.BytesIO()
             sf.write(buf, clip, sr, format="WAV")
             sysp = (
-                "Sos un transcriptor experto de lyric videos en español, nivel "
-                "Rotor.\n"
+                "Sos un transcriptor experto de lyric videos, nivel Rotor.\n"
+                + _target_language_instruction(language, segs) + "\n"
                 f"Te doy un FRAGMENTO CORTO de audio ({c1 - c0:.0f} s) de un vivo"
                 + (f" ({artist} — {song})" if artist else "") + ".\n"
                 "Transcribí EXACTAMENTE lo que se canta en ESTE fragmento corto.\n\n"
@@ -7264,7 +8162,7 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
                 "(grito)/(instrumental)/(silencio).\n"
                 "3. Una frase por línea, mayúscula al inicio.\n"
                 + (f"- Letra oficial (ortografía, NO forzar): {ref_text}\n"
-                   if canonical else "")
+                   if canonical and prompt_reference else "")
                 + "FORMATO por línea, sin nada más: texto"
             )
             try:
@@ -8069,6 +8967,9 @@ def _normalize_movement_style(s: str) -> str:
         "dinamico": "estandar", "dinámico": "estandar", "dynamic": "estandar",
         "photo": "foto-parallax", "parallax": "foto-parallax",
         "foto+parallax": "foto-parallax", "foto_parallax": "foto-parallax",
+        # Batch profile name; internally it uses the existing static register
+        # so frontend render-parity catalogs remain backwards compatible.
+        "foto-estatica": "estatico", "photo-static": "estatico", "foto_static": "estatico",
         "animated": "animado", "illustration": "animado", "cartoon": "animado",
     }
     if s in aliases:
@@ -8326,7 +9227,7 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
     # For an explicit non-static register (sutil/estandar/foto-parallax/
     # animado) the existing movement_rule steers it, so clause (2) keeps its
     # original "exact camera movement" wording.
-    _static = normalized_movement == "estatico"
+    _static = normalized_movement in {"estatico", "foto-estatica"}
     _sutil = normalized_movement == "sutil"
     _animado = normalized_movement == "animado"
     _foto = normalized_movement == "foto-parallax"
@@ -8867,17 +9768,7 @@ Hard rules:
                 job_id, sorted(set(observed)),
             )
 
-    full_prompt = f"system:{system_prompt}\nuser:{user_content}"
-
-    recorder = record_ai_call(
-        job_id=job_id or "unknown",
-        step="lyrics_analysis",
-        tool_name="gemini-2.5-flash",
-        tool_provider="google_vertex",
-        prompt=full_prompt,
-        input_data_types=["artist_name", "lyrics_text_600chars"],
-    ) if job_id else None
-
+    recorder = None
     try:
         # Corrective re-roll for the noir-urban-alley cliché. The system
         # prompt already instructs against alleys, but Gemini ignores that
@@ -8924,6 +9815,18 @@ Hard rules:
                     if policy_enforces(atmospherics_policy) else {}
                 ),
             )
+            # One provenance row per provider attempt. The corrective alley
+            # re-roll below is a second billed Gemini call, not merely local
+            # post-processing, so a recorder outside this loop undercounted
+            # the denominator used by invoice-derived rates.
+            recorder = record_ai_call(
+                job_id=job_id or "unknown",
+                step="lyrics_analysis",
+                tool_name="gemini-2.5-flash",
+                tool_provider="google_vertex",
+                prompt=f"system:{_sys_instr}\nuser:{user_content}",
+                input_data_types=["artist_name", "lyrics_text_1800chars"],
+            ) if job_id else None
             # Quota-aware wrapper (2026-07-24): a single 429/RESOURCE_EXHAUSTED
             # used to abort the whole analysis and drop to the fallback prompt.
             # Retries 429s with backoff; TimeoutError still propagates raw.
@@ -8966,6 +9869,13 @@ Hard rules:
                                 "with hard-negative. genre=%s job=%s",
                                 _attempt, normalized_genre or 'auto', job_id,
                             )
+                            if recorder:
+                                recorder.finish(
+                                    response_summary=(
+                                        f"attempt={_attempt} corrective_alley_retry "
+                                        + text[:440]
+                                    )
+                                )
                             continue  # re-roll with the anti-alley addendum
                         logger.warning(
                             "[BG][ALLEY-BIAS PERSISTENT] re-roll still chose alley; "
@@ -8977,6 +9887,10 @@ Hard rules:
                     return {"style": style, "prompt": prompt}
             # Parse failed this attempt. If attempts remain, the loop retries
             # (a re-roll often parses cleanly); otherwise fall through.
+            if recorder:
+                recorder.finish(
+                    response_summary=f"attempt={_attempt} parse_failed: {text[:420]}"
+                )
 
         # All attempts exhausted without a usable parse.
         finish_reason = "unknown"
@@ -8989,8 +9903,6 @@ Hard rules:
             pass
         logger.warning("[BG] Failed to parse Gemini JSON, using combinatorial fallback. "
                        "raw_len=%s finish_reason=%s", len(text), finish_reason)
-        if recorder:
-            recorder.finish(response_summary=f"parse_failed: {text[:200]}")
         return {"style": "video", "prompt": None}
 
     except Exception as e:
@@ -9068,7 +9980,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
     # Movement-aware camera pool for the combinatorial fallback (rare — only
     # when Gemini fails to parse). Static intent must NOT get a motion verb.
     _norm_move = _normalize_movement_style(movement_style)
-    _camera_pool = _BG_CAMERAS_STATIC if _norm_move == "estatico" else _BG_CAMERAS
+    _camera_pool = _BG_CAMERAS_STATIC if _norm_move in {"estatico", "foto-estatica"} else _BG_CAMERAS
 
     # Gemini analysis
     if lyrics_text or song_title:
@@ -9204,6 +10116,854 @@ def _veo_cache_key(prompt: str, model: str, params: dict) -> str:
     return _hash.sha256(payload.encode()).hexdigest()[:16]
 
 
+class VeoBudgetExceeded(RuntimeError):
+    """Una canción pidió más generaciones de Veo que el tope configurado.
+
+    Los tres llamadores de `_generate_veo_video` ya envuelven la llamada en
+    try/except con fallback (gradiente o reintento), así que esto frena el
+    gasto sin romper la entrega."""
+
+
+class VeoAmbiguousSubmission(RuntimeError):
+    """Vertex may have accepted a paid operation whose id we cannot recover.
+
+    Callers must fall back without another submission: retrying at either the
+    HTTP layer or the outer background layer can duplicate a billable render.
+    """
+
+
+class VeoTrackingUnavailable(RuntimeError):
+    """A paid call cannot proceed without durable budget/provenance state."""
+
+
+# Familias de degradación — determinan la UX cuando el reintento automático no
+# alcanza (ver _guard_against_degraded_delivery y los failure callbacks):
+#   - "provider": falla transitoria de Veo/infra (breaker, 429, corte de
+#     Vertex, submission ambigua, tracking cancelado, foto_viva). Reintentar
+#     SIRVE — se auto-sana cuando el proveedor se recupera.
+#   - "content": el fondo generado no cumplió la política (persona/logo/texto) y
+#     el re-roll tampoco. Reintentar el mismo prompt NO sirve: hace falta variar
+#     el prompt o que el operador ajuste el fondo.
+BG_DEGRADE_FAMILY_PROVIDER = "provider"
+BG_DEGRADE_FAMILY_CONTENT = "content"
+
+# El único fallback que produce el camino de RECHAZO DE CONTENIDO
+# (_write_safe_gradient_background con su filename default, tras validación +
+# re-roll rechazados). El resto de los *fallback.mp4 vienen de fallas de
+# proveedor/infra. Ver pipeline: la recuperación de validación usa el default.
+_CONTENT_FALLBACK_BASENAME = "bg_policy_safe_fallback.mp4"
+
+
+class BackgroundDegraded(RuntimeError):
+    """El fondo entregable cayó a un fallback determinístico (gradiente o Ken
+    Burns) en vez del video que pidió el operador.
+
+    Contrato del guardrail "nunca degradar" (aplica a TODOS los tenants): cuando
+    el fondo pedido no se pudo producir, el pipeline NO entrega un video
+    degradado. Se levanta en la finalización, ANTES de subir los deliverables,
+    para que el Retry de RQ reintente con backoff (run_pipeline resetea la fila
+    y re-genera; el gradiente NO se cachea en R2, así que un Veo recuperado
+    produce el fondo real). Si el reintento automático no alcanza, los failure
+    callbacks NO dejan el job en "error": lo marcan con ``error_category``
+    ``background_attention:<familia>`` para que la UI muestre una tarjeta
+    accionable (reintentar / ajustar el fondo), nunca un error crudo ni un
+    gradiente en silencio.
+
+    ``family`` (BG_DEGRADE_FAMILY_*) decide la UX: "provider" = reintentar,
+    "content" = variar/ajustar.
+    """
+
+    def __init__(self, message: str, *, family: str = BG_DEGRADE_FAMILY_PROVIDER,
+                 fallback_basename: str = ""):
+        super().__init__(message)
+        self.family = family
+        self.fallback_basename = fallback_basename
+
+
+# Kill-switch del guardrail. Default OFF: desplegar el código es inerte hasta
+# que se habilite explícitamente + QA (mismo patrón que el resto de los guards
+# del pipeline). Cuando está OFF se conserva el comportamiento histórico
+# (entregar el gradiente para no colgar el job).
+def _veo_no_degrade_guard_enabled() -> bool:
+    return os.environ.get("VEO_NO_DEGRADE_GUARD", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _is_deterministic_fallback_bg(bg_path: str | None) -> bool:
+    """True si el asset de fondo es un fallback determinístico local.
+
+    Los 15 caminos de degradación (breaker abierto, 429 sostenido, budget,
+    submission ambigua, tracking cancelado, validación rechazada + re-roll
+    rechazado, errores de edición) producen todos un archivo cuyo nombre
+    termina en ``fallback.mp4`` vía ``_write_safe_gradient_background``. Un
+    chequeo por nombre captura uniformemente incluso el fallback profundo de
+    ``_generate_veo_video`` que no propaga un flag al llamador.
+    """
+    if not bg_path:
+        return False
+    return os.path.basename(bg_path).endswith("fallback.mp4")
+
+
+def _guard_against_degraded_delivery(
+    job_id: str,
+    *,
+    bg_image_path: str | None,
+    is_deterministic_fallback: bool,
+    animation_degraded: bool,
+) -> None:
+    """Levanta BackgroundDegraded si el fondo final NO es el pedido.
+
+    No-op cuando el guardrail está apagado (comportamiento histórico) o cuando
+    el fondo es el real. La detección combina los flags locales del generador
+    con el chequeo por nombre de archivo, así que cubre tanto los fallbacks que
+    setean un flag como los que sólo devuelven el path del gradiente.
+    """
+    if not _veo_no_degrade_guard_enabled():
+        return
+    _fallback = (
+        is_deterministic_fallback
+        or _is_deterministic_fallback_bg(bg_image_path)
+    )
+    if not (_fallback or animation_degraded):
+        return
+    _basename = os.path.basename(bg_image_path or "")
+    # Clasificación por familia: sólo el rechazo de contenido usa el filename
+    # default de _write_safe_gradient_background; todo lo demás es proveedor.
+    _family = (
+        BG_DEGRADE_FAMILY_CONTENT if _basename == _CONTENT_FALLBACK_BASENAME
+        else BG_DEGRADE_FAMILY_PROVIDER
+    )
+    _reason = (
+        "animación degradada a Ken Burns" if animation_degraded and not _fallback
+        else "fondo degradado a gradiente determinístico"
+    )
+    raise BackgroundDegraded(
+        f"job {job_id}: {_reason} (bg={_basename}, familia={_family}). "
+        "No se entrega el video degradado; se reintenta la generación.",
+        family=_family,
+        fallback_basename=_basename,
+    )
+
+
+def _veo_http_failure_is_ambiguous(status_code: int) -> bool:
+    """HTTP failures that may arrive after Vertex accepted the operation."""
+    return status_code == 408 or 500 <= status_code <= 599
+
+
+# Tope de generaciones PAGAS de Veo POR CANCIÓN. Medido en jul-2026: en prod,
+# 12 jobs (el 10%) se comieron el **42,8%** del gasto de Veo, y uno solo llegó
+# a 26 llamadas — unos $16 en un video que se vende a $8. Un job sano usa 1-3.
+#
+# El presupuesto es por CANCIÓN, no por job, y la diferencia importa: una
+# edición o un re-render crean un job NUEVO, así que un tope por job se
+# esquiva solo. Una canción que pasa por 5 ediciones a 10 llamadas cada una
+# gasta 50 sin que ningún tope se entere. Se cuenta sobre todos los jobs que
+# comparten `artista|título` normalizado — la misma identidad que usa
+# `cost_attribution`, así que el tope y el reporte de costos hablan de la
+# misma unidad.
+#
+# La ventana de `VEO_BUDGET_WINDOW_DAYS` evita que una canción rendereada
+# hace meses bloquee un re-render legítimo de hoy.
+#
+# El default es APAGADO: activar un techo cambia el entregable cuando una
+# canción lo alcanza, así que producción debe pasar explícitamente por shadow
+# y canary después de auditar las filas históricas. Un valor inicial razonable
+# para ese canary es 10; bajarlo a 4-6 puede cortar storyboards multi-escena
+# legítimos.
+#
+# CORRECCIÓN (ago-2026): una versión anterior de este comentario decía que
+# los reintentos re-pagan Veo "porque el prompt sale con temperature=0.8 y
+# cambia el hash". Es FALSO y no estaba verificado: no existe ningún
+# temperature=0.8 en el código (los prompts se generan con 0.0-0.1), y
+# `queue_jobs.py` documenta que las fallas de Veo caen al gradient fallback
+# sin re-lanzar, así que el Retry de RQ NO reintenta Veo. El re-pago real
+# viene de los re-rolls y de `policy-recovery`, que fuerza cache miss.
+#
+# `VEO_MAX_CALLS_PER_SONG=0` lo desactiva.
+VEO_MAX_CALLS_PER_SONG = int(
+    os.environ.get("VEO_MAX_CALLS_PER_SONG",
+                   # Nombre viejo, para no romper entornos ya configurados.
+                   os.environ.get("VEO_MAX_CALLS_PER_JOB", "0"))
+)
+VEO_BUDGET_TENANTS = frozenset(
+    tenant.strip()
+    for tenant in os.environ.get("VEO_BUDGET_TENANTS", "*").split(",")
+    if tenant.strip()
+)
+VEO_BUDGET_WINDOW_DAYS = int(os.environ.get("VEO_BUDGET_WINDOW_DAYS", "30"))
+# A reservation only bridges the budget decision, auth lookup and final POST
+# guard. If a worker dies in that gap it must not consume a slot for 30 days.
+# Ten minutes is deliberately much longer than normal token acquisition while
+# still recovering capacity promptly after a deploy/OOM/SIGKILL.
+VEO_RESERVATION_LEASE_SECONDS = max(
+    30, int(os.environ.get("VEO_RESERVATION_LEASE_SECONDS", "600")),
+)
+
+
+def _veo_budget_enforced_for_job(job_id: str | None) -> bool:
+    """Whether the paid ceiling protocol is active for this job.
+
+    The numerical cap defaults to zero, so deploying the code is behaviorally
+    inert.  ``VEO_BUDGET_TENANTS`` permits a one-tenant canary before widening
+    to ``*``.  When no tenant is allowlisted, even an accidentally configured
+    positive cap remains off.
+    """
+    if VEO_MAX_CALLS_PER_SONG <= 0 or not VEO_BUDGET_TENANTS:
+        return False
+    if "*" in VEO_BUDGET_TENANTS:
+        return True
+    if not job_id:
+        return False
+
+    try:
+        from database import Job, SessionLocal
+
+        db = SessionLocal()
+        try:
+            row = db.query(Job.tenant_id).filter(Job.job_id == job_id).one_or_none()
+        finally:
+            db.close()
+    except Exception as exc:
+        # Same fail-open posture as the existing budget query. Provenance still
+        # records the call; an observability outage cannot stop delivery.
+        logger.warning(
+            "[BG][BUDGET] no pude resolver tenant para canary job=%s: %r",
+            job_id,
+            exc,
+        )
+        return False
+
+    if row is None:
+        raise VeoTrackingUnavailable(
+            f"Veo Job disappeared before budget canary lookup job_id={job_id}"
+        )
+    return (row[0] or "") in VEO_BUDGET_TENANTS
+
+
+def _discard_provenance_row(recorder) -> None:
+    """Borra la fila in-flight de una llamada que nunca se hizo.
+
+    Nunca levanta: si el borrado falla, se cierra la fila con un resumen que
+    la deja fuera del conteo igual (`cache_hit`-prefijado no sirve acá porque
+    miente sobre el origen, así que se marca y se acepta el ruido).
+    """
+    row_id = getattr(recorder, "_row_id", None)
+    if row_id is None:
+        recorder._finished = True
+        return
+    try:
+        from database import AIProvenance, SessionLocal
+        db = SessionLocal()
+        try:
+            db.query(AIProvenance).filter(AIProvenance.id == row_id).delete(
+                synchronize_session=False)
+            db.commit()
+        finally:
+            db.close()
+        recorder._finished = True
+    except Exception as exc:
+        logger.warning("[BG][BUDGET] no pude borrar la fila %s: %r", row_id, exc)
+        recorder.finish(response_summary="budget_exceeded: no se generó nada")
+
+
+def _persist_veo_reservation_summary(
+    row_id: int | None,
+    summary: str,
+    *,
+    duration_ms: int | None = None,
+    reservation_expires_at=None,
+) -> bool:
+    """Verified provenance UPDATE in a fresh transaction."""
+    if row_id is None:
+        return False
+    from database import AIProvenance, SessionLocal
+
+    db = None
+    try:
+        db = SessionLocal()
+        values = {
+            "response_summary": str(summary)[:2000],
+            "reservation_expires_at": reservation_expires_at,
+        }
+        if duration_ms is not None:
+            values["duration_ms"] = max(0, int(duration_ms))
+        updated = (
+            db.query(AIProvenance)
+            .filter(AIProvenance.id == row_id)
+            .update(
+                values,
+                synchronize_session=False,
+            )
+        )
+        if not updated:
+            db.rollback()
+            return False
+        db.commit()
+        return True
+    except Exception as exc:
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        logger.warning(
+            "[BG][BUDGET] no pude actualizar reserva fila=%s: %r",
+            row_id, exc,
+        )
+        return False
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _delete_provenance_row_by_id(row_id: int | None) -> bool:
+    """Verified fresh-transaction delete for a known zero-cost attempt."""
+    if row_id is None:
+        return False
+    from database import AIProvenance, SessionLocal
+
+    db = None
+    try:
+        db = SessionLocal()
+        deleted = (
+            db.query(AIProvenance)
+            .filter(AIProvenance.id == row_id)
+            .delete(synchronize_session=False)
+        )
+        if not deleted:
+            db.rollback()
+            return False
+        db.commit()
+        return True
+    except Exception as exc:
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        logger.warning(
+            "[BG][BUDGET] no pude borrar reserva libre fila=%s: %r",
+            row_id, exc,
+        )
+        return False
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _release_veo_reservation(recorder, reason: str) -> bool:
+    """Close a reserved row as free after a definite provider rejection.
+
+    Unlike an exception raised by ``requests.post`` (ambiguous: Vertex may
+    have accepted the operation), an HTTP rejection or a pre-POST failure
+    proves there is no billable generation behind the reservation. Keep the
+    row for audit, but exclude it from spend and the per-song ceiling. The
+    generic recorder marks itself finished before knowing whether its UPDATE
+    committed, so this path uses verified fresh transactions instead. If all
+    UPDATE retries fail, deleting the definitely-free row is safer than
+    leaving a false paid reservation behind.
+    """
+    if recorder is None:
+        return False
+    from provenance import BUDGET_RELEASED_PREFIX
+    row_id = getattr(recorder, "_row_id", None)
+    if row_id is None:
+        recorder._finished = True
+        return False
+    summary = f"{BUDGET_RELEASED_PREFIX}: {str(reason)[:1900]}"
+    finished_at = time.time()
+    duration_ms = int(max(
+        0.0, finished_at - getattr(recorder, "start_time", finished_at)
+    ) * 1000)
+    for _attempt in range(3):
+        if _persist_veo_reservation_summary(
+            row_id, summary, duration_ms=duration_ms,
+        ):
+            recorder._finished = True
+            return True
+    if _delete_provenance_row_by_id(row_id):
+        recorder._finished = True
+        logger.error(
+            "[BG][BUDGET] reserva libre fila=%s borrada tras fallar UPDATE; "
+            "se preserva el tope aunque se pierde el detalle de rechazo",
+            row_id,
+        )
+        return True
+    # Do not claim success: callers that require persistent tracking must see
+    # this as an infrastructure failure, and the object remains retryable.
+    recorder._finished = False
+    raise VeoTrackingUnavailable(
+        f"Could not release definitely-free Veo reservation row={row_id}"
+    )
+
+
+def _pause_veo_reservation_for_retry(recorder, reason: str) -> None:
+    """Make a confirmed rejection non-billable between submit attempts.
+
+    Unlike ``_release_veo_reservation``, this does not finish the recorder:
+    the same audit row will be atomically reserved again immediately before
+    the next POST. A delete during auth/backoff can therefore remove the free
+    row without archiving phantom spend into the tombstone ledger.
+    """
+    from provenance import BUDGET_RELEASED_PREFIX
+
+    row_id = getattr(recorder, "_row_id", None)
+    if row_id is None:
+        # The normal delivery path is deliberately fail-open when the initial
+        # provenance INSERT never succeeded. Persistent callers are rejected
+        # earlier; there is no row to pause between confirmed 429 retries.
+        return
+    if not _persist_veo_reservation_summary(
+        row_id, f"{BUDGET_RELEASED_PREFIX}: {str(reason)[:1900]}",
+    ):
+        raise VeoTrackingUnavailable(
+            f"Could not pause rejected Veo reservation row={row_id}"
+        )
+
+
+def _song_identity(artist: str | None, title: str | None,
+                   job_id: str | None = None) -> str:
+    """Identidad de canción, IDÉNTICA a `cost_attribution.song_key`.
+
+    Tiene que colapsar los espacios internos igual que aquella: comparando
+    con `lower(trim(...))` en SQL, "La  Argentinidad" y "La Argentinidad"
+    quedaban como canciones distintas, así que corregir la metadata de un job
+    le estrenaba presupuesto. Se delega en la función de verdad para que no
+    puedan divergir.
+
+    `job_id` NO es opcional en la práctica: `song_key` lo usa para desambiguar
+    las identidades degeneradas (sin metadata, o el placeholder
+    `preview|preview` que escribe `/generate-preview`). Sin pasarlo, TODOS
+    esos jobs colapsan en `__sin_metadata__|desconocido` y comparten un único
+    tope de 10 llamadas para siempre — el tope se agota globalmente y corta
+    previews de canciones que no tienen nada que ver entre sí.
+    """
+    try:
+        from cost_attribution import song_key
+        return song_key(artist, title, job_id)
+    except Exception:
+        import re as _re
+        a = _re.sub(r"\s+", " ", (artist or "").strip().lower())
+        t = _re.sub(r"\s+", " ", (title or "").strip().lower())
+        if not a and not t:
+            return f"__sin_metadata__|{job_id or 'desconocido'}"
+        return f"{a}|{t}"
+
+
+def _mark_veo_reservation_admitted(row_id: int | None, reason: str) -> bool:
+    """Best-effort pending -> admitted transition in a fresh transaction."""
+    from datetime import datetime, timedelta, timezone
+
+    from provenance import BUDGET_RESERVED_PREFIX
+    return _persist_veo_reservation_summary(
+        row_id,
+        f"{BUDGET_RESERVED_PREFIX}: {str(reason)[:1900]}",
+        reservation_expires_at=(
+            datetime.now(timezone.utc)
+            + timedelta(seconds=VEO_RESERVATION_LEASE_SECONDS)
+        ),
+    )
+
+
+def _mark_veo_submission_started(row_id: int | None) -> bool:
+    """Persist the billable boundary immediately before the provider POST."""
+    from provenance import BUDGET_SUBMITTED_PREFIX
+    return _persist_veo_reservation_summary(
+        row_id,
+        f"{BUDGET_SUBMITTED_PREFIX}: provider POST boundary entered",
+    )
+
+
+class _VeoSubmissionGuard:
+    """Serialize budget/cancellation checks with one provider POST.
+
+    Token acquisition deliberately happens before entering this guard. That
+    gives an operator deletion requested during slow auth a chance to commit.
+    Once entered, the budget-scope and per-job PostgreSQL advisory locks are
+    held by this read transaction until the HTTP request returns;
+    delete_job/bulk_delete_jobs take the matching locks before removing the
+    Job and its provenance.
+    """
+
+    def __init__(self, job_id: str, row_id: int | None,
+                 require_persistent_tracking: bool = False):
+        self.job_id = job_id
+        self.row_id = row_id
+        self.require_persistent_tracking = require_persistent_tracking
+        self.db = None
+
+    def __enter__(self):
+        from sqlalchemy import func as _sql_func, text as _sql_text
+
+        from database import AIProvenance, Job, SessionLocal
+        from provenance import BUDGET_RESERVED_PREFIX
+        from veo_budget import advisory_lock_key, scope_hash, submission_lock_key
+
+        self.db = SessionLocal()
+        try:
+            # This first read only discovers the immutable tenant component of
+            # the lock. The authoritative existence checks happen after lock
+            # acquisition, in a fresh READ COMMITTED statement snapshot.
+            tenant_row = (
+                self.db.query(Job.artist, Job.song_title, Job.tenant_id)
+                .filter(Job.job_id == self.job_id)
+                .one_or_none()
+            )
+            if tenant_row is None:
+                raise VeoTrackingUnavailable(
+                    f"Veo Job disappeared before submission job_id={self.job_id}"
+                )
+            artist, title, tenant_id = tenant_row
+            tenant_id = tenant_id or ""
+            budget_scope = scope_hash(
+                tenant_id,
+                _song_identity(artist, title, self.job_id),
+            )
+            bind = getattr(self.db, "bind", None)
+            dialect = getattr(getattr(bind, "dialect", None), "name", "")
+            if dialect == "postgresql":
+                # Deletion acquires this same sorted pair. The budget lock
+                # prevents another worker from ignoring an expired lease
+                # while this guard converts it to submitted spend.
+                lock_keys = {
+                    advisory_lock_key(budget_scope),
+                    submission_lock_key(tenant_id, self.job_id),
+                }
+                for lock_key in sorted(lock_keys):
+                    self.db.execute(
+                        _sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                        {"lock_key": lock_key},
+                    )
+            # PostgreSQL now() is fixed at transaction start, before a
+            # potentially long advisory-lock wait. clock_timestamp() is
+            # evaluated by the statement after both locks are held, so a
+            # lease that expired while waiting cannot still authorize a POST.
+            lease_clock = (
+                _sql_func.clock_timestamp()
+                if dialect == "postgresql"
+                else _sql_func.now()
+            )
+
+            job_exists = (
+                self.db.query(Job.job_id)
+                .filter(Job.job_id == self.job_id)
+                .one_or_none()
+            )
+            reservation_exists = None
+            active_reservation = None
+            if self.row_id is not None:
+                reservation_exists = (
+                    self.db.query(AIProvenance.id)
+                    .filter(
+                        AIProvenance.id == self.row_id,
+                        AIProvenance.job_id == self.job_id,
+                    )
+                    .one_or_none()
+                )
+                active_reservation = (
+                    self.db.query(AIProvenance.id)
+                    .filter(
+                        AIProvenance.id == self.row_id,
+                        AIProvenance.job_id == self.job_id,
+                        AIProvenance.response_summary.like(
+                            f"{BUDGET_RESERVED_PREFIX}%"
+                        ),
+                        AIProvenance.reservation_expires_at > lease_clock,
+                    )
+                    .one_or_none()
+                )
+            if job_exists is None:
+                raise VeoTrackingUnavailable(
+                    "Veo job disappeared before provider submission "
+                    f"job_id={self.job_id}"
+                )
+            if self.row_id is None:
+                if self.require_persistent_tracking:
+                    raise VeoTrackingUnavailable(
+                        "Persistent Veo submission requires provenance "
+                        f"job_id={self.job_id}"
+                    )
+                # Provenance INSERT failed before any row id existed. This is
+                # the documented normal-delivery fail-open mode, distinct
+                # from a known reservation id that deletion removed.
+                return self
+            if reservation_exists is None:
+                raise VeoTrackingUnavailable(
+                    "Veo reservation disappeared before provider submission "
+                    f"job_id={self.job_id} row={self.row_id}"
+                )
+            if active_reservation is None:
+                raise VeoTrackingUnavailable(
+                    "Veo reservation expired or became inactive before "
+                    f"provider submission job_id={self.job_id} row={self.row_id}"
+                )
+            # Deletion now waits on the per-job lock. Mark the precise
+            # external side-effect boundary durably before touching Vertex;
+            # an earlier `budget_reserved` row only occupied capacity and
+            # must never be archived as a paid call.
+            if not _mark_veo_submission_started(self.row_id):
+                raise VeoTrackingUnavailable(
+                    "Could not persist Veo submission boundary "
+                    f"job_id={self.job_id} row={self.row_id}"
+                )
+            return self
+        except VeoTrackingUnavailable:
+            self.db.rollback()
+            self.db.close()
+            self.db = None
+            raise
+        except Exception as exc:
+            self.db.rollback()
+            self.db.close()
+            self.db = None
+            raise VeoTrackingUnavailable(
+                "Could not verify Veo cancellation state before provider "
+                f"submission job_id={self.job_id} row={self.row_id}"
+            ) from exc
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.db is not None:
+            try:
+                # Read-only transaction: rollback releases the xact lock.
+                self.db.rollback()
+            finally:
+                self.db.close()
+                self.db = None
+        return False
+
+
+def _veo_budget_exceeded(job_id: str | None,
+                         own_row_id: int | None = None,
+                         require_persistent_tracking: bool = False,
+                         ) -> tuple[bool, int]:
+    """Reserva atómicamente un lugar de Veo para la canción del job.
+
+    La fila propia nace como `budget_pending` (no facturable). En PostgreSQL,
+    todos los workers de un mismo tenant+canción serializan count+reserva con
+    `pg_advisory_xact_lock`; si hay cupo, la fila cambia a
+    `budget_reserved` ANTES de soltar el lock. Esta reserva ocupa capacidad
+    aunque todavía no sea gasto; `budget_submitted` recién se escribe bajo el
+    guard final inmediatamente antes del POST. Esto evita contar la llamada
+    propia y evita admitir dos escenas cuando queda un solo lugar. Un id de
+    secuencia no alcanza: PostgreSQL puede asignarlo antes del commit y hacer
+    visibles las transacciones en otro orden.
+
+    Suma todos los jobs que comparten `artista|título` dentro de la ventana,
+    así una edición o un re-render no estrenan presupuesto. Cuenta sobre
+    `ai_provenance` con `budget_occupancy_filter()`: coincide con la
+    facturación salvo por un `budget_reserved` cuyo lease siga vigente, que
+    ocupa un lugar contra carreras concurrentes aunque todavía no sea gasto.
+    Una reserva abandonada vence y deja de bloquear; el guard final impide
+    que su worker haga POST después de vencer. Los cache hits no cuentan: no
+    se pagan.
+
+    Si el job no tiene artista ni título (previews sin metadata), cae a
+    contar sólo ese job — es lo más ajustado que se puede hacer sin una
+    identidad de canción.
+
+    Por defecto nunca levanta: si la consulta falla, deja pasar la generación.
+    Los callers internos que declaran ``require_persistent_tracking`` son la
+    excepción: fallan antes del proveedor si no se pudo confirmar la reserva,
+    porque una llamada paga invisible viola el contrato de esos scripts.
+    """
+    if not job_id:
+        return False, 0
+    if require_persistent_tracking and own_row_id is None:
+        raise VeoTrackingUnavailable(
+            "Persistent Veo budget tracking requires a provenance row"
+        )
+    try:
+        from datetime import datetime as _dt, timedelta, timezone as _tz
+        from sqlalchemy import func as _func, text as _sql_text
+
+        from database import AIProvenance, Job, SessionLocal, VeoBudgetLedger
+        from provenance import (
+            BUDGET_RESERVED_PREFIX,
+            budget_occupancy_filter,
+        )
+        from veo_budget import advisory_lock_key, scope_hash
+
+        db = SessionLocal()
+        try:
+            row = (db.query(Job.artist, Job.song_title, Job.tenant_id)
+                     .filter(Job.job_id == job_id).one_or_none())
+            if row is None:
+                # The query itself succeeded, so this is not a transient DB
+                # outage eligible for fail-open. The operator deleted the job
+                # before its worker reached Veo; no paid provider call may
+                # outlive that cancellation. This check intentionally runs
+                # even when the ceiling is disabled.
+                raise VeoTrackingUnavailable(
+                    f"Veo Job disappeared before reservation job_id={job_id}"
+                )
+            artist = (row[0] or "")
+            title = (row[1] or "")
+            tenant = (row[2] or "")
+            mio = _song_identity(artist, title, job_id)
+            budget_scope = scope_hash(tenant, mio)
+
+            # Diagnostic callers do not own a provenance row, so disabling the
+            # cap is a true no-op after the parent-existence check. Provider
+            # submissions still transition their row to a billable state.
+            if VEO_MAX_CALLS_PER_SONG <= 0 and own_row_id is None:
+                return False, 0
+            if VEO_MAX_CALLS_PER_SONG <= 0:
+                marked = _mark_veo_reservation_admitted(
+                    own_row_id, "ceiling disabled")
+                if require_persistent_tracking and not marked:
+                    raise VeoTrackingUnavailable(
+                        f"Could not persist Veo reservation row={own_row_id}"
+                    )
+                return False, 0
+
+            # Cross-process serialization in production. Deletions take this
+            # same lock while atomically moving spend from live provenance to
+            # the tombstone ledger. Diagnostic/preflight reads also lock so
+            # their separate live+ledger SELECTs cannot straddle that move and
+            # briefly double-count it. SQLite is used by the local suite and
+            # serializes its writes independently.
+            bind = getattr(db, "bind", None)
+            dialect = getattr(getattr(bind, "dialect", None), "name", "")
+            if dialect == "postgresql":
+                db.execute(
+                    _sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                    {"lock_key": advisory_lock_key(budget_scope)},
+                )
+
+            budget_now = _dt.now(_tz.utc)
+            since = budget_now - timedelta(days=VEO_BUDGET_WINDOW_DAYS)
+            q = (db.query(_func.count(AIProvenance.id))
+                   .filter(AIProvenance.tool_name.like("veo%"))
+                   .filter(budget_occupancy_filter(budget_now)))
+
+            if not mio.startswith("__sin_metadata__|"):
+                # Sólo los jobs con actividad de Veo que ocupa presupuesto en
+                # la ventana pueden ser hermanos. Arrancar por ahí en vez de
+                # la tabla `jobs` entera acota el escaneo a lo relevante.
+                con_gasto = [r[0] for r in
+                             db.query(AIProvenance.job_id)
+                               .filter(AIProvenance.tool_name.like("veo%"))
+                               .filter(budget_occupancy_filter(budget_now))
+                               .filter(AIProvenance.created_at >= since)
+                               .distinct().all()]
+                # El presupuesto es POR TENANT: sin este filtro, dos clientes
+                # que rinden la misma canción comparten un único techo de 10 y
+                # el primero en llegar le corta el render pago al segundo.
+                candidatos = (db.query(Job.job_id, Job.artist, Job.song_title)
+                                .filter(Job.job_id.in_(con_gasto or [job_id]))
+                                .filter(Job.tenant_id == tenant)
+                                .all())
+                hermanos = [
+                    jid for jid, a, t in candidatos
+                    if _song_identity(a, t, jid) == mio
+                ]
+                # `or [job_id]` cubre el arranque: el job todavía puede no
+                # estar visible en su propia transacción.
+                q = q.filter(AIProvenance.job_id.in_(hermanos or [job_id]))
+                # El filtro por fecha va sobre la PROVENANCE, no sobre el job:
+                # un job viejo puede seguir generando hoy (re-render de una
+                # canción de hace meses), y acotar sólo por `Job.created_at`
+                # lo dejaba fuera del presupuesto.
+                q = q.filter(AIProvenance.created_at >= since)
+                alcance = f"canción {mio!r} ({len(hermanos)} jobs, tenant {tenant!r})"
+            else:
+                # Sin metadata de canción (o con el placeholder `preview`) no
+                # hay identidad que compartir: cada job lleva su propio tope.
+                # La ventana se aplica IGUAL: un job_id estable y reutilizado
+                # (los `sample-{style}` del script de muestras, por ejemplo)
+                # quedaba bloqueado para siempre al llegar a 10, aunque los
+                # VEO_BUDGET_WINDOW_DAYS hubieran pasado hace meses.
+                q = q.filter(AIProvenance.job_id == job_id)
+                q = q.filter(AIProvenance.created_at >= since)
+                alcance = f"job {job_id} (sin metadata de canción)"
+
+            live_count = int(q.scalar() or 0)
+            archived_count = int(
+                db.query(_func.count(VeoBudgetLedger.id))
+                .filter(VeoBudgetLedger.scope_hash == budget_scope)
+                .filter(VeoBudgetLedger.provider_call_at >= since)
+                .scalar()
+                or 0
+            )
+            n = live_count + archived_count
+
+            # Reserve inside the same transaction as the advisory lock. The
+            # next worker must see this live lease as occupied before deciding.
+            if n < VEO_MAX_CALLS_PER_SONG and own_row_id is not None:
+                updated = (
+                    db.query(AIProvenance)
+                    .filter(AIProvenance.id == own_row_id)
+                    .update(
+                        {
+                            "response_summary": (
+                                f"{BUDGET_RESERVED_PREFIX}: tenant={tenant} "
+                                f"song={mio}"
+                            ),
+                            "reservation_expires_at": (
+                                budget_now + timedelta(
+                                    seconds=VEO_RESERVATION_LEASE_SECONDS,
+                                )
+                            ),
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                if not updated:
+                    db.rollback()
+                    # A successful UPDATE statement that matched zero rows is
+                    # not a transient DB outage: the reservation disappeared
+                    # (normally because an operator deleted the processing
+                    # job and its provenance). There is then no durable row or
+                    # tombstone to account for the provider call, so abort even
+                    # on the production fail-open path before touching Vertex.
+                    logger.info(
+                        "[BG][BUDGET] reserva fila=%s desapareció; se cancela Veo",
+                        own_row_id,
+                    )
+                    raise VeoTrackingUnavailable(
+                        f"Veo reservation row disappeared row={own_row_id}"
+                    )
+                db.commit()
+        finally:
+            db.close()
+    except VeoTrackingUnavailable:
+        raise
+    except Exception as exc:
+        logger.warning("[BG] no pude chequear el tope de Veo para job=%s: %r",
+                       job_id, exc)
+        # Delivery remains fail-open, but a provider POST follows immediately.
+        # Retry the state transition in a fresh transaction so a later worker
+        # crash cannot leave paid spend hidden as `budget_pending`.
+        marked = _mark_veo_reservation_admitted(
+            own_row_id, f"budget check failed; fail-open: {exc}")
+        if require_persistent_tracking and not marked:
+            raise VeoTrackingUnavailable(
+                f"Could not persist Veo reservation row={own_row_id}"
+            ) from exc
+        return False, 0
+
+    if n >= VEO_MAX_CALLS_PER_SONG:
+        logger.error(
+            "[BG][BUDGET] %s alcanzó el tope de Veo: %d generaciones "
+            "pagas (tope %d). Se corta acá.",
+            alcance, n, VEO_MAX_CALLS_PER_SONG,
+        )
+        return True, n
+    if n >= VEO_MAX_CALLS_PER_SONG - 2:
+        logger.warning(
+            "[BG][BUDGET] %s va por %d/%d generaciones de Veo",
+            alcance, n, VEO_MAX_CALLS_PER_SONG,
+        )
+    return False, n
+
+
 def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         cache_namespace: str = "",
                         image_path: str | None = None,
@@ -9217,7 +10977,8 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         cache_only: bool = False,
                         cache_key_override: str | None = None,
                         cache_override_policy_fingerprint: str | None = None,
-                        out_meta: dict | None = None) -> str:
+                        out_meta: dict | None = None,
+                        require_persistent_tracking: bool = False) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
 
     We bypass google-genai SDK for Veo specifically because its internal auth
@@ -9245,6 +11006,11 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     `live_photo`: preserves an image-to-video seed and animates exactly one
     semantic region. It explicitly rejects generic atmospheric filler unless
     the source/operator already asks for it.
+
+    `require_persistent_tracking`: operator-run generators set this so a
+    failed provenance reservation aborts before Vertex. Production renders
+    retain the existing fail-open behavior for transient audit-DB outages,
+    while every fresh call still requires a non-empty job_id.
     """
     from provenance import record_ai_call
     import storage as _storage
@@ -9432,7 +11198,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             f"{_base_negatives}"
             " no extra animation noise."
         )
-    elif _norm_move == "estatico":
+    elif _norm_move == "estatico" or _norm_move == "foto-estatica":
         # C2 (2026-05-25) — Hardening del prompt estatico. Veo ignoraba
         # ~50% de las locked-frame requests pre-2026-05-22, motivando el
         # routing a Imagen. Ahora endurecemos vía:
@@ -9520,7 +11286,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # untouched for everything else, and lets us A/B fast-vs-standard + measure
     # real cost without a redeploy (see plan Phase 5).
     _static_model = os.environ.get("VEO_MODEL_STATIC", "").strip()
-    if _static_model and (high_fidelity or _norm_move == "estatico"):
+    if _static_model and (high_fidelity or _norm_move in {"estatico", "foto-estatica"}):
         model = _static_model
         logger.info("[BG] high-fidelity render → model=%s (movement=%s, verbatim=%s)",
                     model, _norm_move or "auto", high_fidelity)
@@ -9529,6 +11295,32 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "sampleCount": 1,
         "generateAudio": False,
     }
+    # Veo bills per second of generated video. The palindrome loop
+    # (_prerender_looped_bg) fills the whole song from this native clip, so a
+    # shorter native clip costs proportionally less (~50% at 4s vs 8s); the only
+    # visual effect is a shorter cycle before the loop repeats. Opt-in via
+    # VEO_CLIP_SECONDS — unset keeps Veo's native 8s default so deploying this
+    # is behaviorally inert until enabled + QA'd. Only provider-supported
+    # lengths are forwarded so an out-of-range value can never make Vertex
+    # reject the request. Keep provenance._VEO_CLIP_SECONDS in sync for the
+    # cost dashboard.
+    _veo_clip_seconds_raw = os.environ.get("VEO_CLIP_SECONDS", "").strip()
+    if _veo_clip_seconds_raw:
+        try:
+            _veo_clip_seconds = int(float(_veo_clip_seconds_raw))
+        except ValueError:
+            _veo_clip_seconds = 0
+        if _veo_clip_seconds in (4, 6, 8):
+            veo_params["durationSeconds"] = _veo_clip_seconds
+            logger.info(
+                "[BG] Veo clip length = %ss (VEO_CLIP_SECONDS)", _veo_clip_seconds
+            )
+        else:
+            logger.warning(
+                "[BG] Ignoring VEO_CLIP_SECONDS=%r — not a supported Veo clip "
+                "length (4, 6, 8); using provider default.",
+                _veo_clip_seconds_raw,
+            )
     try:
         blur_sigma = float(os.environ.get("BG_BLUR_SIGMA", "1.0"))
     except ValueError:
@@ -9560,14 +11352,32 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         out_meta["cache_object_key"] = cache_object_key
         out_meta["policy_fingerprint"] = _policy_fingerprint
 
-    recorder = record_ai_call(
-        job_id=job_id or "unknown",
-        step="video_bg",
-        tool_name=model,
-        tool_provider="google_vertex",
-        prompt=safe_prompt,
-        input_data_types=["generated_prompt"],
-    ) if job_id else None
+    def _registrar_cache_only(summary: str, artifact: str | None = None):
+        """Registra una consulta `cache_only` DESPUÉS de saber su resultado.
+
+        A diferencia de una generación real, un lookup cache_only nunca toca
+        al proveedor: no hay plata en vuelo que trazar si el worker muere en
+        el medio, que es la razón por la que el recorder normal inserta la
+        fila por adelantado. Y esa fila adelantada sí hacía daño: mientras
+        está "en vuelo" (`response_summary` NULL) `billable_filter()` la
+        cuenta como paga, y en un regen multi-escena estas consultas corren
+        en paralelo con la única escena que sí paga — le comían el tope con
+        llamadas que nunca costaron nada.
+        """
+        if not job_id:
+            return
+        try:
+            record_ai_call(
+                job_id=job_id, step="video_bg", tool_name=model,
+                tool_provider="google_vertex", prompt=safe_prompt,
+                input_data_types=["generated_prompt"],
+                # The lookup is known to be free already. Persist that fact
+                # in the INSERT itself so another worker cannot observe a
+                # transient NULL and count it as a paid reservation.
+                initial_response_summary=summary,
+            ).finish(response_summary=summary, output_artifact=artifact)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[BG] no pude registrar el lookup cache_only: %r", exc)
 
     # cache_only (multi-escena regen): SÓLO servir de caché, NUNCA generar
     # fresco. Garantiza que regenerar UNA escena no re-cobre las otras N: si su
@@ -9597,6 +11407,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         for _ck in dict.fromkeys(_candidates):  # dedup preservando orden
             if (_storage.is_enabled() and _storage.object_exists(_ck)
                     and _storage.download_object(_ck, output_path)):
+                _apply_film_frame_guard(output_path, job_id=job_id)
                 size_mb = os.path.getsize(output_path) / 1024 / 1024
                 _via = "stored-key" if _ck == cache_key_override else "recomputed"
                 logger.info("[BG] Veo cache HIT (cache_only via %s, %s): %.1f MB",
@@ -9605,15 +11416,36 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                     # La key que REALMENTE sirvió el clip — así el GC y las
                     # próximas búsquedas apuntan al objeto vivo.
                     out_meta["cache_object_key"] = _ck
-                if recorder:
-                    recorder.finish(response_summary=f"cache_hit(cache_only,{_via}): {size_mb:.1f}MB key={_ck}",
-                                    output_artifact=output_path)
+                _registrar_cache_only(
+                    f"cache_hit(cache_only,{_via}): {size_mb:.1f}MB key={_ck}",
+                    output_path)
                 return output_path
-        if recorder:
-            recorder.finish(response_summary=f"cache_only_miss: keys={_candidates}")
+        _registrar_cache_only(f"cache_only_miss: keys={_candidates}")
         raise RuntimeError(
             f"[BG] cache_only: sin clip cacheado (probé {_candidates}) — no se genera "
             "para no re-cobrar Veo en una regeneración de escena")
+
+    if not job_id:
+        raise RuntimeError(
+            "Paid Veo generation requires a persistent job_id; refusing an "
+            "untracked provider submission"
+        )
+
+    _budget_enforced = _veo_budget_enforced_for_job(job_id)
+
+    # Fast read-only rejection before the global provider cooldown. This is
+    # deliberately only an optimization: another worker can spend the final
+    # slot after this read, so the atomic reservation immediately before the
+    # POST remains the authority.
+    if _budget_enforced:
+        _pre_over, _pre_spent = _veo_budget_exceeded(job_id)
+        if _pre_over:
+            raise VeoBudgetExceeded(
+                f"job {job_id}: {_pre_spent} generaciones de Veo ya hechas "
+                f"para esta canción (tope {VEO_MAX_CALLS_PER_SONG}). No se "
+                "espera el cooldown ni se genera más; el llamador cae a su "
+                "fallback."
+            )
 
     # Fresh provider output is intentionally not read from the shared raw
     # cache here. This function runs before content validation, so a normal
@@ -9674,7 +11506,6 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     MAX_BACKOFF_S = 120
     MAX_ATTEMPTS = 5
     operation_name: str | None = None
-    last_error: str | None = None
     rate_limit_hits = 0
 
     import veo_breaker
@@ -9685,80 +11516,208 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     _submit_budget_s = float(os.environ.get("VEO_SUBMIT_BUDGET_S", "240"))
     _submit_deadline = _time.time() + _submit_budget_s
 
+    from provenance import BUDGET_PENDING_PREFIX
+
+    recorder = record_ai_call(
+        job_id=job_id or "unknown",
+        step="video_bg",
+        tool_name=model,
+        tool_provider="google_vertex",
+        prompt=safe_prompt,
+        input_data_types=["generated_prompt"],
+        initial_response_summary=(
+            BUDGET_PENDING_PREFIX if _budget_enforced else None
+        ),
+    )
+    if require_persistent_tracking and recorder._row_id is None:
+        raise VeoTrackingUnavailable(
+            "Veo Job disappeared or provenance reservation could not be "
+            f"persisted for job_id={job_id!r}"
+        )
+
+    # Reserva y chequeo atómicos en el último punto seguro antes del POST. A
+    # partir de `_req.post` un timeout es ambiguo (Vertex puede haber aceptado
+    # la generación), por eso esos errores conservan la reserva facturable.
+    if _budget_enforced:
+        _over, _spent = _veo_budget_exceeded(
+            job_id,
+            own_row_id=getattr(recorder, "_row_id", None),
+            require_persistent_tracking=require_persistent_tracking,
+        )
+    else:
+        _over, _spent = False, 0
+    if _over:
+        # La fila se BORRA en vez de cerrarse: no hubo llamada al proveedor,
+        # así que dejarla registrada inventaba gasto y además contaminaba el
+        # propio conteo del tope en la siguiente pasada.
+        _discard_provenance_row(recorder)
+        raise VeoBudgetExceeded(
+            f"job {job_id}: {_spent} generaciones de Veo ya hechas para esta "
+            f"canción (tope {VEO_MAX_CALLS_PER_SONG}). No se genera más para no "
+            f"seguir gastando; el llamador cae a su fallback."
+        )
+
+    # Check the ceiling before touching credentials so a blocked song exits
+    # immediately even during an auth outage. Token acquisition is still a
+    # definite pre-submit failure: release this reservation before falling
+    # back because Vertex has not received a request.
+    try:
+        token = _veo_access_token()
+    except Exception as exc:
+        _release_veo_reservation(
+            recorder, f"pre-submit auth failed: {exc}")
+        raise
+
     for attempt in range(MAX_ATTEMPTS):
+        if attempt:
+            try:
+                token = _veo_access_token()
+            except Exception as exc:
+                # Every prior attempt was a confirmed 429 rejection. If token
+                # refresh now fails, no request for this reservation is in
+                # flight and the slot is definitely free.
+                _release_veo_reservation(
+                    recorder, f"pre-submit auth failed: {exc}")
+                raise
+            # The previous attempt was a confirmed 429 and its row was made
+            # non-billable before releasing the submission lock. Re-acquire a
+            # budget slot only now, after auth and immediately before the next
+            # guarded POST. If deletion won during backoff/auth, this aborts.
+            if _budget_enforced:
+                _retry_over, _retry_spent = _veo_budget_exceeded(
+                    job_id,
+                    own_row_id=getattr(recorder, "_row_id", None),
+                    require_persistent_tracking=require_persistent_tracking,
+                )
+                if _retry_over:
+                    raise VeoBudgetExceeded(
+                        f"job {job_id}: {_retry_spent} generaciones de Veo ya "
+                        f"hechas para esta canción (tope "
+                        f"{VEO_MAX_CALLS_PER_SONG}). No se reintenta."
+                    )
+        rejected_429 = False
         try:
             logger.info("[BG] Veo 3: generating video (attempt %s/%s)...", attempt + 1, MAX_ATTEMPTS)
-            token = _veo_access_token()
-            r = _req.post(
-                submit_url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                    "x-goog-user-project": _VERTEX_PROJECT,
-                },
-                json=request_body,
-                timeout=60,
-            )
-            if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
-                rate_limit_hits += 1
-                last_error = f"HTTP {r.status_code} rate-limited"
-                veo_breaker.record_rate_limit()  # feeds the cross-worker breaker
-                # Capped exponential backoff + ±20 % jitter. Without
-                # jitter, N concurrent jobs that all hit a 429 at the
-                # same instant retry in lock-step → second wave of
-                # 429s → cascade. Jitter spreads the retry window so
-                # quota recovers naturally.
-                base = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
-                wait = base * random.uniform(0.8, 1.2)
-                # Submit budget: don't keep sleeping in-slot past the budget —
-                # bail so the job falls to gradient instead of burning the full
-                # backoff during a quota storm.
-                if _time.time() + wait > _submit_deadline:
-                    logger.warning("[BG] Veo submit budget (%.0fs) exhausted — bailing to fallback", _submit_budget_s)
-                    break
-                logger.warning("[BG] Rate limited (HTTP %s), waiting %.1fs before retry...",
-                               r.status_code, wait)
-                _time.sleep(wait)
-                continue
-            if not r.ok:
-                detail = r.text[:500]
-                # Non-retryable: bubble immediately so the caller can mark
-                # the job error with a useful reason.
-                raise RuntimeError(
-                    f"Veo predictLongRunning HTTP {r.status_code}: {detail}"
+            # Re-check deletion after token acquisition, then keep the same
+            # lock through the external side-effect. This closes the final
+            # cancellation race without holding a DB connection during auth.
+            if _budget_enforced:
+                _submission_guard = _VeoSubmissionGuard(
+                    job_id,
+                    getattr(recorder, "_row_id", None),
+                    require_persistent_tracking=require_persistent_tracking,
                 )
-            payload = r.json()
-            operation_name = payload.get("name")
-            if not operation_name:
-                raise RuntimeError(f"Veo response missing 'name': {payload}")
-            veo_breaker.record_success()  # Veo accepted → close the breaker if open
-            break
-        except RuntimeError:
+            else:
+                from contextlib import nullcontext
+                _submission_guard = nullcontext()
+            with _submission_guard:
+                try:
+                    r = _req.post(
+                        submit_url,
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json",
+                            "x-goog-user-project": _VERTEX_PROJECT,
+                        },
+                        json=request_body,
+                        timeout=60,
+                    )
+                except Exception as e:
+                    _raise_if_job_timeout(e)
+                    # The provider may have accepted the request. Persist the
+                    # ambiguous/billable state before deletion can take the
+                    # shared lock and archive it.
+                    if recorder:
+                        recorder.finish(response_summary=(
+                            "error: ambiguous submission; not retrying: "
+                            f"{str(e)[:300]}"
+                        ))
+                    raise VeoAmbiguousSubmission(
+                        "Veo 3 submission response was ambiguous; not "
+                        f"retrying: {e}"
+                    ) from e
+
+                if r.status_code == 429 or "RESOURCE_EXHAUSTED" in r.text:
+                    rate_limit_hits += 1
+                    veo_breaker.record_rate_limit()
+                    _pause_veo_reservation_for_retry(
+                        recorder,
+                        f"HTTP {r.status_code} rate limited attempt "
+                        f"{attempt + 1}",
+                    )
+                    rejected_429 = True
+                elif not r.ok:
+                    detail = r.text[:500]
+                    if _veo_http_failure_is_ambiguous(r.status_code):
+                        if recorder:
+                            recorder.finish(response_summary=(
+                                f"error: ambiguous HTTP {r.status_code}; "
+                                f"not retrying: {detail[:300]}"
+                            ))
+                        raise VeoAmbiguousSubmission(
+                            f"Veo predictLongRunning HTTP {r.status_code} was "
+                            f"ambiguous; not retrying: {detail}"
+                        )
+                    _release_veo_reservation(
+                        recorder, f"HTTP {r.status_code} rejected: {detail}")
+                    raise RuntimeError(
+                        f"Veo predictLongRunning HTTP {r.status_code}: {detail}"
+                    )
+                else:
+                    try:
+                        payload = r.json()
+                    except Exception as exc:
+                        if recorder:
+                            recorder.finish(response_summary=(
+                                "error: ambiguous success response; not "
+                                f"retrying: {str(exc)[:300]}"
+                            ))
+                        raise VeoAmbiguousSubmission(
+                            "Veo returned an unreadable success response"
+                        ) from exc
+                    operation_name = payload.get("name")
+                    if not operation_name:
+                        if recorder:
+                            recorder.finish(response_summary=(
+                                "error: ambiguous success response missing operation name; "
+                                "not retrying: "
+                                f"{str(payload)[:300]}"
+                            ))
+                        raise VeoAmbiguousSubmission(
+                            f"Veo response missing 'name': {payload}"
+                        )
+        except VeoTrackingUnavailable:
+            # No request began. The row may already have been removed by the
+            # deletion transaction; release it only when it still exists.
+            try:
+                _release_veo_reservation(
+                    recorder, "job cancelled before provider submission")
+            except VeoTrackingUnavailable:
+                pass
             raise
-        except Exception as e:
-            _raise_if_job_timeout(e)
-            last_error = f"network/transient: {e}"
-            logger.error("[BG] Veo 3 attempt %s request error: %s", attempt + 1, e)
-            base = min(MAX_BACKOFF_S, 15 * (2 ** attempt))
+        if rejected_429:
+            # Capped exponential backoff + ±20 % jitter. All retries here are
+            # safe because every prior HTTP response explicitly rejected the
+            # request. The reservation stays non-billable during this wait.
+            base = min(MAX_BACKOFF_S, 30 * (2 ** attempt))
             wait = base * random.uniform(0.8, 1.2)
             if _time.time() + wait > _submit_deadline:
-                logger.warning("[BG] Veo submit budget exhausted (transient) — bailing to fallback")
+                logger.warning("[BG] Veo submit budget (%.0fs) exhausted — bailing to fallback", _submit_budget_s)
                 break
+            logger.warning("[BG] Rate limited (HTTP %s), waiting %.1fs before retry...",
+                           r.status_code, wait)
             _time.sleep(wait)
             continue
+        veo_breaker.record_success()  # Veo accepted → close the breaker if open
+        break
 
     if operation_name is None:
-        reason = last_error or "unknown"
-        summary = (
-            f"error: rate_limited_after_{MAX_ATTEMPTS}_retries"
-            if rate_limit_hits == MAX_ATTEMPTS
-            else f"error: {reason} after {MAX_ATTEMPTS} retries"
+        _release_veo_reservation(
+            recorder,
+            f"rate limited {rate_limit_hits} times; no operation created",
         )
-        if recorder:
-            recorder.finish(response_summary=summary)
-        if rate_limit_hits == MAX_ATTEMPTS:
-            raise RuntimeError(f"Veo 3 rate limit exceeded after {MAX_ATTEMPTS} retries")
-        raise RuntimeError(f"Veo 3 submission failed after {MAX_ATTEMPTS} retries: {reason}")
+        raise RuntimeError(
+            f"Veo 3 rate limit exceeded after {rate_limit_hits} rejected attempts")
 
     _last_veo_request = _time.time()
     logger.info("[BG] Veo 3 operation: %s", operation_name)
@@ -9896,6 +11855,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     except Exception as e:
         _raise_if_job_timeout(e)
         logger.warning("[BG] Letterbox check skipped (non-fatal): %s", e)
+
+    # A literal "old film" cue can make Veo render the physical film frame
+    # itself: a stable black shell plus an opaque sprocket/placeholder. The
+    # compound detector repairs only that signature with a local uniform zoom;
+    # it never triggers another paid generation.
+    _apply_film_frame_guard(output_path, job_id=job_id)
 
     # Apply subtle gaussian blur. Veo Fast outputs are slightly softer than
     # standard; a small blur normalises that softness, hides minor artefacts,
@@ -10370,7 +12335,9 @@ def _measure_camera_drift(video_path: str, samples: int = 30) -> dict | None:
                 pass
 
 
-def _score_video_relevance(video_path: str, prompt: str) -> int:
+def _score_video_relevance(
+    video_path: str, prompt: str, job_id: str | None = None,
+) -> int:
     """Ask Gemini Vision whether the video matches the intended scene prompt.
 
     Extracts one frame and returns a relevance score 1-10.
@@ -10380,6 +12347,7 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
     import tempfile
 
     tmp_frame = None
+    recorder = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             tmp_frame = f.name
@@ -10393,6 +12361,19 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
         # generated Veo video; a hang here adds to total render latency
         # but is gated by the same outer except → fall-through to score=8.
         # 30 s suffices (single-frame Vision call is fast).
+        if job_id:
+            from provenance import record_ai_call
+            recorder = record_ai_call(
+                job_id=job_id,
+                step="video_relevance",
+                # One JPEG frame, same billing shape as the single-image
+                # validation call. The generic text key weighted this request
+                # ~20x too high after invoice calibration.
+                tool_name="gemini-2.5-flash-vision-image",
+                tool_provider="google_vertex",
+                prompt=prompt,
+                input_data_types=["video_frame", "scene_prompt"],
+            )
         response = _call_with_timeout(
             lambda: client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -10419,8 +12400,12 @@ def _score_video_relevance(video_path: str, prompt: str) -> int:
         import re as _re
         m = _re.search(r'\b(10|[1-9])\b', response.text)
         score = int(m.group()) if m else 5
+        if recorder:
+            recorder.finish(response_summary=f"score={score}")
         return max(1, min(10, score))
     except Exception as e:
+        if recorder:
+            recorder.finish(response_summary=f"error: {e!r}")
         _raise_if_job_timeout(e)
         logger.warning("[BG] Relevance score error (fail-open): %s", e)
         return 8
@@ -10898,6 +12883,11 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         # En un regen (regen_keys set), las escenas NO-target son cache_only:
         # se sirven de caché o se degradan, nunca pagan Veo de nuevo.
         _cache_only = regen_keys is not None and key not in regen_keys
+        # Veredicto que este clip YA tenía. Sólo es evidencia sobre los bytes
+        # que vamos a rendear cuando la escena es cache_only (el clip vuelve
+        # de la caché sin cambiar); un regen escribe bytes nuevos y no puede
+        # heredar nada. Ver _inherit_inconclusive_scene_verdict.
+        _prior_scene_validation = dict(scene.get("validation") or {})
         _meta = {}
         scene_policy = (
             rebase_stored_atmospherics_policy(scene.get("atmospherics_policy"))
@@ -10989,7 +12979,20 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                     ),
                     "policy_fingerprint": _policy_fp,
                 }
-                if _scene_validation.get("passed") is not True:
+                if _inherit_inconclusive_scene_verdict(
+                    scene,
+                    verdict=_scene_validation,
+                    prior_validation=_prior_scene_validation,
+                    policy_fingerprint=_policy_fp,
+                    cache_only=_cache_only,
+                ):
+                    logger.error(
+                        "[SCENES] re-chequeo inconcluso del clip cacheado %s "
+                        "(job=%s) — conservo el veredicto previo en vez de "
+                        "tirar la escena: issues=%s",
+                        key, job_id, _scene_validation.get("issues"),
+                    )
+                elif _scene_validation.get("passed") is not True:
                     if _validation_observe_only():
                         logger.warning(
                             "[SCENES] observe-only: keeping clip %s job=%s "
@@ -11059,6 +13062,12 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                 ),
                 "validation": dict(scene.get("validation") or {}),
             }
+        except (VeoAmbiguousSubmission, VeoTrackingUnavailable):
+            # An ambiguous provider submission or an operator cancellation
+            # must escape the per-scene substitution path. Collapsing either
+            # into a recoverable miss can reach the single-background path and
+            # submit Veo again after the reservation/job disappeared.
+            raise
         except Exception as e:  # noqa: BLE001
             _raise_if_job_timeout(e)
             # Cache_only-miss ESPERADO (review del PR del Sentinel, 2026-07-10):
@@ -11503,7 +13512,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        allow_people: bool = False,
                        atmospherics_policy: dict | None = None,
                        audio_duration: float | None = None,
-                       generation_nonce: str = "") -> str:
+                       generation_nonce: str = "",
+                       out_meta: dict | None = None) -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     background_hint: optional free-form operator description, set via /edit
@@ -11521,6 +13531,10 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
 
     Returns path to .mp4 (video style) or .jpg/.png (photo/illustration style).
     """
+    if out_meta is not None:
+        out_meta["provider_fallback"] = False
+        out_meta.pop("fallback_reason", None)
+
     creative_mode = resolve_creative_mode(
         match_lyrics=match_lyrics,
         operator_prompt=background_hint,
@@ -11575,6 +13589,11 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     if not _live_photo and _norm_move_bg == "animado" and bg_mode != "veo":
         logger.info("[BG] movement=animado overrides bg_mode → veo")
         bg_mode = "veo"
+    # Foto estática is a still photo with a locked frame and optional overlay;
+    # unlike foto-parallax it must never enter the Ken Burns path.
+    elif _norm_move_bg == "foto-estatica" and bg_mode != "imagen":
+        logger.info("[BG] movement=foto-estatica overrides bg_mode → imagen (locked photo)")
+        bg_mode = "imagen"
     # Foto + parallax is a still photo that gains depth via a slow LATERAL pan.
     # Veo can't do clean 2.5D parallax from a text prompt (it comes out muddy),
     # so this register always routes through Imagen-4 + the lateral Ken Burns
@@ -11718,6 +13737,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 raise RuntimeError("Veo returned no living-photo artifact")
             except Exception as exc:
                 _raise_if_job_timeout(exc)
+                if out_meta is not None:
+                    out_meta["provider_fallback"] = True
+                    out_meta["fallback_reason"] = "foto_viva_provider_failed"
                 logger.warning(
                     "[BG] foto_viva provider failed; using bounded local "
                     "photo-motion fallback: %s", exc,
@@ -11803,6 +13825,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     import veo_breaker
     _veo_breaker_open = veo_breaker.is_open()
     if _veo_breaker_open:
+        if out_meta is not None:
+            out_meta["fallback_reason"] = "veo_breaker_open"
         logger.warning("[BG] Veo breaker OPEN — short-circuiting to gradient (skipping Veo)")
     # 1 retry interno (2 intentos). Antes eran 3, lo que sumado al
     # poll_deadline de 600s de Veo podía exceder cualquier job_timeout
@@ -11835,7 +13859,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # to bound cost (+$0.80 worst case). quality_retry_used gates the
             # re-generation decision, not the scoring itself, so the retry's
             # result is also evaluated before we accept and return it.
-            score = _score_video_relevance(bg_path, prompt)
+            score = _score_video_relevance(bg_path, prompt, job_id=job_id)
             logger.info("[BG] Relevance score: %s/10 for prompt: %s...", score, prompt[:60])
             # Detector de corte de escena (incidente mural 2026-06-09):
             # un clip cuyo primer y último frame son escenas distintas
@@ -11869,7 +13893,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # → clip idéntico), quedarse con el MEJOR de los dos candidatos,
             # presupuesto propio, y no-op duro si veo_breaker está abierto o
             # bg_verbatim. Va en un PR aparte, con los datos en la mano.
-            if _norm_move_bg == "estatico":
+            if _norm_move_bg in {"estatico", "foto-estatica"}:
                 _drift = _measure_camera_drift(bg_path)
                 if _drift:
                     # El modelo va en la línea porque es la variable que se
@@ -11949,6 +13973,30 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # Real RQ death-penalty timeout — propagate (don't degrade to
             # gradient + swallow). Keeps the JobTimeoutException visible.
             raise
+        except VeoBudgetExceeded as e:
+            # No es un fallo transitorio: el tope no puede cambiar durante los
+            # 30s de espera, así que reintentar sólo agrega latencia y otro
+            # ciclo de reserva+borrado de fila. Directo al fallback local.
+            logger.error("[BG] %s — sin reintento, al fallback", e)
+            if out_meta is not None:
+                out_meta["fallback_reason"] = "veo_budget_exceeded"
+            break
+        except VeoAmbiguousSubmission as e:
+            # Vertex may already be rendering and billing this operation. The
+            # inner submitter preserved one reservation; do not re-enter it
+            # from this outer quality/transient retry loop.
+            logger.error("[BG] %s — envío ambiguo, sin reintento", e)
+            if out_meta is not None:
+                out_meta["fallback_reason"] = "veo_ambiguous_submission"
+            break
+        except VeoTrackingUnavailable as e:
+            # A vanished reservation is cancellation, not a transient provider
+            # error. Retrying after 30s can reach Vertex with the job and its
+            # provenance already deleted, so go directly to the local fallback.
+            logger.info("[BG] %s — tracking cancelado, sin reintento", e)
+            if out_meta is not None:
+                out_meta["fallback_reason"] = "veo_tracking_cancelled"
+            break
         except Exception as e:
             logger.error("[BG] Veo 3 attempt %s/2 failed: %s", attempt + 1, e)
             if attempt < 1:
@@ -11965,6 +14013,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             "falling back to local masked motion"
         )
         _static_image_to_mp4(image_to_video_path, bg_path, duration=60.0)
+        if out_meta is not None:
+            out_meta["provider_fallback"] = True
+            out_meta.setdefault("fallback_reason", "foto_viva_provider_failed")
         return bg_path
 
     # All Veo attempts failed — render a gradient as fallback.
@@ -11972,6 +14023,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
     # tenants need clear provenance of every visual element, and a stock asset
     # silently substituted into an AI-mode job would break that contract.
     logger.warning("[BG] Veo 3 unavailable, falling back to gradient background")
+    if out_meta is not None:
+        out_meta["provider_fallback"] = True
+        out_meta.setdefault("fallback_reason", "veo_unavailable")
     fallback_path = os.path.join(job_dir, "bg_gradient_fallback.mp4")
     gradient = _make_gradient_clip(30.0, style_hint)
     gradient.write_videofile(fallback_path, fps=24, logger=None)
@@ -12490,6 +14544,151 @@ def _video_dims(path: str) -> tuple[int, int] | None:
         return None
 
 
+def _decodes_ok(path: str, frames: int = 1) -> bool:
+    """True si ffmpeg puede DECODIFICAR de verdad los primeros `frames`.
+
+    ffprobe no sirve para esto: lee el header y te miente. En el incidente
+    UMG Chile 2026-08-21 el `short_bg_only.mp4` roto reportaba un moov
+    perfectamente sano (1080x1920, 24 fps, 30,00 s, 721 frames) y no tenía
+    un solo packet de video decodificable. Los dos consumidores del archivo
+    —la pasada libass y el fallback moviepy— lo aceptaron y reventaron:
+    ffmpeg con `-22 Invalid argument` ("Nothing was written into output
+    file, because at least one of its streams received no packets") y
+    moviepy con `OSError: failed to read the first frame`, que sin atrapar
+    se llevó puesto el job y un master de 519 MB ya validado.
+
+    Decodificar un frame a /dev/null cuesta milisegundos y es la única
+    verificación que distingue "header lindo" de "archivo usable".
+    """
+    if not path or not os.path.exists(path) or os.path.getsize(path) < 1024:
+        return False
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", path,
+             "-frames:v", str(max(1, frames)), "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except Exception:
+        return False
+    return r.returncode == 0 and not (r.stderr or "").strip()
+
+
+def _alert_sentry(fingerprint: str, message: str, *, job_dir: str = "",
+                  level: str = "error") -> None:
+    """Manda un aviso a Sentry con fingerprint propio. Nunca levanta.
+
+    Estos caminos degradan la entrega en silencio (short sin fondo real,
+    short sin la tipografía del video). Sin una alerta agrupable el que se
+    entera es el cliente, que es exactamente como nos enteramos del
+    incidente del 21-08.
+    """
+    try:
+        import sentry_sdk
+        with sentry_sdk.push_scope() as _scope:
+            _scope.fingerprint = [fingerprint]
+            if job_dir:
+                _scope.set_tag("job_id", os.path.basename(job_dir.rstrip("/")))
+            sentry_sdk.capture_message(message, level=level)
+    except Exception:
+        pass  # sin Sentry (dev/tests) el log del caller alcanza
+
+
+def _log_short_bg_forensics(path: str, job_dir: str) -> None:
+    """Volcá todo lo que se sepa del intermedio del short cuando falla.
+
+    Seguimos sin saber POR QUÉ `short_bg_only.mp4` sale a veces con el moov
+    sano y sin packets. Quedaron dos hipótesis vivas y hoy son
+    indistinguibles con lo que se loguea: (a) el archivo se escribe roto o
+    se trunca después, (b) los procesos ffmpeg se mueren por presión de
+    memoria — `generate_short` corre en progress=75, que es justo donde ya
+    hay documentados workers SIGKILL-eados.
+
+    Estos tres datos las separan: si ffprobe CUENTA packets pero ffmpeg no
+    los decodifica, el archivo está corrupto en disco (a). Si el archivo
+    está sano acá, los lectores se están muriendo (b). Y el disco libre
+    descarta ENOSPC, que hoy no se mide en ningún lado de este módulo.
+    Best-effort: esto corre en un camino de error y nunca puede levantar.
+    """
+    try:
+        size = os.path.getsize(path) if os.path.exists(path) else -1
+    except OSError:
+        size = -1
+    packets = "?"
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-count_packets", "-show_entries", "stream=nb_read_packets",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=60,
+        )
+        packets = (r.stdout or "").strip() or "?"
+    except Exception:
+        pass
+    disk = "?"
+    try:
+        import shutil as _sh
+        _u = _sh.disk_usage(job_dir)
+        disk = f"free={_u.free // (1024 * 1024)}MB/total={_u.total // (1024 * 1024)}MB"
+    except Exception:
+        pass
+    logger.error(
+        "[SHORT-FORENSE] %s size=%sB nb_read_packets=%s disco=%s",
+        os.path.basename(path), size, packets, disk,
+    )
+
+
+def _prerender_short_bg_loop(bg_path: str, duration: float, job_dir: str) -> str:
+    """Loopea un fondo corto a 1080x1920 para el short, con ffmpeg.
+
+    Reemplaza al patrón "abrir N VideoFileClip del mismo archivo y
+    concatenarlos con moviepy", que filtraba un proceso ffmpeg por vuelta
+    (`concatenate_videoclips` no cascadea `close()`).
+
+    Deliberadamente NO usa `_prerender_looped_bg`, por dos razones:
+
+    1. Ese helper pone el `-t` DESPUÉS del `-i`, o sea como opción de
+       output, así que el input con `-stream_loop -1` nunca da EOF y el
+       filtro `reverse` —que necesita EOF para emitir— bufferea sin límite.
+       Medido a 1080x1920: 2,24 GB de RSS contra 662 MB de esta forma, y
+       framemd5 IDÉNTICO al del loop plano. O sea paga 3,4x de memoria por
+       un palíndromo que no produce. Meterlo acá pondría ese pico justo en
+       progress=75, el paso que ya venía matando workers por OOM.
+    2. Aunque funcionara, no queremos palindromear en esta rama: un
+       timeline multi-escena corto reproduciría las escenas en REVERSA al
+       final, que es justo lo que `_get_background_clip_from_path` evita.
+
+    El nombre empieza con `bg_looped_` a propósito: `_cleanup_local_intermediates`
+    barre por ese glob, así que el intermedio se limpia solo en vez de
+    acumular decenas de MB por job.
+    """
+    out_path = os.path.join(job_dir, "bg_looped_short_1080x1920.mp4")
+    run_checked(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-stream_loop", "-1", "-i", bg_path,
+            "-t", str(duration),
+            "-vf", (
+                "scale=1080:1920:force_original_aspect_ratio=increase,"
+                "crop=1080:1920,setpts=PTS-STARTPTS"
+            ),
+            # crf 16: este archivo se re-encodea dos veces más aguas abajo
+            # (fx + libass), así que arrancamos con margen para no acumular
+            # banding en los degradés oscuros que suele dar Veo.
+            "-c:v", "libx264", "-preset", "fast", "-crf", "16",
+            "-pix_fmt", "yuv420p", "-an",
+            out_path,
+        ],
+        label="ffmpeg-short-bg-loop",
+        # 30s de salida se encodean en ~3s medidos. 120s es cliff de sobra;
+        # los 900s de _prerender_looped_bg son para masters de 6 minutos.
+        timeout=120,
+        output_path=out_path,
+    )
+    if not _decodes_ok(out_path):
+        raise RuntimeError(f"loop de fondo del short ilegible: {out_path}")
+    return out_path
+
+
 # --- Letterbox output-QA -----------------------------------------------------
 # Veo occasionally bakes a black 2.39:1 anamorphic letterbox INTO a 16:9 clip
 # (stochastic — one video shows bars, the next doesn't; see the anti-letterbox
@@ -12725,82 +14924,127 @@ def _normalize_bg_to_spec(bg_path: str, job_dir: str,
     return out_path
 
 
+# Tope de duración para palindromear. El filtro `reverse` bufferea el clip
+# ENTERO descomprimido en RAM: medido a resolución nativa 1280x720 son ~430 MB
+# para 4s y escala lineal (~107 MB por segundo de clip). Los clips de Veo son
+# de 4/6/8s, así que 10s cubre el caso real con margen; cualquier cosa más
+# larga cae al loop plano en vez de arriesgar el worker.
+_PALINDROME_MAX_CLIP_S = 10.0
+
+
 def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
                          target_w=1920, target_h=1080,
                          out_name: str = "bg_looped.mp4") -> str:
     """Pre-render a seamlessly looped background using palindrome (A + reverse(A)).
 
-    A straight -stream_loop jumps from the last frame back to the first, which
-    is visible as a "pop" when the scene has camera movement. Concatenating A
-    with its reverse makes the last frame of one pass match the first frame of
-    the next — the loop is mathematically seamless.
+    Un `-stream_loop` pelado salta del último frame al primero, y eso se ve
+    como un "pop" cuando la escena tiene movimiento de cámara. Concatenar A con
+    su reverso hace que el último frame de una pasada coincida con el primero
+    de la siguiente: el loop queda matemáticamente sin costura.
 
-    We scale and crop first, then palindrome, then loop the palindrome to fill
-    the requested duration.
+    DOS ETAPAS, y el orden es el punto (bug 2026-08-21):
+
+    La versión anterior armaba el palíndromo sobre `-stream_loop -1` con el
+    `-t` DESPUÉS del `-i` — o sea como opción de OUTPUT. Un input con
+    `-stream_loop -1` nunca da EOF, y el filtro `reverse` necesita EOF para
+    emitir aunque sea un frame: bufferaba sin límite mientras `concat` dejaba
+    pasar el segmento `[a]`, que ya era el loop infinito. Resultado: el
+    "palíndromo" NUNCA se produjo para ningún caller —se entregaba un loop
+    plano, con el pop que este helper existe para evitar— y encima pagando
+    2,24 GB de RSS a 1080x1920 contra 662 MB del loop plano. Verificado con
+    framemd5: la rama del palíndromo y su propio fallback daban frames
+    idénticos bit a bit.
+
+    La forma correcta es palindromear el clip UNIDAD con un input acotado (así
+    `reverse` ve EOF) y recién después loopear ese palíndromo. Y se palindromea
+    a resolución NATIVA, escalando en la segunda pasada: el buffer de `reverse`
+    es proporcional a los píxeles, así que escalar antes lo encarecía al doble
+    (893 MB contra 430 MB medidos con un clip de 4s a 1080p de salida). Con
+    esto el pico total queda en ~634 MB, prácticamente igual que el loop plano
+    (625 MB) — o sea el palíndromo pasa a ser gratis y además funciona.
+
+    Los dos callers ya filtran `bg_prelooped` antes de llegar acá, así que un
+    timeline multi-escena nunca se palindromea (se reproducirían las escenas en
+    reversa al final).
     """
     out_path = os.path.join(job_dir, out_name)
-    cmd = [
-        "ffmpeg", "-y",
-        "-stream_loop", "-1",
-        "-i", bg_path,
-        "-t", str(duration),
-        "-filter_complex", (
-            f"[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-            f"crop={target_w}:{target_h},setpts=PTS-STARTPTS,split[a][b];"
-            "[b]reverse[br];"
-            "[a][br]concat=n=2:v=1:a=0"
-        ),
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        "-an",
-        out_path,
-    ]
-    # Audit 2026-05-26: timeout=900s. Without it, a corrupted Veo output
-    # or a filter_complex that locks the encoder (palindrome on a
-    # zero-length input has been observed) hung the worker indefinitely.
-    # The fallback branch below already uses run_checked(timeout=900);
-    # mirroring that bound here is the consistent fix. capture_output=True
-    # buffers stderr in memory so we can still report the tail on failure.
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-    except subprocess.TimeoutExpired:
-        logger.error("[BG] Palindrome loop timed out after 900s — falling back")
-        # Synthesize a "failed" result so we drop into the fallback branch
-        # without duplicating the call.
-        class _Timeout:
-            returncode = 124
-            stderr = "ffmpeg palindrome loop timed out (>900s)"
-        result = _Timeout()
-    if result.returncode != 0:
-        # Fall back to the simple loop if the palindrome filter graph fails
-        # (e.g. clip too short or memory-constrained machines).
-        logger.warning("[BG] Palindrome loop failed, falling back to stream_loop: %s",
-                       result.stderr[-200:])
-        cmd_fallback = [
-            "ffmpeg", "-y",
-            "-stream_loop", "-1",
-            "-i", bg_path,
-            "-t", str(duration),
-            "-vf", (
-                f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-                f"crop={target_w}:{target_h},"
-                "setpts=PTS-STARTPTS"
-            ),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-an",
-            out_path,
-        ]
-        # 900s mirrors the kenburns sibling — a stream_loop encode of a
-        # multi-minute lyric video sits comfortably under 5 min in
-        # healthy runs; double that as the cliff.
+    scale_crop = (
+        f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+        f"crop={target_w}:{target_h},setpts=PTS-STARTPTS"
+    )
+
+    def _flat_loop(src: str, label: str) -> str:
+        """Loop plano: el camino seguro. Sin costura no, pero siempre sale."""
         run_checked(
-            cmd_fallback,
-            label="ffmpeg-palindrome-fallback",
+            [
+                "ffmpeg", "-y",
+                "-stream_loop", "-1", "-i", src,
+                "-t", str(duration),
+                "-vf", scale_crop,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-an",
+                out_path,
+            ],
+            label=label,
+            # 900s mirrors the kenburns sibling — a stream_loop encode of a
+            # multi-minute lyric video sits comfortably under 5 min in
+            # healthy runs; double that as the cliff.
             timeout=900,
             output_path=out_path,
         )
+        return out_path
+
+    clip_dur = _ffprobe_duration(bg_path) or 0.0
+    if not (0 < clip_dur <= _PALINDROME_MAX_CLIP_S):
+        # Clip largo (o duración ilegible): palindromear costaría GB de RAM y
+        # además no aporta — un fondo largo ya no repite lo suficiente como
+        # para que el corte moleste.
+        logger.info(
+            "[BG] clip de %.1fs fuera del rango de palíndromo (máx %.0fs) — loop plano",
+            clip_dur, _PALINDROME_MAX_CLIP_S,
+        )
+        _flat_loop(bg_path, "ffmpeg-flat-loop")
+    else:
+        # Prefijo bg_looped_ a propósito: además del unlink explícito de abajo,
+        # _cleanup_local_intermediates barre por ese glob, así que un worker
+        # muerto entre medio tampoco deja el intermedio tirado.
+        unit_path = os.path.join(job_dir, f"bg_looped_palindrome_unit_{out_name}")
+        try:
+            # Etapa 1 — palíndromo del clip unidad, a resolución nativa, con
+            # input ACOTADO (sin -stream_loop) para que `reverse` vea el EOF.
+            # crf 16: es un intermedio que se re-encodea en la etapa 2.
+            run_checked(
+                [
+                    "ffmpeg", "-y", "-i", bg_path,
+                    "-filter_complex",
+                    "[0:v]setpts=PTS-STARTPTS,split[a][b];"
+                    "[b]reverse[br];"
+                    "[a][br]concat=n=2:v=1:a=0",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "16",
+                    "-pix_fmt", "yuv420p", "-an",
+                    unit_path,
+                ],
+                label="ffmpeg-palindrome-unit",
+                # Medido: 0,5s para un clip de 4s. 120s es cliff de sobra y
+                # acota el buffer de `reverse` si algo sale mal.
+                timeout=120,
+                output_path=unit_path,
+            )
+            # Etapa 2 — loopear el palíndromo (que SÍ empalma consigo mismo)
+            # hasta cubrir la canción, escalando acá.
+            _flat_loop(unit_path, "ffmpeg-palindrome-loop")
+            logger.info("[BG] palíndromo real: unidad de %.1fs → %.1fs", clip_dur * 2, duration)
+        except Exception as e:
+            _raise_if_job_timeout(e)
+            logger.warning(
+                "[BG] palíndromo falló (%s) — loop plano (se ve el corte, pero sale)", e,
+            )
+            _flat_loop(bg_path, "ffmpeg-palindrome-fallback")
+        finally:
+            try:
+                os.unlink(unit_path)
+            except OSError:
+                pass
 
     size_mb = os.path.getsize(out_path) / 1024 / 1024
     logger.info("[BG] Pre-rendered palindrome loop: %.0fs, %.1f MB", duration, size_mb)
@@ -15587,24 +17831,58 @@ def _burn_short_text_ass(
 
         out_tmp = os.path.join(job_dir, "short_ass_tmp.mp4")
         # Mismo escaping canónico que el burn del video (fx_compositor).
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-i", os.path.basename(bg_short_path),
-            "-vf", f"subtitles=short_lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "copy", "-movflags", "+faststart",
-            "-r", str(fps), os.path.basename(out_tmp),
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=600, cwd=job_dir)
-        if r.returncode != 0 or not os.path.exists(out_tmp):
-            logger.warning("[SHORT] libass text burn failed (%s) — fallback moviepy",
-                           (r.stderr or "")[-300:])
-            return None
-        logger.info("[SHORT] texto quemado con libass (font=%s anim=%s)",
-                    os.path.basename(font_path), lyrics_animation)
-        return out_tmp
+        #
+        # El retry con re-encode aac se agregó el 19-08 atribuyendo el
+        # "Invalid argument" al stream de AUDIO ("some source/container
+        # combinations make ffmpeg reject that stream"). Esa hipótesis está
+        # REFUTADA: el error es `[vost#0:0/libx264] ... return code -22`
+        # acompañado de `Could not open encoder before EOF`, y `vost#0:0` es
+        # el stream de VIDEO. Lo que pasa es que el input no entrega packets
+        # de video, y por eso el retry con aac también falla — en el
+        # incidente del 21-08 falló. El retry se queda (es barato y cubre el
+        # caso de audio de verdad), pero que nadie vuelva a "arreglar" el
+        # -22 por el lado del audio.
+        #
+        # Ojo también: `-map 0:a:0` NO es opcional, así que un bg_short_path
+        # sin stream de audio hace fallar este comando entero.
+        audio_modes = (
+            ["-c:a", "copy"],
+            ["-c:a", "aac", "-b:a", "192k"],
+        )
+        errors: list[str] = []
+        for audio_args in audio_modes:
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", os.path.basename(bg_short_path),
+                "-vf", f"subtitles=short_lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}",
+                "-map", "0:v:0", "-map", "0:a:0",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-pix_fmt", "yuv420p",
+                *audio_args, "-movflags", "+faststart", "-shortest",
+                "-r", str(fps), os.path.basename(out_tmp),
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=600, cwd=job_dir)
+            if r.returncode == 0 and os.path.exists(out_tmp):
+                logger.info("[SHORT] texto quemado con libass (font=%s anim=%s audio=%s)",
+                            os.path.basename(font_path), lyrics_animation,
+                            "copy" if audio_args[1] == "copy" else "aac-reencode")
+                return out_tmp
+            # stderr COMPLETO, no [-300:]. El recorte cortaba justo la línea
+            # que nombra la causa ("Could not open encoder before EOF") y nos
+            # dejó dos meses arreglando la capa equivocada.
+            errors.append(
+                f"[{'copy' if audio_args[1] == 'copy' else 'aac'}] rc={r.returncode} "
+                f"{(r.stderr or '').strip()}"
+            )
+            try:
+                os.unlink(out_tmp)
+            except OSError:
+                pass
+        logger.warning("[SHORT] libass text burn failed — fallback moviepy. %s",
+                       " || ".join(errors))
+        _log_short_bg_forensics(bg_short_path, job_dir)
+        return None
     except Exception as e:
         logger.warning("[SHORT] libass text pass errored (%s) — fallback moviepy", e)
         return None
@@ -15731,10 +18009,16 @@ def generate_short(
         bg_full = _ken_burns_clip(bg_source, short_dur, static=True)
         bg = _cover_resize(bg_full, 1080, 1920)
     elif bg_source and os.path.exists(bg_source):
+        raw = None
         try:
+            # Antes acá había un `raw.get_frame(0)` como prueba de vida. No
+            # servía: moviepy warnea y SUSTITUYE por el último frame válido
+            # en vez de levantar (salvo justo en __init__), así que un fondo
+            # a medio decodificar pasaba el chequeo y contaminaba el encode.
+            # Decodificar de verdad con ffmpeg es la única prueba honesta.
+            if not _decodes_ok(bg_source):
+                raise RuntimeError("el fondo no decodifica (header sano, sin packets usables)")
             raw = VideoFileClip(bg_source)
-            raw.get_frame(0)
-            raw = _cover_resize(raw, 1080, 1920)
             if raw.duration >= short_dur:
                 # El short usa la MISMA ventana temporal que su audio/letra
                 # (el coro, start_time..end_time), no los primeros 30s. En un
@@ -15742,16 +18026,56 @@ def generate_short(
                 # multi-escena hace que el short muestre las escenas del CORO
                 # que matchean la letra —incl. una escena corregida ahí— en vez
                 # de las de la intro. Clamp para no pasar el final del clip.
-                _bg_start = max(0.0, min(start_time, raw.duration - short_dur))
-                bg = raw.subclip(_bg_start, _bg_start + short_dur)
+                _resized = _cover_resize(raw, 1080, 1920)
+                _bg_start = max(0.0, min(start_time, _resized.duration - short_dur))
+                bg = _resized.subclip(_bg_start, _bg_start + short_dur)
+                raw = None  # `bg` deriva de él: lo cierra la cadena de moviepy
             else:
-                loops = math.ceil(short_dur / raw.duration) + 1
-                clips = []
-                for i in range(loops):
-                    c = _cover_resize(VideoFileClip(bg_source), 1080, 1920)
-                    clips.append(c)
-                bg = concatenate_videoclips(clips).subclip(0, short_dur)
-        except Exception:
+                # El fondo es más corto que el short (típico: clip Veo de 4-8s)
+                # → hay que loopearlo. Antes esto abría `ceil(30/dur)+1`
+                # VideoFileClip sobre el MISMO archivo y los concatenaba con
+                # moviepy. Con VEO_CLIP_SECONDS=4 son 9 clips, y como los
+                # clips de Veo traen audio moviepy abre reader de video Y de
+                # audio por clip: ~20 procesos ffmpeg por job, NINGUNO cerrado
+                # (concatenate_videoclips no cascadea close(), y el
+                # final.close() de más abajo no los alcanza).
+                #
+                # Es el último sobreviviente de un patrón que el master ya
+                # erradicó: ver _get_background_clip_from_path, cuyo comentario
+                # dice textualmente "the no-job_dir fallback used to
+                # concatenate N opened VideoFileClips and leak each one".
+                # Loopeamos con ffmpeg y abrimos UN solo lector.
+                raw.close()
+                raw = None
+                looped = _prerender_short_bg_loop(bg_source, short_dur, job_dir)
+                # Sin _cover_resize: el prerender ya deja exactamente
+                # 1080x1920, y _cover_resize NO es no-op cuando las dims
+                # coinciden (hace resize+crop por frame igual).
+                bg = VideoFileClip(looped)
+        except Exception as _bg_err:
+            _raise_if_job_timeout(_bg_err)
+            if raw is not None:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+            # Degradar a degradé es la decisión correcta (mejor un short feo
+            # que ningún short), pero hasta hoy era SILENCIOSA: en el
+            # incidente UMG Chile 2026-08-21 el fondo Veo era ilegible para
+            # moviepy, el short salió con degradé y el master con el fondo
+            # Veo — divergencia visible para el cliente y nadie se enteró.
+            logger.warning(
+                "[SHORT] fondo %s inutilizable (%s) — el short cae a DEGRADÉ "
+                "mientras el master conserva el fondo real",
+                os.path.basename(bg_source), _bg_err,
+            )
+            _alert_sentry(
+                "short-bg-source-unreadable",
+                f"[SHORT-BG] {os.path.basename(job_dir.rstrip('/'))}: el fondo del "
+                f"short no se pudo usar ({_bg_err}) — salió con degradé y no "
+                "coincide con el master",
+                job_dir=job_dir,
+            )
             bg = _cover_resize(_make_gradient_clip(short_dur, style), 1080, 1920)
     else:
         bg = _cover_resize(_make_gradient_clip(short_dur, style), 1080, 1920)
@@ -15808,6 +18132,21 @@ def generate_short(
     audio.close()
     final.close()
 
+    # Validar el intermedio ANTES de que lo consuma nadie. moviepy no
+    # chequea el returncode del ffmpeg escritor (FFMPEG_VideoWriter.close()
+    # hace proc.wait() y descarta el resultado), así que write_videofile
+    # puede retornar de lo más normal habiendo dejado un archivo con moov
+    # sano y cero packets — que es exactamente lo que rompió el job de UMG
+    # Chile el 21-08. Sin esta línea el archivo roto viaja hasta el
+    # VideoFileClip del fallback moviepy, 40 renglones más abajo, donde
+    # revienta con un OSError que hasta hoy mataba el job entero.
+    if not _decodes_ok(bg_only_path):
+        _log_short_bg_forensics(bg_only_path, job_dir)
+        raise RuntimeError(
+            f"short_bg_only.mp4 quedó ilegible tras write_videofile "
+            f"(moviepy no reporta fallos del encoder): {bg_only_path}"
+        )
+
     # Effects belong to the background, BEFORE the subtitle burn. Applying a
     # photo transform after libass would displace/mirror the lyric glyphs too
     # (most visible with kaleido/liquid_glass/cutout_echo) and diverge from the
@@ -15821,6 +18160,15 @@ def generate_short(
             bg_only_path, fx, fps, job_dir, rhythm=_short_rhythm,
             style=style, custom_colors=custom_colors,
         )
+        # _apply_short_effect hace os.replace sobre el intermedio chequeando
+        # sólo el returncode, así que puede dejar un archivo inservible
+        # exactamente igual que el write de moviepy. Revalidar: el burn
+        # libass y el fallback dependen de que esto se pueda decodificar.
+        if not _decodes_ok(bg_only_path):
+            _log_short_bg_forensics(bg_only_path, job_dir)
+            raise RuntimeError(
+                f"el efecto '{effect}' dejó el fondo del short ilegible: {bg_only_path}"
+            )
 
     burned = _burn_short_text_ass(
         bg_only_path, window_segments, job_dir, short_dur, fps,
@@ -15838,19 +18186,13 @@ def generate_short(
         # se ALERTA en Sentry: este es el único camino que puede volver a
         # producir la divergencia tipográfica del incidente UMG Chile —
         # si dispara, hay que enterarse antes que el cliente.
-        try:
-            import sentry_sdk
-            with sentry_sdk.push_scope() as _scope:
-                _job_tag = os.path.basename(job_dir.rstrip("/"))
-                _scope.fingerprint = ["short-libass-fallback"]
-                _scope.set_tag("job_id", _job_tag)
-                sentry_sdk.capture_message(
-                    f"[SHORT-FALLBACK] {_job_tag}: la pasada libass falló — el short "
-                    "salió con el motor moviepy (tipografía puede diferir del video)",
-                    level="error",
-                )
-        except Exception:
-            pass  # sin Sentry (dev/tests) el log de arriba alcanza
+        _job_tag = os.path.basename(job_dir.rstrip("/"))
+        _alert_sentry(
+            "short-libass-fallback",
+            f"[SHORT-FALLBACK] {_job_tag}: la pasada libass falló — el short "
+            "salió con el motor moviepy (tipografía puede diferir del video)",
+            job_dir=job_dir,
+        )
         _do_fade = (line_transition or "none") not in ("none", "cut", "")
         text_layers = []
         for seg in window_segments:
@@ -16197,8 +18539,30 @@ def run_edit_pipeline(
         # produce". Archived .vN keys use this number so v1 is the file
         # that existed at the moment of the 1st edit, v2 at the 2nd, etc.
         prior_s3_keys = dict(job_row.s3_keys) if job_row.s3_keys else None
+        # Verdict this job's background already earned, BEFORE this edit
+        # overwrites validation_result. A reuse edit re-checks bytes that are
+        # byte-identical to the ones certified here, so this snapshot is the
+        # evidence that lets an inconclusive re-check keep the asset instead of
+        # destroying it (see the revalidation branch below).
+        _prior_validation_result = (
+            dict(job_row.validation_result) if job_row.validation_result else {}
+        )
         version_n = int(job_row.edit_count or 0)
         prior_versions = list(job_row.previous_versions or [])
+        # A job carries ProRes deliverables whenever it has a umg_spec (the
+        # config ensure_prores_exists needs) or already materialised a .mov
+        # key — INDEPENDENT of delivery_profile. Those derivatives are lazy-
+        # transcoded from lyric_video.mp4, so any edit leaves them stale. The
+        # portal serves the ProRes straight from its deterministic R2 key with
+        # NO lazy re-transcode, so unless we refresh here it keeps serving the
+        # pre-edit cut. Gating the invalidation below on wants_umg was the bug:
+        # a delivery_profile="youtube" job with umg_spec kept a stale ProRes
+        # master across three lyric edits while the MP4 updated, so UMG QC'd the
+        # old cut on the portal (Rata Blanca / Los Pericos, 2026-08-03).
+        has_prores_deliverable = bool(umg_spec) or bool(
+            prior_s3_keys
+            and (prior_s3_keys.get("umg_master") or prior_s3_keys.get("umg_short"))
+        )
         # Multi-escena: para edit_type=="scene" reconstruimos el timeline desde
         # el storyboard persistido (regenerando sólo la escena pedida).
         scene_plan = dict(job_row.scene_plan) if job_row.scene_plan else None
@@ -16224,6 +18588,36 @@ def run_edit_pipeline(
             )
     finally:
         db.close()
+
+    # Edits and scene regenerations render through a separate worker entry
+    # point. Check the exact segment snapshot here, before source download,
+    # Veo and the compositor, so /edit cannot bypass the central policy.
+    try:
+        quality_ok, quality_reason = _transcription_quality_render_allowed(
+            job_id, segments,
+        )
+        if not quality_ok:
+            logger.error(
+                "[QUALITY-GATE] edit render blocked reason=%s job=%s type=%s",
+                quality_reason, job_id, edit_type,
+            )
+            update_job(
+                job_id, status="pending_review", current_step="quality_review",
+                error=(
+                    "La letra requiere revisión de calidad antes de renderizar "
+                    f"({quality_reason})."
+                ),
+            )
+            return
+    except Exception:
+        logger.exception("[QUALITY-GATE] edit render check failed job=%s", job_id)
+        from transcription_quality import policy_mode
+        if policy_mode() == "enforce":
+            update_job(
+                job_id, status="pending_review", current_step="quality_review",
+                error="No se pudo verificar la calidad de la letra antes del render.",
+            )
+            return
 
     # Merge base render params with the requested overrides.
     merged = {**base_params, **edit_params}
@@ -16390,6 +18784,16 @@ def run_edit_pipeline(
         # image-to-video → provenance AI-derived (aplica validación). Sin
         # animar es human-provided. Se resuelve dentro de la rama custom.
         _animate_custom = False
+        # True when a FAILED generation degraded back to the asset this job had
+        # already certified. The edit type still says "background"/"scene", but
+        # the bytes in hand are the old certified ones: they must not be
+        # recached, must not be re-labelled as freshly generated, and must not
+        # be thrown away by an inconclusive re-check.
+        _kept_previous_background = False
+        _edit_ai_generated_override: bool | None = None
+        # Defensive: every branch below assigns it, but keeping the name bound
+        # means a future branch that returns early cannot NameError here.
+        bg_image_path = None
         if edit_type in ("typography", "lyrics", "metadata"):
             # All three reuse the cached background — only the foreground
             # layer changes. Lyrics edit ALSO swaps the segments, and
@@ -16404,12 +18808,19 @@ def run_edit_pipeline(
             # los cambios de la canción. Si la estructura cambió o falla, caemos
             # al timeline cacheado estático.
             if edit_type == "lyrics" and _is_scene_job:
-                _sc_audio = scene_plan.get("audio_duration")
+                # Audit 2026-08-13 (F2): re-measure instead of trusting the
+                # value persisted at original-render time. _audio_duration is
+                # now a cross-checked real measurement (~80ms), not a bare
+                # header read — so "re-derive" is both correct AND still
+                # cheap. A stale/wrong scene_plan["audio_duration"] (e.g.
+                # persisted before the corrupted-header fix, or simply from
+                # a job whose source file changed) used to flow straight
+                # into stitch_timeline unexamined. Only fall back to the
+                # persisted value if a fresh measurement is unavailable
+                # (e.g. mp3_path missing).
+                _sc_audio = _audio_duration(mp3_path) or _ffprobe_duration(mp3_path)
                 if not _sc_audio:
-                    try:
-                        _sc_audio = _audio_duration(mp3_path)
-                    except Exception:
-                        _sc_audio = _ffprobe_duration(mp3_path)
+                    _sc_audio = scene_plan.get("audio_duration")
                 try:
                     _re_tl, scene_plan = _restitch_scenes_for_edit(
                         scene_plan, segments, _sc_audio, job_dir, artist=artist,
@@ -16470,7 +18881,18 @@ def run_edit_pipeline(
                     # timeline: lo loopeamos (feo pero nunca negro) y avisamos.
                     try:
                         _bg_dur = _ffprobe_duration(bg_image_path)
-                        _aud_dur = scene_plan.get("audio_duration") or _audio_duration(mp3_path)
+                        # Audit 2026-08-13 (F2): this guard exists specifically
+                        # to catch "cached bg is shorter than the real audio"
+                        # — it was comparing _bg_dur (a real ffprobe
+                        # measurement) against scene_plan["audio_duration"]
+                        # (metadata persisted when THAT bg was generated).
+                        # If the persisted value was itself wrong, the guard
+                        # validated the background against the same bad
+                        # number that produced it — blind by construction in
+                        # exactly the case it exists to catch. Measure fresh
+                        # first; only fall back to the persisted value if a
+                        # fresh read is unavailable.
+                        _aud_dur = _audio_duration(mp3_path) or scene_plan.get("audio_duration")
                         if _bg_dur and _aud_dur and (_aud_dur - _bg_dur) > 3.5:
                             logger.warning(
                                 "[SCENES] cached bg de job multi-escena NO es un "
@@ -16516,19 +18938,40 @@ def run_edit_pipeline(
                 # Imagen can raise before returning an asset (Veo normally
                 # degrades internally).  A provider failure must not strand a
                 # Universal/common AI edit in ``error`` or ``validation_failed``.
-                logger.error(
-                    "[EDIT] background generation failed job=%s; using safe "
-                    "local fallback: %s",
-                    job_id, _background_generation_error,
+                # First choice is the background this job already had: a failed
+                # regeneration should leave the operator exactly where they
+                # were, not swap their art for a gradient AND recache it.
+                _previous_bg = _download_previously_certified_background(
+                    job_id, job_dir, bg_r2_key_cached, _prior_validation_result,
                 )
-                bg_image_path = _write_safe_gradient_background(
-                    job_dir, style, filename="bg_edit_policy_fallback.mp4",
-                )
-                _force_policy_fallback = True
-                _policy_fallback_reason = "background_generation_error"
+                if _previous_bg:
+                    logger.error(
+                        "[EDIT] background generation failed job=%s; keeping "
+                        "the previously certified background (retry the regen "
+                        "later): %s",
+                        job_id, _background_generation_error,
+                    )
+                    bg_image_path = _previous_bg
+                    _kept_previous_background = True
+                    _edit_ai_generated_override = bool(
+                        _stored_background_ai_generated
+                    )
+                else:
+                    logger.error(
+                        "[EDIT] background generation failed job=%s; using safe "
+                        "local fallback: %s",
+                        job_id, _background_generation_error,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style, filename="bg_edit_policy_fallback.mp4",
+                    )
+                    _force_policy_fallback = True
+                    _policy_fallback_reason = "background_generation_error"
             update_job(job_id, progress=35)
-            # Do not replace the last known-good cache until validation passes.
-            _pending_background_recache = True
+            # Do not replace the last known-good cache until validation passes —
+            # and never recache when we are re-rendering the bytes that ARE the
+            # cache.
+            _pending_background_recache = not _kept_previous_background
 
         elif edit_type == "scene":
             # Regenerar UNA escena del storyboard y re-armar el timeline. Sólo
@@ -16540,12 +18983,12 @@ def run_edit_pipeline(
                 raise RuntimeError("edit_type='scene' requiere scene_key.")
             update_job(job_id, status="editing", current_step="scenes", progress=22)
             lyrics_text = " ".join(seg.get("text", "") for seg in segments)
-            _scene_audio_dur = scene_plan.get("audio_duration")
+            # Audit 2026-08-13 (F2): re-measure instead of trusting the
+            # persisted value — see the identical fix on the lyrics-edit
+            # path above for the full rationale.
+            _scene_audio_dur = _audio_duration(mp3_path) or _ffprobe_duration(mp3_path)
             if not _scene_audio_dur:
-                try:
-                    _scene_audio_dur = _audio_duration(mp3_path)
-                except Exception:
-                    _scene_audio_dur = _ffprobe_duration(mp3_path)
+                _scene_audio_dur = scene_plan.get("audio_duration")
             try:
                 bg_image_path, scene_plan = _regenerate_scene_background(
                     scene_plan, scene_key, job_dir,
@@ -16573,26 +19016,51 @@ def run_edit_pipeline(
                 _pending_scene_recache = True
             except Exception as _scene_generation_error:
                 _raise_if_job_timeout(_scene_generation_error)
-                logger.error(
-                    "[EDIT] scene regeneration failed job=%s scene=%s; using "
-                    "safe local fallback: %s",
-                    job_id, scene_key, _scene_generation_error,
-                )
-                bg_image_path = _write_safe_gradient_background(
-                    job_dir, style, filename="bg_edit_policy_fallback.mp4",
-                )
-                bg_prelooped = False
-                _scene_timeline_from_current_clips = False
-                _pending_scene_recache = False
-                _pending_background_recache = True
-                _force_policy_fallback = True
-                _policy_fallback_reason = "scene_generation_error"
-                # The cached background is now a single deterministic asset,
-                # not the storyboard represented by the old plan.  Persisting
-                # that plan would make the next edit trust false provenance.
-                scene_plan = None
-                _pending_scene_plan_clear = True
-                update_job(job_id, progress=35)
+                if _scene_plan_before_edit is not None:
+                    # "Otra toma" failed at the provider. The pre-edit
+                    # storyboard is intact and already certified, so restore it
+                    # and let the dense revalidation below rebuild that exact
+                    # timeline from the cached clips: the edit becomes a no-op
+                    # the operator can retry. Wiping the storyboard because ONE
+                    # re-roll failed was destroying N-1 good scenes plus every
+                    # scene prompt in the plan.
+                    logger.error(
+                        "[EDIT] scene regeneration failed job=%s scene=%s; "
+                        "restoring the pre-edit storyboard (retry the re-roll "
+                        "later): %s",
+                        job_id, scene_key, _scene_generation_error,
+                    )
+                    scene_plan = _copy.deepcopy(_scene_plan_before_edit)
+                    bg_prelooped = False
+                    _scene_timeline_from_current_clips = False
+                    _pending_scene_recache = False
+                    _pending_background_recache = False
+                    _kept_previous_background = True
+                    update_job(job_id, scene_plan=scene_plan, progress=35)
+                else:
+                    logger.error(
+                        "[EDIT] scene regeneration failed job=%s scene=%s; using "
+                        "safe local fallback: %s",
+                        job_id, scene_key, _scene_generation_error,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style, filename="bg_edit_policy_fallback.mp4",
+                    )
+                    bg_prelooped = False
+                    _scene_timeline_from_current_clips = False
+                    _pending_scene_recache = False
+                    _pending_background_recache = True
+                    _force_policy_fallback = True
+                    _policy_fallback_reason = "scene_generation_error"
+                    # The cached background is now a single deterministic asset,
+                    # not the storyboard represented by the old plan.  Persisting
+                    # that plan would make the next edit trust false provenance.
+                    scene_plan = _archive_and_clear_scene_plan(
+                        merged, scene_plan, job_id,
+                        reason="scene_generation_error",
+                    )
+                    _pending_scene_plan_clear = True
+                    update_job(job_id, progress=35)
 
         elif edit_type == "background_library":
             # Swap a un asset CURADO de biblioteca — la salida del loop no
@@ -16749,6 +19217,10 @@ def run_edit_pipeline(
             (True if _animate_custom else False) if edit_type == "custom" else
             bool(_stored_background_ai_generated)
         )
+        if _edit_ai_generated_override is not None:
+            # A failed regeneration degraded to the OLD asset: its provenance
+            # is whatever that asset was, not "freshly AI-generated".
+            _edit_ai_generated = _edit_ai_generated_override
         _edit_safety_policy = _background_safety_policy(
             job_id, _edit_operator_prompt
         )
@@ -16781,12 +19253,12 @@ def run_edit_pipeline(
             or not _scene_timeline_from_current_clips
         ):
             try:
-                _dense_audio_duration = scene_plan.get("audio_duration")
+                # Audit 2026-08-13 (F2): re-measure instead of trusting the
+                # persisted value — see the identical fix on the lyrics-edit
+                # path above for the full rationale.
+                _dense_audio_duration = _audio_duration(mp3_path) or _ffprobe_duration(mp3_path)
                 if not _dense_audio_duration:
-                    try:
-                        _dense_audio_duration = _audio_duration(mp3_path)
-                    except Exception:
-                        _dense_audio_duration = _ffprobe_duration(mp3_path)
+                    _dense_audio_duration = scene_plan.get("audio_duration")
                 bg_image_path = _densely_revalidate_scene_plan_for_edit(
                     scene_plan,
                     job_dir,
@@ -16810,7 +19282,53 @@ def run_edit_pipeline(
                     "[SCENES] dense edit revalidation failed job=%s: %s",
                     job_id, _dense_error,
                 )
-                if _edit_safety_policy["is_umg"] or _edit_ai_generated:
+                _dense_decisive = _scene_plan_failure_is_decisive(scene_plan)
+                _cached_timeline = (
+                    None if _dense_decisive
+                    else _download_previously_certified_background(
+                        job_id, job_dir, bg_r2_key_cached,
+                        _prior_validation_result,
+                        filename_stem="bg_cached_timeline",
+                    )
+                )
+                if _cached_timeline:
+                    # Nothing forbidden was SEEN — a clip was unreachable, the
+                    # breaker was open, or the re-scan never got a verdict. The
+                    # cached timeline is the storyboard this job already
+                    # certified, so render it and keep the plan. Wiping both
+                    # over an infrastructure error is what turned a quota blip
+                    # into "se me fue el fondo" (incidente 2026-08-20).
+                    logger.error(
+                        "[SCENES] revalidación no concluyente job=%s — rendeo "
+                        "el timeline cacheado y CONSERVO el storyboard",
+                        job_id,
+                    )
+                    bg_image_path = _cached_timeline
+                    bg_prelooped = True
+                    _scene_timeline_from_current_clips = False
+                    _clips_already_validated = True
+                    _pending_scene_recache = False
+                    _pending_background_recache = False
+                    # Restore the pre-edit plan: this attempt marked scenes
+                    # failed/reused, and persisting that would leave the job
+                    # permanently short of clip evidence — every later edit
+                    # would re-run the dense pass and fall back again. Keep the
+                    # reason on the plan so the failure is still diagnosable.
+                    if _scene_plan_before_edit:
+                        scene_plan = _copy.deepcopy(_scene_plan_before_edit)
+                    scene_plan["last_revalidation_error"] = str(_dense_error)[:300]
+                    update_job(job_id, scene_plan=scene_plan)
+                    update_job(job_id, validation_result={
+                        **_prior_validation_result,
+                        "passed": True,
+                        "policy_reason": _edit_safety_policy["reason"],
+                        "policy_version": _edit_safety_policy["policy_version"],
+                        "policy_mode": _edit_safety_policy["policy_mode"],
+                        "validation_scope": "reused_asset_prior_certification",
+                        "revalidation_inconclusive": True,
+                        "revalidation_error": str(_dense_error)[:300],
+                    })
+                elif _edit_safety_policy["is_umg"] or _edit_ai_generated:
                     # Preserve the storyboard diagnostics, but render this
                     # revision over a deterministic clean background. A bad or
                     # unverifiable scene clip must never reject the whole
@@ -16825,7 +19343,10 @@ def run_edit_pipeline(
                     merged["background_ai_generated"] = False
                     _pending_scene_recache = False
                     _pending_background_recache = True
-                    scene_plan = None
+                    scene_plan = _archive_and_clear_scene_plan(
+                        merged, scene_plan, job_id,
+                        reason="scene_validation_error",
+                    )
                     _pending_scene_plan_clear = True
                     update_job(job_id, validation_result={
                         "passed": True,
@@ -16835,6 +19356,7 @@ def run_edit_pipeline(
                         "policy_mode": _edit_safety_policy["policy_mode"],
                         "validation_scope": "deterministic_local_fallback",
                         "recovered_from_scene_validation_error": True,
+                        "decisive_policy_finding": bool(_dense_decisive),
                     })
                 else:
                     if edit_type == "scene" and _scene_plan_before_edit is not None:
@@ -16850,13 +19372,51 @@ def run_edit_pipeline(
                     )
                     return
         if not _clips_already_validated:
+            _edit_verdict: dict = {}
             _edit_validation_ok = _validate_background_asset_for_job(
                 job_id,
                 bg_image_path,
                 _edit_operator_prompt,
                 ai_generated=_edit_ai_generated,
                 failure_status=None,
+                verdict_out=_edit_verdict,
             )
+            if not _edit_validation_ok and _should_keep_certified_background(
+                edit_type,
+                verdict=_edit_verdict,
+                prior_validation_result=_prior_validation_result,
+                asset_path=bg_image_path,
+                forced_fallback=_force_policy_fallback,
+                reusing_certified_asset=_kept_previous_background,
+            ):
+                # The operator only touched the FOREGROUND (letra, tipografía,
+                # metadata): these bytes are the ones this job already
+                # certified, and the re-check produced no verdict at all — only
+                # quota/timeout errors. Replacing them with the safe gradient
+                # adds zero safety and permanently destroys the background the
+                # customer paid for: the fallback also recaches itself over
+                # bg_r2_key_cached (incident 2026-08-20, UMG Chile "La Funa" —
+                # one 429 on frame 6 of 8 wiped a Veo background that had
+                # passed 8/8 twice). Keep the certified asset, keep the cache,
+                # and record WHY so the audit trail shows an inconclusive
+                # re-check rather than a fresh pass.
+                logger.error(
+                    "[VALIDATION] inconclusive re-check of a REUSED background "
+                    "job=%s edit_type=%s — keeping the previously certified "
+                    "asset (issues=%s)",
+                    job_id, edit_type, _edit_verdict.get("issues"),
+                )
+                update_job(job_id, validation_result={
+                    **_prior_validation_result,
+                    "passed": True,
+                    "validation_scope": "reused_asset_prior_certification",
+                    "revalidation_inconclusive": True,
+                    "revalidation_issues": _edit_verdict.get("issues", []),
+                    "policy_reason": _edit_safety_policy["reason"],
+                    "policy_version": _edit_safety_policy["policy_version"],
+                    "policy_mode": _edit_safety_policy["policy_mode"],
+                })
+                _edit_validation_ok = True
             if not _edit_validation_ok:
                 _recover_edit_background = bool(
                     _edit_safety_policy["is_umg"] or _edit_ai_generated
@@ -16907,7 +19467,10 @@ def run_edit_pipeline(
                     _pending_scene_recache = False
                     _pending_background_recache = True
                     if scene_plan is not None:
-                        scene_plan = None
+                        scene_plan = _archive_and_clear_scene_plan(
+                            merged, scene_plan, job_id,
+                            reason="unsafe_generation_recovery",
+                        )
                         _pending_scene_plan_clear = True
                     _edit_validation_ok = True
                     update_job(job_id, validation_result={
@@ -16976,7 +19539,7 @@ def run_edit_pipeline(
             bg_prelooped=bg_prelooped,
             # Espejo de run_pipeline: un edit no puede perder el "quieta".
             still_background=(
-                _normalize_movement_style(movement_style) == "estatico"
+                _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
             ),
         )
         # Cinemascope opt-in — mirror run_pipeline. YouTube master only.
@@ -16987,6 +19550,9 @@ def run_edit_pipeline(
             except Exception as e:
                 logger.warning("[FMT] frame_format skip (non-fatal): %s", e)
         files = {"video_url": f"/download/{job_id}/video"}
+        # Ver el homónimo de run_pipeline: local, la señal persistida es que
+        # short_url/thumbnail_url queden NULL.
+        missing_deliverables: list[str] = []
         update_job(job_id, progress=55)
 
         if wants_umg:
@@ -16999,28 +19565,61 @@ def run_edit_pipeline(
         if wants_youtube or wants_umg:
             update_job(job_id, current_step="short", progress=75)
             short_fps = float(umg_spec["fps"]) if wants_umg and umg_spec else 24
-            generate_short(
-                mp3_path, segments, job_dir, bg_source=bg_source,
-                style=style, font=chosen_font, fps=short_fps,
-                text_case=text_case, font_scale=font_scale,
-                lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
-                text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
-                lyrics_animation=lyrics_animation, line_transition=line_transition,
-            )
-            files["short_url"] = f"/download/{job_id}/short"
+            # Espejo de run_pipeline: el short y el thumbnail no pueden matar
+            # un edit cuyo master ya se re-renderizó. Acá pesa MÁS que en el
+            # primer render: /edit ya puso video_url/short_url/thumbnail_url y
+            # s3_keys en NULL antes de arrancar (main.py), así que un fallo
+            # dejaba el job en 'error' con los entregables ANTERIORES ya
+            # borrados de la fila — el edit perdía más que run_pipeline.
+            try:
+                generate_short(
+                    mp3_path, segments, job_dir, bg_source=bg_source,
+                    style=style, font=chosen_font, fps=short_fps,
+                    text_case=text_case, font_scale=font_scale,
+                    lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                    text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
+                    lyrics_animation=lyrics_animation, line_transition=line_transition,
+                )
+                files["short_url"] = f"/download/{job_id}/short"
+            except Exception as _short_err:
+                _accessory_failed("short", job_id, job_dir, _short_err)
+                missing_deliverables.append("short")
             update_job(job_id, progress=85)
 
             update_job(job_id, current_step="thumbnail", progress=90)
-            generate_thumbnail(artist, mp3_path, job_dir, bg_source=bg_source, song_title=song_title)
-            files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
+            try:
+                generate_thumbnail(artist, mp3_path, job_dir, bg_source=bg_source, song_title=song_title)
+                files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
+            except Exception as _thumb_err:
+                _accessory_failed("thumbnail", job_id, job_dir, _thumb_err)
+                missing_deliverables.append("thumbnail")
 
         # ----------------------------------------------------------------
         # Verify + upload to R2 (replacing previous deliverables)
         # ----------------------------------------------------------------
-        try:
-            audio_dur = _audio_duration(mp3_path)
-        except Exception:
+        # _audio_duration returns None on failure, it never raises — the
+        # `except` below was dead code and this fell through to
+        # _verify_deliverables(..., None), which short-circuits the whole
+        # duration check (`if expected_dur is not None:`). That silently
+        # disabled the safety net on every edit re-render whose duration
+        # read failed, which is exactly the failure mode most likely on
+        # this path (audit 2026-08-12, same incident as the run_pipeline
+        # fix). Mirror run_pipeline's explicit None-check instead.
+        audio_dur = _audio_duration(mp3_path)
+        if audio_dur is None:
             audio_dur = _ffprobe_duration(mp3_path)
+
+        # Guardrail "nunca degradar" (default OFF): un edit cuyo fondo cayó a un
+        # gradiente determinístico no se entrega — se reintenta (ver el except
+        # dedicado más abajo). _policy_fallback_reason cubre los fallbacks que
+        # setean flag; el chequeo por nombre cubre el resto.
+        _guard_against_degraded_delivery(
+            job_id,
+            bg_image_path=bg_image_path,
+            is_deterministic_fallback=bool(_policy_fallback_reason),
+            animation_degraded=False,
+        )
+
         _verify_deliverables(job_dir, files, audio_dur)
 
         # Stage the new background cache only after the complete edit rendered
@@ -17084,7 +19683,12 @@ def run_edit_pipeline(
         # already archived the prior .mov keys as {key}.vN, so the rollback
         # path is preserved. Then re-enqueue prewarm (mirrors run_pipeline)
         # so UMG gets an instant 302 instead of a cold 60-120 s transcode.
-        if wants_umg:
+        #
+        # Gate on has_prores_deliverable, NOT wants_umg: the portal serves the
+        # ProRes from its deterministic R2 key with no lazy re-transcode, so a
+        # umg_spec job on delivery_profile="youtube" would otherwise keep the
+        # stale cut forever (2026-08-03 incident).
+        if wants_umg or has_prores_deliverable:
             for _ft in ("umg_master", "umg_short"):
                 _stale = os.path.join(job_dir, _DELIVERABLE_FILENAMES[_ft])
                 if os.path.exists(_stale):
@@ -17108,8 +19712,19 @@ def run_edit_pipeline(
                 # publishing). Then re-enqueue fresh.
                 for _ft in ("umg_master", "umg_short"):
                     cancel_rq_job(f"prewarm:{job_id}:{_ft}")
-                enqueue_prores_prewarm(job_id, "umg_master")
-                enqueue_prores_prewarm(job_id, "umg_short")
+                # force=True: the portal has NO lazy re-transcode fallback (it
+                # signs the deterministic R2 key directly), so this rewarm is
+                # the only thing that refreshes the delivered ProRes after an
+                # edit. Without force, queue-depth backpressure silently skips
+                # it during a UMG batch and the portal serves the stale cut
+                # (observed 2026-08-03). One transcode per edit is affordable.
+                enqueue_prores_prewarm(job_id, "umg_master", force=True)
+                # Si el short se perdió en este edit, NO re-encolar: el
+                # remove_s3_keys de arriba ya invalidó el umg_short viejo, y
+                # prewarmear sobre un short.mp4 ausente o truncado publicaría
+                # un .mov corrupto (prores.py no valida el source).
+                if "short" not in missing_deliverables:
+                    enqueue_prores_prewarm(job_id, "umg_short", force=True)
             except Exception as _e:
                 logger.warning("[EDIT] prores prewarm re-enqueue skipped: %s", _e)
 
@@ -17160,18 +19775,39 @@ def run_edit_pipeline(
             },
         )
 
+    except BackgroundDegraded as _bg_deg:
+        # Guardrail "nunca degradar": no entregamos el edit con fondo degradado.
+        # Re-lanzamos para que el Retry de RQ (enqueue_edit usa el mismo
+        # PIPELINE_RETRY_MAX × PIPELINE_RETRY_INTERVAL_S) reintente la
+        # generación; al agotar, edit_failure_callback deja el job en error
+        # (escalamiento). El job queda en pending_review sólo con el fondo real.
+        logger.error(
+            "[NO-DEGRADE][EDIT] job=%s %s — reintentando en vez de entregar el "
+            "edit degradado", job_id, _bg_deg,
+        )
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as _scope:
+                _scope.set_tag("event", "edit.background_degraded")
+                _scope.set_tag("job_id", job_id)
+                sentry_sdk.capture_message(str(_bg_deg), level="warning")
+        except Exception:
+            pass
+        raise
+
     except Exception as exc:
         _raise_if_job_timeout(exc)
         logger.error("[EDIT] job=%s FAILED: %s", job_id, exc, exc_info=True)
-        from error_taxonomy import classify_error
+        from error_taxonomy import classify_error, public_error
         error_category = (
             "storage_upload" if isinstance(exc, StorageUploadError)
             else classify_error(str(exc))
         )
-        update_job(
-            job_id, status="error", error=f"Edit failed: {exc}",
-            error_category=error_category,
+        error_code, error_message = public_error(
+            exc, context="edit", category=error_category,
         )
+        update_job(job_id, status="error", error=error_message,
+                   error_category=error_category, error_code=error_code)
         _write_edit_audit(
             action="job.edit_failed",
             detail={
@@ -17193,7 +19829,7 @@ def run_edit_pipeline(
                 locals().get("job_dir"),
             )
         elif locals().get("input_r2_key"):
-            _cleanup_job_dir_on_failure(locals().get("job_dir"))
+            _cleanup_job_dir_on_failure(locals().get("job_dir"), job_id)
         else:
             try:
                 _cleanup_local_intermediates(locals().get("job_dir") or "")

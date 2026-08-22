@@ -21,8 +21,14 @@ Tests pinean el contrato API + el comportamiento del edit-slot:
   - el AuditLog lleva `metadata_only=True`
 """
 import uuid
+from datetime import datetime, timezone
 
-from database import Job as JobModel, User as UserModel, AuditLog
+from database import (
+    AuditLog,
+    Job as JobModel,
+    JobOutboxEvent,
+    User as UserModel,
+)
 
 
 def _create_pending_review_job(db, tenant_id, user_id, **overrides):
@@ -96,6 +102,150 @@ def test_metadata_updates_db_and_enqueues(client, admin_token, db, monkeypatch):
     assert edit_params.get("artist") == "Sín Gamulán"
     assert edit_params.get("song_title") == "Los Abuelos De La Nada"
     assert captured[0]["edit_type"] == "metadata"
+
+
+def test_edit_rejected_clears_failed_completion_timestamp(
+    client, admin_token, db, monkeypatch,
+):
+    """A rescued rejection must be stamped when it is actually delivered.
+
+    Keeping the rejection timestamp assigns a July rescue to June's delivery
+    denominator because ``update_job`` only stamps terminal transitions when
+    ``completed_at`` is null.
+    """
+    _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    rejected_at = datetime(2026, 6, 30, tzinfo=timezone.utc)
+    job_id = _create_pending_review_job(
+        db, tenant_id, user_id, status="rejected", completed_at=rejected_at)
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "metadata", "song_title": "Título corregido"},
+    )
+    assert res.status_code == 200, res.text
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    assert row.status == "editing"
+    assert row.completed_at is None
+
+    from jobs import update_job
+    update_job(job_id, status="pending_review")
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    assert row.completed_at is not None
+    completed_at = row.completed_at
+    if completed_at.tzinfo is None:  # SQLite drops timezone information.
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    assert completed_at > rejected_at
+
+
+def test_edit_rejected_preserves_retained_delivery_timestamp(
+    client, admin_token, db, monkeypatch,
+):
+    """A rejection after an earlier delivery remains attributed to that month."""
+    _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    delivered_at = datetime(2026, 6, 28, tzinfo=timezone.utc)
+    reopened_at = datetime(2026, 6, 29, tzinfo=timezone.utc)
+    job_id = _create_pending_review_job(
+        db,
+        tenant_id,
+        user_id,
+        status="rejected",
+        completed_at=delivered_at,
+        editing_started_at=reopened_at,
+    )
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "metadata", "song_title": "Título corregido"},
+    )
+    assert res.status_code == 200, res.text
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    completed_at = row.completed_at
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    assert completed_at == delivered_at
+
+
+def test_enqueue_fallido_persiste_intento_sin_rebobinar_revision(
+    client, admin_token, db, monkeypatch,
+):
+    import main
+
+    user_id, tenant_id = _admin_identity(db)
+    rejected_at = datetime(2026, 6, 30, tzinfo=timezone.utc)
+    job_id = _create_pending_review_job(
+        db, tenant_id, user_id, status="rejected", completed_at=rejected_at)
+    monkeypatch.setattr(
+        main, "enqueue_edit",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("redis down")),
+    )
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "metadata", "song_title": "Título corregido"},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["queue_pending"] is True
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    assert row.status == "editing"
+    assert row.completed_at is None
+    assert row.song_title == "Título corregido"
+    outbox = db.query(JobOutboxEvent).filter(
+        JobOutboxEvent.id == res.json()["outbox_event_id"],
+    ).one()
+    assert outbox.status == "pending"
+    assert outbox.attempts == 1
+
+
+def test_enqueue_fallido_conserva_evidencia_de_entrega_reabierta(
+    client, admin_token, db, monkeypatch,
+):
+    import main
+
+    user_id, tenant_id = _admin_identity(db)
+    delivered_at = datetime(2026, 6, 28, tzinfo=timezone.utc)
+    reopened_at = datetime(2026, 6, 29, tzinfo=timezone.utc)
+    job_id = _create_pending_review_job(
+        db,
+        tenant_id,
+        user_id,
+        status="rejected",
+        completed_at=delivered_at,
+        editing_started_at=reopened_at,
+    )
+    monkeypatch.setattr(
+        main, "enqueue_edit",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("redis down")),
+    )
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"edit_type": "metadata", "song_title": "Título corregido"},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["queue_pending"] is True
+    db.expire_all()
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    completed_at = row.completed_at
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    assert completed_at == delivered_at
+    assert row.status == "editing"
+    assert row.editing_started_at is not None
+    assert row.song_title == "Título corregido"
+    outbox = db.query(JobOutboxEvent).filter(
+        JobOutboxEvent.id == res.json()["outbox_event_id"],
+    ).one()
+    assert outbox.status == "pending"
 
 
 def test_metadata_does_not_consume_edit_slot(client, admin_token, db, monkeypatch):
@@ -347,20 +497,14 @@ def test_typography_audit_log_metadata_only_false(client, admin_token, db, monke
     assert log.detail.get("metadata_only") is False
 
 
-def test_metadata_rollback_restores_original_values_on_enqueue_failure(
+def test_metadata_and_outbox_commit_atomically_on_enqueue_failure(
     client, admin_token, db, monkeypatch,
 ):
-    """REGRESSION F1 audit 2026-05-27:
+    """Redis failure leaves one durable intent and never rewinds state.
 
-    Previously the handler captured _pre_edit_artist = job.artist AFTER
-    mutating job.artist = new_artist (lines 7635-7720). The rollback in
-    the enqueue-failure branch then restored the NEW value, not the
-    original. UI showed "Guardado" but no actual save happened — silent
-    data corruption.
-
-    This test reproduces the failure mode: monkey-patch enqueue_edit to
-    raise, POST a metadata edit, and assert the DB still has the original
-    artist/song_title.
+    The transactional outbox deliberately replaces the former rollback:
+    reverting an editor revision after an ambiguous queue timeout creates an
+    ABA race in which an old callback can overwrite newer operator work.
     """
     import main
 
@@ -382,24 +526,20 @@ def test_metadata_rollback_restores_original_values_on_enqueue_failure(
         headers={"Authorization": f"Bearer {admin_token}"},
         json={
             "edit_type": "metadata",
-            "artist": "Should NOT persist",
-            "song_title": "Should NOT persist either",
+            "artist": "Persisted artist",
+            "song_title": "Persisted title",
         },
     )
-    # Endpoint must signal failure to the client (503 with retry hint).
-    assert res.status_code == 503, res.text
+    assert res.status_code == 200, res.text
+    assert res.json()["queue_pending"] is True
 
-    # Crucially: the DB row must hold the ORIGINAL values, not the
-    # rejected ones. Before the fix this assertion would fail.
     db.expire_all()
     job_after = db.query(JobModel).filter(JobModel.job_id == job_id).first()
-    assert job_after.artist == ORIGINAL_ARTIST, (
-        f"Rollback regression: artist should still be {ORIGINAL_ARTIST!r}, "
-        f"got {job_after.artist!r}"
-    )
-    assert job_after.song_title == ORIGINAL_TITLE, (
-        f"Rollback regression: song_title should still be {ORIGINAL_TITLE!r}, "
-        f"got {job_after.song_title!r}"
-    )
-    # And status should be back to pending_review (rollback also fixes it).
-    assert job_after.status == "pending_review"
+    assert job_after.artist == "Persisted artist"
+    assert job_after.song_title == "Persisted title"
+    assert job_after.status == "editing"
+    outbox = db.query(JobOutboxEvent).filter(
+        JobOutboxEvent.id == res.json()["outbox_event_id"],
+    ).one()
+    assert outbox.status == "pending"
+    assert outbox.payload["edit_params"]["artist"] == "Persisted artist"
