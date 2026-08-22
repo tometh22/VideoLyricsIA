@@ -66,6 +66,12 @@ from moviepy.editor import (
 # filenames / metadata — "La Vida Al Revés" → 0xe9). Without this, AudioFileClip
 # / VideoFileClip crash on any accented title. Self-applies on import.
 import moviepy_utf8_patch  # noqa: F401
+# Y que el writer de moviepy deje de tragarse los fallos de su ffmpeg: su
+# close() descarta el returncode, así que un encoder que muere en la
+# finalización (reubicación del +faststart) devuelve "éxito" con un archivo
+# roto en disco. Es lo que dejó el short_bg_only.mp4 con moov sano y cero
+# packets en el incidente UMG Chile 2026-08-21. Self-applies on import.
+import moviepy_writer_patch  # noqa: F401
 from PIL import Image, ImageDraw, ImageFont
 
 from jobs import update_job, get_job_model
@@ -14912,82 +14918,127 @@ def _normalize_bg_to_spec(bg_path: str, job_dir: str,
     return out_path
 
 
+# Tope de duración para palindromear. El filtro `reverse` bufferea el clip
+# ENTERO descomprimido en RAM: medido a resolución nativa 1280x720 son ~430 MB
+# para 4s y escala lineal (~107 MB por segundo de clip). Los clips de Veo son
+# de 4/6/8s, así que 10s cubre el caso real con margen; cualquier cosa más
+# larga cae al loop plano en vez de arriesgar el worker.
+_PALINDROME_MAX_CLIP_S = 10.0
+
+
 def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
                          target_w=1920, target_h=1080,
                          out_name: str = "bg_looped.mp4") -> str:
     """Pre-render a seamlessly looped background using palindrome (A + reverse(A)).
 
-    A straight -stream_loop jumps from the last frame back to the first, which
-    is visible as a "pop" when the scene has camera movement. Concatenating A
-    with its reverse makes the last frame of one pass match the first frame of
-    the next — the loop is mathematically seamless.
+    Un `-stream_loop` pelado salta del último frame al primero, y eso se ve
+    como un "pop" cuando la escena tiene movimiento de cámara. Concatenar A con
+    su reverso hace que el último frame de una pasada coincida con el primero
+    de la siguiente: el loop queda matemáticamente sin costura.
 
-    We scale and crop first, then palindrome, then loop the palindrome to fill
-    the requested duration.
+    DOS ETAPAS, y el orden es el punto (bug 2026-08-21):
+
+    La versión anterior armaba el palíndromo sobre `-stream_loop -1` con el
+    `-t` DESPUÉS del `-i` — o sea como opción de OUTPUT. Un input con
+    `-stream_loop -1` nunca da EOF, y el filtro `reverse` necesita EOF para
+    emitir aunque sea un frame: bufferaba sin límite mientras `concat` dejaba
+    pasar el segmento `[a]`, que ya era el loop infinito. Resultado: el
+    "palíndromo" NUNCA se produjo para ningún caller —se entregaba un loop
+    plano, con el pop que este helper existe para evitar— y encima pagando
+    2,24 GB de RSS a 1080x1920 contra 662 MB del loop plano. Verificado con
+    framemd5: la rama del palíndromo y su propio fallback daban frames
+    idénticos bit a bit.
+
+    La forma correcta es palindromear el clip UNIDAD con un input acotado (así
+    `reverse` ve EOF) y recién después loopear ese palíndromo. Y se palindromea
+    a resolución NATIVA, escalando en la segunda pasada: el buffer de `reverse`
+    es proporcional a los píxeles, así que escalar antes lo encarecía al doble
+    (893 MB contra 430 MB medidos con un clip de 4s a 1080p de salida). Con
+    esto el pico total queda en ~634 MB, prácticamente igual que el loop plano
+    (625 MB) — o sea el palíndromo pasa a ser gratis y además funciona.
+
+    Los dos callers ya filtran `bg_prelooped` antes de llegar acá, así que un
+    timeline multi-escena nunca se palindromea (se reproducirían las escenas en
+    reversa al final).
     """
     out_path = os.path.join(job_dir, out_name)
-    cmd = [
-        "ffmpeg", "-y",
-        "-stream_loop", "-1",
-        "-i", bg_path,
-        "-t", str(duration),
-        "-filter_complex", (
-            f"[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-            f"crop={target_w}:{target_h},setpts=PTS-STARTPTS,split[a][b];"
-            "[b]reverse[br];"
-            "[a][br]concat=n=2:v=1:a=0"
-        ),
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        "-an",
-        out_path,
-    ]
-    # Audit 2026-05-26: timeout=900s. Without it, a corrupted Veo output
-    # or a filter_complex that locks the encoder (palindrome on a
-    # zero-length input has been observed) hung the worker indefinitely.
-    # The fallback branch below already uses run_checked(timeout=900);
-    # mirroring that bound here is the consistent fix. capture_output=True
-    # buffers stderr in memory so we can still report the tail on failure.
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-    except subprocess.TimeoutExpired:
-        logger.error("[BG] Palindrome loop timed out after 900s — falling back")
-        # Synthesize a "failed" result so we drop into the fallback branch
-        # without duplicating the call.
-        class _Timeout:
-            returncode = 124
-            stderr = "ffmpeg palindrome loop timed out (>900s)"
-        result = _Timeout()
-    if result.returncode != 0:
-        # Fall back to the simple loop if the palindrome filter graph fails
-        # (e.g. clip too short or memory-constrained machines).
-        logger.warning("[BG] Palindrome loop failed, falling back to stream_loop: %s",
-                       result.stderr[-200:])
-        cmd_fallback = [
-            "ffmpeg", "-y",
-            "-stream_loop", "-1",
-            "-i", bg_path,
-            "-t", str(duration),
-            "-vf", (
-                f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-                f"crop={target_w}:{target_h},"
-                "setpts=PTS-STARTPTS"
-            ),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-an",
-            out_path,
-        ]
-        # 900s mirrors the kenburns sibling — a stream_loop encode of a
-        # multi-minute lyric video sits comfortably under 5 min in
-        # healthy runs; double that as the cliff.
+    scale_crop = (
+        f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+        f"crop={target_w}:{target_h},setpts=PTS-STARTPTS"
+    )
+
+    def _flat_loop(src: str, label: str) -> str:
+        """Loop plano: el camino seguro. Sin costura no, pero siempre sale."""
         run_checked(
-            cmd_fallback,
-            label="ffmpeg-palindrome-fallback",
+            [
+                "ffmpeg", "-y",
+                "-stream_loop", "-1", "-i", src,
+                "-t", str(duration),
+                "-vf", scale_crop,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-an",
+                out_path,
+            ],
+            label=label,
+            # 900s mirrors the kenburns sibling — a stream_loop encode of a
+            # multi-minute lyric video sits comfortably under 5 min in
+            # healthy runs; double that as the cliff.
             timeout=900,
             output_path=out_path,
         )
+        return out_path
+
+    clip_dur = _ffprobe_duration(bg_path) or 0.0
+    if not (0 < clip_dur <= _PALINDROME_MAX_CLIP_S):
+        # Clip largo (o duración ilegible): palindromear costaría GB de RAM y
+        # además no aporta — un fondo largo ya no repite lo suficiente como
+        # para que el corte moleste.
+        logger.info(
+            "[BG] clip de %.1fs fuera del rango de palíndromo (máx %.0fs) — loop plano",
+            clip_dur, _PALINDROME_MAX_CLIP_S,
+        )
+        _flat_loop(bg_path, "ffmpeg-flat-loop")
+    else:
+        # Prefijo bg_looped_ a propósito: además del unlink explícito de abajo,
+        # _cleanup_local_intermediates barre por ese glob, así que un worker
+        # muerto entre medio tampoco deja el intermedio tirado.
+        unit_path = os.path.join(job_dir, f"bg_looped_palindrome_unit_{out_name}")
+        try:
+            # Etapa 1 — palíndromo del clip unidad, a resolución nativa, con
+            # input ACOTADO (sin -stream_loop) para que `reverse` vea el EOF.
+            # crf 16: es un intermedio que se re-encodea en la etapa 2.
+            run_checked(
+                [
+                    "ffmpeg", "-y", "-i", bg_path,
+                    "-filter_complex",
+                    "[0:v]setpts=PTS-STARTPTS,split[a][b];"
+                    "[b]reverse[br];"
+                    "[a][br]concat=n=2:v=1:a=0",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "16",
+                    "-pix_fmt", "yuv420p", "-an",
+                    unit_path,
+                ],
+                label="ffmpeg-palindrome-unit",
+                # Medido: 0,5s para un clip de 4s. 120s es cliff de sobra y
+                # acota el buffer de `reverse` si algo sale mal.
+                timeout=120,
+                output_path=unit_path,
+            )
+            # Etapa 2 — loopear el palíndromo (que SÍ empalma consigo mismo)
+            # hasta cubrir la canción, escalando acá.
+            _flat_loop(unit_path, "ffmpeg-palindrome-loop")
+            logger.info("[BG] palíndromo real: unidad de %.1fs → %.1fs", clip_dur * 2, duration)
+        except Exception as e:
+            _raise_if_job_timeout(e)
+            logger.warning(
+                "[BG] palíndromo falló (%s) — loop plano (se ve el corte, pero sale)", e,
+            )
+            _flat_loop(bg_path, "ffmpeg-palindrome-fallback")
+        finally:
+            try:
+                os.unlink(unit_path)
+            except OSError:
+                pass
 
     size_mb = os.path.getsize(out_path) / 1024 / 1024
     logger.info("[BG] Pre-rendered palindrome loop: %.0fs, %.1f MB", duration, size_mb)
