@@ -10,14 +10,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { fetchSse, SseUnauthorizedError } from "../lib/fetchSse";
-
-const TERMINAL = new Set([
-  "done",
-  "pending_review",
-  "error",
-  "validation_failed",
-  "rejected",
-]);
+import { isTerminalStatus } from "../lib/jobStatus";
 
 export default function useJobProgress(jobId, { api, token } = {}) {
   const [state, setState] = useState({
@@ -58,7 +51,7 @@ export default function useJobProgress(jobId, { api, token } = {}) {
         error: data.error ?? prev.error,
         status: data.status ?? prev.status,
       }));
-      if (data.status && TERMINAL.has(data.status)) close();
+      if (data.status && isTerminalStatus(data.status)) close();
     };
 
     const startPolling = () => {

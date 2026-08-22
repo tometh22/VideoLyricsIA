@@ -20,6 +20,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     event,
+    inspect,
     text,
 )
 from sqlalchemy.types import TypeDecorator
@@ -556,6 +557,9 @@ class Job(Base):
     # agrupe errores sin parsear mensajes. Nullable: rows viejas se
     # clasifican a lectura con el mismo clasificador.
     error_category = Column(String(32), nullable=True)
+    # Stable machine-readable code. ``error`` is deliberately sanitized for
+    # browser delivery; full exception details remain in structured logs.
+    error_code = Column(String(64), nullable=True)
     # Which engine produced the lyric timing for this job: forced_align |
     # lrclib_synced | gemini_aligner | whisper. Observability so we can
     # answer "what timed this job?" without grepping logs that scroll.
@@ -591,6 +595,11 @@ class Job(Base):
     active_quality_attempt_id = Column(
         String(QUALITY_ATTEMPT_ID_MAX_LENGTH), nullable=True,
     )
+    # Durable publication identities for the currently-authorized worker
+    # attempts. Context-bound workers are fenced in jobs.update_job so a late
+    # process from an older enqueue cannot overwrite a newer retry.
+    active_pipeline_attempt_id = Column(String(36), nullable=True)
+    active_transcription_attempt_id = Column(String(36), nullable=True)
 
     # In-flight multipart upload id while the browser is still PUTting
     # parts directly to R2. Cleared on multipart_complete (or aborted by
@@ -748,6 +757,7 @@ class Job(Base):
             ),
             "error": self.error,
             "error_category": self.error_category,
+            "error_code": self.error_code,
             "youtube": self.youtube_data,
             "youtube_short": self.youtube_short_data,
             "validation_result": self.validation_result,
@@ -1699,6 +1709,31 @@ class CostSnapshot(Base):
 # Init
 # ---------------------------------------------------------------------------
 
+def assert_runtime_schema_contract() -> None:
+    """Fail fast when Alembic has not installed the model contract.
+
+    Production-like services must never repair schema while accepting traffic:
+    startup DDL races rolling deploys and a swallowed lock timeout leaves a
+    superficially healthy process with an unusable database.
+    """
+    inspector = inspect(engine)
+    present_tables = set(inspector.get_table_names())
+    expected_tables = set(Base.metadata.tables)
+    missing_tables = sorted(expected_tables - present_tables)
+    missing_columns = []
+    for table_name in sorted(expected_tables & present_tables):
+        present = {item["name"] for item in inspector.get_columns(table_name)}
+        expected = {column.name for column in Base.metadata.tables[table_name].columns}
+        missing_columns.extend(
+            f"{table_name}.{column}" for column in sorted(expected - present)
+        )
+    if missing_tables or missing_columns:
+        detail = ", ".join(
+            [*(f"table:{name}" for name in missing_tables), *missing_columns]
+        )
+        raise RuntimeError(f"database schema is behind Alembic head: {detail}")
+
+
 def init_db():
     """Create all tables. Call once at startup.
 
@@ -1707,6 +1742,10 @@ def init_db():
     boot without an Alembic setup. SQLAlchemy's create_all only creates
     missing TABLES — it ignores missing COLUMNS on existing tables.
     """
+    environment = os.environ.get("ENVIRONMENT", "production").strip().lower()
+    if environment in {"prod", "production", "staging"}:
+        assert_runtime_schema_contract()
+        return
     Base.metadata.create_all(bind=engine)
     _migrate_user_columns()
 

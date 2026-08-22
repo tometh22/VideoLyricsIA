@@ -31,7 +31,7 @@ def test_quality_retry_propagates_background_hint():
     # Find the retry block. The marker is the log statement that
     # announces the retry; everything between that and the `continue` is
     # the retry call.
-    retry_marker = "Score %s < 7 — generating new prompt and retrying VEO"
+    retry_marker = "generating new prompt and retrying VEO"
     retry_idx = src.find(retry_marker)
     assert retry_idx >= 0, (
         "Could not find the quality-retry block in _ensure_background. "
@@ -96,11 +96,8 @@ def test_pipeline_merges_render_params_preserving_hint():
     src = inspect.getsource(pipeline.run_pipeline)
 
     # Must NOT replace wholesale with a literal dict that drops the hint.
-    assert "_merged_rp" in src, (
-        "run_pipeline must build a merged render_params dict, not replace it"
-    )
-    assert ".update(_new_rp)" in src, (
-        "run_pipeline must merge the new fields over existing render_params"
+    assert "merge_render_params(job_id, _new_rp)" in src, (
+        "run_pipeline must merge render params atomically, not replace them"
     )
     # Must conditionally carry background_hint into the persisted params.
     assert 'if background_hint:' in src and '_new_rp["background_hint"] = background_hint' in src, (

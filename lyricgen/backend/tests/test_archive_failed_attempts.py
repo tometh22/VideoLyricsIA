@@ -8,7 +8,9 @@ filas de transcripciones muertas del P0 + re-subidas que parecían
 duplicados.
 """
 from datetime import datetime, timedelta, timezone
+import uuid
 
+from auth import create_user
 from database import Job, SessionLocal
 from jobs import archive_failed_attempts
 
@@ -48,14 +50,14 @@ def test_archiva_fallidos_previos_del_mismo_filename():
         _cleanup(db)
         _seed(db, job_id="fail-transcr", status="transcription_failed", age_min=120)
         _seed(db, job_id="fail-error", status="error", age_min=90)
-        _seed(db, job_id="fail-rejected", status="rejected", age_min=80)
+        _seed(db, job_id="fail-reject", status="rejected", age_min=80)
         keep = _seed(db, job_id="winner", status="done", age_min=10)
 
         n = archive_failed_attempts(db, keep_job=keep)
         db.commit()
 
         assert n == 3
-        assert _archived_ids(db) == {"fail-transcr", "fail-error", "fail-rejected"}
+        assert _archived_ids(db) == {"fail-transcr", "fail-error", "fail-reject"}
         assert db.query(Job).filter(Job.job_id == "winner").one().archived_at is None
     finally:
         _cleanup(db)
@@ -107,8 +109,17 @@ def test_no_cruza_filename_usuario_ni_tenant():
     db = SessionLocal()
     try:
         _cleanup(db)
+        other_user = create_user(
+            db,
+            username=f"archive_other_{uuid.uuid4().hex[:8]}",
+            password="testpass12345",
+            tenant_id=f"archive_other_{uuid.uuid4().hex[:8]}",
+        )
         _seed(db, job_id="otro-archivo", status="error", filename="otra.wav", age_min=100)
-        _seed(db, job_id="otro-user", status="error", user_id=2, age_min=100)
+        _seed(
+            db, job_id="otro-user", status="error",
+            user_id=other_user.id, age_min=100,
+        )
         keep = _seed(db, job_id="winner", status="done", age_min=10)
 
         n = archive_failed_attempts(db, keep_job=keep)

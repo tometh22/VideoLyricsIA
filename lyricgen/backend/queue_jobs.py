@@ -344,19 +344,18 @@ def transcription_failure_callback(job, connection, type_, value, traceback) -> 
     own `failure_callbacks` AFTER the kill, so this hook is the last
     chance to surface a real error to the user.
 
-    Audit 2026-05-26: routes through update_job (same reasoning as
-    pipeline_failure_callback). Note `transcription_failed` is currently
-    NOT in update_job's terminal set (_TERMINAL_STATUSES), so the
-    terminal-state guard treats this as a regular update — which is
-    fine because the only safer states than transcription_failed are
-    the truly-terminal ones (done, rejected, etc.) and update_job won't
-    flip from any of those backward thanks to its own guard.
+    Audit remediation: routes through update_job and the canonical terminal
+    state set. A late callback is attempt-fenced, so it cannot overwrite a
+    newer transcription retry or any successful terminal state.
     """
     try:
-        from jobs import update_job
+        from jobs import bind_job_attempt, update_job
         rq_job_id = getattr(job, "id", "") or ""
+        meta = dict(getattr(job, "meta", None) or {})
         # RQ job_id has prefix `transcribe:<job_id>` (set at enqueue time).
-        if rq_job_id.startswith("transcribe:"):
+        if meta.get("db_job_id"):
+            job_id_db = str(meta["db_job_id"])
+        elif rq_job_id.startswith("transcribe:"):
             job_id_db = rq_job_id.split(":", 1)[1]
         else:
             job_id_db = rq_job_id
@@ -367,21 +366,30 @@ def transcription_failure_callback(job, connection, type_, value, traceback) -> 
         # never got the chance to run.
         _capture_job_failure("transcription", job_id_db, type_, value)
         is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
+        from error_taxonomy import public_error
         if is_abandoned:
+            error_code = "transcription_worker_abandoned"
             err_msg = (
                 "El worker se reinició mientras transcribíamos y los "
                 "reintentos automáticos también fallaron. Reintentá "
                 "subiendo el archivo de nuevo."
             )
         else:
-            tb_msg = str(value)[:400] if value else (type_.__name__ if type_ else "error")
-            err_msg = f"La transcripción falló: {tb_msg}"
-        update_job(
-            job_id_db,
-            status="transcription_failed",
-            error=err_msg[:500],
-            current_step="error",
-        )
+            error_code, err_msg = public_error(value, context="transcription")
+        event_id = str(meta.get("outbox_event_id") or "")
+        if event_id:
+            with bind_job_attempt("transcription", event_id):
+                update_job(
+                    job_id_db, status="transcription_failed",
+                    error=err_msg[:500], error_code=error_code,
+                    current_step="error",
+                )
+        else:
+            update_job(
+                job_id_db, status="transcription_failed",
+                error=err_msg[:500], error_code=error_code,
+                current_step="error",
+            )
     except Exception as e:  # pragma: no cover
         logger.warning("transcription_failure_callback failed: %s", e)
 
@@ -450,14 +458,16 @@ def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
     failure path is worse than no callback at all.
     """
     try:
-        from jobs import update_job
+        from jobs import bind_job_attempt, update_job
         # RQ's job.id == our job_id (we map them 1:1 in enqueue_pipeline).
         rq_job_id = getattr(job, "id", None) or ""
-        if not rq_job_id:
+        meta = dict(getattr(job, "meta", None) or {})
+        job_id_db = str(meta.get("db_job_id") or rq_job_id)
+        if not job_id_db:
             return
         # Surface to Sentry tagged with job/tenant — a permanently-dead
         # render is always incident-worthy, doubly so for a B2B tenant.
-        _capture_job_failure("render_pipeline", rq_job_id, type_, value)
+        _capture_job_failure("render_pipeline", job_id_db, type_, value)
         # Guardrail "nunca degradar": si el reintento automático no alcanzó a
         # generar el fondo real, NO dejamos el job en "error" crudo — lo
         # marcamos para que la UI muestre una tarjeta accionable (reintentar /
@@ -465,11 +475,21 @@ def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
         _bg_attention = _background_attention_from_exc(type_, value)
         if _bg_attention:
             _category, _msg = _bg_attention
-            update_job(rq_job_id, status="error", error=_msg[:500],
-                       error_category=_category)
+            event_id = str(meta.get("outbox_event_id") or "")
+            if event_id:
+                with bind_job_attempt("pipeline", event_id):
+                    update_job(job_id_db, status="error", error=_msg[:500],
+                               error_category=_category,
+                               error_code="pipeline_background_attention")
+            else:
+                update_job(job_id_db, status="error", error=_msg[:500],
+                           error_category=_category,
+                           error_code="pipeline_background_attention")
             return
         is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
+        from error_taxonomy import public_error
         if is_abandoned:
+            error_code = "pipeline_worker_abandoned"
             err_msg = (
                 "El servidor se reinició mientras generábamos el video y "
                 "los reintentos automáticos también fallaron. Tu MP3 sigue "
@@ -480,14 +500,20 @@ def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
             # version of the message to the user (the full traceback is
             # in Sentry / worker logs). Keep it under 500 chars so it
             # fits the UI error box without truncation surprises.
-            tb_msg = str(value)[:400] if value else (type_.__name__ if type_ else "error")
-            err_msg = f"El render falló tras reintentos: {tb_msg}"
+            error_code, err_msg = public_error(value, context="pipeline")
         # update_job's terminal-state guard means status="error" lands
         # even if the row is currently "processing"/"queued" (target is
         # terminal → guard always lets it through), but loses cleanly
         # to a concurrent "done" because both contend on the same
         # FOR UPDATE lock.
-        update_job(rq_job_id, status="error", error=err_msg[:500])
+        event_id = str(meta.get("outbox_event_id") or "")
+        if event_id:
+            with bind_job_attempt("pipeline", event_id):
+                update_job(job_id_db, status="error", error=err_msg[:500],
+                           error_code=error_code)
+        else:
+            update_job(job_id_db, status="error", error=err_msg[:500],
+                       error_code=error_code)
     except Exception as e:  # pragma: no cover
         logger.warning("pipeline_failure_callback failed: %s", e)
 
@@ -591,15 +617,28 @@ def _evict_stale_rq_job(connection, rq_job_id: str) -> None:
 
     `enqueue_edit` already had this logic inline since the original UMG
     edit-resurrection incident. Extracted here so the three queue-using
-    helpers stay consistent. Best-effort; a Redis hiccup during the fetch
-    must not block the enqueue.
+    helpers stay consistent. Missing terminal records are harmless; an active
+    record or ambiguous Redis failure is propagated so the durable outbox can
+    retry without deleting live work.
     """
     try:
         from rq.job import Job as RQJob
         stale = RQJob.fetch(rq_job_id, connection=connection)
+        status = stale.get_status(refresh=True)
+        value = str(getattr(status, "value", status) or "").lower()
+        if value in {"queued", "started", "deferred", "scheduled"}:
+            raise RuntimeError(f"rq_job_active:{rq_job_id}:{value}")
         stale.delete()
-    except Exception:
-        pass  # no stale job, or Redis hiccup — proceed normally
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        # Missing jobs are normal. A Redis transport failure must propagate so
+        # the durable outbox remains pending instead of pretending publication
+        # was safe after an ambiguous fetch.
+        if type(exc).__name__ not in {"NoSuchJobError"}:
+            message = str(exc).lower()
+            if not any(token in message for token in ("no such job", "not found")):
+                raise
 
 
 def _active_rq_job(connection, rq_job_id: str):
@@ -632,6 +671,8 @@ def enqueue_pipeline(
     style: str,
     plan: str = "100",
     tenant_id: str = "",
+    publication_id: str | None = None,
+    publication_dedupe_key: str | None = None,
     **kwargs,
 ) -> str:
     """Enqueue a run_pipeline job. Returns RQ job id (or 'thread:<job_id>' in
@@ -650,14 +691,27 @@ def enqueue_pipeline(
     q = _pick_queue(plan, tenant_id=tenant_id)
     if q is not None:
         from rq import Retry
-        from pipeline import run_pipeline
+        if publication_id:
+            from transactional_outbox import run_outbox_pipeline as target
+            target_args = (
+                job_id, publication_id, str(publication_dedupe_key or ""),
+                mp3_path, artist, style, kwargs,
+            )
+            target_kwargs = {}
+            rq_job_id = f"pipeline:{publication_id}"
+        else:
+            from pipeline import run_pipeline as target
+            target_args = (job_id, mp3_path, artist, style)
+            target_kwargs = kwargs
+            rq_job_id = job_id
         # Evict any stale RQ entry with the same job_id. /retry re-uses the
         # same job_id for the same Postgres row; without this evict, the
         # second enqueue would silently reuse the failed first attempt's
         # cached args (no preserved_bg_r2_key, no frame_size override, etc.)
         # and the operator would see "Retry" do exactly nothing useful.
         # See _evict_stale_rq_job docstring for the full reasoning.
-        _evict_stale_rq_job(q.connection, job_id)
+        if not publication_id:
+            _evict_stale_rq_job(q.connection, job_id)
         # RQ's enqueue() does not accept positional args together with the
         # explicit kwargs= parameter — you have to pass either bare *args/**kwargs
         # or use both args= and kwargs= explicitly. We use the explicit form
@@ -677,15 +731,17 @@ def enqueue_pipeline(
         # lookup in the [BG] Veo cache STORED path.
         retry = Retry(max=PIPELINE_RETRY_MAX, interval=PIPELINE_RETRY_INTERVAL_S)
         rq_job = q.enqueue(
-            run_pipeline,
-            args=(job_id, mp3_path, artist, style),
-            kwargs=kwargs,
+            target,
+            args=target_args,
+            kwargs=target_kwargs,
             job_timeout=timeout,
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
-            job_id=job_id,  # map RQ id to our job_id for easy lookup
+            job_id=rq_job_id,
             meta=rq_payload_metadata(
                 "pipeline", background_policy_fingerprint=policy_fingerprint,
+                db_job_id=job_id,
+                outbox_event_id=publication_id,
             ),
             retry=retry,
             on_failure=pipeline_failure_callback,
@@ -695,7 +751,7 @@ def enqueue_pipeline(
     # Redis-less path. In production this would silently bypass JOB_TIMEOUT,
     # concurrency caps, and durability — refuse instead and let the
     # operator fix the Redis dependency.
-    if _ENVIRONMENT == "production":
+    if _ENVIRONMENT in {"production", "prod", "staging"}:
         logger.error(
             "Refusing to enqueue %s via thread fallback: Redis is required "
             "in production but unreachable.", job_id,
@@ -706,11 +762,21 @@ def enqueue_pipeline(
         )
 
     # Dev fallback: same thread model as before.
-    from pipeline import run_pipeline
+    if publication_id:
+        from transactional_outbox import run_outbox_pipeline as target
+        target_args = (
+            job_id, publication_id, str(publication_dedupe_key or ""),
+            mp3_path, artist, style, kwargs,
+        )
+        target_kwargs = {}
+    else:
+        from pipeline import run_pipeline as target
+        target_args = (job_id, mp3_path, artist, style)
+        target_kwargs = kwargs
     t = threading.Thread(
-        target=run_pipeline,
-        args=(job_id, mp3_path, artist, style),
-        kwargs=kwargs,
+        target=target,
+        args=target_args,
+        kwargs=target_kwargs,
         daemon=True,
     )
     t.start()
@@ -728,6 +794,8 @@ def enqueue_transcription(
     live: bool = False,
     tenant_id: str = "",
     anchor_lyrics: str = "",
+    publication_id: str | None = None,
+    publication_dedupe_key: str | None = None,
 ) -> str:
     """Enqueue una transcripción en la queue `transcription` (alta prioridad,
     drenada por el mismo worker container que enterprise/default).
@@ -758,7 +826,24 @@ def enqueue_transcription(
         # existentes que no la conocen).
         from rq import Queue, Retry
         q = Queue("transcription", connection=_redis)
-        from transcription_worker import run_transcription_job
+        transcription_kwargs = {
+            "language": language, "artist": artist, "title": title,
+            "filename": filename, "live": live,
+            "anchor_lyrics": anchor_lyrics,
+        }
+        if publication_id:
+            from transactional_outbox import run_outbox_transcription as target
+            target_args = (
+                job_id, publication_id, str(publication_dedupe_key or ""),
+                audio_path, transcription_kwargs,
+            )
+            target_kwargs = {}
+            rq_job_id = f"transcription:{publication_id}"
+        else:
+            from transcription_worker import run_transcription_job as target
+            target_args = (job_id, audio_path)
+            target_kwargs = transcription_kwargs
+            rq_job_id = f"transcribe:{job_id}"
         # INCIDENT 2026-05-24: previous default was 300s (5 min). The
         # post-PR-G pipeline runs demucs (60-180s) + forced_align (75-480s
         # budget) + whisperX (60-480s budget) + Whisper-1 fallback. Worst
@@ -773,20 +858,20 @@ def enqueue_transcription(
         # enqueue_pipeline. Without this, a transcription retry would silently
         # re-use the failed first job and the operator's edit (filename,
         # artist override, etc.) would be ignored. Audit 2026-05-26.
-        _evict_stale_rq_job(_redis, f"transcribe:{job_id}")
+        if not publication_id:
+            _evict_stale_rq_job(_redis, f"transcribe:{job_id}")
         rq_job = q.enqueue(
-            run_transcription_job,
-            args=(job_id, audio_path),
-            kwargs={
-                "language": language, "artist": artist, "title": title,
-                "filename": filename, "live": live,
-                "anchor_lyrics": anchor_lyrics,
-            },
+            target,
+            args=target_args,
+            kwargs=target_kwargs,
             job_timeout=timeout,
             result_ttl=RESULT_TTL,
             failure_ttl=FAILURE_TTL,
-            job_id=f"transcribe:{job_id}",  # prefix evita colisión con render job_id
-            meta=rq_payload_metadata("transcription"),
+            job_id=rq_job_id,
+            meta=rq_payload_metadata(
+                "transcription", db_job_id=job_id,
+                outbox_event_id=publication_id,
+            ),
             retry=retry,
             # INCIDENT 2026-05-24: when RQ killed the work-horse (timeout
             # or OOM), `transcription_worker._fail` never ran (it lives
@@ -799,7 +884,7 @@ def enqueue_transcription(
         return rq_job.id
 
     # Dev fallback (sin Redis): thread daemon, idéntico al de enqueue_pipeline.
-    if _ENVIRONMENT == "production":
+    if _ENVIRONMENT in {"production", "prod", "staging"}:
         logger.error(
             "Refusing to enqueue transcription %s via thread fallback: Redis is "
             "required in production but unreachable.", job_id,
@@ -807,15 +892,26 @@ def enqueue_transcription(
         raise RuntimeError(
             "Transcription queue unavailable: Redis is required in production."
         )
-    from transcription_worker import run_transcription_job
+    transcription_kwargs = {
+        "language": language, "artist": artist, "title": title,
+        "filename": filename, "live": live,
+        "anchor_lyrics": anchor_lyrics,
+    }
+    if publication_id:
+        from transactional_outbox import run_outbox_transcription as target
+        target_args = (
+            job_id, publication_id, str(publication_dedupe_key or ""),
+            audio_path, transcription_kwargs,
+        )
+        target_kwargs = {}
+    else:
+        from transcription_worker import run_transcription_job as target
+        target_args = (job_id, audio_path)
+        target_kwargs = transcription_kwargs
     t = threading.Thread(
-        target=run_transcription_job,
-        args=(job_id, audio_path),
-        kwargs={
-            "language": language, "artist": artist, "title": title,
-            "filename": filename, "live": live,
-            "anchor_lyrics": anchor_lyrics,
-        },
+        target=target,
+        args=target_args,
+        kwargs=target_kwargs,
         daemon=True,
     )
     t.start()
@@ -1599,25 +1695,28 @@ def edit_failure_callback(job, connection, type_, value, traceback) -> None:
         if _bg_attention:
             _category, _msg = _bg_attention
             update_job(rq_job_id, status="error", error=_msg[:500],
-                       error_category=_category)
+                       error_category=_category,
+                       error_code="edit_background_attention")
             return
         is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
+        from error_taxonomy import public_error
         if is_abandoned:
+            error_code = "edit_worker_abandoned"
             err_msg = (
                 "El servidor se reinició mientras aplicábamos los cambios y "
                 "los reintentos automáticos también fallaron. El video "
                 "anterior sigue disponible: podés volver a pedir el edit."
             )
         else:
-            tb_msg = str(value)[:400] if value else (type_.__name__ if type_ else "error")
-            err_msg = f"Edit falló: {tb_msg}"
+            error_code, err_msg = public_error(value, context="edit")
         # Audit 2026-05-26: route through update_job so we share the FOR
         # UPDATE row lock with the worker (race-safe). update_job's terminal
         # target ("error") always lands, but contends on the lock — if
         # run_edit_pipeline managed to commit `pending_review` first, the
         # worker wins and the user sees the edit they actually got, not
         # a false error.
-        update_job(rq_job_id, status="error", error=err_msg[:500])
+        update_job(rq_job_id, status="error", error=err_msg[:500],
+                   error_code=error_code)
     except Exception as e:
         logger.warning("edit_failure_callback failed: %s", e)
 

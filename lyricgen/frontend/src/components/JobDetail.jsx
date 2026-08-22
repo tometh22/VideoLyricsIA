@@ -18,6 +18,7 @@ import ReviewVideoPlayer from "./ReviewVideoPlayer";
 import JobSettingsCard from "./JobSettingsCard";
 import { SingleGeneratingHero } from "./BatchProgress";
 import { hasArtTrackAccess } from "../lib/artTrackAccess";
+import { reviewJobPath } from "../lib/reviewJobRoute";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -960,7 +961,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
 
   // `transcribed` y `transcribed_pending` = audio + segments están en la DB
   // y el user nunca hizo /generate. La acción correcta es abrir el wizard
-  // pre-cargado (/new?resume=...) para que edite lyrics y dispare la
+  // pre-cargado (/review/:jobId) para que edite lyrics y dispare la
   // generación. Vía `/transcribe-uploaded` queda `transcribed_pending` (path
   // sync legacy) o el async worker setea `transcribed_pending` como estado
   // FINAL — ver transcription_worker.py:147 y jobs.py:49-51. NO es "subida
@@ -972,7 +973,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // renderizaba el CTA. El usuario veía 27 jobs "Sin generar" en el
   // historial y al entrar no había forma de seguir — panel sin acción.
   if (isTranscribed || isTranscribedPending) {
-    const navHref = `/new?resume=${encodeURIComponent(job.job_id)}`;
+    const navHref = reviewJobPath(job.job_id);
     return (
       <div className="w-full max-w-2xl animate-fade-in">
         <div className="flex items-center gap-3 mb-6">
@@ -1661,10 +1662,21 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // Short ProRes follows the same opt-in: any UMG-flavoured job gets a
   // separate vertical-format master alongside the main one. Generated
   // lazily by /download/{id}/umg_short the first time it's clicked.
-  const hasUmgShort = isUmgJob && isJobDone;
+  // Sin short.mp4 no hay ProRes vertical que derivar.
+  const hasUmgShort = isUmgJob && isJobDone && !!job.files?.short_url;
+
+  // Un job puede entregarse SIN short o SIN thumbnail: desde el incidente
+  // UMG Chile 2026-08-21 el backend prefiere entregar el master solo antes
+  // que perder el render entero por un accesorio. Mostrar igual el tab
+  // dejaba un <video> vacío que 404eaba y un botón de descarga muerto, así
+  // que se ofrece únicamente lo que existe. `video` va siempre: si faltara
+  // el master no habría job que mirar.
+  const availableMediaTabs = MEDIA_TABS.filter(
+    (tab) => tab.key === "video" || !!job.files?.[`${tab.key}_url`],
+  );
 
   const ALL_TABS = [
-    ...MEDIA_TABS,
+    ...availableMediaTabs,
     ...(hasUmgMaster ? [PRORES_MASTER_TAB] : []),
     { key: "provenance", label: t("prov.title") || "Provenance" },
   ];

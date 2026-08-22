@@ -30,7 +30,9 @@ from auth import create_user, get_plan_usage
 from database import Job, SessionLocal, User
 
 _T = "tenant_quota_test"
-_USER_ID = 999_001
+# init_db always provisions the default admin. Reusing that real FK keeps the
+# quota fixtures valid on PostgreSQL; tenant scoping is supplied explicitly.
+_USER_ID = 1
 
 
 def _seed_job(

@@ -14,6 +14,23 @@ from typing import Any, Callable
 
 
 OUTBOX_CONSUMER_MIN_LEASE_SECONDS = 3900
+OUTBOX_DEFAULT_MAX_ATTEMPTS = 12
+
+
+class OutboxDeliveryError(RuntimeError):
+    """A classified publication failure.
+
+    Outbox rows are durable state, so storing only ``RuntimeError`` makes an
+    incident impossible to diagnose and causes non-retryable rollout/config
+    results to spin forever.  Keep the public exception small and safe: the
+    code is persisted, while the original exception remains available to the
+    caller/logging path.
+    """
+
+    def __init__(self, code: str, *, retryable: bool = True):
+        self.code = str(code)[:96] or "outbox_delivery_failed"
+        self.retryable = bool(retryable)
+        super().__init__(self.code)
 
 
 def _now() -> datetime:
@@ -50,6 +67,31 @@ def _outbox_stale_processing_seconds() -> int:
     except (TypeError, ValueError):
         configured = OUTBOX_CONSUMER_MIN_LEASE_SECONDS
     return max(_outbox_consumer_lease_seconds(), configured)
+
+
+def _outbox_max_attempts() -> int:
+    """Bound transient outbox retries so a broken dependency cannot spin.
+
+    Twelve attempts is long enough to cover a rolling deploy or a short R2 /
+    Redis incident while still producing a visible terminal state within a
+    bounded window. Operators can raise it for a controlled recovery.
+    """
+    try:
+        configured = int(os.environ.get(
+            "JOB_OUTBOX_MAX_ATTEMPTS", str(OUTBOX_DEFAULT_MAX_ATTEMPTS),
+        ))
+    except (TypeError, ValueError):
+        configured = OUTBOX_DEFAULT_MAX_ATTEMPTS
+    return max(1, min(configured, 100))
+
+
+def _outbox_error_code(exc: Exception) -> str:
+    code = getattr(exc, "code", None)
+    if code:
+        return str(code)[:140]
+    # Generic dependency exceptions are deliberately classified without
+    # persisting their messages, which may contain provider/request details.
+    return type(exc).__name__[:140] or "outbox_delivery_failed"
 
 
 def create_outbox_event(
@@ -121,10 +163,66 @@ def create_quality_outbox_event(
     )
 
 
+def create_pipeline_outbox_event(
+    db,
+    *,
+    job,
+    purpose: str,
+    mp3_path: str | None,
+    artist: str,
+    style: str,
+    plan: str,
+    tenant_id: str,
+    pipeline_kwargs: dict[str, Any],
+):
+    """Commit-ready intent for a render pipeline invocation."""
+    event = create_outbox_event(
+        db,
+        job_id=job.job_id,
+        event_type="pipeline.enqueue",
+        dedupe_key=f"pipeline:{job.job_id}:{uuid.uuid4()}",
+        payload={
+            "purpose": str(purpose)[:32],
+            "mp3_path": mp3_path,
+            "artist": artist,
+            "style": style,
+            "plan": plan,
+            "tenant_id": tenant_id,
+            "pipeline_kwargs": dict(pipeline_kwargs),
+        },
+    )
+    job.active_pipeline_attempt_id = event.id
+    return event
+
+
+def create_transcription_outbox_event(
+    db,
+    *,
+    job,
+    audio_path: str,
+    transcription_kwargs: dict[str, Any],
+):
+    """Commit-ready intent for a transcription invocation."""
+    event = create_outbox_event(
+        db,
+        job_id=job.job_id,
+        event_type="transcription.enqueue",
+        dedupe_key=f"transcription:{job.job_id}:{uuid.uuid4()}",
+        payload={
+            "audio_path": audio_path,
+            "transcription_kwargs": dict(transcription_kwargs),
+        },
+    )
+    job.active_transcription_attempt_id = event.id
+    return event
+
+
 def _publish(
     event,
     *,
     edit_publisher: Callable[..., str | None] | None = None,
+    pipeline_publisher: Callable[..., str | None] | None = None,
+    transcription_publisher: Callable[..., str | None] | None = None,
 ) -> str | None:
     payload = dict(event.payload or {})
     if event.event_type == "edit.enqueue":
@@ -152,7 +250,7 @@ def _publish(
         if not _valid_quality_audio_identity(audio_revision, audio_sha256):
             identity = ensure_legacy_audio_identity(event.job_id)
             if not identity:
-                raise RuntimeError("audio_identity_backfill_pending")
+                raise OutboxDeliveryError("audio_identity_backfill_pending")
             audio_revision = int(identity["audio_revision"])
             audio_sha256 = str(identity["audio_sha256"])
         result = enqueue_transcription_quality(
@@ -166,12 +264,47 @@ def _publish(
             publication_id=str(event.id),
             publication_dedupe_key=str(event.dedupe_key),
         )
-        if str(result).startswith((
-            "disabled:", "rollout:", "rollout-excluded:", "identity-missing:",
-        )):
-            raise RuntimeError(str(result).split(":", 1)[0] + "_quality_delivery")
+        if str(result).startswith(("disabled:", "rollout-excluded:")):
+            # Quality analysis is advisory. A disabled or excluded rollout is
+            # a deliberate terminal outcome, not a transient delivery error.
+            raise OutboxDeliveryError(
+                str(result).split(":", 1)[0] + "_quality_delivery",
+                retryable=False,
+            )
+        if str(result).startswith(("rollout:", "identity-missing:")):
+            raise OutboxDeliveryError(
+                str(result).split(":", 1)[0] + "_quality_delivery",
+            )
         return result
-    raise ValueError(f"unsupported outbox event type: {event.event_type}")
+    if event.event_type == "pipeline.enqueue":
+        if pipeline_publisher is None:
+            from queue_jobs import enqueue_pipeline as pipeline_publisher
+
+        return pipeline_publisher(
+            job_id=event.job_id,
+            mp3_path=payload.get("mp3_path"),
+            artist=str(payload.get("artist") or ""),
+            style=str(payload.get("style") or "oscuro"),
+            plan=str(payload.get("plan") or "100"),
+            tenant_id=str(payload.get("tenant_id") or ""),
+            publication_id=str(event.id),
+            publication_dedupe_key=str(event.dedupe_key),
+            **dict(payload.get("pipeline_kwargs") or {}),
+        )
+    if event.event_type == "transcription.enqueue":
+        if transcription_publisher is None:
+            from queue_jobs import enqueue_transcription as transcription_publisher
+
+        return transcription_publisher(
+            event.job_id,
+            str(payload.get("audio_path") or ""),
+            publication_id=str(event.id),
+            publication_dedupe_key=str(event.dedupe_key),
+            **dict(payload.get("transcription_kwargs") or {}),
+        )
+    raise OutboxDeliveryError(
+        f"unsupported_event_type:{event.event_type}", retryable=False,
+    )
 
 
 def dispatch_outbox_event(
@@ -179,6 +312,8 @@ def dispatch_outbox_event(
     *,
     raise_on_error: bool = False,
     edit_publisher: Callable[..., str | None] | None = None,
+    pipeline_publisher: Callable[..., str | None] | None = None,
+    transcription_publisher: Callable[..., str | None] | None = None,
 ) -> dict:
     from database import JobOutboxEvent, SessionLocal
 
@@ -189,25 +324,42 @@ def dispatch_outbox_event(
         ).with_for_update().first()
         if event is None:
             return {"status": "missing", "event_id": event_id}
-        if event.status in {"dispatched", "processing", "consumed"}:
-            return {"status": "dispatched", "event_id": event_id, "deduplicated": True}
+        if event.status in {"dispatched", "processing", "consumed", "failed", "skipped"}:
+            return {"status": event.status, "event_id": event_id, "deduplicated": True}
         if _aware(event.available_at) and _aware(event.available_at) > _now():
             return {"status": "deferred", "event_id": event_id}
         try:
-            rq_id = _publish(event, edit_publisher=edit_publisher)
+            rq_id = _publish(
+                event,
+                edit_publisher=edit_publisher,
+                pipeline_publisher=pipeline_publisher,
+                transcription_publisher=transcription_publisher,
+            )
         except Exception as exc:
             event.attempts = int(event.attempts or 0) + 1
-            event.status = "pending"
-            event.last_error = type(exc).__name__[:160]
-            event.available_at = _now() + timedelta(
-                seconds=min(300, max(5, 2 ** min(event.attempts, 8))),
-            )
+            error_code = _outbox_error_code(exc)
+            retryable = bool(getattr(exc, "retryable", True))
+            exhausted = event.attempts >= _outbox_max_attempts()
+            if retryable and not exhausted:
+                event.status = "pending"
+                event.last_error = error_code
+                event.available_at = _now() + timedelta(
+                    seconds=min(300, max(5, 2 ** min(event.attempts, 8))),
+                )
+            else:
+                # ``skipped`` is intentional for advisory quality rollouts;
+                # ``failed`` means a retryable dependency never recovered.
+                event.status = "failed" if retryable else "skipped"
+                event.last_error = (
+                    f"{error_code}:attempts={event.attempts}"
+                )[:160]
+                event.available_at = _now()
             db.commit()
             if raise_on_error:
                 raise
             return {
-                "status": "pending", "event_id": event_id,
-                "error": type(exc).__name__, "attempts": event.attempts,
+                "status": event.status, "event_id": event_id,
+                "error": error_code, "attempts": event.attempts,
             }
         event.status = "dispatched"
         event.dispatched_at = _now()
@@ -258,6 +410,8 @@ def dispatch_pending_outbox_events(*, limit: int = 50) -> dict:
         "attempted": len(results),
         "dispatched": sum(item.get("status") == "dispatched" for item in results),
         "pending": sum(item.get("status") == "pending" for item in results),
+        "failed": sum(item.get("status") == "failed" for item in results),
+        "skipped": sum(item.get("status") == "skipped" for item in results),
     }
 
 
@@ -365,6 +519,73 @@ def run_outbox_edit_pipeline(
         raise
     _finish_outbox_consumer(event_id, dedupe_key, token, success=True)
     return result
+
+
+def _run_outbox_job(
+    *,
+    kind: str,
+    job_id: str,
+    event_id: str,
+    dedupe_key: str,
+    callback: Callable[[], Any],
+):
+    token = str(uuid.uuid4())
+    claim = _claim_outbox_consumer(event_id, dedupe_key, token)
+    if claim == "consumed":
+        return {"status": "already_consumed", "event_id": event_id}
+    if claim == "busy":
+        raise RuntimeError("outbox_consumer_busy")
+    if claim != "claimed":
+        raise RuntimeError("outbox_consumer_identity_mismatch")
+    try:
+        from jobs import bind_job_attempt
+        with bind_job_attempt(kind, event_id):
+            result = callback()
+    except BaseException:
+        _finish_outbox_consumer(event_id, dedupe_key, token, success=False)
+        raise
+    _finish_outbox_consumer(event_id, dedupe_key, token, success=True)
+    return result
+
+
+def run_outbox_pipeline(
+    job_id: str,
+    event_id: str,
+    dedupe_key: str,
+    mp3_path: str | None,
+    artist: str,
+    style: str,
+    pipeline_kwargs: dict,
+):
+    def _call():
+        from pipeline import run_pipeline
+        return run_pipeline(
+            job_id, mp3_path, artist, style, **dict(pipeline_kwargs or {}),
+        )
+
+    return _run_outbox_job(
+        kind="pipeline", job_id=job_id, event_id=event_id,
+        dedupe_key=dedupe_key, callback=_call,
+    )
+
+
+def run_outbox_transcription(
+    job_id: str,
+    event_id: str,
+    dedupe_key: str,
+    audio_path: str,
+    transcription_kwargs: dict,
+):
+    def _call():
+        from transcription_worker import run_transcription_job
+        return run_transcription_job(
+            job_id, audio_path, **dict(transcription_kwargs or {}),
+        )
+
+    return _run_outbox_job(
+        kind="transcription", job_id=job_id, event_id=event_id,
+        dedupe_key=dedupe_key, callback=_call,
+    )
 
 
 def reconcile_job_outbox() -> dict:

@@ -70,8 +70,14 @@ test.describe("lyrics editor browser contract", () => {
     await expect(page.getByTestId("guided-timing-review")).toBeVisible();
     await expect(page.getByRole("tab", { name: "Revisión guiada" })).toHaveAttribute("aria-selected", "true");
     await expect(page.getByText("Parte 1 de 2")).toBeVisible();
+    await expect(page.getByTestId("guided-stepper")).toContainText("1. Escuchá");
+    await expect(page.getByTestId("guided-stepper")).toContainText("2. Compará/Ajustá");
+    await expect(page.getByTestId("guided-stepper")).toContainText("3. Confirmá");
+    await expect(page.getByRole("button", { name: /Escuchar fragmento/ })).toBeVisible();
     await page.getByRole("button", { name: /Reproducir este tramo en loop/ }).click();
     await expect.poll(() => page.locator("audio").evaluate((audio) => audio.paused)).toBe(false);
+    await expect(page.getByText("¿La frase aparece cuando empieza la voz?")).toBeVisible();
+    await page.getByRole("button", { name: "Sí, está bien" }).click();
     await page.getByRole("button", { name: /Confirmar y seguir/ }).click();
     await expect(page.getByText("Parte 2 de 2")).toBeVisible();
     await expect.poll(() => page.locator("audio").evaluate((audio) => audio.paused)).toBe(true);

@@ -8,6 +8,13 @@ import { IS_PRODUCTION, APP_ENV } from "./env";
 import { fetchWithTimeout } from "./fetchWithTimeout";
 import { uploadFileToR2 } from "./r2Upload";
 import * as wizardPersistence from "./wizardPersistence";
+import {
+  AUTH_REFRESH_LEASE_MS,
+  AUTH_REFRESH_MIN_INTERVAL_MS,
+  acquireAuthRefreshLease,
+  releaseAuthRefreshLease,
+  shouldRefreshToken,
+} from "./lib/authRefresh";
 import LoginPage from "./components/LoginPage";
 import Sidebar from "./components/Sidebar";
 import GlobalTopbar from "./components/GlobalTopbar";
@@ -74,6 +81,7 @@ import {
 } from "./lib/generationRecovery";
 import { loadEditorAudio } from "./lib/editorAudioRecovery";
 import { isReusableEditSnapshot } from "./lib/reviewRecovery";
+import { reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -1556,6 +1564,8 @@ export default function App() {
 
   const [token, setToken] = useState(getToken());
   const [user, setUser] = useState(getUser());
+  const authRefreshInFlight = useRef(null);
+  const authRefreshLastAt = useRef(0);
   const [files, setFiles] = useState([]);
   // Ref que espeja `files` para que callbacks sin dependencias (ej.
   // handleUploadAdvance en un setTimeout) lean el estado actual sin re-render
@@ -1749,6 +1759,17 @@ export default function App() {
   // upload→whisper handoff. Drives the progress bar in /review.
   const [transcribeProgress, setTranscribeProgress] = useState(null);
   const [readyToGenerate, setReadyToGenerate] = useState(false);
+
+  // Give every server-backed transcription a stable URL as soon as its
+  // review is ready. The route renders the same wizard tree, so changing the
+  // address does not remount the editor or interrupt playback/autosave.
+  useEffect(() => {
+    const jobId = currentReview?.transcribeJobId;
+    if (!jobId || wizardStage !== "review") return;
+    if (location.pathname !== "/new" && !location.pathname.startsWith("/review")) return;
+    const target = reviewJobPath(jobId);
+    if (location.pathname !== target) navigate(target, { replace: true });
+  }, [currentReview?.transcribeJobId, location.pathname, navigate, wizardStage]);
 
   const [jobs, setJobs] = useState([]);
   // Pre-fetched transcription results for batch review songs 1..N-1.
@@ -1968,7 +1989,7 @@ export default function App() {
   }, [files, approvedJobs, currentReview, reviewQueue]);
 
   // 2026-05-25 — Resume desde el historial. JobDetail enlaza a
-  // /new?resume=<jobId> cuando el operador clickea "Editar lyrics y
+  // /review/<jobId> cuando el operador clickea "Editar lyrics y
   // generar" sobre una card en estado `transcribed`. Sin handler, el
   // wizard caía en pantalla de upload (bug reportado durante UMG
   // dry-run: "los Sin generar cuando abrís te devuelve a Crear el
@@ -1977,13 +1998,12 @@ export default function App() {
   // `audioUrl` al LyricsEditor que ya acepta el prop), setear
   // wizardStage="review". El approve flow ya soporta retomar via
   // `transcribeJobId` — el backend skipea file upload y reusa R2.
-  const resumeJobAttemptedRef = useRef(false);
+  const resumeJobAttemptedRef = useRef(null);
   useEffect(() => {
-    const params = new URLSearchParams(location.search);
-    const resumeJobId = params.get("resume");
+    const resumeJobId = reviewJobIdFromLocation(location.pathname, location.search);
     if (!resumeJobId) return;
-    if (resumeJobAttemptedRef.current) return;
-    resumeJobAttemptedRef.current = true;
+    if (resumeJobAttemptedRef.current === resumeJobId) return;
+    resumeJobAttemptedRef.current = resumeJobId;
 
     let cancelled = false;
     (async () => {
@@ -2038,11 +2058,12 @@ export default function App() {
         setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
         setArtTrack(false);
         setWizardStage("review");
-        // Limpiar el query param sin agregar a history (replace).
-        navigate("/new", { replace: true });
+        // Canonicalize legacy /new?resume= links without adding a history
+        // entry. Direct /review/:jobId links already point at this target.
+        navigate(reviewJobPath(resumeJobId), { replace: true });
       } catch (err) {
         console.warn("[RESUME] no pude cargar el job:", err);
-        resumeJobAttemptedRef.current = false;   // permitir reintento si el operador cambia URL
+        resumeJobAttemptedRef.current = null;   // permitir reintento si el operador cambia URL
         // Fallback honesto: si el resume falla (auth no lista, red, 4xx),
         // mandar al JobDetail en vez de dejar al usuario varado en /new
         // con el wizard vacío — que parece "crear video nuevo".
@@ -2050,7 +2071,7 @@ export default function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [location.search, navigate, retryTranscriptionReviewAudio]);
+  }, [location.pathname, location.search, navigate, retryTranscriptionReviewAudio]);
 
   // Imperative resume — called by the banner's "Continuar" button.
   const resumeWizard = useCallback(() => {
@@ -2321,13 +2342,17 @@ export default function App() {
     const onStorage = (e) => {
       if (e.key === "genly_token" && e.newValue === null && token) {
         handleLogout("expired");
+      } else if (e.key === "genly_token" && e.newValue && e.newValue !== token) {
+        // Another tab may have refreshed the session. Adopt its token so all
+        // tabs share one refresh and do not stampede /auth/refresh.
+        setToken(e.newValue);
       }
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
   }, [token, handleLogout]);
 
-  // Proactively refresh the JWT when it has less than 1 day left, so users
+  // Proactively refresh the JWT when it has less than 6 hours left, so users
   // with active sessions never hit a sudden 401 mid-session. Runs once per
   // token value (i.e. on load and whenever a fresh token is stored).
   //
@@ -2353,8 +2378,17 @@ export default function App() {
     if (!exp) return;
     const secondsLeft = exp - Math.floor(Date.now() / 1000);
     const alreadyExpired = secondsLeft <= 0;
-    if (!alreadyExpired && secondsLeft > 86400) return;
-    authFetch(`${API}/auth/refresh`, { method: "POST" })
+    if (!alreadyExpired && !shouldRefreshToken(secondsLeft)) return;
+    if (authRefreshInFlight.current) return;
+    const now = Date.now();
+    if (now - authRefreshLastAt.current < AUTH_REFRESH_MIN_INTERVAL_MS) return;
+    const lease = acquireAuthRefreshLease(
+      typeof window !== "undefined" ? window.localStorage : null,
+      now,
+    );
+    if (!lease) return;
+    authRefreshLastAt.current = now;
+    const request = authFetch(`${API}/auth/refresh`, { method: "POST" })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`refresh ${r.status}`))))
       .then((data) => {
         if (data?.token) {
@@ -2374,7 +2408,18 @@ export default function App() {
           // devtools but don't disrupt the session.
           console.warn("[auth] preemptive refresh failed (will retry on next mount):", err?.message);
         }
+      })
+      .finally(() => {
+        // Keep the cross-tab lease alive briefly after success so sibling
+        // tabs can receive the storage event with the fresh token before
+        // another one is allowed to claim the lock.
+        window.setTimeout(() => releaseAuthRefreshLease(
+          typeof window !== "undefined" ? window.localStorage : null,
+          lease,
+        ), AUTH_REFRESH_LEASE_MS);
+        authRefreshInFlight.current = null;
       });
+    authRefreshInFlight.current = request;
   }, [token, handleLogout]);
 
   // `historyError` lets the dashboard surface a "connection failed,
@@ -3630,11 +3675,19 @@ export default function App() {
       movementStyle: _rf("movementStyle"), effect: _rf("effect"),
       backgroundHint: _rf("backgroundHint"), bgVerbatim: !!r.bgVerbatim,
       textCase: r.textCase || "upper",
+      frameFormat: r.frameFormat || "full",
       fontScale: r.fontScale || "1.0",
       // lyricTransition + textMotion: deprecados 2026-05-23.
       lyricsAnimation: r.lyricsAnimation || "none",
       lineTransition: r.lineTransition || "none",
       textContrast: r.textContrast || "medium",
+      lyricColor: r.lyricColor || "#FFFFFF",
+      lyricSungColor: r.lyricSungColor || "#FFFFFF",
+      titleTemplate: r.titleTemplate || "auto",
+      titleSize: r.titleSize || "1.0",
+      titleArtistFont: r.titleArtistFont || "",
+      titleSongFont: r.titleSongFont || "",
+      titleSongBreak: r.titleSongBreak || "",
       segments: editedSegments,
       segmentsRevision: Number.isInteger(saveMeta.baseRevision)
         ? saveMeta.baseRevision
@@ -4390,14 +4443,16 @@ export default function App() {
     // "Generar". El badge "Listo p/ editar" promete 1-click → editor;
     // cortocircuitamos /videos/<id> y vamos directo al resume flow.
     if (status === "transcribed") {
-      navigate(`/new?resume=${encodeURIComponent(jobId)}`);
+      navigate(reviewJobPath(jobId));
       return;
     }
     navigate(`/videos/${jobId}`);
   };
 
   const handleSearchSelectJob = (jobId, status) => {
-    const onWizardRoute = ["/new", "/review", "/generating"].includes(location.pathname);
+    const onWizardRoute = location.pathname === "/new"
+      || location.pathname.startsWith("/review")
+      || location.pathname === "/generating";
     if (onWizardRoute && wizardPersistence.hasResumableContent(wizardPersistence.load())) {
       const msg =
         t("wizard.confirm_leave") ||
@@ -5068,6 +5123,26 @@ export default function App() {
     </div>
   );
 
+  const handleCopyReviewLink = useCallback(async () => {
+    const jobId = currentReview?.transcribeJobId;
+    if (!jobId) return;
+    const url = new URL(reviewJobPath(jobId), window.location.origin).toString();
+    try {
+      if (!navigator.clipboard?.writeText) {
+        window.prompt("Copiá el enlace de revisión", url);
+        return;
+      }
+      await navigator.clipboard.writeText(url);
+      alert({
+        title: "Enlace copiado",
+        description: "La revisión se abre en este job y retoma la última versión guardada.",
+        tone: "success",
+      });
+    } catch {
+      window.prompt("Copiá el enlace de revisión", url);
+    }
+  }, [alert, currentReview?.transcribeJobId]);
+
   // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
   // before launching generation. Empty state → redirect home.
@@ -5178,6 +5253,24 @@ export default function App() {
     if (currentReview) {
       return (
         <div className="flex justify-center">
+          <div className="w-full max-w-[980px]">
+          {currentReview.transcribeJobId && (
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/[0.08] bg-surface-2/50 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-xs font-medium text-gray-200">Revisión guardada</p>
+                <p className="truncate text-[11px] text-gray-500">
+                  {reviewJobPath(currentReview.transcribeJobId)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleCopyReviewLink}
+                className="btn-secondary shrink-0 px-3 py-2 text-xs"
+              >
+                Copiar enlace
+              </button>
+            </div>
+          )}
           <Suspense fallback={<EditorSuspenseFallback />}>
           <LyricsEditor
             // 2026-07-16: cuando el wizard pasa un slot (bajo el video), el
@@ -5308,6 +5401,7 @@ export default function App() {
             onPlaybackTick={handlePlaybackTick}
           />
           </Suspense>
+          </div>
         </div>
       );
     }
@@ -5469,12 +5563,13 @@ export default function App() {
               />
             </Suspense>
           } />
-          {/* Capa B 2026-05-24 — /new y /review renderizan el MISMO content
+          {/* /new y /review renderizan el MISMO content
               (wizardScreen) que conmuta upload ↔ review ↔ ready_to_generate
-              vía wizardStage. /review se mantiene como ruta válida sólo para
-              compat con bookmarks viejos; URL nueva canónica es /new. */}
+              vía wizardStage. /review/:jobId es la URL durable y compartible
+              de una transcripción; /review queda por compatibilidad. */}
           <Route path="/new" element={wizardScreen} />
           <Route path="/review" element={wizardScreen} />
+          <Route path="/review/:jobId" element={wizardScreen} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
             <Suspense fallback={<RouteSuspenseFallback />}>

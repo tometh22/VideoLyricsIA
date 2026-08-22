@@ -341,6 +341,58 @@ def test_stale_outbox_consumer_is_recovered_without_touching_quality_queue(monke
         verify.close()
 
 
+def test_outbox_transient_failures_become_terminal_and_keep_error_code(monkeypatch):
+    _job_id, event_id, _dedupe = _seed_outbox_event()
+    monkeypatch.setenv("JOB_OUTBOX_MAX_ATTEMPTS", "2")
+    monkeypatch.setattr(
+        transactional_outbox, "_publish",
+        lambda _event, **_kwargs: (_ for _ in ()).throw(
+            ConnectionError("redis details must not be persisted")
+        ),
+    )
+
+    first = transactional_outbox.dispatch_outbox_event(event_id)
+    assert first["status"] == "pending"
+    db = SessionLocal()
+    try:
+        event = db.query(JobOutboxEvent).filter(JobOutboxEvent.id == event_id).one()
+        event.available_at = datetime.now(timezone.utc)
+        db.commit()
+    finally:
+        db.close()
+    second = transactional_outbox.dispatch_outbox_event(event_id)
+    assert second["status"] == "failed"
+
+    db = SessionLocal()
+    try:
+        event = db.query(JobOutboxEvent).filter(JobOutboxEvent.id == event_id).one()
+        assert event.status == "failed"
+        assert event.last_error == "ConnectionError:attempts=2"
+    finally:
+        db.close()
+
+
+def test_quality_rollout_skip_is_terminal(monkeypatch):
+    _job_id, event_id, _dedupe = _seed_outbox_event()
+    monkeypatch.setattr(
+        transactional_outbox, "_publish",
+        lambda _event, **_kwargs: (_ for _ in ()).throw(
+            transactional_outbox.OutboxDeliveryError(
+                "disabled_quality_delivery", retryable=False,
+            )
+        ),
+    )
+    result = transactional_outbox.dispatch_outbox_event(event_id)
+    assert result["status"] == "skipped"
+    db = SessionLocal()
+    try:
+        event = db.query(JobOutboxEvent).filter(JobOutboxEvent.id == event_id).one()
+        assert event.status == "skipped"
+        assert event.last_error == "disabled_quality_delivery:attempts=1"
+    finally:
+        db.close()
+
+
 def test_legacy_audio_identity_backfill_is_content_addressed_and_cas_safe(monkeypatch):
     import storage
 

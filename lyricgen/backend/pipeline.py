@@ -57,12 +57,21 @@ from moviepy.editor import (
     TextClip,
     VideoClip,
     VideoFileClip,
-    concatenate_videoclips,
 )
+# concatenate_videoclips sale del import de módulo a propósito: era el
+# patrón "abrir N clips del mismo archivo y concatenarlos", que filtraba un
+# proceso ffmpeg por vuelta. El único uso vivo (_apply_short_effect) lo
+# importa localmente. Que reaparecer acá cueste una línea extra.
 # Make moviepy tolerant of non-UTF-8 bytes in ffmpeg's output (accented
 # filenames / metadata — "La Vida Al Revés" → 0xe9). Without this, AudioFileClip
 # / VideoFileClip crash on any accented title. Self-applies on import.
 import moviepy_utf8_patch  # noqa: F401
+# Y que el writer de moviepy deje de tragarse los fallos de su ffmpeg: su
+# close() descarta el returncode, así que un encoder que muere en la
+# finalización (reubicación del +faststart) devuelve "éxito" con un archivo
+# roto en disco. Es lo que dejó el short_bg_only.mp4 con moov sano y cero
+# packets en el incidente UMG Chile 2026-08-21. Self-applies on import.
+import moviepy_writer_patch  # noqa: F401
 from PIL import Image, ImageDraw, ImageFont
 
 from jobs import update_job, get_job_model
@@ -154,6 +163,12 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
        behavior because they're lazy-regenerated on first /download.
     """
     if not storage.is_enabled():
+        if os.environ.get("ENVIRONMENT", "production").strip().lower() in {
+            "production", "prod", "staging",
+        }:
+            raise StorageUploadError(
+                "Required object storage is not configured for deliverables"
+            )
         return {}
     from jobs import merge_s3_keys, heartbeat
     # We need a SQLAlchemy session, but this function runs in the worker
@@ -515,7 +530,7 @@ def _cleanup_local_intermediates(job_dir: str) -> None:
         pass
 
 
-def _cleanup_job_dir_on_failure(job_dir: str) -> None:
+def _cleanup_job_dir_on_failure(job_dir: str, job_id: str | None = None) -> None:
     """Remove the ENTIRE local job dir when a render FAILS (Tier 4 / C5).
 
     Unlike _cleanup_local_intermediates (success path: keeps any leftover
@@ -534,10 +549,132 @@ def _cleanup_job_dir_on_failure(job_dir: str) -> None:
         return
     if not job_dir or not os.path.isdir(job_dir):
         return
+    # Última barrera antes de destruir evidencia: si el render llegó a
+    # producir un master sano, no se tira. Cubre las bombas que los
+    # try/except por paso no anticiparon (ver _rescue_master_before_cleanup).
+    if job_id:
+        try:
+            _rescue_master_before_cleanup(job_id, job_dir)
+        except Exception:
+            pass
     try:
         import shutil
         shutil.rmtree(job_dir, ignore_errors=True)
         logger.info("[PIPELINE] cleaned up failed job dir (freed disk): %s", job_dir)
+    except Exception:
+        pass
+
+
+def _rescue_master_before_cleanup(job_id: str, job_dir: str) -> bool:
+    """Sube el master a R2 si sobrevivió sano, ANTES de borrar el job dir.
+
+    Incidente UMG Chile 2026-08-21 (job d6fdeb72088e): el master estaba
+    renderizado y validado (352s, 519.5 MB) cuando el paso del short —un
+    entregable secundario— levantó un OSError. El except global marcó el
+    job 'error' y `_cleanup_job_dir_on_failure` hizo rmtree del directorio
+    con el master adentro. El cliente perdió el video dos veces.
+
+    Los try/except por paso (ver `_accessory_failed`) tapan las bombas que
+    CONOCEMOS. Esto es la red para las que no: entre el momento en que
+    `lyric_video.mp4` existe en disco y el `_upload_deliverables_to_r2`
+    que lo sube hay ~120 renglones donde el master existe en un solo lugar
+    del mundo, y cualquier excepción ahí lo borraba.
+
+    El docstring de `_cleanup_job_dir_on_failure` justifica el rmtree con
+    "an RQ retry re-downloads + re-renders". Eso es FALSO: el except
+    genérico de run_pipeline no re-lanza, así que RQ ve el work-horse
+    terminar OK y `Retry` nunca dispara. Sin este rescate el master se
+    perdía definitivamente, sin reintento.
+
+    Best-effort y silencioso ante fallos: esto corre en el camino de error,
+    jamás puede pisar la excepción original. Devuelve True si subió algo.
+    """
+    if not job_dir or not os.path.isdir(job_dir):
+        return False
+    master = os.path.join(job_dir, "lyric_video.mp4")
+    if not os.path.exists(master):
+        return False
+    try:
+        if not storage.is_enabled():
+            return False
+        # Solo rescatamos un master REPRODUCIBLE. Subir uno truncado sería
+        # peor que perderlo: quedaría publicado como entregable bueno.
+        _validate_rendered_mp4(master, 0)
+    except Exception as e:
+        logger.warning("[RESCUE] master presente pero no válido (%s) — no se sube", e)
+        return False
+    try:
+        from jobs import merge_s3_keys
+        from database import SessionLocal as _SL
+        _db = _SL()
+        try:
+            _row = get_job_model(_db, job_id)
+            tenant_id = (_row.tenant_id if _row is not None else None) or "default"
+        finally:
+            _db.close()
+        key = storage.upload_master(master, tenant_id, job_id, "lyric_video.mp4")
+        if not key:
+            raise RuntimeError("upload_master returned no key")
+        merge_s3_keys(job_id, "video", key)
+        logger.warning(
+            "[RESCUE] job=%s falló DESPUÉS de renderizar el master — "
+            "master rescatado a R2 (%s) antes de limpiar el dir", job_id, key,
+        )
+        return True
+    except Exception as e:
+        logger.warning("[RESCUE] no se pudo rescatar el master de job=%s: %s", job_id, e)
+        return False
+
+
+# Entregables SECUNDARIOS: su fallo degrada la entrega, nunca la cancela.
+_ACCESSORY_ARTIFACTS = {"short": "short.mp4", "thumbnail": "thumbnail.jpg"}
+
+
+def _accessory_failed(kind: str, job_id: str, job_dir: str, exc: BaseException) -> None:
+    """Da por perdido un entregable secundario sin matar el job.
+
+    El master es el producto; el short vertical y el thumbnail son
+    accesorios. Antes de este handler cualquier excepción en esos pasos
+    subía al except global de run_pipeline y se llevaba puesto un master
+    ya renderizado (incidente UMG Chile 2026-08-21, ver
+    `_rescue_master_before_cleanup`).
+
+    Tres cosas, en este orden:
+
+    1. `_raise_if_job_timeout` PRIMERO. Si esto es el death penalty de RQ,
+       se re-lanza: la resiliencia jamás puede neutralizarlo (si no, el
+       worker seguiría al thumbnail y a subir cientos de MB pasado el
+       deadline).
+    2. Borrar el artefacto a medio escribir. `generate_short` escribe
+       DIRECTO sobre short.mp4 (sin .tmp + rename), así que un fallo a
+       mitad deja un MP4 truncado, y `_cleanup_local_intermediates` no lo
+       barre (solo toca bg_*). Si sobrevive, `enqueue_prores_prewarm` lo
+       transcodea y publica un .mov corrupto en R2 — prores.py sólo
+       chequea `os.path.exists` del source, nunca lo valida.
+    3. Sentry con fingerprint propio. Una entrega sin short es una entrega
+       DEGRADADA, no un éxito: tiene que verse.
+    """
+    _raise_if_job_timeout(exc)
+    logger.exception(
+        "[%s] falló — el job sigue y se entrega sin ese archivo (job=%s)",
+        kind.upper(), job_id,
+    )
+    artifact = _ACCESSORY_ARTIFACTS.get(kind)
+    if artifact:
+        path = os.path.join(job_dir, artifact)
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+                logger.warning("[%s] borrado el %s a medio escribir", kind.upper(), artifact)
+        except OSError:
+            pass
+    try:
+        import sentry_sdk
+        with sentry_sdk.push_scope() as _scope:
+            _scope.fingerprint = [f"{kind}-generation-failed"]
+            _scope.set_tag("job_id", job_id)
+            _scope.set_tag("deliverable", kind)
+            sentry_sdk.capture_exception(exc)
     except Exception:
         pass
 
@@ -1672,6 +1809,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             logger.warning("[BG] merge_render_params failed: %s", _rp_exc)
 
         files = {}
+        # Entregables accesorios que se perdieron por el camino. Local: la
+        # señal PERSISTIDA es que job.short_url / job.thumbnail_url quedan
+        # NULL, porque update_job(files=...) sólo escribe las keys presentes
+        # en el dict (jobs.py) y /retry y /edit ya las resetean a NULL antes
+        # de re-renderizar. O sea "job done con short_url NULL" == no hay
+        # short, sin columna nueva ni migración. Esto sólo evita releer la
+        # fila para decidir el prewarm de ProRes acá mismo.
+        missing_deliverables: list[str] = []
         # La elección de tipografía se hace UNA vez acá (operador o pick
         # del pool) y fluye a video + short + persiste para re-renders.
         # Fix incidente UMG Chile 2026-06-11 — ver _pick_concrete_font.
@@ -2122,45 +2267,57 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         if wants_youtube or wants_umg:
             update_job(job_id, current_step="short", progress=75)
             short_fps = float(umg_spec["fps"]) if wants_umg else 24
-            if art_track:
-                # Art track short: vertical (9:16) composite of the cover over
-                # a 30s high-energy window (no lyrics → pick the window by RMS
-                # energy, not chorus repetition). Same look as the master.
-                _short_spec = (
-                    RenderSpec.umg_intermediate_short(umg_spec) if wants_umg
-                    else RenderSpec.youtube_short()
-                )
-                generate_art_track_short(
-                    mp3_path, bg_source, job_dir, spec=_short_spec,
-                    artist=artist, song_title=song_title,
-                    label_line=label_line, effect=effect,
-                )
-            else:
-                generate_short(
-                    mp3_path, segments, job_dir, bg_source=bg_source,
-                    style=style, font=chosen_font, fps=short_fps,
-                    text_case=text_case, font_scale=font_scale,
-                    lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
-                    text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
-                    lyrics_animation=lyrics_animation, line_transition=line_transition,
-                )
-            files["short_url"] = f"/download/{job_id}/short"
+            # El short y el thumbnail son ACCESORIOS: a esta altura el master
+            # ya está renderizado y validado en disco, y hasta el incidente
+            # UMG Chile 2026-08-21 una excepción acá lo borraba entero (ver
+            # `_accessory_failed`). Se degrada la entrega, nunca se cancela.
+            try:
+                if art_track:
+                    # Art track short: vertical (9:16) composite of the cover over
+                    # a 30s high-energy window (no lyrics → pick the window by RMS
+                    # energy, not chorus repetition). Same look as the master.
+                    _short_spec = (
+                        RenderSpec.umg_intermediate_short(umg_spec) if wants_umg
+                        else RenderSpec.youtube_short()
+                    )
+                    generate_art_track_short(
+                        mp3_path, bg_source, job_dir, spec=_short_spec,
+                        artist=artist, song_title=song_title,
+                        label_line=label_line, effect=effect,
+                    )
+                else:
+                    generate_short(
+                        mp3_path, segments, job_dir, bg_source=bg_source,
+                        style=style, font=chosen_font, fps=short_fps,
+                        text_case=text_case, font_scale=font_scale,
+                        lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                        text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
+                        lyrics_animation=lyrics_animation, line_transition=line_transition,
+                    )
+                files["short_url"] = f"/download/{job_id}/short"
+            except Exception as _short_err:
+                _accessory_failed("short", job_id, job_dir, _short_err)
+                missing_deliverables.append("short")
             update_job(job_id, progress=85)
 
             # Step 4 — Thumbnail (art tracks reuse the composite look so the
             # thumbnail matches what plays; lyric videos keep the raw bg).
             update_job(job_id, current_step="thumbnail", progress=90)
-            if art_track:
-                generate_art_track_thumbnail(
-                    bg_source, mp3_path, job_dir, artist=artist,
-                    song_title=song_title, label_line=label_line,
-                )
-            else:
-                generate_thumbnail(
-                    artist, mp3_path, job_dir, bg_source=bg_source,
-                    song_title=song_title,
-                )
-            files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
+            try:
+                if art_track:
+                    generate_art_track_thumbnail(
+                        bg_source, mp3_path, job_dir, artist=artist,
+                        song_title=song_title, label_line=label_line,
+                    )
+                else:
+                    generate_thumbnail(
+                        artist, mp3_path, job_dir, bg_source=bg_source,
+                        song_title=song_title,
+                    )
+                files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
+            except Exception as _thumb_err:
+                _accessory_failed("thumbnail", job_id, job_dir, _thumb_err)
+                missing_deliverables.append("thumbnail")
 
         # Content validation already happened pre-render (Step 1b) so the
         # background here is guaranteed clean. No post-render check needed.
@@ -2179,15 +2336,18 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
 
         # P3: join INCONDICIONAL de la validación observe-paralela, ANTES de
         # _verify_deliverables — o sea antes del cleanup que borra el archivo
-        # que el hilo lee y antes del status final. result() re-lanza
-        # cualquier error del hilo (patrón del fan-out de escenas): un fallo
-        # de Vision produce el mismo estado terminal 'error' que hoy en
-        # secuencial. A esta altura el hilo (~65s) casi siempre ya terminó
-        # (encode+short ~180s) → costo del join ≈ 0. Timeout defensivo
-        # (audit adversarial 2026-07-17): con Vertex degradado la validación
-        # puede sumar minutos a un render EXITOSO — justo la latencia que
-        # este PR elimina, invertida. A los 180s se sigue de largo tratando
-        # el veredicto como no-concluyente (observe nunca bloquea igual).
+        # que el hilo lee y antes del status final. A esta altura el hilo
+        # (~65s) casi siempre ya terminó (encode+short ~180s) → costo ≈ 0.
+        # Timeout defensivo (audit adversarial 2026-07-17): con Vertex
+        # degradado la validación puede sumar minutos a un render EXITOSO.
+        #
+        # El except era `except _cf_join.TimeoutError` a secas, así que
+        # result() RE-LANZABA cualquier otra excepción del hilo. Ese hilo hace
+        # dos update_job + un record_ai_call contra Postgres: un pool saturado
+        # en un batch UMG mataba —y borraba— un master perfecto, en el modo
+        # que existe LITERALMENTE para no bloquear la entrega (observe nunca
+        # bloquea). Se traga todo: recolectar el veredicto es best-effort, la
+        # entrega no. El rescue join del `finally` persiste igual lo que haya.
         if _bg_validation_future is not None:
             import concurrent.futures as _cf_join
             try:
@@ -2196,6 +2356,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 logger.warning(
                     "[VALIDATION] observe-parallel join timeout (180s) job=%s "
                     "— sigo sin veredicto (observe no bloquea)", job_id,
+                )
+            except Exception as _val_join_err:
+                _raise_if_job_timeout(_val_join_err)
+                logger.warning(
+                    "[VALIDATION] observe-parallel join falló job=%s (%s) "
+                    "— sigo: observe jamás puede costar la entrega", job_id,
+                    _val_join_err,
                 )
             _bg_validation_pool.shutdown(wait=False)
             _bg_validation_future = None
@@ -2289,7 +2456,12 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             try:
                 from queue_jobs import enqueue_prores_prewarm
                 enqueue_prores_prewarm(job_id, "umg_master")
-                enqueue_prores_prewarm(job_id, "umg_short")
+                # Sin short.mp4 no hay ProRes short que derivar. prores.py sólo
+                # chequea os.path.exists del source y nunca lo valida, así que
+                # encolarlo igual publicaría un .mov derivado de un archivo
+                # ausente o truncado.
+                if "short" not in missing_deliverables:
+                    enqueue_prores_prewarm(job_id, "umg_short")
             except Exception as e:  # pragma: no cover
                 logger.warning("[PIPELINE] prores prewarm enqueue skipped: %s", e)
 
@@ -2351,7 +2523,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # Liberar los intermedios pesados igual que el except general, pero
         # conservando el input local cuando no está en R2 (el retry lo necesita).
         if input_r2_key:
-            _cleanup_job_dir_on_failure(job_dir)
+            _cleanup_job_dir_on_failure(job_dir, job_id)
         else:
             _cleanup_local_intermediates(job_dir)
         raise
@@ -2359,15 +2531,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     except Exception as exc:
         _raise_if_job_timeout(exc)
         traceback.print_exc()
-        from error_taxonomy import classify_error
+        from error_taxonomy import classify_error, public_error
         error_category = (
             "storage_upload" if isinstance(exc, StorageUploadError)
             else classify_error(str(exc))
         )
-        update_job(
-            job_id, status="error", error=str(exc),
-            error_category=error_category,
+        error_code, error_message = public_error(
+            exc, context="pipeline", category=error_category,
         )
+        update_job(job_id, status="error", error=error_message,
+                   error_category=error_category, error_code=error_code)
         # Surface render failures to Sentry. The worker runs outside
         # the FastAPI request loop so the framework's auto-capture
         # doesn't fire — without this explicit hook, ffmpeg hangs,
@@ -2385,17 +2558,23 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # Tier 4 (C5): free the disk on failure. Without this, a failed render's
         # multi-GB intermediates pile up until the disk fills and the NEXT
         # render fails mid-flush. When R2 is enabled the input can be re-fetched
-        # (input_r2_key), so rmtree the whole dir — an RQ retry re-downloads +
-        # re-renders. When it ISN'T, the input lives only locally inside job_dir,
-        # so preserve it (just free the heavy bg intermediates) — else the retry
-        # would fail for lack of its own input. (Adversarial-review guard.)
+        # (input_r2_key), so rmtree the whole dir. When it ISN'T, the input
+        # lives only locally inside job_dir, so preserve it (just free the heavy
+        # bg intermediates) — else a retry would fail for lack of its own input.
+        #
+        # OJO (corregido 2026-08-21): este comentario decía que el rmtree era
+        # seguro porque "an RQ retry re-downloads + re-renders". Es falso: este
+        # except NO re-lanza, así que RQ ve el work-horse terminar OK y el
+        # Retry(max=3) de queue_jobs nunca dispara. No hay reintento
+        # automático. Por eso pasamos job_id: el cleanup rescata a R2 un
+        # master sano antes de borrar (ver _rescue_master_before_cleanup).
         if isinstance(exc, StorageUploadError):
             logger.warning(
                 "[R2] preserving local outputs after exhausted upload retries: %s",
                 job_dir,
             )
         elif input_r2_key:
-            _cleanup_job_dir_on_failure(job_dir)
+            _cleanup_job_dir_on_failure(job_dir, job_id)
         else:
             _cleanup_local_intermediates(job_dir)
     finally:
@@ -6189,12 +6368,24 @@ def _validate_background_asset_for_job(
     *,
     ai_generated: bool = True,
     failure_status: str | None = "validation_failed",
+    verdict_out: dict | None = None,
 ) -> bool:
-    """Apply the same authoritative gate to initial, edit and cache paths."""
+    """Apply the same authoritative gate to initial, edit and cache paths.
+
+    ``verdict_out``: optional dict updated in place with the raw validator
+    result. A caller that must distinguish "the classifier saw a violation"
+    from "the classifier never answered" (quota/timeout) reads
+    ``verdict_out["inconclusive"]`` — the boolean return stays fail-closed
+    for everyone else.
+    """
     policy = _background_safety_policy(job_id, operator_prompt)
     if not policy["should_validate"]:
         return True
     if not asset_path or not os.path.exists(asset_path):
+        if verdict_out is not None:
+            # Missing asset: nothing to keep, so this is NOT a recoverable
+            # inconclusive verdict even though no frame was ever checked.
+            verdict_out.update({"passed": False, "inconclusive": False})
         if failure_status:
             update_job(
                 job_id, status=failure_status,
@@ -6227,6 +6418,8 @@ def _validate_background_asset_for_job(
     result["policy_mode"] = policy["policy_mode"]
     result["allow_people"] = policy["allow_people"]
     result["allow_atmospherics"] = policy["allow_atmospherics"]
+    if verdict_out is not None:
+        verdict_out.update(result)
     update_job(job_id, validation_result=result)
     if result.get("passed") is not True:
         if _validation_observe_only():
@@ -6243,6 +6436,195 @@ def _validate_background_asset_for_job(
             )
         logger.warning("[VALIDATION] FAILED for job %s: %s", job_id, result.get("issues"))
         return False
+    return True
+
+
+# Edits that change only the FOREGROUND layer. They render over the background
+# already stored for the job — no new asset enters the pipeline — so the bytes
+# handed to the validator are the same ones a previous run certified.
+_BACKGROUND_REUSE_EDIT_TYPES = ("typography", "lyrics", "metadata")
+
+
+def _should_keep_certified_background(
+    edit_type: str,
+    *,
+    verdict: dict,
+    prior_validation_result: dict,
+    asset_path: str | None,
+    forced_fallback: bool = False,
+    reusing_certified_asset: bool = False,
+) -> bool:
+    """True when a failed re-check must NOT discard the reused background.
+
+    All four conditions are required:
+
+    1. the edit reuses the stored background (foreground-only change),
+    2. the re-check was INCONCLUSIVE — quota/timeout/extraction errors, no
+       policy finding. A decisive violation still destroys the asset, which is
+       the whole point of the gate,
+    3. this job's background already holds a ``passed`` verdict, so keeping it
+       preserves an existing certification instead of inventing one,
+    4. the asset is actually on disk to render with.
+
+    ``forced_fallback`` means the background in hand is already the safe local
+    gradient; there is nothing to preserve.
+
+    ``reusing_certified_asset`` covers the other way a certified asset ends up
+    in hand: a background/scene edit whose GENERATION failed and degraded back
+    to the previously cached asset. The edit type says "new background" but the
+    bytes are the old, already-certified ones — same rule applies.
+    """
+    if forced_fallback:
+        return False
+    if not (
+        reusing_certified_asset or edit_type in _BACKGROUND_REUSE_EDIT_TYPES
+    ):
+        return False
+    if not verdict.get("inconclusive"):
+        return False
+    if prior_validation_result.get("passed") is not True:
+        return False
+    return bool(asset_path and os.path.exists(asset_path))
+
+
+def _download_previously_certified_background(
+    job_id: str,
+    job_dir: str,
+    bg_r2_key_cached: str | None,
+    prior_validation_result: dict,
+    *,
+    filename_stem: str = "bg_prev_certified",
+) -> str | None:
+    """Local copy of the last background/timeline this job certified.
+
+    The degraded destination for a FAILED generation. Historically any
+    provider error (Veo outage, Imagen 500, breaker open) degraded to the
+    deterministic gradient — which then recached itself over
+    ``bg_r2_key_cached``, so "regenerate my background" failing at the
+    provider destroyed the background the operator already had. Degrading to
+    the previous certified asset instead means a failed regeneration is a
+    no-op the user can retry, not a loss.
+
+    Returns None when there is nothing certified to fall back to; the caller
+    then uses the gradient exactly as before.
+    """
+    if prior_validation_result.get("passed") is not True:
+        return None
+    if not bg_r2_key_cached or not storage.is_enabled():
+        return None
+    ext = os.path.splitext(bg_r2_key_cached)[1].lower() or ".mp4"
+    dest = os.path.join(job_dir, f"{filename_stem}{ext}")
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return dest
+    try:
+        if storage.download_object(bg_r2_key_cached, dest):
+            return dest
+    except Exception as _download_error:  # noqa: BLE001
+        logger.warning(
+            "[EDIT] no pude bajar el fondo certificado previo job=%s key=%s: %s",
+            job_id, bg_r2_key_cached, _download_error,
+        )
+    return None
+
+
+def _archive_and_clear_scene_plan(
+    merged: dict,
+    scene_plan: dict | None,
+    job_id: str,
+    *,
+    reason: str,
+) -> None:
+    """Drop the storyboard from the job, but keep a copy for recovery.
+
+    Clearing ``scene_plan`` is correct when the rendered background stops
+    being the storyboard's timeline — a later edit reading that plan would
+    trust false provenance. Losing it outright is not: the plan holds every
+    scene PROMPT, i.e. the creative direction the operator wrote. Stash it in
+    render_params (same write as the clear, no migration) so ops can rebuild
+    the storyboard instead of asking the customer to describe it again.
+
+    Nothing reads ``scene_plan_archived`` — it is inert recovery data, so it
+    cannot resurrect stale provenance.
+    """
+    if scene_plan:
+        merged["scene_plan_archived"] = {
+            "reason": reason,
+            "plan": scene_plan,
+        }
+        logger.error(
+            "[SCENES] storyboard descartado del job=%s (%s) — copia de "
+            "recuperación en render_params.scene_plan_archived",
+            job_id, reason,
+        )
+    return None
+
+
+_DECISIVE_SCENE_REJECTION_MARKERS = (
+    "rejected by no-human policy",
+    "content policy",
+)
+
+
+def _scene_plan_failure_is_decisive(scene_plan: dict | None) -> bool:
+    """Did a storyboard re-scan actually SEE something forbidden?
+
+    ``_generate_scene_clips`` records the outcome per scene. A decisive
+    rejection (the classifier flagged people/brand) means the persisted clips
+    are genuinely unusable and the caller must degrade to the safe gradient. A
+    cache miss, a download error or an open Veo breaker means we could not
+    look — which is not evidence, and must not cost the operator a storyboard
+    that has never failed a check.
+    """
+    for scene in (scene_plan or {}).get("scenes", []) or []:
+        validation = scene.get("validation") or {}
+        if validation.get("passed") is True:
+            continue
+        detections = validation.get("detections") or {}
+        if detections.get("people") or detections.get("brand"):
+            return True
+        blob = f"{validation.get('error') or ''} {scene.get('error') or ''}".lower()
+        if any(marker in blob for marker in _DECISIVE_SCENE_REJECTION_MARKERS):
+            return True
+    return False
+
+
+def _inherit_inconclusive_scene_verdict(
+    scene: dict,
+    *,
+    verdict: dict,
+    prior_validation: dict,
+    policy_fingerprint: str,
+    cache_only: bool,
+) -> bool:
+    """Same rule as :func:`_should_keep_certified_background`, per scene clip.
+
+    A storyboard edit re-scans every persisted clip. When a clip comes back
+    from the cache UNCHANGED (``cache_only``) and its re-scan is inconclusive
+    — quota/timeout, no policy finding — the verdict it already earned under
+    the SAME policy fingerprint is still the best evidence available about
+    those exact bytes. Without this, one 429 marks the scene failed, the
+    substitution phase cannot find a compatible replacement, the dense
+    revalidation raises, and the whole storyboard gets thrown away over a
+    transient provider error.
+
+    Mutates ``scene["validation"]`` in place and returns True when the prior
+    verdict was inherited.
+    """
+    if not cache_only or not verdict.get("inconclusive"):
+        return False
+    if prior_validation.get("passed") is not True:
+        return False
+    if prior_validation.get("policy_fingerprint") != policy_fingerprint:
+        # Policy moved since that certification: the old verdict says nothing
+        # about the rules in force now. Fail closed, as before.
+        return False
+    scene["validation"] = {
+        **prior_validation,
+        "passed": True,
+        "policy_fingerprint": policy_fingerprint,
+        "revalidation_inconclusive": True,
+        "revalidation_issues": list(verdict.get("issues") or []),
+    }
     return True
 
 
@@ -12495,6 +12877,11 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         # En un regen (regen_keys set), las escenas NO-target son cache_only:
         # se sirven de caché o se degradan, nunca pagan Veo de nuevo.
         _cache_only = regen_keys is not None and key not in regen_keys
+        # Veredicto que este clip YA tenía. Sólo es evidencia sobre los bytes
+        # que vamos a rendear cuando la escena es cache_only (el clip vuelve
+        # de la caché sin cambiar); un regen escribe bytes nuevos y no puede
+        # heredar nada. Ver _inherit_inconclusive_scene_verdict.
+        _prior_scene_validation = dict(scene.get("validation") or {})
         _meta = {}
         scene_policy = (
             rebase_stored_atmospherics_policy(scene.get("atmospherics_policy"))
@@ -12586,7 +12973,20 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                     ),
                     "policy_fingerprint": _policy_fp,
                 }
-                if _scene_validation.get("passed") is not True:
+                if _inherit_inconclusive_scene_verdict(
+                    scene,
+                    verdict=_scene_validation,
+                    prior_validation=_prior_scene_validation,
+                    policy_fingerprint=_policy_fp,
+                    cache_only=_cache_only,
+                ):
+                    logger.error(
+                        "[SCENES] re-chequeo inconcluso del clip cacheado %s "
+                        "(job=%s) — conservo el veredicto previo en vez de "
+                        "tirar la escena: issues=%s",
+                        key, job_id, _scene_validation.get("issues"),
+                    )
+                elif _scene_validation.get("passed") is not True:
                     if _validation_observe_only():
                         logger.warning(
                             "[SCENES] observe-only: keeping clip %s job=%s "
@@ -14138,6 +14538,158 @@ def _video_dims(path: str) -> tuple[int, int] | None:
         return None
 
 
+def _decodes_ok(path: str, frames: int = 1) -> bool:
+    """True si ffmpeg puede DECODIFICAR de verdad los primeros `frames`.
+
+    ffprobe no sirve para esto: lee el header y te miente. En el incidente
+    UMG Chile 2026-08-21 el `short_bg_only.mp4` roto reportaba un moov
+    perfectamente sano (1080x1920, 24 fps, 30,00 s, 721 frames) y no tenía
+    un solo packet de video decodificable. Los dos consumidores del archivo
+    —la pasada libass y el fallback moviepy— lo aceptaron y reventaron:
+    ffmpeg con `-22 Invalid argument` ("Nothing was written into output
+    file, because at least one of its streams received no packets") y
+    moviepy con `OSError: failed to read the first frame`, que sin atrapar
+    se llevó puesto el job y un master de 519 MB ya validado.
+
+    Decodificar un frame a /dev/null cuesta milisegundos y es la única
+    verificación que distingue "header lindo" de "archivo usable".
+    """
+    if not path or not os.path.exists(path) or os.path.getsize(path) < 1024:
+        return False
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", path,
+             "-frames:v", str(max(1, frames)), "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except Exception:
+        return False
+    return r.returncode == 0 and not (r.stderr or "").strip()
+
+
+def _alert_sentry(fingerprint: str, message: str, *, job_dir: str = "",
+                  level: str = "error",
+                  extra: dict | None = None) -> None:
+    """Manda un aviso a Sentry con fingerprint propio. Nunca levanta.
+
+    Estos caminos degradan la entrega en silencio (short sin fondo real,
+    short sin la tipografía del video). Sin una alerta agrupable el que se
+    entera es el cliente, que es exactamente como nos enteramos del
+    incidente del 21-08.
+
+    `extra` adjunta contexto de diagnóstico (ej. el stderr de ffmpeg o el
+    repr de una excepción) para no tener que correlacionar logs de worker
+    por timestamp cuando el evento dispara.
+    """
+    try:
+        import sentry_sdk
+        with sentry_sdk.push_scope() as _scope:
+            _scope.fingerprint = [fingerprint]
+            if job_dir:
+                _scope.set_tag("job_id", os.path.basename(job_dir.rstrip("/")))
+            for key, value in (extra or {}).items():
+                _scope.set_extra(key, value)
+            sentry_sdk.capture_message(message, level=level)
+    except Exception:
+        pass  # sin Sentry (dev/tests) el log del caller alcanza
+
+
+def _log_short_bg_forensics(path: str, job_dir: str) -> None:
+    """Volcá todo lo que se sepa del intermedio del short cuando falla.
+
+    Seguimos sin saber POR QUÉ `short_bg_only.mp4` sale a veces con el moov
+    sano y sin packets. Quedaron dos hipótesis vivas y hoy son
+    indistinguibles con lo que se loguea: (a) el archivo se escribe roto o
+    se trunca después, (b) los procesos ffmpeg se mueren por presión de
+    memoria — `generate_short` corre en progress=75, que es justo donde ya
+    hay documentados workers SIGKILL-eados.
+
+    Estos tres datos las separan: si ffprobe CUENTA packets pero ffmpeg no
+    los decodifica, el archivo está corrupto en disco (a). Si el archivo
+    está sano acá, los lectores se están muriendo (b). Y el disco libre
+    descarta ENOSPC, que hoy no se mide en ningún lado de este módulo.
+    Best-effort: esto corre en un camino de error y nunca puede levantar.
+    """
+    try:
+        size = os.path.getsize(path) if os.path.exists(path) else -1
+    except OSError:
+        size = -1
+    packets = "?"
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-count_packets", "-show_entries", "stream=nb_read_packets",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=60,
+        )
+        packets = (r.stdout or "").strip() or "?"
+    except Exception:
+        pass
+    disk = "?"
+    try:
+        import shutil as _sh
+        _u = _sh.disk_usage(job_dir)
+        disk = f"free={_u.free // (1024 * 1024)}MB/total={_u.total // (1024 * 1024)}MB"
+    except Exception:
+        pass
+    logger.error(
+        "[SHORT-FORENSE] %s size=%sB nb_read_packets=%s disco=%s",
+        os.path.basename(path), size, packets, disk,
+    )
+
+
+def _prerender_short_bg_loop(bg_path: str, duration: float, job_dir: str) -> str:
+    """Loopea un fondo corto a 1080x1920 para el short, con ffmpeg.
+
+    Reemplaza al patrón "abrir N VideoFileClip del mismo archivo y
+    concatenarlos con moviepy", que filtraba un proceso ffmpeg por vuelta
+    (`concatenate_videoclips` no cascadea `close()`).
+
+    Deliberadamente NO usa `_prerender_looped_bg`, por dos razones:
+
+    1. Ese helper pone el `-t` DESPUÉS del `-i`, o sea como opción de
+       output, así que el input con `-stream_loop -1` nunca da EOF y el
+       filtro `reverse` —que necesita EOF para emitir— bufferea sin límite.
+       Medido a 1080x1920: 2,24 GB de RSS contra 662 MB de esta forma, y
+       framemd5 IDÉNTICO al del loop plano. O sea paga 3,4x de memoria por
+       un palíndromo que no produce. Meterlo acá pondría ese pico justo en
+       progress=75, el paso que ya venía matando workers por OOM.
+    2. Aunque funcionara, no queremos palindromear en esta rama: un
+       timeline multi-escena corto reproduciría las escenas en REVERSA al
+       final, que es justo lo que `_get_background_clip_from_path` evita.
+
+    El nombre empieza con `bg_looped_` a propósito: `_cleanup_local_intermediates`
+    barre por ese glob, así que el intermedio se limpia solo en vez de
+    acumular decenas de MB por job.
+    """
+    out_path = os.path.join(job_dir, "bg_looped_short_1080x1920.mp4")
+    run_checked(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-stream_loop", "-1", "-i", bg_path,
+            "-t", str(duration),
+            "-vf", (
+                "scale=1080:1920:force_original_aspect_ratio=increase,"
+                "crop=1080:1920,setpts=PTS-STARTPTS"
+            ),
+            # crf 16: este archivo se re-encodea dos veces más aguas abajo
+            # (fx + libass), así que arrancamos con margen para no acumular
+            # banding en los degradés oscuros que suele dar Veo.
+            "-c:v", "libx264", "-preset", "fast", "-crf", "16",
+            "-pix_fmt", "yuv420p", "-an",
+            out_path,
+        ],
+        label="ffmpeg-short-bg-loop",
+        # 30s de salida se encodean en ~3s medidos. 120s es cliff de sobra;
+        # los 900s de _prerender_looped_bg son para masters de 6 minutos.
+        timeout=120,
+        output_path=out_path,
+    )
+    if not _decodes_ok(out_path):
+        raise RuntimeError(f"loop de fondo del short ilegible: {out_path}")
+    return out_path
+
+
 # --- Letterbox output-QA -----------------------------------------------------
 # Veo occasionally bakes a black 2.39:1 anamorphic letterbox INTO a 16:9 clip
 # (stochastic — one video shows bars, the next doesn't; see the anti-letterbox
@@ -14373,82 +14925,127 @@ def _normalize_bg_to_spec(bg_path: str, job_dir: str,
     return out_path
 
 
+# Tope de duración para palindromear. El filtro `reverse` bufferea el clip
+# ENTERO descomprimido en RAM: medido a resolución nativa 1280x720 son ~430 MB
+# para 4s y escala lineal (~107 MB por segundo de clip). Los clips de Veo son
+# de 4/6/8s, así que 10s cubre el caso real con margen; cualquier cosa más
+# larga cae al loop plano en vez de arriesgar el worker.
+_PALINDROME_MAX_CLIP_S = 10.0
+
+
 def _prerender_looped_bg(bg_path: str, duration: float, job_dir: str,
                          target_w=1920, target_h=1080,
                          out_name: str = "bg_looped.mp4") -> str:
     """Pre-render a seamlessly looped background using palindrome (A + reverse(A)).
 
-    A straight -stream_loop jumps from the last frame back to the first, which
-    is visible as a "pop" when the scene has camera movement. Concatenating A
-    with its reverse makes the last frame of one pass match the first frame of
-    the next — the loop is mathematically seamless.
+    Un `-stream_loop` pelado salta del último frame al primero, y eso se ve
+    como un "pop" cuando la escena tiene movimiento de cámara. Concatenar A con
+    su reverso hace que el último frame de una pasada coincida con el primero
+    de la siguiente: el loop queda matemáticamente sin costura.
 
-    We scale and crop first, then palindrome, then loop the palindrome to fill
-    the requested duration.
+    DOS ETAPAS, y el orden es el punto (bug 2026-08-21):
+
+    La versión anterior armaba el palíndromo sobre `-stream_loop -1` con el
+    `-t` DESPUÉS del `-i` — o sea como opción de OUTPUT. Un input con
+    `-stream_loop -1` nunca da EOF, y el filtro `reverse` necesita EOF para
+    emitir aunque sea un frame: bufferaba sin límite mientras `concat` dejaba
+    pasar el segmento `[a]`, que ya era el loop infinito. Resultado: el
+    "palíndromo" NUNCA se produjo para ningún caller —se entregaba un loop
+    plano, con el pop que este helper existe para evitar— y encima pagando
+    2,24 GB de RSS a 1080x1920 contra 662 MB del loop plano. Verificado con
+    framemd5: la rama del palíndromo y su propio fallback daban frames
+    idénticos bit a bit.
+
+    La forma correcta es palindromear el clip UNIDAD con un input acotado (así
+    `reverse` ve EOF) y recién después loopear ese palíndromo. Y se palindromea
+    a resolución NATIVA, escalando en la segunda pasada: el buffer de `reverse`
+    es proporcional a los píxeles, así que escalar antes lo encarecía al doble
+    (893 MB contra 430 MB medidos con un clip de 4s a 1080p de salida). Con
+    esto el pico total queda en ~634 MB, prácticamente igual que el loop plano
+    (625 MB) — o sea el palíndromo pasa a ser gratis y además funciona.
+
+    Los dos callers ya filtran `bg_prelooped` antes de llegar acá, así que un
+    timeline multi-escena nunca se palindromea (se reproducirían las escenas en
+    reversa al final).
     """
     out_path = os.path.join(job_dir, out_name)
-    cmd = [
-        "ffmpeg", "-y",
-        "-stream_loop", "-1",
-        "-i", bg_path,
-        "-t", str(duration),
-        "-filter_complex", (
-            f"[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-            f"crop={target_w}:{target_h},setpts=PTS-STARTPTS,split[a][b];"
-            "[b]reverse[br];"
-            "[a][br]concat=n=2:v=1:a=0"
-        ),
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        "-an",
-        out_path,
-    ]
-    # Audit 2026-05-26: timeout=900s. Without it, a corrupted Veo output
-    # or a filter_complex that locks the encoder (palindrome on a
-    # zero-length input has been observed) hung the worker indefinitely.
-    # The fallback branch below already uses run_checked(timeout=900);
-    # mirroring that bound here is the consistent fix. capture_output=True
-    # buffers stderr in memory so we can still report the tail on failure.
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-    except subprocess.TimeoutExpired:
-        logger.error("[BG] Palindrome loop timed out after 900s — falling back")
-        # Synthesize a "failed" result so we drop into the fallback branch
-        # without duplicating the call.
-        class _Timeout:
-            returncode = 124
-            stderr = "ffmpeg palindrome loop timed out (>900s)"
-        result = _Timeout()
-    if result.returncode != 0:
-        # Fall back to the simple loop if the palindrome filter graph fails
-        # (e.g. clip too short or memory-constrained machines).
-        logger.warning("[BG] Palindrome loop failed, falling back to stream_loop: %s",
-                       result.stderr[-200:])
-        cmd_fallback = [
-            "ffmpeg", "-y",
-            "-stream_loop", "-1",
-            "-i", bg_path,
-            "-t", str(duration),
-            "-vf", (
-                f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-                f"crop={target_w}:{target_h},"
-                "setpts=PTS-STARTPTS"
-            ),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-an",
-            out_path,
-        ]
-        # 900s mirrors the kenburns sibling — a stream_loop encode of a
-        # multi-minute lyric video sits comfortably under 5 min in
-        # healthy runs; double that as the cliff.
+    scale_crop = (
+        f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+        f"crop={target_w}:{target_h},setpts=PTS-STARTPTS"
+    )
+
+    def _flat_loop(src: str, label: str) -> str:
+        """Loop plano: el camino seguro. Sin costura no, pero siempre sale."""
         run_checked(
-            cmd_fallback,
-            label="ffmpeg-palindrome-fallback",
+            [
+                "ffmpeg", "-y",
+                "-stream_loop", "-1", "-i", src,
+                "-t", str(duration),
+                "-vf", scale_crop,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-an",
+                out_path,
+            ],
+            label=label,
+            # 900s mirrors the kenburns sibling — a stream_loop encode of a
+            # multi-minute lyric video sits comfortably under 5 min in
+            # healthy runs; double that as the cliff.
             timeout=900,
             output_path=out_path,
         )
+        return out_path
+
+    clip_dur = _ffprobe_duration(bg_path) or 0.0
+    if not (0 < clip_dur <= _PALINDROME_MAX_CLIP_S):
+        # Clip largo (o duración ilegible): palindromear costaría GB de RAM y
+        # además no aporta — un fondo largo ya no repite lo suficiente como
+        # para que el corte moleste.
+        logger.info(
+            "[BG] clip de %.1fs fuera del rango de palíndromo (máx %.0fs) — loop plano",
+            clip_dur, _PALINDROME_MAX_CLIP_S,
+        )
+        _flat_loop(bg_path, "ffmpeg-flat-loop")
+    else:
+        # Prefijo bg_looped_ a propósito: además del unlink explícito de abajo,
+        # _cleanup_local_intermediates barre por ese glob, así que un worker
+        # muerto entre medio tampoco deja el intermedio tirado.
+        unit_path = os.path.join(job_dir, f"bg_looped_palindrome_unit_{out_name}")
+        try:
+            # Etapa 1 — palíndromo del clip unidad, a resolución nativa, con
+            # input ACOTADO (sin -stream_loop) para que `reverse` vea el EOF.
+            # crf 16: es un intermedio que se re-encodea en la etapa 2.
+            run_checked(
+                [
+                    "ffmpeg", "-y", "-i", bg_path,
+                    "-filter_complex",
+                    "[0:v]setpts=PTS-STARTPTS,split[a][b];"
+                    "[b]reverse[br];"
+                    "[a][br]concat=n=2:v=1:a=0",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "16",
+                    "-pix_fmt", "yuv420p", "-an",
+                    unit_path,
+                ],
+                label="ffmpeg-palindrome-unit",
+                # Medido: 0,5s para un clip de 4s. 120s es cliff de sobra y
+                # acota el buffer de `reverse` si algo sale mal.
+                timeout=120,
+                output_path=unit_path,
+            )
+            # Etapa 2 — loopear el palíndromo (que SÍ empalma consigo mismo)
+            # hasta cubrir la canción, escalando acá.
+            _flat_loop(unit_path, "ffmpeg-palindrome-loop")
+            logger.info("[BG] palíndromo real: unidad de %.1fs → %.1fs", clip_dur * 2, duration)
+        except Exception as e:
+            _raise_if_job_timeout(e)
+            logger.warning(
+                "[BG] palíndromo falló (%s) — loop plano (se ve el corte, pero sale)", e,
+            )
+            _flat_loop(bg_path, "ffmpeg-palindrome-fallback")
+        finally:
+            try:
+                os.unlink(unit_path)
+            except OSError:
+                pass
 
     size_mb = os.path.getsize(out_path) / 1024 / 1024
     logger.info("[BG] Pre-rendered palindrome loop: %.0fs, %.1f MB", duration, size_mb)
@@ -17238,28 +17835,59 @@ def _burn_short_text_ass(
 
         out_tmp = os.path.join(job_dir, "short_ass_tmp.mp4")
         # Mismo escaping canónico que el burn del video (fx_compositor).
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-i", os.path.basename(bg_short_path),
-            "-vf", f"subtitles=short_lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "copy", "-movflags", "+faststart",
-            "-r", str(fps), os.path.basename(out_tmp),
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=600, cwd=job_dir)
-        if r.returncode != 0 or not os.path.exists(out_tmp):
-            reason = (
-                f"ffmpeg rc={r.returncode}: "
-                f"{(r.stderr or '').strip()[-300:] or '(sin stderr)'}"
+        #
+        # El retry con re-encode aac se agregó el 19-08 atribuyendo el
+        # "Invalid argument" al stream de AUDIO ("some source/container
+        # combinations make ffmpeg reject that stream"). Esa hipótesis está
+        # REFUTADA: el error es `[vost#0:0/libx264] ... return code -22`
+        # acompañado de `Could not open encoder before EOF`, y `vost#0:0` es
+        # el stream de VIDEO. Lo que pasa es que el input no entrega packets
+        # de video, y por eso el retry con aac también falla — en el
+        # incidente del 21-08 falló. El retry se queda (es barato y cubre el
+        # caso de audio de verdad), pero que nadie vuelva a "arreglar" el
+        # -22 por el lado del audio.
+        #
+        # Ojo también: `-map 0:a:0` NO es opcional, así que un bg_short_path
+        # sin stream de audio hace fallar este comando entero.
+        audio_modes = (
+            ["-c:a", "copy"],
+            ["-c:a", "aac", "-b:a", "192k"],
+        )
+        errors: list[str] = []
+        for audio_args in audio_modes:
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", os.path.basename(bg_short_path),
+                "-vf", f"subtitles=short_lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}",
+                "-map", "0:v:0", "-map", "0:a:0",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-pix_fmt", "yuv420p",
+                *audio_args, "-movflags", "+faststart", "-shortest",
+                "-r", str(fps), os.path.basename(out_tmp),
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=600, cwd=job_dir)
+            if r.returncode == 0 and os.path.exists(out_tmp):
+                logger.info("[SHORT] texto quemado con libass (font=%s anim=%s audio=%s)",
+                            os.path.basename(font_path), lyrics_animation,
+                            "copy" if audio_args[1] == "copy" else "aac-reencode")
+                return out_tmp, None
+            # stderr COMPLETO, no [-300:]. El recorte cortaba justo la línea
+            # que nombra la causa ("Could not open encoder before EOF") y nos
+            # dejó dos meses arreglando la capa equivocada.
+            errors.append(
+                f"[{'copy' if audio_args[1] == 'copy' else 'aac'}] rc={r.returncode} "
+                f"{(r.stderr or '').strip()}"
             )
-            logger.warning("[SHORT] libass text burn failed (%s) — fallback moviepy",
-                           reason)
-            return None, reason
-        logger.info("[SHORT] texto quemado con libass (font=%s anim=%s)",
-                    os.path.basename(font_path), lyrics_animation)
-        return out_tmp, None
+            try:
+                os.unlink(out_tmp)
+            except OSError:
+                pass
+        reason = " || ".join(errors)
+        logger.warning("[SHORT] libass text burn failed — fallback moviepy. %s",
+                       reason)
+        _log_short_bg_forensics(bg_short_path, job_dir)
+        return None, reason
     except Exception as e:
         reason = f"{type(e).__name__}: {e}"
         logger.warning("[SHORT] libass text pass errored (%s) — fallback moviepy", reason)
@@ -17387,10 +18015,16 @@ def generate_short(
         bg_full = _ken_burns_clip(bg_source, short_dur, static=True)
         bg = _cover_resize(bg_full, 1080, 1920)
     elif bg_source and os.path.exists(bg_source):
+        raw = None
         try:
+            # Antes acá había un `raw.get_frame(0)` como prueba de vida. No
+            # servía: moviepy warnea y SUSTITUYE por el último frame válido
+            # en vez de levantar (salvo justo en __init__), así que un fondo
+            # a medio decodificar pasaba el chequeo y contaminaba el encode.
+            # Decodificar de verdad con ffmpeg es la única prueba honesta.
+            if not _decodes_ok(bg_source):
+                raise RuntimeError("el fondo no decodifica (header sano, sin packets usables)")
             raw = VideoFileClip(bg_source)
-            raw.get_frame(0)
-            raw = _cover_resize(raw, 1080, 1920)
             if raw.duration >= short_dur:
                 # El short usa la MISMA ventana temporal que su audio/letra
                 # (el coro, start_time..end_time), no los primeros 30s. En un
@@ -17398,16 +18032,56 @@ def generate_short(
                 # multi-escena hace que el short muestre las escenas del CORO
                 # que matchean la letra —incl. una escena corregida ahí— en vez
                 # de las de la intro. Clamp para no pasar el final del clip.
-                _bg_start = max(0.0, min(start_time, raw.duration - short_dur))
-                bg = raw.subclip(_bg_start, _bg_start + short_dur)
+                _resized = _cover_resize(raw, 1080, 1920)
+                _bg_start = max(0.0, min(start_time, _resized.duration - short_dur))
+                bg = _resized.subclip(_bg_start, _bg_start + short_dur)
+                raw = None  # `bg` deriva de él: lo cierra la cadena de moviepy
             else:
-                loops = math.ceil(short_dur / raw.duration) + 1
-                clips = []
-                for i in range(loops):
-                    c = _cover_resize(VideoFileClip(bg_source), 1080, 1920)
-                    clips.append(c)
-                bg = concatenate_videoclips(clips).subclip(0, short_dur)
-        except Exception:
+                # El fondo es más corto que el short (típico: clip Veo de 4-8s)
+                # → hay que loopearlo. Antes esto abría `ceil(30/dur)+1`
+                # VideoFileClip sobre el MISMO archivo y los concatenaba con
+                # moviepy. Con VEO_CLIP_SECONDS=4 son 9 clips, y como los
+                # clips de Veo traen audio moviepy abre reader de video Y de
+                # audio por clip: ~20 procesos ffmpeg por job, NINGUNO cerrado
+                # (concatenate_videoclips no cascadea close(), y el
+                # final.close() de más abajo no los alcanza).
+                #
+                # Es el último sobreviviente de un patrón que el master ya
+                # erradicó: ver _get_background_clip_from_path, cuyo comentario
+                # dice textualmente "the no-job_dir fallback used to
+                # concatenate N opened VideoFileClips and leak each one".
+                # Loopeamos con ffmpeg y abrimos UN solo lector.
+                raw.close()
+                raw = None
+                looped = _prerender_short_bg_loop(bg_source, short_dur, job_dir)
+                # Sin _cover_resize: el prerender ya deja exactamente
+                # 1080x1920, y _cover_resize NO es no-op cuando las dims
+                # coinciden (hace resize+crop por frame igual).
+                bg = VideoFileClip(looped)
+        except Exception as _bg_err:
+            _raise_if_job_timeout(_bg_err)
+            if raw is not None:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+            # Degradar a degradé es la decisión correcta (mejor un short feo
+            # que ningún short), pero hasta hoy era SILENCIOSA: en el
+            # incidente UMG Chile 2026-08-21 el fondo Veo era ilegible para
+            # moviepy, el short salió con degradé y el master con el fondo
+            # Veo — divergencia visible para el cliente y nadie se enteró.
+            logger.warning(
+                "[SHORT] fondo %s inutilizable (%s) — el short cae a DEGRADÉ "
+                "mientras el master conserva el fondo real",
+                os.path.basename(bg_source), _bg_err,
+            )
+            _alert_sentry(
+                "short-bg-source-unreadable",
+                f"[SHORT-BG] {os.path.basename(job_dir.rstrip('/'))}: el fondo del "
+                f"short no se pudo usar ({_bg_err}) — salió con degradé y no "
+                "coincide con el master",
+                job_dir=job_dir,
+            )
             bg = _cover_resize(_make_gradient_clip(short_dur, style), 1080, 1920)
     else:
         bg = _cover_resize(_make_gradient_clip(short_dur, style), 1080, 1920)
@@ -17464,6 +18138,21 @@ def generate_short(
     audio.close()
     final.close()
 
+    # Validar el intermedio ANTES de que lo consuma nadie. moviepy no
+    # chequea el returncode del ffmpeg escritor (FFMPEG_VideoWriter.close()
+    # hace proc.wait() y descarta el resultado), así que write_videofile
+    # puede retornar de lo más normal habiendo dejado un archivo con moov
+    # sano y cero packets — que es exactamente lo que rompió el job de UMG
+    # Chile el 21-08. Sin esta línea el archivo roto viaja hasta el
+    # VideoFileClip del fallback moviepy, 40 renglones más abajo, donde
+    # revienta con un OSError que hasta hoy mataba el job entero.
+    if not _decodes_ok(bg_only_path):
+        _log_short_bg_forensics(bg_only_path, job_dir)
+        raise RuntimeError(
+            f"short_bg_only.mp4 quedó ilegible tras write_videofile "
+            f"(moviepy no reporta fallos del encoder): {bg_only_path}"
+        )
+
     # Effects belong to the background, BEFORE the subtitle burn. Applying a
     # photo transform after libass would displace/mirror the lyric glyphs too
     # (most visible with kaleido/liquid_glass/cutout_echo) and diverge from the
@@ -17477,6 +18166,15 @@ def generate_short(
             bg_only_path, fx, fps, job_dir, rhythm=_short_rhythm,
             style=style, custom_colors=custom_colors,
         )
+        # _apply_short_effect hace os.replace sobre el intermedio chequeando
+        # sólo el returncode, así que puede dejar un archivo inservible
+        # exactamente igual que el write de moviepy. Revalidar: el burn
+        # libass y el fallback dependen de que esto se pueda decodificar.
+        if not _decodes_ok(bg_only_path):
+            _log_short_bg_forensics(bg_only_path, job_dir)
+            raise RuntimeError(
+                f"el efecto '{effect}' dejó el fondo del short ilegible: {bg_only_path}"
+            )
 
     burned, libass_error = _burn_short_text_ass(
         bg_only_path, window_segments, job_dir, short_dur, fps,
@@ -17494,24 +18192,17 @@ def generate_short(
         # se ALERTA en Sentry: este es el único camino que puede volver a
         # producir la divergencia tipográfica del incidente UMG Chile —
         # si dispara, hay que enterarse antes que el cliente.
-        try:
-            import sentry_sdk
-            with sentry_sdk.push_scope() as _scope:
-                _job_tag = os.path.basename(job_dir.rstrip("/"))
-                _scope.fingerprint = ["short-libass-fallback"]
-                _scope.set_tag("job_id", _job_tag)
-                # Adjuntar el motivo del fallo de libass (stderr de ffmpeg o
-                # repr de la excepción) para diagnosticar la causa raíz sin
-                # correlacionar logs de worker por timestamp.
-                if libass_error:
-                    _scope.set_extra("libass_error", libass_error)
-                sentry_sdk.capture_message(
-                    f"[SHORT-FALLBACK] {_job_tag}: la pasada libass falló — el short "
-                    "salió con el motor moviepy (tipografía puede diferir del video)",
-                    level="error",
-                )
-        except Exception:
-            pass  # sin Sentry (dev/tests) el log de arriba alcanza
+        _job_tag = os.path.basename(job_dir.rstrip("/"))
+        _alert_sentry(
+            "short-libass-fallback",
+            f"[SHORT-FALLBACK] {_job_tag}: la pasada libass falló — el short "
+            "salió con el motor moviepy (tipografía puede diferir del video)",
+            job_dir=job_dir,
+            # Motivo del fallo de libass (stderr de ffmpeg o repr de la
+            # excepción) para diagnosticar la causa raíz sin correlacionar
+            # logs de worker por timestamp.
+            extra={"libass_error": libass_error} if libass_error else None,
+        )
         _do_fade = (line_transition or "none") not in ("none", "cut", "")
         text_layers = []
         for seg in window_segments:
@@ -17858,6 +18549,14 @@ def run_edit_pipeline(
         # produce". Archived .vN keys use this number so v1 is the file
         # that existed at the moment of the 1st edit, v2 at the 2nd, etc.
         prior_s3_keys = dict(job_row.s3_keys) if job_row.s3_keys else None
+        # Verdict this job's background already earned, BEFORE this edit
+        # overwrites validation_result. A reuse edit re-checks bytes that are
+        # byte-identical to the ones certified here, so this snapshot is the
+        # evidence that lets an inconclusive re-check keep the asset instead of
+        # destroying it (see the revalidation branch below).
+        _prior_validation_result = (
+            dict(job_row.validation_result) if job_row.validation_result else {}
+        )
         version_n = int(job_row.edit_count or 0)
         prior_versions = list(job_row.previous_versions or [])
         # A job carries ProRes deliverables whenever it has a umg_spec (the
@@ -18095,6 +18794,16 @@ def run_edit_pipeline(
         # image-to-video → provenance AI-derived (aplica validación). Sin
         # animar es human-provided. Se resuelve dentro de la rama custom.
         _animate_custom = False
+        # True when a FAILED generation degraded back to the asset this job had
+        # already certified. The edit type still says "background"/"scene", but
+        # the bytes in hand are the old certified ones: they must not be
+        # recached, must not be re-labelled as freshly generated, and must not
+        # be thrown away by an inconclusive re-check.
+        _kept_previous_background = False
+        _edit_ai_generated_override: bool | None = None
+        # Defensive: every branch below assigns it, but keeping the name bound
+        # means a future branch that returns early cannot NameError here.
+        bg_image_path = None
         if edit_type in ("typography", "lyrics", "metadata"):
             # All three reuse the cached background — only the foreground
             # layer changes. Lyrics edit ALSO swaps the segments, and
@@ -18239,19 +18948,40 @@ def run_edit_pipeline(
                 # Imagen can raise before returning an asset (Veo normally
                 # degrades internally).  A provider failure must not strand a
                 # Universal/common AI edit in ``error`` or ``validation_failed``.
-                logger.error(
-                    "[EDIT] background generation failed job=%s; using safe "
-                    "local fallback: %s",
-                    job_id, _background_generation_error,
+                # First choice is the background this job already had: a failed
+                # regeneration should leave the operator exactly where they
+                # were, not swap their art for a gradient AND recache it.
+                _previous_bg = _download_previously_certified_background(
+                    job_id, job_dir, bg_r2_key_cached, _prior_validation_result,
                 )
-                bg_image_path = _write_safe_gradient_background(
-                    job_dir, style, filename="bg_edit_policy_fallback.mp4",
-                )
-                _force_policy_fallback = True
-                _policy_fallback_reason = "background_generation_error"
+                if _previous_bg:
+                    logger.error(
+                        "[EDIT] background generation failed job=%s; keeping "
+                        "the previously certified background (retry the regen "
+                        "later): %s",
+                        job_id, _background_generation_error,
+                    )
+                    bg_image_path = _previous_bg
+                    _kept_previous_background = True
+                    _edit_ai_generated_override = bool(
+                        _stored_background_ai_generated
+                    )
+                else:
+                    logger.error(
+                        "[EDIT] background generation failed job=%s; using safe "
+                        "local fallback: %s",
+                        job_id, _background_generation_error,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style, filename="bg_edit_policy_fallback.mp4",
+                    )
+                    _force_policy_fallback = True
+                    _policy_fallback_reason = "background_generation_error"
             update_job(job_id, progress=35)
-            # Do not replace the last known-good cache until validation passes.
-            _pending_background_recache = True
+            # Do not replace the last known-good cache until validation passes —
+            # and never recache when we are re-rendering the bytes that ARE the
+            # cache.
+            _pending_background_recache = not _kept_previous_background
 
         elif edit_type == "scene":
             # Regenerar UNA escena del storyboard y re-armar el timeline. Sólo
@@ -18296,26 +19026,51 @@ def run_edit_pipeline(
                 _pending_scene_recache = True
             except Exception as _scene_generation_error:
                 _raise_if_job_timeout(_scene_generation_error)
-                logger.error(
-                    "[EDIT] scene regeneration failed job=%s scene=%s; using "
-                    "safe local fallback: %s",
-                    job_id, scene_key, _scene_generation_error,
-                )
-                bg_image_path = _write_safe_gradient_background(
-                    job_dir, style, filename="bg_edit_policy_fallback.mp4",
-                )
-                bg_prelooped = False
-                _scene_timeline_from_current_clips = False
-                _pending_scene_recache = False
-                _pending_background_recache = True
-                _force_policy_fallback = True
-                _policy_fallback_reason = "scene_generation_error"
-                # The cached background is now a single deterministic asset,
-                # not the storyboard represented by the old plan.  Persisting
-                # that plan would make the next edit trust false provenance.
-                scene_plan = None
-                _pending_scene_plan_clear = True
-                update_job(job_id, progress=35)
+                if _scene_plan_before_edit is not None:
+                    # "Otra toma" failed at the provider. The pre-edit
+                    # storyboard is intact and already certified, so restore it
+                    # and let the dense revalidation below rebuild that exact
+                    # timeline from the cached clips: the edit becomes a no-op
+                    # the operator can retry. Wiping the storyboard because ONE
+                    # re-roll failed was destroying N-1 good scenes plus every
+                    # scene prompt in the plan.
+                    logger.error(
+                        "[EDIT] scene regeneration failed job=%s scene=%s; "
+                        "restoring the pre-edit storyboard (retry the re-roll "
+                        "later): %s",
+                        job_id, scene_key, _scene_generation_error,
+                    )
+                    scene_plan = _copy.deepcopy(_scene_plan_before_edit)
+                    bg_prelooped = False
+                    _scene_timeline_from_current_clips = False
+                    _pending_scene_recache = False
+                    _pending_background_recache = False
+                    _kept_previous_background = True
+                    update_job(job_id, scene_plan=scene_plan, progress=35)
+                else:
+                    logger.error(
+                        "[EDIT] scene regeneration failed job=%s scene=%s; using "
+                        "safe local fallback: %s",
+                        job_id, scene_key, _scene_generation_error,
+                    )
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style, filename="bg_edit_policy_fallback.mp4",
+                    )
+                    bg_prelooped = False
+                    _scene_timeline_from_current_clips = False
+                    _pending_scene_recache = False
+                    _pending_background_recache = True
+                    _force_policy_fallback = True
+                    _policy_fallback_reason = "scene_generation_error"
+                    # The cached background is now a single deterministic asset,
+                    # not the storyboard represented by the old plan.  Persisting
+                    # that plan would make the next edit trust false provenance.
+                    scene_plan = _archive_and_clear_scene_plan(
+                        merged, scene_plan, job_id,
+                        reason="scene_generation_error",
+                    )
+                    _pending_scene_plan_clear = True
+                    update_job(job_id, progress=35)
 
         elif edit_type == "background_library":
             # Swap a un asset CURADO de biblioteca — la salida del loop no
@@ -18472,6 +19227,10 @@ def run_edit_pipeline(
             (True if _animate_custom else False) if edit_type == "custom" else
             bool(_stored_background_ai_generated)
         )
+        if _edit_ai_generated_override is not None:
+            # A failed regeneration degraded to the OLD asset: its provenance
+            # is whatever that asset was, not "freshly AI-generated".
+            _edit_ai_generated = _edit_ai_generated_override
         _edit_safety_policy = _background_safety_policy(
             job_id, _edit_operator_prompt
         )
@@ -18533,7 +19292,53 @@ def run_edit_pipeline(
                     "[SCENES] dense edit revalidation failed job=%s: %s",
                     job_id, _dense_error,
                 )
-                if _edit_safety_policy["is_umg"] or _edit_ai_generated:
+                _dense_decisive = _scene_plan_failure_is_decisive(scene_plan)
+                _cached_timeline = (
+                    None if _dense_decisive
+                    else _download_previously_certified_background(
+                        job_id, job_dir, bg_r2_key_cached,
+                        _prior_validation_result,
+                        filename_stem="bg_cached_timeline",
+                    )
+                )
+                if _cached_timeline:
+                    # Nothing forbidden was SEEN — a clip was unreachable, the
+                    # breaker was open, or the re-scan never got a verdict. The
+                    # cached timeline is the storyboard this job already
+                    # certified, so render it and keep the plan. Wiping both
+                    # over an infrastructure error is what turned a quota blip
+                    # into "se me fue el fondo" (incidente 2026-08-20).
+                    logger.error(
+                        "[SCENES] revalidación no concluyente job=%s — rendeo "
+                        "el timeline cacheado y CONSERVO el storyboard",
+                        job_id,
+                    )
+                    bg_image_path = _cached_timeline
+                    bg_prelooped = True
+                    _scene_timeline_from_current_clips = False
+                    _clips_already_validated = True
+                    _pending_scene_recache = False
+                    _pending_background_recache = False
+                    # Restore the pre-edit plan: this attempt marked scenes
+                    # failed/reused, and persisting that would leave the job
+                    # permanently short of clip evidence — every later edit
+                    # would re-run the dense pass and fall back again. Keep the
+                    # reason on the plan so the failure is still diagnosable.
+                    if _scene_plan_before_edit:
+                        scene_plan = _copy.deepcopy(_scene_plan_before_edit)
+                    scene_plan["last_revalidation_error"] = str(_dense_error)[:300]
+                    update_job(job_id, scene_plan=scene_plan)
+                    update_job(job_id, validation_result={
+                        **_prior_validation_result,
+                        "passed": True,
+                        "policy_reason": _edit_safety_policy["reason"],
+                        "policy_version": _edit_safety_policy["policy_version"],
+                        "policy_mode": _edit_safety_policy["policy_mode"],
+                        "validation_scope": "reused_asset_prior_certification",
+                        "revalidation_inconclusive": True,
+                        "revalidation_error": str(_dense_error)[:300],
+                    })
+                elif _edit_safety_policy["is_umg"] or _edit_ai_generated:
                     # Preserve the storyboard diagnostics, but render this
                     # revision over a deterministic clean background. A bad or
                     # unverifiable scene clip must never reject the whole
@@ -18548,7 +19353,10 @@ def run_edit_pipeline(
                     merged["background_ai_generated"] = False
                     _pending_scene_recache = False
                     _pending_background_recache = True
-                    scene_plan = None
+                    scene_plan = _archive_and_clear_scene_plan(
+                        merged, scene_plan, job_id,
+                        reason="scene_validation_error",
+                    )
                     _pending_scene_plan_clear = True
                     update_job(job_id, validation_result={
                         "passed": True,
@@ -18558,6 +19366,7 @@ def run_edit_pipeline(
                         "policy_mode": _edit_safety_policy["policy_mode"],
                         "validation_scope": "deterministic_local_fallback",
                         "recovered_from_scene_validation_error": True,
+                        "decisive_policy_finding": bool(_dense_decisive),
                     })
                 else:
                     if edit_type == "scene" and _scene_plan_before_edit is not None:
@@ -18573,13 +19382,51 @@ def run_edit_pipeline(
                     )
                     return
         if not _clips_already_validated:
+            _edit_verdict: dict = {}
             _edit_validation_ok = _validate_background_asset_for_job(
                 job_id,
                 bg_image_path,
                 _edit_operator_prompt,
                 ai_generated=_edit_ai_generated,
                 failure_status=None,
+                verdict_out=_edit_verdict,
             )
+            if not _edit_validation_ok and _should_keep_certified_background(
+                edit_type,
+                verdict=_edit_verdict,
+                prior_validation_result=_prior_validation_result,
+                asset_path=bg_image_path,
+                forced_fallback=_force_policy_fallback,
+                reusing_certified_asset=_kept_previous_background,
+            ):
+                # The operator only touched the FOREGROUND (letra, tipografía,
+                # metadata): these bytes are the ones this job already
+                # certified, and the re-check produced no verdict at all — only
+                # quota/timeout errors. Replacing them with the safe gradient
+                # adds zero safety and permanently destroys the background the
+                # customer paid for: the fallback also recaches itself over
+                # bg_r2_key_cached (incident 2026-08-20, UMG Chile "La Funa" —
+                # one 429 on frame 6 of 8 wiped a Veo background that had
+                # passed 8/8 twice). Keep the certified asset, keep the cache,
+                # and record WHY so the audit trail shows an inconclusive
+                # re-check rather than a fresh pass.
+                logger.error(
+                    "[VALIDATION] inconclusive re-check of a REUSED background "
+                    "job=%s edit_type=%s — keeping the previously certified "
+                    "asset (issues=%s)",
+                    job_id, edit_type, _edit_verdict.get("issues"),
+                )
+                update_job(job_id, validation_result={
+                    **_prior_validation_result,
+                    "passed": True,
+                    "validation_scope": "reused_asset_prior_certification",
+                    "revalidation_inconclusive": True,
+                    "revalidation_issues": _edit_verdict.get("issues", []),
+                    "policy_reason": _edit_safety_policy["reason"],
+                    "policy_version": _edit_safety_policy["policy_version"],
+                    "policy_mode": _edit_safety_policy["policy_mode"],
+                })
+                _edit_validation_ok = True
             if not _edit_validation_ok:
                 _recover_edit_background = bool(
                     _edit_safety_policy["is_umg"] or _edit_ai_generated
@@ -18630,7 +19477,10 @@ def run_edit_pipeline(
                     _pending_scene_recache = False
                     _pending_background_recache = True
                     if scene_plan is not None:
-                        scene_plan = None
+                        scene_plan = _archive_and_clear_scene_plan(
+                            merged, scene_plan, job_id,
+                            reason="unsafe_generation_recovery",
+                        )
                         _pending_scene_plan_clear = True
                     _edit_validation_ok = True
                     update_job(job_id, validation_result={
@@ -18710,6 +19560,9 @@ def run_edit_pipeline(
             except Exception as e:
                 logger.warning("[FMT] frame_format skip (non-fatal): %s", e)
         files = {"video_url": f"/download/{job_id}/video"}
+        # Ver el homónimo de run_pipeline: local, la señal persistida es que
+        # short_url/thumbnail_url queden NULL.
+        missing_deliverables: list[str] = []
         update_job(job_id, progress=55)
 
         if wants_umg:
@@ -18722,20 +19575,34 @@ def run_edit_pipeline(
         if wants_youtube or wants_umg:
             update_job(job_id, current_step="short", progress=75)
             short_fps = float(umg_spec["fps"]) if wants_umg and umg_spec else 24
-            generate_short(
-                mp3_path, segments, job_dir, bg_source=bg_source,
-                style=style, font=chosen_font, fps=short_fps,
-                text_case=text_case, font_scale=font_scale,
-                lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
-                text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
-                lyrics_animation=lyrics_animation, line_transition=line_transition,
-            )
-            files["short_url"] = f"/download/{job_id}/short"
+            # Espejo de run_pipeline: el short y el thumbnail no pueden matar
+            # un edit cuyo master ya se re-renderizó. Acá pesa MÁS que en el
+            # primer render: /edit ya puso video_url/short_url/thumbnail_url y
+            # s3_keys en NULL antes de arrancar (main.py), así que un fallo
+            # dejaba el job en 'error' con los entregables ANTERIORES ya
+            # borrados de la fila — el edit perdía más que run_pipeline.
+            try:
+                generate_short(
+                    mp3_path, segments, job_dir, bg_source=bg_source,
+                    style=style, font=chosen_font, fps=short_fps,
+                    text_case=text_case, font_scale=font_scale,
+                    lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                    text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
+                    lyrics_animation=lyrics_animation, line_transition=line_transition,
+                )
+                files["short_url"] = f"/download/{job_id}/short"
+            except Exception as _short_err:
+                _accessory_failed("short", job_id, job_dir, _short_err)
+                missing_deliverables.append("short")
             update_job(job_id, progress=85)
 
             update_job(job_id, current_step="thumbnail", progress=90)
-            generate_thumbnail(artist, mp3_path, job_dir, bg_source=bg_source, song_title=song_title)
-            files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
+            try:
+                generate_thumbnail(artist, mp3_path, job_dir, bg_source=bg_source, song_title=song_title)
+                files["thumbnail_url"] = f"/download/{job_id}/thumbnail"
+            except Exception as _thumb_err:
+                _accessory_failed("thumbnail", job_id, job_dir, _thumb_err)
+                missing_deliverables.append("thumbnail")
 
         # ----------------------------------------------------------------
         # Verify + upload to R2 (replacing previous deliverables)
@@ -18862,7 +19729,12 @@ def run_edit_pipeline(
                 # it during a UMG batch and the portal serves the stale cut
                 # (observed 2026-08-03). One transcode per edit is affordable.
                 enqueue_prores_prewarm(job_id, "umg_master", force=True)
-                enqueue_prores_prewarm(job_id, "umg_short", force=True)
+                # Si el short se perdió en este edit, NO re-encolar: el
+                # remove_s3_keys de arriba ya invalidó el umg_short viejo, y
+                # prewarmear sobre un short.mp4 ausente o truncado publicaría
+                # un .mov corrupto (prores.py no valida el source).
+                if "short" not in missing_deliverables:
+                    enqueue_prores_prewarm(job_id, "umg_short", force=True)
             except Exception as _e:
                 logger.warning("[EDIT] prores prewarm re-enqueue skipped: %s", _e)
 
@@ -18936,15 +19808,16 @@ def run_edit_pipeline(
     except Exception as exc:
         _raise_if_job_timeout(exc)
         logger.error("[EDIT] job=%s FAILED: %s", job_id, exc, exc_info=True)
-        from error_taxonomy import classify_error
+        from error_taxonomy import classify_error, public_error
         error_category = (
             "storage_upload" if isinstance(exc, StorageUploadError)
             else classify_error(str(exc))
         )
-        update_job(
-            job_id, status="error", error=f"Edit failed: {exc}",
-            error_category=error_category,
+        error_code, error_message = public_error(
+            exc, context="edit", category=error_category,
         )
+        update_job(job_id, status="error", error=error_message,
+                   error_category=error_category, error_code=error_code)
         _write_edit_audit(
             action="job.edit_failed",
             detail={
@@ -18966,7 +19839,7 @@ def run_edit_pipeline(
                 locals().get("job_dir"),
             )
         elif locals().get("input_r2_key"):
-            _cleanup_job_dir_on_failure(locals().get("job_dir"))
+            _cleanup_job_dir_on_failure(locals().get("job_dir"), job_id)
         else:
             try:
                 _cleanup_local_intermediates(locals().get("job_dir") or "")

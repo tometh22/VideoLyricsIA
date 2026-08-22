@@ -214,7 +214,8 @@ def test_pipeline_callback_captures_and_marks_error(monkeypatch):
         row = db.query(Job).filter(Job.job_id == jid).first()
         db.refresh(row)
         assert row.status == "error"
-        assert "ffmpeg" in (row.error or "").lower()
+        assert "ffmpeg" not in (row.error or "").lower()
+        assert row.error_code == "pipeline_render"
     finally:
         _cleanup(db)
         db.close()

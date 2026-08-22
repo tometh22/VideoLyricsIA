@@ -110,14 +110,16 @@ def test_fallback_alerts_sentry():
     import pipeline as _p
     src = inspect.getsource(_p.generate_short)
     assert "short-libass-fallback" in src
-    assert "capture_message" in src
+    # El capture_message vive en el helper compartido _alert_sentry, no
+    # inline: verificamos que el helper se use acá Y que realmente alerte.
+    assert "_alert_sentry(" in src
+    assert "capture_message" in inspect.getsource(_p._alert_sentry)
 
 
 def test_burn_short_returns_reason_on_ffmpeg_failure(tmp_path, monkeypatch):
-    """El fallo de libass debe propagar el stderr recortado de ffmpeg al
-    caller para adjuntarlo al evento de Sentry (diagnosticabilidad: la causa
-    raíz viaja con la alerta, sin correlacionar logs de worker por
-    timestamp)."""
+    """El fallo de libass debe propagar el stderr de ffmpeg al caller para
+    adjuntarlo al evento de Sentry (diagnosticabilidad: la causa raíz viaja
+    con la alerta, sin correlacionar logs de worker por timestamp)."""
     class _FakeProc:
         returncode = 1
         stderr = "Fontconfig error: Cannot load default config file\nboom libass"
@@ -155,11 +157,72 @@ def test_burn_short_returns_reason_on_exception(tmp_path, monkeypatch):
 
 
 def test_fallback_attaches_libass_error_to_sentry():
-    """La rama de fallback debe adjuntar el motivo del fallo de libass como
-    extra del scope ANTES del capture_message — es el propósito del fix."""
+    """La rama de fallback debe pasar el motivo del fallo de libass como
+    `extra` a `_alert_sentry`, y el helper debe adjuntarlo al scope con
+    set_extra ANTES de capturar el mensaje — es el propósito del fix."""
     import inspect
     src = inspect.getsource(pipeline.generate_short)
     assert "libass_error" in src
-    assert 'set_extra("libass_error"' in src
-    # El extra se setea antes de capturar el mensaje.
-    assert src.index("set_extra(\"libass_error\"") < src.index("capture_message(")
+    assert "extra=" in src
+    helper_src = inspect.getsource(pipeline._alert_sentry)
+    assert "set_extra(" in helper_src
+    assert helper_src.index("set_extra(") < helper_src.index("capture_message(")
+
+
+def test_bg_ilegible_alerta_en_vez_de_degradar_en_silencio():
+    """Si el fondo del short no se puede usar, el short sale con degradé
+    mientras el MASTER conserva el fondo real. Eso es una divergencia
+    visible para el cliente: pasó con UMG Chile el 21-08 y nadie se enteró
+    porque el except era mudo. Tiene que alertar."""
+    import inspect
+    import pipeline as _p
+    src = inspect.getsource(_p.generate_short)
+    assert "short-bg-source-unreadable" in src
+    # Y el degradé sigue existiendo: alertar no significa dejar de degradar.
+    assert "_make_gradient_clip(" in src
+
+
+def test_short_no_abre_n_lectores_del_mismo_archivo():
+    """El fondo corto se loopea con ffmpeg, no concatenando N VideoFileClip.
+
+    El patrón viejo abría `ceil(short_dur/clip_dur)+1` lectores sobre el
+    MISMO archivo y no cerraba ninguno (concatenate_videoclips no cascadea
+    close()). Con VEO_CLIP_SECONDS=4 son 9 clips, y como los clips de Veo
+    traen audio moviepy abre reader de video y de audio por clip: ~20
+    procesos ffmpeg filtrados por job en un worker de vida larga. El master
+    ya lo había erradicado en _get_background_clip_from_path; el short era
+    el último sobreviviente."""
+    import inspect
+    import pipeline as _p
+    src = inspect.getsource(_p.generate_short)
+    # Con paréntesis: los comentarios la nombran para explicar por qué se fue.
+    assert "concatenate_videoclips(" not in src
+    assert "_prerender_short_bg_loop(" in src
+    # La rama de subclip abre UN VideoFileClip y está bien. Lo prohibido es
+    # abrirlo DENTRO de un bucle: ninguna apertura de archivo puede escalar
+    # con la duración del clip de fondo. Se chequea sobre el AST y no por
+    # texto, porque las comprehensions de al lado (`... for c in layers`)
+    # hacen que cualquier heurístico de líneas dé falsos positivos.
+    import ast
+    import textwrap
+    arbol = ast.parse(textwrap.dedent(src))
+
+    def _aperturas_en_bucle(nodo, dentro_de_bucle=False):
+        encontradas = []
+        for hijo in ast.iter_child_nodes(nodo):
+            _bucle = dentro_de_bucle or isinstance(
+                hijo, (ast.For, ast.AsyncFor, ast.While,
+                       ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+            )
+            if (dentro_de_bucle and isinstance(hijo, ast.Call)
+                    and isinstance(hijo.func, ast.Name)
+                    and hijo.func.id == "VideoFileClip"):
+                encontradas.append(hijo.lineno)
+            encontradas.extend(_aperturas_en_bucle(hijo, _bucle))
+        return encontradas
+
+    culpables = _aperturas_en_bucle(arbol)
+    assert not culpables, (
+        f"VideoFileClip abierto dentro de un bucle (líneas relativas {culpables}) — "
+        "ese es exactamente el patrón que filtraba un proceso ffmpeg por vuelta"
+    )

@@ -9,8 +9,8 @@ Genera automáticamente:
 
 ## Requisitos previos
 
-- Python 3.10+
-- Node.js 18+
+- Python 3.11+
+- Node.js 20+
 - FFmpeg instalado y disponible en PATH (`sudo apt install ffmpeg` / `brew install ffmpeg`)
 
 ## Instalación
@@ -74,6 +74,8 @@ Abre **http://localhost:5173** en tu navegador.
 
 ## Notas
 
-- Los jobs se almacenan en memoria (no hay base de datos).
-- El procesamiento corre en un thread por job.
-- Todo funciona offline después de la instalación inicial.
+- Los jobs y su outbox durable se almacenan en PostgreSQL.
+- Redis/RQ distribuye transcripción, previews, renders y entregables en pools
+  separados; los reintentos están protegidos por un identificador de intento.
+- Los archivos se guardan en R2/S3. Las funciones de IA y transcripción pueden
+  requerir proveedores externos según la configuración.

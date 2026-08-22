@@ -55,6 +55,7 @@ fallback para períodos todavía no calibrados.
 | `POST /admin/cost/calibrate-rates?period=…` | Deriva y persiste tarifas mensuales desde la factura GCP por SKU. Requiere ambos entornos. |
 | `GET /admin/cost/rates?period=…` | Muestra la tarifa aplicada y si viene de factura o del fallback estimado. |
 | `GET /admin/margin` | Dashboard modelado, ahora con `waste` y `row_quality`. |
+| `GET /admin/cost/by-video-type?period=YYYY-MM` | Costo y margen por **tipo de producto**: `lyric_veo` / `lyric_static` / `art_track`. Ver detalle abajo. |
 
 > ⚠️ **`POST /admin/cost/refresh` hay que correrlo todos los meses.** Las
 > APIs de los proveedores sólo exponen una ventana móvil: Railway muestra
@@ -344,6 +345,55 @@ elimina de esta suma para no duplicarlo.
 Estas suscripciones son la parte del costo unitario que **se amortiza**: a 65
 videos/mes son $0,37/video, a 400/mes son $0,06. Dejarlas afuera es lo que hace
 que los meses de bajo volumen parezcan baratos.
+
+---
+
+## Costo por TIPO de video (`lyric_veo` / `lyric_static` / `art_track`)
+
+El contrato de Universal no es un precio único: 400 lyric videos/mes a $6
+(con la condición de que la MITAD use fondo de foto fija en vez de Veo,
+como palanca de costo) + 250 Art Tracks/mes a $4 (portada + waveform, sin
+Veo, sin editor de letra). `GET /admin/cost/by-video-type?period=YYYY-MM`
+(implementado en `cost_by_video_type.py`) es la primera vista que separa
+el costo de estos 3 productos — hasta ahora solo existía agregado por
+tenant/canción, lo que puede esconder que uno de los tres da pérdida
+mientras los otros dos lo compensan.
+
+Parámetros opcionales: `labor_rate_usd_per_hour` (default `10.0`, no hay
+otra convención documentada en el repo) y `price_lyric_veo_usd` /
+`price_lyric_static_usd` / `price_art_track_usd` — sin precio, el
+endpoint devuelve costo nomás (nunca inventa un precio para calcular
+margen).
+
+**Cómo se clasifica un job** (no existe una columna `video_type`):
+
+1. `render_params["art_track"] == True` → `art_track`. Lo persiste
+   `main.py` antes de encolar el pipeline cuando el request trae
+   `art_track=true`.
+2. Si no, `render_params["background_ai_generated"]` (lo escribe
+   `pipeline._background_source_is_ai()`): `True` → `lyric_veo`,
+   `False` → `lyric_static`.
+3. Si el campo no está (jobs previos a esa instrumentación) → `unknown`,
+   contado aparte y **nunca** forzado a una de las 3 categorías
+   facturables.
+
+**Limitaciones conocidas:**
+
+- `unknown` puede ser una porción significativa en meses viejos — el
+  endpoint reporta `unknown.delivered_count` para que se vea la cobertura
+  real en vez de asumir 100%.
+- `labor_minutes_avg`/`labor_minutes_p50` de `art_track` habitualmente
+  salen en `null`: ese flujo nunca abre el editor de letra (`App.jsx`:
+  "background_file + art_track=true + empty segments. No lyrics editor"),
+  así que no emite el evento `editor_approved` del que sale
+  `active_edit_ms`. No es un hueco de telemetría — el producto no tiene
+  esa mano de obra.
+- Sólo lee el entorno de la sesión que recibe (no hace merge
+  staging↔prod como `/cost/umg`). La producción gestionada de UMG corre
+  en staging bajo cuentas del equipo — correrlo sólo contra prod
+  subestima el volumen real de lyric videos.
+- Es de solo lectura: agrega sobre `Job.render_params`, `AIProvenance` y
+  `ProductEvent` ya existentes, no cambia nada del pipeline de render.
 
 ---
 
