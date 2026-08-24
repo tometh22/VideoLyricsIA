@@ -138,7 +138,8 @@ function Waveform({ peaks, duration, currentTime, segments, onSeek }) {
 export default function CorpusAnnotator() {
   const { token } = useParams();
 
-  const [phase, setPhase] = useState("loading"); // loading | invalid_link | songs | annotating
+  const [phase, setPhase] = useState("loading"); // loading | invalid_link | load_error | songs | annotating
+  const [loadAttempt, setLoadAttempt] = useState(0); // bump para forzar un reintento
   const [annotatorName, setAnnotatorName] = useState("");
   const [songs, setSongs] = useState([]);
   const [activeSong, setActiveSong] = useState(null);
@@ -159,29 +160,41 @@ export default function CorpusAnnotator() {
   const saveTimer = useRef(null);
 
   // --- Carga inicial: valida el link + trae la lista de canciones ---
+  // OJO: envuelto en try/catch a propósito. Sin esto, cualquier falla de red
+  // (un corte momentáneo, un bloqueador de anuncios, un cold-start del
+  // backend) deja a la persona mirando "Cargando…" para siempre, sin error
+  // ni forma de reintentar — pasó en la práctica el 24-ago con la primera
+  // anotadora real. `phase="load_error"` le da una salida visible.
   useEffect(() => {
     let cancelled = false;
+    setPhase("loading");
     (async () => {
-      const res = await api(`/annotate/${token}`);
-      if (cancelled) return;
-      if (!res.ok) {
-        setPhase("invalid_link");
-        return;
+      try {
+        const res = await api(`/annotate/${token}`);
+        if (cancelled) return;
+        if (!res.ok) {
+          setPhase("invalid_link");
+          return;
+        }
+        const data = await res.json();
+        if (cancelled) return;
+        setAnnotatorName(data.name);
+        const listRes = await api(`/annotate/${token}/songs`);
+        if (cancelled) return;
+        if (!listRes.ok) {
+          setPhase("invalid_link");
+          return;
+        }
+        const listData = await listRes.json();
+        if (cancelled) return;
+        setSongs(listData.songs || []);
+        setPhase("songs");
+      } catch {
+        if (!cancelled) setPhase("load_error");
       }
-      const data = await res.json();
-      setAnnotatorName(data.name);
-      const listRes = await api(`/annotate/${token}/songs`);
-      if (cancelled) return;
-      if (!listRes.ok) {
-        setPhase("invalid_link");
-        return;
-      }
-      const listData = await listRes.json();
-      setSongs(listData.songs || []);
-      setPhase("songs");
     })();
     return () => { cancelled = true; };
-  }, [token]);
+  }, [token, loadAttempt]);
 
   const openSong = useCallback(async (song) => {
     setSongError("");
@@ -195,11 +208,20 @@ export default function CorpusAnnotator() {
     setAudioUrl(null);
     setWaveform({ peaks: [], duration: 0 });
 
-    const [annRes, audioRes, waveRes] = await Promise.all([
-      api(`/annotate/${token}/songs/${song.id}`),
-      api(`/annotate/${token}/songs/${song.id}/audio-url`),
-      api(`/annotate/${token}/songs/${song.id}/waveform`),
-    ]);
+    let annRes, audioRes, waveRes;
+    try {
+      [annRes, audioRes, waveRes] = await Promise.all([
+        api(`/annotate/${token}/songs/${song.id}`),
+        api(`/annotate/${token}/songs/${song.id}/audio-url`),
+        api(`/annotate/${token}/songs/${song.id}/waveform`),
+      ]);
+    } catch {
+      // Mismo problema que la carga inicial: sin este catch, un corte de
+      // red acá deja la canción abierta con la forma de onda vacía y sin
+      // audio, sin ningún mensaje — parece "roto" en vez de "reintentá".
+      setSongError("Hubo un problema de conexión cargando esta canción. Volvé a intentar.");
+      return;
+    }
 
     if (annRes.ok) {
       const data = await annRes.json();
@@ -348,6 +370,26 @@ export default function CorpusAnnotator() {
     return (
       <Shell>
         <p className="text-ink-secondary text-body">Cargando…</p>
+      </Shell>
+    );
+  }
+
+  if (phase === "load_error") {
+    return (
+      <Shell>
+        <div className="max-w-md text-center">
+          <h1 className="text-h2 text-ink-primary mb-4">No se pudo cargar</h1>
+          <p className="text-ink-secondary text-body mb-6">
+            Hubo un problema de conexión. Puede pasar, no es nada que hayas
+            hecho mal — apretá el botón para intentar de nuevo.
+          </p>
+          <button
+            onClick={() => setLoadAttempt((n) => n + 1)}
+            className="rounded-button bg-brand hover:bg-brand-light text-white px-6 py-3 font-semibold transition-colors duration-brand"
+          >
+            Reintentar
+          </button>
+        </div>
       </Shell>
     );
   }
