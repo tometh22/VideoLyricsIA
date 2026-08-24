@@ -14644,55 +14644,74 @@ def _log_short_bg_forensics(path: str, job_dir: str) -> None:
     )
 
 
-def _prerender_short_bg_loop(bg_path: str, duration: float, job_dir: str) -> str:
-    """Loopea un fondo corto a 1080x1920 para el short, con ffmpeg.
+def _prepare_short_bg(bg_path: str, start_time: float, short_dur: float,
+                      job_dir: str) -> str:
+    """Deja el fondo del short listo a 1080x1920, SIN que moviepy lea el original.
 
-    Reemplaza al patrón "abrir N VideoFileClip del mismo archivo y
-    concatenarlos con moviepy", que filtraba un proceso ffmpeg por vuelta
-    (`concatenate_videoclips` no cascadea `close()`).
+    Ésta es la lección cara del incidente UMG Chile 2026-08-21. En ese job,
+    ffmpeg leyó `bg_cached.mp4` perfectamente —el master salió de ahí: 352 s,
+    548 MB, validado— y moviepy levantó en el PRIMER frame del MISMO archivo.
+    Los dos usan ffmpeg, pero no el mismo binario: moviepy trae el suyo
+    embebido (imageio-ffmpeg) y el pipeline llama al del sistema. Resultado:
+    el master salió con el fondo Veo y el short con un degradé, en silencio.
 
-    Deliberadamente NO usa `_prerender_looped_bg`, por dos razones:
+    Validar el fuente con `_decodes_ok()` NO alcanza para esto, y conviene
+    entenderlo antes de "simplificar" este helper: ese chequeo corre con el
+    ffmpeg del sistema, así que en este escenario da OK y moviepy revienta
+    igual dos líneas después. La única defensa real es que moviepy NUNCA lea
+    el fondo original: leemos y normalizamos con ffmpeg, validamos la salida,
+    y recién ahí le damos a moviepy un archivo que acabamos de escribir
+    nosotros. Es la misma forma que el master ya usa (`_prerender_looped_bg`
+    + un solo `VideoFileClip`), que es el camino probado.
 
-    1. Ese helper pone el `-t` DESPUÉS del `-i`, o sea como opción de
-       output, así que el input con `-stream_loop -1` nunca da EOF y el
-       filtro `reverse` —que necesita EOF para emitir— bufferea sin límite.
-       Medido a 1080x1920: 2,24 GB de RSS contra 662 MB de esta forma, y
-       framemd5 IDÉNTICO al del loop plano. O sea paga 3,4x de memoria por
-       un palíndromo que no produce. Meterlo acá pondría ese pico justo en
-       progress=75, el paso que ya venía matando workers por OOM.
-    2. Aunque funcionara, no queremos palindromear en esta rama: un
-       timeline multi-escena corto reproduciría las escenas en REVERSA al
-       final, que es justo lo que `_get_background_clip_from_path` evita.
+    Dos ramas, las dos en ffmpeg:
 
-    El nombre empieza con `bg_looped_` a propósito: `_cleanup_local_intermediates`
-    barre por ese glob, así que el intermedio se limpia solo en vez de
-    acumular decenas de MB por job.
+    - Fondo >= largo del short: se recorta la MISMA ventana temporal que el
+      audio y la letra (el coro), no los primeros 30 s. En un fondo único da
+      igual (es uniforme); en un timeline multi-escena hace que el short
+      muestre las escenas del CORO —incluida una escena corregida ahí— en vez
+      de las de la intro (#785).
+    - Fondo más corto (el caso típico: clip Veo de 4-8 s): `-stream_loop`.
+
+    El nombre arranca con `bg_looped_` a propósito aunque no siempre loopee:
+    `_cleanup_local_intermediates` barre por ese glob, así que el intermedio
+    se limpia solo en vez de acumular decenas de MB por job.
     """
     out_path = os.path.join(job_dir, "bg_looped_short_1080x1920.mp4")
+    vf = ("scale=1080:1920:force_original_aspect_ratio=increase,"
+          "crop=1080:1920,setpts=PTS-STARTPTS")
+    # crf 16: este archivo se re-encodea dos veces más aguas abajo (fx +
+    # libass), así que arrancamos con margen para no acumular banding en los
+    # degradés oscuros que suele dar Veo.
+    encode = ["-c:v", "libx264", "-preset", "fast", "-crf", "16",
+              "-pix_fmt", "yuv420p", "-an"]
+
+    clip_dur = _ffprobe_duration(bg_path) or 0.0
+    if clip_dur >= short_dur > 0:
+        # Clamp para no pasarnos del final del clip.
+        bg_start = max(0.0, min(start_time, clip_dur - short_dur))
+        # -ss ANTES del -i: seek rápido por keyframe, y evita decodificar
+        # todo lo anterior a la ventana en un timeline de varios minutos.
+        cmd = ["ffmpeg", "-y", "-loglevel", "error",
+               "-ss", f"{bg_start:.3f}", "-i", bg_path, "-t", f"{short_dur:.3f}",
+               "-vf", vf, *encode, out_path]
+        label = "ffmpeg-short-bg-window"
+    else:
+        cmd = ["ffmpeg", "-y", "-loglevel", "error",
+               "-stream_loop", "-1", "-i", bg_path, "-t", f"{short_dur:.3f}",
+               "-vf", vf, *encode, out_path]
+        label = "ffmpeg-short-bg-loop"
+
     run_checked(
-        [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-stream_loop", "-1", "-i", bg_path,
-            "-t", str(duration),
-            "-vf", (
-                "scale=1080:1920:force_original_aspect_ratio=increase,"
-                "crop=1080:1920,setpts=PTS-STARTPTS"
-            ),
-            # crf 16: este archivo se re-encodea dos veces más aguas abajo
-            # (fx + libass), así que arrancamos con margen para no acumular
-            # banding en los degradés oscuros que suele dar Veo.
-            "-c:v", "libx264", "-preset", "fast", "-crf", "16",
-            "-pix_fmt", "yuv420p", "-an",
-            out_path,
-        ],
-        label="ffmpeg-short-bg-loop",
+        cmd, label=label,
         # 30s de salida se encodean en ~3s medidos. 120s es cliff de sobra;
         # los 900s de _prerender_looped_bg son para masters de 6 minutos.
         timeout=120,
         output_path=out_path,
     )
     if not _decodes_ok(out_path):
-        raise RuntimeError(f"loop de fondo del short ilegible: {out_path}")
+        _log_short_bg_forensics(out_path, job_dir)
+        raise RuntimeError(f"el fondo normalizado del short quedó ilegible: {out_path}")
     return out_path
 
 
@@ -18021,61 +18040,25 @@ def generate_short(
         bg_full = _ken_burns_clip(bg_source, short_dur, static=True)
         bg = _cover_resize(bg_full, 1080, 1920)
     elif bg_source and os.path.exists(bg_source):
-        raw = None
         try:
-            # Antes acá había un `raw.get_frame(0)` como prueba de vida. No
-            # servía: moviepy warnea y SUSTITUYE por el último frame válido
-            # en vez de levantar (salvo justo en __init__), así que un fondo
-            # a medio decodificar pasaba el chequeo y contaminaba el encode.
-            # Decodificar de verdad con ffmpeg es la única prueba honesta.
-            if not _decodes_ok(bg_source):
-                raise RuntimeError("el fondo no decodifica (header sano, sin packets usables)")
-            raw = VideoFileClip(bg_source)
-            if raw.duration >= short_dur:
-                # El short usa la MISMA ventana temporal que su audio/letra
-                # (el coro, start_time..end_time), no los primeros 30s. En un
-                # fondo único no cambia nada (es uniforme); en un timeline
-                # multi-escena hace que el short muestre las escenas del CORO
-                # que matchean la letra —incl. una escena corregida ahí— en vez
-                # de las de la intro. Clamp para no pasar el final del clip.
-                _resized = _cover_resize(raw, 1080, 1920)
-                _bg_start = max(0.0, min(start_time, _resized.duration - short_dur))
-                bg = _resized.subclip(_bg_start, _bg_start + short_dur)
-                raw = None  # `bg` deriva de él: lo cierra la cadena de moviepy
-            else:
-                # El fondo es más corto que el short (típico: clip Veo de 4-8s)
-                # → hay que loopearlo. Antes esto abría `ceil(30/dur)+1`
-                # VideoFileClip sobre el MISMO archivo y los concatenaba con
-                # moviepy. Con VEO_CLIP_SECONDS=4 son 9 clips, y como los
-                # clips de Veo traen audio moviepy abre reader de video Y de
-                # audio por clip: ~20 procesos ffmpeg por job, NINGUNO cerrado
-                # (concatenate_videoclips no cascadea close(), y el
-                # final.close() de más abajo no los alcanza).
-                #
-                # Es el último sobreviviente de un patrón que el master ya
-                # erradicó: ver _get_background_clip_from_path, cuyo comentario
-                # dice textualmente "the no-job_dir fallback used to
-                # concatenate N opened VideoFileClips and leak each one".
-                # Loopeamos con ffmpeg y abrimos UN solo lector.
-                raw.close()
-                raw = None
-                looped = _prerender_short_bg_loop(bg_source, short_dur, job_dir)
-                # Sin _cover_resize: el prerender ya deja exactamente
-                # 1080x1920, y _cover_resize NO es no-op cuando las dims
-                # coinciden (hace resize+crop por frame igual).
-                bg = VideoFileClip(looped)
+            # moviepy NO lee el fondo original. Ver _prepare_short_bg: en el
+            # incidente del 21-08 ffmpeg leyó ese archivo sin problema (el
+            # master salió de ahí) y moviepy levantó en el primer frame del
+            # mismo archivo — binarios distintos. Normalizamos con ffmpeg,
+            # validamos, y recién ahí abrimos UN VideoFileClip sobre algo que
+            # escribimos nosotros.
+            normalizado = _prepare_short_bg(bg_source, start_time, short_dur, job_dir)
+            # Sin _cover_resize: el prerender ya deja exactamente 1080x1920, y
+            # _cover_resize NO es no-op cuando las dims coinciden (hace
+            # resize+crop por frame igual).
+            bg = VideoFileClip(normalizado)
         except Exception as _bg_err:
             _raise_if_job_timeout(_bg_err)
-            if raw is not None:
-                try:
-                    raw.close()
-                except Exception:
-                    pass
             # Degradar a degradé es la decisión correcta (mejor un short feo
-            # que ningún short), pero hasta hoy era SILENCIOSA: en el
-            # incidente UMG Chile 2026-08-21 el fondo Veo era ilegible para
-            # moviepy, el short salió con degradé y el master con el fondo
-            # Veo — divergencia visible para el cliente y nadie se enteró.
+            # que ningún short), pero hasta el 21-08 era SILENCIOSA: el fondo
+            # Veo era ilegible para moviepy, el short salió con degradé y el
+            # master con el fondo real — divergencia visible para el cliente
+            # y nadie se enteró hasta que la reportó UMG.
             logger.warning(
                 "[SHORT] fondo %s inutilizable (%s) — el short cae a DEGRADÉ "
                 "mientras el master conserva el fondo real",
@@ -18087,6 +18070,7 @@ def generate_short(
                 f"short no se pudo usar ({_bg_err}) — salió con degradé y no "
                 "coincide con el master",
                 job_dir=job_dir,
+                extra={"bg_source": os.path.basename(bg_source)},
             )
             bg = _cover_resize(_make_gradient_clip(short_dur, style), 1080, 1920)
     else:
@@ -18131,33 +18115,62 @@ def generate_short(
 
     out_path = os.path.join(job_dir, "short.mp4")
     bg_only_path = os.path.join(job_dir, "short_bg_only.mp4")
-    final.write_videofile(
-        bg_only_path,
-        fps=fps,
-        codec="libx264",
-        audio_codec="aac",
-        threads=2,
-        preset="veryfast",
-        ffmpeg_params=["-movflags", "+faststart"],
-        logger=None,
-    )
+    # Escribir + VALIDAR, con un reintento.
+    #
+    # Validar es obligatorio: moviepy no chequea el returncode de su ffmpeg
+    # escritor (close() hace proc.wait() y descarta el resultado), así que
+    # write_videofile puede retornar de lo más normal habiendo dejado un
+    # archivo con moov sano y CERO packets. Eso es lo que rompió el job de
+    # UMG Chile el 21-08: el archivo roto viajaba hasta el VideoFileClip del
+    # fallback moviepy, 40 renglones más abajo, y reventaba con un OSError
+    # que mataba el job entero.
+    #
+    # El reintento es lo que separa "robusto" de "no explota": la causa de
+    # fondo sigue sin determinarse y las hipótesis vivas (el encoder muere
+    # en la finalización) son TRANSITORIAS por naturaleza. Sin reintento,
+    # un hipo de 30 segundos le cuesta el short entero al cliente. Con él,
+    # el caso normal se recupera solo y sólo degradamos si falla dos veces.
+    _intento_err = None
+    for _intento in (1, 2):
+        try:
+            final.write_videofile(
+                bg_only_path,
+                fps=fps,
+                codec="libx264",
+                audio_codec="aac",
+                threads=2,
+                preset="veryfast",
+                ffmpeg_params=["-movflags", "+faststart"],
+                logger=None,
+            )
+            if _decodes_ok(bg_only_path):
+                _intento_err = None
+                break
+            _intento_err = RuntimeError(
+                "short_bg_only.mp4 quedó ilegible tras write_videofile "
+                "(moviepy no reporta fallos del encoder)"
+            )
+        except Exception as _e:
+            _raise_if_job_timeout(_e)
+            _intento_err = _e
+        _log_short_bg_forensics(bg_only_path, job_dir)
+        logger.warning("[SHORT] intento %d/2 de escribir el fondo falló: %s",
+                       _intento, _intento_err)
+        try:
+            os.unlink(bg_only_path)
+        except OSError:
+            pass
+        gc.collect()
     audio.close()
     final.close()
-
-    # Validar el intermedio ANTES de que lo consuma nadie. moviepy no
-    # chequea el returncode del ffmpeg escritor (FFMPEG_VideoWriter.close()
-    # hace proc.wait() y descarta el resultado), así que write_videofile
-    # puede retornar de lo más normal habiendo dejado un archivo con moov
-    # sano y cero packets — que es exactamente lo que rompió el job de UMG
-    # Chile el 21-08. Sin esta línea el archivo roto viaja hasta el
-    # VideoFileClip del fallback moviepy, 40 renglones más abajo, donde
-    # revienta con un OSError que hasta hoy mataba el job entero.
-    if not _decodes_ok(bg_only_path):
-        _log_short_bg_forensics(bg_only_path, job_dir)
-        raise RuntimeError(
-            f"short_bg_only.mp4 quedó ilegible tras write_videofile "
-            f"(moviepy no reporta fallos del encoder): {bg_only_path}"
+    if _intento_err is not None:
+        _alert_sentry(
+            "short-bg-write-failed",
+            f"[SHORT-BG] {os.path.basename(job_dir.rstrip('/'))}: el fondo del "
+            f"short no se pudo escribir en 2 intentos ({_intento_err})",
+            job_dir=job_dir,
         )
+        raise RuntimeError(f"{_intento_err}: {bg_only_path}")
 
     # Effects belong to the background, BEFORE the subtitle burn. Applying a
     # photo transform after libass would displace/mirror the lyric glyphs too

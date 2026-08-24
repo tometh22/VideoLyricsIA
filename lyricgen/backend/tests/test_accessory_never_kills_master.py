@@ -143,7 +143,7 @@ def test_decodes_ok_rechaza_inexistente_y_vacio(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# _prerender_short_bg_loop — loop con ffmpeg, un solo lector
+# _prepare_short_bg — fondo del short 100% ffmpeg, un solo lector
 # --------------------------------------------------------------------------
 
 @needs_ffmpeg
@@ -158,7 +158,7 @@ def test_loop_del_fondo_del_short_produce_un_mp4_usable(tmp_path):
         check=True, capture_output=True, timeout=120,
     )
 
-    out = pipeline._prerender_short_bg_loop(str(src), 30.0, str(tmp_path))
+    out = pipeline._prepare_short_bg(str(src), 0.0, 30.0, str(tmp_path))
 
     assert pipeline._decodes_ok(out)
     assert pipeline._video_dims(out) == (1080, 1920)
@@ -172,7 +172,7 @@ def test_el_intermedio_del_loop_se_limpia_solo():
     el job_dir de cada render exitoso — decenas de MB por job, que es la
     cascada de disco que el propio módulo documenta."""
     import inspect
-    src = inspect.getsource(pipeline._prerender_short_bg_loop)
+    src = inspect.getsource(pipeline._prepare_short_bg)
     assert "bg_looped_short_1080x1920.mp4" in src
 
     limpieza = inspect.getsource(pipeline._cleanup_local_intermediates)
@@ -187,7 +187,7 @@ def test_el_loop_del_short_no_usa_prerender_looped_bg():
     nunca). Meterlo en el short pondría ese pico justo en progress=75, que es
     donde ya hay documentados workers SIGKILL-eados por OOM."""
     import inspect
-    src = inspect.getsource(pipeline._prerender_short_bg_loop)
+    src = inspect.getsource(pipeline._prepare_short_bg)
     # Con paréntesis: el docstring lo nombra para explicar por qué NO se usa.
     assert "_prerender_looped_bg(" not in src
     # Sin filter_complex no hay grafo de `reverse` que bufferear, y sin
