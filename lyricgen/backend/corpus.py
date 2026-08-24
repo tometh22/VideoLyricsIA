@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 
 import storage
 from admin import require_admin
+from corpus_reference import backfill_reference_segments
 from database import (
     AuditLog,
     CorpusAnnotation,
@@ -176,7 +177,30 @@ async def list_corpus_songs(
         .order_by(CorpusSong.created_at.desc())
         .all()
     )
-    return {"songs": [s.to_dict() for s in songs]}
+    return {"songs": [s.to_dict(include_admin_fields=True) for s in songs]}
+
+
+@router.post("/admin/corpus/songs/backfill-references")
+async def backfill_corpus_reference_segments_endpoint(
+    apply: bool = False,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Idempotent one-off (see corpus_reference.py): seeds
+    reference_segments from each song's already-reviewed editor_documents
+    transcription, and flips is_control for the songs marked "CONTROL:" in
+    notes. Defaults to a dry run — pass ?apply=true to persist. Exists so
+    this can be triggered from the admin panel/curl with just a JWT,
+    without needing Railway shell access to run the equivalent CLI
+    (scripts/backfill_corpus_reference_segments.py)."""
+    stats = backfill_reference_segments(db, dry_run=not apply)
+    db.add(AuditLog(
+        user_id=admin.get("id"),
+        action="corpus.reference_segments_backfilled",
+        detail={**stats, "applied": apply},
+    ))
+    db.commit()
+    return {"applied": apply, **stats}
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +325,7 @@ async def compare_song_annotations(
         d["annotator_id"] = annotator.id
         annotations.append(d)
 
-    return {"song": song.to_dict(), "annotations": annotations}
+    return {"song": song.to_dict(include_admin_fields=True), "annotations": annotations}
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +374,17 @@ async def list_assigned_songs(token: str, db: Session = Depends(get_db)):
 def _get_or_create_own_annotation(
     annotator: CorpusAnnotatorToken, song: CorpusSong, db: Session,
 ) -> CorpusAnnotation:
+    """Load this annotator's draft, creating it on first open.
+
+    This is the ONLY place a precarga is ever applied: the very first time
+    this annotator opens this song and no row exists yet, seed her draft
+    from `song.reference_segments` (when there is one and this isn't a
+    control song) instead of starting empty. From that moment the row
+    exists, so every later call here just returns it as-is — a later
+    autosave (even one that empties every segment) is never re-seeded,
+    satisfying "once she's saved anything of her own, her version always
+    wins" without needing a separate flag to track that.
+    """
     row = (
         db.query(CorpusAnnotation)
         .filter(
@@ -359,8 +394,19 @@ def _get_or_create_own_annotation(
         .first()
     )
     if row is None:
+        seed_segments: list = []
+        seeded = False
+        if not song.is_control and song.reference_segments:
+            # Deep-copy-ish: plain dicts, never share list/dict identity
+            # with the song row so later per-annotator edits can't leak
+            # across annotators via a shared mutable object.
+            seed_segments = [dict(seg) for seg in song.reference_segments]
+            seeded = True
         row = CorpusAnnotation(
-            song_id=song.id, annotator_token_id=annotator.id, segments=[],
+            song_id=song.id,
+            annotator_token_id=annotator.id,
+            segments=seed_segments,
+            seeded_from_reference=seeded,
         )
         db.add(row)
         db.commit()

@@ -155,6 +155,10 @@ export default function CorpusAnnotator() {
   const [saveState, setSaveState] = useState("idle"); // idle | saving | saved | error
   const [songError, setSongError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  // true cuando esta canción arrancó con frases ya marcadas de antes (ver
+  // GET /annotate/{token}/songs/{song_id} en corpus.py) — no le decimos de
+  // dónde salió esa marca, solo que ya hay una primera pasada para revisar.
+  const [seededFromReference, setSeededFromReference] = useState(false);
 
   const audioRef = useRef(null);
   const saveTimer = useRef(null);
@@ -207,6 +211,7 @@ export default function CorpusAnnotator() {
     setIsPlaying(false);
     setAudioUrl(null);
     setWaveform({ peaks: [], duration: 0 });
+    setSeededFromReference(false);
 
     let annRes, audioRes, waveRes;
     try {
@@ -227,6 +232,7 @@ export default function CorpusAnnotator() {
       const data = await annRes.json();
       setSegments(data.annotation.segments || []);
       setStatus(data.annotation.status || "draft");
+      setSeededFromReference(Boolean(data.annotation.seeded_from_reference));
     }
     if (audioRes.ok) {
       const data = await audioRes.json();
@@ -481,6 +487,13 @@ export default function CorpusAnnotator() {
         {songError && (
           <div className="rounded-card bg-red-500/10 border border-red-500/30 text-red-300 px-4 py-3 mb-4 text-ui">
             {songError}
+          </div>
+        )}
+
+        {seededFromReference && (
+          <div className="rounded-card bg-accent/10 border border-accent/30 text-ink-primary px-4 py-3 mb-4 text-ui">
+            Esta canción ya tiene una primera marca hecha. Escuchá cada frase igual
+            y corregí lo que haga falta — no des por buena una frase sin escucharla.
           </div>
         )}
 
