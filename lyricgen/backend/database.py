@@ -1706,6 +1706,117 @@ class CostSnapshot(Base):
 
 
 # ---------------------------------------------------------------------------
+# Gold corpus annotation (validator calibration — 50-song blind double-
+# annotation project, see corpus.py). Deliberately separate from Job: these
+# rows are never client jobs, never render anything, and must never be
+# joined into tenant-scoped job queries by accident.
+# ---------------------------------------------------------------------------
+
+class CorpusSong(Base):
+    """One gold-corpus song. The audio itself is not duplicated here — it
+    already lives in R2 (same bucket other jobs use); this row is just the
+    pointer + metadata an admin registers once via POST /admin/corpus/songs."""
+    __tablename__ = "corpus_songs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    artist = Column(String(255), nullable=False)
+    title = Column(String(500), nullable=False)
+    # R2 key of the source audio (mp3/wav), same object-storage mechanism
+    # jobs.input_r2_key uses. Text (not VARCHAR) — mirrors jobs.input_r2_key,
+    # which was widened after R2 handed back keys longer than 255 chars.
+    audio_r2_key = Column(Text, nullable=False)
+    audio_sha256 = Column(String(64), nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    notes = Column(Text, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "artist": self.artist,
+            "title": self.title,
+            "duration_seconds": self.duration_seconds,
+            "notes": self.notes,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class CorpusAnnotatorToken(Base):
+    """Magic-link identity for one non-technical annotator. Knowledge of the
+    `token` string IS the auth — no username/password, no login screen, and
+    (deliberately) no expiry: the annotator is a real person doing manual
+    work over days/weeks and must never get logged out mid-song. Admin
+    revokes access by flipping `is_active` off, not by rotating a secret."""
+    __tablename__ = "corpus_annotator_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(200), nullable=False)
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "token": self.token,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "last_used_at": self.last_used_at.isoformat() if self.last_used_at else None,
+        }
+
+
+class CorpusAnnotation(Base):
+    """One annotator's segment markup for one corpus song — draft or
+    submitted. Blind by construction: every token-scoped endpoint in
+    corpus.py resolves `annotator_token_id` from the caller's OWN URL
+    token and filters by it server-side. There is no endpoint that accepts
+    an arbitrary annotator id, so annotator A's request can never reach
+    annotator B's row for the same song — the only surface that can see
+    both sides at once is the admin-only comparison endpoint."""
+    __tablename__ = "corpus_annotations"
+    __table_args__ = (
+        UniqueConstraint(
+            "song_id", "annotator_token_id",
+            name="uq_corpus_annotation_song_annotator",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    song_id = Column(
+        Integer, ForeignKey("corpus_songs.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    annotator_token_id = Column(
+        Integer, ForeignKey("corpus_annotator_tokens.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # List of {start, end, text, event_type} — event_type in
+    # (lexical, vocalization, mixed). Validated at the API boundary, not
+    # here — the column itself just carries whatever the annotator saved.
+    segments = Column(JSONB, nullable=False, default=list)
+    status = Column(String(20), nullable=False, default="draft", server_default="draft")
+    submitted_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "song_id": self.song_id,
+            "segments": self.segments or [],
+            "status": self.status,
+            "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------
 

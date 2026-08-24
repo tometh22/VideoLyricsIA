@@ -46,6 +46,10 @@ const SearchPalette = lazy(() => import("./components/SearchPalette"));
 // /variant no lleva segments y el autosave del editor le escribiría al
 // job padre). Ver components/VariantLyricsSummary.jsx.
 const VariantLyricsSummary = lazy(() => import("./components/VariantLyricsSummary"));
+// Herramienta de anotación del corpus (calibración del validador). Página
+// pública standalone, sin relación con LyricsEditor/AppShell — ver
+// components/CorpusAnnotator.jsx y backend/corpus.py.
+const CorpusAnnotator = lazy(() => import("./components/CorpusAnnotator"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
@@ -5532,6 +5536,17 @@ export default function App() {
                   resetToken={resetToken}
                   onResetComplete={() => setResetToken(null)}
                 />
+          }
+        />
+        {/* Anotación del corpus (calibración del validador): link mágico
+            público, sin JWT/login. Fuera de <RequireAuth> a propósito —
+            el anotador (no técnico, externo) nunca tiene una cuenta. */}
+        <Route
+          path="/annotate/:token"
+          element={
+            <Suspense fallback={<RouteSuspenseFallback />}>
+              <CorpusAnnotator />
+            </Suspense>
           }
         />
         <Route
