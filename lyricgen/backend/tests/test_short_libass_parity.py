@@ -197,7 +197,7 @@ def test_short_no_abre_n_lectores_del_mismo_archivo():
     src = inspect.getsource(_p.generate_short)
     # Con paréntesis: los comentarios la nombran para explicar por qué se fue.
     assert "concatenate_videoclips(" not in src
-    assert "_prerender_short_bg_loop(" in src
+    assert "_prepare_short_bg(" in src
     # La rama de subclip abre UN VideoFileClip y está bien. Lo prohibido es
     # abrirlo DENTRO de un bucle: ninguna apertura de archivo puede escalar
     # con la duración del clip de fondo. Se chequea sobre el AST y no por
