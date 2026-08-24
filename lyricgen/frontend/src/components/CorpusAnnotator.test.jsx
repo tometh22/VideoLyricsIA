@@ -66,6 +66,31 @@ describe("CorpusAnnotator", () => {
     expect(screen.getByText("✓ Enviada")).toBeTruthy();
   });
 
+  it("shows a retry screen instead of hanging forever when the network fails", async () => {
+    // Regression test for the 24-ago incident: a rejected fetch (not a 404,
+    // an actual thrown/rejected promise — a real network blip) left the
+    // real annotator staring at "Cargando…" forever, with no error and no
+    // way to retry. The unhandled rejection never updated `phase`.
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("Failed to fetch"));
+
+    renderAt("good-token");
+
+    await waitFor(() => expect(screen.getByText(/no se pudo cargar/i)).toBeTruthy());
+    expect(screen.queryByText(/^Cargando…$/)).toBeFalsy();
+
+    // Reintentar debe disparar la carga de nuevo, no quedar pegado.
+    mockFetchByUrl([
+      [/\/annotate\/good-token$/, { ok: true, json: async () => ({ name: "Marina" }) }],
+      [/\/annotate\/good-token\/songs$/, {
+        ok: true,
+        json: async () => ({ annotator_name: "Marina", songs: [] }),
+      }],
+    ]);
+    fireEvent.click(screen.getByText(/reintentar/i));
+
+    await waitFor(() => expect(screen.getByText(/hola, marina/i)).toBeTruthy());
+  });
+
   it("opens a song and loads audio + waveform + existing draft", async () => {
     mockFetchByUrl([
       [/\/annotate\/good-token$/, { ok: true, json: async () => ({ name: "Marina" }) }],
