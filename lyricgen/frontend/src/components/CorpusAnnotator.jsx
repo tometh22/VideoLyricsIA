@@ -15,9 +15,9 @@ import { useParams } from "react-router-dom";
 const API = import.meta.env.VITE_API_URL || "";
 
 const EVENT_TYPES = [
-  { value: "lexical", label: "Palabra real", hint: "Se entiende lo que dice" },
-  { value: "vocalization", label: "Sonido sin palabra", hint: "Ej: \"oh oh\", \"la la la\"" },
-  { value: "mixed", label: "Mezcla", hint: "Parte palabra, parte sonido" },
+  { value: "lexical", label: "Palabra real", hint: "Se entiende lo que dice. Ej: \"te quiero\"" },
+  { value: "vocalization", label: "Sonido sin palabra", hint: "No hay palabras. Ej: \"oh oh\", \"la la la\", un grito" },
+  { value: "mixed", label: "Mezcla", hint: "Las dos cosas juntas. Ej: \"vamos, oh oh oh\"" },
 ];
 
 function formatTime(seconds) {
@@ -371,10 +371,29 @@ export default function CorpusAnnotator() {
       <Shell>
         <div className="w-full max-w-2xl">
           <h1 className="text-h2 text-ink-primary mb-2">Hola, {annotatorName} 👋</h1>
-          <p className="text-ink-secondary text-body mb-8">
-            Elegí una canción para marcar dónde empieza y termina cada frase cantada.
-            Tu progreso se guarda solo, podés cerrar la página y volver cuando quieras.
+          <p className="text-ink-secondary text-body mb-6">
+            Elegí una canción de la lista de abajo. Para cada una vas a ir marcando,
+            frase por frase, dónde empieza y dónde termina lo que se canta.
           </p>
+
+          <div className="bg-surface-1 rounded-card p-5 mb-8">
+            <h2 className="text-ink-primary font-semibold mb-3">Cómo funciona, paso a paso</h2>
+            <ol className="text-ink-secondary text-body space-y-2 list-decimal list-inside">
+              <li>Escuchá la canción hasta que empiece la primera frase cantada.</li>
+              <li>Apretá <b className="text-ink-primary">"Marcar inicio"</b> justo cuando arranca esa frase.</li>
+              <li>Dejá que siga sonando y apretá <b className="text-ink-primary">"Marcar fin"</b> justo cuando esa frase termina.</li>
+              <li>Escribí lo que se canta en ese pedacito (o dejalo vacío si es solo un sonido, sin palabras).</li>
+              <li>Elegí si fue una palabra real, un sonido sin palabra, o una mezcla de las dos.</li>
+              <li>Apretá <b className="text-ink-primary">"Agregar frase"</b> y repetí con la siguiente, hasta terminar la canción.</li>
+              <li>Cuando termines toda la canción, apretá <b className="text-ink-primary">"Enviar canción"</b>.</li>
+            </ol>
+            <p className="text-ink-secondary text-ui mt-4">
+              No hay apuro ni hay que hacerlo perfecto a la primera: si te equivocás en una frase,
+              la podés borrar y volver a marcarla. Todo lo que vas haciendo se guarda solo — podés
+              cerrar la página en cualquier momento y seguir después donde quedaste.
+            </p>
+          </div>
+
           <div className="space-y-3">
             {songs.length === 0 && (
               <p className="text-ink-secondary">Todavía no hay canciones cargadas.</p>
@@ -452,7 +471,13 @@ export default function CorpusAnnotator() {
 
             {/* Marcado de frase */}
             <div className="bg-surface-1 rounded-card p-5 mb-4">
-              <h2 className="text-ink-primary font-semibold mb-3">Marcar una frase</h2>
+              <h2 className="text-ink-primary font-semibold mb-2">Marcar una frase</h2>
+              <p className="text-ink-secondary text-ui mb-4">
+                Ejemplo: si la canción dice <b className="text-ink-primary">"te quiero"</b> y
+                empieza a sonar en el segundo 12 y termina en el segundo 14 — apretás
+                "Marcar inicio" en el segundo 12, dejás que siga la canción, y apretás
+                "Marcar fin" en el segundo 14. Después escribís "te quiero" y elegís "Palabra real".
+              </p>
 
               {!hasPendingRange ? (
                 <div className="flex flex-wrap items-center gap-3">
