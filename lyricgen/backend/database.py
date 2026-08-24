@@ -1729,11 +1729,26 @@ class CorpusSong(Base):
     duration_seconds = Column(Float, nullable=True)
     notes = Column(Text, nullable=True)
     is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Pre-review precarga (see corpus_reference.py): cleaned-down copy of
+    # the already-human-reviewed editor_documents.current_segments for the
+    # delivered job this song was copied from — [{start, end, text,
+    # event_type}], event_type always "lexical" (production data has no
+    # vocalization/mixed classification). NULL means "start empty", either
+    # because this is a control song (see is_control) or because no
+    # reviewed editor_documents row could be matched for it.
+    reference_segments = Column(JSONB, nullable=True)
+    # True for the handful of songs deliberately held out with NO
+    # precarga (marked "CONTROL:" in `notes`) — the check that annotators
+    # do just as well starting from zero as they do reviewing a precarga.
+    # Never combine this with a populated reference_segments: the backfill
+    # in corpus_reference.py enforces that, and _get_or_create_own_annotation
+    # in corpus.py double-checks it before seeding a draft.
+    is_control = Column(Boolean, nullable=False, default=False, server_default="false")
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
-    def to_dict(self):
-        return {
+    def to_dict(self, *, include_admin_fields: bool = False):
+        d = {
             "id": self.id,
             "artist": self.artist,
             "title": self.title,
@@ -1742,6 +1757,13 @@ class CorpusSong(Base):
             "is_active": self.is_active,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+        if include_admin_fields:
+            # Admin-only: revealing `is_control` to an annotator would tell
+            # her which song is the blind control, defeating its purpose.
+            # Annotator-facing responses must never call to_dict(True).
+            d["is_control"] = self.is_control
+            d["has_reference_segments"] = bool(self.reference_segments)
+        return d
 
 
 class CorpusAnnotatorToken(Base):
@@ -1801,6 +1823,15 @@ class CorpusAnnotation(Base):
     # here — the column itself just carries whatever the annotator saved.
     segments = Column(JSONB, nullable=False, default=list)
     status = Column(String(20), nullable=False, default="draft", server_default="draft")
+    # True when this row's initial `segments` came from the song's
+    # reference_segments precarga (set once, at row creation, in
+    # corpus._get_or_create_own_annotation — never touched again, even if
+    # the annotator later empties every line). Lets the frontend keep
+    # showing the "this one already has a first pass — verify it" note on
+    # every later open of the song, not just the very first one.
+    seeded_from_reference = Column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
     submitted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
@@ -1811,6 +1842,7 @@ class CorpusAnnotation(Base):
             "song_id": self.song_id,
             "segments": self.segments or [],
             "status": self.status,
+            "seeded_from_reference": self.seeded_from_reference,
             "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
