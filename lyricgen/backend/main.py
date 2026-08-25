@@ -333,17 +333,21 @@ else:
 # the client on the very first request after an idle period.
 #
 # SQLAlchemy auto-invalidates the dead connection on error, so the next
-# checkout gets a fresh one. We just need to retry once.
+# checkout gets a fresh one. A small bounded retry window absorbs the short
+# bursts Railway showed during this incident.
 #
 # Implemented as raw ASGI middleware (not BaseHTTPMiddleware) because we
 # need to buffer the request body before the inner app consumes it and
 # then synthesize a fresh `receive` callable on retry. BaseHTTPMiddleware
 # does not let you re-call the inner app with a replayed body.
 _TRANSIENT_DB_MARKERS = (
-    "SSL connection has been closed",
+    "ssl connection has been closed",
     "server closed the connection",
     "connection already closed",
     "could not connect to server",
+    "bad record mac",
+    "ssl syscall error",
+    "eof detected",
 )
 
 # Hard cap on request bodies eligible for replay-on-retry. Above this we
@@ -353,7 +357,7 @@ _RETRY_BODY_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB
 
 
 class DbTransientRetryMiddleware:
-    """Retry once if a Postgres connection drops mid-request.
+    """Retry a bounded number of times if Postgres drops mid-request.
 
     Small POST/PUT/PATCH JSON bodies are buffered up front and the inner
     app is invoked with a replay-able `receive`. On a matching
@@ -416,65 +420,110 @@ class DbTransientRetryMiddleware:
                 body_bytes = b"".join(chunks)
                 body_buffered = True
 
-        # First attempt. Capture send so we can tell if the response
-        # already started (in which case retrying is unsafe).
-        response_started = False
+        max_attempts = 3
         captured_exc = None
+        replayable = body_buffered or method in ("GET", "HEAD", "OPTIONS", "DELETE")
 
-        async def wrapped_send(message):
-            nonlocal response_started
-            if message.get("type") == "http.response.start":
-                response_started = True
-            await send(message)
+        for attempt in range(max_attempts):
+            response_started = False
 
-        first_receive = _make_replay_receive(body_bytes) if body_buffered else receive
-        try:
-            await self.app(scope, first_receive, wrapped_send)
-            return
-        except OperationalError as e:
-            captured_exc = e
-            transient = any(m in str(e) for m in _TRANSIENT_DB_MARKERS)
-            if not transient:
-                raise
-            if response_started:
-                logger.warning(
-                    "Transient DB error on %s %s after response started — can't retry",
-                    method, scope.get("path", ""),
-                )
-                raise
-            if method in ("POST", "PUT", "PATCH") and not body_buffered:
-                logger.warning(
-                    "Transient DB error on %s %s but body not buffered — not retrying",
-                    method, scope.get("path", ""),
-                )
-                raise
+            async def wrapped_send(message):
+                nonlocal response_started
+                if message.get("type") == "http.response.start":
+                    response_started = True
+                await send(message)
 
-        # Retry path. Fresh receive over the same body. Real send.
-        logger.warning(
-            "Transient DB error on %s %s — retrying once",
-            method, scope.get("path", ""),
+            # Preserve the real disconnect channel on the first bodyless
+            # request. StreamingResponse (notably /events SSE) listens to it;
+            # replacing it with an immediate synthetic disconnect cancels the
+            # stream before its first event. Buffered bodies and retries need
+            # a synthetic request body because the original was consumed.
+            attempt_receive = (
+                _make_replay_receive(body_bytes)
+                if body_buffered or (replayable and attempt > 0)
+                else receive
+            )
+            try:
+                await self.app(scope, attempt_receive, wrapped_send)
+                return
+            except OperationalError as exc:
+                error_text = str(exc).lower()
+                if not any(marker in error_text for marker in _TRANSIENT_DB_MARKERS):
+                    raise
+                captured_exc = captured_exc or exc
+                if response_started:
+                    logger.warning(
+                        "Transient DB error on %s %s after response started — can't retry",
+                        method, scope.get("path", ""),
+                    )
+                    raise
+                if not replayable:
+                    logger.warning(
+                        "Transient DB error on %s %s but body not buffered — not retrying",
+                        method, scope.get("path", ""),
+                    )
+                    raise
+                if attempt + 1 < max_attempts:
+                    logger.warning(
+                        "Transient DB error on %s %s — retrying (%d/%d)",
+                        method, scope.get("path", ""), attempt + 1, max_attempts - 1,
+                    )
+                    try:
+                        from ops_metrics import increment
+                        increment("db_transient_retry")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.15 * (2 ** attempt))
+                    continue
+
+        # A transient infrastructure failure is recoverable and must not look
+        # like an application 500. Capture one richly-tagged Sentry event,
+        # then give the browser an explicit retry contract.
+        path = scope.get("path", "")
+        logger.error(
+            "Transient DB error exhausted %d attempts on %s %s — returning 503",
+            max_attempts, method, path,
         )
-        await asyncio.sleep(0.15)
-        second_receive = _make_replay_receive(body_bytes) if body_buffered else receive
         try:
-            await self.app(scope, second_receive, send)
-        except OperationalError:
-            # Second attempt also failed — surface the ORIGINAL error so
-            # logs/Sentry show "this is the SSL drop case, not a fresh bug".
-            assert captured_exc is not None
-            raise captured_exc
+            from ops_metrics import increment
+            increment("db_transient_exhausted")
+        except Exception:
+            pass
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as sentry_scope:
+                sentry_scope.set_tag("db.transient", True)
+                sentry_scope.set_tag("db.retry_attempts", max_attempts)
+                sentry_scope.set_tag("http.path", path)
+                job_match = re.search(r"/([0-9a-f]{12})(?:/|$)", path)
+                if job_match:
+                    sentry_scope.set_tag("job_id", job_match.group(1))
+                sentry_sdk.capture_exception(captured_exc)
+        except Exception:
+            pass
+        response = JSONResponse(
+            status_code=503,
+            content={
+                "detail": "La base de datos está reconectando. Reintentá en unos segundos.",
+                "code": "db_transient_unavailable",
+            },
+            headers={"Retry-After": "2"},
+        )
+        await response(scope, _make_replay_receive(b""), send)
 
 
 def _make_replay_receive(body: bytes):
     """Return an ASGI `receive` callable that yields `body` once and
-    then keeps returning http.disconnect (mirrors a closed stream)."""
+    then waits like a still-connected client until the response completes."""
     delivered = False
+    connected = asyncio.Event()
 
     async def _replay_receive():
         nonlocal delivered
         if not delivered:
             delivered = True
             return {"type": "http.request", "body": body, "more_body": False}
+        await connected.wait()
         return {"type": "http.disconnect"}
 
     return _replay_receive
@@ -11403,7 +11452,20 @@ async def get_source_audio_url(
     # needed for his 26 jobs with set-but-DEAD input_r2_key (lifecycle
     # GC after 30 d retention purged the originals).
     if job.input_r2_key and storage.object_exists(job.input_r2_key):
-        url = storage.generate_signed_url(job.input_r2_key, expiry_seconds=3600)
+        extension = os.path.splitext(job.input_r2_key)[1].lower()
+        content_type = {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".aac": "audio/aac",
+            ".flac": "audio/flac",
+            ".ogg": "audio/ogg",
+        }.get(extension)
+        url = storage.generate_signed_url(
+            job.input_r2_key,
+            expiry_seconds=3600,
+            response_content_type=content_type,
+        )
         if url:
             # Audit: this serves a signed URL to the ORIGINAL master the
             # label uploaded — exactly the access a compliance review asks
@@ -11439,7 +11501,11 @@ async def get_source_audio_url(
                 continue
             if not storage.object_exists(r2_key):
                 continue
-            url = storage.generate_signed_url(r2_key, expiry_seconds=3600)
+            url = storage.generate_signed_url(
+                r2_key,
+                expiry_seconds=3600,
+                response_content_type="video/mp4",
+            )
             if url:
                 _audit_media_access(
                     current_user, job_id, "source_audio",
@@ -11693,14 +11759,15 @@ def get_waveform(
     from database import Job as JobModel
     from waveform_compute import compute_and_cache_waveform
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"],
+        )
+    job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _audit_cross_tenant_access(db, current_user, job, "waveform")
     if not job.input_r2_key:
         raise HTTPException(
             status_code=404, detail="Source audio is not available for this job."

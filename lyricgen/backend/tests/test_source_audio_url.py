@@ -48,8 +48,13 @@ def test_source_audio_url_returns_signed_url(client, admin_token, db, monkeypatc
     """Job propio con input_r2_key → 200 con url firmada y TTL."""
     import storage
     monkeypatch.setattr(storage, "object_exists", lambda key: True)
-    monkeypatch.setattr(storage, "generate_signed_url",
-                        lambda key, expiry_seconds=3600: f"https://r2.fake/{key}?sig=ok")
+    signed_calls = []
+
+    def signed_url(key, expiry_seconds=3600, **kwargs):
+        signed_calls.append((key, kwargs))
+        return f"https://r2.fake/{key}?sig=ok"
+
+    monkeypatch.setattr(storage, "generate_signed_url", signed_url)
     user_id, tenant_id = _admin_identity(db)
     job_id = _create_job(db, tenant_id, user_id)
 
@@ -61,13 +66,14 @@ def test_source_audio_url_returns_signed_url(client, admin_token, db, monkeypatc
     body = res.json()
     assert body["url"].startswith("https://r2.fake/")
     assert body["expires_in"] == 3600
+    assert signed_calls[0][1]["response_content_type"] == "audio/mpeg"
 
 
 def test_source_audio_url_404_when_no_input_key(client, admin_token, db, monkeypatch):
     """input_r2_key NULL (jobs viejos) → 404, no 500."""
     import storage
     monkeypatch.setattr(storage, "generate_signed_url",
-                        lambda key, expiry_seconds=3600: "https://should/not/be/called")
+                        lambda key, expiry_seconds=3600, **kwargs: "https://should/not/be/called")
     user_id, tenant_id = _admin_identity(db)
     job_id = _create_job(db, tenant_id, user_id, input_r2_key=None)
 
@@ -86,3 +92,27 @@ def test_source_audio_url_unknown_job_returns_404(client, admin_token):
         headers={"Authorization": f"Bearer {admin_token}"},
     )
     assert res.status_code == 404
+
+
+def test_admin_can_load_cross_tenant_waveform(client, admin_token, db, monkeypatch):
+    """Platform admin review must use the same cross-tenant scope as audio."""
+    import storage
+    import waveform_compute
+
+    user_id, admin_tenant = _admin_identity(db)
+    job_id = _create_job(db, "universal_chile", user_id)
+    assert admin_tenant != "universal_chile"
+    monkeypatch.setattr(storage, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        waveform_compute,
+        "compute_and_cache_waveform",
+        lambda _job_id, _key: {"peaks": [0.1, 0.7], "duration": 236.4},
+    )
+
+    res = client.get(
+        f"/jobs/{job_id}/waveform",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["duration"] == 236.4

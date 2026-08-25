@@ -5,6 +5,44 @@ async function responseBody(response) {
   try { return await response.clone().json(); } catch { return {}; }
 }
 
+const EDITOR_LOAD_MAX_ATTEMPTS = 3;
+
+function isTransientEditorLoad(response) {
+  const status = response?.status;
+  return status === 408 || status === 429 || status === 503 || status >= 500;
+}
+
+export async function loadEditorDocumentWithRetry({
+  request,
+  path,
+  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  maxAttempts = EDITOR_LOAD_MAX_ATTEMPTS,
+}) {
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const response = await request(path);
+      const body = await responseBody(response);
+      if (response.ok) return { ok: true, body };
+      const detail = typeof body?.detail === "string"
+        ? body.detail : `editor_load_${response.status}`;
+      lastError = new Error(detail);
+      lastError.status = response.status;
+      if (!isTransientEditorLoad(response)) break;
+      const retryAfter = Number.parseInt(response.headers?.get?.("Retry-After") || "", 10);
+      if (attempt + 1 < maxAttempts) {
+        await wait(Number.isFinite(retryAfter) && retryAfter > 0
+          ? Math.min(retryAfter * 1_000, 10_000)
+          : 500 * (2 ** attempt));
+      }
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < maxAttempts) await wait(500 * (2 ** attempt));
+    }
+  }
+  return { ok: false, error: lastError || new Error("editor_load_failed") };
+}
+
 function staleDocumentFrom(body, localSegments, fallbackRevision = 0) {
   const detail = body?.detail && typeof body.detail === "object" ? body.detail : body;
   return {
@@ -52,15 +90,11 @@ export function useEditorDocument({ jobId, enabled, request }) {
     setError(null);
     setErrorStatus(null);
     try {
-      const response = await request(`/editor/${jobId}`);
-      const body = await responseBody(response);
-      if (!response.ok) {
-        const detail = typeof body?.detail === "string"
-          ? body.detail : `editor_load_${response.status}`;
-        const loadError = new Error(detail);
-        loadError.status = response.status;
-        throw loadError;
-      }
+      const result = await loadEditorDocumentWithRetry({
+        request, path: `/editor/${jobId}`,
+      });
+      if (!result.ok) throw result.error;
+      const body = result.body;
       applyDocument(body);
       return body;
     } catch (err) {
