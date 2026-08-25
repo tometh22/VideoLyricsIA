@@ -503,6 +503,7 @@ def generate_signed_url(
     expiry_seconds: int = 3600,
     *,
     download_filename: str | None = None,
+    response_content_type: str | None = None,
 ) -> Optional[str]:
     """Pre-signed GET URL for the stored object. None if R2 is disabled.
 
@@ -518,6 +519,13 @@ def generate_signed_url(
         params["ResponseContentDisposition"] = (
             f'attachment; filename="{download_filename}"'
         )
+    if response_content_type:
+        # Multipart browser uploads historically landed in R2 as
+        # application/octet-stream. That is fine for downloads, but Chromium
+        # can abort progressive <audio> playback after its initial buffer when
+        # a WAV is served as a generic binary. Override the response metadata
+        # in the signed URL without mutating the immutable source object.
+        params["ResponseContentType"] = response_content_type
     return client.generate_presigned_url(
         "get_object",
         Params=params,

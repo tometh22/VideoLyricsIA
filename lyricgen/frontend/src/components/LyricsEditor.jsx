@@ -1714,11 +1714,11 @@ export default function LyricsEditor({
     };
   }, [audioFile]);
 
-  // The durable R2 URL is authoritative as soon as it reaches this render.
-  // Keeping it declarative avoids the prop -> effect -> local-state gap that
-  // could leave an edit session stuck in the no-audio state. The blob remains
-  // a valid fallback and is revoked only when its own lifecycle ends.
-  const audioUrl = audioUrlProp || blobAudioUrl;
+  // A real local Blob is the most stable source for the upload session. The
+  // durable R2 URL often arrives a few seconds after transcription; replacing
+  // `src` at that moment resets the media element and used to cut playback at
+  // ~3 seconds. Resumed jobs have no Blob and correctly use the signed URL.
+  const audioUrl = blobAudioUrl || audioUrlProp;
   const audioTemporarilyUnavailable = !audioUrl && audioUnavailableReason === "temporary";
 
   const audioRef = useRef(null);
