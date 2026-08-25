@@ -1610,6 +1610,78 @@ class VeoBudgetLedger(Base):
     )
 
 
+class DeletedJobLyricsArchive(Base):
+    """Best-effort copy of an operator's hand-corrected lyrics, taken right
+    before a stuck/failed Job row (and its ON DELETE CASCADE children
+    editor_documents/editor_versions) is hard-deleted via delete_job /
+    bulk_delete_jobs.
+
+    Incident (audited 2026-08-24): 137 jobs with real lyric corrections were
+    hard-deleted via the operator cleanup flow with no recoverable trace of
+    which song they belonged to — editor_documents/editor_versions cascade
+    with the Job, and the Job row itself (artist/song_title) is gone by the
+    time anyone notices. This table exists solely to survive that delete:
+
+    - `job_id` is a PLAIN string, deliberately with NO ForeignKey to
+      jobs.job_id — the whole point is that this row outlives the job.
+    - `artist`/`song_title` are copied from the Job BEFORE it's deleted,
+      which is exactly the piece of context the 137 lost rows are missing.
+
+    Never blocks deletion: written best-effort in the same transaction as
+    the delete, and only when there's actually something to archive (a
+    non-empty editor_documents.current_segments, or at least one
+    editor_versions row). Jobs nobody ever touched in the editor produce no
+    row here — this is a safety net for lost human work, not a full audit
+    log of every deletion.
+    """
+    __tablename__ = "deleted_job_lyrics_archive"
+    __table_args__ = (
+        Index(
+            "ix_deleted_job_lyrics_archive_archived_at", "archived_at",
+        ),
+        Index(
+            "ix_deleted_job_lyrics_archive_tenant_job",
+            "tenant_id",
+            "job_id",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(12), nullable=False, index=True)
+    tenant_id = Column(String(100), nullable=False)
+    artist = Column(String(255), nullable=True)
+    song_title = Column(String(500), nullable=True)
+    job_status_at_deletion = Column(String(20), nullable=False)
+    segments = Column(JSONB, nullable=False)
+    # "editor_documents" | "editor_versions" — which table the segments were
+    # recovered from. editor_documents.current_segments is preferred (it's
+    # the operator's latest working copy); editor_versions is the fallback
+    # when there's no live document but at least one saved checkpoint.
+    source = Column(String(20), nullable=False)
+    archived_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    # Nullable, deliberately no ForeignKey (unlike AuditLog.user_id): this
+    # archive must survive independently of both the job AND the acting
+    # user's row, and users.id has no ON DELETE behavior defined today —
+    # a strict FK here would risk a future user deletion blocking on, or
+    # cascading into, lyrics-recovery history that has nothing to do with
+    # user-account lifecycle.
+    deleted_by_user_id = Column(Integer, nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "job_id": self.job_id,
+            "tenant_id": self.tenant_id,
+            "artist": self.artist,
+            "song_title": self.song_title,
+            "job_status_at_deletion": self.job_status_at_deletion,
+            "segments": self.segments,
+            "source": self.source,
+            "archived_at": self.archived_at.isoformat() if self.archived_at else None,
+            "deleted_by_user_id": self.deleted_by_user_id,
+        }
+
+
 class LyricsCache(Base):
     """Reference lyrics fetched via Gemini-grounded web search, cached
     per (artist, title) so we only pay Gemini once per song across the
