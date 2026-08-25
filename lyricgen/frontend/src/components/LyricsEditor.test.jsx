@@ -219,7 +219,7 @@ describe("LyricsEditor — recuperación de audio remoto post-mount", () => {
     expect(screen.getByRole("button", { name: "Buscar" })).toBeInTheDocument();
   });
 
-  it("mantiene el blob válido como fallback durante el upgrade a la URL firmada", () => {
+  it("mantiene el blob local como fuente estable cuando llega la URL firmada", () => {
     const createObjectUrlSpy = vi
       .spyOn(URL, "createObjectURL")
       .mockReturnValue("blob:http://localhost/upload");
@@ -239,7 +239,13 @@ describe("LyricsEditor — recuperación de audio remoto post-mount", () => {
     const signedUrl = "https://media.example.test/source.wav?signature=fresh";
     rerender(<LyricsEditor {...props} audioUrl={signedUrl} />);
 
-    expect(container.querySelector("audio")).toHaveAttribute("src", signedUrl);
+    // Cambiar src durante reproducción reinicia/pausa el media element. La
+    // URL remota queda disponible para sesiones retomadas, pero el upload
+    // actual conserva su Blob hasta desmontar.
+    expect(container.querySelector("audio")).toHaveAttribute(
+      "src",
+      "blob:http://localhost/upload",
+    );
     expect(revokeObjectUrlSpy).not.toHaveBeenCalled();
 
     unmount();

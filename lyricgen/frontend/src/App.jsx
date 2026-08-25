@@ -222,6 +222,34 @@ function authFetchWithTimeout(url, opts = {}, timeoutMs = 10_000) {
   return fetchWithTimeout(url, { ...opts, headers }, timeoutMs);
 }
 
+// Critical editor reads must outlive one dropped DB connection, but must not
+// leave the operator on an endless spinner. Retry only transient responses or
+// timeout/network failures; real 4xx responses remain immediate.
+async function authFetchCriticalRead(url, opts = {}, {
+  maxAttempts = 3,
+  timeoutMs = 10_000,
+} = {}) {
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const response = await authFetchWithTimeout(url, opts, timeoutMs);
+      const transient = response.status === 408 || response.status === 429
+        || response.status === 503 || response.status >= 500;
+      if (!transient || attempt + 1 === maxAttempts) return response;
+      const retryAfter = Number.parseInt(response.headers.get("Retry-After") || "", 10);
+      const delayMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(retryAfter * 1_000, 10_000)
+        : 500 * (2 ** attempt);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 === maxAttempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 500 * (2 ** attempt)));
+    }
+  }
+  throw lastError || new Error("critical_read_failed");
+}
+
 // authFetch + client-side retry on 503 with Retry-After header. Used for
 // endpoints that may transiently saturate (Whisper transcription on burst
 // load, where the server retries internally but if it exhausts retries
@@ -914,7 +942,7 @@ function EditLyricsRoute({
       // Fase A — /status: critical path, blocking.
       let statusRes;
       try {
-        statusRes = await authFetchWithTimeout(`${API}/status/${id}`, {}, 10_000);
+        statusRes = await authFetchCriticalRead(`${API}/status/${id}`);
       } catch (e) {
         // TimeoutError o network error. /status es rápido en condiciones
         // normales (~50ms); un timeout de 10s implica DB stuck u otra
@@ -1331,7 +1359,7 @@ function VariantWizardRoute({
       // y las URLs firmadas (audio/waveform/fondo) lo enriquecen después.
       let statusRes;
       try {
-        statusRes = await authFetchWithTimeout(`${API}/status/${id}`, {}, 10_000);
+        statusRes = await authFetchCriticalRead(`${API}/status/${id}`);
       } catch {
         if (alive) setState({ status: "error" });
         return;
@@ -2012,7 +2040,7 @@ export default function App() {
     let cancelled = false;
     (async () => {
       try {
-        const statusRes = await authFetch(`${API}/status/${resumeJobId}`);
+        const statusRes = await authFetchCriticalRead(`${API}/status/${resumeJobId}`);
         if (!statusRes.ok) throw new Error(`status ${statusRes.status}`);
         const job = await statusRes.json();
         if (cancelled) return;
@@ -3269,7 +3297,12 @@ export default function App() {
     [],
   );
   const editorRequest = useCallback(
-    (path, options = {}) => authFetch(`${API}${path}`, options),
+    (path, options = {}) => {
+      const method = String(options.method || "GET").toUpperCase();
+      return method === "GET"
+        ? authFetchWithTimeout(`${API}${path}`, options, 10_000)
+        : authFetch(`${API}${path}`, options);
+    },
     [],
   );
   // Una sola cola por App sobrevive remounts del editor (pasos 6↔4 y

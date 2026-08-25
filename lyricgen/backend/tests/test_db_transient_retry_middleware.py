@@ -12,6 +12,12 @@ def transient_error():
     )
 
 
+def bad_record_mac_error():
+    return OperationalError(
+        "SELECT 1", {}, Exception("SSL error: tlsv1 alert bad record mac"),
+    )
+
+
 def test_bodyless_editor_heartbeat_is_retried_once(monkeypatch):
     calls = 0
     received = []
@@ -77,3 +83,43 @@ def test_unknown_bodyless_post_is_not_retried():
         asyncio.run(run())
 
     assert calls == 1
+
+
+def test_get_retries_bad_record_mac_and_returns_503_contract(monkeypatch):
+    calls = 0
+    sent = []
+
+    async def inner_app(_scope, receive, _send):
+        nonlocal calls
+        calls += 1
+        assert (await receive())["type"] == "http.request"
+        raise bad_record_mac_error()
+
+    original_calls = 0
+
+    async def original_receive():
+        nonlocal original_calls
+        original_calls += 1
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def capture_send(message):
+        sent.append(message)
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("main.asyncio.sleep", no_sleep)
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/jobs/d4b22e7ed4b2/source-audio-url",
+        "headers": [],
+    }
+
+    asyncio.run(DbTransientRetryMiddleware(inner_app)(scope, original_receive, capture_send))
+
+    assert calls == 3
+    assert original_calls == 1
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    assert start["status"] == 503
+    assert (b"retry-after", b"2") in start["headers"]
