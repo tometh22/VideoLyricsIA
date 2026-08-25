@@ -1,6 +1,6 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { useEditorDocument } from "./useEditorDocument";
+import { loadEditorDocumentWithRetry, useEditorDocument } from "./useEditorDocument";
 
 function reply(body, status = 200) {
   return {
@@ -11,6 +11,42 @@ function reply(body, status = 200) {
 }
 
 afterEach(() => vi.restoreAllMocks());
+
+describe("loadEditorDocumentWithRetry", () => {
+  it("recovers from DB backpressure using Retry-After", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ...reply({ detail: "reconnecting" }, 503),
+        headers: { get: () => "2" },
+      })
+      .mockResolvedValueOnce(reply({ job_id: "job-1", revision: 4, segments: [] }));
+    const wait = vi.fn().mockResolvedValue(undefined);
+
+    await expect(loadEditorDocumentWithRetry({
+      request, path: "/editor/job-1", wait,
+    })).resolves.toEqual({
+      ok: true,
+      body: { job_id: "job-1", revision: 4, segments: [] },
+    });
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenCalledWith(2_000);
+  });
+
+  it("does not retry a real 404", async () => {
+    const request = vi.fn().mockResolvedValue(reply({ detail: "Job not found." }, 404));
+    const wait = vi.fn();
+
+    const result = await loadEditorDocumentWithRetry({
+      request, path: "/editor/missing", wait,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error.status).toBe(404);
+    expect(request).toHaveBeenCalledOnce();
+    expect(wait).not.toHaveBeenCalled();
+  });
+});
 
 describe("useEditorDocument save ordering", () => {
   it("serializes PATCH requests and gives the second save the confirmed revision", async () => {
