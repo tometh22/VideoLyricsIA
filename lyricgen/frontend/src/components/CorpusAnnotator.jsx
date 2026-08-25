@@ -497,6 +497,18 @@ export default function CorpusAnnotator() {
           </div>
         )}
 
+        {/* Traer el audio + la forma de onda tarda unos segundos (son archivos
+            de varios minutos). Sin este aviso la pantalla queda en blanco
+            todo ese tiempo y parece que la página está rota — le pasó a la
+            primera anotadora real el 25-ago: abandonó la canción pensando
+            que no funcionaba. */}
+        {!audioUrl && !songError && (
+          <div className="bg-surface-1 rounded-card p-8 mb-4 flex flex-col items-center gap-3">
+            <div className="w-8 h-8 rounded-full border-2 border-white/20 border-t-brand animate-spin" />
+            <p className="text-ink-secondary text-body">Cargando la canción… puede tardar unos segundos.</p>
+          </div>
+        )}
+
         {audioUrl && (
           <>
             {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
