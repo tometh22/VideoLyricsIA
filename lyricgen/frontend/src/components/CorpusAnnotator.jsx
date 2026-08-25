@@ -159,9 +159,13 @@ export default function CorpusAnnotator() {
   // GET /annotate/{token}/songs/{song_id} en corpus.py) — no le decimos de
   // dónde salió esa marca, solo que ya hay una primera pasada para revisar.
   const [seededFromReference, setSeededFromReference] = useState(false);
+  // Frase existente cuyo tiempo se está volviendo a marcar (null = se está
+  // agregando una frase nueva, no corrigiendo una vieja).
+  const [editingSegment, setEditingSegment] = useState(null);
 
   const audioRef = useRef(null);
   const saveTimer = useRef(null);
+  const markCardRef = useRef(null);
 
   // --- Carga inicial: valida el link + trae la lista de canciones ---
   // OJO: envuelto en try/catch a propósito. Sin esto, cualquier falla de red
@@ -299,10 +303,46 @@ export default function CorpusAnnotator() {
     if (el.paused) el.play(); else el.pause();
   };
 
+  // Barra espaciadora = play/pausa, como en cualquier reproductor de video o
+  // audio — evita ir a buscar el botón con el mouse en cada frase, que es la
+  // acción que más veces por minuto se repite en todo el ejercicio. Se
+  // desactiva mientras se está escribiendo en un campo de texto para no
+  // interrumpir a alguien tipeando un espacio.
+  useEffect(() => {
+    if (phase !== "annotating" || !audioUrl) return;
+    const onKeyDown = (e) => {
+      if (e.code !== "Space") return;
+      const tag = document.activeElement?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      e.preventDefault();
+      togglePlay();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [phase, audioUrl]);
+
   const seek = (t) => {
     const el = audioRef.current;
     if (el) el.currentTime = t;
     setCurrentTime(t);
+  };
+
+  // Reproduce solo el pedacito de una frase ya marcada y se pausa solo al
+  // llegar al final — así se puede revisar cada frase precargada sin tener
+  // que calcular a mano dónde parar.
+  const playSegment = (seg) => {
+    const el = audioRef.current;
+    if (!el) return;
+    el.currentTime = seg.start;
+    setCurrentTime(seg.start);
+    const stopAtEnd = () => {
+      if (el.currentTime >= seg.end) {
+        el.pause();
+        el.removeEventListener("timeupdate", stopAtEnd);
+      }
+    };
+    el.addEventListener("timeupdate", stopAtEnd);
+    el.play();
   };
 
   const handleMarkStart = () => setMarkStart(currentTime);
@@ -341,10 +381,47 @@ export default function CorpusAnnotator() {
     setPendingStart(null);
     setPendingEnd(null);
     setMarkStart(null);
+    setEditingSegment(null);
   };
 
-  const removeSegment = (idx) => {
-    setSegments((prev) => prev.filter((_, i) => i !== idx));
+  // `sortedSegments` reordena `segments` para mostrarlo, pero son los MISMOS
+  // objetos (el `sort` de abajo no clona) — por eso identificamos la frase a
+  // borrar/editar por referencia y no por posición en la lista ordenada:
+  // usar el índice de la lista ordenada para mutar el array original rompía
+  // si alguna frase quedaba fuera de orden cronológico.
+  const removeSegment = (segToRemove) => {
+    setSegments((prev) => prev.filter((s) => s !== segToRemove));
+  };
+
+  const updateSegment = (segToUpdate, patch) => {
+    setSegments((prev) =>
+      prev
+        .map((s) => (s === segToUpdate ? { ...s, ...patch } : s))
+        .sort((a, b) => a.start - b.start),
+    );
+  };
+
+  // Reutiliza el mismo flujo de "Marcar inicio" / "Marcar fin" que ya conoce
+  // la persona, pero para corregir el tiempo de una frase que ya existe en
+  // vez de agregar una nueva — evita inventar controles nuevos (arrastrar en
+  // la forma de onda, tipear segundos a mano) para algo que en la práctica
+  // va a pasar poco (los tiempos precargados ya vienen de una corrección
+  // real hecha antes).
+  const startEditingTime = (seg) => {
+    setEditingSegment(seg);
+    setMarkStart(null);
+    setPendingStart(null);
+    setPendingEnd(null);
+    markCardRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  const confirmTimeEdit = () => {
+    if (!hasPendingRange || !editingSegment) return;
+    updateSegment(editingSegment, { start: pendingStart, end: pendingEnd });
+    setPendingStart(null);
+    setPendingEnd(null);
+    setMarkStart(null);
+    setEditingSegment(null);
   };
 
   const handleSubmit = async () => {
@@ -368,6 +445,20 @@ export default function CorpusAnnotator() {
     () => [...segments].sort((a, b) => a.start - b.start),
     [segments],
   );
+
+  // "Canción 3 de 60" — sin esto, una lista de 60 canciones se siente
+  // interminable y es fácil perder la cuenta de cuánto falta.
+  const songIndex = activeSong ? songs.findIndex((s) => s.id === activeSong.id) + 1 : 0;
+
+  const progressSummary = useMemo(() => {
+    let submittedCount = 0;
+    let draftCount = 0;
+    for (const s of songs) {
+      if (s.my_status === "submitted") submittedCount++;
+      else if (s.my_status === "draft") draftCount++;
+    }
+    return { submittedCount, draftCount, notStartedCount: songs.length - submittedCount - draftCount };
+  }, [songs]);
 
   // ---------------------------------------------------------------------
   // Render
@@ -419,10 +510,16 @@ export default function CorpusAnnotator() {
       <Shell>
         <div className="w-full max-w-2xl">
           <h1 className="text-h2 text-ink-primary mb-2">Hola, {annotatorName} 👋</h1>
-          <p className="text-ink-secondary text-body mb-6">
+          <p className="text-ink-secondary text-body mb-2">
             Elegí una canción de la lista de abajo. Para cada una vas a ir marcando,
             frase por frase, dónde empieza y dónde termina lo que se canta.
           </p>
+          {songs.length > 0 && (
+            <p className="text-ink-secondary text-ui mb-6">
+              {progressSummary.submittedCount} enviadas · {progressSummary.draftCount} en borrador
+              {" "}· {progressSummary.notStartedCount} sin empezar de {songs.length} en total
+            </p>
+          )}
 
           <div className="bg-surface-1 rounded-card p-5 mb-8">
             <h2 className="text-ink-primary font-semibold mb-3">Cómo funciona, paso a paso</h2>
@@ -439,6 +536,13 @@ export default function CorpusAnnotator() {
               No hay apuro ni hay que hacerlo perfecto a la primera: si te equivocás en una frase,
               la podés borrar y volver a marcarla. Todo lo que vas haciendo se guarda solo — podés
               cerrar la página en cualquier momento y seguir después donde quedaste.
+            </p>
+            <p className="text-ink-secondary text-ui mt-2">
+              Algunas canciones ya vienen con las frases marcadas de antes: en esas, solo tenés que
+              escuchar cada una con el botón ▶ y corregir el texto o el tipo directo ahí donde
+              aparece — no hace falta borrar y marcar de nuevo, salvo que el tiempo esté mal
+              (para eso está "Corregir tiempo"). Y podés usar la barra espaciadora para
+              reproducir/pausar en vez del botón.
             </p>
           </div>
 
@@ -482,7 +586,10 @@ export default function CorpusAnnotator() {
             <span className="text-accent text-ui font-semibold">✓ Enviada</span>
           )}
         </div>
-        <p className="text-ink-secondary text-body mb-6">{activeSong?.artist}</p>
+        <p className="text-ink-secondary text-body mb-1">{activeSong?.artist}</p>
+        {songIndex > 0 && (
+          <p className="text-ink-secondary text-caption mb-6">Canción {songIndex} de {songs.length}</p>
+        )}
 
         {songError && (
           <div className="rounded-card bg-red-500/10 border border-red-500/30 text-red-300 px-4 py-3 mb-4 text-ui">
@@ -494,6 +601,18 @@ export default function CorpusAnnotator() {
           <div className="rounded-card bg-accent/10 border border-accent/30 text-ink-primary px-4 py-3 mb-4 text-ui">
             Esta canción ya tiene una primera marca hecha. Escuchá cada frase igual
             y corregí lo que haga falta — no des por buena una frase sin escucharla.
+          </div>
+        )}
+
+        {/* Traer el audio + la forma de onda tarda unos segundos (son archivos
+            de varios minutos). Sin este aviso la pantalla queda en blanco
+            todo ese tiempo y parece que la página está rota — le pasó a la
+            primera anotadora real el 25-ago: abandonó la canción pensando
+            que no funcionaba. */}
+        {!audioUrl && !songError && (
+          <div className="bg-surface-1 rounded-card p-8 mb-4 flex flex-col items-center gap-3">
+            <div className="w-8 h-8 rounded-full border-2 border-white/20 border-t-brand animate-spin" />
+            <p className="text-ink-secondary text-body">Cargando la canción… puede tardar unos segundos.</p>
           </div>
         )}
 
@@ -521,18 +640,106 @@ export default function CorpusAnnotator() {
                 <span className="text-ink-secondary text-ui tabular-nums">
                   {formatTime(currentTime)} / {formatTime(waveform.duration)}
                 </span>
+                <span className="text-ink-secondary/60 text-caption hidden sm:inline">
+                  (podés usar la barra espaciadora para reproducir/pausar)
+                </span>
               </div>
             </div>
 
-            {/* Marcado de frase */}
+            {/* Lista de frases marcadas — primero, porque en la mayoría de las
+                canciones (las que ya vienen con precarga) la tarea principal
+                es revisar/corregir estas, no agregar frases nuevas. Cada
+                frase se puede escuchar, editar y reclasificar acá mismo, sin
+                tener que borrarla y volver a marcarla de cero. */}
             <div className="bg-surface-1 rounded-card p-5 mb-4">
-              <h2 className="text-ink-primary font-semibold mb-2">Marcar una frase</h2>
-              <p className="text-ink-secondary text-ui mb-4">
-                Ejemplo: si la canción dice <b className="text-ink-primary">"te quiero"</b> y
-                empieza a sonar en el segundo 12 y termina en el segundo 14 — apretás
-                "Marcar inicio" en el segundo 12, dejás que siga la canción, y apretás
-                "Marcar fin" en el segundo 14. Después escribís "te quiero" y elegís "Palabra real".
-              </p>
+              <h2 className="text-ink-primary font-semibold mb-3">
+                Frases marcadas ({sortedSegments.length})
+              </h2>
+              {sortedSegments.length === 0 ? (
+                <p className="text-ink-secondary text-ui">Todavía no marcaste ninguna frase.</p>
+              ) : (
+                <div className="space-y-3">
+                  {sortedSegments.map((seg, idx) => (
+                    <div
+                      key={`${seg.start}-${idx}`}
+                      className="rounded-button bg-surface-3 px-4 py-3"
+                    >
+                      <div className="flex flex-wrap items-center gap-3 mb-2">
+                        <button
+                          onClick={() => playSegment(seg)}
+                          className="w-8 h-8 shrink-0 rounded-full bg-brand hover:bg-brand-light flex items-center justify-center text-white text-sm transition-colors duration-brand"
+                          aria-label="Escuchar esta frase"
+                        >
+                          ▶
+                        </button>
+                        <button
+                          onClick={() => seek(seg.start)}
+                          className="text-ink-secondary text-caption tabular-nums hover:text-ink-primary"
+                        >
+                          {formatTime(seg.start)}–{formatTime(seg.end)}
+                        </button>
+                        <button
+                          onClick={() => startEditingTime(seg)}
+                          className="text-ink-secondary hover:text-ink-primary text-caption underline"
+                        >
+                          Corregir tiempo
+                        </button>
+                        <div className="flex-1" />
+                        <button
+                          onClick={() => removeSegment(seg)}
+                          className="text-ink-secondary hover:text-red-400 text-ui px-2"
+                          aria-label="Borrar frase"
+                        >
+                          Borrar
+                        </button>
+                      </div>
+                      <input
+                        type="text"
+                        value={seg.text}
+                        onChange={(e) => updateSegment(seg, { text: e.target.value })}
+                        placeholder="(sin texto — es solo un sonido, sin palabras)"
+                        className="w-full rounded-button bg-surface-2 border border-white/10 text-ink-primary px-3 py-2 text-body placeholder:text-ink-secondary/60 focus:outline-none focus:border-brand mb-2"
+                      />
+                      <div className="flex flex-wrap gap-2">
+                        {EVENT_TYPES.map((opt) => (
+                          <button
+                            key={opt.value}
+                            onClick={() => updateSegment(seg, { event_type: opt.value })}
+                            className={`rounded-button border px-3 py-1.5 text-caption transition-colors duration-brand ${
+                              seg.event_type === opt.value
+                                ? "bg-brand/20 border-brand text-ink-primary"
+                                : "bg-surface-2 border-white/10 text-ink-secondary hover:border-white/20"
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Marcar una frase nueva / corregir el tiempo de una existente */}
+            <div ref={markCardRef} className="bg-surface-1 rounded-card p-5 mb-4">
+              <h2 className="text-ink-primary font-semibold mb-2">
+                {editingSegment ? "Corregir el tiempo de una frase" : "Marcar una frase nueva"}
+              </h2>
+              {editingSegment ? (
+                <p className="text-ink-secondary text-ui mb-4">
+                  Escuchá de nuevo desde un poco antes y volvé a apretar "Marcar inicio" / "Marcar fin"
+                  en el momento correcto para{" "}
+                  <b className="text-ink-primary">"{editingSegment.text || "(sin texto)"}"</b>.
+                </p>
+              ) : (
+                <p className="text-ink-secondary text-ui mb-4">
+                  Ejemplo: si la canción dice <b className="text-ink-primary">"te quiero"</b> y
+                  empieza a sonar en el segundo 12 y termina en el segundo 14 — apretás
+                  "Marcar inicio" en el segundo 12, dejás que siga la canción, y apretás
+                  "Marcar fin" en el segundo 14. Después escribís "te quiero" y elegís "Palabra real".
+                </p>
+              )}
 
               {!hasPendingRange ? (
                 <div className="flex flex-wrap items-center gap-3">
@@ -554,6 +761,34 @@ export default function CorpusAnnotator() {
                       Reproducí hasta el final de la frase y tocá "Marcar fin".
                     </span>
                   )}
+                  {editingSegment && (
+                    <button
+                      onClick={cancelPending}
+                      className="text-ink-secondary hover:text-ink-primary text-ui underline"
+                    >
+                      Cancelar corrección
+                    </button>
+                  )}
+                </div>
+              ) : editingSegment ? (
+                <div className="space-y-4">
+                  <p className="text-ink-secondary text-ui">
+                    Nuevo tiempo: {formatTime(pendingStart)} a {formatTime(pendingEnd)}
+                  </p>
+                  <div className="flex gap-3">
+                    <button
+                      onClick={confirmTimeEdit}
+                      className="rounded-button bg-brand hover:bg-brand-light text-white px-6 py-3 font-semibold transition-colors duration-brand"
+                    >
+                      Guardar cambio
+                    </button>
+                    <button
+                      onClick={cancelPending}
+                      className="rounded-button bg-transparent hover:bg-surface-3 text-ink-secondary px-6 py-3 transition-colors duration-brand"
+                    >
+                      Cancelar
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <div className="space-y-4">
@@ -598,47 +833,6 @@ export default function CorpusAnnotator() {
                       Cancelar
                     </button>
                   </div>
-                </div>
-              )}
-            </div>
-
-            {/* Lista de frases marcadas */}
-            <div className="bg-surface-1 rounded-card p-5 mb-4">
-              <h2 className="text-ink-primary font-semibold mb-3">
-                Frases marcadas ({sortedSegments.length})
-              </h2>
-              {sortedSegments.length === 0 ? (
-                <p className="text-ink-secondary text-ui">Todavía no marcaste ninguna frase.</p>
-              ) : (
-                <div className="space-y-2">
-                  {sortedSegments.map((seg, idx) => (
-                    <div
-                      key={`${seg.start}-${idx}`}
-                      className="flex items-center justify-between rounded-button bg-surface-3 px-4 py-3"
-                    >
-                      <button
-                        onClick={() => seek(seg.start)}
-                        className="text-left flex-1 mr-3"
-                      >
-                        <span className="text-ink-secondary text-caption tabular-nums mr-3">
-                          {formatTime(seg.start)}–{formatTime(seg.end)}
-                        </span>
-                        <span className="text-ink-primary">
-                          {seg.text || <em className="text-ink-secondary">(sin texto)</em>}
-                        </span>
-                        <span className="ml-2 text-caption text-accent">
-                          {EVENT_TYPES.find((t) => t.value === seg.event_type)?.label}
-                        </span>
-                      </button>
-                      <button
-                        onClick={() => removeSegment(idx)}
-                        className="text-ink-secondary hover:text-red-400 text-ui px-2"
-                        aria-label="Borrar frase"
-                      >
-                        Borrar
-                      </button>
-                    </div>
-                  ))}
                 </div>
               )}
             </div>
