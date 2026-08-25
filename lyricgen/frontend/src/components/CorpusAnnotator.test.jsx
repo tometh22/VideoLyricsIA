@@ -121,7 +121,7 @@ describe("CorpusAnnotator", () => {
     fireEvent.click(screen.getByText("Canción Uno").closest("button"));
 
     await waitFor(() => expect(screen.getByText(/frases marcadas \(1\)/i)).toBeTruthy());
-    expect(screen.getByText("hola")).toBeTruthy();
+    expect(screen.getByDisplayValue("hola")).toBeTruthy();
   });
 
   it("shows the review note and preloads segments for a song seeded from a reference", async () => {
@@ -158,10 +158,93 @@ describe("CorpusAnnotator", () => {
     fireEvent.click(screen.getByText("Canción Uno").closest("button"));
 
     await waitFor(() => expect(screen.getByText(/frases marcadas \(2\)/i)).toBeTruthy());
-    expect(screen.getByText("primera frase ya marcada")).toBeTruthy();
-    expect(screen.getByText("segunda frase ya marcada")).toBeTruthy();
+    expect(screen.getByDisplayValue("primera frase ya marcada")).toBeTruthy();
+    expect(screen.getByDisplayValue("segunda frase ya marcada")).toBeTruthy();
     // The "verify, don't invent" note only appears for a seeded song.
     expect(screen.getByText(/ya tiene una primera marca hecha/i)).toBeTruthy();
+  });
+
+  it("lets you edit a segment's text inline instead of deleting and re-marking it", async () => {
+    mockFetchByUrl([
+      [/\/annotate\/good-token$/, { ok: true, json: async () => ({ name: "Marina" }) }],
+      [/\/annotate\/good-token\/songs$/, {
+        ok: true,
+        json: async () => ({
+          annotator_name: "Marina",
+          songs: [{ id: 1, artist: "Artista X", title: "Canción Uno", my_status: "draft", my_segment_count: 1 }],
+        }),
+      }],
+      [/\/songs\/1$/, {
+        ok: true,
+        json: async () => ({
+          song: { id: 1, artist: "Artista X", title: "Canción Uno" },
+          annotation: {
+            segments: [{ start: 0, end: 1.5, text: "hola", event_type: "lexical" }],
+            status: "draft",
+          },
+        }),
+      }],
+      [/\/songs\/1\/audio-url$/, { ok: true, json: async () => ({ url: "https://fake/audio.mp3" }) }],
+      [/\/songs\/1\/waveform$/, { ok: true, json: async () => ({ peaks: [], duration: 10 }) }],
+    ]);
+
+    renderAt("good-token");
+
+    await waitFor(() => expect(screen.getByText("Canción Uno")).toBeTruthy());
+    fireEvent.click(screen.getByText("Canción Uno").closest("button"));
+
+    const input = await screen.findByDisplayValue("hola");
+    fireEvent.change(input, { target: { value: "hola corregido" } });
+
+    expect(screen.getByDisplayValue("hola corregido")).toBeTruthy();
+    // Sigue siendo la misma frase (mismo horario), no se duplicó ni se perdió.
+    expect(screen.getByText(/frases marcadas \(1\)/i)).toBeTruthy();
+  });
+
+  it("deletes the segment that was actually clicked, even if segments arrive out of chronological order", async () => {
+    // Regresión: borrar/editar por índice de la lista ordenada en vez de por
+    // referencia al objeto borraba la frase equivocada cuando el array que
+    // manda el backend no viene ya ordenado por tiempo.
+    mockFetchByUrl([
+      [/\/annotate\/good-token$/, { ok: true, json: async () => ({ name: "Marina" }) }],
+      [/\/annotate\/good-token\/songs$/, {
+        ok: true,
+        json: async () => ({
+          annotator_name: "Marina",
+          songs: [{ id: 1, artist: "Artista X", title: "Canción Uno", my_status: "draft", my_segment_count: 2 }],
+        }),
+      }],
+      [/\/songs\/1$/, {
+        ok: true,
+        json: async () => ({
+          song: { id: 1, artist: "Artista X", title: "Canción Uno" },
+          annotation: {
+            // Fuera de orden a propósito: el que empieza más tarde va primero.
+            segments: [
+              { start: 5, end: 6, text: "segunda frase cronológica", event_type: "lexical" },
+              { start: 1, end: 2, text: "primera frase cronológica", event_type: "lexical" },
+            ],
+            status: "draft",
+          },
+        }),
+      }],
+      [/\/songs\/1\/audio-url$/, { ok: true, json: async () => ({ url: "https://fake/audio.mp3" }) }],
+      [/\/songs\/1\/waveform$/, { ok: true, json: async () => ({ peaks: [], duration: 10 }) }],
+    ]);
+
+    renderAt("good-token");
+
+    await waitFor(() => expect(screen.getByText("Canción Uno")).toBeTruthy());
+    fireEvent.click(screen.getByText("Canción Uno").closest("button"));
+
+    await waitFor(() => expect(screen.getByDisplayValue("primera frase cronológica")).toBeTruthy());
+    // Se muestran ordenadas por tiempo: la primera fila es la que empieza en
+    // el segundo 1, aunque el backend la haya mandado segunda.
+    const deleteButtons = await screen.findAllByLabelText("Borrar frase");
+    fireEvent.click(deleteButtons[0]);
+
+    await waitFor(() => expect(screen.queryByDisplayValue("primera frase cronológica")).toBeFalsy());
+    expect(screen.getByDisplayValue("segunda frase cronológica")).toBeTruthy();
   });
 
   it("does not show the review note for a song with no precarga (control or fresh)", async () => {
