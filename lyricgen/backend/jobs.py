@@ -570,7 +570,86 @@ def _archive_veo_budget_spend(db: Session, job_rows: list[Job]) -> None:
         ))
 
 
-def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
+def _archive_deleted_job_lyrics(
+    db: Session, job_rows: list[Job], deleted_by_user_id: Optional[int] = None,
+) -> None:
+    """Copy any human-edited lyrics for jobs about to be hard-deleted into
+    `deleted_job_lyrics_archive`, before the ON DELETE CASCADE on
+    editor_documents/editor_versions removes them along with the Job row.
+
+    Incident (audited 2026-08-24): 137 jobs carrying real operator lyric
+    corrections were hard-deleted via this cleanup flow with no recoverable
+    trace of which song they belonged to — editor_documents/editor_versions
+    cascade with the Job, and by the time anyone notices, the Job row's
+    artist/song_title are gone too. This copies exactly that missing
+    context BEFORE the delete, into a table with no FK back to jobs.job_id,
+    so it survives the delete it was taken ahead of.
+
+    Best-effort and additive only: writes in the same transaction as the
+    delete (so a rollback of the delete rolls this back too) but never
+    raises to block it, and only inserts a row when there's actually
+    something to recover — a non-empty `editor_documents.current_segments`
+    (preferred: the operator's latest working copy), or failing that the
+    most recent `editor_versions` checkpoint. Jobs nobody ever touched in
+    the editor produce no row here; this is a safety net for lost human
+    work, not a full audit log of every deletion.
+    """
+    from database import DeletedJobLyricsArchive, EditorDocument, EditorVersion
+
+    if not job_rows:
+        return
+    job_ids = [j.job_id for j in job_rows]
+
+    docs_by_job = {
+        d.job_id: d
+        for d in (
+            db.query(EditorDocument)
+            .filter(EditorDocument.job_id.in_(job_ids))
+            .order_by(EditorDocument.job_id)
+            .all()
+        )
+    }
+    latest_version_by_job: dict = {}
+    for v in (
+        db.query(EditorVersion)
+        .filter(EditorVersion.job_id.in_(job_ids))
+        .order_by(EditorVersion.job_id, EditorVersion.created_at.desc())
+        .all()
+    ):
+        # First hit per job_id wins — rows arrive ordered by created_at DESC.
+        latest_version_by_job.setdefault(v.job_id, v)
+
+    now = datetime.now(timezone.utc)
+    for job in job_rows:
+        doc = docs_by_job.get(job.job_id)
+        segments = None
+        source = None
+        if doc is not None and doc.current_segments:
+            segments = doc.current_segments
+            source = "editor_documents"
+        else:
+            version = latest_version_by_job.get(job.job_id)
+            if version is not None and version.segments:
+                segments = version.segments
+                source = "editor_versions"
+        if segments is None:
+            continue
+        db.add(DeletedJobLyricsArchive(
+            job_id=job.job_id,
+            tenant_id=job.tenant_id,
+            artist=job.artist,
+            song_title=job.song_title,
+            job_status_at_deletion=job.status,
+            segments=segments,
+            source=source,
+            archived_at=now,
+            deleted_by_user_id=deleted_by_user_id,
+        ))
+
+
+def delete_job(
+    db: Session, job_id: str, tenant_id: str, deleted_by_user_id: Optional[int] = None,
+) -> tuple[bool, str]:
     """Hard-delete a job row owned by `tenant_id`. Returns (ok, reason).
 
     Safety: only stuck/failed jobs can be deleted — done/pending_review jobs
@@ -592,6 +671,7 @@ def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
     if job.status not in _DELETABLE_STATUSES:
         return False, f"protected_status:{job.status}"
     _archive_veo_budget_spend(db, [job])
+    _archive_deleted_job_lyrics(db, [job], deleted_by_user_id)
     db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
     db.delete(job)
     db.commit()
@@ -605,7 +685,9 @@ def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
     return True, "ok"
 
 
-def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
+def bulk_delete_jobs(
+    db: Session, job_ids: list[str], tenant_id: str, deleted_by_user_id: Optional[int] = None,
+) -> dict:
     """Delete many jobs in one transaction. Returns {deleted: [...], skipped: {id: reason}}.
 
     Skipped reasons: 'not_found', 'protected_status:<status>'. The endpoint
@@ -643,6 +725,7 @@ def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
         r2_rows = [r for r in rows if r.job_id in deletable_set]
 
         _archive_veo_budget_spend(db, r2_rows)
+        _archive_deleted_job_lyrics(db, r2_rows, deleted_by_user_id)
         db.query(AIProvenance).filter(AIProvenance.job_id.in_(deletable_ids)).delete(synchronize_session=False)
         db.query(Job).filter(Job.tenant_id == tenant_id, Job.job_id.in_(deletable_ids)).delete(synchronize_session=False)
         db.commit()

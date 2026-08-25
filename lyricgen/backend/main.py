@@ -10243,7 +10243,7 @@ async def delete_job_endpoint(
     state. Done / pending_review jobs are protected (audit trail + plan
     quota integrity)."""
     tenant_id = current_user["tenant_id"]
-    ok, reason = delete_job(db, job_id, tenant_id)
+    ok, reason = delete_job(db, job_id, tenant_id, deleted_by_user_id=current_user.get("id"))
     if not ok:
         if reason == "not_found":
             raise HTTPException(status_code=404, detail="Job not found.")
@@ -10276,7 +10276,7 @@ async def bulk_delete_jobs_endpoint(
     # nuke the whole table in one call.
     if len(ids) > 200:
         raise HTTPException(status_code=400, detail="Too many ids in one request (max 200).")
-    return bulk_delete_jobs(db, ids, tenant_id)
+    return bulk_delete_jobs(db, ids, tenant_id, deleted_by_user_id=current_user.get("id"))
 
 
 FILE_MAP = {
