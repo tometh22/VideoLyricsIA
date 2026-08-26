@@ -7,7 +7,6 @@ transcription on English (and other non-Spanish) songs.
 
 from __future__ import annotations
 
-import os
 import re
 import unicodedata
 from collections import Counter
@@ -57,7 +56,7 @@ _MARKERS = {
 _DIAGNOSTIC_MARKERS = {
     "es": frozenset(
         "hoy ayer nadie tampoco quizás aquí allí daño lejos temprano tiempo "
-        "estoy tengo eres fueron hice corazón corazon".split()
+        "estoy tengo eres fueron hice nunca noche amor vida yo corazón corazon".split()
     ),
     "en": frozenset(
         "the and you that was are with they this have from not what can your "
@@ -159,7 +158,41 @@ def detect_text_language(value) -> str | None:
     # catches compact mixed-language text where each side has real evidence.
     if runner_score and winner_score <= runner_score * 1.5:
         return None
-    return winner
+    # Re-check with the multi-label profile: a dominant verse must not hide a
+    # genuinely evidenced second language in a bilingual chorus.
+    languages = detect_text_languages(value)
+    return winner if languages == {winner} else None
+
+
+def detect_text_languages(value) -> frozenset[str]:
+    """Return all supported languages with meaningful evidence.
+
+    A bilingual song is valid input. It must remain multi-label instead of
+    being coerced to whichever language happens to have the highest score.
+    """
+    token_counts: Counter[str] = Counter()
+    for text in _texts(value):
+        normalized = unicodedata.normalize("NFC", text).casefold()
+        normalized = normalized.replace("’", "'").replace("'", " ")
+        token_counts.update(re.findall(r"[^\W\d_]+", normalized, re.UNICODE))
+
+    for markers in _UNSUPPORTED_DIAGNOSTIC_MARKERS.values():
+        if len(set(token_counts).intersection(markers)) >= 2:
+            return frozenset()
+
+    scores = {
+        language: sum(min(token_counts[token], 2) for token in markers)
+        for language, markers in _MARKERS.items()
+    }
+    winner_score = max(scores.values(), default=0)
+    if winner_score < 4:
+        return frozenset()
+    return frozenset(
+        language for language, score in scores.items()
+        if score >= 4
+        and score >= winner_score * 0.25
+        and len(set(token_counts).intersection(_DIAGNOSTIC_MARKERS[language])) >= 2
+    )
 
 
 def resolve_transcription_language(
@@ -178,47 +211,19 @@ def resolve_transcription_language(
     explicit = normalize_language(requested_language)
     if explicit:
         return explicit
-    return detect_text_language(reference_text) or detect_text_language(result or {})
-
-
-def forced_language_for_tenant(
-    tenant_id: str | None, requested_language: str | None
-) -> str:
-    """Pin the transcription language for single-language tenants.
-
-    A tenant that only ever uploads one language (e.g. UMG Chile = always
-    Spanish) can be configured to force it, so WhisperX cannot misdetect a
-    Spanish song as English and poison the transcription cache under `en`
-    (incident 2026-08-12: Sebastián/UMG Chile got English lyrics from a
-    Spanish audio because auto-detect chose `en`, and every re-upload hit
-    the cached English result).
-
-    Env: ``TRANSCRIPTION_LANG_BY_TENANT="universal_chile:es,other:pt"``.
-    Read per-call (not import-time) so an ops change applies on redeploy
-    without import-order surprises — same pattern as the editor_v2 gate.
-
-    A configured tenant's language OVERRIDES auto-detect. If the tenant is
-    not configured, the requested language passes through unchanged.
-    """
-    tid = (tenant_id or "").strip().lower()
-    if not tid:
-        return requested_language or ""
-    raw = os.environ.get("TRANSCRIPTION_LANG_BY_TENANT", "")
-    for pair in raw.split(","):
-        if ":" not in pair:
-            continue
-        mapped_tenant, _, mapped_lang = pair.partition(":")
-        if mapped_tenant.strip().lower() == tid:
-            forced = normalize_language(mapped_lang)
-            if forced:
-                return forced
-    return requested_language or ""
+    reference_languages = detect_text_languages(reference_text)
+    if len(reference_languages) == 1:
+        return next(iter(reference_languages))
+    result_languages = detect_text_languages(result or {})
+    if len(result_languages) == 1:
+        return next(iter(result_languages))
+    return None
 
 
 __all__ = [
     "SUPPORTED_LANGUAGES",
     "detect_text_language",
+    "detect_text_languages",
     "normalize_language",
     "resolve_transcription_language",
-    "forced_language_for_tenant",
 ]

@@ -8,7 +8,7 @@ import pytest
 
 from transcription_language import (
     detect_text_language,
-    forced_language_for_tenant,
+    detect_text_languages,
     normalize_language,
     resolve_transcription_language,
 )
@@ -73,6 +73,16 @@ def test_explicit_operator_choice_wins_over_reference_detection():
 
 def test_spanish_auto_detection_remains_supported():
     assert detect_text_language(SPANISH_REFERENCE) == "es"
+
+
+def test_bilingual_reference_stays_multi_label():
+    reference = (
+        "Yo tengo una razón para cambiar la noche y nunca volver atrás.\n"
+        "The night is falling and I can hear you tonight because you will leave me alone."
+    )
+    assert detect_text_languages(reference) == {"es", "en"}
+    assert detect_text_language(reference) is None
+    assert resolve_transcription_language("", reference_text=reference) is None
 
 
 def test_repeated_common_token_does_not_misclassify_los_pericos_as_portuguese():
@@ -203,27 +213,3 @@ def test_auto_language_is_resolved_before_primary_whisperx():
     ]
     assert resolution_lines and whisperx_lines
     assert min(resolution_lines) < min(whisperx_lines)
-
-
-def test_forced_language_pins_configured_tenant(monkeypatch):
-    """A single-language tenant (UMG Chile) pins Spanish, overriding auto-detect
-    and even an explicit choice, so WhisperX can't misdetect + poison the cache
-    (incident 2026-08-12, Sebastián/UMG Chile got English from a Spanish audio)."""
-    monkeypatch.setenv("TRANSCRIPTION_LANG_BY_TENANT", "universal_chile:es,acme:pt")
-    assert forced_language_for_tenant("universal_chile", "") == "es"
-    assert forced_language_for_tenant("universal_chile", "en") == "es"
-    assert forced_language_for_tenant("UNIVERSAL_CHILE", "") == "es"  # case-insensitive
-    assert forced_language_for_tenant("acme", "") == "pt"
-
-
-def test_forced_language_passes_through_unconfigured(monkeypatch):
-    monkeypatch.setenv("TRANSCRIPTION_LANG_BY_TENANT", "universal_chile:es")
-    assert forced_language_for_tenant("genly", "") == ""
-    assert forced_language_for_tenant("genly", "en") == "en"
-    assert forced_language_for_tenant("", "") == ""
-
-
-def test_forced_language_unset_env_is_noop(monkeypatch):
-    monkeypatch.delenv("TRANSCRIPTION_LANG_BY_TENANT", raising=False)
-    assert forced_language_for_tenant("universal_chile", "") == ""
-    assert forced_language_for_tenant("universal_chile", "en") == "en"

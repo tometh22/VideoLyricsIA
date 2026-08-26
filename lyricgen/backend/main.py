@@ -121,7 +121,11 @@ from pipeline import run_pipeline, transcribe, _normalize_movement_style
 from segment_timing import normalize_segments_timing, normalize_editor_segments, timing_anomalies
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
-from transcription_language import resolve_transcription_language, forced_language_for_tenant
+from transcription_language import (
+    detect_text_languages,
+    normalize_language,
+    resolve_transcription_language,
+)
 from provenance import job_was_delivered
 from batch_profiles import (
     RenderProfileError, normalize_render_profile, pipeline_fields,
@@ -4438,7 +4442,7 @@ async def transcribe_uploaded(
         # row and create ghost jobs.
         _result = await _run_transcription_for_job(
             request, current_user, job_id, audio_path,
-            language=forced_language_for_tenant(current_user.get("tenant_id", ""), body.language),
+            language=body.language,
             artist=_row_artist,
             title=_row_title,
             filename=_row_filename,
@@ -5204,7 +5208,7 @@ async def transcribe_endpoint(
     db.close()
     _result = await _run_transcription_for_job(
         request, current_user, job_id, audio_path,
-        language=forced_language_for_tenant(current_user.get("tenant_id", ""), language),
+        language=language,
         artist=artist, title=title,
         filename=file.filename,
     )
@@ -6530,7 +6534,7 @@ def _can_infer_primary_language_from_reference(
     Studio uploads keep the existing reliability hint.  A live performance
     can legitimately use another language (or mix languages), so Auto must be
     decided by the audio provider instead of a catalogue entry for a different
-    recording.  Explicit operator/tenant choices are handled separately and
+    recording.  Explicit per-song operator choices are handled separately and
     continue to win.
     """
     return bool(
@@ -6577,7 +6581,10 @@ async def _run_transcription_for_job(
     _vocal_stem = None   # demucs output path (lazy), cleaned up in finally
 
     try:
-        lang = language.strip() if language.strip() else None
+        # Language is a per-job property. Tenant, role and geography never
+        # participate in this decision; a workspace may contain any mix of
+        # Spanish, English and other supported languages.
+        lang = normalize_language(language)
         loop = asyncio.get_event_loop()
 
         # Progress emission helper. The render pipeline already writes
@@ -6711,6 +6718,57 @@ async def _run_transcription_for_job(
             polished = normalized_polished
             out = {"job_id": job_id, "segments": polished,
                    "reference_lyrics": reference_lyrics}
+
+            # Language is evaluated at the same single output chokepoint as
+            # timing. A bilingual song is valid: preserve multi-label
+            # evidence instead of forcing one global language.
+            reference_languages = detect_text_languages(reference_lyrics)
+            try:
+                language_evidence = _wx_segs if _wx_segs else polished
+            except NameError:
+                language_evidence = polished
+            detected_languages = detect_text_languages(language_evidence)
+            requested_language = normalize_language(language)
+            reference_language = (
+                next(iter(reference_languages))
+                if len(reference_languages) == 1 else None
+            )
+            detected_language = (
+                next(iter(detected_languages))
+                if len(detected_languages) == 1 else None
+            )
+            mixed_language = (
+                len(reference_languages) > 1 or len(detected_languages) > 1
+            )
+            expected_language = lang or requested_language or reference_language
+            language_conflict = bool(
+                expected_language
+                and detected_languages
+                and expected_language not in detected_languages
+                and not mixed_language
+            )
+            language_uncertain = bool(
+                not requested_language
+                and not reference_languages
+                and len(detected_languages) <= 1
+            )
+            if language_conflict:
+                logger.error(
+                    "[LANGUAGE] conflict job=%s expected=%s detected=%s; "
+                    "blocking approval",
+                    job_id, expected_language, detected_language,
+                )
+            out.update({
+                "requested_language": requested_language,
+                "detected_language": detected_language,
+                "detected_languages": sorted(detected_languages),
+                "reference_language": reference_language,
+                "reference_languages": sorted(reference_languages),
+                "mixed_language": mixed_language,
+                "language_conflict": language_conflict,
+                "language_uncertain": language_uncertain,
+            })
+
             # Segmentos crudos de whisperX (la performance REAL): viajan en
             # result para que el modo vivo pueda reemplazar el sufijo
             # divergente por lo que se canta (live_swap_tail). Se hace pop
@@ -7019,22 +7077,43 @@ async def _run_transcription_for_job(
         # canonical lyrics before the primary ASR runs, so English references
         # are transcribed as English while Spanish references retain the
         # explicit hint that historically made Whisper more reliable.
-        if lrc and _can_infer_primary_language_from_reference(
-            lang, live=live, title=title, filename=filename,
-        ):
+        if lrc:
             _reference_for_language = (
                 (lrc.get("plain") or "").strip()
                 or (lrc.get("synced") or "").strip()
             )
-            _detected_lang = resolve_transcription_language(
-                None,
-                reference_text=_reference_for_language,
+            _reference_languages = detect_text_languages(_reference_for_language)
+            # Whisper's language parameter is global. A Spanish verse plus
+            # English chorus must stay provider-auto; forcing either language
+            # would damage the other half of the song.
+            if len(_reference_languages) > 1:
+                if lang:
+                    logger.info(
+                        "[LANGUAGE] mixed reference; ignoring single-language "
+                        "ASR hint %s for job=%s",
+                        lang, job_id,
+                    )
+                lang = None
+            _detected_lang = (
+                resolve_transcription_language(
+                    None, reference_text=_reference_for_language,
+                )
+                if len(_reference_languages) == 1
+                and _can_infer_primary_language_from_reference(
+                    lang, live=live, title=title, filename=filename,
+                ) else None
             )
             if _detected_lang:
                 lang = _detected_lang
                 logger.info(
                     "[LANGUAGE] auto-resolved %s from reference before primary ASR job=%s",
                     lang,
+                    job_id,
+                )
+            elif len(_reference_languages) > 1:
+                logger.info(
+                    "[LANGUAGE] mixed reference %s; keeping provider-auto job=%s",
+                    sorted(_reference_languages),
                     job_id,
                 )
 
@@ -7242,8 +7321,8 @@ async def _run_transcription_for_job(
                         # In live auto-mode the performance decides the
                         # language.  Catalogue text may describe a studio cut
                         # or even another-language version.  Explicit choices
-                        # (including tenant-forced values) still win because
-                        # they arrive in the original `language` argument.
+                        # still win because they arrive in the original
+                        # `language` argument.
                         _live_language = resolve_transcription_language(
                             language if (language or "").strip() else None,
                             result={"segments": _wx_segs},
@@ -9246,6 +9325,22 @@ async def generate_with_segments(
     if not isinstance(segments, list):
         raise HTTPException(status_code=400, detail="segments_json must be an array")
     segments = normalize_editor_segments(segments)
+    requested_language = normalize_language(language)
+    observed_languages = detect_text_languages(segments)
+    if (
+        requested_language
+        and len(observed_languages) == 1
+        and requested_language not in observed_languages
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Transcription language conflict: requested "
+                f"{requested_language}, detected {next(iter(observed_languages))}. "
+                "Choose the song language and transcribe again."
+            ),
+        )
+    language = requested_language
     try:
         requested_revision = int(base_revision) if str(base_revision).strip() else None
         if requested_revision is not None and requested_revision < 0:

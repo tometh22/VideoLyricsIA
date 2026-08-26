@@ -2969,7 +2969,8 @@ export default function App() {
       setTranscribing(false);
       setTranscribeProgress(null);
       setCurrentReview({
-        file: entry.file, artist: entry.artist, language: entry.language,
+        file: entry.file, artist: entry.artist,
+        language: entry.language || data.reference_language || data.detected_language || "",
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
         concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
@@ -2996,6 +2997,9 @@ export default function App() {
         coverageWarning: !!data.coverage_warning,
         transcriptionQuality: data.transcription_quality || null,
         recoverySource: data.recovery_source || "",
+        languageConflict: !!data.language_conflict,
+        languageUncertain: !!data.language_uncertain,
+        mixedLanguage: !!data.mixed_language,
         transcribeJobId: data.job_id || jobId,
         queueIdx: idx, queue,
       });
@@ -3054,7 +3058,8 @@ export default function App() {
           setTranscribing(false);
           setTranscribeProgress(null);
           setCurrentReview({
-            file: entry.file, artist: entry.artist, language: entry.language,
+            file: entry.file, artist: entry.artist,
+            language: entry.language || data.reference_language || data.detected_language || "",
             songTitle: entry.songTitle || "",
             genre: entry.genre || "", font: entry.font || "",
             concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
@@ -3072,6 +3077,9 @@ export default function App() {
             coverageWarning: !!data.coverage_warning,
             transcriptionQuality: data.transcription_quality || null,
             recoverySource: data.recovery_source || "",
+            languageConflict: !!data.language_conflict,
+            languageUncertain: !!data.language_uncertain,
+            mixedLanguage: !!data.mixed_language,
             transcribeJobId: data.job_id || cached.jobId,
             queueIdx: idx, queue,
           });
@@ -3209,7 +3217,8 @@ export default function App() {
       setTranscribing(false);
       setTranscribeProgress(null);
       setCurrentReview({
-        file: entry.file, artist: entry.artist, language: entry.language,
+        file: entry.file, artist: entry.artist,
+        language: entry.language || data.reference_language || data.detected_language || "",
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
         concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
@@ -3232,6 +3241,9 @@ export default function App() {
         coverageWarning: !!data.coverage_warning,
         transcriptionQuality: data.transcription_quality || null,
         recoverySource: data.recovery_source || "",
+        languageConflict: !!data.language_conflict,
+        languageUncertain: !!data.language_uncertain,
+        mixedLanguage: !!data.mixed_language,
         transcribeJobId: data.job_id || uploadJobId,
         queueIdx: idx, queue,
       });
@@ -5371,6 +5383,9 @@ export default function App() {
             coverageWarning={currentReview.coverageWarning}
             transcriptionQuality={currentReview.transcriptionQuality}
             recoverySource={currentReview.recoverySource}
+            languageConflict={!!currentReview.languageConflict}
+            languageUncertain={!!currentReview.languageUncertain}
+            mixedLanguage={!!currentReview.mixedLanguage}
             onApprove={handleApproveLyrics}
             onBack={handleBackInReview}
             // Post-render edit: cuando editingJobId está set, el autosave
