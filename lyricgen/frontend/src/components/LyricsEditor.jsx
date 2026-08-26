@@ -666,6 +666,7 @@ export default function LyricsEditor({
   // de producción (reservado / lo ejercitan sólo los tests).
   segments, filename, audioFile, referenceLyrics,
   coverageWarning = false, transcriptionQuality: transcriptionQualityProp = null, recoverySource = "",
+  languageConflict = false, languageUncertain = false, mixedLanguage = false,
   onApprove, onBack, isBatch = false, batchProgress = "",
   user = null,
   font = "",
@@ -3972,7 +3973,7 @@ export default function LyricsEditor({
           </div>
           <button
             onClick={handleApprove}
-            disabled={isApproving || (editorV2Enabled && (!durableHydrated || durableEditor.loading)) || saveErrorReason === "draft-corrupt"}
+            disabled={isApproving || languageConflict || languageUncertain || (editorV2Enabled && (!durableHydrated || durableEditor.loading)) || saveErrorReason === "draft-corrupt"}
             aria-busy={isApproving}
             aria-label={isApproving
               ? (t("editor.applying_changes") || "Aplicando cambios…")
@@ -4003,6 +4004,28 @@ export default function LyricsEditor({
           </svg>
           <p className="text-xs text-ink-secondary leading-relaxed">
             {t("editor.coverage_warning")}
+          </p>
+        </div>
+      )}
+
+      {languageConflict && (
+        <div className="mb-4 rounded-2xl bg-red-400/[0.08] px-4 py-3 ring-1 ring-red-400/30">
+          <p className="text-xs leading-relaxed text-red-100">
+            {t("editor.language_conflict") || "El idioma del audio y la transcripción no coincide. Volvé atrás, elegí el idioma de esta canción y reprocesá."}
+          </p>
+        </div>
+      )}
+      {languageUncertain && !languageConflict && (
+        <div className="mb-4 rounded-2xl bg-amber-400/[0.08] px-4 py-3 ring-1 ring-amber-400/30">
+          <p className="text-xs leading-relaxed text-amber-100">
+            {t("editor.language_uncertain") || "No pudimos corroborar el idioma. Elegí el idioma de esta canción y reprocesá antes de aprobar."}
+          </p>
+        </div>
+      )}
+      {mixedLanguage && !languageConflict && (
+        <div className="mb-4 rounded-2xl bg-brand-light/[0.06] px-4 py-3 ring-1 ring-brand-light/25">
+          <p className="text-xs leading-relaxed text-ink-secondary">
+            {t("editor.mixed_language") || "Detectamos más de un idioma. No se fuerza un idioma único."}
           </p>
         </div>
       )}
