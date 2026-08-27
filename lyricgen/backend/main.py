@@ -10429,6 +10429,7 @@ FILE_MAP = {
     "thumbnail": "thumbnail.jpg",
     "umg_master": "umg_master.mov",
     "umg_short": "umg_short.mov",
+    "canvas": "canvas.mp4",
 }
 
 MEDIA_TYPES = {
@@ -10437,6 +10438,7 @@ MEDIA_TYPES = {
     "thumbnail": "image/jpeg",
     "umg_master": "video/quicktime",
     "umg_short": "video/quicktime",
+    "canvas": "video/mp4",
 }
 
 # File types that can't be previewed in-browser (ProRes is not browser-playable).
@@ -10598,7 +10600,7 @@ async def issue_media_token(
     # alguien los pide— y "all" ya filtra por los archivos presentes.
     # Ojo: get_job devuelve un DICT con los entregables anidados en "files",
     # no el modelo ORM (ver su contrato en jobs.py).
-    if file_type in ("short", "thumbnail"):
+    if file_type in ("short", "thumbnail", "canvas"):
         if not (job.get("files") or {}).get(f"{file_type}_url"):
             raise HTTPException(
                 status_code=404,
@@ -11300,7 +11302,7 @@ class EnableProResRequest(BaseModel):
 
 class DeliverToDriveRequest(BaseModel):
     """Body para POST /jobs/{job_id}/deliver-to-drive."""
-    file_type: str = Field(..., max_length=20)  # "umg_master" | "umg_short" | "video" | "short"
+    file_type: str = Field(..., max_length=20)  # "umg_master" | "umg_short" | "video" | "short" | "canvas"
 
 
 @app.post("/approve/{job_id}")

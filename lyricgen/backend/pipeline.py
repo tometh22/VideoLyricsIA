@@ -105,6 +105,7 @@ _DELIVERABLE_FILENAMES = {
     "thumbnail": "thumbnail.jpg",
     "umg_master": "umg_master.mov",
     "umg_short": "umg_short.mov",
+    "canvas": "canvas.mp4",
 }
 
 
@@ -459,6 +460,9 @@ def _verify_deliverables(job_dir: str, files: dict, audio_duration: float) -> No
     expected = {
         "video_url":      ("lyric_video.mp4", "h264", audio_duration),
         "short_url":      ("short.mp4",        "h264", None),  # short is a fixed clip, not full audio
+        # El canvas es un loop de 8s sin audio: se valida el codec para
+        # atajar un archivo truncado, pero nunca contra la duración del tema.
+        "canvas_url":     ("canvas.mp4",       "h264", None),
         "thumbnail_url":  ("thumbnail.jpg",   None,   None),
         # umg_master is generated lazily at download time via ffmpeg from
         # the MP4 above (see /download/{id}/umg_master). It does NOT
@@ -518,10 +522,14 @@ def _cleanup_local_intermediates(job_dir: str) -> None:
                 os.unlink(path)
             except OSError:
                 pass
-    # Also drop any per-spec looped backgrounds (bg_looped_*.mp4)
+    # Also drop any per-spec looped backgrounds (bg_looped_*.mp4) and the
+    # Canvas palindrome unit (canvas_unit_*.mp4). generate_canvas ya lo borra
+    # en un `finally`, pero un worker muerto ENTRE las dos pasadas lo dejaría:
+    # el glob es el mismo cinturón que usa el palíndromo del fondo.
     try:
         for entry in os.listdir(job_dir):
-            if entry.startswith("bg_looped_") and entry.endswith(".mp4"):
+            if (entry.startswith("bg_looped_")
+                    or entry.startswith("canvas_unit_")) and entry.endswith(".mp4"):
                 try:
                     os.unlink(os.path.join(job_dir, entry))
                 except OSError:
@@ -627,7 +635,8 @@ def _rescue_master_before_cleanup(job_id: str, job_dir: str) -> bool:
 
 
 # Entregables SECUNDARIOS: su fallo degrada la entrega, nunca la cancela.
-_ACCESSORY_ARTIFACTS = {"short": "short.mp4", "thumbnail": "thumbnail.jpg"}
+_ACCESSORY_ARTIFACTS = {"short": "short.mp4", "thumbnail": "thumbnail.jpg",
+                        "canvas": "canvas.mp4"}
 
 
 def _accessory_failed(kind: str, job_id: str, job_dir: str, exc: BaseException) -> None:
@@ -2312,6 +2321,19 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 _accessory_failed("short", job_id, job_dir, _short_err)
                 missing_deliverables.append("short")
             update_job(job_id, progress=85)
+
+            # Step 3b — Canvas de Spotify (1080x1920, 8s, loop sin costura,
+            # sin audio). Accesorio como el short: sale del MISMO bg_source
+            # que ya se pagó para el master, así que no dispara ninguna
+            # llamada de IA. Art tracks incluidos: ahí el bg_source es la
+            # portada y el push suave del still es un Canvas válido.
+            update_job(job_id, current_step="canvas", progress=88)
+            try:
+                generate_canvas(bg_source, job_dir, effect=effect)
+                files["canvas_url"] = f"/download/{job_id}/canvas"
+            except Exception as _canvas_err:
+                _accessory_failed("canvas", job_id, job_dir, _canvas_err)
+                missing_deliverables.append("canvas")
 
             # Step 4 — Thumbnail (art tracks reuse the composite look so the
             # thumbnail matches what plays; lyric videos keep the raw bg).
@@ -18375,6 +18397,167 @@ def generate_art_track_short(
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# Spotify Canvas
+# ---------------------------------------------------------------------------
+# Spec (support.spotify.com/artists, verificado 2026-08-27): 9:16 vertical,
+# 3-8 segundos, MP4 SIN pista de audio, y Spotify lo loopea solo en la vista
+# Now Playing de la app móvil. La guía de Spotify escribe el tamaño como
+# "between 720px - 1080px tall", que se lee como el lado CORTO: el rango que
+# todo el mundo entrega es 720x1280 a 1080x1920. Vamos al techo, que además
+# es exactamente lo que el short vertical ya produce, así la matemática de
+# crop es la misma y compartimos `_prepare_short_bg`/`_cover_resize`.
+CANVAS_WIDTH = 1080
+CANVAS_HEIGHT = 1920
+CANVAS_FPS = 30
+# El clip se arma como una UNIDAD de 4s que después se palindromea, así que
+# el total cae en 8,000s exactos: el máximo que Spotify acepta (rechaza
+# cualquier cosa por encima) y el ciclo más largo posible antes de repetir.
+# 4s no es casual: es el `VEO_CLIP_SECONDS` que ya corre en producción, o sea
+# el fondo Veo entra entero en la unidad sin recortar nada.
+CANVAS_UNIT_SECONDS = 4.0
+CANVAS_SECONDS = CANVAS_UNIT_SECONDS * 2
+_CANVAS_STILL_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
+
+def generate_canvas(
+    bg_source: str | None,
+    job_dir: str,
+    *,
+    effect: str = "",
+    out_name: str = "canvas.mp4",
+) -> str:
+    """Render the Spotify Canvas (1080x1920, 8,000s exactos, loop sin costura,
+    SIN pista de audio) a partir del fondo que el job ya tiene en disco.
+
+    No genera nada nuevo: reusa el mismo `bg_source` que alimentó al master y
+    al short. Para un job con fondo Veo eso es el clip de 4s ya pagado; para
+    uno de foto fija es la imagen, que se mueve con un push suave; para un art
+    track es la portada. En los tres casos el costo marginal de IA es CERO.
+
+    DOS PASADAS, y el orden importa por la misma razón que en
+    `_prerender_looped_bg` (bug 2026-08-21): el `-t` va como opción de SALIDA.
+    Un input con `-stream_loop -1` nunca da EOF, y `reverse` necesita EOF para
+    emitir aunque sea un frame. Por eso la pasada 1 escribe una unidad ACOTADA
+    en disco y recién la pasada 2 la palindromea.
+
+    El palíndromo es el corazón del producto: Spotify repite el loop cada 8
+    segundos, así que un corte visible se ve decenas de veces por escucha. Un
+    `-stream_loop` pelado salta del último frame al primero y eso se nota.
+    """
+    import fx_compositor as _fx
+
+    if not bg_source or not os.path.exists(bg_source):
+        raise ValueError(f"generate_canvas: bg_source inexistente ({bg_source!r})")
+
+    out_path = os.path.join(job_dir, out_name)
+    unit_path = os.path.join(job_dir, f"canvas_unit_{out_name}")
+    unit_frames = int(round(CANVAS_UNIT_SECONDS * CANVAS_FPS))
+    total_frames = unit_frames * 2
+    W, H = CANVAS_WIDTH, CANVAS_HEIGHT
+    is_still = bg_source.lower().endswith(_CANVAS_STILL_EXTS)
+
+    # ---- Pasada 1 — unidad de 4s a 1080x1920 -----------------------------
+    inputs: list[str] = []
+    if is_still:
+        # Una foto fija sin movimiento es un Canvas válido (Spotify acepta
+        # hasta un JPG), pero un push lentísimo la hace leer como viva. Se
+        # supersamplea 1,4x antes del zoompan porque el filtro reescala desde
+        # el frame de entrada y a resolución nativa deja bordes blandos.
+        # Arranca en z=1.0 a propósito: al palindromear, el frame 0 y el
+        # último coinciden y el ciclo cierra sin salto.
+        inputs += ["-loop", "1", "-i", os.path.abspath(bg_source)]
+        base_chain = (
+            f"[0:v]scale={int(W * 1.4)}:{int(H * 1.4)}:"
+            f"force_original_aspect_ratio=increase,"
+            f"crop={int(W * 1.4)}:{int(H * 1.4)},"
+            f"zoompan=z='1+0.045*on/{unit_frames}'"
+            f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+            f":d={unit_frames}:s={W}x{H}:fps={CANVAS_FPS},setsar=1[base]"
+        )
+    else:
+        # Un fondo en video ya trae su propio movimiento. `-stream_loop -1`
+        # cubre el caso de un clip MÁS CORTO que la unidad sin ramas aparte;
+        # el `-t` de salida lo acota igual.
+        inputs += ["-stream_loop", "-1", "-i", os.path.abspath(bg_source)]
+        base_chain = (
+            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},fps={CANVAS_FPS},setpts=PTS-STARTPTS,setsar=1[base]"
+        )
+
+    fx_path = _fx.effect_path(effect) if effect else None
+    if fx_path and os.path.exists(fx_path):
+        inputs += ["-stream_loop", "-1", "-i", os.path.abspath(fx_path)]
+        filtergraph = (
+            base_chain + ";"
+            f"[1:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},fps={CANVAS_FPS},setpts=PTS-STARTPTS,format=gbrp[fxv];"
+            "[base][fxv]blend=all_mode=screen:all_opacity=0.30,"
+            "setrange=tv,format=yuv420p[o]"
+        )
+    else:
+        filtergraph = (base_chain.replace("[base]", "[b0]")
+                       + ";[b0]setrange=tv,format=yuv420p[o]")
+
+    run_checked(
+        ["ffmpeg", "-y", *inputs,
+         "-filter_complex", filtergraph,
+         "-map", "[o]",
+         # -frames:v en vez de -t: fija el conteo exacto y evita que un
+         # redondeo de timestamps deje el archivo en 8,03s, que Spotify
+         # rechaza por pasarse del máximo.
+         "-frames:v", str(unit_frames),
+         "-r", str(CANVAS_FPS),
+         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+         "-pix_fmt", "yuv420p", "-an",
+         unit_path],
+        label="ffmpeg-canvas-unit",
+        # Medido: ~6s para una unidad de 4s a 1080x1920. 180s es cliff de
+        # sobra y acota el zoompan si el fondo viene raro.
+        timeout=180,
+        output_path=unit_path,
+    )
+
+    # ---- Pasada 2 — palíndromo + encode final ----------------------------
+    try:
+        run_checked(
+            ["ffmpeg", "-y", "-i", unit_path,
+             "-filter_complex",
+             "[0:v]setpts=PTS-STARTPTS,split[a][b];"
+             "[b]reverse[br];"
+             "[a][br]concat=n=2:v=1:a=0[o]",
+             "-map", "[o]",
+             "-frames:v", str(total_frames),
+             "-r", str(CANVAS_FPS),
+             "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+             "-pix_fmt", "yuv420p", "-color_range", "tv",
+             # -an no es cosmético: Spotify rechaza un Canvas con pista de
+             # audio, y el fondo puede traerla si vino de un clip con sonido.
+             "-an",
+             "-movflags", "+faststart",
+             out_path],
+            label="ffmpeg-canvas-palindrome",
+            timeout=180,
+            output_path=out_path,
+        )
+    finally:
+        try:
+            os.unlink(unit_path)
+        except OSError:
+            pass
+
+    dur = _ffprobe_duration(out_path)
+    if dur is not None and dur > 8.05:
+        # Cinturón: si algún día el conteo de frames y el contenedor se
+        # desalinean, es preferible fallar acá que entregar un archivo que
+        # Spotify rechaza sin decir por qué.
+        raise RuntimeError(
+            f"canvas fuera de spec: {dur:.3f}s (máximo 8s de Spotify)"
+        )
+    logger.info("[CANVAS] listo job_dir=%s dur=%.3fs still=%s effect=%r",
+                os.path.basename(job_dir), dur or -1, is_still, effect)
+    return out_path
+
 def generate_short(
     mp3_path: str,
     segments: list[dict],
@@ -20009,6 +20192,19 @@ def run_edit_pipeline(
                 _accessory_failed("short", job_id, job_dir, _short_err)
                 missing_deliverables.append("short")
             update_job(job_id, progress=85)
+
+            # Step 3b — Canvas de Spotify (1080x1920, 8s, loop sin costura,
+            # sin audio). Accesorio como el short: sale del MISMO bg_source
+            # que ya se pagó para el master, así que no dispara ninguna
+            # llamada de IA. Art tracks incluidos: ahí el bg_source es la
+            # portada y el push suave del still es un Canvas válido.
+            update_job(job_id, current_step="canvas", progress=88)
+            try:
+                generate_canvas(bg_source, job_dir, effect=effect)
+                files["canvas_url"] = f"/download/{job_id}/canvas"
+            except Exception as _canvas_err:
+                _accessory_failed("canvas", job_id, job_dir, _canvas_err)
+                missing_deliverables.append("canvas")
 
             update_job(job_id, current_step="thumbnail", progress=90)
             try:
