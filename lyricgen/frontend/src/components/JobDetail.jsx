@@ -45,6 +45,18 @@ const MEDIA_TABS = [
   { key: "thumbnail", label: "Thumbnail", desc: "1280x720" },
 ];
 
+// Canvas de Spotify: SOLO admin. Tres variantes del mismo fondo (encuadre
+// izquierda / centro / derecha) para poder rotar el Canvas durante la
+// campaña sin volver a producir. Van aparte de MEDIA_TABS porque se montan
+// detrás de `features.canvas` — el backend igual devuelve 403 en
+// /media-token, /download y /preview, esto es sólo para no mostrar un tab
+// que no se puede abrir.
+const CANVAS_TABS = [
+  { key: "canvas", label: "Canvas 1", desc: "1080x1920 · Spotify" },
+  { key: "canvas_v2", label: "Canvas 2", desc: "1080x1920 · Spotify" },
+  { key: "canvas_v3", label: "Canvas 3", desc: "1080x1920 · Spotify" },
+];
+
 /**
  * @deprecated PR feat/edit-wizard-mode 2026-05-27. Metadata editing
  * moved into the edit-wizard at /videos/:id/edit-lyrics (top banner with
@@ -1671,9 +1683,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // dejaba un <video> vacío que 404eaba y un botón de descarga muerto, así
   // que se ofrece únicamente lo que existe. `video` va siempre: si faltara
   // el master no habría job que mirar.
-  const availableMediaTabs = MEDIA_TABS.filter(
-    (tab) => tab.key === "video" || !!job.files?.[`${tab.key}_url`],
-  );
+  // `features.canvas` es admin-only y lo resuelve el backend; acá sólo
+  // decide si los tabs se montan. El filtro por archivo existente sigue
+  // valiendo: un job sin canvas (porque no es de un admin) no muestra nada.
+  const canvasEnabled = currentUser?.features?.canvas === true;
+  const availableMediaTabs = [
+    ...MEDIA_TABS,
+    ...(canvasEnabled ? CANVAS_TABS : []),
+  ].filter((tab) => tab.key === "video" || !!job.files?.[`${tab.key}_url`]);
 
   const ALL_TABS = [
     ...availableMediaTabs,
@@ -2057,7 +2074,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           {/* File info */}
           <div className="flex items-center justify-between mb-6">
             <p className="text-xs text-gray-500">
-              {MEDIA_TABS.find((t) => t.key === activeTab)?.desc}
+              {availableMediaTabs.find((t) => t.key === activeTab)?.desc}
               {activeTab !== "thumbnail" ? " MP4" : " JPG"}
             </p>
             {canDownload && downloadHref && (
@@ -2066,7 +2083,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                   <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
                 </svg>
-                {t("detail.download")} {MEDIA_TABS.find((tb) => tb.key === activeTab)?.label}
+                {t("detail.download")} {availableMediaTabs.find((tb) => tb.key === activeTab)?.label}
               </a>
             )}
           </div>
