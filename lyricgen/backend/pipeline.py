@@ -1480,6 +1480,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             library_asset_id=variation_parent_asset_id,
         )
         _background_is_deterministic_fallback = False
+        # Telemetría del corrector de deriva de cámara (_correct_camera_drift).
+        # Se persiste en render_params más abajo: si a la foto del operador hubo
+        # que recortarle un borde para clavar la cámara, eso tiene que quedar
+        # dicho en el job y no sólo en un log.
+        _bg_drift_meta: dict = {}
         # ¿La animación que pidió el operador terminó degradada a imagen fija?
         # Hasta ahora esto se perdía en un logger.warning: el operador pedía
         # animar su foto, Veo fallaba, se entregaba un zoom lento y no había
@@ -1692,6 +1697,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         effect=effect,
                         allow_people=_compute_allow_people(job_id, background_hint),
                         audio_duration=_audio_dur_for_kb,
+                        out_meta=_bg_drift_meta,
                     )
                 except RQJobTimeoutException:
                     raise
@@ -1762,6 +1768,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "effect": effect,
             "match_lyrics": match_lyrics,
             "background_ai_generated": _background_is_ai_generated,
+            # Deriva de cámara del clip de Veo y si se corrigió. Sólo presente
+            # cuando el corrector efectivamente corrió (fondo i2v, o estatico
+            # con BG_STABILIZE_STATIC): un `.get()` que devuelve None significa
+            # "no se midió", que es distinto de "no se movió".
+            **({"camera_drift_pct": _bg_drift_meta["camera_drift_pct"],
+                "camera_drift_corrected": _bg_drift_meta["camera_drift_corrected"]}
+               if "camera_drift_pct" in _bg_drift_meta else {}),
             # Title-card customization (Full Rotor v1). Safe defaults, always
             # persisted so future edits/retries inherit the operator's choice.
             "title_template": title_template,
@@ -12335,6 +12348,356 @@ def _measure_camera_drift(video_path: str, samples: int = 30) -> dict | None:
                 pass
 
 
+# Umbral inferior: por debajo de esto la cámara ya está clavada y corregir sólo
+# agregaría un recorte y un reencode. Calibrado contra la medición de los
+# fondos `estatico` de staging (25-jul-2026): los 6 clips de cámara fija dieron
+# ≤0,03% del ancho, el push-in real 5,9%.
+_CAMERA_DRIFT_CORRECT_MIN_PCT = 0.5
+# Umbral superior: corregir un paneo grande cuesta recortar ese mismo % del
+# encuadre. A 27-30% (los dos peores casos medidos en staging) el recorte
+# destruye más de lo que arregla, así que ahí NO se toca: se loguea y se deja
+# pasar para que lo resuelva un re-roll (PR aparte). Es un corrector de deriva
+# fina, no un salvavidas de clips arruinados.
+_CAMERA_DRIFT_CORRECT_MAX_PCT = 8.0
+
+
+def _estimate_camera_track(video_path: str, samples: int = 30):
+    """Trayectoria de la cámara respecto del PRIMER frame: [(t, scale, tx, ty)].
+
+    Complementa `_measure_camera_drift`, que responde "¿cuánto se movió?" con un
+    solo número. Para CORREGIR hace falta el modelo completo — cuánto zoom y
+    cuánta traslación, en cada instante — así que acá se estima una similitud
+    (escala + traslación) por frame muestreado.
+
+    Cómo se separa zoom de paneo con el mismo estimador de traslación que ya
+    existe: bajo `p → s·(p − c) + c + t`, el desplazamiento de un punto depende
+    de su distancia al centro, `d(y) = (s−1)·(y − h/2) + ty`. Midiendo las
+    franjas OPUESTAS por separado, la DIFERENCIA entre ellas aísla la escala y
+    el PROMEDIO aísla la traslación:
+
+        s − 1 = (d_abajo − d_arriba) / (h − banda)      ty = (d_arriba + d_abajo) / 2
+
+    Un zoom puro centrado mueve las franjas en sentidos opuestos (promedio ~0,
+    diferencia grande); un paneo puro las mueve juntas (diferencia ~0). Por eso
+    un `_estimate_shift` global sobre el frame entero —que es lo que mide la
+    función de medición— ve un push-in centrado como ~0 de traslación: hay que
+    mirar los bordes.
+
+    Se usan las franjas de borde por la misma razón que `_measure_camera_drift`:
+    son el ancla más estática que tiene un plano fijo cuyo interior está
+    DISEÑADO para moverse (follaje, agua, nubes). Y se mide siempre contra el
+    frame 0, no contra el anterior, para no perder derivas lentas por
+    cuantización acumulada.
+
+    Devuelve None (fail-open) ante cualquier problema: esto jamás debe tumbar
+    un fondo.
+    """
+    tmpdir = None
+    try:
+        import numpy as _np
+        import tempfile as _tf
+        from PIL import Image as _Img
+
+        tmpdir = _tf.mkdtemp(prefix="track_")
+        pattern = os.path.join(tmpdir, "f_%03d.png")
+        run_checked(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path,
+             "-vf", "fps=3,scale=320:180", "-frames:v", str(samples), pattern],
+            label="ffmpeg-track-frames",
+            timeout=120,
+        )
+        files = sorted(f for f in os.listdir(tmpdir) if f.endswith(".png"))
+        if len(files) < 3:
+            return None
+
+        frames = []
+        for name in files:
+            with _Img.open(os.path.join(tmpdir, name)) as im:
+                frames.append(_np.asarray(im.convert("L"), dtype=_np.float64))
+
+        h, w = frames[0].shape
+        full_window = _np.outer(_np.hanning(h), _np.hanning(w))
+
+        def _predict(frame0, s, tx, ty):
+            """Predice el frame i aplicando (s,tx,ty) HACIA ADELANTE al frame 0.
+
+            La dirección importa. Alinear el frame i de vuelta al 0 exigiría
+            píxeles de afuera del cuadro —los que un zoom-in se comió, que Veo
+            nunca generó—, así que sólo se puede ir para este lado: invertir
+            `q = s·(p−c)+c+t` da `p = (q−c−t)/s + c`, y para s ≥ 1 ese rango cae
+            siempre DENTRO del frame 0.
+            """
+            c_x, c_y = w / 2.0, h / 2.0
+            x0 = (0.0 - c_x - tx) / s + c_x
+            x1 = (float(w) - c_x - tx) / s + c_x
+            y0 = (0.0 - c_y - ty) / s + c_y
+            y1 = (float(h) - c_y - ty) / s + c_y
+            if x1 - x0 < 8 or y1 - y0 < 8:
+                return None
+            if x0 < -1 or y0 < -1 or x1 > w + 1 or y1 > h + 1:
+                return None
+            return _np.asarray(
+                _Img.fromarray(frame0.astype(_np.uint8)).resize(
+                    (w, h), _Img.BILINEAR,
+                    box=(max(0.0, x0), max(0.0, y0),
+                         min(float(w), x1), min(float(h), y1))),
+                dtype=_np.float64,
+            )
+
+        # Región interior para comparar: los bordes del frame predicho vienen de
+        # extrapolar/clampear el box y siempre difieren, así que puntuarlos
+        # sesga la búsqueda hacia "no hubo zoom".
+        my, mx = max(4, h // 8), max(4, w // 8)
+
+        def _residual(frame0, target, s, tx, ty):
+            pred = _predict(frame0, s, tx, ty)
+            if pred is None:
+                return None
+            return float(_np.abs(pred - target)[my:-my, mx:-mx].mean())
+
+        def _fit(frame0, target):
+            """(escala, tx, ty) por búsqueda directa sobre el frame COMPLETO.
+
+            Por qué no se despeja la escala de las franjas de borde (que sería
+            más barato y fue el primer intento): sobre contenido real
+            SUBESTIMA. Contra el clip sintético de zoom-in 1,0400 daba 1,0368,
+            pero contra el clip real de Veo —con follaje y luz moviéndose dentro
+            de la escena— daba 1,0260 donde la deriva real era 1,0325, y esa
+            diferencia se ve: corregida con 1,026 la mesa y la guitarra seguían
+            marcadas en el mapa de diferencias. El movimiento propio de la
+            escena contamina las franjas y las arrastra hacia "no se movió".
+            La búsqueda directa usa TODOS los píxeles, así que ese movimiento
+            local queda diluido en vez de dominar.
+
+            Grueso-a-fino sobre un solo parámetro (la escala), con la traslación
+            resuelta por correlación de fase para cada candidato: es un espacio
+            de búsqueda chico y los frames son de 320x180, así que cuesta
+            milisegundos.
+            """
+            best = (1.0, 0.0, 0.0, _residual(frame0, target, 1.0, 0.0, 0.0))
+            if best[3] is None:
+                return None
+            grid = [(_np.arange(0.970, 1.1001, 0.005)), None]
+            for stage in range(2):
+                if stage == 1:
+                    c = best[0]
+                    grid[1] = _np.arange(c - 0.006, c + 0.0061, 0.001)
+                for s in grid[stage]:
+                    s = float(s)
+                    if s <= 0:
+                        continue
+                    pred = _predict(frame0, s, 0.0, 0.0)
+                    if pred is None:
+                        continue
+                    # Traslación residual para ESTA escala. `_estimate_shift`
+                    # devuelve la transformación inversa, de ahí el signo.
+                    dx, dy = _estimate_shift(pred, target, full_window)
+                    tx, ty = -float(dx) * s, -float(dy) * s
+                    r = _residual(frame0, target, s, tx, ty)
+                    if r is not None and r < best[3]:
+                        best = (s, tx, ty, r)
+            return best[0], best[1], best[2]
+
+        track = [(0.0, 1.0, 0.0, 0.0)]
+        for i in range(1, len(frames)):
+            fit = _fit(frames[0], frames[i])
+            if fit is None:
+                track.append((i / float(len(frames) - 1), 1.0, 0.0, 0.0))
+                continue
+            s, tx, ty = fit
+            track.append((
+                i / float(len(frames) - 1),
+                float(s),
+                float(tx) / float(w),
+                float(ty) / float(h),
+            ))
+        return track
+    except Exception as e:
+        _raise_if_job_timeout(e)
+        logger.warning("[BG][DRIFT] estimación de trayectoria falló (fail-open): %s", e)
+        return None
+    finally:
+        if tmpdir:
+            try:
+                import shutil as _sh
+                _sh.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+def _correct_camera_drift(video_path: str, job_id: str | None = None) -> dict | None:
+    """Cancela el movimiento de cámara de un clip reencuadrándolo. In-place.
+
+    Existe porque Veo ignora el "locked camera" del prompt bastante seguido y NO
+    expone ningún parámetro para forzarlo (`veo_params` sólo lleva aspectRatio,
+    sampleCount, generateAudio y durationSeconds): pedirlo por texto es el único
+    lever, y ya se pide dos veces —al principio y al final del prompt— sin que
+    alcance. Así que en vez de seguir negociando con el modelo, se mide lo que
+    devolvió y se deshace.
+
+    Cómo: si la cámara se acercó un 3%, todos los frames menos el primero
+    muestran un recorte más chico de la escena. NO se puede "alejar" el último
+    frame —esos píxeles nunca se generaron—, así que se hace al revés: se
+    recorta TODA la serie al rectángulo que es visible en todos los frames y se
+    lo reescala a la resolución original. Todos los frames pasan a mostrar
+    exactamente la misma región del mundo, o sea cámara clavada. El movimiento
+    DENTRO de la escena (follaje, luz, agua) queda intacto: sólo se cancela la
+    componente global.
+
+    El precio, y por qué está acotado: ese rectángulo común es más chico que el
+    encuadre original, justo en la magnitud de la deriva. A 3% es un borde fino;
+    a 27% (el peor caso medido en staging) sería mutilar el plano, y por eso
+    `_CAMERA_DRIFT_CORRECT_MAX_PCT` deja pasar esos clips sin tocarlos — un
+    paneo grande se arregla re-rolleando, no recortando.
+
+    Para el fondo de una foto SUBIDA por el operador esto es además una cuestión
+    de fidelidad y no sólo de estética: el arte lo aprobó el sello, y un push-in
+    significa entregar ese arte progresivamente recortado. Corrigiéndolo el
+    recorte pasa a ser uniforme y conocido en vez de una deriva.
+
+    Devuelve {"corrected", "crop_pct", "reason"} o None si falla (fail-open:
+    ante cualquier error se deja el clip como vino).
+    """
+    tmp_out = None
+    try:
+        import numpy as _np
+        from PIL import Image as _Img
+
+        track = _estimate_camera_track(video_path)
+        if not track or len(track) < 3:
+            return None
+
+        probe = run_checked(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            label="ffprobe-drift-dims",
+            timeout=30,
+        )
+        parts = [p for p in (probe.stdout or "").split() if p]
+        if len(parts) < 3:
+            return None
+        W, H = int(parts[0]), int(parts[1])
+        num, _, den = parts[2].partition("/")
+        fps = float(num) / float(den or 1)
+
+        # Rectángulo común: el más grande, centrado, que sigue DENTRO del cuadro
+        # en todos los frames de la trayectoria. Despejado de
+        # `s·(±a) + W/2 + tx·W ∈ [0, W]` → `a ≤ (W/2 − |tx|·W) / s`.
+        half_w, half_h = W / 2.0, H / 2.0
+        for _, s, tx, ty in track:
+            if s <= 0:
+                return None
+            half_w = min(half_w, (W / 2.0 - abs(tx) * W) / s)
+            half_h = min(half_h, (H / 2.0 - abs(ty) * H) / s)
+        half_w = min(half_w, W / 2.0)
+        half_h = min(half_h, H / 2.0)
+        if half_w <= 1 or half_h <= 1:
+            return {"corrected": False, "crop_pct": 100.0, "reason": "degenerate"}
+
+        crop_pct = round(100.0 * max(1.0 - half_w / (W / 2.0),
+                                     1.0 - half_h / (H / 2.0)), 2)
+
+        if crop_pct < _CAMERA_DRIFT_CORRECT_MIN_PCT:
+            return {"corrected": False, "crop_pct": crop_pct, "reason": "already_locked"}
+        if crop_pct > _CAMERA_DRIFT_CORRECT_MAX_PCT:
+            logger.warning(
+                "[BG][DRIFT] job=%s deriva %.2f%% > %.1f%% — NO se corrige "
+                "(el recorte costaría más que el paneo); clip entregado tal cual",
+                job_id, crop_pct, _CAMERA_DRIFT_CORRECT_MAX_PCT,
+            )
+            return {"corrected": False, "crop_pct": crop_pct, "reason": "drift_too_large"}
+
+        ts = [t for t, _, _, _ in track]
+        ss = [s for _, s, _, _ in track]
+        txs = [tx for _, _, tx, _ in track]
+        tys = [ty for _, _, _, ty in track]
+
+        tmp_out = video_path + ".stab.mp4"
+        dec = subprocess.Popen(
+            ["ffmpeg", "-v", "error", "-i", video_path,
+             "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+            stdout=subprocess.PIPE,
+        )
+        enc = subprocess.Popen(
+            ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+             "-s", f"{W}x{H}", "-r", f"{fps:.6f}", "-i", "-",
+             "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p", tmp_out],
+            stdin=subprocess.PIPE,
+        )
+        frame_bytes = W * H * 3
+        # Los frames se procesan de a uno en streaming: cargar el clip entero en
+        # RAM fue exactamente el OOM que mató un worker con el Ken Burns por
+        # moviepy (incidente "Rata Blanca" 2026-06-02).
+        n_total = 0
+        try:
+            while True:
+                buf = dec.stdout.read(frame_bytes)
+                if not buf or len(buf) < frame_bytes:
+                    break
+                n_total += 1
+        finally:
+            dec.stdout.close()
+            dec.wait()
+        if n_total < 2:
+            enc.stdin.close()
+            enc.wait()
+            return None
+
+        dec = subprocess.Popen(
+            ["ffmpeg", "-v", "error", "-i", video_path,
+             "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+            stdout=subprocess.PIPE,
+        )
+        try:
+            idx = 0
+            while True:
+                buf = dec.stdout.read(frame_bytes)
+                if not buf or len(buf) < frame_bytes:
+                    break
+                u = idx / float(n_total - 1)
+                s = float(_np.interp(u, ts, ss))
+                tx = float(_np.interp(u, ts, txs)) * W
+                ty = float(_np.interp(u, ts, tys)) * H
+                # Dónde cae, EN ESTE frame, el rectángulo común definido en
+                # coordenadas del frame 0.
+                x0 = s * (-half_w) + W / 2.0 + tx
+                x1 = s * (half_w) + W / 2.0 + tx
+                y0 = s * (-half_h) + H / 2.0 + ty
+                y1 = s * (half_h) + H / 2.0 + ty
+                box = (max(0.0, x0), max(0.0, y0), min(float(W), x1), min(float(H), y1))
+                arr = _np.frombuffer(buf, dtype=_np.uint8).reshape(H, W, 3)
+                im = _Img.fromarray(arr).resize((W, H), _Img.LANCZOS, box=box)
+                enc.stdin.write(im.tobytes())
+                idx += 1
+        finally:
+            dec.stdout.close()
+            dec.wait()
+            enc.stdin.close()
+            enc.wait()
+
+        if enc.returncode != 0 or not os.path.exists(tmp_out) or os.path.getsize(tmp_out) == 0:
+            return None
+        os.replace(tmp_out, video_path)
+        tmp_out = None
+        logger.info(
+            "[BG][DRIFT] job=%s cámara estabilizada — deriva %.2f%% cancelada "
+            "(recorte uniforme del %.2f%%, %s frames)",
+            job_id, crop_pct, crop_pct, n_total,
+        )
+        return {"corrected": True, "crop_pct": crop_pct, "reason": "stabilized"}
+    except Exception as e:
+        _raise_if_job_timeout(e)
+        logger.warning("[BG][DRIFT] corrección falló (fail-open, clip intacto): %s", e)
+        return None
+    finally:
+        if tmp_out and os.path.exists(tmp_out):
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
+
+
 def _score_video_relevance(
     video_path: str, prompt: str, job_id: str | None = None,
 ) -> int:
@@ -13968,6 +14331,38 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                         )
                 except Exception:
                     pass
+            # Cámara clavada, garantizada acá y no en el prompt (2026-08-26).
+            #
+            # El prompt ya pide "camera completely LOCKED" DOS veces —char 199 y
+            # char 2201 de 2324, o sea en las dos posiciones de máxima atención—
+            # y Veo lo ignora igual: el fondo de "Tu Cárcel" (Universal) salió
+            # con un push-in del 3,3%. No hay parámetro de API para forzarlo, así
+            # que en vez de seguir reescribiendo el prompt se mide lo que
+            # devolvió y se deshace. Determinístico, sin otra llamada a Veo y sin
+            # tocar la escena — a diferencia de un re-roll, que re-deriva el
+            # prompt y cambia el fondo entero ("me cambió todo").
+            #
+            # Se corre acá y no dentro del loop a propósito: sólo sobre el clip
+            # ACEPTADO. Estabilizar un candidato que después se descarta por
+            # score o por corte de escena es trabajo tirado.
+            #
+            # Alcance: SIEMPRE para la foto subida por el operador (i2v), porque
+            # ahí la deriva no es sólo estética — recorta progresivamente un arte
+            # que aprobó el sello. Para los fondos `estatico` generados por IA
+            # queda detrás de flag y apagado por default: la decisión de
+            # 2026-07-25 fue medir antes de actuar, y este PR no la revierte de
+            # prepo.
+            _stabilize = _i2v_animate or (
+                _norm_move_bg in {"estatico", "foto-estatica"}
+                and os.environ.get("BG_STABILIZE_STATIC", "").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            if _stabilize:
+                _corr = _correct_camera_drift(bg_path, job_id=job_id)
+                if _corr and out_meta is not None:
+                    out_meta["camera_drift_pct"] = _corr["crop_pct"]
+                    out_meta["camera_drift_corrected"] = bool(_corr["corrected"])
+                    out_meta["camera_drift_reason"] = _corr["reason"]
             return bg_path
         except RQJobTimeoutException:
             # Real RQ death-penalty timeout — propagate (don't degrade to
