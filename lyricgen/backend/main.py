@@ -77,6 +77,7 @@ from auth import (
     has_drive_access,
     has_scenes_access,
     has_art_track_access,
+    has_canvas_access,
     scenes_credit_cost,
     telemetry_enabled,
     editor_v2_enabled,
@@ -117,7 +118,8 @@ from editor import (
     revoke_quality_proposal_if_disabled,
 )
 from observability import init_sentry, init_logging, health_snapshot
-from pipeline import run_pipeline, transcribe, _normalize_movement_style
+from pipeline import (run_pipeline, transcribe, _normalize_movement_style,
+                      CANVAS_FILE_TYPES)
 from segment_timing import normalize_segments_timing, normalize_editor_segments, timing_anomalies
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
@@ -1464,6 +1466,9 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
                 # Art Track gateado por tenant (default OFF salvo admin). El
                 # front oculta la opción "Art Track" si esto es false.
                 "art_track": has_art_track_access(user),
+                # Canvas de Spotify: SOLO admin, sin env var que lo abra.
+                # El front esconde el botón de descarga si esto es false.
+                "canvas": has_canvas_access(user),
                 "telemetry": telemetry_enabled(),
                 "editor_v2": editor_v2_enabled(user),
                 # Versión B (letra anclada): el frontend gatea el textarea
@@ -1573,6 +1578,9 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
                 # Art Track gateado por tenant (default OFF salvo admin). El
                 # front oculta la opción "Art Track" si esto es false.
                 "art_track": has_art_track_access(user),
+                # Canvas de Spotify: SOLO admin, sin env var que lo abra.
+                # El front esconde el botón de descarga si esto es false.
+                "canvas": has_canvas_access(user),
                 "telemetry": telemetry_enabled(),
                 "editor_v2": editor_v2_enabled(user),
                 # Versión B (letra anclada): el frontend gatea el textarea
@@ -1648,6 +1656,7 @@ def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get
             "scenes": has_scenes_access(_u),
             "scenes_credit_cost": scenes_credit_cost(),
             "art_track": has_art_track_access(_u),
+            "canvas": has_canvas_access(_u),
             "telemetry": telemetry_enabled(),
             "editor_v2": editor_v2_enabled(_u),
             # Versión B (letra anclada): el frontend gatea el textarea
@@ -10429,8 +10438,22 @@ FILE_MAP = {
     "thumbnail": "thumbnail.jpg",
     "umg_master": "umg_master.mov",
     "umg_short": "umg_short.mov",
-    "canvas": "canvas.mp4",
+    # canvas, canvas_v2, canvas_v3 — la fuente de verdad es pipeline.
+    **{ft: f"{ft}.mp4" for ft in CANVAS_FILE_TYPES},
 }
+
+def _require_canvas_access(file_type: str, user) -> None:
+    """403 si alguien que no es admin pide el Canvas.
+
+    Defensa en profundidad, tercera capa: el front ya esconde el botón
+    (`features.canvas`) y el worker ni siquiera produce el archivo para un job
+    que no es de un admin (`_job_owner_is_admin`). Esto ataja el caso que las
+    otras dos no cubren — un token viejo, una URL compartida, o un job que SÍ
+    es de admin cuyo archivo alguien intenta bajar con otra cuenta.
+    """
+    if file_type in CANVAS_FILE_TYPES and not has_canvas_access(user):
+        raise HTTPException(status_code=403, detail="Canvas no disponible.")
+
 
 MEDIA_TYPES = {
     "video": "video/mp4",
@@ -10438,7 +10461,7 @@ MEDIA_TYPES = {
     "thumbnail": "image/jpeg",
     "umg_master": "video/quicktime",
     "umg_short": "video/quicktime",
-    "canvas": "video/mp4",
+    **{ft: "video/mp4" for ft in CANVAS_FILE_TYPES},
 }
 
 # File types that can't be previewed in-browser (ProRes is not browser-playable).
@@ -10584,6 +10607,7 @@ async def issue_media_token(
     """
     if file_type not in FILE_MAP and file_type != "all":
         raise HTTPException(status_code=400, detail="Invalid file type.")
+    _require_canvas_access(file_type, current_user)
     job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -10600,7 +10624,7 @@ async def issue_media_token(
     # alguien los pide— y "all" ya filtra por los archivos presentes.
     # Ojo: get_job devuelve un DICT con los entregables anidados en "files",
     # no el modelo ORM (ver su contrato en jobs.py).
-    if file_type in ("short", "thumbnail", "canvas"):
+    if file_type in ("short", "thumbnail") + CANVAS_FILE_TYPES:
         if not (job.get("files") or {}).get(f"{file_type}_url"):
             raise HTTPException(
                 status_code=404,
@@ -10662,6 +10686,7 @@ async def download(
         raise HTTPException(status_code=400, detail="Invalid file type.")
     with scoped_db() as db:
         current_user = verify_media_token(token, job_id, file_type, db)
+        _require_canvas_access(file_type, current_user)
         job = get_job(db, job_id, **_job_scope(current_user))
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found.")
@@ -10799,6 +10824,7 @@ async def preview(
         )
     with scoped_db() as db:
         current_user = verify_media_token(token, job_id, file_type, db)
+        _require_canvas_access(file_type, current_user)
         job = get_job(db, job_id, **_job_scope(current_user))
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found.")

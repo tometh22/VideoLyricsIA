@@ -254,3 +254,170 @@ def test_cleanup_barre_la_unidad_si_el_worker_muere(tmp_path):
     pipeline._cleanup_local_intermediates(str(tmp_path))
     assert not huerfano.exists(), "el intermedio tiene que barrerse"
     assert entregable.exists(), "el entregable NUNCA se toca"
+
+
+# --------------------------------------------------------------------------
+# Gate admin-only (decisión de producto 27-ago-2026)
+# --------------------------------------------------------------------------
+
+class _U:
+    def __init__(self, role, tenant_id="universal_music", billing_group="universal_music"):
+        self.role = role
+        self.tenant_id = tenant_id
+        self.billing_group = billing_group
+
+
+def test_solo_admin_tiene_canvas():
+    import auth
+    assert auth.has_canvas_access(_U("admin")) is True
+    assert auth.has_canvas_access(_U("user")) is False
+    assert auth.has_canvas_access(_U("operator")) is False
+    assert auth.has_canvas_access(None) is False
+    # Forma dict (así viaja current_user en los endpoints).
+    assert auth.has_canvas_access({"role": "admin"}) is True
+    assert auth.has_canvas_access({"role": "user"}) is False
+    assert auth.has_canvas_access({}) is False
+
+
+def test_ninguna_env_var_abre_el_canvas(monkeypatch):
+    """A diferencia de art_track, el Canvas NO tiene válvula de escape: abrirlo
+    tiene que ser un cambio de código revisado, no una variable de entorno."""
+    import auth
+    for var in ("CANVAS_GLOBALLY_ENABLED", "CANVAS_ENABLED_TENANTS",
+                "ART_TRACK_GLOBALLY_ENABLED", "ART_TRACK_ENABLED_TENANTS"):
+        monkeypatch.setenv(var, "1")
+    monkeypatch.setenv("CANVAS_ENABLED_TENANTS", "universal_music")
+    assert auth.has_canvas_access(_U("user")) is False
+    # ...y art_track SÍ se abre, para probar que el test mide lo que cree.
+    assert auth.has_art_track_access(_U("user")) is True
+
+
+def test_job_owner_is_admin_es_fail_closed(monkeypatch):
+    """Si no se puede resolver el rol, NO se genera el Canvas. Perder un
+    accesorio no le hace nada a la entrega; filtrarlo sí."""
+    def boom():
+        raise RuntimeError("db caída")
+    monkeypatch.setattr(pipeline, "SessionLocal", boom, raising=False)
+    import database
+    monkeypatch.setattr(database, "SessionLocal", boom)
+    assert pipeline._job_owner_is_admin("cualquiera") is False
+
+
+def test_el_zip_de_download_all_no_incluye_el_canvas():
+    """Un zip se reenvía por mail. El Canvas es admin-only y no puede viajar
+    dentro de un bundle que termine en manos del cliente."""
+    import main
+    assert "canvas" not in main._BUNDLE_TYPES
+
+
+def test_endpoints_403_para_no_admin():
+    import main
+    from fastapi import HTTPException
+    # No admin pidiendo canvas → 403.
+    for user in ({"role": "user"}, {"role": "operator"}, None):
+        with pytest.raises(HTTPException) as ei:
+            main._require_canvas_access("canvas", user)
+        assert ei.value.status_code == 403
+    # Admin pasa.
+    main._require_canvas_access("canvas", {"role": "admin"})
+    # Y el gate NO toca ningún otro entregable.
+    for ft in ("video", "short", "thumbnail", "umg_master"):
+        main._require_canvas_access(ft, {"role": "user"})
+
+
+# --------------------------------------------------------------------------
+# Variantes (3 encuadres del mismo fondo)
+# --------------------------------------------------------------------------
+
+def test_nombres_de_variante_y_compatibilidad_hacia_atras():
+    # La variante 1 conserva el nombre pelado: renombrarla dejaría huérfanos
+    # los s3_keys de los jobs ya renderizados.
+    assert pipeline.canvas_file_type(1) == "canvas"
+    assert pipeline.canvas_file_type(2) == "canvas_v2"
+    assert pipeline.CANVAS_FILE_TYPES == ("canvas", "canvas_v2", "canvas_v3")
+    assert len(pipeline.CANVAS_FILE_TYPES) == pipeline.CANVAS_VARIANTS
+
+
+def test_todas_las_variantes_estan_registradas():
+    import main
+    for ft in pipeline.CANVAS_FILE_TYPES:
+        assert pipeline._DELIVERABLE_FILENAMES[ft] == f"{ft}.mp4"
+        assert pipeline._ACCESSORY_ARTIFACTS[ft] == f"{ft}.mp4"
+        assert ft not in pipeline._CRITICAL_DELIVERABLES
+        assert main.FILE_MAP[ft] == f"{ft}.mp4"
+        assert main.MEDIA_TYPES[ft] == "video/mp4"
+        assert ft not in main._BUNDLE_TYPES
+
+
+def test_todas_las_variantes_estan_gateadas_a_admin():
+    """Un 403 que sólo cubriera `canvas` dejaría `canvas_v2` abierto."""
+    import main
+    from fastapi import HTTPException
+    for ft in pipeline.CANVAS_FILE_TYPES:
+        with pytest.raises(HTTPException) as ei:
+            main._require_canvas_access(ft, {"role": "user"})
+        assert ei.value.status_code == 403
+        main._require_canvas_access(ft, {"role": "admin"})
+
+
+@pytest.mark.parametrize("variant,anchor", [(1, "0.5"), (2, "0.15"), (3, "0.85")])
+def test_cada_variante_recorta_en_otra_posicion(tmp_path, monkeypatch, variant, anchor):
+    cmds = _capture(monkeypatch)
+    src = tmp_path / "bg.mp4"
+    src.write_bytes(b"fake")
+    pipeline.generate_canvas(str(src), str(tmp_path), variant=variant)
+    graph = cmds[0][cmds[0].index("-filter_complex") + 1]
+    assert f"(in_w-out_w)*{anchor}" in graph
+
+
+def test_variante_invalida_falla(tmp_path):
+    src = tmp_path / "bg.mp4"
+    src.write_bytes(b"fake")
+    for bad in (0, 4, -1, 99):
+        with pytest.raises(ValueError, match="variante"):
+            pipeline.generate_canvas(str(src), str(tmp_path), variant=bad)
+
+
+def test_cada_variante_escribe_su_propio_archivo(tmp_path, monkeypatch):
+    """Si dos variantes compartieran nombre, la última pisaría a la anterior."""
+    cmds = _capture(monkeypatch)
+    src = tmp_path / "bg.mp4"
+    src.write_bytes(b"fake")
+    salidas = []
+    for v in range(1, pipeline.CANVAS_VARIANTS + 1):
+        cmds.clear()
+        salidas.append(os.path.basename(cmds_out := pipeline.generate_canvas(
+            str(src), str(tmp_path), variant=v)))
+        assert cmds_out.endswith(f"{pipeline.canvas_file_type(v)}.mp4")
+    assert len(set(salidas)) == pipeline.CANVAS_VARIANTS
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg no disponible")
+def test_render_real_las_variantes_son_visualmente_distintas(tmp_path):
+    """El valor de las variantes es poder ROTAR el Canvas durante la campaña.
+    Si las tres se vieran casi igual, la feature no existe."""
+    from PIL import Image, ImageChops
+    bg = tmp_path / "bg.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i",
+         "testsrc2=size=1920x1080:rate=24:duration=4",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(bg), "-loglevel", "error"],
+        check=True)
+
+    frames = {}
+    for v in range(1, pipeline.CANVAS_VARIANTS + 1):
+        out = pipeline.generate_canvas(str(bg), str(tmp_path), variant=v)
+        png = tmp_path / f"v{v}.png"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", out,
+                        "-vf", "select=eq(n\\,60)", "-vframes", "1", str(png)],
+                       check=True)
+        frames[v] = Image.open(png).convert("L")
+
+    def mad(a, b):
+        hist = ImageChops.difference(frames[a], frames[b]).histogram()
+        return sum(i * c for i, c in enumerate(hist)) / sum(hist)
+
+    for a, b in ((1, 2), (1, 3), (2, 3)):
+        d = mad(a, b)
+        assert d > 8, f"v{a} y v{b} son casi el mismo plano (diferencia {d:.1f})"

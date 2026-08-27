@@ -220,6 +220,28 @@ def has_art_track_access(user) -> bool:
     return (tenant_id or "").lower() in ART_TRACK_ENABLED_TENANTS or (billing_group or "").lower() in ART_TRACK_ENABLED_TENANTS
 
 
+def has_canvas_access(user) -> bool:
+    """True iff `user` puede ver/descargar el Canvas de Spotify.
+
+    **SOLO ADMIN, sin excepciones** (decisión de producto 27-ago-2026): a
+    diferencia de `has_art_track_access`, acá NO hay env var que lo abra por
+    tenant ni globalmente. Es deliberado — abrirlo tiene que ser un cambio de
+    código revisado, no una variable de entorno que alguien prende de noche.
+
+    Gobierna tres capas, todas necesarias:
+      1. `features.canvas` en login/refresh/me → el front no muestra el botón.
+      2. Los endpoints de media (`/media-token`, `/download`, `/preview`) →
+         403 aunque el archivo exista en R2.
+      3. El worker (`_job_owner_is_admin`) → ni siquiera se PRODUCE el archivo
+         para un job que no es de un admin, así no se paga storage por algo
+         que nadie puede bajar.
+    """
+    if user is None:
+        return False
+    role = getattr(user, "role", None) if not isinstance(user, dict) else user.get("role")
+    return role == "admin"
+
+
 def telemetry_enabled() -> bool:
     """True si la telemetría de sesiones (heartbeat de tiempo-en-app) está prendida.
 
