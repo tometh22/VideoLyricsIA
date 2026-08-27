@@ -3381,6 +3381,26 @@ export default function App() {
     // el fondo, aunque no toques ningún campo).
     if (r.variantMode) {
       const parentJobId = r.parentJobId;
+      // Audit 2026-08-26 (incidente Universal "Tu Cárcel"): buildVariantPayload
+      // sólo sabe mandar background_id/background_mode (Biblioteca) — no tiene
+      // ningún campo para el archivo subido ni para animateImage, así que un
+      // bgSelectMode "custom" se descartaba en silencio: el operador subía su
+      // foto, tildaba "Animar con AI", el POST /variant salía sin ninguno de
+      // los dos, y el backend generaba una escena random con Gemini/Veo — sin
+      // error, gastando la llamada a Veo, con contenido sin relación a la foto.
+      // Hasta que /variant soporte fondo custom + animate (mismo camino que ya
+      // funciona en /edit), cortamos acá con un error claro en vez de dejar
+      // pasar el submit y quemar cuota de Veo para nada.
+      if (bgSelectMode === "custom") {
+        alert({
+          title: t("variant.custom_bg_unsupported_title") ||
+            "\"Subir la mía\" no está disponible en variantes",
+          description: t("variant.custom_bg_unsupported_desc") ||
+            "Crear variante sólo genera fondos con IA o de la Biblioteca. Para animar tu foto, usá \"Editar\" en vez de \"Crear variante\".",
+          tone: "warning",
+        });
+        return;
+      }
       if (editSubmitLockRef.current) return;
       editSubmitLockRef.current = true;
       setVariantSubmitting(true);

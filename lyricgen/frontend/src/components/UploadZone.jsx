@@ -3390,7 +3390,17 @@ export default function UploadZone({
               // backend lo soporta (sube el archivo a R2 vía
               // /edit/{job}/custom-background y re-renderiza), así que la
               // restauramos en el wizard de edición.
-              { id: "custom", label: t("upload.bg_custom_tab") || "Upload" },
+              //
+              // EXCEPTO en variantMode (auditoría 2026-08-26, incidente
+              // Universal "Tu Cárcel"): /variant nunca tuvo el mismo soporte
+              // que /edit — buildVariantPayload no manda ni el archivo ni
+              // animateImage — así que elegir "custom" acá es el mismo no-op
+              // silencioso que #970 ya había sacado de edición, sólo que
+              // gastando una llamada a Veo. La sacamos de acá hasta que
+              // /variant tenga el mismo camino que /edit.
+              ...(variantMode ? [] : [
+                { id: "custom", label: t("upload.bg_custom_tab") || "Upload" },
+              ]),
             ].map((m) => (
               <button
                 key={m.id}
