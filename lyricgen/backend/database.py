@@ -638,6 +638,9 @@ class Job(Base):
     # metrics, retry evidence and revision-scoped acknowledgement together
     # prevents API/editor/worker drift without adding a column per metric.
     transcription_quality = Column(JSONB, nullable=True)
+    # Final-render label-style preflight.  Kept separate from transcription
+    # quality because it is bound to an encoded render, not only to segments.
+    delivery_qc = Column(JSONB, nullable=True)
     # Server-owned optimistic concurrency version for editor writes.
     segments_revision = Column(BigInteger, default=0, nullable=False, server_default="0")
     # Monotonic invalidation fence for asynchronous correction learning. Every
@@ -775,6 +778,7 @@ class Job(Base):
             "segments_json": self.segments_json,
             "segments_revision": self.segments_revision or 0,
             "transcription_quality": self.transcription_quality,
+            "delivery_qc": self.delivery_qc,
             "bg_r2_key_cached": self.bg_r2_key_cached,
             # Storyboard multi-escena (NULL en jobs de fondo único). El panel
             # de edición lo usa para mostrar las escenas y ofrecer "regenerar
@@ -1992,6 +1996,7 @@ def _migrate_user_columns():
         # Edit-requests feature: partial re-render support at review stage.
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_json JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS transcription_quality JSONB",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS delivery_qc JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS render_params JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS edit_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS bg_r2_key_cached TEXT",

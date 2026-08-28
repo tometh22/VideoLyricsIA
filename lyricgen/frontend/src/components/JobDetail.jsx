@@ -5,6 +5,7 @@ import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
+import DeliveryQCPanel from "./DeliveryQCPanel";
 import ArtTrackEditPanel from "./ArtTrackEditPanel";
 import ContentValidationToggle, { isUniversalAccount } from "./ContentValidationToggle";
 import { useAlert } from "./AlertProvider";
@@ -2134,6 +2135,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         <ArtTrackEditPanel job={job} onEdited={handleEditTriggered} />
       )}
 
+      {(isPendingReview || isDone || isRejected) && (
+        <DeliveryQCPanel
+          job={job}
+          onJobUpdate={onJobUpdate}
+          onSeek={seekVideo}
+          onOpenEditor={() => navigate(`/videos/${job.job_id}/edit-lyrics`)}
+        />
+      )}
+
       {/* Approval panel for pending_review */}
       {isPendingReview && (
         <div
@@ -2166,7 +2176,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           <div className="flex flex-wrap gap-3">
             <button
               onClick={handleApprove}
-              disabled={approving}
+              disabled={approving || job.delivery_qc?.approval?.blocked === true}
               className="inline-flex items-center justify-center h-12 px-6 rounded-button text-sm font-semibold text-white bg-accent hover:bg-accent/90 disabled:opacity-50 transition-colors"
             >
               {approving ? (

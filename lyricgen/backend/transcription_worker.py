@@ -643,10 +643,18 @@ def run_transcription_job(
             # arriba pueden haber movido start/end o words de forma
             # independiente. Lockstep con los dos caminos HTTP de main.py.
             r = _maybe_timing_consistency(r, job_id)
-            return await _quality_gate_and_retry(
+            r = await _quality_gate_and_retry(
                 r, audio_path, job_id, _post_lang, _antes,
                 _maybe_timing_consistency,
                 live_hint=live or _looks_live(title, filename),
+            )
+            from delivery_repair_shadow import attach_delivery_repair_shadow
+            return attach_delivery_repair_shadow(
+                r,
+                artist=artist,
+                title=title,
+                filename=filename,
+                is_live=live or _looks_live(title, filename),
             )
 
         result = asyncio.run(_run_with_retime())

@@ -2470,6 +2470,21 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
 
         _verify_deliverables(job_dir, files, audio_dur_for_verify)
 
+        # Final-render Delivery QC (UMG-style). It inspects the exact encoded
+        # MP4 before R2 removes the local file. Observe mode can never cost a
+        # delivery; enforce mode is applied later at human approval, not here.
+        try:
+            from delivery_qc_runtime import run_delivery_qc_for_job
+            run_delivery_qc_for_job(
+                job_id, os.path.join(job_dir, "lyric_video.mp4"),
+                segments=segments,
+            )
+        except Exception as _delivery_qc_error:
+            logger.exception(
+                "[DELIVERY-QC] preflight failed job=%s (render continues): %s",
+                job_id, _delivery_qc_error,
+            )
+
         # Post-render upload to cloud storage. No-op if R2 env not set.
         # _upload_deliverables_to_r2 now persists each successful key
         # atomically via merge_s3_keys (audit 2026-05-26) — caller no
@@ -20317,6 +20332,20 @@ def run_edit_pipeline(
         )
 
         _verify_deliverables(job_dir, files, audio_dur)
+
+        # Re-run the same final-frame preflight after every editor render. The
+        # previous report was marked stale when the edit was requested.
+        try:
+            from delivery_qc_runtime import run_delivery_qc_for_job
+            run_delivery_qc_for_job(
+                job_id, os.path.join(job_dir, "lyric_video.mp4"),
+                segments=segments,
+            )
+        except Exception as _delivery_qc_error:
+            logger.exception(
+                "[DELIVERY-QC] edit preflight failed job=%s (render continues): %s",
+                job_id, _delivery_qc_error,
+            )
 
         # Stage the new background cache only after the complete edit rendered
         # and verified successfully. The DB commit is deferred until the
