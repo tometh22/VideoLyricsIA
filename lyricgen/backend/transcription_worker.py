@@ -345,6 +345,8 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     initial = evaluate(
         r.get("segments") or [], post.get("coverage_final"),
         unsafe_windows=windows, require_independent=require_independent,
+        is_live=live_hint,
+        reference_attestation=r.get("reference_attestation"),
     )
     retry_stats = {"attempted": False}
     try:
@@ -404,13 +406,18 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         unsafe_windows=windows,
         retry_stats=_sanitize_analytical_evidence(retry_stats),
         require_independent=require_independent,
+        is_live=live_hint,
         acoustic_evidence=_sanitize_analytical_evidence(acoustic_evidence),
+        reference_attestation=r.get("reference_attestation"),
     )
     final["initial_decision"] = initial.get("decision")
     final["initial_score"] = initial.get("score")
     final["evaluated_revision"] = 0
     final_metrics = dict(final.get("metrics") or {})
     final_metrics["is_live"] = bool(live_hint)
+    if live_hint:
+        from lyric_content_policy import EDITORIAL_POLICY_ID
+        final_metrics["editorial_policy_id"] = EDITORIAL_POLICY_ID
     final_metrics["language"] = str(language or "unknown")[:16]
     final["metrics"] = final_metrics
     r["transcription_quality"] = final

@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from typing import Any, Mapping
+
+
+EDITORIAL_POLICY_ID = "rotor-umg-display-policy-v2"
+MELODIC_INTERJECTION_MIN_SECONDS = 0.75
 
 
 _METADATA = re.compile(
@@ -68,3 +73,106 @@ def should_include_as_lyric(
     if classification == "SPEECH_CANDIDATE" and isolated_tail:
         return False
     return True
+
+
+def editorial_display_decision(
+    text: str,
+    *,
+    provider_kind: str = "",
+    duration_s: float = 0.0,
+    performer_role: str = "",
+    compositional_speech: bool | None = None,
+    adds_new_text: bool | None = None,
+) -> dict[str, Any]:
+    """Apply the approved seven-rule display policy without guessing roles.
+
+    Ambiguous speech, crowd and backing-vocal cases are routed to review.  A
+    text heuristic may never decide that speech is compositional or that a
+    backing voice adds new text; those require provider/audio evidence.
+    """
+
+    classification = classify_content(text, provider_kind=provider_kind)
+    role = str(performer_role or "").strip().lower()
+    display = "normal"
+    review_required = False
+    reason = "lead_or_guest_lyric"
+
+    if classification in {"METADATA", "CROWD_NOISE"}:
+        display, reason = "do_not_show", "incidental_or_metadata"
+    elif classification in {"SPEECH", "SPEECH_CANDIDATE"}:
+        if compositional_speech is True:
+            display, reason = "normal", "compositional_speech"
+        elif compositional_speech is False:
+            display, reason = "do_not_show", "incidental_speech"
+        else:
+            display, review_required = "review", True
+            reason = "speech_compositionality_unknown"
+    elif classification == "NONLEXICAL":
+        if float(duration_s or 0.0) >= MELODIC_INTERJECTION_MIN_SECONDS:
+            display, reason = "parenthesize", "long_melodic_interjection"
+        else:
+            display, reason = "do_not_show", "short_melodic_interjection"
+    elif classification == "SUNG_CROWD" or role in {"backing", "crowd", "chorus"}:
+        if adds_new_text is True:
+            display, reason = "normal", "secondary_voice_adds_text"
+        elif adds_new_text is False:
+            display, reason = "do_not_show", "background_repeats_existing_text"
+        else:
+            display, review_required = "review", True
+            reason = "secondary_voice_text_novelty_unknown"
+    elif role == "adlib":
+        display, reason = "parenthesize", "artist_adlib"
+
+    return {
+        "schema_version": "editorial-display-decision-v1",
+        "policy_id": EDITORIAL_POLICY_ID,
+        "classification": classification,
+        "display": display,
+        "reason": reason,
+        "review_required": review_required,
+        "safe_for_auto_insert": False,
+    }
+
+
+def classify_acoustic_window(structure: Mapping[str, Any]) -> dict[str, Any]:
+    """Produce text-free editorial routing from acoustic event taxonomy."""
+
+    events = [
+        event
+        for event in ((structure.get("best_partition") or {}).get("events") or [])
+        if isinstance(event, Mapping)
+    ]
+    taxonomies = [str(event.get("taxonomy") or "UNKNOWN") for event in events]
+    duration = sum(
+        max(0.0, float(event.get("end") or 0.0) - float(event.get("start") or 0.0))
+        for event in events
+    )
+    taxonomy_set = set(taxonomies)
+    if not events:
+        content_type, display, reason = "none", "do_not_show", "no_acoustic_events"
+    elif taxonomy_set <= {"NONLEXICAL"}:
+        decision = editorial_display_decision(
+            "oh", provider_kind="vocalization", duration_s=duration,
+        )
+        content_type = "melodic_vocalization"
+        display, reason = decision["display"], decision["reason"]
+    elif taxonomy_set <= {"SPEECH"}:
+        content_type, display = "speech", "review"
+        reason = "speech_compositionality_unknown"
+    elif taxonomy_set & {"SUNG_LEAD", "SUNG_CROWD"}:
+        content_type, display = "lexical_candidate", "review"
+        reason = "independent_text_consensus_required"
+    else:
+        content_type, display = "ambiguous", "review"
+        reason = "mixed_or_unknown_acoustic_events"
+    return {
+        "schema_version": "acoustic-editorial-route-v1",
+        "policy_id": EDITORIAL_POLICY_ID,
+        "content_type": content_type,
+        "display": display,
+        "reason": reason,
+        "event_count": len(events),
+        "duration": round(duration, 3),
+        "allow_lexical_ranking": False,
+        "safe_for_auto_insert": False,
+    }
