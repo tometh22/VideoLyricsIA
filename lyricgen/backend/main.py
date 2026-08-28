@@ -115,6 +115,7 @@ from editor import (
     sync_legacy_snapshot,
     ensure_document,
     dismiss_quality_proposal,
+    rebase_operator_suggestions_after_manual_edit,
     reject_operator_suggestion,
     record_quality_observation,
     revoke_quality_proposal_if_disabled,
@@ -12161,6 +12162,7 @@ async def patch_editor_document(
     previous_editor_segments = [
         dict(item) for item in (document.current_segments or [])
     ]
+    operator_proposal_before = dict(document.quality_proposal or {})
     try:
         _audit_cross_tenant_access(db, current_user, job, "editor_save", commit=False)
         document, version, applied = save_document(
@@ -12168,6 +12170,12 @@ async def patch_editor_document(
             body.segments, body.checkpoint,
         )
         if applied:
+            manual_suggestion_decisions = (
+                rebase_operator_suggestions_after_manual_edit(
+                    document, operator_proposal_before,
+                    previous_editor_segments,
+                )
+            )
             from correction_learning import invalidate_job_observations
             invalidate_job_observations(db, job_id, "later_editor_revision")
             job.transcription_quality = _invalidate_quality_after_editor_save(
@@ -12180,6 +12188,22 @@ async def patch_editor_document(
                 segments=list(document.current_segments or []),
                 quality=job.transcription_quality, reason="editor_save",
             )
+            for evidence in manual_suggestion_decisions:
+                db.add(ProductEvent(
+                    tenant_id=str(job.tenant_id),
+                    user_id=current_user["id"], job_id=job_id,
+                    name="editor_operator_suggestion_decision",
+                    properties={
+                        key: value for key, value in evidence.items()
+                        if key != "decided_at" and value is not None
+                    } | {
+                        "pipeline_release": str(
+                            (job.transcription_quality or {}).get(
+                                "pipeline_release"
+                            ) or "unknown"
+                        ),
+                    },
+                ))
         db.commit()
     except RuntimeError:
         db.rollback()
@@ -12731,7 +12755,9 @@ _PRODUCT_EVENT_PROPERTIES = {
     },
     "editor_operator_suggestion_decision": {
         "decision", "suggestion_type", "confidence", "impact_ms",
-        "proposed_delta_ms", "reason", "window_id", "pipeline_release",
+        "proposed_delta_ms", "chosen_delta_ms",
+        "distance_to_proposal_ms", "reason", "window_id",
+        "pipeline_release",
     },
 }
 _PRODUCT_EVENT_COMMON_PROPERTIES = {"session_id"}
@@ -12873,7 +12899,7 @@ async def product_metrics(
     route_work: dict[str, dict] = {}
     release_work: dict[str, list[float]] = {}
     suggestion_metrics = {
-        kind: {"shown": 0, "accepted": 0, "rejected": 0}
+        kind: {"shown": 0, "accepted": 0, "rejected": 0, "manual": 0}
         for kind in ("timing", "text", "vocalization")
     }
     seen_approvals: set[tuple] = set()
@@ -12962,8 +12988,11 @@ async def product_metrics(
         elif row.name == "editor_operator_suggestion_decision":
             kind = str(properties.get("suggestion_type") or "")
             decision = str(properties.get("decision") or "")
-            if kind in suggestion_metrics and decision in {"accepted", "rejected"}:
-                suggestion_metrics[kind][decision] += 1
+            if kind in suggestion_metrics:
+                if decision in {"accepted", "rejected"}:
+                    suggestion_metrics[kind][decision] += 1
+                elif decision == "manual_override":
+                    suggestion_metrics[kind]["manual"] += 1
     session_durations = [
         (session["last"] - session["first"]).total_seconds() * 1000
         for session in sessions.values() if session["last"] >= session["first"]

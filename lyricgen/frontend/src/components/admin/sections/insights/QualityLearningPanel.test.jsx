@@ -25,6 +25,17 @@ describe("QualityLearningPanel", () => {
             by_route: { acoustic_dp: { observations: 8, operator_minutes_p50: 3.5, operator_minutes_p90: 7.1 } },
           },
           model_readiness: { eligible: false, trusted_observations: 12 },
+          operator_suggestions: {
+            songs: 2,
+            by_type: {
+              timing: { shown: 4, accepted: 2, rejected: 1, manual: 1, decided: 3, acceptance_rate: 2 / 3, sanity_gate_met: false },
+              text: { shown: 0, accepted: 0, rejected: 0, manual: 0, decided: 0, acceptance_rate: null, sanity_gate_met: false },
+              vocalization: { shown: 0, accepted: 0, rejected: 0, manual: 0, decided: 0, acceptance_rate: null, sanity_gate_met: false },
+            },
+            severe_timing_resolved: 2,
+            severe_timing_accepted: 1,
+            severe_timing_manual: 1,
+          },
         };
       } else if (value.includes("/patterns")) {
         body = { patterns: [{
@@ -55,6 +66,8 @@ describe("QualityLearningPanel", () => {
     expect(screen.getByLabelText("Filtrar patrones por estado")).toBeInTheDocument();
     expect(screen.getByText("is_live=true")).toBeInTheDocument();
     expect(screen.getByText(/Ninguna acción modifica/)).toBeInTheDocument();
+    expect(screen.getByText(/1 manuales/)).toBeInTheDocument();
+    expect(screen.getByText(/Finales graves resueltos: 2/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Validar" }));
     await waitFor(() => expect(global.fetch).toHaveBeenCalledWith(

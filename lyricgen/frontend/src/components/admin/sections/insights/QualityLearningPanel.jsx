@@ -217,7 +217,7 @@ export default function QualityLearningPanel() {
                   <StatusBadge status={row.sanity_gate_met ? "ready" : "validating"} map={STATUS} />
                 </div>
                 <p className="mt-2 text-label text-gray-400">
-                  {row.accepted || 0} aceptadas · {row.rejected || 0} rechazadas · {row.shown || 0} mostradas
+                  {row.accepted || 0} aceptadas · {row.rejected || 0} rechazadas · {row.manual || 0} manuales · {row.shown || 0} mostradas
                 </p>
                 <p className="mt-1 text-label text-gray-500">
                   Aceptación {row.acceptance_rate == null ? "—" : `${Math.round(row.acceptance_rate * 100)}%`} · gate 70%
@@ -227,7 +227,8 @@ export default function QualityLearningPanel() {
           })}
         </div>
         <p className="mt-3 text-label text-gray-500">
-          Finales graves resueltos por clic: {operatorSuggestions.severe_timing_accepted || 0}.
+          Finales graves resueltos: {operatorSuggestions.severe_timing_resolved || 0}
+          {" "}({operatorSuggestions.severe_timing_accepted || 0} por clic · {operatorSuggestions.severe_timing_manual || 0} a mano).
         </p>
       </section>
 

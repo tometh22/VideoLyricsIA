@@ -1236,6 +1236,179 @@ def dismiss_quality_proposal(
     return True
 
 
+def rebase_operator_suggestions_after_manual_edit(
+    document: EditorDocument,
+    proposal: dict | None,
+    previous_segments: list[dict],
+) -> list[dict]:
+    """Keep untouched suggestions and record only rows resolved by hand.
+
+    Ordinary autosave invalidates model proposals. Operator-only suggestions
+    are a review worklist: editing one line must not erase unrelated work, and
+    the chosen timing delta is calibration evidence. Returned evidence is
+    deliberately text-free and safe for ProductEvent.
+    """
+    proposal = dict(proposal or {})
+    from transcription_quality import segments_hash
+    if (
+        proposal.get("operator_suggestion_only") is not True
+        or proposal.get("status") != "pending"
+    ):
+        return []
+
+    before = [dict(item) for item in (previous_segments or [])
+              if isinstance(item, dict)]
+    after = [dict(item) for item in (document.current_segments or [])
+             if isinstance(item, dict)]
+
+    def semantic_key(row: dict) -> tuple:
+        return (
+            round(float(row.get("start") or 0), 4),
+            round(float(row.get("end") or 0), 4),
+            str(row.get("text") or ""),
+        )
+
+    after_keys = {semantic_key(item) for item in after}
+    history = [
+        dict(item) for item in (proposal.get("decision_history") or [])
+        if isinstance(item, dict)
+    ][-99:]
+    remaining: list[dict] = []
+    decisions: list[dict] = []
+
+    def original_index(row: dict) -> int | None:
+        key = _segment_key(row)
+        for index, item in enumerate(before):
+            if _segment_key(item) == key:
+                return index
+        return None
+
+    def chosen_row(row: dict, index: int | None) -> dict | None:
+        # Stable editor ordering is the strongest occurrence identity for
+        # repeated choruses. Fall back only within the same local start/text.
+        row_id = row.get("_id") or row.get("id") or row.get("segment_id")
+        if row_id:
+            identified = next(
+                (item for item in after if _segment_key(item) == _segment_key(row)),
+                None,
+            )
+            if identified is not None:
+                return identified
+        if index is not None and index < len(after):
+            candidate = after[index]
+            if (
+                str(candidate.get("text") or "").strip().casefold()
+                == str(row.get("text") or "").strip().casefold()
+                or abs(float(candidate.get("start") or 0)
+                       - float(row.get("start") or 0)) <= 0.75
+            ):
+                return candidate
+        candidates = [
+            item for item in after
+            if str(item.get("text") or "").strip().casefold()
+            == str(row.get("text") or "").strip().casefold()
+            and abs(float(item.get("start") or 0)
+                    - float(row.get("start") or 0)) <= 0.75
+        ]
+        return min(
+            candidates,
+            key=lambda item: abs(float(item.get("start") or 0)
+                                 - float(row.get("start") or 0)),
+            default=None,
+        )
+
+    for raw in proposal.get("windows") or []:
+        if not isinstance(raw, dict):
+            continue
+        window = dict(raw)
+        current = [dict(item) for item in (window.get("current_segments") or [])
+                   if isinstance(item, dict)]
+        final_row = None
+        if current:
+            target = current[0]
+            if semantic_key(target) in after_keys:
+                remaining.append(window)
+                continue
+            final_row = chosen_row(target, original_index(target))
+        else:
+            # Gap suggestion: resolve it manually only when this edit added
+            # content into that exact acoustic window.
+            start = float(window.get("start") or 0)
+            end = float(window.get("end") or start)
+            prior_overlap = any(
+                min(end, float(item.get("end") or 0))
+                - max(start, float(item.get("start") or 0)) > 0.20
+                for item in before
+            )
+            new_overlap = [
+                item for item in after
+                if min(end, float(item.get("end") or 0))
+                - max(start, float(item.get("start") or 0)) > 0.20
+            ]
+            if not prior_overlap and new_overlap:
+                final_row = new_overlap[0]
+            else:
+                remaining.append(window)
+                continue
+
+        suggestion_type = str(window.get("suggestion_type") or "unknown")
+        current_end = window.get("current_end")
+        proposed_end = window.get("proposed_end")
+        chosen_end = final_row.get("end") if isinstance(final_row, dict) else None
+        proposed_delta_ms = chosen_delta_ms = distance_ms = None
+        if suggestion_type == "timing":
+            try:
+                proposed_delta_ms = round(1000 * (
+                    float(proposed_end) - float(current_end)
+                ))
+                if chosen_end is not None:
+                    chosen_delta_ms = round(1000 * (
+                        float(chosen_end) - float(current_end)
+                    ))
+                    distance_ms = round(1000 * (
+                        float(chosen_end) - float(proposed_end)
+                    ))
+            except (TypeError, ValueError):
+                proposed_delta_ms = chosen_delta_ms = distance_ms = None
+        evidence = {
+            "decision": "manual_override",
+            "window_id": hashlib.sha256(
+                str(window.get("id") or "").encode()
+            ).hexdigest()[:16],
+            "suggestion_type": suggestion_type,
+            "confidence": str(window.get("confidence") or "unknown"),
+            "impact_ms": int(window.get("impact_ms") or 0),
+            "proposed_delta_ms": proposed_delta_ms,
+            "chosen_delta_ms": chosen_delta_ms,
+            "distance_to_proposal_ms": distance_ms,
+            "decided_at": now_utc().isoformat(),
+        }
+        decisions.append(evidence)
+        history.append(evidence)
+
+    if remaining:
+        document.quality_proposal = {
+            **proposal,
+            "status": "pending",
+            "windows": remaining,
+            "base_revision": int(document.revision or 0),
+            "segments_hash": segments_hash(after),
+            "segments_content_hash": segments_content_hash(after),
+            "decision_history": history[-100:],
+            "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
+        }
+    else:
+        document.quality_proposal = {
+            "id": proposal.get("id"),
+            "status": "manually_resolved" if decisions else "stale",
+            "windows": [],
+            "base_revision": int(document.revision or 0),
+            "decision_history": history[-100:],
+            "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
+        }
+    return decisions
+
+
 def save_document(
     db: Session,
     job: Job,
