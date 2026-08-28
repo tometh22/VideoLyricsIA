@@ -20,6 +20,7 @@ from editor import (
     get_or_create_document,
     persist_quality_proposal_if_current,
     persist_quality_observation_if_current,
+    persist_operator_review_proposal_if_current,
     save_document,
 )
 from transcription_quality import segments_hash
@@ -398,6 +399,100 @@ def test_quality_proposal_is_audio_revision_scoped_and_applies_idempotently(
             EditorVersion.reason == "quality_proposal",
         ).all()
         assert len(versions) == 1
+    finally:
+        verify.close()
+
+
+def test_operator_suggestions_accept_and_reject_one_at_a_time(client, monkeypatch):
+    monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    first, _second, job_id = _users_and_job("editor_operator_suggestions")
+    token = _token_for(first)
+    proposal_id = f"operator-{uuid.uuid4().hex}"
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        job.input_audio_sha256 = "f" * 64
+        job.audio_revision = 2
+        windows = []
+        for window_id, current, proposed in (
+            ("timing-one", {"start": 0, "end": 1, "text": "one"},
+             {"start": 0, "end": 0.8, "text": "one"}),
+            ("text-two", {"start": 1, "end": 2, "text": "two"},
+             {"start": 1, "end": 2, "text": "TWO"}),
+        ):
+            windows.append({
+                "kind": "review_proposal_window",
+                "schema": PROPOSAL_WINDOW_SCHEMA,
+                "id": window_id,
+                "start": current["start"], "end": current["end"],
+                "reasons": ["operator_review"],
+                "current_segments": [current],
+                "proposed_segments": [proposed],
+                "suggestion_type": "timing" if window_id.startswith("timing") else "text",
+                "confidence": "high", "impact_ms": 200,
+                "current_end": current["end"], "proposed_end": proposed["end"],
+                "automatic_apply_allowed": False,
+            })
+        assert persist_operator_review_proposal_if_current(
+            db, job_id=job_id, expected_revision=0,
+            expected_segments_hash=segments_hash(document.current_segments),
+            expected_audio_revision=2, expected_audio_sha256="f" * 64,
+            proposal={
+                "kind": "operator_review_proposal",
+                "schema": "operator-review-proposal-v1",
+                "id": proposal_id, "review_only": True,
+                "operator_suggestion_only": True,
+                "automatic_apply_allowed": False, "windows": windows,
+            },
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    accepted = client.post(
+        f"/editor/{job_id}/quality-proposals/{proposal_id}/apply",
+        headers=auth(token), json={
+            "base_revision": 0, "window_ids": ["timing-one"],
+            "idempotency_key": "operator-accept-request-0001",
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["applied"] is True
+    loaded = client.get(f"/editor/{job_id}", headers=auth(token)).json()
+    assert loaded["revision"] == 1
+    assert [item["id"] for item in loaded["quality_proposal"]["windows"]] == [
+        "text-two",
+    ]
+    assert loaded["quality_proposal"]["base_revision"] == 1
+
+    rejected = client.post(
+        f"/editor/{job_id}/quality-proposals/{proposal_id}/windows/text-two/reject",
+        headers=auth(token), json={
+            "base_revision": 1,
+            "idempotency_key": "operator-reject-request-0001",
+            "reason": "incorrect_content",
+        },
+    )
+    assert rejected.status_code == 200, rejected.text
+    assert rejected.json()["rejected"] is True
+
+    verify = SessionLocal()
+    try:
+        document = verify.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        assert document.current_segments[0]["end"] == 0.8
+        assert document.quality_proposal["status"] == "dismissed"
+        decisions = verify.query(ProductEvent).filter(
+            ProductEvent.job_id == job_id,
+            ProductEvent.name == "editor_operator_suggestion_decision",
+        ).all()
+        assert sorted(item.properties["decision"] for item in decisions) == [
+            "accepted", "rejected",
+        ]
     finally:
         verify.close()
 

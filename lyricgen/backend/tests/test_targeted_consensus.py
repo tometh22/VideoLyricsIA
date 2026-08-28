@@ -322,6 +322,37 @@ def test_gap_candidate_is_dark_in_observe_and_reviewable_in_enforce(monkeypatch)
     assert enforced["segments"] == []
 
 
+def test_gap_gemini_consensus_becomes_one_click_vocalization(monkeypatch):
+    monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    monkeypatch.setenv("TARGETED_GEMINI_VERIFY_ENABLED", "1")
+    recovered = words("oh oh oh", start=10.0, step=0.3)
+
+    output, stats = tc.reprocess(
+        {
+            "segments": [], "_asr_words": [],
+            "_targeted_asr_family": "targeted_openai_asr",
+        },
+        "mix.wav",
+        [{"id": "gap-oh", "start": 9, "end": 14,
+          "reasons": ["voiced_gap"]}],
+        transcribe_fn=lambda *_a, **_k: recovered,
+        gemini_fn=lambda *_a, **_k: [{
+            "start": 10.0, "end": 11.2, "text": "oh oh oh",
+            "kind": "vocalization",
+        }],
+        stem_path="stem.wav",
+    )
+
+    assert output["segments"] == []
+    proposal = stats["quality_proposal_windows"][0]
+    assert proposal["current_segments"] == []
+    assert proposal["proposed_segments"][0]["text"] == "(oh oh oh)"
+    assert "vocalization" in proposal["reasons"]
+    assert proposal["source_families"] == [
+        "gemini_audio", "targeted_openai_asr",
+    ]
+
+
 def test_slowed_and_same_model_witness_cannot_suggest_insertion(
         monkeypatch):
     recovered = words("real wow wow", start=60.0)

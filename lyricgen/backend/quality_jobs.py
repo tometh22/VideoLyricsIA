@@ -236,12 +236,47 @@ def _release() -> str:
 
 def _snapshot(job_id: str):
     from database import Job, SessionLocal
+    from sqlalchemy import func
 
     db = SessionLocal()
     try:
         row = db.query(Job).filter(Job.job_id == job_id).first()
         if row is None:
             return None
+        # Bounded same-artist vocabulary is a decoding hint, never evidence.
+        # It can help names/slang already present in this tenant's approved
+        # catalogue, but a suggestion still requires independent audio
+        # consensus before it reaches the operator.
+        lexicon_terms: list[str] = []
+        artist = str(row.artist or "").strip()
+        if artist:
+            catalog_rows = db.query(Job.segments_json).filter(
+                Job.tenant_id == row.tenant_id,
+                Job.job_id != row.job_id,
+                Job.status == "done",
+                func.lower(Job.artist) == artist.lower(),
+                Job.segments_json.isnot(None),
+            ).order_by(Job.approved_at.desc()).limit(12).all()
+            seen = set()
+            for (catalog_segments,) in catalog_rows:
+                for segment in catalog_segments or []:
+                    if not isinstance(segment, dict):
+                        continue
+                    for token in re.findall(
+                        r"[A-Za-zÀ-ÖØ-öø-ÿÑñ0-9][A-Za-zÀ-ÖØ-öø-ÿÑñ0-9'’-]{2,}",
+                        str(segment.get("text") or ""),
+                    ):
+                        folded = unicodedata.normalize("NFKC", token).casefold()
+                        if folded in seen:
+                            continue
+                        seen.add(folded)
+                        lexicon_terms.append(token)
+                        if len(lexicon_terms) >= 120:
+                            break
+                    if len(lexicon_terms) >= 120:
+                        break
+                if len(lexicon_terms) >= 120:
+                    break
         return {
             "revision": int(row.segments_revision or 0),
             "segments": [dict(item) for item in (row.segments_json or [])],
@@ -251,6 +286,11 @@ def _snapshot(job_id: str):
             "audio_sha256": str(row.input_audio_sha256 or ""),
             "active_quality_attempt_id": str(row.active_quality_attempt_id or ""),
             "filename": row.filename,
+            "artist_lexicon_prompt": (
+                "Vocabulario posible del catálogo del mismo artista: "
+                + ", ".join(lexicon_terms)
+            )[:850] if lexicon_terms else "",
+            "artist_lexicon_terms": len(lexicon_terms),
         }
     finally:
         db.close()
@@ -368,7 +408,8 @@ def _persist_if_current(job_id: str, expected_revision: int,
                         expected_audio_sha256: str = "",
                         analysis_attempt_id: str = "",
                         quality_proposal: dict | None = None,
-                        quality_observation: dict | None = None) -> bool:
+                        quality_observation: dict | None = None,
+                        operator_proposal: dict | None = None) -> bool:
     from database import Job, SessionLocal
     from transcription_quality import quality_fingerprint, segments_hash
 
@@ -435,7 +476,26 @@ def _persist_if_current(job_id: str, expected_revision: int,
                 "available": False, "reason": "prediction_failed",
                 "mutated_segments": False,
             }
-        if quality_proposal:
+        if operator_proposal:
+            try:
+                from editor import persist_operator_review_proposal_if_current
+                quality["operator_suggestions_persisted"] = bool(
+                    persist_operator_review_proposal_if_current(
+                        db, job_id=job_id,
+                        expected_revision=expected_revision,
+                        expected_segments_hash=expected_hash,
+                        expected_audio_revision=audio_revision,
+                        expected_audio_sha256=audio_sha256,
+                        proposal=operator_proposal,
+                    )
+                )
+            except Exception:
+                logger.error(
+                    "[OPERATOR-SUGGESTION] fail-closed persistence job=%s",
+                    job_id,
+                )
+                quality["operator_suggestions_persisted"] = False
+        elif quality_proposal:
             try:
                 from editor import persist_quality_proposal_if_current
                 quality["review_proposal_persisted"] = bool(
@@ -1193,6 +1253,11 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 len(selected_tiles) - len(lexical_retry_tiles)
             )
             raw_proposal_windows = []
+            timing_review_candidates = []
+            timing_review_report = {
+                "enabled": False, "proposal_count": 0,
+                "automatic_apply_allowed": False,
+            }
             # The provider/content retry remains separately kill-switchable.
             # Raw rows stay in memory until the typed, signed review-proposal
             # gate accepts them; global quality analytics receive only counts.
@@ -1201,6 +1266,10 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             }:
                 from targeted_consensus import reprocess
                 asr_context = _attested_asr_context(snapshot["segments"])
+                if snapshot.get("artist_lexicon_prompt"):
+                    asr_context["_artist_lexicon_prompt"] = snapshot[
+                        "artist_lexicon_prompt"
+                    ]
                 _ignored, provider_stats = reprocess(
                     {"segments": snapshot["segments"], **asr_context},
                     audio_path, lexical_retry_tiles,
@@ -1210,7 +1279,45 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                     provider_stats.pop("quality_proposal_windows", []) or []
                 )
                 retry_stats.update(provider_stats)
+                retry_stats["artist_lexicon_terms"] = int(
+                    snapshot.get("artist_lexicon_terms") or 0
+                )
                 retry_stats["mutated_segments"] = False
+
+            if os.environ.get(
+                "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
+            ).strip().lower() in {"1", "true", "yes", "on"}:
+                try:
+                    from pathlib import Path
+                    from timing_review_suggestions import (
+                        build_timing_review_candidates, load_acoustic_track,
+                    )
+
+                    acoustic_track = load_acoustic_track(Path(stem_path))
+                    timing_review_candidates, timing_review_report = (
+                        build_timing_review_candidates(
+                            snapshot["segments"], acoustic_track,
+                        )
+                    )
+                    timing_review_report = {
+                        **timing_review_report, "enabled": True,
+                    }
+                except Exception as exc:
+                    # Suggestions are an optional, human-operated layer. A
+                    # pitch failure must not fail transcription quality.
+                    logger.warning(
+                        "[T4-SUGGESTION] fail-closed job=%s error=%s",
+                        job_id, type(exc).__name__,
+                    )
+                    timing_review_candidates = []
+                    timing_review_report = {
+                        "enabled": True, "proposal_count": 0,
+                        "failure": type(exc).__name__,
+                        "automatic_apply_allowed": False,
+                    }
+            retry_stats["timing_review_suggestions"] = (
+                _sanitize_analytical_evidence(timing_review_report)
+            )
 
             evidence_windows = [
                 {
@@ -1255,6 +1362,23 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             complete_parent_ids = {
                 parent_id for parent_id, item in coverage.items() if item.get("complete")
             }
+            operator_proposal = None
+            if os.environ.get(
+                "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
+            ).strip().lower() in {"1", "true", "yes", "on"}:
+                from operator_review_proposals import build_operator_review_proposal
+
+                operator_proposal, operator_telemetry = (
+                    build_operator_review_proposal(
+                        snapshot["segments"],
+                        timing_candidates=timing_review_candidates,
+                        text_candidates=raw_proposal_windows,
+                        complete_parent_ids=complete_parent_ids,
+                    )
+                )
+                retry_stats["operator_suggestions"] = (
+                    _sanitize_analytical_evidence(operator_telemetry)
+                )
             complete_windows = [
                 item for item in windows
                 if str(item.get("id")) in complete_parent_ids
@@ -1325,6 +1449,7 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             analysis_attempt_id=analysis_attempt_id,
             quality_proposal=quality_proposal,
             quality_observation=quality_observation,
+            operator_proposal=operator_proposal,
         )
         return {
             "status": "persisted" if persisted else "discarded",

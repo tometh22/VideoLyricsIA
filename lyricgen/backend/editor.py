@@ -44,6 +44,13 @@ def quality_consensus_observations_enabled() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def operator_suggestions_enabled() -> bool:
+    """Human-click suggestions are independent from automatic correction."""
+    return os.environ.get(
+        "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def revoke_quality_proposal_if_disabled(document: EditorDocument) -> bool:
     """Delete tenant-scoped proposal text when the serving switch is off."""
     proposal = document.quality_proposal
@@ -51,12 +58,17 @@ def revoke_quality_proposal_if_disabled(document: EditorDocument) -> bool:
         return False
     status = str(proposal.get("status") or "pending")
     observation = proposal.get("observation_only") is True
+    operator_only = proposal.get("operator_suggestion_only") is True
     should_revoke = (
         observation
         and status == "observing"
         and not quality_consensus_observations_enabled()
     ) or (
-        not observation
+        operator_only
+        and status == "pending"
+        and not operator_suggestions_enabled()
+    ) or (
+        not observation and not operator_only
         and status == "pending"
         and not quality_v6_proposals_enabled()
     )
@@ -755,6 +767,101 @@ def persist_quality_observation_if_current(
     return True
 
 
+def persist_operator_review_proposal_if_current(
+    db: Session,
+    *,
+    job_id: str,
+    expected_revision: int,
+    expected_segments_hash: str,
+    expected_audio_revision: int,
+    expected_audio_sha256: str,
+    proposal: dict,
+) -> bool:
+    """Persist auditable one-click suggestions without authorizing automation."""
+    from transcription_quality import segments_hash
+
+    if not operator_suggestions_enabled():
+        return False
+    if not (
+        isinstance(proposal, dict)
+        and proposal.get("kind") == "operator_review_proposal"
+        and proposal.get("schema") == "operator-review-proposal-v1"
+        and proposal.get("review_only") is True
+        and proposal.get("operator_suggestion_only") is True
+        and proposal.get("automatic_apply_allowed") is False
+    ):
+        return False
+    job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == job_id,
+    ).with_for_update().first()
+    if job is None or document is None:
+        return False
+    if (
+        int(document.revision or 0) != int(expected_revision)
+        or segments_hash(document.current_segments or []) != expected_segments_hash
+        or int(job.audio_revision or 0) != int(expected_audio_revision)
+        or str(job.input_audio_sha256 or "") != str(expected_audio_sha256 or "")
+    ):
+        return False
+
+    # Once an operator has changed a line, the original machine snapshot no
+    # longer contains that exact row. Suggestions on that line fail closed.
+    original_keys = {
+        _segment_key(dict(item))
+        for item in (document.original_segments or []) if isinstance(item, dict)
+    }
+    eligible_windows = []
+    for window in proposal.get("windows") or []:
+        if not isinstance(window, dict):
+            continue
+        current = [
+            dict(item) for item in (window.get("current_segments") or [])
+            if isinstance(item, dict)
+        ]
+        suggestion_type = str(window.get("suggestion_type") or "")
+        if (not current and suggestion_type == "timing") or any(
+            item.get("locked") is True or item.get("operator_locked") is True
+            or _segment_key(item) not in original_keys
+            for item in current
+        ):
+            continue
+        if (
+            suggestion_type not in {"timing", "text", "vocalization"}
+            or str(window.get("confidence") or "")
+            not in {"high", "medium", "low"}
+            or window.get("automatic_apply_allowed") is not False
+        ):
+            continue
+        eligible_windows.append(dict(window))
+    if not eligible_windows:
+        return False
+    try:
+        validated = _validate_review_proposal_against_document(
+            {**proposal, "windows": eligible_windows},
+            list(document.current_segments or []),
+        )
+    except ValueError:
+        return False
+    created = now_utc()
+    document.quality_proposal = {
+        **validated,
+        "id": str(proposal.get("id") or uuid.uuid4()),
+        "status": "pending",
+        "base_revision": int(expected_revision),
+        "segments_hash": expected_segments_hash,
+        "segments_content_hash": segments_content_hash(
+            list(document.current_segments or []),
+        ),
+        "audio_revision": int(expected_audio_revision),
+        "audio_sha256": expected_audio_sha256,
+        "created_at": created.isoformat(),
+        "expires_at": (created + timedelta(days=7)).isoformat(),
+    }
+    db.flush()
+    return True
+
+
 def record_quality_observation(
     db: Session,
     job: Job,
@@ -900,16 +1007,29 @@ def apply_quality_proposal(
     document = db.query(EditorDocument).filter(
         EditorDocument.job_id == document.job_id,
     ).populate_existing().with_for_update().one()
-    if not quality_v6_proposals_enabled():
+    proposal = dict(document.quality_proposal or {})
+    operator_only = proposal.get("operator_suggestion_only") is True
+    if operator_only:
+        if not operator_suggestions_enabled():
+            revoke_quality_proposal_if_disabled(document)
+            db.flush()
+            raise QualityProposalsDisabled("operator_suggestions_disabled")
+    elif not quality_v6_proposals_enabled():
         revoke_quality_proposal_if_disabled(document)
         db.flush()
         raise QualityProposalsDisabled("quality_v6_proposals_disabled")
-    proposal = dict(document.quality_proposal or {})
     if proposal.get("observation_only") is True:
         raise QualityProposalsDisabled("quality_observation_cannot_be_applied")
     idem_hash = proposal_idempotency_hash(idempotency_key)
     if proposal.get("id") != proposal_id:
         raise LookupError("quality_proposal_not_found")
+    if any(
+        isinstance(item, dict)
+        and item.get("idempotency_hash") == idem_hash
+        and item.get("decision") == "accepted"
+        for item in (proposal.get("decision_history") or [])
+    ):
+        return document, None, False
     if proposal.get("status") == "applied" and proposal.get("idempotency_hash") == idem_hash:
         return document, None, False
     visible_proposal = _proposal_for_response(document) or {}
@@ -968,13 +1088,128 @@ def apply_quality_proposal(
     document, version, applied = save_document(
         db, job, document, user_id, base_revision, segments, "quality_proposal",
     )
-    document.quality_proposal = {
-        "id": proposal_id, "status": "applied", "windows": [],
-        "base_revision": base_revision, "applied_revision": int(document.revision or 0),
-        "idempotency_hash": idem_hash, "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
-    }
+    history = [
+        dict(item) for item in (proposal.get("decision_history") or [])
+        if isinstance(item, dict)
+    ][-99:]
+    history.append({
+        "decision": "accepted",
+        "window_ids": sorted(selected),
+        "idempotency_hash": idem_hash,
+        "decided_at": now_utc().isoformat(),
+    })
+    remaining = [
+        dict(item) for item in validated_proposal["windows"]
+        if str(item.get("id")) not in selected
+    ]
+    if operator_only and remaining:
+        current = list(document.current_segments or [])
+        document.quality_proposal = {
+            **proposal,
+            "status": "pending",
+            "windows": remaining,
+            "base_revision": int(document.revision or 0),
+            "segments_hash": segments_hash(current),
+            "segments_content_hash": segments_content_hash(current),
+            "decision_history": history,
+            "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
+        }
+    else:
+        document.quality_proposal = {
+            "id": proposal_id, "status": "applied", "windows": [],
+            "base_revision": base_revision,
+            "applied_revision": int(document.revision or 0),
+            "idempotency_hash": idem_hash,
+            "decision_history": history,
+            "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
+        }
     db.flush()
     return document, version, applied
+
+
+def reject_operator_suggestion(
+    db: Session,
+    document: EditorDocument,
+    *,
+    proposal_id: str,
+    window_id: str,
+    base_revision: int,
+    reason: str,
+    idempotency_key: str,
+) -> tuple[dict, bool]:
+    """Reject one human-only suggestion and retain the rest of the batch."""
+
+    allowed_reasons = {
+        "operator_rejected", "incorrect_content", "incorrect_timing",
+        "not_helpful", "already_fixed", "uncertain",
+    }
+    if reason not in allowed_reasons:
+        raise ValueError("invalid_operator_suggestion_reason")
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == document.job_id,
+    ).populate_existing().with_for_update().one()
+    proposal = dict(document.quality_proposal or {})
+    if (
+        proposal.get("id") != proposal_id
+        or proposal.get("operator_suggestion_only") is not True
+    ):
+        raise LookupError("operator_suggestion_not_found")
+    if not operator_suggestions_enabled():
+        revoke_quality_proposal_if_disabled(document)
+        db.flush()
+        raise QualityProposalsDisabled("operator_suggestions_disabled")
+    idem_hash = proposal_idempotency_hash(idempotency_key)
+    history = [
+        dict(item) for item in (proposal.get("decision_history") or [])
+        if isinstance(item, dict)
+    ][-99:]
+    for item in history:
+        if (
+            item.get("idempotency_hash") == idem_hash
+            and item.get("decision") == "rejected"
+        ):
+            return dict(item), False
+    if proposal.get("status") != "pending":
+        raise RuntimeError("quality_proposal_stale")
+    if int(document.revision or 0) != int(base_revision):
+        raise RuntimeError("editor_revision_conflict")
+    windows = [
+        dict(item) for item in (proposal.get("windows") or [])
+        if isinstance(item, dict)
+    ]
+    target = next(
+        (item for item in windows if str(item.get("id")) == str(window_id)),
+        None,
+    )
+    if target is None:
+        raise LookupError("operator_suggestion_not_found")
+    evidence = {
+        "decision": "rejected",
+        "window_id": hashlib.sha256(str(window_id).encode()).hexdigest()[:16],
+        "suggestion_type": str(target.get("suggestion_type") or "unknown"),
+        "confidence": str(target.get("confidence") or "unknown"),
+        "impact_ms": int(target.get("impact_ms") or 0),
+        "proposed_delta_ms": round(1000 * (
+            float(target.get("proposed_end") or 0)
+            - float(target.get("current_end") or 0)
+        )) if target.get("suggestion_type") == "timing" else None,
+        "reason": reason,
+        "idempotency_hash": idem_hash,
+        "decided_at": now_utc().isoformat(),
+    }
+    history.append(evidence)
+    remaining = [
+        item for item in windows if str(item.get("id")) != str(window_id)
+    ]
+    document.quality_proposal = {
+        **proposal,
+        "status": "pending" if remaining else "dismissed",
+        "windows": remaining,
+        "decision_history": history,
+        "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
+    }
+    db.flush()
+    return evidence, True
 
 
 def dismiss_quality_proposal(

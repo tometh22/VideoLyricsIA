@@ -115,6 +115,7 @@ from editor import (
     sync_legacy_snapshot,
     ensure_document,
     dismiss_quality_proposal,
+    reject_operator_suggestion,
     record_quality_observation,
     revoke_quality_proposal_if_disabled,
 )
@@ -12027,6 +12028,18 @@ class EditorQualityProposalDismissRequest(BaseModel):
     )
 
 
+class EditorOperatorSuggestionRejectRequest(BaseModel):
+    base_revision: int = Field(ge=0)
+    idempotency_key: str = Field(min_length=16, max_length=160)
+    reason: str = Field(
+        default="operator_rejected",
+        pattern=(
+            r"^(operator_rejected|incorrect_content|incorrect_timing|"
+            r"not_helpful|already_fixed|uncertain)$"
+        ),
+    )
+
+
 class EditorQualityObservationRequest(BaseModel):
     base_revision: int = Field(ge=0)
     window_id: str = Field(min_length=1, max_length=128)
@@ -12199,6 +12212,12 @@ async def apply_editor_quality_proposal(
     job, document = _editor_document_or_404(db, job_id, current_user)
     quality_outbox_id = None
     previous = [dict(item) for item in (document.current_segments or [])]
+    proposal_before = dict(document.quality_proposal or {})
+    windows_before = {
+        str(item.get("id")): dict(item)
+        for item in (proposal_before.get("windows") or [])
+        if isinstance(item, dict)
+    }
     try:
         document, version, applied = apply_quality_proposal(
             db, job, document, current_user["id"], proposal_id=proposal_id,
@@ -12219,6 +12238,43 @@ async def apply_editor_quality_proposal(
                 quality=job.transcription_quality,
                 reason="quality_proposal_applied",
             )
+            if proposal_before.get("operator_suggestion_only") is True:
+                for window_id in body.window_ids:
+                    suggestion = windows_before.get(str(window_id)) or {}
+                    suggestion_type = str(
+                        suggestion.get("suggestion_type") or "unknown"
+                    )
+                    current_end = suggestion.get("current_end")
+                    proposed_end = suggestion.get("proposed_end")
+                    proposed_delta_ms = None
+                    if suggestion_type == "timing":
+                        try:
+                            proposed_delta_ms = round(1000 * (
+                                float(proposed_end) - float(current_end)
+                            ))
+                        except (TypeError, ValueError):
+                            proposed_delta_ms = None
+                    db.add(ProductEvent(
+                        tenant_id=str(job.tenant_id),
+                        user_id=current_user["id"], job_id=job_id,
+                        name="editor_operator_suggestion_decision",
+                        properties={
+                            "decision": "accepted",
+                            "suggestion_type": suggestion_type,
+                            "confidence": str(
+                                suggestion.get("confidence") or "unknown"
+                            ),
+                            "impact_ms": int(
+                                suggestion.get("impact_ms") or 0
+                            ),
+                            "proposed_delta_ms": proposed_delta_ms,
+                            "pipeline_release": str(
+                                (job.transcription_quality or {}).get(
+                                    "pipeline_release"
+                                ) or "unknown"
+                            ),
+                        },
+                    ))
         db.add(AuditLog(
             user_id=current_user["id"], action="editor.quality_proposal_apply",
             detail={
@@ -12248,6 +12304,67 @@ async def apply_editor_quality_proposal(
         "revision": int(document.revision or 0),
         "version_id": version.id if version else None,
         "applied": applied, "idempotent": not applied,
+    }
+
+
+@app.post(
+    "/editor/{job_id}/quality-proposals/{proposal_id}/windows/{window_id}/reject"
+)
+async def reject_editor_operator_suggestion(
+    job_id: str,
+    proposal_id: str,
+    window_id: str,
+    body: EditorOperatorSuggestionRejectRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    try:
+        evidence, rejected = reject_operator_suggestion(
+            db, document, proposal_id=proposal_id, window_id=window_id,
+            base_revision=body.base_revision, reason=body.reason,
+            idempotency_key=body.idempotency_key,
+        )
+        if rejected:
+            db.add(ProductEvent(
+                tenant_id=str(job.tenant_id), user_id=current_user["id"],
+                job_id=job_id, name="editor_operator_suggestion_decision",
+                properties={
+                    key: value for key, value in evidence.items()
+                    if key not in {"idempotency_hash", "decided_at"}
+                } | {"pipeline_release": str(
+                    (job.transcription_quality or {}).get(
+                        "pipeline_release"
+                    ) or "unknown"
+                )},
+            ))
+            db.add(AuditLog(
+                user_id=current_user["id"],
+                action="editor.operator_suggestion_reject",
+                detail={
+                    "job_id": job_id, "proposal_id": proposal_id,
+                    "window_id_hash": evidence.get("window_id"),
+                    "suggestion_type": evidence.get("suggestion_type"),
+                    "reason": body.reason,
+                },
+            ))
+        db.commit()
+    except QualityProposalsDisabled as exc:
+        db.commit()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except RuntimeError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {
+        "job_id": job_id, "proposal_id": proposal_id,
+        "window_id": window_id, "rejected": rejected,
+        "idempotent": not rejected,
     }
 
 
@@ -12570,7 +12687,8 @@ _PRODUCT_EVENT_NAMES = {
     "editor_selection_created", "editor_group_moved", "editor_timing_changed",
     "editor_undo", "editor_autosave_success", "editor_autosave_failed",
     "editor_conflict", "editor_version_restored", "editor_approved",
-    "editor_help_opened",
+    "editor_help_opened", "editor_operator_suggestions_shown",
+    "editor_operator_suggestion_decision",
 }
 
 # Ventana de /admin/product-metrics. Sin esto la única acotación era
@@ -12607,6 +12725,14 @@ _PRODUCT_EVENT_PROPERTIES = {
         "lines_reordered", "active_edit_ms", "quality_acknowledged",
     },
     "editor_help_opened": {"context"},
+    "editor_operator_suggestions_shown": {
+        "proposal_id", "total", "timing_count", "text_count",
+        "vocalization_count",
+    },
+    "editor_operator_suggestion_decision": {
+        "decision", "suggestion_type", "confidence", "impact_ms",
+        "proposed_delta_ms", "reason", "window_id", "pipeline_release",
+    },
 }
 _PRODUCT_EVENT_COMMON_PROPERTIES = {"session_id"}
 from product_telemetry import valid_property as _valid_product_event_property
@@ -12746,6 +12872,10 @@ async def product_metrics(
     }
     route_work: dict[str, dict] = {}
     release_work: dict[str, list[float]] = {}
+    suggestion_metrics = {
+        kind: {"shown": 0, "accepted": 0, "rejected": 0}
+        for kind in ("timing", "text", "vocalization")
+    }
     seen_approvals: set[tuple] = set()
     sessions: dict[tuple, dict] = {}
     view_usage = {"basic": 0, "advanced": 0}
@@ -12824,6 +12954,16 @@ async def product_metrics(
                 route_row["quality_reasons"][code] = (
                     route_row["quality_reasons"].get(code, 0) + 1
                 )
+        elif row.name == "editor_operator_suggestions_shown":
+            for kind in suggestion_metrics:
+                count = properties.get(f"{kind}_count")
+                if isinstance(count, (int, float)):
+                    suggestion_metrics[kind]["shown"] += max(0, int(count))
+        elif row.name == "editor_operator_suggestion_decision":
+            kind = str(properties.get("suggestion_type") or "")
+            decision = str(properties.get("decision") or "")
+            if kind in suggestion_metrics and decision in {"accepted", "rejected"}:
+                suggestion_metrics[kind][decision] += 1
     session_durations = [
         (session["last"] - session["first"]).total_seconds() * 1000
         for session in sessions.values() if session["last"] >= session["first"]
@@ -12891,6 +13031,19 @@ async def product_metrics(
         }
         for release, durations in release_work.items()
     }
+    suggestion_summary = {}
+    for kind, values in suggestion_metrics.items():
+        decided = values["accepted"] + values["rejected"]
+        suggestion_summary[kind] = {
+            **values,
+            "decided": decided,
+            "acceptance_rate": (
+                values["accepted"] / decided if decided else None
+            ),
+            "sanity_gate_met": (
+                decided >= 10 and values["accepted"] / decided >= 0.70
+            ) if decided else False,
+        }
     return {
         "events": counts,
         "sample_size": len(rows),
@@ -12927,6 +13080,7 @@ async def product_metrics(
             "corrections": correction_totals,
             "by_timing_source": route_metrics,
             "by_pipeline_release": release_metrics,
+            "suggestions": suggestion_summary,
         },
     }
 
