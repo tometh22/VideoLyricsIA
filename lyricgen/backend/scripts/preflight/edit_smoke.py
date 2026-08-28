@@ -107,6 +107,40 @@ def _quality_gate_go(job_id: str, phase: str, code: str) -> int:
     return 0
 
 
+def _delivery_qc_contract_error(status_payload: dict) -> str | None:
+    """Validate that /status exposes a fresh report for the current render."""
+    report = status_payload.get("delivery_qc")
+    if not isinstance(report, dict):
+        return "delivery_qc ausente en /status"
+    if report.get("status") != "COMPLETE":
+        return f"delivery_qc no está fresco (status={report.get('status')})"
+    if report.get("mode") not in {"observe", "enforce"}:
+        return f"delivery_qc mode inválido: {report.get('mode')}"
+    if not report.get("generated_at") or not report.get("segments_hash"):
+        return "delivery_qc no tiene identidad temporal/de segmentos"
+    expected_revision = int(status_payload.get("segments_revision") or 0)
+    if int(report.get("segments_revision") or 0) != expected_revision:
+        return (
+            "delivery_qc corresponde a otra revisión "
+            f"({report.get('segments_revision')} != {expected_revision})"
+        )
+    identity = report.get("render_identity") or {}
+    expected_edit_count = int(status_payload.get("edit_count") or 0)
+    if int(identity.get("edit_count") or 0) != expected_edit_count:
+        return (
+            "delivery_qc corresponde a otro render/edit "
+            f"({identity.get('edit_count')} != {expected_edit_count})"
+        )
+    technical = report.get("technical") or {}
+    video = technical.get("video") or {}
+    if not video.get("codec") or int(technical.get("audio_streams") or 0) < 1:
+        return "delivery_qc no certificó streams de audio/video"
+    approval = report.get("approval") or {}
+    if report.get("mode") == "observe" and approval.get("blocked") is not False:
+        return "delivery_qc observe bloqueó la aprobación"
+    return None
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--api-url", required=True)
@@ -117,6 +151,13 @@ def main() -> int:
         help=(
             "acepta un 409 fail-closed del gate v6 para este fixture de silencio; "
             "staging lo usa con enforcement, producción conserva el smoke completo"
+        ),
+    )
+    p.add_argument(
+        "--require-delivery-qc", action="store_true",
+        help=(
+            "exige que cada render publique en /status un preflight fresco, "
+            "ligado a la revisión y al edit_count actuales"
         ),
     )
     args = p.parse_args()
@@ -262,6 +303,13 @@ def main() -> int:
     gate_code = _status_quality_gate_code(st)
     if args.allow_quality_gate_block and gate_code:
         return _quality_gate_go(job_id, "render", gate_code)
+    _initial_qc_generated_at = None
+    if args.require_delivery_qc:
+        contract_error = _delivery_qc_contract_error(st)
+        if contract_error:
+            return _fail(f"render inicial: {contract_error}")
+        _initial_qc_generated_at = st["delivery_qc"]["generated_at"]
+        print("[edit-smoke] delivery_qc inicial fresco y ligado al render")
 
     # 2.5. Autosave del editor — el camino que los operadores reportan como
     # frágil (issue #934). GO/NO-GO: POST /jobs/{id}/save-segments con una
@@ -303,6 +351,13 @@ def main() -> int:
         if args.allow_quality_gate_block and gate_code:
             return _quality_gate_go(job_id, "edit", gate_code)
         return _fail(f"edit dejó error residual: {st['error']}")
+    if args.require_delivery_qc:
+        contract_error = _delivery_qc_contract_error(st)
+        if contract_error:
+            return _fail(f"re-render editado: {contract_error}")
+        if st["delivery_qc"]["generated_at"] == _initial_qc_generated_at:
+            return _fail("el edit reutilizó el delivery_qc del render anterior")
+        print("[edit-smoke] delivery_qc regenerado y ligado al edit actual")
     print(f"[edit-smoke] GO ✅ — job {job_id}: upload→render→edit→re-render OK")
     return 0
 

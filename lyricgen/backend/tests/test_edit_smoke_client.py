@@ -231,3 +231,30 @@ def test_edit_smoke_only_accepts_known_quality_status_errors():
     assert edit_smoke._status_quality_gate_code({
         "error": "render_failed: transcription provider unavailable",
     }) is None
+
+
+def test_delivery_qc_contract_requires_fresh_current_render():
+    status = {
+        "segments_revision": 3,
+        "edit_count": 2,
+        "delivery_qc": {
+            "status": "COMPLETE",
+            "mode": "observe",
+            "generated_at": "2026-08-28T12:00:00+00:00",
+            "segments_hash": "abc123",
+            "segments_revision": 3,
+            "render_identity": {"edit_count": 2},
+            "technical": {
+                "video": {"codec": "h264"},
+                "audio_streams": 1,
+            },
+            "approval": {"blocked": False, "can_approve": True},
+        },
+    }
+    assert edit_smoke._delivery_qc_contract_error(status) is None
+
+    status["delivery_qc"]["status"] = "STALE"
+    assert "no está fresco" in edit_smoke._delivery_qc_contract_error(status)
+    status["delivery_qc"]["status"] = "COMPLETE"
+    status["delivery_qc"]["render_identity"]["edit_count"] = 1
+    assert "otro render/edit" in edit_smoke._delivery_qc_contract_error(status)

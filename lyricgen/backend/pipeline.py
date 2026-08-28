@@ -2475,10 +2475,20 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # delivery; enforce mode is applied later at human approval, not here.
         try:
             from delivery_qc_runtime import run_delivery_qc_for_job
-            run_delivery_qc_for_job(
+            _delivery_qc_report = run_delivery_qc_for_job(
                 job_id, os.path.join(job_dir, "lyric_video.mp4"),
                 segments=segments,
             )
+            if _delivery_qc_report:
+                logger.info(
+                    "[DELIVERY-QC] persisted job=%s phase=initial status=%s "
+                    "decision=%s open=%s mode=%s",
+                    job_id,
+                    _delivery_qc_report.get("status"),
+                    _delivery_qc_report.get("decision"),
+                    (_delivery_qc_report.get("summary") or {}).get("open_count"),
+                    _delivery_qc_report.get("mode"),
+                )
         except Exception as _delivery_qc_error:
             logger.exception(
                 "[DELIVERY-QC] preflight failed job=%s (render continues): %s",
@@ -20337,10 +20347,20 @@ def run_edit_pipeline(
         # previous report was marked stale when the edit was requested.
         try:
             from delivery_qc_runtime import run_delivery_qc_for_job
-            run_delivery_qc_for_job(
+            _delivery_qc_report = run_delivery_qc_for_job(
                 job_id, os.path.join(job_dir, "lyric_video.mp4"),
                 segments=segments,
             )
+            if _delivery_qc_report:
+                logger.info(
+                    "[DELIVERY-QC] persisted job=%s phase=edit status=%s "
+                    "decision=%s open=%s mode=%s",
+                    job_id,
+                    _delivery_qc_report.get("status"),
+                    _delivery_qc_report.get("decision"),
+                    (_delivery_qc_report.get("summary") or {}).get("open_count"),
+                    _delivery_qc_report.get("mode"),
+                )
         except Exception as _delivery_qc_error:
             logger.exception(
                 "[DELIVERY-QC] edit preflight failed job=%s (render continues): %s",
