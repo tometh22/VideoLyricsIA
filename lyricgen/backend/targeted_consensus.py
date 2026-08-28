@@ -949,7 +949,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         # operational ceiling.
         max_windows = min(12, _env_int("TARGETED_CONSENSUS_MAX_WINDOWS", 3))
         configured_billed_s = min(
-            180.0,
+            360.0,
             _env_float("TARGETED_CONSENSUS_MAX_BILLED_SECONDS", 120.0),
         )
         job_asr_budget = min(
@@ -972,7 +972,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         stats["attempted"] = True
         started_at = time.monotonic()
         hard_deadline_s = min(
-            150.0, _env_float("TARGETED_CONSENSUS_DEADLINE_SECONDS", 120.0)
+            600.0, _env_float("TARGETED_CONSENSUS_DEADLINE_SECONDS", 120.0)
         )
         from quality_mutation import mutation_authorized
         allow_insertions = mutation_authorized(job_id=job_id)
