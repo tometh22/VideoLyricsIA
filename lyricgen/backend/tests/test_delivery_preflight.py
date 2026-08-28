@@ -1,3 +1,5 @@
+import json
+
 from delivery_preflight import build_delivery_preflight, frame_timecode
 
 
@@ -124,3 +126,24 @@ def test_reference_health_blocks_wrong_or_incomplete_catalogue_text():
     assert {item["code"] for item in report["issues"]} == {
         "REFERENCE_TEXT_UNATTESTED", "REFERENCE_TIMELINE_INCOMPLETE"
     }
+
+
+def test_report_is_strict_json_even_with_non_finite_upstream_diagnostics():
+    report = build_delivery_preflight(
+        metadata={"artist": "Artist", "title": "Song"},
+        asset={"duration": float("inf")},
+        segments=[{
+            "start": 1.0, "end": float("nan"), "text": "corrupt timing",
+        }],
+        quality={"metrics": {"endpoint_error": float("nan")}},
+        reference_health={"metrics": {"coverage": float("inf")}},
+        acoustic_findings=[{"seconds": float("nan"), "score": float("inf")}],
+        fps=float("nan"),
+    )
+
+    # allow_nan=False models the strict JSON accepted by PostgreSQL JSONB.
+    json.dumps(report, allow_nan=False)
+    assert report["asset"]["fps"] == 30.0
+    assert report["asset"]["duration"] is None
+    assert report["upstream_quality"]["metrics"]["endpoint_error"] is None
+    assert report["reference_health"]["metrics"]["coverage"] is None
