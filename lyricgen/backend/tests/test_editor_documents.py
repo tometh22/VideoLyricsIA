@@ -19,6 +19,7 @@ from editor import (
     expire_stale_quality_proposals,
     get_or_create_document,
     persist_quality_proposal_if_current,
+    persist_quality_observation_if_current,
     save_document,
 )
 from transcription_quality import segments_hash
@@ -399,6 +400,127 @@ def test_quality_proposal_is_audio_revision_scoped_and_applies_idempotently(
         assert len(versions) == 1
     finally:
         verify.close()
+
+
+def test_quality_observation_records_hash_only_verdict_without_mutation(
+    client, monkeypatch,
+):
+    monkeypatch.setenv("QUALITY_CONSENSUS_OBSERVATIONS_ENABLED", "1")
+    monkeypatch.setenv(
+        "QUALITY_CONTENT_FINGERPRINT_HMAC_KEY",
+        "test-observation-key-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    )
+    first, _second, job_id = _users_and_job("editor_quality_observation")
+    token = _token_for(first)
+    proposal_id = f"observation-{uuid.uuid4().hex}"
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        job.input_audio_sha256 = "b" * 64
+        job.audio_revision = 2
+        stored = persist_quality_observation_if_current(
+            db, job_id=job_id, expected_revision=0,
+            expected_segments_hash=segments_hash(document.current_segments),
+            expected_audio_revision=2, expected_audio_sha256="b" * 64,
+            proposal={
+                **_proposal(proposal_id, [{
+                    "id": "window-a", "start": 0.0, "end": 1.0,
+                    "current_segments": [{"start": 0, "end": 1, "text": "one"}],
+                    "proposed_segments": [{"start": 0, "end": 1, "text": "won"}],
+                    "source_families": ["whisper", "gemini_audio"],
+                }]),
+                "observation_only": True,
+            },
+        )
+        assert stored is True
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/editor/{job_id}/quality-proposals/{proposal_id}/observe",
+        headers=auth(token),
+        json={
+            "base_revision": 0, "window_id": "window-a",
+            "verdict": "correct",
+            "idempotency_key": "quality-observation-request-0001",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["recorded"] is True
+
+    verify = SessionLocal()
+    try:
+        document = verify.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        assert document.revision == 0
+        assert [row["text"] for row in document.current_segments] == ["one", "two"]
+        assert document.quality_proposal["status"] == "observed"
+        assert "won" not in str(document.quality_proposal)
+        event = verify.query(ProductEvent).filter(
+            ProductEvent.job_id == job_id,
+            ProductEvent.name == "quality_consensus_observation",
+        ).one()
+        assert event.properties["verdict"] == "correct"
+        assert len(event.properties["candidate_sha256"]) == 64
+        assert "won" not in str(event.properties)
+    finally:
+        verify.close()
+
+    # Even if the separately signed production-proposal switch is enabled,
+    # an observation remains technically non-applicable.
+    monkeypatch.setenv("QUALITY_V6_PROPOSALS_ENABLED", "1")
+    apply_response = client.post(
+        f"/editor/{job_id}/quality-proposals/{proposal_id}/apply",
+        headers=auth(token),
+        json={
+            "base_revision": 0, "window_ids": ["window-a"],
+            "idempotency_key": "quality-observation-apply-0001",
+        },
+    )
+    assert apply_response.status_code == 409
+    assert apply_response.json()["detail"] == "quality_observation_cannot_be_applied"
+
+
+def test_quality_observation_kill_switch_erases_pending_raw_candidate(
+    client, monkeypatch,
+):
+    monkeypatch.setenv("QUALITY_CONSENSUS_OBSERVATIONS_ENABLED", "1")
+    first, _second, job_id = _users_and_job("editor_observation_kill_switch")
+    token = _token_for(first)
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        job.input_audio_sha256 = "c" * 64
+        assert persist_quality_observation_if_current(
+            db, job_id=job_id, expected_revision=0,
+            expected_segments_hash=segments_hash(document.current_segments),
+            expected_audio_revision=0, expected_audio_sha256="c" * 64,
+            proposal={
+                **_proposal("observation-kill", [{
+                    "id": "window-kill", "start": 0.0, "end": 1.0,
+                    "current_segments": [{"start": 0, "end": 1, "text": "one"}],
+                    "proposed_segments": [{"start": 0, "end": 1, "text": "candidate"}],
+                    "source_families": ["whisper", "gemini_audio"],
+                }]),
+                "observation_only": True,
+            },
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setenv("QUALITY_CONSENSUS_OBSERVATIONS_ENABLED", "0")
+    loaded = client.get(f"/editor/{job_id}", headers=auth(token))
+    assert loaded.status_code == 200
+    assert loaded.json()["quality_proposal"] is None
 
 
 def test_quality_proposal_rejects_stale_audio_identity(db, monkeypatch):

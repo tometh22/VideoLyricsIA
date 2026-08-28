@@ -115,6 +115,7 @@ from editor import (
     sync_legacy_snapshot,
     ensure_document,
     dismiss_quality_proposal,
+    record_quality_observation,
     revoke_quality_proposal_if_disabled,
 )
 from observability import init_sentry, init_logging, health_snapshot
@@ -12026,6 +12027,13 @@ class EditorQualityProposalDismissRequest(BaseModel):
     )
 
 
+class EditorQualityObservationRequest(BaseModel):
+    base_revision: int = Field(ge=0)
+    window_id: str = Field(min_length=1, max_length=128)
+    verdict: str = Field(pattern=r"^(correct|incorrect|uncertain)$")
+    idempotency_key: str = Field(min_length=16, max_length=160)
+
+
 class EditorConflictRequest(BaseModel):
     strategy: str
     server_revision: int = Field(ge=0)
@@ -12274,6 +12282,60 @@ async def dismiss_editor_quality_proposal(
     return {
         "job_id": job_id, "proposal_id": proposal_id,
         "dismissed": dismissed, "idempotent": not dismissed,
+    }
+
+
+@app.post("/editor/{job_id}/quality-proposals/{proposal_id}/observe")
+async def observe_editor_quality_proposal(
+    job_id: str,
+    proposal_id: str,
+    body: EditorQualityObservationRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    try:
+        evidence, recorded = record_quality_observation(
+            db, job, document,
+            proposal_id=proposal_id,
+            window_id=body.window_id,
+            base_revision=body.base_revision,
+            verdict=body.verdict,
+            idempotency_key=body.idempotency_key,
+        )
+        if recorded:
+            db.add(ProductEvent(
+                tenant_id=str(job.tenant_id), user_id=current_user["id"],
+                job_id=job_id, name="quality_consensus_observation",
+                properties=evidence,
+            ))
+            db.add(AuditLog(
+                user_id=current_user["id"],
+                action="editor.quality_consensus_observe",
+                detail={
+                    "job_id": job_id,
+                    "proposal_id": proposal_id,
+                    "window_id_hash": evidence.get("window_id"),
+                    "verdict": body.verdict,
+                },
+            ))
+        db.commit()
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except RuntimeError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {
+        "job_id": job_id,
+        "proposal_id": proposal_id,
+        "window_id": body.window_id,
+        "verdict": body.verdict,
+        "recorded": recorded,
+        "idempotent": not recorded,
     }
 
 

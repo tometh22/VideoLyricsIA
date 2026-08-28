@@ -38,12 +38,29 @@ def quality_v6_proposals_enabled() -> bool:
     }
 
 
+def quality_consensus_observations_enabled() -> bool:
+    return os.environ.get(
+        "QUALITY_CONSENSUS_OBSERVATIONS_ENABLED", "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def revoke_quality_proposal_if_disabled(document: EditorDocument) -> bool:
     """Delete tenant-scoped proposal text when the serving switch is off."""
     proposal = document.quality_proposal
-    if quality_v6_proposals_enabled() or not isinstance(proposal, dict):
+    if not isinstance(proposal, dict):
         return False
-    if str(proposal.get("status") or "pending") != "pending":
+    status = str(proposal.get("status") or "pending")
+    observation = proposal.get("observation_only") is True
+    should_revoke = (
+        observation
+        and status == "observing"
+        and not quality_consensus_observations_enabled()
+    ) or (
+        not observation
+        and status == "pending"
+        and not quality_v6_proposals_enabled()
+    )
+    if not should_revoke:
         return False
     document.quality_proposal = None
     return True
@@ -659,6 +676,201 @@ def persist_quality_proposal_if_current(
     return True
 
 
+def persist_quality_observation_if_current(
+    db: Session,
+    *,
+    job_id: str,
+    expected_revision: int,
+    expected_segments_hash: str,
+    expected_audio_revision: int,
+    expected_audio_sha256: str,
+    proposal: dict,
+) -> bool:
+    """Store a non-applicable suggestion for human calibration.
+
+    This path intentionally does not call the production proposal
+    authorization.  Its stored status is ``observing`` and every mutation
+    endpoint rejects it, so it can collect labels without bypassing the
+    signed Quality v6 certificate.
+    """
+    from quality_v6_contracts import ReviewProposal
+    from transcription_quality import segments_hash
+
+    if not quality_consensus_observations_enabled():
+        return False
+    if proposal.get("observation_only") is not True:
+        return False
+    raw_windows = {
+        str(item.get("id")): dict(item)
+        for item in (proposal.get("windows") or []) if isinstance(item, dict)
+    }
+    try:
+        typed = ReviewProposal.from_mapping(proposal).to_dict()
+    except (TypeError, ValueError):
+        return False
+    for window in typed["windows"]:
+        raw = raw_windows.get(str(window.get("id"))) or {}
+        families = raw.get("source_families")
+        if not isinstance(families, list) or len(set(families)) < 2:
+            return False
+        window["source_families"] = sorted(set(str(item) for item in families))
+
+    job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == job_id,
+    ).with_for_update().first()
+    if job is None or document is None:
+        return False
+    if (
+        int(document.revision or 0) != int(expected_revision)
+        or segments_hash(document.current_segments or []) != expected_segments_hash
+        or int(job.audio_revision or 0) != int(expected_audio_revision)
+        or str(job.input_audio_sha256 or "") != str(expected_audio_sha256 or "")
+    ):
+        return False
+    try:
+        typed = _validate_review_proposal_against_document(
+            typed, list(document.current_segments or []),
+        )
+    except ValueError:
+        return False
+    created = now_utc()
+    document.quality_proposal = {
+        **typed,
+        "id": str(proposal.get("id") or uuid.uuid4()),
+        "status": "observing",
+        "observation_only": True,
+        "certificate_policy_version": "independent-consensus-review-policy-v1",
+        "base_revision": int(expected_revision),
+        "segments_hash": expected_segments_hash,
+        "segments_content_hash": segments_content_hash(
+            list(document.current_segments or []),
+        ),
+        "audio_revision": int(expected_audio_revision),
+        "audio_sha256": expected_audio_sha256,
+        "created_at": created.isoformat(),
+        "expires_at": (created + timedelta(days=7)).isoformat(),
+    }
+    db.flush()
+    return True
+
+
+def record_quality_observation(
+    db: Session,
+    job: Job,
+    document: EditorDocument,
+    *,
+    proposal_id: str,
+    window_id: str,
+    base_revision: int,
+    verdict: str,
+    idempotency_key: str,
+) -> tuple[dict, bool]:
+    """Record one hash-only human verdict without changing editor content."""
+    if verdict not in {"correct", "incorrect", "uncertain"}:
+        raise ValueError("invalid_quality_observation_verdict")
+    job = db.query(Job).filter(Job.job_id == job.job_id).with_for_update().one()
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == document.job_id,
+    ).populate_existing().with_for_update().one()
+    proposal = dict(document.quality_proposal or {})
+    if (
+        proposal.get("id") != proposal_id
+        or proposal.get("observation_only") is not True
+    ):
+        raise LookupError("quality_observation_not_found")
+    if int(document.revision or 0) != int(base_revision):
+        raise RuntimeError("editor_revision_conflict")
+    if (
+        int(proposal.get("audio_revision", -1)) != int(job.audio_revision or 0)
+        or str(proposal.get("audio_sha256") or "") != str(job.input_audio_sha256 or "")
+        or str(proposal.get("segments_content_hash") or "")
+        != segments_content_hash(list(document.current_segments or []))
+    ):
+        raise RuntimeError("quality_observation_stale")
+    windows = [dict(item) for item in (proposal.get("windows") or [])]
+    matching = [item for item in windows if str(item.get("id")) == str(window_id)]
+    if len(matching) != 1:
+        raise LookupError("quality_observation_window_not_found")
+    window = matching[0]
+    idem_hash = proposal_idempotency_hash(idempotency_key)
+    existing = window.get("human_verdict")
+    if existing:
+        if (
+            existing == verdict
+            and window.get("verdict_idempotency_hash") == idem_hash
+        ):
+            return dict(window.get("observation_evidence") or {}), False
+        raise RuntimeError("quality_observation_already_recorded")
+
+    from consensus_review_certificate import (
+        OBSERVATION_SCHEMA, canonical_source_family,
+    )
+    from evidence_contracts import privacy_fingerprint
+    families = sorted({
+        canonical_source_family(item)
+        for item in (window.get("source_families") or [])
+        if canonical_source_family(item)
+    })
+    if len(families) < 2:
+        raise RuntimeError("independent_source_family_missing")
+
+    def private_digest(namespace: str, value: Any) -> str:
+        fingerprint = privacy_fingerprint(namespace, value)
+        if not fingerprint:
+            raise RuntimeError("quality_observation_privacy_key_missing")
+        return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+    evidence = {
+        "schema": OBSERVATION_SCHEMA,
+        "window_id": private_digest(
+            "consensus-observation-window",
+            {"job_id": job.job_id, "proposal_id": proposal_id, "window_id": window_id},
+        ),
+        "song_id": private_digest("consensus-observation-song", job.job_id),
+        "verdict": verdict,
+        "source_families": families,
+        "candidate_sha256": private_digest(
+            "consensus-observation-candidate", window.get("proposed_segments") or [],
+        ),
+        "audio_window_sha256": private_digest(
+            "consensus-observation-audio-window", {
+                "audio_sha256": job.input_audio_sha256,
+                "start": window.get("start"), "end": window.get("end"),
+            },
+        ),
+    }
+    moment = now_utc().isoformat()
+    for index, item in enumerate(windows):
+        if str(item.get("id")) == str(window_id):
+            windows[index] = {
+                **item,
+                "human_verdict": verdict,
+                "reviewed_at": moment,
+                "verdict_idempotency_hash": idem_hash,
+                "observation_evidence": evidence,
+            }
+            break
+    complete = all(item.get("human_verdict") for item in windows)
+    if complete:
+        # The certificate consumes only hashes. Erase raw current/proposed
+        # lyrics as soon as every window is judged while retaining enough
+        # state for an idempotent retry of a response lost in transit.
+        windows = [{
+            "id": item.get("id"),
+            "start": item.get("start"), "end": item.get("end"),
+            "human_verdict": item.get("human_verdict"),
+            "reviewed_at": item.get("reviewed_at"),
+            "verdict_idempotency_hash": item.get("verdict_idempotency_hash"),
+            "observation_evidence": item.get("observation_evidence"),
+        } for item in windows]
+    proposal["windows"] = windows
+    proposal["status"] = "observed" if complete else "observing"
+    document.quality_proposal = proposal
+    db.flush()
+    return evidence, True
+
+
 def _segment_key(segment: dict) -> tuple:
     row_id = segment.get("_id") or segment.get("id") or segment.get("segment_id")
     if row_id:
@@ -693,6 +905,8 @@ def apply_quality_proposal(
         db.flush()
         raise QualityProposalsDisabled("quality_v6_proposals_disabled")
     proposal = dict(document.quality_proposal or {})
+    if proposal.get("observation_only") is True:
+        raise QualityProposalsDisabled("quality_observation_cannot_be_applied")
     idem_hash = proposal_idempotency_hash(idempotency_key)
     if proposal.get("id") != proposal_id:
         raise LookupError("quality_proposal_not_found")

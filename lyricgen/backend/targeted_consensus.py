@@ -167,6 +167,14 @@ def _proposal_candidate_payload(
         "proposed_segments": [dict(item) for item in proposed_segments],
         "source": str(source),
     }
+    if isinstance(calibrated_evidence, dict):
+        source_families = calibrated_evidence.get("source_families") or (
+            calibrated_evidence.get("independent_content_attestation") or {}
+        ).get("families")
+        if isinstance(source_families, (list, tuple, set)):
+            payload["source_families"] = sorted({
+                str(family).strip() for family in source_families if str(family).strip()
+            })
     certification = _calibrated_review_certification(calibrated_evidence)
     if certification is not None:
         payload["certification"] = certification
