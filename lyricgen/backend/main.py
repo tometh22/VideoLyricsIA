@@ -6592,6 +6592,12 @@ async def _run_transcription_for_job(
     tmp_path = audio_path
     _vocal_stem = None   # demucs output path (lazy), cleaned up in finally
 
+    # Filled after the audio-first ASR exists.  `_emit_segments` reads this
+    # state at the single output chokepoint so every downstream branch gets
+    # the same reference-health observability without duplicating payload
+    # plumbing across the cascade.
+    _reference_attestation_state = {"report": None}
+
     try:
         # Language is a per-job property. Tenant, role and geography never
         # participate in this decision; a workspace may contain any mix of
@@ -6679,6 +6685,7 @@ async def _run_transcription_for_job(
 
         def _emit_segments(segments, source, *,
                             reference_lyrics: str = "",
+                            content_reference_used: bool | None = None,
                             recovery_source=None,
                             coverage_warning: bool = False,
                             extra=None):
@@ -6697,16 +6704,23 @@ async def _run_transcription_for_job(
             # passes can alter text/timing. Unselected variants remain in
             # their provider-specific cache/N-best artifacts.
             from line_evidence import annotate_provider_evidence
+            reference_used = (
+                bool(str(reference_lyrics or "").strip())
+                if content_reference_used is None
+                else bool(content_reference_used)
+            )
             frozen_segments = annotate_provider_evidence(
                 segments,
                 source=source,
                 content_source=(
-                    "catalog_reference" if str(reference_lyrics or "").strip()
+                    "catalog_reference" if reference_used
                     else source
                 ),
                 timing_source=source,
-                reference_text=reference_lyrics or None,
-                reference_id=f"{artist}:{title}" if reference_lyrics else None,
+                reference_text=reference_lyrics if reference_used else None,
+                reference_id=(
+                    f"{artist}:{title}" if reference_used else None
+                ),
             )
             deduped = _dedup_collisions(frozen_segments)
             if deduped and segments and len(deduped) != len(segments):
@@ -6800,6 +6814,10 @@ async def _run_transcription_for_job(
                 out["coverage_warning"] = True
             if extra:
                 out.update(extra)
+            if isinstance(_reference_attestation_state.get("report"), dict):
+                out["reference_attestation"] = dict(
+                    _reference_attestation_state["report"]
+                )
 
             # Cobertura contra el AUDIO en el punto de salida de la cascada.
             # Toda métrica previa se mide contra la letra de REFERENCIA y por
@@ -7305,6 +7323,67 @@ async def _run_transcription_for_job(
                     if _dropped:
                         logger.warning("[WC] dropped %d whisperX hallucination phrase(s)", _dropped)
 
+                # Catalogue text is a candidate, never truth by declaration.
+                # Compare it with clean audio-first WhisperX before it can own
+                # vocabulary or whole-song structure.  Default mode is OFF;
+                # `observe` exports metrics only, while `enforce` fails closed
+                # to raw WhisperX when the candidate lacks ASR support.
+                _reference_gate_mode = os.environ.get(
+                    "REFERENCE_ATTESTATION_MODE", "off"
+                ).strip().lower()
+                if _wx_segs and _canonical and _reference_gate_mode in {
+                    "observe", "enforce",
+                }:
+                    from reference_attestation import (
+                        assess_reference_attestation,
+                        reference_gate_action,
+                    )
+                    from timing_sources import WHISPERX as _WC_WX
+                    _reference_is_live = bool(
+                        live or _looks_live(title, filename)
+                    )
+                    _reference_report = assess_reference_attestation(
+                        _canonical,
+                        _wx_segs,
+                        reference_source="catalog_unverified",
+                        audio_duration_s=_audio_dur_for_lrc,
+                        is_live=_reference_is_live,
+                    )
+                    _reference_attestation_state["report"] = _reference_report
+                    logger.info(
+                        "[REFERENCE-ATTEST] mode=%s status=%s score=%.3f "
+                        "vocabulary=%s global=%s job=%s",
+                        _reference_gate_mode,
+                        _reference_report["text_status"],
+                        _reference_report["metrics"]["attestation_score"],
+                        _reference_report["allow_vocabulary_reconciliation"],
+                        _reference_report["allow_global_forced_alignment"],
+                        job_id,
+                    )
+                    _reference_action = reference_gate_action(
+                        _reference_report,
+                        mode=_reference_gate_mode,
+                        is_live=_reference_is_live,
+                    )
+                    if _reference_action == "audio_first":
+                        logger.warning(
+                            "[REFERENCE-ATTEST] catalogue candidate lacks "
+                            "safe text/structure attestation; "
+                            "emitting audio-first WhisperX without reference "
+                            "reconciliation job=%s",
+                            job_id,
+                        )
+                        return _emit_segments(
+                            _wx_segs,
+                            _WC_WX,
+                            reference_lyrics="",
+                            extra={
+                                "reference_candidate_rejected": True,
+                                "reference_gate_action": _reference_action,
+                                "reference_source": lyrics_source,
+                            },
+                        )
+
                 if _wx_segs:
                     from timing_sources import (
                         WHISPERX_RECONCILED as _WC_WX_REC,
@@ -7347,6 +7426,7 @@ async def _run_transcription_for_job(
                         )
                         return _emit_segments(
                             _wx_segs, _WC_WX, reference_lyrics=_canonical,
+                            content_reference_used=False,
                             extra={
                                 "live_audio_truth": True,
                                 "resolved_language": _live_language,
@@ -11150,6 +11230,17 @@ class ApproveJobRequest(BaseModel):
     notes: str = Field(default="", max_length=2048)
 
 
+class DeliveryQCIssueDecisionRequest(BaseModel):
+    decision: str = Field(pattern="^(acknowledged|rejected|resolved_manual)$")
+    reason: str = Field(default="", max_length=300)
+
+
+class DeliveryQCExternalResultRequest(BaseModel):
+    finding_count: int = Field(ge=0, le=10000)
+    report_id: str = Field(default="", max_length=160)
+    source: str = Field(default="umg", pattern="^[a-zA-Z0-9_-]{1,32}$")
+
+
 def _merge_content_validation_choice(
     render_params: dict | None,
     *,
@@ -11201,6 +11292,9 @@ class EditJobRequest(BaseModel):
     # segments_json before enqueueing. Each segment must have start (s),
     # end (s), text (str); anything else is ignored.
     segments: list[dict] | None = Field(default=None)
+    # Optional one-click Delivery QC repairs. IDs are server-issued and bound
+    # to the fresh report; arbitrary browser patches are never accepted.
+    delivery_qc_action_ids: list[str] = Field(default_factory=list, max_length=64)
     base_revision: int | None = Field(default=None, ge=0)
     editor_revision: int | None = Field(default=None, ge=0)
     editor_version_id: str | None = Field(default=None, max_length=36)
@@ -11369,6 +11463,18 @@ async def approve_job(
     if job.status != "pending_review":
         raise HTTPException(status_code=400, detail="Job is not pending review")
 
+    from delivery_qc_runtime import approval_gate, effective_delivery_qc_mode
+    _delivery_gate = approval_gate(job.delivery_qc, effective_delivery_qc_mode())
+    if _delivery_gate.get("blocked"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "delivery_qc_blocked",
+                "message": "El preflight de entrega tiene hallazgos pendientes.",
+                "delivery_qc": _delivery_gate,
+            },
+        )
+
     scene_plan = job.scene_plan if isinstance(job.scene_plan, dict) else {}
     approval_credits = (
         scenes_credit_cost() if scene_plan.get("scenes") is not None else 1
@@ -11425,6 +11531,18 @@ async def approve_job(
         ProductEvent.job_id == job_id,
         ProductEvent.name == "editor_approved",
     ).order_by(ProductEvent.created_at.desc()).first()
+    _qc_summary = dict((job.delivery_qc or {}).get("summary") or {})
+    db.add(ProductEvent(
+        tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job_id,
+        name="delivery_qc_approved",
+        properties={
+            "mode": str((job.delivery_qc or {}).get("mode") or "off"),
+            "decision": str((job.delivery_qc or {}).get("decision") or "missing"),
+            "open_count": int(_qc_summary.get("open_count") or 0),
+            "fail_count": int(_qc_summary.get("fail_count") or 0),
+            "warn_count": int(_qc_summary.get("warn_count") or 0),
+        },
+    ))
     db.commit()
 
     if learning_version is not None:
@@ -11458,6 +11576,106 @@ async def approve_job(
         pass
 
     return {"ok": True, "status": "done", "job_id": job_id}
+
+
+@app.post("/jobs/{job_id}/delivery-qc/issues/{issue_id}/decision")
+async def decide_delivery_qc_issue(
+    job_id: str,
+    issue_id: str,
+    body: DeliveryQCIssueDecisionRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Persist one reviewer decision; raw lyric text never enters telemetry."""
+    query = db.query(Job).filter(Job.job_id == job_id)
+    if current_user.get("role") != "admin":
+        query = query.filter(Job.tenant_id == current_user["tenant_id"])
+    job = query.with_for_update().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    report = dict(job.delivery_qc or {})
+    if report.get("status") != "COMPLETE":
+        raise HTTPException(status_code=409, detail="delivery_qc_report_stale")
+    found = None
+    issues = []
+    status_map = {
+        "acknowledged": "ACKNOWLEDGED",
+        "rejected": "REJECTED",
+        "resolved_manual": "RESOLVED_MANUAL",
+    }
+    for raw in report.get("issues") or []:
+        row = dict(raw)
+        if str(row.get("issue_id")) == issue_id:
+            found = row
+            row["status"] = status_map[body.decision]
+            row["operator_decision"] = {
+                "decision": body.decision, "reason": body.reason,
+                "user_id": current_user["id"],
+                "decided_at": datetime.now(timezone.utc).isoformat(),
+            }
+        issues.append(row)
+    if found is None:
+        raise HTTPException(status_code=404, detail="delivery_qc_issue_not_found")
+    report["issues"] = issues
+    open_rows = [row for row in issues if row.get("status") == "OPEN"]
+    report["summary"] = {
+        **dict(report.get("summary") or {}),
+        "open_count": len(open_rows),
+        "fail_count": sum(row.get("severity") == "FAIL" for row in open_rows),
+        "warn_count": sum(row.get("severity") == "WARN" for row in open_rows),
+    }
+    from delivery_qc_runtime import approval_gate, effective_delivery_qc_mode
+    report["approval"] = approval_gate(report, effective_delivery_qc_mode())
+    job.delivery_qc = report
+    db.add(ProductEvent(
+        tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job_id,
+        name="delivery_qc_issue_decision",
+        properties={
+            "issue_id": issue_id, "decision": body.decision,
+            "code": str(found.get("code") or "unknown"),
+            "category": str(found.get("category") or "unknown"),
+            "severity": str(found.get("severity") or "unknown"),
+        },
+    ))
+    db.add(AuditLog(
+        user_id=current_user["id"], action="delivery_qc.issue_decision",
+        detail={"job_id": job_id, "issue_id": issue_id, "decision": body.decision},
+    ))
+    db.commit()
+    return {"ok": True, "delivery_qc": report}
+
+
+@app.post("/jobs/{job_id}/delivery-qc/external-result")
+async def record_delivery_qc_external_result(
+    job_id: str,
+    body: DeliveryQCExternalResultRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Record label QC outcome so 'zero external findings' is measurable."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    report = dict(job.delivery_qc or {})
+    history = list(report.get("external_results") or [])
+    result = {
+        "source": body.source, "report_id": body.report_id,
+        "finding_count": body.finding_count,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "recorded_by": current_user["id"],
+    }
+    history.append(result)
+    report["external_results"] = history[-20:]
+    job.delivery_qc = report
+    db.add(ProductEvent(
+        tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job_id,
+        name="delivery_qc_external_result",
+        properties={"source": body.source, "finding_count": body.finding_count},
+    ))
+    db.commit()
+    return {"ok": True, "external_result": result}
 
 
 @app.post("/reject/{job_id}")
@@ -11967,6 +12185,11 @@ def _invalidate_quality_after_editor_save(
         *(current.get("unsafe_windows") or []),
         *_editor_changed_windows(previous_segments or [], segments),
     ]
+    if isinstance(getattr(job, "delivery_qc", None), dict):
+        from delivery_qc_runtime import mark_delivery_qc_stale
+        job.delivery_qc = mark_delivery_qc_stale(
+            job.delivery_qc, revision=revision, reason="editor_segments_changed",
+        )
     return supersede_pending_analysis(
         current, revision=revision, segments=segments,
     ) or current
@@ -14050,6 +14273,26 @@ async def request_edit(
     job = _edit_q.with_for_update().first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    _delivery_qc_actions: list[dict] = []
+    if body.delivery_qc_action_ids:
+        report = job.delivery_qc if isinstance(job.delivery_qc, dict) else {}
+        if report.get("status") != "COMPLETE" or int(report.get("segments_revision") or -1) != int(job.segments_revision or 0):
+            raise HTTPException(status_code=409, detail="delivery_qc_report_stale")
+        indexed = {
+            str(row.get("action_id")): row
+            for row in ((report.get("repairs") or {}).get("actions") or [])
+            if isinstance(row, dict)
+        }
+        missing = [value for value in body.delivery_qc_action_ids if value not in indexed]
+        if missing:
+            raise HTTPException(status_code=400, detail={"code": "delivery_qc_action_unknown", "action_ids": missing})
+        _delivery_qc_actions = [indexed[value] for value in body.delivery_qc_action_ids]
+        if any(row.get("status") != "APPLIED" for row in _delivery_qc_actions):
+            raise HTTPException(status_code=400, detail="delivery_qc_action_not_safe")
+        allowed_domain = {"lyrics": {"text", "timing"}, "metadata": {"metadata"}}.get(body.edit_type, set())
+        if any(row.get("domain") not in allowed_domain for row in _delivery_qc_actions):
+            raise HTTPException(status_code=400, detail="delivery_qc_action_wrong_edit_type")
     _audit_cross_tenant_access(db, current_user, job, "edit", commit=False)
     if job.status == "editing":
         raise HTTPException(
@@ -14705,6 +14948,21 @@ async def request_edit(
         job.completed_at = None
 
     # Flip to editing immediately so the UI can show progress.
+    if isinstance(job.delivery_qc, dict):
+        from delivery_qc_runtime import mark_delivery_qc_stale
+        _qc = dict(job.delivery_qc)
+        accepted = set(body.delivery_qc_action_ids)
+        if accepted:
+            repairs = dict(_qc.get("repairs") or {})
+            repairs["actions"] = [
+                {**row, "operator_status": "ACCEPTED_PENDING_RERENDER"}
+                if str(row.get("action_id")) in accepted else row
+                for row in repairs.get("actions") or []
+            ]
+            _qc["repairs"] = repairs
+        job.delivery_qc = mark_delivery_qc_stale(
+            _qc, revision=int(job.segments_revision or 0), reason="edit_render_pending",
+        )
     job.status = "editing"
     job.edit_count = new_edit_count
     # Both typography and lyrics edits jump straight into the video
@@ -14760,6 +15018,18 @@ async def request_edit(
             "tenant_id": current_user.get("tenant_id", ""),
         },
     )
+    for _qc_action in _delivery_qc_actions:
+        db.add(ProductEvent(
+            tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job_id,
+            name="delivery_qc_action_decision",
+            properties={
+                "decision": "accepted",
+                "action_id": str(_qc_action.get("action_id") or ""),
+                "domain": str(_qc_action.get("domain") or "unknown"),
+                "code": str(_qc_action.get("code") or "unknown"),
+                "confidence": float(_qc_action.get("confidence") or 0),
+            },
+        ))
     # HOTFIX F1 2026-05-27 (audit): the pre-edit capture moved UP to
     # before the in-memory mutation (search "_pre_edit_artist =" above).
     # The old capture here was a no-op because it read AFTER the
