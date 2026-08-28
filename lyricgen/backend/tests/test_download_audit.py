@@ -66,7 +66,10 @@ def _mock_r2(monkeypatch, *, exists=True):
     import storage
     signed_url_calls = []
 
-    def _signed_url(key, expiry_seconds=3600, download_filename=None):
+    def _signed_url(
+        key, expiry_seconds=3600, download_filename=None,
+        response_content_type=None,
+    ):
         signed_url_calls.append((key, expiry_seconds, download_filename))
         return f"https://r2.fake/{key}?sig=ok"
 

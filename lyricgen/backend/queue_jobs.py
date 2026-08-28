@@ -811,13 +811,6 @@ def enqueue_transcription(
     aparte. Si en el futuro la cola se acumula y un tenant grande está
     bloqueado, mover la decisión de queue acá.
     """
-    # Tenants de un solo idioma (UMG Chile = siempre español) fijan el idioma
-    # acá para que WhisperX no lo auto-detecte mal y envenene la cache de
-    # transcripción con `en` (incidente 2026-08-12, Sebastián/UMG Chile).
-    # Aplica al path real del frontend (enqueue → ShortWorker).
-    from transcription_language import forced_language_for_tenant
-    language = forced_language_for_tenant(tenant_id, language)
-
     _require_submissions_open()
     _, q_default, _ = _init_redis()
     if q_default is not None:

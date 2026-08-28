@@ -99,12 +99,58 @@ OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
 BACKGROUNDS_DIR = os.path.join(ASSETS_DIR, "backgrounds")
 
 
+# ---------------------------------------------------------------------------
+# Spotify Canvas
+# ---------------------------------------------------------------------------
+# Spec (support.spotify.com/artists, verificado 2026-08-27): 9:16 vertical,
+# 3-8 segundos, MP4 SIN pista de audio, y Spotify lo loopea solo en la vista
+# Now Playing de la app móvil. La guía de Spotify escribe el tamaño como
+# "between 720px - 1080px tall", que se lee como el lado CORTO: el rango que
+# todo el mundo entrega es 720x1280 a 1080x1920. Vamos al techo, que además
+# es exactamente lo que el short vertical ya produce, así la matemática de
+# crop es la misma y compartimos `_prepare_short_bg`/`_cover_resize`.
+CANVAS_WIDTH = 1080
+CANVAS_HEIGHT = 1920
+CANVAS_FPS = 30
+# El clip se arma como una UNIDAD de 4s que después se palindromea, así que
+# el total cae en 8,000s exactos: el máximo que Spotify acepta (rechaza
+# cualquier cosa por encima) y el ciclo más largo posible antes de repetir.
+# 4s no es casual: es el `VEO_CLIP_SECONDS` que ya corre en producción, o sea
+# el fondo Veo entra entero en la unidad sin recortar nada.
+CANVAS_UNIT_SECONDS = 4.0
+CANVAS_SECONDS = CANVAS_UNIT_SECONDS * 2
+_CANVAS_STILL_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+# Spotify mide que AGREGAR O REFRESCAR el Canvas mejora las compartidas, así
+# que el formato premia rotarlo por fase de campaña. Las variantes salen del
+# MISMO fondo moviendo el encuadre horizontal: un 16:9 escalado a 1920 de alto
+# mide ~3413 de ancho y recortamos 1080, o sea sobra muchísimo lado. Izquierda,
+# centro y derecha son tres composiciones genuinamente distintas, no el mismo
+# plano con un filtro encima. Costo marginal: otra pasada de ffmpeg, cero IA.
+CANVAS_VARIANTS = 3
+_CANVAS_VARIANT_ANCHORS = {1: 0.5, 2: 0.15, 3: 0.85}
+
+
+def canvas_file_type(variant: int) -> str:
+    """`canvas` para la variante 1, `canvas_vN` para el resto.
+
+    La 1 conserva el nombre pelado a propósito: es la que ya existía antes de
+    las variantes, y renombrarla habría dejado huérfanos los `s3_keys` de los
+    jobs ya renderizados.
+    """
+    return "canvas" if variant == 1 else f"canvas_v{variant}"
+
+
+CANVAS_FILE_TYPES = tuple(canvas_file_type(v) for v in range(1, CANVAS_VARIANTS + 1))
+
+
 _DELIVERABLE_FILENAMES = {
     "video": "lyric_video.mp4",
     "short": "short.mp4",
     "thumbnail": "thumbnail.jpg",
     "umg_master": "umg_master.mov",
     "umg_short": "umg_short.mov",
+    # canvas, canvas_v2, canvas_v3 — ver CANVAS_FILE_TYPES.
+    **{ft: f"{ft}.mp4" for ft in CANVAS_FILE_TYPES},
 }
 
 
@@ -459,6 +505,9 @@ def _verify_deliverables(job_dir: str, files: dict, audio_duration: float) -> No
     expected = {
         "video_url":      ("lyric_video.mp4", "h264", audio_duration),
         "short_url":      ("short.mp4",        "h264", None),  # short is a fixed clip, not full audio
+        # El canvas es un loop de 8s sin audio: se valida el codec para
+        # atajar un archivo truncado, pero nunca contra la duración del tema.
+        **{f"{ft}_url": (f"{ft}.mp4", "h264", None) for ft in CANVAS_FILE_TYPES},
         "thumbnail_url":  ("thumbnail.jpg",   None,   None),
         # umg_master is generated lazily at download time via ffmpeg from
         # the MP4 above (see /download/{id}/umg_master). It does NOT
@@ -518,10 +567,14 @@ def _cleanup_local_intermediates(job_dir: str) -> None:
                 os.unlink(path)
             except OSError:
                 pass
-    # Also drop any per-spec looped backgrounds (bg_looped_*.mp4)
+    # Also drop any per-spec looped backgrounds (bg_looped_*.mp4) and the
+    # Canvas palindrome unit (canvas_unit_*.mp4). generate_canvas ya lo borra
+    # en un `finally`, pero un worker muerto ENTRE las dos pasadas lo dejaría:
+    # el glob es el mismo cinturón que usa el palíndromo del fondo.
     try:
         for entry in os.listdir(job_dir):
-            if entry.startswith("bg_looped_") and entry.endswith(".mp4"):
+            if (entry.startswith("bg_looped_")
+                    or entry.startswith("canvas_unit_")) and entry.endswith(".mp4"):
                 try:
                     os.unlink(os.path.join(job_dir, entry))
                 except OSError:
@@ -627,7 +680,8 @@ def _rescue_master_before_cleanup(job_id: str, job_dir: str) -> bool:
 
 
 # Entregables SECUNDARIOS: su fallo degrada la entrega, nunca la cancela.
-_ACCESSORY_ARTIFACTS = {"short": "short.mp4", "thumbnail": "thumbnail.jpg"}
+_ACCESSORY_ARTIFACTS = {"short": "short.mp4", "thumbnail": "thumbnail.jpg",
+                        **{ft: f"{ft}.mp4" for ft in CANVAS_FILE_TYPES}}
 
 
 def _accessory_failed(kind: str, job_id: str, job_dir: str, exc: BaseException) -> None:
@@ -1480,6 +1534,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             library_asset_id=variation_parent_asset_id,
         )
         _background_is_deterministic_fallback = False
+        # Telemetría del corrector de deriva de cámara (_correct_camera_drift).
+        # Se persiste en render_params más abajo: si a la foto del operador hubo
+        # que recortarle un borde para clavar la cámara, eso tiene que quedar
+        # dicho en el job y no sólo en un log.
+        _bg_drift_meta: dict = {}
         # ¿La animación que pidió el operador terminó degradada a imagen fija?
         # Hasta ahora esto se perdía en un logger.warning: el operador pedía
         # animar su foto, Veo fallaba, se entregaba un zoom lento y no había
@@ -1692,6 +1751,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         effect=effect,
                         allow_people=_compute_allow_people(job_id, background_hint),
                         audio_duration=_audio_dur_for_kb,
+                        out_meta=_bg_drift_meta,
                     )
                 except RQJobTimeoutException:
                     raise
@@ -1762,6 +1822,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "effect": effect,
             "match_lyrics": match_lyrics,
             "background_ai_generated": _background_is_ai_generated,
+            # Deriva de cámara del clip de Veo y si se corrigió. Sólo presente
+            # cuando el corrector efectivamente corrió (fondo i2v, o estatico
+            # con BG_STABILIZE_STATIC): un `.get()` que devuelve None significa
+            # "no se midió", que es distinto de "no se movió".
+            **({"camera_drift_pct": _bg_drift_meta["camera_drift_pct"],
+                "camera_drift_corrected": _bg_drift_meta["camera_drift_corrected"]}
+               if "camera_drift_pct" in _bg_drift_meta else {}),
             # Title-card customization (Full Rotor v1). Safe defaults, always
             # persisted so future edits/retries inherit the operator's choice.
             "title_template": title_template,
@@ -2299,6 +2366,27 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 _accessory_failed("short", job_id, job_dir, _short_err)
                 missing_deliverables.append("short")
             update_job(job_id, progress=85)
+
+            # Step 3b — Canvas de Spotify (1080x1920, 8s, loop sin costura,
+            # sin audio). Accesorio como el short: sale del MISMO bg_source
+            # que ya se pagó para el master, así que no dispara ninguna
+            # llamada de IA. Art tracks incluidos: ahí el bg_source es la
+            # portada y el push suave del still es un Canvas válido.
+            if _job_owner_is_admin(job_id):
+                update_job(job_id, current_step="canvas", progress=88)
+                for _v in range(1, CANVAS_VARIANTS + 1):
+                    _ft = canvas_file_type(_v)
+                    try:
+                        generate_canvas(bg_source, job_dir, effect=effect, variant=_v)
+                        files[f"{_ft}_url"] = f"/download/{job_id}/{_ft}"
+                    except Exception as _canvas_err:
+                        # Cada variante falla sola: perder la 2 no puede
+                        # llevarse la 1. Y NINGUNA va a missing_deliverables —
+                        # el Canvas es admin-only y opcional, su ausencia no es
+                        # una entrega degradada para el cliente.
+                        _accessory_failed(_ft, job_id, job_dir, _canvas_err)
+            else:
+                logger.info("[CANVAS] job=%s no es de un admin — no se genera", job_id)
 
             # Step 4 — Thumbnail (art tracks reuse the composite look so the
             # thumbnail matches what plays; lyric videos keep the raw bg).
@@ -12335,6 +12423,356 @@ def _measure_camera_drift(video_path: str, samples: int = 30) -> dict | None:
                 pass
 
 
+# Umbral inferior: por debajo de esto la cámara ya está clavada y corregir sólo
+# agregaría un recorte y un reencode. Calibrado contra la medición de los
+# fondos `estatico` de staging (25-jul-2026): los 6 clips de cámara fija dieron
+# ≤0,03% del ancho, el push-in real 5,9%.
+_CAMERA_DRIFT_CORRECT_MIN_PCT = 0.5
+# Umbral superior: corregir un paneo grande cuesta recortar ese mismo % del
+# encuadre. A 27-30% (los dos peores casos medidos en staging) el recorte
+# destruye más de lo que arregla, así que ahí NO se toca: se loguea y se deja
+# pasar para que lo resuelva un re-roll (PR aparte). Es un corrector de deriva
+# fina, no un salvavidas de clips arruinados.
+_CAMERA_DRIFT_CORRECT_MAX_PCT = 8.0
+
+
+def _estimate_camera_track(video_path: str, samples: int = 30):
+    """Trayectoria de la cámara respecto del PRIMER frame: [(t, scale, tx, ty)].
+
+    Complementa `_measure_camera_drift`, que responde "¿cuánto se movió?" con un
+    solo número. Para CORREGIR hace falta el modelo completo — cuánto zoom y
+    cuánta traslación, en cada instante — así que acá se estima una similitud
+    (escala + traslación) por frame muestreado.
+
+    Cómo se separa zoom de paneo con el mismo estimador de traslación que ya
+    existe: bajo `p → s·(p − c) + c + t`, el desplazamiento de un punto depende
+    de su distancia al centro, `d(y) = (s−1)·(y − h/2) + ty`. Midiendo las
+    franjas OPUESTAS por separado, la DIFERENCIA entre ellas aísla la escala y
+    el PROMEDIO aísla la traslación:
+
+        s − 1 = (d_abajo − d_arriba) / (h − banda)      ty = (d_arriba + d_abajo) / 2
+
+    Un zoom puro centrado mueve las franjas en sentidos opuestos (promedio ~0,
+    diferencia grande); un paneo puro las mueve juntas (diferencia ~0). Por eso
+    un `_estimate_shift` global sobre el frame entero —que es lo que mide la
+    función de medición— ve un push-in centrado como ~0 de traslación: hay que
+    mirar los bordes.
+
+    Se usan las franjas de borde por la misma razón que `_measure_camera_drift`:
+    son el ancla más estática que tiene un plano fijo cuyo interior está
+    DISEÑADO para moverse (follaje, agua, nubes). Y se mide siempre contra el
+    frame 0, no contra el anterior, para no perder derivas lentas por
+    cuantización acumulada.
+
+    Devuelve None (fail-open) ante cualquier problema: esto jamás debe tumbar
+    un fondo.
+    """
+    tmpdir = None
+    try:
+        import numpy as _np
+        import tempfile as _tf
+        from PIL import Image as _Img
+
+        tmpdir = _tf.mkdtemp(prefix="track_")
+        pattern = os.path.join(tmpdir, "f_%03d.png")
+        run_checked(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path,
+             "-vf", "fps=3,scale=320:180", "-frames:v", str(samples), pattern],
+            label="ffmpeg-track-frames",
+            timeout=120,
+        )
+        files = sorted(f for f in os.listdir(tmpdir) if f.endswith(".png"))
+        if len(files) < 3:
+            return None
+
+        frames = []
+        for name in files:
+            with _Img.open(os.path.join(tmpdir, name)) as im:
+                frames.append(_np.asarray(im.convert("L"), dtype=_np.float64))
+
+        h, w = frames[0].shape
+        full_window = _np.outer(_np.hanning(h), _np.hanning(w))
+
+        def _predict(frame0, s, tx, ty):
+            """Predice el frame i aplicando (s,tx,ty) HACIA ADELANTE al frame 0.
+
+            La dirección importa. Alinear el frame i de vuelta al 0 exigiría
+            píxeles de afuera del cuadro —los que un zoom-in se comió, que Veo
+            nunca generó—, así que sólo se puede ir para este lado: invertir
+            `q = s·(p−c)+c+t` da `p = (q−c−t)/s + c`, y para s ≥ 1 ese rango cae
+            siempre DENTRO del frame 0.
+            """
+            c_x, c_y = w / 2.0, h / 2.0
+            x0 = (0.0 - c_x - tx) / s + c_x
+            x1 = (float(w) - c_x - tx) / s + c_x
+            y0 = (0.0 - c_y - ty) / s + c_y
+            y1 = (float(h) - c_y - ty) / s + c_y
+            if x1 - x0 < 8 or y1 - y0 < 8:
+                return None
+            if x0 < -1 or y0 < -1 or x1 > w + 1 or y1 > h + 1:
+                return None
+            return _np.asarray(
+                _Img.fromarray(frame0.astype(_np.uint8)).resize(
+                    (w, h), _Img.BILINEAR,
+                    box=(max(0.0, x0), max(0.0, y0),
+                         min(float(w), x1), min(float(h), y1))),
+                dtype=_np.float64,
+            )
+
+        # Región interior para comparar: los bordes del frame predicho vienen de
+        # extrapolar/clampear el box y siempre difieren, así que puntuarlos
+        # sesga la búsqueda hacia "no hubo zoom".
+        my, mx = max(4, h // 8), max(4, w // 8)
+
+        def _residual(frame0, target, s, tx, ty):
+            pred = _predict(frame0, s, tx, ty)
+            if pred is None:
+                return None
+            return float(_np.abs(pred - target)[my:-my, mx:-mx].mean())
+
+        def _fit(frame0, target):
+            """(escala, tx, ty) por búsqueda directa sobre el frame COMPLETO.
+
+            Por qué no se despeja la escala de las franjas de borde (que sería
+            más barato y fue el primer intento): sobre contenido real
+            SUBESTIMA. Contra el clip sintético de zoom-in 1,0400 daba 1,0368,
+            pero contra el clip real de Veo —con follaje y luz moviéndose dentro
+            de la escena— daba 1,0260 donde la deriva real era 1,0325, y esa
+            diferencia se ve: corregida con 1,026 la mesa y la guitarra seguían
+            marcadas en el mapa de diferencias. El movimiento propio de la
+            escena contamina las franjas y las arrastra hacia "no se movió".
+            La búsqueda directa usa TODOS los píxeles, así que ese movimiento
+            local queda diluido en vez de dominar.
+
+            Grueso-a-fino sobre un solo parámetro (la escala), con la traslación
+            resuelta por correlación de fase para cada candidato: es un espacio
+            de búsqueda chico y los frames son de 320x180, así que cuesta
+            milisegundos.
+            """
+            best = (1.0, 0.0, 0.0, _residual(frame0, target, 1.0, 0.0, 0.0))
+            if best[3] is None:
+                return None
+            grid = [(_np.arange(0.970, 1.1001, 0.005)), None]
+            for stage in range(2):
+                if stage == 1:
+                    c = best[0]
+                    grid[1] = _np.arange(c - 0.006, c + 0.0061, 0.001)
+                for s in grid[stage]:
+                    s = float(s)
+                    if s <= 0:
+                        continue
+                    pred = _predict(frame0, s, 0.0, 0.0)
+                    if pred is None:
+                        continue
+                    # Traslación residual para ESTA escala. `_estimate_shift`
+                    # devuelve la transformación inversa, de ahí el signo.
+                    dx, dy = _estimate_shift(pred, target, full_window)
+                    tx, ty = -float(dx) * s, -float(dy) * s
+                    r = _residual(frame0, target, s, tx, ty)
+                    if r is not None and r < best[3]:
+                        best = (s, tx, ty, r)
+            return best[0], best[1], best[2]
+
+        track = [(0.0, 1.0, 0.0, 0.0)]
+        for i in range(1, len(frames)):
+            fit = _fit(frames[0], frames[i])
+            if fit is None:
+                track.append((i / float(len(frames) - 1), 1.0, 0.0, 0.0))
+                continue
+            s, tx, ty = fit
+            track.append((
+                i / float(len(frames) - 1),
+                float(s),
+                float(tx) / float(w),
+                float(ty) / float(h),
+            ))
+        return track
+    except Exception as e:
+        _raise_if_job_timeout(e)
+        logger.warning("[BG][DRIFT] estimación de trayectoria falló (fail-open): %s", e)
+        return None
+    finally:
+        if tmpdir:
+            try:
+                import shutil as _sh
+                _sh.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+def _correct_camera_drift(video_path: str, job_id: str | None = None) -> dict | None:
+    """Cancela el movimiento de cámara de un clip reencuadrándolo. In-place.
+
+    Existe porque Veo ignora el "locked camera" del prompt bastante seguido y NO
+    expone ningún parámetro para forzarlo (`veo_params` sólo lleva aspectRatio,
+    sampleCount, generateAudio y durationSeconds): pedirlo por texto es el único
+    lever, y ya se pide dos veces —al principio y al final del prompt— sin que
+    alcance. Así que en vez de seguir negociando con el modelo, se mide lo que
+    devolvió y se deshace.
+
+    Cómo: si la cámara se acercó un 3%, todos los frames menos el primero
+    muestran un recorte más chico de la escena. NO se puede "alejar" el último
+    frame —esos píxeles nunca se generaron—, así que se hace al revés: se
+    recorta TODA la serie al rectángulo que es visible en todos los frames y se
+    lo reescala a la resolución original. Todos los frames pasan a mostrar
+    exactamente la misma región del mundo, o sea cámara clavada. El movimiento
+    DENTRO de la escena (follaje, luz, agua) queda intacto: sólo se cancela la
+    componente global.
+
+    El precio, y por qué está acotado: ese rectángulo común es más chico que el
+    encuadre original, justo en la magnitud de la deriva. A 3% es un borde fino;
+    a 27% (el peor caso medido en staging) sería mutilar el plano, y por eso
+    `_CAMERA_DRIFT_CORRECT_MAX_PCT` deja pasar esos clips sin tocarlos — un
+    paneo grande se arregla re-rolleando, no recortando.
+
+    Para el fondo de una foto SUBIDA por el operador esto es además una cuestión
+    de fidelidad y no sólo de estética: el arte lo aprobó el sello, y un push-in
+    significa entregar ese arte progresivamente recortado. Corrigiéndolo el
+    recorte pasa a ser uniforme y conocido en vez de una deriva.
+
+    Devuelve {"corrected", "crop_pct", "reason"} o None si falla (fail-open:
+    ante cualquier error se deja el clip como vino).
+    """
+    tmp_out = None
+    try:
+        import numpy as _np
+        from PIL import Image as _Img
+
+        track = _estimate_camera_track(video_path)
+        if not track or len(track) < 3:
+            return None
+
+        probe = run_checked(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            label="ffprobe-drift-dims",
+            timeout=30,
+        )
+        parts = [p for p in (probe.stdout or "").split() if p]
+        if len(parts) < 3:
+            return None
+        W, H = int(parts[0]), int(parts[1])
+        num, _, den = parts[2].partition("/")
+        fps = float(num) / float(den or 1)
+
+        # Rectángulo común: el más grande, centrado, que sigue DENTRO del cuadro
+        # en todos los frames de la trayectoria. Despejado de
+        # `s·(±a) + W/2 + tx·W ∈ [0, W]` → `a ≤ (W/2 − |tx|·W) / s`.
+        half_w, half_h = W / 2.0, H / 2.0
+        for _, s, tx, ty in track:
+            if s <= 0:
+                return None
+            half_w = min(half_w, (W / 2.0 - abs(tx) * W) / s)
+            half_h = min(half_h, (H / 2.0 - abs(ty) * H) / s)
+        half_w = min(half_w, W / 2.0)
+        half_h = min(half_h, H / 2.0)
+        if half_w <= 1 or half_h <= 1:
+            return {"corrected": False, "crop_pct": 100.0, "reason": "degenerate"}
+
+        crop_pct = round(100.0 * max(1.0 - half_w / (W / 2.0),
+                                     1.0 - half_h / (H / 2.0)), 2)
+
+        if crop_pct < _CAMERA_DRIFT_CORRECT_MIN_PCT:
+            return {"corrected": False, "crop_pct": crop_pct, "reason": "already_locked"}
+        if crop_pct > _CAMERA_DRIFT_CORRECT_MAX_PCT:
+            logger.warning(
+                "[BG][DRIFT] job=%s deriva %.2f%% > %.1f%% — NO se corrige "
+                "(el recorte costaría más que el paneo); clip entregado tal cual",
+                job_id, crop_pct, _CAMERA_DRIFT_CORRECT_MAX_PCT,
+            )
+            return {"corrected": False, "crop_pct": crop_pct, "reason": "drift_too_large"}
+
+        ts = [t for t, _, _, _ in track]
+        ss = [s for _, s, _, _ in track]
+        txs = [tx for _, _, tx, _ in track]
+        tys = [ty for _, _, _, ty in track]
+
+        tmp_out = video_path + ".stab.mp4"
+        dec = subprocess.Popen(
+            ["ffmpeg", "-v", "error", "-i", video_path,
+             "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+            stdout=subprocess.PIPE,
+        )
+        enc = subprocess.Popen(
+            ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+             "-s", f"{W}x{H}", "-r", f"{fps:.6f}", "-i", "-",
+             "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p", tmp_out],
+            stdin=subprocess.PIPE,
+        )
+        frame_bytes = W * H * 3
+        # Los frames se procesan de a uno en streaming: cargar el clip entero en
+        # RAM fue exactamente el OOM que mató un worker con el Ken Burns por
+        # moviepy (incidente "Rata Blanca" 2026-06-02).
+        n_total = 0
+        try:
+            while True:
+                buf = dec.stdout.read(frame_bytes)
+                if not buf or len(buf) < frame_bytes:
+                    break
+                n_total += 1
+        finally:
+            dec.stdout.close()
+            dec.wait()
+        if n_total < 2:
+            enc.stdin.close()
+            enc.wait()
+            return None
+
+        dec = subprocess.Popen(
+            ["ffmpeg", "-v", "error", "-i", video_path,
+             "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+            stdout=subprocess.PIPE,
+        )
+        try:
+            idx = 0
+            while True:
+                buf = dec.stdout.read(frame_bytes)
+                if not buf or len(buf) < frame_bytes:
+                    break
+                u = idx / float(n_total - 1)
+                s = float(_np.interp(u, ts, ss))
+                tx = float(_np.interp(u, ts, txs)) * W
+                ty = float(_np.interp(u, ts, tys)) * H
+                # Dónde cae, EN ESTE frame, el rectángulo común definido en
+                # coordenadas del frame 0.
+                x0 = s * (-half_w) + W / 2.0 + tx
+                x1 = s * (half_w) + W / 2.0 + tx
+                y0 = s * (-half_h) + H / 2.0 + ty
+                y1 = s * (half_h) + H / 2.0 + ty
+                box = (max(0.0, x0), max(0.0, y0), min(float(W), x1), min(float(H), y1))
+                arr = _np.frombuffer(buf, dtype=_np.uint8).reshape(H, W, 3)
+                im = _Img.fromarray(arr).resize((W, H), _Img.LANCZOS, box=box)
+                enc.stdin.write(im.tobytes())
+                idx += 1
+        finally:
+            dec.stdout.close()
+            dec.wait()
+            enc.stdin.close()
+            enc.wait()
+
+        if enc.returncode != 0 or not os.path.exists(tmp_out) or os.path.getsize(tmp_out) == 0:
+            return None
+        os.replace(tmp_out, video_path)
+        tmp_out = None
+        logger.info(
+            "[BG][DRIFT] job=%s cámara estabilizada — deriva %.2f%% cancelada "
+            "(recorte uniforme del %.2f%%, %s frames)",
+            job_id, crop_pct, crop_pct, n_total,
+        )
+        return {"corrected": True, "crop_pct": crop_pct, "reason": "stabilized"}
+    except Exception as e:
+        _raise_if_job_timeout(e)
+        logger.warning("[BG][DRIFT] corrección falló (fail-open, clip intacto): %s", e)
+        return None
+    finally:
+        if tmp_out and os.path.exists(tmp_out):
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
+
+
 def _score_video_relevance(
     video_path: str, prompt: str, job_id: str | None = None,
 ) -> int:
@@ -13968,6 +14406,38 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                         )
                 except Exception:
                     pass
+            # Cámara clavada, garantizada acá y no en el prompt (2026-08-26).
+            #
+            # El prompt ya pide "camera completely LOCKED" DOS veces —char 199 y
+            # char 2201 de 2324, o sea en las dos posiciones de máxima atención—
+            # y Veo lo ignora igual: el fondo de "Tu Cárcel" (Universal) salió
+            # con un push-in del 3,3%. No hay parámetro de API para forzarlo, así
+            # que en vez de seguir reescribiendo el prompt se mide lo que
+            # devolvió y se deshace. Determinístico, sin otra llamada a Veo y sin
+            # tocar la escena — a diferencia de un re-roll, que re-deriva el
+            # prompt y cambia el fondo entero ("me cambió todo").
+            #
+            # Se corre acá y no dentro del loop a propósito: sólo sobre el clip
+            # ACEPTADO. Estabilizar un candidato que después se descarta por
+            # score o por corte de escena es trabajo tirado.
+            #
+            # Alcance: SIEMPRE para la foto subida por el operador (i2v), porque
+            # ahí la deriva no es sólo estética — recorta progresivamente un arte
+            # que aprobó el sello. Para los fondos `estatico` generados por IA
+            # queda detrás de flag y apagado por default: la decisión de
+            # 2026-07-25 fue medir antes de actuar, y este PR no la revierte de
+            # prepo.
+            _stabilize = _i2v_animate or (
+                _norm_move_bg in {"estatico", "foto-estatica"}
+                and os.environ.get("BG_STABILIZE_STATIC", "").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            if _stabilize:
+                _corr = _correct_camera_drift(bg_path, job_id=job_id)
+                if _corr and out_meta is not None:
+                    out_meta["camera_drift_pct"] = _corr["crop_pct"]
+                    out_meta["camera_drift_corrected"] = bool(_corr["corrected"])
+                    out_meta["camera_drift_reason"] = _corr["reason"]
             return bg_path
         except RQJobTimeoutException:
             # Real RQ death-penalty timeout — propagate (don't degrade to
@@ -17980,6 +18450,182 @@ def generate_art_track_short(
     return out_path
 
 
+def _job_owner_is_admin(job_id: str) -> bool:
+    """True sólo si el dueño del job es admin.
+
+    El Canvas es admin-only (decisión de producto 27-ago-2026). Se resuelve
+    acá, en el worker, y no sólo en los endpoints, por dos razones: no gastar
+    CPU ni storage de R2 en un archivo que nadie va a poder descargar, y que
+    un job de otro tenant no quede con un entregable fantasma en `s3_keys`.
+
+    FAIL-CLOSED a propósito: si la consulta falla, NO se produce el Canvas.
+    Es un accesorio — perderlo no le hace nada a la entrega, mientras que
+    producirlo de más filtra una feature que no debería existir para ese
+    usuario.
+    """
+    try:
+        from database import SessionLocal, Job, User
+        db = SessionLocal()
+        try:
+            row = (db.query(User.role)
+                     .join(Job, Job.user_id == User.id)
+                     .filter(Job.job_id == job_id)
+                     .first())
+            return bool(row) and row[0] == "admin"
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("[CANVAS] no se pudo resolver el rol del dueño de job=%s "
+                       "(%s) — no se genera el Canvas", job_id, exc)
+        return False
+
+
+def generate_canvas(
+    bg_source: str | None,
+    job_dir: str,
+    *,
+    effect: str = "",
+    variant: int = 1,
+    out_name: str | None = None,
+) -> str:
+    """Render the Spotify Canvas (1080x1920, 8,000s exactos, loop sin costura,
+    SIN pista de audio) a partir del fondo que el job ya tiene en disco.
+
+    No genera nada nuevo: reusa el mismo `bg_source` que alimentó al master y
+    al short. Para un job con fondo Veo eso es el clip de 4s ya pagado; para
+    uno de foto fija es la imagen, que se mueve con un push suave; para un art
+    track es la portada. En los tres casos el costo marginal de IA es CERO.
+
+    DOS PASADAS, y el orden importa por la misma razón que en
+    `_prerender_looped_bg` (bug 2026-08-21): el `-t` va como opción de SALIDA.
+    Un input con `-stream_loop -1` nunca da EOF, y `reverse` necesita EOF para
+    emitir aunque sea un frame. Por eso la pasada 1 escribe una unidad ACOTADA
+    en disco y recién la pasada 2 la palindromea.
+
+    El palíndromo es el corazón del producto: Spotify repite el loop cada 8
+    segundos, así que un corte visible se ve decenas de veces por escucha. Un
+    `-stream_loop` pelado salta del último frame al primero y eso se nota.
+    """
+    import fx_compositor as _fx
+
+    if not bg_source or not os.path.exists(bg_source):
+        raise ValueError(f"generate_canvas: bg_source inexistente ({bg_source!r})")
+    if variant not in _CANVAS_VARIANT_ANCHORS:
+        raise ValueError(f"generate_canvas: variante inválida {variant!r}")
+
+    out_name = out_name or f"{canvas_file_type(variant)}.mp4"
+    # Fracción del sobrante horizontal donde se apoya el recorte: 0.5 centra,
+    # 0.15 tira a la izquierda, 0.85 a la derecha.
+    crop_x = f"(in_w-out_w)*{_CANVAS_VARIANT_ANCHORS[variant]}"
+    out_path = os.path.join(job_dir, out_name)
+    unit_path = os.path.join(job_dir, f"canvas_unit_{out_name}")
+    unit_frames = int(round(CANVAS_UNIT_SECONDS * CANVAS_FPS))
+    total_frames = unit_frames * 2
+    W, H = CANVAS_WIDTH, CANVAS_HEIGHT
+    is_still = bg_source.lower().endswith(_CANVAS_STILL_EXTS)
+
+    # ---- Pasada 1 — unidad de 4s a 1080x1920 -----------------------------
+    inputs: list[str] = []
+    if is_still:
+        # Una foto fija sin movimiento es un Canvas válido (Spotify acepta
+        # hasta un JPG), pero un push lentísimo la hace leer como viva. Se
+        # supersamplea 1,4x antes del zoompan porque el filtro reescala desde
+        # el frame de entrada y a resolución nativa deja bordes blandos.
+        # Arranca en z=1.0 a propósito: al palindromear, el frame 0 y el
+        # último coinciden y el ciclo cierra sin salto.
+        inputs += ["-loop", "1", "-i", os.path.abspath(bg_source)]
+        base_chain = (
+            f"[0:v]scale={int(W * 1.4)}:{int(H * 1.4)}:"
+            f"force_original_aspect_ratio=increase,"
+            f"crop={int(W * 1.4)}:{int(H * 1.4)}:{crop_x}:(in_h-out_h)/2,"
+            f"zoompan=z='1+0.045*on/{unit_frames}'"
+            f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+            f":d={unit_frames}:s={W}x{H}:fps={CANVAS_FPS},setsar=1[base]"
+        )
+    else:
+        # Un fondo en video ya trae su propio movimiento. `-stream_loop -1`
+        # cubre el caso de un clip MÁS CORTO que la unidad sin ramas aparte;
+        # el `-t` de salida lo acota igual.
+        inputs += ["-stream_loop", "-1", "-i", os.path.abspath(bg_source)]
+        base_chain = (
+            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H}:{crop_x}:(in_h-out_h)/2,"
+            f"fps={CANVAS_FPS},setpts=PTS-STARTPTS,setsar=1[base]"
+        )
+
+    fx_path = _fx.effect_path(effect) if effect else None
+    if fx_path and os.path.exists(fx_path):
+        inputs += ["-stream_loop", "-1", "-i", os.path.abspath(fx_path)]
+        filtergraph = (
+            base_chain + ";"
+            f"[1:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},fps={CANVAS_FPS},setpts=PTS-STARTPTS,format=gbrp[fxv];"
+            "[base][fxv]blend=all_mode=screen:all_opacity=0.30,"
+            "setrange=tv,format=yuv420p[o]"
+        )
+    else:
+        filtergraph = (base_chain.replace("[base]", "[b0]")
+                       + ";[b0]setrange=tv,format=yuv420p[o]")
+
+    run_checked(
+        ["ffmpeg", "-y", *inputs,
+         "-filter_complex", filtergraph,
+         "-map", "[o]",
+         # -frames:v en vez de -t: fija el conteo exacto y evita que un
+         # redondeo de timestamps deje el archivo en 8,03s, que Spotify
+         # rechaza por pasarse del máximo.
+         "-frames:v", str(unit_frames),
+         "-r", str(CANVAS_FPS),
+         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+         "-pix_fmt", "yuv420p", "-an",
+         unit_path],
+        label="ffmpeg-canvas-unit",
+        # Medido: ~6s para una unidad de 4s a 1080x1920. 180s es cliff de
+        # sobra y acota el zoompan si el fondo viene raro.
+        timeout=180,
+        output_path=unit_path,
+    )
+
+    # ---- Pasada 2 — palíndromo + encode final ----------------------------
+    try:
+        run_checked(
+            ["ffmpeg", "-y", "-i", unit_path,
+             "-filter_complex",
+             "[0:v]setpts=PTS-STARTPTS,split[a][b];"
+             "[b]reverse[br];"
+             "[a][br]concat=n=2:v=1:a=0[o]",
+             "-map", "[o]",
+             "-frames:v", str(total_frames),
+             "-r", str(CANVAS_FPS),
+             "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+             "-pix_fmt", "yuv420p", "-color_range", "tv",
+             # -an no es cosmético: Spotify rechaza un Canvas con pista de
+             # audio, y el fondo puede traerla si vino de un clip con sonido.
+             "-an",
+             "-movflags", "+faststart",
+             out_path],
+            label="ffmpeg-canvas-palindrome",
+            timeout=180,
+            output_path=out_path,
+        )
+    finally:
+        try:
+            os.unlink(unit_path)
+        except OSError:
+            pass
+
+    dur = _ffprobe_duration(out_path)
+    if dur is not None and dur > 8.05:
+        # Cinturón: si algún día el conteo de frames y el contenedor se
+        # desalinean, es preferible fallar acá que entregar un archivo que
+        # Spotify rechaza sin decir por qué.
+        raise RuntimeError(
+            f"canvas fuera de spec: {dur:.3f}s (máximo 8s de Spotify)"
+        )
+    logger.info("[CANVAS] listo v%d job_dir=%s dur=%.3fs still=%s effect=%r",
+                variant, os.path.basename(job_dir), dur or -1, is_still, effect)
+    return out_path
+
 def generate_short(
     mp3_path: str,
     segments: list[dict],
@@ -19614,6 +20260,27 @@ def run_edit_pipeline(
                 _accessory_failed("short", job_id, job_dir, _short_err)
                 missing_deliverables.append("short")
             update_job(job_id, progress=85)
+
+            # Step 3b — Canvas de Spotify (1080x1920, 8s, loop sin costura,
+            # sin audio). Accesorio como el short: sale del MISMO bg_source
+            # que ya se pagó para el master, así que no dispara ninguna
+            # llamada de IA. Art tracks incluidos: ahí el bg_source es la
+            # portada y el push suave del still es un Canvas válido.
+            if _job_owner_is_admin(job_id):
+                update_job(job_id, current_step="canvas", progress=88)
+                for _v in range(1, CANVAS_VARIANTS + 1):
+                    _ft = canvas_file_type(_v)
+                    try:
+                        generate_canvas(bg_source, job_dir, effect=effect, variant=_v)
+                        files[f"{_ft}_url"] = f"/download/{job_id}/{_ft}"
+                    except Exception as _canvas_err:
+                        # Cada variante falla sola: perder la 2 no puede
+                        # llevarse la 1. Y NINGUNA va a missing_deliverables —
+                        # el Canvas es admin-only y opcional, su ausencia no es
+                        # una entrega degradada para el cliente.
+                        _accessory_failed(_ft, job_id, job_dir, _canvas_err)
+            else:
+                logger.info("[CANVAS] job=%s no es de un admin — no se genera", job_id)
 
             update_job(job_id, current_step="thumbnail", progress=90)
             try:

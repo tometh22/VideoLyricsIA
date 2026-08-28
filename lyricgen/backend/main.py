@@ -77,6 +77,7 @@ from auth import (
     has_drive_access,
     has_scenes_access,
     has_art_track_access,
+    has_canvas_access,
     scenes_credit_cost,
     telemetry_enabled,
     editor_v2_enabled,
@@ -117,11 +118,16 @@ from editor import (
     revoke_quality_proposal_if_disabled,
 )
 from observability import init_sentry, init_logging, health_snapshot
-from pipeline import run_pipeline, transcribe, _normalize_movement_style
+from pipeline import (run_pipeline, transcribe, _normalize_movement_style,
+                      CANVAS_FILE_TYPES)
 from segment_timing import normalize_segments_timing, normalize_editor_segments, timing_anomalies
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
-from transcription_language import resolve_transcription_language, forced_language_for_tenant
+from transcription_language import (
+    detect_text_languages,
+    normalize_language,
+    resolve_transcription_language,
+)
 from provenance import job_was_delivered
 from batch_profiles import (
     RenderProfileError, normalize_render_profile, pipeline_fields,
@@ -334,17 +340,21 @@ else:
 # the client on the very first request after an idle period.
 #
 # SQLAlchemy auto-invalidates the dead connection on error, so the next
-# checkout gets a fresh one. We just need to retry once.
+# checkout gets a fresh one. A small bounded retry window absorbs the short
+# bursts Railway showed during this incident.
 #
 # Implemented as raw ASGI middleware (not BaseHTTPMiddleware) because we
 # need to buffer the request body before the inner app consumes it and
 # then synthesize a fresh `receive` callable on retry. BaseHTTPMiddleware
 # does not let you re-call the inner app with a replayed body.
 _TRANSIENT_DB_MARKERS = (
-    "SSL connection has been closed",
+    "ssl connection has been closed",
     "server closed the connection",
     "connection already closed",
     "could not connect to server",
+    "bad record mac",
+    "ssl syscall error",
+    "eof detected",
 )
 
 # Hard cap on request bodies eligible for replay-on-retry. Above this we
@@ -354,7 +364,7 @@ _RETRY_BODY_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB
 
 
 class DbTransientRetryMiddleware:
-    """Retry once if a Postgres connection drops mid-request.
+    """Retry a bounded number of times if Postgres drops mid-request.
 
     Small POST/PUT/PATCH JSON bodies are buffered up front and the inner
     app is invoked with a replay-able `receive`. On a matching
@@ -417,65 +427,110 @@ class DbTransientRetryMiddleware:
                 body_bytes = b"".join(chunks)
                 body_buffered = True
 
-        # First attempt. Capture send so we can tell if the response
-        # already started (in which case retrying is unsafe).
-        response_started = False
+        max_attempts = 3
         captured_exc = None
+        replayable = body_buffered or method in ("GET", "HEAD", "OPTIONS", "DELETE")
 
-        async def wrapped_send(message):
-            nonlocal response_started
-            if message.get("type") == "http.response.start":
-                response_started = True
-            await send(message)
+        for attempt in range(max_attempts):
+            response_started = False
 
-        first_receive = _make_replay_receive(body_bytes) if body_buffered else receive
-        try:
-            await self.app(scope, first_receive, wrapped_send)
-            return
-        except OperationalError as e:
-            captured_exc = e
-            transient = any(m in str(e) for m in _TRANSIENT_DB_MARKERS)
-            if not transient:
-                raise
-            if response_started:
-                logger.warning(
-                    "Transient DB error on %s %s after response started — can't retry",
-                    method, scope.get("path", ""),
-                )
-                raise
-            if method in ("POST", "PUT", "PATCH") and not body_buffered:
-                logger.warning(
-                    "Transient DB error on %s %s but body not buffered — not retrying",
-                    method, scope.get("path", ""),
-                )
-                raise
+            async def wrapped_send(message):
+                nonlocal response_started
+                if message.get("type") == "http.response.start":
+                    response_started = True
+                await send(message)
 
-        # Retry path. Fresh receive over the same body. Real send.
-        logger.warning(
-            "Transient DB error on %s %s — retrying once",
-            method, scope.get("path", ""),
+            # Preserve the real disconnect channel on the first bodyless
+            # request. StreamingResponse (notably /events SSE) listens to it;
+            # replacing it with an immediate synthetic disconnect cancels the
+            # stream before its first event. Buffered bodies and retries need
+            # a synthetic request body because the original was consumed.
+            attempt_receive = (
+                _make_replay_receive(body_bytes)
+                if body_buffered or (replayable and attempt > 0)
+                else receive
+            )
+            try:
+                await self.app(scope, attempt_receive, wrapped_send)
+                return
+            except OperationalError as exc:
+                error_text = str(exc).lower()
+                if not any(marker in error_text for marker in _TRANSIENT_DB_MARKERS):
+                    raise
+                captured_exc = captured_exc or exc
+                if response_started:
+                    logger.warning(
+                        "Transient DB error on %s %s after response started — can't retry",
+                        method, scope.get("path", ""),
+                    )
+                    raise
+                if not replayable:
+                    logger.warning(
+                        "Transient DB error on %s %s but body not buffered — not retrying",
+                        method, scope.get("path", ""),
+                    )
+                    raise
+                if attempt + 1 < max_attempts:
+                    logger.warning(
+                        "Transient DB error on %s %s — retrying (%d/%d)",
+                        method, scope.get("path", ""), attempt + 1, max_attempts - 1,
+                    )
+                    try:
+                        from ops_metrics import increment
+                        increment("db_transient_retry")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.15 * (2 ** attempt))
+                    continue
+
+        # A transient infrastructure failure is recoverable and must not look
+        # like an application 500. Capture one richly-tagged Sentry event,
+        # then give the browser an explicit retry contract.
+        path = scope.get("path", "")
+        logger.error(
+            "Transient DB error exhausted %d attempts on %s %s — returning 503",
+            max_attempts, method, path,
         )
-        await asyncio.sleep(0.15)
-        second_receive = _make_replay_receive(body_bytes) if body_buffered else receive
         try:
-            await self.app(scope, second_receive, send)
-        except OperationalError:
-            # Second attempt also failed — surface the ORIGINAL error so
-            # logs/Sentry show "this is the SSL drop case, not a fresh bug".
-            assert captured_exc is not None
-            raise captured_exc
+            from ops_metrics import increment
+            increment("db_transient_exhausted")
+        except Exception:
+            pass
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as sentry_scope:
+                sentry_scope.set_tag("db.transient", True)
+                sentry_scope.set_tag("db.retry_attempts", max_attempts)
+                sentry_scope.set_tag("http.path", path)
+                job_match = re.search(r"/([0-9a-f]{12})(?:/|$)", path)
+                if job_match:
+                    sentry_scope.set_tag("job_id", job_match.group(1))
+                sentry_sdk.capture_exception(captured_exc)
+        except Exception:
+            pass
+        response = JSONResponse(
+            status_code=503,
+            content={
+                "detail": "La base de datos está reconectando. Reintentá en unos segundos.",
+                "code": "db_transient_unavailable",
+            },
+            headers={"Retry-After": "2"},
+        )
+        await response(scope, _make_replay_receive(b""), send)
 
 
 def _make_replay_receive(body: bytes):
     """Return an ASGI `receive` callable that yields `body` once and
-    then keeps returning http.disconnect (mirrors a closed stream)."""
+    then waits like a still-connected client until the response completes."""
     delivered = False
+    connected = asyncio.Event()
 
     async def _replay_receive():
         nonlocal delivered
         if not delivered:
             delivered = True
             return {"type": "http.request", "body": body, "more_body": False}
+        await connected.wait()
         return {"type": "http.disconnect"}
 
     return _replay_receive
@@ -1411,6 +1466,9 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
                 # Art Track gateado por tenant (default OFF salvo admin). El
                 # front oculta la opción "Art Track" si esto es false.
                 "art_track": has_art_track_access(user),
+                # Canvas de Spotify: SOLO admin, sin env var que lo abra.
+                # El front esconde el botón de descarga si esto es false.
+                "canvas": has_canvas_access(user),
                 "telemetry": telemetry_enabled(),
                 "editor_v2": editor_v2_enabled(user),
                 # Versión B (letra anclada): el frontend gatea el textarea
@@ -1520,6 +1578,9 @@ async def register(body: RegisterRequest, request: Request, db: Session = Depend
                 # Art Track gateado por tenant (default OFF salvo admin). El
                 # front oculta la opción "Art Track" si esto es false.
                 "art_track": has_art_track_access(user),
+                # Canvas de Spotify: SOLO admin, sin env var que lo abra.
+                # El front esconde el botón de descarga si esto es false.
+                "canvas": has_canvas_access(user),
                 "telemetry": telemetry_enabled(),
                 "editor_v2": editor_v2_enabled(user),
                 # Versión B (letra anclada): el frontend gatea el textarea
@@ -1595,6 +1656,7 @@ def me(current_user: dict = Depends(get_current_user), db: Session = Depends(get
             "scenes": has_scenes_access(_u),
             "scenes_credit_cost": scenes_credit_cost(),
             "art_track": has_art_track_access(_u),
+            "canvas": has_canvas_access(_u),
             "telemetry": telemetry_enabled(),
             "editor_v2": editor_v2_enabled(_u),
             # Versión B (letra anclada): el frontend gatea el textarea
@@ -4389,7 +4451,7 @@ async def transcribe_uploaded(
         # row and create ghost jobs.
         _result = await _run_transcription_for_job(
             request, current_user, job_id, audio_path,
-            language=forced_language_for_tenant(current_user.get("tenant_id", ""), body.language),
+            language=body.language,
             artist=_row_artist,
             title=_row_title,
             filename=_row_filename,
@@ -5155,7 +5217,7 @@ async def transcribe_endpoint(
     db.close()
     _result = await _run_transcription_for_job(
         request, current_user, job_id, audio_path,
-        language=forced_language_for_tenant(current_user.get("tenant_id", ""), language),
+        language=language,
         artist=artist, title=title,
         filename=file.filename,
     )
@@ -6481,7 +6543,7 @@ def _can_infer_primary_language_from_reference(
     Studio uploads keep the existing reliability hint.  A live performance
     can legitimately use another language (or mix languages), so Auto must be
     decided by the audio provider instead of a catalogue entry for a different
-    recording.  Explicit operator/tenant choices are handled separately and
+    recording.  Explicit per-song operator choices are handled separately and
     continue to win.
     """
     return bool(
@@ -6528,7 +6590,10 @@ async def _run_transcription_for_job(
     _vocal_stem = None   # demucs output path (lazy), cleaned up in finally
 
     try:
-        lang = language.strip() if language.strip() else None
+        # Language is a per-job property. Tenant, role and geography never
+        # participate in this decision; a workspace may contain any mix of
+        # Spanish, English and other supported languages.
+        lang = normalize_language(language)
         loop = asyncio.get_event_loop()
 
         # Progress emission helper. The render pipeline already writes
@@ -6662,6 +6727,57 @@ async def _run_transcription_for_job(
             polished = normalized_polished
             out = {"job_id": job_id, "segments": polished,
                    "reference_lyrics": reference_lyrics}
+
+            # Language is evaluated at the same single output chokepoint as
+            # timing. A bilingual song is valid: preserve multi-label
+            # evidence instead of forcing one global language.
+            reference_languages = detect_text_languages(reference_lyrics)
+            try:
+                language_evidence = _wx_segs if _wx_segs else polished
+            except NameError:
+                language_evidence = polished
+            detected_languages = detect_text_languages(language_evidence)
+            requested_language = normalize_language(language)
+            reference_language = (
+                next(iter(reference_languages))
+                if len(reference_languages) == 1 else None
+            )
+            detected_language = (
+                next(iter(detected_languages))
+                if len(detected_languages) == 1 else None
+            )
+            mixed_language = (
+                len(reference_languages) > 1 or len(detected_languages) > 1
+            )
+            expected_language = lang or requested_language or reference_language
+            language_conflict = bool(
+                expected_language
+                and detected_languages
+                and expected_language not in detected_languages
+                and not mixed_language
+            )
+            language_uncertain = bool(
+                not requested_language
+                and not reference_languages
+                and len(detected_languages) <= 1
+            )
+            if language_conflict:
+                logger.error(
+                    "[LANGUAGE] conflict job=%s expected=%s detected=%s; "
+                    "blocking approval",
+                    job_id, expected_language, detected_language,
+                )
+            out.update({
+                "requested_language": requested_language,
+                "detected_language": detected_language,
+                "detected_languages": sorted(detected_languages),
+                "reference_language": reference_language,
+                "reference_languages": sorted(reference_languages),
+                "mixed_language": mixed_language,
+                "language_conflict": language_conflict,
+                "language_uncertain": language_uncertain,
+            })
+
             # Segmentos crudos de whisperX (la performance REAL): viajan en
             # result para que el modo vivo pueda reemplazar el sufijo
             # divergente por lo que se canta (live_swap_tail). Se hace pop
@@ -6970,22 +7086,43 @@ async def _run_transcription_for_job(
         # canonical lyrics before the primary ASR runs, so English references
         # are transcribed as English while Spanish references retain the
         # explicit hint that historically made Whisper more reliable.
-        if lrc and _can_infer_primary_language_from_reference(
-            lang, live=live, title=title, filename=filename,
-        ):
+        if lrc:
             _reference_for_language = (
                 (lrc.get("plain") or "").strip()
                 or (lrc.get("synced") or "").strip()
             )
-            _detected_lang = resolve_transcription_language(
-                None,
-                reference_text=_reference_for_language,
+            _reference_languages = detect_text_languages(_reference_for_language)
+            # Whisper's language parameter is global. A Spanish verse plus
+            # English chorus must stay provider-auto; forcing either language
+            # would damage the other half of the song.
+            if len(_reference_languages) > 1:
+                if lang:
+                    logger.info(
+                        "[LANGUAGE] mixed reference; ignoring single-language "
+                        "ASR hint %s for job=%s",
+                        lang, job_id,
+                    )
+                lang = None
+            _detected_lang = (
+                resolve_transcription_language(
+                    None, reference_text=_reference_for_language,
+                )
+                if len(_reference_languages) == 1
+                and _can_infer_primary_language_from_reference(
+                    lang, live=live, title=title, filename=filename,
+                ) else None
             )
             if _detected_lang:
                 lang = _detected_lang
                 logger.info(
                     "[LANGUAGE] auto-resolved %s from reference before primary ASR job=%s",
                     lang,
+                    job_id,
+                )
+            elif len(_reference_languages) > 1:
+                logger.info(
+                    "[LANGUAGE] mixed reference %s; keeping provider-auto job=%s",
+                    sorted(_reference_languages),
                     job_id,
                 )
 
@@ -7193,8 +7330,8 @@ async def _run_transcription_for_job(
                         # In live auto-mode the performance decides the
                         # language.  Catalogue text may describe a studio cut
                         # or even another-language version.  Explicit choices
-                        # (including tenant-forced values) still win because
-                        # they arrive in the original `language` argument.
+                        # still win because they arrive in the original
+                        # `language` argument.
                         _live_language = resolve_transcription_language(
                             language if (language or "").strip() else None,
                             result={"segments": _wx_segs},
@@ -9197,6 +9334,22 @@ async def generate_with_segments(
     if not isinstance(segments, list):
         raise HTTPException(status_code=400, detail="segments_json must be an array")
     segments = normalize_editor_segments(segments)
+    requested_language = normalize_language(language)
+    observed_languages = detect_text_languages(segments)
+    if (
+        requested_language
+        and len(observed_languages) == 1
+        and requested_language not in observed_languages
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Transcription language conflict: requested "
+                f"{requested_language}, detected {next(iter(observed_languages))}. "
+                "Choose the song language and transcribe again."
+            ),
+        )
+    language = requested_language
     try:
         requested_revision = int(base_revision) if str(base_revision).strip() else None
         if requested_revision is not None and requested_revision < 0:
@@ -10243,7 +10396,7 @@ async def delete_job_endpoint(
     state. Done / pending_review jobs are protected (audit trail + plan
     quota integrity)."""
     tenant_id = current_user["tenant_id"]
-    ok, reason = delete_job(db, job_id, tenant_id)
+    ok, reason = delete_job(db, job_id, tenant_id, deleted_by_user_id=current_user.get("id"))
     if not ok:
         if reason == "not_found":
             raise HTTPException(status_code=404, detail="Job not found.")
@@ -10276,7 +10429,7 @@ async def bulk_delete_jobs_endpoint(
     # nuke the whole table in one call.
     if len(ids) > 200:
         raise HTTPException(status_code=400, detail="Too many ids in one request (max 200).")
-    return bulk_delete_jobs(db, ids, tenant_id)
+    return bulk_delete_jobs(db, ids, tenant_id, deleted_by_user_id=current_user.get("id"))
 
 
 FILE_MAP = {
@@ -10285,7 +10438,22 @@ FILE_MAP = {
     "thumbnail": "thumbnail.jpg",
     "umg_master": "umg_master.mov",
     "umg_short": "umg_short.mov",
+    # canvas, canvas_v2, canvas_v3 — la fuente de verdad es pipeline.
+    **{ft: f"{ft}.mp4" for ft in CANVAS_FILE_TYPES},
 }
+
+def _require_canvas_access(file_type: str, user) -> None:
+    """403 si alguien que no es admin pide el Canvas.
+
+    Defensa en profundidad, tercera capa: el front ya esconde el botón
+    (`features.canvas`) y el worker ni siquiera produce el archivo para un job
+    que no es de un admin (`_job_owner_is_admin`). Esto ataja el caso que las
+    otras dos no cubren — un token viejo, una URL compartida, o un job que SÍ
+    es de admin cuyo archivo alguien intenta bajar con otra cuenta.
+    """
+    if file_type in CANVAS_FILE_TYPES and not has_canvas_access(user):
+        raise HTTPException(status_code=403, detail="Canvas no disponible.")
+
 
 MEDIA_TYPES = {
     "video": "video/mp4",
@@ -10293,6 +10461,7 @@ MEDIA_TYPES = {
     "thumbnail": "image/jpeg",
     "umg_master": "video/quicktime",
     "umg_short": "video/quicktime",
+    **{ft: "video/mp4" for ft in CANVAS_FILE_TYPES},
 }
 
 # File types that can't be previewed in-browser (ProRes is not browser-playable).
@@ -10438,6 +10607,7 @@ async def issue_media_token(
     """
     if file_type not in FILE_MAP and file_type != "all":
         raise HTTPException(status_code=400, detail="Invalid file type.")
+    _require_canvas_access(file_type, current_user)
     job = get_job(db, job_id, **_job_scope(current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -10454,7 +10624,7 @@ async def issue_media_token(
     # alguien los pide— y "all" ya filtra por los archivos presentes.
     # Ojo: get_job devuelve un DICT con los entregables anidados en "files",
     # no el modelo ORM (ver su contrato en jobs.py).
-    if file_type in ("short", "thumbnail"):
+    if file_type in ("short", "thumbnail") + CANVAS_FILE_TYPES:
         if not (job.get("files") or {}).get(f"{file_type}_url"):
             raise HTTPException(
                 status_code=404,
@@ -10516,6 +10686,7 @@ async def download(
         raise HTTPException(status_code=400, detail="Invalid file type.")
     with scoped_db() as db:
         current_user = verify_media_token(token, job_id, file_type, db)
+        _require_canvas_access(file_type, current_user)
         job = get_job(db, job_id, **_job_scope(current_user))
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found.")
@@ -10653,6 +10824,7 @@ async def preview(
         )
     with scoped_db() as db:
         current_user = verify_media_token(token, job_id, file_type, db)
+        _require_canvas_access(file_type, current_user)
         job = get_job(db, job_id, **_job_scope(current_user))
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found.")
@@ -11156,7 +11328,7 @@ class EnableProResRequest(BaseModel):
 
 class DeliverToDriveRequest(BaseModel):
     """Body para POST /jobs/{job_id}/deliver-to-drive."""
-    file_type: str = Field(..., max_length=20)  # "umg_master" | "umg_short" | "video" | "short"
+    file_type: str = Field(..., max_length=20)  # "umg_master" | "umg_short" | "video" | "short" | "canvas"
 
 
 @app.post("/approve/{job_id}")
@@ -11405,7 +11577,20 @@ async def get_source_audio_url(
     # needed for his 26 jobs with set-but-DEAD input_r2_key (lifecycle
     # GC after 30 d retention purged the originals).
     if job.input_r2_key and storage.object_exists(job.input_r2_key):
-        url = storage.generate_signed_url(job.input_r2_key, expiry_seconds=3600)
+        extension = os.path.splitext(job.input_r2_key)[1].lower()
+        content_type = {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".aac": "audio/aac",
+            ".flac": "audio/flac",
+            ".ogg": "audio/ogg",
+        }.get(extension)
+        url = storage.generate_signed_url(
+            job.input_r2_key,
+            expiry_seconds=3600,
+            response_content_type=content_type,
+        )
         if url:
             # Audit: this serves a signed URL to the ORIGINAL master the
             # label uploaded — exactly the access a compliance review asks
@@ -11441,7 +11626,11 @@ async def get_source_audio_url(
                 continue
             if not storage.object_exists(r2_key):
                 continue
-            url = storage.generate_signed_url(r2_key, expiry_seconds=3600)
+            url = storage.generate_signed_url(
+                r2_key,
+                expiry_seconds=3600,
+                response_content_type="video/mp4",
+            )
             if url:
                 _audit_media_access(
                     current_user, job_id, "source_audio",
@@ -11695,14 +11884,15 @@ def get_waveform(
     from database import Job as JobModel
     from waveform_compute import compute_and_cache_waveform
 
-    job = (
-        db.query(JobModel)
-        .filter(JobModel.job_id == job_id)
-        .filter(JobModel.tenant_id == current_user["tenant_id"])
-        .first()
-    )
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"],
+        )
+    job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _audit_cross_tenant_access(db, current_user, job, "waveform")
     if not job.input_r2_key:
         raise HTTPException(
             status_code=404, detail="Source audio is not available for this job."

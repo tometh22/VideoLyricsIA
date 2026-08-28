@@ -25,7 +25,7 @@ from auth import (
     is_explicitly_local_environment,
     is_super_admin,
 )
-from database import User, Job, Invoice, AuditLog, AIProvenance, AssetUsage, BackgroundAsset, UserSession, LoginSession, get_db
+from database import User, Job, Invoice, AuditLog, AIProvenance, AssetUsage, BackgroundAsset, UserSession, LoginSession, DeletedJobLyricsArchive, get_db
 from error_taxonomy import classify_error
 
 BACKGROUNDS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
@@ -689,6 +689,37 @@ async def list_all_jobs(
     return {
         "total": total,
         "jobs": [{**job.to_dict(), "username": username} for job, username in rows],
+    }
+
+
+@router.get("/deleted-job-lyrics-archive")
+async def list_deleted_job_lyrics_archive(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    limit: int = Query(50, le=500),
+    offset: int = Query(0, ge=0),
+    tenant_id: str = Query(""),
+):
+    """Read-only audit view over `deleted_job_lyrics_archive`.
+
+    Every row here is a hand-corrected lyric that would otherwise have
+    been lost forever when its (stuck/failed) job was hard-deleted via
+    delete_job/bulk_delete_jobs — see DeletedJobLyricsArchive for the
+    incident this backstops. Sorted newest-first so a recent bulk cleanup
+    shows up at the top.
+    """
+    query = db.query(DeletedJobLyricsArchive).order_by(
+        DeletedJobLyricsArchive.archived_at.desc(),
+    )
+    if tenant_id:
+        query = query.filter(DeletedJobLyricsArchive.tenant_id == tenant_id)
+
+    total = query.count()
+    rows = query.offset(offset).limit(limit).all()
+
+    return {
+        "total": total,
+        "entries": [row.to_dict() for row in rows],
     }
 
 

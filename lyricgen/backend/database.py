@@ -1610,6 +1610,78 @@ class VeoBudgetLedger(Base):
     )
 
 
+class DeletedJobLyricsArchive(Base):
+    """Best-effort copy of an operator's hand-corrected lyrics, taken right
+    before a stuck/failed Job row (and its ON DELETE CASCADE children
+    editor_documents/editor_versions) is hard-deleted via delete_job /
+    bulk_delete_jobs.
+
+    Incident (audited 2026-08-24): 137 jobs with real lyric corrections were
+    hard-deleted via the operator cleanup flow with no recoverable trace of
+    which song they belonged to — editor_documents/editor_versions cascade
+    with the Job, and the Job row itself (artist/song_title) is gone by the
+    time anyone notices. This table exists solely to survive that delete:
+
+    - `job_id` is a PLAIN string, deliberately with NO ForeignKey to
+      jobs.job_id — the whole point is that this row outlives the job.
+    - `artist`/`song_title` are copied from the Job BEFORE it's deleted,
+      which is exactly the piece of context the 137 lost rows are missing.
+
+    Never blocks deletion: written best-effort in the same transaction as
+    the delete, and only when there's actually something to archive (a
+    non-empty editor_documents.current_segments, or at least one
+    editor_versions row). Jobs nobody ever touched in the editor produce no
+    row here — this is a safety net for lost human work, not a full audit
+    log of every deletion.
+    """
+    __tablename__ = "deleted_job_lyrics_archive"
+    __table_args__ = (
+        Index(
+            "ix_deleted_job_lyrics_archive_archived_at", "archived_at",
+        ),
+        Index(
+            "ix_deleted_job_lyrics_archive_tenant_job",
+            "tenant_id",
+            "job_id",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(12), nullable=False, index=True)
+    tenant_id = Column(String(100), nullable=False)
+    artist = Column(String(255), nullable=True)
+    song_title = Column(String(500), nullable=True)
+    job_status_at_deletion = Column(String(20), nullable=False)
+    segments = Column(JSONB, nullable=False)
+    # "editor_documents" | "editor_versions" — which table the segments were
+    # recovered from. editor_documents.current_segments is preferred (it's
+    # the operator's latest working copy); editor_versions is the fallback
+    # when there's no live document but at least one saved checkpoint.
+    source = Column(String(20), nullable=False)
+    archived_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    # Nullable, deliberately no ForeignKey (unlike AuditLog.user_id): this
+    # archive must survive independently of both the job AND the acting
+    # user's row, and users.id has no ON DELETE behavior defined today —
+    # a strict FK here would risk a future user deletion blocking on, or
+    # cascading into, lyrics-recovery history that has nothing to do with
+    # user-account lifecycle.
+    deleted_by_user_id = Column(Integer, nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "job_id": self.job_id,
+            "tenant_id": self.tenant_id,
+            "artist": self.artist,
+            "song_title": self.song_title,
+            "job_status_at_deletion": self.job_status_at_deletion,
+            "segments": self.segments,
+            "source": self.source,
+            "archived_at": self.archived_at.isoformat() if self.archived_at else None,
+            "deleted_by_user_id": self.deleted_by_user_id,
+        }
+
+
 class LyricsCache(Base):
     """Reference lyrics fetched via Gemini-grounded web search, cached
     per (artist, title) so we only pay Gemini once per song across the
@@ -1729,11 +1801,26 @@ class CorpusSong(Base):
     duration_seconds = Column(Float, nullable=True)
     notes = Column(Text, nullable=True)
     is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Pre-review precarga (see corpus_reference.py): cleaned-down copy of
+    # the already-human-reviewed editor_documents.current_segments for the
+    # delivered job this song was copied from — [{start, end, text,
+    # event_type}], event_type always "lexical" (production data has no
+    # vocalization/mixed classification). NULL means "start empty", either
+    # because this is a control song (see is_control) or because no
+    # reviewed editor_documents row could be matched for it.
+    reference_segments = Column(JSONB, nullable=True)
+    # True for the handful of songs deliberately held out with NO
+    # precarga (marked "CONTROL:" in `notes`) — the check that annotators
+    # do just as well starting from zero as they do reviewing a precarga.
+    # Never combine this with a populated reference_segments: the backfill
+    # in corpus_reference.py enforces that, and _get_or_create_own_annotation
+    # in corpus.py double-checks it before seeding a draft.
+    is_control = Column(Boolean, nullable=False, default=False, server_default="false")
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
-    def to_dict(self):
-        return {
+    def to_dict(self, *, include_admin_fields: bool = False):
+        d = {
             "id": self.id,
             "artist": self.artist,
             "title": self.title,
@@ -1742,6 +1829,13 @@ class CorpusSong(Base):
             "is_active": self.is_active,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+        if include_admin_fields:
+            # Admin-only: revealing `is_control` to an annotator would tell
+            # her which song is the blind control, defeating its purpose.
+            # Annotator-facing responses must never call to_dict(True).
+            d["is_control"] = self.is_control
+            d["has_reference_segments"] = bool(self.reference_segments)
+        return d
 
 
 class CorpusAnnotatorToken(Base):
@@ -1801,6 +1895,15 @@ class CorpusAnnotation(Base):
     # here — the column itself just carries whatever the annotator saved.
     segments = Column(JSONB, nullable=False, default=list)
     status = Column(String(20), nullable=False, default="draft", server_default="draft")
+    # True when this row's initial `segments` came from the song's
+    # reference_segments precarga (set once, at row creation, in
+    # corpus._get_or_create_own_annotation — never touched again, even if
+    # the annotator later empties every line). Lets the frontend keep
+    # showing the "this one already has a first pass — verify it" note on
+    # every later open of the song, not just the very first one.
+    seeded_from_reference = Column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
     submitted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
@@ -1811,6 +1914,7 @@ class CorpusAnnotation(Base):
             "song_id": self.song_id,
             "segments": self.segments or [],
             "status": self.status,
+            "seeded_from_reference": self.seeded_from_reference,
             "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

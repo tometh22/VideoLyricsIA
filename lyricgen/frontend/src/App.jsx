@@ -222,6 +222,34 @@ function authFetchWithTimeout(url, opts = {}, timeoutMs = 10_000) {
   return fetchWithTimeout(url, { ...opts, headers }, timeoutMs);
 }
 
+// Critical editor reads must outlive one dropped DB connection, but must not
+// leave the operator on an endless spinner. Retry only transient responses or
+// timeout/network failures; real 4xx responses remain immediate.
+async function authFetchCriticalRead(url, opts = {}, {
+  maxAttempts = 3,
+  timeoutMs = 10_000,
+} = {}) {
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const response = await authFetchWithTimeout(url, opts, timeoutMs);
+      const transient = response.status === 408 || response.status === 429
+        || response.status === 503 || response.status >= 500;
+      if (!transient || attempt + 1 === maxAttempts) return response;
+      const retryAfter = Number.parseInt(response.headers.get("Retry-After") || "", 10);
+      const delayMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(retryAfter * 1_000, 10_000)
+        : 500 * (2 ** attempt);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 === maxAttempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 500 * (2 ** attempt)));
+    }
+  }
+  throw lastError || new Error("critical_read_failed");
+}
+
 // authFetch + client-side retry on 503 with Retry-After header. Used for
 // endpoints that may transiently saturate (Whisper transcription on burst
 // load, where the server retries internally but if it exhausts retries
@@ -914,7 +942,7 @@ function EditLyricsRoute({
       // Fase A — /status: critical path, blocking.
       let statusRes;
       try {
-        statusRes = await authFetchWithTimeout(`${API}/status/${id}`, {}, 10_000);
+        statusRes = await authFetchCriticalRead(`${API}/status/${id}`);
       } catch (e) {
         // TimeoutError o network error. /status es rápido en condiciones
         // normales (~50ms); un timeout de 10s implica DB stuck u otra
@@ -1331,7 +1359,7 @@ function VariantWizardRoute({
       // y las URLs firmadas (audio/waveform/fondo) lo enriquecen después.
       let statusRes;
       try {
-        statusRes = await authFetchWithTimeout(`${API}/status/${id}`, {}, 10_000);
+        statusRes = await authFetchCriticalRead(`${API}/status/${id}`);
       } catch {
         if (alive) setState({ status: "error" });
         return;
@@ -2012,7 +2040,7 @@ export default function App() {
     let cancelled = false;
     (async () => {
       try {
-        const statusRes = await authFetch(`${API}/status/${resumeJobId}`);
+        const statusRes = await authFetchCriticalRead(`${API}/status/${resumeJobId}`);
         if (!statusRes.ok) throw new Error(`status ${statusRes.status}`);
         const job = await statusRes.json();
         if (cancelled) return;
@@ -2941,7 +2969,8 @@ export default function App() {
       setTranscribing(false);
       setTranscribeProgress(null);
       setCurrentReview({
-        file: entry.file, artist: entry.artist, language: entry.language,
+        file: entry.file, artist: entry.artist,
+        language: entry.language || data.reference_language || data.detected_language || "",
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
         concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
@@ -2968,6 +2997,9 @@ export default function App() {
         coverageWarning: !!data.coverage_warning,
         transcriptionQuality: data.transcription_quality || null,
         recoverySource: data.recovery_source || "",
+        languageConflict: !!data.language_conflict,
+        languageUncertain: !!data.language_uncertain,
+        mixedLanguage: !!data.mixed_language,
         transcribeJobId: data.job_id || jobId,
         queueIdx: idx, queue,
       });
@@ -3026,7 +3058,8 @@ export default function App() {
           setTranscribing(false);
           setTranscribeProgress(null);
           setCurrentReview({
-            file: entry.file, artist: entry.artist, language: entry.language,
+            file: entry.file, artist: entry.artist,
+            language: entry.language || data.reference_language || data.detected_language || "",
             songTitle: entry.songTitle || "",
             genre: entry.genre || "", font: entry.font || "",
             concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
@@ -3044,6 +3077,9 @@ export default function App() {
             coverageWarning: !!data.coverage_warning,
             transcriptionQuality: data.transcription_quality || null,
             recoverySource: data.recovery_source || "",
+            languageConflict: !!data.language_conflict,
+            languageUncertain: !!data.language_uncertain,
+            mixedLanguage: !!data.mixed_language,
             transcribeJobId: data.job_id || cached.jobId,
             queueIdx: idx, queue,
           });
@@ -3181,7 +3217,8 @@ export default function App() {
       setTranscribing(false);
       setTranscribeProgress(null);
       setCurrentReview({
-        file: entry.file, artist: entry.artist, language: entry.language,
+        file: entry.file, artist: entry.artist,
+        language: entry.language || data.reference_language || data.detected_language || "",
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
         concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
@@ -3204,6 +3241,9 @@ export default function App() {
         coverageWarning: !!data.coverage_warning,
         transcriptionQuality: data.transcription_quality || null,
         recoverySource: data.recovery_source || "",
+        languageConflict: !!data.language_conflict,
+        languageUncertain: !!data.language_uncertain,
+        mixedLanguage: !!data.mixed_language,
         transcribeJobId: data.job_id || uploadJobId,
         queueIdx: idx, queue,
       });
@@ -3269,7 +3309,12 @@ export default function App() {
     [],
   );
   const editorRequest = useCallback(
-    (path, options = {}) => authFetch(`${API}${path}`, options),
+    (path, options = {}) => {
+      const method = String(options.method || "GET").toUpperCase();
+      return method === "GET"
+        ? authFetchWithTimeout(`${API}${path}`, options, 10_000)
+        : authFetch(`${API}${path}`, options);
+    },
     [],
   );
   // Una sola cola por App sobrevive remounts del editor (pasos 6↔4 y
@@ -3336,6 +3381,26 @@ export default function App() {
     // el fondo, aunque no toques ningún campo).
     if (r.variantMode) {
       const parentJobId = r.parentJobId;
+      // Audit 2026-08-26 (incidente Universal "Tu Cárcel"): buildVariantPayload
+      // sólo sabe mandar background_id/background_mode (Biblioteca) — no tiene
+      // ningún campo para el archivo subido ni para animateImage, así que un
+      // bgSelectMode "custom" se descartaba en silencio: el operador subía su
+      // foto, tildaba "Animar con AI", el POST /variant salía sin ninguno de
+      // los dos, y el backend generaba una escena random con Gemini/Veo — sin
+      // error, gastando la llamada a Veo, con contenido sin relación a la foto.
+      // Hasta que /variant soporte fondo custom + animate (mismo camino que ya
+      // funciona en /edit), cortamos acá con un error claro en vez de dejar
+      // pasar el submit y quemar cuota de Veo para nada.
+      if (bgSelectMode === "custom") {
+        alert({
+          title: t("variant.custom_bg_unsupported_title") ||
+            "\"Subir la mía\" no está disponible en variantes",
+          description: t("variant.custom_bg_unsupported_desc") ||
+            "Crear variante sólo genera fondos con IA o de la Biblioteca. Para animar tu foto, usá \"Editar\" en vez de \"Crear variante\".",
+          tone: "warning",
+        });
+        return;
+      }
       if (editSubmitLockRef.current) return;
       editSubmitLockRef.current = true;
       setVariantSubmitting(true);
@@ -5338,6 +5403,9 @@ export default function App() {
             coverageWarning={currentReview.coverageWarning}
             transcriptionQuality={currentReview.transcriptionQuality}
             recoverySource={currentReview.recoverySource}
+            languageConflict={!!currentReview.languageConflict}
+            languageUncertain={!!currentReview.languageUncertain}
+            mixedLanguage={!!currentReview.mixedLanguage}
             onApprove={handleApproveLyrics}
             onBack={handleBackInReview}
             // Post-render edit: cuando editingJobId está set, el autosave
