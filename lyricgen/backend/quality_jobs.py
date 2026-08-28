@@ -23,6 +23,20 @@ import unicodedata
 logger = logging.getLogger("genly.quality_jobs")
 
 
+def _attach_structural_t4_shadow(quality: dict, segments: list[dict]) -> dict:
+    """Persist T4 evidence only when the staging observation flag is on."""
+
+    if os.environ.get(
+        "QUALITY_T4_STRUCTURAL_OBSERVE_ENABLED", "0",
+    ).strip().lower() not in {"1", "true", "yes", "on"}:
+        return quality
+    from structural_t4_shadow import build_structural_t4_shadow
+
+    output = dict(quality)
+    output["t4_structural_shadow"] = build_structural_t4_shadow(segments)
+    return output
+
+
 def _pending_marker_is_stale(quality: dict, *, now=None, max_age_s: int = 900) -> bool:
     """Pure predicate for recovering a crash between DB marker and Redis."""
     from datetime import datetime, timezone
@@ -545,7 +559,7 @@ _ANALYTICAL_KEYS = frozenset({
     # Containers and identity-safe references.
     "windows", "window", "window_id", "id", "parent_window_id",
     "analysis_windows", "acoustic_structure", "content_mapping", "events",
-    "editorial_content_route",
+    "editorial_content_route", "omission_content_route",
     "subevents", "performance_boundaries", "best_partition", "n_best",
     "cardinality_posterior", "motif_groups", "self_similarity", "diagnostics",
     "phonetic_evidence", "phonetic_candidates", "model_identity",
@@ -559,6 +573,7 @@ _ANALYTICAL_KEYS = frozenset({
     "v6_legacy_mutation_blocked",
     "independent_content_verified", "acoustic_crowd_evidence", "cache_hit",
     "windows_processed", "windows_total", "windows_skipped", "windows_truncated",
+    "content_gate_declined", "omission_only",
     "windows_considered", "windows_tiled", "windows_resolved", "window_count",
     "parent_windows_total", "parent_windows_incomplete", "boundary_count",
     "n_best_count", "event_count", "word_count", "text_count", "text_length",
@@ -603,6 +618,8 @@ _ANALYTICAL_STRING_VALUES = frozenset({
     "short_melodic_interjection", "speech_compositionality_unknown",
     "independent_text_consensus_required", "mixed_or_unknown_acoustic_events",
     "rotor-umg-display-policy-v2", "acoustic-editorial-route-v1",
+    "omission-content-route-v1", "content_gate_abstention",
+    "acoustic_content_supports_lexical_ranking", "not_an_omission_only_window",
     "lexical_plus_vocalization", "source_audio_demucs",
     *_WINDOW_REASON_PRIORITY.keys(),
     "acoustic_cardinality_disagreement", "quality_windows_unprocessed",
@@ -1093,7 +1110,9 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             ]
             windows = prioritized_windows
             from quality_windows import parent_coverage, tile_unsafe_windows
-            from lyric_content_policy import classify_acoustic_window
+            from lyric_content_policy import (
+                classify_acoustic_window, route_omission_window,
+            )
             all_tiles = tile_unsafe_windows(
                 prioritized_windows, core_seconds=24.0, context_seconds=3.0,
                 audio_duration=float(audio_duration),
@@ -1136,10 +1155,15 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                     for event in best_events if isinstance(event, dict)
                 )
                 cache_hits += int(hit)
+                content_route = classify_acoustic_window(structure)
+                omission_route = route_omission_window(bounded, content_route)
+                bounded["editorial_content_route"] = content_route
+                bounded["omission_content_route"] = omission_route
                 analyses.append({
                     "window": bounded,
                     "structure": _structure_summary(structure),
-                    "editorial_content_route": classify_acoustic_window(structure),
+                    "editorial_content_route": content_route,
+                    "omission_content_route": omission_route,
                 })
             # selected_tiles contains the same dictionaries mutated above;
             # provider retries now consume acoustic disagreement directly.
@@ -1159,6 +1183,15 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 "stem_cache_hit": stem_cache_hit,
                 "demucs_attempts": 0 if stem_cache_hit else 1,
             }
+            lexical_retry_tiles = [
+                item for item in selected_tiles
+                if (item.get("omission_content_route") or {}).get(
+                    "allow_lexical_ranking"
+                ) is not False
+            ]
+            retry_stats["content_gate_declined"] = (
+                len(selected_tiles) - len(lexical_retry_tiles)
+            )
             raw_proposal_windows = []
             # The provider/content retry remains separately kill-switchable.
             # Raw rows stay in memory until the typed, signed review-proposal
@@ -1170,7 +1203,8 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 asr_context = _attested_asr_context(snapshot["segments"])
                 _ignored, provider_stats = reprocess(
                     {"segments": snapshot["segments"], **asr_context},
-                    audio_path, selected_tiles, job_id=job_id, stem_path=stem_path,
+                    audio_path, lexical_retry_tiles,
+                    job_id=job_id, stem_path=stem_path,
                 )
                 raw_proposal_windows = list(
                     provider_stats.pop("quality_proposal_windows", []) or []
@@ -1257,6 +1291,9 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             )
             quality["analysis_windows"] = _sanitize_analytical_evidence(analyses)
             quality["timing_source"] = quality_before.get("timing_source", "unknown")
+            quality = _attach_structural_t4_shadow(
+                quality, snapshot["segments"],
+            )
 
         usage_after = resource.getrusage(resource.RUSAGE_SELF)
         quality["quality_job"] = {

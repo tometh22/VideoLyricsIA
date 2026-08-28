@@ -11,6 +11,33 @@ from auth import create_user
 from database import Job
 
 
+def test_structural_t4_shadow_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("QUALITY_T4_STRUCTURAL_OBSERVE_ENABLED", raising=False)
+    quality = {"decision": "review_required"}
+
+    assert quality_jobs._attach_structural_t4_shadow(quality, []) is quality
+
+
+def test_structural_t4_shadow_is_observable_but_never_mutates(monkeypatch):
+    monkeypatch.setenv("QUALITY_T4_STRUCTURAL_OBSERVE_ENABLED", "1")
+    segments = [{
+        "start": 1.0, "end": 2.0, "text": "line",
+        "words": [{"start": 1.0, "end": 2.5, "word": "line", "score": .9}],
+    }]
+    frozen = json.loads(json.dumps(segments))
+
+    output = quality_jobs._attach_structural_t4_shadow(
+        {"decision": "review_required"}, segments,
+    )
+
+    assert segments == frozen
+    assert output["t4_structural_shadow"]["mode"] == "observe"
+    assert output["t4_structural_shadow"]["proposal_count"] == 0
+    assert output["t4_structural_shadow"][
+        "automatic_timing_change_allowed"
+    ] is False
+
+
 def test_cardinality_route_does_not_promote_ambiguous_best_path_to_fact():
     structure = {
         "best_partition": {"event_count": 8},

@@ -173,6 +173,51 @@ def classify_acoustic_window(structure: Mapping[str, Any]) -> dict[str, Any]:
         "reason": reason,
         "event_count": len(events),
         "duration": round(duration, 3),
-        "allow_lexical_ranking": False,
+        # Ranking is still review-only.  The content gate merely decides
+        # whether it is sensible to spend lexical ASR/judging work here.
+        "allow_lexical_ranking": content_type in {"lexical_candidate", "speech"},
+        "safe_for_auto_insert": False,
+    }
+
+
+_OMISSION_REASONS = frozenset({
+    "voiced_gap", "uncovered_asr", "independent_uncovered_asr",
+})
+
+
+def route_omission_window(
+    window: Mapping[str, Any], content_route: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply the acoustic content gate only to omission-only windows.
+
+    Mixed-risk windows keep their existing route because they may contain a
+    timing or text mismatch in addition to an apparent gap.  Pure reverb,
+    instrumental tails, melodic interjections and human-ambiguous audio stay
+    observable but are not sent to the lexical omission ranker.
+    """
+
+    reasons = {
+        str(value) for value in (
+            window.get("reasons") or [window.get("reason")]
+        ) if value
+    }
+    omission_only = bool(reasons) and reasons <= _OMISSION_REASONS
+    content_type = str(content_route.get("content_type") or "ambiguous")
+    allowed = bool(
+        not omission_only or content_route.get("allow_lexical_ranking") is True
+    )
+    if allowed:
+        reason = (
+            "acoustic_content_supports_lexical_ranking"
+            if omission_only else "not_an_omission_only_window"
+        )
+    else:
+        reason = "content_gate_abstention"
+    return {
+        "schema_version": "omission-content-route-v1",
+        "omission_only": omission_only,
+        "content_type": content_type,
+        "allow_lexical_ranking": allowed,
+        "reason": reason,
         "safe_for_auto_insert": False,
     }
