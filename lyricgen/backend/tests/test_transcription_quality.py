@@ -83,6 +83,45 @@ def test_gate_blocks_text_audio_mismatch_even_with_full_coverage(monkeypatch):
     )
 
 
+def test_unattested_catalogue_reference_is_a_blocking_text_risk():
+    quality = tq.evaluate(
+        [_segment(10, 13, "audio first words")],
+        {
+            "audio_coverage": 1.0, "text_mismatches": 0,
+            "voiced_gap_s": 0, "uncovered_seconds": 0,
+        },
+        reference_attestation={
+            "text_status": "unsafe_without_witness",
+            "allow_vocabulary_reconciliation": False,
+            "allow_global_forced_alignment": False,
+            "reasons": ["reference_text_not_attested"],
+        },
+    )
+    codes = {reason["code"] for reason in quality["reasons"]}
+    assert "reference_text_unattested" in codes
+    assert quality["risk_dimensions"]["text"] == 0.92
+    assert quality["decision"] == "review_required"
+
+
+def test_live_local_reference_does_not_claim_global_structure_or_block():
+    quality = tq.evaluate(
+        [_segment(10, 13, "performance words")],
+        {
+            "audio_coverage": 1.0, "text_mismatches": 0,
+            "voiced_gap_s": 0, "uncovered_seconds": 0,
+        },
+        reference_attestation={
+            "text_status": "independently_attested",
+            "allow_vocabulary_reconciliation": True,
+            "allow_global_forced_alignment": False,
+            "reasons": ["live_structure_requires_local_alignment"],
+        },
+    )
+    codes = {reason["code"] for reason in quality["reasons"]}
+    assert "reference_text_unattested" not in codes
+    assert "reference_structure_unattested" not in codes
+
+
 def test_gate_detects_the_exact_backwards_selector_failure():
     quality = tq.evaluate(
         [_segment(45.9, 48), _segment(45.1, 47)],
@@ -104,6 +143,31 @@ def test_missing_evidence_and_nonfinite_timing_never_pass():
     quality = tq.evaluate([_segment(float("nan"), 2)], evidence)
     assert quality["metrics"]["invalid_ranges"] == 1
     assert quality["decision"] == "review_required"
+
+
+def test_live_recording_always_requires_human_review(monkeypatch):
+    monkeypatch.setattr(
+        tq,
+        "calibration_identity",
+        lambda: {
+            "calibrated": True,
+            "calibration_id": "test-calibration",
+            "artifact_sha256": "test",
+        },
+    )
+    evidence = {
+        "audio_coverage": 1.0,
+        "uncovered_seconds": 0.0,
+        "text_mismatches": 0,
+        "voiced_gap_s": 0.0,
+    }
+
+    quality = tq.evaluate([_segment(1, 2)], evidence, is_live=True)
+
+    assert quality["decision"] == "review_required"
+    assert "live_recording_requires_human_review" in {
+        reason["code"] for reason in quality["reasons"]
+    }
 
 
 def test_ack_is_revision_scoped(monkeypatch):

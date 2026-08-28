@@ -526,6 +526,7 @@ _ANALYTICAL_KEYS = frozenset({
     # Containers and identity-safe references.
     "windows", "window", "window_id", "id", "parent_window_id",
     "analysis_windows", "acoustic_structure", "content_mapping", "events",
+    "editorial_content_route",
     "subevents", "performance_boundaries", "best_partition", "n_best",
     "cardinality_posterior", "motif_groups", "self_similarity", "diagnostics",
     "phonetic_evidence", "phonetic_candidates", "model_identity",
@@ -534,6 +535,7 @@ _ANALYTICAL_KEYS = frozenset({
     "structural_hybrid_diagnostics", "current_segments", "proposed_segments",
     # Booleans, counters and bounded measurements.
     "accepted", "complete", "attempted", "failed", "blocked", "suggested",
+    "allow_lexical_ranking", "safe_for_auto_insert", "review_required",
     "applied", "mutated_segments", "phonetic_verified",
     "v6_legacy_mutation_blocked",
     "independent_content_verified", "acoustic_crowd_evidence", "cache_hit",
@@ -556,6 +558,7 @@ _ANALYTICAL_KEYS = frozenset({
     "estimated_openai_asr_cost_usd", "estimated_gemini_cost_usd",
     "cost_complete", "stem_cache_hit", "calibration_id", "schema",
     "policy_version", "kind", "taxonomy", "composition", "source", "status",
+    "policy_id", "content_type", "display",
     "failure_reason", "selected_candidate_id", "evidence_sha256",
     "model_revision", "stem_sha256", "mix_sha256", "cache_ref",
     "evidence_fingerprint", "stem_fingerprint", "mix_fingerprint",
@@ -575,6 +578,12 @@ _ANALYTICAL_STRING_VALUES = frozenset({
     "cross_occurrence_content_consensus", "recurrence_content_disagreement",
     "SUNG_LEAD", "SUNG_CROWD", "SPEECH", "NONLEXICAL", "METADATA",
     "CROWD_NOISE", "UNKNOWN", "lexical", "vocalization", "sustained",
+    "none", "speech", "lexical_candidate", "melodic_vocalization", "ambiguous",
+    "normal", "parenthesize", "do_not_show", "review",
+    "no_acoustic_events", "long_melodic_interjection",
+    "short_melodic_interjection", "speech_compositionality_unknown",
+    "independent_text_consensus_required", "mixed_or_unknown_acoustic_events",
+    "rotor-umg-display-policy-v2", "acoustic-editorial-route-v1",
     "lexical_plus_vocalization", "source_audio_demucs",
     *_WINDOW_REASON_PRIORITY.keys(),
     "acoustic_cardinality_disagreement", "quality_windows_unprocessed",
@@ -975,6 +984,7 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
         failed = evaluate(
             snapshot["segments"], quality_before.get("metrics") or {},
             unsafe_windows=windows,
+            is_live=bool((quality_before.get("metrics") or {}).get("is_live")),
             retry_stats={
                 "attempted": True, "failed": True,
                 "failure_reason": "input_r2_key_missing",
@@ -1031,6 +1041,7 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             ]
             windows = prioritized_windows
             from quality_windows import parent_coverage, tile_unsafe_windows
+            from lyric_content_policy import classify_acoustic_window
             all_tiles = tile_unsafe_windows(
                 prioritized_windows, core_seconds=24.0, context_seconds=3.0,
                 audio_duration=float(audio_duration),
@@ -1076,6 +1087,7 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 analyses.append({
                     "window": bounded,
                     "structure": _structure_summary(structure),
+                    "editorial_content_route": classify_acoustic_window(structure),
                 })
             # selected_tiles contains the same dictionaries mutated above;
             # provider retries now consume acoustic disagreement directly.
@@ -1173,6 +1185,7 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             quality = evaluate(
                 snapshot["segments"], metrics,
                 unsafe_windows=remaining_windows,
+                is_live=bool(metrics.get("is_live")),
                 retry_stats=_sanitize_analytical_evidence(retry_stats),
                 acoustic_evidence=diagnostic,
                 resolved_reason_counts=resolved_reasons,
@@ -1262,6 +1275,9 @@ def transcription_quality_failure_callback(job, connection, type_, value, traceb
         failed = evaluate(
             snapshot["segments"], snapshot["quality"].get("metrics") or {},
             unsafe_windows=snapshot["quality"].get("unsafe_windows") or [],
+            is_live=bool(
+                (snapshot["quality"].get("metrics") or {}).get("is_live")
+            ),
             retry_stats={
                 "attempted": True, "failed": True,
                 "failure_reason": (

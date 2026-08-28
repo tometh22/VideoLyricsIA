@@ -55,6 +55,8 @@ _PIPELINE_CONFIG_KEYS = (
     "TARGETED_STRUCTURAL_AUTOREPAIR_MODE",
     "TRANSCRIPTION_QUALITY_CALIBRATED",
     "TRANSCRIPTION_QUALITY_INLINE_RETRY",
+    "REFERENCE_ATTESTATION_MODE",
+    "DELIVERY_REPAIR_SHADOW_MODE",
     "PERFORMANCE_GRAPH_V6_ENABLED", "QUALITY_V6_ANALYSIS_ENABLED",
     "TARGETED_RESIDUAL_ASR_ENABLED", "QUALITY_V6_MAX_PRIMITIVE_DTW_PAIRS",
     "QUALITY_V6_PROPOSALS_ENABLED", "QUALITY_V6_MODEL_ENABLED",
@@ -444,6 +446,8 @@ def quality_fingerprint(quality: dict, *, revision: int,
             "retry": quality.get("retry"),
             "acoustic_evidence": quality.get("acoustic_evidence"),
             "analysis_windows": quality.get("analysis_windows"),
+            "reference_attestation": quality.get("reference_attestation"),
+            "delivery_repair_shadow": quality.get("delivery_repair_shadow"),
         },
     }
     encoded = json.dumps(
@@ -535,7 +539,9 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
              unsafe_windows: list[dict] | None = None,
              retry_stats: dict | None = None,
              require_independent: bool = False,
+             is_live: bool = False,
              acoustic_evidence: dict | None = None,
+             reference_attestation: dict | None = None,
              resolved_reason_counts: dict[str, int] | None = None) -> dict:
     """Evaluate output and return a serializable, explainable verdict."""
     required_evidence = {
@@ -572,6 +578,44 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
         add("empty_transcription", "critical", 0, 50)
     if not evidence_available:
         add("quality_evidence_unavailable", "critical", True, 40)
+
+    # Published live masters remain a Tier-2 workflow. Crowd vocals,
+    # improvisations and performance-only structure are not calibrated well
+    # enough for unattended approval, even when generic checks happen to pass.
+    # Keep this explicit so a future signed calibration cannot accidentally
+    # turn live recordings into Tier-1 auto-approvals.
+    if is_live:
+        add("live_recording_requires_human_review", "critical", True, 0)
+
+    # A catalogue hit is a candidate, not proof that those words occur in this
+    # recording.  Put the independent audio-first attestation in the same
+    # quality verdict that drives editor review and render safety.
+    reference_attestation = (
+        dict(reference_attestation)
+        if isinstance(reference_attestation, dict) else {}
+    )
+    if reference_attestation:
+        reference_status = str(
+            reference_attestation.get("text_status") or "unknown"
+        )
+        if not reference_attestation.get("allow_vocabulary_reconciliation"):
+            add(
+                "reference_text_unattested", "critical",
+                reference_status, 45,
+            )
+        is_live_attestation = (
+            "live_structure_requires_local_alignment"
+            in set(reference_attestation.get("reasons") or [])
+        )
+        if (
+            not is_live_attestation
+            and reference_attestation.get("allow_vocabulary_reconciliation")
+            and not reference_attestation.get("allow_global_forced_alignment")
+        ):
+            add(
+                "reference_structure_unattested", "critical",
+                reference_status, 40,
+            )
     independent_words = int(coverage.get("independent_witness_words") or 0)
     independent_required_fields = {
         "independent_audio_coverage", "independent_text_mismatches",
@@ -814,7 +858,8 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
             "independent_text_audio_mismatch", "live_lexical_unverified",
             "empty_lyric_lines", "empty_transcription",
             "low_asr_content_confidence", "isolated_tail_low_support",
-            "text_word_cardinality_mismatch",
+            "text_word_cardinality_mismatch", "reference_text_unattested",
+            "reference_structure_unattested",
         },
         "event_count": {
             "live_structural_disagreement", "acoustic_mapping_ambiguous",
@@ -881,6 +926,7 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
         "shadow_decision": shadow_decision,
         "retry": retry_stats,
         "acoustic_evidence": acoustic_evidence,
+        "reference_attestation": reference_attestation or None,
         "evidence_lineage": evidence_lineage,
         "segments_hash": segments_hash(segments),
         **runtime_identity(),
