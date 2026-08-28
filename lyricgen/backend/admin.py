@@ -1865,11 +1865,12 @@ def quality_learning_summary(
         }),
     ).all()
     suggestion_types = {
-        kind: {"shown": 0, "accepted": 0, "rejected": 0}
+        kind: {"shown": 0, "accepted": 0, "rejected": 0, "manual": 0}
         for kind in ("timing", "text", "vocalization")
     }
     suggestion_jobs = set()
     severe_timing_accepted = 0
+    severe_timing_manual = 0
     for event in suggestion_rows:
         properties = event.properties or {}
         if event.job_id:
@@ -1882,8 +1883,11 @@ def quality_learning_summary(
             continue
         kind = str(properties.get("suggestion_type") or "")
         decision = str(properties.get("decision") or "")
-        if kind in suggestion_types and decision in {"accepted", "rejected"}:
-            suggestion_types[kind][decision] += 1
+        if kind in suggestion_types:
+            if decision in {"accepted", "rejected"}:
+                suggestion_types[kind][decision] += 1
+            elif decision == "manual_override":
+                suggestion_types[kind]["manual"] += 1
         try:
             impact_ms = float(properties.get("impact_ms") or 0)
         except (TypeError, ValueError):
@@ -1893,6 +1897,11 @@ def quality_learning_summary(
             and impact_ms >= 1000
         ):
             severe_timing_accepted += 1
+        if (
+            kind == "timing" and decision == "manual_override"
+            and impact_ms >= 1000
+        ):
+            severe_timing_manual += 1
     for values in suggestion_types.values():
         decided = values["accepted"] + values["rejected"]
         values["decided"] = decided
@@ -1911,6 +1920,10 @@ def quality_learning_summary(
             "songs": len(suggestion_jobs),
             "by_type": suggestion_types,
             "severe_timing_accepted": severe_timing_accepted,
+            "severe_timing_manual": severe_timing_manual,
+            "severe_timing_resolved": (
+                severe_timing_accepted + severe_timing_manual
+            ),
             "automatic_apply_allowed": False,
         },
         "privacy": {

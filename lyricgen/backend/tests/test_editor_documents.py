@@ -4,6 +4,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Barrier
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,7 @@ from editor import (
     persist_quality_proposal_if_current,
     persist_quality_observation_if_current,
     persist_operator_review_proposal_if_current,
+    rebase_operator_suggestions_after_manual_edit,
     save_document,
 )
 from transcription_quality import segments_hash
@@ -495,6 +497,122 @@ def test_operator_suggestions_accept_and_reject_one_at_a_time(client, monkeypatc
         ]
     finally:
         verify.close()
+
+
+def test_manual_timing_edit_keeps_other_suggestions_and_records_delta(
+    client, monkeypatch,
+):
+    monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    first, _second, job_id = _users_and_job("editor_operator_manual")
+    token = _token_for(first)
+    proposal_id = f"operator-{uuid.uuid4().hex}"
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job_id,
+        ).one()
+        job.input_audio_sha256 = "d" * 64
+        job.audio_revision = 1
+        windows = []
+        for window_id, current, proposed in (
+            ("timing-one", {"start": 0, "end": 1, "text": "one"},
+             {"start": 0, "end": 0.8, "text": "one"}),
+            ("timing-two", {"start": 1, "end": 2, "text": "two"},
+             {"start": 1, "end": 1.8, "text": "two"}),
+        ):
+            windows.append({
+                "kind": "review_proposal_window",
+                "schema": PROPOSAL_WINDOW_SCHEMA,
+                "id": window_id,
+                "start": current["start"], "end": current["end"],
+                "reasons": ["operator_review"],
+                "current_segments": [current],
+                "proposed_segments": [proposed],
+                "suggestion_type": "timing", "confidence": "high",
+                "impact_ms": 1200 if window_id == "timing-one" else 200,
+                "current_end": current["end"],
+                "proposed_end": proposed["end"],
+                "automatic_apply_allowed": False,
+            })
+        assert persist_operator_review_proposal_if_current(
+            db, job_id=job_id, expected_revision=0,
+            expected_segments_hash=segments_hash(document.current_segments),
+            expected_audio_revision=1, expected_audio_sha256="d" * 64,
+            proposal={
+                "kind": "operator_review_proposal",
+                "schema": "operator-review-proposal-v1",
+                "id": proposal_id, "review_only": True,
+                "operator_suggestion_only": True,
+                "automatic_apply_allowed": False, "windows": windows,
+            },
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    saved = client.patch(
+        f"/editor/{job_id}", headers=auth(token), json={
+            "base_revision": 0,
+            "segments": [
+                {"start": 0, "end": 0.7, "text": "one"},
+                {"start": 1, "end": 2, "text": "two"},
+            ],
+            "checkpoint": "manual",
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    loaded = client.get(f"/editor/{job_id}", headers=auth(token)).json()
+    assert loaded["quality_proposal"]["base_revision"] == 1
+    assert [row["id"] for row in loaded["quality_proposal"]["windows"]] == [
+        "timing-two",
+    ]
+
+    verify = SessionLocal()
+    try:
+        event = verify.query(ProductEvent).filter(
+            ProductEvent.job_id == job_id,
+            ProductEvent.name == "editor_operator_suggestion_decision",
+        ).one()
+        assert event.properties["decision"] == "manual_override"
+        assert event.properties["suggestion_type"] == "timing"
+        assert event.properties["proposed_delta_ms"] == -200
+        assert event.properties["chosen_delta_ms"] == -300
+        assert event.properties["distance_to_proposal_ms"] == -100
+        assert "text" not in event.properties
+    finally:
+        verify.close()
+
+
+def test_manual_rebase_detects_timing_change_with_stable_row_id():
+    previous = [{"_id": "line-1", "start": 0, "end": 1, "text": "one"}]
+    document = SimpleNamespace(
+        current_segments=[
+            {"_id": "line-1", "start": 0, "end": 0.7, "text": "one"},
+        ],
+        revision=1,
+        quality_proposal=None,
+    )
+    decisions = rebase_operator_suggestions_after_manual_edit(
+        document,
+        {
+            "id": "proposal-stable-id", "status": "pending",
+            "operator_suggestion_only": True,
+            "windows": [{
+                "id": "timing-one", "suggestion_type": "timing",
+                "confidence": "high", "impact_ms": 1200,
+                "current_end": 1, "proposed_end": 0.8,
+                "current_segments": previous,
+                "proposed_segments": [
+                    {"_id": "line-1", "start": 0, "end": 0.8, "text": "one"},
+                ],
+            }],
+        },
+        previous,
+    )
+    assert decisions[0]["chosen_delta_ms"] == -300
+    assert decisions[0]["distance_to_proposal_ms"] == -100
+    assert document.quality_proposal["status"] == "manually_resolved"
 
 
 def test_quality_observation_records_hash_only_verdict_without_mutation(
