@@ -113,6 +113,28 @@ def test_proposal_builder_fails_closed_without_signed_calibration(monkeypatch):
     assert "old" not in str(telemetry) and "new" not in str(telemetry)
 
 
+def test_observation_builder_requires_independent_source_families():
+    candidate = _candidate()
+    candidate["source_families"] = ["whisper_raw", "gemini_audio"]
+    proposal, telemetry = quality_jobs._build_review_proposal(
+        _window()["current_segments"], [candidate],
+        {"parent": {"complete": True}}, observation_only=True,
+    )
+    assert telemetry["authorized_windows"] == 1
+    assert proposal["observation_only"] is True
+    assert proposal["windows"][0]["source_families"] == [
+        "gemini_audio", "whisper",
+    ]
+
+    candidate["source_families"] = ["whisper_raw", "whisper_contextual"]
+    proposal, telemetry = quality_jobs._build_review_proposal(
+        _window()["current_segments"], [candidate],
+        {"parent": {"complete": True}}, observation_only=True,
+    )
+    assert proposal is None
+    assert "independent_source_family_missing" in telemetry["blockers"]
+
+
 def test_only_complete_parent_windows_can_become_proposals(monkeypatch):
     monkeypatch.setattr(
         quality_v6_calibration, "runtime_review_proposal_authorization",

@@ -107,6 +107,36 @@ describe("QualityProposalPanel", () => {
     expect(onDismiss).toHaveBeenCalledWith(PROPOSAL);
   });
 
+  it("califica observaciones sin ofrecer ninguna acción de aplicación", async () => {
+    const user = userEvent.setup();
+    const onObserve = vi.fn();
+    const observation = {
+      ...PROPOSAL,
+      id: "observation-v1",
+      status: "observing",
+      observation_only: true,
+      windows: [PROPOSAL.windows[0]],
+    };
+    render(
+      <QualityProposalPanel
+        proposal={observation}
+        currentRevision={12}
+        onApplySelected={vi.fn()}
+        onDismiss={vi.fn()}
+        onObserve={onObserve}
+      />,
+    );
+
+    expect(screen.getByText(/Calibración observable/i)).toBeInTheDocument();
+    expect(screen.getByText(/nunca modifica la letra ni el timing/i)).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Aplicar seleccionadas/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Descartar propuesta/i })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Correcta" }));
+    expect(onObserve).toHaveBeenCalledWith("outro-a", "correct", observation);
+  });
+
   it("marca como obsoleta una propuesta de otra revisión y bloquea mutaciones", () => {
     const onApplySelected = vi.fn();
     const onDismiss = vi.fn();

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-const CLOSED_STATUSES = new Set(["applied", "dismissed", "rejected", "cancelled"]);
+const CLOSED_STATUSES = new Set(["applied", "dismissed", "rejected", "cancelled", "observed"]);
 
 const REASON_LABELS = {
   acoustic_cardinality_disagreement: "La cantidad de frases no coincide con el audio",
@@ -101,6 +101,7 @@ function parseExpiry(value) {
  * - onSeek(startSeconds, window)
  * - onApplySelected(windowIds, proposal)
  * - onDismiss(proposal)
+ * - onObserve(windowId, verdict, proposal)
  */
 export default function QualityProposalPanel({
   proposal,
@@ -108,8 +109,10 @@ export default function QualityProposalPanel({
   onSeek,
   onApplySelected,
   onDismiss,
+  onObserve,
   applying = false,
   dismissing = false,
+  observing = false,
 }) {
   const [selectedKeys, setSelectedKeys] = useState(() => new Set());
   const [clock, setClock] = useState(() => Date.now());
@@ -128,6 +131,7 @@ export default function QualityProposalPanel({
   );
   const expiry = parseExpiry(proposal?.expires_at);
   const status = String(proposal?.status || "pending").toLowerCase();
+  const observationOnly = proposal?.observation_only === true;
   const closed = CLOSED_STATUSES.has(status);
   const expired = status === "expired" || (expiry != null && expiry <= clock);
   const stale = status === "stale" || (
@@ -164,7 +168,7 @@ export default function QualityProposalPanel({
   if (!proposal) return null;
 
   const selectedEntries = windowEntries.filter((entry) => selectedKeys.has(entry.key));
-  const busy = applying || dismissing;
+  const busy = applying || dismissing || observing;
   const applyDisabled = unavailable || busy || selectedEntries.length === 0;
   const dismissDisabled = unavailable || busy;
 
@@ -195,6 +199,8 @@ export default function QualityProposalPanel({
       : closed
         ? status === "applied"
           ? "Esta propuesta ya fue aplicada."
+          : status === "observed"
+            ? "Todas las sugerencias quedaron calificadas para la calibración. No se aplicó ningún cambio."
           : "Esta propuesta ya no está disponible."
         : null;
 
@@ -208,13 +214,15 @@ export default function QualityProposalPanel({
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-300">
-            Revisión de calidad
+            {observationOnly ? "Calibración observable" : "Revisión de calidad"}
           </p>
           <h2 id={`quality-proposal-title-${proposal.id}`} className="mt-1 text-base font-semibold text-white">
-            Compará los cambios sugeridos
+            {observationOnly ? "Ayudanos a medir estas sugerencias" : "Compará los cambios sugeridos"}
           </h2>
           <p className="mt-1 max-w-2xl text-sm leading-relaxed text-gray-400">
-            Escuchá cada zona y elegí solamente las correcciones que quieras aplicar. Nada se aplica automáticamente.
+            {observationOnly
+              ? "Escuchá cada zona y calificá si la sugerencia coincide con el audio. Este modo nunca modifica la letra ni el timing."
+              : "Escuchá cada zona y elegí solamente las correcciones que quieras aplicar. Nada se aplica automáticamente."}
           </p>
         </div>
         <span className="w-fit rounded-full border border-white/10 bg-white/5 px-2.5 py-1 font-mono text-[11px] text-gray-400">
@@ -252,15 +260,15 @@ export default function QualityProposalPanel({
               data-testid={`quality-proposal-window-${key}`}
             >
               <div className="flex flex-wrap items-center justify-between gap-3">
-                <label className="flex min-w-0 cursor-pointer items-center gap-3 text-sm font-semibold text-white">
-                  <input
+                <label className="flex min-w-0 items-center gap-3 text-sm font-semibold text-white">
+                  {!observationOnly && <input
                     type="checkbox"
                     className="h-4 w-4 shrink-0 accent-cyan-400"
                     checked={checked}
                     onChange={() => toggleWindow(key)}
                     disabled={unavailable || busy}
                     aria-label={`Seleccionar ${label.toLowerCase()}, ${range}`}
-                  />
+                  />}
                   <span>
                     {label}
                     <span className="ml-2 font-mono text-xs font-normal text-gray-400">
@@ -311,12 +319,35 @@ export default function QualityProposalPanel({
                   tone="proposed"
                 />
               </div>
+              {observationOnly && (
+                <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-white/10 pt-3">
+                  {proposalWindow?.human_verdict ? (
+                    <p className="text-xs font-medium text-emerald-300">
+                      Calificada: {proposalWindow.human_verdict === "correct" ? "correcta" : proposalWindow.human_verdict === "incorrect" ? "incorrecta" : "dudosa"}
+                    </p>
+                  ) : [
+                    ["correct", "Correcta"],
+                    ["incorrect", "Incorrecta"],
+                    ["uncertain", "No se distingue"],
+                  ].map(([verdict, text]) => (
+                    <button
+                      key={verdict}
+                      type="button"
+                      className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-gray-200 hover:border-cyan-300/40 disabled:cursor-not-allowed disabled:opacity-50"
+                      onClick={() => onObserve?.(proposalWindow?.id, verdict, proposal)}
+                      disabled={unavailable || busy || typeof onObserve !== "function"}
+                    >
+                      {text}
+                    </button>
+                  ))}
+                </div>
+              )}
             </article>
           );
         })}
       </fieldset>
 
-      <div className="mt-5 flex flex-col-reverse gap-2 border-t border-white/10 pt-4 sm:flex-row sm:items-center sm:justify-between">
+      {!observationOnly && <div className="mt-5 flex flex-col-reverse gap-2 border-t border-white/10 pt-4 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-xs text-gray-400" aria-live="polite">
           {selectedEntries.length === 0
             ? "No seleccionaste ninguna corrección."
@@ -340,7 +371,7 @@ export default function QualityProposalPanel({
             {applying ? "Aplicando…" : `Aplicar seleccionadas (${selectedEntries.length})`}
           </button>
         </div>
-      </div>
+      </div>}
     </section>
   );
 }

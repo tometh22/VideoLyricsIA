@@ -353,7 +353,8 @@ def _persist_if_current(job_id: str, expected_revision: int,
                         expected_audio_revision: int | None = None,
                         expected_audio_sha256: str = "",
                         analysis_attempt_id: str = "",
-                        quality_proposal: dict | None = None) -> bool:
+                        quality_proposal: dict | None = None,
+                        quality_observation: dict | None = None) -> bool:
     from database import Job, SessionLocal
     from transcription_quality import quality_fingerprint, segments_hash
 
@@ -438,6 +439,24 @@ def _persist_if_current(job_id: str, expected_revision: int,
                     "[QUALITY-PROPOSAL] fail-closed persistence job=%s", job_id,
                 )
                 quality["review_proposal_persisted"] = False
+        elif quality_observation:
+            try:
+                from editor import persist_quality_observation_if_current
+                quality["review_observation_persisted"] = bool(
+                    persist_quality_observation_if_current(
+                        db, job_id=job_id,
+                        expected_revision=expected_revision,
+                        expected_segments_hash=expected_hash,
+                        expected_audio_revision=audio_revision,
+                        expected_audio_sha256=audio_sha256,
+                        proposal=quality_observation,
+                    )
+                )
+            except Exception:
+                logger.error(
+                    "[QUALITY-OBSERVATION] fail-closed persistence job=%s", job_id,
+                )
+                quality["review_observation_persisted"] = False
         new_fingerprint = quality_fingerprint(
             quality, revision=revision, content_hash=current_hash,
         )
@@ -674,7 +693,8 @@ def _sanitize_analytical_evidence(value, *, _key: str = ""):
 
 
 def _build_review_proposal(segments: list[dict], raw_windows: list[dict],
-                           coverage: dict[str, dict]) -> tuple[dict | None, dict]:
+                           coverage: dict[str, dict], *,
+                           observation_only: bool = False) -> tuple[dict | None, dict]:
     """Build a typed tenant-scoped proposal; return only text-free telemetry."""
     from quality_v6_calibration import runtime_review_proposal_authorization
     from quality_v6_contracts import (
@@ -704,6 +724,7 @@ def _build_review_proposal(segments: list[dict], raw_windows: list[dict],
             "current_segments": [], "proposed_segments": [],
             "certification": candidate.certification,
             "certification_conflict": False,
+            "source_families": set(),
         })
         if group["certification"] != candidate.certification:
             group["certification_conflict"] = True
@@ -712,6 +733,11 @@ def _build_review_proposal(segments: list[dict], raw_windows: list[dict],
         group["reasons"].update(candidate.reasons)
         group["current_segments"].extend(dict(item) for item in candidate.current_segments)
         group["proposed_segments"].extend(dict(item) for item in candidate.proposed_segments)
+        if isinstance(raw.get("source_families"), (list, tuple)):
+            group["source_families"].update(
+                str(item).strip() for item in raw["source_families"]
+                if str(item).strip()
+            )
 
     def key(item: dict) -> tuple:
         return (
@@ -734,10 +760,25 @@ def _build_review_proposal(segments: list[dict], raw_windows: list[dict],
         if any(key(item) not in current_keys for item in group["current_segments"]):
             authorization_blockers.add("proposal_current_segments_mismatch")
             continue
-        authorization = runtime_review_proposal_authorization(group.pop("certification", None))
-        authorization_blockers.update(authorization.get("blockers") or [])
-        if not authorization.get("authorized"):
-            continue
+        certification = group.pop("certification", None)
+        if observation_only:
+            from consensus_review_certificate import canonical_source_family
+            independent_families = {
+                canonical_source_family(item) for item in group["source_families"]
+                if canonical_source_family(item)
+            }
+            if len(independent_families) < 2:
+                authorization_blockers.add("independent_source_family_missing")
+                continue
+            group["source_families"] = sorted(independent_families)
+        else:
+            authorization = runtime_review_proposal_authorization(certification)
+            authorization_blockers.update(authorization.get("blockers") or [])
+            if not authorization.get("authorized"):
+                continue
+            # The signed production proposal contract intentionally contains
+            # no observational metadata.
+            group.pop("source_families", None)
         for field in ("current_segments", "proposed_segments"):
             unique = {}
             for item in group[field]:
@@ -763,6 +804,17 @@ def _build_review_proposal(segments: list[dict], raw_windows: list[dict],
             "review_only": True,
             "windows": windows,
         }).to_dict()
+        if observation_only:
+            metadata = {
+                str(item["id"]): list(item.get("source_families") or [])
+                for item in windows
+            }
+            proposal["observation_only"] = True
+            proposal["certificate_policy_version"] = (
+                "independent-consensus-review-policy-v1"
+            )
+            for item in proposal["windows"]:
+                item["source_families"] = metadata.get(str(item["id"]), [])
     except (TypeError, ValueError):
         telemetry["blocked"] = True
         telemetry["blockers"] = sorted(set(telemetry["blockers"] + ["invalid_contract"]))
@@ -1154,6 +1206,18 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 snapshot["segments"], raw_proposal_windows, coverage,
             )
             retry_stats["review_proposal"] = proposal_telemetry
+            quality_observation = None
+            if (
+                quality_proposal is None
+                and os.environ.get(
+                    "QUALITY_CONSENSUS_OBSERVATIONS_ENABLED", "0",
+                ).strip().lower() in {"1", "true", "yes", "on"}
+            ):
+                quality_observation, observation_telemetry = _build_review_proposal(
+                    snapshot["segments"], raw_proposal_windows, coverage,
+                    observation_only=True,
+                )
+                retry_stats["review_observation"] = observation_telemetry
             complete_parent_ids = {
                 parent_id for parent_id, item in coverage.items() if item.get("complete")
             }
@@ -1223,6 +1287,7 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             expected_audio_sha256=expected_audio_sha256,
             analysis_attempt_id=analysis_attempt_id,
             quality_proposal=quality_proposal,
+            quality_observation=quality_observation,
         )
         return {
             "status": "persisted" if persisted else "discarded",

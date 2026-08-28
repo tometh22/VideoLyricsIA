@@ -206,11 +206,11 @@ export async function qualityProposalIdempotencyKey({
     (Array.isArray(windowIds) ? windowIds : []).map((value) => String(value)),
   )].sort();
   if (
-    !["apply", "dismiss"].includes(normalizedAction)
+    !(["apply", "dismiss"].includes(normalizedAction) || normalizedAction.startsWith("observe-"))
     || !String(jobId || "")
     || !String(proposalId || "")
     || !Number.isInteger(Number(baseRevision))
-    || (normalizedAction === "apply" && normalizedWindows.length === 0)
+    || ((normalizedAction === "apply" || normalizedAction.startsWith("observe-")) && normalizedWindows.length === 0)
   ) {
     throw new Error("invalid_quality_proposal_idempotency_scope");
   }
@@ -1855,7 +1855,7 @@ export default function LyricsEditor({
   // Toast for per-anchor confirmation feedback.
   const { toast } = useToast();
   const [qualityProposalBusy, setQualityProposalBusy] = useState({
-    applying: false, dismissing: false,
+    applying: false, dismissing: false, observing: false,
   });
   // Global timing offset panel — UX entry point for "the whole song is
   // shifted by N ms" cases. Different from Sync Mode (which anchors a
@@ -2617,7 +2617,7 @@ export default function LyricsEditor({
       toast({ message: "Guardá tus cambios actuales antes de aplicar una propuesta.", tone: "warning" });
       return;
     }
-    setQualityProposalBusy({ applying: true, dismissing: false });
+    setQualityProposalBusy({ applying: true, dismissing: false, observing: false });
     try {
       const idempotencyKey = await qualityProposalIdempotencyKey({
         action: "apply",
@@ -2671,7 +2671,7 @@ export default function LyricsEditor({
         tone: appliedRemotely ? "success" : "error",
       });
     } finally {
-      setQualityProposalBusy({ applying: false, dismissing: false });
+      setQualityProposalBusy({ applying: false, dismissing: false, observing: false });
     }
   }, [
     editorRequest, isDirty, qualityProposalBusy.applying,
@@ -2680,7 +2680,7 @@ export default function LyricsEditor({
 
   const dismissQualityProposal = useCallback(async (proposal) => {
     if (!editorRequest || !transcribeJobId || qualityProposalBusy.dismissing) return;
-    setQualityProposalBusy({ applying: false, dismissing: true });
+    setQualityProposalBusy({ applying: false, dismissing: true, observing: false });
     try {
       const idempotencyKey = await qualityProposalIdempotencyKey({
         action: "dismiss",
@@ -2727,10 +2727,63 @@ export default function LyricsEditor({
         tone: dismissedRemotely ? "success" : "error",
       });
     } finally {
-      setQualityProposalBusy({ applying: false, dismissing: false });
+      setQualityProposalBusy({ applying: false, dismissing: false, observing: false });
     }
   }, [
     editorRequest, qualityProposalBusy.dismissing,
+    reconcileQualityProposalDocument, toast, transcribeJobId,
+  ]);
+
+  const observeQualityProposal = useCallback(async (windowId, verdict, proposal) => {
+    if (!editorRequest || !transcribeJobId || qualityProposalBusy.observing) return;
+    setQualityProposalBusy({ applying: false, dismissing: false, observing: true });
+    try {
+      const idempotencyKey = await qualityProposalIdempotencyKey({
+        action: `observe-${verdict}`,
+        jobId: transcribeJobId,
+        proposalId: proposal.id,
+        baseRevision: proposal.base_revision,
+        windowIds: [windowId],
+      });
+      const response = await editorRequest(
+        `/editor/${transcribeJobId}/quality-proposals/${proposal.id}/observe`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            base_revision: proposal.base_revision,
+            window_id: windowId,
+            verdict,
+            idempotency_key: idempotencyKey,
+          }),
+        },
+      );
+      if (!response?.ok) {
+        await reconcileQualityProposalDocument();
+        toast({
+          message: response?.status === 409
+            ? "La sugerencia cambió o ya había sido calificada. Actualizamos el panel."
+            : "No pudimos guardar la calificación.",
+          tone: "error",
+        });
+        return;
+      }
+      await reconcileQualityProposalDocument();
+      toast({
+        message: "Calificación guardada. No se modificó la letra ni el timing.",
+        tone: "success",
+      });
+    } catch {
+      await reconcileQualityProposalDocument();
+      toast({
+        message: "No pudimos confirmar la calificación. Actualizamos el estado para que puedas reintentar.",
+        tone: "error",
+      });
+    } finally {
+      setQualityProposalBusy({ applying: false, dismissing: false, observing: false });
+    }
+  }, [
+    editorRequest, qualityProposalBusy.observing,
     reconcileQualityProposalDocument, toast, transcribeJobId,
   ]);
 
@@ -4058,8 +4111,10 @@ export default function LyricsEditor({
             onSeek={(start) => seekTo(start, true)}
             onApplySelected={applyQualityProposal}
             onDismiss={dismissQualityProposal}
+            onObserve={observeQualityProposal}
             applying={qualityProposalBusy.applying}
             dismissing={qualityProposalBusy.dismissing}
+            observing={qualityProposalBusy.observing}
           />
         </div>
       )}
