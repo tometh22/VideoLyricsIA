@@ -10237,6 +10237,11 @@ def status(
         # (JobDetail.jsx fetches `/status/${job_id}`, never `/jobs/{id}`).
         "segments_json": job.get("segments_json"),
         "segments_revision": int(job.get("segments_revision") or 0),
+        # Final-render preflight is consumed by JobDetail from this polling
+        # endpoint.  Returning it here is essential: /jobs is only the list
+        # bootstrap, while a refresh and every render/edit completion hydrate
+        # the editor from /status/{job_id}.
+        "delivery_qc": job.get("delivery_qc"),
         "bg_r2_key_cached": job.get("bg_r2_key_cached"),
         # Approval state. JobDetail uses these to render the "Aprobado"
         # badge and to gate the "Enviar a UMG" button (admin-only). Both
