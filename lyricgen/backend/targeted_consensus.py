@@ -935,6 +935,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 return _transcribe_window(
                     path, start, duration, lang, current_job_id,
                     provenance_step="targeted_consensus",
+                    prompt=str(result.get("_artist_lexicon_prompt") or "") or None,
                 )
         if not stem_path:
             import vocal_sep
@@ -946,9 +947,9 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
 
         # Environment values may tune downward but can never remove the hard
         # operational ceiling.
-        max_windows = min(4, _env_int("TARGETED_CONSENSUS_MAX_WINDOWS", 3))
+        max_windows = min(12, _env_int("TARGETED_CONSENSUS_MAX_WINDOWS", 3))
         configured_billed_s = min(
-            180.0,
+            360.0,
             _env_float("TARGETED_CONSENSUS_MAX_BILLED_SECONDS", 120.0),
         )
         job_asr_budget = min(
@@ -971,7 +972,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         stats["attempted"] = True
         started_at = time.monotonic()
         hard_deadline_s = min(
-            150.0, _env_float("TARGETED_CONSENSUS_DEADLINE_SECONDS", 120.0)
+            600.0, _env_float("TARGETED_CONSENSUS_DEADLINE_SECONDS", 120.0)
         )
         from quality_mutation import mutation_authorized
         allow_insertions = mutation_authorized(job_id=job_id)
@@ -1495,6 +1496,41 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                         witness_words=witness_group,
                         stream_families=stream_families,
                     )
+                    matched_gemini = None
+                    if not agreed and gemini_events:
+                        isolated_text = _text(group)
+                        viable_events = [
+                            event for event in gemini_events
+                            if isinstance(event, dict)
+                            and _f(event.get("end")) >= a - 0.9
+                            and _f(event.get("start")) <= b + 0.9
+                        ]
+                        if viable_events:
+                            matched_gemini = max(
+                                viable_events,
+                                key=lambda event: _similarity(
+                                    isolated_text,
+                                    str(event.get("text") or ""),
+                                ),
+                            )
+                            agreement = _similarity(
+                                isolated_text,
+                                str(matched_gemini.get("text") or ""),
+                            )
+                            isolated_family = str(
+                                stream_families.get(
+                                    "slowed_stem" if is_slow_group else "stem"
+                                ) or ""
+                            )
+                            if agreement >= 0.90 and isolated_family:
+                                agreed = group
+                                _evidence = {
+                                    "sources": [isolated_source, "gemini"],
+                                    "source_families": [
+                                        isolated_family, "gemini_audio",
+                                    ],
+                                    "agreement": round(agreement, 3),
+                                }
                     if not agreed:
                         continue
                     agreed_a = _f(agreed[0].get("start"))
@@ -1513,7 +1549,48 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                     cross_model = (
                         bool(result.get("live_audio_truth"))
                         and "primary" in sources
-                    )
+                    ) or "gemini" in sources
+                    operator_mode = os.environ.get(
+                        "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
+                    ).strip().lower() in _TRUE
+                    if operator_mode and cross_model:
+                        proposal_reasons = set(reasons)
+                        proposed_text = _text(agreed)
+                        tokens = _word_tokens(proposed_text)
+                        is_vocalization = bool(
+                            (matched_gemini or {}).get("kind") == "vocalization"
+                            or (
+                                b - a >= 0.75 and tokens
+                                and all(token in _VOCALIZATION_TOKENS for token in tokens)
+                            )
+                        )
+                        if is_vocalization:
+                            proposal_reasons.add("vocalization")
+                            proposed_text = f"({proposed_text})"
+                        stats["quality_proposal_windows"].append(
+                            _proposal_candidate_payload(
+                                candidate_id=str(window.get("id") or ""),
+                                parent_window_id=str(
+                                    window.get("parent_window_id")
+                                    or window.get("id") or ""
+                                ),
+                                start=agreed_a, end=agreed_b,
+                                reasons=proposal_reasons,
+                                current_segments=[],
+                                proposed_segments=[{
+                                    "start": round(agreed_a, 3),
+                                    "end": round(agreed_b, 3),
+                                    "text": proposed_text,
+                                    "review": True,
+                                    "consensus_reprocessed": True,
+                                    "consensus_sources": sorted(sources),
+                                }],
+                                source="independent_gap_consensus",
+                                calibrated_evidence=_evidence,
+                            )
+                        )
+                        stats["lines_suggested"] += 1
+                        continue
                     if not allow_insertions or not cross_model:
                         # Observe mode measures how often consensus could help
                         # but cannot mutate the delivered lyric. Auto-insertions

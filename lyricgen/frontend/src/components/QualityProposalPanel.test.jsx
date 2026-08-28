@@ -107,6 +107,50 @@ describe("QualityProposalPanel", () => {
     expect(onDismiss).toHaveBeenCalledWith(PROPOSAL);
   });
 
+  it("ofrece aceptar o rechazar con un clic en sugerencias operativas", async () => {
+    const user = userEvent.setup();
+    const onApplySelected = vi.fn();
+    const onRejectWindow = vi.fn();
+    const operatorProposal = {
+      ...PROPOSAL,
+      id: "operator-v1",
+      operator_suggestion_only: true,
+      automatic_apply_allowed: false,
+      windows: [{
+        ...PROPOSAL.windows[0],
+        id: "timing-a",
+        suggestion_type: "timing",
+        confidence: "high",
+        impact_ms: 920,
+        current_end: 70.83,
+        proposed_end: 69.91,
+        preview_start: 68.5,
+      }],
+    };
+    const onSeek = vi.fn();
+    render(
+      <QualityProposalPanel
+        proposal={operatorProposal}
+        currentRevision={12}
+        onApplySelected={onApplySelected}
+        onRejectWindow={onRejectWindow}
+        onSeek={onSeek}
+      />,
+    );
+
+    expect(screen.getByText(/Sugerencias de un clic/i)).toBeInTheDocument();
+    expect(screen.getByText(/Fin actual/i)).toHaveTextContent("1:10.8");
+    expect(screen.getByText(/Fin propuesto/i)).toHaveTextContent("1:09.9");
+    await user.click(screen.getByRole("button", { name: /Escuchar zona 1/i }));
+    expect(onSeek).toHaveBeenCalledWith(68.5, operatorProposal.windows[0]);
+    await user.click(screen.getByRole("button", { name: "Aceptar" }));
+    expect(onApplySelected).toHaveBeenCalledWith(["timing-a"], operatorProposal);
+    await user.click(screen.getByRole("button", { name: "Rechazar" }));
+    expect(onRejectWindow).toHaveBeenCalledWith(
+      "timing-a", "operator_rejected", operatorProposal,
+    );
+  });
+
   it("califica observaciones sin ofrecer ninguna acción de aplicación", async () => {
     const user = userEvent.setup();
     const onObserve = vi.fn();

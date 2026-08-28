@@ -1845,7 +1845,7 @@ def quality_learning_summary(
 ):
     from correction_learning import model_readiness, public_observation_summary
     from database import (
-        CorrectionObservation, QualityFixProposal, QualityPattern,
+        CorrectionObservation, ProductEvent, QualityFixProposal, QualityPattern,
     )
     since = datetime.now(timezone.utc) - timedelta(days=days)
     rows = db.query(CorrectionObservation).filter(
@@ -1857,11 +1857,62 @@ def quality_learning_summary(
     pattern_counts = dict(db.query(
         QualityPattern.status, func.count(QualityPattern.id),
     ).group_by(QualityPattern.status).all())
+    suggestion_rows = db.query(ProductEvent).filter(
+        ProductEvent.created_at >= since,
+        ProductEvent.name.in_({
+            "editor_operator_suggestions_shown",
+            "editor_operator_suggestion_decision",
+        }),
+    ).all()
+    suggestion_types = {
+        kind: {"shown": 0, "accepted": 0, "rejected": 0}
+        for kind in ("timing", "text", "vocalization")
+    }
+    suggestion_jobs = set()
+    severe_timing_accepted = 0
+    for event in suggestion_rows:
+        properties = event.properties or {}
+        if event.job_id:
+            suggestion_jobs.add(event.job_id)
+        if event.name == "editor_operator_suggestions_shown":
+            for kind in suggestion_types:
+                value = properties.get(f"{kind}_count")
+                if isinstance(value, (int, float)):
+                    suggestion_types[kind]["shown"] += max(0, int(value))
+            continue
+        kind = str(properties.get("suggestion_type") or "")
+        decision = str(properties.get("decision") or "")
+        if kind in suggestion_types and decision in {"accepted", "rejected"}:
+            suggestion_types[kind][decision] += 1
+        try:
+            impact_ms = float(properties.get("impact_ms") or 0)
+        except (TypeError, ValueError):
+            impact_ms = 0.0
+        if (
+            kind == "timing" and decision == "accepted"
+            and impact_ms >= 1000
+        ):
+            severe_timing_accepted += 1
+    for values in suggestion_types.values():
+        decided = values["accepted"] + values["rejected"]
+        values["decided"] = decided
+        values["acceptance_rate"] = (
+            round(values["accepted"] / decided, 4) if decided else None
+        )
+        values["sanity_gate_met"] = bool(
+            decided >= 10 and values["accepted"] / decided >= 0.70
+        ) if decided else False
     return {
         "period_days": days,
         "observations": public_observation_summary(rows),
         "patterns": pattern_counts, "proposals": proposal_counts,
         "model_readiness": model_readiness(db),
+        "operator_suggestions": {
+            "songs": len(suggestion_jobs),
+            "by_type": suggestion_types,
+            "severe_timing_accepted": severe_timing_accepted,
+            "automatic_apply_allowed": False,
+        },
         "privacy": {
             "raw_lyrics_exposed": False, "raw_audio_exposed": False,
             "minimum_pattern_jobs": 10, "minimum_pattern_tenants": 3,

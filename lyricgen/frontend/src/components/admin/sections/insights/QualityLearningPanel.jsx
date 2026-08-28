@@ -153,6 +153,16 @@ export default function QualityLearningPanel() {
 
   const observations = summary?.observations || {};
   const readiness = summary?.model_readiness || {};
+  const operatorSuggestions = summary?.operator_suggestions || {};
+  const suggestionTypes = operatorSuggestions.by_type || {};
+  const suggestionTotals = Object.values(suggestionTypes).reduce(
+    (total, row) => ({
+      shown: total.shown + Number(row?.shown || 0),
+      accepted: total.accepted + Number(row?.accepted || 0),
+      decided: total.decided + Number(row?.decided || 0),
+    }),
+    { shown: 0, accepted: 0, decided: 0 },
+  );
   const filteredPatterns = patternStatus
     ? patterns.filter((row) => row.status === patternStatus) : patterns;
   const filteredProposals = proposalStatus
@@ -181,6 +191,45 @@ export default function QualityLearningPanel() {
         <MetricBreakdown title="Trabajo por release" rows={observations.by_release} />
         <MetricBreakdown title="Trabajo por ruta" rows={observations.by_route} />
       </div>
+
+      <section className="glass rounded-card p-4">
+        <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
+          <div>
+            <h3 className="text-ui font-semibold text-white">Sugerencias de un clic</h3>
+            <p className="text-label text-gray-500 mt-0.5">Aceptación humana y ahorro operativo; nunca autocorrige.</p>
+          </div>
+          <div className="flex gap-2 text-label">
+            <span className="rounded-md bg-white/[0.04] px-2 py-1 text-gray-300">{operatorSuggestions.songs || 0} canciones</span>
+            <span className="rounded-md bg-white/[0.04] px-2 py-1 text-gray-300">{suggestionTotals.shown} mostradas</span>
+            <span className="rounded-md bg-accent/10 px-2 py-1 text-accent">
+              {suggestionTotals.decided ? `${Math.round(100 * suggestionTotals.accepted / suggestionTotals.decided)}% aceptadas` : "Sin decisiones aún"}
+            </span>
+          </div>
+        </div>
+        <div className="grid gap-2 md:grid-cols-3">
+          {["timing", "text", "vocalization"].map((kind) => {
+            const row = suggestionTypes[kind] || {};
+            const label = kind === "timing" ? "Timing" : kind === "text" ? "Texto" : "Vocalizaciones";
+            return (
+              <div key={kind} className="rounded-card bg-white/[0.025] ring-1 ring-white/[0.06] p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-caption font-medium text-gray-200">{label}</span>
+                  <StatusBadge status={row.sanity_gate_met ? "ready" : "validating"} map={STATUS} />
+                </div>
+                <p className="mt-2 text-label text-gray-400">
+                  {row.accepted || 0} aceptadas · {row.rejected || 0} rechazadas · {row.shown || 0} mostradas
+                </p>
+                <p className="mt-1 text-label text-gray-500">
+                  Aceptación {row.acceptance_rate == null ? "—" : `${Math.round(row.acceptance_rate * 100)}%`} · gate 70%
+                </p>
+              </div>
+            );
+          })}
+        </div>
+        <p className="mt-3 text-label text-gray-500">
+          Finales graves resueltos por clic: {operatorSuggestions.severe_timing_accepted || 0}.
+        </p>
+      </section>
 
       <section className="glass rounded-card p-4">
         <div className="flex items-center justify-between gap-3 mb-3">

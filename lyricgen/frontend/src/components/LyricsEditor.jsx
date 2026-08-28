@@ -206,11 +206,11 @@ export async function qualityProposalIdempotencyKey({
     (Array.isArray(windowIds) ? windowIds : []).map((value) => String(value)),
   )].sort();
   if (
-    !(["apply", "dismiss"].includes(normalizedAction) || normalizedAction.startsWith("observe-"))
+    !(["apply", "dismiss", "reject"].includes(normalizedAction) || normalizedAction.startsWith("observe-"))
     || !String(jobId || "")
     || !String(proposalId || "")
     || !Number.isInteger(Number(baseRevision))
-    || ((normalizedAction === "apply" || normalizedAction.startsWith("observe-")) && normalizedWindows.length === 0)
+    || ((["apply", "reject"].includes(normalizedAction) || normalizedAction.startsWith("observe-")) && normalizedWindows.length === 0)
   ) {
     throw new Error("invalid_quality_proposal_idempotency_scope");
   }
@@ -1144,6 +1144,25 @@ export default function LyricsEditor({
       }] }),
     }).catch(() => {});
   }, [editorRequest, transcribeJobId]);
+  const shownOperatorProposalRef = useRef("");
+  useEffect(() => {
+    const proposal = durableEditor.document?.quality_proposal;
+    if (
+      proposal?.operator_suggestion_only !== true
+      || String(proposal?.status || "pending") !== "pending"
+      || !proposal?.id
+      || shownOperatorProposalRef.current === String(proposal.id)
+    ) return;
+    const proposalWindows = Array.isArray(proposal.windows) ? proposal.windows : [];
+    shownOperatorProposalRef.current = String(proposal.id);
+    trackEditorEvent("editor_operator_suggestions_shown", {
+      proposal_id: String(proposal.id).slice(0, 128),
+      total: proposalWindows.length,
+      timing_count: proposalWindows.filter((item) => item?.suggestion_type === "timing").length,
+      text_count: proposalWindows.filter((item) => item?.suggestion_type === "text").length,
+      vocalization_count: proposalWindows.filter((item) => item?.suggestion_type === "vocalization").length,
+    });
+  }, [durableEditor.document?.quality_proposal, trackEditorEvent]);
   const heartbeatSeqRef = useRef(0);
   const heartbeatInFlightRef = useRef(false);
   useEffect(() => {
@@ -1855,7 +1874,7 @@ export default function LyricsEditor({
   // Toast for per-anchor confirmation feedback.
   const { toast } = useToast();
   const [qualityProposalBusy, setQualityProposalBusy] = useState({
-    applying: false, dismissing: false, observing: false,
+    applying: false, dismissing: false, observing: false, rejecting: false,
   });
   // Global timing offset panel — UX entry point for "the whole song is
   // shifted by N ms" cases. Different from Sync Mode (which anchors a
@@ -2784,6 +2803,50 @@ export default function LyricsEditor({
     }
   }, [
     editorRequest, qualityProposalBusy.observing,
+    reconcileQualityProposalDocument, toast, transcribeJobId,
+  ]);
+
+  const rejectQualityProposalWindow = useCallback(async (windowId, reason, proposal) => {
+    if (!editorRequest || !transcribeJobId || qualityProposalBusy.rejecting) return;
+    setQualityProposalBusy({ applying: false, dismissing: false, observing: false, rejecting: true });
+    try {
+      const idempotencyKey = await qualityProposalIdempotencyKey({
+        action: "reject",
+        jobId: transcribeJobId,
+        proposalId: proposal.id,
+        baseRevision: proposal.base_revision,
+        windowIds: [windowId],
+      });
+      const response = await editorRequest(
+        `/editor/${transcribeJobId}/quality-proposals/${proposal.id}/windows/${windowId}/reject`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            base_revision: proposal.base_revision,
+            idempotency_key: idempotencyKey,
+            reason: reason || "operator_rejected",
+          }),
+        },
+      );
+      await reconcileQualityProposalDocument();
+      toast({
+        message: response?.ok
+          ? "Sugerencia rechazada. Guardamos la decisión para mejorar el selector."
+          : "No pudimos rechazar la sugerencia; actualizamos el panel.",
+        tone: response?.ok ? "success" : "error",
+      });
+    } catch {
+      await reconcileQualityProposalDocument();
+      toast({
+        message: "No pudimos confirmar el rechazo. Actualizamos el panel para que puedas reintentar.",
+        tone: "error",
+      });
+    } finally {
+      setQualityProposalBusy({ applying: false, dismissing: false, observing: false, rejecting: false });
+    }
+  }, [
+    editorRequest, qualityProposalBusy.rejecting,
     reconcileQualityProposalDocument, toast, transcribeJobId,
   ]);
 
@@ -4112,9 +4175,11 @@ export default function LyricsEditor({
             onApplySelected={applyQualityProposal}
             onDismiss={dismissQualityProposal}
             onObserve={observeQualityProposal}
+            onRejectWindow={rejectQualityProposalWindow}
             applying={qualityProposalBusy.applying}
             dismissing={qualityProposalBusy.dismissing}
             observing={qualityProposalBusy.observing}
+            rejecting={qualityProposalBusy.rejecting}
           />
         </div>
       )}
