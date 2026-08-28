@@ -11,6 +11,11 @@ from auth import create_user
 from database import Job
 
 
+def test_quality_window_cap_allows_difficult_live_songs(monkeypatch):
+    monkeypatch.setenv("TRANSCRIPTION_QUALITY_MAX_WINDOWS", "200")
+    assert quality_jobs._max_windows() == 64
+
+
 def test_structural_t4_shadow_is_off_by_default(monkeypatch):
     monkeypatch.delenv("QUALITY_T4_STRUCTURAL_OBSERVE_ENABLED", raising=False)
     quality = {"decision": "review_required"}

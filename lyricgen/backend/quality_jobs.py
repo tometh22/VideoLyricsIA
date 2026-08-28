@@ -223,7 +223,10 @@ def _max_windows() -> int:
         configured = int(os.environ.get("TRANSCRIPTION_QUALITY_MAX_WINDOWS", "4"))
     except (TypeError, ValueError):
         configured = 4
-    return max(1, min(12, configured))
+    # High-gap live recordings can legitimately contain dozens of review
+    # windows.  The downstream billed-audio and wall-clock budgets remain the
+    # authoritative cost/safety limits; this cap only guards malformed input.
+    return max(1, min(64, configured))
 
 
 def _release() -> str:

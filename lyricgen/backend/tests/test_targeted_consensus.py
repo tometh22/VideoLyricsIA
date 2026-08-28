@@ -7,6 +7,11 @@ import vocal_sep
 from quality_v6_contracts import PROPOSAL_CANDIDATE_SCHEMA, ReviewProposalCandidate
 
 
+def test_targeted_window_cap_allows_difficult_live_songs(monkeypatch):
+    monkeypatch.setenv("TARGETED_CONSENSUS_MAX_WINDOWS", "200")
+    assert tc._max_targeted_windows() == 64
+
+
 def words(text, start=10.0, step=0.7):
     return [
         {"word": token, "start": start + i * step, "end": start + i * step + 0.5}

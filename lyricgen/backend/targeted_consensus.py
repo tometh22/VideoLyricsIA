@@ -899,6 +899,11 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _max_targeted_windows() -> int:
+    """Bound malformed inputs without truncating legitimate live-song gaps."""
+    return min(64, _env_int("TARGETED_CONSENSUS_MAX_WINDOWS", 3))
+
+
 def reprocess(result: dict, audio_path: str, windows: list[dict], *,
               language: str = "", job_id: str = "",
               transcribe_fn=None, gemini_fn=None,
@@ -947,7 +952,10 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
 
         # Environment values may tune downward but can never remove the hard
         # operational ceiling.
-        max_windows = min(12, _env_int("TARGETED_CONSENSUS_MAX_WINDOWS", 3))
+        # Do not truncate difficult live songs at the historical 12-window
+        # pilot limit.  Spend is still bounded independently by
+        # TARGETED_CONSENSUS_MAX_BILLED_SECONDS and the hard deadline.
+        max_windows = _max_targeted_windows()
         configured_billed_s = min(
             360.0,
             _env_float("TARGETED_CONSENSUS_MAX_BILLED_SECONDS", 120.0),
