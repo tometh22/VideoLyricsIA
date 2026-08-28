@@ -53,6 +53,25 @@ def _finite_number(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _json_safe(value: Any) -> Any:
+    """Return a strict-JSON representation suitable for PostgreSQL JSONB.
+
+    Python's encoder accepts NaN/Infinity by default, while PostgreSQL JSONB
+    correctly rejects them.  QC is a guardrail and must not become the reason
+    an otherwise valid render fails to persist when upstream diagnostics carry
+    one non-finite measurement.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
 def frame_timecode(seconds: Any, fps: float = 30.0) -> str:
     """Convert elapsed seconds to a non-drop ``HH:MM:SS:FF`` timecode."""
     value = max(0.0, _finite_number(seconds) or 0.0)
@@ -551,6 +570,9 @@ def build_delivery_preflight(
     asset_row = dict(asset or {})
     segment_rows = [dict(item) for item in segments if isinstance(item, Mapping)]
     duration = _finite_number(asset_row.get("duration"))
+    effective_fps = _finite_number(fps)
+    if effective_fps is None or effective_fps <= 0:
+        effective_fps = 30.0
     occurrences: list[tuple[int, _Occurrence]] = []
     occurrences.extend(_metadata_occurrences(meta, asset_row))
     occurrences.extend(_timeline_occurrences(segment_rows, duration))
@@ -561,7 +583,9 @@ def build_delivery_preflight(
             segment_rows, approved_lyrics, reference_trusted=reference_trusted
         ))
 
-    issues = _aggregate(occurrences, total_segments=len(segment_rows), fps=fps)
+    issues = _aggregate(
+        occurrences, total_segments=len(segment_rows), fps=effective_fps,
+    )
     fail_count = sum(item["severity"] == "FAIL" for item in issues)
     warn_count = sum(item["severity"] == "WARN" for item in issues)
     decision = "BLOCK" if fail_count else "REVIEW" if warn_count else "PASS"
@@ -585,7 +609,7 @@ def build_delivery_preflight(
     elif quality_verdict == "review_required" and decision == "PASS":
         decision = "REVIEW"
 
-    return {
+    report = {
         "schema_version": SCHEMA_VERSION,
         "mode": "observe",
         "decision": decision,
@@ -596,7 +620,7 @@ def build_delivery_preflight(
             "isrc": meta.get("isrc"),
             "filename": asset_row.get("filename"),
             "duration": duration,
-            "fps": fps,
+            "fps": effective_fps,
         },
         "summary": {
             "issue_count": len(issues),
@@ -611,3 +635,4 @@ def build_delivery_preflight(
         "reference_health": dict(reference_health or {}),
         "acoustic_finding_count": len(acoustic_findings or []),
     }
+    return _json_safe(report)
