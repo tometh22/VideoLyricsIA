@@ -36,6 +36,12 @@ make eval-freeze AUTOPSY_41=.context/autopsy-41.json AUTOPSY_57=.context/autopsy
 make eval-t4-learned
 make eval-error-predictor
 make eval-lora-prep
+make eval-lora-research-prep
+make eval-taxonomy-ensemble
+make eval-runtime-replay
+make eval-t7-prep
+make eval-phase2-status
+make eval-publish-diagnostic
 make eval-nonhistorical
 make eval VARIANT=baseline HYPOTHESIS_ROOT=/ruta/a/hipotesis
 ```
@@ -58,6 +64,25 @@ rechaza hacerlo hasta que los cinco controles del portal estén confirmados.
 ejecución bloqueada: la política publicada afirma que no se entrena con datos
 del cliente y que el audio no sale de la infraestructura. Esa autorización se
 resuelve antes de cualquier upload a RunPod.
+
+`eval-lora-research-prep` descarga tres canciones en español de JamendoLyrics
+y solo acepta licencias BY/BY-SA/CC BY/CC BY-SA; excluye marcadores NC y ND.
+El ejecutor `eval.train_whisper_lora` exige un identificador de licencia por
+muestra de investigación. Para UMG, además exige `ALLOW_UMG_TRAINING=1`; ese
+flag no se configura hasta que la autorización quede registrada.
+
+`eval-runtime-replay` carga el selector de timing directamente del objeto Git
+desplegado y registra el SHA-256 de su fuente. Solo usa stems `mdx_extra`; si
+faltan, el resultado queda como piloto incompleto. `eval-stems-local` regenera
+los faltantes en la Mac, sin egreso, y permite reanudar por canción.
+
+La taxonomía estricta requiere unanimidad de Qwen, Gemma y Mistral. Las filas
+disputadas no se convierten en verdad por mayoría; `eval.export_taxonomy_clips`
+genera la cola local con audio para adjudicación.
+
+`eval-t7-prep` prepara pares sintéticos correcto/corrupto y registra el split
+por canción, pero no entrena: el ejecutor UMG permanece detrás de la misma
+autorización cerrada que LoRA.
 
 La taxonomía se puede ejecutar enteramente con Ollama. El subcomando externo
 `eval.classify_errors submit` está bloqueado además por código y exige

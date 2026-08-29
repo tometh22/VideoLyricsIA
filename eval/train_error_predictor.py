@@ -13,7 +13,7 @@ from typing import Any
 import joblib
 import numpy as np
 from lightgbm import LGBMClassifier
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import GroupKFold
 
 from eval.bootstrap import song_bootstrap_ci
@@ -51,17 +51,40 @@ def build_dataset(golden: Path) -> list[dict[str, Any]]:
             text_value = str(segment.get("text") or "")
             provenance = segment.get("content_provenance") or {}
             source = str(segment.get("content_source") or provenance.get("source") or "")
+            start = _number(segment.get("start"))
+            end = _number(segment.get("end"))
+            first_word_start = _number(words[0].get("start")) if words else start
+            last_word_end = _number(words[-1].get("end")) if words else end
+            previous_end = _number(raw[line_idx - 1].get("end")) if line_idx else start
+            next_start = _number(raw[line_idx + 1].get("start")) if line_idx + 1 < len(raw) else end
+            word_durations = [
+                max(0.0, _number(word.get("end")) - _number(word.get("start")))
+                for word in words
+            ]
+            language = str((meta.get("language") or {}).get("value") or "unknown")
             row = {
                 "song_id": item["song_id"], "line_idx": line_idx,
                 "text": text_value, "label_corrected": int(corrected[line_idx] > 0),
                 "correction_events": corrected[line_idx],
-                "duration_s": max(0.0, _number(segment.get("end")) - _number(segment.get("start"))),
+                "duration_s": max(0.0, end - start),
                 "word_count": len(text_value.split()), "char_count": len(text_value),
                 "line_position": line_idx / max(1, len(raw) - 1),
                 "repeated_line": int(repeats[normalized[line_idx]] > 1),
+                "repetition_group": int(segment.get("repetition_group") is not None),
+                "language_es": int(language == "es"),
+                "language_en": int(language == "en"),
+                "language_other": int(language not in {"es", "en"}),
                 "asr_word_score_mean": float(np.mean(scores)) if scores else 0.0,
                 "asr_word_score_min": float(np.min(scores)) if scores else 0.0,
                 "asr_word_score_available": int(bool(scores)),
+                "word_duration_mean": float(np.mean(word_durations)) if word_durations else 0.0,
+                "word_duration_max": float(np.max(word_durations)) if word_durations else 0.0,
+                "line_start_padding": first_word_start - start,
+                "line_end_padding": end - last_word_end,
+                "gap_from_previous": start - previous_end,
+                "gap_to_next": next_start - end,
+                "boundary_touches_next": int(abs(next_start - end) <= 0.02),
+                "fixed_end_padding_250ms": int(abs((end - last_word_end) - 0.25) <= 0.03),
                 "ctc_lr": _number(segment.get("ctc_lr")),
                 "alignment_score": _number(segment.get("alignment_score")),
                 "ctc_mean_score": _number(segment.get("ctc_mean_score")),
@@ -97,6 +120,7 @@ def train(rows: list[dict[str, Any]], output: Path) -> dict[str, Any]:
         prediction[test_index] = model.predict_proba(x[test_index])[:, 1]
         models.append(model)
     auc = float(roc_auc_score(y, prediction))
+    pr_auc = float(average_precision_score(y, prediction))
     blocks = []
     for song_id in sorted(set(groups)):
         indices = np.where(groups == song_id)[0]
@@ -108,12 +132,60 @@ def train(rows: list[dict[str, Any]], output: Path) -> dict[str, Any]:
         return float(roc_auc_score(labels, predictions)) if len(set(labels)) > 1 else 0.5
 
     auc_ci = song_bootstrap_ci(blocks, bootstrap_auc)
+
+    def bootstrap_pr_auc(sample: list[dict[str, Any]]) -> float:
+        labels = [value for block in sample for value in block["labels"]]
+        predictions = [value for block in sample for value in block["predictions"]]
+        return float(average_precision_score(labels, predictions)) if any(labels) else 0.0
+
+    def top_third_recall(labels: np.ndarray, scores: np.ndarray) -> float:
+        count = max(1, int(np.ceil(len(labels) / 3)))
+        selected = np.argsort(-scores)[:count]
+        return float(np.sum(labels[selected]) / max(1, np.sum(labels)))
+
+    top_third = top_third_recall(y, prediction)
+    current_order_scores = -np.asarray([
+        float(row["line_position"]) for row in rows
+    ], dtype=np.float32)
+    current_order_top_third = top_third_recall(y, current_order_scores)
+
+    def bootstrap_top_third(sample: list[dict[str, Any]]) -> float:
+        labels = np.asarray([value for block in sample for value in block["labels"]], dtype=np.int8)
+        predictions = np.asarray([value for block in sample for value in block["predictions"]])
+        return top_third_recall(labels, predictions)
+
     report = {
-        "schema_version": 1, "model": "lightgbm_error_predictor_v1",
+        "schema_version": 2, "model": "lightgbm_error_predictor_v2",
         "rows": len(rows), "songs": len(set(groups)),
         "positive_rows": int(np.sum(y)), "positive_rate": float(np.mean(y)),
         "features": features, "validation": "5-fold GroupKFold by song",
         "auc_song_bootstrap_ci": auc_ci,
+        "pr_auc": pr_auc,
+        "pr_auc_song_bootstrap_ci": song_bootstrap_ci(blocks, bootstrap_pr_auc),
+        "review_queue_efficiency": {
+            "fraction_reviewed": 1 / 3,
+            "real_corrections_found": top_third,
+            "song_bootstrap_ci": song_bootstrap_ci(blocks, bootstrap_top_third),
+            "current_line_order_corrections_found": current_order_top_third,
+            "random_expected": 1 / 3,
+            "interpretation": "ranking only; it does not edit or approve content",
+        },
+        "independent_family_features": {
+            "whisper_word_vote_rows": int(sum(row["family_agreement_word_vote"] for row in rows)),
+            "gemini_agreement_rows": 0,
+            "auto_consistency_rows": 0,
+            "note": "Missing families are reported, not imputed as agreement.",
+        },
+        "taxonomy_feature": {
+            "status": "EXCLUDED_GOLD_LEAKAGE",
+            "reason": "the current taxonomy is computed from pre-human versus approved word edits; feeding it to the same predictor would expose the target",
+            "safe_future_path": "cross-fit a raw-only taxonomy-risk model inside each outer song fold",
+        },
+        "repeat_context_denominator": {
+            "unit": "reference word",
+            "repeated_line_error_rate": 0.06045406546990496,
+            "unique_line_error_rate": 0.0552689756816507,
+        },
         "gate": {"required_auc": 0.80, "status": "GO_REVIEW_RANKING" if auc >= 0.80 else "NO_GO"},
     }
     output.mkdir(parents=True, exist_ok=True)

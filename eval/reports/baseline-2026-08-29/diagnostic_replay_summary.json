@@ -1,0 +1,245 @@
+{
+  "current_runtime_suggestion_replay": {
+    "eligible_songs": 41,
+    "missing_runtime_stems": 31,
+    "replayed_songs": 10,
+    "text_and_vocalization": {
+      "reason": "historical corpus does not preserve the independent candidate-family inputs required by the deployed consensus selector",
+      "status": "NOT_REPLAYABLE_FROM_PRESERVED_ARTIFACTS",
+      "substitution_forbidden": "approved lyrics are not supplied to candidate generation"
+    },
+    "timing": {
+      "correct_proposals": 6,
+      "corrections": 60,
+      "gate": {
+        "minimum_precision": 0.7,
+        "minimum_recall": 0.2,
+        "status": "NO_GO"
+      },
+      "precision": 0.0379746835443038,
+      "precision_song_bootstrap_ci": {
+        "confidence": 0.95,
+        "estimate": 0.0379746835443038,
+        "high": 0.06349206349206349,
+        "iterations": 2000,
+        "low": 0.014705882352941176,
+        "seed": 20260829,
+        "unit": "song"
+      },
+      "proposals": 158,
+      "recall": 0.1,
+      "recall_song_bootstrap_ci": {
+        "confidence": 0.95,
+        "estimate": 0.1,
+        "high": 0.16,
+        "iterations": 2000,
+        "low": 0.061224489795918366,
+        "seed": 20260829,
+        "unit": "song"
+      }
+    }
+  },
+  "decisions": [
+    {
+      "evidence": "Solo 70/454 son unánimes; 384 requieren adjudicación.",
+      "id": "taxonomy_human_certificate",
+      "question": "¿Completar la validación humana antes de publicar categorías no unánimes?",
+      "recommendation": "SI; no usar mayoría simple como ground truth."
+    },
+    {
+      "evidence": "El ejecutor large-v3-turbo funciona localmente con Jamendo; el contrato publicado hoy dice que no se entrena con datos del cliente.",
+      "id": "allow_umg_training",
+      "question": "¿Autorizar entrenamiento con las 498 muestras UMG?",
+      "recommendation": "NO todavía; resolver uso, retención, borrado y titularidad del adaptador."
+    },
+    {
+      "evidence": "Primer tercio concentra 52.6% de correcciones vs 29.6% del orden actual; AUC 79.0% no pasa 0,80.",
+      "id": "observe_error_predictor",
+      "question": "¿Mostrar el predictor solo como orden sugerido en observación?",
+      "recommendation": "SI en observación; NO como router obligatorio."
+    }
+  ],
+  "error_predictor": {
+    "first_third_real_corrections": {
+      "current_line_order_corrections_found": 0.2959697732997481,
+      "fraction_reviewed": 0.3333333333333333,
+      "interpretation": "ranking only; it does not edit or approve content",
+      "random_expected": 0.3333333333333333,
+      "real_corrections_found": 0.5264483627204031,
+      "song_bootstrap_ci": {
+        "confidence": 0.95,
+        "estimate": 0.5264483627204031,
+        "high": 0.6002949852507374,
+        "iterations": 2000,
+        "low": 0.46145251396648046,
+        "seed": 20260829,
+        "unit": "song"
+      }
+    },
+    "new_auc": {
+      "confidence": 0.95,
+      "estimate": 0.7903665603917494,
+      "high": 0.851155437352246,
+      "iterations": 2000,
+      "low": 0.7234315763727528,
+      "seed": 20260829,
+      "unit": "song"
+    },
+    "new_pr_auc": {
+      "confidence": 0.95,
+      "estimate": 0.8242025076222701,
+      "high": 0.8808789081922939,
+      "iterations": 2000,
+      "low": 0.7617527850335175,
+      "seed": 20260829,
+      "unit": "song"
+    },
+    "old_auc": {
+      "confidence": 0.95,
+      "estimate": 0.70846735128851,
+      "high": 0.7826183517185747,
+      "iterations": 2000,
+      "low": 0.643790117928049,
+      "seed": 20260829,
+      "unit": "song"
+    },
+    "verdict": "NO_GO"
+  },
+  "lora_executor": {
+    "base_model": "openai/whisper-large-v3-turbo",
+    "data_egress": false,
+    "pipeline_validated": false,
+    "remaining_pipeline_gate": "run held-out song inference through eval.score and publish song-bootstrap CI",
+    "research_songs": 3,
+    "training_executor_validated": true,
+    "umg_training": "BLOCKED_POLICY_AUTHORIZATION"
+  },
+  "phase2": {
+    "gate": {
+      "minimum_precision": 0.7,
+      "minimum_recall": 0.2,
+      "unit": "song bootstrap"
+    },
+    "gold_leakage": false,
+    "modules": [
+      {
+        "bucket": 202,
+        "module": "2.1 phonetic_rescoring",
+        "reason": "gold contains the winning approved token for scoring, but not the pre-human n-best or frame posteriors needed to generate and rank without leakage",
+        "status": "BLOCKED_MISSING_PREHUMAN_NBEST_AND_IPA_POSTERIORS"
+      },
+      {
+        "bucket": 229,
+        "module": "2.2 repeated_section_voting",
+        "reason": "per-word repeated-line rate is not materially above unique-line rate",
+        "status": "SKIPPED_BY_PREREQUISITE"
+      },
+      {
+        "bucket": 454,
+        "module": "2.3 gemini_full_song_coherence",
+        "status": "BLOCKED_CREDENTIAL_AND_CLIENT_AUDIO_EGRESS"
+      },
+      {
+        "eligible_songs": 41,
+        "module": "2.4 whisper_n5_auto_consistency",
+        "runtime_stems_available": 10,
+        "status": "WAITING_EXACT_RUNTIME_STEMS"
+      },
+      {
+        "module": "T7 synthetic_corruption_verifier",
+        "prepared_samples": 9746,
+        "prepared_songs": 65,
+        "reason": "preparation is local, but client-data training remains contrary to the published policy until authorized",
+        "status": "BLOCKED_UMG_TRAINING_AUTHORIZATION"
+      }
+    ],
+    "repetition_prerequisite": {
+      "decision": "NOT_MATERIAL_SKIP",
+      "material_uplift_threshold": 0.2,
+      "relative_uplift": 0.09381555790214713,
+      "repeated_error_rate": 0.06045406546990496,
+      "repeated_song_bootstrap_ci": {
+        "confidence": 0.95,
+        "estimate": 0.06045406546990496,
+        "high": 0.10417811984606927,
+        "iterations": 2000,
+        "low": 0.028624933119315143,
+        "seed": 20260829,
+        "unit": "song"
+      },
+      "unique_error_rate": 0.0552689756816507,
+      "unique_song_bootstrap_ci": {
+        "confidence": 0.95,
+        "estimate": 0.0552689756816507,
+        "high": 0.0826271186440678,
+        "iterations": 2000,
+        "low": 0.030893897189161815,
+        "seed": 20260829,
+        "unit": "song"
+      }
+    },
+    "schema_version": 1
+  },
+  "schema_version": 1,
+  "scope": "eval branch only; no staging/production mutation",
+  "t4": {
+    "best_trivial_within_150ms": {
+      "confidence": 0.95,
+      "estimate": 0.19786096256684493,
+      "high": 0.3157894736842105,
+      "iterations": 2000,
+      "low": 0.10843373493975904,
+      "seed": 20260829,
+      "unit": "song"
+    },
+    "classifier_auc": {
+      "confidence": 0.95,
+      "estimate": 0.8618282130666032,
+      "high": 0.9590198911489254,
+      "iterations": 2000,
+      "low": 0.7575716087490457,
+      "seed": 20260829,
+      "unit": "song"
+    },
+    "intermediate_drag_events_removed": 428,
+    "old_within_150ms": 0.037037037037037035,
+    "regressor_within_150ms": {
+      "confidence": 0.95,
+      "estimate": 0.13368983957219252,
+      "high": 0.18518518518518517,
+      "iterations": 2000,
+      "low": 0.08196721311475409,
+      "seed": 20260829,
+      "unit": "song"
+    },
+    "verdict": "NO_GO"
+  },
+  "t7_preparation": {
+    "counts": {
+      "interjection_insertion": 2372,
+      "none": 2593,
+      "phonetic_substitution": 2409,
+      "word_omission": 2372
+    },
+    "execution_gate": {
+      "data_egress_performed": false,
+      "required_environment": "ALLOW_UMG_TRAINING=1",
+      "status": "BLOCKED_UMG_TRAINING_AUTHORIZATION"
+    },
+    "samples": 9746,
+    "schema_version": 1,
+    "songs": 65,
+    "split_contract": "GroupKFold/leave-one-song-out; evaluated song never supplies training rows"
+  },
+  "taxonomy": {
+    "audio_clips": 384,
+    "data_egress": false,
+    "disputed": 384,
+    "models": [
+      "qwen3.5:9b",
+      "gemma3:4b",
+      "mistral:7b-instruct"
+    ],
+    "unanimous": 70
+  }
+}
