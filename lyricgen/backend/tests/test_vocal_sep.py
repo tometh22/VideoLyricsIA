@@ -8,11 +8,39 @@ from unittest.mock import MagicMock
 import vocal_sep as vs
 
 
+class _SucceededPrediction:
+    """Prediction ya terminada, para el camino `predictions.create + poll`."""
+
+    def __init__(self, output):
+        self.status = "succeeded"
+        self.logs = ""
+        self.error = None
+        self.output = output
+
+    def reload(self):
+        pass
+
+    def cancel(self):
+        pass
+
+
 def _fake_replicate(monkeypatch, *, run):
     """Inject a stand-in `replicate` module (the SDK isn't installed in the
-    test venv; prod has it). `run` is the callable / mock for replicate.run."""
+    test venv; prod has it). `run` is the callable / mock for replicate.run.
+
+    Desde el fix del presupuesto (incidente 2026-08-26/28) `call_with_budget`
+    va SIEMPRE por `predictions.create + poll` — el único camino que corta en
+    el deadline — así que los modelos pinneados ya no pasan por
+    `replicate.run`. Derivamos `predictions.create` del MISMO `run` para que
+    cada test siga declarando su output en un solo lugar (y para que un `run`
+    con `side_effect` que lanza siga propagando el fallo igual)."""
     fake = types.ModuleType("replicate")
     fake.run = run
+
+    def _create(version, input):
+        return _SucceededPrediction(run(version, input=input))
+
+    fake.predictions = types.SimpleNamespace(create=_create)
     monkeypatch.setitem(sys.modules, "replicate", fake)
 
 

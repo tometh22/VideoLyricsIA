@@ -14,6 +14,7 @@ usaba, o que mezclaran meses:
 
 from datetime import datetime, timedelta, timezone
 import json
+import types
 
 import pytest
 
@@ -1777,6 +1778,28 @@ def test_replicate_registra_whisperx_demucs_y_forced_align_por_job(
                artist="A", filename="a.mp3", status="processing"))
     db.commit()
     monkeypatch.setattr("replicate.run", lambda *_args, **_kwargs: {"ok": True})
+
+    # Desde el fix del presupuesto (incidente 2026-08-26/28) los modelos
+    # pinneados van por `predictions.create + poll`, el único camino que hace
+    # cumplir el deadline. Lo que este test verifica —una fila de provenance
+    # por intento— es igual en los dos caminos.
+    class _Succeeded:
+        status = "succeeded"
+        logs = ""
+        error = None
+        output = {"ok": True}
+
+        def reload(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(
+        "replicate.predictions",
+        types.SimpleNamespace(create=lambda version, input: _Succeeded()),
+        raising=False,
+    )
 
     try:
         set_job_log_context(job_id)
