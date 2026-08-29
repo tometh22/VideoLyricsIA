@@ -1188,11 +1188,18 @@ class ProvenanceRecorder:
         finally:
             db.close()
 
-    def finish(self, response_summary: str = None, output_artifact: str = None):
+    def finish(self, response_summary: str = None, output_artifact: str = None,
+               predict_time_ms: int = None, queue_time_ms: int = None):
         """Update the in-flight provenance row with end-of-call data.
 
         Idempotent — calling finish() twice is safe. No-op when the
         initial INSERT failed (self._row_id is None).
+
+        `predict_time_ms` / `queue_time_ms` desglosan `duration_ms` cuando el
+        proveedor lo expone (Replicate lo da en `metrics.predict_time` y en
+        `started_at - created_at`). Sin el desglose, una corrida lenta es
+        ambigua entre "el modelo tardó" y "esperamos GPU", que son dos
+        problemas con soluciones opuestas — ver incidente 2026-08-26/28.
         """
         if self._finished or self._row_id is None:
             self._finished = True
@@ -1212,15 +1219,21 @@ class ProvenanceRecorder:
                         "output_artifact": (str(output_artifact)[:500]
                                             if output_artifact else None),
                         "duration_ms": duration_ms,
+                        "predict_time_ms": predict_time_ms,
+                        "queue_time_ms": queue_time_ms,
                     },
                     synchronize_session=False,
                 )
             )
             db.commit()
             if updated:
+                _split = ""
+                if predict_time_ms is not None or queue_time_ms is not None:
+                    _split = (f" queue={queue_time_ms}ms "
+                              f"predict={predict_time_ms}ms")
                 logger.info(
                     f"Provenance recorded: job={self.job_id} step={self.step} "
-                    f"tool={self.tool_name} duration={duration_ms}ms"
+                    f"tool={self.tool_name} duration={duration_ms}ms{_split}"
                 )
         except Exception as e:
             logger.error(f"Failed to update provenance row: {e}")

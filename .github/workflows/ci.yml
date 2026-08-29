@@ -82,6 +82,33 @@ jobs:
       - name: Lint — undefined names (F821, prevent NameError shipping)
         run: ruff check --select F821 .
 
+      # Gate de migraciones, fail-fast (2026-08-29). El paso de Postgres de
+      # abajo YA detecta una colisión de revision id — pero recién después de
+      # levantar el servicio Postgres. Esto corre en segundos, sin servicios,
+      # y además cubre una brecha que aquél no ve: `alembic heads` devuelve
+      # exit 0 con MÚLTIPLES heads, así que un branch de migraciones sólo se
+      # manifiesta como un "Multiple head revisions" confuso más adelante.
+      #
+      # Origen: un PR usó `a1b2c3d4e5f6` como revision id sin notar que ya
+      # existía (`cost_snapshots`). Alembic lo reporta como "Cycle is detected
+      # in revisions", no como colisión, y rompe TODAS las migraciones — no
+      # sólo la nueva. Usar siempre `alembic revision` para generar el id.
+      - name: Migrations — head único + upgrade sobre sqlite limpio
+        env:
+          DATABASE_URL: "sqlite:////tmp/ci_migration_check.db"
+        run: |
+          set -euo pipefail
+          rm -f /tmp/ci_migration_check.db
+          n_heads=$(python -m alembic heads | grep -c '(head)' || true)
+          if [ "$n_heads" -ne 1 ]; then
+            echo "::error::Se esperaba exactamente 1 head de alembic, hay $n_heads."
+            echo "Un revision id duplicado o un branch de migraciones rompe el"
+            echo "prod_migrate.sh que corre antes de cada deploy. Detalle:"
+            python -m alembic heads
+            exit 1
+          fi
+          python -m alembic upgrade head
+
       - name: Apply migrations on real PostgreSQL
         env:
           DATABASE_URL: "postgresql://genly:genly@localhost:5432/genly_test"
