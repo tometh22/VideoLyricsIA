@@ -1,0 +1,5 @@
+name: prod_raw
+source: raw_pipeline_output
+historical: true
+models: []
+status: ready

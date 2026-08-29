@@ -23,3 +23,10 @@ lyricgen/backend/.pytest_cache/
 # stress / load tests; runtime artifact, not source.
 dump.rdb
 *.rdb
+# Golden-set audio, model caches, and generated evaluation outputs are local.
+eval/golden/
+eval/runs/
+eval/cache/
+eval/*.partial/
+.pytest_cache/
+**/__pycache__/

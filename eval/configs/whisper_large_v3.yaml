@@ -1,0 +1,4 @@
+name: whisper_large_v3
+extends: baseline
+asr_model: large-v3
+status: blocked_until_baseline_approved

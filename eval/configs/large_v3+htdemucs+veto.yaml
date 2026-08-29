@@ -1,0 +1,6 @@
+name: large_v3+htdemucs+veto
+extends: baseline
+asr_model: large-v3
+vocal_separator: htdemucs
+repetition_occurrence_veto: true
+status: blocked_until_baseline_approved

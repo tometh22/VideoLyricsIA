@@ -1,0 +1,4 @@
+name: veto_repeats
+extends: baseline
+repetition_occurrence_veto: true
+status: blocked_until_baseline_approved

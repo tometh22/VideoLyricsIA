@@ -1,0 +1,2 @@
+scipy==1.13.1
+lingua-language-detector==2.1.1

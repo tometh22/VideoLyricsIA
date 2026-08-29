@@ -1,0 +1,5 @@
+name: large_v3+htdemucs
+extends: baseline
+asr_model: large-v3
+vocal_separator: htdemucs
+status: blocked_until_baseline_approved

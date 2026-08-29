@@ -1,0 +1,4 @@
+name: htdemucs_local
+extends: baseline
+vocal_separator: htdemucs
+status: blocked_until_baseline_approved

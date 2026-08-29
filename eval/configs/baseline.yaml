@@ -1,0 +1,6 @@
+name: baseline
+source: local_pipeline
+pipeline_ref: origin/claude/build-lyricgen-app-g8gYT
+seed: 20260829
+temperature: 0
+status: blocked_pending_verified_audio
