@@ -37,4 +37,39 @@ describe("DeliveryQCPanel", () => {
     ));
     expect(onJobUpdate).toHaveBeenCalled();
   });
+
+  it("applies only server-certified text/timing actions with one click", async () => {
+    const onJobUpdate = vi.fn();
+    const actionableJob = {
+      ...job,
+      delivery_qc: {
+        ...job.delivery_qc,
+        repairs: {
+          candidate_segments: [{ start: 1, end: 2, text: "Letra corregida" }],
+          actions: [
+            { action_id: "safe-timing", domain: "timing", status: "APPLIED" },
+            { action_id: "unsafe-text", domain: "text", status: "PROPOSED" },
+          ],
+        },
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ ok: true }),
+    }));
+
+    render(<DeliveryQCPanel job={actionableJob} onSeek={vi.fn()} onJobUpdate={onJobUpdate} onOpenEditor={vi.fn()} />);
+    fireEvent.click(screen.getByText("Corregir texto/timing seguro"));
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    const [, request] = fetch.mock.calls[0];
+    const body = JSON.parse(request.body);
+    expect(body.delivery_qc_action_ids).toEqual(["safe-timing"]);
+    expect(body.delivery_qc_action_ids).not.toContain("unsafe-text");
+    expect(body.segments).toEqual(actionableJob.delivery_qc.repairs.candidate_segments);
+    expect(onJobUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      status: "editing",
+      delivery_qc: expect.objectContaining({ status: "STALE" }),
+    }));
+  });
 });
