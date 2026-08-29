@@ -1574,6 +1574,16 @@ class AIProvenance(Base):
     input_data_types = Column(JSONB, nullable=True)      # ["lyrics_text", "artist_name"]
     output_artifact = Column(String(500), nullable=True) # path to generated file
     duration_ms = Column(Integer, nullable=True)
+    # Desglose de `duration_ms` (incidente 2026-08-26/28). El total mide la
+    # ventana entera de la llamada, así que una corrida lenta es ambigua entre
+    # "el modelo tardó" y "esperamos GPU" — dos problemas con soluciones
+    # opuestas. Medido sobre 238 corridas de demucs: la degradación de agosto
+    # fue 100% cola (predict_time mediana 87,6s idéntica antes y después;
+    # cola de 23,5s a 204,3s, picos de 1824s).
+    # NULL cuando el proveedor no expone el desglose (OpenAI, Vertex) o en
+    # filas anteriores a la migración.
+    predict_time_ms = Column(Integer, nullable=True)
+    queue_time_ms = Column(Integer, nullable=True)
     # Only pre-submit Veo budget reservations use this lease. Once the worker
     # crosses the provider POST boundary it is cleared and the row remains in
     # the rolling ceiling as actual/ambiguous spend via response_summary.
