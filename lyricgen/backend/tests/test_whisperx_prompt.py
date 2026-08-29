@@ -34,6 +34,13 @@ def _force_enabled():
         fake = types.ModuleType("replicate")
         fake.run = MagicMock()
         sys.modules["replicate"] = fake
+    # Desde el fix del presupuesto (incidente 2026-08-26/28) `call_with_budget`
+    # va SIEMPRE por `predictions.create + poll` — el único camino que corta en
+    # el deadline. `replicate.run` ya no se usa con modelos pinneados. Un fake
+    # inyectado por otro módulo de tests puede no tenerlo: lo aseguramos acá.
+    if not hasattr(sys.modules["replicate"], "predictions"):
+        sys.modules["replicate"].predictions = types.SimpleNamespace(
+            create=MagicMock())
     import whisperx_transcribe
     importlib.reload(whisperx_transcribe)        # pick up our env + new code
     return whisperx_transcribe
@@ -60,9 +67,13 @@ def fake_audio():
 
 
 def _mock_replicate_run():
-    """Return a mock that replays a tiny but valid whisperX result so the
-    function returns segments and we can assert. The captured `input` arg
-    is exposed on the mock for the test to inspect."""
+    """Mock de `replicate.predictions.create` que devuelve una prediction ya
+    `succeeded` con un resultado whisperX mínimo pero válido.
+
+    Sigue exponiendo el `input` capturado en `m.call_args` para que los tests
+    inspeccionen `initial_prompt`: `predictions.create(version=..., input=...)`
+    lo pasa como kwarg igual que lo hacía `replicate.run(model, input=...)`.
+    """
     fake_output = {
         "segments": [
             {"start": 0.0, "end": 1.0, "text": "Legalícenla",
@@ -71,12 +82,24 @@ def _mock_replicate_run():
              "words": [{"word": "Legalícenla", "start": 1.5, "end": 2.5, "score": 0.94}]},
         ]
     }
-    return MagicMock(return_value=fake_output)
+    class _Succeeded:
+        status = "succeeded"
+        logs = ""
+        error = None
+        output = fake_output
+
+        def reload(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    return MagicMock(return_value=_Succeeded())
 
 
 def test_initial_prompt_omitted_when_no_hint(fake_audio):
     wx = _force_enabled()
-    with patch("replicate.run", _mock_replicate_run()) as m:
+    with patch("replicate.predictions.create", _mock_replicate_run()) as m:
         result = wx.transcribe_whisperx(fake_audio, language="es")
     assert result is not None
     # call_args = ((model_str,), {"input": {...}})
@@ -92,7 +115,7 @@ def test_initial_prompt_included_when_hint_passed(fake_audio):
         "Legalícenla\nLegalícenla\nLegalícenla\nOh-oh-oh\n"
         "Legalícenla\nOh-oh-oh\nHubo tiempos de guerras"
     )
-    with patch("replicate.run", _mock_replicate_run()) as m:
+    with patch("replicate.predictions.create", _mock_replicate_run()) as m:
         result = wx.transcribe_whisperx(fake_audio, language="es", lyrics_hint=lyrics)
     assert result is not None
     _model, kwargs = m.call_args
@@ -113,7 +136,7 @@ def test_initial_prompt_capped_at_120_chars(fake_audio):
     wx = _force_enabled()
     lyrics = ("Una linea larga que excede facilmente cien caracteres por si sola "
               "para forzar el truncado. " * 5)
-    with patch("replicate.run", _mock_replicate_run()) as m:
+    with patch("replicate.predictions.create", _mock_replicate_run()) as m:
         wx.transcribe_whisperx(fake_audio, language="es", lyrics_hint=lyrics)
     _, kwargs = m.call_args
     sent = kwargs["input"]["initial_prompt"]
@@ -132,7 +155,7 @@ def test_initial_prompt_extracts_first_seed_lines(fake_audio):
         "Hubo tiempos de guerras, tiempos de paz\n"
         "Hubo un tiempo en que era ilegal"
     )
-    with patch("replicate.run", _mock_replicate_run()) as m:
+    with patch("replicate.predictions.create", _mock_replicate_run()) as m:
         wx.transcribe_whisperx(fake_audio, language="es", lyrics_hint=lyrics)
     _, kwargs = m.call_args
     sent = kwargs["input"]["initial_prompt"]
@@ -159,12 +182,12 @@ def test_initial_prompt_skipped_when_empty_string(tmp_path):
     audio_b = tmp_path / "b.wav"
     audio_b.write_bytes(b"RIFF$\x00\x00\x00WAVEfmt " + os.urandom(64))
 
-    with patch("replicate.run", _mock_replicate_run()) as m:
+    with patch("replicate.predictions.create", _mock_replicate_run()) as m:
         wx.transcribe_whisperx(str(audio_a), language="es", lyrics_hint="")
     _, kwargs = m.call_args
     assert "initial_prompt" not in kwargs["input"]
 
-    with patch("replicate.run", _mock_replicate_run()) as m:
+    with patch("replicate.predictions.create", _mock_replicate_run()) as m:
         wx.transcribe_whisperx(str(audio_b), language="es", lyrics_hint="   \n  ")
     _, kwargs = m.call_args
     assert "initial_prompt" not in kwargs["input"]
