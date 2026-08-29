@@ -47,6 +47,10 @@ make eval-final-text-realign
 make eval-flag-union
 make eval-mss-alt
 make eval-publish-zero-touch
+make eval-agent-prepare CANDIDATES=/ruta/a/candidatos.jsonl EXTRACT_CLIPS=1
+ALLOW_EXTERNAL_CLIENT_AUDIO_AGENT_REPLAY=1 make eval-agent-run AGENT_LIMIT=10
+make eval-agent-score ADJUDICATIONS=/ruta/a/tres-jueces.jsonl
+make eval-agent-policy ACTIVATED_AT=2026-08-29T12:00:00Z
 make eval-nonhistorical
 make eval VARIANT=baseline HYPOTHESIS_ROOT=/ruta/a/hipotesis
 ```
@@ -103,6 +107,38 @@ flags y segundos reales de audio que el revisor debería escuchar.
 `eval-mss-alt` implementa el replay de arXiv:2506.15514: calcula RMS-VAD sobre
 el stem `mdx_extra`, pero transcribe el mix original. Siempre genera un control
 nativo con el mismo Whisper y persiste ambas familias para replays futuros.
+
+## Capa D: agente corrector
+
+`eval-agent-prepare` construye dos artefactos físicamente separados: el pedido
+que puede ver el agente y el gold de Agus que solo puede leer el scorer. Un
+candidato entra únicamente si lo respaldan al menos dos familias acústicas
+independientes. Whisper v2/v3/faster-whisper se colapsan a una sola familia;
+Gemini se excluye como fuente porque es el agente que decide. También se
+rechaza cualquier candidato derivado del texto o timing aprobado.
+
+El contrato JSONL de candidatos es:
+
+```json
+{"zone_id":"song-id:12","proposals":[{"candidate_id":"p-123","category":"text","value":{"text":"línea candidata"},"supporting_families":[{"name":"whisper-large-v3"},{"name":"qwen3-asr"}]}]}
+```
+
+Una eliminación verificada se representa como `"value":{"delete":true}`;
+también debe tener dos familias independientes. No se trata como generación
+libre.
+
+`eval-agent-run` no permite egreso accidental: además de credenciales Gemini
+exige `ALLOW_EXTERNAL_CLIENT_AUDIO_AGENT_REPLAY=1`. El agente solo puede elegir
+un candidato, editarlo mínimamente o abstenerse. El scorer habilita una
+categoría únicamente con al menos 50 decisiones en 10 canciones, acuerdo
+funcional ≥80%, falsos resueltos <3% y los desacuerdos requeridos juzgados por
+tres familias no-Gemini. Vivo queda excluido siempre.
+
+`eval-agent-policy` produce solo una política de elegibilidad. Nunca activa
+runtime, nunca promueve a auto y exige un certificado firmado más una decisión
+explícita de Tomi. La auditoría determinista es 20% durante 14 días y 10%
+después. `eval.agent_tiers dashboard` resume participación auto/agente/Agus,
+minutos humanos por canción y reversiones.
 
 La taxonomía estricta requiere unanimidad de Qwen, Gemma y Mistral. Las filas
 disputadas no se convierten en verdad por mayoría; `eval.export_taxonomy_clips`
