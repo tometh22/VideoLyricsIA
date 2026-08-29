@@ -107,18 +107,32 @@ def test_progress_monotonic_and_time_based_fallback(monkeypatch):
     assert seen[-1] == 1.0
 
 
-def test_no_on_progress_uses_blocking_run(monkeypatch):
-    """When on_progress is not passed, the original `replicate.run` path
-    stays in use — guards forced_align/whisperX from accidental changes."""
+def test_no_on_progress_still_uses_the_bounded_poll_path(monkeypatch):
+    """CONTRATO INVERTIDO (incidente 2026-08-26/28).
+
+    Este test afirmaba lo contrario: que sin `on_progress` se usaba
+    `replicate.run`. Ese era exactamente el bug — `replicate.run` es un
+    `prediction.wait()` sin timeout global, así que `total_budget_s` no se
+    aplicaba dentro de la llamada y sólo se chequeaba ENTRE intentos.
+    En prod eso dio una llamada de whisperX de 26,5 min con presupuesto 480 s
+    y demucs huérfanos que colgaban el teardown de `asyncio.run`.
+
+    Ahora la barra de progreso es lo único opcional; el enforcement del
+    presupuesto no lo es. El fallback a `replicate.run` sobrevive sólo para
+    modelos sin version hash — ver
+    `test_model_without_version_hash_keeps_legacy_path`.
+    """
     from replicate_budget import call_with_budget
 
-    called = {"n": 0}
+    prediction = _FakePrediction([
+        ("succeeded", "", {"ok": True}),
+    ])
+    used_run = []
 
     fake = types.ModuleType("replicate")
-    fake.run = lambda model, input: (called.__setitem__("n", called["n"] + 1), {"ok": True})[1]
-    fake.predictions = types.SimpleNamespace(create=lambda **_kw: pytest.fail(
-        "predictions.create should NOT be called when on_progress is None"
-    ))
+    fake.predictions = types.SimpleNamespace(
+        create=lambda version, input: prediction)
+    fake.run = lambda *a, **kw: used_run.append(True)
     sys.modules["replicate"] = fake
     monkeypatch.setattr(time, "sleep", lambda *_a, **_kw: None)
 
@@ -128,9 +142,14 @@ def test_no_on_progress_uses_blocking_run(monkeypatch):
         total_budget_s=60.0,
         backoff=[0],
         call_label="forced_test",
+        # sin on_progress a propósito
     )
+
     assert out == {"ok": True}
-    assert called["n"] == 1
+    assert not used_run, (
+        "sin on_progress se volvió a usar replicate.run: el presupuesto "
+        "deja de aplicarse dentro de la llamada"
+    )
 
 
 def test_failed_status_propagates_to_caller(monkeypatch):
@@ -156,3 +175,123 @@ def test_failed_status_propagates_to_caller(monkeypatch):
     )
     # Caller returns None when the attempt fails and no retries succeed.
     assert out is None
+
+
+# --- Regresión incidente 2026-08-26/28 (UMG Chile) -------------------------
+#
+# `total_budget_s` sólo se hacía cumplir en el camino con `on_progress`. Sin
+# él, `call_with_budget` caía a `replicate.run()`, que internamente es un
+# `prediction.wait()` sin timeout global: el presupuesto se chequeaba
+# únicamente ENTRE intentos. En prod eso produjo una llamada de whisperX de
+# 26,5 min con total_budget_s=480, y demucs huérfanos que colgaban el
+# `loop.shutdown_default_executor()` del teardown de `asyncio.run` hasta que
+# RQ mataba el job por death penalty — tirando transcripciones YA terminadas.
+#
+# OJO al escribir estos tests: `call_with_budget` ATRAPA toda excepción del
+# SDK y la degrada a "attempt failed" → devolver None. Por eso un stub de
+# `replicate.run` que hace `pytest.fail()` NO sirve como aserción: el fallo
+# queda tragado y el test pasa igual. El discriminante real es si la
+# predicción terminó `canceled` (sólo el camino con deadline la cancela).
+
+
+class _StuckPrediction:
+    """Prediction que nunca sale de `processing` — el modelo lento del incidente."""
+
+    def __init__(self):
+        self.status = "processing"
+        self.logs = "sin porcentaje parseable"
+        self.output = None
+        self.error = None
+        self.reloads = 0
+
+    def reload(self):
+        self.reloads += 1
+
+    def cancel(self):
+        self.status = "canceled"
+
+
+class _FakeClock:
+    """Reloj determinista: cada `sleep(n)` adelanta n segundos."""
+
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def test_budget_enforced_within_call_without_on_progress(monkeypatch):
+    """Sin `on_progress`, el deadline corta DENTRO de la llamada y cancela.
+
+    Antes del fix se usaba `replicate.run` (sin tope) y la predicción nunca
+    se cancelaba: `used_run` quedaba True y `status` seguía en "processing".
+    """
+    import replicate_budget
+
+    prediction = _StuckPrediction()
+    used_run = []
+
+    fake = types.ModuleType("replicate")
+    fake.predictions = types.SimpleNamespace(
+        create=lambda version, input: prediction)
+    fake.run = lambda *a, **kw: used_run.append(True)
+    sys.modules["replicate"] = fake
+    monkeypatch.setattr(replicate_budget, "_t", _FakeClock())
+
+    out = replicate_budget.call_with_budget(
+        "cjwbw/demucs:abc123",
+        lambda: {"audio": "x"},
+        total_budget_s=30.0,
+        backoff=[0],
+        call_label="VOCALSEP",
+        # on_progress deliberadamente ausente: ese era el camino roto.
+    )
+
+    assert not used_run, (
+        "sin on_progress se volvió a usar replicate.run — presupuesto "
+        "inaplicable dentro de la llamada"
+    )
+    assert prediction.status == "canceled", (
+        "al vencer el deadline hay que cancelar la predicción en Replicate; "
+        "si no, se sigue pagando y el thread queda huérfano"
+    )
+    assert out is None, "budget agotado debe abortar, no devolver output"
+
+
+def test_model_without_version_hash_keeps_legacy_path(monkeypatch):
+    """Un modelo sin `:version` no sirve para `predictions.create`.
+
+    Ese caso (override por env var, no el default) conserva el camino
+    histórico en vez de romper.
+    """
+    import replicate_budget
+
+    called = {}
+    fake = types.ModuleType("replicate")
+    fake.predictions = types.SimpleNamespace(
+        create=lambda version, input: pytest.fail(
+            "predictions.create no puede usarse sin version hash"),
+    )
+
+    def _run(model, input):
+        called["model"] = model
+        return {"ok": True}
+
+    fake.run = _run
+    sys.modules["replicate"] = fake
+    monkeypatch.setattr(replicate_budget, "_t", _FakeClock())
+
+    out = replicate_budget.call_with_budget(
+        "owner/sin-version",
+        lambda: {"audio": "x"},
+        total_budget_s=60.0,
+        backoff=[0],
+        call_label="VOCALSEP",
+    )
+
+    assert out == {"ok": True}
+    assert called["model"] == "owner/sin-version"

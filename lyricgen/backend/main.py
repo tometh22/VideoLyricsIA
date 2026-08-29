@@ -6024,8 +6024,11 @@ async def _maybe_adlib_filter(result, audio_path: str, job_id: str,
         # el chequeo de cola solo, un cache miss no justifica Demucs.
         if not _stem and _has_adlib and os.environ.get(
                 "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
+            # Timeout derivado de la MISMA fuente que el presupuesto
+            # interno (REPLICATE_BUDGET_S_DEMUCS). Ver vocal_sep.
             _stem = await asyncio.wait_for(
-                asyncio.to_thread(_vs.separate_vocals, audio_path), timeout=360)
+                asyncio.to_thread(_vs.separate_vocals, audio_path),
+                timeout=_vs.thread_budget_s())
         if not _stem:
             logger.info("[ADLIB] sin stem — omito el filtro (job=%s)", job_id)
             return result
@@ -6169,9 +6172,14 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
             # (separate_vocals sube el stem al cache R2). El timeout deja
             # margen para el peor caso de Replicate.
             logger.info("[CTC] no cached stem — computing it (job=%s)", job_id)
+            # Timeout derivado de la MISMA fuente que el presupuesto
+            # interno (REPLICATE_BUDGET_S_DEMUCS). Antes eran 360s
+            # fijos: el loop abandonaba la espera mientras el thread
+            # seguía corriendo, y ese huérfano bloqueaba el
+            # shutdown_default_executor() del teardown de asyncio.run.
             _stem = await asyncio.wait_for(
                 asyncio.to_thread(_vs.separate_vocals, audio_path),
-                timeout=360,
+                timeout=_vs.thread_budget_s(),
             )
         # Fallback a la MEZCLA (medido en el gold set, 03/07): la
         # declinación de CTC varía según la fuente — Grignani alineó
@@ -6359,9 +6367,14 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         if not _stem and os.environ.get(
                 "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
             logger.info("[ANCHOR] no cached stem — computing it (job=%s)", job_id)
+            # Timeout derivado de la MISMA fuente que el presupuesto
+            # interno (REPLICATE_BUDGET_S_DEMUCS). Antes eran 360s
+            # fijos: el loop abandonaba la espera mientras el thread
+            # seguía corriendo, y ese huérfano bloqueaba el
+            # shutdown_default_executor() del teardown de asyncio.run.
             _stem = await asyncio.wait_for(
                 asyncio.to_thread(_vs.separate_vocals, audio_path),
-                timeout=360,
+                timeout=_vs.thread_budget_s(),
             )
         # Sin stem → alinear sobre la MEZCLA (misma decisión que el mix
         # fallback de _maybe_ctc_retime: la mezcla como fuente está
