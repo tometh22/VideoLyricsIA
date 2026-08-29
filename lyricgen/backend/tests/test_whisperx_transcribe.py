@@ -7,10 +7,36 @@ from unittest.mock import MagicMock
 import whisperx_transcribe as wx
 
 
+class _SucceededPrediction:
+    """Prediction ya terminada, para el camino `predictions.create + poll`."""
+
+    def __init__(self, output):
+        self.status = "succeeded"
+        self.logs = ""
+        self.error = None
+        self.output = output
+
+    def reload(self):
+        pass
+
+    def cancel(self):
+        pass
+
+
 def _fake_replicate(monkeypatch, *, run):
-    """Inject a stand-in `replicate` module (SDK not installed in test venv)."""
+    """Inject a stand-in `replicate` module (SDK not installed in test venv).
+
+    Desde el fix del presupuesto (incidente 2026-08-26/28) `call_with_budget`
+    va SIEMPRE por `predictions.create + poll` — el único camino que corta en
+    el deadline. Derivamos la prediction del MISMO `run` para que cada test
+    siga declarando su output en un solo lugar."""
     fake = types.ModuleType("replicate")
     fake.run = run
+
+    def _create(version, input):
+        return _SucceededPrediction(run(version, input=input))
+
+    fake.predictions = types.SimpleNamespace(create=_create)
     monkeypatch.setitem(sys.modules, "replicate", fake)
 
 

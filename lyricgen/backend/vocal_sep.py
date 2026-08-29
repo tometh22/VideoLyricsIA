@@ -225,16 +225,26 @@ def _download(value, dest_path: str, deadline: float | None = None) -> bool:
             return float(_DOWNLOAD_READ_TIMEOUT_S)
         return max(1.0, deadline - _t.monotonic())
 
+    is_url_string = isinstance(value, str)
+    raw_url = value if is_url_string else getattr(value, "url", None)
+    # `.url` de un objeto puede ser cualquier cosa (un MagicMock en tests, un
+    # descriptor raro en otra versión del SDK). Sólo nos sirve si es str.
+    url = raw_url if isinstance(raw_url, str) else None
+
+    # El guard SSRF de PR #284 sólo puede RECHAZAR cuando la entrada ES una
+    # URL cruda: ahí no hay otro camino y bajar de un host arbitrario sería
+    # el bug. Si en cambio es un FileOutput con `.url` inutilizable, caemos a
+    # `.read()` como siempre en vez de romper la descarga.
+    if is_url_string and not (url and _is_safe_replicate_url(url)):
+        logger.warning("[VOCALSEP] refusing download from non-Replicate host: %s",
+                       str(value)[:120])
+        return False
+
     try:
-        # Preferimos SIEMPRE la URL: es el único camino que podemos acotar.
+        # Preferimos la URL cuando se puede: es el único camino acotable.
         # `FileOutput.read()` de replicate>=1.0 hace una request HTTP interna
         # sin timeout — mismo agujero que urlretrieve.
-        url = getattr(value, "url", None) or (value if isinstance(value, str) else None)
-        if url:
-            if not _is_safe_replicate_url(url):
-                logger.warning("[VOCALSEP] refusing download from non-Replicate host: %s",
-                               url[:120])
-                return False
+        if url and _is_safe_replicate_url(url):
             import requests
             read_timeout = min(float(_DOWNLOAD_READ_TIMEOUT_S), _remaining())
             with requests.get(

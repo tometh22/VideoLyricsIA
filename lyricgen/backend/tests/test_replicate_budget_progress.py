@@ -107,18 +107,32 @@ def test_progress_monotonic_and_time_based_fallback(monkeypatch):
     assert seen[-1] == 1.0
 
 
-def test_no_on_progress_uses_blocking_run(monkeypatch):
-    """When on_progress is not passed, the original `replicate.run` path
-    stays in use — guards forced_align/whisperX from accidental changes."""
+def test_no_on_progress_still_uses_the_bounded_poll_path(monkeypatch):
+    """CONTRATO INVERTIDO (incidente 2026-08-26/28).
+
+    Este test afirmaba lo contrario: que sin `on_progress` se usaba
+    `replicate.run`. Ese era exactamente el bug — `replicate.run` es un
+    `prediction.wait()` sin timeout global, así que `total_budget_s` no se
+    aplicaba dentro de la llamada y sólo se chequeaba ENTRE intentos.
+    En prod eso dio una llamada de whisperX de 26,5 min con presupuesto 480 s
+    y demucs huérfanos que colgaban el teardown de `asyncio.run`.
+
+    Ahora la barra de progreso es lo único opcional; el enforcement del
+    presupuesto no lo es. El fallback a `replicate.run` sobrevive sólo para
+    modelos sin version hash — ver
+    `test_model_without_version_hash_keeps_legacy_path`.
+    """
     from replicate_budget import call_with_budget
 
-    called = {"n": 0}
+    prediction = _FakePrediction([
+        ("succeeded", "", {"ok": True}),
+    ])
+    used_run = []
 
     fake = types.ModuleType("replicate")
-    fake.run = lambda model, input: (called.__setitem__("n", called["n"] + 1), {"ok": True})[1]
-    fake.predictions = types.SimpleNamespace(create=lambda **_kw: pytest.fail(
-        "predictions.create should NOT be called when on_progress is None"
-    ))
+    fake.predictions = types.SimpleNamespace(
+        create=lambda version, input: prediction)
+    fake.run = lambda *a, **kw: used_run.append(True)
     sys.modules["replicate"] = fake
     monkeypatch.setattr(time, "sleep", lambda *_a, **_kw: None)
 
@@ -128,9 +142,14 @@ def test_no_on_progress_uses_blocking_run(monkeypatch):
         total_budget_s=60.0,
         backoff=[0],
         call_label="forced_test",
+        # sin on_progress a propósito
     )
+
     assert out == {"ok": True}
-    assert called["n"] == 1
+    assert not used_run, (
+        "sin on_progress se volvió a usar replicate.run: el presupuesto "
+        "deja de aplicarse dentro de la llamada"
+    )
 
 
 def test_failed_status_propagates_to_caller(monkeypatch):
