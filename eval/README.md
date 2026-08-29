@@ -23,6 +23,7 @@ make eval-test
 make eval-extract
 make eval-finalize VERIFICATION=.context/portal-verification.json
 make eval VARIANT=prod_raw
+make eval-autopsy
 make eval VARIANT=baseline HYPOTHESIS_ROOT=/ruta/a/hipotesis
 ```
 

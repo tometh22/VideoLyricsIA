@@ -3,13 +3,16 @@ VARIANT ?= prod_raw
 GOLDEN ?= eval/golden
 HYPOTHESIS_ROOT ?= eval/hypotheses/$(VARIANT)
 
-.PHONY: eval eval-test eval-extract eval-finalize eval-from-snapshot
+.PHONY: eval eval-test eval-autopsy eval-extract eval-finalize eval-from-snapshot
 
 eval:
 	PYTHONPATH=. $(PYTHON) -m eval.score --golden "$(GOLDEN)" --variant "$(VARIANT)" $(if $(filter prod_raw,$(VARIANT)),,--hypothesis-root "$(HYPOTHESIS_ROOT)")
 
 eval-test:
 	PYTHONPATH=. $(PYTHON) -m pytest -q eval/tests
+
+eval-autopsy:
+	PYTHONPATH=. $(PYTHON) -m eval.autopsy --golden "$(GOLDEN)" $(if $(INCLUDE_ESTIMATED),--include-estimated,)
 
 eval-extract:
 	PYTHONPATH=. $(PYTHON) -m eval.extract --output "$(GOLDEN)" --expected-count 65
