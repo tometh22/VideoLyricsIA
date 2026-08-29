@@ -13,3 +13,4 @@ joblib>=1.4,<2
 openai>=2.31,<3
 peft>=0.17,<1
 accelerate>=1.10,<2
+phonemizer>=3.3,<4

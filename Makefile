@@ -4,7 +4,7 @@ GOLDEN ?= eval/golden
 HYPOTHESIS_ROOT ?= eval/hypotheses/$(VARIANT)
 BACKEND ?= lyricgen/backend
 
-.PHONY: eval eval-test eval-autopsy eval-extract eval-verify-portal eval-finalize eval-language-id eval-freeze eval-t4-learned eval-error-predictor eval-lora-prep eval-nonhistorical eval-from-snapshot eval-taxonomy-ensemble eval-runtime-replay eval-stems-local eval-lora-research-prep eval-t7-prep eval-phase2-status eval-publish-diagnostic
+.PHONY: eval eval-test eval-autopsy eval-extract eval-verify-portal eval-finalize eval-language-id eval-freeze eval-t4-learned eval-error-predictor eval-lora-prep eval-nonhistorical eval-from-snapshot eval-taxonomy-ensemble eval-runtime-replay eval-stems-local eval-lora-research-prep eval-t7-prep eval-phase2-status eval-publish-diagnostic eval-ztlr eval-final-text-realign eval-flag-union eval-mss-alt eval-publish-zero-touch
 
 eval:
 	PYTHONPATH=. $(PYTHON) -m eval.score --golden "$(GOLDEN)" --variant "$(VARIANT)" $(if $(filter prod_raw,$(VARIANT)),,--hypothesis-root "$(HYPOTHESIS_ROOT)")
@@ -59,6 +59,21 @@ eval-phase2-status:
 
 eval-publish-diagnostic:
 	PYTHONPATH=. $(PYTHON) -m eval.publish_diagnostic_report
+
+eval-ztlr:
+	PYTHONPATH=. $(PYTHON) -m eval.ztlr
+
+eval-final-text-realign:
+	PYTHONPATH=. $(PYTHON) -m eval.realign_final_text
+
+eval-flag-union:
+	PYTHONPATH=. $(PYTHON) -m eval.flag_union
+
+eval-mss-alt:
+	PYTHONPATH=. $(PYTHON) -m eval.mss_alt
+
+eval-publish-zero-touch:
+	PYTHONPATH=. $(PYTHON) -m eval.publish_zero_touch
 
 eval-nonhistorical:
 	PYTHONPATH=. $(PYTHON) -m eval.generate_nonhistorical --golden "$(GOLDEN)" --backend "$(BACKEND)" --output eval/hypotheses/local_baseline_8

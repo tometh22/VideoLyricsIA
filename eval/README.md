@@ -42,6 +42,11 @@ make eval-runtime-replay
 make eval-t7-prep
 make eval-phase2-status
 make eval-publish-diagnostic
+make eval-ztlr
+make eval-final-text-realign
+make eval-flag-union
+make eval-mss-alt
+make eval-publish-zero-touch
 make eval-nonhistorical
 make eval VARIANT=baseline HYPOTHESIS_ROOT=/ruta/a/hipotesis
 ```
@@ -75,6 +80,26 @@ flag no se configura hasta que la autorización quede registrada.
 desplegado y registra el SHA-256 de su fuente. Solo usa stems `mdx_extra`; si
 faltan, el resultado queda como piloto incompleto. `eval-stems-local` regenera
 los faltantes en la Mac, sin egreso, y permite reanudar por canción.
+
+`eval-ztlr` publica la métrica norte operacional: una línea es zero-touch solo
+si conserva texto, inicio y final desde el snapshot prehumano. El denominador
+incluye líneas agregadas y eliminadas. El corpus histórico no contiene un timer
+fiable de actividad del editor, por lo que no inventa minutos retroactivos.
+
+`eval-final-text-realign` alinea el texto aprobado sin entregar a los modelos
+ningún timestamp aprobado. Compara el CTC actual fijado por commit, MMS_FA y un
+XLSR fonético con eSpeak. MMS_FA queda marcado como investigación no comercial;
+el reporte usa bootstrap por canción y decide el gate p90 < 250 ms.
+El backend `xlsr_ipa` requiere `espeak-ng` instalado localmente además de las
+dependencias Python; nunca envía texto ni audio a un servicio externo.
+
+`eval-flag-union` combina únicamente probabilidades out-of-fold y busca el
+umbral con recall de líneas corregidas ≥95% que minimiza la cola. Reporta falsos
+flags y segundos reales de audio que el revisor debería escuchar.
+
+`eval-mss-alt` implementa el replay de arXiv:2506.15514: calcula RMS-VAD sobre
+el stem `mdx_extra`, pero transcribe el mix original. Siempre genera un control
+nativo con el mismo Whisper y persiste ambas familias para replays futuros.
 
 La taxonomía estricta requiere unanimidad de Qwen, Gemma y Mistral. Las filas
 disputadas no se convierten en verdad por mayoría; `eval.export_taxonomy_clips`
