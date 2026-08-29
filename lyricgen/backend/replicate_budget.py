@@ -236,6 +236,15 @@ def _run_predict_with_progress(
             _emit(max(0.05, approx))
 
 
+def _noop_progress(_fraction: float) -> None:
+    """Progress sink for callers that don't render a bar.
+
+    Existe para que `call_with_budget` pueda mandar a TODOS los callers por
+    `_run_predict_with_progress` — el único camino que hace cumplir el
+    deadline — sin obligarlos a inventar un callback.
+    """
+
+
 def call_with_budget(
     model: str,
     input_factory: Callable[[], dict],
@@ -260,11 +269,15 @@ def call_with_budget(
     which path burned the budget when reading logs.
 
     `on_progress` (optional): callback `(fraction: float) -> None` called
-    with 0..1 as the model runs. When present, we swap `replicate.run`
-    for `predictions.create + poll`, parsing model logs to estimate
-    progress. Callers without `on_progress` keep the original
-    blocking-run path (forced_align, whisperX). Demucs uses this to
-    keep the "Aislando voz" bar moving instead of stuck at 25%.
+    with 0..1 as the model runs. Demucs uses this to keep the "Aislando
+    voz" bar moving instead of stuck at 25%.
+
+    NOTA (incidente 2026-08-26/28): omitir `on_progress` NO cambia el
+    enforcement del presupuesto. Siempre usamos `predictions.create +
+    poll`, que es el único camino que corta en `deadline` y hace
+    `prediction.cancel()`; los callers sin barra reciben un no-op. El
+    viejo atajo `replicate.run()` sólo sobrevive para modelos sin version
+    hash, y ahí el presupuesto NO se hace cumplir dentro de la llamada.
     """
     import replicate
     deadline = _t.monotonic() + total_budget_s
@@ -292,15 +305,41 @@ def call_with_budget(
         _closables = [v for v in _input.values() if hasattr(v, "close") and callable(v.close)]
         recorder = start_replicate_provenance(model, call_label, attempt + 1)
         try:
-            if on_progress is not None:
+            # INCIDENT 2026-08-26/28 (UMG Chile): `total_budget_s` SÓLO se
+            # hacía cumplir dentro de `_run_predict_with_progress` (que
+            # pollea y hace `prediction.cancel()` al cruzar el deadline).
+            # El camino `replicate.run()` es un `prediction.wait()` — un
+            # `while status not in (...): sleep(); reload()` SIN timeout
+            # global — así que el presupuesto quedaba en decoración y sólo
+            # se chequeaba ENTRE intentos. Consecuencias medidas en prod:
+            #   - whisperX: una sola llamada de 1.589.943 ms (26,5 min) con
+            #     total_budget_s=480 → se comió el TRANSCRIBE_JOB_TIMEOUT.
+            #   - demucs desde los post-pases (CTC/anchor/adlib): el
+            #     `asyncio.wait_for(asyncio.to_thread(...), 360)` de arriba
+            #     abandona la ESPERA pero no puede cancelar el thread; el
+            #     thread seguía poll-eando sin límite y bloqueaba el
+            #     `loop.shutdown_default_executor()` del teardown de
+            #     `asyncio.run` (que en Python 3.11 no acepta timeout),
+            #     matando por death-penalty transcripciones YA terminadas.
+            # Ahora TODOS los callers pasan por el camino con deadline; el
+            # que no quiere barra de progreso pasa un no-op.
+            if ":" in model:
                 result = _run_predict_with_progress(
                     model, _input,
                     deadline=deadline,
                     call_label=call_label,
-                    on_progress=on_progress,
+                    on_progress=on_progress or _noop_progress,
                     typical_runtime_s=typical_runtime_s,
                 )
             else:
+                # `predictions.create` necesita el version hash; un modelo
+                # sin pinear (override por env) no puede usar ese camino.
+                # Conservamos el histórico y avisamos que va sin tope real.
+                logger.warning(
+                    "[%s] model %r has no version hash — falling back to the "
+                    "UNBOUNDED replicate.run path (budget not enforced "
+                    "within the call)", call_label, model,
+                )
                 result = replicate.run(model, input=_input)
             finish_replicate_provenance(recorder, "succeeded")
             return result
