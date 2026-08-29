@@ -13,7 +13,7 @@ from typing import Any, Sequence
 
 from eval.bootstrap import percentile, song_bootstrap_ci
 from eval.canonical import read_json, segments_to_lines, write_json
-from eval.metrics import normalize_text, score_song
+from eval.metrics import NORMALIZATION_VERSION, normalize_text, score_song
 
 INTERJECTIONS = {
     "ah", "ay", "eh", "ey", "oh", "uh", "uy", "yeah", "hey", "wow",
@@ -119,6 +119,7 @@ def analyze(golden: Path, output: Path, qualities: set[str]) -> dict[str, Any]:
         "language": Counter(), "repeat_context": Counter(),
     }
     observed_edit_count = derived_edit_count = 0
+    repeat_reference_words: Counter[str] = Counter()
     for item in manifest["cases"]:
         case = golden / item["path"]
         meta = read_json(case / "meta.json")
@@ -129,6 +130,12 @@ def analyze(golden: Path, output: Path, qualities: set[str]) -> dict[str, Any]:
         hypothesis = segments_to_lines(raw_payload["segments"])
         metrics, _, _ = score_song(item["song_id"], reference, hypothesis)
         repeat_counts = Counter(normalize_text(line["text"]) for line in reference)
+        for line in reference:
+            if line.get("kind", "main") != "main":
+                continue
+            normalized = normalize_text(re.sub(r"\([^)]*\)", " ", line["text"]))
+            context = "repeated_line" if repeat_counts[normalize_text(line["text"])] > 1 else "unique_line"
+            repeat_reference_words[context] += len(normalized.split())
         song_edits = _word_edit_operations_tokens(_main_tokens(reference), _main_tokens(hypothesis))
         if len(song_edits) != metrics["edit_counts_main"]["word_edits"]:
             raise RuntimeError(f"word traceback diverged from WER numerator for {item['song_id']}")
@@ -167,6 +174,7 @@ def analyze(golden: Path, output: Path, qualities: set[str]) -> dict[str, Any]:
             timing_rows.append({
                 "song_id": item["song_id"], "line_idx": edit.get("line_idx"),
                 "boundary": "start" if edit["op"] == "start_edit" else "end",
+                "position_in_line": "line_start" if edit["op"] == "start_edit" else "last_word_or_line_end",
                 "before_s": before, "after_s": after, "delta_ms": delta_ms,
                 "direction": "later" if delta_ms > 0 else "earlier" if delta_ms < 0 else "unchanged",
                 "derived": derived, "source": edit.get("source", "initial_final_diff"),
@@ -180,6 +188,15 @@ def analyze(golden: Path, output: Path, qualities: set[str]) -> dict[str, Any]:
         ]
         for name, counter in buckets.items()
     }
+    repeat_context_rates = [
+        {
+            "context": context,
+            "errors": buckets["repeat_context"].get(context, 0),
+            "reference_words": repeat_reference_words.get(context, 0),
+            "error_rate": buckets["repeat_context"].get(context, 0) / max(1, repeat_reference_words.get(context, 0)),
+        }
+        for context in ("repeated_line", "unique_line")
+    ]
     wer_ci = song_bootstrap_ci(
         song_rows,
         lambda sample: sum(row["word_errors"] for row in sample) / max(1, sum(row["reference_words"] for row in sample)),
@@ -189,12 +206,31 @@ def analyze(golden: Path, output: Path, qualities: set[str]) -> dict[str, Any]:
         lambda sample: percentile([value for row in sample for value in row["end_abs_samples_ms"]], 0.90),
     )
     timing_magnitudes = [abs(row["delta_ms"]) for row in timing_rows]
+    observed_timing = [row for row in timing_rows if not row["derived"]]
+    by_song_timing = []
+    for song_id in sorted({row["song_id"] for row in timing_rows}):
+        rows = [row for row in timing_rows if row["song_id"] == song_id]
+        observed = [row for row in rows if not row["derived"]]
+        by_song_timing.append({
+            "song_id": song_id,
+            "corrections": len(rows),
+            "observed_corrections": len(observed),
+            "earlier": sum(row["direction"] == "earlier" for row in rows),
+            "later": sum(row["direction"] == "later" for row in rows),
+            "observed_earlier": sum(row["direction"] == "earlier" for row in observed),
+            "observed_later": sum(row["direction"] == "later" for row in observed),
+            "end_boundary_corrections": sum(row["boundary"] == "end" for row in rows),
+            "abs_delta_p50_ms": percentile([abs(row["delta_ms"]) for row in rows], 0.50),
+            "abs_delta_p90_ms": percentile([abs(row["delta_ms"]) for row in rows], 0.90),
+        })
     report = {
         "schema_version": 1, "cohort_raw_qualities": sorted(qualities),
+        "normalization_version": NORMALIZATION_VERSION,
         "songs": len(song_rows), "word_errors": total_errors,
         "wer_main_song_bootstrap_ci": wer_ci,
         "end_abs_p90_ms_song_bootstrap_ci": end_ci,
         "buckets": bucket_report,
+        "repeat_context_rates": repeat_context_rates,
         "timing_corrections": {
             "count": len(timing_rows),
             "observed_count": sum(not row["derived"] for row in timing_rows),
@@ -203,6 +239,14 @@ def analyze(golden: Path, output: Path, qualities: set[str]) -> dict[str, Any]:
             "earlier_count": sum(row["direction"] == "earlier" for row in timing_rows),
             "abs_delta_p50_ms": percentile(timing_magnitudes, 0.50) if timing_magnitudes else None,
             "abs_delta_p90_ms": percentile(timing_magnitudes, 0.90) if timing_magnitudes else None,
+            "observed_only": {
+                "count": len(observed_timing),
+                "later_count": sum(row["direction"] == "later" for row in observed_timing),
+                "earlier_count": sum(row["direction"] == "earlier" for row in observed_timing),
+                "end_boundary_count": sum(row["boundary"] == "end" for row in observed_timing),
+                "start_boundary_count": sum(row["boundary"] == "start" for row in observed_timing),
+            },
+            "by_song": by_song_timing,
         },
         "edit_provenance": {"observed": observed_edit_count, "derived": derived_edit_count},
         "songs_by_error_contribution": [
@@ -243,6 +287,12 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.extend([f"## {name}", "", "| Bucket | Errores | % del total |", "|---|---:|---:|"])
         lines.extend(f"| {row['bucket']} | {row['errors']} | {100*row['pct_error_total']:.1f}% |" for row in rows)
         lines.append("")
+    lines.extend(["## repeat_context_rate", "", "| Contexto | Errores | Palabras | Tasa |", "|---|---:|---:|---:|"])
+    lines.extend(
+        f"| {row['context']} | {row['errors']} | {row['reference_words']} | {100*row['error_rate']:.2f}% |"
+        for row in report["repeat_context_rates"]
+    )
+    lines.append("")
     timing = report["timing_corrections"]
     lines.extend([
         "## Timing humano", "",

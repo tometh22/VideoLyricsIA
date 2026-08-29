@@ -1,0 +1,44 @@
+{
+  "auc_song_bootstrap_ci": {
+    "confidence": 0.95,
+    "estimate": 0.70846735128851,
+    "high": 0.7826183517185747,
+    "iterations": 2000,
+    "low": 0.643790117928049,
+    "seed": 20260829,
+    "unit": "song"
+  },
+  "features": [
+    "duration_s",
+    "word_count",
+    "char_count",
+    "line_position",
+    "repeated_line",
+    "asr_word_score_mean",
+    "asr_word_score_min",
+    "asr_word_score_available",
+    "ctc_lr",
+    "alignment_score",
+    "ctc_mean_score",
+    "ctc_min_score",
+    "recognition_score",
+    "family_agreement_word_vote",
+    "pipeline_review_flag",
+    "locked",
+    "catalog_reference",
+    "gap_recovered",
+    "repetition_recovered",
+    "interjection_shape"
+  ],
+  "gate": {
+    "required_auc": 0.8,
+    "status": "NO_GO"
+  },
+  "model": "lightgbm_error_predictor_v1",
+  "positive_rate": 0.5261762756792577,
+  "positive_rows": 794,
+  "rows": 1509,
+  "schema_version": 1,
+  "songs": 41,
+  "validation": "5-fold GroupKFold by song"
+}

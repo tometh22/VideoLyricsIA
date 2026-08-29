@@ -19,11 +19,13 @@ El final p90 es **750 ms**, CI95 por canción **511–1.067 ms**.
 | contexto | línea repetida | 228 | 50,2% |
 | contexto | línea única | 226 | 49,8% |
 
-El bucket dominante provisional es sustitución; la mitad de todo el residuo
-cae en líneas repetidas, por lo que la consistencia de estribillo merece ser
-reconsiderada después de la autopsia final. Esto todavía no autoriza una
-variante: los idiomas figuran `unknown` porque el snapshot anterior no los
-derivaba.
+Con el denominador correcto, las líneas repetidas tienen **228/3.788 = 6,02%**
+de error y las únicas **226/4.074 = 5,55%**. La diferencia es pequeña: el share
+de 50,2% se explica principalmente porque casi la mitad de las palabras está
+en repeticiones, no porque los estribillos fallen mucho más. Por ahora no se
+justifica priorizar consistencia de estribillo. El bucket dominante provisional
+es sustitución. Esto todavía no autoriza una variante: los idiomas figuran
+`unknown` porque el snapshot anterior no los derivaba.
 
 Los diffs inicial→final producen 612 cambios de timing: 227 hacia más tarde y
 385 hacia más temprano, magnitud absoluta p50 **310 ms** y p90 **2.390 ms**.

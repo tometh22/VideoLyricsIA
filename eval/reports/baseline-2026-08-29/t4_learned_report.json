@@ -1,0 +1,156 @@
+{
+  "features": [
+    "line_word_count",
+    "line_char_count",
+    "last_word_char_count",
+    "last_word_ends_vowel",
+    "ends_punctuation",
+    "repeated_line",
+    "line_position",
+    "approved_line_duration_s",
+    "rms_before_400ms",
+    "rms_after_400ms",
+    "rms_after_1200ms",
+    "rms_after_over_before",
+    "zcr_after",
+    "spectral_centroid_after",
+    "voiced_ratio_after",
+    "pitch_median_after"
+  ],
+  "model": "lightgbm_t4_perceptual_v1",
+  "oof": {
+    "baseline_no_change_mae_ms": 3659.45263671875,
+    "mae_ms": 3581.146728515625,
+    "within_150ms_all": 0.037037037037037035
+  },
+  "per_song": [
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "04a3a7530640"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "195f117a2a2b"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "24a8c89b36b5"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "2ed1d6124725"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "398e6c004fa6"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "3ed05746d7b8"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "44f1095c0753"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "4af8c731051c"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "76e0700e91a4"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "8119212892a3"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "83f95d0e2679"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "8b79a73aa822"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "8f3a08ef5be2"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "9858aa88f108"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "a2893308c85e"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "ad2a155868e6"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "b7a9ae138f09"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "bc2485d619cb"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "c040348b681c"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "c54adb6de148"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "d228f1da80bd"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "f44edb310fb4"
+    },
+    {
+      "accurate": 0,
+      "proposals": 0,
+      "song_id": "ffa93697b8fb"
+    }
+  ],
+  "proposal_gate": {
+    "coverage_of_observed_end_corrections": 0.0,
+    "mean_proposals_per_song": 0.0,
+    "proposals": 0,
+    "required_point_accuracy": 0.6,
+    "status": "NO_GO",
+    "uncertainty_threshold_ms": null,
+    "within_150ms_song_bootstrap_ci": null
+  },
+  "rows": 729,
+  "schema_version": 1,
+  "songs": 23,
+  "validation": "5-fold GroupKFold by song; 3-seed fold ensemble"
+}

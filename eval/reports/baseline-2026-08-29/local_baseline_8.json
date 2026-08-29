@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "variant": "local_baseline_8",
+  "historical": false,
+  "source": "local_whisper_large_v3_turbo",
+  "songs": 8,
+  "normalization_version": "genly-wer-nfd-strip-marks-v1",
+  "wer_main_corpus": 0.34133790737564323,
+  "cer_main_mean_by_song": 0.31060822079275846,
+  "lines_omitted_total": 120,
+  "lines_invented_total": 134,
+  "start_abs_err_p90_ms": 3740.000000000009,
+  "end_abs_err_p90_ms": 2246.664886474605,
+  "word_timing_available": false,
+  "generator_report_sha256": "fbf03a7fad534d436b7a9ffab8205e7f4293a315869d96527ffa1f38acde0400",
+  "score_summary_sha256": "7c8de5879b8eb1e19907fd574a43695079becafd339b0de870347947c8e1018d",
+  "cohort_note": "No raw historical pipeline output exists for these deliveries. This locally generated sensitivity baseline is excluded from all historical 41/57 comparisons."
+}

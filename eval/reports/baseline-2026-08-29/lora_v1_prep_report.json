@@ -1,0 +1,41 @@
+{
+  "base_model": "openai/whisper-large-v3-turbo",
+  "execution_gate": {
+    "data_egress_performed": false,
+    "estimated_gpu_budget_usd": [
+      20,
+      30
+    ],
+    "reason": "docs/GenLy_AI_Compliance_Report.md states that GenLy does not fine-tune on client data and that audio never leaves GenLy infrastructure. A RunPod upload would change that representation and requires explicit policy/contract approval.",
+    "status": "BLOCKED_POLICY_AUTHORIZATION"
+  },
+  "leave_artist_out": {
+    "artists": [
+      "Babasonicos",
+      "Viejas Locas"
+    ],
+    "songs": 14
+  },
+  "samples": 498,
+  "schema_version": 1,
+  "song_split": {
+    "train_songs": 52,
+    "validation_song_ids": [
+      "1734a6cec812",
+      "195f117a2a2b",
+      "2ed1d6124725",
+      "398e6c004fa6",
+      "3ac8c2b7b975",
+      "808d64aa5221",
+      "8119212892a3",
+      "8b79a73aa822",
+      "9858aa88f108",
+      "a9b4b62c3489",
+      "cca79f9919a6",
+      "d1814cf914f0",
+      "f8113ff0ba0c"
+    ],
+    "validation_songs": 13
+  },
+  "songs": 65
+}

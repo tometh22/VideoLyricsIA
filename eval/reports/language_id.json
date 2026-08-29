@@ -1,0 +1,1447 @@
+{
+  "agreement_count": 62,
+  "cases": [
+    {
+      "acoustic": {
+        "confidence": 0.8671379089355469,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8671379089355469,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "b7a9ae138f09",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.3181924819946289,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.3181924819946289,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "4af8c731051c",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 0.9992669622554283,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.5547990202903748,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.5547990202903748,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "44f1095c0753",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8961285948753357,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8961285948753357,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "b5ee8a4a3d38",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8587415218353271,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8587415218353271,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "3ed05746d7b8",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9083102941513062,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9083102941513062,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "be25dc55da34",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.660977303981781,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.660977303981781,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "8f3a08ef5be2",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8914571404457092,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8914571404457092,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "83f95d0e2679",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.7959694266319275,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.7959694266319275,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "9b1332ebc3d7",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8726709485054016,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8726709485054016,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "04a3a7530640",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9534035325050354,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9534035325050354,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "d0a1f8acf039",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.5893117189407349,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.5893117189407349,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "f44edb310fb4",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 0.9999999999999977,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8254337906837463,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8254337906837463,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "a9b4b62c3489",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9412098526954651,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9412098526954651,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "b7a217f4e4a4",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.6863884925842285,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.6863884925842285,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "bc2485d619cb",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.7995349764823914,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.7995349764823914,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "b20be28c4621",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9274275302886963,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9274275302886963,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "a2893308c85e",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9313087463378906,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9313087463378906,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "398e6c004fa6",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8577203750610352,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8577203750610352,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "fef30a2434d0",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8861116170883179,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8861116170883179,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "34bbf1872ae4",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9015512466430664,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9015512466430664,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "eb5ce54efb30",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.29717472195625305,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "en"
+      },
+      "agreement": false,
+      "confidence": 1.0,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "8119212892a3",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.4092283248901367,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.4092283248901367,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "eb820712f1ac",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8838518857955933,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8838518857955933,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "d228f1da80bd",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.4776451587677002,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.4776451587677002,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "cca79f9919a6",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8207364082336426,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8207364082336426,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "c040348b681c",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8557426929473877,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8557426929473877,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "2771136f15ad",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8290325403213501,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8290325403213501,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "8b79a73aa822",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.4708373248577118,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.4708373248577118,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "6ce7471f2eee",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8166123032569885,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8166123032569885,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "9858aa88f108",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8676314353942871,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8676314353942871,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "fdb3a36d20b7",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.41012442111968994,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.41012442111968994,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "3ac8c2b7b975",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8225927352905273,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8225927352905273,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "c54adb6de148",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9044696688652039,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9044696688652039,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "db23953660b0",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8875977993011475,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8875977993011475,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "2822253d32d4",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8938430547714233,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8938430547714233,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "bf0f97b5b69b",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9350626468658447,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9350626468658447,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "99b008285857",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8987459540367126,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": false,
+      "confidence": 0.8987459540367126,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "ffa93697b8fb",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "en"
+      },
+      "text_lingua": {
+        "confidence": 0.9999999999999998,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8683257102966309,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8683257102966309,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "ad2a155868e6",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9407986998558044,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9407986998558044,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "195f117a2a2b",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.6593207716941833,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.6593207716941833,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "24a8c89b36b5",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8873611092567444,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8873611092567444,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "76e0700e91a4",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9203940033912659,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9203940033912659,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "4731f1c1e630",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8653851747512817,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8653851747512817,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "f4654cb485fc",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8811653852462769,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8811653852462769,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "962334f0a483",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.6355355978012085,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.6355355978012085,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "bd0bab38f3aa",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9551096558570862,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9551096558570862,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "808d64aa5221",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.86585533618927,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.86585533618927,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "0e05f381a281",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8069987297058105,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8069987297058105,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "c5f60273c812",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9117579460144043,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9117579460144043,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "42ad7696d2a7",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8764904737472534,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8764904737472534,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "2070a7d0f08a",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9360480308532715,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9360480308532715,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "72ccd9f64daf",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.9455353617668152,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.9455353617668152,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "29712b01a948",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.7819441556930542,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.7819441556930542,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "c22e68b90847",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.7796926498413086,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.7796926498413086,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "b4ff9574d14c",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.6485218405723572,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.6485218405723572,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "1734a6cec812",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8300432562828064,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8300432562828064,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "f8113ff0ba0c",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.6756979823112488,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.6756979823112488,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "d1814cf914f0",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.5948193669319153,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "en"
+      },
+      "agreement": true,
+      "confidence": 0.5948193669319153,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "0470deaebd04",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "en"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "en"
+      },
+      "value": "en"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.687394380569458,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.687394380569458,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "5097fac65a89",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 0.9999999999999997,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8017106652259827,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8017106652259827,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "9ffe4c854c3b",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.19833049178123474,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.19833049178123474,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "00a7189bc28c",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.5083315968513489,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.5083315968513489,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "f0a15106c107",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8063817024230957,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": false,
+      "confidence": 0.8063817024230957,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "2ed1d6124725",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "en"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    },
+    {
+      "acoustic": {
+        "confidence": 0.8498736619949341,
+        "input": "local_htdemucs_vocal_stem_30s",
+        "model": "openai-whisper-base",
+        "value": "es"
+      },
+      "agreement": true,
+      "confidence": 0.8498736619949341,
+      "derived": true,
+      "resolved_by_majority": true,
+      "song_id": "7a295254ab9d",
+      "text_confirmation": {
+        "model": "qwen3.5:9b",
+        "value": "es"
+      },
+      "text_lingua": {
+        "confidence": 1.0,
+        "value": "es"
+      },
+      "value": "es"
+    }
+  ],
+  "disagreement_count": 3,
+  "disagreement_song_ids": [
+    "8119212892a3",
+    "ffa93697b8fb",
+    "2ed1d6124725"
+  ],
+  "llm_model": "qwen3.5:9b",
+  "schema_version": 1,
+  "songs": 65,
+  "unresolved_count": 0,
+  "unresolved_song_ids": [],
+  "whisper_model": "base"
+}

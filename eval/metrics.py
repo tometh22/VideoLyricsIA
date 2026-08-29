@@ -16,6 +16,7 @@ KINDS = {"main", "adlib", "spoken", "feat"}
 MATCH_THRESHOLD = 0.35
 TIMING_OK_MS = 150.0
 MAX_TEXT_ONLY_DRIFT_S = 10.0
+NORMALIZATION_VERSION = "genly-wer-nfd-strip-marks-v1"
 
 
 def normalize_text(text: str) -> str:

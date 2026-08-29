@@ -1,2 +1,13 @@
 scipy==1.13.1
 lingua-language-detector==2.1.1
+boto3>=1.40,<2
+SQLAlchemy>=2.0,<3
+psycopg2-binary>=2.9,<3
+pytest>=8,<9
+openai-whisper==20250625
+demucs==4.0.1
+librosa==0.11.0
+lightgbm==4.6.0
+scikit-learn==1.6.1
+joblib>=1.4,<2
+openai>=2.31,<3

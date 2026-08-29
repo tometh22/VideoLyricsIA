@@ -12,7 +12,8 @@ from typing import Any
 
 from eval.canonical import read_json, segments_to_lines, write_json
 from eval.metrics import (
-    aggregate_edit_effort, aggregate_song_metrics, score_edit_effort, score_song,
+    NORMALIZATION_VERSION, aggregate_edit_effort, aggregate_song_metrics,
+    score_edit_effort, score_song,
 )
 
 
@@ -82,6 +83,7 @@ def run(golden: Path, variant: str, output: Path, hypothesis_root: Path | None =
     summary = {
         "schema_version": 1,
         "variant": variant,
+        "normalization_version": NORMALIZATION_VERSION,
         "cohorts": {
             "raw_exact_plus_reconstructed": aggregate_song_metrics(exact_reconstructed),
             "raw_all_57": aggregate_song_metrics(all_historical),

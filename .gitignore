@@ -27,6 +27,12 @@ dump.rdb
 eval/golden/
 eval/runs/
 eval/cache/
+eval/hypotheses/
 eval/*.partial/
+# Human-review exports may contain approved client lyrics. Keep them local;
+# their generators and aggregate reports remain versioned.
+eval/reports/**/word_errors_*.csv
+eval/reports/**/timing_corrections_*.csv
+eval/reports/**/error_taxonomy_validation_*.csv
 .pytest_cache/
 **/__pycache__/

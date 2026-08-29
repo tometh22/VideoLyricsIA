@@ -1,0 +1,67 @@
+{
+  "categories": [
+    {
+      "category": "otro",
+      "errors": 213,
+      "material_before_validation": true,
+      "pct_error_total": 0.46916299559471364
+    },
+    {
+      "category": "homofono_par_fonetico_minimo",
+      "errors": 71,
+      "material_before_validation": true,
+      "pct_error_total": 0.15638766519823788
+    },
+    {
+      "category": "interjeccion",
+      "errors": 54,
+      "material_before_validation": true,
+      "pct_error_total": 0.11894273127753303
+    },
+    {
+      "category": "palabra_otro_idioma",
+      "errors": 52,
+      "material_before_validation": true,
+      "pct_error_total": 0.1145374449339207
+    },
+    {
+      "category": "contraccion_oral",
+      "errors": 42,
+      "material_before_validation": false,
+      "pct_error_total": 0.09251101321585903
+    },
+    {
+      "category": "nombre_propio",
+      "errors": 12,
+      "material_before_validation": false,
+      "pct_error_total": 0.02643171806167401
+    },
+    {
+      "category": "error_segmentacion",
+      "errors": 9,
+      "material_before_validation": false,
+      "pct_error_total": 0.019823788546255508
+    },
+    {
+      "category": "jerga_lunfardo",
+      "errors": 1,
+      "material_before_validation": false,
+      "pct_error_total": 0.0022026431718061676
+    }
+  ],
+  "data_egress": false,
+  "errors": 454,
+  "model": "qwen3.5:9b",
+  "openai_batch": {
+    "blocked_by_client_data_policy": true,
+    "prepared_requests": 454,
+    "submitted": false
+  },
+  "schema_version": 1,
+  "status": "PROVISIONAL_PENDING_30_HUMAN_VALIDATIONS",
+  "validation": {
+    "completed": 0,
+    "path": "error_taxonomy_validation_30.csv",
+    "required": 30
+  }
+}
