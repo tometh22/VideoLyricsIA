@@ -11,6 +11,7 @@
 - **mix/current_xlsr/acoustic_raw:** 31 canciones, p50 172 ms, p90 1583 ms, ±150 ms en 18.0%, ZTLR proyectado 17.4%; **NO_GO**.
 - **mix/mms_fa/display_lightgbm:** 41 canciones, p50 375 ms, p90 4447 ms, ±150 ms en 15.0%, ZTLR proyectado 13.4%; **NO_GO**.
 - **mix/xlsr_ipa/display_lightgbm:** 41 canciones, p50 2526 ms, p90 38203 ms, ±150 ms en 0.2%, ZTLR proyectado 0.2%; **NO_GO**.
+- **mix/current_xlsr_anchored/acoustic_raw:** 5 canciones, p50 250 ms, p90 2240 ms, ±150 ms en 18.4%, ZTLR proyectado 17.8%; **NO_GO**.
 - **stem/current_xlsr/display_robust_global_median:** 18 canciones, p50 20 ms, p90 499 ms, ±150 ms en 50.9%, ZTLR proyectado 46.7%; **NO_GO**.
 
 ## Encontrar el residuo

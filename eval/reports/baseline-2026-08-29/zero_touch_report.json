@@ -261,6 +261,224 @@
             }
           }
         },
+        "current_xlsr_anchored": {
+          "best": {
+            "boundaries": 238,
+            "coverage": {
+              "confidence": 0.95,
+              "estimate": 0.8439716312056738,
+              "high": 0.9726027397260274,
+              "iterations": 2000,
+              "low": 0.7058823529411765,
+              "seed": 20260829,
+              "unit": "song"
+            },
+            "gate": {
+              "requirement": "p90_boundary_abs_ms < 250",
+              "status": "NO_GO"
+            },
+            "p50_boundary_abs_ms": {
+              "confidence": 0.95,
+              "estimate": 250.0000000000142,
+              "high": 379.99999999999545,
+              "iterations": 2000,
+              "low": 69.99999999999318,
+              "seed": 20260829,
+              "unit": "song"
+            },
+            "p90_boundary_abs_ms": {
+              "confidence": 0.95,
+              "estimate": 2239.999999999995,
+              "high": 12750.000000000015,
+              "iterations": 2000,
+              "low": 969.9999999999989,
+              "seed": 20260829,
+              "unit": "song"
+            },
+            "projected_ztlr": {
+              "confidence": 0.95,
+              "estimate": 0.1780821917808219,
+              "high": 0.3787878787878788,
+              "iterations": 2000,
+              "low": 0.028368794326241134,
+              "seed": 20260829,
+              "unit": "song"
+            },
+            "songs": 5,
+            "within_150ms_both": {
+              "confidence": 0.95,
+              "estimate": 0.18439716312056736,
+              "high": 0.3937007874015748,
+              "iterations": 2000,
+              "low": 0.029411764705882353,
+              "seed": 20260829,
+              "unit": "song"
+            }
+          },
+          "best_variant": "acoustic_raw",
+          "failures": [],
+          "variants": {
+            "acoustic_raw": {
+              "boundaries": 238,
+              "coverage": {
+                "confidence": 0.95,
+                "estimate": 0.8439716312056738,
+                "high": 0.9726027397260274,
+                "iterations": 2000,
+                "low": 0.7058823529411765,
+                "seed": 20260829,
+                "unit": "song"
+              },
+              "gate": {
+                "requirement": "p90_boundary_abs_ms < 250",
+                "status": "NO_GO"
+              },
+              "p50_boundary_abs_ms": {
+                "confidence": 0.95,
+                "estimate": 250.0000000000142,
+                "high": 379.99999999999545,
+                "iterations": 2000,
+                "low": 69.99999999999318,
+                "seed": 20260829,
+                "unit": "song"
+              },
+              "p90_boundary_abs_ms": {
+                "confidence": 0.95,
+                "estimate": 2239.999999999995,
+                "high": 12750.000000000015,
+                "iterations": 2000,
+                "low": 969.9999999999989,
+                "seed": 20260829,
+                "unit": "song"
+              },
+              "projected_ztlr": {
+                "confidence": 0.95,
+                "estimate": 0.1780821917808219,
+                "high": 0.3787878787878788,
+                "iterations": 2000,
+                "low": 0.028368794326241134,
+                "seed": 20260829,
+                "unit": "song"
+              },
+              "songs": 5,
+              "within_150ms_both": {
+                "confidence": 0.95,
+                "estimate": 0.18439716312056736,
+                "high": 0.3937007874015748,
+                "iterations": 2000,
+                "low": 0.029411764705882353,
+                "seed": 20260829,
+                "unit": "song"
+              }
+            },
+            "display_lightgbm": {
+              "boundaries": 238,
+              "coverage": {
+                "confidence": 0.95,
+                "estimate": 0.8439716312056738,
+                "high": 0.9726027397260274,
+                "iterations": 2000,
+                "low": 0.7058823529411765,
+                "seed": 20260829,
+                "unit": "song"
+              },
+              "gate": {
+                "requirement": "p90_boundary_abs_ms < 250",
+                "status": "NO_GO"
+              },
+              "p50_boundary_abs_ms": {
+                "confidence": 0.95,
+                "estimate": 753.7453177485355,
+                "high": 1086.3330716818116,
+                "iterations": 2000,
+                "low": 656.3257041293346,
+                "seed": 20260829,
+                "unit": "song"
+              },
+              "p90_boundary_abs_ms": {
+                "confidence": 0.95,
+                "estimate": 2270.00000000001,
+                "high": 12674.74537194362,
+                "iterations": 2000,
+                "low": 1445.4650478528204,
+                "seed": 20260829,
+                "unit": "song"
+              },
+              "projected_ztlr": {
+                "confidence": 0.95,
+                "estimate": 0.0136986301369863,
+                "high": 0.027972027972027972,
+                "iterations": 2000,
+                "low": 0.0,
+                "seed": 20260829,
+                "unit": "song"
+              },
+              "songs": 5,
+              "within_150ms_both": {
+                "confidence": 0.95,
+                "estimate": 0.014184397163120567,
+                "high": 0.03125,
+                "iterations": 2000,
+                "low": 0.0,
+                "seed": 20260829,
+                "unit": "song"
+              }
+            },
+            "display_robust_global_median": {
+              "boundaries": 238,
+              "coverage": {
+                "confidence": 0.95,
+                "estimate": 0.8439716312056738,
+                "high": 0.9726027397260274,
+                "iterations": 2000,
+                "low": 0.7058823529411765,
+                "seed": 20260829,
+                "unit": "song"
+              },
+              "gate": {
+                "requirement": "p90_boundary_abs_ms < 250",
+                "status": "NO_GO"
+              },
+              "p50_boundary_abs_ms": {
+                "confidence": 0.95,
+                "estimate": 269.999999999996,
+                "high": 394.999999999996,
+                "iterations": 2000,
+                "low": 229.99999999999687,
+                "seed": 20260829,
+                "unit": "song"
+              },
+              "p90_boundary_abs_ms": {
+                "confidence": 0.95,
+                "estimate": 2254.9999999999955,
+                "high": 12740.000000000016,
+                "iterations": 2000,
+                "low": 990.0000000000091,
+                "seed": 20260829,
+                "unit": "song"
+              },
+              "projected_ztlr": {
+                "confidence": 0.95,
+                "estimate": 0.04794520547945205,
+                "high": 0.11875,
+                "iterations": 2000,
+                "low": 0.0,
+                "seed": 20260829,
+                "unit": "song"
+              },
+              "songs": 5,
+              "within_150ms_both": {
+                "confidence": 0.95,
+                "estimate": 0.04964539007092199,
+                "high": 0.12258064516129032,
+                "iterations": 2000,
+                "low": 0.0,
+                "seed": 20260829,
+                "unit": "song"
+              }
+            }
+          }
+        },
         "mms_fa": {
           "best": {
             "boundaries": 3000,

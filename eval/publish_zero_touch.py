@@ -43,12 +43,15 @@ def _realign_summary(path: Path) -> dict[str, Any] | None:
 
 
 def publish(
-    ztlr_path: Path, flags_path: Path, mix_path: Path, stem_path: Path,
+    ztlr_path: Path, flags_path: Path, mix_path: Path, anchored_path: Path, stem_path: Path,
     mss_path: Path, json_output: Path, markdown_output: Path,
 ) -> dict[str, Any]:
     ztlr = read_json(ztlr_path)
     flags = read_json(flags_path)
     mix = _realign_summary(mix_path)
+    anchored = _realign_summary(anchored_path)
+    if mix and anchored:
+        mix["aligners"].update(anchored["aligners"])
     stem = _realign_summary(stem_path)
     mss = read_json(mss_path) if mss_path.is_file() else None
     report = {
@@ -140,12 +143,16 @@ def main() -> int:
     parser.add_argument("--ztlr", type=Path, default=Path("eval/runs/ztlr_baseline/report.json"))
     parser.add_argument("--flags", type=Path, default=Path("eval/runs/flag_union/report.json"))
     parser.add_argument("--mix", type=Path, default=Path("eval/runs/final_text_realign_mix/report.json"))
+    parser.add_argument("--anchored", type=Path, default=Path("eval/runs/final_text_realign_mix_anchored/report.json"))
     parser.add_argument("--stem", type=Path, default=Path("eval/runs/final_text_realign/report.json"))
     parser.add_argument("--mss", type=Path, default=Path("eval/runs/mss_alt/large-v3-turbo/report.json"))
     parser.add_argument("--json-output", type=Path, default=base / "zero_touch_report.json")
     parser.add_argument("--markdown-output", type=Path, default=base / "ZERO_TOUCH_REPORT.md")
     args = parser.parse_args()
-    result = publish(args.ztlr, args.flags, args.mix, args.stem, args.mss, args.json_output, args.markdown_output)
+    result = publish(
+        args.ztlr, args.flags, args.mix, args.anchored, args.stem, args.mss,
+        args.json_output, args.markdown_output,
+    )
     print(json.dumps({"ztlr": result["north_star"]["ztlr_baseline"], "outputs": [str(args.json_output), str(args.markdown_output)]}, indent=2))
     return 0
 

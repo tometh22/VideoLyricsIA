@@ -24,8 +24,10 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import types
 import unicodedata
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -36,7 +38,8 @@ from eval.canonical import read_json, segments_to_lines, write_json
 from eval.metrics import align_lines, normalize_text
 
 
-ALIGNERS = {"current_xlsr", "mms_fa", "xlsr_ipa"}
+ALIGNERS = {"current_xlsr", "current_xlsr_anchored", "mms_fa", "xlsr_ipa"}
+DEFAULT_ALIGNERS = ("current_xlsr", "mms_fa", "xlsr_ipa")
 IPA_MODEL_ID = "facebook/wav2vec2-xlsr-53-espeak-cv-ft"
 
 
@@ -281,6 +284,136 @@ def _align_current(
     }
 
 
+def _raw_occurrence_anchors(
+    approved: Sequence[dict[str, Any]], raw: Sequence[dict[str, Any]], duration_s: float,
+) -> list[dict[str, Any]]:
+    """Attach final text to coarse pre-human positions, never approved timing."""
+    raw_lines = segments_to_lines(raw)
+    anchors: list[dict[str, Any] | None] = [None] * len(approved)
+    # SequenceMatcher is deliberately text-only and monotonic. Using the
+    # generic metric aligner here would leak approved timing through its IoU
+    # and centre-distance terms. Exact unchanged lines are sufficient as
+    # occurrence landmarks; edited/added lines are interpolated below.
+    approved_norm = [normalize_text(str(row.get("text") or "")) for row in approved]
+    raw_norm = [normalize_text(str(row.get("text") or "")) for row in raw_lines]
+    matcher = SequenceMatcher(None, approved_norm, raw_norm, autojunk=False)
+    for block in matcher.get_matching_blocks():
+        for offset in range(block.size):
+            approved_idx, raw_idx = block.a + offset, block.b + offset
+            anchors[approved_idx] = {
+                "start": float(raw_lines[raw_idx]["start_s"]),
+                "end": float(raw_lines[raw_idx]["end_s"]),
+                "text": str(approved[approved_idx].get("text") or ""),
+                "anchor_source": "exact_text_sequence_raw_line",
+            }
+
+    # Added human lines have no raw counterpart. Interpolate only a coarse
+    # window between neighbouring raw anchors; this value selects an
+    # occurrence and is never scored as the final boundary.
+    index = 0
+    while index < len(anchors):
+        if anchors[index] is not None:
+            index += 1
+            continue
+        first = index
+        while index < len(anchors) and anchors[index] is None:
+            index += 1
+        last = index
+        left = float(anchors[first - 1]["end"]) if first else 0.0
+        right = float(anchors[last]["start"]) if last < len(anchors) else duration_s
+        right = max(left + 0.05 * (last - first), right)
+        weights = [max(1, len(normalize_text(str(approved[i].get("text") or "")))) for i in range(first, last)]
+        total, cursor = max(1, sum(weights)), 0
+        for offset, weight in enumerate(weights):
+            start = left + (right - left) * cursor / total
+            cursor += weight
+            end = left + (right - left) * cursor / total
+            anchors[first + offset] = {
+                "start": start, "end": end,
+                "text": str(approved[first + offset].get("text") or ""),
+                "anchor_source": "interpolated_raw_gap",
+            }
+    return [dict(anchor) for anchor in anchors if anchor is not None]
+
+
+def _group_ranges(count: int, size: int = 8) -> list[tuple[int, int]]:
+    if count < 3:
+        return []
+    ranges = [(start, min(count, start + size)) for start in range(0, count, size)]
+    if len(ranges) > 1 and ranges[-1][1] - ranges[-1][0] < 3:
+        ranges[-2] = (ranges[-2][0], count)
+        ranges.pop()
+    return ranges
+
+
+def _offset_prediction(rows: Sequence[dict[str, Any]], offset: float) -> list[dict[str, Any]]:
+    output = []
+    for row in rows:
+        copied = dict(row)
+        if copied.get("start") is not None:
+            copied["start"] = float(copied["start"]) + offset
+        if copied.get("end") is not None:
+            copied["end"] = float(copied["end"]) + offset
+        copied["words"] = [
+            {
+                **word,
+                "start": float(word["start"]) + offset if word.get("start") is not None else None,
+                "end": float(word["end"]) + offset if word.get("end") is not None else None,
+            }
+            for word in (copied.get("words") or [])
+        ]
+        output.append(copied)
+    return output
+
+
+def _align_current_anchored(
+    module: types.ModuleType, audio_path: Path, approved: Sequence[dict[str, Any]],
+    raw: Sequence[dict[str, Any]], duration_s: float, song_id: str,
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any]]:
+    """Confine CTC to raw-timing sections so repeated lyrics cannot jump occurrence."""
+    import torchaudio
+
+    anchors = _raw_occurrence_anchors(approved, raw, duration_s)
+    ranges = _group_ranges(len(anchors))
+    if not ranges:
+        return None, {"reason": "fewer_than_three_lines"}
+    os.environ["CTC_ALIGN_ENABLED"] = "1"
+    waveform, sample_rate = torchaudio.load(str(audio_path))
+    output: list[dict[str, Any]] = []
+    declined = 0
+    with tempfile.TemporaryDirectory(prefix=f"gold-anchor-{song_id}-") as temporary:
+        temporary_path = Path(temporary)
+        for group_idx, (first, last) in enumerate(ranges):
+            left = max(0.0, float(anchors[first]["start"]) - 3.0)
+            right = min(duration_s, float(anchors[last - 1]["end"]) + 3.0)
+            if right - left < 5.0:
+                right = min(duration_s, left + 5.0)
+                left = max(0.0, right - 5.0)
+            chunk = waveform[:, int(left * sample_rate):int(right * sample_rate)]
+            chunk_path = temporary_path / f"group-{group_idx}.wav"
+            torchaudio.save(str(chunk_path), chunk, sample_rate)
+            local = [
+                {**row, "start": max(0.0, float(row["start"]) - left), "end": max(0.0, float(row["end"]) - left)}
+                for row in anchors[first:last]
+            ]
+            aligned = module.retime_segments(
+                str(chunk_path), local, job_id=f"gold-raw-anchor-{song_id}-{group_idx}",
+            )
+            if aligned:
+                output.extend(_offset_prediction(aligned, left))
+            else:
+                declined += 1
+                output.extend({"text": row["text"], "unaligned": True} for row in anchors[first:last])
+    return output, {
+        "model": getattr(module, "MODEL_ID", None),
+        "model_revision": getattr(module, "MODEL_REVISION", None),
+        "approved_timing_input": False,
+        "raw_timing_as_occurrence_prior": True,
+        "policy": "non-overlapping 8-line groups with 3s raw-timing context",
+        "groups": len(ranges), "declined_groups": declined,
+    }
+
+
 def _score_prediction(
     song_id: str, prediction: Sequence[dict[str, Any]], approved: Sequence[dict[str, Any]],
     raw: Sequence[dict[str, Any]],
@@ -501,7 +634,7 @@ def run(
     if limit is not None:
         cases = cases[:limit]
     current = current_source = None
-    if "current_xlsr" in aligners:
+    if {"current_xlsr", "current_xlsr_anchored"} & set(aligners):
         current, current_source = _load_current(runtime_ref)
     reports: dict[str, list[dict[str, Any]]] = {name: [] for name in aligners}
     failures: dict[str, list[dict[str, str]]] = {name: [] for name in aligners}
@@ -538,6 +671,10 @@ def run(
                         prediction, metadata = persisted["prediction"], persisted["metadata"]
                 elif name == "current_xlsr":
                     prediction, metadata = _align_current(current, audio_path, approved, duration, item["song_id"])
+                elif name == "current_xlsr_anchored":
+                    prediction, metadata = _align_current_anchored(
+                        current, audio_path, approved, raw, duration, item["song_id"],
+                    )
                 elif name == "mms_fa":
                     prediction, metadata = _align_mms(audio_path, approved)
                 else:
@@ -595,7 +732,7 @@ def main() -> int:
     parser.add_argument("--golden", type=Path, default=Path("eval/golden"))
     parser.add_argument("--stems", type=Path, default=Path("eval/cache/full_stems"))
     parser.add_argument("--output", type=Path, default=Path("eval/runs/final_text_realign"))
-    parser.add_argument("--aligners", default=",".join(sorted(ALIGNERS)))
+    parser.add_argument("--aligners", default=",".join(DEFAULT_ALIGNERS))
     parser.add_argument("--runtime-ref", default="origin/staging")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--song-id", action="append", default=[])

@@ -92,6 +92,9 @@ XLSR fonético con eSpeak. MMS_FA queda marcado como investigación no comercial
 el reporte usa bootstrap por canción y decide el gate p90 < 250 ms.
 El backend `xlsr_ipa` requiere `espeak-ng` instalado localmente además de las
 dependencias Python; nunca envía texto ni audio a un servicio externo.
+La variante opcional `current_xlsr_anchored` usa el timing crudo únicamente
+como prior de ocurrencia por bloques; su piloto de cinco canciones permanece
+separado y `NO_GO`, por lo que no forma parte del replay predeterminado.
 
 `eval-flag-union` combina únicamente probabilidades out-of-fold y busca el
 umbral con recall de líneas corregidas ≥95% que minimiza la cola. Reporta falsos

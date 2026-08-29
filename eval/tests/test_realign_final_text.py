@@ -1,7 +1,9 @@
 from eval.realign_final_text import (
     ESPEAK_LANGUAGES,
+    _group_ranges,
     _lines_from_word_spans,
     _neutral_segments,
+    _raw_occurrence_anchors,
     _score_prediction,
 )
 
@@ -41,3 +43,23 @@ def test_score_projects_zero_touch_only_when_raw_text_and_new_timing_are_good():
 
 def test_supported_catalog_languages_have_explicit_espeak_mapping():
     assert set(ESPEAK_LANGUAGES) == {"de", "en", "es", "fr", "it", "pt"}
+
+
+def test_raw_occurrence_anchors_use_raw_not_approved_timing_and_fill_added_line():
+    approved = [
+        _line(100, 101, "primera"),
+        _line(200, 201, "línea humana nueva"),
+        _line(300, 301, "tercera"),
+    ]
+    raw = [_line(10, 11, "primera"), _line(20, 21, "tercera")]
+    anchors = _raw_occurrence_anchors(approved, raw, 30)
+    assert (anchors[0]["start"], anchors[0]["end"]) == (10, 11)
+    assert anchors[0]["anchor_source"] == "exact_text_sequence_raw_line"
+    assert anchors[1]["anchor_source"] == "interpolated_raw_gap"
+    assert 11 <= anchors[1]["start"] < anchors[1]["end"] <= 20
+    assert (anchors[2]["start"], anchors[2]["end"]) == (20, 21)
+
+
+def test_group_ranges_never_leave_a_short_tail():
+    assert _group_ranges(18) == [(0, 8), (8, 18)]
+    assert _group_ranges(19) == [(0, 8), (8, 16), (16, 19)]
