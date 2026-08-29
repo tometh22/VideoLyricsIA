@@ -451,6 +451,31 @@ def run_transcription_job(
     # Observability 2026-06-10: toda línea de log de este job lleva job_id.
     from observability import set_job_log_context
     set_job_log_context(job_id)
+
+    # 0. Guard de reintento (incidente 2026-08-26, UMG Chile).
+    #
+    # `Retry(max=2, interval=10)` en queue_jobs re-encola el job cuando el
+    # work-horse muere — y muere por SIGKILL de `monitor_work_horse` a
+    # `job_timeout + 60s` si el proceso no cierra limpio. Hasta acá NO había
+    # ningún guard: el reintento volvía a poner el job en "transcribing" y
+    # rehacía TODO, pagando demucs + whisperX otra vez para tirar el
+    # resultado (el job ya estaba terminal). Medido: 3 corridas del mismo job
+    # en 65 min, las tres facturadas.
+    #
+    # Un fallo por deadline es determinista: si agotó 900s, los vuelve a
+    # agotar. Se descarta. Los transitorios (red, 5xx) siguen reintentándose,
+    # que es para lo que se puso el Retry.
+    if _should_discard_retry(job_id):
+        logger.warning(
+            "[TRANSCRIBE-WORKER] descarto reintento job=%s — el fallo previo "
+            "fue por deadline (determinista); reintentarlo sólo vuelve a "
+            "pagar Replicate", job_id,
+        )
+        return {
+            "job_id": job_id, "status": "discarded",
+            "reason": "non_retryable_previous_failure",
+        }
+
     # Lazy import — main.py es pesado y el worker no debería pagarlo si
     # corre otros queues. asyncio.run abre/cierra su propio event loop por job,
     # que es lo que queremos (jobs independientes, sin event-loop leak).
@@ -664,9 +689,14 @@ def run_transcription_job(
                 )
         except Exception:
             pass  # never let Sentry failures break the error path
+        # Clasificamos sobre la EXCEPCIÓN, no sobre el mensaje al usuario:
+        # `error_type` es sólo el nombre de la clase y perdería el texto
+        # ("exceeded wall-clock budget") que distingue un deadline de un
+        # fallo transitorio.
         return _fail(
             job_id,
             f"No pudimos completar la transcripción. Código: {error_type}.",
+            error_code=classify_error_code(f"{error_type}: {exc}"),
         )
 
     # 4. Persistir el resultado en el row.
@@ -838,11 +868,89 @@ def run_transcription_job(
     return result
 
 
-def _fail(job_id: str, error_msg: str, tb: str = "") -> dict:
+# Códigos de fallo que NO tiene sentido reintentar: son deterministas en el
+# wall-clock, no baches transitorios. Si una corrida agotó su presupuesto de
+# 900s, la siguiente va a agotar los mismos 900s — reintentarla sólo quema
+# otro turno de worker y vuelve a pagar Replicate para tirar el resultado.
+# Incidente 2026-08-26 (UMG Chile): el mismo job corrió 3 veces (21:47, 22:18,
+# 22:52), las tres pagaron demucs + whisperX, y la 3ª siguió trabajando con el
+# job YA en estado terminal ("[TIMING] set_timing_source skipped — job is in
+# terminal state 'transcription_failed'").
+#
+# Lo que SÍ se reintenta: red, 5xx y cualquier otro error transitorio, que es
+# el caso para el que se puso `Retry(max=2)` originalmente ("whisper hiccup").
+_NON_RETRYABLE_ERROR_CODES = frozenset({
+    "transcription_deadline",   # presupuesto de wall-clock agotado
+    "transcription_cancelled",  # predicción cancelada por deadline
+})
+
+# Fragmentos que identifican un fallo por deadline en el texto de la excepción.
+# `JobTimeoutException` es la death penalty de RQ; el `TimeoutError` con
+# "exceeded wall-clock budget" lo emite `replicate_budget`.
+_DEADLINE_ERROR_FRAGMENTS = (
+    "jobtimeoutexception",
+    "exceeded wall-clock budget",
+    "task exceeded maximum timeout",
+)
+
+
+def classify_error_code(exc_or_msg) -> str:
+    """Mapea una excepción (o su texto) al `error_code` que se persiste.
+
+    Devuelve uno de `_NON_RETRYABLE_ERROR_CODES` cuando el fallo es un
+    agotamiento de presupuesto, o "transcription_unknown" en cualquier otro
+    caso (que sigue siendo reintentable).
+    """
+    text = str(exc_or_msg or "").lower()
+    if any(f in text for f in _DEADLINE_ERROR_FRAGMENTS):
+        return "transcription_deadline"
+    if "cancel" in text and "prediction" in text:
+        return "transcription_cancelled"
+    return "transcription_unknown"
+
+
+def _should_discard_retry(job_id: str) -> bool:
+    """True si este job ya falló por una causa que reintentar no arregla.
+
+    Lee el estado persistido en vez de inspeccionar la excepción del intento
+    anterior: RQ no le pasa nada al reintento, y el work-horse pudo haber
+    muerto por SIGKILL sin dejar rastro en memoria.
+
+    Fail-open a propósito: si no podemos leer el job, dejamos correr el
+    reintento. Un trabajo repetido es mucho más barato que negarle a un
+    operador una transcripción que sí habría salido.
+    """
+    try:
+        from database import SessionLocal
+        from jobs import get_job_model
+        db = SessionLocal()
+        try:
+            row = get_job_model(db, job_id)
+            if row is None:
+                return False
+            if str(row.status or "") != "transcription_failed":
+                return False
+            return str(row.error_code or "") in _NON_RETRYABLE_ERROR_CODES
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning(
+            "[TRANSCRIBE-WORKER] no pude evaluar el guard de reintento "
+            "job=%s error_type=%s — dejo correr el reintento",
+            job_id, _safe_exception_code(exc),
+        )
+        return False
+
+
+def _fail(job_id: str, error_msg: str, tb: str = "",
+          error_code: str = "") -> dict:
     """Marca el job como transcription_failed con un mensaje para el frontend.
 
     ``tb`` se conserva sólo por compatibilidad de firma y se descarta. Un
     traceback puede incluir audio paths, respuestas ASR o letras.
+
+    ``error_code`` decide si un reintento de RQ vuelve a hacer el trabajo o lo
+    descarta — ver `_should_discard_retry`.
     """
     from jobs import update_job
     try:
@@ -851,6 +959,7 @@ def _fail(job_id: str, error_msg: str, tb: str = "") -> dict:
             status="transcription_failed",
             current_step="error",
             error=error_msg[:500],
+            error_code=(error_code or classify_error_code(error_msg))[:64],
         )
     except Exception as exc:
         logger.warning(
