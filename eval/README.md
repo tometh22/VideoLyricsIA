@@ -39,6 +39,8 @@ make eval-lora-prep
 make eval-lora-research-prep
 make eval-taxonomy-ensemble
 make eval-runtime-replay
+make eval-stem-cohorts
+make eval-stem-audit
 make eval-t7-prep
 make eval-phase2-status
 make eval-publish-diagnostic
