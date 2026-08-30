@@ -44,6 +44,9 @@ make eval-phase2-status
 make eval-publish-diagnostic
 make eval-ztlr
 make eval-final-text-realign
+make eval-hierarchical-realign
+make eval-report-hierarchical
+make eval-post-realign-review
 make eval-flag-union
 make eval-mss-alt
 make eval-publish-zero-touch
@@ -99,6 +102,17 @@ dependencias Python; nunca envía texto ni audio a un servicio externo.
 La variante opcional `current_xlsr_anchored` usa el timing crudo únicamente
 como prior de ocurrencia por bloques; su piloto de cinco canciones permanece
 separado y `NO_GO`, por lo que no forma parte del replay predeterminado.
+
+`current_xlsr_hierarchical` encuentra líneas únicas y n-gramas raros con una
+cadena monotónica, encierra cada ocurrencia en ventanas locales y combina CTC
+global/local con abstención explícita. El scorer compara siempre cohortes
+idénticas y distingue el techo ZTLR del resultado medido. La variante
+`current_xlsr_hierarchical_acoustic` localiza primero las anclas con CTC global;
+permanece como experimento separado porque su stress test no pasó el gate.
+
+`eval-post-realign-review` expresa el residuo en líneas, no solo en spans de
+audio. Usa el gold únicamente para descomponer retrospectivamente texto,
+timing y falsos flags; su salida no es un selector desplegable.
 
 `eval-flag-union` combina únicamente probabilidades out-of-fold y busca el
 umbral con recall de líneas corregidas ≥95% que minimiza la cola. Reporta falsos

@@ -25,6 +25,16 @@ el estado pre-humano, con candidatos respaldados por dos familias realmente
 independientes. Whisper large-v2 y large-v3 cuentan como una sola familia;
 Gemini no puede aportar candidatos porque actúa como decisor.
 
+La regeneración tendrá una asimetría temporal explícita: los candidatos se
+producirán hoy con modelos actuales, no serán necesariamente los que Agus vio
+históricamente. D1 medirá la pregunta más exigente y útil para producción:
+si el agente actual, viendo únicamente candidatos actuales no derivados del
+gold, reproduce decisiones humanas históricas tomadas sin esa misma ayuda.
+
+El orden de costo es controles + texto primero (674 + 171 zonas) y timing
+después. Las 511 zonas de timing solo entran a D1 cuando el realineado
+jerárquico determine cuáles no puede resolver sin agente.
+
 Cuando exista ese artefacto, el flujo ya implementado es:
 
 1. extraer clips de ±4 s solamente para zonas con candidato verificado;

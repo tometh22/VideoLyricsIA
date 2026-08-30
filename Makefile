@@ -4,7 +4,7 @@ GOLDEN ?= eval/golden
 HYPOTHESIS_ROOT ?= eval/hypotheses/$(VARIANT)
 BACKEND ?= lyricgen/backend
 
-.PHONY: eval eval-test eval-autopsy eval-extract eval-verify-portal eval-finalize eval-language-id eval-freeze eval-t4-learned eval-error-predictor eval-lora-prep eval-nonhistorical eval-from-snapshot eval-taxonomy-ensemble eval-runtime-replay eval-stems-local eval-lora-research-prep eval-t7-prep eval-phase2-status eval-publish-diagnostic eval-ztlr eval-final-text-realign eval-flag-union eval-mss-alt eval-publish-zero-touch eval-agent-prepare eval-agent-run eval-agent-score eval-agent-policy
+.PHONY: eval eval-test eval-autopsy eval-extract eval-verify-portal eval-finalize eval-language-id eval-freeze eval-t4-learned eval-error-predictor eval-lora-prep eval-nonhistorical eval-from-snapshot eval-taxonomy-ensemble eval-runtime-replay eval-stems-local eval-lora-research-prep eval-t7-prep eval-phase2-status eval-publish-diagnostic eval-ztlr eval-final-text-realign eval-hierarchical-realign eval-report-hierarchical eval-post-realign-review eval-flag-union eval-mss-alt eval-publish-zero-touch eval-agent-prepare eval-agent-run eval-agent-score eval-agent-policy
 
 eval:
 	PYTHONPATH=. $(PYTHON) -m eval.score --golden "$(GOLDEN)" --variant "$(VARIANT)" $(if $(filter prod_raw,$(VARIANT)),,--hypothesis-root "$(HYPOTHESIS_ROOT)")
@@ -65,6 +65,15 @@ eval-ztlr:
 
 eval-final-text-realign:
 	PYTHONPATH=. $(PYTHON) -m eval.realign_final_text
+
+eval-hierarchical-realign:
+	PYTHONPATH=. $(PYTHON) -m eval.realign_final_text --aligners current_xlsr_hierarchical --audio-source stem --output eval/runs/final_text_realign_hierarchical_26
+
+eval-report-hierarchical:
+	PYTHONPATH=. $(PYTHON) -m eval.report_hierarchical_realign
+
+eval-post-realign-review:
+	PYTHONPATH=. $(PYTHON) -m eval.post_realign_review
 
 eval-flag-union:
 	PYTHONPATH=. $(PYTHON) -m eval.flag_union

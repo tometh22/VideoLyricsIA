@@ -38,7 +38,10 @@ from eval.canonical import read_json, segments_to_lines, write_json
 from eval.metrics import align_lines, normalize_text
 
 
-ALIGNERS = {"current_xlsr", "current_xlsr_anchored", "mms_fa", "xlsr_ipa"}
+ALIGNERS = {
+    "current_xlsr", "current_xlsr_anchored", "current_xlsr_hierarchical",
+    "current_xlsr_hierarchical_acoustic", "mms_fa", "xlsr_ipa",
+}
 DEFAULT_ALIGNERS = ("current_xlsr", "mms_fa", "xlsr_ipa")
 IPA_MODEL_ID = "facebook/wav2vec2-xlsr-53-espeak-cv-ft"
 
@@ -334,6 +337,402 @@ def _raw_occurrence_anchors(
                 "anchor_source": "interpolated_raw_gap",
             }
     return [dict(anchor) for anchor in anchors if anchor is not None]
+
+
+def _hard_occurrence_anchors(
+    approved: Sequence[dict[str, Any]], raw: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Find monotonic occurrence anchors without approved timestamps.
+
+    A normalized line that is unique in both texts is a hard anchor. Repeated
+    lines may also become hard anchors when they belong to a unique exact
+    bigram or trigram. A maximum-weight monotonic chain removes conflicting
+    matches before any audio window is constructed.
+    """
+    raw_lines = segments_to_lines(raw)
+    approved_norm = [normalize_text(str(row.get("text") or "")) for row in approved]
+    raw_norm = [normalize_text(str(row.get("text") or "")) for row in raw_lines]
+    candidates: dict[tuple[int, int], dict[str, Any]] = {}
+
+    def add(approved_idx: int, raw_idx: int, source: str, weight: float) -> None:
+        if not approved_norm[approved_idx] or approved_norm[approved_idx] != raw_norm[raw_idx]:
+            return
+        key = (approved_idx, raw_idx)
+        previous = candidates.get(key)
+        if previous is None or weight > previous["weight"]:
+            candidates[key] = {
+                "approved_idx": approved_idx, "raw_idx": raw_idx,
+                "source": source, "weight": weight,
+            }
+
+    approved_counts = {text: approved_norm.count(text) for text in set(approved_norm) if text}
+    raw_counts = {text: raw_norm.count(text) for text in set(raw_norm) if text}
+    for approved_idx, text in enumerate(approved_norm):
+        if len(text.replace(" ", "")) >= 4 and approved_counts.get(text) == raw_counts.get(text) == 1:
+            add(approved_idx, raw_norm.index(text), "unique_line", 10 + min(5, len(text) / 20))
+
+    for size in (3, 2):
+        approved_ngrams: dict[tuple[str, ...], list[int]] = {}
+        raw_ngrams: dict[tuple[str, ...], list[int]] = {}
+        for index in range(max(0, len(approved_norm) - size + 1)):
+            key = tuple(approved_norm[index:index + size])
+            if all(key):
+                approved_ngrams.setdefault(key, []).append(index)
+        for index in range(max(0, len(raw_norm) - size + 1)):
+            key = tuple(raw_norm[index:index + size])
+            if all(key):
+                raw_ngrams.setdefault(key, []).append(index)
+        for key, approved_positions in approved_ngrams.items():
+            raw_positions = raw_ngrams.get(key) or []
+            if len(approved_positions) != 1 or len(raw_positions) != 1:
+                continue
+            for offset in range(size):
+                add(
+                    approved_positions[0] + offset, raw_positions[0] + offset,
+                    f"unique_{size}gram", 20 + size * 10,
+                )
+
+    ordered = sorted(candidates.values(), key=lambda row: (row["approved_idx"], row["raw_idx"]))
+    if not ordered:
+        return []
+    # Weighted longest increasing subsequence: one-to-one and monotonic.
+    scores, previous = [], []
+    for index, candidate in enumerate(ordered):
+        best_score, best_previous = float(candidate["weight"]), -1
+        for prior_idx, prior in enumerate(ordered[:index]):
+            if prior["approved_idx"] < candidate["approved_idx"] and prior["raw_idx"] < candidate["raw_idx"]:
+                score = scores[prior_idx] + float(candidate["weight"])
+                if score > best_score:
+                    best_score, best_previous = score, prior_idx
+        scores.append(best_score)
+        previous.append(best_previous)
+    cursor = max(range(len(ordered)), key=lambda index: scores[index])
+    chain = []
+    while cursor >= 0:
+        chain.append(ordered[cursor])
+        cursor = previous[cursor]
+    output = []
+    for candidate in reversed(chain):
+        raw_line = raw_lines[int(candidate["raw_idx"])]
+        output.append({
+            **candidate,
+            "start": float(raw_line["start_s"]),
+            "end": float(raw_line["end_s"]),
+            "text": str(approved[int(candidate["approved_idx"])].get("text") or ""),
+        })
+    return output
+
+
+def _hard_anchor_scaffold(
+    approved: Sequence[dict[str, Any]], hard_anchors: Sequence[dict[str, Any]], duration_s: float,
+) -> list[dict[str, Any]]:
+    """Interpolate coarse occurrence positions between hard anchors."""
+    scaffold: list[dict[str, Any] | None] = [None] * len(approved)
+    for anchor in hard_anchors:
+        index = int(anchor["approved_idx"])
+        scaffold[index] = {
+            "start": float(anchor["start"]), "end": float(anchor["end"]),
+            "text": str(approved[index].get("text") or ""),
+            "anchor_source": str(anchor["source"]),
+        }
+    index = 0
+    while index < len(scaffold):
+        if scaffold[index] is not None:
+            index += 1
+            continue
+        first = index
+        while index < len(scaffold) and scaffold[index] is None:
+            index += 1
+        last = index
+        left = float(scaffold[first - 1]["end"]) if first else 0.0
+        right = float(scaffold[last]["start"]) if last < len(scaffold) else duration_s
+        right = max(left + 0.05 * (last - first), right)
+        weights = [max(1, len(normalize_text(str(approved[i].get("text") or "")))) for i in range(first, last)]
+        total, cursor = max(1, sum(weights)), 0
+        for offset, weight in enumerate(weights):
+            start = left + (right - left) * cursor / total
+            cursor += weight
+            end = left + (right - left) * cursor / total
+            scaffold[first + offset] = {
+                "start": start, "end": end,
+                "text": str(approved[first + offset].get("text") or ""),
+                "anchor_source": "interpolated_between_hard_anchors",
+            }
+    return [dict(row) for row in scaffold if row is not None]
+
+
+def _line_text_similarity(left: str, right: str) -> float:
+    left, right = normalize_text(left), normalize_text(right)
+    if not left or not right:
+        return 0.0
+    character = SequenceMatcher(None, left, right, autojunk=False).ratio()
+    left_words, right_words = set(left.split()), set(right.split())
+    token = len(left_words & right_words) / max(1, len(left_words | right_words))
+    containment = 1.0 if len(left) >= 4 and len(right) >= 4 and (left in right or right in left) else 0.0
+    return max(character, token, containment)
+
+
+def _soft_interval_matches(
+    approved_texts: Sequence[str], raw_texts: Sequence[str],
+) -> list[tuple[int, int]]:
+    """Text-only monotonic alignment for coarse positions inside hard anchors."""
+    n, m, gap = len(approved_texts), len(raw_texts), 0.35
+    scores = [[0.0] * (m + 1) for _ in range(n + 1)]
+    steps = [[""] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        scores[i][0], steps[i][0] = -gap * i, "up"
+    for j in range(1, m + 1):
+        scores[0][j], steps[0][j] = -gap * j, "left"
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            similarity = _line_text_similarity(approved_texts[i - 1], raw_texts[j - 1])
+            options = {
+                "diag": scores[i - 1][j - 1] + 2 * similarity - 0.70,
+                "up": scores[i - 1][j] - gap,
+                "left": scores[i][j - 1] - gap,
+            }
+            step = max(options, key=options.get)
+            scores[i][j], steps[i][j] = options[step], step
+    matches, i, j = [], n, m
+    while i or j:
+        step = steps[i][j]
+        if step == "diag":
+            if _line_text_similarity(approved_texts[i - 1], raw_texts[j - 1]) >= 0.45:
+                matches.append((i - 1, j - 1))
+            i, j = i - 1, j - 1
+        elif step == "up":
+            i -= 1
+        else:
+            j -= 1
+    return list(reversed(matches))
+
+
+def _occurrence_scaffold(
+    approved: Sequence[dict[str, Any]], raw: Sequence[dict[str, Any]],
+    hard_anchors: Sequence[dict[str, Any]], duration_s: float,
+) -> list[dict[str, Any]]:
+    """Hard-anchor-bounded fuzzy text alignment; still no approved timing."""
+    raw_lines = segments_to_lines(raw)
+    mapping = {
+        int(row["approved_idx"]): {
+            "raw_idx": int(row["raw_idx"]), "source": str(row["source"]),
+            "start": float(row["start"]), "end": float(row["end"]),
+        }
+        for row in hard_anchors
+    }
+    sentinels = [
+        {"approved_idx": -1, "raw_idx": -1},
+        *hard_anchors,
+        {"approved_idx": len(approved), "raw_idx": len(raw_lines)},
+    ]
+    for left, right in zip(sentinels, sentinels[1:]):
+        approved_start, approved_end = int(left["approved_idx"]) + 1, int(right["approved_idx"])
+        raw_start, raw_end = int(left["raw_idx"]) + 1, int(right["raw_idx"])
+        approved_texts = [str(row.get("text") or "") for row in approved[approved_start:approved_end]]
+        raw_texts = [str(row.get("text") or "") for row in raw_lines[raw_start:raw_end]]
+        for approved_offset, raw_offset in _soft_interval_matches(approved_texts, raw_texts):
+            raw_idx = raw_start + raw_offset
+            raw_line = raw_lines[raw_idx]
+            mapping.setdefault(approved_start + approved_offset, {
+                "raw_idx": raw_idx, "source": "soft_text_between_hard_anchors",
+                "start": float(raw_line["start_s"]), "end": float(raw_line["end_s"]),
+            })
+    pseudo_hard = []
+    for approved_idx, value in sorted(mapping.items()):
+        pseudo_hard.append({
+            "approved_idx": approved_idx, "raw_idx": int(value["raw_idx"]),
+            "source": str(value["source"]),
+            "start": float(value["start"]), "end": float(value["end"]),
+        })
+    return _hard_anchor_scaffold(approved, pseudo_hard, duration_s)
+
+
+def _acoustic_hard_anchors(
+    module: types.ModuleType, audio_path: Path, approved: Sequence[dict[str, Any]],
+    hard_anchors: Sequence[dict[str, Any]], duration_s: float, song_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Localize the hard anchor sequence acoustically before making windows."""
+    if len(hard_anchors) < 3:
+        return list(hard_anchors), {"status": "raw_fallback", "reason": "fewer_than_three_anchors"}
+    anchor_text = [
+        {"text": str(approved[int(anchor["approved_idx"])].get("text") or "")}
+        for anchor in hard_anchors
+    ]
+    prediction, _metadata = _align_current(
+        module, audio_path, anchor_text, duration_s, f"{song_id}-unique-anchor-localization",
+    )
+    if not prediction or len(prediction) != len(hard_anchors):
+        return list(hard_anchors), {"status": "raw_fallback", "reason": "ctc_declined"}
+    localized, replaced = [], 0
+    previous_end = -1.0
+    for anchor, row in zip(hard_anchors, prediction):
+        start, end = row.get("start"), row.get("end")
+        if start is None or end is None or float(start) < previous_end - 0.20 or float(end) <= float(start):
+            localized.append(dict(anchor))
+            previous_end = max(previous_end, float(anchor["end"]))
+            continue
+        localized.append({
+            **anchor, "start": float(start), "end": float(end),
+            "source": f"{anchor['source']}+global_ctc",
+        })
+        previous_end = float(end)
+        replaced += 1
+    return localized, {"status": "ok", "localized": replaced, "total": len(hard_anchors)}
+
+
+def _hierarchical_ranges(
+    count: int, hard_indices: Sequence[int], maximum: int = 8,
+    scaffold: Sequence[dict[str, Any]] | None = None, maximum_window_s: float = 45.0,
+    context_s: float = 3.0,
+) -> list[tuple[int, int]]:
+    """Partition lines into local windows, preferring hard cuts and <=45 s."""
+    if count < 2:
+        return []
+    hard = {int(index) for index in hard_indices if 0 < int(index) < count}
+    output, start = [], 0
+    while count - start > maximum or (scaffold is not None and count - start >= 2):
+        maximum_end = min(count, start + maximum)
+        valid = []
+        for end in range(start + 2, maximum_end + 1):
+            if count - end == 1:
+                continue
+            if scaffold is not None:
+                left = max(0.0, float(scaffold[start]["start"]) - context_s)
+                right = float(scaffold[end - 1]["end"]) + context_s
+                if right - left > maximum_window_s:
+                    continue
+            valid.append(end)
+        if not valid:
+            end = min(count, start + 2)
+        else:
+            hard_choices = [end for end in valid if end in hard]
+            end = max(hard_choices or valid)
+        output.append((start, end))
+        start = end
+        if start == count:
+            break
+    if count - start == 1 and output:
+        previous_start, previous_end = output[-1]
+        if previous_end - previous_start < maximum:
+            output[-1] = (previous_start, count)
+        else:
+            output[-1] = (previous_start, previous_end - 1)
+            output.append((previous_end - 1, count))
+    elif start < count:
+        output.append((start, count))
+    return output
+
+
+def _align_current_hierarchical(
+    module: types.ModuleType, audio_path: Path, approved: Sequence[dict[str, Any]],
+    raw: Sequence[dict[str, Any]], duration_s: float, song_id: str,
+    acoustic_anchors: bool = False,
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any]]:
+    """Unique/rare text anchors -> occurrence windows -> local monotonic CTC."""
+    hard = _hard_occurrence_anchors(approved, raw)
+    if len(hard) < 2:
+        return None, {"reason": "fewer_than_two_hard_occurrence_anchors", "hard_anchors": len(hard)}
+    acoustic_anchor_metadata = {"status": "disabled"}
+    if acoustic_anchors:
+        hard, acoustic_anchor_metadata = _acoustic_hard_anchors(
+            module, audio_path, approved, hard, duration_s, song_id,
+        )
+    scaffold = _occurrence_scaffold(approved, raw, hard, duration_s)
+    trusted_first = int(hard[0]["approved_idx"])
+    trusted_last = int(hard[-1]["approved_idx"]) + 1
+    trusted_count = trusted_last - trusted_first
+    ranges = _hierarchical_ranges(
+        trusted_count,
+        [int(row["approved_idx"]) - trusted_first for row in hard],
+        scaffold=scaffold[trusted_first:trusted_last],
+    )
+    if not ranges:
+        return None, {"reason": "fewer_than_two_lines", "hard_anchors": len(hard)}
+    os.environ["CTC_ALIGN_ENABLED"] = "1"
+    local_output: list[dict[str, Any]] = [
+        {"text": str(row.get("text") or ""), "unaligned": True}
+        for row in approved[:trusted_first]
+    ]
+    declined = 0
+    for group_idx, (relative_first, relative_last) in enumerate(ranges):
+        first, last = relative_first + trusted_first, relative_last + trusted_first
+        left = max(0.0, float(scaffold[first]["start"]) - 3.0)
+        right = min(duration_s, float(scaffold[last - 1]["end"]) + 3.0)
+        if right - left > 45.0:
+            # Structural CTC has an audited 45-second ceiling. Do not widen a
+            # window and silently reintroduce cross-occurrence jumps.
+            declined += 1
+            local_output.extend({"text": str(row.get("text") or ""), "unaligned": True} for row in approved[first:last])
+            continue
+        aligned = module.align_structural_window(
+            str(audio_path), [str(row.get("text") or "") for row in approved[first:last]],
+            left, right, job_id=f"gold-hard-anchor-{song_id}-{group_idx}",
+        )
+        events = aligned.get("events") if aligned else None
+        if not events or len(events) != last - first:
+            declined += 1
+            local_output.extend({"text": str(row.get("text") or ""), "unaligned": True} for row in approved[first:last])
+            continue
+        local_output.extend(events)
+    local_output.extend(
+        {"text": str(row.get("text") or ""), "unaligned": True}
+        for row in approved[trusted_last:]
+    )
+    global_output, _global_metadata = _align_current(
+        module, audio_path, approved, duration_s, f"{song_id}-hierarchical-global-witness",
+    )
+    global_output = global_output or [
+        {"text": str(row.get("text") or ""), "unaligned": True} for row in approved
+    ]
+    output, selected_sources = [], {"global": 0, "local": 0, "abstain": 0}
+    for index, (global_row, local_row) in enumerate(zip(global_output, local_output)):
+        if not trusted_first <= index < trusted_last:
+            output.append({"text": str(approved[index].get("text") or ""), "unaligned": True})
+            selected_sources["abstain"] += 1
+            continue
+        expected_center = (float(scaffold[index]["start"]) + float(scaffold[index]["end"])) / 2
+        candidates = []
+        for source, row in (("global", global_row), ("local", local_row)):
+            if row.get("start") is None or row.get("end") is None:
+                continue
+            center = (float(row["start"]) + float(row["end"])) / 2
+            candidates.append((abs(center - expected_center), source, row))
+        if not candidates:
+            output.append({"text": str(approved[index].get("text") or ""), "unaligned": True})
+            selected_sources["abstain"] += 1
+            continue
+        by_source = {source: (distance, row) for distance, source, row in candidates}
+        if "global" in by_source and "local" in by_source:
+            global_center = (float(by_source["global"][1]["start"]) + float(by_source["global"][1]["end"])) / 2
+            local_center = (float(by_source["local"][1]["start"]) + float(by_source["local"][1]["end"])) / 2
+            chosen = (by_source["global"][0], "global", by_source["global"][1]) if abs(global_center - local_center) <= 1.0 else min(candidates)
+        else:
+            chosen = min(candidates)
+        distance, source, row = chosen
+        if distance > 6.0:
+            output.append({"text": str(approved[index].get("text") or ""), "unaligned": True})
+            selected_sources["abstain"] += 1
+            continue
+        output.append({**row, "selection_source": source, "occurrence_distance_s": distance})
+        selected_sources[source] += 1
+    sources: dict[str, int] = {}
+    for anchor in hard:
+        sources[anchor["source"]] = sources.get(anchor["source"], 0) + 1
+    return output, {
+        "model": getattr(module, "MODEL_ID", None),
+        "model_revision": getattr(module, "MODEL_REVISION", None),
+        "approved_timing_input": False,
+        "raw_timing_as_occurrence_prior": True,
+        "policy": "hard occurrence anchors; local/global CTC witnesses; raw-position selection; explicit abstention",
+        "hard_anchors": len(hard), "hard_anchor_sources": sources,
+        "acoustic_anchor_localization": acoustic_anchor_metadata,
+        "groups": len(ranges), "declined_groups": declined,
+        "trusted_line_range": [trusted_first, trusted_last],
+        "one_sided_untrusted_lines": trusted_first + len(approved) - trusted_last,
+        "selected_sources": selected_sources,
+        "maximum_occurrence_distance_s": 6.0,
+        "algorithm_variant": "acoustic_hard_anchors" if acoustic_anchors else "raw_hard_anchors",
+    }
 
 
 def _group_ranges(count: int, size: int = 8) -> list[tuple[int, int]]:
@@ -634,7 +1033,10 @@ def run(
     if limit is not None:
         cases = cases[:limit]
     current = current_source = None
-    if {"current_xlsr", "current_xlsr_anchored"} & set(aligners):
+    if {
+        "current_xlsr", "current_xlsr_anchored", "current_xlsr_hierarchical",
+        "current_xlsr_hierarchical_acoustic",
+    } & set(aligners):
         current, current_source = _load_current(runtime_ref)
     reports: dict[str, list[dict[str, Any]]] = {name: [] for name in aligners}
     failures: dict[str, list[dict[str, str]]] = {name: [] for name in aligners}
@@ -661,27 +1063,46 @@ def run(
             print(f"realign {position}/{len(cases)} {name} {item['song_id']}", flush=True)
             try:
                 stale_ipa = False
+                stale_hierarchical = False
+                needs_compute = not destination.is_file()
                 if destination.is_file():
                     persisted = read_json(destination)
                     expected_g2p = f"espeak-{ESPEAK_LANGUAGES.get(language)}-local"
                     stale_ipa = name == "xlsr_ipa" and persisted.get("metadata", {}).get("g2p") != expected_g2p
-                    if stale_ipa:
-                        prediction, metadata = _align_ipa(audio_path, approved, language)
-                    else:
-                        prediction, metadata = persisted["prediction"], persisted["metadata"]
-                elif name == "current_xlsr":
-                    prediction, metadata = _align_current(current, audio_path, approved, duration, item["song_id"])
-                elif name == "current_xlsr_anchored":
-                    prediction, metadata = _align_current_anchored(
-                        current, audio_path, approved, raw, duration, item["song_id"],
+                    expected_hierarchical = {
+                        "current_xlsr_hierarchical": "raw_hard_anchors",
+                        "current_xlsr_hierarchical_acoustic": "acoustic_hard_anchors",
+                    }.get(name)
+                    stale_hierarchical = bool(
+                        expected_hierarchical
+                        and persisted.get("metadata", {}).get("algorithm_variant") != expected_hierarchical
                     )
-                elif name == "mms_fa":
-                    prediction, metadata = _align_mms(audio_path, approved)
-                else:
-                    prediction, metadata = _align_ipa(audio_path, approved, language)
+                    needs_compute = stale_ipa or stale_hierarchical
+                    if not needs_compute:
+                        prediction, metadata = persisted["prediction"], persisted["metadata"]
+                if needs_compute:
+                    if name == "current_xlsr":
+                        prediction, metadata = _align_current(current, audio_path, approved, duration, item["song_id"])
+                    elif name == "current_xlsr_anchored":
+                        prediction, metadata = _align_current_anchored(
+                            current, audio_path, approved, raw, duration, item["song_id"],
+                        )
+                    elif name == "current_xlsr_hierarchical":
+                        prediction, metadata = _align_current_hierarchical(
+                            current, audio_path, approved, raw, duration, item["song_id"],
+                        )
+                    elif name == "current_xlsr_hierarchical_acoustic":
+                        prediction, metadata = _align_current_hierarchical(
+                            current, audio_path, approved, raw, duration, item["song_id"],
+                            acoustic_anchors=True,
+                        )
+                    elif name == "mms_fa":
+                        prediction, metadata = _align_mms(audio_path, approved)
+                    else:
+                        prediction, metadata = _align_ipa(audio_path, approved, language)
                 if not prediction:
                     raise RuntimeError("aligner declined")
-                if not destination.is_file() or stale_ipa:
+                if needs_compute:
                     write_json(destination, {
                         "song_id": item["song_id"], "aligner": name,
                         "approved_text_sha256": hashlib.sha256("\n".join(str(row.get("text") or "") for row in approved).encode()).hexdigest(),
