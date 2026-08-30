@@ -119,7 +119,37 @@ jobs:
           DATABASE_URL: "postgresql://genly:genly@localhost:5432/genly_test"
           JWT_SECRET: "ci-test-secret-key"
           ADMIN_PASSWORD: "testadmin123"
-        run: python -m pytest tests/ -v --tb=short
+        # `-rs` lista el motivo de cada skip; el paso siguiente lo audita.
+        run: python -m pytest tests/ -v --tb=short -rs | tee /tmp/pytest_out.txt; exit ${PIPESTATUS[0]}
+
+      # Un test saltado en silencio es PEOR que uno en rojo: el job sale verde
+      # sin haber ejercitado nada. Pasó el 2026-08-29 — un archivo con
+      # `async def test_` + `@pytest.mark.asyncio` se saltó entero porque
+      # `pytest-asyncio` no está en requirements.txt. Cuatro tests de una
+      # regresión de producción no corrieron y el PR figuraba en verde.
+      #
+      # Un skip DELIBERADO (`@pytest.mark.skip`/`skipif`, `pytest.skip()`) es
+      # legítimo y pasa. Lo que rompe el build es el skip por infraestructura:
+      # plugin ausente, import fallido, módulo faltante.
+      - name: Tests — ningún skip por infraestructura
+        run: |
+          set -uo pipefail
+          if [ ! -f /tmp/pytest_out.txt ]; then
+            echo "::error::no se encontró la salida de pytest"; exit 1
+          fi
+          malos=$(grep -E "^SKIPPED" /tmp/pytest_out.txt \
+                  | grep -Ei "not natively supported|could not import|No module named|failed to import" \
+                  || true)
+          if [ -n "$malos" ]; then
+            echo "::error::Hay tests saltados por infraestructura (plugin/import), no por decisión."
+            echo "$malos"
+            echo ""
+            echo "Un skip así deja el job en verde sin ejercitar el código."
+            echo "Arreglalo instalando la dependencia o reescribiendo el test,"
+            echo "no agregando un skip explícito."
+            exit 1
+          fi
+          echo "OK — sin skips por infraestructura"
 
       - name: Real MoviePy + libass render gates
         env:

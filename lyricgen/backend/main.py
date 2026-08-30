@@ -439,7 +439,7 @@ class DbTransientRetryMiddleware:
             # stream before its first event. Buffered bodies and retries need
             # a synthetic request body because the original was consumed.
             attempt_receive = (
-                _make_replay_receive(body_bytes)
+                _make_replay_receive(body_bytes, upstream=receive)
                 if body_buffered or (replayable and attempt > 0)
                 else receive
             )
@@ -509,21 +509,44 @@ class DbTransientRetryMiddleware:
             },
             headers={"Retry-After": "2"},
         )
-        await response(scope, _make_replay_receive(b""), send)
+        await response(scope, _make_replay_receive(b"", upstream=receive), send)
 
 
-def _make_replay_receive(body: bytes):
-    """Return an ASGI `receive` callable that yields `body` once and
-    then waits like a still-connected client until the response completes."""
+def _make_replay_receive(body: bytes, upstream=None):
+    """ASGI `receive` que entrega `body` una vez y después delega al canal real.
+
+    El body original ya fue consumido por el buffering del middleware, así que
+    la primera llamada lo reproduce. Las siguientes DEBEN seguir hablando con
+    el cliente de verdad: es por ahí que llega `http.disconnect`.
+
+    BUG (PR #1200, en prod desde 2026-08-25): esto esperaba sobre un
+    `asyncio.Event()` que **nunca se hacía `set()`**, así que la segunda
+    llamada colgaba para siempre. Verificado: la corrutina queda viva
+    indefinidamente si nadie la cancela.
+
+    El disparador es `/events/{job_id}` (SSE). El middleware usa este replay
+    en GETs cuando `attempt > 0` — o sea cuando la request se reintentó por un
+    `OperationalError` transitorio. El `listen_for_disconnect` de
+    `StreamingResponse` se quedaba colgado ahí, y como en un SSE el stream no
+    termina solo, **el server nunca se enteraba de que el cliente se fue**: el
+    generador seguía corriendo y ocupando un worker de uvicorn.
+
+    Sin `upstream` conservamos la espera indefinida anterior en vez de devolver
+    un disconnect sintético inmediato: eso último cancelaría el stream antes de
+    su primer evento, que es el fallo que el comentario del middleware ya
+    documentaba.
+    """
     delivered = False
-    connected = asyncio.Event()
+    never = asyncio.Event()
 
     async def _replay_receive():
         nonlocal delivered
         if not delivered:
             delivered = True
             return {"type": "http.request", "body": body, "more_body": False}
-        await connected.wait()
+        if upstream is not None:
+            return await upstream()
+        await never.wait()
         return {"type": "http.disconnect"}
 
     return _replay_receive
