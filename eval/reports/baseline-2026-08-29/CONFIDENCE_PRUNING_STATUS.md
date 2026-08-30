@@ -46,9 +46,15 @@ El pod se eliminó al terminar; costo aproximado: USD 0,19.
 - MSS-ALT: WER 18,80% → 18,07%; mejora relativa 3,88%, CI95 −5,83% a
   +14,45%; 10 canciones regresan más de 2 puntos. En la cola difícil mejora
   sólo 0,8% relativo. `NO_GO`.
+- Sugerencias de timing exactas del runtime de staging (`c9bdc358`), ahora
+  re-ejecutadas 41/41: 599 propuestas, 27 correctas, precisión 4,51% y recall
+  9,31%. `NO_GO` contra el gate de 70%/20%.
 
-Ninguno de estos tres candidatos se promueve. Staging conserva el flujo
-anterior.
+Ninguno de estos candidatos se promueve. Staging conserva el flujo
+anterior. Como el flag operativo de sugerencias estaba activo, se apagó
+`QUALITY_OPERATOR_SUGGESTIONS_ENABLED` en `quality-worker` y `api`; ambos
+redeploys terminaron `SUCCESS`. El cambio es reversible y no modifica letras,
+timings ni trabajos existentes.
 
 ## Validación local
 
