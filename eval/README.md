@@ -54,6 +54,13 @@ make eval-agent-prepare CANDIDATES=/ruta/a/candidatos.jsonl EXTRACT_CLIPS=1
 ALLOW_EXTERNAL_CLIENT_AUDIO_AGENT_REPLAY=1 make eval-agent-run AGENT_LIMIT=10
 make eval-agent-score ADJUDICATIONS=/ruta/a/tres-jueces.jsonl
 make eval-agent-policy ACTIVATED_AT=2026-08-29T12:00:00Z
+make eval-difficult-cohort
+make eval-code-switch-lid
+make eval-difficulty-router
+ALLOW_EXTERNAL_CLIENT_AUDIO_HEAVY_REPLAY=1 make eval-gemini-heavy
+make eval-difficult-heavy INDEPENDENT_ROOT=/ruta/a/candidatos-gemini
+make eval-difficult-score
+make eval-difficult-report
 make eval-nonhistorical
 make eval VARIANT=baseline HYPOTHESIS_ROOT=/ruta/a/hipotesis
 ```
@@ -190,3 +197,34 @@ corrida guarda matriz de alineación, matches, métricas y errores auditables.
 Una coincidencia solo textual sin solapamiento temporal se veta cuando está a
 más de 10 segundos: evita confundir ocurrencias distintas del mismo estribillo
 y contaminar las métricas de timing.
+
+## Cola de canciones difíciles
+
+`eval-difficult-cohort` congela la etiqueta histórica usando WER, vivo y solo
+sesiones compactas que además tengan ediciones de texto observadas. Esa
+etiqueta nunca entra como feature. `eval-code-switch-lid` recorre la canción
+completa: Whisper LID, margen de log-probabilidad forzada, confirmación léxica
+y persistencia temporal. Un stem faltante puede usar el mix como fallback, pero
+queda explícito y el enrutador lo manda al pipeline pesado por incertidumbre.
+
+El enrutador usa `LeaveOneGroupOut` por canción sobre 30–60 segundos de audio:
+actividad vocal, onsets, articulaciones de pitch, tempo, relación voz/mezcla y
+señales LID. En duda enruta pesado; nunca reduce calidad a una fácil. El pesado
+tiene un máximo de cinco pasadas: fronteras MSS-ALT, original, slow 20%, pitch
+−3 y modo code-switch cuando corresponda. Las TTA de Whisper se consideran una
+sola familia; Gemini es un testigo independiente opcional, nunca fuente y juez.
+Vivo continúa en Tier 2 aunque mejore el replay.
+
+Los candidatos Gemini tienen un ejecutor separado y bloqueado por defecto:
+además de credenciales exige `ALLOW_EXTERNAL_CLIENT_AUDIO_HEAVY_REPLAY=1`.
+Recibe audio, metadatos/LID previos y nunca importa el texto aprobado. Sus
+respuestas se cachean por chunk para que una interrupción no repita costo.
+
+`eval.vocalization_resolver` solo consume ventanas que el gate previo marcó
+como vocalización con confianza alta. Exige ≥0,75 s, propone paréntesis y puede
+extender melismas únicamente sobre pitch contiguo dentro de ±2 semitonos y sin
+pisar la siguiente línea. Todo queda en sugerencia; no autocorrige.
+
+El reporte del bloque publica primero WER difícil antes/después y luego minutos
+fácil/difícil. Si faltan stems, candidatos independientes, timer o suficientes
+canciones spanglish, muestra `PENDING/BLOCKED` en vez de fabricar un resultado.

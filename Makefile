@@ -4,7 +4,7 @@ GOLDEN ?= eval/golden
 HYPOTHESIS_ROOT ?= eval/hypotheses/$(VARIANT)
 BACKEND ?= lyricgen/backend
 
-.PHONY: eval eval-test eval-autopsy eval-extract eval-verify-portal eval-finalize eval-language-id eval-freeze eval-t4-learned eval-error-predictor eval-lora-prep eval-nonhistorical eval-from-snapshot eval-taxonomy-ensemble eval-runtime-replay eval-stems-local eval-lora-research-prep eval-t7-prep eval-phase2-status eval-publish-diagnostic eval-ztlr eval-final-text-realign eval-hierarchical-realign eval-report-hierarchical eval-post-realign-review eval-flag-union eval-mss-alt eval-publish-zero-touch eval-agent-prepare eval-agent-run eval-agent-score eval-agent-policy
+.PHONY: eval eval-test eval-autopsy eval-extract eval-verify-portal eval-finalize eval-language-id eval-freeze eval-t4-learned eval-error-predictor eval-lora-prep eval-nonhistorical eval-from-snapshot eval-taxonomy-ensemble eval-runtime-replay eval-stems-local eval-lora-research-prep eval-t7-prep eval-phase2-status eval-publish-diagnostic eval-ztlr eval-final-text-realign eval-hierarchical-realign eval-report-hierarchical eval-post-realign-review eval-flag-union eval-mss-alt eval-publish-zero-touch eval-agent-prepare eval-agent-run eval-agent-score eval-agent-policy eval-difficult-cohort eval-code-switch-lid eval-difficulty-router eval-gemini-heavy eval-difficult-heavy eval-difficult-score eval-difficult-report
 
 eval:
 	PYTHONPATH=. $(PYTHON) -m eval.score --golden "$(GOLDEN)" --variant "$(VARIANT)" $(if $(filter prod_raw,$(VARIANT)),,--hypothesis-root "$(HYPOTHESIS_ROOT)")
@@ -96,6 +96,27 @@ eval-agent-score:
 eval-agent-policy:
 	@test -n "$(ACTIVATED_AT)" || (echo "ACTIVATED_AT is required" >&2; exit 2)
 	PYTHONPATH=. $(PYTHON) -m eval.agent_tiers policy --activated-at "$(ACTIVATED_AT)"
+
+eval-difficult-cohort:
+	PYTHONPATH=. $(PYTHON) -m eval.difficult_cohort
+
+eval-code-switch-lid:
+	PYTHONPATH=. $(PYTHON) -m eval.code_switching lid --stems eval/cache/full_stems --output eval/runs/code_switch_lid_full --quality exact --quality reconstructed --fallback-to-mix
+
+eval-difficulty-router:
+	PYTHONPATH=. $(PYTHON) -m eval.difficulty_router --lid eval/runs/code_switch_lid_full/report.json
+
+eval-gemini-heavy:
+	PYTHONPATH=. $(PYTHON) -m eval.gemini_heavy_candidates $(if $(GEMINI_LIMIT),--limit "$(GEMINI_LIMIT)",)
+
+eval-difficult-heavy:
+	PYTHONPATH=. $(PYTHON) -m eval.difficult_pipeline run $(if $(INDEPENDENT_ROOT),--independent-root "$(INDEPENDENT_ROOT)",)
+
+eval-difficult-score:
+	PYTHONPATH=. $(PYTHON) -m eval.difficult_pipeline score
+
+eval-difficult-report:
+	PYTHONPATH=. $(PYTHON) -m eval.difficult_block_report
 
 eval-nonhistorical:
 	PYTHONPATH=. $(PYTHON) -m eval.generate_nonhistorical --golden "$(GOLDEN)" --backend "$(BACKEND)" --output eval/hypotheses/local_baseline_8
