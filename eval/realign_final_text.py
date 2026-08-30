@@ -684,10 +684,41 @@ def _align_current_hierarchical(
     global_output = global_output or [
         {"text": str(row.get("text") or ""), "unaligned": True} for row in approved
     ]
+    hard_indices = [int(row["approved_idx"]) for row in hard]
+    normalized = [normalize_text(str(row.get("text") or "")) for row in approved]
+
+    def witness(index: int, global_row: dict[str, Any], local_row: dict[str, Any]) -> dict[str, Any]:
+        def edge(row: dict[str, Any], key: str) -> float | None:
+            return float(row[key]) if row.get(key) is not None else None
+
+        def score(row: dict[str, Any]) -> float:
+            if row.get("ctc_score") is not None:
+                return float(row["ctc_score"])
+            values = [float(word["score"]) for word in (row.get("words") or []) if word.get("score") is not None]
+            return float(np.mean(values)) if values else 0.0
+
+        before = [anchor for anchor in hard_indices if anchor <= index]
+        after = [anchor for anchor in hard_indices if anchor >= index]
+        return {
+            "global_start": edge(global_row, "start"),
+            "global_end": edge(global_row, "end"),
+            "global_ctc_score": score(global_row),
+            "local_start": edge(local_row, "start"),
+            "local_end": edge(local_row, "end"),
+            "local_ctc_score": score(local_row),
+            "hard_anchor_lines_before": index - max(before) if before else len(approved),
+            "hard_anchor_lines_after": min(after) - index if after else len(approved),
+            "text_occurrences": normalized.count(normalized[index]) if normalized[index] else 0,
+        }
+
     output, selected_sources = [], {"global": 0, "local": 0, "abstain": 0}
     for index, (global_row, local_row) in enumerate(zip(global_output, local_output)):
+        selector_witness = witness(index, global_row, local_row)
         if not trusted_first <= index < trusted_last:
-            output.append({"text": str(approved[index].get("text") or ""), "unaligned": True})
+            output.append({
+                "text": str(approved[index].get("text") or ""), "unaligned": True,
+                "selector_witness": selector_witness,
+            })
             selected_sources["abstain"] += 1
             continue
         expected_center = (float(scaffold[index]["start"]) + float(scaffold[index]["end"])) / 2
@@ -698,7 +729,10 @@ def _align_current_hierarchical(
             center = (float(row["start"]) + float(row["end"])) / 2
             candidates.append((abs(center - expected_center), source, row))
         if not candidates:
-            output.append({"text": str(approved[index].get("text") or ""), "unaligned": True})
+            output.append({
+                "text": str(approved[index].get("text") or ""), "unaligned": True,
+                "selector_witness": selector_witness,
+            })
             selected_sources["abstain"] += 1
             continue
         by_source = {source: (distance, row) for distance, source, row in candidates}
@@ -710,10 +744,16 @@ def _align_current_hierarchical(
             chosen = min(candidates)
         distance, source, row = chosen
         if distance > 6.0:
-            output.append({"text": str(approved[index].get("text") or ""), "unaligned": True})
+            output.append({
+                "text": str(approved[index].get("text") or ""), "unaligned": True,
+                "selector_witness": selector_witness,
+            })
             selected_sources["abstain"] += 1
             continue
-        output.append({**row, "selection_source": source, "occurrence_distance_s": distance})
+        output.append({
+            **row, "selection_source": source, "occurrence_distance_s": distance,
+            "selector_witness": selector_witness,
+        })
         selected_sources[source] += 1
     sources: dict[str, int] = {}
     for anchor in hard:
@@ -731,7 +771,12 @@ def _align_current_hierarchical(
         "one_sided_untrusted_lines": trusted_first + len(approved) - trusted_last,
         "selected_sources": selected_sources,
         "maximum_occurrence_distance_s": 6.0,
-        "algorithm_variant": "acoustic_hard_anchors" if acoustic_anchors else "raw_hard_anchors",
+        "hard_anchor_evidence": [
+            {key: row[key] for key in ("approved_idx", "raw_idx", "source", "start", "end")}
+            for row in hard
+        ],
+        "selector_witness_schema": 1,
+        "algorithm_variant": "acoustic_hard_anchors_selector_v1" if acoustic_anchors else "raw_hard_anchors_selector_v1",
     }
 
 
@@ -1070,8 +1115,8 @@ def run(
                     expected_g2p = f"espeak-{ESPEAK_LANGUAGES.get(language)}-local"
                     stale_ipa = name == "xlsr_ipa" and persisted.get("metadata", {}).get("g2p") != expected_g2p
                     expected_hierarchical = {
-                        "current_xlsr_hierarchical": "raw_hard_anchors",
-                        "current_xlsr_hierarchical_acoustic": "acoustic_hard_anchors",
+                        "current_xlsr_hierarchical": "raw_hard_anchors_selector_v1",
+                        "current_xlsr_hierarchical_acoustic": "acoustic_hard_anchors_selector_v1",
                     }.get(name)
                     stale_hierarchical = bool(
                         expected_hierarchical

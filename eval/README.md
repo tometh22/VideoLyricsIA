@@ -77,6 +77,24 @@ ejecución bloqueada: la política publicada afirma que no se entrena con datos
 del cliente y que el audio no sale de la infraestructura. Esa autorización se
 resuelve antes de cualquier upload a RunPod.
 
+## Replay de selector y poda (2026-08-30)
+
+El bloque nuevo no muta staging. Su secuencia cerrada es:
+
+1. `python3 -m eval.runpod_stems package --archive /ruta/segura/missing-stems.tar.gz`
+2. Ejecutar `run_job.sh` en el RunPod permitido y traer `genly-stem-results.tar.gz`.
+3. `python3 -m eval.runpod_stems import --archive /ruta/segura/genly-stem-results.tar.gz`
+4. Re-ejecutar `current_xlsr` y `current_xlsr_hierarchical` sobre los 41 stems.
+5. `python3 -m eval.timing_confidence`
+6. `python3 -m eval.prune_review_flags`
+7. Completar `python3 -m eval.mss_alt` y cerrar con `python3 -m eval.review_block_report`.
+
+El importador verifica la identidad SHA-256 del master y del stem. El selector
+usa `LeaveOneGroupOut` por canción, jamás aprueba una abstención jerárquica y
+excluye vivo de automatización. La poda también es estrictamente song-held-out.
+Un reporte parcial siempre queda `BLOCKED_INCOMPLETE_*`; no puede preparar
+flags de staging.
+
 `eval-lora-research-prep` descarga tres canciones en español de JamendoLyrics
 y solo acepta licencias BY/BY-SA/CC BY/CC BY-SA; excluye marcadores NC y ND.
 El ejecutor `eval.train_whisper_lora` exige un identificador de licencia por

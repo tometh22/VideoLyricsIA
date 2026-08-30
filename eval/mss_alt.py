@@ -19,7 +19,7 @@ import numpy as np
 
 from eval.bootstrap import song_bootstrap_ci
 from eval.canonical import read_json, segments_to_lines, write_json
-from eval.metrics import error_rate_counts, full_text
+from eval.metrics import align_lines, error_rate_counts, full_text, normalize_text
 
 
 def rms_vad_boundaries(
@@ -96,12 +96,58 @@ def _offset_segments(segments: Sequence[dict[str, Any]], offset: float) -> list[
 
 
 def _score(approved: Sequence[dict[str, Any]], hypothesis: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    reference = full_text(segments_to_lines(approved))
+    approved_lines, hypothesis_lines = segments_to_lines(approved), segments_to_lines(hypothesis)
+    reference = full_text(approved_lines)
     hypothesis_text = " ".join(str(segment.get("text") or "") for segment in hypothesis)
     counts = error_rate_counts(reference, hypothesis_text)
+    alignment = align_lines(approved_lines, hypothesis_lines)
+    correct_reference_lines = {
+        int(match["ref_idx"]) for match in alignment["matches"]
+        if normalize_text(approved_lines[int(match["ref_idx"])]["text"])
+        == normalize_text(hypothesis_lines[int(match["hyp_idx"])]["text"])
+    }
     return {
         **counts,
         "wer": counts["word_edits"] / max(1, counts["reference_words"]),
+        "reference_lines": len(approved_lines),
+        "correct_reference_line_indices": sorted(correct_reference_lines),
+        "reference_line_errors": len(approved_lines) - len(correct_reference_lines),
+    }
+
+
+def _comparison(rows: Sequence[dict[str, Any]], eligible_songs: int) -> dict[str, Any]:
+    def relative_improvement(sample: Sequence[dict[str, Any]]) -> float:
+        native = sum(row["families"]["native"]["word_edits"] for row in sample)
+        mss = sum(row["families"]["mss_rms_vad"]["word_edits"] for row in sample)
+        return (native - mss) / max(1, native)
+
+    regressions = []
+    lines_fixed, lines_regressed = 0, 0
+    for row in rows:
+        native, mss = row["families"]["native"], row["families"]["mss_rms_vad"]
+        delta = float(mss["wer"]) - float(native["wer"])
+        if delta > 0.02:
+            regressions.append({"song_id": row["song_id"], "absolute_wer_regression": delta})
+        native_correct = set(native["correct_reference_line_indices"])
+        mss_correct = set(mss["correct_reference_line_indices"])
+        lines_fixed += len(mss_correct - native_correct)
+        lines_regressed += len(native_correct - mss_correct)
+    ci = song_bootstrap_ci(rows, relative_improvement) if rows else None
+    complete = len(rows) == eligible_songs == 41
+    passes = bool(complete and ci and float(ci["low"]) > 0.0 and not regressions)
+    return {
+        "paired_relative_wer_improvement": ci,
+        "songs_regressing_more_than_2pct_absolute": regressions,
+        "downstream_reference_lines": {
+            "native_error_lines_fixed_by_mss": lines_fixed,
+            "native_correct_lines_regressed_by_mss": lines_regressed,
+            "net_lines_leaving_text_error_state": lines_fixed - lines_regressed,
+            "note": "scorer-only alignment against approved lines; no approved text or timing enters transcription",
+        },
+        "gate": {
+            "requirements": "41/41; paired relative-WER CI95 low > 0; no song WER regression > 0.02 absolute",
+            "status": "GO_PRODUCT" if passes else "BLOCKED_INCOMPLETE_COHORT" if not complete else "NO_GO",
+        },
     }
 
 
@@ -174,6 +220,7 @@ def run(
         "by_song": rows,
         "ztlr": "NOT_DIRECTLY_DERIVABLE_FROM_UNFORMATTED_ASR_SEGMENTS",
     }
+    summary["comparison"] = _comparison(rows, len(cases))
     write_json(output / model_name / "report.json", summary)
     print(json.dumps({"completed_songs": len(rows), "families": summary["families"]}, indent=2))
     return summary
