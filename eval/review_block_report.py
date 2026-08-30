@@ -25,10 +25,13 @@ def build(selector_path: Path, pruning_path: Path, mss_path: Path, output: Path)
     pruning_complete = (pruning.get("gate") or {}).get("status") != "BLOCKED_INCOMPLETE_TIMING_SELECTOR"
     mss_complete = bool(mss and (mss.get("comparison") or {}).get("gate", {}).get("status") in {"GO_PRODUCT", "NO_GO"})
     mss_downstream_applied = bool(mss and mss.get("downstream_flag_replay_applied"))
-    complete = selector_complete and pruning_complete and mss_complete and mss_downstream_applied
+    mss_gate = ((mss or {}).get("comparison") or {}).get("gate", {}).get("status", "MISSING")
+    # A conclusive MSS NO_GO preserves the baseline and needs no propagation.
+    # Only a winning MSS candidate must be replayed through downstream flags.
+    mss_closed = mss_complete and (mss_gate == "NO_GO" or mss_downstream_applied)
+    complete = selector_complete and pruning_complete and mss_closed
     after = float(selected.get("queue_seconds_per_song") or 0.0) if complete else None
     recall = float(selected.get("correction_recall") or 0.0) if complete else None
-    mss_gate = ((mss or {}).get("comparison") or {}).get("gate", {}).get("status", "MISSING")
     gate = bool(
         complete and after is not None and after <= TARGET_SECONDS_PER_SONG
         and recall is not None and recall >= TARGET_RECALL and mss_gate == "GO_PRODUCT"
@@ -61,13 +64,22 @@ def build(selector_path: Path, pruning_path: Path, mss_path: Path, output: Path)
             },
         },
         "gate": {
-            "requirements": "seconds/song <= 50; recall >= 0.93; all 41 stems; MSS gate passed and propagated through downstream flag replay",
+            "requirements": (
+                "seconds/song <= 50; recall >= 0.93; all 41 stems; MSS conclusively "
+                "evaluated and, only if it wins, propagated through downstream flag replay"
+            ),
             "status": "GO_PREPARE_STAGING_FLAGS" if gate else "BLOCKED_INCOMPLETE_REPLAY" if not complete else "NO_GO",
         },
         "staging_mutated": False,
         "decisions_for_tomi": {
-            "selector_precision": "PENDING_COMPLETE_41_SONG_CURVE" if not complete else "choose one of 90/93/95",
-            "pruning_cutoff": "PENDING_COMPLETE_ENSEMBLE" if not complete else "choose one of recall 90/93/95/min-cost",
+            "selector_precision": (
+                "PENDING_COMPLETE_41_SONG_CURVE" if not complete
+                else "NO_PROMOTION_CANDIDATE_FAILED_EVIDENCE_GATE"
+            ),
+            "pruning_cutoff": (
+                "PENDING_COMPLETE_ENSEMBLE" if not complete
+                else "NO_PROMOTION_CANDIDATE_FAILED_REVIEW_COST_GATE"
+            ),
         },
     }
     output.mkdir(parents=True, exist_ok=True)
@@ -81,11 +93,16 @@ def build(selector_path: Path, pruning_path: Path, mss_path: Path, output: Path)
         f"| Stems 41/41 | {'OK' if selector_complete else 'BLOQUEADO'} | cohorte selector: {(selector.get('cohort_gate') or {}).get('status')} |",
         f"| Selector timing | {(selector.get('gate') or {}).get('status')} | ZTLR medido: {(selector.get('ztlr') or {}).get('measured_with_correctly_resolved_timing_only', 'pendiente')} |",
         f"| Poda flags | {(pruning.get('gate') or {}).get('status')} | recall: {selected.get('correction_recall', 'pendiente')}; falsos: {selected.get('false_flags', 'pendiente')} |",
-        f"| MSS-ALT | {mss_gate} | cohorte completa requerida |",
+        f"| MSS-ALT | {mss_gate} | 41/41 evaluadas; un NO_GO conserva baseline sin propagación |",
         "",
         f"**Gate conjunto:** {report['gate']['status']}. Staging no fue modificado.",
         "",
-        "Decisiones de Tomi: umbral del selector y corte de poda quedan cerradas recién con la curva completa de 41 canciones.",
+        (
+            "Decisiones de Tomi: ninguna promoción pendiente en este bloque; selector, poda y "
+            "MSS-ALT fallaron sus gates y conservan el flujo anterior."
+            if complete else
+            "Decisiones de Tomi: umbral del selector y corte de poda quedan cerradas recién con la curva completa."
+        ),
     ]
     (output / "REPORT.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report

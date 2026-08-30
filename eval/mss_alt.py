@@ -72,9 +72,21 @@ def rms_vad_boundaries(
 
 def _transcribe(model, audio, language: str) -> dict[str, Any]:
     return model.transcribe(
-        audio, language=language, word_timestamps=True, verbose=False,
-        condition_on_previous_text=False, beam_size=1, best_of=1,
+        audio, language=language, word_timestamps=False, verbose=False,
+        condition_on_previous_text=False, beam_size=1, best_of=1, fp16=False,
     )
+
+
+def _resolve_device(requested: str) -> str:
+    if requested != "auto":
+        return requested
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def _offset_segments(segments: Sequence[dict[str, Any]], offset: float) -> list[dict[str, Any]]:
@@ -151,9 +163,42 @@ def _comparison(rows: Sequence[dict[str, Any]], eligible_songs: int) -> dict[str
     }
 
 
+def _cohort_splits(rows: Sequence[dict[str, Any]], difficulty_path: Path) -> dict[str, Any]:
+    if not difficulty_path.is_file():
+        return {"status": "MISSING_DIFFICULTY_COHORT"}
+    difficulty = read_json(difficulty_path)
+    labels = {
+        str(row["song_id"]): "difficult" if row.get("difficult_gold") else "easy"
+        for row in difficulty.get("cases") or []
+        if row.get("difficult_gold") is not None
+    }
+    result: dict[str, Any] = {"status": "COMPLETE", "cohorts": {}}
+    for cohort in ("easy", "difficult"):
+        subset = [row for row in rows if labels.get(str(row["song_id"])) == cohort]
+
+        def corpus_wer(sample: Sequence[dict[str, Any]], family: str) -> float:
+            edits = sum(item["families"][family]["word_edits"] for item in sample)
+            words = sum(item["families"][family]["reference_words"] for item in sample)
+            return edits / max(1, words)
+
+        def relative(sample: Sequence[dict[str, Any]]) -> float:
+            native = corpus_wer(sample, "native")
+            mss = corpus_wer(sample, "mss_rms_vad")
+            return (native - mss) / max(1e-12, native)
+
+        result["cohorts"][cohort] = {
+            "songs": len(subset),
+            "native_wer": song_bootstrap_ci(subset, lambda sample: corpus_wer(sample, "native")),
+            "mss_rms_vad_wer": song_bootstrap_ci(subset, lambda sample: corpus_wer(sample, "mss_rms_vad")),
+            "paired_relative_wer_improvement": song_bootstrap_ci(subset, relative),
+        }
+    return result
+
+
 def run(
     golden: Path, stems: Path, output: Path, model_name: str, limit: int | None,
-    song_ids: set[str] | None,
+    song_ids: set[str] | None, device: str = "auto",
+    difficulty_path: Path = Path("eval/runs/difficult_cohort/report.json"),
 ) -> dict[str, Any]:
     import whisper
 
@@ -163,7 +208,16 @@ def run(
         cases = [item for item in cases if item["song_id"] in song_ids]
     if limit is not None:
         cases = cases[:limit]
-    model = whisper.load_model(model_name)
+    resolved_device = _resolve_device(device)
+    decoding = {
+        "device": resolved_device,
+        "word_timestamps": False,
+        "condition_on_previous_text": False,
+        "beam_size": 1,
+        "best_of": 1,
+        "fp16": False,
+    }
+    model = whisper.load_model(model_name, device=resolved_device)
     rows, failures = [], []
     for position, item in enumerate(cases, 1):
         case, song_id = golden / item["path"], item["song_id"]
@@ -180,8 +234,9 @@ def run(
         for family in ("native", "mss_rms_vad"):
             destination = output / model_name / family / f"{song_id}.json"
             print(f"mss-alt {position}/{len(cases)} {model_name} {family} {song_id}", flush=True)
-            if destination.is_file():
-                payload = read_json(destination)
+            payload = read_json(destination) if destination.is_file() else None
+            reusable = bool(payload and payload.get("decoding") == decoding)
+            if reusable:
                 segments = payload["segments"]
             elif family == "native":
                 result = _transcribe(model, audio, language)
@@ -192,11 +247,12 @@ def run(
                     chunk = audio[int(left * 16000):int(right * 16000)]
                     result = _transcribe(model, chunk, language)
                     segments.extend(_offset_segments(result.get("segments") or [], left))
-            if not destination.is_file():
+            if not reusable:
                 write_json(destination, {
                     "schema_version": 1, "song_id": song_id, "family": family,
                     "model": model_name, "input_audio": "original_mix",
                     "boundary_source": "native" if family == "native" else "mdx_extra_rms_vad",
+                    "decoding": decoding,
                     "boundaries": boundaries if family == "mss_rms_vad" else None,
                     "segments": segments,
                 })
@@ -209,7 +265,7 @@ def run(
         return edits / max(1, words)
     summary = {
         "schema_version": 1, "experiment": "arxiv-2506.15514-rms-vad",
-        "model": model_name, "data_egress": False,
+        "model": model_name, "decoding": decoding, "data_egress": False,
         "eligible_songs": len(cases), "completed_songs": len(rows), "failures": failures,
         "families": {
             family: {
@@ -221,6 +277,7 @@ def run(
         "ztlr": "NOT_DIRECTLY_DERIVABLE_FROM_UNFORMATTED_ASR_SEGMENTS",
     }
     summary["comparison"] = _comparison(rows, len(cases))
+    summary["cohort_splits"] = _cohort_splits(rows, difficulty_path)
     write_json(output / model_name / "report.json", summary)
     print(json.dumps({"completed_songs": len(rows), "families": summary["families"]}, indent=2))
     return summary
@@ -232,12 +289,14 @@ def main() -> int:
     parser.add_argument("--stems", type=Path, default=Path("eval/cache/full_stems"))
     parser.add_argument("--output", type=Path, default=Path("eval/runs/mss_alt"))
     parser.add_argument("--model", default="large-v3-turbo")
+    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "mps", "cuda"))
+    parser.add_argument("--difficulty", type=Path, default=Path("eval/runs/difficult_cohort/report.json"))
     parser.add_argument("--limit", type=int)
     parser.add_argument("--song-id", action="append", default=[])
     args = parser.parse_args()
     run(
         args.golden.resolve(), args.stems.resolve(), args.output.resolve(), args.model,
-        args.limit, set(args.song_id) or None,
+        args.limit, set(args.song_id) or None, args.device, args.difficulty.resolve(),
     )
     return 0
 

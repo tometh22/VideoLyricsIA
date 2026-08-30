@@ -50,17 +50,22 @@ def _selector_rows(path: Path) -> tuple[dict[tuple[str, int], dict[str, Any]], d
     if not report_path.is_file() or not csv_path.is_file():
         return {}, {"status": "MISSING"}
     report = read_json(report_path)
+    cohort_status = (report.get("cohort_gate") or {}).get("status", "UNKNOWN")
+    selector_status = (report.get("gate") or {}).get("status", "UNKNOWN")
+    enabled = cohort_status == "COMPLETE" and selector_status == "GO_STAGING"
     threshold = float((report.get("operating_points") or {}).get("0.9", {}).get("threshold") or 2.0)
     rows = {}
     with csv_path.open(encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             rows[(row["song_id"], int(row["line_idx"]))] = {
-                "approved": int(row["hierarchical_abstained"]) == 0 and float(row["oof_probability"]) >= threshold,
+                "approved": enabled and int(row["hierarchical_abstained"]) == 0 and float(row["oof_probability"]) >= threshold,
                 "safe": int(row["label_safe"]) == 1,
                 "probability": float(row["oof_probability"]),
             }
     return rows, {
-        "status": (report.get("cohort_gate") or {}).get("status", "UNKNOWN"),
+        "status": cohort_status,
+        "selector_gate": selector_status,
+        "auto_resolution_enabled": enabled,
         "threshold": threshold,
         "songs": report.get("songs"),
     }
@@ -75,7 +80,7 @@ def _oof_probabilities(rows: list[dict[str, Any]], features: list[str], target: 
         model = LGBMClassifier(
             n_estimators=300, learning_rate=0.025, max_depth=4, num_leaves=18,
             min_child_samples=20, reg_lambda=3.0, class_weight="balanced",
-            random_state=20260830, verbosity=-1,
+            n_jobs=1, random_state=20260830, verbosity=-1,
         )
         model.fit(x[train_idx], y[train_idx])
         probabilities[test_idx] = model.booster_.predict(x[test_idx])

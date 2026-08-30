@@ -69,12 +69,38 @@ def _source_from_git(ref: str, path: str) -> tuple[str, str]:
 
 
 def _load_current(ref: str) -> tuple[types.ModuleType, dict[str, str]]:
+    _ensure_torchaudio_info()
     path = "lyricgen/backend/ctc_align.py"
     source, sha = _source_from_git(ref, path)
     module = types.ModuleType("_pinned_ctc_align")
     module.__file__ = f"git:{ref}:{path}"
     exec(compile(source, module.__file__, "exec"), module.__dict__)
     return module, {"git_ref": ref, "source_path": path, "source_sha256": sha}
+
+
+def _ensure_torchaudio_info() -> None:
+    """Restore the metadata shim removed by recent TorchAudio releases.
+
+    The pinned staging aligner uses ``torchaudio.info`` only to calculate
+    safe frame offsets before a windowed load.  TorchAudio 2.13 removed that
+    API while retaining ``load(..., frame_offset=..., num_frames=...)``.
+    SoundFile reads the same WAV header without decoding audio, so exposing
+    the two legacy fields keeps the replay faithful to the pinned aligner.
+    """
+    import soundfile as sf
+    import torchaudio
+
+    if hasattr(torchaudio, "info"):
+        return
+
+    def _info(path: str | os.PathLike[str]):
+        metadata = sf.info(str(path))
+        return types.SimpleNamespace(
+            sample_rate=int(metadata.samplerate),
+            num_frames=int(metadata.frames),
+        )
+
+    torchaudio.info = _info
 
 
 def _audio(path: Path):
@@ -1011,7 +1037,10 @@ def _loo_display_calibration(rows: Sequence[dict[str, Any]]) -> dict[str, Any] |
             model = LGBMRegressor(
                 n_estimators=120, learning_rate=0.035, max_depth=3,
                 num_leaves=12, min_child_samples=20, reg_lambda=2.0,
-                verbosity=-1, random_state=20260829,
+                # A replay can fit two models per held-out song.  Keeping
+                # LightGBM single-threaded avoids the macOS OpenMP teardown
+                # crash observed once the complete 41-song cohort is loaded.
+                n_jobs=1, verbosity=-1, random_state=20260829,
             )
             model.fit(x_train, y)
             predictions.append(np.clip(model.predict(x_test), -1500.0, 1500.0))

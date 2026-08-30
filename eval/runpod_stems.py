@@ -55,9 +55,21 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg
 fi
-python -m pip install --upgrade pip
-python -m pip install "demucs==4.0.1" "soundfile>=0.12,<1"
-python - <<'PY'
+VENV=/workspace/genly-stems-venv
+if command -v uv >/dev/null 2>&1; then
+  uv venv --system-site-packages --seed "$VENV"
+else
+  python -m venv --system-site-packages "$VENV"
+fi
+PYTHON_BIN="$VENV/bin/python"
+"$PYTHON_BIN" -m pip install --upgrade pip
+"$PYTHON_BIN" -m pip install "demucs==4.0.1" "soundfile>=0.12,<1"
+# PyTorch 2.9 requires TorchCodec 0.8/0.9.  Use its CPU wheel because Demucs
+# only needs it to encode the returned WAV; a latest CUDA wheel can require a
+# newer libnvrtc than the pod image and fail after the expensive separation.
+"$PYTHON_BIN" -m pip install --no-deps \
+  --index-url https://download.pytorch.org/whl/cpu "torchcodec==0.9.1"
+"$PYTHON_BIN" - <<'PY'
 import hashlib, json, subprocess, sys, time
 from pathlib import Path
 import soundfile as sf
@@ -79,6 +91,25 @@ for number, case in enumerate(bundle["cases"], 1):
     source = root / case_id / case["filename"]
     if sha(source) != case["source_audio_sha256"]:
         raise RuntimeError(f"{case_id}: source SHA-256 mismatch before separation")
+    target_dir = destination / case_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / "vocals.wav"
+    if target.is_file():
+        info = sf.info(str(target))
+        duration = info.frames / info.samplerate
+        if duration + 1.0 >= float(case["duration_s"]):
+            rows.append({
+                "song_id": case_id,
+                "source_audio_sha256": case["source_audio_sha256"],
+                "stem_sha256": sha(target),
+                "duration_s": duration,
+                "model": "mdx_extra",
+                "device": "cuda",
+                "elapsed_s": 0.0,
+                "resumed": True,
+            })
+            print(f"[{number}/{len(bundle['cases'])}] {case_id} resumed", flush=True)
+            continue
     output = Path("work") / case_id
     started = time.monotonic()
     subprocess.run([
@@ -88,9 +119,6 @@ for number, case in enumerate(bundle["cases"], 1):
     stem = output / "mdx_extra" / source.stem / "vocals.wav"
     if not stem.is_file():
         raise RuntimeError(f"{case_id}: Demucs output missing: {stem}")
-    target_dir = destination / case_id
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / "vocals.wav"
     target.write_bytes(stem.read_bytes())
     info = sf.info(str(target))
     rows.append({
@@ -109,7 +137,7 @@ Path("results/manifest.json").write_text(json.dumps({
     "bundle_sha256": bundle["identity_sha256"],
     "model": "mdx_extra",
     "cases": rows,
-}, indent=2, sort_keys=True) + "\n")
+}, indent=2, sort_keys=True) + "\\n")
 PY
 tar -czf /workspace/genly-stem-results.tar.gz results
 sha256sum /workspace/genly-stem-results.tar.gz > /workspace/genly-stem-results.tar.gz.sha256
@@ -194,9 +222,19 @@ def _safe_extract(archive: Path, destination: Path) -> None:
 
 
 def import_results(golden: Path, cache: Path, archive: Path) -> dict[str, Any]:
-    expected = {row["song_id"]: row for row in _pending(golden, cache)}
+    pending = _pending(golden, cache)
+    expected = {row["song_id"]: row for row in pending}
     if not expected:
         raise RuntimeError("no missing stems to import")
+    expected_cases = [
+        {key: row[key] for key in (
+            "song_id", "filename", "source_audio_sha256", "duration_s",
+        )}
+        for row in pending
+    ]
+    expected_identity = _sha256_bytes(json.dumps(
+        expected_cases, sort_keys=True, separators=(",", ":"),
+    ).encode())
     with tempfile.TemporaryDirectory(prefix="genly-runpod-stems-") as temporary:
         root = Path(temporary)
         _safe_extract(archive, root)
@@ -204,6 +242,8 @@ def import_results(golden: Path, cache: Path, archive: Path) -> dict[str, Any]:
         remote = read_json(results / "manifest.json")
         if remote.get("model") != MODEL:
             raise RuntimeError(f"unexpected separator model: {remote.get('model')!r}")
+        if remote.get("bundle_sha256") != expected_identity:
+            raise RuntimeError("result bundle identity does not match the pending cohort")
         remote_rows = {row["song_id"]: row for row in remote.get("cases") or []}
         if set(remote_rows) != set(expected):
             raise RuntimeError("result song IDs do not exactly match the pending cohort")

@@ -38,6 +38,21 @@ def _variant(report: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     return name, calibrated["variants"]["robust_global_median"]["by_song"]
 
 
+def _explicit_declines(report: dict[str, Any]) -> set[str]:
+    """Return songs where an aligner ran and deliberately abstained.
+
+    An explicit model decline is a complete, safe outcome for the cohort: it
+    must never create an approved line, but it must not be confused with an
+    infrastructure failure or an audio file that was never evaluated.
+    """
+    _name, payload = next(iter(report["aligners"].items()))
+    return {
+        str(row["song_id"])
+        for row in payload.get("failures") or []
+        if str(row.get("reason") or "").endswith("aligner declined")
+    }
+
+
 def _display_edges(line: dict[str, Any]) -> tuple[float, float]:
     return (
         float(line["predicted_start"]) + float(line.get("start_display_delta_ms") or 0.0) / 1000.0,
@@ -169,10 +184,25 @@ def build_dataset(
                 "word_count": len(normalized[line_idx].split()),
                 "character_count": len(normalized[line_idx].replace(" ", "")),
             })
+    eligible_non_live = {
+        song_id
+        for song_id, meta in meta_by_song.items()
+        if not LIVE_PATTERN.search(str(meta.get("title") or ""))
+    }
+    global_success = {str(song["song_id"]) for song in global_songs}
+    hierarchical_success = {str(song["song_id"]) for song in hierarchical_songs}
+    paired_success = eligible_non_live & global_success & hierarchical_success
+    explicit_safe_abstentions = eligible_non_live & (
+        _explicit_declines(global_report) | _explicit_declines(hierarchical_report)
+    )
+    accounted = paired_success | explicit_safe_abstentions
     diagnostics = {
         "global_aligner": global_name,
         "hierarchical_aligner": hierarchical_name,
-        "songs_with_global_and_hierarchical": len({row["song_id"] for row in rows}),
+        "eligible_non_live_songs": len(eligible_non_live),
+        "songs_with_global_and_hierarchical": len(paired_success),
+        "songs_explicit_safe_abstention": sorted(explicit_safe_abstentions),
+        "songs_unaccounted": sorted(eligible_non_live - accounted),
         "live_songs_excluded": sorted(excluded_live),
         "songs_missing_global_witness": sorted(missing_global),
         "rows_missing_persisted_selector_witness": missing_witness,
@@ -212,6 +242,7 @@ def _operating_point(rows: list[dict[str, Any]], target: float) -> dict[str, Any
         "precision_song_bootstrap_ci": song_bootstrap_ci(blocks, block_precision),
         "approved_lines": len(selected),
         "correct_approved_lines": sum(row["label_safe"] for row in selected),
+        "approved_songs": len({row["song_id"] for row in selected}),
         "approval_fraction": len(selected) / max(1, len(eligible)),
     }
 
@@ -229,7 +260,7 @@ def train(rows: list[dict[str, Any]], ztlr_path: Path, output: Path) -> dict[str
         model = LGBMClassifier(
             n_estimators=240, learning_rate=0.025, max_depth=4, num_leaves=15,
             min_child_samples=20, reg_lambda=3.0, class_weight="balanced",
-            random_state=20260830, verbosity=-1,
+            n_jobs=1, random_state=20260830, verbosity=-1,
         )
         model.fit(x[train_idx], y[train_idx])
         probabilities[test_idx] = model.booster_.predict(x[test_idx])
@@ -238,6 +269,13 @@ def train(rows: list[dict[str, Any]], ztlr_path: Path, output: Path) -> dict[str
 
     points = {str(value): _operating_point(rows, value) for value in (0.90, 0.93, 0.95)}
     chosen = points["0.9"]
+    chosen_ci_low = float((chosen.get("precision_song_bootstrap_ci") or {}).get("low") or 0.0)
+    staging_evidence = bool(
+        chosen.get("precision", 0.0) >= 0.90
+        and chosen_ci_low >= 0.90
+        and int(chosen.get("approved_lines") or 0) >= 50
+        and int(chosen.get("approved_songs") or 0) >= 10
+    )
     threshold = float(chosen.get("threshold") or 2.0)
     selected_keys = {
         (row["song_id"], row["line_idx"])
@@ -276,8 +314,11 @@ def train(rows: list[dict[str, Any]], ztlr_path: Path, output: Path) -> dict[str
         "average_precision": float(average_precision_score(y, probabilities)),
         "operating_points": points,
         "gate": {
-            "requirement": "precision >= 0.90 on approved lines; hierarchical abstentions never approved",
-            "status": "GO_REPLAY_PARTIAL" if chosen.get("precision", 0.0) >= 0.90 else "NO_GO",
+            "requirement": (
+                "precision >= 0.90 with song-bootstrap lower bound >= 0.90, "
+                ">=50 approved lines across >=10 songs; hierarchical abstentions never approved"
+            ),
+            "status": "GO_STAGING" if staging_evidence else "NO_GO_INSUFFICIENT_EVIDENCE",
         },
         "timing_only": {
             "eligible_non_live_lines": len(timing_only),
@@ -306,13 +347,16 @@ def run(
     report = train(rows, ztlr, output)
     report["inputs"] = diagnostics
     complete = (
-        diagnostics["songs_with_global_and_hierarchical"] >= 38
-        and not diagnostics["songs_missing_global_witness"]
+        diagnostics["eligible_non_live_songs"] >= 38
+        and not diagnostics["songs_unaccounted"]
         and diagnostics["rows_missing_persisted_selector_witness"] == 0
     )
     report["cohort_gate"] = {
         "status": "COMPLETE" if complete else "INCOMPLETE",
-        "requirement": "all non-live songs have both witnesses and selector telemetry",
+        "requirement": (
+            "every non-live song has both witnesses or an explicit safe aligner "
+            "abstention; persisted witnesses include selector telemetry"
+        ),
     }
     if not complete:
         report["gate"]["status"] = "BLOCKED_INCOMPLETE_COHORT"

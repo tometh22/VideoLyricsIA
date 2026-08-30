@@ -1,4 +1,4 @@
-from eval.timing_confidence import _display_edges, _operating_point
+from eval.timing_confidence import _display_edges, _explicit_declines, _operating_point
 
 
 def test_display_edges_apply_loo_display_delta():
@@ -16,4 +16,13 @@ def test_operating_point_never_approves_hierarchical_abstention():
     ]
     point = _operating_point(rows, .9)
     assert point["approved_lines"] == 1
+    assert point["approved_songs"] == 1
     assert point["precision"] == 1.0
+
+
+def test_explicit_decline_is_distinct_from_infrastructure_failure():
+    report = {"aligners": {"x": {"failures": [
+        {"song_id": "safe", "reason": "RuntimeError: aligner declined"},
+        {"song_id": "missing", "reason": "missing_stem_audio"},
+    ]}}}
+    assert _explicit_declines(report) == {"safe"}

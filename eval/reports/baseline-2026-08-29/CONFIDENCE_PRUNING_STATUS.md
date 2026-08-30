@@ -1,7 +1,7 @@
 # Selector de confianza + poda — estado 2026-08-30
 
-**Segundos de revisión/canción: 127,1 → pendiente.** No se publica un número
-parcial como resultado del bloque.
+**Segundos de revisión/canción: 127,1 → 342,9 en el punto de recall 93%.** El
+ensamble evaluado es `NO_GO`: aumentaría el trabajo del revisor.
 
 ## Implementado
 
@@ -19,28 +19,39 @@ parcial como resultado del bloque.
   borra un flag de texto pendiente.
 - Gate MSS-ALT pareado: CI95 de mejora relativa y veto a cualquier canción que
   empeore más de 2 puntos absolutos de WER.
-- Agregador final que exige cohorte completa y propagación MSS aguas abajo. No
-  prepara staging con resultados parciales.
+- Agregador final que exige cohorte completa. Un MSS ganador debe propagarse
+  aguas abajo; un `NO_GO` conserva explícitamente el baseline.
+- Runtime local MPS reproducible para MSS-ALT, sin timestamps de palabra que
+  no intervienen en WER y con la configuración de decodificación persistida.
 
-## Bloqueo externo comprobado
+## Cohorte completa
 
-`runpodctl` responde `API_KEY_MISSING`. El bundle local contiene 15 canciones,
-709.515.347 bytes y SHA-256
+Los 15 stems faltantes se produjeron en RunPod, se importaron sólo después de
+verificar identidad, hashes y duración, y el cache quedó 41/41. El bundle de
+entrada tuvo SHA-256
 `fd80406ad3d678625bb41804e651bf22464a18581a448a322b7f05ad253064f0`.
-La clave antes pegada en el chat no se reutiliza.
+El archivo de resultados verificado tuvo SHA-256
+`ea20618fb8e5c19aa2bc84db97b2d37262a483d7beac4c8c5c1c64267bce4926`.
+El pod se eliminó al terminar; costo aproximado: USD 0,19.
 
-Para habilitar el canal seguro, Tomi debe ejecutar en Terminal:
+## Resultados
 
-```zsh
-/Users/tomi/conductor/workspaces/VideoLyricsIA-main/riyadh/.context/bin/runpodctl doctor
-```
+- Alineador global: 35/41, p50 120 ms, p90 860 ms, `NO_GO` global.
+- Jerárquico: 40/41, p50 150 ms, p90 771 ms, `NO_GO` global.
+- Selector leave-one-song-out: 31 canciones comparables y 7 abstenciones
+  seguras; AUC 0,684. Sólo aprueba 2/1.117 líneas en dos canciones. Su CI por
+  canción es 0–100%, por lo que queda `NO_GO_INSUFFICIENT_EVIDENCE`.
+- Poda a recall 93,2%: 1.406 líneas, 762 falsos flags y 342,9 s de cola por
+  canción. `NO_GO`.
+- MSS-ALT: WER 18,80% → 18,07%; mejora relativa 3,88%, CI95 −5,83% a
+  +14,45%; 10 canciones regresan más de 2 puntos. En la cola difícil mejora
+  sólo 0,8% relativo. `NO_GO`.
 
-La clave se pega en ese prompt privado. No debe enviarse por chat. Después de
-eso el bloque continúa: procesar/importar los 15 stems, re-ejecutar ambos
-alineadores sobre la cohorte, selector, poda, MSS-ALT y el reporte conjunto.
+Ninguno de estos tres candidatos se promueve. Staging conserva el flujo
+anterior.
 
 ## Validación local
 
-59 tests pasan. La corrida parcial queda marcada
-`BLOCKED_INCOMPLETE_COHORT`; no es un NO_GO del selector ni una autorización de
-staging.
+82 tests pasan. Las abstenciones explícitas cuentan como evaluación completa
+pero jamás como permiso de mutación. Un selector cuyo gate falla no puede
+quitar líneas de la cola humana.
