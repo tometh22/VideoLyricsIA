@@ -84,6 +84,38 @@ _DOWNLOAD_READ_TIMEOUT_S = 60.0
 _R2_UPLOAD_MIN_S = 15.0
 
 
+def _marcar_degradacion(audio_path: str, motivo: str) -> None:
+    """Deja rastro de que una canción se procesó SIN separación de voz.
+
+    Va a `ai_provenance` (paso `vocal_sep_degraded`) para que un lote pueda
+    auditarse después con una query, y a Sentry para verlo en el momento.
+    Best-effort: la telemetría nunca puede romper el pipeline.
+    """
+    try:
+        from observability import current_job_log_context
+        job_id = current_job_log_context()
+        if job_id:
+            from provenance import record_ai_call
+            rec = record_ai_call(
+                job_id, "vocal_sep_degraded", "none", "internal",
+                f"separacion de voz no disponible: {motivo}",
+                input_data_types=["audio"],
+            )
+            if rec is not None:
+                try:
+                    rec.finish(response_summary=f"degraded: {motivo}")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        import sentry_sdk
+        sentry_sdk.capture_message(
+            f"vocal_sep_degraded:{motivo}", level="warning")
+    except Exception:
+        pass
+
+
 def budget_s() -> float:
     """Presupuesto de wall-clock para la llamada a Replicate (demucs)."""
     from replicate_budget import _budget_for
@@ -386,6 +418,7 @@ def separate_vocals(
         import replicate  # noqa: F401 — used inside `call_with_budget`
     except ImportError:
         logger.warning("[VOCALSEP] replicate SDK not installed — falling back")
+        _marcar_degradacion(audio_path, "replicate_sdk_missing")
         return None
 
     # OBSERVABILITY (audit 2026-05-24): demucs USED to be a single
@@ -394,7 +427,7 @@ def separate_vocals(
     # blocking the worker on the very first step. Same shape as the
     # forced_align bug PR #281 already fixed — extracted to a shared
     # helper so all three call sites stay in sync.
-    from replicate_budget import call_with_budget, _budget_for
+    from replicate_budget import call_with_budget
 
     # Cada retry del budget llama al factory de nuevo; acumulamos los
     # handles para cerrarlos en `finally`. Sin esto el worker leakea un
@@ -410,12 +443,38 @@ def separate_vocals(
             "model_name": _VARIANT,
         }
 
+    # Semáforo global: `cjwbw/demucs` se comporta como UN slot serializado.
+    # Con 2 predicciones nuestras simultáneas la cola del proveedor se
+    # multiplica por ~37 (medido sobre 1500 predicciones, excluyendo la
+    # ventana degradada). Esperar el turno da MÁS throughput que mandar todo
+    # junto. Fail-open: sin Redis no limita nada.
+    _sem_lease = None
     try:
+        import demucs_semaphore as _sem
+        _sem_lease = _sem.acquire()
+    except Exception as exc:
+        logger.debug("[VOCALSEP] semáforo no disponible (%s)", type(exc).__name__)
+
+    try:
+        # La espera del semaforo forma parte del techo del thread. Antes se
+        # esperaba hasta 900 s y DESPUES se daba a Replicate el presupuesto
+        # completo de 1200 s: el caller abandonaba el to_thread antes de que
+        # terminara y recreaba el incidente de threads huerfanos de agosto.
+        # Reservamos el margen de descarga/validacion/cache y entregamos a la
+        # llamada solamente el presupuesto que queda.
+        _call_budget_s = min(
+            budget_s(),
+            _deadline - _t.monotonic() - _POST_PROCESS_MARGIN_S,
+        )
+        if _call_budget_s <= 0:
+            logger.error("[VOCALSEP] presupuesto agotado esperando slot de demucs")
+            _marcar_degradacion(audio_path, "demucs_slot_wait_exhausted_budget")
+            return None
         output = call_with_budget(
             _MODEL, _input_factory,
             # Fuente única: `budget_s()` lee REPLICATE_BUDGET_S_DEMUCS, el
             # mismo valor del que main.py deriva su `wait_for`.
-            total_budget_s=budget_s(),
+            total_budget_s=_call_budget_s,
             backoff=[0, 8, 24],
             call_label="VOCALSEP",
             on_progress=on_progress,
@@ -431,12 +490,33 @@ def separate_vocals(
                 _h.close()
             except Exception:
                 pass
+        if _sem_lease:
+            try:
+                import demucs_semaphore as _sem
+                _sem.release(_sem_lease)
+            except Exception:
+                pass
     if output is None:
+        # DEGRADACIÓN SILENCIOSA (hallazgo de auditoría): devolver None acá
+        # hace que el pipeline siga con el audio MEZCLADO en vez del stem
+        # vocal — sin error, sin marca, sin alerta. Separar la voz es lo que
+        # baja el WER de 47% a 28% (arXiv 2506.15514), así que la canción sale
+        # con transcripción visiblemente peor y nadie se entera hasta que un
+        # revisor la abre. En un lote de 1000 eso es la diferencia entre 1000
+        # entregas buenas y 1000 malas INDISTINGUIBLES entre sí.
+        # No podemos fallar el job (el fallback al mix es deliberado), pero sí
+        # dejar rastro contable.
+        logger.error(
+            "[VOCALSEP] SIN STEM para %s — la transcripción va a usar el audio "
+            "MEZCLADO y la calidad va a ser peor. Degradación silenciosa: el "
+            "job NO falla.", os.path.basename(audio_path))
+        _marcar_degradacion(audio_path, "vocal_sep_unavailable")
         return None
 
     vocals = _pick_vocals(output)
     if vocals is None:
         logger.warning("[VOCALSEP] no vocal stem in output — falling back")
+        _marcar_degradacion(audio_path, "demucs_output_missing_vocals")
         return None
 
     fd, dest = tempfile.mkstemp(suffix="_vocals.wav", prefix="genly_stem_")
@@ -447,6 +527,7 @@ def separate_vocals(
         except OSError:
             pass
         logger.warning("[VOCALSEP] could not save vocal stem — falling back")
+        _marcar_degradacion(audio_path, "vocal_stem_download_failed")
         return None
 
     # Validate the stem before publishing it to callers. A bad stem
@@ -462,6 +543,7 @@ def separate_vocals(
             os.unlink(dest)
         except OSError:
             pass
+        _marcar_degradacion(audio_path, f"vocal_stem_invalid:{reason}")
         return None
 
     # PR #300 cache-write: upload the fresh stem to R2 under the

@@ -962,12 +962,14 @@ def test_fresh_transcribing_queued_is_left_alone():
         db.close()
 
 
-def test_old_transcribing_queued_is_reaped_with_retry_cta():
+def test_old_transcribing_queued_is_reaped_with_retry_cta(monkeypatch):
     """A 130-min transcribing_queued row → transcription_failed with the
     'Reintentar' message the editor's CTA matches. The audio still on R2
     means the retry skips re-upload."""
     db = SessionLocal()
     try:
+        import queue_jobs
+        monkeypatch.setattr(queue_jobs, "rq_job_is_active", lambda _jid: False)
         _cleanup(db)
         jid = _seed(db, status="transcribing_queued", age_minutes=130)
         reap_all_stuck(threshold_min=180)  # high render-side threshold
@@ -980,6 +982,23 @@ def test_old_transcribing_queued_is_reaped_with_retry_cta():
             f"expected transcription-specific reason, got {row.error!r}"
         )
         assert row.completed_at is not None, "completed_at should be stamped"
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_old_but_still_queued_transcription_is_not_reaped(monkeypatch):
+    """Una ola grande puede esperar >120 min sin estar muerta."""
+    import queue_jobs
+    monkeypatch.setattr(queue_jobs, "rq_job_is_active", lambda _jid: True)
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="transcribing_queued", age_minutes=130)
+        reap_all_stuck(threshold_min=180)
+        row = db.query(Job).filter(Job.job_id == jid).first()
+        db.refresh(row)
+        assert row.status == "transcribing_queued"
     finally:
         _cleanup(db)
         db.close()
@@ -1037,6 +1056,7 @@ def test_stuck_transcription_cancels_rq_entry_with_prefix(monkeypatch):
     is now in a terminal state."""
     import queue_jobs
     calls: list[str] = []
+    monkeypatch.setattr(queue_jobs, "rq_job_is_active", lambda _jid: False)
     monkeypatch.setattr(queue_jobs, "cancel_rq_job",
                         lambda jid: calls.append(jid) or True)
     db = SessionLocal()
@@ -1049,6 +1069,29 @@ def test_stuck_transcription_cancels_rq_entry_with_prefix(monkeypatch):
             f"cancel_rq_job should be called with {prefixed!r}, "
             f"got calls={calls!r}"
         )
+    finally:
+        _cleanup(db)
+        db.close()
+
+
+def test_stuck_transcription_cancels_outbox_attempt_id(monkeypatch):
+    """El path actual usa `transcription:<event_id>`, no el id legacy."""
+    import queue_jobs
+    calls: list[str] = []
+    monkeypatch.setattr(queue_jobs, "rq_job_is_active", lambda _jid: False)
+    monkeypatch.setattr(
+        queue_jobs, "cancel_rq_job", lambda jid: calls.append(jid) or True,
+    )
+    db = SessionLocal()
+    try:
+        _cleanup(db)
+        jid = _seed(db, status="transcribing_queued", age_minutes=130)
+        row = db.query(Job).filter(Job.job_id == jid).first()
+        row.active_transcription_attempt_id = "attempt-123"
+        db.commit()
+        reap_all_stuck(threshold_min=180)
+        assert "transcription:attempt-123" in calls
+        assert f"transcribe:{jid}" not in calls
     finally:
         _cleanup(db)
         db.close()

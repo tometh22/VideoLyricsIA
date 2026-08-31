@@ -3115,8 +3115,38 @@ USER_BACKLOG_LIMIT = int(os.environ.get("USER_BACKLOG_LIMIT", "5"))
 TENANT_BACKLOG_LIMIT = int(os.environ.get("TENANT_BACKLOG_LIMIT", str(USER_BACKLOG_LIMIT * 5)))
 
 _BACKLOG_STATUSES = [
-    "awaiting_upload", "queued", "processing", "pending_review",
+    "awaiting_upload", "transcribing_queued", "transcribing",
+    "transcribed_pending", "queued", "processing", "pending_review",
 ]
+
+
+def _campaign_scope_enabled(current_user: dict) -> bool:
+    """Opt-in explicito para cuentas con una campaña batch activa.
+
+    El default vacio conserva todos los topes historicos. Los valores pueden
+    ser tenant_id o billing_group, separados por coma; así no se relajan los
+    guardrails para clientes retail al preparar una campaña de UMG.
+    """
+    allowed = {
+        value.strip().lower()
+        for value in os.environ.get("BATCH_CAMPAIGN_SCOPES", "").split(",")
+        if value.strip()
+    }
+    if not allowed:
+        return False
+    scopes = {
+        str(current_user.get("tenant_id") or "").strip().lower(),
+        str(current_user.get("billing_group") or "").strip().lower(),
+    }
+    return bool((scopes - {""}) & allowed)
+
+
+def _backlog_limits(current_user: dict) -> tuple[int, int]:
+    if not _campaign_scope_enabled(current_user):
+        return USER_BACKLOG_LIMIT, TENANT_BACKLOG_LIMIT
+    user_limit = int(os.environ.get("BATCH_USER_BACKLOG_LIMIT", "50"))
+    tenant_limit = int(os.environ.get("BATCH_TENANT_BACKLOG_LIMIT", "50"))
+    return max(1, user_limit), max(1, tenant_limit)
 
 
 def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
@@ -3129,20 +3159,22 @@ def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
         return
     tenant_id = current_user["tenant_id"]
     user_id = current_user["id"]
+    user_limit, tenant_limit = _backlog_limits(current_user)
 
     # Per-user check first (faster to fail and more relevant feedback).
     user_in_flight = (
         db.query(Job)
         .filter(Job.user_id == user_id)
+        .filter(Job.tenant_id == tenant_id)
         .filter(Job.status.in_(_BACKLOG_STATUSES))
         .count()
     )
-    if user_in_flight >= USER_BACKLOG_LIMIT:
+    if user_in_flight >= user_limit:
         raise HTTPException(
             status_code=429,
             detail=(
                 f"Tenés {user_in_flight} videos en proceso o pendientes de "
-                f"revisión (límite: {USER_BACKLOG_LIMIT} por usuario). "
+                f"revisión (límite: {user_limit} por usuario). "
                 f"Aprobá o rechazá algunos antes de subir más."
             ),
         )
@@ -3154,12 +3186,12 @@ def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
         .filter(Job.status.in_(_BACKLOG_STATUSES))
         .count()
     )
-    if tenant_in_flight >= TENANT_BACKLOG_LIMIT:
+    if tenant_in_flight >= tenant_limit:
         raise HTTPException(
             status_code=429,
             detail=(
                 f"Tu equipo tiene {tenant_in_flight} videos en proceso o "
-                f"pendientes de revisión (límite: {TENANT_BACKLOG_LIMIT} por "
+                f"pendientes de revisión (límite: {tenant_limit} por "
                 f"equipo). Esperá a que se completen algunos antes de subir más."
             ),
         )
@@ -3172,17 +3204,11 @@ def _enforce_daily_volume_cap(db: Session, current_user: dict) -> None:
     Bypass: plan="unlimited" no tiene cap diario (por definición). El control
     de costo en unlimited vive en el budget anual / billing aparte.
     """
-    plan = (current_user.get("plan") or "").strip().lower()
-    if plan == "unlimited":
+    cap = _daily_volume_limit(db, current_user)
+    if cap is None:
         return
 
     tenant_id = current_user["tenant_id"]
-    user_model = db.query(User).filter(User.id == current_user["id"]).first()
-
-    cap = (user_model.max_videos_per_day if user_model
-           and user_model.max_videos_per_day is not None
-           else DEFAULT_DAILY_CAP)
-
     # Count jobs created in the last 24 hours, regardless of status (queueing
     # 100 broken jobs in an hour still wastes resources and signals abuse).
     since = datetime.now(timezone.utc) - timedelta(hours=24)
@@ -3201,6 +3227,22 @@ def _enforce_daily_volume_cap(db: Session, current_user: dict) -> None:
                 "Try again later, or contact support to increase your cap."
             ),
         )
+
+
+def _daily_volume_limit(db: Session, current_user: dict) -> int | None:
+    """Tope efectivo; None significa bypass por plan unlimited."""
+    plan = (current_user.get("plan") or "").strip().lower()
+    if plan == "unlimited":
+        return None
+    user_model = db.query(User).filter(User.id == current_user["id"]).first()
+    if user_model and user_model.max_videos_per_day is not None:
+        # El override individual siempre es la autoridad: un bloqueo manual
+        # de ops no puede quedar anulado por activar una campaña del tenant.
+        return int(user_model.max_videos_per_day)
+    if _campaign_scope_enabled(current_user):
+        # 1000 de campaña + margen para canary/reintentos del mismo día.
+        return max(1, int(os.environ.get("BATCH_DAILY_VOLUME_CAP", "1200")))
+    return DEFAULT_DAILY_CAP
 
 
 # Minimum free disk to accept a new upload. A single 4K@60 UMG render
@@ -10723,6 +10765,57 @@ def batch_job_status(
     if row is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     return row
+
+
+@app.get("/batch/capacity")
+def batch_capacity(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Preflight read-only para no descubrir un tope en la canción 26/501."""
+    is_admin = current_user.get("role") == "admin"
+    tenant_id = current_user["tenant_id"]
+    user_limit, tenant_limit = _backlog_limits(current_user)
+    user_in_flight = (
+        db.query(Job)
+        .filter(Job.user_id == current_user["id"])
+        .filter(Job.tenant_id == tenant_id)
+        .filter(Job.status.in_(_BACKLOG_STATUSES))
+        .count()
+    )
+    tenant_in_flight = (
+        db.query(Job)
+        .filter(Job.tenant_id == tenant_id)
+        .filter(Job.status.in_(_BACKLOG_STATUSES))
+        .count()
+    )
+    daily_limit = _daily_volume_limit(db, current_user)
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    daily_used = (
+        db.query(Job)
+        .filter(Job.tenant_id == tenant_id)
+        .filter(Job.created_at >= since)
+        .count()
+    )
+    return {
+        "campaign_enabled": _campaign_scope_enabled(current_user),
+        "bypass": is_admin,
+        "user_backlog": {
+            "used": user_in_flight,
+            "limit": None if is_admin else user_limit,
+            "remaining": None if is_admin else max(0, user_limit - user_in_flight),
+        },
+        "tenant_backlog": {
+            "used": tenant_in_flight,
+            "limit": None if is_admin else tenant_limit,
+            "remaining": None if is_admin else max(0, tenant_limit - tenant_in_flight),
+        },
+        "daily": {
+            "used": daily_used,
+            "limit": daily_limit,
+            "remaining": None if daily_limit is None else max(0, daily_limit - daily_used),
+        },
+    }
 
 
 @app.delete("/jobs/{job_id}")
