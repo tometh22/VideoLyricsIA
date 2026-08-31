@@ -99,12 +99,19 @@ def test_railway_empty_window_is_error_not_zero(monkeypatch):
 # El borde inclusivo de OpenAI
 # ---------------------------------------------------------------------------
 
-def test_openai_day_never_reaches_into_the_next_day(monkeypatch):
-    """La API incluye el bucket que ARRANCA en `end_time`.
+def test_openai_pide_el_bucket_completo_del_dia(monkeypatch):
+    """La ventana tiene que llegar a `D+1 00:00`, no a `D 23:59:59`.
 
-    Con `end = D+1 00:00` cada día trae también D+1 y la suma del mes sale
-    al doble. Medido en la org real: julio dio $567 con el borde inclusivo
-    contra $492 con el correcto.
+    La API recorta a buckets COMPLETOS. El bucket diario va de `D 00:00` a
+    `D+1 00:00`; con la ventana terminando en `23:59:59` no entra entero y
+    devuelve **cero buckets**. Verificado contra la organización real el
+    20-ago-2026: `23:59:59` → sin buckets ($0); `D+1 00:00` → un bucket de
+    $0,1138.
+
+    Ese `23:59:59` venía de arreglar el problema opuesto y se pasó de largo:
+    el colector guardó $0,00 TODOS los días de julio y agosto contra una
+    factura de $19,41. El test anterior fijaba justamente el borde
+    equivocado, así que el bug estaba protegido por su propio test.
     """
     monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-x")
     capturado = {}
@@ -120,9 +127,42 @@ def test_openai_day_never_reaches_into_the_next_day(monkeypatch):
     monkeypatch.setattr(requests, "get", _get)
 
     cdc._openai_day(date(2026, 8, 15))
+    ini = datetime.fromtimestamp(capturado["start_time"], timezone.utc)
     fin = datetime.fromtimestamp(capturado["end_time"], timezone.utc)
-    assert fin.date() == date(2026, 8, 15), "el fin se fue al día siguiente"
-    assert (fin.hour, fin.minute, fin.second) == (23, 59, 59)
+    assert ini == datetime(2026, 8, 15, tzinfo=timezone.utc)
+    # Exactamente 24 h: el bucket del día entra entero y ninguno más.
+    assert fin == datetime(2026, 8, 16, tzinfo=timezone.utc)
+
+
+def test_openai_descarta_el_bucket_del_dia_siguiente(monkeypatch):
+    """Con la ventana llegando a `D+1 00:00`, la API puede devolver también
+    el bucket que ARRANCA ahí. Sumar días duplicaría.
+
+    El no-doble-conteo se garantiza filtrando por el arranque del bucket, no
+    achicando la ventana — así no depende de cómo la API interprete el borde.
+    """
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-x")
+    d15 = int(datetime(2026, 8, 15, tzinfo=timezone.utc).timestamp())
+    d16 = int(datetime(2026, 8, 16, tzinfo=timezone.utc).timestamp())
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"data": [
+                {"start_time": d15, "end_time": d16,
+                 "results": [{"line_item": "whisper", "amount": {"value": 3.0}}]},
+                # El intruso: arranca justo en el borde.
+                {"start_time": d16, "end_time": d16 + 86400,
+                 "results": [{"line_item": "whisper", "amount": {"value": 99.0}}]},
+            ], "has_more": False}
+
+    import requests
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: _Resp())
+
+    res = cdc._openai_day(date(2026, 8, 15))
+    total = next(r["amount_usd"] for r in res.rows if r["dim_type"] == "total")
+    assert total == 3.0, f"se coló el bucket del 16: {total}"
 
 
 def test_openai_keeps_every_line_item_so_the_filter_can_change_later(monkeypatch):
@@ -367,35 +407,83 @@ def test_gcp_storage_is_stock_not_variable():
     assert cdc._gcp_behavior("Network Internet Egress") == "stock"
 
 
-def test_railway_persists_the_service_breakdown_not_only_measurements(monkeypatch):
-    """El desglose por servicio se calculaba y se tiraba.
+def test_railway_desglosa_por_NOMBRE_de_servicio_no_por_uuid(monkeypatch):
+    """El desglose por servicio se guardaba con el UUID, no con el nombre.
 
-    `dim_value` guardaba el nombre de la MEDICIÓN (`MEMORY_USAGE_GB`), no el
-    del servicio, así que era imposible separar `api` —residente, fijo— de
-    los workers, que escalan con los renders. Esa es justamente la pregunta
-    de cuánto del "fijo" es en realidad semi-variable.
+    La query de `usage` sólo trae `tags { serviceId }`. Guardarlo crudo dejó
+    la tabla de julio con `bdf24933-a1ab-4316-a33c-3ff161bd3b1a: $144,44`,
+    que no responde la pregunta para la que existe el desglose: cuánto del
+    "fijo" es `api` —residente— y cuánto son los workers, que escalan con
+    los renders.
+
+    **El mock usa UUIDs reales a propósito.** La versión anterior de este
+    test mockeaba `"serviceId": "api"` —un valor que la API nunca devuelve—
+    y por eso pasaba en verde con el bug puesto: afirmaba que aparecían
+    nombres mientras el código guardaba UUIDs. Un mock que no puede
+    distinguir el bug del arreglo no es un test.
     """
     monkeypatch.setenv("RAILWAY_API_TOKEN", "t")
     monkeypatch.setenv("RAILWAY_PROJECT_ID", "p")
+    cdc._RAILWAY_SERVICE_NAMES.clear()
+
+    API_UUID = "78364446-79a5-4d75-a6e0-9ba9b6bb0caa"
+    WORKER_UUID = "bdf24933-a1ab-4316-a33c-3ff161bd3b1a"
+
+    class _Resp:
+        def __init__(self, payload): self._p = payload
+        def raise_for_status(self): pass
+        def json(self): return self._p
+
+    def _post(url, **kw):
+        q = (kw.get("json") or {}).get("query", "")
+        if "services" in q:
+            return _Resp({"data": {"project": {"services": {"edges": [
+                {"node": {"id": API_UUID, "name": "api"}},
+                {"node": {"id": WORKER_UUID, "name": "Worker"}}]}}}})
+        return _Resp({"data": {"usage": [
+            {"measurement": "MEMORY_USAGE_GB", "value": 4 * 1440,
+             "tags": {"serviceId": API_UUID}},
+            {"measurement": "MEMORY_USAGE_GB", "value": 6 * 1440,
+             "tags": {"serviceId": WORKER_UUID}}]}})
+
+    import requests
+    monkeypatch.setattr(requests, "post", _post)
+
+    res = cdc._railway_day(date(2026, 8, 5))
+    servicios = {r["dim_value"]: r["amount_usd"]
+                 for r in res.rows if r["dim_type"] == "service"}
+    assert set(servicios) == {"api", "Worker"}, servicios
+    # Worker consume 1,5x lo de api y eso tiene que verse.
+    assert servicios["Worker"] > servicios["api"]
+    # Y las mediciones siguen estando, en su propia dimensión.
+    mediciones = {r["dim_value"] for r in res.rows if r["dim_type"] == "sku"}
+    assert mediciones == {"MEMORY_USAGE_GB"}
+
+
+def test_railway_cae_al_uuid_si_no_puede_resolver_nombres(monkeypatch):
+    # Un nombre faltante no puede tirar abajo la recolección del gasto: sin
+    # la fila, ese servicio desaparece del total.
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "t")
+    monkeypatch.setenv("RAILWAY_PROJECT_ID", "p")
+    cdc._RAILWAY_SERVICE_NAMES.clear()
+    UUID = "bdf24933-a1ab-4316-a33c-3ff161bd3b1a"
 
     class _Resp:
         def raise_for_status(self): pass
         def json(self):
             return {"data": {"usage": [
                 {"measurement": "MEMORY_USAGE_GB", "value": 4 * 1440,
-                 "tags": {"serviceId": "api"}},
-                {"measurement": "MEMORY_USAGE_GB", "value": 6 * 1440,
-                 "tags": {"serviceId": "Worker"}},
-            ]}}
+                 "tags": {"serviceId": UUID}}]}}
+
+    def _post(url, **kw):
+        if "services" in (kw.get("json") or {}).get("query", ""):
+            raise RuntimeError("la API de nombres no contesta")
+        return _Resp()
+
     import requests
-    monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp())
+    monkeypatch.setattr(requests, "post", _post)
 
     res = cdc._railway_day(date(2026, 8, 5))
-    servicios = {r["dim_value"]: r["amount_usd"]
-                 for r in res.rows if r["dim_type"] == "service"}
-    assert set(servicios) == {"api", "Worker"}
-    # Worker consume 1,5x lo de api y eso tiene que verse.
-    assert servicios["Worker"] > servicios["api"]
-    # Y las mediciones siguen estando, en su propia dimensión.
-    mediciones = {r["dim_value"] for r in res.rows if r["dim_type"] == "sku"}
-    assert mediciones == {"MEMORY_USAGE_GB"}
+    servicios = {r["dim_value"] for r in res.rows if r["dim_type"] == "service"}
+    assert servicios == {UUID}
+    assert res.status == "ok"
