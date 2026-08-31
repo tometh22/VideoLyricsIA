@@ -184,6 +184,17 @@ def test_campaign_scope_gets_bounded_backlog_window(db, monkeypatch):
             filename=f"{index}.wav",
             status="pending_review",
         ))
+    # El mismo ID histórico puede tener jobs de otro tenant (por migración o
+    # fixtures compartidas). No deben consumir la ventana de esta campaña.
+    for index in range(30):
+        db.add(Job(
+            job_id=f"other{index:06d}"[:12],
+            user_id=1,
+            tenant_id="another-tenant",
+            artist="Test",
+            filename=f"other-{index}.wav",
+            status="pending_review",
+        ))
     db.flush()
     _enforce_tenant_backlog(db, user)
 

@@ -3165,6 +3165,7 @@ def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
     user_in_flight = (
         db.query(Job)
         .filter(Job.user_id == user_id)
+        .filter(Job.tenant_id == tenant_id)
         .filter(Job.status.in_(_BACKLOG_STATUSES))
         .count()
     )
@@ -10778,6 +10779,7 @@ def batch_capacity(
     user_in_flight = (
         db.query(Job)
         .filter(Job.user_id == current_user["id"])
+        .filter(Job.tenant_id == tenant_id)
         .filter(Job.status.in_(_BACKLOG_STATUSES))
         .count()
     )
