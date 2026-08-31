@@ -21,7 +21,8 @@ checkpoint exacto:
 
 Con una mediana de error propio de 7,5%, el instrumento es del mismo orden que
 la señal que se quiere medir (baseline histórico 8,3%). Por eso `reconstructed`
-se degradó a `estimated` y **sólo `exact` sirve para métricas**.
+se degradó a uso diagnóstico —sin destruir su etiqueta de procedencia— y
+**sólo `exact` sirve para métricas**.
 
 CONTRATO
 --------

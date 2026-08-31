@@ -22,6 +22,7 @@ from typing import Any
 import soundfile as sf
 
 from eval.canonical import read_json, write_json
+from eval.raw_cohort import RAW_TRUSTED
 
 
 MODEL = "mdx_extra"

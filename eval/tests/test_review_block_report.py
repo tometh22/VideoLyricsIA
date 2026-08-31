@@ -15,7 +15,14 @@ def test_incomplete_inputs_never_prepare_staging(tmp_path: Path):
         "gate": {"status": "BLOCKED_INCOMPLETE_TIMING_SELECTOR"},
         "operating_points": {"recall_93": {}},
     }))
-    result = build(selector, pruning, tmp_path / "missing.json", tmp_path / "out")
+    post = tmp_path / "post.json"
+    post.write_text(json.dumps({
+        "scored_songs": 23,
+        "buckets": {"text": {"seconds_per_scored_song": 127.1}},
+    }))
+    result = build(
+        selector, pruning, tmp_path / "missing.json", post, tmp_path / "out",
+    )
     assert result["gate"]["status"] == "BLOCKED_INCOMPLETE_REPLAY"
     assert result["staging_mutated"] is False
     assert "127.1 → PENDIENTE" in (tmp_path / "out" / "REPORT.md").read_text()
@@ -40,6 +47,11 @@ def test_conclusive_mss_no_go_closes_replay_without_downstream_propagation(tmp_p
         "comparison": {"gate": {"status": "NO_GO"}},
         "downstream_flag_replay_applied": False,
     }))
-    result = build(selector, pruning, mss, tmp_path / "out")
+    post = tmp_path / "post.json"
+    post.write_text(json.dumps({
+        "scored_songs": 23,
+        "buckets": {"text": {"seconds_per_scored_song": 55.0}},
+    }))
+    result = build(selector, pruning, mss, post, tmp_path / "out")
     assert result["after_seconds_per_song"] == 100
     assert result["gate"]["status"] == "NO_GO"

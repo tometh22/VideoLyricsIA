@@ -146,7 +146,7 @@ def _comparison(rows: Sequence[dict[str, Any]], eligible_songs: int) -> dict[str
         lines_fixed += len(mss_correct - native_correct)
         lines_regressed += len(native_correct - mss_correct)
     ci = song_bootstrap_ci(rows, relative_improvement) if rows else None
-    complete = len(rows) == eligible_songs == 41
+    complete = eligible_songs > 0 and len(rows) == eligible_songs
     passes = bool(complete and ci and float(ci["low"]) > 0.0 and not regressions)
     return {
         "paired_relative_wer_improvement": ci,
@@ -158,7 +158,10 @@ def _comparison(rows: Sequence[dict[str, Any]], eligible_songs: int) -> dict[str
             "note": "scorer-only alignment against approved lines; no approved text or timing enters transcription",
         },
         "gate": {
-            "requirements": "41/41; paired relative-WER CI95 low > 0; no song WER regression > 0.02 absolute",
+            "requirements": (
+                f"{eligible_songs}/{eligible_songs} canonical exact songs; paired "
+                "relative-WER CI95 low > 0; no song WER regression > 0.02 absolute"
+            ),
             "status": "GO_PRODUCT" if passes else "BLOCKED_INCOMPLETE_COHORT" if not complete else "NO_GO",
         },
     }
@@ -218,7 +221,9 @@ def run(
         "best_of": 1,
         "fp16": False,
     }
-    model = whisper.load_model(model_name, device=resolved_device)
+    # Reports are frequently re-scored after a cohort-definition change.  Do
+    # not allocate a multi-GB model when every exact hypothesis is cached.
+    model = None
     rows, failures = [], []
     for position, item in enumerate(cases, 1):
         case, song_id = golden / item["path"], item["song_id"]
@@ -240,9 +245,13 @@ def run(
             if reusable:
                 segments = payload["segments"]
             elif family == "native":
+                if model is None:
+                    model = whisper.load_model(model_name, device=resolved_device)
                 result = _transcribe(model, audio, language)
                 segments = result.get("segments") or []
             else:
+                if model is None:
+                    model = whisper.load_model(model_name, device=resolved_device)
                 segments = []
                 for left, right in boundaries:
                     chunk = audio[int(left * 16000):int(right * 16000)]

@@ -11,15 +11,23 @@ from typing import Any
 from eval.canonical import read_json, write_json
 
 
-BASELINE_SECONDS_PER_SONG = 127.1
 TARGET_SECONDS_PER_SONG = 50.0
 TARGET_RECALL = 0.93
 
 
-def build(selector_path: Path, pruning_path: Path, mss_path: Path, output: Path) -> dict[str, Any]:
+def build(
+    selector_path: Path, pruning_path: Path, mss_path: Path,
+    post_realign_path: Path, output: Path,
+) -> dict[str, Any]:
     selector = read_json(selector_path)
     pruning = read_json(pruning_path)
     mss = read_json(mss_path) if mss_path.is_file() else None
+    post_realign = read_json(post_realign_path)
+    baseline_seconds_per_song = sum(
+        float(bucket.get("seconds_per_scored_song") or 0.0)
+        for bucket in (post_realign.get("buckets") or {}).values()
+    )
+    canonical_songs = int(post_realign.get("scored_songs") or 0)
     selected = (pruning.get("operating_points") or {}).get("recall_93") or {}
     selector_complete = (selector.get("cohort_gate") or {}).get("status") == "COMPLETE"
     pruning_complete = (pruning.get("gate") or {}).get("status") != "BLOCKED_INCOMPLETE_TIMING_SELECTOR"
@@ -39,7 +47,7 @@ def build(selector_path: Path, pruning_path: Path, mss_path: Path, output: Path)
     report = {
         "schema_version": 1,
         "objective": "total reviewer seconds per song",
-        "baseline_seconds_per_song": BASELINE_SECONDS_PER_SONG,
+        "baseline_seconds_per_song": baseline_seconds_per_song,
         "after_seconds_per_song": after,
         "target_seconds_per_song": TARGET_SECONDS_PER_SONG,
         "correction_recall": recall,
@@ -65,7 +73,7 @@ def build(selector_path: Path, pruning_path: Path, mss_path: Path, output: Path)
         },
         "gate": {
             "requirements": (
-                "seconds/song <= 50; recall >= 0.93; all 41 stems; MSS conclusively "
+                f"seconds/song <= 50; recall >= 0.93; all {canonical_songs} canonical stems; MSS conclusively "
                 "evaluated and, only if it wins, propagated through downstream flag replay"
             ),
             "status": "GO_PREPARE_STAGING_FLAGS" if gate else "BLOCKED_INCOMPLETE_REPLAY" if not complete else "NO_GO",
@@ -86,14 +94,14 @@ def build(selector_path: Path, pruning_path: Path, mss_path: Path, output: Path)
     write_json(output / "report.json", report)
     after_label = f"{after:.1f}" if after is not None else "PENDIENTE"
     lines = [
-        f"**Segundos de revisión/canción: {BASELINE_SECONDS_PER_SONG:.1f} → {after_label}.**",
+        f"**Segundos de revisión/canción: {baseline_seconds_per_song:.1f} → {after_label}.**",
         "",
         "| Parte | Estado | Resultado |",
         "|---|---|---|",
-        f"| Stems 41/41 | {'OK' if selector_complete else 'BLOQUEADO'} | cohorte selector: {(selector.get('cohort_gate') or {}).get('status')} |",
+        f"| Stems canónicos {canonical_songs}/{canonical_songs} | {'OK' if selector_complete else 'BLOQUEADO'} | cohorte selector: {(selector.get('cohort_gate') or {}).get('status')} |",
         f"| Selector timing | {(selector.get('gate') or {}).get('status')} | ZTLR medido: {(selector.get('ztlr') or {}).get('measured_with_correctly_resolved_timing_only', 'pendiente')} |",
         f"| Poda flags | {(pruning.get('gate') or {}).get('status')} | recall: {selected.get('correction_recall', 'pendiente')}; falsos: {selected.get('false_flags', 'pendiente')} |",
-        f"| MSS-ALT | {mss_gate} | 41/41 evaluadas; un NO_GO conserva baseline sin propagación |",
+        f"| MSS-ALT | {mss_gate} | {canonical_songs}/{canonical_songs} evaluadas; un NO_GO conserva baseline sin propagación |",
         "",
         f"**Gate conjunto:** {report['gate']['status']}. Staging no fue modificado.",
         "",
@@ -113,9 +121,13 @@ def main() -> int:
     parser.add_argument("--selector", type=Path, default=Path("eval/runs/timing_confidence/report.json"))
     parser.add_argument("--pruning", type=Path, default=Path("eval/runs/pruned_review_flags/report.json"))
     parser.add_argument("--mss", type=Path, default=Path("eval/runs/mss_alt/large-v3-turbo/report.json"))
+    parser.add_argument("--post-realign", type=Path, default=Path("eval/runs/post_realign_review/report.json"))
     parser.add_argument("--output", type=Path, default=Path("eval/runs/review_block"))
     args = parser.parse_args()
-    report = build(args.selector.resolve(), args.pruning.resolve(), args.mss.resolve(), args.output.resolve())
+    report = build(
+        args.selector.resolve(), args.pruning.resolve(), args.mss.resolve(),
+        args.post_realign.resolve(), args.output.resolve(),
+    )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 

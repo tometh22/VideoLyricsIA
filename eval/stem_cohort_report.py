@@ -11,6 +11,7 @@ from typing import Any, Sequence
 from eval.bootstrap import percentile, song_bootstrap_ci
 from eval.canonical import read_json, write_json
 from eval.stem_cohort_audit import RUNPOD_ORIGIN
+from eval.raw_cohort import RAW_TRUSTED
 
 
 def cohort_ids(manifest: dict[str, Any]) -> dict[str, set[str]]:
@@ -84,17 +85,35 @@ def _mss_metrics(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 
 def run(
-    stems_manifest: Path, global_report: Path, hierarchical_report: Path,
+    stems_manifest: Path, golden_manifest: Path, global_report: Path, hierarchical_report: Path,
     mss_report: Path, output: Path,
 ) -> dict[str, Any]:
     manifest = read_json(stems_manifest)
-    cohorts = cohort_ids(manifest)
+    inventory_cohorts = cohort_ids(manifest)
+    golden = read_json(golden_manifest)
+    canonical_ids = {
+        str(row["song_id"]) for row in golden["cases"]
+        if row.get("raw_quality") in RAW_TRUSTED
+    }
+    cohorts = {
+        name: ids & canonical_ids for name, ids in inventory_cohorts.items()
+    }
     origins = {}
     for row in manifest["cases"]:
         origins[str(row.get("origin"))] = origins.get(str(row.get("origin")), 0) + 1
 
     global_payload = read_json(global_report)["aligners"]["current_xlsr"]
     hierarchical_payload = read_json(hierarchical_report)["aligners"]["current_xlsr_hierarchical"]
+    # The 20 ms result discussed in the realignment gate is the song-held-out
+    # display-calibrated variant.  Splitting the uncalibrated rows here would
+    # answer a different question and falsely attribute display convention to
+    # stem origin.
+    global_rows_all = global_payload[
+        "loo_display_calibration"
+    ]["variants"]["robust_global_median"]["by_song"]
+    hierarchical_rows_all = hierarchical_payload[
+        "loo_display_calibration"
+    ]["variants"]["robust_global_median"]["by_song"]
     mss_payload = read_json(mss_report)
     report: dict[str, Any] = {
         "schema_version": 1,
@@ -103,12 +122,17 @@ def run(
             "previous_26": "all cached stems present before the RunPod completion; includes 21 documented local MPS and 5 legacy with unrecorded origin",
             "runpod_15": "15 missing stems generated on RunPod CUDA with mdx_extra / Demucs 4.0.1",
             "origin_counts": origins,
+            "source_inventory_counts": {
+                name: len(ids) for name, ids in inventory_cohorts.items()
+            },
+            "canonical_raw_quality": sorted(RAW_TRUSTED),
+            "canonical_counts": {name: len(ids) for name, ids in cohorts.items()},
         },
         "cohorts": {},
     }
     for name, ids in cohorts.items():
-        global_rows = [row for row in global_payload["by_song"] if row["song_id"] in ids]
-        hierarchical_rows = [row for row in hierarchical_payload["by_song"] if row["song_id"] in ids]
+        global_rows = [row for row in global_rows_all if row["song_id"] in ids]
+        hierarchical_rows = [row for row in hierarchical_rows_all if row["song_id"] in ids]
         mss_rows = [row for row in mss_payload["by_song"] if row["song_id"] in ids]
         report["cohorts"][name] = {
             "expected_songs": len(ids),
@@ -132,13 +156,14 @@ def run(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stems-manifest", type=Path, default=Path("eval/cache/full_stems/manifest.json"))
+    parser.add_argument("--golden-manifest", type=Path, default=Path("eval/golden/manifest.json"))
     parser.add_argument("--global-report", type=Path, default=Path("eval/runs/final_text_realign/report.json"))
     parser.add_argument("--hierarchical-report", type=Path, default=Path("eval/runs/final_text_realign_hierarchical_26/report.json"))
     parser.add_argument("--mss-report", type=Path, default=Path("eval/runs/mss_alt/large-v3-turbo/report.json"))
     parser.add_argument("--output", type=Path, default=Path("eval/runs/stem_cohort_comparison/report.json"))
     args = parser.parse_args()
     report = run(
-        args.stems_manifest.resolve(), args.global_report.resolve(),
+        args.stems_manifest.resolve(), args.golden_manifest.resolve(), args.global_report.resolve(),
         args.hierarchical_report.resolve(), args.mss_report.resolve(), args.output.resolve(),
     )
     print(json.dumps(report["cohorts"], indent=2, sort_keys=True))

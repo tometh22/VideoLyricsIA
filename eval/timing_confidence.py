@@ -328,7 +328,10 @@ def train(rows: list[dict[str, Any]], ztlr_path: Path, output: Path) -> dict[str
         "ztlr": {
             "historical": float(ztlr["ztlr"]),
             "measured_with_correctly_resolved_timing_only": measured_ztlr,
-            "note": "denominator remains the full historical 41-song work-unit set; live lines receive no automation",
+            "note": (
+                f"denominator remains the canonical {int(ztlr['songs'])}-song "
+                "exact work-unit set; live lines receive no automation"
+            ),
         },
         "abstention_by_song_type": abstention_by_type,
     }
@@ -348,7 +351,7 @@ def run(
     report = train(rows, ztlr, output)
     report["inputs"] = diagnostics
     complete = (
-        diagnostics["eligible_non_live_songs"] >= 38
+        diagnostics["eligible_non_live_songs"] > 0
         and not diagnostics["songs_unaccounted"]
         and diagnostics["rows_missing_persisted_selector_witness"] == 0
     )
