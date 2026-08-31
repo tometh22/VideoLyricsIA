@@ -162,6 +162,31 @@ describe("un cambio real sí viaja", () => {
     expect(out.editType).toBe("typography");
     expect(out.payload.font).toBe("anton");
   });
+
+  it("minúsculas + letra corregida viajan juntas en un único POST lyrics", () => {
+    // Es el payload exacto del incidente: editar letra no puede borrar ni
+    // esconder una selección tipográfica hecha en el mismo wizard.
+    const bareUpper = {
+      ...JOB_FULL,
+      status: "done",
+      render_params: { ...JOB_FULL.render_params, text_case: "upper" },
+    };
+    const { baseline } = buildEditReview(bareUpper, null);
+    const current = currentFrom(bareUpper, { textCase: "lower" });
+    current.segments = [{ start: 1, end: 2, text: "letra corregida" }];
+
+    const out = resolveEditSubmission({
+      baseline,
+      current,
+      jobStatus: "done",
+    });
+
+    expect(out.editType).toBe("lyrics");
+    expect(out.payload.text_case).toBe("lower");
+    expect(out.payload.segments).toEqual([
+      { start: 1, end: 2, text: "letra corregida" },
+    ]);
+  });
 });
 
 describe("gates por status: nada se descarta en silencio", () => {
