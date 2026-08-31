@@ -135,6 +135,17 @@ def _reap_seeded_transcription(db, job_id: str) -> None:
     db.commit()
 
 
+def _reap_seeded_orphan(db, job_id: str) -> None:
+    """Exercise the orphan row contract without racing the daemon lock."""
+    orphans = find_orphan_polling_jobs(db, threshold_min=10)
+    job = next((row for row in orphans if row.job_id == job_id), None)
+    assert job is not None, f"expected seeded orphan {job_id!r}"
+    assert _reaper.reap_stuck_job(
+        db, job, _reaper._reason_for_orphan(job),
+    ) is True
+    db.commit()
+
+
 def test_recent_processing_job_is_left_alone():
     """A job that's only been in processing for 30 min is not a zombie."""
     db = SessionLocal()
@@ -325,8 +336,7 @@ def test_reap_all_stuck_reaps_orphans_with_user_facing_message():
         jid = _seed(db, status="processing", age_minutes=25)
         _seed_provenance(db, job_id=jid, age_minutes=15, duration_ms=None)
 
-        n = reap_all_stuck(threshold_min=100)
-        assert n >= 1, "reaper should have flagged the orphan"
+        _reap_seeded_orphan(db, jid)
 
         row = db.query(Job).filter(Job.job_id == jid).first()
         db.refresh(row)
