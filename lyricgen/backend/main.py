@@ -4471,6 +4471,20 @@ async def transcribe_uploaded(
         if (body.anchor_lyrics or "").strip():
             _result = await _maybe_anchor_align(_result, audio_path, job_id,
                                                 body.anchor_lyrics)
+            if (
+                isinstance(_result, dict)
+                and (_result.get("anchor_alignment") or {}).get("status")
+                == "declined"
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Recibimos la letra oficial, pero no pudimos "
+                        "sincronizarla con seguridad. No la reemplazamos por "
+                        "una transcripción automática. Revisá que corresponda "
+                        "a esta versión del audio y reintentá."
+                    ),
+                )
         if not (isinstance(_result, dict)
                 and _result.get("timing_source") == "anchor_ctc"):
             _result = await _maybe_ctc_retime(_result, audio_path, job_id,
@@ -6362,125 +6376,303 @@ def _anchor_lyrics_enabled() -> bool:
 
 async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                               anchor_lyrics: str):
-    """Versión B — anclar la letra OFICIAL del operador al motor CTC
-    (ANCHOR_LYRICS_ENABLED, default OFF). En vez de retimear el texto
-    transcrito de la cascada, alinea las líneas que el operador pegó
-    (anchor lyrics) sobre el stem de voz vía `ctc_align.retime_segments`
-    — mismo motor, misma paridad Rotor (benchmark 18 gold: mediana
-    0.32s, 0 cascadas, 1 decline seguro).
+    """Align operator-provided lyrics without ever silently discarding them.
 
-    Contrato idéntico a `_maybe_ctc_retime`: NUNCA rompe una
-    transcripción. Flag off / anchor vacío / <3 líneas / decline /
-    excepción → devuelve `result` sin tocar (cae a la Versión A, la
-    cascada actual). En éxito reemplaza `result["segments"]` y setea
-    `result["timing_source"] = "anchor_ctc"` para que el worker saltee
-    el retime CTC normal (no doble retime).
-
-    Gate por línea (outliers del benchmark): líneas cuya mediana de
-    word-scores queda < ANCHOR_REVIEW_MIN_SCORE (default 0.25) se marcan
-    `review=True` — el editor las señala para que el operador las revise."""
+    Local CTC remains the preferred timing engine. If it declines (including
+    repeated live refrains or a non-Spanish reference), Whisper-1 word stamps
+    plus monotonic DP provide an independent fallback. If both decline, the
+    result carries ``anchor_alignment.status=declined``; upload callers must
+    fail closed instead of publishing free ASR as if the reference never
+    existed (incident c6553b32b6c1, 2026-08-31).
+    """
     _stem = None
-    try:
-        if not _anchor_lyrics_enabled():
-            return result
-        if not isinstance(result, dict) or not (anchor_lyrics or "").strip():
-            return result
-        psegs = [{"text": line, "start": 0.0, "end": 0.0}
-                 for line in anchor_lyrics.splitlines() if line.strip()]
-        if len(psegs) < 3:
-            return result
-        # Todo (imports incluidos) dentro del try: un módulo roto debe
-        # degradar a "sin anchor", nunca a un 500 en cada transcripción.
-        import ctc_align as _ctc
-        import vocal_sep as _vs
-        # Mismo patrón de stem que _maybe_ctc_retime: cache_only primero
-        # (si la cascada computó el stem hace segundos es solo una
-        # descarga de R2), y si no hay, computarlo si el flag lo permite.
-        _stem = await asyncio.wait_for(
-            asyncio.to_thread(_vs.separate_vocals, audio_path, cache_only=True),
-            timeout=120,
-        )
-        if not _stem and os.environ.get(
-                "CTC_ALIGN_COMPUTE_STEM", "1").strip().lower() in ("1", "true", "yes", "on"):
-            logger.info("[ANCHOR] no cached stem — computing it (job=%s)", job_id)
-            # Timeout derivado de la MISMA fuente que el presupuesto
-            # interno (REPLICATE_BUDGET_S_DEMUCS). Antes eran 360s
-            # fijos: el loop abandonaba la espera mientras el thread
-            # seguía corriendo, y ese huérfano bloqueaba el
-            # shutdown_default_executor() del teardown de asyncio.run.
-            _stem = await asyncio.wait_for(
-                asyncio.to_thread(_vs.separate_vocals, audio_path),
-                timeout=_vs.thread_budget_s(),
-            )
-        # Sin stem → alinear sobre la MEZCLA (misma decisión que el mix
-        # fallback de _maybe_ctc_retime: la mezcla como fuente está
-        # validada en el gold set).
-        _align_src = _stem or audio_path
-        if not _stem:
-            logger.info("[ANCHOR] no stem — aligning on the MIX (job=%s)", job_id)
-        retimed = await asyncio.wait_for(
-            asyncio.to_thread(_ctc.retime_segments, _align_src, psegs,
-                              job_id, audio_path),
-            timeout=420,
-        )
-        if retimed is None:
-            # Decline seguro → Versión A intacta (la cascada ya corrió).
-            logger.info("[ANCHOR] declined (reason=%s) job=%s",
-                        _ctc.last_decline_reason or "unknown", job_id)
-            return result
-        # GATE POR LÍNEA: mediana de word-scores < umbral → review=True
-        # (el editor la señala para revisar). Sin scores → no marcar.
-        # Umbral tuneable vía ANCHOR_REVIEW_MIN_SCORE (default 0.25). Se bajó
-        # 0.35 → 0.30 → 0.25 (2026-07): con anclado Rotor-grade (mediana
-        # global ~0.13s) hasta el 0.30 seguía marcando líneas perfectas —
-        # 11/26 en "Hablando" cuando solo 2-4 estaban genuinamente off. Sólo
-        # cambia CUÁNTAS se marcan; el decline global (retimed is None) no se
-        # toca.
+    anchor_text = (anchor_lyrics or "").strip()
+    psegs = [
+        {"text": line, "start": 0.0, "end": 0.0}
+        for line in anchor_text.splitlines() if line.strip()
+    ]
+
+    def _declined(base, reason: str, *, error_type: str = ""):
+        out = dict(base) if isinstance(base, dict) else base
+        if isinstance(out, dict):
+            out["reference_lyrics"] = anchor_text
+            out["anchor_alignment"] = {
+                "status": "declined",
+                "reason": str(reason or "unknown")[:80],
+                "error_type": str(error_type or "")[:80],
+                "content_source": "operator_reference",
+                "original_provider_segment_count": len(
+                    (base or {}).get("segments") or []
+                ),
+            }
+        return out
+
+    def _apply(base, aligned, *, timing_source: str, decline_reason: str = ""):
         try:
-            _review_min = float(os.environ.get("ANCHOR_REVIEW_MIN_SCORE", "0.25"))
+            review_min = float(
+                os.environ.get("ANCHOR_REVIEW_MIN_SCORE", "0.25")
+            )
         except (TypeError, ValueError):
-            _review_min = 0.25
-        from statistics import median as _median
+            review_min = 0.25
+        from statistics import median
+
         flagged = 0
         anchored = []
-        for seg in retimed:
-            seg = dict(seg)
-            seg["content_source"] = "operator_reference"
-            seg["provider_evidence"] = {
+        for segment in aligned:
+            segment = dict(segment)
+            segment["content_source"] = "operator_reference"
+            segment["provider_evidence"] = {
                 "source": "operator_reference",
-                "text": str(seg.get("text") or ""),
-                "start": round(float(seg.get("start") or 0.0), 3),
-                "end": round(float(seg.get("end") or 0.0), 3),
-                "words": [], "word_count": 0,
-                "mean_score": None, "min_score": None,
+                "text": str(segment.get("text") or ""),
+                "start": round(float(segment.get("start") or 0.0), 3),
+                "end": round(float(segment.get("end") or 0.0), 3),
+                "words": [],
+                "word_count": 0,
+                "mean_score": None,
+                "min_score": None,
             }
-            seg["evidence_lineage"] = [
-                "operator_reference_content", "ctc_timing_only",
+            segment["evidence_lineage"] = [
+                "operator_reference_content", timing_source,
             ]
-            scores = [w.get("score") for w in (seg.get("words") or [])
-                      if isinstance(w.get("score"), (int, float))]
-            if scores and _median(scores) < _review_min:
-                seg["review"] = True
+            scores = [
+                word.get("score") for word in (segment.get("words") or [])
+                if isinstance(word.get("score"), (int, float))
+            ]
+            needs_review = bool(scores and median(scores) < review_min)
+            if timing_source == "whisper_align" and not scores:
+                # This line was interpolated between acoustic word anchors.
+                needs_review = True
+            if needs_review:
+                segment["review"] = True
                 flagged += 1
-            anchored.append(seg)
-        result = dict(result)
-        result["_pre_anchor_provider_segments"] = [
-            dict(segment) for segment in (result.get("segments") or [])
+            anchored.append(segment)
+
+        out = dict(base)
+        out["_pre_anchor_provider_segments"] = [
+            dict(segment) for segment in (base.get("segments") or [])
             if isinstance(segment, dict)
         ]
-        result["segments"] = anchored
-        result["timing_source"] = "anchor_ctc"
-        result["anchor_alignment"] = {
+        out["segments"] = anchored
+        out["reference_lyrics"] = anchor_text
+        # Historical internal marker used by worker + reanchor to skip a
+        # second CTC pass. The actual timing engine is recorded below.
+        out["timing_source"] = "anchor_ctc"
+        out["anchor_alignment"] = {
+            "status": "applied",
             "content_source": "operator_reference",
-            "timing_source": "ctc_timing_only",
+            "timing_source": timing_source,
+            "ctc_decline_reason": str(decline_reason or "")[:80],
             "original_provider_segment_count": len(
-                result["_pre_anchor_provider_segments"]
+                out["_pre_anchor_provider_segments"]
             ),
+            "review_count": flagged,
         }
-        logger.info("[ANCHOR] anchored %d líneas (%d en review, job=%s)",
-                    len(anchored), flagged, job_id)
-    except Exception as e:
-        logger.warning("[ANCHOR] wrapper declined: %r (job=%s)", e, job_id)
+        logger.info(
+            "[ANCHOR] anchored %d líneas via %s (%d en review, job=%s)",
+            len(anchored), timing_source, flagged, job_id,
+        )
+        return out
+
+    def _safe_alignment(aligned) -> bool:
+        """Reject partial, reordered, or occurrence-collapsed fallbacks."""
+        if not isinstance(aligned, list) or len(aligned) != len(psegs):
+            return False
+        expected_texts = [segment["text"] for segment in psegs]
+        actual_texts = [str(segment.get("text") or "").strip() for segment in aligned]
+        if actual_texts != expected_texts:
+            return False
+        try:
+            starts = [float(segment.get("start")) for segment in aligned]
+            ends = [float(segment.get("end")) for segment in aligned]
+        except (TypeError, ValueError):
+            return False
+        if any(end <= start for start, end in zip(starts, ends)):
+            return False
+        # Equal starts are the classic repeated-chorus pile-up. Small line
+        # overlaps are valid, but occurrence order must remain strict.
+        return all(right > left for left, right in zip(starts, starts[1:]))
+
+    try:
+        if not _anchor_lyrics_enabled():
+            # A stale browser may submit after an ops flag flip. Receiving an
+            # official reference and silently treating it as absent would
+            # recreate the incident even though the UI is now hidden.
+            return (
+                _declined(result, "feature_disabled")
+                if isinstance(result, dict) and anchor_text and psegs
+                else result
+            )
+        if not isinstance(result, dict) or not anchor_text:
+            return result
+        if not psegs:
+            return result
+
+        import ctc_align as _ctc
+        import vocal_sep as _vs
+
+        try:
+            _stem = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _vs.separate_vocals, audio_path, cache_only=True,
+                ),
+                timeout=120,
+            )
+        except Exception as stem_exc:
+            logger.warning(
+                "[ANCHOR] cached stem unavailable error_type=%s job=%s",
+                type(stem_exc).__name__, job_id,
+            )
+            _stem = None
+        if not _stem and os.environ.get(
+            "CTC_ALIGN_COMPUTE_STEM", "1"
+        ).strip().lower() in ("1", "true", "yes", "on"):
+            logger.info("[ANCHOR] no cached stem — computing it (job=%s)", job_id)
+            try:
+                _stem = await asyncio.wait_for(
+                    asyncio.to_thread(_vs.separate_vocals, audio_path),
+                    timeout=_vs.thread_budget_s(),
+                )
+            except Exception as stem_exc:
+                logger.warning(
+                    "[ANCHOR] stem compute unavailable error_type=%s job=%s",
+                    type(stem_exc).__name__, job_id,
+                )
+                _stem = None
+
+        align_src = _stem or audio_path
+        if not _stem:
+            logger.info("[ANCHOR] no stem — aligning on the MIX (job=%s)", job_id)
+        if len(psegs) >= 3:
+            try:
+                retimed = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _ctc.retime_segments,
+                        align_src,
+                        psegs,
+                        job_id,
+                        audio_path,
+                    ),
+                    timeout=420,
+                )
+                decline_reason = str(_ctc.last_decline_reason or "unknown")
+            except Exception as ctc_exc:
+                logger.warning(
+                    "[ANCHOR] CTC failed error_type=%s job=%s; trying "
+                    "Whisper-DP fallback",
+                    type(ctc_exc).__name__, job_id,
+                )
+                retimed = None
+                decline_reason = f"ctc_{type(ctc_exc).__name__}"
+        else:
+            # The local CTC contract needs >=3 lines, but a one-line official
+            # lyric is still authoritative and Whisper-DP can align it.
+            retimed = None
+            decline_reason = "too_few_lines_for_ctc"
+        if retimed is not None:
+            result = _apply(
+                result, retimed, timing_source="ctc_timing_only",
+            )
+        else:
+            logger.info(
+                "[ANCHOR] CTC declined (reason=%s) job=%s; trying hosted "
+                "forced alignment",
+                decline_reason, job_id,
+            )
+            # This aligner has a different occurrence model from local CTC
+            # and is already part of the production stack. It is especially
+            # useful for known lyrics over mastered live mixes where Demucs
+            # removes audience vocals. Accept only a complete, strictly
+            # monotonic result so repeated choruses can never pile up.
+            try:
+                from forced_align import forced_align_lyrics
+                retimed = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        forced_align_lyrics, audio_path, anchor_text,
+                    ),
+                    timeout=540,
+                )
+            except Exception as forced_exc:
+                logger.warning(
+                    "[ANCHOR] hosted forced align failed error_type=%s job=%s",
+                    type(forced_exc).__name__, job_id,
+                )
+                retimed = None
+            if _safe_alignment(retimed):
+                result = _apply(
+                    result,
+                    retimed,
+                    timing_source="forced_align",
+                    decline_reason=decline_reason,
+                )
+                return result
+            if retimed:
+                logger.warning(
+                    "[ANCHOR] rejected unsafe hosted alignment lines=%d job=%s",
+                    len(retimed), job_id,
+                )
+
+            logger.info(
+                "[ANCHOR] hosted alignment declined job=%s; trying "
+                "Whisper-DP fallback",
+                job_id,
+            )
+            try:
+                from lyrics_whisper_align import whisper_word_align
+                resolved_language = resolve_transcription_language(
+                    "", reference_text=anchor_text,
+                )
+                # Demucs may erase a distant/crowd vocal from a mastered live
+                # recording. Try the preferred stem first, then the untouched
+                # mix as an independent acoustic view before declining.
+                fallback_sources = list(dict.fromkeys((align_src, audio_path)))
+                retimed = None
+                for fallback_source in fallback_sources:
+                    retimed = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            whisper_word_align,
+                            fallback_source,
+                            [segment["text"] for segment in psegs],
+                            language=resolved_language,
+                            job_id=job_id,
+                        ),
+                        timeout=240,
+                    )
+                    if _safe_alignment(retimed):
+                        break
+                    logger.info(
+                        "[ANCHOR] Whisper-DP declined source=%s job=%s",
+                        "stem" if fallback_source == _stem else "mix",
+                        job_id,
+                    )
+            except Exception as fallback_exc:
+                logger.warning(
+                    "[ANCHOR] Whisper fallback failed error_type=%s job=%s",
+                    type(fallback_exc).__name__, job_id,
+                )
+                retimed = None
+            if not _safe_alignment(retimed):
+                logger.error(
+                    "[ANCHOR] fail-closed: official lyrics received but both "
+                    "aligners declined ctc_reason=%s job=%s",
+                    decline_reason, job_id,
+                )
+                result = _declined(result, decline_reason)
+            else:
+                result = _apply(
+                    result,
+                    retimed,
+                    timing_source="whisper_align",
+                    decline_reason=decline_reason,
+                )
+    except Exception as exc:
+        logger.warning(
+            "[ANCHOR] fail-closed wrapper error_type=%s (job=%s)",
+            type(exc).__name__, job_id,
+        )
+        if isinstance(result, dict) and anchor_text and psegs:
+            result = _declined(
+                result, "wrapper_error", error_type=type(exc).__name__,
+            )
     finally:
         if _stem:
             try:
