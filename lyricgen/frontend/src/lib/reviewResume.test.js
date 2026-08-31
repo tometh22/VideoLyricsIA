@@ -21,6 +21,13 @@ describe("creativeFieldsForReviewResume", () => {
     expect(restored.bgVerbatim).toBe(true);
     expect(restored.movementStyle).toBe("estatico");
     expect(restored.genre).toBe("rock");
+    expect(restored.animateImage).toBe(false);
+  });
+
+  it("restores the image-to-video choice for a backend-prepared job", () => {
+    expect(creativeFieldsForReviewResume({
+      render_params: { animate_image: true },
+    }).animateImage).toBe(true);
   });
 
   it("keeps legacy top-level creative fields when render_params is absent", () => {
@@ -38,6 +45,7 @@ describe("creativeFieldsForReviewResume", () => {
       effect: "grain",
       backgroundHint: "bandera suave",
       bgVerbatim: true,
+      animateImage: false,
     });
   });
 });

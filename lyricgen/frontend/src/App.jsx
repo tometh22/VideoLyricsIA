@@ -2173,7 +2173,7 @@ export default function App() {
         // resumido no trae fondo propio (transcribed, pre-/generate), así
         // que IA es el default correcto.
         setBackgroundFile(null); setBackgroundId(null);
-        setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
+        setBgSelectMode("auto"); setAnimateImage(!!resumedCreativeFields.animateImage); setEnableScenes(false);
         setArtTrack(false);
         setWizardStage("review");
         // Canonicalize legacy /new?resume= links without adding a history
