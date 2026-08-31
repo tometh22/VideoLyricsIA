@@ -24,8 +24,12 @@ REQUIRED_COLUMNS = {
     ("jobs", "segments_json"),
     ("jobs", "render_params"),
     ("jobs", "last_progress_at"),
+    ("jobs", "workload_class"),
+    ("jobs", "campaign_id"),
+    ("jobs", "campaign_item_id"),
     ("editor_documents", "quality_proposal"),
     ("editor_documents", "machine_evidence"),
+    ("editor_documents", "lock_session_id"),
     ("editor_versions", "provenance"),
     ("job_outbox_events", "dedupe_key"),
     ("job_outbox_events", "available_at"),
@@ -36,6 +40,9 @@ REQUIRED_COLUMNS = {
     ("quality_patterns", "fingerprint"),
     ("quality_fix_proposals", "candidate_config"),
     ("quality_experiment_runs", "candidate_config_hash"),
+    ("batch_campaigns", "id"),
+    ("batch_campaign_items", "id"),
+    ("batch_upload_sessions", "id"),
 }
 
 

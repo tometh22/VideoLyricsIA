@@ -42,6 +42,7 @@ const HistoryView = lazy(() => import("./components/HistoryView"));
 const Dashboard = lazy(() => import("./components/Dashboard"));
 const UploadZone = lazy(() => import("./components/UploadZone"));
 const SearchPalette = lazy(() => import("./components/SearchPalette"));
+const CampaignsPage = lazy(() => import("./components/CampaignsPage"));
 // Paso final del wizard de variante: la letra en modo LECTURA (el POST
 // /variant no lleva segments y el autosave del editor le escribiría al
 // job padre). Ver components/VariantLyricsSummary.jsx.
@@ -92,6 +93,7 @@ import {
 import { isReusableEditSnapshot } from "./lib/reviewRecovery";
 import { reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
 import { creativeFieldsForReviewResume } from "./lib/reviewResume";
+import { editorSessionHeaders } from "./lib/editorSession";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -566,6 +568,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
   const activeView =
     (pathname === "/new" || pathname === "/review" || pathname === "/generating") ? "new" :
     (pathname === "/videos" || pathname.startsWith("/videos/")) ? "history" :
+    pathname.startsWith("/campaigns") ? "campaigns" :
     pathname === "/account" ? "settings" :
     pathname === "/admin" ? "admin" :
     "dashboard";
@@ -623,6 +626,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
     if (id === "dashboard") navigate("/dashboard");
     else if (id === "new") navigate("/new");
     else if (id === "history") navigate("/videos");
+    else if (id === "campaigns") navigate("/campaigns");
     else if (id === "settings") navigate("/account");
     else if (id === "admin") navigate("/admin");
   };
@@ -2134,6 +2138,12 @@ export default function App() {
         if (cancelled) return;
         const segments = job.segments || job.segments_json || [];
         const resumedCreativeFields = creativeFieldsForReviewResume(job);
+        const campaignPreset = {
+          ...(job.campaign?.default_render_params || {}),
+          ...(job.campaign?.render_overrides || {}),
+        };
+        const preset = (snake, camel, fallback = "") =>
+          campaignPreset[snake] ?? campaignPreset[camel] ?? fallback;
         setCurrentReview({
           file: null,                            // no tenemos el File original
           filename: job.filename || `${job.song_title || job.artist || "audio"}.wav`,
@@ -2144,14 +2154,20 @@ export default function App() {
           songTitle: job.song_title || "",
           language: job.language || "es",
           ...resumedCreativeFields,
-          font: job.font || "",
-          textCase: job.text_case || "upper",
-          fontScale: String(job.font_scale || "1.0"),
-          lyricsAnimation: job.lyrics_animation || "none",
-          lineTransition: job.line_transition || "none",
-          lyricColor: job.lyric_color || "#FFFFFF",
-          lyricSungColor: job.lyric_sung_color || "#FFFFFF",
-          textContrast: job.text_contrast || "medium",
+          genre: preset("genre", "genre", resumedCreativeFields.genre),
+          concept: preset("concept", "concept", resumedCreativeFields.concept),
+          movementStyle: preset("movement_style", "movementStyle", resumedCreativeFields.movementStyle),
+          effect: preset("effect", "effect", resumedCreativeFields.effect),
+          backgroundHint: preset("background_hint", "backgroundHint", resumedCreativeFields.backgroundHint),
+          font: preset("font", "font", job.font || ""),
+          textCase: preset("text_case", "textCase", job.text_case || "upper"),
+          frameFormat: preset("frame_format", "frameFormat", "full"),
+          fontScale: String(preset("font_scale", "fontScale", job.font_scale || "1.0")),
+          lyricsAnimation: preset("lyrics_animation", "lyricsAnimation", job.lyrics_animation || "none"),
+          lineTransition: preset("line_transition", "lineTransition", job.line_transition || "none"),
+          lyricColor: preset("lyric_color", "lyricColor", job.lyric_color || "#FFFFFF"),
+          lyricSungColor: preset("lyric_sung_color", "lyricSungColor", job.lyric_sung_color || "#FFFFFF"),
+          textContrast: preset("text_contrast", "textContrast", job.text_contrast || "medium"),
           segments,
           segmentsRevision: Number.isInteger(job.segments_revision) ? job.segments_revision : 0,
           referenceLyrics: job.reference_lyrics || "",
@@ -2159,6 +2175,8 @@ export default function App() {
           transcriptionQuality: job.transcription_quality || null,
           recoverySource: job.recovery_source || "",
           transcribeJobId: resumeJobId,           // backend reusa R2 audio
+          campaignId: job.campaign_id || null,
+          campaignItemId: job.campaign_item_id || null,
           queueIdx: 0,
           queue: [{ filename: job.filename || "audio.wav" }],
         });
@@ -2172,9 +2190,27 @@ export default function App() {
         // silencio (la variante "resume" del bug de Ana M.). El job
         // resumido no trae fondo propio (transcribed, pre-/generate), así
         // que IA es el default correcto.
-        setBackgroundFile(null); setBackgroundId(null);
-        setBgSelectMode("auto"); setAnimateImage(!!resumedCreativeFields.animateImage); setEnableScenes(false);
+        setBackgroundFile(null);
+        const presetBackgroundId = preset("background_id", "backgroundId", null);
+        setBackgroundId(job.campaign_id ? presetBackgroundId : null);
+        setBgSelectMode(job.campaign_id && presetBackgroundId ? "library" : "auto");
+        setBackgroundMode(preset("background_mode", "backgroundMode", "as_is") === "variation" ? "variation" : "as_is");
+        setAnimateImage(job.campaign_id
+          ? preset("animate_image", "animateImage", false) === true
+          : !!resumedCreativeFields.animateImage);
+        setEnableScenes(false);
         setArtTrack(false);
+        if (job.campaign_id) {
+          setStyle(preset("style", "style", "auto"));
+          setInspiredByLyrics(preset("match_lyrics", "matchLyrics", true) !== false);
+          setDelivery((current) => ({
+            ...current,
+            delivery_profile: preset("delivery_profile", "deliveryProfile", "youtube"),
+            umg_frame_size: preset("umg_frame_size", "umgFrameSize", current.umg_frame_size),
+            umg_fps: preset("umg_fps", "umgFps", current.umg_fps),
+            umg_prores_profile: preset("umg_prores_profile", "umgProresProfile", current.umg_prores_profile),
+          }));
+        }
         setWizardStage("review");
         // Canonicalize legacy /new?resume= links without adding a history
         // entry. Direct /review/:jobId links already point at this target.
@@ -3852,10 +3888,12 @@ export default function App() {
       transcribeJobId: r.transcribeJobId || null,
       operatorMetrics: saveMeta.operatorMetrics || null,
       transcriptionQuality: r.transcriptionQuality || null,
+      campaignId: r.campaignId || null,
+      campaignItemId: r.campaignItemId || null,
       // Capa C 2026-05-24: bgCacheKey viene del useBackgroundPreview hook
       // que corrió durante review. Si null = no se hizo pre-gen (free-tier
       // o params no estables); pipeline corre Veo/Imagen como siempre.
-      bgCacheKey: r.bgCacheKey || null,
+      bgCacheKey: r.campaignId ? null : (r.bgCacheKey || null),
     }];
     track("wizard.approve_lyrics", { segments: (editedSegments || []).length });
     setApprovedJobs(newApproved);
@@ -3954,8 +3992,9 @@ export default function App() {
       ...buildGenerationJob(entry),
       _approvedSource: entry,
     }));
+    const campaignId = jobList.length === 1 ? jobList[0].campaignId : null;
     setJobs(jobList);
-    navigate("/generating");
+    if (!campaignId) navigate("/generating");
     setReadyToGenerate(false);
 
     // Remove a song from the recoverable wizard state only once the backend
@@ -3966,6 +4005,41 @@ export default function App() {
       setApprovedJobs((prev) => prev.filter((entry) => entry !== job._approvedSource));
       setFiles((prev) => prev.filter((entry) => entry?.file !== job._file));
       setReviewQueue((prev) => prev.filter((entry) => entry?.file !== job._file));
+    };
+
+    const openNextCampaignReview = async () => {
+      try {
+        const next = await authFetch(`${API}/batch/campaigns/${campaignId}/next`, {
+          method: "POST",
+          headers: editorSessionHeaders(),
+        });
+        const data = await next.json().catch(() => ({}));
+        setJobs([]);
+        if (next.ok && data.job_id) {
+          navigate(reviewJobPath(data.job_id), { replace: true });
+          return;
+        }
+        navigate(`/campaigns/${campaignId}`, { replace: true });
+        if (!next.ok) throw new Error(
+          typeof data.detail === "string" ? data.detail : "No se pudo abrir la siguiente canción.",
+        );
+      } catch (error) {
+        setJobs([]);
+        navigate(`/campaigns/${campaignId}`, { replace: true });
+        alert({
+          title: "El video quedó generando",
+          description: `No pudimos abrir la siguiente canción. Volvé a intentar desde la campaña. ${error?.message || ""}`,
+          tone: "warning",
+        });
+      }
+    };
+
+    const restoreCampaignReview = (job, segments) => {
+      if (!campaignId) return;
+      setCurrentReview({ ...job._approvedSource, segments });
+      setWizardStage("review");
+      setJobs([]);
+      navigate(reviewJobPath(job.transcribeJobId), { replace: true });
     };
 
     let nextIdx = 0;
@@ -4064,6 +4138,7 @@ export default function App() {
             // Surface it — a silent status="error" left the single-song hero
             // frozen on "Construyendo tu video" with no feedback (audit 2026-07-27).
             alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
+            restoreCampaignReview(jobList[i], generationSegments);
             continue;
           }
 
@@ -4153,17 +4228,22 @@ export default function App() {
             if (!editorConflict) {
               alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
             }
+            if (campaignId) {
+              restoreCampaignReview(jobList[i], generationSegments);
+            }
             continue;
           }
           setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
           markGenerationAccepted(jobList[i]);
-          await pollJob(data.job_id);
+          if (campaignId) await openNextCampaignReview();
+          else await pollJob(data.job_id);
         } catch (err) {
           const reason = await describeFetchError(err, res, t);
           setJobs((prev) => prev.map((j, idx) =>
             idx === i ? { ...j, status: "error", error: reason } : j
           ));
           alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
+          restoreCampaignReview(jobList[i], generationSegments);
         }
       }
     };
@@ -4778,7 +4858,7 @@ export default function App() {
       // Variante: el pre-gen tampoco sirve. El job nuevo lo crea el
       // backend con su propio pipeline y no le pasamos bgCacheKey, así
       // que pre-generar sería pura quema de cuota Gemini/Veo.
-      editMode: !!currentReview?.editMode || !!currentReview?.variantMode,
+      editMode: !!currentReview?.editMode || !!currentReview?.variantMode || !!currentReview?.campaignId,
       bgSelectMode,
       enableScenes,
     }),
@@ -5493,6 +5573,7 @@ export default function App() {
             languageUncertain={!!currentReview.languageUncertain}
             mixedLanguage={!!currentReview.mixedLanguage}
             onApprove={handleApproveLyrics}
+            submitLabel={currentReview.campaignId ? "Generar y seguir" : null}
             onBack={handleBackInReview}
             // Post-render edit: cuando editingJobId está set, el autosave
             // de /save-segments va al job real (no al transcribeJob, que
@@ -5739,6 +5820,8 @@ export default function App() {
           <Route path="/new" element={wizardScreen} />
           <Route path="/review" element={wizardScreen} />
           <Route path="/review/:jobId" element={wizardScreen} />
+          <Route path="/campaigns" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
+          <Route path="/campaigns/:campaignId" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
             <Suspense fallback={<RouteSuspenseFallback />}>

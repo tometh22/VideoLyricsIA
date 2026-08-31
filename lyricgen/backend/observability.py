@@ -364,6 +364,10 @@ def _fleet_service_name(value: object) -> str:
         return "short_worker"
     if compact == "qualityworker":
         return "quality_worker"
+    if compact == "batchshortworker":
+        return "batch_short_worker"
+    if compact == "batchworker":
+        return "batch_worker"
     if compact == "worker":
         return "worker"
     return compact or "unknown"
@@ -393,6 +397,16 @@ def _fleet_readiness_config(environment: str | None = None) -> tuple[bool, dict[
             "EXPECTED_SHORT_WORKER_REPLICAS", short_default,
         ),
     }
+    batch_enabled = os.environ.get(
+        "BATCH_CAMPAIGN_ENABLED", "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if batch_enabled:
+        expected["batch_short_worker"] = _replicas(
+            "EXPECTED_BATCH_SHORT_WORKER_REPLICAS", "2" if managed else "0",
+        )
+        expected["batch_worker"] = _replicas(
+            "EXPECTED_BATCH_WORKER_REPLICAS", "2" if managed else "0",
+        )
     quality_enabled = os.environ.get(
         "TRANSCRIPTION_QUALITY_QUEUE_ENABLED", "0",
     ).strip().lower() in {"1", "true", "yes", "on"}
@@ -417,6 +431,16 @@ def worker_fleet_coherence(
         for service, count in (expected_service_counts or {}).items()
     ):
         expected.add("transcription_quality")
+    if any(
+        _fleet_service_name(service) == "batch_short_worker" and int(count) > 0
+        for service, count in (expected_service_counts or {}).items()
+    ):
+        expected.update({"transcription_batch", "campaign_control"})
+    if any(
+        _fleet_service_name(service) == "batch_worker" and int(count) > 0
+        for service, count in (expected_service_counts or {}).items()
+    ):
+        expected.add("batch_render")
     advertised = {
         queue for row in release_rows for queue in (row.get("queues") or [])
     }
@@ -591,7 +615,10 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
             try:
                 from rq import Queue, Worker
                 queues = {}
-                queue_names = ["transcription", "bg_preview", "enterprise", "default"]
+                queue_names = [
+                    "transcription", "bg_preview", "enterprise", "default",
+                    "transcription_batch", "batch_render", "campaign_control",
+                ]
                 if os.environ.get(
                     "TRANSCRIPTION_QUALITY_QUEUE_ENABLED", "0"
                 ).strip().lower() in {"1", "true", "yes", "on"}:
