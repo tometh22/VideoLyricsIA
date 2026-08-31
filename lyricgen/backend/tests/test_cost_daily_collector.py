@@ -349,3 +349,53 @@ def test_batch_sources_are_asked_once_per_month_not_once_per_day(db, monkeypatch
     assert out["attempted"] == 20
     assert out["ok"] == 20
     assert len(llamadas) == 1, f"se llamó {len(llamadas)} veces, esperaba 1"
+
+
+# ---------------------------------------------------------------------------
+# Comportamiento de costo: no todo lo de un proveedor se comporta igual
+# ---------------------------------------------------------------------------
+
+def test_gcp_storage_is_stock_not_variable():
+    """GCP no es una sola cosa.
+
+    Marcar el 100% de GCP como 'variable' hacía que el costo marginal de un
+    video más se viera más caro de lo que es: Cloud Storage es consecuencia
+    acumulada de entregas pasadas, no producción de este mes, y no baja solo.
+    """
+    assert cdc._gcp_behavior("Veo 3.1 Fast Video Generation") == "variable"
+    assert cdc._gcp_behavior("Cloud Storage Standard Storage US") == "stock"
+    assert cdc._gcp_behavior("Network Internet Egress") == "stock"
+
+
+def test_railway_persists_the_service_breakdown_not_only_measurements(monkeypatch):
+    """El desglose por servicio se calculaba y se tiraba.
+
+    `dim_value` guardaba el nombre de la MEDICIÓN (`MEMORY_USAGE_GB`), no el
+    del servicio, así que era imposible separar `api` —residente, fijo— de
+    los workers, que escalan con los renders. Esa es justamente la pregunta
+    de cuánto del "fijo" es en realidad semi-variable.
+    """
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "t")
+    monkeypatch.setenv("RAILWAY_PROJECT_ID", "p")
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"data": {"usage": [
+                {"measurement": "MEMORY_USAGE_GB", "value": 4 * 1440,
+                 "tags": {"serviceId": "api"}},
+                {"measurement": "MEMORY_USAGE_GB", "value": 6 * 1440,
+                 "tags": {"serviceId": "Worker"}},
+            ]}}
+    import requests
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp())
+
+    res = cdc._railway_day(date(2026, 8, 5))
+    servicios = {r["dim_value"]: r["amount_usd"]
+                 for r in res.rows if r["dim_type"] == "service"}
+    assert set(servicios) == {"api", "Worker"}
+    # Worker consume 1,5x lo de api y eso tiene que verse.
+    assert servicios["Worker"] > servicios["api"]
+    # Y las mediciones siguen estando, en su propia dimensión.
+    mediciones = {r["dim_value"] for r in res.rows if r["dim_type"] == "sku"}
+    assert mediciones == {"MEMORY_USAGE_GB"}

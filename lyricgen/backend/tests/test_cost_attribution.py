@@ -17,6 +17,7 @@ in ago-2026):
 import pytest
 
 import cost_attribution as ca
+from cost_attribution import is_ci_tenant
 
 
 def _job(job_id, artist, title, tenant, status="done", env="staging",
@@ -389,3 +390,156 @@ def test_period_bounds_wraps_december():
     start, end = ca.period_bounds("2026-12")
     assert (start.year, start.month) == (2026, 12)
     assert (end.year, end.month) == (2027, 1)
+
+
+# ---------------------------------------------------------------------------
+# Tenants de laboratorio que escapaban al filtro de CI
+# ---------------------------------------------------------------------------
+#
+# Medido en ago-2026 contra las bases de producción Y staging: 30 tenants
+# generados por scripts caían en `otros_clientes`, el bucket de clientes que
+# PAGAN. El patrón original era `^dk_d1_` — literalmente una sola de las
+# tandas del mismo experimento.
+#
+# Por qué importa más de lo que parece: el costo por video se calcula
+# dividiendo la factura del proveedor por las canciones entregadas. Meter
+# barridos de CI en ese denominador lo infla y el $/video sale a la mitad. Y
+# ese es justo el número que alguien copia para cotizarle a un sello.
+#
+# La regla es el SUFIJO DE EPOCH, no el prefijo: los scripts pegan
+# `int(time.time())` al final. Enumerar prefijos ya falló una vez —la
+# primera versión se dejó `rt2_` afuera— y vuelve a fallar con la próxima
+# tanda. Ningún humano nombra una cuenta con un epoch de 10 dígitos.
+
+CI_ESCAPADOS = [
+    # Las tandas dk_d2..dk_d4 que `^dk_d1_` no cubría.
+    "dk_d2_1780457650", "dk_d2_stars_1780457583",
+    "dk_d3_1780457719", "dk_d4_mixed_1780457845",
+    # Barridos de matriz.
+    "mx_a_1780448038", "mx_f_1780448038",
+    "val_v1_solid_1780454342", "val_v4_1780454511",
+    "vf_a_1780487123", "vf_d_1780487321",
+    # Casos con el color en el nombre: rompen el regex de labels de GCP y
+    # aun así se contaban como cliente.
+    "cc_a_snow_upper_#33ccff_medium_1.0_1780446180",
+    "cc_d_rain_lower_#ff0066_slow_0.5_1780446512",
+    # Pruebas de carga / drenaje de cola.
+    "long_1780459048", "drain_1780499412",
+    # El que la enumeración de prefijos se dejó afuera. Su único job está en
+    # `pending_review`, que cuenta como entregado: era el único "cliente"
+    # que staging aportaba en junio-2026.
+    "rt2_1780431884",
+    # Un prefijo que todavía no existe. Este es el punto de la regla.
+    "prefijo_que_no_inventamos_1780500000",
+]
+
+
+@pytest.mark.parametrize("tenant", CI_ESCAPADOS)
+def test_tenants_de_laboratorio_cuentan_como_ci(tenant):
+    assert is_ci_tenant(tenant), f"{tenant} se cuenta como cliente que paga"
+
+
+# La otra mitad del test importa igual: un patrón demasiado goloso factura
+# menos de lo real. Estos son los 9 tenant_id que NO son de laboratorio en
+# las dos bases, más nombres cercanos que un prefijo goloso se tragaría.
+NO_SON_CI = [
+    "universal_chile", "universal_argentina", "umg_archive",
+    "genly", "agus77", "omg", "default", "tomas@epical.digital",
+    "__internal_samples__",
+    "longplay_records",     # empieza con "long" pero sin epoch
+    "valparaiso_music",     # empieza con "val" pero sin epoch
+    "mx_records", "ccm_estudio", "vfx_studio", "dk_music",
+    "sello_2026",           # dígitos al final, pero no un epoch de 10
+]
+
+
+@pytest.mark.parametrize("tenant", NO_SON_CI)
+def test_no_se_traga_clientes_reales(tenant):
+    assert not is_ci_tenant(tenant), f"{tenant} es un cliente y se descartó"
+
+
+def test_ci_no_depende_de_la_capitalizacion():
+    # La columna es String(100) libre, sin constraint de normalización.
+    assert is_ci_tenant("MX_A_1780448038")
+    assert is_ci_tenant("  drain_1780499412  ")
+
+
+# ---------------------------------------------------------------------------
+# `clave_facturable` — el denominador del costo por video
+# ---------------------------------------------------------------------------
+
+UMG_KEYS = {"los bunkers|nada nuevo bajo el sol", "coti|nada fue un error"}
+
+
+def test_produccion_gestionada_bajo_cuenta_del_equipo_es_facturable():
+    """El bug más caro que tuvo este código.
+
+    Las entregas del portal de UMG corren bajo `agus77`, `default`, `omg`,
+    `genly` y `tomas@epical.digital` — no bajo `universal_*`. Filtrar por
+    "no está en TEAM_TENANTS" descartaba el 100% de las entregas reales:
+    medido en ago-2026, dejaba 23 canciones de las ≥77 entregadas, y el
+    costo por canción salía 3,35x arriba del real.
+    """
+    for cuenta in ("agus77", "default", "omg", "genly", "tomas@epical.digital"):
+        clave = ca.clave_facturable(
+            cuenta, "los bunkers|nada nuevo bajo el sol", UMG_KEYS)
+        assert clave is not None, f"{cuenta} descartada como interna"
+        # Todas contra el MISMO contrato: si cada cuenta fuera su propia
+        # clave, la misma canción contaría cinco veces.
+        assert clave == ("__umg_gestionada__",
+                         "los bunkers|nada nuevo bajo el sol")
+
+
+def test_la_misma_cuenta_haciendo_id_interno_no_es_facturable():
+    # Lo que distingue una cosa de la otra es el PORTAL, no el tenant.
+    assert ca.clave_facturable("agus77", "prueba|experimento", UMG_KEYS) is None
+
+
+def test_ci_nunca_es_facturable_aunque_nombre_una_cancion_del_portal():
+    # El render bot re-renderiza el catálogo para QA: nombra las mismas
+    # canciones. Por eso CI se chequea ANTES que el portal.
+    assert ca.clave_facturable(
+        "golden_render_bot", "los bunkers|nada nuevo bajo el sol",
+        UMG_KEYS) is None
+
+
+def test_dos_sellos_con_el_mismo_tema_son_dos_entregas():
+    """Colisión real medida en producción, jun-2026.
+
+    "La Mosca / Para no verte más" fue entregada por `universal_argentina`
+    Y por `universal_chile`. Sin el tenant en la clave, dos entregas
+    facturables a dos clientes distintos cuentan como una y el costo por
+    canción sale al doble.
+    """
+    tema = "la mosca|para no verte mas"
+    a = ca.clave_facturable("universal_argentina", tema, UMG_KEYS)
+    b = ca.clave_facturable("universal_chile", tema, UMG_KEYS)
+    assert a is not None and b is not None
+    assert a != b
+    assert len({a, b}) == 2
+
+
+def test_jobs_sin_metadata_no_colapsan_en_una_sola_cancion():
+    """31 jobs entregados en prod tienen artista y título vacíos.
+
+    `song_key` cae al job_id justamente para esto: la clave `"|"` haría
+    que todos ellos sean UNA canción que se lleva la factura entera. En un
+    probe contra el endpoint real, 10 jobs sin título dieron $1.000/canción
+    en vez de $100.
+    """
+    claves = {
+        ca.clave_facturable("cliente_x", ca.song_key(None, None, jid), UMG_KEYS)
+        for jid in ("job-a", "job-b", "job-c")
+    }
+    assert len(claves) == 3
+
+
+def test_las_variantes_de_un_mismo_tema_son_una_sola_cancion():
+    # Lo contrario del test anterior: una canción entregada arrastra ~2,87
+    # jobs entre variantes, re-renders y ediciones. Ésos SÍ colapsan.
+    claves = {
+        ca.clave_facturable(
+            "cliente_x", ca.song_key("Los Bunkers", "Nada Nuevo", jid), UMG_KEYS)
+        for jid in ("job-a", "job-b", "job-c")
+    }
+    assert len(claves) == 1

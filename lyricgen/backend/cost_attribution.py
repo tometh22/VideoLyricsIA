@@ -67,7 +67,24 @@ CI_TENANT_PATTERNS = (
     re.compile(r"^preflight_"),
     re.compile(r"_smoke_|^genly_edit_smoke"),
     re.compile(r"^e2e"),
-    re.compile(r"^dk_d1_"),
+    # Barridos de laboratorio: el sufijo de EPOCH es la señal.
+    #
+    # `^dk_d1_` estaba solo y 29 tenants con la misma forma caían en
+    # `otros_clientes`, el bucket de clientes que PAGAN. La primera versión
+    # de este arreglo enumeró los prefijos que existían ese día
+    # (`mx_`, `val_v`, `cc_`, `vf_`, `long_`, `drain_`) y se dejó `rt2_`
+    # afuera — la siguiente tanda con un prefijo nuevo volvía a colarse sin
+    # que nada avisara.
+    #
+    # Lo que TODOS comparten no es el prefijo sino cómo se generan: el
+    # script les pega `int(time.time())` al final. Ningún humano nombra una
+    # cuenta con un epoch de 10 dígitos, así que esa es la regla y los
+    # prefijos dejan de importar. Verificado contra los 47 tenant_id
+    # distintos de las dos bases: matchea los 30 de laboratorio y ningún
+    # cliente real.
+    re.compile(r"_\d{10}$"),
+    # Se conserva por linaje: cubre un `dk_d…` sin sufijo de epoch.
+    re.compile(r"^dk_d\d+[_-]"),
 )
 
 # Accounts the GenLy team operates. Their jobs are managed production when
@@ -88,8 +105,16 @@ CAT_RND = "id_interno"
 
 
 def is_ci_tenant(tenant_id: str | None) -> bool:
-    t = (tenant_id or "").strip()
+    # `.lower()` igual que `is_umg_tenant`: la columna es String(100) libre,
+    # sin constraint de normalización, así que `MX_A_178…` entraba como
+    # cliente que paga sólo por la mayúscula.
+    t = (tenant_id or "").strip().lower()
     return any(p.search(t) for p in CI_TENANT_PATTERNS)
+
+
+def is_team_tenant(tenant_id: str | None) -> bool:
+    """Cuenta operada por el equipo. Normaliza igual que las otras dos."""
+    return (tenant_id or "").strip().lower() in TEAM_TENANTS
 
 
 def is_umg_tenant(tenant_id: str | None) -> bool:
@@ -400,17 +425,63 @@ def collect_portal_songs(db_prod) -> dict:
 # Cross-environment merge + classification
 # ---------------------------------------------------------------------------
 
-def classify_job(job: JobCost, umg_keys: set[str]) -> str:
-    """Bucket a job. Order is load-bearing — see the module docstring."""
-    if is_ci_tenant(job.tenant_id):
+def classify_key(tenant_id: str | None, key: str, umg_keys: set[str]) -> str:
+    """Bucket, a partir de tenant + identidad de canción. El orden importa.
+
+    Un job de `golden_render_bot` puede nombrar la misma canción que una
+    entrega real —el bot re-renderiza el catálogo para QA—, así que CI se
+    chequea PRIMERO y nunca puede ser UMG, diga la canción que diga.
+    """
+    if is_ci_tenant(tenant_id):
         return CAT_CI
-    if is_umg_tenant(job.tenant_id):
+    if is_umg_tenant(tenant_id):
         return CAT_UMG
-    if job.key in umg_keys:
+    # La producción gestionada corre bajo cuentas del EQUIPO: el portal es
+    # el que dice que esa canción se entregó y se cobró. Este chequeo va
+    # antes que TEAM_TENANTS, si no se descarta como I+D interno.
+    if key in umg_keys:
         return CAT_UMG
-    if job.tenant_id in TEAM_TENANTS:
+    if is_team_tenant(tenant_id):
         return CAT_RND
     return CAT_OTHER_CLIENT
+
+
+def classify_job(job: JobCost, umg_keys: set[str]) -> str:
+    """Bucket a job. Order is load-bearing — see the module docstring."""
+    return classify_key(job.tenant_id, job.key, umg_keys)
+
+
+# Categorías que le facturan a alguien. `CAT_CI` es infraestructura de
+# pruebas y `CAT_RND` es I+D interno: ninguna de las dos genera un video
+# vendido, así que ninguna puede estar en el denominador del costo por video.
+CATEGORIAS_FACTURABLES = frozenset({CAT_UMG, CAT_OTHER_CLIENT})
+
+
+def clave_facturable(tenant_id: str | None, key: str,
+                     umg_keys: set[str]) -> tuple[str, str] | None:
+    """Identidad de la unidad que se factura, o `None` si no se factura.
+
+    Deduplica canciones para el denominador de "costo por video". Dos
+    decisiones que costaron dinero cuando estuvieron mal:
+
+    * **El tenant forma parte de la clave.** Dos sellos distintos pueden
+      entregar el mismo tema — pasó en jun-2026 con "La Mosca / Para no
+      verte más", entregada por `universal_argentina` Y `universal_chile`.
+      Sin el tenant las dos entregas facturables cuentan como una y el
+      costo por canción sale al doble.
+
+    * **La producción gestionada de UMG colapsa en un solo comprador.**
+      Esas canciones se entregan desde varias cuentas del equipo
+      (`agus77`, `default`, `omg`, …) contra un único contrato, y encima
+      pueden tener jobs en los dos entornos. Contarlas por cuenta las
+      duplicaría.
+    """
+    cat = classify_key(tenant_id, key, umg_keys)
+    if cat not in CATEGORIAS_FACTURABLES:
+        return None
+    if cat == CAT_UMG and not is_umg_tenant(tenant_id):
+        return ("__umg_gestionada__", key)
+    return ((tenant_id or "").strip().lower(), key)
 
 
 def build_attribution(jobs_by_env: dict[str, dict[str, JobCost]],

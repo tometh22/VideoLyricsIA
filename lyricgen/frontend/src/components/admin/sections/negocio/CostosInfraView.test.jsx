@@ -39,7 +39,6 @@ const BASE = {
 function montar(overrides = {}) {
   const props = {
     data: { ...BASE, ...overrides }, loading: false,
-    rango: "30d", setRango: vi.fn(),
     granularity: "day", setGranularity: vi.fn(),
     groupBy: "source", setGroupBy: vi.fn(),
     colectar: vi.fn(), colectando: false,
@@ -114,7 +113,6 @@ describe("desglose", () => {
         })),
       },
       loading: false,
-      rango: "30d", setRango: vi.fn(),
       granularity: "day", setGranularity: vi.fn(),
       groupBy: "behavior", setGroupBy: vi.fn(),
       colectar: vi.fn(), colectando: false,
@@ -141,7 +139,6 @@ describe("estados de borde", () => {
       <AdminProvider>
         <CostosInfraView
           data={null} loading={false}
-          rango="30d" setRango={vi.fn()}
           granularity="day" setGranularity={vi.fn()}
           groupBy="source" setGroupBy={vi.fn()}
           colectar={vi.fn()} colectando={false}
@@ -149,5 +146,36 @@ describe("estados de borde", () => {
         />
       </AdminProvider>);
     expect(screen.getByText(/sin datos de costo/i)).toBeTruthy();
+  });
+});
+
+
+describe("límite de series", () => {
+  it("pliega el 7º grupo en “Otros” en vez de generar un color nuevo", () => {
+    // Ocho hues es el límite del sistema y el ORDEN es el mecanismo de
+    // seguridad CVD. Ciclar la paleta haría que dos series distintas
+    // compartan color — peor que agrupar.
+    const nueve = {
+      "gcp:Veo": 40, "gcp:Gemini": 20, "gcp:Imagen": 10, "r2:storage": 7,
+      "railway:mem": 5, "railway:cpu": 3, "replicate:demucs": 2,
+      "replicate:whisperx": 1, "openai:whisper": 0.5,
+    };
+    montar({
+      group_by: "sku", by_group: nueve, total_usd: 88.5,
+      series: [
+        { bucket: "2026-08-21", total: 44.25, by: nueve },
+        { bucket: "2026-08-22", total: 44.25, by: nueve },
+      ],
+    });
+
+    expect(screen.getAllByText("Otros").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("(4 más)")).toBeTruthy();
+    // Los 4 plegados no aparecen sueltos en la tabla.
+    expect(screen.queryByText("replicate:whisperx")).toBeNull();
+  });
+
+  it("no pliega nada cuando hay 6 grupos o menos", () => {
+    montar();
+    expect(screen.queryByText("Otros")).toBeNull();
   });
 });

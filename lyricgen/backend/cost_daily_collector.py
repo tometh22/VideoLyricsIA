@@ -214,13 +214,20 @@ def _railway_day(day: date) -> DayResult:
     total = sum(per_service.values())
     rows = [_row("total", "total", total, behavior="fijo", estimate=True,
                  detail=f"métricas × tarifas publicadas ÷ {minutes} min del mes")]
+    # Por MEDICIÓN: memoria/CPU/disco vs egress.
     for m, (cost, units, unit) in per_measure.items():
-        # Compute is resident capacity: it accrues whether or not a video is
-        # rendered, so it is a fixed floor, not a per-video cost. Egress is
-        # the only line that genuinely tracks volume.
+        # El compute es capacidad residente: se acumula haya o no renders,
+        # así que es piso fijo y no costo por video. El egress es la única
+        # línea que sigue de verdad al volumen.
         behavior = "variable" if m == "NETWORK_TX_GB" else "fijo"
-        rows.append(_row("service", m, cost, qty=units, unit=unit,
+        rows.append(_row("sku", m, cost, qty=units, unit=unit,
                          behavior=behavior, estimate=True))
+    # Por SERVICIO. Esta dimensión se calculaba y se tiraba: `dim_value`
+    # guardaba el nombre de la MEDICIÓN, no el del servicio, así que era
+    # imposible separar `api` (residente) de los workers (escalan con
+    # renders) — justo la pregunta de cuánto del "fijo" es semi-variable.
+    for svc, cost in per_service.items():
+        rows.append(_row("service", svc[:255], cost, estimate=True))
     _check_dims_sum_to_total(rows, "railway", day)
     return DayResult("railway", day, "ok", rows)
 
@@ -383,6 +390,20 @@ def _fixed_month(day: date) -> DayResult:
     return DayResult("fixed", day, "ok", rows)
 
 
+# Los SKU de Cloud Storage son consecuencia acumulada de entregas pasadas,
+# igual que R2: no se mueven con la producción de este mes y no bajan solos.
+# Marcarlos 'variable' junto con Vertex haría que el costo marginal de un
+# video más se vea más caro de lo que es.
+_GCP_STOCK = ("storage", "cloud storage", "egress", "network")
+
+
+def _gcp_behavior(sku: str) -> str:
+    low = (sku or "").lower()
+    if any(k in low for k in _GCP_STOCK):
+        return "stock"
+    return "variable"
+
+
 def gcp_month(any_day_in_month: date) -> list[DayResult]:
     """GCP for the WHOLE month in ONE query, returned split by day and SKU.
 
@@ -516,10 +537,10 @@ def gcp_month(any_day_in_month: date) -> list[DayResult]:
             d += timedelta(days=1)
             continue
         rows = [_row("total", "total", sum(skus.values()) + cred,
-                     behavior="variable",
                      detail="cost + credits, tal como cae en la factura")]
         for sku, bruto in skus.items():
-            rows.append(_row("sku", sku, bruto, behavior="variable"))
+            rows.append(_row("sku", sku, bruto,
+                             behavior=_gcp_behavior(sku)))
         if cred:
             rows.append(_row("sku", "__creditos__", cred, behavior="variable",
                              detail="créditos y descuentos (negativos)"))

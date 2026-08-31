@@ -62,6 +62,21 @@ export function fmtMoney(usd) {
   return `$${(Number(usd) || 0).toFixed(2)}`;
 }
 
+/** Plata que puede no existir. `null` → "—", NUNCA "$0.00".
+ *
+ * El backend devuelve `null` a propósito cuando la división no se puede
+ * hacer: `cost_per_deliverable` con 0 entregables, `rejection_rate` sin
+ * jobs terminados, `cost_per_client_song` sin ningún snapshot de costo.
+ * `fmtMoney` los aplasta a "$0.00" —`Number(null) || 0`— y un "$0.00/video"
+ * se lee como margen del 100%, que es exactamente al revés de lo que pasa.
+ *
+ * Un guión obliga a preguntar por qué; un cero no.
+ */
+export function fmtMoneyOrDash(usd) {
+  if (usd === null || usd === undefined || Number.isNaN(Number(usd))) return "—";
+  return fmtMoney(usd);
+}
+
 // --- Métricas de actividad --------------------------------------------------
 
 // Suma de señales de retrabajo de una fila de /admin/activity.

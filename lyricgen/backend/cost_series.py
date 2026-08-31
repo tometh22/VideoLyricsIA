@@ -90,7 +90,17 @@ def coverage(db: Session, since: date, until: date) -> dict:
         for source in SOURCES:
             expected += 1
             status = runs.get((d, source))
-            if status in ("ok", "not_configured"):
+            # `not_configured` NO cuenta como recolectado. Si contara, el mes
+            # en que falte la credencial de GCP — el 52% de la factura —
+            # reportaría `complete: true` con GCP en $0, que es exactamente
+            # el modo de falla que este panel existe para hacer imposible:
+            # un número más chico con cara de buena noticia.
+            #
+            # El costo de esto es que `complete` no llega a verde mientras
+            # una fuente esté sin configurar. Eso es correcto: significa que
+            # el total ES un piso. Para excluir una fuente a propósito hay
+            # que sacarla de SOURCES, no disfrazarla de recolectada.
+            if status == "ok":
                 collected += 1
             else:
                 missing.append({"day": d.isoformat(), "source": source,
@@ -104,44 +114,62 @@ def coverage(db: Session, since: date, until: date) -> dict:
     }
 
 
-def _apply_monthly_rules(db: Session, month_rows: dict, month: str) -> dict:
-    """Franquicias y mínimos: reglas del MES, aplicadas una sola vez.
+def monthly_adjustments(db: Session, since: date, until: date) -> dict:
+    """Franquicias del MES, aplicadas una sola vez sobre el agregado.
 
-    Restar la franquicia de 1M de operaciones clase A por día da $0 todos
-    los días aunque el mes pase el millón; restar 1/31 tampoco sirve porque
-    el excedente no es lineal. Por eso se aplica acá, sobre el agregado.
+    El colector guarda crudo justamente para que esto se pueda calcular
+    acá: restar la franquicia de 1M de operaciones clase A por día daría
+    $0 todos los días aunque el mes pase el millón, y restar 1/31 tampoco
+    sirve porque el excedente no es lineal.
+
+    Sólo se aplica cuando el rango ES un mes calendario completo. Sobre una
+    semana la franquicia mensual no significa nada, y prorratearla sería
+    inventar un número.
     """
+    import billing_sources as bs
+
+    primero = since.replace(day=1)
+    ultimo = date(since.year, since.month,
+                  calendar.monthrange(since.year, since.month)[1])
+    if since != primero or until != ultimo:
+        return {"aplicables": False, "motivo": "el rango no es un mes completo",
+                "ajustes": [], "total_usd": 0.0}
+    if os.environ.get("R2_APPLY_FREE_TIER", "1") != "1":
+        return {"aplicables": False, "motivo": "R2_APPLY_FREE_TIER=0",
+                "ajustes": [], "total_usd": 0.0}
+
+    dias = (ultimo - primero).days + 1
+    filas = (db.query(CostDaily)
+             .filter(CostDaily.day >= since, CostDaily.day <= until,
+                     CostDaily.source == "r2", CostDaily.dim_type == "sku").all())
+    qty = {}
+    for f in filas:
+        qty[f.dim_value] = qty.get(f.dim_value, 0.0) + (f.qty or 0.0)
+
     ajustes = []
-
-    # R2: franquicias mensuales
-    if os.environ.get("R2_APPLY_FREE_TIER", "1") == "1":
-        import billing_sources as bs
-        gb_mes = month_rows.get(("r2", "storage"), {}).get("qty", 0.0)
-        # `qty` de storage viene en GB por día; el GB-mes es el promedio.
-        dias = month_rows.get("_dias", 1) or 1
-        gb_promedio = gb_mes / dias
-        libres = min(gb_promedio, bs.R2_FREE_GB)
-        if libres > 0:
+    # `qty` de storage viene en GB por día: el GB-mes es el promedio.
+    gb_promedio = qty.get("storage", 0.0) / dias
+    libres_gb = min(gb_promedio, bs.R2_FREE_GB)
+    if libres_gb > 0:
+        ajustes.append({
+            "concepto": "r2_franquicia_storage",
+            "amount_usd": -round(libres_gb * bs.R2_USD_PER_GB_MONTH, 4),
+            "detail": f"{libres_gb:.1f} de {gb_promedio:.1f} GB-mes sin cargo",
+        })
+    for clase, libre_n, tarifa in (
+        ("class_a", bs.R2_FREE_CLASS_A, bs.R2_USD_PER_MILLION_CLASS_A),
+        ("class_b", bs.R2_FREE_CLASS_B, bs.R2_USD_PER_MILLION_CLASS_B),
+    ):
+        reqs = qty.get(clase, 0.0)
+        libres_n = min(reqs, libre_n)
+        if libres_n > 0:
             ajustes.append({
-                "concepto": "r2_franquicia_storage",
-                "amount_usd": -round(libres * bs.R2_USD_PER_GB_MONTH, 4),
-                "detail": f"{libres:.1f} GB-mes gratis de los {gb_promedio:.1f} usados",
+                "concepto": f"r2_franquicia_{clase}",
+                "amount_usd": -round(libres_n / 1_000_000 * tarifa, 4),
+                "detail": f"{int(libres_n):,} de {int(reqs):,} requests sin cargo",
             })
-        for clase, libre_n, tarifa in (
-            ("class_a", bs.R2_FREE_CLASS_A, bs.R2_USD_PER_MILLION_CLASS_A),
-            ("class_b", bs.R2_FREE_CLASS_B, bs.R2_USD_PER_MILLION_CLASS_B),
-        ):
-            reqs = month_rows.get(("r2", clase), {}).get("qty", 0.0)
-            libres_n = min(reqs, libre_n)
-            if libres_n > 0:
-                ajustes.append({
-                    "concepto": f"r2_franquicia_{clase}",
-                    "amount_usd": -round(libres_n / 1_000_000 * tarifa, 4),
-                    "detail": f"{int(libres_n):,} de {int(reqs):,} requests gratis",
-                })
-
-    return {"month": month, "ajustes": ajustes,
-            "total_ajustes": round(sum(a["amount_usd"] for a in ajustes), 4)}
+    return {"aplicables": True, "motivo": None, "ajustes": ajustes,
+            "total_usd": round(sum(a["amount_usd"] for a in ajustes), 4)}
 
 
 def series(db: Session, since: date, until: date, *,
@@ -240,6 +268,13 @@ def series(db: Session, since: date, until: date, *,
             totales[g] = totales.get(g, 0.0) + f.amount_usd
             facturado += f.amount_usd
 
+    # Franquicias mensuales: el colector guarda crudo y esto es lo único
+    # que las resta. Sin este llamado la función existía y nunca corría —
+    # R2 quedaba sobrevaluado y el "principio rector" era una promesa vacía.
+    ajustes = monthly_adjustments(db, since, until)
+    if ajustes["aplicables"] and ajustes["total_usd"]:
+        totales["_ajustes"] = ajustes["total_usd"]
+
     total = round(sum(totales.values()), 4)
     serie = [{"bucket": k, "total": round(sum(v.values()), 4),
               "by": {g: round(x, 4) for g, x in sorted(v.items())}}
@@ -256,5 +291,6 @@ def series(db: Session, since: date, until: date, *,
         "estimated_usd": round(estimado, 4),
         "estimated_share": round(estimado / total, 4) if total else None,
         "coverage": cov,
+        "monthly_adjustments": ajustes,
         "openai_line_item_filter": of,
     }

@@ -60,17 +60,33 @@ def test_an_errored_day_is_missing_not_collected(db):
     assert cov["missing"][0]["status"] == "error"
 
 
-def test_not_configured_counts_as_covered(db):
-    """Una fuente sin credenciales es una respuesta, no un hueco.
+def test_not_configured_is_a_hole_not_a_covered_cell(db):
+    """Una fuente sin credenciales NO puede contar como recolectada.
 
-    Si contara como hueco, `complete` nunca sería verde y el flag dejaría de
-    ser señal en dos semanas.
+    Esta aserción estuvo invertida. El argumento para contarla como cubierta
+    era que si no, `complete` nunca llega a verde y el flag deja de ser
+    señal. Pero la consecuencia es peor: el mes en que falte la credencial
+    de GCP —el 52% de la factura— reportaría `complete: true` con GCP en $0.
+    Un número más chico con cara de buena noticia, que es exactamente el
+    modo de falla que este panel existe para hacer imposible.
+
+    Que `complete` esté en rojo mientras falta una credencial es la
+    respuesta correcta: el total ES un piso. Para excluir una fuente a
+    propósito hay que sacarla de SOURCES, no disfrazarla de recolectada.
+
+    Nota: `pending_gaps` SÍ la trata como resuelta, y no se contradice con
+    esto — no reintentar una credencial que falta es ahorro de llamadas;
+    decir que el mes está completo es mentir.
     """
     d = date(2020, 3, 10)
     for src in cs.SOURCES:
         _run(db, d, src, status="not_configured")
     db.commit()
-    assert coverage(db, d, d)["complete"] is True
+
+    cov = coverage(db, d, d)
+    assert cov["complete"] is False
+    assert cov["collected_cells"] == 0
+    assert all(m["status"] == "not_configured" for m in cov["missing"])
 
 
 def test_today_is_excluded_from_coverage_because_it_is_still_accruing(db):
@@ -252,3 +268,59 @@ def test_sku_view_includes_openai_and_totals_match_the_source_view(db, monkeypat
     assert por_sku["total_usd"] == pytest.approx(14.0), "las dos vistas no cuadran"
     assert "openai:whisper" in por_sku["by_group"]
     assert "openai:gpt-5.4, output" not in por_sku["by_group"]
+
+
+# ---------------------------------------------------------------------------
+# Franquicias mensuales — la función existía y NUNCA se llamaba
+# ---------------------------------------------------------------------------
+
+def test_r2_free_tier_is_subtracted_on_a_full_month(db, monkeypatch):
+    """El colector guarda crudo justamente para poder restar esto acá.
+
+    `monthly_adjustments` estuvo escrita y sin ningún llamador: la
+    franquicia de R2 nunca se restaba y el "principio rector" (reglas del
+    mes al leer) era una promesa vacía.
+    """
+    monkeypatch.setenv("R2_APPLY_FREE_TIER", "1")
+    d0, d1 = date(2021, 4, 1), date(2021, 4, 30)
+    d = d0
+    while d <= d1:
+        # 100 GB constantes: la franquicia son 10 GB-mes.
+        _fact(db, d, "r2", "sku", "storage", 0.05, qty=100.0, behavior="stock")
+        _fact(db, d, "r2", "total", "total", 0.05, behavior="stock")
+        for src in cs.SOURCES:
+            _run(db, d, src)
+        d += timedelta(days=1)
+    db.commit()
+
+    aj = cs.monthly_adjustments(db, d0, d1)
+    assert aj["aplicables"] is True
+    storage = next(a for a in aj["ajustes"] if a["concepto"] == "r2_franquicia_storage")
+    # 10 GB-mes gratis x $0,015 = -$0,15
+    assert storage["amount_usd"] == pytest.approx(-0.15)
+
+    out = series(db, d0, d1)
+    assert out["monthly_adjustments"]["total_usd"] == pytest.approx(-0.15)
+
+
+def test_free_tier_is_not_prorated_over_a_partial_range(db, monkeypatch):
+    """Sobre una semana la franquicia MENSUAL no significa nada.
+
+    Restar 1/31 por día tampoco sirve: el excedente no es lineal, así que
+    prorratearla sería inventar un número.
+    """
+    monkeypatch.setenv("R2_APPLY_FREE_TIER", "1")
+    d0, d1 = date(2021, 5, 3), date(2021, 5, 9)
+    d = d0
+    while d <= d1:
+        _fact(db, d, "r2", "sku", "storage", 0.05, qty=100.0, behavior="stock")
+        for src in cs.SOURCES:
+            _run(db, d, src)
+        d += timedelta(days=1)
+    db.commit()
+
+    aj = cs.monthly_adjustments(db, d0, d1)
+    assert aj["aplicables"] is False
+    assert aj["total_usd"] == 0.0
+    assert "mes completo" in aj["motivo"]
+

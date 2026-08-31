@@ -831,18 +831,49 @@ def admin_margin_dashboard(
     db: Session = Depends(get_db),
     since_days: int = Query(30, ge=1, le=365),
     revenue_per_video_usd: float = Query(8.0, ge=0, le=10000),
+    since: str = Query("", description="YYYY-MM-DD; gana sobre since_days"),
+    until: str = Query("", description="YYYY-MM-DD inclusive"),
 ):
     """Global margin dashboard for the operator. Returns total AI spend,
     per-provider breakdown (veo/gemini/whisper/...), video counts
     (done/pending/rejected/error), cost-per-deliverable and a margin
     estimate against `revenue_per_video_usd` (default $8 reflects the
     current Universal contract: $2,000 / 250 videos). Tighter window =
-    fresher signal but noisier, looser window = stable averages."""
+    fresher signal but noisier, looser window = stable averages.
+
+    `since`/`until` dan una ventana EXPLÍCITA. `since_days` cuenta hacia
+    atrás desde hoy y por eso nunca puede alinearse con un mes calendario,
+    que es la unidad en la que facturan los proveedores: el panel de costos
+    lo ponía al lado del gasto facturado de julio mientras esto medía
+    jul-ago. Sin `since` el comportamiento es el de siempre.
+    """
+    from datetime import datetime, timedelta, timezone
     from provenance import cost_dashboard_global
+
+    def _dia(valor: str, campo: str):
+        if not valor.strip():
+            return None
+        try:
+            d = datetime.strptime(valor.strip(), "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(400, f"{campo} inválido, se espera YYYY-MM-DD")
+        return d.replace(tzinfo=timezone.utc)
+
+    desde = _dia(since, "since")
+    # `until` llega como un día INCLUSIVE (así lo piensa quien lo escribe);
+    # la comparación es `< until`, así que se corre un día.
+    hasta = _dia(until, "until")
+    if hasta is not None:
+        hasta = hasta + timedelta(days=1)
+    if desde is not None and hasta is not None and hasta <= desde:
+        raise HTTPException(400, "until tiene que ser >= since")
+
     return cost_dashboard_global(
         db,
         since_days=since_days,
         revenue_per_video_usd=revenue_per_video_usd,
+        since=desde,
+        until=hasta,
     )
 
 
@@ -1247,9 +1278,25 @@ def admin_costs_collect(
 
     Es un disparador manual: el camino normal es el cron. Existe para
     reparar a mano después de un outage sin esperar a la próxima corrida.
+
+    Mismo gate de entorno que `scripts/collect_costs.py`, y por la misma
+    razón: staging tiene TODAS las credenciales de facturación y comparte
+    proyecto GCP, bucket R2 y proyecto Railway con producción. Sin el gate,
+    apretar este botón en staging carga la factura entera de la cuenta en
+    la base de staging, y los dos paneles pasan a reclamar el mismo gasto.
+    El gate estaba en el cron y faltaba acá.
     """
     import cost_daily_collector
 
+    env = os.environ.get("ENVIRONMENT", "").strip().lower()
+    if env != "production" and os.environ.get("COST_COLLECTOR_FORCE") != "1":
+        raise HTTPException(
+            status_code=409,
+            detail=(f"ENVIRONMENT={env!r} no es production. Staging comparte "
+                    "proyecto GCP, bucket R2 y proyecto Railway con prod: "
+                    "colectar acá haría que ambos paneles reclamen el gasto "
+                    "entero de la cuenta. COST_COLLECTOR_FORCE=1 para forzar."),
+        )
     return cost_daily_collector.run_backfill(db, days=days)
 
 
@@ -1338,12 +1385,63 @@ def admin_cost_unit_economics(
             .filter(Job.created_at >= start_dt, Job.created_at < end_dt)
             .scalar() or 0
         )
-        return delivered, created
+        # DE CLIENTE: los mismos entregados, menos CI e I+D interno.
+        #
+        # La clasificación NO se reimplementa acá. Filtrar por
+        # `tenant not in TEAM_TENANTS` parece razonable y descarta el 100%
+        # de las entregas reales: la producción gestionada de UMG corre bajo
+        # `agus77`, `default`, `omg`, `genly` y `tomas@epical.digital`, no
+        # bajo `universal_*`. Medido en ago-2026, ese filtro dejaba 23
+        # canciones de las ≥77 entregadas — el KPI que la pantalla rotula
+        # "el correcto" salía 3,35x arriba del costo real.
+        #
+        # Lo que las distingue de I+D interno es el PORTAL: si la canción
+        # está en `deliveries`, se entregó y se cobró. Por eso el orden de
+        # `clave_facturable` es el mismo de `classify_job`.
+        import cost_attribution as ca
+
+        filas = (
+            session.query(Job.job_id, Job.tenant_id, Job.artist, Job.song_title)
+            .filter(entregado_en >= start_dt, entregado_en < end_dt)
+            .filter(delivered_job_filter())
+            .all()
+        )
+        claves = [
+            ca.clave_facturable(
+                f.tenant_id,
+                # `song_key` cae al job_id cuando artista Y título están
+                # vacíos: sin eso los 31 jobs sin metadata de prod colapsan
+                # en UNA canción que se lleva toda la factura.
+                ca.song_key(f.artist, f.song_title, f.job_id),
+                umg_keys,
+            )
+            for f in filas
+        ]
+        de_cliente = [k for k in claves if k is not None]
+        # La unidad facturable es la CANCIÓN, no el job: una canción
+        # entregada arrastra ~2,87 jobs (variantes, re-renders, ediciones).
+        return delivered, created, len(de_cliente), set(de_cliente)
 
     # Ventana EXPLÍCITA del mes pedido. Con `since_days` la ventana termina
     # hoy, así que pedir junio en agosto medía jul-ago y lo comparaba contra
     # la factura de junio.
-    delivered, created = _count(db)
+    # Las canciones del portal de entregas. Es la única fuente que sabe que
+    # una canción bajo una cuenta del equipo fue trabajo cobrado y no I+D.
+    # El portal vive en producción; `scoped_deliveries_db` rutea solo.
+    import cost_attribution as ca
+    from database import scoped_deliveries_db
+
+    try:
+        with scoped_deliveries_db() as portal_db:
+            umg_keys = set(ca.collect_portal_songs(portal_db)["songs"])
+    except Exception:
+        # Sin portal el denominador queda SUBESTIMADO (la producción
+        # gestionada se descarta como interna), lo que sobre-estima el costo
+        # por canción. Se avisa en la respuesta en vez de fallar la página.
+        umg_keys = set()
+    portal_disponible = bool(umg_keys)
+
+    delivered, created, cliente_jobs, canciones = _count(db)
     counted_environments = 1
     # Una sola base de valuación para los dos entornos: la calibración vive
     # en la base local y la peer no la tiene, así que dejarla cargar la suya
@@ -1354,9 +1452,16 @@ def admin_cost_unit_economics(
                                         rates=_waste_rates)]
     with scoped_peer_db() as peer:
         if peer is not None:
-            d2, c2 = _count(peer)
+            d2, c2, cj2, cc2 = _count(peer)
             delivered += d2
             created += c2
+            cliente_jobs += cj2
+            # UNIÓN, no suma: una canción de producción gestionada puede
+            # tener jobs en los dos entornos y es UNA sola entrega. Sumar
+            # los conteos la contaría dos veces y bajaría el costo a la
+            # mitad. La clave incluye el tenant, así que dos sellos
+            # distintos con el mismo tema siguen siendo dos.
+            canciones |= cc2
             counted_environments = 2
             # El desperdicio también sale de los DOS entornos: la producción
             # gestionada de UMG corre en staging, así que un subárbol local
@@ -1367,37 +1472,101 @@ def admin_cost_unit_economics(
                                      rates=_waste_rates))
     waste = merge_waste_breakdowns(*waste_parts)
 
-    cost_per_delivered = round(real_total / delivered, 4) if delivered else None
-    # Kept only to show the operator how misleading it is next to the real
-    # one — it is the number the old internal doc quoted.
-    cost_per_created = round(real_total / created, 4) if created else None
+    # SIN NINGÚN SNAPSHOT no se divide.
+    #
+    # `cost_snapshots` está vacía en las dos bases —/cost/refresh nunca se
+    # corrió—, así que `real_total` es 0 y esto devolvía
+    # `cost_per_delivered = 0.0` y por lo tanto **margen 100%**, con el
+    # `cost_complete: false` viajando en un campo aparte que nadie mira.
+    # Un 0.0 con nota al pie se lee como buena noticia; un null obliga a
+    # mirar por qué.
+    #
+    # Con dato PARCIAL sí se divide, y el margen se sigue calculando: el
+    # contrato existente lo hace a propósito (ver el test de esta misma
+    # suite que asserta margen negativo con cost_complete=false). Un costo
+    # parcial es un piso, así que el margen que sale es optimista — lo
+    # señala `cost_per_delivered_is_floor` en vez de callarlo.
+    #
+    # Negarse también con dato parcial sería peor que el bug: `github` no
+    # está configurado en ningún entorno, así que `cost_complete` nunca
+    # llega a true y el endpoint quedaría mudo para siempre.
+    cliente_canciones = len(canciones)
+    sin_dato = real_total <= 0
+    if sin_dato:
+        cost_per_delivered = None
+        cost_per_created = None
+        cost_per_client_song = None
+    else:
+        cost_per_delivered = round(real_total / delivered, 4) if delivered else None
+        # Kept only to show the operator how misleading it is next to the real
+        # one — it is the number the old internal doc quoted.
+        cost_per_created = round(real_total / created, 4) if created else None
+        # EL HONESTO: la factura entera dividida por las canciones de
+        # cliente. La factura del proveedor no distingue quién la causó, así
+        # que el gasto de CI y de I+D se reparte entre los videos vendidos —
+        # que es exactamente lo que pasa en el estado de resultados.
+        cost_per_client_song = (
+            round(real_total / cliente_canciones, 4) if cliente_canciones else None
+        )
+    # El margen va contra el costo por CANCIÓN DE CLIENTE. Calcularlo sobre
+    # `cost_per_delivered` —el denominador que este mismo endpoint rotula
+    # como equivocado— hacía que la API y la pantalla dieran márgenes
+    # distintos para el mismo período, y los consumidores no-UI
+    # (`scripts/umg_cost_report.py`, el smoke diario) tomaban el viejo.
+    puede_calcular_margen = cost_per_client_song is not None
 
     return {
         "period": period,
         "real_cost_usd": round(real_total, 2),
         "cost_complete": cost_complete,
         "missing_sources": sorted(set(billing_sources.SOURCES) - have),
-        "videos_delivered": delivered,
-        "videos_created": created,
+        # CUATRO denominadores, con nombre, porque difieren hasta 2,8x y
+        # confundirlos es el error más caro de esta pantalla.
+        "videos_delivered": delivered,          # jobs entregados, incluye CI
+        "videos_created": created,              # jobs creados (engañoso)
+        "delivered_client_jobs": cliente_jobs,  # entregados sin CI ni internos
+        "delivered_client_songs": cliente_canciones,   # ← el que hay que usar
+        "denominator_note": (
+            "videos_delivered incluye barridos de CI (preflight_*, "
+            "golden_render_bot). delivered_client_songs es la unidad "
+            "facturable: una canción arrastra ~2,87 jobs."
+        ),
         # 1 = only this environment was counted while the invoice covers
         # both; the cost per video is then overstated. Check before quoting.
         "counted_environments": counted_environments,
         "cost_per_delivered": cost_per_delivered,
         "cost_per_created_MISLEADING": cost_per_created,
+        # El que hay que usar para cotizar: factura ÷ canciones de cliente.
+        "cost_per_client_song": cost_per_client_song,
         "price_per_video_usd": price_per_video_usd,
+        # Null cuando el costo está incompleto: un margen calculado sobre un
+        # costo parcial sale inflado y es el número que se copia para cotizar.
         "margin_per_video": (
-            round(price_per_video_usd - cost_per_delivered, 4)
-            if cost_per_delivered is not None else None
+            round(price_per_video_usd - cost_per_client_song, 4)
+            if puede_calcular_margen else None
         ),
         "margin_pct": (
-            round((price_per_video_usd - cost_per_delivered)
+            round((price_per_video_usd - cost_per_client_song)
                   / price_per_video_usd, 4)
-            if cost_per_delivered is not None and price_per_video_usd else None
+            if puede_calcular_margen and price_per_video_usd else None
+        ),
+        "cost_per_delivered_is_floor": (
+            cost_per_delivered is not None and not cost_complete
         ),
         "waste": waste,
+        # Sin portal la producción gestionada de UMG se descarta como I+D
+        # interno y el denominador queda corto → el costo por canción sale
+        # SOBRE-estimado. Es lo contrario del error que uno esperaría.
+        "portal_disponible": portal_disponible,
         "note": (
-            "cost_per_delivered usa SOLO videos entregados como denominador. "
-            "Si cost_complete=false, el número es un piso."
+            "margin_per_video usa cost_per_client_song (factura ÷ canciones "
+            "de cliente), no cost_per_delivered, que incluye barridos de CI. "
+            "Sin ningún snapshot de costo sale null: 0/N daría margen 100%. "
+            "Con datos PARCIALES sí se divide y el margen sale optimista — "
+            "lo marca cost_per_delivered_is_floor. `github` no está "
+            "configurado en ningún entorno, así que cost_complete nunca "
+            "llega a true y negarse con dato parcial dejaría el endpoint "
+            "mudo para siempre. Corré POST /admin/cost/refresh."
         ),
     }
 

@@ -91,3 +91,22 @@ describe("MargenTenantsView", () => {
     expect(container.firstChild).toBe(null);
   });
 });
+
+describe("MargenTenantsView: 403 vs todavía cargando", () => {
+  it("un 403 se oculta, no queda girando", () => {
+    // El endpoint exige super-admin. `loading` se derivaba de
+    // `economics == null`, así que un admin sin permiso veía un esqueleto
+    // eterno bajo el título "Margen por tenant" — parecía un cuelgue.
+    const { container } = render(
+      <MargenTenantsView
+        economics={{ __forbidden: true }} loading={false} forbidden
+      />,
+    );
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("distingue no-cargó-todavía de no-te-corresponde", () => {
+    render(<MargenTenantsView economics={null} loading forbidden={false} />);
+    expect(screen.getByText("Margen por tenant")).toBeTruthy();
+  });
+});

@@ -1,9 +1,9 @@
-// Costo de infraestructura, diario y filtrable.
+// Bloque 1 de la página de Costos: lo que los proveedores COBRAN, por día.
 //
-// Muestra lo que los proveedores COBRAN (billing_sources → cost_daily), no
-// el costo modelado que muestra "Costos y márgenes" (ai_provenance × tabla
-// de tarifas). Los dos conviven: el modelado atribuye por job y por tenant,
-// que ninguna factura puede hacer; éste es la verdad pero no se desagrega.
+// Es la factura (billing_sources → cost_daily), no el costo modelado del
+// bloque 3 (ai_provenance × tabla de tarifas). Los dos conviven en la misma
+// página a propósito: el modelado atribuye por job y por tenant, que ninguna
+// factura puede hacer; éste es la verdad pero no se desagrega.
 //
 // LA REGLA VISUAL DE ESTA PANTALLA
 // Un día que el proveedor no contestó se dibuja idéntico a un día barato.
@@ -14,7 +14,7 @@
 import { useMemo, useState } from "react";
 
 import {
-  Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend,
+  Bar, BarChart, CartesianGrid, Legend,
   ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 
@@ -23,14 +23,26 @@ import DataTable from "../../primitives/DataTable";
 import EmptyState from "../../primitives/EmptyState";
 import FilterBar from "../../primitives/FilterBar";
 import KpiCard from "../../primitives/KpiCard";
-import SectionHeader from "../../layout/SectionHeader";
-import { RANGOS } from "./useCostosInfra";
 
-// Paleta de series. Violeta de marca + teal en su paso oscuro (accent.dark,
-// NO accent.DEFAULT: #14C8A8 cae fuera de la banda de luminosidad para
-// fondo oscuro y se lava). El par pasa los chequeos de separación CVD
-// (ΔE 25,5 deuteranopía) contra la superficie #12121A.
-const COLORES = ["#6D4AFF", "#0FA88B", "#FBBF24", "#F87171", "#60A5FA", "#C084FC"];
+// Paleta de series, VALIDADA para 6 slots sobre la superficie oscura
+// (#12121A): banda de luminosidad, piso de croma, separación CVD
+// (peor par adyacente ΔE 8,4 protanopía) y piso de visión normal (19,3).
+//
+// El orden ES el mecanismo de seguridad CVD, no decoración: se asigna en
+// secuencia y NUNCA se cicla. La versión anterior de este archivo usaba
+// #60A5FA y #C084FC en los slots 5 y 6, que dan **ΔE 1,3 en deuteranopía**
+// — indistinguibles. La vista por SKU llega a 6 series, así que eso habría
+// sido ilegible justo donde más detalle hay.
+//
+// Slot 1 es el violeta de marca; del 2 al 6 son pasos elegidos para fondo
+// oscuro, no versiones aclaradas de los de fondo claro.
+const COLORES = ["#6D4AFF", "#d95926", "#199e70", "#c98500", "#d55181", "#008300"];
+
+// Un 7º grupo no genera un color nuevo: se pliega a "Otros". Ocho hues es
+// el límite del sistema y a partir del 4º ya hacen falta etiquetas
+// visibles como canal secundario.
+const MAX_SERIES = 6;
+const OTROS = "__otros__";
 
 const ETIQUETA_FUENTE = {
   gcp: "Google Vertex", railway: "Railway", r2: "Cloudflare R2",
@@ -42,6 +54,7 @@ const ETIQUETA_COMPORTAMIENTO = {
 };
 
 function nombre(grupo, groupBy) {
+  if (grupo === OTROS) return "Otros";
   if (groupBy === "source") return ETIQUETA_FUENTE[grupo] || grupo;
   if (groupBy === "behavior") return ETIQUETA_COMPORTAMIENTO[grupo] || grupo;
   return grupo;
@@ -109,19 +122,41 @@ function BannerCobertura({ cobertura, onColectar, colectando }) {
 }
 
 export default function CostosInfraView({
-  data, loading, rango, setRango, granularity, setGranularity,
+  data, loading, granularity, setGranularity,
   groupBy, setGroupBy, colectar, colectando, since, until,
 }) {
   const [verTabla, setVerTabla] = useState(false);
 
-  const grupos = useMemo(
-    () => Object.keys(data?.by_group || {}), [data]);
+  // El backend ya devuelve `by_group` ordenado por costo descendente. Los
+  // primeros MAX_SERIES-1 conservan su color; el resto se pliega en "Otros".
+  // Un 7º grupo NO recibe un hue generado: ocho hues es el límite del
+  // sistema y ciclarlos haría que dos series distintas compartan color.
+  const { grupos, plegados } = useMemo(() => {
+    const todos = Object.keys(data?.by_group || {});
+    if (todos.length <= MAX_SERIES) return { grupos: todos, plegados: [] };
+    return {
+      grupos: [...todos.slice(0, MAX_SERIES - 1), OTROS],
+      plegados: todos.slice(MAX_SERIES - 1),
+    };
+  }, [data]);
 
   // Recharts quiere un objeto plano por bucket con una clave por serie.
-  const datosGrafico = useMemo(() => (data?.series || []).map((b) => ({
-    bucket: b.bucket,
-    ...Object.fromEntries(grupos.map((g) => [g, b.by[g] ?? 0])),
-  })), [data, grupos]);
+  const datosGrafico = useMemo(() => (data?.series || []).map((b) => {
+    const fila = { bucket: b.bucket };
+    for (const g of grupos) {
+      fila[g] = g === OTROS
+        ? plegados.reduce((a, p) => a + (b.by[p] ?? 0), 0)
+        : (b.by[g] ?? 0);
+    }
+    return fila;
+  }), [data, grupos, plegados]);
+
+  const totalPorGrupo = useMemo(() => Object.fromEntries(grupos.map((g) => [
+    g,
+    g === OTROS
+      ? plegados.reduce((a, p) => a + (data.by_group[p] ?? 0), 0)
+      : data.by_group[g],
+  ])), [data, grupos, plegados]);
 
   const incompleto = data && !data.coverage?.complete;
   const diasConDato = data?.series?.length || 0;
@@ -129,30 +164,13 @@ export default function CostosInfraView({
 
   if (!loading && !data) {
     return <EmptyState title="Sin datos de costo"
-                       hint="Todavía no se recolectó nada para este rango." />;
+                       message="Todavía no se recolectó nada para este rango." />;
   }
 
   return (
     <div>
-      <SectionHeader
-        title="Costo de infraestructura"
-        subtitle="Lo que cobran los proveedores, por día. Distinto del costo modelado de “Costos y márgenes”."
-        right={
-          <button
-            onClick={colectar}
-            disabled={colectando}
-            className="text-caption px-3 py-1.5 rounded-lg glass hover:bg-white/[0.06] disabled:opacity-40 transition-colors"
-          >
-            {colectando ? "Recolectando…" : "Recolectar"}
-          </button>
-        }
-      />
 
       <FilterBar>
-        <FilterBar.Chips
-          label="Rango" value={rango} onChange={setRango}
-          options={RANGOS.map((r) => ({ id: r.id, label: r.label }))}
-        />
         <FilterBar.Select
           label="Grano" value={granularity} onChange={setGranularity}
           options={[
@@ -264,8 +282,12 @@ export default function CostosInfraView({
                     )}
                   />
                   {grupos.map((g, i) => (
+                    // El separador entre segmentos es un trazo del COLOR DE
+                    // LA SUPERFICIE, no un borde: el espacio negativo es lo
+                    // que separa, y un borde agregaría tinta que no es dato.
                     <Bar key={g} dataKey={g} stackId="c"
-                         fill={COLORES[i % COLORES.length]}
+                         fill={COLORES[i]}
+                         stroke="#0B0B10" strokeWidth={1}
                          radius={i === grupos.length - 1 ? [4, 4, 0, 0] : 0} />
                   ))}
                 </BarChart>
@@ -293,8 +315,9 @@ export default function CostosInfraView({
             loading={loading}
             rowKey={(r) => r.grupo}
             rows={grupos.map((g) => ({
-              grupo: g, monto: data.by_group[g],
-              share: data.total_usd ? data.by_group[g] / data.total_usd : 0,
+              grupo: g, monto: totalPorGrupo[g],
+              share: data.total_usd ? totalPorGrupo[g] / data.total_usd : 0,
+              detalle: g === OTROS ? plegados : null,
             }))}
             empty={<EmptyState title="Sin costo en el rango" />}
             columns={[
@@ -303,8 +326,13 @@ export default function CostosInfraView({
                 render: (r) => (
                   <span className="flex items-center gap-2">
                     <span className="w-2.5 h-2.5 rounded-sm shrink-0"
-                          style={{ background: COLORES[grupos.indexOf(r.grupo) % COLORES.length] }} />
+                          style={{ background: COLORES[grupos.indexOf(r.grupo)] }} />
                     {nombre(r.grupo, groupBy)}
+                    {r.detalle && (
+                      <span className="text-label text-gray-600">
+                        ({r.detalle.length} más)
+                      </span>
+                    )}
                   </span>
                 ),
               },
@@ -314,7 +342,7 @@ export default function CostosInfraView({
                   <div className="h-1.5 rounded-full bg-white/[0.06] overflow-hidden w-28">
                     <div className="h-full rounded-full"
                          style={{ width: `${Math.max(2, r.share * 100)}%`,
-                                  background: COLORES[grupos.indexOf(r.grupo) % COLORES.length] }} />
+                                  background: COLORES[grupos.indexOf(r.grupo)] }} />
                   </div>
                 ),
               },

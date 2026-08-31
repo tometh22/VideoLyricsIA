@@ -245,15 +245,19 @@ export default function InsightsSection({ subTab = "resumen" }) {
         <QualityLearningPanel />
       ) : subTab === "margen" ? (
         nav.level === "app" ? (
-          <MargenTenantsView economics={economics} loading={!economics} forbidden={false} />
+          <MargenTenantsView
+            economics={economics}
+            loading={economics === null}
+            forbidden={!!economics?.__forbidden}
+          />
         ) : (
           <MargenTenantsView
-            economics={economics && {
+            economics={economics && !economics.__forbidden && {
               ...economics,
               tenants: (economics.tenants || []).filter((t) => t.tenant_id === nav.tenantId),
             }}
-            loading={!economics}
-            forbidden={false}
+            loading={economics === null}
+            forbidden={!!economics?.__forbidden}
           />
         )
       ) : (
