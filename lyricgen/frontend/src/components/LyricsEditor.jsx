@@ -1746,6 +1746,10 @@ export default function LyricsEditor({
   const rowRefs = useRef({});
   const rafRef = useRef(null);
   const playbackTimeRef = useRef(0);
+  const audioPlayingRef = useRef(false);
+  const previousAudioUrlRef = useRef(audioUrl);
+  const pendingAudioRecoveryRef = useRef(null);
+  const autoRecoveryAttemptedUrlRef = useRef(null);
   const guidedPlaybackRangeRef = useRef(null);
   const lastPublishedTimeRef = useRef(-Infinity);
   const lastPublishedActiveIdRef = useRef(null);
@@ -1758,6 +1762,17 @@ export default function LyricsEditor({
   const [guidedPlayingWindowId, setGuidedPlayingWindowId] = useState(null);
 
   useEffect(() => {
+    if (previousAudioUrlRef.current && previousAudioUrlRef.current !== audioUrl) {
+      // A proactive signed-URL renewal swaps `src`. Preserve the operator's
+      // exact timing position (and playback intent) across that transparent
+      // media reload instead of jumping back to 0:00.
+      pendingAudioRecoveryRef.current ||= {
+        time: playbackTimeRef.current,
+        shouldPlay: audioPlayingRef.current,
+      };
+    }
+    previousAudioUrlRef.current = audioUrl;
+    autoRecoveryAttemptedUrlRef.current = null;
     setAudioError(false);
     setAudioMetadataReady(false);
     setDuration(0);
@@ -4007,8 +4022,27 @@ export default function LyricsEditor({
             const mediaDuration = Number(e.currentTarget.duration);
             setDuration(Number.isFinite(mediaDuration) && mediaDuration > 0 ? mediaDuration : 0);
             setAudioMetadataReady(Number.isFinite(mediaDuration) && mediaDuration > 0);
+            const recovery = pendingAudioRecoveryRef.current;
+            pendingAudioRecoveryRef.current = null;
+            if (recovery && Number.isFinite(recovery.time) && recovery.time > 0) {
+              const restoredTime = Number.isFinite(mediaDuration) && mediaDuration > 0
+                ? Math.min(recovery.time, Math.max(0, mediaDuration - 0.05))
+                : recovery.time;
+              try {
+                e.currentTarget.currentTime = restoredTime;
+                playbackTimeRef.current = restoredTime;
+                lastPublishedTimeRef.current = restoredTime;
+                setCurrentTime(restoredTime);
+              } catch { /* a non-seekable source will emit its own media error */ }
+              if (recovery.shouldPlay) {
+                e.currentTarget.play().catch(() => {});
+              }
+            }
           }}
-          onPlay={() => setIsPlaying(true)}
+          onPlay={() => {
+            audioPlayingRef.current = true;
+            setIsPlaying(true);
+          }}
           onPause={(e) => {
             const time = e.currentTarget.currentTime;
             guidedPlaybackRangeRef.current = null;
@@ -4016,6 +4050,7 @@ export default function LyricsEditor({
             playbackTimeRef.current = time;
             lastPublishedTimeRef.current = time;
             setCurrentTime(time);
+            audioPlayingRef.current = false;
             setIsPlaying(false);
           }}
           onEnded={(e) => {
@@ -4025,13 +4060,44 @@ export default function LyricsEditor({
             playbackTimeRef.current = time;
             lastPublishedTimeRef.current = time;
             setCurrentTime(time);
+            audioPlayingRef.current = false;
             setIsPlaying(false);
           }}
-          onError={() => {
+          onError={(event) => {
+            const media = event.currentTarget;
+            const failedAt = Number(media.currentTime) || playbackTimeRef.current || 0;
+            const mediaErrorCode = media.error?.code || null;
+            const shouldResume = audioPlayingRef.current;
             guidedPlaybackRangeRef.current = null;
             setGuidedPlayingWindowId(null);
             setAudioError(true);
+            audioPlayingRef.current = false;
             setIsPlaying(false);
+            trackEditorEvent("editor_audio_playback_failed", {
+              position_ms: Math.round(failedAt * 1_000),
+              media_error_code: mediaErrorCode,
+              automatic_recovery_available: !!onRetryAudio,
+            });
+            // This used to be a handled DOM event only, so Sentry stayed green
+            // while operators lost audio. The tagged warning is forwarded by
+            // observability.js (throttled) without exposing the signed URL.
+            console.warn("[editor-audio] playback failed; renewing signed source", {
+              job_id: transcribeJobId || null,
+              position_ms: Math.round(failedAt * 1_000),
+              media_error_code: mediaErrorCode,
+              automatic_recovery_available: !!onRetryAudio,
+            });
+            if (onRetryAudio && autoRecoveryAttemptedUrlRef.current !== audioUrl) {
+              autoRecoveryAttemptedUrlRef.current = audioUrl;
+              pendingAudioRecoveryRef.current = { time: failedAt, shouldPlay: shouldResume };
+              Promise.resolve(onRetryAudio({ reason: "media_error", mediaErrorCode }))
+                .catch((error) => {
+                  console.warn("[editor-audio] automatic renewal failed", {
+                    job_id: transcribeJobId || null,
+                    error: error?.message || String(error),
+                  });
+                });
+            }
           }}
         />
       )}
