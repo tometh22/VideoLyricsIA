@@ -39,8 +39,8 @@ from __future__ import annotations
 # (`editor_documents.original_segments`), no una reconstrucción.
 RAW_TRUSTED = frozenset({"exact"})
 
-# Degradadas el 2026-08-30. Conservan su crudo en disco para diagnóstico, pero
-# NO pueden alimentar ninguna métrica.
+# Excluidas de métricas el 2026-08-31. Conservan su etiqueta de procedencia y
+# su crudo en disco para diagnóstico, pero NO pueden alimentar ningún gate.
 RAW_DIAGNOSTIC_ONLY = frozenset({"reconstructed", "estimated"})
 
 RAW_ABSENT = frozenset({"none"})

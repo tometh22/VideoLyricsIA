@@ -76,8 +76,8 @@ def test_require_raw_trusted_falla_fuerte_en_vez_de_recortar():
     assert "b" in str(exc.value)
 
 
-def test_el_manifest_real_quedo_degradado():
-    """El corpus en disco debe reflejar 23 / 42 / 8, no la clasificación vieja."""
+def test_el_manifest_preserva_procedencia_y_solo_exact_es_confiable():
+    """Excluir de métricas no debe borrar cómo se obtuvo cada baseline."""
     import json
 
     manifest = EVAL_DIR / "golden" / "manifest.json"
@@ -85,11 +85,7 @@ def test_el_manifest_real_quedo_degradado():
         pytest.skip("corpus no extraído en este worktree")
     counts = json.loads(manifest.read_text())["raw_quality_counts"]
     assert counts.get("exact") == 23
-    # 18 reconstructed + 16 estimated = 34. (No 42: eso sumaria 73 de 65.)
-    assert counts.get("estimated") == 34, (
-        "las 18 'reconstructed' deben estar degradadas dentro de 'estimated', "
-        "sumando 34 con las 16 que ya lo eran")
+    assert counts.get("reconstructed") == 18
+    assert counts.get("estimated") == 16
     assert sum(counts.values()) == 65
     assert counts.get("none") == 8
-    assert not counts.get("reconstructed"), (
-        "'reconstructed' ya no es una categoría válida del corpus")
