@@ -70,6 +70,7 @@ const NAV = [
       { id: "fondos", label: "Biblioteca de fondos" },
       { id: "compliance", label: "Compliance UMG" },
       { id: "costos", label: "Costos y márgenes" },
+      { id: "infra", label: "Costo de infra" },
       { id: "facturacion", label: "Facturación" },
       { id: "creditos", label: "Créditos de regalo" },
     ],
