@@ -20,7 +20,6 @@ import cost_daily_collector as cdc
 from cost_daily_collector import (
     DayResult,
     _check_dims_sum_to_total,
-    _month_minutes,
     _persist,
     collect_day,
     pending_gaps,
@@ -33,19 +32,99 @@ from database import CostCollectionRun, CostDaily
 # El bug de 26,9x
 # ---------------------------------------------------------------------------
 
-def test_month_minutes_uses_the_month_not_the_window():
-    """31 días = 44.640 min; febrero no bisiesto = 40.320."""
-    assert _month_minutes(date(2026, 8, 15)) == 31 * 24 * 60
-    assert _month_minutes(date(2026, 2, 10)) == 28 * 24 * 60
-    assert _month_minutes(date(2028, 2, 10)) == 29 * 24 * 60   # bisiesto
+def test_railway_no_divide_por_ninguna_ventana():
+    """La tarifa es por MINUTO, igual que en la factura de Railway.
+
+    Historia de este cálculo, que se equivocó dos veces en la misma línea:
+
+    1. Dividía por los minutos de la VENTANA. En grano diario eso daba
+       **26,9x de más**: Σ7 días = $613,51 contra $101,14 del mes.
+    2. Pasó a dividir por los minutos del MES. Corregía el 26,9x pero
+       dejaba ±3% según el mes tuviera 28, 30 o 31 días.
+
+    Las dos versiones existían para convertir unidad-minuto → unidad-mes, y
+    esa conversión nunca hizo falta: la UI de Railway dice "Metrics are
+    shown as minutely accumulated values" y su Bill Breakdown cobra
+    $0,000231/GB/minuto. Sin división no hay denominador que errar.
+
+    Este test fija esa propiedad: mismo consumo por minuto ⇒ mismo costo,
+    caiga en febrero o en un mes de 31 días.
+    """
+    import billing_sources as bs
+
+    GB_MIN = 1000.0
+    esperado = (GB_MIN * bs.RAILWAY_RATES_PER_UNIT_MONTH["MEMORY_USAGE_GB"]
+                / bs.RAILWAY_MINUTES_PER_BILLED_MONTH)
+
+    def _corrida(monkeypatch, day):
+        monkeypatch.setenv("RAILWAY_API_TOKEN", "t")
+        monkeypatch.setenv("RAILWAY_PROJECT_ID", "p")
+        cdc._RAILWAY_SERVICE_NAMES.clear()
+
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"data": {"usage": [
+                    {"measurement": "MEMORY_USAGE_GB", "value": GB_MIN,
+                     "tags": {"serviceId": "svc"}}]}}
+
+        import requests
+        monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp())
+        res = cdc._railway_day(day)
+        return next(r["amount_usd"] for r in res.rows if r["dim_type"] == "total")
+
+    with pytest.MonkeyPatch.context() as mp:
+        feb = _corrida(mp, date(2026, 2, 10))
+    with pytest.MonkeyPatch.context() as mp:
+        ago = _corrida(mp, date(2026, 8, 10))
+
+    # `_row` redondea el monto a 6 decimales.
+    assert feb == pytest.approx(esperado, abs=1e-6)
+    assert ago == pytest.approx(esperado, abs=1e-6)
+    assert feb == ago, "el largo del mes no puede cambiar el precio"
+
+
+def test_tarifas_de_railway_son_las_del_bill_breakdown():
+    """Reproducen el "Bill Breakdown" del dashboard, ciclo 20-jul→20-ago-2026.
+
+    No se asertan las tarifas redondeadas que muestra la UI (0,000231) sino
+    las LÍNEAS de la factura, que es lo que tiene que cuadrar. La tarifa
+    exacta es mensual ÷ 43200 y coincide a 7 cifras.
+
+    Si Railway cambia precios esto falla y avisa, que es mejor que el panel
+    valorizando meses enteros a la tarifa vieja en silencio.
+    """
+    import billing_sources as bs
+
+    # El mes facturable son 30 días fijos, no el mes real. Ésa es la
+    # constante que las dos versiones anteriores erraron.
+    assert bs.RAILWAY_MINUTES_PER_BILLED_MONTH == 43200
+    assert bs.RAILWAY_USD_PER_EGRESS_GB == 0.05
+
+    # La línea de la factura: 440390,97 GB-minuto → $101,9424.
+    assert (440390.97 * bs.RAILWAY_RATES_PER_UNIT_MINUTE["MEMORY_USAGE_GB"]
+            == pytest.approx(101.9424, abs=0.001))
+    # 24435,87 vCPU-minuto → $11,3129.
+    assert (24435.87 * bs.RAILWAY_RATES_PER_UNIT_MINUTE["CPU_USAGE"]
+            == pytest.approx(11.3129, abs=0.001))
+    # 1649,23 GB de egress → $82,4616.
+    assert (1649.23 * bs.RAILWAY_USD_PER_EGRESS_GB
+            == pytest.approx(82.4616, abs=0.001))
 
 
 def test_railway_daily_sums_to_the_month_not_31x_it(monkeypatch):
     """Σ(31 días) tiene que dar el mes, no 31 veces el mes.
 
-    Este es EL test del módulo. Con la fórmula de `fetch_railway` (dividir
-    por los minutos de la ventana), 8 GB residentes darían $10 por día y
-    $310 en el mes, cuando el mes real son $10.
+    Este es EL test del módulo. Dividiendo por los minutos de la VENTANA,
+    8 GB residentes daban $10 por día y $310 en el mes.
+
+    Ojo con la expectativa: **no** son $80. Railway cobra contra un mes
+    facturable de 30 días fijos, así que 31 días de 8 GB son
+    8 × 44640 GB-min × ($10 / 43200) = **$82,67**, un 3,3% más que un mes
+    de 30. Eso no es un error de redondeo nuestro: es lo que la factura
+    dice. La versión anterior de este test asertaba $80 porque dividía por
+    el largo REAL del mes, y con esa expectativa el test habría rechazado
+    el cálculo correcto.
     """
     RESIDENTES_GB = 8.0
     monkeypatch.setenv("RAILWAY_API_TOKEN", "t")
@@ -71,8 +150,13 @@ def test_railway_daily_sums_to_the_month_not_31x_it(monkeypatch):
         assert res.status == "ok"
         total += next(r["amount_usd"] for r in res.rows if r["dim_type"] == "total")
 
-    # 8 GB residentes todo el mes × $10/GB-mes = $80. Ni $2.480 ni $2,58.
-    assert total == pytest.approx(RESIDENTES_GB * 10.0, rel=1e-6)
+    import billing_sources as bs
+    esperado = (RESIDENTES_GB * 1440 * 31
+                * bs.RAILWAY_RATES_PER_UNIT_MONTH["MEMORY_USAGE_GB"]
+                / bs.RAILWAY_MINUTES_PER_BILLED_MONTH)
+    assert esperado == pytest.approx(82.67, abs=0.01)
+    # Ni $2.480 (dividir por la ventana) ni $2,58 (dividir de más).
+    assert total == pytest.approx(esperado, rel=1e-6)
 
 
 def test_railway_empty_window_is_error_not_zero(monkeypatch):

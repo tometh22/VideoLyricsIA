@@ -80,16 +80,6 @@ class DayResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _month_minutes(d: date) -> int:
-    """Minutes in the calendar month `d` belongs to.
-
-    The denominator for every Railway unit-minute → unit-month conversion.
-    Using the window length instead is the 26.9x bug described above; using
-    a fixed 43200 skews every month that is not 30 days.
-    """
-    return calendar.monthrange(d.year, d.month)[1] * 24 * 60
-
-
 def _row(dim_type: str, dim_value: str, amount: float | None, *,
          qty: float | None = None, unit: str | None = None,
          behavior: str | None = None, basis: str = "measured",
@@ -232,7 +222,6 @@ def _railway_day(day: date) -> DayResult:
         return DayResult("railway", day, "error", [],
                          "la API no devolvió uso para ese día")
 
-    minutes = _month_minutes(day)
     nombres = _railway_service_names(token, project_id) if project_id else {}
     per_service: dict[str, float] = {}
     per_measure: dict[str, tuple[float, float, str]] = {}
@@ -246,19 +235,24 @@ def _railway_day(day: date) -> DayResult:
         if m == "NETWORK_TX_GB":
             cost, units, unit = raw * bs.RAILWAY_USD_PER_EGRESS_GB, raw, "GB"
         else:
-            rate = bs.RAILWAY_RATES_PER_UNIT_MONTH.get(m)
+            rate = bs.RAILWAY_RATES_PER_UNIT_MINUTE.get(m)
             if rate is None:
                 continue
-            # ← el fix: minutos del MES, no de la ventana
-            units = raw / minutes
-            cost, unit = units * rate, "unidad-mes"
+            # La métrica YA viene en unidad-minutos y la tarifa es por
+            # unidad-minuto: no hay ninguna división por ventana, así que
+            # tampoco hay forma de equivocarla. La versión original dividía
+            # por los minutos de la VENTANA (26,9x de más en grano diario);
+            # la siguiente por los del MES, que corregía el 26,9x pero
+            # dejaba ±3% según el mes tuviera 28, 30 o 31 días.
+            units, cost, unit = raw, raw * rate, "unidad-minuto"
         per_service[svc] = per_service.get(svc, 0.0) + cost
         prev = per_measure.get(m, (0.0, 0.0, unit))
         per_measure[m] = (prev[0] + cost, prev[1] + units, unit)
 
     total = sum(per_service.values())
     rows = [_row("total", "total", total, behavior="fijo", estimate=True,
-                 detail=f"métricas × tarifas publicadas ÷ {minutes} min del mes")]
+                 detail="métricas unidad-minuto × tarifas por minuto del "
+                        "Bill Breakdown de Railway")]
     # Por MEDICIÓN: memoria/CPU/disco vs egress.
     for m, (cost, units, unit) in per_measure.items():
         # El compute es capacidad residente: se acumula haya o no renders,

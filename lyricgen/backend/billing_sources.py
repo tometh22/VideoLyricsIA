@@ -359,8 +359,30 @@ def _gcp_credentials() -> str:
 #
 # Resource metrics come back as unit-MINUTES accumulated over the window
 # (e.g. MEMORY_USAGE_GB is GB-minutes), except NETWORK_TX_GB which is a
-# flow already expressed in GB. Validated against the jun-2026 invoice:
-# this model produced $126.02 against $124.54 actually billed (1.2% off).
+# flow already expressed in GB. La propia UI de Railway lo dice: "Metrics
+# are shown as minutely accumulated values".
+#
+# EL MES FACTURABLE DE RAILWAY SON 30 DÍAS FIJOS, NO EL MES REAL.
+#
+# Las tarifas mensuales de acá abajo siempre estuvieron bien; lo que estaba
+# mal era el denominador. Derivado del "Bill Breakdown" del dashboard
+# (ciclo 20-jul→20-ago-2026), que coincide a 7 cifras:
+#
+#   memoria  101,9424 / 440390,97 GB-min = 0,000231482 = 10   / 43200
+#   cpu       11,3129 /  24435,87 vCPU-min = 0,000462963 = 20  / 43200
+#   volumen    1,3267 / 382099,00 GB-min = 0,000003472 = 0,15 / 43200
+#   backup     0,1026 /  29545,52 GB-min = 0,000003473 = 0,15 / 43200
+#
+# Esta línea se equivocó dos veces seguidas:
+#   1. Dividía por los minutos de la VENTANA → 26,9x de más en grano diario
+#      (Σ7 días = $613,51 contra $101,14 del mes).
+#   2. Pasó a dividir por los minutos del MES REAL, que corregía el 26,9x
+#      pero dejaba ±3% en meses de 28 o 31 días. Un agosto de 31 días se
+#      valorizaba 3,2% barato.
+# Railway cobra contra 43200 minutos siempre, tenga el mes los días que
+# tenga. Por eso es una constante y no `calendar.monthrange`.
+RAILWAY_MINUTES_PER_BILLED_MONTH = 43200          # 30 días × 24 h × 60 min
+
 RAILWAY_RATES_PER_UNIT_MONTH = {
     "CPU_USAGE": float(os.environ.get("RAILWAY_USD_PER_VCPU_MONTH", "20.0")),
     "MEMORY_USAGE_GB": float(os.environ.get("RAILWAY_USD_PER_GB_MONTH", "10.0")),
@@ -368,6 +390,13 @@ RAILWAY_RATES_PER_UNIT_MONTH = {
     "EPHEMERAL_DISK_USAGE_GB": 0.0,     # included in the plan
     "BACKUP_USAGE_GB": float(os.environ.get("RAILWAY_USD_PER_BACKUP_GB_MONTH", "0.15")),
 }
+
+# Lo que se usa para valorizar: por unidad-MINUTO, igual que la factura.
+RAILWAY_RATES_PER_UNIT_MINUTE = {
+    m: r / RAILWAY_MINUTES_PER_BILLED_MONTH
+    for m, r in RAILWAY_RATES_PER_UNIT_MONTH.items()
+}
+
 # Charged per GB transferred, not per GB-month.
 RAILWAY_USD_PER_EGRESS_GB = float(os.environ.get("RAILWAY_USD_PER_EGRESS_GB", "0.05"))
 
@@ -487,12 +516,14 @@ def fetch_railway(period: str) -> SourceCost:
             cost = raw_value * RAILWAY_USD_PER_EGRESS_GB
             units, unit_label = raw_value, "GB transferidos"
         else:
-            rate = RAILWAY_RATES_PER_UNIT_MONTH.get(measurement)
+            rate = RAILWAY_RATES_PER_UNIT_MINUTE.get(measurement)
             if rate is None:
                 continue
-            units = raw_value / minutes_in_period      # unit-minutes → unit-months
-            cost = units * rate
-            unit_label = "unidad-mes"
+            # Directo: la métrica YA viene en unidad-minutos y la tarifa es
+            # por unidad-minuto. Sin dividir por la ventana no hay forma de
+            # que el largo del período distorsione el precio.
+            units, cost = raw_value, raw_value * rate
+            unit_label = "unidad-minuto"
         total += cost
         breakdown.append({
             "measurement": measurement,
