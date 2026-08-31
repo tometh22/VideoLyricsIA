@@ -9,6 +9,7 @@ const MAX_RETRY_AFTER_MS = 60_000;
 const DEFAULT_URL_EXPIRY_SECONDS = 3_600;
 const URL_REFRESH_SAFETY_MS = 5 * 60_000;
 const MIN_URL_REFRESH_DELAY_MS = 5_000;
+export const PROACTIVE_URL_RETRY_MS = 30_000;
 
 export function isTransientAudioFailure(response) {
   const status = response?.status;
@@ -35,6 +36,36 @@ export function audioUrlRefreshDelayMs(expiresInSeconds) {
     ? parsed * 1_000
     : DEFAULT_URL_EXPIRY_SECONDS * 1_000;
   return Math.max(MIN_URL_REFRESH_DELAY_MS, expiryMs - URL_REFRESH_SAFETY_MS);
+}
+
+// A preventive renewal runs while the current URL still has a five-minute
+// safety window. If the API is temporarily unavailable, fail open: keep the
+// known-good source and retry shortly. Initial loads and recovery after an
+// actual media error still fail closed so the UI can offer its manual retry.
+export function editorAudioFailureState(previous, {
+  reason,
+  failureReason = "temporary",
+  now = Date.now,
+} = {}) {
+  if (
+    reason === "signed_url_expiring"
+    && failureReason === "temporary"
+    && previous?.audioUrl
+  ) {
+    return {
+      ...previous,
+      audioLoading: false,
+      audioUnavailableReason: null,
+      audioRefreshAt: now() + PROACTIVE_URL_RETRY_MS,
+    };
+  }
+  return {
+    ...previous,
+    audioUrl: null,
+    audioLoading: false,
+    audioUnavailableReason: failureReason,
+    audioRefreshAt: null,
+  };
 }
 
 /**
