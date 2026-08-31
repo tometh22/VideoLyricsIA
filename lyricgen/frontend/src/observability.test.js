@@ -9,6 +9,7 @@
 import { describe, expect, it } from "vitest";
 import {
   consoleTagOf,
+  consoleEventLevel,
   consoleTitleFromArgs,
   shouldForwardConsoleEvent,
 } from "./observability";
@@ -25,6 +26,17 @@ describe("consoleTagOf", () => {
     expect(consoleTagOf("Failed prop type")).toBe(null);
     expect(consoleTagOf("")).toBe(null);
     expect(consoleTagOf(undefined)).toBe(null);
+  });
+});
+
+describe("consoleEventLevel", () => {
+  it("eleva cada outcome de audio a error sin compartir el throttle por tag", () => {
+    expect(consoleEventLevel("editor-audio")).toBe("error");
+    expect(consoleEventLevel("editor-audio-load")).toBe("error");
+    expect(consoleEventLevel("editor-audio-renewal")).toBe("error");
+    expect(consoleEventLevel("editor-audio-resume")).toBe("error");
+    expect(consoleEventLevel("ui-freeze")).toBe("error");
+    expect(consoleEventLevel("wizard")).toBe("warning");
   });
 });
 

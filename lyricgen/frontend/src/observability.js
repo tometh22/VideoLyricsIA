@@ -99,17 +99,25 @@ export function consoleTitleFromArgs(args, maxLen = 500) {
 const _TAG_THROTTLE_MS = 60_000;
 const _lastSentByTag = new Map();
 
-// Tags that signal a UI freeze / render-storm (P0 UMG Chile 2026-06-16). These
-// escalate to `error` level in beforeSend so Sentry's replaysOnErrorSampleRate
-// (1.0) records a Session Replay of the moment — a watchable clip of the freeze
-// instead of just a counter. Everything else stays `warning` (no replay).
-const _FREEZE_TAGS = new Set([
+// Diagnostics that must page as errors instead of remaining warning-only.
+// Replay capture has its own SDK sampling rules; severity here is for issue
+// visibility and alert rules, not a promise that every console event has replay.
+const _ERROR_TAGS = new Set([
   "ui-freeze",
   "reseed-storm",
   "render-storm",
   "editor-reload-loop",
   "ui-longtask-burst",
+  // Loss of the editor's media source blocks timing work just like a UI freeze.
+  "editor-audio",
+  "editor-audio-load",
+  "editor-audio-renewal",
+  "editor-audio-resume",
 ]);
+
+export function consoleEventLevel(tag) {
+  return _ERROR_TAGS.has(tag) ? "error" : "warning";
+}
 
 // Benign lifecycle chatter, not diagnostics — forwarding these only clutters
 // the Sentry issue list and buries real errors. "[auto-update] new build
@@ -186,12 +194,9 @@ export function initSentry() {
         const { forward, tag } = shouldForwardConsoleEvent(msg);
         if (!forward) return null;
         event.fingerprint = ["console-tag", tag];
-        // Freeze/storm diagnostics escalate to `error` so replaysOnErrorSampleRate
-        // (1.0) records a Session Replay of the ~60s leading up to the freeze —
-        // turning the operator's "se traba / titila" into a watchable clip with
-        // the exact action sequence (P0 UMG Chile 2026-06-16). Other tagged
-        // diagnostics stay `warning` (no replay, saves quota).
-        event.level = _FREEZE_TAGS.has(tag) ? "error" : "warning";
+        // Operationally blocking diagnostics escalate to `error` so Sentry
+        // alert rules see them. Other tagged diagnostics remain warnings.
+        event.level = consoleEventLevel(tag);
         // captureConsoleIntegration renders object args as "[object
         // Object]" in the title (safeJoin), hiding the diagnostic
         // payload. Rebuild the title from the captured args with real
