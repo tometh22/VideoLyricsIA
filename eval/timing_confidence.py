@@ -26,6 +26,7 @@ from sklearn.model_selection import LeaveOneGroupOut
 from eval.bootstrap import song_bootstrap_ci
 from eval.canonical import read_json, write_json
 from eval.metrics import normalize_text
+from eval.raw_cohort import RAW_TRUSTED
 
 
 TARGET_EDGE_MS = 150.0
@@ -92,7 +93,7 @@ def _vad_density(path: Path, start_s: float, end_s: float) -> float:
 def _metadata(golden: Path) -> dict[str, dict[str, Any]]:
     result = {}
     for item in read_json(golden / "manifest.json")["cases"]:
-        if item["raw_quality"] not in {"exact", "reconstructed"}:
+        if item["raw_quality"] not in RAW_TRUSTED:
             continue
         meta = read_json(golden / item["path"] / "meta.json")
         result[item["song_id"]] = {**meta, "case_path": item["path"]}

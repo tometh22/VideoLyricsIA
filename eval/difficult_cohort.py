@@ -18,6 +18,7 @@ from lingua import Language, LanguageDetectorBuilder
 
 from eval.canonical import read_json, segments_to_lines, write_json
 from eval.metrics import score_song
+from eval.raw_cohort import RAW_TRUSTED
 
 
 HARD_WER = 0.10
@@ -124,7 +125,7 @@ def build(golden: Path, output: Path) -> dict[str, Any]:
             "difficult_gold": None,
             "difficulty_reasons": [],
         }
-        if item["raw_quality"] in {"exact", "reconstructed"} and (case / "raw_pipeline_output.json").is_file():
+        if item["raw_quality"] in RAW_TRUSTED and (case / "raw_pipeline_output.json").is_file():
             raw = segments_to_lines(read_json(case / "raw_pipeline_output.json")["segments"])
             metrics, _alignment, _errors = score_song(item["song_id"], approved, raw)
             row.update({

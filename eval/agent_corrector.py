@@ -29,6 +29,7 @@ from typing import Any, Iterable, Sequence
 
 from eval.canonical import read_json, segments_to_lines, write_json
 from eval.metrics import align_lines, normalize_text
+from eval.raw_cohort import RAW_TRUSTED
 
 
 CATEGORIES = ("text", "timing", "vocalization")
@@ -220,7 +221,7 @@ def prepare(
     manifest = read_json(golden / "manifest.json")
     allowed = {
         item["song_id"]: item for item in manifest["cases"]
-        if item["raw_quality"] in {"exact", "reconstructed"}
+        if item["raw_quality"] in RAW_TRUSTED
     }
     for song_id, zone_rows in sorted(by_song.items()):
         item = allowed.get(song_id)

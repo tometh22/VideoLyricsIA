@@ -23,6 +23,7 @@ from lingua import Language, LanguageDetectorBuilder
 from eval.bootstrap import song_bootstrap_ci
 from eval.canonical import read_json, segments_to_lines, write_json
 from eval.metrics import error_rate_counts, main_text, normalize_text
+from eval.raw_cohort import RAW_TRUSTED
 
 
 _TEXT_LID = LanguageDetectorBuilder.from_languages(Language.SPANISH, Language.ENGLISH).build()
@@ -464,7 +465,7 @@ def evaluate(
     cases = {row["song_id"]: row for row in cohort["cases"]}
     rows = []
     for song_id, label in cases.items():
-        if label["raw_quality"] not in {"exact", "reconstructed"}:
+        if label["raw_quality"] not in RAW_TRUSTED:
             continue
         case = golden / song_id
         approved = read_json(case / "approved.json")
@@ -499,7 +500,7 @@ def evaluate(
         for row in mono if row["candidate"]["wer"] > row["baseline"]["wer"] + 1e-12
     ]
     detected_mixed = set((read_json(lid_path) if lid_path.is_file() else {}).get("mixed_song_ids") or [])
-    comparable_labels = [row for row in cases.values() if row["raw_quality"] in {"exact", "reconstructed"}]
+    comparable_labels = [row for row in cases.values() if row["raw_quality"] in RAW_TRUSTED]
     false_positive_routes = [
         row["song_id"] for row in comparable_labels
         if not row["text_language_gold"]["is_es_en_code_switch"] and row["song_id"] in detected_mixed

@@ -130,3 +130,10 @@ eval-nonhistorical:
 
 eval-from-snapshot:
 	PYTHONPATH=. $(PYTHON) -m eval.build_from_snapshot --snapshot "$(SNAPSHOT)" --output "$(GOLDEN)"
+
+# Chequeo semanal: produccion sigue guardando el crudo exacto de cada job?
+# Es la unica via para que la cohorte limpia (hoy 23 de 65) crezca. Si esto
+# se rompe el sintoma es invisible: los jobs se aprueban igual y meses despues
+# descubris que la cohorte no crecio.
+check-raw-coverage:
+	@python3 -m eval.check_raw_coverage --days 7 --min-pct 100

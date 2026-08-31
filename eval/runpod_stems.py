@@ -73,6 +73,7 @@ PYTHON_BIN="$VENV/bin/python"
 import hashlib, json, subprocess, sys, time
 from pathlib import Path
 import soundfile as sf
+from eval.raw_cohort import RAW_TRUSTED
 
 root = Path("dataset")
 destination = Path("results")
@@ -150,7 +151,7 @@ def _pending(golden: Path, cache: Path) -> list[dict[str, Any]]:
     cached = {row["song_id"]: row for row in cache_manifest["cases"]}
     rows = []
     for item in golden_manifest["cases"]:
-        if item["raw_quality"] not in {"exact", "reconstructed"}:
+        if item["raw_quality"] not in RAW_TRUSTED:
             continue
         if cached.get(item["song_id"], {}).get("status") == "downloaded":
             continue

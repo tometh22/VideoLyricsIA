@@ -20,6 +20,7 @@ from pathlib import Path
 import soundfile as sf
 
 from eval.canonical import read_json, write_json
+from eval.raw_cohort import RAW_TRUSTED
 
 
 def _sha256(path: Path) -> str:
@@ -39,7 +40,7 @@ def run(golden: Path, cache: Path, device: str, limit: int | None) -> dict:
         item for item in golden_manifest["cases"]
         if case_records.get(item["song_id"], {}).get("status") != "downloaded"
         and read_json(golden / item["path"] / "meta.json").get("raw_quality")
-        in {"exact", "reconstructed"}
+        in RAW_TRUSTED
     ]
     pending.sort(key=lambda item: float(
         read_json(golden / item["path"] / "meta.json").get("duration_s") or float("inf")

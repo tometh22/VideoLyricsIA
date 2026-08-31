@@ -15,6 +15,7 @@ from typing import Any
 from eval.bootstrap import song_bootstrap_ci
 from eval.canonical import read_json, write_json
 from eval.metrics import normalize_text
+from eval.raw_cohort import RAW_TRUSTED
 
 
 def _repeat_rows(golden: Path, word_errors: Path) -> list[dict[str, Any]]:
@@ -27,7 +28,7 @@ def _repeat_rows(golden: Path, word_errors: Path) -> list[dict[str, Any]]:
     for item in manifest["cases"]:
         case = golden / item["path"]
         meta = read_json(case / "meta.json")
-        if meta.get("raw_quality") not in {"exact", "reconstructed"}:
+        if meta.get("raw_quality") not in RAW_TRUSTED:
             continue
         lines = read_json(case / "lines.json")
         counts = Counter(normalize_text(line.get("text") or "") for line in lines)

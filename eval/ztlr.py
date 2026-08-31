@@ -17,6 +17,7 @@ from typing import Any, Sequence
 from eval.bootstrap import song_bootstrap_ci
 from eval.canonical import read_json, segments_to_lines, write_json
 from eval.metrics import align_lines, normalize_text
+from eval.raw_cohort import RAW_TRUSTED
 
 
 NET_UNTOUCHED_TOLERANCE_S = 0.001
@@ -142,7 +143,7 @@ def main() -> int:
     parser.add_argument("--golden", type=Path, default=Path("eval/golden"))
     parser.add_argument("--output", type=Path, default=Path("eval/runs/ztlr_baseline/report.json"))
     args = parser.parse_args()
-    report = calculate(args.golden.resolve(), args.output.resolve(), {"exact", "reconstructed"})
+    report = calculate(args.golden.resolve(), args.output.resolve(), RAW_TRUSTED)
     print(json.dumps({key: report[key] for key in ("songs", "work_units", "zero_touch_lines", "ztlr", "ztlr_song_bootstrap_ci", "category_counts", "minutes")}, indent=2))
     return 0
 

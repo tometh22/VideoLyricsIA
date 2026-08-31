@@ -18,6 +18,7 @@ from sklearn.model_selection import GroupKFold
 
 from eval.bootstrap import song_bootstrap_ci
 from eval.canonical import read_json
+from eval.raw_cohort import RAW_TRUSTED
 
 
 def _number(value: Any) -> float:
@@ -33,7 +34,7 @@ def build_dataset(golden: Path) -> list[dict[str, Any]]:
     for item in manifest["cases"]:
         case = golden / item["path"]
         meta = read_json(case / "meta.json")
-        if meta["raw_quality"] not in {"exact", "reconstructed"}:
+        if meta["raw_quality"] not in RAW_TRUSTED:
             continue
         raw = read_json(case / "raw_pipeline_output.json")["segments"]
         edits = read_json(case / "edits.json")

@@ -20,6 +20,7 @@ import numpy as np
 from eval.bootstrap import song_bootstrap_ci
 from eval.canonical import read_json, segments_to_lines, write_json
 from eval.metrics import align_lines, error_rate_counts, full_text, normalize_text
+from eval.raw_cohort import RAW_TRUSTED
 
 
 def rms_vad_boundaries(
@@ -203,7 +204,7 @@ def run(
     import whisper
 
     manifest = read_json(golden / "manifest.json")
-    cases = [item for item in manifest["cases"] if item["raw_quality"] in {"exact", "reconstructed"}]
+    cases = [item for item in manifest["cases"] if item["raw_quality"] in RAW_TRUSTED]
     if song_ids:
         cases = [item for item in cases if item["song_id"] in song_ids]
     if limit is not None:

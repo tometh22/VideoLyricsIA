@@ -21,6 +21,7 @@ from sklearn.model_selection import GroupKFold
 from eval.bootstrap import percentile, song_bootstrap_ci
 from eval.canonical import read_json, write_json
 from eval.metrics import normalize_text
+from eval.raw_cohort import RAW_TRUSTED
 
 
 def _mean(values: np.ndarray) -> float:
@@ -429,7 +430,7 @@ def main() -> int:
     parser.add_argument("--golden", type=Path, default=Path("eval/golden"))
     parser.add_argument("--output", type=Path, default=Path("eval/runs/t4_learned_v2"))
     args = parser.parse_args()
-    dataset = build_datasets(args.golden.resolve(), {"exact", "reconstructed"})
+    dataset = build_datasets(args.golden.resolve(), RAW_TRUSTED)
     report = train(dataset, args.output.resolve())
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0

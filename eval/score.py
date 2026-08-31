@@ -15,6 +15,7 @@ from eval.metrics import (
     NORMALIZATION_VERSION, aggregate_edit_effort, aggregate_song_metrics,
     score_edit_effort, score_song,
 )
+from eval.raw_cohort import RAW_TRUSTED
 
 
 def _hypothesis(golden_case: Path, variant: str, hypothesis_root: Path | None) -> list[dict[str, Any]] | None:
@@ -78,7 +79,7 @@ def run(golden: Path, variant: str, output: Path, hypothesis_root: Path | None =
             effort["raw_quality"] = meta["raw_quality"]
             edit_effort.append(effort)
 
-    exact_reconstructed = [row for row in rows if row["raw_quality"] in {"exact", "reconstructed"}]
+    exact_reconstructed = [row for row in rows if row["raw_quality"] in RAW_TRUSTED]
     all_historical = [row for row in rows if row["raw_quality"] in {"exact", "reconstructed", "estimated"}]
     summary = {
         "schema_version": 1,

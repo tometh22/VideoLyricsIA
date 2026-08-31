@@ -19,6 +19,7 @@ import numpy as np
 
 from eval.bootstrap import song_bootstrap_ci
 from eval.canonical import read_json, segments_to_lines, write_json
+from eval.raw_cohort import RAW_TRUSTED
 
 
 def _csv(path: Path) -> list[dict[str, str]]:
@@ -50,7 +51,7 @@ def _load_rows(golden: Path, predictor: Path, timing: Path) -> list[dict[str, An
     raw_by_song: dict[str, list[dict[str, Any]]] = {}
     duration_by_song: dict[str, float] = {}
     for item in manifest["cases"]:
-        if item["raw_quality"] not in {"exact", "reconstructed"}:
+        if item["raw_quality"] not in RAW_TRUSTED:
             continue
         case = golden / item["path"]
         raw_by_song[item["song_id"]] = segments_to_lines(read_json(case / "raw_pipeline_output.json")["segments"])

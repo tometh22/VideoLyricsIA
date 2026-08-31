@@ -13,6 +13,7 @@ from pathlib import Path
 import boto3
 
 from eval.canonical import read_json, write_json
+from eval.raw_cohort import RAW_TRUSTED
 
 
 def _sha256(path: Path) -> str:
@@ -48,7 +49,7 @@ def download(golden: Path, output: Path) -> dict:
     for item in manifest["cases"]:
         case = golden / item["path"]
         meta = read_json(case / "meta.json")
-        if meta["raw_quality"] not in {"exact", "reconstructed"}:
+        if meta["raw_quality"] not in RAW_TRUSTED:
             continue
         song_id = item["song_id"]
         prefix = f"stems/{meta['audio']['sha256']}_mdx_extra_"

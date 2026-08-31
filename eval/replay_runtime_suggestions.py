@@ -21,6 +21,7 @@ from typing import Any
 
 from eval.bootstrap import song_bootstrap_ci
 from eval.canonical import read_json, write_json
+from eval.raw_cohort import RAW_TRUSTED
 
 
 RUNTIME_PATH = "lyricgen/backend/timing_review_suggestions.py"
@@ -72,7 +73,7 @@ def run(
     for item in manifest["cases"]:
         case = golden / item["path"]
         meta = read_json(case / "meta.json")
-        if meta.get("raw_quality") not in {"exact", "reconstructed"}:
+        if meta.get("raw_quality") not in RAW_TRUSTED:
             continue
         song_id = item["song_id"]
         stem_record = stem_records.get(song_id) or {}
@@ -147,7 +148,7 @@ def run(
         "gold_leakage": False,
         "gold_usage": "scoring only after proposals are frozen",
         "eligible_songs": sum(
-            (read_json(golden / item["path"] / "meta.json").get("raw_quality") in {"exact", "reconstructed"})
+            (read_json(golden / item["path"] / "meta.json").get("raw_quality") in RAW_TRUSTED)
             for item in manifest["cases"]
         ),
         "replayed_songs": len(rows),

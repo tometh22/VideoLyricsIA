@@ -14,6 +14,7 @@ from typing import Any, Sequence
 from eval.bootstrap import percentile, song_bootstrap_ci
 from eval.canonical import read_json, segments_to_lines, write_json
 from eval.metrics import NORMALIZATION_VERSION, normalize_text, score_song
+from eval.raw_cohort import RAW_TRUSTED
 
 INTERJECTIONS = {
     "ah", "ay", "eh", "ey", "oh", "uh", "uy", "yeah", "hey", "wow",
@@ -308,7 +309,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("eval/runs/prod_raw/autopsy"))
     parser.add_argument("--include-estimated", action="store_true")
     args = parser.parse_args()
-    qualities = {"exact", "reconstructed"}
+    qualities = RAW_TRUSTED
     if args.include_estimated:
         qualities.add("estimated")
     report = analyze(args.golden.resolve(), args.output.resolve(), qualities)
