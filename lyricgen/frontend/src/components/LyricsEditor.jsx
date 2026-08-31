@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect, useCallback } from "react";
+import { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
@@ -1710,6 +1710,7 @@ export default function LyricsEditor({
   // <audio> element in the DOM still references it — playback dies a few
   // seconds in once the initial buffered range is consumed.
   const [blobAudioUrl, setBlobAudioUrl] = useState(null);
+  const [localAudioFailed, setLocalAudioFailed] = useState(false);
 
   // Blob URL lifecycle — only re-runs when audioFile changes.
   useEffect(() => {
@@ -1734,21 +1735,33 @@ export default function LyricsEditor({
     };
   }, [audioFile]);
 
+  useEffect(() => {
+    setLocalAudioFailed(false);
+  }, [blobAudioUrl]);
+
   // A real local Blob is the most stable source for the upload session. The
   // durable R2 URL often arrives a few seconds after transcription; replacing
   // `src` at that moment resets the media element and used to cut playback at
   // ~3 seconds. Resumed jobs have no Blob and correctly use the signed URL.
-  const audioUrl = blobAudioUrl || audioUrlProp;
+  const usingLocalAudio = !!blobAudioUrl && !localAudioFailed;
+  const audioUrl = usingLocalAudio ? blobAudioUrl : audioUrlProp;
   const audioTemporarilyUnavailable = !audioUrl && audioUnavailableReason === "temporary";
 
   const audioRef = useRef(null);
+  const lastMountedAudioRef = useRef(null);
+  const setAudioElementRef = useCallback((element) => {
+    audioRef.current = element;
+    if (element) lastMountedAudioRef.current = element;
+  }, []);
   const listRef = useRef(null);
   const rowRefs = useRef({});
   const rafRef = useRef(null);
   const playbackTimeRef = useRef(0);
   const audioPlayingRef = useRef(false);
   const previousAudioUrlRef = useRef(audioUrl);
+  const previousAudioLoadingRef = useRef(audioLoading);
   const pendingAudioRecoveryRef = useRef(null);
+  const sourceSwapInProgressRef = useRef(false);
   const autoRecoveryAttemptedUrlRef = useRef(null);
   const guidedPlaybackRangeRef = useRef(null);
   const lastPublishedTimeRef = useRef(-Infinity);
@@ -1761,14 +1774,46 @@ export default function LyricsEditor({
   const [audioMetadataReady, setAudioMetadataReady] = useState(false);
   const [guidedPlayingWindowId, setGuidedPlayingWindowId] = useState(null);
 
-  useEffect(() => {
-    if (previousAudioUrlRef.current && previousAudioUrlRef.current !== audioUrl) {
-      // A proactive signed-URL renewal swaps `src`. Preserve the operator's
-      // exact timing position (and playback intent) across that transparent
-      // media reload instead of jumping back to 0:00.
-      pendingAudioRecoveryRef.current ||= {
+  // Capture playback intent as soon as a renewal starts, while the old source
+  // is still mounted and before resource selection can emit a synthetic pause.
+  useLayoutEffect(() => {
+    const wasLoading = previousAudioLoadingRef.current;
+    if (audioLoading && !previousAudioLoadingRef.current && audioUrl) {
+      pendingAudioRecoveryRef.current = {
         time: playbackTimeRef.current,
-        shouldPlay: audioPlayingRef.current,
+        shouldPlay: pendingAudioRecoveryRef.current?.shouldPlay ?? audioPlayingRef.current,
+      };
+    }
+    // A preventive failure keeps the same src. Discard the provisional
+    // snapshot so the next attempt captures the then-current playhead/intent.
+    if (
+      !audioLoading && wasLoading
+      && previousAudioUrlRef.current === audioUrl
+      && !sourceSwapInProgressRef.current
+    ) {
+      if (audioError && pendingAudioRecoveryRef.current && audioRef.current) {
+        // Presigning twice inside the same timestamp can legally return the
+        // same URL string. After a real media error, force resource selection
+        // so React equality does not leave the element in its failed state.
+        sourceSwapInProgressRef.current = true;
+        audioRef.current.load();
+      } else {
+        pendingAudioRecoveryRef.current = null;
+      }
+    }
+    previousAudioLoadingRef.current = audioLoading;
+  }, [audioError, audioLoading, audioUrl]);
+
+  useLayoutEffect(() => {
+    if (previousAudioUrlRef.current && previousAudioUrlRef.current !== audioUrl && audioUrl) {
+      // A proactive signed-URL renewal swaps `src`. Preserve the operator's
+      // latest timing position across that transparent media reload. Keep the
+      // explicit play/pause intent captured during the request, before the src
+      // mutation can emit a synthetic pause event.
+      sourceSwapInProgressRef.current = true;
+      pendingAudioRecoveryRef.current = {
+        time: playbackTimeRef.current,
+        shouldPlay: pendingAudioRecoveryRef.current?.shouldPlay ?? audioPlayingRef.current,
       };
     }
     previousAudioUrlRef.current = audioUrl;
@@ -2601,13 +2646,13 @@ export default function LyricsEditor({
     });
   }, [duration, guidedPlayingWindowId, stopGuidedPlayback, trackEditorEvent, waveform?.duration]);
 
-  useEffect(() => {
-    const mountedAudio = audioRef.current;
-    return () => {
-      if (mountedAudio) mountedAudio.pause();
-      guidedPlaybackRangeRef.current = null;
-    };
-  }, [audioUrl]);
+  useEffect(() => () => {
+    // Removing the media element stops playback. Do not call pause() on every
+    // src change: React reuses the element, so that cleanup could pause the
+    // freshly renewed source after recovery had already resumed it.
+    lastMountedAudioRef.current?.pause();
+    guidedPlaybackRangeRef.current = null;
+  }, []);
 
   useEffect(() => {
     if (viewMode !== "advanced" || timingWorkspaceMode !== "guided") stopGuidedPlayback();
@@ -4008,7 +4053,7 @@ export default function LyricsEditor({
       {/* Hidden audio element drives playback. */}
       {audioUrl && (
         <audio
-          ref={audioRef}
+          ref={setAudioElementRef}
           src={audioUrl}
           onTimeUpdate={(e) => {
             const time = e.currentTarget.currentTime;
@@ -4020,11 +4065,14 @@ export default function LyricsEditor({
           }}
           onLoadedMetadata={(e) => {
             const mediaDuration = Number(e.currentTarget.duration);
+            setAudioError(false);
+            autoRecoveryAttemptedUrlRef.current = null;
             setDuration(Number.isFinite(mediaDuration) && mediaDuration > 0 ? mediaDuration : 0);
             setAudioMetadataReady(Number.isFinite(mediaDuration) && mediaDuration > 0);
             const recovery = pendingAudioRecoveryRef.current;
             pendingAudioRecoveryRef.current = null;
-            if (recovery && Number.isFinite(recovery.time) && recovery.time > 0) {
+            sourceSwapInProgressRef.current = false;
+            if (recovery && Number.isFinite(recovery.time) && recovery.time >= 0) {
               const restoredTime = Number.isFinite(mediaDuration) && mediaDuration > 0
                 ? Math.min(recovery.time, Math.max(0, mediaDuration - 0.05))
                 : recovery.time;
@@ -4035,12 +4083,20 @@ export default function LyricsEditor({
                 setCurrentTime(restoredTime);
               } catch { /* a non-seekable source will emit its own media error */ }
               if (recovery.shouldPlay) {
-                e.currentTarget.play().catch(() => {});
+                e.currentTarget.play().catch((error) => {
+                  console.warn("[editor-audio-resume] resume after renewal was blocked", {
+                    job_id: transcribeJobId || null,
+                    error_name: error?.name || "unknown",
+                  });
+                });
               }
             }
           }}
           onPlay={() => {
             audioPlayingRef.current = true;
+            if (pendingAudioRecoveryRef.current && !sourceSwapInProgressRef.current) {
+              pendingAudioRecoveryRef.current.shouldPlay = true;
+            }
             setIsPlaying(true);
           }}
           onPause={(e) => {
@@ -4051,6 +4107,12 @@ export default function LyricsEditor({
             lastPublishedTimeRef.current = time;
             setCurrentTime(time);
             audioPlayingRef.current = false;
+            if (pendingAudioRecoveryRef.current && !sourceSwapInProgressRef.current) {
+              pendingAudioRecoveryRef.current = {
+                time,
+                shouldPlay: false,
+              };
+            }
             setIsPlaying(false);
           }}
           onEnded={(e) => {
@@ -4068,15 +4130,19 @@ export default function LyricsEditor({
             const failedAt = Number(media.currentTime) || playbackTimeRef.current || 0;
             const mediaErrorCode = media.error?.code || null;
             const shouldResume = audioPlayingRef.current;
+            const failedLocalAudio = usingLocalAudio && audioUrl === blobAudioUrl;
+            const canRecover = !!onRetryAudio || (failedLocalAudio && !!audioUrlProp);
             guidedPlaybackRangeRef.current = null;
             setGuidedPlayingWindowId(null);
             setAudioError(true);
             audioPlayingRef.current = false;
             setIsPlaying(false);
+            if (autoRecoveryAttemptedUrlRef.current === audioUrl) return;
+            autoRecoveryAttemptedUrlRef.current = audioUrl;
             trackEditorEvent("editor_audio_playback_failed", {
               position_ms: Math.round(failedAt * 1_000),
-              media_error_code: mediaErrorCode,
-              automatic_recovery_available: !!onRetryAudio,
+              media_error_code: Number(mediaErrorCode) || 0,
+              automatic_recovery_available: canRecover,
             });
             // This used to be a handled DOM event only, so Sentry stayed green
             // while operators lost audio. The tagged warning is forwarded by
@@ -4085,16 +4151,17 @@ export default function LyricsEditor({
               job_id: transcribeJobId || null,
               position_ms: Math.round(failedAt * 1_000),
               media_error_code: mediaErrorCode,
-              automatic_recovery_available: !!onRetryAudio,
+              automatic_recovery_available: canRecover,
+              source: failedLocalAudio ? "local_blob" : "remote",
             });
-            if (onRetryAudio && autoRecoveryAttemptedUrlRef.current !== audioUrl) {
-              autoRecoveryAttemptedUrlRef.current = audioUrl;
-              pendingAudioRecoveryRef.current = { time: failedAt, shouldPlay: shouldResume };
+            pendingAudioRecoveryRef.current = { time: failedAt, shouldPlay: shouldResume };
+            if (failedLocalAudio) setLocalAudioFailed(true);
+            if (onRetryAudio) {
               Promise.resolve(onRetryAudio({ reason: "media_error", mediaErrorCode }))
                 .catch((error) => {
-                  console.warn("[editor-audio] automatic renewal failed", {
+                  console.warn("[editor-audio-renewal] automatic renewal failed", {
                     job_id: transcribeJobId || null,
-                    error: error?.message || String(error),
+                    error_name: error?.name || "unknown",
                   });
                 });
             }
