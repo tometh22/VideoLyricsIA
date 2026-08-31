@@ -604,6 +604,32 @@ def cancel_rq_job(job_id: str) -> bool:
     return True
 
 
+def rq_job_is_active(job_id: str) -> bool | None:
+    """True=RQ todavia lo sirve; False=ausente/terminal; None=desconocido.
+
+    El tercer estado es deliberado: un reaper nunca debe interpretar una
+    caida de Redis como evidencia de que un job desaparecio y matar trabajo
+    que simplemente sigue en cola.
+    """
+    if not job_id:
+        return False
+    connection, _, _ = _init_redis()
+    if connection is None:
+        return None
+    try:
+        from rq.job import Job as RQJob
+        from rq.exceptions import NoSuchJobError
+        existing = RQJob.fetch(job_id, connection=connection)
+        status = existing.get_status(refresh=True)
+        value = str(getattr(status, "value", status) or "").lower()
+        return value in {"queued", "started", "deferred", "scheduled"}
+    except NoSuchJobError:
+        return False
+    except Exception as exc:
+        logger.warning("RQ liveness check failed for %s: %s", job_id, exc)
+        return None
+
+
 def _evict_stale_rq_job(connection, rq_job_id: str) -> None:
     """Delete any RQ Job with `rq_job_id` from Redis before re-enqueueing.
 
