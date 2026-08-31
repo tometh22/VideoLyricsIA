@@ -12093,6 +12093,7 @@ async def reject_job(
 async def get_source_audio_url(
     job_id: str,
     request: Request,
+    prefer_original: bool = Query(False),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -12105,15 +12106,22 @@ async def get_source_audio_url(
     editor sessions.
 
     Resolution order:
-      1. `input_r2_key` (original uploaded MP3/WAV) — best quality.
-      2. `s3_keys["video"]` (rendered HD MP4) — fallback when the
+      1. content-addressed editor AAC preview (when ready).
+      2. `input_r2_key` (original uploaded MP3/WAV) — safe fallback and the
+         only source used by the final render.
+      3. `s3_keys["video"]` (rendered HD MP4) — fallback when the
          original is gone (lifecycle GC, very old job, or one of the
          duplicate-job-bug casualties). Browsers play the audio track
          out of an <audio src="...mp4"> just fine, no client change
          needed. The response sets `source="video"` + `fallback=true`
          so the UI can show a "playing audio from rendered video" badge.
-      3. `s3_keys["short"]` (vertical/short MP4) — second fallback.
-      4. Nothing exists → 404 with a re-upload message.
+      4. `s3_keys["short"]` (vertical/short MP4) — second fallback.
+      5. Nothing exists → 404 with a re-upload message.
+
+    ``prefer_original=1`` is a non-persistent client-side escape hatch: if a
+    browser reports that a preview cannot be decoded, it gets a fresh signed
+    URL for the original without disabling preview generation for other
+    editors. It is intentionally not stored in the job row.
 
     HOTFIX FASE 2 — 2026-05-27: previously this only checked
     input_r2_key, so jobs whose original was lost (the duplicate-job
@@ -12137,6 +12145,74 @@ async def get_source_audio_url(
         raise HTTPException(status_code=404, detail="Job not found")
     _audit_cross_tenant_access(db, current_user, job, "source_audio")
 
+    preview_status = "unavailable"
+    preview_pending = False
+    # Do not probe the large master before a ready preview. A transient R2
+    # failure on the master must not delay a cached editor session; the
+    # original is only needed for queueing or fallback.
+    input_available = None
+    # The digest is populated by the transcription worker after validating the
+    # uploaded bytes. If it is absent (legacy rows), do not download a 43 MB
+    # source in the API just to discover it: preserve the old original path.
+    if (
+        not prefer_original
+        and re.fullmatch(r"[0-9a-fA-F]{64}", str(job.input_audio_sha256 or ""))
+    ):
+        from queue_jobs import enqueue_editor_audio_preview
+
+        preview_key = storage.editor_audio_preview_key(job.input_audio_sha256)
+        preview_exists = storage.object_exists(preview_key)
+        if preview_exists:
+            preview_url = storage.generate_signed_url(
+                preview_key,
+                expiry_seconds=3600,
+                response_content_type="audio/mp4",
+            )
+            if preview_url:
+                _audit_media_access(
+                    current_user, job_id, "source_audio",
+                    action="job.source_audio_access", source="editor_preview", request=request,
+                )
+                return {
+                    "url": preview_url,
+                    "expires_in": 3600,
+                    "source": "editor_preview",
+                    "fallback": False,
+                    "preview_status": "ready",
+                }
+            preview_status = "unavailable"
+        else:
+            # Kept below the preview HEAD so a cache hit never depends on the
+            # availability/latency of the original object's HEAD request.
+            input_available = bool(
+                job.input_r2_key and storage.object_exists(job.input_r2_key)
+            )
+            if input_available:
+                try:
+                    queued = enqueue_editor_audio_preview(
+                        job.input_r2_key,
+                        str(job.input_audio_sha256).strip().lower(),
+                        preview_key,
+                    )
+                    preview_status = "pending" if queued.get("status") in {
+                        "queued", "pending",
+                    } else "unavailable"
+                    preview_pending = preview_status == "pending"
+                except Exception as exc:
+                    # Preview is an optimization. Keep the original editor
+                    # path alive when Redis, R2, or the worker fleet is
+                    # degraded.
+                    logger.warning(
+                        "[EDITOR-AUDIO-PREVIEW] enqueue unavailable job=%s reason=%s",
+                        job_id, type(exc).__name__,
+                    )
+                    preview_status = "unavailable"
+
+    if input_available is None:
+        input_available = bool(
+            job.input_r2_key and storage.object_exists(job.input_r2_key)
+        )
+
     # 1. Try the original audio first (best quality, no render artifacts).
     #
     # HOTFIX 2026-05-27: presign is unconditional (it just signs a URL
@@ -12148,7 +12224,7 @@ async def get_source_audio_url(
     # (one-shot per session) and is exactly the diagnostic agus.cafisi
     # needed for his 26 jobs with set-but-DEAD input_r2_key (lifecycle
     # GC after 30 d retention purged the originals).
-    if job.input_r2_key and storage.object_exists(job.input_r2_key):
+    if input_available:
         extension = os.path.splitext(job.input_r2_key)[1].lower()
         content_type = {
             ".wav": "audio/wav",
@@ -12176,6 +12252,9 @@ async def get_source_audio_url(
                 "expires_in": 3600,
                 "source": "input",
                 "fallback": False,
+                "preview_status": preview_status,
+                "preview_pending": preview_pending,
+                "preview_retry_after_seconds": 5 if preview_pending else None,
             }
         # Storage signed-URL helper returned None (storage disabled mid-
         # request, etc.). Fall through to render fallback rather than
@@ -12213,6 +12292,7 @@ async def get_source_audio_url(
                     "expires_in": 3600,
                     "source": source_type,
                     "fallback": True,
+                    "preview_status": "unavailable",
                 }
 
     # 4. Neither original nor any rendered MP4 — operator must re-upload.

@@ -1071,6 +1071,9 @@ function EditLyricsRoute({
         filename: job.filename || job.artist || "lyrics",
         file: null,
         audioUrl: null,           // populated by Phase B
+        audioSource: null,
+        audioPreviewPending: false,
+        audioPreviewRetryAt: null,
         audioLoading: true,       // Phase B en vuelo → el editor muestra
                                   // "Cargando audio…" en vez de "no disponible"
         // `temporary` means the API/R2 path was unavailable, NOT that the
@@ -1155,8 +1158,11 @@ function EditLyricsRoute({
       // is a false claim: the DB could not validate the session long enough to
       // presign the R2 object. Respect the server's Retry-After, preserve the
       // local draft, and keep a user-initiated retry available afterwards.
-      retryAudio = async ({ reason = "initial" } = {}) => {
+      retryAudio = async ({ reason = "initial", preferOriginal = false } = {}) => {
         const preventive = reason === "signed_url_expiring";
+        const previewPoll = reason === "preview_pending";
+        const useOriginal = preferOriginal || reason === "media_error";
+        const nonBlocking = preventive || previewPoll;
         // A real media error has priority over the clock-driven refresh. Do not
         // let a later timer invalidate an in-flight recovery for broken audio.
         if (preventive && reactiveAudioRequestInFlight) return;
@@ -1168,7 +1174,7 @@ function EditLyricsRoute({
             ...prev,
             // A preventive refresh must not cover the timing workspace with a
             // loading state while the current URL (or local Blob) still works.
-            audioLoading: preventive && prev.audioUrl ? false : true,
+            audioLoading: nonBlocking && prev.audioUrl ? false : true,
             audioUnavailableReason: null,
           };
         });
@@ -1177,7 +1183,7 @@ function EditLyricsRoute({
           // short cap turns pool backpressure into a recoverable UI state
           // instead of holding the timing screen on a spinner for a minute.
           request: () => authFetchWithTimeout(
-            `${API}/jobs/${id}/source-audio-url`,
+            `${API}/jobs/${id}/source-audio-url${useOriginal ? "?prefer_original=1" : ""}`,
             { cache: "no-store" },
             8_000,
           ),
@@ -1199,12 +1205,31 @@ function EditLyricsRoute({
         setCurrentReview((prev) => {
           if (!prev || prev.editingJobId !== id) return prev;
           if (result.ok) {
+            const resultSource = result.source || prev.audioSource || "input";
+            const keepCurrentSource = previewPoll
+              && prev.audioUrl
+              && prev.audioSource !== "editor_preview"
+              && resultSource !== "editor_preview";
+            const previewPending = !useOriginal && result.previewStatus === "pending";
             return {
               ...prev,
-              audioUrl: result.url,
+              audioUrl: keepCurrentSource ? prev.audioUrl : result.url,
+              audioSource: keepCurrentSource ? prev.audioSource : resultSource,
               audioLoading: false,
               audioUnavailableReason: null,
+              audioPreviewPending: previewPending,
+              audioPreviewRetryAt: previewPending
+                ? Date.now() + Math.max(1, result.previewRetryAfterSeconds || 5) * 1_000
+                : null,
               audioRefreshAt: Date.now() + audioUrlRefreshDelayMs(result.expiresIn),
+            };
+          }
+          if (nonBlocking && prev.audioUrl && result.reason === "temporary") {
+            return {
+              ...prev,
+              audioLoading: false,
+              audioUnavailableReason: null,
+              audioPreviewRetryAt: previewPoll ? Date.now() + PROACTIVE_URL_RETRY_MS : prev.audioPreviewRetryAt,
             };
           }
           return editorAudioFailureState(prev, {
@@ -1500,6 +1525,9 @@ function VariantWizardRoute({
         filename: job.filename || job.artist || "lyrics",
         file: null,
         audioUrl: null,           // Fase B
+        audioSource: null,
+        audioPreviewPending: false,
+        audioPreviewRetryAt: null,
         waveform: null,           // Fase B
         bgUrl: null,              // Fase B
         ...initialFields,
@@ -1703,9 +1731,12 @@ export default function App() {
   // transient API/DB failure never strands the timing editor without audio.
   const reviewAudioRequestSequenceRef = useRef(0);
   const reviewReactiveAudioRequestRef = useRef(false);
-  const retryTranscriptionReviewAudio = useCallback(async (jobId, { reason = "initial" } = {}) => {
+  const retryTranscriptionReviewAudio = useCallback(async (jobId, { reason = "initial", preferOriginal = false } = {}) => {
     if (!jobId) return;
     const preventive = reason === "signed_url_expiring";
+    const previewPoll = reason === "preview_pending";
+    const useOriginal = preferOriginal || reason === "media_error";
+    const nonBlocking = preventive || previewPoll;
     if (preventive && reviewReactiveAudioRequestRef.current) return;
     const requestSequence = ++reviewAudioRequestSequenceRef.current;
     if (!preventive) reviewReactiveAudioRequestRef.current = true;
@@ -1713,14 +1744,14 @@ export default function App() {
       previous?.transcribeJobId === jobId
         ? {
           ...previous,
-          audioLoading: preventive && previous.audioUrl ? false : true,
+          audioLoading: nonBlocking && previous.audioUrl ? false : true,
           audioUnavailableReason: null,
         }
         : previous
     ));
     const result = await loadEditorAudio({
       request: () => authFetchWithTimeout(
-        `${API}/jobs/${jobId}/source-audio-url`,
+        `${API}/jobs/${jobId}/source-audio-url${useOriginal ? "?prefer_original=1" : ""}`,
         { cache: "no-store" },
         8_000,
       ),
@@ -1741,18 +1772,35 @@ export default function App() {
     }
     setCurrentReview((previous) => {
       if (previous?.transcribeJobId !== jobId) return previous;
-      return result.ok
-        ? {
+      if (result.ok) {
+        const resultSource = result.source || previous.audioSource || "input";
+        const keepCurrentSource = previewPoll
+          && previous.audioUrl
+          && previous.audioSource !== "editor_preview"
+          && resultSource !== "editor_preview";
+        const previewPending = !useOriginal && result.previewStatus === "pending";
+        return {
           ...previous,
-          audioUrl: result.url,
+          audioUrl: keepCurrentSource ? previous.audioUrl : result.url,
+          audioSource: keepCurrentSource ? previous.audioSource : resultSource,
           audioLoading: false,
           audioUnavailableReason: null,
+          audioPreviewPending: previewPending,
+          audioPreviewRetryAt: previewPending
+            ? Date.now() + Math.max(1, result.previewRetryAfterSeconds || 5) * 1_000
+            : null,
           audioRefreshAt: Date.now() + audioUrlRefreshDelayMs(result.expiresIn),
-        }
-        : editorAudioFailureState(previous, {
-          reason,
-          failureReason: result.reason,
-        });
+        };
+      }
+      if (nonBlocking && previous.audioUrl && result.reason === "temporary") {
+        return {
+          ...previous,
+          audioLoading: false,
+          audioUnavailableReason: null,
+          audioPreviewRetryAt: previewPoll ? Date.now() + PROACTIVE_URL_RETRY_MS : previous.audioPreviewRetryAt,
+        };
+      }
+      return editorAudioFailureState(previous, { reason, failureReason: result.reason });
     });
     if (!preventive && requestSequence === reviewAudioRequestSequenceRef.current) {
       reviewReactiveAudioRequestRef.current = false;
@@ -1762,21 +1810,27 @@ export default function App() {
     || currentReview?.transcribeJobId
     || null;
   const activeReviewAudioRefreshAt = currentReview?.audioRefreshAt || null;
+  const activeReviewAudioPreviewRetryAt = currentReview?.audioPreviewRetryAt || null;
   useEffect(() => {
-    if (!activeReviewAudioJobId || !activeReviewAudioRefreshAt || currentReview?.audioLoading) {
+    if (!activeReviewAudioJobId || currentReview?.audioLoading
+      || (!activeReviewAudioRefreshAt && !activeReviewAudioPreviewRetryAt)) {
       return undefined;
     }
-    const delayMs = Math.max(0, activeReviewAudioRefreshAt - Date.now());
+    const previewPoll = activeReviewAudioPreviewRetryAt
+      && (!activeReviewAudioRefreshAt || activeReviewAudioPreviewRetryAt <= activeReviewAudioRefreshAt);
+    const nextAt = previewPoll ? activeReviewAudioPreviewRetryAt : activeReviewAudioRefreshAt;
+    const delayMs = Math.max(0, nextAt - Date.now());
     const timer = window.setTimeout(() => {
       const retry = currentReview?.editingJobId
         ? editorAudioRetryRef.current
         : (options) => retryTranscriptionReviewAudio(activeReviewAudioJobId, options);
-      if (retry) void retry({ reason: "signed_url_expiring" });
+      if (retry) void retry({ reason: previewPoll ? "preview_pending" : "signed_url_expiring" });
     }, Math.min(delayMs, 2_147_483_647));
     return () => window.clearTimeout(timer);
   }, [
     activeReviewAudioJobId,
     activeReviewAudioRefreshAt,
+    activeReviewAudioPreviewRetryAt,
     currentReview?.audioLoading,
     currentReview?.editingJobId,
     retryTranscriptionReviewAudio,
@@ -2138,6 +2192,9 @@ export default function App() {
           file: null,                            // no tenemos el File original
           filename: job.filename || `${job.song_title || job.artist || "audio"}.wav`,
           audioUrl: null,
+          audioSource: null,
+          audioPreviewPending: false,
+          audioPreviewRetryAt: null,
           audioLoading: true,
           audioUnavailableReason: null,
           artist: job.artist || "",
@@ -3331,21 +3388,20 @@ export default function App() {
         languageUncertain: !!data.language_uncertain,
         mixedLanguage: !!data.mixed_language,
         transcribeJobId: data.job_id || uploadJobId,
+        audioUrl: null,
+        audioSource: null,
+        audioPreviewPending: false,
+        audioPreviewRetryAt: null,
+        audioLoading: true,
         queueIdx: idx, queue,
       });
-      // Phase B: fetch signed R2 audio URL in background so LyricsEditor
-      // can use a durable server-side URL instead of the ephemeral blob.
-      // Fire-and-forget — editor already works with the blob URL; this just
-      // upgrades it to avoid ERR_FILE_NOT_FOUND when the blob gets revoked.
+      // Phase B: use the same bounded loader as resumed/edit sessions. It
+      // serves the original immediately when the shared preview is cold,
+      // polls until the AAC is ready, and falls back automatically if media
+      // decoding or R2 fails. The local Blob remains an immediate fallback.
       const _newJobId = data.job_id || uploadJobId;
       if (_newJobId) {
-        authFetch(`${API}/jobs/${_newJobId}/source-audio-url`)
-          .then((r) => r.ok ? r.json() : null)
-          .then((d) => {
-            const url = d?.url || null;
-            if (url) setCurrentReview((prev) => prev?.transcribeJobId === _newJobId ? { ...prev, audioUrl: url } : prev);
-          })
-          .catch(() => { /* blob URL still works as fallback */ });
+        void retryTranscriptionReviewAudio(_newJobId);
       }
       // Kick off background upload+transcription for songs idx+1..N-1
       // while the user is reading/editing the current song's lyrics.
@@ -5476,6 +5532,8 @@ export default function App() {
             filename={currentReview.file?.name || currentReview.filename || ""}
             audioFile={currentReview.file}
             audioUrl={currentReview.audioUrl || null}
+            audioSource={currentReview.audioSource || null}
+            audioPreviewPending={!!currentReview.audioPreviewPending}
             audioLoading={!!currentReview.audioLoading}
             audioUnavailableReason={currentReview.audioUnavailableReason || null}
             onRetryAudio={currentReview.editingJobId

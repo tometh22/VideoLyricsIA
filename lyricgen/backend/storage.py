@@ -329,6 +329,11 @@ def _transfer_config():
 # tenant prefix and then ask /download to sign that key.
 _KEY_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
+# This is deliberately explicit and immutable. Bumping the version creates a
+# new content-addressed object, so an encoder change can never silently serve
+# bytes produced by an older format.
+EDITOR_AUDIO_PREVIEW_FORMAT_VERSION = "aac-stereo-96k-v1"
+
 
 def _safe_filename(filename: str) -> str:
     """Sanitize a user-controlled filename so it is safe to use as the
@@ -380,6 +385,26 @@ def content_addressed_input_key(
         f"inputs/{_safe_key_component(tenant_id)}/{_safe_key_component(job_id)}"
         f"/sha256/{digest}/{_safe_filename(filename)}"
     )
+
+
+def editor_audio_preview_key(
+    audio_sha256: str,
+    format_version: str = EDITOR_AUDIO_PREVIEW_FORMAT_VERSION,
+) -> str:
+    """Return the shared editor-preview key for an immutable audio digest.
+
+    The key intentionally contains no tenant or job identifier: identical
+    source bytes share one preview across jobs and tenants. Callers must still
+    perform authorization before probing or signing this key; this helper is
+    not an authorization boundary.
+    """
+    digest = str(audio_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("audio_sha256 must be a lowercase SHA-256 digest")
+    version = str(format_version or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", version):
+        raise ValueError("format_version contains invalid characters")
+    return f"editor-previews/{digest}/{version}.m4a"
 
 
 def upload_master(local_path: str, tenant_id: str, job_id: str, filename: str) -> Optional[str]:
@@ -1214,6 +1239,8 @@ def _guess_content_type(filename: str) -> Optional[str]:
         return "video/quicktime"
     if low.endswith(".mp4"):
         return "video/mp4"
+    if low.endswith(".m4a"):
+        return "audio/mp4"
     if low.endswith(".jpg") or low.endswith(".jpeg"):
         return "image/jpeg"
     if low.endswith(".png"):

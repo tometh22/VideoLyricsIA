@@ -275,16 +275,17 @@ def _warn_if_shutdown_grace_too_short() -> None:
         )
 
 
-_DEFAULT_QUEUES = "transcription,bg_preview,enterprise,default,canary"
+_DEFAULT_QUEUES = "transcription,bg_preview,enterprise,default,audio_preview,canary"
 
 
 def _resolve_queue_names() -> list:
     """Queue names this worker process listens on, in priority order.
 
     Env-driven (QUEUES, comma-separated) so the SAME image runs as a segmented
-    fleet: a small ShortWorker pool (QUEUES=transcription,bg_preview) drains the
-    always-short jobs without waiting behind 12-20 min renders, while the render
-    pool (QUEUES=enterprise,default) owns the heavy work. RQ priority alone
+    fleet: a small ShortWorker pool (QUEUES=transcription,bg_preview,audio_preview)
+    drains latency-sensitive and derivative jobs while the render pool
+    (QUEUES=enterprise,default) owns heavy work. Editor previews stay on the
+    short-worker pool so they can never occupy a render slot. RQ priority alone
     doesn't preempt — once all render workers are inside long renders, a short
     transcription waits the full render time; a dedicated pool fixes that.
 
@@ -479,9 +480,12 @@ def main():
     #      no debe bloquear los renders finales (default). Latencia ~60-120s.
     #   3. enterprise — premium tenants (UMG/OMG) van antes que default.
     #   4. default — todo lo demás.
+    #   5. audio_preview — derivative-only AAC work, best effort and always
+    #      behind generation/render work.
     # Workers listen in this order; RQ pickup respects it. The set is
     # env-driven (QUEUES) so this image can run as a segmented fleet — see
-    # _resolve_queue_names(). Default = all four = current behavior.
+    # _resolve_queue_names(). Default = the shared legacy queues plus the
+    # isolated audio-preview queue.
     queue_names = _resolve_queue_names()
     queues = [Queue(name, connection=conn) for name in queue_names]
     _schedule_worker_maintenance(queue_names)

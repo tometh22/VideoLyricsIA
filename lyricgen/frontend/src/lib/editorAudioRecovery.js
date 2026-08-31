@@ -48,7 +48,7 @@ export function editorAudioFailureState(previous, {
   now = Date.now,
 } = {}) {
   if (
-    reason === "signed_url_expiring"
+    (reason === "signed_url_expiring" || reason === "preview_pending")
     && failureReason === "temporary"
     && previous?.audioUrl
   ) {
@@ -86,11 +86,26 @@ export async function loadEditorAudio({
       if (response?.ok) {
         const body = await response.json();
         if (body?.url) {
-          return {
+          const result = {
             ok: true,
             url: body.url,
             expiresIn: Number(body.expires_in) || DEFAULT_URL_EXPIRY_SECONDS,
           };
+          // Keep the helper's legacy result shape for older servers while
+          // accepting the additive preview metadata from the new contract.
+          if (Object.prototype.hasOwnProperty.call(body, "source")) {
+            result.source = body.source || null;
+          }
+          if (
+            Object.prototype.hasOwnProperty.call(body, "preview_status")
+            || Object.prototype.hasOwnProperty.call(body, "preview")
+          ) {
+            result.previewStatus = body.preview_status || body.preview?.status || null;
+            result.previewRetryAfterSeconds = Number(
+              body.preview_retry_after_seconds || body.preview?.retry_after_seconds,
+            ) || 5;
+          }
+          return result;
         }
         // The endpoint's successful contract always contains a URL. Treat a
         // malformed success as temporary rather than falsely saying the file
