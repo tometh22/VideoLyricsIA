@@ -79,7 +79,10 @@ import {
   isMissingGenerationJob,
   rebuildGenerationRequestFromLocalAudio,
 } from "./lib/generationRecovery";
-import { loadEditorAudio } from "./lib/editorAudioRecovery";
+import {
+  audioUrlRefreshDelayMs,
+  loadEditorAudio,
+} from "./lib/editorAudioRecovery";
 import { isReusableEditSnapshot } from "./lib/reviewRecovery";
 import { reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
 
@@ -1156,7 +1159,11 @@ function EditLyricsRoute({
           // This endpoint is a DB lookup + presigned URL, normally <1 s. A
           // short cap turns pool backpressure into a recoverable UI state
           // instead of holding the timing screen on a spinner for a minute.
-          request: () => authFetchWithTimeout(`${API}/jobs/${id}/source-audio-url`, {}, 8_000),
+          request: () => authFetchWithTimeout(
+            `${API}/jobs/${id}/source-audio-url`,
+            { cache: "no-store" },
+            8_000,
+          ),
           maxRetries: 3,
         });
         if (!alive) return;
@@ -1168,12 +1175,15 @@ function EditLyricsRoute({
               audioUrl: result.url,
               audioLoading: false,
               audioUnavailableReason: null,
+              audioRefreshAt: Date.now() + audioUrlRefreshDelayMs(result.expiresIn),
             };
           }
           return {
             ...prev,
+            audioUrl: null,
             audioLoading: false,
             audioUnavailableReason: result.reason,
+            audioRefreshAt: null,
           };
         });
       };
@@ -1670,7 +1680,11 @@ export default function App() {
         : previous
     ));
     const result = await loadEditorAudio({
-      request: () => authFetchWithTimeout(`${API}/jobs/${jobId}/source-audio-url`, {}, 8_000),
+      request: () => authFetchWithTimeout(
+        `${API}/jobs/${jobId}/source-audio-url`,
+        { cache: "no-store" },
+        8_000,
+      ),
       maxRetries: 3,
     });
     setCurrentReview((previous) => {
@@ -1681,14 +1695,45 @@ export default function App() {
           audioUrl: result.url,
           audioLoading: false,
           audioUnavailableReason: null,
+          audioRefreshAt: Date.now() + audioUrlRefreshDelayMs(result.expiresIn),
         }
         : {
           ...previous,
+          audioUrl: null,
           audioLoading: false,
           audioUnavailableReason: result.reason,
+          audioRefreshAt: null,
         };
     });
   }, []);
+  const activeReviewAudioJobId = currentReview?.editingJobId
+    || currentReview?.transcribeJobId
+    || null;
+  const activeReviewAudioRefreshAt = currentReview?.audioRefreshAt || null;
+  const activeReviewUsesLocalAudio = (
+    typeof Blob !== "undefined"
+    && currentReview?.file instanceof Blob
+    && !currentReview.file?._restoredStub
+  );
+  useEffect(() => {
+    if (!activeReviewAudioJobId || !activeReviewAudioRefreshAt || activeReviewUsesLocalAudio) {
+      return undefined;
+    }
+    const delayMs = Math.max(0, activeReviewAudioRefreshAt - Date.now());
+    const timer = window.setTimeout(() => {
+      const retry = currentReview?.editingJobId
+        ? editorAudioRetryRef.current
+        : () => retryTranscriptionReviewAudio(activeReviewAudioJobId);
+      if (retry) void retry({ reason: "signed_url_expiring" });
+    }, Math.min(delayMs, 2_147_483_647));
+    return () => window.clearTimeout(timer);
+  }, [
+    activeReviewAudioJobId,
+    activeReviewAudioRefreshAt,
+    activeReviewUsesLocalAudio,
+    currentReview?.editingJobId,
+    retryTranscriptionReviewAudio,
+  ]);
   const [approvedJobs, setApprovedJobs] = useState([]);
   const [transcribing, setTranscribing] = useState(false);
   const [transcribeError, setTranscribeError] = useState(null);

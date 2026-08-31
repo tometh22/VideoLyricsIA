@@ -252,6 +252,43 @@ describe("LyricsEditor — recuperación de audio remoto post-mount", () => {
     expect(revokeObjectUrlSpy).toHaveBeenCalledOnce();
     expect(revokeObjectUrlSpy).toHaveBeenCalledWith("blob:http://localhost/upload");
   });
+
+  it("renueva automáticamente una URL firmada que vence durante la reproducción", () => {
+    const onRetryAudio = vi.fn().mockResolvedValue(undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const props = baseProps({
+      audioUrl: "https://media.example.test/source.wav?signature=expired",
+      onRetryAudio,
+      transcribeJobId: "d6fe637f27f3",
+    });
+    const { container } = render(<LyricsEditor {...props} />);
+    const audio = container.querySelector("audio");
+
+    audio.currentTime = 220;
+    fireEvent.timeUpdate(audio);
+    fireEvent.play(audio);
+    Object.defineProperty(audio, "error", {
+      configurable: true,
+      value: { code: 2 },
+    });
+    fireEvent.error(audio);
+
+    expect(onRetryAudio).toHaveBeenCalledOnce();
+    expect(onRetryAudio).toHaveBeenCalledWith({ reason: "media_error", mediaErrorCode: 2 });
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("renewing signed source"),
+      expect.objectContaining({
+        job_id: "d6fe637f27f3",
+        position_ms: 220_000,
+        media_error_code: 2,
+      }),
+    );
+
+    // A noisy media element must not create a request loop for the same URL.
+    fireEvent.error(audio);
+    expect(onRetryAudio).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
 });
 
 describe("LyricsEditor — advanced shell and timing safety", () => {
