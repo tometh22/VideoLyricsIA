@@ -4687,7 +4687,7 @@ class _GeneratePreviewReq(BaseModel):
     custom_colors: str = Field(default="", max_length=200)
     genre: str = Field(default="", max_length=64)
     concept: str = Field(default="", max_length=2000)
-    background_hint: str = Field(default="", max_length=2000)
+    background_hint: str = Field(default="", max_length=4000)
     bg_verbatim: bool = False
     background_mode: str = Field(default="veo", max_length=16)
     animate_image: bool = False
@@ -4961,7 +4961,7 @@ async def upload(
     lyric_color: str = Form("", max_length=8),
     lyric_sung_color: str = Form("", max_length=8),
     match_lyrics: bool = Form(True),
-    background_hint: str = Form("", max_length=2000),
+    background_hint: str = Form("", max_length=4000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
     # Add-on premium "Escenas" (multi-escena). Parity con /generate; la
@@ -9625,7 +9625,7 @@ async def generate_with_segments(
     lyric_color: str = Form("", max_length=8),
     lyric_sung_color: str = Form("", max_length=8),
     match_lyrics: bool = Form(True),
-    background_hint: str = Form("", max_length=2000),
+    background_hint: str = Form("", max_length=4000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
     # Batch-only canonical visual contract. Empty keeps the legacy individual
@@ -11653,12 +11653,13 @@ class EditJobRequest(BaseModel):
     # types what they want the new background to convey ("paisaje cálido
     # al atardecer", "abstracto con ondas de luz suave", etc.) and the
     # pipeline forwards it to Gemini's system prompt as an explicit
-    # operator override. Bump 300→2000 (2026-05-18): los modelos de
+    # operator override. Bump 300→2000 (2026-05-18) and 2000→4000
+    # (2026-08-31): los modelos de
     # imagen/video rinden mejor con prompts detallados que permitan
     # negaciones redundantes ("no cars, no traffic, no people…") y
     # spec granular de cámara. 300 obligaba a sacrificar negaciones que
     # son críticas para evitar bias del modelo. Costo Gemini marginal.
-    background_hint: str | None = Field(default=None, max_length=2000)
+    background_hint: str | None = Field(default=None, max_length=4000)
     # Explicit non-Universal opt-in used together with a prompt that asks for
     # people. Universal accounts remain validation-mandatory in pipeline.py;
     # this request field can never relax that server-side rule.
@@ -16407,8 +16408,8 @@ class VariantJobRequest(BaseModel):
     """
     # Mismo formato y max_length que EditJobRequest.background_hint —
     # va al user_content de Gemini con header [OPERATOR OVERRIDE].
-    # 2000 chars (bumped 2026-05-18, ver EditJobRequest para rationale).
-    background_hint: str | None = Field(default=None, max_length=2000)
+    # 4000 chars (bumped 2026-08-31, ver EditJobRequest para rationale).
+    background_hint: str | None = Field(default=None, max_length=4000)
     # Same central policy as edit/retry: only a non-Universal account with an
     # explicit people prompt can use this opt-in; Universal remains strict.
     bypass_content_validation: bool = Field(default=False)

@@ -91,6 +91,7 @@ import {
 } from "./lib/editorAudioRecovery";
 import { isReusableEditSnapshot } from "./lib/reviewRecovery";
 import { reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
+import { creativeFieldsForReviewResume } from "./lib/reviewResume";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -2132,6 +2133,7 @@ export default function App() {
         const job = await statusRes.json();
         if (cancelled) return;
         const segments = job.segments || job.segments_json || [];
+        const resumedCreativeFields = creativeFieldsForReviewResume(job);
         setCurrentReview({
           file: null,                            // no tenemos el File original
           filename: job.filename || `${job.song_title || job.artist || "audio"}.wav`,
@@ -2141,11 +2143,8 @@ export default function App() {
           artist: job.artist || "",
           songTitle: job.song_title || "",
           language: job.language || "es",
-          genre: job.genre || "",
+          ...resumedCreativeFields,
           font: job.font || "",
-          concept: job.concept || "",
-          movementStyle: job.movement_style || "",
-          effect: job.effect || "",
           textCase: job.text_case || "upper",
           fontScale: String(job.font_scale || "1.0"),
           lyricsAnimation: job.lyrics_animation || "none",
