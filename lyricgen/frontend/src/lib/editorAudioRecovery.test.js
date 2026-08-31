@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  audioUrlRefreshDelayMs,
   isTransientAudioFailure,
   loadEditorAudio,
   retryAfterMs,
@@ -19,13 +20,17 @@ describe("editor source audio recovery", () => {
     const request = vi.fn()
       .mockResolvedValueOnce(response(503, {}, "3"))
       .mockResolvedValueOnce(response(503, {}, "3"))
-      .mockResolvedValueOnce(response(200, { url: "https://r2.example/song.mp3" }));
+      .mockResolvedValueOnce(response(200, {
+        url: "https://r2.example/song.mp3",
+        expires_in: 3_600,
+      }));
     const wait = vi.fn().mockResolvedValue(undefined);
     const onRetry = vi.fn();
 
     await expect(loadEditorAudio({ request, wait, onRetry })).resolves.toEqual({
       ok: true,
       url: "https://r2.example/song.mp3",
+      expiresIn: 3_600,
     });
     expect(wait).toHaveBeenCalledWith(3_000);
     expect(wait).toHaveBeenCalledTimes(2);
@@ -58,5 +63,11 @@ describe("editor source audio recovery", () => {
     expect(isTransientAudioFailure(response(500))).toBe(true);
     expect(isTransientAudioFailure(response(404))).toBe(false);
     expect(retryAfterMs(response(503, {}, "999"), 0)).toBe(60_000);
+  });
+
+  it("renews a one-hour signed URL five minutes before it expires", () => {
+    expect(audioUrlRefreshDelayMs(3_600)).toBe(55 * 60_000);
+    expect(audioUrlRefreshDelayMs(undefined)).toBe(55 * 60_000);
+    expect(audioUrlRefreshDelayMs(60)).toBe(5_000);
   });
 });
