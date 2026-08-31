@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   audioUrlRefreshDelayMs,
+  editorAudioFailureState,
   isTransientAudioFailure,
   loadEditorAudio,
   retryAfterMs,
@@ -69,5 +70,35 @@ describe("editor source audio recovery", () => {
     expect(audioUrlRefreshDelayMs(3_600)).toBe(55 * 60_000);
     expect(audioUrlRefreshDelayMs(undefined)).toBe(55 * 60_000);
     expect(audioUrlRefreshDelayMs(60)).toBe(5_000);
+  });
+
+  it("keeps a still-valid URL and schedules another attempt after a proactive transient failure", () => {
+    const previous = {
+      audioUrl: "https://r2.example/still-valid",
+      audioLoading: true,
+      audioRefreshAt: 123,
+    };
+    expect(editorAudioFailureState(previous, {
+      reason: "signed_url_expiring",
+      failureReason: "temporary",
+      now: () => 1_000,
+    })).toEqual({
+      ...previous,
+      audioLoading: false,
+      audioUnavailableReason: null,
+      audioRefreshAt: 31_000,
+    });
+  });
+
+  it("fails closed after a real media error or a definitive missing response", () => {
+    const previous = { audioUrl: "https://r2.example/old", audioLoading: true };
+    expect(editorAudioFailureState(previous, {
+      reason: "media_error",
+      failureReason: "temporary",
+    })).toMatchObject({ audioUrl: null, audioUnavailableReason: "temporary", audioRefreshAt: null });
+    expect(editorAudioFailureState(previous, {
+      reason: "signed_url_expiring",
+      failureReason: "missing",
+    })).toMatchObject({ audioUrl: null, audioUnavailableReason: "missing", audioRefreshAt: null });
   });
 });

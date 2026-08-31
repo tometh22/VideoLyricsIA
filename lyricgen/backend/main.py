@@ -13192,7 +13192,7 @@ _PRODUCT_EVENT_NAMES = {
     "editor_undo", "editor_autosave_success", "editor_autosave_failed",
     "editor_conflict", "editor_version_restored", "editor_approved",
     "editor_help_opened", "editor_operator_suggestions_shown",
-    "editor_operator_suggestion_decision",
+    "editor_operator_suggestion_decision", "editor_audio_playback_failed",
 }
 
 # Ventana de /admin/product-metrics. Sin esto la única acotación era
@@ -13238,6 +13238,9 @@ _PRODUCT_EVENT_PROPERTIES = {
         "proposed_delta_ms", "chosen_delta_ms",
         "distance_to_proposal_ms", "reason", "window_id",
         "pipeline_release",
+    },
+    "editor_audio_playback_failed": {
+        "position_ms", "media_error_code", "automatic_recovery_available",
     },
 }
 _PRODUCT_EVENT_COMMON_PROPERTIES = {"session_id"}

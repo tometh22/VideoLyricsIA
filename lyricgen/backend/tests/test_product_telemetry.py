@@ -21,6 +21,11 @@ def test_session_and_boolean_types_are_strict():
     assert valid_property("session_id", "editor-1786674137720-abc123")
     assert valid_property("quality_acknowledged", True)
     assert not valid_property("quality_acknowledged", 1)
+    assert valid_property("automatic_recovery_available", True)
+    assert not valid_property("automatic_recovery_available", 1)
+    assert valid_property("media_error_code", 0)
+    assert valid_property("media_error_code", 4)
+    assert not valid_property("media_error_code", 5)
 
 
 def test_categories_are_enums_or_short_machine_codes_only():
@@ -83,3 +88,12 @@ def test_todo_lo_que_emite_autosave_esta_en_su_allowlist():
         ("editor_autosave_success", {"duration_ms", "checkpoint", "retry_count"}),
     ):
         assert keys <= main._PRODUCT_EVENT_PROPERTIES[event], event
+
+
+def test_audio_playback_failure_acepta_lo_que_emite_el_cliente():
+    import main
+    event = "editor_audio_playback_failed"
+    assert event in main._PRODUCT_EVENT_NAMES
+    assert {
+        "position_ms", "media_error_code", "automatic_recovery_available",
+    } <= main._PRODUCT_EVENT_PROPERTIES[event]
