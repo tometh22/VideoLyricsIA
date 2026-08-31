@@ -253,6 +253,19 @@ BUDGET_SUBMITTED_PREFIX = "budget_submitted"
 # rows, which remain conservatively billable).
 LEGACY_CONFIRMED_RATE_LIMIT_PREFIX = "error: rate_limited_after_5_retries"
 
+# El reuso de fondo desde `bg_cache` existe para EVITAR una llamada a Veo:
+# es un ahorro, no un gasto. `pipeline._record_bg_cache_reuse` graba la fila
+# con este texto y su propio docstring dice que usa un tool_name distinto de
+# `veo-%` "para no contar como generación en las métricas de gasto" — pero el
+# filtro de facturables mira el PREFIJO del summary, no el tool_name, así que
+# la fila pasaba como facturable y caía en DEFAULT_COST_PER_CALL.
+#
+# Un cache hit cobrado invierte el signo del incentivo: el tenant que más
+# reusa fondos es el que más "gasta". Medido: 27 filas en agosto, 4 en julio.
+# El texto se conserva acá (y no sólo se cambia en el writer) porque las
+# filas históricas ya escritas también tienen que quedar afuera.
+BG_CACHE_REUSE_PREFIX = "reused cached background"
+
 # Prefijos de `response_summary` que significan "esta fila existe para el
 # registro de auditoría, pero no salió plata". Toda la contabilidad los filtra.
 NON_BILLABLE_PREFIXES = (
@@ -263,6 +276,7 @@ NON_BILLABLE_PREFIXES = (
     BUDGET_RELEASED_PREFIX,
     BUDGET_RESERVED_PREFIX,
     LEGACY_CONFIRMED_RATE_LIMIT_PREFIX,
+    BG_CACHE_REUSE_PREFIX,
 )
 
 # Atomic budget occupancy differs from actual billing by one state: admitted
@@ -715,7 +729,9 @@ def _bucket_for(tool_name: str, tool_provider: str) -> str:
 
 
 def cost_dashboard_global(db: Session, since_days: int = 30,
-                          revenue_per_video_usd: float = 8.0) -> dict:
+                          revenue_per_video_usd: float = 8.0,
+                          since: "datetime | None" = None,
+                          until: "datetime | None" = None) -> dict:
     """Margin-style cost dashboard across all tenants.
 
     Powers /admin/margin. Returns enough data for the operator panel to
@@ -729,7 +745,24 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
     `("whisper-1", "openai")` is what catches our prod transcriptions.
     Local Whisper stays at 0 (matches actual marginal cost).
     """
-    since = datetime.now(timezone.utc) - timedelta(days=since_days)
+    # Ventana EXPLÍCITA opcional.
+    #
+    # `since_days` cuenta hacia atrás desde HOY, así que no puede alinearse
+    # con un mes calendario — y el mes calendario es la unidad en la que los
+    # proveedores facturan. Pedir julio en agosto con since_days medía
+    # jul-ago y lo ponía al lado de la factura de julio.
+    #
+    # Sin `since` explícito el comportamiento es idéntico al de antes: se
+    # deriva de `since_days` y no hay cota superior.
+    if since is None:
+        since = datetime.now(timezone.utc) - timedelta(days=since_days)
+
+    def _ventana(col):
+        """Condiciones de tiempo de la ventana, para `.filter(*_ventana(col))`."""
+        if until is None:
+            return (col >= since,)
+        return (col >= since, col < until)
+
     _rates = rates_for_window(db, since)
     rate_year, rate_month = _provenance_month_columns()
 
@@ -742,7 +775,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
             rate_month,
             func.count(AIProvenance.id).label("calls"),
         )
-        .filter(AIProvenance.created_at >= since)
+        .filter(*_ventana(AIProvenance.created_at))
         .filter(billable_filter())
         .group_by(
             AIProvenance.tool_name, AIProvenance.tool_provider,
@@ -758,13 +791,13 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
     # trusting a single opaque number.
     cache_hits = int(
         db.query(func.count(AIProvenance.id))
-        .filter(AIProvenance.created_at >= since)
+        .filter(*_ventana(AIProvenance.created_at))
         .filter(AIProvenance.response_summary.like(f"{CACHE_HIT_PREFIX}%"))
         .scalar() or 0
     )
     errored = int(
         db.query(func.count(AIProvenance.id))
-        .filter(AIProvenance.created_at >= since)
+        .filter(*_ventana(AIProvenance.created_at))
         .filter(AIProvenance.response_summary.like("error%"))
         # Some legacy ``error:`` summaries are confirmed pre-operation
         # rejections and therefore excluded from spend. Keep this counter's
@@ -774,7 +807,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
     )
     in_flight = int(
         db.query(func.count(AIProvenance.id))
-        .filter(AIProvenance.created_at >= since)
+        .filter(*_ventana(AIProvenance.created_at))
         # A recorder can carry a meaningful provisional summary
         # (``budget_reserved``) while the provider operation is still polling.
         # ``duration_ms`` is the durable finish marker; combine it with the
@@ -831,7 +864,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
     # --- Video counts (same window so the cost-per-video math is honest) ---
     video_counts = dict(
         db.query(Job.status, func.count(Job.id))
-        .filter(Job.created_at >= since)
+        .filter(*_ventana(Job.created_at))
         .group_by(Job.status)
         .all()
     )
@@ -874,7 +907,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
             func.count(AIProvenance.id).label("calls"),
         )
         .join(Job, Job.job_id == AIProvenance.job_id)
-        .filter(AIProvenance.created_at >= since)
+        .filter(*_ventana(AIProvenance.created_at))
         .filter(billable_filter())
         .group_by(
             Job.tenant_id, AIProvenance.tool_name,
@@ -896,7 +929,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
     # Video status counts per tenant (same window).
     tenant_status_rows = (
         db.query(Job.tenant_id, Job.status, func.count(Job.id))
-        .filter(Job.created_at >= since)
+        .filter(*_ventana(Job.created_at))
         .group_by(Job.tenant_id, Job.status)
         .all()
     )
@@ -953,7 +986,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
         )
         .join(Job, Job.job_id == AIProvenance.job_id)
         .outerjoin(UserModel, UserModel.id == Job.user_id)
-        .filter(AIProvenance.created_at >= since)
+        .filter(*_ventana(AIProvenance.created_at))
         .filter(billable_filter())
         .group_by(Job.user_id, Job.tenant_id, UserModel.username,
                   AIProvenance.tool_name, AIProvenance.tool_provider,
@@ -979,7 +1012,7 @@ def cost_dashboard_global(db: Session, since_days: int = 30,
 
     user_status_rows = (
         db.query(Job.user_id, Job.tenant_id, Job.status, func.count(Job.id))
-        .filter(Job.created_at >= since)
+        .filter(*_ventana(Job.created_at))
         .group_by(Job.user_id, Job.tenant_id, Job.status)
         .all()
     )

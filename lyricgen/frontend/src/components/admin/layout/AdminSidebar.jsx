@@ -69,7 +69,10 @@ const NAV = [
       { id: "usuarios", label: "Usuarios" },
       { id: "fondos", label: "Biblioteca de fondos" },
       { id: "compliance", label: "Compliance UMG" },
-      { id: "costos", label: "Costos y márgenes" },
+      // Una sola entrada: "Costos y márgenes" y "Costo de infra" eran dos
+      // pantallas con dos controles de tiempo distintos que respondían la
+      // misma pregunta con números que no coincidían.
+      { id: "costos", label: "Costos" },
       { id: "facturacion", label: "Facturación" },
       { id: "creditos", label: "Créditos de regalo" },
     ],

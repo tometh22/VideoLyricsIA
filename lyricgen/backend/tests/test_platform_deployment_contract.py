@@ -23,7 +23,30 @@ def test_railway_uses_one_config_per_service():
     assert not (REPO / "railway.toml").exists()
     assert {p.name for p in (REPO / "railway").glob("*.toml")} == {
         "api.toml", "worker.toml", "short-worker.toml", "quality-worker.toml",
+        # Cron de costos. Es un servicio y no un thread de fondo en `api`
+        # porque `api` corre numReplicas=2 x --workers 2 = 4 procesos, y los
+        # loops de main.py son sleep() desde el boot: un horario fijo es
+        # imposible y cada deploy resetea el reloj.
+        "cost-collector.toml",
     }
+
+
+def test_cost_collector_is_a_cron_that_exits_not_a_daemon():
+    """El colector tiene que arrancar, trabajar y salir.
+
+    `restartPolicyType = NEVER` es lo que impide que Railway lo reinicie en
+    loop cuando termina bien. Si alguien lo pasara a ON_FAILURE junto con un
+    cronSchedule, cada corrida exitosa dispararía un reinicio y el colector
+    pegaría a los proveedores en bucle — el panel de costos generando costo.
+    """
+    cfg = _config("cost-collector.toml")
+    assert cfg["deploy"]["cronSchedule"] == "0 6 * * *"
+    assert cfg["deploy"]["restartPolicyType"] == "NEVER"
+    assert cfg["deploy"]["numReplicas"] == 1
+    assert cfg["deploy"]["startCommand"] == "python backend/scripts/collect_costs.py"
+    # Comparte imagen con los workers: no necesita uvicorn ni healthcheck HTTP.
+    assert cfg["build"]["dockerfilePath"] == "Dockerfile.worker"
+    assert "healthcheckPath" not in cfg["deploy"]
 
 
 def test_api_deployment_contract():

@@ -512,3 +512,254 @@ def test_change_requests_rejects_malformed_period(client, admin_token):
     res = client.get("/admin/quality/change-requests?period=2026-13",
                      headers=auth(admin_token))
     assert res.status_code == 400
+
+
+def test_unit_economics_refuses_to_divide_with_no_snapshot_at_all(
+    client, admin_token, db,
+):
+    """Con `cost_snapshots` vacía este endpoint devolvía margen 100%.
+
+    `real_total` = 0 → `cost_per_delivered` = 0.0 → `margin_pct` = 1.0, o
+    sea el precio entero como ganancia. El `cost_complete: false` viajaba
+    en un campo aparte que nadie mira, y la tabla está vacía en las DOS
+    bases porque /cost/refresh nunca se corrió.
+
+    Etiquetar no alcanza cuando el número etiquetado es justo el que
+    alguien copia para cotizarle a un cliente: un `null` obliga a mirar por
+    qué, un `0.0` con nota al pie se lee como una buena noticia.
+    """
+    from datetime import datetime, timezone
+
+    from database import CostSnapshot, Job
+
+    # Tiene que haber ENTREGAS: si el denominador fuera 0 el endpoint
+    # devolvería null por otro motivo y el test pasaría sin ejercitar nada.
+    period = "2021-07"
+    when = datetime(2021, 7, 10, tzinfo=timezone.utc)
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    db.query(Job).filter(Job.tenant_id == "sin-snapshot-test").delete()
+    for jid in ("ns1", "ns2"):
+        db.add(Job(job_id=jid, user_id=1, tenant_id="sin-snapshot-test",
+                   artist="A", filename="a.mp3", status="done", created_at=when))
+    db.commit()
+    try:
+        r = client.get(
+            f"/admin/cost/unit-economics?period={period}&price_per_video_usd=13.5",
+            headers=auth(admin_token))
+        assert r.status_code == 200
+        d = r.json()
+        assert d["videos_delivered"] >= 2, "sin denominador el test no prueba nada"
+        assert d["real_cost_usd"] == 0
+        assert d["cost_per_delivered"] is None, "0/N daría margen 100%"
+        assert d["cost_per_created_MISLEADING"] is None
+        assert d["margin_per_video"] is None
+        assert d["margin_pct"] is None
+        assert d["missing_sources"], "tiene que decir QUÉ falta"
+    finally:
+        db.query(Job).filter(Job.tenant_id == "sin-snapshot-test").delete()
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Los CUATRO denominadores
+# ---------------------------------------------------------------------------
+#
+# `videos_delivered` no es el costo por video. Medido en ago-2026 sobre las
+# bases de prod y staging: 163 entregados, 77 de cliente (47%), y la unidad
+# facturable no es el job sino la CANCIÓN — una canción entregada arrastra
+# ~2,87 jobs entre variantes, re-renders y ediciones.
+#
+# Dividir la factura por el denominador equivocado da hasta 2,8x de
+# diferencia, siempre hacia abajo. Y ese es el número que se copia para
+# cotizarle a un sello.
+
+def test_unit_economics_separa_jobs_de_ci_de_los_de_cliente(
+    client, admin_token, db,
+):
+    """5 jobs entregados: 2 de cliente (1 sola canción) y 3 que no facturan."""
+    from database import CostSnapshot, Job
+    from datetime import datetime, timezone
+
+    period = "2020-07"
+    when = datetime(2020, 7, 15, tzinfo=timezone.utc)
+    tenants = ("den-cliente", "preflight_staging", "mx_a_1780448038", "genly")
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    db.query(Job).filter(Job.tenant_id.in_(tenants)).delete(
+        synchronize_session=False)
+
+    db.add(CostSnapshot(period=period, source="gcp", amount_usd=100.0,
+                        status="ok"))
+    filas = [
+        # Dos jobs del MISMO tema: una variante y su re-render. Es UNA
+        # canción entregada, no dos.
+        ("d1", "den-cliente", "Los Bunkers", "Nada Nuevo Bajo El Sol"),
+        ("d2", "den-cliente", "los bunkers", "nada nuevo bajo el sol"),
+        # Barrido de CI: el patrón viejo lo contaba como cliente.
+        ("d3", "preflight_staging", "CI", "smoke"),
+        ("d4", "mx_a_1780448038", "CI", "matriz"),
+        # Cuenta del equipo con una canción que NO está en el portal: I+D.
+        ("d5", "genly", "Demo", "interno"),
+    ]
+    for jid, tenant, artist, song in filas:
+        db.add(Job(job_id=jid, user_id=1, tenant_id=tenant, artist=artist,
+                   song_title=song, filename="a.mp3", status="done",
+                   created_at=when, completed_at=when))
+    db.commit()
+
+    try:
+        res = client.get(f"/admin/cost/unit-economics?period={period}",
+                         headers=auth(admin_token))
+        assert res.status_code == 200
+        body = res.json()
+
+        assert body["videos_delivered"] == 5,   "el crudo cuenta todo"
+        assert body["delivered_client_jobs"] == 2, "sin CI ni I+D interno"
+        assert body["delivered_client_songs"] == 1, "las 2 filas son un tema"
+
+        # El costo real por canción entregada es 5x el que sugiere el crudo.
+        # Ese 5x es la diferencia entre cotizar con margen y cotizar a pérdida.
+        assert body["cost_per_delivered"] == 20.0
+        assert body["cost_per_client_song"] == 100.0
+    finally:
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.query(Job).filter(Job.tenant_id.in_(tenants)).delete(
+            synchronize_session=False)
+        db.commit()
+
+
+def test_unit_economics_cuenta_la_produccion_gestionada_de_umg(
+    client, admin_token, db,
+):
+    """El bug que el filtro por tenant introducía, a nivel endpoint.
+
+    Las entregas del portal corren bajo cuentas del EQUIPO. Descartarlas
+    como I+D interno dejaba 23 canciones de las ≥77 realmente entregadas en
+    ago-2026: el KPI que la pantalla rotula "el correcto" salía 3,35x
+    arriba del costo real. Y el error crece mes a mes, porque la producción
+    gestionada se fue corriendo cada vez más a esas cuentas.
+    """
+    from database import CostSnapshot, Delivery, Job
+    from datetime import datetime, timezone
+
+    period = "2020-08"
+    when = datetime(2020, 8, 10, tzinfo=timezone.utc)
+    tenants = ("agus77", "default")
+    db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+    db.query(Job).filter(Job.tenant_id.in_(tenants)).delete(
+        synchronize_session=False)
+    db.query(Delivery).filter(Delivery.job_id.in_(("ug1", "ug2"))).delete(
+        synchronize_session=False)
+
+    db.add(CostSnapshot(period=period, source="gcp", amount_usd=200.0,
+                        status="ok"))
+    entregas = [
+        ("ug1", "agus77", "Los Bunkers", "Nada Nuevo Bajo El Sol"),
+        ("ug2", "default", "Coti", "Nada Fue Un Error"),
+    ]
+    for jid, tenant, artist, song in entregas:
+        db.add(Job(job_id=jid, user_id=1, tenant_id=tenant, artist=artist,
+                   song_title=song, filename="a.mp3", status="done",
+                   created_at=when, completed_at=when))
+        # El portal es lo que prueba que se entregó y se cobró.
+        db.add(Delivery(job_id=jid, tenant_snapshot="umusic",
+                        added_by_user_id=1,
+                        artist_snapshot=artist, song_title_snapshot=song))
+    # Mismas cuentas, canción que NO está en el portal: sigue siendo I+D.
+    db.add(Job(job_id="ug3", user_id=1, tenant_id="agus77", artist="Prueba",
+               song_title="Experimento", filename="a.mp3", status="done",
+               created_at=when, completed_at=when))
+    db.commit()
+
+    try:
+        res = client.get(f"/admin/cost/unit-economics?period={period}",
+                         headers=auth(admin_token))
+        assert res.status_code == 200
+        body = res.json()
+
+        assert body["videos_delivered"] == 3
+        assert body["delivered_client_jobs"] == 2, "las 2 del portal"
+        assert body["delivered_client_songs"] == 2
+        # $200 / 2 = $100. Descartando el portal habría dado 0 canciones y
+        # el KPI entero en null.
+        assert body["cost_per_client_song"] == 100.0
+        assert body["portal_disponible"] is True
+        # Y el margen sale del MISMO denominador que el KPI de la pantalla.
+        assert body["margin_per_video"] == round(13.5 - 100.0, 4)
+    finally:
+        db.query(Delivery).filter(Delivery.job_id.in_(("ug1", "ug2"))).delete(
+            synchronize_session=False)
+        db.query(CostSnapshot).filter(CostSnapshot.period == period).delete()
+        db.query(Job).filter(Job.tenant_id.in_(tenants)).delete(
+            synchronize_session=False)
+        db.commit()
+
+
+
+# ---------------------------------------------------------------------------
+# /admin/margin — ventana explícita
+# ---------------------------------------------------------------------------
+#
+# `since_days` cuenta hacia atrás desde HOY, así que no puede alinearse con
+# un mes calendario. En la página de costos consolidada eso ponía la
+# atribución por tenant de "los últimos 30 días" al lado del gasto FACTURADO
+# de julio, sin decir en ningún lado que eran períodos distintos.
+
+def test_margin_respeta_la_ventana_explicita(client, admin_token, db):
+    from database import Job
+    from datetime import datetime, timezone
+
+    tenant = "margin-window-test"
+    db.query(Job).filter(Job.tenant_id == tenant).delete()
+    # Uno DENTRO de julio y uno en agosto. Con `until` sólo cuenta el
+    # primero; sin `until` (o con since_days) entrarían los dos.
+    for jid, cuando in (
+        ("mw-jul", datetime(2021, 7, 15, tzinfo=timezone.utc)),
+        ("mw-ago", datetime(2021, 8, 15, tzinfo=timezone.utc)),
+    ):
+        db.add(Job(job_id=jid, user_id=1, tenant_id=tenant, artist="A",
+                   filename="a.mp3", status="done", created_at=cuando,
+                   completed_at=cuando))
+    db.commit()
+
+    def _de_este_tenant(body):
+        return next((t for t in body["by_tenant"] if t["tenant_id"] == tenant),
+                    None)
+
+    try:
+        julio = client.get(
+            "/admin/margin?since=2021-07-01&until=2021-07-31",
+            headers=auth(admin_token))
+        assert julio.status_code == 200
+        fila = _de_este_tenant(julio.json())
+        assert fila is not None and fila["done"] == 1, "sólo el job de julio"
+
+        # `until` es INCLUSIVE: el último día del mes tiene que entrar.
+        ultimo = client.get(
+            "/admin/margin?since=2021-07-15&until=2021-07-15",
+            headers=auth(admin_token))
+        assert _de_este_tenant(ultimo.json())["done"] == 1
+
+        ambos = client.get(
+            "/admin/margin?since=2021-07-01&until=2021-08-31",
+            headers=auth(admin_token))
+        assert _de_este_tenant(ambos.json())["done"] == 2
+    finally:
+        db.query(Job).filter(Job.tenant_id == tenant).delete()
+        db.commit()
+
+
+def test_margin_rechaza_una_ventana_al_reves(client, admin_token):
+    res = client.get("/admin/margin?since=2021-07-31&until=2021-07-01",
+                     headers=auth(admin_token))
+    assert res.status_code == 400
+
+    malo = client.get("/admin/margin?since=julio", headers=auth(admin_token))
+    assert malo.status_code == 400
+
+
+def test_margin_sin_ventana_se_comporta_como_siempre(client, admin_token):
+    # El contrato viejo (`since_days`) no se toca: hay llamadores que lo usan
+    # y una regresión ahí es silenciosa.
+    res = client.get("/admin/margin?since_days=30", headers=auth(admin_token))
+    assert res.status_code == 200
+    assert res.json()["since_days"] == 30
