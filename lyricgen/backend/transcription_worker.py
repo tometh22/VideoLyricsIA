@@ -613,13 +613,18 @@ def run_transcription_job(
             # Versión B (ANCHOR_LYRICS_ENABLED, default off): si el operador
             # pegó la letra oficial, anclarla con CTC ANTES del retime normal.
             # Si ancló (timing_source == "anchor_ctc"), saltear el retime CTC
-            # de la cascada — los segments YA salieron del motor CTC con la
-            # letra oficial, un segundo retime sería doble trabajo sobre otro
-            # texto. En decline/excepción el helper devuelve r intacto y este
-            # if no matchea → cae a la Versión A tal cual hoy.
+            # de la cascada — los segments YA tienen la letra oficial y timing
+            # de uno de los alineadores aceptados. Si todos declinan, fallar
+            # cerrado: nunca publicar ASR libre en lugar del texto entregado.
             if (anchor_lyrics or "").strip():
                 r = await _maybe_anchor_align(r, audio_path, job_id,
                                               anchor_lyrics)
+                if (
+                    isinstance(r, dict)
+                    and (r.get("anchor_alignment") or {}).get("status")
+                    == "declined"
+                ):
+                    raise RuntimeError("operator_reference_alignment_declined")
             if not (isinstance(r, dict)
                     and r.get("timing_source") == "anchor_ctc"):
                 r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
@@ -665,25 +670,37 @@ def run_transcription_job(
         result = asyncio.run(_run_with_retime())
     except Exception as exc:
         error_type = _safe_exception_code(exc)
-        logger.error(
-            "[TRANSCRIBE-WORKER] job=%s failed error_type=%s",
-            job_id, error_type,
+        anchor_declined = str(exc) == "operator_reference_alignment_declined"
+        log_failure = logger.warning if anchor_declined else logger.error
+        log_failure(
+            "[TRANSCRIBE-WORKER] job=%s failed error_type=%s "
+            "expected_anchor_decline=%s",
+            job_id, error_type, anchor_declined,
         )
         # OBSERVABILITY (audit 2026-05-24): the orchestrator catches +
         # re-raises, but worker process exceptions don't reach Sentry
         # via FastAPI's auto-capture. Capture explicitly here so prod
         # crashes are visible in the Sentry dashboard, not just stdout.
-        try:
-            import sentry_sdk
-            with sentry_sdk.push_scope() as scope:
-                scope.set_tag("job_id", job_id)
-                scope.set_tag("layer", "transcription_worker")
-                scope.set_tag("error_type", error_type)
-                sentry_sdk.capture_message(
-                    "transcription_worker_failure", level="error",
-                )
-        except Exception:
-            pass  # never let Sentry failures break the error path
+        if not anchor_declined:
+            try:
+                import sentry_sdk
+                with sentry_sdk.push_scope() as scope:
+                    scope.set_tag("job_id", job_id)
+                    scope.set_tag("layer", "transcription_worker")
+                    scope.set_tag("error_type", error_type)
+                    sentry_sdk.capture_message(
+                        "transcription_worker_failure", level="error",
+                    )
+            except Exception:
+                pass  # never let Sentry failures break the error path
+        if anchor_declined:
+            return _fail(
+                job_id,
+                "Recibimos la letra oficial, pero no pudimos sincronizarla "
+                "con seguridad. No la reemplazamos por una transcripción "
+                "automática. Revisá que corresponda a esta versión del audio "
+                "y reintentá.",
+            )
         return _fail(
             job_id,
             f"No pudimos completar la transcripción. Código: {error_type}.",
