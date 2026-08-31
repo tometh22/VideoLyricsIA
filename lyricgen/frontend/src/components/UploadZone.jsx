@@ -1892,11 +1892,12 @@ export default function UploadZone({
       </div>
   );
 
-  // QA fix 2026-05-28: en edit mode files=[] (no se sube nada nuevo, el
-  // job ya tiene su audio), pero el operador SÍ necesita ver los
-  // controls de movement/effect en step 3 para corregir esos campos.
-  // El gate original `files.length > 0` ocultaba todo el panel en edit
-  // mode → step 3 quedaba vacío. Ahora abrimos también para editMode.
+  // QA fix 2026-08-31: en edit mode Y en /review files=[] (el job ya tiene su
+  // audio), pero el operador SÍ necesita ver movement/effect en step 3. El
+  // gate anterior contemplaba editMode pero no el resume pre-render de
+  // /review/:jobId: la pestaña existía y quedaba completamente vacía justo
+  // después de subir una foto. hasReviewableContent es la señal común y no
+  // depende de que haya un File de audio local.
   // Los sub-bloques internos siguen con sus propios checks
   // (`files.length > 1` para acciones de batch) — esos correctamente
   // se ocultan si no hay archivos.
@@ -1947,7 +1948,7 @@ export default function UploadZone({
     </div>
   ) : null;
 
-  const _batchSettingsBlock = (files.length > 0 || editMode) ? (
+  const _batchSettingsBlock = (files.length > 0 || editMode || hasReviewableContent) ? (
     <div className="mt-3 glass rounded-card px-4 py-4">
       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-3">
         {files.length > 1
@@ -2086,13 +2087,14 @@ export default function UploadZone({
                   {t("upload.movement_custom_video_note")}
                 </div>
               ) : _customStill ? (
-                <div
-                  role="radiogroup"
-                  aria-label={t("upload.movement_photo_title")}
-                  data-testid="photo-motion-group"
-                  className="grid grid-cols-2 gap-2"
-                >
-                  {PHOTO_MOTIONS.map((p, _i) => {
+                <div>
+                  <div
+                    role="radiogroup"
+                    aria-label={t("upload.movement_photo_title")}
+                    data-testid="photo-motion-group"
+                    className="grid grid-cols-2 gap-2"
+                  >
+                    {PHOTO_MOTIONS.map((p, _i) => {
                     const active = _photoMotion === p.code;
                     return (
                       <button
@@ -2173,7 +2175,16 @@ export default function UploadZone({
                         </div>
                       </button>
                     );
-                  })}
+                    })}
+                  </div>
+                  {animateImage && (
+                    <p
+                      data-testid="photo-motion-preview-pending"
+                      className="mt-2 rounded-lg border border-cyan-300/10 bg-cyan-300/[0.04] px-2.5 py-2 text-[9px] leading-snug text-cyan-100/70"
+                    >
+                      {t("upload.photo_motion_preview_pending") || "La vista previa conserva la foto quieta. El movimiento de sus elementos se genera al aprobar el video."}
+                    </p>
+                  )}
                 </div>
               ) : (
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
@@ -3947,6 +3958,7 @@ export default function UploadZone({
               customColors={customColors}
               movementStyle={hoverMovement ?? batchDefaults.movementStyle}
               operatorPhoto={_customStill}
+              photoAnimated={_customStill && animateImage}
               effect={hoverEffect ?? batchDefaults.effect}
               lyricsAnimation={hoverAnimation ?? batchDefaults.lyricsAnimation}
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}

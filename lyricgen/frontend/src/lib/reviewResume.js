@@ -17,5 +17,6 @@ export function creativeFieldsForReviewResume(job = {}) {
     bgVerbatim: params.bg_verbatim != null
       ? !!params.bg_verbatim
       : !!job.bg_verbatim,
+    animateImage: params.animate_image === true || params.animate_image === "true",
   };
 }
