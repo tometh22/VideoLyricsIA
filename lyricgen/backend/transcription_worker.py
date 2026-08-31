@@ -429,6 +429,11 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
             final["score"], [x.get("code") for x in final["reasons"]],
             len(windows), job_id,
         )
+    # Capture the private recognition streams before removing transport-only
+    # keys.  Persistence later binds this to EditorDocument.original_segments
+    # in the same transaction that exposes the job to the editor.
+    from machine_evidence import build_machine_evidence
+    r["_machine_evidence"] = build_machine_evidence(r)
     r.pop("_asr_words", None)
     r.pop("_independent_asr_words", None)
     r.pop("_pre_anchor_provider_segments", None)
@@ -694,6 +699,10 @@ def run_transcription_job(
     # y el editor abría vacío.
     try:
         segments = result.get("segments") if isinstance(result, dict) else None
+        machine_evidence = (
+            result.pop("_machine_evidence", None)
+            if isinstance(result, dict) else None
+        )
         reference_lyrics = result.get("reference_lyrics", "") if isinstance(result, dict) else ""
         quality = None
         persisted_revision = 0
@@ -756,16 +765,17 @@ def run_transcription_job(
                 )
                 quality = None
             else:
-                if segments is not None:
-                    row.segments_json = segments
-                    # Freeze the exact machine snapshot before the editor can
-                    # autosave. Lazy creation was too late for legacy clients:
-                    # their first save could become `original_segments`.
-                    from editor import get_or_create_document
-                    get_or_create_document(
-                        _persist_db, job_id, row.tenant_id, segments,
-                        initial_reason="transcription",
-                    )
+                if not isinstance(segments, list):
+                    raise RuntimeError("transcription_segments_missing")
+                row.segments_json = segments
+                # Freeze the exact machine snapshot before the editor can
+                # autosave. Lazy creation was too late for legacy clients:
+                # their first save could become `original_segments`.
+                from editor import get_or_create_document
+                document = get_or_create_document(
+                    _persist_db, job_id, row.tenant_id, segments,
+                    initial_reason="transcription",
+                )
                 previous_quality = (
                     dict(row.transcription_quality)
                     if isinstance(row.transcription_quality, dict) else {}
@@ -773,6 +783,10 @@ def run_transcription_job(
                 quality = result.get("transcription_quality") if isinstance(result, dict) else None
                 if isinstance(quality, dict):
                     quality = dict(quality)
+                    quality["machine_evidence_required"] = True
+                    quality["machine_evidence_schema"] = (
+                        "machine-transcription-evidence-v1"
+                    )
                     quality["audio_sha256"] = source_audio_sha256
                     quality["audio_revision"] = int(row.audio_revision or 0)
                     quality["evaluated_revision"] = current_revision
@@ -809,8 +823,29 @@ def run_transcription_job(
                             else "initial"
                         ),
                     )
-            row.status = "transcribed_pending"
-            row.current_step = "editing"
+                quality = dict(
+                    quality if isinstance(quality, dict)
+                    else row.transcription_quality or {}
+                )
+                quality["machine_evidence_required"] = True
+                quality["machine_evidence_schema"] = (
+                    "machine-transcription-evidence-v1"
+                )
+                row.transcription_quality = quality
+                from machine_evidence import finalize_machine_evidence
+                durable_evidence = finalize_machine_evidence(
+                    machine_evidence,
+                    original_segments=document.original_segments or [],
+                    quality=quality,
+                    audio_sha256=source_audio_sha256,
+                    audio_revision=int(row.audio_revision or 0),
+                )
+                from editor import attach_machine_evidence, require_machine_snapshot
+                attach_machine_evidence(_persist_db, document, durable_evidence)
+                row.machine_snapshot_required = True
+                require_machine_snapshot(row, document)
+                row.status = "transcribed_pending"
+                row.current_step = "editing"
             _persist_db.commit()
             persisted_revision = current_revision
             persisted_tenant_id = str(row.tenant_id or "")
@@ -849,6 +884,10 @@ def run_transcription_job(
         logger.warning(
             "[TRANSCRIBE-WORKER] failed to persist final state error_type=%s",
             _safe_exception_code(exc),
+        )
+        return _fail(
+            job_id,
+            "No pudimos guardar la evidencia de la transcripción. Reintentá.",
         )
     return result
 
