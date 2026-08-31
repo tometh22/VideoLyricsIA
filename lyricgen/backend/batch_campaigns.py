@@ -719,7 +719,13 @@ def claim_next_review(
             EditorDocument.lock_expires_at.is_(None),
             EditorDocument.lock_expires_at <= now,
         ),
-    ).order_by(BatchCampaignItem.ordinal.asc()).with_for_update(skip_locked=True).limit(10).all()
+    # PostgreSQL rejects a blanket FOR UPDATE when an OUTER JOIN is present
+    # because the nullable editor_documents side cannot be locked. Lock only
+    # the jobs that are being claimed; the editor lock is acquired separately
+    # below under its own row lock.
+    ).order_by(BatchCampaignItem.ordinal.asc()).with_for_update(
+        of=Job, skip_locked=True,
+    ).limit(10).all()
     if not candidates:
         return {"job_id": None, "empty": True}
     from editor import acquire_lock, get_or_create_document

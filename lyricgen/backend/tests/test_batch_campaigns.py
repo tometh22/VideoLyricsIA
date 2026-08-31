@@ -5,8 +5,48 @@ import pytest
 from fastapi import HTTPException
 
 import batch_campaigns as batch
-from database import BatchCampaign, BatchCampaignItem, EditorDocument, Job, SessionLocal, User
+from database import (
+    BatchCampaign, BatchCampaignItem, BatchUploadSession, EditorDocument, Job,
+    JobOutboxEvent, SessionLocal, User,
+)
 from editor import acquire_lock, release_lock
+
+
+@pytest.fixture(autouse=True)
+def clean_batch_campaign_rows():
+    """Campaign tests commit deliberately; keep their outbox rows isolated.
+
+    The full PostgreSQL suite shares one database for speed. Leaving the 50
+    feeder events from the window tests behind can fill the next outbox
+    reconciliation page and make an unrelated stale-consumer test wait for a
+    second cycle.
+    """
+    def clean():
+        session = SessionLocal()
+        try:
+            job_ids = [row[0] for row in session.query(Job.job_id).filter(
+                Job.workload_class == "batch",
+            ).all()]
+            if job_ids:
+                session.query(EditorDocument).filter(
+                    EditorDocument.job_id.in_(job_ids),
+                ).delete(synchronize_session=False)
+                session.query(JobOutboxEvent).filter(
+                    JobOutboxEvent.job_id.in_(job_ids),
+                ).delete(synchronize_session=False)
+            session.query(Job).filter(
+                Job.workload_class == "batch",
+            ).delete(synchronize_session=False)
+            session.query(BatchUploadSession).delete(synchronize_session=False)
+            session.query(BatchCampaignItem).delete(synchronize_session=False)
+            session.query(BatchCampaign).delete(synchronize_session=False)
+            session.commit()
+        finally:
+            session.close()
+
+    clean()
+    yield
+    clean()
 
 
 def _campaign(db, count=60):
