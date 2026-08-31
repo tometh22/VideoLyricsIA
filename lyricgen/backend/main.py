@@ -12419,7 +12419,7 @@ _PRODUCT_EVENT_NAMES = {
     "editor_selection_created", "editor_group_moved", "editor_timing_changed",
     "editor_undo", "editor_autosave_success", "editor_autosave_failed",
     "editor_conflict", "editor_version_restored", "editor_approved",
-    "editor_help_opened",
+    "editor_help_opened", "editor_audio_playback_failed",
 }
 
 # Ventana de /admin/product-metrics. Sin esto la única acotación era
@@ -12456,6 +12456,9 @@ _PRODUCT_EVENT_PROPERTIES = {
         "lines_reordered", "active_edit_ms", "quality_acknowledged",
     },
     "editor_help_opened": {"context"},
+    "editor_audio_playback_failed": {
+        "position_ms", "media_error_code", "automatic_recovery_available",
+    },
 }
 _PRODUCT_EVENT_COMMON_PROPERTIES = {"session_id"}
 from product_telemetry import valid_property as _valid_product_event_property

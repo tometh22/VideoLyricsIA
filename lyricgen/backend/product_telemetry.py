@@ -22,10 +22,11 @@ MAX_BY_NUMBER = {
     "from_revision": 1_000_000_000,
     "to_revision": 1_000_000_000,
     "retry_count": 100,
+    "media_error_code": 4,
     "status": 599,
 }
 SIGNED_NUMBERS = {"delta_ms"}
-BOOLEANS = {"quality_acknowledged"}
+BOOLEANS = {"quality_acknowledged", "automatic_recovery_available"}
 ENUMS = {
     "view": {"basic", "advanced"},
     "from": {"basic", "advanced"},

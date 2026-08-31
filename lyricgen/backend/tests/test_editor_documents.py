@@ -265,6 +265,25 @@ def test_editor_rejects_other_tenant_and_analytics_is_bounded(client):
     assert events.json()["accepted"] == 1
 
 
+def test_audio_playback_failure_analytics_is_persisted(client):
+    first, _, job_id = _users_and_job("editor_audio_analytics")
+    response = client.post(
+        "/analytics/events", headers=auth(_token_for(first)),
+        json={"events": [{
+            "name": "editor_audio_playback_failed",
+            "job_id": job_id,
+            "properties": {
+                "position_ms": 220_000,
+                "media_error_code": 2,
+                "automatic_recovery_available": True,
+                "session_id": f"editor-{int(datetime.now().timestamp() * 1000)}-abc123",
+            },
+        }]},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"accepted": 1, "rejected": 0}
+
+
 def test_platform_admin_can_use_editor_for_cross_tenant_review(client):
     _, _, job_id = _users_and_job("editor_client_workspace")
     db = SessionLocal()
