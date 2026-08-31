@@ -30,7 +30,16 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "d7c2f9a41b83"
-down_revision: Union[str, Sequence[str], None] = "e3a7c9b1d5f0"
+# Re-parentada sobre `e4b8c2d6f0a1` (machine_transcription_evidence), que
+# entró a staging mientras esto se desarrollaba. Las dos colgaban de
+# `e3a7c9b1d5f0` y eso daba DOS cabezas: `alembic upgrade head` falla con
+# "Multiple head revisions" y el release command de Railway corre
+# exactamente ese comando, así que el deploy se habría caído.
+#
+# Se re-parenta en vez de agregar una migración de merge porque `cost_daily`
+# no existe todavía en ningún entorno: nadie tiene esta revisión aplicada,
+# así que mover el padre no deja ninguna base en un estado imposible.
+down_revision: Union[str, Sequence[str], None] = "e4b8c2d6f0a1"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
