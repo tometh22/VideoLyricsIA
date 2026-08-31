@@ -86,6 +86,7 @@ from auth import (
     is_super_admin,
 )
 import storage
+from machine_evidence import MachineSnapshotMissing
 from datetime import datetime, timedelta, timezone
 
 from database import (
@@ -116,6 +117,7 @@ from editor import (
     ensure_document,
     dismiss_quality_proposal,
     rebase_operator_suggestions_after_manual_edit,
+    require_machine_snapshot,
     reject_operator_suggestion,
     record_quality_observation,
     revoke_quality_proposal_if_disabled,
@@ -4442,8 +4444,10 @@ async def transcribe_uploaded(
         try:
             _row3 = get_job_model(_db3, job_id)
             if _row3 is not None:
-                _row3.status = "transcribed_pending"
-                _row3.current_step = "editing"
+                # The job is not editor-ready until the finalizer commits its
+                # immutable pre-human snapshot and family hypotheses.
+                _row3.status = "transcribing"
+                _row3.current_step = "transcribing"
                 _db3.commit()
         finally:
             _db3.close()
@@ -5169,7 +5173,7 @@ async def transcribe_endpoint(
         user_id=current_user["id"],
         tenant_id=current_user["tenant_id"],
         delivery_profile="youtube",        # set for real in /generate
-        initial_status="transcribed_pending",
+        initial_status="transcribing",
         song_title=job_song_title,
     )
     # 2026-05-28 dedup gap: mirror /generate (main.py ~5688) on the
@@ -5812,6 +5816,7 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
     persisted_revision = 0
     persisted_hash = ""
     persisted_tenant_id = ""
+    machine_evidence = finalized.pop("_machine_evidence", None)
     try:
         from database import SessionLocal as _QualitySession
         _quality_db = _QualitySession()
@@ -5820,6 +5825,8 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                 _quality_db.query(Job).filter(Job.job_id == job_id)
                 .with_for_update().first()
             )
+            if row is None:
+                raise LookupError("job disappeared before machine snapshot persistence")
             if row is not None:
                 segments = finalized.get("segments") or []
                 revision = int(row.segments_revision or 0)
@@ -5831,7 +5838,7 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                 else:
                     row.segments_json = segments
                     from editor import get_or_create_document
-                    get_or_create_document(
+                    document = get_or_create_document(
                         _quality_db, job_id, row.tenant_id, segments,
                         initial_reason="transcription",
                     )
@@ -5842,6 +5849,10 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                     quality = finalized.get("transcription_quality")
                     if isinstance(quality, dict):
                         quality = dict(quality)
+                        quality["machine_evidence_required"] = True
+                        quality["machine_evidence_schema"] = (
+                            "machine-transcription-evidence-v1"
+                        )
                         from quality_cache import sha256_file
                         quality["audio_sha256"] = sha256_file(audio_path)
                         quality["evaluated_revision"] = revision
@@ -5871,6 +5882,11 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                         persisted_revision = revision
                         persisted_hash = str(quality.get("segments_hash") or "")
                         persisted_tenant_id = str(row.tenant_id or "")
+                    quality = dict(quality or {})
+                    quality["machine_evidence_required"] = True
+                    quality["machine_evidence_schema"] = (
+                        "machine-transcription-evidence-v1"
+                    )
                     row.transcription_quality = quality
                     if isinstance(quality, dict):
                         from quality_shadow import record_shadow_decision
@@ -5882,13 +5898,33 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                                 else "initial"
                             ),
                         )
-                row.status = "transcribed_pending"
-                row.current_step = "editing"
+                    from machine_evidence import finalize_machine_evidence
+                    durable_evidence = finalize_machine_evidence(
+                        machine_evidence,
+                        original_segments=document.original_segments or [],
+                        quality=quality,
+                        audio_sha256=quality.get("audio_sha256"),
+                        audio_revision=int(row.audio_revision or 0),
+                    )
+                    from editor import attach_machine_evidence, require_machine_snapshot
+                    attach_machine_evidence(_quality_db, document, durable_evidence)
+                    row.machine_snapshot_required = True
+                    require_machine_snapshot(row, document)
+                    row.status = "transcribed_pending"
+                    row.current_step = "editing"
                 _quality_db.commit()
         finally:
             _quality_db.close()
     except Exception as exc:
         logger.warning("[QUALITY-GATE] inline persistence failed: %s job=%s", exc, job_id)
+        try:
+            from jobs import update_job
+            update_job(
+                job_id, status="transcription_failed", current_step="error",
+                error="No pudimos guardar la evidencia de la transcripción. Reintentá.",
+            )
+        finally:
+            raise RuntimeError("machine_snapshot_persistence_failed") from exc
     if (
         isinstance(quality_to_enqueue, dict)
         and quality_to_enqueue.get("decision") != "pass"
@@ -9551,6 +9587,11 @@ async def generate_with_segments(
                 )
             except LookupError:
                 raise HTTPException(status_code=409, detail="editor_version_not_found") from None
+            except MachineSnapshotMissing as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "machine_snapshot_missing", "detail": str(exc)},
+                ) from None
             except RuntimeError:
                 # job_row.tenant_id, not current_user["tenant_id"]: an admin
                 # regenerating another tenant's job must resolve the
@@ -9868,6 +9909,7 @@ async def generate_with_segments(
                 editor_document = get_or_create_document(
                     db, job_id, job_row.tenant_id, job_row.segments_json or [],
                 )
+            require_machine_snapshot(job_row, editor_document)
             if editor_document.revision < current_revision:
                 sync_legacy_snapshot(
                     db, editor_document, current_user["id"],
@@ -9881,6 +9923,11 @@ async def generate_with_segments(
             if approved_version and approved_version.segments == (job_row.segments_json or []):
                 approved_version.is_approved = True
                 approved_version.reason = "approve"
+        except MachineSnapshotMissing as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "machine_snapshot_missing", "detail": str(exc)},
+            ) from None
         except ValueError:
             # Keep legacy generate compatibility for malformed-but-JSON
             # payloads; the durable editor layer must never turn that existing

@@ -1,0 +1,45 @@
+# Machine snapshot invariant — 2026-08-31
+
+## Confirmed staging incident
+
+Read-only inspection of job `9f502fede03f` confirmed the blocking failure:
+
+- status: `done`
+- `jobs.segments_json`: 30 rows
+- `editor_documents`: absent
+- `editor_versions`: absent
+- original pre-human snapshot and machine provenance: absent
+
+The historical raw state cannot be reconstructed honestly from the approved
+output.  This job must not be used as exact pre-human gold.
+
+## Invariant for new transcriptions
+
+The successful transcription transaction now commits all of these together:
+
+1. `Job.segments_json`;
+2. immutable `EditorDocument.original_segments`;
+3. tenant-private `EditorDocument.machine_evidence`, including primary,
+   independent and pre-anchor hypotheses when available, the selected machine
+   output, and the machine quality/route decisions;
+4. `Job.machine_snapshot_required = true`;
+5. the transition to `transcribed_pending` / `editing`.
+
+If capture, validation or persistence fails, the transaction does not expose
+the job to the editor and the transcription becomes `transcription_failed`.
+Legacy synchronous paths remain in `transcribing` until the same transaction
+finishes.
+
+Approval and generate paths fail closed with `machine_snapshot_missing` for a
+job enrolled in the invariant when the evidence is absent, malformed or does
+not hash to `original_segments`.  Historical jobs keep their legacy behavior;
+the system does not pretend that missing old raw data can be recovered.
+
+## Verification
+
+- machine evidence capture, family separation and decisions;
+- snapshot hash binding and immutability;
+- approval rejection when evidence is missing or mismatched;
+- editor, generate, transcription-quality, evidence and correction-learning
+  regression suites.
+

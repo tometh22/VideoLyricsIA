@@ -103,6 +103,9 @@ def create_job(
       - "transcribed_pending": user has called /transcribe; the audio is
         persisted but the user is still editing lyrics. /generate will
         flip the row to processing/queued once the segments come in.
+      - "transcribing": synchronous legacy /transcribe is still producing
+        and atomically freezing its mandatory pre-human evidence. The job is
+        deliberately not editor-ready in this state.
       - "awaiting_upload": browser is still PUTting bytes directly to
         R2 via a presigned URL. /transcribe-uploaded promotes to
         transcribed_pending once the upload completes.
@@ -112,8 +115,8 @@ def create_job(
         The worker promotes to "bg_preview_done" / "bg_preview_failed".
     """
     valid_states = (
-        "processing", "queued", "transcribed_pending", "awaiting_upload",
-        "bg_preview_queued",
+        "processing", "queued", "transcribing", "transcribed_pending",
+        "awaiting_upload", "bg_preview_queued",
     )
     if initial_status not in valid_states:
         raise ValueError(f"unsupported initial_status {initial_status!r}")
@@ -132,6 +135,7 @@ def create_job(
         current_step=(
             "whisper" if initial_status == "processing"
             else "queued" if initial_status == "queued"
+            else "transcribing" if initial_status == "transcribing"
             else "uploading" if initial_status == "awaiting_upload"
             else "editing"
         ),

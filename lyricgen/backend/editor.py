@@ -410,6 +410,39 @@ def attach_machine_provenance(db: Session, job_id: str, provenance: dict) -> boo
     return True
 
 
+def attach_machine_evidence(
+    db: Session, document: EditorDocument, evidence: dict,
+) -> bool:
+    """Persist the private machine payload exactly once.
+
+    A retry carrying the identical evidence is idempotent.  A different
+    payload must never replace the pre-human snapshot after an editor may have
+    opened it; that would corrupt the correction-learning baseline.
+    """
+    from machine_evidence import validate_machine_evidence
+
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == document.job_id,
+        EditorDocument.tenant_id == document.tenant_id,
+    ).populate_existing().with_for_update().one()
+    validate_machine_evidence(evidence, document.original_segments)
+    if document.machine_evidence is not None:
+        if document.machine_evidence == evidence:
+            return False
+        raise RuntimeError("machine_snapshot_already_frozen")
+    document.machine_evidence = dict(evidence)
+    db.flush()
+    return True
+
+
+def require_machine_snapshot(job: Job, document: EditorDocument) -> None:
+    """Fail closed for jobs enrolled in the durable-evidence contract."""
+    if not bool(getattr(job, "machine_snapshot_required", False)):
+        return
+    from machine_evidence import validate_machine_evidence
+    validate_machine_evidence(document.machine_evidence, document.original_segments)
+
+
 def serialize_document(db: Session, document: EditorDocument) -> dict:
     lock_expires = _aware(document.lock_expires_at)
     lock_active = bool(lock_expires and lock_expires > now_utc())
@@ -1641,6 +1674,7 @@ def approve_document(
     document = get_or_create_document(
         db, job.job_id, job.tenant_id, job.segments_json or [],
     )
+    require_machine_snapshot(job, document)
     selected = None
     selected_is_equivalent_current = False
     if editor_version_id:
