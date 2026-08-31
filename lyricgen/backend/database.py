@@ -8,6 +8,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Column,
+    Date,
     DateTime,
     Enum,
     Float,
@@ -1778,6 +1779,91 @@ class CostSnapshot(Base):
 
     __table_args__ = (
         UniqueConstraint("period", "source", name="uq_cost_snapshot_period_source"),
+    )
+
+
+class CostCollectionRun(Base):
+    """Did we manage to ask provider X about day D — and what happened.
+
+    THE POINT OF THIS TABLE: without it, a day the collector could not fetch
+    is indistinguishable from a cheap day. `cost_daily` would simply have no
+    rows for it, the month total would quietly drop, and the panel would
+    render a dip that looks like good news. The whole reason the cost panel
+    exists is to be trusted without a monthly manual audit, so "failed
+    silently" is a worse outcome than "no panel".
+
+    The row is written with status='pending' BEFORE the provider call. A
+    crash mid-call therefore leaves evidence; a missing row means the
+    collector never even got to that day, which is itself the alarm.
+    """
+    __tablename__ = "cost_collection_runs"
+
+    day = Column(Date, primary_key=True)
+    source = Column(String(32), primary_key=True)
+    # pending | ok | error | not_configured
+    status = Column(String(20), nullable=False, default="pending")
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    last_attempt_at = Column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        Index("ix_cost_runs_status_day", "status", "day"),
+    )
+
+
+class CostDaily(Base):
+    """One raw cost fact, at the finest grain the provider will give us.
+
+    DESIGN RULE — the collector stores the provider's RAW granularity; every
+    business rule is applied at read time. That rule is not stylistic, it is
+    what keeps the numbers correct:
+
+      * R2's free allowances (10 GB-month, 1M class-A, 10M class-B) are a
+        function of the MONTH. Subtracting 1M class-A per day yields $0 every
+        day even when the month blows past the million.
+      * Railway's plan minimum is `max(metered, 20)` over the month — no
+        per-day split reproduces it.
+      * OpenAI's line-item filter changes over time (July's `gpt-4o-mini` was
+        not ours; August's is). Filtering at collect time freezes a wrong
+        answer into history forever.
+
+    `amount_usd` is NULLABLE for the same reason as CostSnapshot: a source we
+    could not reach must never read as $0.
+
+    `grain` exists because a monthly-only fact (flat subscriptions, or the
+    invoice total itself) must never be summed into a day range. Mixing the
+    two in one table without it is how a month gets counted twice.
+
+    Writes are DELETE-then-INSERT per (day, source, grain) inside one
+    transaction, never upsert: a dimension that stops being reported (a SKU
+    reversed to a credit, a tenant that went quiet) must disappear, or
+    `SUM(dims)` drifts above `total` forever.
+    """
+    __tablename__ = "cost_daily"
+
+    day = Column(Date, primary_key=True)
+    source = Column(String(32), primary_key=True)
+    grain = Column(String(8), primary_key=True)        # day | month
+    dim_type = Column(String(16), primary_key=True)    # total | sku | service | line_item | job
+    dim_value = Column(String(255), primary_key=True)
+
+    qty = Column(Float, nullable=True)                 # cantidad cruda del proveedor
+    unit = Column(String(32), nullable=True)           # GB-min, requests, seconds...
+    amount_usd = Column(Float, nullable=True)
+
+    # fijo | variable | stock — separa el piso mensual del costo marginal por
+    # video. Sin esto el "$/video" baja al subir el volumen y hace parecer
+    # una mejora lo que en realidad recorta la ganancia absoluta.
+    cost_behavior = Column(String(10), nullable=True)
+
+    basis = Column(String(16), nullable=False, default="measured")  # measured|allocated|invoice_manual
+    basis_detail = Column(Text, nullable=True)
+    is_estimate = Column(Boolean, nullable=False, default=False)
+    fetched_at = Column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        Index("ix_cost_daily_day_source", "day", "source"),
+        Index("ix_cost_daily_dim", "dim_type", "dim_value"),
     )
 
 

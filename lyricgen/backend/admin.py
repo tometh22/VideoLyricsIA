@@ -1168,6 +1168,91 @@ def admin_cost_real(          # `def`, no `async def`: con live=true hace HTTP
     }
 
 
+# ---------------------------------------------------------------------------
+# Panel de costos DIARIO
+# ---------------------------------------------------------------------------
+# `/cost/real` responde "cuánto facturó el proveedor este MES". Lo de abajo
+# responde lo mismo por día/semana, que es lo que hace falta para ver una
+# tendencia o el efecto de un cambio tres días después de shipearlo.
+
+
+@router.get("/costs/series")
+def admin_costs_series(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    since: str = Query(..., description="YYYY-MM-DD inclusive"),
+    until: str = Query(..., description="YYYY-MM-DD inclusive"),
+    granularity: str = Query("day", description="day|week|month"),
+    group_by: str = Query("source", description="source|behavior|sku"),
+):
+    """Serie de costo con su cobertura al lado.
+
+    `coverage.complete=false` significa que faltan celdas (día, fuente): el
+    total es un PISO. El frontend tiene que pintar esos días como faltantes
+    y nunca como cero — un día que el proveedor no contestó se dibuja igual
+    que un día barato, y esa es exactamente la falla que este panel existe
+    para no tener.
+    """
+    from datetime import date as _date
+
+    import cost_series
+
+    try:
+        d0, d1 = _date.fromisoformat(since), _date.fromisoformat(until)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="fechas en formato YYYY-MM-DD")
+    if d1 < d0:
+        raise HTTPException(status_code=422, detail="until no puede ser anterior a since")
+    if (d1 - d0).days > 400:
+        raise HTTPException(status_code=422, detail="rango máximo 400 días")
+    try:
+        return cost_series.series(db, d0, d1, granularity=granularity,
+                                  group_by=group_by)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@router.get("/costs/coverage")
+def admin_costs_coverage(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    since: str = Query(...), until: str = Query(...),
+):
+    """Qué (día, fuente) falta. El endpoint que mira el watchdog."""
+    from datetime import date as _date
+
+    import cost_series
+
+    try:
+        d0, d1 = _date.fromisoformat(since), _date.fromisoformat(until)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="fechas en formato YYYY-MM-DD")
+    return cost_series.coverage(db, d0, d1)
+
+
+@router.post("/costs/collect")
+def admin_costs_collect(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    days: int = Query(35, ge=1, le=400),
+):
+    """Rellena los huecos de los últimos `days`. Idempotente.
+
+    **`def`, no `async def`, a propósito.** El colector hace HTTP bloqueante
+    (BigQuery, Cloudflare, Railway, OpenAI, Replicate). Dentro de un
+    `async def` eso corre en el event loop y congela TODAS las demás
+    requests del proceso; con 2 réplicas × 2 workers, un cuarto de la API.
+    FastAPI corre un `def` en su threadpool y la I/O bloqueante queda fuera
+    del loop. Mismo razonamiento que `/cost/refresh`.
+
+    Es un disparador manual: el camino normal es el cron. Existe para
+    reparar a mano después de un outage sin esperar a la próxima corrida.
+    """
+    import cost_daily_collector
+
+    return cost_daily_collector.run_backfill(db, days=days)
+
+
 @router.get("/cost/unit-economics")
 def admin_cost_unit_economics(
     admin: dict = Depends(require_admin),
