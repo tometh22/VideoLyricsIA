@@ -4352,7 +4352,7 @@ export default function UploadZone({
                       <textarea
                         value={batchDefaults.backgroundHint || ""}
                         onChange={(e) => {
-                          const v = e.target.value.slice(0, 2000);
+                          const v = e.target.value.slice(0, 4000);
                           updateBatchDefault("backgroundHint", v);
                           // Sincronizar el "guardado" con lo que el operador
                           // escribe. Sin esto, borrar el texto A MANO dejaba el
@@ -4362,7 +4362,7 @@ export default function UploadZone({
                           setSavedPrompt(v.trim());
                         }}
                         rows={3}
-                        maxLength={2000}
+                        maxLength={4000}
                         placeholder={t("upload.bg_prompt_placeholder") || "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…"}
                         className="w-full text-caption rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-gray-200 placeholder:text-gray-600 resize-y outline-none"
                       />
