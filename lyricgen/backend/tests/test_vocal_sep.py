@@ -111,4 +111,40 @@ def test_separate_vocals_none_on_replicate_failure(monkeypatch, tmp_path):
     src = tmp_path / "song.mp3"
     src.write_bytes(b"fake")
     _fake_replicate(monkeypatch, run=MagicMock(side_effect=RuntimeError("boom")))
+    degraded = MagicMock()
+    monkeypatch.setattr(vs, "_marcar_degradacion", degraded)
     assert vs.separate_vocals(str(src)) is None
+    degraded.assert_called_once_with(str(src), "vocal_sep_unavailable")
+
+
+def test_separate_vocals_releases_global_slot_on_failure(monkeypatch, tmp_path):
+    """El slot global no se pierde si Replicate falla o agota presupuesto."""
+    monkeypatch.setenv("VOCAL_SEP_ENABLED", "1")
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_x")
+    src = tmp_path / "song.mp3"
+    src.write_bytes(b"fake")
+    _fake_replicate(monkeypatch, run=MagicMock(side_effect=RuntimeError("boom")))
+
+    import demucs_semaphore
+    acquire = MagicMock(return_value="lease-1")
+    release = MagicMock()
+    monkeypatch.setattr(demucs_semaphore, "acquire", acquire)
+    monkeypatch.setattr(demucs_semaphore, "release", release)
+    monkeypatch.setattr(vs, "_marcar_degradacion", MagicMock())
+
+    assert vs.separate_vocals(str(src)) is None
+    acquire.assert_called_once_with()
+    release.assert_called_once_with("lease-1")
+
+
+def test_missing_vocal_output_is_visible_degradation(monkeypatch, tmp_path):
+    monkeypatch.setenv("VOCAL_SEP_ENABLED", "1")
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_x")
+    src = tmp_path / "song.mp3"
+    src.write_bytes(b"fake")
+    _fake_replicate(monkeypatch, run=MagicMock(return_value={"drums": "u://d"}))
+    degraded = MagicMock()
+    monkeypatch.setattr(vs, "_marcar_degradacion", degraded)
+
+    assert vs.separate_vocals(str(src)) is None
+    degraded.assert_called_once_with(str(src), "demucs_output_missing_vocals")

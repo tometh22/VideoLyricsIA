@@ -429,6 +429,11 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
             final["score"], [x.get("code") for x in final["reasons"]],
             len(windows), job_id,
         )
+    # Capture the private recognition streams before removing transport-only
+    # keys.  Persistence later binds this to EditorDocument.original_segments
+    # in the same transaction that exposes the job to the editor.
+    from machine_evidence import build_machine_evidence
+    r["_machine_evidence"] = build_machine_evidence(r)
     r.pop("_asr_words", None)
     r.pop("_independent_asr_words", None)
     r.pop("_pre_anchor_provider_segments", None)
@@ -608,13 +613,18 @@ def run_transcription_job(
             # Versión B (ANCHOR_LYRICS_ENABLED, default off): si el operador
             # pegó la letra oficial, anclarla con CTC ANTES del retime normal.
             # Si ancló (timing_source == "anchor_ctc"), saltear el retime CTC
-            # de la cascada — los segments YA salieron del motor CTC con la
-            # letra oficial, un segundo retime sería doble trabajo sobre otro
-            # texto. En decline/excepción el helper devuelve r intacto y este
-            # if no matchea → cae a la Versión A tal cual hoy.
+            # de la cascada — los segments YA tienen la letra oficial y timing
+            # de uno de los alineadores aceptados. Si todos declinan, fallar
+            # cerrado: nunca publicar ASR libre en lugar del texto entregado.
             if (anchor_lyrics or "").strip():
                 r = await _maybe_anchor_align(r, audio_path, job_id,
                                               anchor_lyrics)
+                if (
+                    isinstance(r, dict)
+                    and (r.get("anchor_alignment") or {}).get("status")
+                    == "declined"
+                ):
+                    raise RuntimeError("operator_reference_alignment_declined")
             if not (isinstance(r, dict)
                     and r.get("timing_source") == "anchor_ctc"):
                 r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
@@ -660,25 +670,37 @@ def run_transcription_job(
         result = asyncio.run(_run_with_retime())
     except Exception as exc:
         error_type = _safe_exception_code(exc)
-        logger.error(
-            "[TRANSCRIBE-WORKER] job=%s failed error_type=%s",
-            job_id, error_type,
+        anchor_declined = str(exc) == "operator_reference_alignment_declined"
+        log_failure = logger.warning if anchor_declined else logger.error
+        log_failure(
+            "[TRANSCRIBE-WORKER] job=%s failed error_type=%s "
+            "expected_anchor_decline=%s",
+            job_id, error_type, anchor_declined,
         )
         # OBSERVABILITY (audit 2026-05-24): the orchestrator catches +
         # re-raises, but worker process exceptions don't reach Sentry
         # via FastAPI's auto-capture. Capture explicitly here so prod
         # crashes are visible in the Sentry dashboard, not just stdout.
-        try:
-            import sentry_sdk
-            with sentry_sdk.push_scope() as scope:
-                scope.set_tag("job_id", job_id)
-                scope.set_tag("layer", "transcription_worker")
-                scope.set_tag("error_type", error_type)
-                sentry_sdk.capture_message(
-                    "transcription_worker_failure", level="error",
-                )
-        except Exception:
-            pass  # never let Sentry failures break the error path
+        if not anchor_declined:
+            try:
+                import sentry_sdk
+                with sentry_sdk.push_scope() as scope:
+                    scope.set_tag("job_id", job_id)
+                    scope.set_tag("layer", "transcription_worker")
+                    scope.set_tag("error_type", error_type)
+                    sentry_sdk.capture_message(
+                        "transcription_worker_failure", level="error",
+                    )
+            except Exception:
+                pass  # never let Sentry failures break the error path
+        if anchor_declined:
+            return _fail(
+                job_id,
+                "Recibimos la letra oficial, pero no pudimos sincronizarla "
+                "con seguridad. No la reemplazamos por una transcripción "
+                "automática. Revisá que corresponda a esta versión del audio "
+                "y reintentá.",
+            )
         return _fail(
             job_id,
             f"No pudimos completar la transcripción. Código: {error_type}.",
@@ -694,6 +716,10 @@ def run_transcription_job(
     # y el editor abría vacío.
     try:
         segments = result.get("segments") if isinstance(result, dict) else None
+        machine_evidence = (
+            result.pop("_machine_evidence", None)
+            if isinstance(result, dict) else None
+        )
         reference_lyrics = result.get("reference_lyrics", "") if isinstance(result, dict) else ""
         quality = None
         persisted_revision = 0
@@ -756,16 +782,17 @@ def run_transcription_job(
                 )
                 quality = None
             else:
-                if segments is not None:
-                    row.segments_json = segments
-                    # Freeze the exact machine snapshot before the editor can
-                    # autosave. Lazy creation was too late for legacy clients:
-                    # their first save could become `original_segments`.
-                    from editor import get_or_create_document
-                    get_or_create_document(
-                        _persist_db, job_id, row.tenant_id, segments,
-                        initial_reason="transcription",
-                    )
+                if not isinstance(segments, list):
+                    raise RuntimeError("transcription_segments_missing")
+                row.segments_json = segments
+                # Freeze the exact machine snapshot before the editor can
+                # autosave. Lazy creation was too late for legacy clients:
+                # their first save could become `original_segments`.
+                from editor import get_or_create_document
+                document = get_or_create_document(
+                    _persist_db, job_id, row.tenant_id, segments,
+                    initial_reason="transcription",
+                )
                 previous_quality = (
                     dict(row.transcription_quality)
                     if isinstance(row.transcription_quality, dict) else {}
@@ -773,6 +800,10 @@ def run_transcription_job(
                 quality = result.get("transcription_quality") if isinstance(result, dict) else None
                 if isinstance(quality, dict):
                     quality = dict(quality)
+                    quality["machine_evidence_required"] = True
+                    quality["machine_evidence_schema"] = (
+                        "machine-transcription-evidence-v1"
+                    )
                     quality["audio_sha256"] = source_audio_sha256
                     quality["audio_revision"] = int(row.audio_revision or 0)
                     quality["evaluated_revision"] = current_revision
@@ -809,8 +840,29 @@ def run_transcription_job(
                             else "initial"
                         ),
                     )
-            row.status = "transcribed_pending"
-            row.current_step = "editing"
+                quality = dict(
+                    quality if isinstance(quality, dict)
+                    else row.transcription_quality or {}
+                )
+                quality["machine_evidence_required"] = True
+                quality["machine_evidence_schema"] = (
+                    "machine-transcription-evidence-v1"
+                )
+                row.transcription_quality = quality
+                from machine_evidence import finalize_machine_evidence
+                durable_evidence = finalize_machine_evidence(
+                    machine_evidence,
+                    original_segments=document.original_segments or [],
+                    quality=quality,
+                    audio_sha256=source_audio_sha256,
+                    audio_revision=int(row.audio_revision or 0),
+                )
+                from editor import attach_machine_evidence, require_machine_snapshot
+                attach_machine_evidence(_persist_db, document, durable_evidence)
+                row.machine_snapshot_required = True
+                require_machine_snapshot(row, document)
+                row.status = "transcribed_pending"
+                row.current_step = "editing"
             _persist_db.commit()
             persisted_revision = current_revision
             persisted_tenant_id = str(row.tenant_id or "")
@@ -849,6 +901,10 @@ def run_transcription_job(
         logger.warning(
             "[TRANSCRIBE-WORKER] failed to persist final state error_type=%s",
             _safe_exception_code(exc),
+        )
+        return _fail(
+            job_id,
+            "No pudimos guardar la evidencia de la transcripción. Reintentá.",
         )
     return result
 

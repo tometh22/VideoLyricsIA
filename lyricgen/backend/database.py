@@ -639,6 +639,11 @@ class Job(Base):
     # metrics, retry evidence and revision-scoped acknowledgement together
     # prevents API/editor/worker drift without adding a column per metric.
     transcription_quality = Column(JSONB, nullable=True)
+    # Set atomically with the durable pre-human editor snapshot.  Approval
+    # fails closed for these jobs when the snapshot is absent or inconsistent.
+    machine_snapshot_required = Column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
     # Final-render label-style preflight.  Kept separate from transcription
     # quality because it is bound to an encoded render, not only to segments.
     delivery_qc = Column(JSONB, nullable=True)
@@ -852,6 +857,9 @@ class EditorDocument(Base):
     # Raw proposal text is intentionally tenant-scoped in the editor layer;
     # analytics/quality JSON stores only hashes and aggregate diagnostics.
     quality_proposal = Column(JSONB, nullable=True)
+    # Tenant-private raw hypotheses and machine decisions captured before any
+    # human edit.  Unlike analytics lineage this intentionally preserves text.
+    machine_evidence = Column(JSONB, nullable=True)
 
     job = relationship("Job", back_populates="editor_document")
 
@@ -2082,6 +2090,7 @@ def _migrate_user_columns():
         # Edit-requests feature: partial re-render support at review stage.
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_json JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS transcription_quality JSONB",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS machine_snapshot_required BOOLEAN DEFAULT FALSE NOT NULL",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS delivery_qc JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS render_params JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS edit_count INTEGER NOT NULL DEFAULT 0",
@@ -2143,6 +2152,7 @@ def _migrate_user_columns():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER DEFAULT 0 NOT NULL",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_revision BIGINT DEFAULT 0 NOT NULL",
         "ALTER TABLE editor_documents ADD COLUMN IF NOT EXISTS quality_proposal JSONB",
+        "ALTER TABLE editor_documents ADD COLUMN IF NOT EXISTS machine_evidence JSONB",
         "ALTER TABLE job_outbox_events ADD COLUMN IF NOT EXISTS processing_at TIMESTAMPTZ",
         "ALTER TABLE job_outbox_events ADD COLUMN IF NOT EXISTS processing_token VARCHAR(36)",
         "ALTER TABLE job_outbox_events ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ",

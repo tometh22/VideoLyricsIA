@@ -252,6 +252,181 @@ describe("LyricsEditor — recuperación de audio remoto post-mount", () => {
     expect(revokeObjectUrlSpy).toHaveBeenCalledOnce();
     expect(revokeObjectUrlSpy).toHaveBeenCalledWith("blob:http://localhost/upload");
   });
+
+  it("renueva automáticamente una URL firmada que vence durante la reproducción", () => {
+    const onRetryAudio = vi.fn().mockResolvedValue(undefined);
+    const editorRequest = vi.fn().mockResolvedValue({ ok: true });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const props = baseProps({
+      audioUrl: "https://media.example.test/source.wav?signature=expired",
+      onRetryAudio,
+      editorRequest,
+      transcribeJobId: "d6fe637f27f3",
+    });
+    const { container } = render(<LyricsEditor {...props} />);
+    const audio = container.querySelector("audio");
+
+    audio.currentTime = 220;
+    fireEvent.timeUpdate(audio);
+    fireEvent.play(audio);
+    Object.defineProperty(audio, "error", {
+      configurable: true,
+      value: { code: 2 },
+    });
+    fireEvent.error(audio);
+
+    expect(onRetryAudio).toHaveBeenCalledOnce();
+    expect(onRetryAudio).toHaveBeenCalledWith({ reason: "media_error", mediaErrorCode: 2 });
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("renewing signed source"),
+      expect.objectContaining({
+        job_id: "d6fe637f27f3",
+        position_ms: 220_000,
+        media_error_code: 2,
+      }),
+    );
+
+    // A noisy media element must not create a request loop for the same URL.
+    fireEvent.error(audio);
+    expect(onRetryAudio).toHaveBeenCalledOnce();
+    const audioEvents = editorRequest.mock.calls.filter(([, options]) => (
+      JSON.parse(options.body).events[0].name === "editor_audio_playback_failed"
+    ));
+    expect(audioEvents).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it("restaura posición e intención de reproducción al cambiar la URL", () => {
+    const firstUrl = "https://media.example.test/source.wav?signature=old";
+    const nextUrl = "https://media.example.test/source.wav?signature=fresh";
+    const props = baseProps({ audioUrl: firstUrl, audioLoading: false });
+    const { container, rerender } = render(<LyricsEditor {...props} />);
+    const audio = container.querySelector("audio");
+    const play = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(audio, "play", { configurable: true, value: play });
+    audio.currentTime = 220;
+    fireEvent.timeUpdate(audio);
+    fireEvent.play(audio);
+
+    // The loading transition captures intent before the old src is replaced,
+    // but the playhead must remain live while a slow renewal is in flight.
+    rerender(<LyricsEditor {...props} audioLoading />);
+    audio.currentTime = 240;
+    fireEvent.timeUpdate(audio);
+    rerender(<LyricsEditor {...props} audioUrl={nextUrl} audioLoading={false} />);
+    const renewedAudio = container.querySelector("audio");
+    Object.defineProperty(renewedAudio, "duration", { configurable: true, value: 371 });
+    fireEvent.loadedMetadata(renewedAudio);
+
+    expect(renewedAudio.currentTime).toBeCloseTo(240);
+    expect(play).toHaveBeenCalledOnce();
+  });
+
+  it("respeta una pausa explícita mientras la renovación está en vuelo", () => {
+    const firstUrl = "https://media.example.test/source.wav?signature=old-pause";
+    const props = baseProps({ audioUrl: firstUrl, audioLoading: false });
+    const { container, rerender } = render(<LyricsEditor {...props} />);
+    const audio = container.querySelector("audio");
+    audio.currentTime = 100;
+    fireEvent.timeUpdate(audio);
+    fireEvent.play(audio);
+    rerender(<LyricsEditor {...props} audioLoading />);
+    audio.currentTime = 130;
+    fireEvent.pause(audio);
+
+    rerender(<LyricsEditor {...props} audioUrl="https://media.example.test/source.wav?signature=new-pause" />);
+    const renewedAudio = container.querySelector("audio");
+    const play = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(renewedAudio, "play", { configurable: true, value: play });
+    Object.defineProperty(renewedAudio, "duration", { configurable: true, value: 371 });
+    fireEvent.loadedMetadata(renewedAudio);
+
+    expect(renewedAudio.currentTime).toBeCloseTo(130);
+    expect(play).not.toHaveBeenCalled();
+  });
+
+  it("reanuda también cuando el fallo ocurrió exactamente en 0:00", () => {
+    const props = baseProps({
+      audioUrl: "https://media.example.test/source.wav?signature=expired",
+      onRetryAudio: vi.fn().mockResolvedValue(undefined),
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { container, rerender } = render(<LyricsEditor {...props} />);
+    const audio = container.querySelector("audio");
+    fireEvent.play(audio);
+    fireEvent.error(audio);
+    rerender(<LyricsEditor {...props} audioUrl="https://media.example.test/source.wav?signature=fresh" />);
+    const renewedAudio = container.querySelector("audio");
+    const play = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(renewedAudio, "play", { configurable: true, value: play });
+    Object.defineProperty(renewedAudio, "duration", { configurable: true, value: 371 });
+    fireEvent.loadedMetadata(renewedAudio);
+
+    expect(renewedAudio.currentTime).toBe(0);
+    expect(play).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it("fuerza reload si la recuperación devuelve exactamente la misma URL", () => {
+    const stableUrl = "https://media.example.test/source.wav?signature=same-second";
+    const props = baseProps({
+      audioUrl: stableUrl,
+      audioLoading: false,
+      onRetryAudio: vi.fn().mockResolvedValue(undefined),
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { container, rerender } = render(<LyricsEditor {...props} />);
+    const audio = container.querySelector("audio");
+    const load = vi.fn();
+    const play = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(audio, "load", { configurable: true, value: load });
+    Object.defineProperty(audio, "play", { configurable: true, value: play });
+    audio.currentTime = 45;
+    fireEvent.timeUpdate(audio);
+    fireEvent.play(audio);
+    fireEvent.error(audio);
+
+    rerender(<LyricsEditor {...props} audioLoading />);
+    rerender(<LyricsEditor {...props} audioLoading={false} />);
+    expect(load).toHaveBeenCalledOnce();
+    Object.defineProperty(audio, "duration", { configurable: true, value: 371 });
+    fireEvent.loadedMetadata(audio);
+    expect(audio.currentTime).toBeCloseTo(45);
+    expect(play).toHaveBeenCalledOnce();
+    expect(screen.queryByText(/Audio no disponible para reproducir/i)).toBeNull();
+
+    // A successful load resets the per-source guard, so a later independent
+    // failure of the same URL remains observable and recoverable.
+    fireEvent.error(audio);
+    expect(props.onRetryAudio).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+
+  it("descarta un Blob local fallido y cae a la fuente remota recuperable", () => {
+    const createObjectUrlSpy = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:http://localhost/broken");
+    const revokeObjectUrlSpy = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const onRetryAudio = vi.fn().mockResolvedValue(undefined);
+    const audioFile = new File(["audio"], "song.wav", { type: "audio/wav" });
+    const remoteUrl = "https://media.example.test/source.wav?signature=fresh";
+    const { container, unmount } = render(<LyricsEditor {...baseProps({
+      audioFile,
+      audioUrl: remoteUrl,
+      onRetryAudio,
+    })} />);
+    const audio = container.querySelector("audio");
+    expect(audio).toHaveAttribute("src", "blob:http://localhost/broken");
+
+    fireEvent.error(audio);
+
+    expect(container.querySelector("audio")).toHaveAttribute("src", remoteUrl);
+    expect(onRetryAudio).toHaveBeenCalledOnce();
+    unmount();
+    expect(revokeObjectUrlSpy).toHaveBeenCalledWith("blob:http://localhost/broken");
+    createObjectUrlSpy.mockRestore();
+    revokeObjectUrlSpy.mockRestore();
+    warn.mockRestore();
+  });
 });
 
 describe("LyricsEditor — advanced shell and timing safety", () => {

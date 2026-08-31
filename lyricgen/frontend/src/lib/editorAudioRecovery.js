@@ -6,6 +6,10 @@
 
 const FALLBACK_RETRY_MS = 1_000;
 const MAX_RETRY_AFTER_MS = 60_000;
+const DEFAULT_URL_EXPIRY_SECONDS = 3_600;
+const URL_REFRESH_SAFETY_MS = 5 * 60_000;
+const MIN_URL_REFRESH_DELAY_MS = 5_000;
+export const PROACTIVE_URL_RETRY_MS = 30_000;
 
 export function isTransientAudioFailure(response) {
   const status = response?.status;
@@ -20,6 +24,48 @@ export function retryAfterMs(response, attempt) {
   // A bounded exponential fallback prevents a flaky connection from turning
   // into a request storm when the server could not provide a Retry-After.
   return Math.min(FALLBACK_RETRY_MS * (2 ** attempt), MAX_RETRY_AFTER_MS);
+}
+
+// R2 URLs used by the editor are intentionally short-lived. Renew them before
+// the signature expires so a long timing session does not run out of buffered
+// audio halfway through the song. Keep the calculation pure for deterministic
+// tests and clamp malformed server values to the endpoint's current contract.
+export function audioUrlRefreshDelayMs(expiresInSeconds) {
+  const parsed = Number(expiresInSeconds);
+  const expiryMs = Number.isFinite(parsed) && parsed > 0
+    ? parsed * 1_000
+    : DEFAULT_URL_EXPIRY_SECONDS * 1_000;
+  return Math.max(MIN_URL_REFRESH_DELAY_MS, expiryMs - URL_REFRESH_SAFETY_MS);
+}
+
+// A preventive renewal runs while the current URL still has a five-minute
+// safety window. If the API is temporarily unavailable, fail open: keep the
+// known-good source and retry shortly. Initial loads and recovery after an
+// actual media error still fail closed so the UI can offer its manual retry.
+export function editorAudioFailureState(previous, {
+  reason,
+  failureReason = "temporary",
+  now = Date.now,
+} = {}) {
+  if (
+    reason === "signed_url_expiring"
+    && failureReason === "temporary"
+    && previous?.audioUrl
+  ) {
+    return {
+      ...previous,
+      audioLoading: false,
+      audioUnavailableReason: null,
+      audioRefreshAt: now() + PROACTIVE_URL_RETRY_MS,
+    };
+  }
+  return {
+    ...previous,
+    audioUrl: null,
+    audioLoading: false,
+    audioUnavailableReason: failureReason,
+    audioRefreshAt: null,
+  };
 }
 
 /**
@@ -39,7 +85,13 @@ export async function loadEditorAudio({
       const response = await request();
       if (response?.ok) {
         const body = await response.json();
-        if (body?.url) return { ok: true, url: body.url };
+        if (body?.url) {
+          return {
+            ok: true,
+            url: body.url,
+            expiresIn: Number(body.expires_in) || DEFAULT_URL_EXPIRY_SECONDS,
+          };
+        }
         // The endpoint's successful contract always contains a URL. Treat a
         // malformed success as temporary rather than falsely saying the file
         // was deleted.

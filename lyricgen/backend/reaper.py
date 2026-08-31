@@ -563,6 +563,13 @@ def _reason_for_transcription(job: Job) -> str:
     )
 
 
+def _transcription_rq_job_id(job: Job) -> str:
+    attempt_id = str(getattr(job, "active_transcription_attempt_id", "") or "")
+    if attempt_id:
+        return f"transcription:{attempt_id}"
+    return f"transcribe:{job.job_id}"
+
+
 def reap_stuck_transcription(db: Session, job: Job) -> None:
     """Flip a stuck transcription to `transcription_failed` and cancel its
     RQ entry. Caller commits.
@@ -570,9 +577,9 @@ def reap_stuck_transcription(db: Session, job: Job) -> None:
     Different reaping path from `reap_stuck_job` because:
       1. Status target is `transcription_failed` (editor's "Reintentar" CTA),
          not the generic `error` (post-render retry).
-      2. Transcription RQ ids are prefixed `transcribe:<job_id>` to avoid
-         collision with the render job sharing the same Postgres job_id;
-         cancel_rq_job is called with the prefixed form.
+      2. Transcription RQ ids use the active outbox attempt id (legacy jobs
+         fall back to `transcribe:<job_id>`), so cancellation targets the
+         exact durable publication instead of a stale/bare DB id.
     """
     # Race guard (audit 2026-05-26): the row read in find_stuck_transcriptions
     # had no lock; the worker may have finished between then and now.
@@ -594,13 +601,31 @@ def reap_stuck_transcription(db: Session, job: Job) -> None:
         )
         return
 
+    # Una fila queued vieja NO es un zombie si su RQ entry sigue queued,
+    # deferred o scheduled. Con olas grandes puede esperar mas de 120 min sin
+    # que ningun worker la haya tocado. Antes el reaper mataba esa cola sana.
+    # Ante Redis caido (None) tambien preservamos: ausencia de evidencia no es
+    # evidencia de muerte. `transcribing` conserva el heartbeat timeout de
+    # siempre porque ahi el worker ya tomo el job.
+    rq_job_id = _transcription_rq_job_id(locked)
+    if locked.status == "transcribing_queued":
+        try:
+            from queue_jobs import rq_job_is_active
+            rq_active = rq_job_is_active(rq_job_id)
+        except Exception:
+            rq_active = None
+        if rq_active is not False:
+            logger.info(
+                "reaper: preserve queued transcription %s — rq_active=%s",
+                locked.job_id, rq_active,
+            )
+            return
+
     rq_removed = False
     previous_status = locked.status  # capture before mutation for audit
     try:
         from queue_jobs import cancel_rq_job
-        # enqueue_transcription uses `transcribe:<job_id>` as the RQ id
-        # (queue_jobs.py:457). Cancelling the bare job_id would miss it.
-        rq_removed = cancel_rq_job(f"transcribe:{locked.job_id}")
+        rq_removed = cancel_rq_job(rq_job_id)
     except Exception as e:  # pragma: no cover
         logger.warning(
             "cancel_rq_job (transcription) failed for %s: %s", locked.job_id, e,

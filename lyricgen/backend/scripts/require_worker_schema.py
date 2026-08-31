@@ -10,6 +10,7 @@ from database import engine
 
 REQUIRED_COLUMNS = {
     ("jobs", "transcription_quality"),
+    ("jobs", "machine_snapshot_required"),
     ("jobs", "quality_learning_epoch"),
     ("jobs", "quality_learning_invalidated_at"),
     ("jobs", "input_audio_sha256"),
@@ -24,6 +25,7 @@ REQUIRED_COLUMNS = {
     ("jobs", "render_params"),
     ("jobs", "last_progress_at"),
     ("editor_documents", "quality_proposal"),
+    ("editor_documents", "machine_evidence"),
     ("editor_versions", "provenance"),
     ("job_outbox_events", "dedupe_key"),
     ("job_outbox_events", "available_at"),
