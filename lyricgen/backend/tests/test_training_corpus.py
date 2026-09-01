@@ -1,8 +1,9 @@
-from datetime import datetime, timezone
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import uuid
 
-from database import Job
+from database import EditorVersion, Job
 from editor import (
     approve_document,
     attach_machine_evidence,
@@ -13,6 +14,7 @@ from machine_evidence import (
     approval_training_provenance,
     build_machine_evidence,
     finalize_machine_evidence,
+    snapshot_hash,
 )
 from training_corpus import build_line_delta_audit, materialize_training_pair
 
@@ -111,6 +113,67 @@ def test_training_pair_materializes_machine_gold_families_and_edits():
     assert pair["hypotheses_by_family"][0]["family"] == "whisper-large-v3"
     assert len(pair["intermediate_line_deltas"]) == 1
 
+    missing_delta = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved], audits=[],
+    )
+    assert missing_delta["complete"] is False
+    assert "editor_delta_missing:0->1" in missing_delta["issues"]
+
+    corrupt_delta = deepcopy(delta)
+    corrupt_delta["changes"][0]["after"]["end"] = 99.0
+    corrupt_audit = SimpleNamespace(
+        id=9, detail=corrupt_delta, created_at=datetime.now(timezone.utc),
+    )
+    invalid_chain = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[corrupt_audit],
+    )
+    assert invalid_chain["complete"] is False
+    assert "editor_delta_content_mismatch:0->1" in invalid_chain["issues"]
+
+    after_approval_segments = [
+        {"_id": "a", "start": 0, "end": 1.4, "text": "hola otra vez"},
+    ]
+    after_approval = SimpleNamespace(
+        id="v2", revision=2, segments=after_approval_segments, reason="autosave",
+        is_approved=False, provenance=None, created_at=datetime.now(timezone.utc),
+    )
+    post_delta = build_line_delta_audit(
+        approved_segments, after_approval_segments, job_id=job.job_id,
+        from_revision=1, to_revision=2, checkpoint="autosave", text_ref=_ref,
+    )
+    post_audit = SimpleNamespace(
+        id=2, detail=post_delta, created_at=datetime.now(timezone.utc),
+    )
+    bounded = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved, after_approval],
+        audits=[audit, post_audit],
+    )
+    assert bounded["complete"] is True
+    assert [row["revision"] for row in bounded["intermediate_checkpoints"]] == [0, 1]
+    assert [row["to_revision"] for row in bounded["intermediate_line_deltas"]] == [1]
+
+    tampered = deepcopy(approval)
+    tampered["song_quality_signal"]["traffic_light"] = "purple"
+    tampered["evidence_sha256"] = snapshot_hash({
+        key: value for key, value in tampered.items() if key != "evidence_sha256"
+    })
+    approved.provenance = {"training_approval": tampered}
+    invalid_signal = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved], audits=[audit],
+    )
+    assert invalid_signal["complete"] is False
+    assert "machine_quality_signal_invalid" in invalid_signal["issues"]
+
+    corrupt_hash = deepcopy(approval)
+    corrupt_hash["evidence_sha256"] = "0" * 64
+    approved.provenance = {"training_approval": corrupt_hash}
+    invalid_hash = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved], audits=[audit],
+    )
+    assert invalid_hash["complete"] is False
+    assert "approval_evidence_hash_mismatch" in invalid_hash["issues"]
+
 
 def test_five_new_jobs_are_exportable_end_to_end(db):
     from scripts.export_training_pairs import export_pairs
@@ -176,3 +239,43 @@ def test_five_new_jobs_are_exportable_end_to_end(db):
     assert all(len(row["hypotheses_by_family"]) == 3 for row in exported)
     assert all(len(row["intermediate_line_deltas"]) == 1 for row in exported)
     assert all(row["approved"]["training_approval"] for row in exported)
+
+
+def test_latest_export_filters_approval_before_limit(db):
+    from scripts.export_training_pairs import _latest_eligible_jobs
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    expected = []
+    for index in range(60):
+        job_id = uuid.uuid4().hex[:12]
+        job = Job(
+            job_id=job_id, user_id=1, tenant_id="latest-export-tests",
+            artist="Artist", song_title=f"Song {index}", filename="song.wav",
+            style="oscuro", status="transcribed_pending", current_step="editing",
+            delivery_profile="youtube", segments_json=[],
+            machine_snapshot_required=True,
+            created_at=base + timedelta(minutes=index),
+        )
+        db.add(job)
+        db.flush()
+        if index < 5:
+            db.add(EditorVersion(
+                id=str(uuid.uuid4()), job_id=job_id, tenant_id=job.tenant_id,
+                revision=0, segments=[], reason="approve", is_approved=True,
+                created_by=1,
+            ))
+            expected.append(job_id)
+    db.flush()
+
+    selected = _latest_eligible_jobs(db, 5)
+
+    assert [row.job_id for row in selected] == list(reversed(expected))
+
+
+def test_require_complete_fails_when_requested_sample_count_is_short():
+    from scripts.export_training_pairs import _required_export_failed
+
+    assert _required_export_failed({"rows": 0, "incomplete_rows": 0}, 5) is True
+    assert _required_export_failed({"rows": 4, "incomplete_rows": 0}, 5) is True
+    assert _required_export_failed({"rows": 5, "incomplete_rows": 1}, 5) is True
+    assert _required_export_failed({"rows": 5, "incomplete_rows": 0}, 5) is False

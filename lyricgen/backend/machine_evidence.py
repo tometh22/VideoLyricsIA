@@ -107,6 +107,26 @@ def quality_training_signal(quality: dict | None) -> dict:
     }
 
 
+def validate_quality_training_signal(signal: Any) -> None:
+    """Validate the persisted song-level calibration label without inventing it."""
+    if not isinstance(signal, dict) or signal.get("schema") != "song-quality-signal-v1":
+        raise MachineSnapshotMissing("machine_quality_signal_missing")
+    if signal.get("traffic_light") not in {"green", "yellow", "red"}:
+        raise MachineSnapshotMissing("machine_quality_signal_invalid")
+    score = signal.get("score")
+    if score is not None and (
+        not isinstance(score, (int, float))
+        or isinstance(score, bool)
+        or not math.isfinite(float(score))
+        or not 0.0 <= float(score) <= 100.0
+    ):
+        raise MachineSnapshotMissing("machine_quality_score_invalid")
+    if signal.get("score_source") not in {
+        "quality_score", "risk_derived", "unavailable",
+    }:
+        raise MachineSnapshotMissing("machine_quality_score_source_invalid")
+
+
 def _provider_family(segments: list[dict]) -> str:
     for segment in segments:
         if not isinstance(segment, dict):
@@ -238,10 +258,7 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
         raise MachineSnapshotMissing("machine_snapshot_hash_mismatch")
     if evidence.get("schema") == SCHEMA:
         signal = (evidence.get("decisions") or {}).get("song_quality_signal")
-        if not isinstance(signal, dict) or signal.get("schema") != "song-quality-signal-v1":
-            raise MachineSnapshotMissing("machine_quality_signal_missing")
-        if signal.get("traffic_light") not in {"green", "yellow", "red"}:
-            raise MachineSnapshotMissing("machine_quality_signal_invalid")
+        validate_quality_training_signal(signal)
         expected_hash = snapshot_hash({
             "hypotheses_by_family": evidence["hypotheses_by_family"],
             "pre_human": evidence["pre_human"],

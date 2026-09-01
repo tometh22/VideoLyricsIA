@@ -86,7 +86,7 @@ from auth import (
     is_super_admin,
 )
 import storage
-from machine_evidence import MachineSnapshotMissing
+from machine_evidence import MachineSnapshotMissing, SCHEMA as MACHINE_EVIDENCE_SCHEMA
 from datetime import datetime, timedelta, timezone
 
 from database import (
@@ -5915,9 +5915,7 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                     if isinstance(quality, dict):
                         quality = dict(quality)
                         quality["machine_evidence_required"] = True
-                        quality["machine_evidence_schema"] = (
-                            "machine-transcription-evidence-v1"
-                        )
+                        quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
                         from quality_cache import sha256_file
                         quality["audio_sha256"] = sha256_file(audio_path)
                         quality["evaluated_revision"] = revision
@@ -5949,9 +5947,7 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                         persisted_tenant_id = str(row.tenant_id or "")
                     quality = dict(quality or {})
                     quality["machine_evidence_required"] = True
-                    quality["machine_evidence_schema"] = (
-                        "machine-transcription-evidence-v1"
-                    )
+                    quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
                     row.transcription_quality = quality
                     if isinstance(quality, dict):
                         from quality_shadow import record_shadow_decision

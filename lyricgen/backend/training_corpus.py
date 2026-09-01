@@ -11,9 +11,11 @@ from collections import defaultdict
 from typing import Any, Callable, Iterable
 
 from machine_evidence import (
+    MachineSnapshotMissing,
     SCHEMA as MACHINE_EVIDENCE_SCHEMA,
     snapshot_hash,
     validate_machine_evidence,
+    validate_quality_training_signal,
 )
 
 
@@ -237,6 +239,35 @@ def _approved_version(versions: Iterable[Any]) -> Any | None:
     return max(approved, key=lambda row: int(getattr(row, "revision", 0))) if approved else None
 
 
+def _delta_content_projection(detail: dict) -> list[dict]:
+    """Canonical, privacy-safe delta content used to verify the audit chain."""
+    projected = []
+    for raw_change in detail.get("changes") or []:
+        change = dict(raw_change or {})
+
+        def line(value: Any) -> dict | None:
+            if not isinstance(value, dict):
+                return None
+            return {
+                "start": _finite_time(value.get("start")),
+                "end": _finite_time(value.get("end")),
+                "text_length": int(value.get("text_length") or 0),
+            }
+
+        projected.append({
+            "operation": change.get("operation"),
+            "line_id": change.get("line_id"),
+            "from_index": change.get("from_index"),
+            "to_index": change.get("to_index"),
+            "before": line(change.get("before")),
+            "after": line(change.get("after")),
+            "fields": dict(change.get("fields") or {}),
+            "start_delta_ms": change.get("start_delta_ms"),
+            "end_delta_ms": change.get("end_delta_ms"),
+        })
+    return projected
+
+
 def materialize_training_pair(
     *, job: Any, document: Any, versions: Iterable[Any], audits: Iterable[Any],
 ) -> dict:
@@ -258,15 +289,38 @@ def materialize_training_pair(
     approval_evidence = dict(approval_provenance.get("training_approval") or {})
     if approval_evidence.get("schema") != "training-approval-evidence-v1":
         issues.append("approval_training_signal_missing")
-    elif approved and approval_evidence.get("segments_sha256") != snapshot_hash(
-        list(getattr(approved, "segments", None) or [])
-    ):
-        issues.append("approved_snapshot_hash_mismatch")
+    elif approved:
+        approved_segments = list(getattr(approved, "segments", None) or [])
+        if approval_evidence.get("revision") != int(getattr(approved, "revision", -1)):
+            issues.append("approval_revision_mismatch")
+        if approval_evidence.get("segments_sha256") != snapshot_hash(approved_segments):
+            issues.append("approved_snapshot_hash_mismatch")
+        expected_approval_hash = snapshot_hash({
+            key: value for key, value in approval_evidence.items()
+            if key != "evidence_sha256"
+        })
+        if approval_evidence.get("evidence_sha256") != expected_approval_hash:
+            issues.append("approval_evidence_hash_mismatch")
+        try:
+            validate_quality_training_signal(
+                approval_evidence.get("song_quality_signal")
+            )
+        except MachineSnapshotMissing as exc:
+            issues.append(str(exc))
 
+    approved_revision = int(getattr(approved, "revision", -1)) if approved else -1
     delta_events = []
     legacy_or_truncated = False
     for audit in audits:
         detail = dict(getattr(audit, "detail", None) or {})
+        try:
+            to_revision = int(detail.get("to_revision"))
+        except (TypeError, ValueError):
+            to_revision = None
+        # The selected approval is the label boundary. Later drafts belong to
+        # a future training pair and must never contaminate this trajectory.
+        if approved is not None and to_revision is not None and to_revision > approved_revision:
+            continue
         if detail.get("schema") != LINE_DELTA_SCHEMA or detail.get("truncated") is not False:
             legacy_or_truncated = True
             continue
@@ -284,7 +338,10 @@ def materialize_training_pair(
         int(row.get("to_revision") or 0), int(row.get("audit_id") or 0),
     ))
 
-    approved_revision = int(getattr(approved, "revision", -1)) if approved else -1
+    checkpoint_rows = [
+        row for row in versions
+        if approved is None or int(getattr(row, "revision", 0)) <= approved_revision
+    ]
     checkpoints = [
         {
             "version_id": str(getattr(row, "id", "")),
@@ -297,9 +354,43 @@ def materialize_training_pair(
             "segments": list(getattr(row, "segments", None) or []),
             "segments_sha256": snapshot_hash(list(getattr(row, "segments", None) or [])),
         }
-        for row in versions
-        if approved is None or int(getattr(row, "revision", 0)) <= approved_revision
+        for row in checkpoint_rows
     ]
+    deltas_by_boundary: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    for event in delta_events:
+        try:
+            boundary = (int(event.get("from_revision")), int(event.get("to_revision")))
+        except (TypeError, ValueError):
+            issues.append("editor_delta_revision_invalid")
+            continue
+        deltas_by_boundary[boundary].append(event)
+    for previous, current in zip(checkpoint_rows, checkpoint_rows[1:]):
+        previous_segments = list(getattr(previous, "segments", None) or [])
+        current_segments = list(getattr(current, "segments", None) or [])
+        material = build_line_delta_audit(
+            previous_segments,
+            current_segments,
+            job_id=str(getattr(job, "job_id", "")),
+            from_revision=int(getattr(previous, "revision", 0)),
+            to_revision=int(getattr(current, "revision", 0)),
+            checkpoint="export_validation",
+            text_ref=lambda _value: None,
+        )
+        if material is None:
+            continue
+        boundary = (
+            int(getattr(previous, "revision", 0)),
+            int(getattr(current, "revision", 0)),
+        )
+        matches = deltas_by_boundary.get(boundary, [])
+        if not matches:
+            issues.append(f"editor_delta_missing:{boundary[0]}->{boundary[1]}")
+        elif len(matches) > 1:
+            issues.append(f"editor_delta_ambiguous:{boundary[0]}->{boundary[1]}")
+        elif _delta_content_projection(matches[0]) != _delta_content_projection(material):
+            issues.append(
+                f"editor_delta_content_mismatch:{boundary[0]}->{boundary[1]}"
+            )
     return {
         "schema": TRAINING_PAIR_SCHEMA,
         "job_id": str(getattr(job, "job_id", "")),

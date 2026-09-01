@@ -24,24 +24,27 @@ from training_corpus import materialize_training_pair  # noqa: E402
 
 
 def _latest_eligible_jobs(db, limit: int) -> list[Job]:
-    candidates = (
+    approved_jobs = (
+        db.query(EditorVersion.job_id)
+        .filter(EditorVersion.is_approved.is_(True))
+        .distinct()
+        .subquery()
+    )
+    return (
         db.query(Job)
+        .join(approved_jobs, approved_jobs.c.job_id == Job.job_id)
         .filter(Job.machine_snapshot_required.is_(True))
         .order_by(Job.created_at.desc(), Job.job_id.desc())
-        .limit(max(limit * 10, 50))
+        .limit(limit)
         .all()
     )
-    selected = []
-    for job in candidates:
-        approved = db.query(EditorVersion.id).filter(
-            EditorVersion.job_id == job.job_id,
-            EditorVersion.is_approved.is_(True),
-        ).first()
-        if approved:
-            selected.append(job)
-        if len(selected) >= limit:
-            break
-    return selected
+
+
+def _required_export_failed(manifest: dict, requested_rows: int) -> bool:
+    return (
+        int(manifest.get("rows") or 0) != int(requested_rows)
+        or int(manifest.get("incomplete_rows") or 0) != 0
+    )
 
 
 def _job_audits(db, job_id: str) -> list[AuditLog]:
@@ -89,9 +92,11 @@ def main() -> int:
         parser.error("--latest must be between 1 and 1000")
 
     db = SessionLocal()
+    requested_rows = args.latest
     try:
         if args.job_id:
             unique_ids = list(dict.fromkeys(str(value) for value in args.job_id))
+            requested_rows = len(unique_ids)
             by_id = {
                 row.job_id: row for row in db.query(Job).filter(
                     Job.job_id.in_(unique_ids),
@@ -120,6 +125,7 @@ def main() -> int:
     manifest = {
         "schema": "transcription-training-export-manifest-v1",
         "rows": len(rows),
+        "requested_rows": requested_rows,
         "complete_rows": sum(bool(row.get("complete")) for row in rows),
         "incomplete_rows": sum(not bool(row.get("complete")) for row in rows),
         "job_ids": [row.get("job_id") for row in rows],
@@ -134,7 +140,7 @@ def main() -> int:
     )
     os.chmod(manifest_path, 0o600)
     print(json.dumps(manifest, separators=(",", ":")))
-    if args.require_complete and manifest["incomplete_rows"]:
+    if args.require_complete and _required_export_failed(manifest, requested_rows):
         return 2
     return 0
 
