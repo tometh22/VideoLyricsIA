@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import tempfile
+from typing import Any
 
 logger = logging.getLogger("genly.forced_align")
 
@@ -81,6 +82,49 @@ def _is_non_retryable(err: Exception) -> bool:
     return any(f in msg for f in _NON_RETRYABLE_FRAGMENTS)
 
 
+def _safe_provider_value(value: Any, *, _seen: set[int] | None = None) -> Any:
+    """Return a JSON-safe lossless-enough view of a Replicate completion.
+
+    Normal Replicate outputs are already JSON values.  The recursive fallback
+    exists for SDK wrappers or malformed rows: every list entry survives, and
+    only an opaque object's bounded string representation replaces that object.
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if value == value and abs(value) != float("inf") else str(value)
+
+    seen = _seen if _seen is not None else set()
+    identity = id(value)
+    if identity in seen:
+        return {"raw": "<recursive-provider-value>"}
+    seen.add(identity)
+    try:
+        if isinstance(value, dict):
+            return {
+                str(key): _safe_provider_value(item, _seen=seen)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [
+                _safe_provider_value(item, _seen=seen) for item in value
+            ]
+        try:
+            dumped = value.model_dump()
+        except Exception:
+            dumped = None
+        if dumped is not None and dumped is not value:
+            return _safe_provider_value(dumped, _seen=seen)
+        return {"raw": str(value)[:2000]}
+    finally:
+        seen.discard(identity)
+
+
+def _raw_replicate_events(output: Any) -> list[dict]:
+    """Wrap one completed Replicate payload as one durable provider event."""
+    return [{"provider_output": _safe_provider_value(output)}]
+
+
 def _call_with_budget(model: str, input_factory, *,
                        total_budget_s: float, backoff: list):
     """Call `replicate.run(model, input=input_factory())` with a global
@@ -132,6 +176,19 @@ def _call_with_budget(model: str, input_factory, *,
             inputs = input_factory()
             recorder = start_replicate_provenance(model, "FORCED", attempt + 1)
             result = replicate.run(model, input=inputs)
+            # The shared helper serves canonical forced alignment and short
+            # gap alignment. Freeze the complete provider payload here, before
+            # either caller extracts wordstamps or rejects a thin/malformed
+            # alignment. Failed network attempts have no completed output and
+            # therefore are intentionally not counted.
+            from recognition_provenance import record_completed
+            record_completed(
+                family=model,
+                events=_raw_replicate_events(result),
+                kind="forced_alignment",
+                view="forced_alignment_audio",
+                transformation="replicate_forced_align_raw",
+            )
             finish_replicate_provenance(recorder, "succeeded")
             return result
         except Exception as e:
