@@ -35,7 +35,11 @@ The v3 producer freezes every completed recognition output at its recognition
 route/provider boundary, before catalogue reconciliation, retry selection or formatting. Each
 raw stream carries an invocation id, exact provider/model family, audio view and
 transformation; rejected full-file/VAD/local-model retries remain separate, as
-do concurrent intro and body runs. The selected editor output is recorded
+do concurrent intro and body runs. Collection resumes from that orchestration
+snapshot through gap rescue, independent word voting, ad-lib checks and the
+targeted-consensus quality retry. WhisperX cache v2 stores raw mapped segments
+separately from processed display segments; legacy processed-only cache rows
+are misses for evidence purposes. The selected editor output is recorded
 separately. An invocation-level counter is part of the immutable evidence hash,
 and any completed attempt without a named durable hypothesis blocks
 approval/export.

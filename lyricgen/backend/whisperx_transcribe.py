@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+from copy import deepcopy
 
 logger = logging.getLogger("genly.whisperx")
 
@@ -282,6 +283,13 @@ def _retranscribe_slice(
                 result.append(out_seg)
             except (KeyError, TypeError, ValueError):
                 continue
+        from recognition_provenance import record_completed
+        record_completed(
+            family="openai/whisper-1",
+            events=result,
+            view="bounded_vocal_window",
+            transformation="whisperx_adlib_retranscribe_offset",
+        )
         return result or None
     except Exception as exc:
         logger.warning(
@@ -683,8 +691,8 @@ def _compute_cache_key(audio_path: str, language: str | None, lyrics_hint: str |
     return (key, audio_hash, hint_hash)
 
 
-def _cache_lookup(cache_key: str, expected_audio_hash: str | None = None) -> list[dict] | None:
-    """Return cached segments for `cache_key`, or None on miss / error.
+def _cache_lookup(cache_key: str, expected_audio_hash: str | None = None) -> dict | list | None:
+    """Return the cache payload for `cache_key`, or None on miss / error.
     Errors are swallowed — cache is best-effort, the path falls through
     to the live Replicate call.
 
@@ -727,8 +735,14 @@ def _cache_lookup(cache_key: str, expected_audio_hash: str | None = None) -> lis
 
 
 def _cache_write(cache_key: str, audio_hash: str, lyrics_hint_hash: str,
-                 language: str | None, segments: list[dict]) -> None:
-    """Persist `segments` under `cache_key`. Swallows all errors — a
+                 language: str | None, segments: list[dict],
+                 *, raw_segments: list[dict]) -> None:
+    """Persist processed and raw mapped segments under `cache_key`.
+
+    Legacy cache rows contain only the processed list. They remain readable
+    at the storage layer but are deliberately treated as misses by the caller:
+    post-filter output cannot honestly stand in for raw recognition evidence.
+    Swallows all errors — a
     failed write must not break the request that just succeeded."""
     try:
         from database import TranscriptionCache, SessionLocal
@@ -742,7 +756,11 @@ def _cache_write(cache_key: str, audio_hash: str, lyrics_hint_hash: str,
                 engine="whisperx",
                 language=(language or "")[:8] or None,
                 lyrics_hint_hash=lyrics_hint_hash or None,
-                segments=json.dumps(segments),
+                segments=json.dumps({
+                    "schema": "whisperx-cache-v2",
+                    "raw_segments": raw_segments,
+                    "processed_segments": segments,
+                }),
             )
             db.merge(row)   # idempotent upsert (cache_key is PK)
             db.commit()
@@ -1004,20 +1022,40 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     cache_key, audio_hash, hint_hash = _compute_cache_key(
         audio_path, language, lyrics_hint, vad_onset, vad_offset)
     if cache_key:
-        cached_segs = _cache_lookup(cache_key, expected_audio_hash=audio_hash)
-        if cached_segs is not None:
+        cached_payload = _cache_lookup(cache_key, expected_audio_hash=audio_hash)
+        if (
+            isinstance(cached_payload, dict)
+            and cached_payload.get("schema") == "whisperx-cache-v2"
+            and isinstance(cached_payload.get("raw_segments"), list)
+            and isinstance(cached_payload.get("processed_segments"), list)
+            and all(
+                isinstance(segment, dict)
+                for segment in cached_payload["raw_segments"]
+            )
+            and all(
+                isinstance(segment, dict)
+                for segment in cached_payload["processed_segments"]
+            )
+        ):
+            cached_raw = cached_payload["raw_segments"]
+            cached_segs = cached_payload["processed_segments"]
             from recognition_provenance import record_completed
             record_completed(
                 family=recognition_family(),
-                events=cached_segs,
+                events=cached_raw,
                 view=provenance_view,
-                transformation="cache_hit",
+                transformation="cache_hit_raw",
             )
             logger.info(
                 "[WHISPERX] cache hit audio_hash=%s (%d segs, $0 + 0 s vs ~75-180 s + $0.005)",
                 audio_hash, len(cached_segs),
             )
             return cached_segs
+        if cached_payload is not None:
+            logger.warning(
+                "[WHISPERX] legacy/malformed cache lacks raw evidence; "
+                "forcing live recompute"
+            )
 
     payload: dict = {"align_output": True,
                      "vad_onset": vad_onset, "vad_offset": vad_offset}
@@ -1093,6 +1131,7 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
         return None
 
     segs = _map_segments(output)
+    raw_segs = deepcopy(segs)
     from recognition_provenance import record_completed
     record_completed(
         family=recognition_family(),
@@ -1125,6 +1164,9 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
 
     # Persist result for future identical calls. Errors silenced inside.
     if cache_key:
-        _cache_write(cache_key, audio_hash, hint_hash, language, segs)
+        _cache_write(
+            cache_key, audio_hash, hint_hash, language, segs,
+            raw_segments=raw_segs,
+        )
 
     return segs

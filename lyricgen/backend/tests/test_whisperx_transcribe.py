@@ -5,6 +5,7 @@ import types
 from unittest.mock import MagicMock
 
 import whisperx_transcribe as wx
+from recognition_provenance import begin_collection, end_collection
 
 
 class _SucceededPrediction:
@@ -298,6 +299,49 @@ def test_transcribe_maps_on_success(monkeypatch, tmp_path):
     _fake_replicate(monkeypatch, run=MagicMock(return_value=out))
     segs = wx.transcribe_whisperx(str(f), language="es")
     assert [s["text"] for s in segs] == ["uno", "dos"]
+
+
+def test_cache_hit_returns_processed_but_records_raw(monkeypatch, tmp_path):
+    monkeypatch.setenv("WHISPERX_ENABLED", "1")
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_x")
+    audio = tmp_path / "cache.mp3"
+    audio.write_bytes(b"cache-fixture")
+    _fake_replicate(
+        monkeypatch,
+        run=MagicMock(side_effect=AssertionError("cache hit must not run")),
+    )
+    raw = [
+        {"start": 0.0, "end": 8.0, "text": "raw merged line"},
+        {"start": 8.0, "end": 10.0, "text": "raw second"},
+    ]
+    processed = [
+        {"start": 0.0, "end": 4.0, "text": "processed one"},
+        {"start": 4.0, "end": 8.0, "text": "processed two"},
+    ]
+    monkeypatch.setattr(
+        wx, "_compute_cache_key",
+        lambda *args, **kwargs: ("cache-key", "audio-hash", "hint-hash"),
+    )
+    monkeypatch.setattr(
+        wx, "_cache_lookup",
+        lambda *args, **kwargs: {
+            "schema": "whisperx-cache-v2",
+            "raw_segments": raw,
+            "processed_segments": processed,
+        },
+    )
+
+    collector, token = begin_collection()
+    try:
+        returned = wx.transcribe_whisperx(str(audio), language="es")
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
+
+    assert returned == processed
+    assert snapshot["completed_attempt_count"] == 1
+    assert snapshot["hypotheses"][0]["events"] == raw
+    assert snapshot["hypotheses"][0]["transformation"] == "cache_hit_raw"
 
 
 # ──────────────────────────────────────────────────────────────────────

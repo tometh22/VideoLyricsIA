@@ -15,10 +15,15 @@ from typing import Any
 
 
 class RecognitionCollector:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        completed_attempt_count: int = 0,
+        hypotheses: list[dict] | None = None,
+    ) -> None:
         self._lock = Lock()
-        self._completed_attempt_count = 0
-        self._hypotheses: list[dict] = []
+        self._completed_attempt_count = max(0, int(completed_attempt_count))
+        self._hypotheses: list[dict] = deepcopy(hypotheses or [])
 
     def record_completed(
         self,
@@ -80,6 +85,42 @@ def begin_collection() -> tuple[RecognitionCollector, Token]:
 
 def end_collection(token: Token) -> None:
     _CURRENT.reset(token)
+
+
+def resume_from_result(result: dict) -> RecognitionCollector:
+    """Continue collection through recognizers in post-processing."""
+    existing = _CURRENT.get()
+    if existing is not None:
+        return existing
+    hypotheses = [
+        row for row in (result.get("_recognition_hypotheses") or [])
+        if isinstance(row, dict)
+    ]
+    count = result.get("_recognition_attempt_count")
+    if type(count) is not int:
+        count = len(hypotheses)
+    collector = RecognitionCollector(
+        completed_attempt_count=count,
+        hypotheses=hypotheses,
+    )
+    _CURRENT.set(collector)
+    return collector
+
+
+def snapshot_into_result(result: dict) -> dict:
+    collector = _CURRENT.get()
+    if collector is None:
+        return result
+    snapshot = collector.snapshot()
+    result["_recognition_hypotheses"] = snapshot["hypotheses"]
+    result["_recognition_attempt_count"] = snapshot[
+        "completed_attempt_count"
+    ]
+    return result
+
+
+def clear_collection() -> None:
+    _CURRENT.set(None)
 
 
 def record_completed(

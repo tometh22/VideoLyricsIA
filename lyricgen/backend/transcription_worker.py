@@ -438,8 +438,13 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     # Capture the private recognition streams before removing transport-only
     # keys.  Persistence later binds this to EditorDocument.original_segments
     # in the same transaction that exposes the job to the editor.
+    from recognition_provenance import clear_collection, snapshot_into_result
     from machine_evidence import build_machine_evidence
-    r["_machine_evidence"] = build_machine_evidence(r)
+    try:
+        snapshot_into_result(r)
+        r["_machine_evidence"] = build_machine_evidence(r)
+    finally:
+        clear_collection()
     r.pop("_asr_words", None)
     r.pop("_independent_asr_words", None)
     r.pop("_pre_anchor_provider_segments", None)
@@ -607,6 +612,8 @@ def run_transcription_job(
                 language=language, artist=artist, title=title, filename=filename,
                 live=live,
             )
+            from recognition_provenance import resume_from_result
+            resume_from_result(r)
             # Immutable provider evidence must exist before anchor CTC or any
             # other timing/content post-pass can replace words and bounds.
             from line_evidence import freeze_result_provider_evidence

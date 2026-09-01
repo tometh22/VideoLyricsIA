@@ -498,6 +498,14 @@ def whisper_word_align(
              "end": getattr(w, "end", None) or w.get("end")}
             for w in words
         ]
+        from recognition_provenance import record_completed
+        record_completed(
+            family="openai/whisper-1",
+            events=word_dicts,
+            kind="word_stream",
+            view="alignment_audio",
+            transformation="whisper_word_align",
+        )
 
         cleaned_to_whisper = _dp_align_tokens(cleaned_tokens, word_dicts)
         anchored_lines = len({

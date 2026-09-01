@@ -4515,6 +4515,8 @@ async def transcribe_uploaded(
             filename=_row_filename,
             live=bool(body.live),
         )
+        from recognition_provenance import resume_from_result
+        resume_from_result(_result)
         from line_evidence import freeze_result_provider_evidence
         _result = freeze_result_provider_evidence(_result)
         # Versión B: si el operador pegó la letra oficial, anclarla con CTC
@@ -5293,6 +5295,8 @@ async def transcribe_endpoint(
         artist=artist, title=title,
         filename=file.filename,
     )
+    from recognition_provenance import resume_from_result
+    resume_from_result(_result)
     from line_evidence import freeze_result_provider_evidence
     _result = freeze_result_provider_evidence(_result)
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
@@ -6210,6 +6214,13 @@ def _make_stem_window_transcriber(
             )
             from pipeline import _transcribe_via_openai_api as _wx
             segs = _wx(clip, language=language) or []
+            from recognition_provenance import record_completed
+            record_completed(
+                family="openai/whisper-1",
+                events=segs,
+                view="bounded_vocal_window",
+                transformation="adlib_consensus",
+            )
             return " ".join((s.get("text") or "").strip() for s in segs).strip()
         except Exception as e:
             logger.warning("[ADLIB] window %.1f-%.1f transcribe failed: %s",

@@ -4,8 +4,11 @@ import pipeline
 from pipeline import _tag_recognition_family, transcription_family
 from recognition_provenance import (
     begin_collection,
+    clear_collection,
     end_collection,
     record_completed,
+    resume_from_result,
+    snapshot_into_result,
 )
 import whisperx_transcribe
 
@@ -157,3 +160,38 @@ def test_collector_context_reaches_provider_worker_thread():
 
     assert snapshot["completed_attempt_count"] == 1
     assert snapshot["hypotheses"][0]["family"] == "threaded/family"
+
+
+def test_postpass_collection_extends_orchestrator_snapshot():
+    initial, token = begin_collection()
+    try:
+        record_completed(
+            family="primary/family",
+            events=[{"text": "first", "start": 0.0, "end": 1.0}],
+        )
+        prefix = initial.snapshot()
+    finally:
+        end_collection(token)
+
+    result = {
+        "_recognition_hypotheses": prefix["hypotheses"],
+        "_recognition_attempt_count": prefix["completed_attempt_count"],
+    }
+    try:
+        resume_from_result(result)
+        record_completed(
+            family="postpass/family",
+            events=[{"text": "second", "start": 1.0, "end": 2.0}],
+            transformation="gap_rescue",
+        )
+        snapshot_into_result(result)
+    finally:
+        clear_collection()
+
+    assert result["_recognition_attempt_count"] == 2
+    assert [
+        row["attempt_id"] for row in result["_recognition_hypotheses"]
+    ] == [0, 1]
+    assert [
+        row["family"] for row in result["_recognition_hypotheses"]
+    ] == ["primary/family", "postpass/family"]

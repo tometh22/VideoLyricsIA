@@ -5850,6 +5850,14 @@ def _whisper_quick_text(mp3_path: str, job_id: str | None = None) -> str:
             r = OpenAI().audio.transcriptions.create(
                 model="whisper-1", file=f, response_format="text",
             )
+        from recognition_provenance import record_completed
+        record_completed(
+            family="openai/whisper-1",
+            events=([{"text": str(r or "").strip()}] if str(r or "").strip() else []),
+            kind="text",
+            view="bounded_alignment_window",
+            transformation="reference_alignment_verify",
+        )
         if recorder is not None:
             try:
                 recorder.finish(response_summary="whisper_quick_ok")

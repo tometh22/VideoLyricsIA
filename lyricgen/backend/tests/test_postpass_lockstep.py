@@ -101,3 +101,16 @@ def test_todo_camino_pasa_el_idioma_resuelto_al_filtro_de_adlibs():
                 f"{fname}:{call.lineno}: _maybe_adlib_filter debe recibir "
                 "el idioma resuelto"
             )
+
+
+def test_todo_camino_reanuda_evidencia_antes_de_postpases():
+    """Post-pass recognizers must extend the orchestration evidence."""
+    for fname, func, calls in _call_sites():
+        assert "resume_from_result" in calls, (
+            f"{fname}:{func}: los reconocedores post-pass perderían sus "
+            "hipótesis porque no reanudan el colector"
+        )
+        assert calls["resume_from_result"] < calls["_maybe_adlib_filter"], (
+            f"{fname}:{func}: hay que reanudar evidencia antes de cualquier "
+            "reconocedor post-pass"
+        )
