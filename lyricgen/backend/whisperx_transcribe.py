@@ -826,6 +826,30 @@ def _map_segments(output) -> list[dict]:
     return segs
 
 
+def _raw_provider_segments(output) -> list[dict]:
+    """Preserve every Replicate segment row before mapping or filtering."""
+    if isinstance(output, dict):
+        if "segments" not in output:
+            return [{"raw": str(output)[:2000]}]
+        source = output.get("segments")
+    elif isinstance(output, list):
+        source = output
+    else:
+        return [] if output is None else [{"raw": str(output)[:2000]}]
+    if not isinstance(source, list):
+        return [] if source is None else [{"raw": str(source)[:2000]}]
+    rows: list[dict] = []
+    for row in source:
+        if isinstance(row, dict):
+            try:
+                rows.append(deepcopy(row))
+            except Exception:
+                rows.append({"raw": str(row)[:2000]})
+        else:
+            rows.append({"raw": str(row)[:2000]})
+    return rows
+
+
 def _filter_ghosts(segs: list[dict]) -> list[dict]:
     """Drop suspicious tiny segments: whisperX occasionally tags an
     instrumental flourish or breath as a 1-word segment (real example on
@@ -1129,15 +1153,15 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     if output is None:
         return None
 
-    segs = _map_segments(output)
-    raw_segs = deepcopy(segs)
+    raw_segs = _raw_provider_segments(output)
     from recognition_provenance import record_completed
     record_completed(
         family=recognition_family(),
-        events=segs,
+        events=raw_segs,
         view=provenance_view,
         transformation="replicate_raw",
     )
+    segs = _map_segments(output)
     raw_n = len(segs)
     segs = _vad_split_adlib_segments(segs, audio_path, language)
     segs = _correct_post_adlib_timing(segs, audio_path)

@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 import pipeline
+from recognition_provenance import begin_collection, end_collection
 
 
 SR = 22050
@@ -122,9 +123,22 @@ def test_live_gap_prompt_does_not_include_catalogue(stem, monkeypatch):
 def test_rejects_loop_hallucination(stem, monkeypatch):
     monkeypatch.setenv("GAP_RECOVERY_ENABLED", "1")
     # the long-clip failure mode: the same phrase repeated many times
-    _mock(monkeypatch, "\n".join(["Nada fue un error"] * 5))
-    out = pipeline._recover_gap_lyrics(SEGS, audio_path=stem, canonical=CANON)
+    raw = "\n".join(["Nada fue un error"] * 5)
+    _mock(monkeypatch, raw)
+    collector, token = begin_collection()
+    try:
+        out = pipeline._recover_gap_lyrics(
+            SEGS, audio_path=stem, canonical=CANON,
+        )
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
     assert all(s.get("provenance") != "gap-recovery" for s in out)
+    assert snapshot["completed_attempt_count"] == 1
+    assert snapshot["hypotheses"][0]["events"] == [{"text": raw}]
+    assert snapshot["hypotheses"][0]["transformation"].startswith(
+        "gap_recovery_raw:start="
+    )
 
 
 def test_rejects_low_containment(stem, monkeypatch):

@@ -180,8 +180,34 @@ def test_local_retries_remain_separate_named_attempts(monkeypatch):
         "openai-whisper/large-v3-local",
     ]
     assert [row["transformation"] for row in snapshot["hypotheses"]] == [
-        "full_file", "late_onset_retry", "sparse_result_retry",
+        "full_file_raw", "late_onset_retry_raw", "sparse_result_retry_raw",
     ]
+
+
+def test_local_whisper_freezes_rows_before_candidate_filters(monkeypatch):
+    model = _FakeLocalModel([[
+        _local_segment("real lyric", 1.0, 2.0),
+        {
+            **_local_segment("Subtitles by Amara.org", 2.0, 3.0),
+            "no_speech_prob": 0.99,
+        },
+    ]])
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("WHISPER_FALLBACK_ENABLED", "0")
+    monkeypatch.setattr(pipeline, "_get_whisper_model", lambda _name: model)
+
+    collector, token = begin_collection()
+    try:
+        selected = pipeline.transcribe("fixture.wav", provenance_view="mix")
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
+
+    assert [row["text"] for row in selected] == ["real lyric"]
+    assert [
+        row["text"] for row in snapshot["hypotheses"][0]["events"]
+    ] == ["real lyric", "Subtitles by Amara.org"]
+    assert snapshot["hypotheses"][0]["transformation"] == "full_file_raw"
 
 
 def test_attempt_counter_survives_hypothesis_serialization_loss():

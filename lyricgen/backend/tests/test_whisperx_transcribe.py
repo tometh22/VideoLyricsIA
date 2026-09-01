@@ -109,6 +109,23 @@ def test_map_segments_handles_non_dict_output():
     assert wx._map_segments([{"start": 0, "end": 1, "text": "hi"}])[0]["text"] == "hi"
 
 
+def test_raw_provider_segments_preserves_rows_the_mapper_rejects():
+    output = {"segments": [
+        {"start": 0, "end": 1, "text": "   "},
+        {"start": "bad", "end": 2, "text": "unmappable"},
+        "malformed provider row",
+        {"start": 2, "end": 3, "text": "usable"},
+    ]}
+
+    assert [row.get("text") for row in wx._map_segments(output)] == ["usable"]
+    assert wx._raw_provider_segments(output) == [
+        {"start": 0, "end": 1, "text": "   "},
+        {"start": "bad", "end": 2, "text": "unmappable"},
+        {"raw": "malformed provider row"},
+        {"start": 2, "end": 3, "text": "usable"},
+    ]
+
+
 def test_filter_ghosts_drops_short_oneword_segments():
     # The El Arbol smoke produced an 'Amén' at 5.15s for 0.18s (1 word).
     # That's whisperX false-flagging an instrumental sound as speech.
@@ -293,12 +310,21 @@ def test_transcribe_maps_on_success(monkeypatch, tmp_path):
     f = tmp_path / "a.mp3"
     f.write_bytes(b"x")
     out = {"segments": [
+        {"start": "bad", "end": 0, "text": "rejected raw"},
         {"start": 0, "end": 1, "text": "uno"},
         {"start": 1, "end": 2, "text": "dos"},
     ]}
     _fake_replicate(monkeypatch, run=MagicMock(return_value=out))
-    segs = wx.transcribe_whisperx(str(f), language="es")
+    collector, token = begin_collection()
+    try:
+        segs = wx.transcribe_whisperx(str(f), language="es")
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
     assert [s["text"] for s in segs] == ["uno", "dos"]
+    assert [
+        row["text"] for row in snapshot["hypotheses"][0]["events"]
+    ] == ["rejected raw", "uno", "dos"]
 
 
 def test_cache_hit_returns_processed_but_records_raw(monkeypatch, tmp_path):

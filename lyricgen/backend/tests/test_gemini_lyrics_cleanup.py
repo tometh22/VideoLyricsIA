@@ -19,6 +19,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 import pipeline
+from recognition_provenance import begin_collection, end_collection
 
 
 @pytest.fixture
@@ -83,6 +84,56 @@ def test_cache_key_unreadable_audio_returns_none():
     assert hh is None
 
 
+def test_cache_hit_returns_cleaned_text_and_freezes_cached_raw(
+        tiny_audio, monkeypatch):
+    monkeypatch.setenv("GEMINI_LYRICS_CLEANUP_ENABLED", "1")
+    raw = "Claro, acá está:\nLínea corregida"
+    cleaned = "Línea corregida"
+    monkeypatch.setattr(
+        pipeline, "_gemini_cleanup_cache_lookup",
+        lambda _key: {
+            "schema": "gemini-cleanup-cache-v2",
+            "raw_text": raw,
+            "cleaned": cleaned,
+        },
+    )
+    monkeypatch.setattr(
+        pipeline, "_get_genai_client",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("v2 cache hit must not call Gemini")
+        ),
+    )
+    collector, token = begin_collection()
+    try:
+        out = pipeline._gemini_cleanup_lyrics(tiny_audio, "Línea original")
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
+
+    assert out == cleaned
+    assert snapshot["completed_attempt_count"] == 1
+    assert snapshot["hypotheses"][0]["events"] == [{"text": raw}]
+    assert snapshot["hypotheses"][0]["transformation"] == (
+        "gemini_cleanup_cache_hit_raw"
+    )
+
+
+def test_legacy_cache_without_raw_forces_live_recompute(tiny_audio, monkeypatch):
+    monkeypatch.setenv("GEMINI_LYRICS_CLEANUP_ENABLED", "1")
+    plain = "Línea uno\nLínea dos\nLínea tres\nLínea cuatro"
+    fake_client = _patch_genai_with(monkeypatch, _FakeResponse(plain))
+    monkeypatch.setattr(
+        pipeline, "_gemini_cleanup_cache_lookup",
+        lambda _key: {"cleaned": "legacy processed only"},
+    )
+    monkeypatch.setattr(
+        pipeline, "_gemini_cleanup_cache_write", lambda *a, **k: None,
+    )
+
+    assert pipeline._gemini_cleanup_lyrics(tiny_audio, plain) == plain
+    assert fake_client.models.generate_content.call_count == 1
+
+
 # ─── Sanity gate on line-count ratio ────────────────────────────────
 
 class _FakeResponse:
@@ -115,10 +166,21 @@ def test_rejects_when_output_too_short(tiny_audio, monkeypatch):
     and returned only the first 20 of 58 lines (PR #X exploration)."""
     monkeypatch.setenv("GEMINI_LYRICS_CLEANUP_ENABLED", "1")
     plain = "\n".join(f"line {i}" for i in range(20))   # 20 lines in
-    _patch_genai_with(monkeypatch, _FakeResponse("line 1\nline 2\nline 3"))  # 3 out
+    raw = "line 1\nline 2\nline 3"
+    _patch_genai_with(monkeypatch, _FakeResponse(raw))  # 3 out
 
-    out = pipeline._gemini_cleanup_lyrics(tiny_audio, plain)
+    collector, token = begin_collection()
+    try:
+        out = pipeline._gemini_cleanup_lyrics(tiny_audio, plain)
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
     assert out is None
+    assert snapshot["completed_attempt_count"] == 1
+    assert snapshot["hypotheses"][0]["events"] == [{"text": raw}]
+    assert snapshot["hypotheses"][0]["transformation"] == (
+        "gemini_cleanup_raw"
+    )
 
 
 def test_rejects_when_output_too_long(tiny_audio, monkeypatch):

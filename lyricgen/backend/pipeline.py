@@ -4013,6 +4013,26 @@ def _tag_recognition_family(
     return segments
 
 
+def _raw_local_whisper_events(result: object) -> list[dict]:
+    """Serialize every local Whisper row before candidate filtering.
+
+    Local Whisper normally returns dictionaries, but malformed rows must not
+    vanish merely because the downstream mapper cannot consume them.  Keep a
+    bounded textual representation for those rows so a completed invocation
+    remains recoverable and auditable.
+    """
+    source = result.get("segments") if isinstance(result, dict) else None
+    if not isinstance(source, list):
+        return [] if source is None else [{"raw": str(source)[:2000]}]
+    rows: list[dict] = []
+    for row in source:
+        if isinstance(row, dict):
+            rows.append(row)
+        else:
+            rows.append({"raw": str(row)[:2000]})
+    return rows
+
+
 def transcribe(mp3_path: str, language: str = None,
                lyrics_hint: str | None = None,
                job_id: str | None = None,
@@ -4150,6 +4170,10 @@ def transcribe(mp3_path: str, language: str = None,
         logger.info("[WHISPER] Forced language: %s", language)
 
     result = model.transcribe(audio_path, **kwargs)
+    _record(
+        _raw_local_whisper_events(result),
+        "openai-whisper/turbo-local", "full_file_raw",
+    )
 
     import re as _re
 
@@ -4191,13 +4215,15 @@ def transcribe(mp3_path: str, language: str = None,
             ]
         segments.append(out_seg)
 
-    _record(segments, "openai-whisper/turbo-local", "full_file")
-
     # Safety net: retry if first segment starts very late
     if segments and segments[0]["start"] > 30:
         logger.warning("[WHISPER] WARNING: first seg at %.1fs, retrying", segments[0]['start'])
         kwargs2 = dict(kwargs, initial_prompt="Song lyrics transcription:", no_speech_threshold=0.4)
         result2 = model.transcribe(mp3_path, **kwargs2)
+        _record(
+            _raw_local_whisper_events(result2),
+            "openai-whisper/turbo-local", "late_onset_retry_raw",
+        )
         segments2 = []
         for seg in result2["segments"]:
             text = seg["text"].strip()
@@ -4216,10 +4242,6 @@ def transcribe(mp3_path: str, language: str = None,
                     for w in words if (w.get("word") or "").strip()
                 ]
             segments2.append(out_seg)
-        _record(
-            segments2, "openai-whisper/turbo-local",
-            "late_onset_retry",
-        )
         if segments2 and segments2[0]["start"] < segments[0]["start"]:
             segments = segments2
 
@@ -4234,6 +4256,11 @@ def transcribe(mp3_path: str, language: str = None,
             try:
                 large = _get_whisper_model("large-v3")
                 result3 = large.transcribe(audio_path, **kwargs)
+                _record(
+                    _raw_local_whisper_events(result3),
+                    "openai-whisper/large-v3-local",
+                    "sparse_result_retry_raw",
+                )
                 segments3 = []
                 for seg in result3["segments"]:
                     text = seg["text"].strip()
@@ -4256,10 +4283,6 @@ def transcribe(mp3_path: str, language: str = None,
                             for w in words if (w.get("word") or "").strip()
                         ]
                     segments3.append(out_seg)
-                _record(
-                    segments3, "openai-whisper/large-v3-local",
-                    "sparse_result_retry",
-                )
                 if len(segments3) > len(segments):
                     logger.info("[WHISPER] large-v3 produced %s segments (turbo: %s); using large-v3",
                                 len(segments3), len(segments))
@@ -7371,8 +7394,8 @@ def _gemini_cleanup_cache_key(audio_path: str, lrclib_plain: str):
     return (key, audio_hash, hint_hash)
 
 
-def _gemini_cleanup_cache_lookup(cache_key: str) -> str | None:
-    """Return cached cleaned text for `cache_key`, or None on miss."""
+def _gemini_cleanup_cache_lookup(cache_key: str) -> dict | None:
+    """Return a v2 cache payload with raw evidence, or None on miss."""
     try:
         from database import TranscriptionCache, SessionLocal
         import json as _json
@@ -7384,7 +7407,7 @@ def _gemini_cleanup_cache_lookup(cache_key: str) -> str | None:
             if not row:
                 return None
             payload = _json.loads(row.segments)
-            return payload.get("cleaned") if isinstance(payload, dict) else None
+            return payload if isinstance(payload, dict) else None
         finally:
             db.close()
     except Exception as e:
@@ -7393,8 +7416,9 @@ def _gemini_cleanup_cache_lookup(cache_key: str) -> str | None:
 
 
 def _gemini_cleanup_cache_write(cache_key: str, audio_hash: str,
-                                 hint_hash: str, cleaned: str) -> None:
-    """Persist `cleaned` text under `cache_key`. Best-effort."""
+                                 hint_hash: str, cleaned: str,
+                                 *, raw_text: str) -> None:
+    """Persist accepted output and its pre-filter provider response."""
     try:
         from database import TranscriptionCache, SessionLocal
         import json as _json
@@ -7406,7 +7430,11 @@ def _gemini_cleanup_cache_write(cache_key: str, audio_hash: str,
                 engine="gemini_cleanup",
                 language=None,
                 lyrics_hint_hash=hint_hash or None,
-                segments=_json.dumps({"cleaned": cleaned}),
+                segments=_json.dumps({
+                    "schema": "gemini-cleanup-cache-v2",
+                    "raw_text": raw_text,
+                    "cleaned": cleaned,
+                }),
             )
             db.merge(row)
             db.commit()
@@ -7414,6 +7442,37 @@ def _gemini_cleanup_cache_write(cache_key: str, audio_hash: str,
             db.close()
     except Exception as e:
         logger.warning("[GEMINI-CLEAN] cache write failed (%s); ignoring", e)
+
+
+def _record_gemini_audio_completion(
+    response: object,
+    *,
+    view: str,
+    transformation: str,
+) -> str:
+    """Freeze a completed Gemini audio response before any local gate.
+
+    Reading ``response.text`` can itself fail for blocked/malformed provider
+    responses.  Such a call still completed and must increment the independent
+    attempt counter, so record an explicit empty hypothesis before re-raising.
+    """
+    from recognition_provenance import record_completed
+
+    try:
+        raw_text = str(getattr(response, "text") or "")
+    except Exception:
+        record_completed(
+            family="google/gemini-2.5-flash-audio",
+            events=[], kind="text", view=view,
+            transformation=f"{transformation}_unreadable",
+        )
+        raise
+    record_completed(
+        family="google/gemini-2.5-flash-audio",
+        events=([{"text": raw_text}] if raw_text else []),
+        kind="text", view=view, transformation=transformation,
+    )
+    return raw_text
 
 
 def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
@@ -7458,9 +7517,30 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     cache_key, audio_hash, hint_hash = _gemini_cleanup_cache_key(audio_path, plain)
     if cache_key:
         cached = _gemini_cleanup_cache_lookup(cache_key)
-        if cached:
+        if (
+            isinstance(cached, dict)
+            and cached.get("schema") == "gemini-cleanup-cache-v2"
+            and isinstance(cached.get("raw_text"), str)
+            and isinstance(cached.get("cleaned"), str)
+            and cached.get("cleaned")
+        ):
+            from recognition_provenance import record_completed
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=(
+                    [{"text": cached["raw_text"]}]
+                    if cached["raw_text"] else []
+                ),
+                kind="text", view="full_audio_with_reference",
+                transformation="gemini_cleanup_cache_hit_raw",
+            )
             logger.info("[GEMINI-CLEAN] cache hit audio_hash=%s (skipped live call)", audio_hash)
-            return cached
+            return cached["cleaned"]
+        if cached is not None:
+            logger.warning(
+                "[GEMINI-CLEAN] legacy/malformed cache lacks raw evidence; "
+                "forcing live recompute"
+            )
 
     try:
         from google import genai
@@ -7541,12 +7621,17 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
             timeout_s=float(timeout_s),
             label="GEMINI-CLEAN",
         )
+        cleaned_raw = _record_gemini_audio_completion(
+            response,
+            view="full_audio_with_reference",
+            transformation="gemini_cleanup_raw",
+        )
+        cleaned = cleaned_raw.strip()
     except Exception as e:
         logger.warning("[GEMINI-CLEAN] Gemini call failed: %s — using lrclib raw", e)
         return None
 
     elapsed = _time.time() - t0
-    cleaned = (response.text or "").strip()
     if not cleaned:
         # Could be safety filter rejection (explicit content) or empty
         # response. Fall back to raw text. Try to surface the reason.
@@ -7626,7 +7711,9 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     )
 
     if cache_key:
-        _gemini_cleanup_cache_write(cache_key, audio_hash, hint_hash, cleaned)
+        _gemini_cleanup_cache_write(
+            cache_key, audio_hash, hint_hash, cleaned, raw_text=cleaned_raw,
+        )
 
     return cleaned
 
@@ -7740,7 +7827,11 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
             ),
             timeout_s=float(timeout_s), label="LLM-SEGMENT",
         )
-        out = (resp.text or "").strip()
+        out = _record_gemini_audio_completion(
+            resp,
+            view="full_audio_word_segmentation",
+            transformation="llm_segment_raw",
+        ).strip()
     except Exception as e:
         logger.warning("[LLM-SEGMENT] failed (%s); keeping whisperX segments", e)
         return segs
@@ -8406,7 +8497,13 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
                     ),
                     timeout_s=float(timeout_s), label="GAP-RECOVER",
                 )
-                out = (resp.text or "").strip()
+                out = _record_gemini_audio_completion(
+                    resp,
+                    view="bounded_vocal_window",
+                    transformation=(
+                        f"gap_recovery_raw:start={c0:.3f};end={c1:.3f}"
+                    ),
+                ).strip()
             except Exception as e:
                 logger.warning("[GAP-RECOVER] Gemini failed on gap %.0f–%.0f: %s",
                                gs, ge, e)
