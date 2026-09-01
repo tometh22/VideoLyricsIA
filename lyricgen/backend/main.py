@@ -10164,7 +10164,8 @@ async def generate_with_segments(
             ).first()
             if approved_version and approved_version.segments == (job_row.segments_json or []):
                 approved_version.is_approved = True
-                approved_version.reason = "approve"
+                if approved_version.reason != "transcription":
+                    approved_version.reason = "approve"
                 freeze_approval_training_evidence(job_row, approved_version)
         except MachineSnapshotMissing as exc:
             raise HTTPException(

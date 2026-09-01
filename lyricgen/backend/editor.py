@@ -224,7 +224,8 @@ def _ensure_version(
             raise RuntimeError("editor_version_content_mismatch")
         if approved:
             existing.is_approved = True
-            existing.reason = "approve"
+            if existing.reason != "transcription":
+                existing.reason = "approve"
         if provenance and existing.provenance is None:
             existing.provenance = provenance
         return existing
@@ -1799,7 +1800,8 @@ def approve_document(
         user_id, "approve", approved=True,
     )
     version.is_approved = True
-    version.reason = "approve"
+    if version.reason != "transcription":
+        version.reason = "approve"
     freeze_approval_training_evidence(job, version)
     job.segments_json = normalize_segments(document.current_segments)
     job.segments_revision = document.revision

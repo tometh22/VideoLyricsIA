@@ -139,6 +139,24 @@ def test_training_pair_materializes_machine_gold_families_and_edits():
     assert pair["hypotheses_by_family"][0]["family"] == "whisper-large-v3"
     assert len(pair["intermediate_line_deltas"]) == 1
 
+    missing_origin = materialize_training_pair(
+        job=job, document=document, versions=[approved], audits=[],
+    )
+    assert missing_origin["complete"] is False
+    assert "transcription_checkpoint_missing" in missing_origin["issues"]
+
+    wrong_origin = SimpleNamespace(
+        id="wrong-v0", revision=0,
+        segments=[{"_id": "a", "start": 0, "end": 1, "text": "different"}],
+        reason="transcription", is_approved=False, provenance=None,
+        created_at=datetime.now(timezone.utc),
+    )
+    mismatched_origin = materialize_training_pair(
+        job=job, document=document, versions=[wrong_origin, approved], audits=[audit],
+    )
+    assert mismatched_origin["complete"] is False
+    assert "transcription_checkpoint_snapshot_mismatch" in mismatched_origin["issues"]
+
     missing_delta = materialize_training_pair(
         job=job, document=document, versions=[initial, approved], audits=[],
     )

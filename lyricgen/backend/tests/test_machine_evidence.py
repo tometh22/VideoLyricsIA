@@ -150,6 +150,7 @@ def test_approval_freezes_song_signal_on_exact_version(db):
         db, row, 1, editor_revision=document.revision,
     )
     approval = version.provenance["training_approval"]
+    assert version.reason == "transcription"
     assert approval["schema"] == "training-approval-evidence-v1"
     assert approval["song_quality_signal"]["traffic_light"] == "yellow"
     assert approval["song_quality_signal"]["score"] == 77.0

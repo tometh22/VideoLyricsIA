@@ -420,6 +420,12 @@ def materialize_training_pair(
         row for row in versions
         if approved is None or int(getattr(row, "revision", 0)) <= approved_revision
     ]
+    if not checkpoint_rows or str(getattr(checkpoint_rows[0], "reason", "")) != "transcription":
+        issues.append("transcription_checkpoint_missing")
+    elif snapshot_hash(
+        list(getattr(checkpoint_rows[0], "segments", None) or [])
+    ) != snapshot_hash(original):
+        issues.append("transcription_checkpoint_snapshot_mismatch")
     checkpoints = [
         {
             "version_id": str(getattr(row, "id", "")),
