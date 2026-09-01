@@ -14,6 +14,19 @@ from threading import Lock
 from typing import Any
 
 
+def bounded_provider_string(
+    value: Any,
+    *,
+    label: str = "opaque-provider-value",
+    limit: int = 2000,
+) -> str:
+    """Stringify an opaque SDK value without ever breaking provider success."""
+    try:
+        return str(value)[:max(0, int(limit))]
+    except Exception:
+        return f"<{label}-{type(value).__name__}>"
+
+
 class RecognitionCollector:
     def __init__(
         self,

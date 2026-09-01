@@ -182,7 +182,7 @@ def test_word_granularity_freezes_complete_top_level_provider_stream(
             raise AttributeError
 
         def __str__(self):
-            return "opaque-provider-word"
+            raise RuntimeError("SDK object cannot be stringified")
 
     response = _stub_whisper_word_response()
     response.words = [
@@ -215,7 +215,9 @@ def test_word_granularity_freezes_complete_top_level_provider_stream(
     assert word_stream["provider_event_type"] == "top_level_words"
     assert len(word_stream["words"]) == 5
     assert word_stream["words"][0]["word"] == "intro"
-    assert word_stream["words"][-1] == {"raw": "opaque-provider-word"}
+    assert word_stream["words"][-1] == {
+        "raw": "<opaque-provider-value-OpaqueWord>",
+    }
 
 
 def test_retries_then_succeeds_on_3rd(patched_transcribe):

@@ -127,17 +127,24 @@ def test_ventana_whisper_registra_provenance_del_job(monkeypatch):
 def test_gap_rescue_preserves_malformed_provider_word_before_mapping():
     from types import SimpleNamespace
 
+    class OpaqueWord:
+        def __getattr__(self, _name):
+            raise AttributeError
+
+        def __str__(self):
+            raise RuntimeError("SDK object cannot be stringified")
+
     source, raw = gr._raw_provider_words(SimpleNamespace(words=[
         SimpleNamespace(word="bien", start=0.1, end=0.5),
         SimpleNamespace(word="mal", start="not-a-time", end=1.0),
-        "opaque-row",
+        OpaqueWord(),
     ]))
 
     assert len(source) == 3
     assert raw == [
         {"word": "bien", "start": 0.1, "end": 0.5},
         {"word": "mal", "start": "not-a-time", "end": 1.0},
-        {"raw": "opaque-row"},
+        {"raw": "<opaque-provider-value-OpaqueWord>"},
     ]
 
 

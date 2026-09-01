@@ -110,10 +110,14 @@ def test_map_segments_handles_non_dict_output():
 
 
 def test_raw_provider_segments_preserves_rows_the_mapper_rejects():
+    class OpaqueRow:
+        def __str__(self):
+            raise RuntimeError("SDK object cannot be stringified")
+
     output = {"segments": [
         {"start": 0, "end": 1, "text": "   "},
         {"start": "bad", "end": 2, "text": "unmappable"},
-        "malformed provider row",
+        OpaqueRow(),
         {"start": 2, "end": 3, "text": "usable"},
     ]}
 
@@ -121,7 +125,7 @@ def test_raw_provider_segments_preserves_rows_the_mapper_rejects():
     assert wx._raw_provider_segments(output) == [
         {"start": 0, "end": 1, "text": "   "},
         {"start": "bad", "end": 2, "text": "unmappable"},
-        {"raw": "malformed provider row"},
+        {"raw": "<opaque-provider-value-OpaqueRow>"},
         {"start": 2, "end": 3, "text": "usable"},
     ]
 

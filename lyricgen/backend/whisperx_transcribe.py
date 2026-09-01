@@ -828,25 +828,30 @@ def _map_segments(output) -> list[dict]:
 
 def _raw_provider_segments(output) -> list[dict]:
     """Preserve every Replicate segment row before mapping or filtering."""
+    from recognition_provenance import bounded_provider_string
     if isinstance(output, dict):
         if "segments" not in output:
-            return [{"raw": str(output)[:2000]}]
+            return [{"raw": bounded_provider_string(output)}]
         source = output.get("segments")
     elif isinstance(output, list):
         source = output
     else:
-        return [] if output is None else [{"raw": str(output)[:2000]}]
+        return [] if output is None else [{
+            "raw": bounded_provider_string(output),
+        }]
     if not isinstance(source, list):
-        return [] if source is None else [{"raw": str(source)[:2000]}]
+        return [] if source is None else [{
+            "raw": bounded_provider_string(source),
+        }]
     rows: list[dict] = []
     for row in source:
         if isinstance(row, dict):
             try:
                 rows.append(deepcopy(row))
             except Exception:
-                rows.append({"raw": str(row)[:2000]})
+                rows.append({"raw": bounded_provider_string(row)})
         else:
-            rows.append({"raw": str(row)[:2000]})
+            rows.append({"raw": bounded_provider_string(row)})
     return rows
 
 

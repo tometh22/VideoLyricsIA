@@ -5,6 +5,7 @@ import pipeline
 from pipeline import _tag_recognition_family, transcription_family
 from recognition_provenance import (
     begin_collection,
+    bounded_provider_string,
     clear_collection,
     end_collection,
     record_completed,
@@ -12,6 +13,16 @@ from recognition_provenance import (
     snapshot_into_result,
 )
 import whisperx_transcribe
+
+
+def test_bounded_provider_string_never_raises_for_opaque_sdk_values():
+    class Unprintable:
+        def __str__(self):
+            raise RuntimeError("cannot stringify")
+
+    assert bounded_provider_string(Unprintable()) == (
+        "<opaque-provider-value-Unprintable>"
+    )
 
 
 def test_transport_marker_records_exact_selected_local_model(monkeypatch):

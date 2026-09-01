@@ -52,7 +52,7 @@ def test_raw_provider_words_preserves_opaque_rows_before_mapping():
             raise AttributeError
 
         def __str__(self):
-            return "opaque-align-word"
+            raise RuntimeError("SDK object cannot be stringified")
 
     raw = _raw_provider_words([
         {"word": "hola", "start": 1.0, "end": 1.4},
@@ -61,7 +61,7 @@ def test_raw_provider_words_preserves_opaque_rows_before_mapping():
 
     assert raw == [
         {"word": "hola", "start": 1.0, "end": 1.4},
-        {"raw": "opaque-align-word"},
+        {"raw": "<opaque-provider-value-OpaqueWord>"},
     ]
 
 

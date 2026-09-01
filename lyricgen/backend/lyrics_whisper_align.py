@@ -400,6 +400,7 @@ def _map_provider_words(words) -> list[dict]:
 
 def _raw_provider_words(words) -> list[dict]:
     """Serialize every completed provider word, including opaque rows."""
+    from recognition_provenance import bounded_provider_string
     raw: list[dict] = []
     for word in words or []:
         if isinstance(word, dict):
@@ -418,7 +419,7 @@ def _raw_provider_words(words) -> list[dict]:
                 values[key] = getattr(word, key)
             except Exception:
                 pass
-        raw.append(values or {"raw": str(word)[:2000]})
+        raw.append(values or {"raw": bounded_provider_string(word)})
     return raw
 
 

@@ -3392,6 +3392,7 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     import re as _re
 
     def _raw_word_events(words: list[object]) -> list[dict]:
+        from recognition_provenance import bounded_provider_string
         durable: list[dict] = []
         for word in words:
             if isinstance(word, dict):
@@ -3410,13 +3411,14 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                     values[key] = getattr(word, key)
                 except Exception:
                     pass
-            durable.append(values or {"raw": str(word)[:2000]})
+            durable.append(values or {"raw": bounded_provider_string(word)})
         return durable
 
     # Freeze both provider streams before assigning words to segments. The
     # top-level word stream may contain pre-segment or opaque rows that the
     # display mapper legitimately rejects but the training corpus must retain.
     raw_provider_events: list[dict] = []
+    from recognition_provenance import bounded_provider_string
     for seg in raw_segments:
         try:
             raw_provider_events.append({
@@ -3428,7 +3430,8 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
             })
         except Exception:
             raw_provider_events.append({
-                "raw": str(seg)[:2000], "provider_event_type": "segment",
+                "raw": bounded_provider_string(seg),
+                "provider_event_type": "segment",
             })
     if return_words:
         raw_provider_events.append({
@@ -3486,7 +3489,7 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                 provider_segment["words"] = seg_words
             provider_segments.append(provider_segment)
         except Exception:
-            provider_segments.append({"raw": str(seg)[:2000]})
+            provider_segments.append({"raw": bounded_provider_string(seg)})
 
     segments: list[dict] = []
     for provider_segment in provider_segments:
@@ -4065,15 +4068,18 @@ def _raw_local_whisper_events(result: object) -> list[dict]:
     bounded textual representation for those rows so a completed invocation
     remains recoverable and auditable.
     """
+    from recognition_provenance import bounded_provider_string
     source = result.get("segments") if isinstance(result, dict) else None
     if not isinstance(source, list):
-        return [] if source is None else [{"raw": str(source)[:2000]}]
+        return [] if source is None else [{
+            "raw": bounded_provider_string(source),
+        }]
     rows: list[dict] = []
     for row in source:
         if isinstance(row, dict):
             rows.append(row)
         else:
-            rows.append({"raw": str(row)[:2000]})
+            rows.append({"raw": bounded_provider_string(row)})
     return rows
 
 

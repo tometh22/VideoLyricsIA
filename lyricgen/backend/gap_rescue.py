@@ -180,10 +180,11 @@ def _agrupar_en_lineas(words: list[dict]) -> list[list[dict]]:
 
 def _raw_provider_words(response: object) -> tuple[list[object], list[dict]]:
     """Return source rows plus a durable pre-mapping representation."""
+    from recognition_provenance import bounded_provider_string
     try:
         source = list(getattr(response, "words", None) or [])
     except Exception:
-        return [], [{"raw": str(response)[:2000]}]
+        return [], [{"raw": bounded_provider_string(response)}]
     raw: list[dict] = []
     for word in source:
         if isinstance(word, dict):
@@ -202,7 +203,7 @@ def _raw_provider_words(response: object) -> tuple[list[object], list[dict]]:
                 values[key] = getattr(word, key)
             except Exception:
                 pass
-        raw.append(values or {"raw": str(word)[:2000]})
+        raw.append(values or {"raw": bounded_provider_string(word)})
     return source, raw
 
 
