@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { useEffect, useState } from "react";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
 import GenlyLogo from "./GenlyLogo";
@@ -39,8 +40,27 @@ function _isPlainLeftClick(e) {
 
 export default function Sidebar({ onNav, activeView, open, onToggle, user, onLogout }) {
   const { t } = useI18n();
+  const [campaignsEnabled, setCampaignsEnabled] = useState(false);
+
+  useEffect(() => {
+    const token = localStorage.getItem("genly_token");
+    if (!token) return undefined;
+    let active = true;
+    fetch(`${API}/batch/campaigns/access`, {
+      headers: { Authorization: `Bearer ${token}` },
+    }).then((response) => response.ok ? response.json() : null)
+      .then((body) => { if (active) setCampaignsEnabled(!!body?.enabled); })
+      .catch(() => {});
+    return () => { active = false; };
+  }, [user?.id, user?.tenant_id]);
 
   const items = ITEMS_BASE(t);
+  if (campaignsEnabled) {
+    items.splice(2, 0, {
+      id: "campaigns", label: "Campañas", path: "/campaigns",
+      icon: <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10" strokeLinecap="round"/><circle cx="19" cy="18" r="2"/></svg>,
+    });
+  }
   if (user?.role === "admin") {
     items.push({
       id: "admin", label: "Admin", path: "/admin",
@@ -48,7 +68,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
     });
   }
   const groups = [
-    { label: t("sidebar.production"), items: items.filter((item) => ["dashboard", "new", "history"].includes(item.id)) },
+    { label: t("sidebar.production"), items: items.filter((item) => ["dashboard", "new", "campaigns", "history"].includes(item.id)) },
     { label: t("sidebar.workspace"), items: items.filter((item) => ["settings", "admin"].includes(item.id)) },
   ];
 

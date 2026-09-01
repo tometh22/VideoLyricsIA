@@ -118,6 +118,34 @@ def _cleanup(db):
     db.commit()
 
 
+def _reap_seeded_transcription(db, job_id: str) -> None:
+    """Exercise the transcription reaper without racing the app daemon.
+
+    The full suite starts FastAPI lifespan threads in earlier tests.  Calling
+    ``reap_all_stuck`` here can therefore lose the advisory-lock race to that
+    daemon and turn these per-row contract tests into nondeterministic
+    integration tests.  Sweep discovery and orchestration have their own
+    coverage; these assertions are about the locked row mutation/cancellation
+    contract.
+    """
+    stuck = find_stuck_transcriptions(db, threshold_min=120)
+    job = next((row for row in stuck if row.job_id == job_id), None)
+    assert job is not None, f"expected seeded transcription {job_id!r} to be stuck"
+    _reaper.reap_stuck_transcription(db, job)
+    db.commit()
+
+
+def _reap_seeded_orphan(db, job_id: str) -> None:
+    """Exercise the orphan row contract without racing the daemon lock."""
+    orphans = find_orphan_polling_jobs(db, threshold_min=10)
+    job = next((row for row in orphans if row.job_id == job_id), None)
+    assert job is not None, f"expected seeded orphan {job_id!r}"
+    assert _reaper.reap_stuck_job(
+        db, job, _reaper._reason_for_orphan(job),
+    ) is True
+    db.commit()
+
+
 def test_recent_processing_job_is_left_alone():
     """A job that's only been in processing for 30 min is not a zombie."""
     db = SessionLocal()
@@ -308,8 +336,7 @@ def test_reap_all_stuck_reaps_orphans_with_user_facing_message():
         jid = _seed(db, status="processing", age_minutes=25)
         _seed_provenance(db, job_id=jid, age_minutes=15, duration_ms=None)
 
-        n = reap_all_stuck(threshold_min=100)
-        assert n >= 1, "reaper should have flagged the orphan"
+        _reap_seeded_orphan(db, jid)
 
         row = db.query(Job).filter(Job.job_id == jid).first()
         db.refresh(row)
@@ -972,7 +999,7 @@ def test_old_transcribing_queued_is_reaped_with_retry_cta(monkeypatch):
         monkeypatch.setattr(queue_jobs, "rq_job_is_active", lambda _jid: False)
         _cleanup(db)
         jid = _seed(db, status="transcribing_queued", age_minutes=130)
-        reap_all_stuck(threshold_min=180)  # high render-side threshold
+        _reap_seeded_transcription(db, jid)
         row = db.query(Job).filter(Job.job_id == jid).first()
         db.refresh(row)
         assert row.status == "transcription_failed", (
@@ -995,7 +1022,7 @@ def test_old_but_still_queued_transcription_is_not_reaped(monkeypatch):
     try:
         _cleanup(db)
         jid = _seed(db, status="transcribing_queued", age_minutes=130)
-        reap_all_stuck(threshold_min=180)
+        _reap_seeded_transcription(db, jid)
         row = db.query(Job).filter(Job.job_id == jid).first()
         db.refresh(row)
         assert row.status == "transcribing_queued"
@@ -1013,7 +1040,7 @@ def test_old_transcribing_in_flight_is_reaped():
         _cleanup(db)
         jid = _seed(db, status="transcribing", age_minutes=130,
                     last_progress_minutes_ago=125)
-        reap_all_stuck(threshold_min=180)
+        _reap_seeded_transcription(db, jid)
         row = db.query(Job).filter(Job.job_id == jid).first()
         db.refresh(row)
         assert row.status == "transcription_failed", (
@@ -1063,7 +1090,7 @@ def test_stuck_transcription_cancels_rq_entry_with_prefix(monkeypatch):
     try:
         _cleanup(db)
         jid = _seed(db, status="transcribing_queued", age_minutes=130)
-        reap_all_stuck(threshold_min=180)
+        _reap_seeded_transcription(db, jid)
         prefixed = f"transcribe:{jid}"
         assert prefixed in calls, (
             f"cancel_rq_job should be called with {prefixed!r}, "
@@ -1089,7 +1116,7 @@ def test_stuck_transcription_cancels_outbox_attempt_id(monkeypatch):
         row = db.query(Job).filter(Job.job_id == jid).first()
         row.active_transcription_attempt_id = "attempt-123"
         db.commit()
-        reap_all_stuck(threshold_min=180)
+        _reap_seeded_transcription(db, jid)
         assert "transcription:attempt-123" in calls
         assert f"transcribe:{jid}" not in calls
     finally:

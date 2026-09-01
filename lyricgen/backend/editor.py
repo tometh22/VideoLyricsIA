@@ -1524,37 +1524,61 @@ def save_document(
     return document, version, True
 
 
-def acquire_lock(db: Session, document: EditorDocument, user_id: int) -> dict:
+def acquire_lock(
+    db: Session,
+    document: EditorDocument,
+    user_id: int,
+    *,
+    session_id: str | None = None,
+) -> dict:
     document = db.query(EditorDocument).filter(
         EditorDocument.job_id == document.job_id,
         EditorDocument.tenant_id == document.tenant_id,
     ).populate_existing().with_for_update().one()
     now = now_utc()
     expires = _aware(document.lock_expires_at)
-    if expires and expires > now and document.lock_user_id not in (None, user_id):
+    owned_by_other_user = document.lock_user_id not in (None, user_id)
+    owned_by_other_tab = bool(
+        session_id
+        and document.lock_session_id
+        and document.lock_session_id != session_id
+    )
+    if expires and expires > now and (owned_by_other_user or owned_by_other_tab):
         return {
             "acquired": False,
             "user": _user_summary(db, document.lock_user_id),
             "expires_at": expires.isoformat(),
+            "other_session": owned_by_other_tab,
         }
     document.lock_user_id = user_id
+    document.lock_session_id = session_id or document.lock_session_id
     document.lock_expires_at = now + timedelta(seconds=LOCK_SECONDS)
     db.flush()
     return {
         "acquired": True,
         "user": _user_summary(db, user_id),
         "expires_at": document.lock_expires_at.isoformat(),
+        "session_id": session_id,
     }
 
 
-def release_lock(db: Session, document: EditorDocument, user_id: int) -> bool:
+def release_lock(
+    db: Session,
+    document: EditorDocument,
+    user_id: int,
+    *,
+    session_id: str | None = None,
+) -> bool:
     document = db.query(EditorDocument).filter(
         EditorDocument.job_id == document.job_id,
         EditorDocument.tenant_id == document.tenant_id,
     ).populate_existing().with_for_update().one()
     if document.lock_user_id not in (None, user_id):
         return False
+    if session_id and document.lock_session_id and document.lock_session_id != session_id:
+        return False
     document.lock_user_id = None
+    document.lock_session_id = None
     document.lock_expires_at = None
     db.flush()
     return True

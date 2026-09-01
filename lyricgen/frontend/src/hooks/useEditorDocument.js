@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { mergeThreeWay, segmentsEquivalent } from "../editorMerge";
+import { editorSessionHeaders } from "../lib/editorSession";
 
 async function responseBody(response) {
   try { return await response.clone().json(); } catch { return {}; }
@@ -122,7 +123,10 @@ export function useEditorDocument({ jobId, enabled, request }) {
     let stopped = false;
     const heartbeat = async () => {
       try {
-        const response = await request(`/editor/${jobId}/lock/heartbeat`, { method: "POST" });
+        const response = await request(`/editor/${jobId}/lock/heartbeat`, {
+          method: "POST",
+          headers: editorSessionHeaders(),
+        });
         const body = await responseBody(response);
         if (!stopped && response.ok) setLock({
           active: true, user: body.user, expires_at: body.expires_at,
@@ -135,7 +139,11 @@ export function useEditorDocument({ jobId, enabled, request }) {
     return () => {
       stopped = true;
       window.clearInterval(timer);
-      request(`/editor/${jobId}/lock`, { method: "DELETE", keepalive: true }).catch(() => {});
+      request(`/editor/${jobId}/lock`, {
+        method: "DELETE",
+        keepalive: true,
+        headers: editorSessionHeaders(),
+      }).catch(() => {});
     };
   }, [enabled, hasDocument, jobId, request]);
 

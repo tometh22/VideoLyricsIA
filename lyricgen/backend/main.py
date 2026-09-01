@@ -140,6 +140,7 @@ from batch_profiles import (
 from billing import router as billing_router
 from admin import router as admin_router
 from corpus import router as corpus_router
+from batch_campaigns import router as batch_campaign_router
 import emails
 
 # ---------------------------------------------------------------------------
@@ -622,6 +623,7 @@ async def enforce_submissions_switch(request: Request, call_next):
 app.include_router(billing_router)
 app.include_router(admin_router)
 app.include_router(corpus_router)
+app.include_router(batch_campaign_router)
 
 
 # --- Startup ---
@@ -3044,6 +3046,10 @@ def _commit_pipeline_publication(
         dispatch_outbox_event,
     )
 
+    pipeline_kwargs.setdefault(
+        "workload_class", getattr(job, "workload_class", "interactive") or "interactive",
+    )
+
     event = create_pipeline_outbox_event(
         db,
         job=job,
@@ -3166,6 +3172,7 @@ def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
         db.query(Job)
         .filter(Job.user_id == user_id)
         .filter(Job.tenant_id == tenant_id)
+        .filter(Job.workload_class != "batch")
         .filter(Job.status.in_(_BACKLOG_STATUSES))
         .count()
     )
@@ -3183,6 +3190,7 @@ def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
     tenant_in_flight = (
         db.query(Job)
         .filter(Job.tenant_id == tenant_id)
+        .filter(Job.workload_class != "batch")
         .filter(Job.status.in_(_BACKLOG_STATUSES))
         .count()
     )
@@ -4687,7 +4695,7 @@ class _GeneratePreviewReq(BaseModel):
     custom_colors: str = Field(default="", max_length=200)
     genre: str = Field(default="", max_length=64)
     concept: str = Field(default="", max_length=2000)
-    background_hint: str = Field(default="", max_length=2000)
+    background_hint: str = Field(default="", max_length=4000)
     bg_verbatim: bool = False
     background_mode: str = Field(default="veo", max_length=16)
     animate_image: bool = False
@@ -4961,7 +4969,7 @@ async def upload(
     lyric_color: str = Form("", max_length=8),
     lyric_sung_color: str = Form("", max_length=8),
     match_lyrics: bool = Form(True),
-    background_hint: str = Form("", max_length=2000),
+    background_hint: str = Form("", max_length=4000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
     # Add-on premium "Escenas" (multi-escena). Parity con /generate; la
@@ -9625,7 +9633,7 @@ async def generate_with_segments(
     lyric_color: str = Form("", max_length=8),
     lyric_sung_color: str = Form("", max_length=8),
     match_lyrics: bool = Form(True),
-    background_hint: str = Form("", max_length=2000),
+    background_hint: str = Form("", max_length=4000),
     bg_verbatim: bool = Form(False),
     custom_colors: str = Form("", max_length=200),
     # Batch-only canonical visual contract. Empty keeps the legacy individual
@@ -9726,6 +9734,7 @@ async def generate_with_segments(
     editor_document = None
     selected_editor_version = None
     approved_version = None
+    _batch_generation = False
 
     if reuse:
         # Reuse path: verify the job belongs to caller and pull the audio
@@ -9774,6 +9783,7 @@ async def generate_with_segments(
             )
         if _is_admin_cross_tenant:
             _audit_cross_tenant_access(db, current_user, job_row, "generate")
+        _batch_generation = job_row.workload_class == "batch"
         # State whitelist for /generate. `transcribed_pending` is what the
         # transcription worker writes on success (post-2026-05-25 fix);
         # `transcribed` is accepted defensively for jobs that were written
@@ -9938,7 +9948,8 @@ async def generate_with_segments(
                                         if enable_scenes and has_scenes_access(current_user)
                                         else 1))
     _enforce_daily_volume_cap(db, current_user)
-    _enforce_tenant_backlog(db, current_user)
+    if not _batch_generation:
+        _enforce_tenant_backlog(db, current_user)
     _enforce_disk_capacity()
     _enforce_memory_pressure()
     # Every submission is accepted as queued; RQ gives it to a worker the
@@ -10291,17 +10302,18 @@ async def generate_with_segments(
     # "Sin_Gamulan_-_..." in DB silently misses every sibling draft —
     # which is exactly how 4 jobs for the same audio ended up coexisting
     # in prod 2026-05-26.
-    try:
-        from jobs import supersede_sibling_drafts
-        _dedup_filename = (
-            _safe_basename(existing_filename) if existing_filename else ""
-        )
-        supersede_sibling_drafts(
-            db, keep_job_id=job_id, user_id=current_user["id"],
-            tenant_id=current_user["tenant_id"], filename=_dedup_filename,
-        )
-    except Exception as e:
-        logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)
+    if not _batch_generation:
+        try:
+            from jobs import supersede_sibling_drafts
+            _dedup_filename = (
+                _safe_basename(existing_filename) if existing_filename else ""
+            )
+            supersede_sibling_drafts(
+                db, keep_job_id=job_id, user_id=current_user["id"],
+                tenant_id=current_user["tenant_id"], filename=_dedup_filename,
+            )
+        except Exception as e:
+            logger.warning("[DEDUP] supersede sibling drafts failed: %s", e)
 
     # P1 2026-07-17: si el frontend no mandó bg_cache_key (race del debounce
     # de 10s de useBackgroundPreview — el operador aprobó dentro de la
@@ -10314,6 +10326,10 @@ async def generate_with_segments(
     # el key de todos modos: un mismatch = generación fresh, nunca un
     # fondo equivocado.
     _bg_cache_key_norm = (bg_cache_key or "").strip() or None
+    if _batch_generation:
+        # Campaign backgrounds are intentionally cold until the durable
+        # approve/generate action. Never reuse a speculative editor preview.
+        _bg_cache_key_norm = None
     _effective_scenes = bool(enable_scenes) and has_scenes_access(current_user)
     # Audit adversarial 2026-07-17: excluir variation EXPLÍCITAMENTE. Una
     # variation de librería devuelve bg_path=None (con variation_source_path
@@ -10353,6 +10369,27 @@ async def generate_with_segments(
     publication_job = (
         db.query(Job).filter(Job.job_id == job_id).with_for_update().one()
     )
+    if reuse and publication_job.status not in (
+        "transcribed_pending", "transcribed", "awaiting_upload",
+    ):
+        # Close the concurrent double-click race. Two requests can both pass
+        # the early ownership check before either publishes; only the first
+        # locked transition may create an outbox event/render.
+        publication_status = publication_job.status
+        db.rollback()
+        if publication_status in {"queued", "processing", "rendering", "pending_review", "done"}:
+            return {
+                "job_id": job_id,
+                "status": publication_status,
+                "deduplicated": True,
+            }
+        return JSONResponse(
+            status_code=409,
+            content={"code": "job_not_generatable", "detail": "Job changed before generation."},
+        )
+    if publication_job.workload_class == "batch":
+        from batch_campaigns import enforce_render_capacity
+        enforce_render_capacity(db, publication_job)
     publication_job.status = initial_status
     publication_job.current_step = "queued"
     publication_job.progress = 0
@@ -10472,8 +10509,18 @@ def status(
     # edit_limit_exempt to skip the limit-reached panel and show "sin
     # límite" instead of a remaining count.
     _is_admin = current_user.get("role") == "admin"
+    campaign_context = None
+    if job.get("workload_class") == "batch":
+        from batch_campaigns import context_for_job
+        job_model = db.query(Job).filter(Job.job_id == job_id).first()
+        if job_model is not None:
+            campaign_context = context_for_job(db, job_model)
     return {
         "job_id": job["job_id"],
+        "workload_class": job.get("workload_class", "interactive"),
+        "campaign_id": job.get("campaign_id"),
+        "campaign_item_id": job.get("campaign_item_id"),
+        "campaign": campaign_context,
         "status": job["status"],
         "current_step": job["current_step"],
         "progress": job["progress"],
@@ -10780,12 +10827,14 @@ def batch_capacity(
         db.query(Job)
         .filter(Job.user_id == current_user["id"])
         .filter(Job.tenant_id == tenant_id)
+        .filter(Job.workload_class != "batch")
         .filter(Job.status.in_(_BACKLOG_STATUSES))
         .count()
     )
     tenant_in_flight = (
         db.query(Job)
         .filter(Job.tenant_id == tenant_id)
+        .filter(Job.workload_class != "batch")
         .filter(Job.status.in_(_BACKLOG_STATUSES))
         .count()
     )
@@ -11653,12 +11702,13 @@ class EditJobRequest(BaseModel):
     # types what they want the new background to convey ("paisaje cálido
     # al atardecer", "abstracto con ondas de luz suave", etc.) and the
     # pipeline forwards it to Gemini's system prompt as an explicit
-    # operator override. Bump 300→2000 (2026-05-18): los modelos de
+    # operator override. Bump 300→2000 (2026-05-18) and 2000→4000
+    # (2026-08-31): los modelos de
     # imagen/video rinden mejor con prompts detallados que permitan
     # negaciones redundantes ("no cars, no traffic, no people…") y
     # spec granular de cámara. 300 obligaba a sacrificar negaciones que
     # son críticas para evitar bias del modelo. Costo Gemini marginal.
-    background_hint: str | None = Field(default=None, max_length=2000)
+    background_hint: str | None = Field(default=None, max_length=4000)
     # Explicit non-Universal opt-in used together with a prompt that asks for
     # people. Universal accounts remain validation-mandatory in pipeline.py;
     # this request field can never relax that server-side rule.
@@ -13057,11 +13107,14 @@ async def observe_editor_quality_proposal(
 @app.post("/editor/{job_id}/lock/heartbeat")
 async def editor_lock(
     job_id: str,
+    x_editor_session: str | None = Header(default=None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _, document = _editor_document_or_404(db, job_id, current_user)
-    result = acquire_lock(db, document, current_user["id"])
+    result = acquire_lock(
+        db, document, current_user["id"], session_id=x_editor_session,
+    )
     db.commit()
     return result
 
@@ -13069,11 +13122,14 @@ async def editor_lock(
 @app.delete("/editor/{job_id}/lock")
 async def editor_unlock(
     job_id: str,
+    x_editor_session: str | None = Header(default=None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _, document = _editor_document_or_404(db, job_id, current_user)
-    if not release_lock(db, document, current_user["id"]):
+    if not release_lock(
+        db, document, current_user["id"], session_id=x_editor_session,
+    ):
         db.rollback()
         raise HTTPException(status_code=409, detail="editor_lock_owned_by_other_user")
     db.commit()
@@ -14626,6 +14682,9 @@ async def request_edit(
     job = _edit_q.with_for_update().first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if getattr(job, "workload_class", "interactive") == "batch":
+        from batch_campaigns import enforce_render_capacity
+        enforce_render_capacity(db, job)
 
     _delivery_qc_actions: list[dict] = []
     if body.delivery_qc_action_ids:
@@ -15369,6 +15428,7 @@ async def request_edit(
             "edit_params": edit_params,
             "plan": current_user.get("plan", "100"),
             "tenant_id": current_user.get("tenant_id", ""),
+            "workload_class": getattr(job, "workload_class", "interactive") or "interactive",
         },
     )
     for _qc_action in _delivery_qc_actions:
@@ -15487,6 +15547,9 @@ async def regenerate_scene(
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if getattr(job, "workload_class", "interactive") == "batch":
+        from batch_campaigns import enforce_render_capacity
+        enforce_render_capacity(db, job)
 
     plan = job.scene_plan if isinstance(job.scene_plan, dict) else None
     if not plan or not plan.get("scenes"):
@@ -15592,6 +15655,7 @@ async def regenerate_scene(
             edit_params=edit_params,
             plan=current_user.get("plan", "100"),
             tenant_id=current_user.get("tenant_id", ""),
+            workload_class=getattr(job, "workload_class", "interactive") or "interactive",
         )
     except Exception as exc:
         logger.error("enqueue_edit (scene) failed for %s: %s", job_id, exc)
@@ -16407,8 +16471,8 @@ class VariantJobRequest(BaseModel):
     """
     # Mismo formato y max_length que EditJobRequest.background_hint —
     # va al user_content de Gemini con header [OPERATOR OVERRIDE].
-    # 2000 chars (bumped 2026-05-18, ver EditJobRequest para rationale).
-    background_hint: str | None = Field(default=None, max_length=2000)
+    # 4000 chars (bumped 2026-08-31, ver EditJobRequest para rationale).
+    background_hint: str | None = Field(default=None, max_length=4000)
     # Same central policy as edit/retry: only a non-Universal account with an
     # explicit people prompt can use this opt-in; Universal remains strict.
     bypass_content_validation: bool = Field(default=False)

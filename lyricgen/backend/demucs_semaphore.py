@@ -45,6 +45,7 @@ _KEY = "demucs:in_flight:v2"
 # 1-2 slots. Con 1: cola p50 ~3 s. Con 2: ~52 s pero +throughput. Por encima
 # de 2 la cola del proveedor se dispara y el throughput CAE.
 _MAX = int(os.environ.get("DEMUCS_MAX_CONCURRENT", "2"))
+_BATCH_MAX = int(os.environ.get("DEMUCS_BATCH_MAX_CONCURRENT", "1"))
 # TTL del lease: si un worker muere sin soltar, el slot se libera solo.
 # Tiene que superar el presupuesto de demucs (1200 s) + margen.
 _TTL_S = int(os.environ.get("DEMUCS_LEASE_TTL_S", "1500"))
@@ -63,7 +64,15 @@ local now_parts = redis.call('TIME')
 local now = tonumber(now_parts[1]) + tonumber(now_parts[2]) / 1000000
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
 local count = redis.call('ZCARD', KEYS[1])
-if count < tonumber(ARGV[3]) then
+local batch_count = 0
+local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+for _, member in ipairs(members) do
+  if string.sub(member, 1, 6) == 'batch:' then
+    batch_count = batch_count + 1
+  end
+end
+local batch_allowed = ARGV[4] ~= '1' or batch_count < tonumber(ARGV[5])
+if count < tonumber(ARGV[3]) and batch_allowed then
   redis.call('ZADD', KEYS[1], now + tonumber(ARGV[2]), ARGV[1])
   redis.call('EXPIRE', KEYS[1], math.ceil(tonumber(ARGV[2])) + 60)
   return count + 1
@@ -101,13 +110,16 @@ def acquire(*, wait_max_s: float | None = None) -> str | None:
     client = _client()
     if client is None:
         return None
-    lease = _uuid.uuid4().hex[:12]
+    workload = os.environ.get("WORKLOAD_CLASS", "interactive").strip().lower()
+    is_batch = workload == "batch"
+    lease = ("batch:" if is_batch else "interactive:") + _uuid.uuid4().hex[:12]
     limite = _t.monotonic() + (wait_max_s if wait_max_s is not None else _WAIT_MAX_S)
     esperado = 0.0
     while True:
         try:
             n = int(client.eval(
                 _ACQUIRE_LUA, 1, _KEY, lease, _TTL_S, _MAX,
+                1 if is_batch else 0, _BATCH_MAX,
             ))
         except Exception as exc:
             logger.debug("[DEMUCS-SEM] Redis no disponible (%s) — sin límite",

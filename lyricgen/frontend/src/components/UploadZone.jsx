@@ -540,12 +540,18 @@ export default function UploadZone({
       return next;
     });
     onFiles((prev) => prev.map((f) => ({ ...f, [field]: value })));
-    // QA fix 2026-05-27: en edit mode files=[] así que el fan-out de
-    // arriba es no-op. Sin esto, los cambios de background_hint /
-    // movement / effect / typography que el operador hace en steps 2-4
-    // nunca llegan a currentReview, y submitEdit (handleApproveLyrics)
-    // los pierde al computar el diff. App.jsx mapea field→currentReview.
-    if (editMode && onEditFieldChange) {
+    // El review que se está mostrando es también una fuente de submit, tanto
+    // al CREAR como al EDITAR. El fan-out a `files[]` no alcanza: reviews
+    // restauradas o server-backed pueden no conservar el mismo objeto File y
+    // el join por file.name de App no encuentra nada. En ese caso el control
+    // cambia visualmente en el wizard pero currentReview conserva el valor
+    // viejo (incidente real: se eligió `lower` dos veces y el POST salió sin
+    // text_case, por lo que el render heredó `upper`).
+    //
+    // Propagamos siempre. Antes de que exista currentReview, el callback de
+    // App es un no-op; durante review escribe el valor elegido directamente y
+    // elimina la dependencia del efecto de reconciliación por filename.
+    if (onEditFieldChange) {
       onEditFieldChange(field, value);
     }
     // UI v1.1 (2026-05-30): when the operator touches a Portada field,
@@ -1892,11 +1898,12 @@ export default function UploadZone({
       </div>
   );
 
-  // QA fix 2026-05-28: en edit mode files=[] (no se sube nada nuevo, el
-  // job ya tiene su audio), pero el operador SÍ necesita ver los
-  // controls de movement/effect en step 3 para corregir esos campos.
-  // El gate original `files.length > 0` ocultaba todo el panel en edit
-  // mode → step 3 quedaba vacío. Ahora abrimos también para editMode.
+  // QA fix 2026-08-31: en edit mode Y en /review files=[] (el job ya tiene su
+  // audio), pero el operador SÍ necesita ver movement/effect en step 3. El
+  // gate anterior contemplaba editMode pero no el resume pre-render de
+  // /review/:jobId: la pestaña existía y quedaba completamente vacía justo
+  // después de subir una foto. hasReviewableContent es la señal común y no
+  // depende de que haya un File de audio local.
   // Los sub-bloques internos siguen con sus propios checks
   // (`files.length > 1` para acciones de batch) — esos correctamente
   // se ocultan si no hay archivos.
@@ -1947,7 +1954,7 @@ export default function UploadZone({
     </div>
   ) : null;
 
-  const _batchSettingsBlock = (files.length > 0 || editMode) ? (
+  const _batchSettingsBlock = (files.length > 0 || editMode || hasReviewableContent) ? (
     <div className="mt-3 glass rounded-card px-4 py-4">
       <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500 mb-3">
         {files.length > 1
@@ -2086,13 +2093,14 @@ export default function UploadZone({
                   {t("upload.movement_custom_video_note")}
                 </div>
               ) : _customStill ? (
-                <div
-                  role="radiogroup"
-                  aria-label={t("upload.movement_photo_title")}
-                  data-testid="photo-motion-group"
-                  className="grid grid-cols-2 gap-2"
-                >
-                  {PHOTO_MOTIONS.map((p, _i) => {
+                <div>
+                  <div
+                    role="radiogroup"
+                    aria-label={t("upload.movement_photo_title")}
+                    data-testid="photo-motion-group"
+                    className="grid grid-cols-2 gap-2"
+                  >
+                    {PHOTO_MOTIONS.map((p, _i) => {
                     const active = _photoMotion === p.code;
                     return (
                       <button
@@ -2173,7 +2181,16 @@ export default function UploadZone({
                         </div>
                       </button>
                     );
-                  })}
+                    })}
+                  </div>
+                  {animateImage && (
+                    <p
+                      data-testid="photo-motion-preview-pending"
+                      className="mt-2 rounded-lg border border-cyan-300/10 bg-cyan-300/[0.04] px-2.5 py-2 text-[9px] leading-snug text-cyan-100/70"
+                    >
+                      {t("upload.photo_motion_preview_pending") || "La vista previa conserva la foto quieta. El movimiento de sus elementos se genera al aprobar el video."}
+                    </p>
+                  )}
                 </div>
               ) : (
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
@@ -2716,6 +2733,8 @@ export default function UploadZone({
               <button
                 key={opt.code}
                 type="button"
+                aria-pressed={batchDefaults.textCase === opt.code}
+                data-text-case={opt.code}
                 title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                 onClick={() => updateBatchDefault("textCase", opt.code)}
                 onMouseEnter={() => setHoverCaseBatch(opt.code)}
@@ -3947,6 +3966,7 @@ export default function UploadZone({
               customColors={customColors}
               movementStyle={hoverMovement ?? batchDefaults.movementStyle}
               operatorPhoto={_customStill}
+              photoAnimated={_customStill && animateImage}
               effect={hoverEffect ?? batchDefaults.effect}
               lyricsAnimation={hoverAnimation ?? batchDefaults.lyricsAnimation}
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}
@@ -4352,7 +4372,7 @@ export default function UploadZone({
                       <textarea
                         value={batchDefaults.backgroundHint || ""}
                         onChange={(e) => {
-                          const v = e.target.value.slice(0, 2000);
+                          const v = e.target.value.slice(0, 4000);
                           updateBatchDefault("backgroundHint", v);
                           // Sincronizar el "guardado" con lo que el operador
                           // escribe. Sin esto, borrar el texto A MANO dejaba el
@@ -4362,7 +4382,7 @@ export default function UploadZone({
                           setSavedPrompt(v.trim());
                         }}
                         rows={3}
-                        maxLength={2000}
+                        maxLength={4000}
                         placeholder={t("upload.bg_prompt_placeholder") || "Ej: mansión surreal de noche, pileta vacía, cámara fija, sólo se mueve el reflejo del agua…"}
                         className="w-full text-caption rounded-lg bg-surface-1 border border-white/[0.08] focus:border-brand/50 px-3 py-2 text-gray-200 placeholder:text-gray-600 resize-y outline-none"
                       />
@@ -4547,6 +4567,8 @@ export default function UploadZone({
                           <button
                             key={opt.code}
                             type="button"
+                            aria-pressed={batchDefaults.textCase === opt.code}
+                            data-text-case={opt.code}
                             title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                             onClick={() => updateBatchDefault("textCase", opt.code)}
                             onMouseEnter={() => setHoverCaseBatch(opt.code)}
