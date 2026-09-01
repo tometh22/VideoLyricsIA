@@ -492,7 +492,7 @@ def run_transcription_job(
         _looks_live, _maybe_anchor_align, _maybe_ctc_retime,
         _maybe_adlib_filter, _maybe_chorus_snap, _maybe_gap_rescue,
         _maybe_phrase_segment, _maybe_repetition_reconcile,
-        _maybe_timing_consistency, _maybe_word_vote,
+        _maybe_timing_consistency, _maybe_word_vote, _maybe_lora_family,
         _resolve_postprocess_language, _run_transcription_for_job,
     )
     from jobs import update_job
@@ -661,6 +661,7 @@ def run_transcription_job(
             )
             r = _maybe_repetition_reconcile(r, job_id)
             r = await _maybe_gap_rescue(r, audio_path, job_id, _post_lang)
+            r = await _maybe_lora_family(r, audio_path, job_id, _post_lang)
             r = await _maybe_word_vote(
                 r, audio_path, job_id, _post_lang,
                 live_hint=live or _looks_live(title, filename),

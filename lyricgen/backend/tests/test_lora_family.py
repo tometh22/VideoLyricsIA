@@ -70,3 +70,34 @@ def test_evaluation_gate_report_is_accepted(monkeypatch, tmp_path):
     family = load_verified_family(report)
     assert family is not None
     assert family["replacement_allowed"] is False
+
+
+def test_attested_adapter_can_be_mounted_at_different_path(monkeypatch, tmp_path):
+    mounted = tmp_path / "mounted" / "adapter_model.safetensors"
+    mounted.parent.mkdir()
+    mounted.write_bytes(b"adapter")
+    import hashlib
+    report = tmp_path / "evaluation.json"
+    report.write_text(json.dumps({
+        "pipeline_validated": True, "evaluation_passed": True,
+        "adapter_path": "/research-pod/no-longer-mounted/adapter",
+        "adapter_sha256": hashlib.sha256(b"adapter").hexdigest(),
+        "replacement_gate": {
+            "additional_family_only": True,
+            "runtime_replacement_allowed": False,
+        },
+    }))
+    monkeypatch.setenv("LORA_V1_FAMILY_ENABLED", "1")
+    monkeypatch.setenv("LORA_V1_ADAPTER_PATH", str(mounted.parent))
+    family = load_verified_family(report)
+    assert family is not None
+    assert family["artifact"] == str(mounted.parent)
+    assert family["adapter_sha256"]
+
+
+def test_transcribe_words_is_fail_closed_when_disabled(monkeypatch, tmp_path):
+    monkeypatch.delenv("LORA_V1_FAMILY_ENABLED", raising=False)
+    words, stats = __import__("lora_family").transcribe_words(tmp_path / "audio.wav")
+    assert words == []
+    assert stats["status"] == "declined"
+    assert stats["reason"] == "not_attested_or_disabled"
