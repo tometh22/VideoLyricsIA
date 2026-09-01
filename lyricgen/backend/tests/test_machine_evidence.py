@@ -315,6 +315,37 @@ def test_v3_blocks_collector_count_when_hypothesis_serialization_was_lost():
         validate_machine_evidence(evidence, SEGMENTS)
 
 
+def test_v2_still_rejects_corrupt_hypothesis_details():
+    """The v3 rollout must not weaken approval checks for durable v2 jobs."""
+    captured = build_machine_evidence({"segments": SEGMENTS})
+    evidence = finalize_machine_evidence(
+        captured,
+        original_segments=SEGMENTS,
+        quality={"decision": "review"},
+        audio_sha256="a" * 64,
+        audio_revision=1,
+    )
+    evidence["schema"] = "machine-transcription-evidence-v2"
+    evidence.pop("capture", None)
+    for hypothesis in evidence["hypotheses_by_family"]:
+        hypothesis.pop("attempt_id", None)
+    evidence["evidence_sha256"] = snapshot_hash({
+        "hypotheses_by_family": evidence["hypotheses_by_family"],
+        "pre_human": evidence["pre_human"],
+        "decisions": evidence["decisions"],
+    })
+    validate_machine_evidence(evidence, SEGMENTS)
+
+    evidence["hypotheses_by_family"][0]["event_count"] = 99
+    evidence["evidence_sha256"] = snapshot_hash({
+        "hypotheses_by_family": evidence["hypotheses_by_family"],
+        "pre_human": evidence["pre_human"],
+        "decisions": evidence["decisions"],
+    })
+    with pytest.raises(MachineSnapshotMissing, match="hypothesis_invalid"):
+        validate_machine_evidence(evidence, SEGMENTS)
+
+
 def test_snapshot_hash_mismatch_blocks_approval(db):
     row, document = _job(db, required=True)
     evidence = _evidence(document)

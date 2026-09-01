@@ -5,6 +5,7 @@ import targeted_consensus as tc
 import quality_mutation
 import transcription_quality
 import vocal_sep
+from recognition_provenance import begin_collection, end_collection
 from quality_v6_contracts import PROPOSAL_CANDIDATE_SCHEMA, ReviewProposalCandidate
 
 
@@ -32,6 +33,23 @@ def gemini_events(lines, starts):
         {"start": start, "end": start + 1.2, "text": line, "kind": "sung"}
         for line, start in zip(lines, starts)
     ]
+
+
+def test_malformed_gemini_event_list_preserves_raw_provider_response():
+    raw = '{"events":["letra cruda",7]}'
+    collector, token = begin_collection()
+    try:
+        tc._record_gemini_event_response(raw, ["letra cruda", 7])
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
+
+    assert snapshot["completed_attempt_count"] == 1
+    assert snapshot["hypotheses"][0]["events"] == [{"text": raw}]
+    assert snapshot["hypotheses"][0]["kind"] == "text"
+    assert snapshot["hypotheses"][0]["transformation"] == (
+        "targeted_consensus_malformed_events_raw"
+    )
 
 
 def test_consensus_requires_stem_and_a_distinct_recognition_family():
@@ -589,8 +607,8 @@ def test_gemini_event_schema_is_bounded_to_vocal_events():
 
 def test_gemini_provenance_freezes_raw_events_before_candidate_filters():
     source = inspect.getsource(tc._transcribe_gemini_events)
-    raw_record = source.index("events=events")
-    candidate_filter = source.index("for event in events")
+    raw_record = source.index("_record_gemini_event_response(raw, events)")
+    candidate_filter = source.index("out = []")
     assert raw_record < candidate_filter
     assert "events=out" not in source
 

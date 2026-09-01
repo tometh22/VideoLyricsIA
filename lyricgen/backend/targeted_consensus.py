@@ -468,13 +468,7 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
             )
             provider_recorded = True
             return []
-        from recognition_provenance import record_completed
-        record_completed(
-            family="google/gemini-2.5-flash-audio",
-            events=events,
-            view="bounded_vocal_window",
-            transformation="targeted_consensus_raw",
-        )
+        _record_gemini_event_response(raw, events)
         provider_recorded = True
         if len(events) > 16:
             return []
@@ -532,6 +526,34 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
             os.unlink(clip)
         except OSError:
             pass
+
+
+def _record_gemini_event_response(raw: str, events: list) -> None:
+    """Freeze the provider response before semantic row validation.
+
+    A JSON ``events`` list can still contain strings, numbers, or other
+    malformed rows.  The recognition collector intentionally accepts only
+    dictionaries, so passing that list directly would make a completed call
+    look like an empty hypothesis.  Preserve the complete raw response as a
+    text event in that case; downstream parsing may still reject it.
+    """
+    from recognition_provenance import record_completed
+
+    if all(isinstance(event, dict) for event in events):
+        record_completed(
+            family="google/gemini-2.5-flash-audio",
+            events=events,
+            view="bounded_vocal_window",
+            transformation="targeted_consensus_raw",
+        )
+        return
+    record_completed(
+        family="google/gemini-2.5-flash-audio",
+        events=([{"text": raw}] if raw else []),
+        kind="text",
+        view="bounded_vocal_window",
+        transformation="targeted_consensus_malformed_events_raw",
+    )
 
 
 def _word_tokens(text: str) -> list[str]:

@@ -116,6 +116,37 @@ def test_succeeds_on_first_attempt(patched_transcribe):
     assert result is not None
 
 
+def test_provider_completion_is_frozen_before_row_filters(patched_transcribe):
+    import pipeline
+    from recognition_provenance import begin_collection, end_collection
+
+    response = _stub_whisper_response("hola mundo")
+    spam = MagicMock()
+    spam.text = "Subtitles by Amara.org"
+    spam.start = 1.0
+    spam.end = 2.0
+    spam.no_speech_prob = 0.99
+    response.segments.append(spam)
+    patched_transcribe([response])
+
+    collector, token = begin_collection()
+    try:
+        selected = pipeline._transcribe_via_openai_api(
+            "/tmp/_test.mp3", language="es",
+            provenance_view="mix",
+            provenance_transformation="full_file_raw",
+        )
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
+
+    assert [row["text"] for row in selected] == ["hola mundo"]
+    assert snapshot["completed_attempt_count"] == 1
+    assert [
+        row["text"] for row in snapshot["hypotheses"][0]["events"]
+    ] == ["hola mundo", "Subtitles by Amara.org"]
+
+
 def test_word_granularity_uses_first_and_last_word_as_segment_bounds(
     patched_transcribe,
 ):

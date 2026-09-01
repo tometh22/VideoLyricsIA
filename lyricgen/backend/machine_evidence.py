@@ -359,7 +359,8 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
         raise MachineSnapshotMissing("machine_pre_human_missing")
     if pre_human.get("segments_sha256") != snapshot_hash(original_segments or []):
         raise MachineSnapshotMissing("machine_snapshot_hash_mismatch")
-    if evidence.get("schema") == SCHEMA:
+    evidence_schema = evidence.get("schema")
+    if evidence_schema in {SCHEMA, "machine-transcription-evidence-v2"}:
         selected_matches_snapshot = False
         named_primary_hypotheses = 0
         primary_attempt_ids: list[Any] = []
@@ -384,11 +385,11 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
                 or event_hash != snapshot_hash(events)
             ):
                 raise MachineSnapshotMissing("machine_hypothesis_invalid")
-            if family.casefold() in {
+            if evidence_schema == SCHEMA and family.casefold() in {
                 "unknown", "unknown-primary-asr", "independent-asr",
             }:
                 raise MachineSnapshotMissing("machine_hypothesis_family_unknown")
-            if role in {"primary", "candidate"}:
+            if evidence_schema == SCHEMA and role in {"primary", "candidate"}:
                 named_primary_hypotheses += 1
                 attempt_id = hypothesis.get("attempt_id")
                 primary_attempt_ids.append(attempt_id)
@@ -399,29 +400,32 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
                     selected_matches_snapshot = True
         if not selected_matches_snapshot:
             raise MachineSnapshotMissing("machine_selected_hypothesis_missing")
-        capture = evidence.get("capture")
-        if not isinstance(capture, dict):
-            raise MachineSnapshotMissing("machine_capture_summary_missing")
-        attempt_count = capture.get("recognition_attempt_count")
-        if type(attempt_count) is not int or attempt_count < 0:
-            raise MachineSnapshotMissing("machine_recognition_attempt_count_invalid")
-        if attempt_count != named_primary_hypotheses:
-            raise MachineSnapshotMissing("machine_recognition_hypothesis_missing")
-        if any(
-            type(attempt_id) is not int or attempt_id < 0
-            for attempt_id in primary_attempt_ids
-        ):
-            raise MachineSnapshotMissing("machine_recognition_attempt_id_invalid")
-        if sorted(primary_attempt_ids) != list(range(attempt_count)):
-            raise MachineSnapshotMissing("machine_recognition_attempt_id_invalid")
+        if evidence_schema == SCHEMA:
+            capture = evidence.get("capture")
+            if not isinstance(capture, dict):
+                raise MachineSnapshotMissing("machine_capture_summary_missing")
+            attempt_count = capture.get("recognition_attempt_count")
+            if type(attempt_count) is not int or attempt_count < 0:
+                raise MachineSnapshotMissing("machine_recognition_attempt_count_invalid")
+            if attempt_count != named_primary_hypotheses:
+                raise MachineSnapshotMissing("machine_recognition_hypothesis_missing")
+            if any(
+                type(attempt_id) is not int or attempt_id < 0
+                for attempt_id in primary_attempt_ids
+            ):
+                raise MachineSnapshotMissing("machine_recognition_attempt_id_invalid")
+            if sorted(primary_attempt_ids) != list(range(attempt_count)):
+                raise MachineSnapshotMissing("machine_recognition_attempt_id_invalid")
         signal = (evidence.get("decisions") or {}).get("song_quality_signal")
         validate_quality_training_signal(signal)
-        expected_hash = snapshot_hash({
+        hash_payload = {
             "hypotheses_by_family": evidence["hypotheses_by_family"],
-            "capture": evidence["capture"],
             "pre_human": evidence["pre_human"],
             "decisions": evidence["decisions"],
-        })
+        }
+        if evidence_schema == SCHEMA:
+            hash_payload["capture"] = evidence["capture"]
+        expected_hash = snapshot_hash(hash_payload)
         if evidence.get("evidence_sha256") != expected_hash:
             raise MachineSnapshotMissing("machine_evidence_hash_mismatch")
 

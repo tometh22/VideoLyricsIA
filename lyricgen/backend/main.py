@@ -6213,14 +6213,11 @@ def _make_stem_window_transcriber(
                 check=True, timeout=30,
             )
             from pipeline import _transcribe_via_openai_api as _wx
-            segs = _wx(clip, language=language) or []
-            from recognition_provenance import record_completed
-            record_completed(
-                family="openai/whisper-1",
-                events=segs,
-                view="bounded_vocal_window",
-                transformation="adlib_consensus",
-            )
+            segs = _wx(
+                clip, language=language,
+                provenance_view="bounded_vocal_window",
+                provenance_transformation="adlib_consensus_raw",
+            ) or []
             return " ".join((s.get("text") or "").strip() for s in segs).strip()
         except Exception as e:
             logger.warning("[ADLIB] window %.1f-%.1f transcribe failed: %s",

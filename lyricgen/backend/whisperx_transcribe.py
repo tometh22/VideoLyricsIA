@@ -262,7 +262,13 @@ def _retranscribe_slice(
                 start_s, end_s, rc.returncode,
             )
             return None
-        raw = _transcribe_via_openai_api(chunk_path, language=language)
+        raw = _transcribe_via_openai_api(
+            chunk_path, language=language,
+            provenance_view="bounded_vocal_window",
+            provenance_transformation=(
+                f"whisperx_adlib_retranscribe_raw:start={start_s:.3f};end={end_s:.3f}"
+            ),
+        )
         if not raw:
             return None
         result: list[dict] = []
@@ -283,13 +289,6 @@ def _retranscribe_slice(
                 result.append(out_seg)
             except (KeyError, TypeError, ValueError):
                 continue
-        from recognition_provenance import record_completed
-        record_completed(
-            family="openai/whisper-1",
-            events=result,
-            view="bounded_vocal_window",
-            transformation="whisperx_adlib_retranscribe_offset",
-        )
         return result or None
     except Exception as exc:
         logger.warning(

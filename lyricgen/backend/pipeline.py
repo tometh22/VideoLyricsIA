@@ -3173,7 +3173,10 @@ def _compress_for_whisper(input_path: str) -> str:
 def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                                 lyrics_hint: str | None = None,
                                 job_id: str | None = None,
-                                return_words: bool = False) -> list[dict]:
+                                return_words: bool = False,
+                                provenance_view: str = "provider_input",
+                                provenance_transformation: str = "full_file_raw",
+                                ) -> list[dict]:
     """Transcribe by calling OpenAI's Whisper API. Returns the same segments
     structure as the local Whisper path. Used in production where loading
     the local model would consume too much worker RAM (~3 GB) and risks OOM.
@@ -3416,10 +3419,35 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
             })
         return bucket
 
-    segments: list[dict] = []
+    provider_segments: list[dict] = []
     for seg in raw_segments:
-        text = (seg.text or "").strip()
-        seg_words = _words_for_segment(seg) if return_words else []
+        try:
+            text = (seg.text or "").strip()
+            seg_words = _words_for_segment(seg) if return_words else []
+            provider_segment = {
+                "start": float(seg.start),
+                "end": float(seg.end),
+                "text": text,
+                "no_speech_prob": float(seg.no_speech_prob or 0.0),
+            }
+            if return_words:
+                provider_segment["words"] = seg_words
+            provider_segments.append(provider_segment)
+        except Exception:
+            provider_segments.append({"raw": str(seg)[:2000]})
+
+    from recognition_provenance import record_completed
+    record_completed(
+        family="openai/whisper-1",
+        events=provider_segments,
+        view=provenance_view,
+        transformation=provenance_transformation,
+    )
+
+    segments: list[dict] = []
+    for provider_segment in provider_segments:
+        text = str(provider_segment.get("text") or "").strip()
+        seg_words = provider_segment.get("words") or []
         if not text or len(text) < 3:
             continue
         # Same filters as local path so behavior matches.
@@ -3435,7 +3463,7 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         # Caso Contigo" interlude, audience cheering on live cuts). The
         # operator can prune obvious non-lyrics in the editor; better to
         # surface borderline content than to silently drop it.
-        if (seg.no_speech_prob or 0) > 0.92:
+        if float(provider_segment.get("no_speech_prob") or 0.0) > 0.92:
             logger.info(
                 "[WHISPER-API] Filtered very-low-confidence (chars=%d)",
                 len(text),
@@ -3449,10 +3477,12 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         # them into human line structure before `_emit_segments` strips the
         # raw Whisper payload.
         word_start = (
-            float(seg_words[0]["start"]) if seg_words else float(seg.start)
+            float(seg_words[0]["start"])
+            if seg_words else float(provider_segment["start"])
         )
         word_end = (
-            float(seg_words[-1]["end"]) if seg_words else float(seg.end)
+            float(seg_words[-1]["end"])
+            if seg_words else float(provider_segment["end"])
         )
         out_seg = {
             "start": word_start,
@@ -3665,7 +3695,8 @@ def _build_chunks_from_audio(mp3_path: str) -> list[tuple[float, float]]:
 def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
                            lyrics_hint: str | None = None,
                            job_id: str | None = None,
-                           return_words: bool = False) -> list[dict]:
+                           return_words: bool = False,
+                           provenance_view: str = "provider_input") -> list[dict]:
     """Chunked Whisper API transcription (VAD-split or time-split).
 
     1. Build transcription chunks via _build_chunks_from_audio():
@@ -3687,6 +3718,8 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
         return _transcribe_via_openai_api(
             mp3_path, language=language, lyrics_hint=lyrics_hint,
             job_id=job_id, return_words=return_words,
+            provenance_view=provenance_view,
+            provenance_transformation="vad_single_file_fallback_raw",
         )
 
     logger.info("[VAD-CHUNK] %d chunks to transcribe", len(chunks))
@@ -3746,6 +3779,10 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
                 lyrics_hint=chunk_prompt,
                 job_id=job_id,   # record every chunk for accurate cost tracking
                 return_words=return_words,
+                provenance_view=provenance_view,
+                provenance_transformation=(
+                    f"vad_chunk_raw:index={i};start={c_start:.3f};end={c_end:.3f}"
+                ),
             )
 
             # Offset timestamps by chunk's absolute start time.
@@ -3783,6 +3820,8 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
         return _transcribe_via_openai_api(
             mp3_path, language=language, lyrics_hint=lyrics_hint,
             job_id=job_id, return_words=return_words,
+            provenance_view=provenance_view,
+            provenance_transformation="vad_all_chunks_failed_fallback_raw",
         )
 
     logger.info("[VAD-CHUNK] %d total segments from %d chunks", len(all_segments), len(chunks))
@@ -4014,16 +4053,17 @@ def transcribe(mp3_path: str, language: str = None,
             segs = _transcribe_via_openai_api(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
+                provenance_view=provenance_view,
+                provenance_transformation="full_file_raw",
             )
-            _record(segs, "openai/whisper-1", "full_file")
         elif vad_first:
             # Legacy path (pre-2026-06): VAD chunking up front. Kept behind a
             # flag so we can A/B or revert without a deploy.
             segs = _vad_chunk_transcribe(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
+                provenance_view=provenance_view,
             )
-            _record(segs, "openai/whisper-1", "vad_chunks")
         else:
             # Default: single full-file pass first (best TEXT — avoids the
             # chunk-boundary mishears VAD introduces), then fall back to VAD
@@ -4035,8 +4075,9 @@ def transcribe(mp3_path: str, language: str = None,
             segs = _transcribe_via_openai_api(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
+                provenance_view=provenance_view,
+                provenance_transformation="full_file_raw",
             )
-            _record(segs, "openai/whisper-1", "full_file")
             audio_dur = None
             duration_bad = False
             duration_reason = ""
@@ -4063,10 +4104,7 @@ def transcribe(mp3_path: str, language: str = None,
                 vad_segs = _vad_chunk_transcribe(
                     mp3_path, language=language, lyrics_hint=None,
                     job_id=job_id, return_words=return_words,
-                )
-                _record(
-                    vad_segs, "openai/whisper-1",
-                    "vad_chunks_retry",
+                    provenance_view=provenance_view,
                 )
                 vad_duration_bad = False
                 try:

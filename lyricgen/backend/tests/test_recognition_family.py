@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pipeline
 from pipeline import _tag_recognition_family, transcription_family
@@ -45,13 +46,26 @@ def test_api_fallback_preserves_rejected_and_selected_attempts(monkeypatch):
         {"start": 8.0, "end": 9.0, "text": "fifth line"},
     ]
     monkeypatch.setenv("OPENAI_API_KEY", "configured-for-test")
+
+    def _primary(*args, **kwargs):
+        record_completed(
+            family="openai/whisper-1", events=initial,
+            view="mix", transformation="full_file_raw",
+        )
+        return [dict(row) for row in initial]
+
+    def _vad(*args, **kwargs):
+        record_completed(
+            family="openai/whisper-1", events=recovered,
+            view="mix", transformation="vad_chunk_raw:index=0",
+        )
+        return [dict(row) for row in recovered]
+
     monkeypatch.setattr(
-        pipeline, "_transcribe_via_openai_api",
-        lambda *args, **kwargs: [dict(row) for row in initial],
+        pipeline, "_transcribe_via_openai_api", _primary,
     )
     monkeypatch.setattr(
-        pipeline, "_vad_chunk_transcribe",
-        lambda *args, **kwargs: [dict(row) for row in recovered],
+        pipeline, "_vad_chunk_transcribe", _vad,
     )
     monkeypatch.setattr(pipeline, "_audio_duration", lambda _path: 60.0)
     monkeypatch.setattr(
@@ -75,8 +89,50 @@ def test_api_fallback_preserves_rejected_and_selected_attempts(monkeypatch):
     assert snapshot["completed_attempt_count"] == 2
     assert [
         row["transformation"] for row in snapshot["hypotheses"]
-    ] == ["full_file", "vad_chunks_retry"]
+    ] == ["full_file_raw", "vad_chunk_raw:index=0"]
     assert [len(row["events"]) for row in snapshot["hypotheses"]] == [1, 5]
+
+
+def test_vad_records_each_completed_provider_chunk_separately(monkeypatch):
+    chunks = [(0.0, 10.0), (8.0, 18.0)]
+    monkeypatch.setattr(
+        pipeline, "_build_chunks_from_audio", lambda _path: chunks,
+    )
+    monkeypatch.setattr(
+        pipeline.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0),
+    )
+
+    def transcribe_chunk(_path, **kwargs):
+        raw = [{"start": 1.0, "end": 2.0, "text": "raw chunk"}]
+        record_completed(
+            family="openai/whisper-1", events=raw,
+            view=kwargs["provenance_view"],
+            transformation=kwargs["provenance_transformation"],
+        )
+        return [dict(row) for row in raw]
+
+    monkeypatch.setattr(
+        pipeline, "_transcribe_via_openai_api", transcribe_chunk,
+    )
+    collector, token = begin_collection()
+    try:
+        selected = pipeline._vad_chunk_transcribe(
+            "fixture.wav", provenance_view="stem",
+        )
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
+
+    assert [row["start"] for row in selected] == [1.0, 9.0]
+    assert snapshot["completed_attempt_count"] == 2
+    assert [row["view"] for row in snapshot["hypotheses"]] == [
+        "stem", "stem",
+    ]
+    assert [row["transformation"] for row in snapshot["hypotheses"]] == [
+        "vad_chunk_raw:index=0;start=0.000;end=10.000",
+        "vad_chunk_raw:index=1;start=8.000;end=18.000",
+    ]
 
 
 class _FakeLocalModel:
