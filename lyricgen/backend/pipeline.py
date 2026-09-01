@@ -12307,6 +12307,129 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     return output_path
 
 
+# --------------------------------------------------------------------------
+# Still-image model resolution (incident 2026-09-01)
+# --------------------------------------------------------------------------
+# Vertex AI stopped serving the ENTIRE Imagen publisher-model family to our
+# project (`gen-lang-client-0900526123`). Verified 2026-09-01 with the live
+# production service account:
+#
+#   POST .../publishers/google/models/<any imagen id>:predict
+#     → 404 "Publisher model ... was not found or your project does not have
+#       access to it"  — in us-central1, us-east4, europe-west4, asia-northeast1
+#   GET  .../v1beta1/publishers/google/models/<any imagen id>
+#     → 404 "Publisher Model ... is not found."
+#
+# It is NOT auth, NOT the SDK, NOT the region and NOT a single retired model
+# id: `imagen-4.0-*`, `imagen-3.0-*` and even the legacy `imagegeneration@006`
+# all fail, while `veo-*`, `gemini-2.5-flash` and `gemini-2.5-flash-image`
+# resolve and answer with the SAME credentials, project and region. The last
+# successful Imagen call recorded in production `ai_provenance` is 2026-07-16.
+#
+# Nobody hit the error because the only product paths that route here
+# (`movement_style=foto-parallax`, `effect=foto_viva`, an explicit
+# `bg_mode=imagen`) went unused all through August. It was a LATENT TRAP: the
+# next operator to pick "Foto fija" would have eaten the 404 and silently
+# fallen back to the gradient background.
+#
+# Fix: generate the still with `gemini-2.5-flash-image` (GA on Vertex, same
+# project/creds, 16:9 supported, ~$0.039/image vs $0.04 standard / $0.06 ultra
+# Imagen) and REFUSE to call any Imagen id, even if an env var still names one.
+# That last part matters: production has `IMAGEN_MODEL_PARALLAX=
+# imagen-4.0-ultra-generate-001` set in Railway, so a defaults-only fix would
+# have left the trap fully armed in prod.
+_DEFAULT_STILL_IMAGE_MODEL = "gemini-2.5-flash-image"
+
+# Model-id prefixes Vertex no longer serves to this project. Anything matching
+# is rewritten to the working model instead of being sent to a guaranteed 404.
+_UNAVAILABLE_IMAGE_MODEL_PREFIXES = ("imagen-", "imagegeneration")
+
+
+def _resolve_still_image_model(requested: str | None = None) -> str:
+    """Return a still-image model Vertex will actually serve.
+
+    Precedence: explicit `requested` → `IMAGEN_MODEL` env →
+    `STILL_IMAGE_MODEL` env → `_DEFAULT_STILL_IMAGE_MODEL`. Whatever comes
+    out, an id from the dead Imagen family is rewritten to the live fallback
+    and logged loudly, because a stale `IMAGEN_MODEL` / `IMAGEN_MODEL_PARALLAX`
+    in Railway must not be able to re-arm the 404.
+
+    Every caller resolves through here — the env reads live in this one place
+    on purpose, so there is no second path that can smuggle a dead id to the
+    wire.
+
+    Escape hatch: set `ALLOW_VERTEX_IMAGEN=1` to send Imagen ids through
+    untouched. Use it only to re-test whether Google restored access; if the
+    probe succeeds, drop the flag and point the env vars back at Imagen.
+    """
+    fallback = (os.environ.get("STILL_IMAGE_MODEL", "").strip()
+                or _DEFAULT_STILL_IMAGE_MODEL)
+    chosen = ((requested or "").strip()
+              or os.environ.get("IMAGEN_MODEL", "").strip()
+              or fallback)
+    if os.environ.get("ALLOW_VERTEX_IMAGEN", "").strip().lower() in ("1", "true", "yes", "on"):
+        return chosen
+    if chosen.lower().startswith(_UNAVAILABLE_IMAGE_MODEL_PREFIXES):
+        substitute = (fallback if not fallback.lower().startswith(
+            _UNAVAILABLE_IMAGE_MODEL_PREFIXES) else _DEFAULT_STILL_IMAGE_MODEL)
+        logger.warning(
+            "[BG] %s is not served to this Vertex project (404 since "
+            "2026-07-16) — generating the still with %s instead. Clear the "
+            "IMAGEN_MODEL / IMAGEN_MODEL_PARALLAX env vars to silence this.",
+            chosen, substitute,
+        )
+        return substitute
+    return chosen
+
+
+def _generate_gemini_still(client, model: str, prompt: str, output_path: str,
+                           aspect_ratio: str = "16:9") -> int:
+    """Generate one still with a Gemini image model; return bytes written.
+
+    Gemini image models answer on `generate_content` with an inline-data part,
+    not on Imagen's `generate_images`, so this is a separate call shape. The
+    aspect ratio travels in `image_config`, which older google-genai releases
+    lack — we only pass it when the installed SDK actually models the field,
+    so a pinned-back SDK degrades to Gemini's default framing instead of
+    raising (the still gets scale+crop'd to 16:9 by `_static_image_to_mp4`
+    either way).
+
+    Raises RuntimeError when the response carries no image (a safety block
+    returns text-only) so the caller's fallback chain engages instead of
+    writing a 0-byte file that later fails deep inside ffmpeg.
+    """
+    from google import genai
+
+    config_kwargs: dict = {"response_modalities": ["TEXT", "IMAGE"]}
+    if (hasattr(genai.types, "ImageConfig")
+            and "image_config" in genai.types.GenerateContentConfig.model_fields):
+        config_kwargs["image_config"] = genai.types.ImageConfig(
+            aspect_ratio=aspect_ratio,
+        )
+    response = _call_with_timeout(
+        lambda: client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(**config_kwargs),
+        ),
+        timeout_s=90.0,
+        label="GEMINI_IMAGE",
+    )
+    for candidate in (getattr(response, "candidates", None) or []):
+        content = getattr(candidate, "content", None)
+        for part in (getattr(content, "parts", None) or []):
+            inline = getattr(part, "inline_data", None)
+            data = getattr(inline, "data", None) if inline is not None else None
+            if data:
+                with open(output_path, "wb") as fh:
+                    fh.write(data)
+                return len(data)
+    raise RuntimeError(
+        f"{model} returned no image part (likely a safety block); "
+        "no still to render"
+    )
+
+
 def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
                             job_id: str = None, model: str | None = None,
                             allow_people: bool = False,
@@ -12341,9 +12464,11 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
         generated=not verbatim,
     )
 
-    chosen_model = (model
-                    or os.environ.get("IMAGEN_MODEL")
-                    or "imagen-4.0-generate-001").strip()
+    # `_resolve_still_image_model` is the 404 guard: it rewrites any id from
+    # the Imagen family (which Vertex stopped serving this project on
+    # 2026-07-16) to a model that actually answers. See its docstring.
+    chosen_model = _resolve_still_image_model(model)
+    _is_gemini_still = chosen_model.lower().startswith("gemini")
 
     # Mismo criterio que en el borde de Veo (2026-07-24): caras reconocibles y
     # personas protagónicas, no la presencia humana incidental de un plano
@@ -12382,6 +12507,7 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
         input_data_types=["generated_prompt"],
     ) if job_id else None
 
+    written = 0
     for attempt in range(max_retries):
         try:
             logger.info("[BG] %s: generating image (attempt %s)...", chosen_model, attempt + 1)
@@ -12392,18 +12518,28 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
             # min but only via AIProvenance, which Imagen records only
             # after the call returns. Better to fail fast and let the
             # outer retry loop reschedule.
-            response = _call_with_timeout(
-                lambda: client.models.generate_images(
-                    model=chosen_model,
-                    prompt=safe_prompt,
-                    config=genai.types.GenerateImagesConfig(
-                        number_of_images=1,
-                        aspect_ratio="16:9",
+            if _is_gemini_still:
+                written = _generate_gemini_still(
+                    client, chosen_model, safe_prompt, output_path,
+                )
+            else:
+                response = _call_with_timeout(
+                    lambda: client.models.generate_images(
+                        model=chosen_model,
+                        prompt=safe_prompt,
+                        config=genai.types.GenerateImagesConfig(
+                            number_of_images=1,
+                            aspect_ratio="16:9",
+                        ),
                     ),
-                ),
-                timeout_s=90.0,
-                label="IMAGEN",
-            )
+                    timeout_s=90.0,
+                    label="IMAGEN",
+                )
+                image = response.generated_images[0]
+                img_bytes = image.image.image_bytes
+                with open(output_path, "wb") as f:
+                    f.write(img_bytes)
+                written = len(img_bytes)
             break
         except ClientError as e:
             if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
@@ -12417,16 +12553,13 @@ def _generate_imagen_image(prompt: str, output_path: str, max_retries: int = 5,
     else:
         if recorder:
             recorder.finish(response_summary="error: rate_limit_exceeded")
-        raise RuntimeError("Imagen 4 rate limit exceeded after all retries")
-
-    image = response.generated_images[0]
-    # Save image bytes
-    img_bytes = image.image.image_bytes
-    with open(output_path, "wb") as f:
-        f.write(img_bytes)
+        raise RuntimeError(
+            f"{chosen_model} rate limit exceeded after all retries"
+        )
 
     size_kb = os.path.getsize(output_path) / 1024
-    logger.info("[BG] Imagen 4 saved: %.0f KB", size_kb)
+    logger.info("[BG] %s still saved: %.0f KB (%s bytes)",
+                chosen_model, size_kb, written)
     if recorder:
         recorder.finish(
             response_summary=f"image_generated: {size_kb:.0f}KB",
@@ -14455,21 +14588,26 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                   else _darken_prompt_for_effect(result["prompt"], _operator_effect))
         image_path = os.path.join(job_dir, "bg_imagen.jpg")
         bg_path = os.path.join(job_dir, "bg_generated.mp4")
-        # A1 (2026-05-25) — foto-parallax es el único register que el
-        # operador eligió específicamente para path Imagen premium.
-        # Merece el modelo ultra (~$0.04 vs $0.02 estándar — despreciable
-        # comparado con los $0.80-3.20 de Veo de los otros registers).
-        # Estatico/sutil legacy (cuando STATIC_SUTIL_VIA_IMAGEN=1) siguen con
-        # el modelo estándar (default IMAGEN_MODEL). Default 2026-05-25 ya no
-        # llega acá — estatico/sutil ahora van por Veo.
+        # A1 (2026-05-25) — foto-parallax era el único register que el
+        # operador eligió específicamente para el path de still premium, así
+        # que llevaba el tier ultra de Imagen (~$0.06 vs $0.04 estándar —
+        # despreciable comparado con los $0.80-3.20 de Veo de los otros
+        # registers).
+        #
+        # 2026-09-01: Vertex dejó de servir TODA la familia Imagen a este
+        # proyecto (404 desde el 16-jul; ver _resolve_still_image_model), y el
+        # reemplazo `gemini-2.5-flash-image` no tiene tiers. El default de
+        # código deja de nombrar un modelo muerto: vacío → resolución estándar.
+        # `IMAGEN_MODEL_PARALLAX` se sigue respetando si alguien la setea a un
+        # modelo vivo; si apunta a Imagen (como hoy en Railway prod), el
+        # resolver la reescribe y lo loguea en vez de garantizar un 404.
         _parallax_model = (
-            os.environ.get("IMAGEN_MODEL_PARALLAX",
-                           "imagen-4.0-ultra-generate-001").strip()
+            os.environ.get("IMAGEN_MODEL_PARALLAX", "").strip() or None
             if _norm_move_bg == "foto-parallax" else None
         )
-        # Imagen-4 has its own internal rate-limit retry (5 attempts with
-        # 60s backoff). Any other exception bubbles up to the caller's
-        # try/except which falls back to the gradient.
+        # The still generator has its own internal rate-limit retry (5
+        # attempts with 60s backoff). Any other exception bubbles up to the
+        # caller's try/except which falls back to the gradient.
         _generate_imagen_image(prompt, image_path, job_id=job_id,
                                 model=_parallax_model,
                                 allow_people=allow_people,
