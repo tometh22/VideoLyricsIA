@@ -52,3 +52,21 @@ def test_attested_family_is_additional_only(monkeypatch, tmp_path):
     )
     assert agreed is not None
     assert "lora" in evidence["sources"]
+
+
+def test_evaluation_gate_report_is_accepted(monkeypatch, tmp_path):
+    artifact = tmp_path / "adapter.bin"
+    artifact.write_bytes(b"adapter")
+    import hashlib
+    report = tmp_path / "evaluation.json"
+    report.write_text(json.dumps({
+        "pipeline_validated": True, "evaluation_passed": True,
+        "adapter_path": str(artifact),
+        "adapter_sha256": hashlib.sha256(b"adapter").hexdigest(),
+        "gate": {"passed": True, "additional_family_only": True,
+                  "runtime_replacement_allowed": False},
+    }))
+    monkeypatch.setenv("LORA_V1_FAMILY_ENABLED", "1")
+    family = load_verified_family(report)
+    assert family is not None
+    assert family["replacement_allowed"] is False
