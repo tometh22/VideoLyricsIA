@@ -432,6 +432,11 @@ def _delta_content_projection(detail: dict) -> dict:
         parsed = float(value)
         return parsed if math.isfinite(parsed) else None
 
+    def strict_text_ref(value: Any) -> str | None:
+        if not isinstance(value, str) or len(value) != 64:
+            return None
+        return value if all(character in "0123456789abcdef" for character in value) else None
+
     projected = []
     raw_changes = detail.get("changes")
     changes = raw_changes if isinstance(raw_changes, list) else [None]
@@ -450,6 +455,7 @@ def _delta_content_projection(detail: dict) -> dict:
                 "start": strict_number(value.get("start")),
                 "end": strict_number(value.get("end")),
                 "text_length": strict_int(value.get("text_length")),
+                "text_hmac": strict_text_ref(value.get("text_hmac")),
             }
 
         fields = change.get("fields")
@@ -653,6 +659,21 @@ def materialize_training_pair(
             int(getattr(current, "revision", 0)),
         )
         matches = deltas_by_boundary.get(boundary, [])
+        text_reference_unverifiable = False
+
+        def expected_text_ref(value: str) -> str | None:
+            nonlocal text_reference_unverifiable
+            try:
+                from correction_learning import hmac_identifier
+                reference = hmac_identifier("audit_lyric", value)
+            except Exception:
+                text_reference_unverifiable = True
+                return None
+            if not isinstance(reference, str) or len(reference) != 64:
+                text_reference_unverifiable = True
+                return None
+            return reference
+
         material = build_line_delta_audit(
             previous_segments,
             current_segments,
@@ -660,8 +681,12 @@ def materialize_training_pair(
             from_revision=int(getattr(previous, "revision", 0)),
             to_revision=int(getattr(current, "revision", 0)),
             checkpoint="export_validation",
-            text_ref=lambda _value: None,
+            text_ref=expected_text_ref,
         )
+        if text_reference_unverifiable:
+            issues.append(
+                f"editor_delta_text_reference_unverifiable:{boundary[0]}->{boundary[1]}"
+            )
         if material is None:
             if matches:
                 issues.append(

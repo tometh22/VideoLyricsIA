@@ -21,7 +21,8 @@ from training_corpus import build_line_delta_audit, materialize_training_pair
 
 
 def _ref(value):
-    return f"h:{value}"
+    from correction_learning import hmac_identifier
+    return hmac_identifier("audit_lyric", value)
 
 
 def test_line_delta_is_complete_and_filters_sub_50ms_jitter():
@@ -379,6 +380,30 @@ def test_training_pair_materializes_machine_gold_families_and_edits():
     assert pair["approved"]["segments"] == approved_segments
     assert pair["hypotheses_by_family"][0]["family"] == "whisper-large-v3"
     assert len(pair["intermediate_line_deltas"]) == 1
+
+    corrupt_text_reference = deepcopy(delta)
+    corrupt_text_reference["changes"][0]["before"]["text_hmac"] = "0" * 64
+    corrupt_reference_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[SimpleNamespace(
+            id=17, detail=corrupt_text_reference,
+            created_at=datetime.now(timezone.utc),
+        )],
+    )
+    assert corrupt_reference_pair["complete"] is False
+    assert "editor_delta_content_mismatch:0->1" in corrupt_reference_pair["issues"]
+
+    missing_text_reference = deepcopy(delta)
+    missing_text_reference["changes"][0]["after"]["text_hmac"] = None
+    missing_reference_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[SimpleNamespace(
+            id=18, detail=missing_text_reference,
+            created_at=datetime.now(timezone.utc),
+        )],
+    )
+    assert missing_reference_pair["complete"] is False
+    assert "editor_delta_content_mismatch:0->1" in missing_reference_pair["issues"]
 
     missing_origin = materialize_training_pair(
         job=job, document=document, versions=[approved], audits=[],
