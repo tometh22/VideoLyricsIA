@@ -642,3 +642,51 @@ def test_un_cero_viejo_ya_no_se_re_pide(db):
             db.query(modelo).filter(modelo.source == "gcp",
                                     modelo.day == viejo).delete(synchronize_session=False)
         db.commit()
+
+
+def test_gcp_no_inventa_ceros_mas_alla_de_donde_llega_el_export(monkeypatch):
+    """El export de facturación se puede cortar, y se cortó.
+
+    El de esta cuenta dejó de escribir el 18-ago-2026: del 19 en adelante no
+    hay una sola fila, aunque `ai_provenance` registra llamadas a Veo el
+    31-ago y el 1-sep en los DOS entornos. Escribir $0,00 para esos días
+    afirma que no se gastó, y es falso.
+
+    Distinguir importa porque las dos cosas se escriben distinto: un día sin
+    gasto DENTRO del tramo cubierto es un cero real; uno posterior al último
+    con datos es falta de dato y tiene que poner la cobertura en rojo.
+    """
+    for k, v in (("GCP_BILLING_BQ_PROJECT", "p"), ("GCP_BILLING_BQ_DATASET", "d"),
+                 ("GCP_BILLING_BQ_TABLE", "t"), ("GCP_BILLING_PROJECT_IDS", "proj"),
+                 ("VERTEX_PROJECT", "proj")):
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(cdc.bs, "_gcp_credentials", lambda: "token")
+
+    # Gasto el 1 y el 3; el 2 sin gasto pero DENTRO del tramo cubierto.
+    filas = [
+        {"f": [{"v": "2026-08-01"}, {"v": "Veo"}, {"v": "10.0"}, {"v": "0"}]},
+        {"f": [{"v": "2026-08-03"}, {"v": "Veo"}, {"v": "5.0"}, {"v": "0"}]},
+    ]
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"jobComplete": True, "rows": filas, "totalRows": len(filas)}
+
+    import requests
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp())
+
+    res = {r.day: r for r in cdc.gcp_month(date(2026, 8, 1))}
+
+    # Días cubiertos por el export.
+    assert res[date(2026, 8, 1)].status == "ok"
+    assert res[date(2026, 8, 2)].status == "ok", "un día flojo adentro es cero real"
+    assert next(x["amount_usd"] for x in res[date(2026, 8, 2)].rows
+                if x["dim_type"] == "total") == 0.0
+    assert res[date(2026, 8, 3)].status == "ok"
+
+    # Del 4 en adelante el export no llega: falta de dato, NO cero.
+    for dia in (4, 15, 31):
+        r = res[date(2026, 8, dia)]
+        assert r.status == "error", f"el {dia}-ago se guardó como cero inventado"
+        assert "no llega a este día" in (r.detail or "")
