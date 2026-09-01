@@ -53,7 +53,11 @@ def test_edit_smoke_uses_current_presigned_upload_flow(monkeypatch):
             assert "smoke" in fields["segments_json"][1]
             return _Response({"status": "queued"})
         if url.endswith("/jobs/smokejob123/save-segments"):
-            return _Response({"count": 2})
+            saved_segments = kwargs["json"]["segments"]
+            assert saved_segments == [{
+                "start": 0.2, "end": 1.4, "text": "smoke",
+            }]
+            return _Response({"count": 1})
         if url.endswith("/edit/smokejob123"):
             return _Response({"status": "editing"})
         raise AssertionError(f"unexpected POST {url}")
@@ -111,6 +115,8 @@ def test_edit_smoke_accepts_fail_closed_quality_gate_in_staging(monkeypatch):
             })
         if url.endswith("/transcribe-uploaded"):
             return _Response({"status": "transcribing"})
+        if url.endswith("/jobs/qualitysmoke1/save-segments"):
+            return _Response({"count": 1})
         if url.endswith("/generate"):
             return _Response(
                 {
@@ -155,6 +161,8 @@ def test_edit_smoke_accepts_asynchronous_quality_gate_in_staging(monkeypatch):
             })
         if url.endswith("/transcribe-uploaded"):
             return _Response({"status": "transcribing"})
+        if url.endswith("/jobs/qualitysmoke3/save-segments"):
+            return _Response({"count": 1})
         if url.endswith("/generate"):
             return _Response({"status": "queued"})
         raise AssertionError(f"unexpected POST {url}")
@@ -182,7 +190,7 @@ def test_edit_smoke_accepts_asynchronous_quality_gate_in_staging(monkeypatch):
     )
 
     assert edit_smoke.main() == 0
-    assert not any(url.endswith("/save-segments") for url in posts)
+    assert any(url.endswith("/save-segments") for url in posts)
 
 
 def test_edit_smoke_does_not_hide_unknown_generate_conflict(monkeypatch):
@@ -199,6 +207,8 @@ def test_edit_smoke_does_not_hide_unknown_generate_conflict(monkeypatch):
             })
         if url.endswith("/transcribe-uploaded"):
             return _Response({"status": "transcribing"})
+        if url.endswith("/jobs/qualitysmoke2/save-segments"):
+            return _Response({"count": 1})
         if url.endswith("/generate"):
             return _Response({"code": "stale_revision"}, status_code=409)
         raise AssertionError(f"unexpected POST {url}")

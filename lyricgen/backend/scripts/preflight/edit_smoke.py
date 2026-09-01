@@ -13,7 +13,8 @@ existe para cazar.
      Corazón", byte 0xf3) — el disparador real del UnicodeDecodeError que
      activó el 234.
   2. Lo sube directo a R2 con el flujo vigente (/upload-url), lo transcribe
-     (/transcribe-uploaded), genera el video y espera pending_review.
+     (/transcribe-uploaded), guarda una corrección de timing pre-aprobación,
+     genera el video y espera pending_review.
   3. Pide un edit de metadata (/edit) — recorre run_edit_pipeline: la
      apertura moviepy del source_audio, el fallback UTF-8, el re-render y
      el re-upload de deliverables.
@@ -248,6 +249,34 @@ def main() -> int:
     else:
         return _fail(f"transcripción no terminó en {args.render_timeout}s")
 
+    # 2.5. Autosave pre-aprobación — además de probar el endpoint del editor,
+    # deja un delta de timing real entre la hipótesis de máquina y la versión
+    # que /generate congela como aprobada. Guardarlo después de /generate no
+    # sirve para entrenamiento: sería contaminación posterior a la aprobación.
+    first_segment = segments[0] if segments else {}
+    edited_segments = [{
+        "start": 0.2,
+        "end": 1.4,
+        "text": str(
+            first_segment.get("text")
+            or "estrechez de corazón (smoke)"
+        ),
+    }]
+    r = requests.post(
+        f"{api}/jobs/{job_id}/save-segments", headers=headers,
+        json={"segments": edited_segments}, timeout=30,
+    )
+    if not r.ok:
+        return _fail(f"/save-segments {r.status_code}: {r.text[:300]}")
+    saved = r.json()
+    if saved.get("count") != len(edited_segments):
+        return _fail(
+            "/save-segments persistió "
+            f"{saved.get('count')} != {len(edited_segments)}"
+        )
+    segments = edited_segments
+    print(f"[edit-smoke] save-segments pre-aprobación ok (count={saved['count']})")
+
     # Generar reusando el audio ya persistido y los segmentos aprobados: es
     # exactamente el contrato que usa el wizard después del editor de letra.
     generate_fields = {
@@ -310,26 +339,6 @@ def main() -> int:
             return _fail(f"render inicial: {contract_error}")
         _initial_qc_generated_at = st["delivery_qc"]["generated_at"]
         print("[edit-smoke] delivery_qc inicial fresco y ligado al render")
-
-    # 2.5. Autosave del editor — el camino que los operadores reportan como
-    # frágil (issue #934). GO/NO-GO: POST /jobs/{id}/save-segments con una
-    # corrección de timing debe 200 y persistir el count. Sin esto el gate
-    # verde no decía nada sobre el guardado del editor (incidente Seba
-    # 21-jul: autosave fallando en prod con smoke verde).
-    _segs = [
-        {"start": 0.2, "end": 1.4, "text": "estrechez de corazón (smoke)"},
-        {"start": 1.5, "end": 2.0, "text": "línea dos"},
-    ]
-    r = requests.post(
-        f"{api}/jobs/{job_id}/save-segments", headers=headers,
-        json={"segments": _segs}, timeout=30,
-    )
-    if not r.ok:
-        return _fail(f"/save-segments {r.status_code}: {r.text[:300]}")
-    _saved = r.json()
-    if _saved.get("count") != len(_segs):
-        return _fail(f"/save-segments persistió {_saved.get('count')} != {len(_segs)}")
-    print(f"[edit-smoke] save-segments ok (count={_saved['count']})")
 
     # 3. Edit de metadata — recorre run_edit_pipeline completo (apertura
     # moviepy del source_audio + fallback UTF-8 + re-render) sin costo Veo.
