@@ -271,7 +271,14 @@ def _record_training_delta(
     to_revision: int,
     checkpoint: str,
 ) -> bool:
-    """Persist one complete material edit in the owning transaction."""
+    """Persist one complete material edit for evidence-enrolled jobs."""
+    # Historical jobs cannot satisfy the machine-snapshot invariant and are
+    # therefore ineligible for training export.  Avoid running the potentially
+    # large aligner on their frequent draft autosaves; their existing bounded
+    # operational audit remains unchanged.
+    if not bool(getattr(job, "machine_snapshot_required", False)):
+        return False
+
     from correction_learning import hmac_identifier
     from training_corpus import build_line_delta_audit
 

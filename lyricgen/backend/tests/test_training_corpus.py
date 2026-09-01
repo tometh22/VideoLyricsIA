@@ -5,6 +5,7 @@ import uuid
 
 from database import EditorVersion, Job
 from editor import (
+    _record_training_delta,
     approve_document,
     attach_machine_evidence,
     ensure_document,
@@ -286,6 +287,23 @@ def test_metadata_only_editor_change_is_not_training_noise():
         before, after, job_id="job", from_revision=1, to_revision=2,
         checkpoint="draft", text_ref=_ref,
     ) is None
+
+
+def test_unenrolled_job_skips_full_delta_audit():
+    class RejectWrites:
+        def add(self, _value):
+            raise AssertionError("unenrolled job attempted an audit write")
+
+    assert _record_training_delta(
+        RejectWrites(),
+        job=SimpleNamespace(job_id="legacy", machine_snapshot_required=False),
+        user_id=1,
+        previous=[{"_id": "line", "start": 0, "end": 1, "text": "before"}],
+        current=[{"_id": "line", "start": 0, "end": 2, "text": "after"}],
+        from_revision=0,
+        to_revision=1,
+        checkpoint="draft",
+    ) is False
 
 
 def test_training_pair_materializes_machine_gold_families_and_edits():
