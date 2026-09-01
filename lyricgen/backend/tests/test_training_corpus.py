@@ -393,6 +393,39 @@ def test_training_pair_materializes_machine_gold_families_and_edits():
     assert malformed_changes_pair["complete"] is False
     assert "editor_delta_content_mismatch:0->1" in malformed_changes_pair["issues"]
 
+    float_revision = deepcopy(delta)
+    float_revision["from_revision"] = 0.9
+    float_revision["to_revision"] = 1.9
+    float_revision_audit = SimpleNamespace(
+        id=15, detail=float_revision, created_at=datetime.now(timezone.utc),
+    )
+    invalid_revision_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[float_revision_audit],
+    )
+    assert invalid_revision_pair["complete"] is False
+    assert "editor_delta_revision_invalid" in invalid_revision_pair["issues"]
+
+    scalar_audit = SimpleNamespace(
+        id=16, detail=7, created_at=datetime.now(timezone.utc),
+    )
+    scalar_audit_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[scalar_audit],
+    )
+    assert scalar_audit_pair["complete"] is False
+    assert "editor_delta_detail_invalid" in scalar_audit_pair["issues"]
+
+    malformed_document = SimpleNamespace(
+        original_segments=original, machine_evidence=["not", "a", "mapping"],
+    )
+    malformed_evidence_pair = materialize_training_pair(
+        job=job, document=malformed_document, versions=[initial, approved],
+        audits=[audit],
+    )
+    assert malformed_evidence_pair["complete"] is False
+    assert "machine_evidence_malformed" in malformed_evidence_pair["issues"]
+
     after_approval_segments = [
         {"_id": "a", "start": 0, "end": 1.4, "text": "hola otra vez"},
     ]

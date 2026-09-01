@@ -445,6 +445,8 @@ def _delta_content_projection(detail: dict) -> dict:
     raw_summary = detail.get("summary")
     summary = raw_summary if isinstance(raw_summary, dict) else {}
     return {
+        "from_revision": strict_int(detail.get("from_revision")),
+        "to_revision": strict_int(detail.get("to_revision")),
         "before_line_count": strict_int(detail.get("before_line_count")),
         "after_line_count": strict_int(detail.get("after_line_count")),
         "changes": projected,
@@ -469,8 +471,28 @@ def materialize_training_pair(
     versions = sorted(versions, key=lambda row: int(getattr(row, "revision", 0)))
     approved = _approved_version(versions)
     issues: list[str] = []
-    evidence = dict(getattr(document, "machine_evidence", None) or {}) if document else {}
-    original = list(getattr(document, "original_segments", None) or []) if document else []
+
+    def row_segments(row: Any, issue: str) -> list[dict]:
+        raw = getattr(row, "segments", None)
+        if isinstance(raw, list):
+            return list(raw)
+        issues.append(issue)
+        return []
+
+    raw_evidence = getattr(document, "machine_evidence", None) if document else None
+    if isinstance(raw_evidence, dict):
+        evidence = dict(raw_evidence)
+    else:
+        evidence = {}
+        if raw_evidence not in (None, {}):
+            issues.append("machine_evidence_malformed")
+    raw_original = getattr(document, "original_segments", None) if document else None
+    if isinstance(raw_original, list):
+        original = list(raw_original)
+    else:
+        original = []
+        if raw_original not in (None, []):
+            issues.append("original_segments_malformed")
     try:
         validate_machine_evidence(evidence, original)
     except Exception as exc:  # exporter reports evidence defects; it never repairs them
@@ -479,12 +501,26 @@ def materialize_training_pair(
         issues.append("machine_evidence_not_current_schema")
     if approved is None:
         issues.append("approved_editor_version_missing")
-    approval_provenance = dict(getattr(approved, "provenance", None) or {}) if approved else {}
-    approval_evidence = dict(approval_provenance.get("training_approval") or {})
+    raw_approval_provenance = getattr(approved, "provenance", None) if approved else None
+    if isinstance(raw_approval_provenance, dict):
+        approval_provenance = dict(raw_approval_provenance)
+    else:
+        approval_provenance = {}
+        if raw_approval_provenance not in (None, {}):
+            issues.append("approval_provenance_malformed")
+    raw_approval_evidence = approval_provenance.get("training_approval")
+    if isinstance(raw_approval_evidence, dict):
+        approval_evidence = dict(raw_approval_evidence)
+    else:
+        approval_evidence = {}
+        if raw_approval_evidence not in (None, {}):
+            issues.append("approval_training_signal_malformed")
+    approved_segments = (
+        row_segments(approved, "approved_segments_malformed") if approved else []
+    )
     if approval_evidence.get("schema") != "training-approval-evidence-v1":
         issues.append("approval_training_signal_missing")
     elif approved:
-        approved_segments = list(getattr(approved, "segments", None) or [])
         if approval_evidence.get("revision") != int(getattr(approved, "revision", -1)):
             issues.append("approval_revision_mismatch")
         if approval_evidence.get("segments_sha256") != snapshot_hash(approved_segments):
@@ -506,11 +542,16 @@ def materialize_training_pair(
     delta_events = []
     legacy_or_truncated = False
     for audit in audits:
-        detail = dict(getattr(audit, "detail", None) or {})
-        try:
-            to_revision = int(detail.get("to_revision"))
-        except (TypeError, ValueError):
-            to_revision = None
+        raw_detail = getattr(audit, "detail", None)
+        if not isinstance(raw_detail, dict):
+            issues.append("editor_delta_detail_invalid")
+            continue
+        detail = dict(raw_detail)
+        from_revision = detail.get("from_revision")
+        to_revision = detail.get("to_revision")
+        if type(from_revision) is not int or type(to_revision) is not int:
+            issues.append("editor_delta_revision_invalid")
+            continue
         # The selected approval is the label boundary. Later drafts belong to
         # a future training pair and must never contaminate this trajectory.
         if approved is not None and to_revision is not None and to_revision > approved_revision:
@@ -534,18 +575,20 @@ def materialize_training_pair(
     if legacy_or_truncated:
         issues.append("legacy_or_truncated_editor_delta")
     delta_events.sort(key=lambda row: (
-        int(row.get("to_revision") or 0), int(row.get("audit_id") or 0),
+        row["to_revision"], int(row.get("audit_id") or 0),
     ))
 
     checkpoint_rows = [
         row for row in versions
         if approved is None or int(getattr(row, "revision", 0)) <= approved_revision
     ]
+    checkpoint_segment_rows = [
+        row_segments(row, "checkpoint_segments_malformed")
+        for row in checkpoint_rows
+    ]
     if not checkpoint_rows or str(getattr(checkpoint_rows[0], "reason", "")) != "transcription":
         issues.append("transcription_checkpoint_missing")
-    elif snapshot_hash(
-        list(getattr(checkpoint_rows[0], "segments", None) or [])
-    ) != snapshot_hash(original):
+    elif snapshot_hash(checkpoint_segment_rows[0]) != snapshot_hash(original):
         issues.append("transcription_checkpoint_snapshot_mismatch")
     checkpoints = [
         {
@@ -556,18 +599,14 @@ def materialize_training_pair(
                 getattr(row, "created_at", None).isoformat()
                 if getattr(row, "created_at", None) else None
             ),
-            "segments": list(getattr(row, "segments", None) or []),
-            "segments_sha256": snapshot_hash(list(getattr(row, "segments", None) or [])),
+            "segments": segments,
+            "segments_sha256": snapshot_hash(segments),
         }
-        for row in checkpoint_rows
+        for row, segments in zip(checkpoint_rows, checkpoint_segment_rows)
     ]
     deltas_by_boundary: dict[tuple[int, int], list[dict]] = defaultdict(list)
     for event in delta_events:
-        try:
-            boundary = (int(event.get("from_revision")), int(event.get("to_revision")))
-        except (TypeError, ValueError):
-            issues.append("editor_delta_revision_invalid")
-            continue
+        boundary = (event["from_revision"], event["to_revision"])
         deltas_by_boundary[boundary].append(event)
     adjacent_boundaries = {
         (
@@ -579,9 +618,11 @@ def materialize_training_pair(
     for boundary in deltas_by_boundary:
         if boundary not in adjacent_boundaries:
             issues.append(f"editor_delta_orphaned:{boundary[0]}->{boundary[1]}")
-    for previous, current in zip(checkpoint_rows, checkpoint_rows[1:]):
-        previous_segments = list(getattr(previous, "segments", None) or [])
-        current_segments = list(getattr(current, "segments", None) or [])
+    for index, (previous, current) in enumerate(
+        zip(checkpoint_rows, checkpoint_rows[1:])
+    ):
+        previous_segments = checkpoint_segment_rows[index]
+        current_segments = checkpoint_segment_rows[index + 1]
         boundary = (
             int(getattr(previous, "revision", 0)),
             int(getattr(current, "revision", 0)),
@@ -610,6 +651,12 @@ def materialize_training_pair(
             issues.append(
                 f"editor_delta_content_mismatch:{boundary[0]}->{boundary[1]}"
             )
+    raw_pre_human = evidence.get("pre_human")
+    pre_human = raw_pre_human if isinstance(raw_pre_human, dict) else {}
+    raw_hypotheses = evidence.get("hypotheses_by_family")
+    hypotheses = list(raw_hypotheses) if isinstance(raw_hypotheses, list) else []
+    raw_decisions = evidence.get("decisions")
+    decisions = dict(raw_decisions) if isinstance(raw_decisions, dict) else {}
     return {
         "schema": TRAINING_PAIR_SCHEMA,
         "job_id": str(getattr(job, "job_id", "")),
@@ -623,16 +670,16 @@ def materialize_training_pair(
         "pre_human": {
             "segments": original,
             "segments_sha256": snapshot_hash(original),
-            "audio_sha256": (evidence.get("pre_human") or {}).get("audio_sha256"),
-            "audio_revision": (evidence.get("pre_human") or {}).get("audio_revision"),
+            "audio_sha256": pre_human.get("audio_sha256"),
+            "audio_revision": pre_human.get("audio_revision"),
         },
-        "hypotheses_by_family": list(evidence.get("hypotheses_by_family") or []),
-        "machine_decisions": dict(evidence.get("decisions") or {}),
+        "hypotheses_by_family": hypotheses,
+        "machine_decisions": decisions,
         "approved": ({
             "version_id": str(getattr(approved, "id", "")),
             "revision": approved_revision,
-            "segments": list(getattr(approved, "segments", None) or []),
-            "segments_sha256": snapshot_hash(list(getattr(approved, "segments", None) or [])),
+            "segments": approved_segments,
+            "segments_sha256": snapshot_hash(approved_segments),
             "training_approval": approval_evidence,
         } if approved else None),
         "intermediate_checkpoints": checkpoints,
