@@ -93,3 +93,65 @@ audio, y el comando los contabiliza como `rejected_missing_audio`.
 La corrida de GPU se ejecuta sólo con `--validate-only` aprobado, el flag de
 autorización activo y un executor/GPU real. Ninguna clave se guarda en el
 repositorio, en Murmur ni en estos reportes.
+
+## Resultado LoRA v1 (2026-09-01)
+
+El replay de v1 sobre la cohorte canónica exacta de 23 canciones produjo:
+
+* Whisper-large-v3-turbo aislado sobre las 168 ventanas: WER 25,66%.
+* La misma inferencia con el adaptador LoRA: WER 22,42%, una mejora relativa
+  de 12,61% (3,24 puntos porcentuales absolutos).
+* El bootstrap por canción dio una diferencia de −3,24 pp, IC 95%
+  [−0,93; +8,41] pp; 11 canciones mejoraron, una quedó igual y 11
+  empeoraron.
+
+El 25,66% no contradice el baseline certificado de aproximadamente 6,9%:
+el primero mide el modelo ASR aislado sobre ventanas preparadas, sin consenso
+ni post-procesos del pipeline; el segundo mide la salida end-to-end ya
+certificada (consenso, filtros, alineación y correcciones). Son condiciones y
+unidades de evaluación distintas. La cohorte canónica no contiene canciones
+`difficult`, por lo que la partición difícil de v1 queda sin observaciones y
+no habilita ninguna conclusión sobre esa cola.
+
+Por ese IC y la regresión en 11 canciones, v1 queda únicamente como familia
+adicional del consenso. `lora_family.load_verified_family` exige un reporte
+completo de evaluación y verifica el SHA-256 del adaptador; nunca permite
+reemplazar Whisper base. El reemplazo requeriría dos evaluaciones consecutivas
+con CI por canción.
+
+## Enlace opcional en staging (fail-closed)
+
+El puente de runtime ya está conectado en los caminos API multipart, legacy y
+worker. Está apagado por defecto y no puede activarse desde un payload de job.
+Para un entorno de staging con el artefacto montado fuera del repositorio:
+
+```sh
+LORA_V1_FAMILY_ENABLED=1
+LORA_V1_EVAL_REPORT=/secure-mounted/lora-v1/evaluation.json
+LORA_V1_ADAPTER_PATH=/secure-mounted/lora-v1/adapter
+```
+
+`LORA_V1_ADAPTER_PATH` sólo cambia dónde se leen los bytes; el reporte sigue
+siendo la autoridad y su SHA-256 debe coincidir. Si falta el montaje, la
+dependencia opcional o el límite de audio, la familia se abstiene y el job
+continúa con Whisper. La inferencia registra únicamente telemetría acotada en
+`postpass_stats.lora_family`; no reemplaza ni muta `segments` directamente.
+Cuando produce palabras, `targeted_consensus` la trata como una familia
+independiente y sólo puede seleccionarla si supera su consenso existente.
+
+## Diagnóstico reconstructed (no-gate)
+
+Las 18 canciones `raw_quality=reconstructed` se evalúan aparte con
+`scripts/diagnose_lora_v1.py`. El comando etiqueta el resultado como
+`diagnostic_non_gate`, conserva bootstrap por canción y fuerza
+`runtime_replacement_allowed=false`; una mejora en esas canciones sirve para
+decidir el sobremuestreo de v2, pero no puede promover el adaptador.
+
+La primera corrida (122 ventanas, 2026-09-01) dio WER 31,10% → 10,68%:
+65,67% de mejora relativa, con diferencia bootstrap por canción de 20,42 pp
+(IC 95% [4,37; 46,20] pp); 15 canciones mejoraron, una quedó igual y dos
+empeoraron. Es una señal direccional fuerte de que el adaptador ayuda más en
+material reconstruido/no canónico que en la cohorte exacta, pero no es un gate:
+el manifest clasifica `reconstructed` como `easy` para entrenamiento y no hay
+una partición `difficult` histórica comparable. La etiqueta correcta para
+calibración de v2 es, por ahora, `raw_quality=reconstructed`, no “difícil”.

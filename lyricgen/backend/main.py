@@ -4820,6 +4820,9 @@ async def transcribe_uploaded(
         _result = _maybe_repetition_reconcile(_result, job_id)
         _result = await _maybe_gap_rescue(_result, audio_path, job_id,
                                           _post_lang)
+        _result = await _maybe_lora_family(
+            _result, audio_path, job_id, _post_lang,
+        )
         _result = await _maybe_word_vote(
             _result, audio_path, job_id, _post_lang,
             live_hint=bool(getattr(body, "live", False))
@@ -5575,6 +5578,9 @@ async def transcribe_endpoint(
     _result = _maybe_repetition_reconcile(_result, job_id)
     _result = await _maybe_gap_rescue(_result, audio_path, job_id,
                                       _post_lang)
+    _result = await _maybe_lora_family(
+        _result, audio_path, job_id, _post_lang,
+    )
     _result = await _maybe_word_vote(
         _result, audio_path, job_id, _post_lang,
         live_hint=_looks_live(title, file.filename),
@@ -6021,6 +6027,54 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
                 os.unlink(_stem)
             except OSError:
                 pass
+
+
+async def _maybe_lora_family(result, audio_path: str, job_id: str,
+                             language: str | None = None):
+    """Attach an attested LoRA witness for consensus, never for mutation.
+
+    LoRA-v1 is a fourth recognition family, not a replacement for Whisper.
+    This wrapper keeps the runtime opt-in and fail-closed: without an
+    explicitly mounted adapter plus a completed evaluation report it records
+    nothing and leaves the existing pipeline byte-for-byte unchanged. When
+    enabled, inference runs off the event loop and only the internal word
+    stream/telemetry is attached; ``targeted_consensus`` remains the sole
+    component allowed to select a proposal.
+    """
+    if not isinstance(result, dict) or not audio_path or not os.path.exists(audio_path):
+        return result
+    try:
+        from lora_family import load_verified_family, transcribe_words, attach_hypothesis
+        report_path = os.environ.get("LORA_V1_EVAL_REPORT", "").strip() or None
+        if load_verified_family(report_path) is None:
+            return result
+        words, stats = await asyncio.to_thread(
+            transcribe_words, audio_path, language=language or "",
+            report_path=report_path,
+        )
+        updated = dict(result)
+        updated.setdefault("postpass_stats", {})["lora_family"] = {
+            key: value for key, value in (stats or {}).items()
+            if key not in {"error", "exception"}
+        }
+        if words and attach_hypothesis(updated, words, report_path=report_path):
+            updated["postpass_stats"]["lora_family"]["attached"] = True
+        else:
+            updated["postpass_stats"]["lora_family"]["attached"] = False
+        logger.info(
+            "[LORA-FAMILY] status=%s words=%d attached=%s job=%s",
+            updated["postpass_stats"]["lora_family"].get("status"),
+            len(words),
+            updated["postpass_stats"]["lora_family"].get("attached"),
+            job_id,
+        )
+        return updated
+    except Exception as exc:  # optional family must never break base ASR
+        logger.warning(
+            "[LORA-FAMILY] declined error_type=%s job=%s",
+            type(exc).__name__, job_id,
+        )
+        return result
 
 
 def _maybe_chorus_snap(result, job_id: str):
