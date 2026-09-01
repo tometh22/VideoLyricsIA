@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import struct
@@ -231,14 +232,18 @@ def main() -> int:
         return _fail(f"R2 PUT {r.status_code}: {r.text[:300]}")
 
     r = requests.post(
-        f"{api}/transcribe-uploaded", headers=headers,
+        f"{api}/transcribe-uploaded",
+        headers={
+            **headers,
+            "Idempotency-Key": f"edit-smoke-transcribe-{job_id}",
+        },
         json={
             "job_id": job_id,
             "language": "es",
             "artist": _ARTIST,
             "title": _TITLE,
         },
-        timeout=120,
+        timeout=15,
     )
     if not r.ok:
         return _fail(f"/transcribe-uploaded {r.status_code}: {r.text[:300]}")
@@ -368,9 +373,18 @@ def main() -> int:
     # 3. Edit de metadata — recorre run_edit_pipeline completo (apertura
     # moviepy del source_audio + fallback UTF-8 + re-render) sin costo Veo.
     r = requests.post(
-        f"{api}/edit/{job_id}", headers=headers,
+        f"{api}/edit/{job_id}",
+        headers={
+            **headers,
+            "Idempotency-Key": (
+                "edit-smoke-edit-"
+                + hashlib.sha256(
+                    f"{job_id}:{_TITLE}:metadata".encode("utf-8"),
+                ).hexdigest()
+            ),
+        },
         json={"edit_type": "metadata", "song_title": f"{_TITLE} · editado"},
-        timeout=30,
+        timeout=15,
     )
     if not r.ok:
         return _fail(f"/edit {r.status_code}: {r.text[:300]}")

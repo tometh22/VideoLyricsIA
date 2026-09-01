@@ -430,7 +430,7 @@ def test_out_of_order_upload_response_can_promote_soft_archived_id(client, monke
             json={"job_id": job_a, "language": "es"},
             headers=auth(token),
         )
-        assert promoted.status_code == 200, promoted.text
+        assert promoted.status_code == 202, promoted.text
         assert enqueued == [job_a]
 
         after = SessionLocal()
