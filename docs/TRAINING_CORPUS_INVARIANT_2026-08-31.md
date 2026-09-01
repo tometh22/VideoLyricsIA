@@ -4,7 +4,7 @@
 
 A new job is a complete transcription-training sample only when it has all of:
 
-1. immutable pre-human segments, hash-bound to machine evidence v2;
+1. immutable pre-human segments, hash-bound to machine evidence v3;
 2. raw hypotheses separated by recognition family;
 3. the exact approved `EditorVersion` and its approval-time quality signal;
 4. every tenant-private editor checkpoint up to approval;
@@ -56,3 +56,9 @@ The gate passes only when the manifest reports `rows=5`, `complete_rows=5` and
 `incomplete_rows=0`. Then verify each row has at least one hypothesis family,
 one approved snapshot, the two quality signals, and a revision-ordered edit
 sequence (empty deltas are valid only when the operator made no material edit).
+
+Evidence v3 additionally rejects placeholder families (`unknown`), hashes the
+recognition-attempt counter, and distinguishes raw recognizer output (for
+example `openai/whisper-1`) from the selected catalogue/reference output. A
+recognizer that completed but lost its raw rows therefore makes the sample
+incomplete instead of silently training on the selected text as if it were ASR.

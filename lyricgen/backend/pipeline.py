@@ -3964,6 +3964,16 @@ def _anchored_recovery_is_safe(
     return True, "ok"
 
 
+def _tag_recognition_family(
+    segments: list[dict], family: str,
+) -> list[dict]:
+    """Attach a transport-only exact model identity to provider rows."""
+    for segment in segments or []:
+        if isinstance(segment, dict):
+            segment["_recognition_family"] = family
+    return segments
+
+
 def transcribe(mp3_path: str, language: str = None,
                lyrics_hint: str | None = None,
                job_id: str | None = None,
@@ -4066,12 +4076,13 @@ def transcribe(mp3_path: str, language: str = None,
             segs = post_reconcile_cleanup(segs)
         except Exception:
             pass
-        return segs
+        return _tag_recognition_family(segs, "openai/whisper-1")
 
     # --- local Whisper path ---
     audio_path = mp3_path
 
     model = _get_whisper_model("turbo")
+    recognition_family = "openai-whisper/turbo-local"
 
     kwargs = dict(
         word_timestamps=True,
@@ -4187,6 +4198,7 @@ def transcribe(mp3_path: str, language: str = None,
                     logger.info("[WHISPER] large-v3 produced %s segments (turbo: %s); using large-v3",
                                 len(segments3), len(segments))
                     segments = segments3
+                    recognition_family = "openai-whisper/large-v3-local"
             except Exception as e:
                 logger.warning("[WHISPER] large-v3 fallback failed: %s; keeping turbo", e)
 
@@ -4207,7 +4219,25 @@ def transcribe(mp3_path: str, language: str = None,
         logger.info("[WHISPER] filtered %s hallucination/loop segment(s)", _dropped_loops)
 
 
-    return segments
+    return _tag_recognition_family(segments, recognition_family)
+
+
+def transcription_family(segments: list[dict] | None = None) -> str:
+    """Return the exact recognition family selected by ``transcribe``.
+
+    This is training provenance, not a routing hint.  Keep it beside the
+    backend selection above so a future model migration cannot leave durable
+    hypotheses labelled with a stale or guessed family.
+    """
+    for segment in segments or []:
+        if not isinstance(segment, dict):
+            continue
+        family = str(segment.get("_recognition_family") or "").strip()
+        if family:
+            return family
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        return "openai/whisper-1"
+    return "openai-whisper/turbo-local"
 
 
 # ---------------------------------------------------------------------------

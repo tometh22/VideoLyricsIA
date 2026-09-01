@@ -111,3 +111,12 @@ def test_deprecated_sources_not_emitted_by_orchestrator():
         bad_pattern = f'set_timing_source(job_id, "{dep}")'
         assert bad_pattern not in src, \
             f"Deprecated timing_source {dep!r} appears in main.py — Bug regression"
+
+
+def test_orchestrator_freezes_raw_recognition_before_selected_output():
+    """Training provenance must survive catalogue reconciliation privately."""
+    src = _MAIN_PATH.read_text()
+    assert "_recognition_hypotheses" in src
+    assert "_remember_recognition(" in src
+    assert 'out["_recognition_hypotheses"]' in src
+    assert 'if key != "_recognition_family"' in src

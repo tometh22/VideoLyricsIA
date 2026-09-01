@@ -57,6 +57,11 @@ def is_enabled() -> bool:
     return flag and bool(os.environ.get("REPLICATE_API_TOKEN", "").strip())
 
 
+def recognition_family() -> str:
+    """Stable provider/model identity persisted with raw hypotheses."""
+    return f"replicate/{_MODEL}"
+
+
 def _find_voice_onset_after_adlib(
     audio_path: str,
     search_from: float,

@@ -176,11 +176,101 @@ def test_machine_snapshot_is_hash_bound_and_immutable(db):
     changed["hypotheses_by_family"][0]["family"] = "different-family"
     changed["evidence_sha256"] = snapshot_hash({
         "hypotheses_by_family": changed["hypotheses_by_family"],
+        "capture": changed["capture"],
         "pre_human": changed["pre_human"],
         "decisions": changed["decisions"],
     })
     with pytest.raises(RuntimeError, match="already_frozen"):
         attach_machine_evidence(db, document, changed)
+
+
+def test_reference_selected_output_keeps_named_raw_recognition_family(db):
+    _row, document = _job(db)
+    selected = [{
+        **SEGMENTS[0],
+        "content_source": "catalog_reference",
+        "provider_evidence": {
+            "source": "catalog_reference",
+            "correlated_family": "unknown",
+        },
+    }]
+    captured = build_machine_evidence({
+        "segments": selected,
+        "_recognition_hypotheses": [{
+            "family": "openai/whisper-1",
+            "kind": "segments",
+            "view": "mix",
+            "events": [{
+                "start": 0.1, "end": 1.2,
+                "text": "quiero despegar crudo",
+            }],
+        }],
+    })
+    evidence = finalize_machine_evidence(
+        captured,
+        original_segments=document.original_segments,
+        quality={"decision": "review", "policy_version": "v-test"},
+        audio_sha256="a" * 64,
+        audio_revision=1,
+    )
+
+    hypotheses = evidence["hypotheses_by_family"]
+    primary = next(item for item in hypotheses if item["role"] == "primary")
+    selected_hypothesis = next(
+        item for item in hypotheses if item["role"] == "selected"
+    )
+    assert primary["family"] == "openai/whisper-1"
+    assert primary["view"] == "mix"
+    assert selected_hypothesis["family"] == "catalog_reference"
+    assert evidence["capture"]["recognition_attempt_count"] == 1
+    validate_machine_evidence(evidence, document.original_segments)
+
+
+def test_v3_rejects_unknown_family():
+    captured = build_machine_evidence({
+        "segments": SEGMENTS,
+        "_recognition_hypotheses": [{
+            "family": "unknown",
+            "kind": "segments",
+            "events": SEGMENTS,
+        }],
+    })
+    evidence = finalize_machine_evidence(
+        captured,
+        original_segments=SEGMENTS,
+        quality={"decision": "review"},
+        audio_sha256="a" * 64,
+        audio_revision=1,
+    )
+    with pytest.raises(MachineSnapshotMissing, match="family_unknown"):
+        validate_machine_evidence(evidence, SEGMENTS)
+
+
+def test_v3_attempt_counter_must_equal_durable_primary_hypotheses():
+    captured = build_machine_evidence({
+        "segments": SEGMENTS,
+        "_recognition_hypotheses": [{
+            "family": "openai/whisper-1",
+            "kind": "segments",
+            "events": SEGMENTS,
+        }],
+    })
+    evidence = finalize_machine_evidence(
+        captured,
+        original_segments=SEGMENTS,
+        quality={"decision": "review"},
+        audio_sha256="a" * 64,
+        audio_revision=1,
+    )
+    evidence["capture"]["recognition_attempt_count"] = 2
+    evidence["evidence_sha256"] = snapshot_hash({
+        "hypotheses_by_family": evidence["hypotheses_by_family"],
+        "capture": evidence["capture"],
+        "pre_human": evidence["pre_human"],
+        "decisions": evidence["decisions"],
+    })
+    with pytest.raises(MachineSnapshotMissing, match="hypothesis_missing"):
+        validate_machine_evidence(evidence, SEGMENTS)
 
 
 def test_snapshot_hash_mismatch_blocks_approval(db):
@@ -212,6 +302,7 @@ def test_nested_scalar_types_in_quality_signal_fail_closed(db):
     }
     evidence["evidence_sha256"] = snapshot_hash({
         "hypotheses_by_family": evidence["hypotheses_by_family"],
+        "capture": evidence["capture"],
         "pre_human": evidence["pre_human"],
         "decisions": evidence["decisions"],
     })
@@ -244,6 +335,7 @@ def test_malformed_or_missing_selected_hypotheses_fail_closed(
     mutate(evidence)
     evidence["evidence_sha256"] = snapshot_hash({
         "hypotheses_by_family": evidence["hypotheses_by_family"],
+        "capture": evidence["capture"],
         "pre_human": evidence["pre_human"],
         "decisions": evidence["decisions"],
     })
