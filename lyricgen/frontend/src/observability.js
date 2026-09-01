@@ -113,6 +113,13 @@ const _ERROR_TAGS = new Set([
   "editor-audio-load",
   "editor-audio-renewal",
   "editor-audio-resume",
+  // Pérdida silenciosa de letra: el merge devolviendo la misma fila dos veces
+  // (`merge-dup`) o el deduplicador borrando filas del operador
+  // (`segment-collision`) es cómo desaparecieron 6 líneas de un entregable UMG
+  // sin un solo error en Sentry (job f866cbcf0e49, 1-sep-2026). Si vuelve a
+  // pasar, tiene que interrumpir, no quedar de adorno en un warning.
+  "merge-dup",
+  "segment-collision",
 ]);
 
 export function consoleEventLevel(tag) {
