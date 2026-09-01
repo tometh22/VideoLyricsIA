@@ -289,21 +289,45 @@ def test_metadata_only_editor_change_is_not_training_noise():
     ) is None
 
 
-def test_unenrolled_job_skips_full_delta_audit():
-    class RejectWrites:
-        def add(self, _value):
-            raise AssertionError("unenrolled job attempted an audit write")
+def test_unenrolled_job_keeps_only_bounded_operational_audit():
+    class CaptureWrites:
+        rows = []
 
+        def add(self, value):
+            self.rows.append(value)
+
+    target = CaptureWrites()
+    before = [
+        {"_id": f"line-{index}", "start": index, "end": index + 1, "text": "before"}
+        for index in range(25)
+    ]
+    after = [
+        {"_id": f"line-{index}", "start": index, "end": index + 2, "text": "after"}
+        for index in range(25)
+    ]
     assert _record_training_delta(
-        RejectWrites(),
+        target,
         job=SimpleNamespace(job_id="legacy", machine_snapshot_required=False),
         user_id=1,
-        previous=[{"_id": "line", "start": 0, "end": 1, "text": "before"}],
-        current=[{"_id": "line", "start": 0, "end": 2, "text": "after"}],
+        previous=before,
+        current=after,
         from_revision=0,
         to_revision=1,
         checkpoint="draft",
-    ) is False
+    ) is True
+    assert len(target.rows) == 1
+    audit = target.rows[0]
+    assert audit.action == "lyrics.segments_diff"
+    assert audit.detail["job_id"] == "legacy"
+    assert audit.detail["correction_summary"] == {
+        "changed_lines": 25,
+        "text_changes": 25,
+        "timing_changes": 25,
+        "reorders": 0,
+    }
+    assert len(audit.detail["changed"]) == 20
+    assert audit.detail["truncated"] is True
+    assert "before" not in str(audit.detail) and "after" not in str(audit.detail)
 
 
 def test_training_pair_materializes_machine_gold_families_and_edits():

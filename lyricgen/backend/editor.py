@@ -272,21 +272,92 @@ def _record_training_delta(
     checkpoint: str,
 ) -> bool:
     """Persist one complete material edit for evidence-enrolled jobs."""
-    # Historical jobs cannot satisfy the machine-snapshot invariant and are
-    # therefore ineligible for training export.  Avoid running the potentially
-    # large aligner on their frequent draft autosaves; their existing bounded
-    # operational audit remains unchanged.
-    if not bool(getattr(job, "machine_snapshot_required", False)):
-        return False
-
     from correction_learning import hmac_identifier
-    from training_corpus import build_line_delta_audit
 
     def protected_text_ref(value: str) -> str | None:
         try:
             return hmac_identifier("audit_lyric", value)
         except RuntimeError:
             return None
+
+    # Historical jobs cannot satisfy the machine-snapshot invariant and are
+    # ineligible for training export. Keep their cheap bounded operational
+    # signal (admin funnel/activity depend on it), but never run the corpus
+    # aligner or persist unbounded per-line data for those frequent autosaves.
+    if not bool(getattr(job, "machine_snapshot_required", False)):
+        before_by_id = {
+            str(row.get("_id") if row.get("_id") not in (None, "") else f"idx_{index}"):
+            (index, row)
+            for index, row in enumerate(previous)
+        }
+        changed: list[dict] = []
+        reordered: list[dict] = []
+        changed_count = text_count = timing_count = reorder_count = 0
+        for index, row in enumerate(current):
+            row_id = str(
+                row.get("_id") if row.get("_id") not in (None, "") else f"idx_{index}"
+            )
+            old = before_by_id.get(row_id)
+            if old is None:
+                continue
+            old_index, old_row = old
+            try:
+                old_start, new_start = float(old_row.get("start") or 0), float(row.get("start") or 0)
+                old_end, new_end = float(old_row.get("end") or 0), float(row.get("end") or 0)
+            except (TypeError, ValueError):
+                old_start = new_start = old_end = new_end = 0.0
+            old_text = str(old_row.get("text") or "").strip()
+            new_text = str(row.get("text") or "").strip()
+            text_changed = old_text != new_text
+            timing_changed = (
+                abs(old_start - new_start) > 0.05
+                or abs(old_end - new_end) > 0.05
+            )
+            if text_changed or timing_changed:
+                changed_count += 1
+                text_count += int(text_changed)
+                timing_count += int(timing_changed)
+                if len(changed) < 20:
+                    changed.append({
+                        "id": row_id,
+                        "prev_start": round(old_start, 3),
+                        "new_start": round(new_start, 3),
+                        "prev_end": round(old_end, 3),
+                        "new_end": round(new_end, 3),
+                        "text_changed": text_changed,
+                        "prev_text_length": len(old_text),
+                        "new_text_length": len(new_text),
+                        "prev_text_hmac": protected_text_ref(old_text),
+                        "new_text_hmac": protected_text_ref(new_text),
+                    })
+            if old_index != index:
+                reorder_count += 1
+                if len(reordered) < 30:
+                    reordered.append({
+                        "id": row_id, "from_idx": old_index, "to_idx": index,
+                    })
+        if not changed_count and not reorder_count:
+            return False
+        db.add(AuditLog(
+            user_id=user_id,
+            action="lyrics.segments_diff",
+            detail={
+                "job_id": job.job_id,
+                "n_lines": len(current),
+                "changed": changed,
+                "reorder": reordered,
+                "correction_summary": {
+                    "changed_lines": changed_count,
+                    "text_changes": text_count,
+                    "timing_changes": timing_count,
+                    "reorders": reorder_count,
+                },
+                "truncated": changed_count > len(changed) or reorder_count > len(reordered),
+            },
+        ))
+        return True
+
+    from training_corpus import build_line_delta_audit
 
     detail = build_line_delta_audit(
         previous,
