@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from difflib import SequenceMatcher
 from typing import Any, Callable, Iterable
 
 from machine_evidence import (
@@ -25,6 +24,7 @@ TRAINING_PAIR_SCHEMA = "transcription-training-pair-v1"
 TIMING_NOISE_THRESHOLD_S = 0.05
 MAX_ALIGNMENT_CELLS = 250_000
 MAX_BANDED_ALIGNMENT_CELLS = 250_000
+MAX_ALIGNMENT_TEXT_CHARS = 256
 
 
 def _finite_time(value: Any) -> float:
@@ -47,14 +47,45 @@ def _signature(row: dict) -> tuple:
     )
 
 
-def _row_match_cost(before: dict, after: dict) -> float:
+def _text_features(value: Any) -> tuple[str, frozenset[str]]:
+    """Return a bounded, reusable representation for legacy-row identity."""
+    normalized = _text(value).casefold()
+    if len(normalized) > MAX_ALIGNMENT_TEXT_CHARS:
+        half = MAX_ALIGNMENT_TEXT_CHARS // 2
+        normalized = normalized[:half] + normalized[-half:]
+    if len(normalized) < 2:
+        grams = frozenset({normalized}) if normalized else frozenset()
+    else:
+        grams = frozenset(
+            normalized[index:index + 2] for index in range(len(normalized) - 1)
+        )
+    return normalized, grams
+
+
+def _feature_similarity(
+    left: tuple[str, frozenset[str]], right: tuple[str, frozenset[str]],
+) -> float:
+    if left[0] == right[0]:
+        return 1.0
+    if not left[1] or not right[1]:
+        return 0.0
+    return 2.0 * len(left[1] & right[1]) / (len(left[1]) + len(right[1]))
+
+
+def _row_match_cost(
+    before: dict,
+    after: dict,
+    before_text: tuple[str, frozenset[str]] | None = None,
+    after_text: tuple[str, frozenset[str]] | None = None,
+) -> float:
     """Cost for monotonic legacy-row alignment; two gaps cost exactly 2."""
     before_id = str(before.get("_id") or "")
     after_id = str(after.get("_id") or "")
     if before_id and after_id and before_id != after_id:
         return math.inf
-    left, right = _text(before.get("text")).casefold(), _text(after.get("text")).casefold()
-    similarity = 1.0 if left == right else SequenceMatcher(None, left, right).ratio()
+    left = before_text or _text_features(before.get("text"))
+    right = after_text or _text_features(after.get("text"))
+    similarity = _feature_similarity(left, right)
     timing_distance = (
         abs(_finite_time(before.get("start")) - _finite_time(after.get("start")))
         + abs(_finite_time(before.get("end")) - _finite_time(after.get("end")))
@@ -84,6 +115,12 @@ def _align_unmatched_rows_exact(
     """Exact Needleman-Wunsch alignment within the declared cell budget."""
     rows, cols = len(before_indices), len(after_indices)
     gap_cost = 1.0
+    before_features = [
+        _text_features(before[index].get("text")) for index in before_indices
+    ]
+    after_features = [
+        _text_features(after[index].get("text")) for index in after_indices
+    ]
     costs = [[math.inf] * (cols + 1) for _ in range(rows + 1)]
     steps: list[list[str | None]] = [[None] * (cols + 1) for _ in range(rows + 1)]
     costs[0][0] = 0.0
@@ -97,6 +134,7 @@ def _align_unmatched_rows_exact(
         for right in range(1, cols + 1):
             match_cost = _row_match_cost(
                 before[before_indices[left - 1]], after[after_indices[right - 1]],
+                before_features[left - 1], after_features[right - 1],
             )
             candidates = [
                 (costs[left - 1][right - 1] + match_cost, 0, "match"),
@@ -359,7 +397,7 @@ def _approved_version(versions: Iterable[Any]) -> Any | None:
     return max(approved, key=lambda row: int(getattr(row, "revision", 0))) if approved else None
 
 
-def _delta_content_projection(detail: dict) -> list[dict]:
+def _delta_content_projection(detail: dict) -> dict:
     """Canonical, privacy-safe delta content used to verify the audit chain."""
     projected = []
     for raw_change in detail.get("changes") or []:
@@ -385,7 +423,23 @@ def _delta_content_projection(detail: dict) -> list[dict]:
             "start_delta_ms": change.get("start_delta_ms"),
             "end_delta_ms": change.get("end_delta_ms"),
         })
-    return projected
+    summary = dict(detail.get("summary") or {})
+    return {
+        "before_line_count": int(detail.get("before_line_count") or 0),
+        "after_line_count": int(detail.get("after_line_count") or 0),
+        "changes": projected,
+        "summary": {
+            key: int(summary.get(key) or 0)
+            for key in (
+                "changed_lines", "text_changes", "timing_changes",
+                "insertions", "deletions", "reorders",
+            )
+        },
+        "timing_noise_threshold_ms": float(
+            detail.get("timing_noise_threshold_ms") or 0.0
+        ),
+        "alignment_complete": detail.get("alignment_complete") is True,
+    }
 
 
 def materialize_training_pair(

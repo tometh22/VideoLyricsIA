@@ -357,6 +357,18 @@ def test_training_pair_materializes_machine_gold_families_and_edits():
     assert invalid_chain["complete"] is False
     assert "editor_delta_content_mismatch:0->1" in invalid_chain["issues"]
 
+    corrupt_summary = deepcopy(delta)
+    corrupt_summary["summary"]["timing_changes"] = 999
+    corrupt_summary_audit = SimpleNamespace(
+        id=12, detail=corrupt_summary, created_at=datetime.now(timezone.utc),
+    )
+    invalid_summary = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[corrupt_summary_audit],
+    )
+    assert invalid_summary["complete"] is False
+    assert "editor_delta_content_mismatch:0->1" in invalid_summary["issues"]
+
     after_approval_segments = [
         {"_id": "a", "start": 0, "end": 1.4, "text": "hola otra vez"},
     ]
