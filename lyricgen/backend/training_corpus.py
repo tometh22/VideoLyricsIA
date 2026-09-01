@@ -52,6 +52,18 @@ def _stable_id(row: dict) -> str:
     return "" if value in (None, "") else str(value)
 
 
+def _has_duplicate_stable_ids(rows: list[dict]) -> bool:
+    seen: set[str] = set()
+    for row in rows:
+        row_id = _stable_id(row)
+        if not row_id:
+            continue
+        if row_id in seen:
+            return True
+        seen.add(row_id)
+    return False
+
+
 def _text_features(value: Any) -> tuple[str, frozenset[str]]:
     """Return a bounded, reusable representation for legacy-row identity."""
     normalized = _text(value).casefold()
@@ -190,6 +202,12 @@ def _match_rows(
     before: list[dict], after: list[dict],
 ) -> tuple[list[tuple], list[int], list[int], bool]:
     """Match stable IDs first, then exact content, then positional legacy rows."""
+    # Stable IDs are identities, not hints.  Reusing one makes any pairing
+    # ambiguous, so retain an auditable delete/insert view while preventing
+    # this transition from becoming a training sample.
+    if _has_duplicate_stable_ids(before) or _has_duplicate_stable_ids(after):
+        return [], list(range(len(before))), list(range(len(after))), False
+
     matched: list[tuple[int, int, str]] = []
     used_before: set[int] = set()
     used_after: set[int] = set()

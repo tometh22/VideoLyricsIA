@@ -106,6 +106,27 @@ def test_zero_stable_id_survives_duplicate_and_edit_in_same_save():
     assert payload["alignment_complete"] is True
 
 
+def test_duplicate_stable_ids_fail_alignment_closed():
+    before = [
+        {"_id": "same", "start": 0.0, "end": 1.0, "text": "first"},
+        {"_id": "same", "start": 2.0, "end": 3.0, "text": "second"},
+    ]
+    after = [
+        {"_id": "same", "start": 0.0, "end": 1.2, "text": "first edited"},
+        {"_id": "same", "start": 2.0, "end": 3.0, "text": "second"},
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert payload["alignment_complete"] is False
+    assert payload["summary"]["deletions"] == 2
+    assert payload["summary"]["insertions"] == 2
+    assert payload["summary"]["text_changes"] == 4
+
+
 def test_large_alignment_uses_bounded_fallback_without_corrupting_insert(monkeypatch):
     import training_corpus
 
