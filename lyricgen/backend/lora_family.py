@@ -38,7 +38,12 @@ def load_verified_family(report_path: str | os.PathLike[str] | None = None) -> d
         report = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    gate = report.get("replacement_gate") or report.get("runtime_policy") or {}
+    gate = (
+        report.get("replacement_gate")
+        or report.get("runtime_policy")
+        or report.get("gate")
+        or {}
+    )
     if gate.get("additional_family_only") is not True:
         return None
     if gate.get("runtime_replacement_allowed") is True:

@@ -31,7 +31,9 @@ otra con el directorio `adapter` de la corrida. Luego
 `scripts/evaluate_lora_v1.py` calcula WER por canción, las particiones
 fácil/difícil, bootstrap e intervalo de confianza. Una corrida marcada
 `trained_uncalibrated` o un smoke test nunca se puede pasar a
-`lora_family.load_verified_family`.
+`lora_family.load_verified_family`; para enlazar el artefacto validado se pasa
+`--training-report run_report.json` al evaluador. El gate de esta etapa sólo
+autoriza añadir la familia al consenso; nunca habilita reemplazo.
 
 ## Evaluación y gates
 
