@@ -274,6 +274,11 @@ def main() -> int:
             "/save-segments persistió "
             f"{saved.get('count')} != {len(edited_segments)}"
         )
+    saved_revision = saved.get("revision")
+    if not isinstance(saved_revision, int) or saved_revision < 1:
+        return _fail(
+            "/save-segments no devolvió una revisión durable positiva"
+        )
     segments = edited_segments
     print(f"[edit-smoke] save-segments pre-aprobación ok (count={saved['count']})")
 
@@ -284,6 +289,7 @@ def main() -> int:
         "artist": _ARTIST,
         "song_title": _TITLE,
         "segments_json": json.dumps(segments, ensure_ascii=False),
+        "base_revision": str(saved_revision),
         "delivery_profile": "youtube",
     }
     r = requests.post(
