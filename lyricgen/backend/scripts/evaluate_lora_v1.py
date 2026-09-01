@@ -39,6 +39,8 @@ def main() -> int:
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--canonical-cohort", type=Path, required=True)
+    parser.add_argument("--training-report", type=Path,
+                        help="optional run_report.json to bind the adapter artifact")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     canonical = _canonical_ids(args.canonical_cohort)
@@ -55,6 +57,26 @@ def main() -> int:
         "easy_difficult_split": True, "global_wer_only": False,
         "additional_family_only": True, "replacement_after_consecutive_evals": 2,
     }
+    # A complete, held-out replay is the gate for *adding* the adapter as a
+    # consensus witness.  It is deliberately not a superiority gate: the
+    # base Whisper remains authoritative until two consecutive evaluations
+    # prove sustained improvement.
+    complete_replay = evaluation.get("songs") == len(canonical)
+    evaluation["pipeline_validated"] = complete_replay
+    evaluation["evaluation_passed"] = complete_replay
+    evaluation["gate"] = {
+        "passed": complete_replay,
+        "reason": "complete_canonical_replay" if complete_replay else "incomplete_canonical_replay",
+        "additional_family_only": True,
+        "runtime_replacement_allowed": False,
+    }
+    if args.training_report:
+        training_report = json.loads(args.training_report.resolve().read_text(encoding="utf-8"))
+        if not isinstance(training_report, dict):
+            raise ValueError("training report must be a JSON object")
+        for key in ("base_model", "adapter_path", "adapter_sha256"):
+            if training_report.get(key) is not None:
+                evaluation[key] = training_report[key]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(evaluation, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(evaluation, ensure_ascii=False, indent=2))
