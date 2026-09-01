@@ -508,6 +508,11 @@ def materialize_training_pair(
     for previous, current in zip(checkpoint_rows, checkpoint_rows[1:]):
         previous_segments = list(getattr(previous, "segments", None) or [])
         current_segments = list(getattr(current, "segments", None) or [])
+        boundary = (
+            int(getattr(previous, "revision", 0)),
+            int(getattr(current, "revision", 0)),
+        )
+        matches = deltas_by_boundary.get(boundary, [])
         material = build_line_delta_audit(
             previous_segments,
             current_segments,
@@ -518,12 +523,11 @@ def materialize_training_pair(
             text_ref=lambda _value: None,
         )
         if material is None:
+            if matches:
+                issues.append(
+                    f"editor_delta_unexpected:{boundary[0]}->{boundary[1]}"
+                )
             continue
-        boundary = (
-            int(getattr(previous, "revision", 0)),
-            int(getattr(current, "revision", 0)),
-        )
-        matches = deltas_by_boundary.get(boundary, [])
         if not matches:
             issues.append(f"editor_delta_missing:{boundary[0]}->{boundary[1]}")
         elif len(matches) > 1:

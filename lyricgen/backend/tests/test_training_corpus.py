@@ -327,6 +327,24 @@ def test_training_pair_materializes_machine_gold_families_and_edits():
     assert ambiguous_pair["complete"] is False
     assert "editor_delta_alignment_ambiguous:0->1" in ambiguous_pair["issues"]
 
+    jitter_segments = [
+        {"_id": "a", "start": 0.0037, "end": 1.0037, "text": "ola"},
+    ]
+    jitter_approval = approval_training_provenance(
+        segments=jitter_segments, quality=quality, revision=1,
+    )
+    jitter_approved = SimpleNamespace(
+        id="v1-jitter", revision=1, segments=jitter_segments, reason="approve",
+        is_approved=True, provenance={"training_approval": jitter_approval},
+        created_at=datetime.now(timezone.utc),
+    )
+    unexpected_delta = materialize_training_pair(
+        job=job, document=document, versions=[initial, jitter_approved],
+        audits=[audit],
+    )
+    assert unexpected_delta["complete"] is False
+    assert "editor_delta_unexpected:0->1" in unexpected_delta["issues"]
+
     corrupt_delta = deepcopy(delta)
     corrupt_delta["changes"][0]["after"]["end"] = 99.0
     corrupt_audit = SimpleNamespace(
