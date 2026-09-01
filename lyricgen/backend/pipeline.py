@@ -3387,9 +3387,61 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         except Exception:
             pass
 
-    raw_segments = response.segments or []
-    raw_words = (getattr(response, "words", None) or []) if return_words else []
+    raw_segments = list(response.segments or [])
+    raw_words = list(getattr(response, "words", None) or []) if return_words else []
     import re as _re
+
+    def _raw_word_events(words: list[object]) -> list[dict]:
+        durable: list[dict] = []
+        for word in words:
+            if isinstance(word, dict):
+                durable.append(dict(word))
+                continue
+            try:
+                dumped = word.model_dump()
+            except Exception:
+                dumped = None
+            if isinstance(dumped, dict):
+                durable.append(dumped)
+                continue
+            values = {}
+            for key in ("word", "start", "end"):
+                try:
+                    values[key] = getattr(word, key)
+                except Exception:
+                    pass
+            durable.append(values or {"raw": str(word)[:2000]})
+        return durable
+
+    # Freeze both provider streams before assigning words to segments. The
+    # top-level word stream may contain pre-segment or opaque rows that the
+    # display mapper legitimately rejects but the training corpus must retain.
+    raw_provider_events: list[dict] = []
+    for seg in raw_segments:
+        try:
+            raw_provider_events.append({
+                "start": getattr(seg, "start"),
+                "end": getattr(seg, "end"),
+                "text": getattr(seg, "text"),
+                "no_speech_prob": getattr(seg, "no_speech_prob", None),
+                "provider_event_type": "segment",
+            })
+        except Exception:
+            raw_provider_events.append({
+                "raw": str(seg)[:2000], "provider_event_type": "segment",
+            })
+    if return_words:
+        raw_provider_events.append({
+            "provider_event_type": "top_level_words",
+            "words": _raw_word_events(raw_words),
+        })
+    from recognition_provenance import record_completed
+    record_completed(
+        family="openai/whisper-1",
+        events=raw_provider_events,
+        view=provenance_view,
+        transformation=provenance_transformation,
+    )
 
     # Word granularity returns a flat top-level word list, not per-segment.
     # Walk both lists in parallel to bucket each word into the segment
@@ -3435,14 +3487,6 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
             provider_segments.append(provider_segment)
         except Exception:
             provider_segments.append({"raw": str(seg)[:2000]})
-
-    from recognition_provenance import record_completed
-    record_completed(
-        family="openai/whisper-1",
-        events=provider_segments,
-        view=provenance_view,
-        transformation=provenance_transformation,
-    )
 
     segments: list[dict] = []
     for provider_segment in provider_segments:

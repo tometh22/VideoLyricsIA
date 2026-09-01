@@ -167,6 +167,57 @@ def test_word_granularity_uses_first_and_last_word_as_segment_bounds(
     assert kwargs["prompt"] == "Letras de canción:"
 
 
+def test_word_granularity_freezes_complete_top_level_provider_stream(
+    patched_transcribe,
+):
+    """Training evidence retains rows that display bucketing cannot use."""
+    import pipeline
+    from recognition_provenance import begin_collection, end_collection
+
+    class OpaqueWord:
+        def model_dump(self):
+            raise ValueError("malformed SDK row")
+
+        def __getattr__(self, _name):
+            raise AttributeError
+
+        def __str__(self):
+            return "opaque-provider-word"
+
+    response = _stub_whisper_word_response()
+    response.words = [
+        MagicMock(word="intro", start=-0.5, end=-0.1),
+        *response.words,
+        MagicMock(word="later", start=6.0, end=6.2),
+        OpaqueWord(),
+    ]
+    patched_transcribe([response])
+
+    collector, token = begin_collection()
+    try:
+        selected = pipeline._transcribe_via_openai_api(
+            "/tmp/_test.mp3",
+            language="es",
+            return_words=True,
+            provenance_view="mix",
+            provenance_transformation="full_file_raw",
+        )
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
+
+    assert [word["word"] for word in selected[0]["words"]] == [
+        "hola", "mundo",
+    ]
+    assert snapshot["completed_attempt_count"] == 1
+    events = snapshot["hypotheses"][0]["events"]
+    word_stream = events[-1]
+    assert word_stream["provider_event_type"] == "top_level_words"
+    assert len(word_stream["words"]) == 5
+    assert word_stream["words"][0]["word"] == "intro"
+    assert word_stream["words"][-1] == {"raw": "opaque-provider-word"}
+
+
 def test_retries_then_succeeds_on_3rd(patched_transcribe):
     """Rate-limit on 1st and 2nd attempts → 3rd succeeds. User never sees error."""
     import pipeline

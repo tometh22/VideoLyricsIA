@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import os
+import inspect
 
 BACKEND = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if BACKEND not in sys.path:
@@ -22,6 +23,8 @@ from lyrics_whisper_align import (  # noqa: E402
     _build_segments,
     _lev_similarity,
     _map_provider_words,
+    _raw_provider_words,
+    whisper_word_align,
     MIN_ANCHOR_RATIO,
     MIN_SEG_DUR_S,
 )
@@ -38,6 +41,36 @@ def test_provider_word_mapping_preserves_empty_completion_and_sdk_objects():
         {"word": "hola", "start": 1.0, "end": 1.4},
         {"word": "mundo", "start": 1.5, "end": 2.0},
     ]
+
+
+def test_raw_provider_words_preserves_opaque_rows_before_mapping():
+    class OpaqueWord:
+        def model_dump(self):
+            raise ValueError("malformed SDK row")
+
+        def __getattr__(self, _name):
+            raise AttributeError
+
+        def __str__(self):
+            return "opaque-align-word"
+
+    raw = _raw_provider_words([
+        {"word": "hola", "start": 1.0, "end": 1.4},
+        OpaqueWord(),
+    ])
+
+    assert raw == [
+        {"word": "hola", "start": 1.0, "end": 1.4},
+        {"raw": "opaque-align-word"},
+    ]
+
+
+def test_alignment_records_raw_words_before_selection_mapping():
+    source = inspect.getsource(whisper_word_align)
+    raw_index = source.index("raw_word_dicts = _raw_provider_words(words)")
+    record_index = source.index("record_completed(", raw_index)
+    map_index = source.index("word_dicts = _map_provider_words(words)")
+    assert raw_index < record_index < map_index
 
 
 # ──────────────────────────────────────────────────────────────────────

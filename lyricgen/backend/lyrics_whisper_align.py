@@ -398,6 +398,30 @@ def _map_provider_words(words) -> list[dict]:
     return mapped
 
 
+def _raw_provider_words(words) -> list[dict]:
+    """Serialize every completed provider word, including opaque rows."""
+    raw: list[dict] = []
+    for word in words or []:
+        if isinstance(word, dict):
+            raw.append(dict(word))
+            continue
+        try:
+            dumped = word.model_dump()
+        except Exception:
+            dumped = None
+        if isinstance(dumped, dict):
+            raw.append(dumped)
+            continue
+        values = {}
+        for key in ("word", "start", "end"):
+            try:
+                values[key] = getattr(word, key)
+            except Exception:
+                pass
+        raw.append(values or {"raw": str(word)[:2000]})
+    return raw
+
+
 def whisper_word_align(
     audio_path: str,
     cleaned_lines: list[str],
@@ -481,11 +505,11 @@ def whisper_word_align(
             return None
 
         words = getattr(response, "words", None) or []
-        word_dicts = _map_provider_words(words)
+        raw_word_dicts = _raw_provider_words(words)
         from recognition_provenance import record_completed
         record_completed(
             family="openai/whisper-1",
-            events=word_dicts,
+            events=raw_word_dicts,
             kind="word_stream",
             view="alignment_audio",
             transformation="whisper_word_align_raw",
@@ -493,6 +517,7 @@ def whisper_word_align(
         if not words:
             logger.warning("[WHISPER-ALIGN] response had no word stamps")
             return None
+        word_dicts = _map_provider_words(words)
 
         # Provenance recording (best effort).
         if job_id:
