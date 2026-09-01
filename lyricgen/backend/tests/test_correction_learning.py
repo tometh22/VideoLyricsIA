@@ -20,7 +20,7 @@ from correction_learning import (
     privacy_safe_features,
     StaleCorrectionSnapshot,
 )
-from database import CorrectionObservation, EditorVersion, Job, ProductEvent
+from database import AuditLog, CorrectionObservation, EditorVersion, Job, ProductEvent
 from editor import approve_document, ensure_document, save_document
 from evidence_attestation import lyric_snapshot_hash
 
@@ -274,6 +274,9 @@ def test_approval_queue_payload_to_worker_observation_is_privacy_safe(
         synchronize_session=False,
     )
     db.query(Job).filter(Job.job_id == job.job_id).delete(synchronize_session=False)
+    db.query(AuditLog).filter(AuditLog.user_id == user.id).delete(
+        synchronize_session=False,
+    )
     from database import User
     db.query(User).filter(User.id == user.id).delete(synchronize_session=False)
     db.commit()
