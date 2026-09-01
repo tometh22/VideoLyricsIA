@@ -143,6 +143,65 @@ def test_bounded_alignment_preserves_multiple_consecutive_gaps(monkeypatch):
     assert inserts == {"new-a", "new-b"}
     assert deletes == {2}
     assert payload["summary"]["reorders"] == 0
+    assert payload["alignment_complete"] is True
+
+
+def test_bounded_alignment_widens_for_large_localized_gap_runs(monkeypatch):
+    import training_corpus
+
+    monkeypatch.setattr(training_corpus, "MAX_ALIGNMENT_CELLS", 1)
+    before = [
+        {"start": index, "end": index + .5, "text": f"old {index}"}
+        for index in range(100)
+    ]
+    after = [
+        {"_id": f"new-{index}", "start": index / 10, "end": index / 10 + .1,
+         "text": f"insert {index}"}
+        for index in range(40)
+    ] + [
+        {"_id": f"kept-{index}", "start": index + .1, "end": index + .6,
+         "text": f"old {index} edited"}
+        for index in range(60)
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert payload["alignment_complete"] is True
+    assert payload["summary"]["insertions"] == 40
+    assert payload["summary"]["deletions"] == 40
+    assert sum(
+        row["operation"] == "update" for row in payload["changes"]
+    ) == 60
+
+
+def test_ambiguous_large_alignment_fails_closed_for_training(monkeypatch):
+    import training_corpus
+
+    monkeypatch.setattr(training_corpus, "MAX_ALIGNMENT_CELLS", 1)
+    monkeypatch.setattr(training_corpus, "MAX_BANDED_ALIGNMENT_CELLS", 1)
+    before = [
+        {"start": index, "end": index + .5, "text": f"old {index}"}
+        for index in range(100)
+    ]
+    after = [
+        {"_id": f"new-{index}", "start": index / 10, "end": index / 10 + .1,
+         "text": f"insert {index}"}
+        for index in range(40)
+    ] + [
+        {"_id": f"kept-{index}", "start": index + .1, "end": index + .6,
+         "text": f"old {index} edited"}
+        for index in range(60)
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert payload["alignment_complete"] is False
 
 
 def test_metadata_only_editor_change_is_not_training_noise():
@@ -227,6 +286,18 @@ def test_training_pair_materializes_machine_gold_families_and_edits():
     )
     assert missing_delta["complete"] is False
     assert "editor_delta_missing:0->1" in missing_delta["issues"]
+
+    ambiguous_delta = deepcopy(delta)
+    ambiguous_delta["alignment_complete"] = False
+    ambiguous_audit = SimpleNamespace(
+        id=8, detail=ambiguous_delta, created_at=datetime.now(timezone.utc),
+    )
+    ambiguous_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[ambiguous_audit],
+    )
+    assert ambiguous_pair["complete"] is False
+    assert "editor_delta_alignment_ambiguous:0->1" in ambiguous_pair["issues"]
 
     corrupt_delta = deepcopy(delta)
     corrupt_delta["changes"][0]["after"]["end"] = 99.0
