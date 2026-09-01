@@ -1,20 +1,23 @@
 """The editor must never lose the machine state it is correcting."""
+from copy import deepcopy
 import uuid
 
 import pytest
 
-from database import EditorDocument, Job
+from database import AuditLog, EditorDocument, EditorVersion, Job
 from editor import (
     approve_document,
     attach_machine_evidence,
     ensure_document,
     require_machine_snapshot,
+    save_document,
 )
 from machine_evidence import (
     MachineSnapshotMissing,
     SCHEMA,
     build_machine_evidence,
     finalize_machine_evidence,
+    snapshot_hash,
 )
 
 
@@ -68,6 +71,16 @@ def test_capture_keeps_independent_family_and_machine_decision(db):
         "primary", "independent", "selected",
     }
     assert evidence["decisions"]["route"] == "review"
+    assert evidence["decisions"]["song_quality_signal"] == {
+        "schema": "song-quality-signal-v1",
+        "traffic_light": "yellow",
+        "verdict": "review",
+        "score": None,
+        "score_source": "unavailable",
+        "raw_score": None,
+        "risk": None,
+        "policy_version": "v-test",
+    }
     assert evidence["pre_human"]["segment_count"] == 1
 
 
@@ -86,8 +99,13 @@ def test_machine_snapshot_is_hash_bound_and_immutable(db):
     require_machine_snapshot(row, document)
     assert attach_machine_evidence(db, document, evidence) is False
 
-    changed = dict(evidence)
-    changed["evidence_sha256"] = "b" * 64
+    changed = deepcopy(evidence)
+    changed["hypotheses_by_family"][0]["family"] = "different-family"
+    changed["evidence_sha256"] = snapshot_hash({
+        "hypotheses_by_family": changed["hypotheses_by_family"],
+        "pre_human": changed["pre_human"],
+        "decisions": changed["decisions"],
+    })
     with pytest.raises(RuntimeError, match="already_frozen"):
         attach_machine_evidence(db, document, changed)
 
@@ -101,3 +119,44 @@ def test_snapshot_hash_mismatch_blocks_approval(db):
     with pytest.raises(MachineSnapshotMissing, match="hash_mismatch"):
         require_machine_snapshot(row, document)
 
+
+def test_approval_freezes_song_signal_on_exact_version(db):
+    row, document = _job(db, required=True)
+    row.transcription_quality = {
+        "decision": "review_required", "risk": 0.23,
+        "score": None, "policy_version": "lyrics-quality-v6",
+    }
+    attach_machine_evidence(db, document, _evidence(document))
+    _document, version = approve_document(
+        db, row, 1, editor_revision=document.revision,
+    )
+    approval = version.provenance["training_approval"]
+    assert approval["schema"] == "training-approval-evidence-v1"
+    assert approval["song_quality_signal"]["traffic_light"] == "yellow"
+    assert approval["song_quality_signal"]["score"] == 77.0
+    assert approval["song_quality_signal"]["score_source"] == "risk_derived"
+
+
+def test_evidence_jobs_keep_every_durable_draft_checkpoint(db):
+    row, document = _job(db, required=True)
+    attach_machine_evidence(db, document, _evidence(document))
+    for index in range(60):
+        document, _version, applied = save_document(
+            db, row, document, 1, document.revision,
+            [{"start": 0.1, "end": 1.2 + index / 10, "text": f"line {index}"}],
+            "draft",
+        )
+        assert applied is True
+    versions = db.query(EditorVersion).filter(
+        EditorVersion.job_id == row.job_id,
+    ).all()
+    assert len(versions) == 61  # transcription + every applied draft
+    audits = [
+        item for item in db.query(AuditLog).filter(
+            AuditLog.action == "lyrics.segments_diff",
+        ).all()
+        if (item.detail or {}).get("job_id") == row.job_id
+    ]
+    assert len(audits) == 60
+    assert all(item.detail["schema"] == "editor-line-delta-v2" for item in audits)
+    assert all(item.detail["truncated"] is False for item in audits)

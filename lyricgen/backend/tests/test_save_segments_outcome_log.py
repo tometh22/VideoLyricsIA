@@ -77,11 +77,14 @@ def test_segment_diff_never_persists_raw_lyrics(client, admin_token, db):
         audit_id = audit.id
         encoded = json.dumps(audit.detail, sort_keys=True)
         assert secret_before not in encoded and secret_after not in encoded
-        change = audit.detail["changed"][0]
-        assert "prev_text" not in change and "new_text" not in change
-        assert change["text_changed"] is True
-        for key in ("prev_text_hmac", "new_text_hmac"):
-            assert change[key] is None or len(change[key]) == 64
+        assert audit.detail["schema"] == "editor-line-delta-v2"
+        change = audit.detail["changes"][0]
+        assert "text" not in (change["before"] or {})
+        assert "text" not in (change["after"] or {})
+        assert change["fields"]["text"] is True
+        for side in ("before", "after"):
+            value = change[side]["text_hmac"]
+            assert value is None or len(value) == 64
     finally:
         if audit_id is not None:
             db.query(AuditLog).filter(AuditLog.id == audit_id).delete(

@@ -13,7 +13,7 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from database import EditorDocument, EditorVersion, Job, User
+from database import AuditLog, EditorDocument, EditorVersion, Job, User
 from segment_timing import canonicalize_editor_segments
 
 EDITOR_REASONS = {
@@ -239,6 +239,12 @@ def _ensure_version(
 
 
 def _prune_versions(db: Session, document: EditorDocument) -> None:
+    # Jobs enrolled in the machine-evidence invariant are training samples.
+    # Pruning their checkpoints would make the operator path impossible to
+    # replay (the first real live edit hit this at revision 51).  Historical
+    # jobs keep the bounded UI-history behaviour.
+    if isinstance(document.machine_evidence, dict):
+        return
     drafts = (
         db.query(EditorVersion)
         .filter(
@@ -251,6 +257,46 @@ def _prune_versions(db: Session, document: EditorDocument) -> None:
     )
     for stale in drafts[50:]:
         db.delete(stale)
+
+
+def _record_training_delta(
+    db: Session,
+    *,
+    job: Job,
+    user_id: int,
+    previous: list[dict],
+    current: list[dict],
+    from_revision: int,
+    to_revision: int,
+    checkpoint: str,
+) -> bool:
+    """Persist one complete material edit in the owning transaction."""
+    from correction_learning import hmac_identifier
+    from training_corpus import build_line_delta_audit
+
+    def protected_text_ref(value: str) -> str | None:
+        try:
+            return hmac_identifier("audit_lyric", value)
+        except RuntimeError:
+            return None
+
+    detail = build_line_delta_audit(
+        previous,
+        current,
+        job_id=job.job_id,
+        from_revision=from_revision,
+        to_revision=to_revision,
+        checkpoint=checkpoint,
+        text_ref=protected_text_ref,
+    )
+    if detail is None:
+        return False
+    db.add(AuditLog(
+        user_id=user_id,
+        action="lyrics.segments_diff",
+        detail=detail,
+    ))
+    return True
 
 
 def _next_revision(db: Session, document: EditorDocument, *candidates: int) -> int:
@@ -1504,6 +1550,8 @@ def save_document(
             _prune_versions(db, document)
         db.flush()
         return document, version, False
+    previous_segments = [dict(item) for item in (document.current_segments or [])]
+    previous_revision = int(document.revision or 0)
     document.current_segments = normalized
     document.revision += 1
     document.updated_by = user_id
@@ -1513,10 +1561,25 @@ def save_document(
     # Any ordinary edit makes a raw proposal stale. Quality-proposal apply
     # writes a text-free tombstone after save_document returns.
     document.quality_proposal = None
+    _record_training_delta(
+        db,
+        job=job,
+        user_id=user_id,
+        previous=previous_segments,
+        current=normalized,
+        from_revision=previous_revision,
+        to_revision=int(document.revision),
+        checkpoint=reason,
+    )
     version = None
-    if reason != "draft":
+    # For evidence-enrolled jobs even the fast 800 ms draft is part of the
+    # recoverable operator path.  Store it as an autosave checkpoint so the
+    # raw tenant-private text is replayable without leaking it into AuditLog.
+    persist_training_draft = bool(getattr(job, "machine_snapshot_required", False))
+    if reason != "draft" or persist_training_draft:
         version = _ensure_version(
-            db, document, document.revision, normalized, user_id, reason,
+            db, document, document.revision, normalized, user_id,
+            "autosave" if reason == "draft" else reason,
             approved=reason == "approve",
         )
         _prune_versions(db, document)
@@ -1598,11 +1661,24 @@ def sync_legacy_snapshot(
         return document
     if revision <= document.revision:
         raise RuntimeError("editor_revision_conflict")
+    job = db.query(Job).filter(Job.job_id == document.job_id).with_for_update().one()
+    previous_segments = [dict(item) for item in (document.current_segments or [])]
+    previous_revision = int(document.revision or 0)
     document.current_segments = normalized
     document.revision = revision
     document.updated_by = user_id
     document.updated_at = now_utc()
     _ensure_version(db, document, revision, normalized, user_id, "autosave")
+    _record_training_delta(
+        db,
+        job=job,
+        user_id=user_id,
+        previous=previous_segments,
+        current=normalized,
+        from_revision=previous_revision,
+        to_revision=revision,
+        checkpoint="legacy_autosave",
+    )
     _prune_versions(db, document)
     db.flush()
     return document
@@ -1700,7 +1776,29 @@ def approve_document(
     )
     version.is_approved = True
     version.reason = "approve"
+    freeze_approval_training_evidence(job, version)
     job.segments_json = normalize_segments(document.current_segments)
     job.segments_revision = document.revision
     db.flush()
     return document, version
+
+
+def freeze_approval_training_evidence(job: Job, version: EditorVersion) -> None:
+    """Attach the quality traffic light to the exact approved lyric version."""
+    from machine_evidence import approval_training_provenance, snapshot_hash
+
+    existing = dict(version.provenance or {})
+    frozen = dict(existing.get("training_approval") or {})
+    if (
+        frozen.get("schema") == "training-approval-evidence-v1"
+        and frozen.get("segments_sha256") == snapshot_hash(list(version.segments or []))
+    ):
+        return
+    version.provenance = {
+        **existing,
+        "training_approval": approval_training_provenance(
+            segments=list(version.segments or []),
+            quality=getattr(job, "transcription_quality", None),
+            revision=int(version.revision),
+        ),
+    }
