@@ -2531,6 +2531,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             try:
                 _job_row = _ndb.query(_Job).filter(_Job.job_id == job_id).first()
                 if _job_row and _job_row.user_id:
+                    try:
+                        from ops_metrics import increment as _increment
+                        _increment(f"{_job_row.workload_class or 'interactive'}_render_completed")
+                    except Exception:
+                        pass
                     _usr = _ndb.query(_User).filter(_User.id == _job_row.user_id).first()
                     if _usr and _usr.email:
                         _settings = _ndb.query(_UserSettings).filter(

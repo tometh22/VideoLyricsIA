@@ -454,6 +454,16 @@ def separate_vocals(
         _sem_lease = _sem.acquire()
     except Exception as exc:
         logger.debug("[VOCALSEP] semáforo no disponible (%s)", type(exc).__name__)
+    if (
+        os.environ.get("WORKLOAD_CLASS", "interactive").strip().lower() == "batch"
+        and os.environ.get("REDIS_URL", "").strip()
+        and not _sem_lease
+    ):
+        # A batch job may degrade to the mix, but it must never consume the
+        # interactive Demucs reservation after its bounded wait expires.
+        logger.warning("[VOCALSEP] batch sin cupo Demucs; preservo slot interactivo")
+        _marcar_degradacion(audio_path, "demucs_batch_capacity_reserved")
+        return None
 
     try:
         # La espera del semaforo forma parte del techo del thread. Antes se

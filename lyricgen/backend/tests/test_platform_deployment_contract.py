@@ -23,6 +23,7 @@ def test_railway_uses_one_config_per_service():
     assert not (REPO / "railway.toml").exists()
     assert {p.name for p in (REPO / "railway").glob("*.toml")} == {
         "api.toml", "worker.toml", "short-worker.toml", "quality-worker.toml",
+        "batch-worker.toml", "batch-short-worker.toml",
         # Cron de costos. Es un servicio y no un thread de fondo en `api`
         # porque `api` corre numReplicas=2 x --workers 2 = 4 procesos, y los
         # loops de main.py son sleep() desde el boot: un horario fijo es
@@ -65,17 +66,23 @@ def test_api_deployment_contract():
 
 
 def test_worker_deployment_contracts_share_image_without_http_healthcheck():
-    expected_replicas = {"worker.toml": 7, "short-worker.toml": 3}
+    expected_replicas = {
+        "worker.toml": 7, "short-worker.toml": 3,
+        "batch-worker.toml": 2, "batch-short-worker.toml": 2,
+    }
     expected_queues = {
         "worker.toml": "enterprise,default,canary",
         "short-worker.toml": "transcription,bg_preview",
+        "batch-worker.toml": "batch_render",
+        "batch-short-worker.toml": "campaign_control,transcription_batch",
     }
     for name, replicas in expected_replicas.items():
         cfg = _config(name)
         assert cfg["build"]["dockerfilePath"] == "Dockerfile.worker"
+        workload = "WORKLOAD_CLASS=batch " if name.startswith("batch-") else ""
         expected_start = (
             "sh -c 'python backend/scripts/require_worker_schema.py "
-            f"&& exec env QUEUES={expected_queues[name]} python backend/worker.py'"
+            f"&& exec env {workload}QUEUES={expected_queues[name]} python backend/worker.py'"
         )
         assert cfg["deploy"]["startCommand"] == expected_start
         assert cfg["deploy"]["numReplicas"] == replicas
@@ -203,6 +210,33 @@ def test_quality_producer_requires_an_isolated_quality_consumer(monkeypatch):
     # normal defaults require 7+3; isolate the queue contract itself.
     expected = {"worker": 1, "short_worker": 1, "quality_worker": 1}
     assert worker_fleet_coherence(workers, "sha", 2, expected)["coherent"] is True
+
+
+def test_batch_campaign_flag_requires_both_reserved_worker_pools(monkeypatch):
+    from observability import _fleet_readiness_config, worker_fleet_coherence
+
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    strict, expected = _fleet_readiness_config("staging")
+    assert strict is True
+    assert expected["batch_short_worker"] == 2
+    assert expected["batch_worker"] == 2
+    workers = [
+        {"service": "Worker", "release": "sha", "rq_payload_version": 2,
+         "queues": ["enterprise", "default"]},
+        {"service": "ShortWorker", "release": "sha", "rq_payload_version": 2,
+         "queues": ["transcription", "bg_preview"]},
+        {"service": "BatchShortWorker", "release": "sha", "rq_payload_version": 2,
+         "queues": ["campaign_control", "transcription_batch"]},
+        {"service": "BatchWorker", "release": "sha", "rq_payload_version": 2,
+         "queues": ["batch_render"]},
+    ]
+    compact_expected = {
+        "worker": 1, "short_worker": 1,
+        "batch_short_worker": 1, "batch_worker": 1,
+    }
+    assert worker_fleet_coherence(
+        workers, "sha", 2, compact_expected,
+    )["coherent"] is True
 
 
 def test_frontend_only_deploy_no_marca_la_flota_como_incoherente():
