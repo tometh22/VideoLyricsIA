@@ -13,7 +13,8 @@ existe para cazar.
      Corazón", byte 0xf3) — el disparador real del UnicodeDecodeError que
      activó el 234.
   2. Lo sube directo a R2 con el flujo vigente (/upload-url), lo transcribe
-     (/transcribe-uploaded), genera el video y espera pending_review.
+     (/transcribe-uploaded), guarda una corrección de timing pre-aprobación,
+     genera el video y espera pending_review.
   3. Pide un edit de metadata (/edit) — recorre run_edit_pipeline: la
      apertura moviepy del source_audio, el fallback UTF-8, el re-render y
      el re-upload de deliverables.
@@ -31,13 +32,14 @@ Uso:
 from __future__ import annotations
 
 import argparse
-import io
+import base64
 import json
 import os
 import struct
 import sys
 import time
-import wave
+import zlib
+from pathlib import Path
 
 import requests
 
@@ -46,15 +48,15 @@ _TITLE = "Estrechez de Corazón (smoke)"
 _ARTIST = "Los Prisioneros - smoke"  # separador ASCII: el tag va en latin-1
 
 
-def _accented_wav_bytes(seconds: int = 2) -> bytes:
-    """WAV PCM válido + chunk LIST/INFO con metadata latin-1."""
-    raw = io.BytesIO()
-    with wave.open(raw, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(8000)
-        w.writeframes(b"\x00\x00" * (8000 * seconds))
-    data = bytearray(raw.getvalue())
+def _accented_wav_bytes() -> bytes:
+    """Voiced WAV fixture + LIST/INFO metadata encoded as latin-1."""
+    fixture = (
+        Path(__file__).with_name("fixtures")
+        / "voiced_smoke.wav.zlib.b64"
+    )
+    data = bytearray(zlib.decompress(base64.b64decode(fixture.read_bytes())))
+    if not data.startswith(b"RIFF") or data[8:12] != b"WAVE":
+        raise RuntimeError("voiced smoke fixture is not a RIFF/WAVE file")
 
     def sub(cid: bytes, text: str) -> bytes:
         b = text.encode("latin-1") + b"\x00"
@@ -70,6 +72,29 @@ def _accented_wav_bytes(seconds: int = 2) -> bytes:
 def _fail(msg: str) -> int:
     print(f"[edit-smoke] NO-GO: {msg}", file=sys.stderr)
     return 1
+
+
+def _timing_only_edit(segments: list[dict]) -> list[dict]:
+    """Move one real machine line while preserving every other line."""
+    if not segments or not all(isinstance(row, dict) for row in segments):
+        raise ValueError("la transcripción no produjo líneas de máquina")
+    first = segments[0]
+    if not str(first.get("text") or "").strip():
+        raise ValueError("la primera línea de máquina no contiene texto")
+    try:
+        start = float(first["start"])
+        end = float(first["end"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("la primera línea no tiene timing válido") from exc
+    shifted_start = round(start + 0.1, 4)
+    if shifted_start >= end:
+        shifted_start = round(max(0.0, start - 0.1), 4)
+    if shifted_start == start or shifted_start >= end:
+        raise ValueError("la primera línea es demasiado corta para el delta")
+
+    edited = [dict(row) for row in segments]
+    edited[0]["start"] = shifted_start
+    return edited
 
 
 _QUALITY_GATE_CODES = {
@@ -248,6 +273,34 @@ def main() -> int:
     else:
         return _fail(f"transcripción no terminó en {args.render_timeout}s")
 
+    # 2.5. Autosave pre-aprobación — además de probar el endpoint del editor,
+    # deja un delta de timing real entre la hipótesis de máquina y la versión
+    # que /generate congela como aprobada. Guardarlo después de /generate no
+    # sirve para entrenamiento: sería contaminación posterior a la aprobación.
+    try:
+        edited_segments = _timing_only_edit(segments)
+    except ValueError as exc:
+        return _fail(f"fixture no apto para delta de timing: {exc}")
+    r = requests.post(
+        f"{api}/jobs/{job_id}/save-segments", headers=headers,
+        json={"segments": edited_segments}, timeout=30,
+    )
+    if not r.ok:
+        return _fail(f"/save-segments {r.status_code}: {r.text[:300]}")
+    saved = r.json()
+    if saved.get("count") != len(edited_segments):
+        return _fail(
+            "/save-segments persistió "
+            f"{saved.get('count')} != {len(edited_segments)}"
+        )
+    saved_revision = saved.get("revision")
+    if not isinstance(saved_revision, int) or saved_revision < 1:
+        return _fail(
+            "/save-segments no devolvió una revisión durable positiva"
+        )
+    segments = edited_segments
+    print(f"[edit-smoke] save-segments pre-aprobación ok (count={saved['count']})")
+
     # Generar reusando el audio ya persistido y los segmentos aprobados: es
     # exactamente el contrato que usa el wizard después del editor de letra.
     generate_fields = {
@@ -255,6 +308,7 @@ def main() -> int:
         "artist": _ARTIST,
         "song_title": _TITLE,
         "segments_json": json.dumps(segments, ensure_ascii=False),
+        "base_revision": str(saved_revision),
         "delivery_profile": "youtube",
     }
     r = requests.post(
@@ -310,26 +364,6 @@ def main() -> int:
             return _fail(f"render inicial: {contract_error}")
         _initial_qc_generated_at = st["delivery_qc"]["generated_at"]
         print("[edit-smoke] delivery_qc inicial fresco y ligado al render")
-
-    # 2.5. Autosave del editor — el camino que los operadores reportan como
-    # frágil (issue #934). GO/NO-GO: POST /jobs/{id}/save-segments con una
-    # corrección de timing debe 200 y persistir el count. Sin esto el gate
-    # verde no decía nada sobre el guardado del editor (incidente Seba
-    # 21-jul: autosave fallando en prod con smoke verde).
-    _segs = [
-        {"start": 0.2, "end": 1.4, "text": "estrechez de corazón (smoke)"},
-        {"start": 1.5, "end": 2.0, "text": "línea dos"},
-    ]
-    r = requests.post(
-        f"{api}/jobs/{job_id}/save-segments", headers=headers,
-        json={"segments": _segs}, timeout=30,
-    )
-    if not r.ok:
-        return _fail(f"/save-segments {r.status_code}: {r.text[:300]}")
-    _saved = r.json()
-    if _saved.get("count") != len(_segs):
-        return _fail(f"/save-segments persistió {_saved.get('count')} != {len(_segs)}")
-    print(f"[edit-smoke] save-segments ok (count={_saved['count']})")
 
     # 3. Edit de metadata — recorre run_edit_pipeline completo (apertura
     # moviepy del source_audio + fallback UTF-8 + re-render) sin costo Veo.
