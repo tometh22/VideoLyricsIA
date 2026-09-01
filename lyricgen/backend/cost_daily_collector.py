@@ -580,13 +580,38 @@ def gcp_month(any_day_in_month: date) -> list[DayResult]:
         por_dia[d][sku] = por_dia[d].get(sku, 0.0) + float(cells[2].get("v") or 0.0)
         creditos[d] = creditos.get(d, 0.0) + float(cells[3].get("v") or 0.0)
 
+    # HASTA DÓNDE LLEGA EL EXPORT, no hasta dónde llega el mes.
+    #
+    # El export de facturación puede cortarse: el de esta cuenta dejó de
+    # escribir el 18-ago-2026 y del 19 en adelante no hay una sola fila,
+    # aunque `ai_provenance` registra llamadas a Veo el 31-ago y el 1-sep en
+    # los dos entornos. Escribir $0,00 para esos días es afirmar que no se
+    # gastó, y es falso.
+    #
+    # Un día POSTERIOR al último con datos no es un cero: es un día que el
+    # export todavía no cubre. Se marca como error para que la cobertura se
+    # ponga en rojo, en vez de depender de que alguien lea el detector de
+    # fuentes sospechosas.
+    #
+    # El costo de esto es que si los últimos días de un mes de verdad no
+    # tuvieron gasto, se reportan como falta de dato. Es el lado correcto
+    # para equivocarse: un piso admitido, no un cero inventado.
+    ultimo_con_datos = max(por_dia) if por_dia else None
+
     out, d = [], first
     while d <= last:
         skus = por_dia.get(d, {})
         cred = creditos.get(d, 0.0)
+        if not skus and not cred and ultimo_con_datos and d > ultimo_con_datos:
+            out.append(DayResult(
+                "gcp", d, "error", [],
+                f"el export de facturación no llega a este día "
+                f"(último con datos: {ultimo_con_datos.isoformat()})"))
+            d += timedelta(days=1)
+            continue
         if not skus and not cred:
-            # Día sin gasto DENTRO de un mes que sí trajo datos: es un cero
-            # real, no un hueco. Se escribe como tal.
+            # Día sin gasto DENTRO del tramo que el export SÍ cubre: es un
+            # cero real, no un hueco. Se escribe como tal.
             out.append(DayResult("gcp", d, "ok", [
                 _row("total", "total", 0.0, behavior="variable")]))
             d += timedelta(days=1)
@@ -824,6 +849,12 @@ def _mark_pending(db: Session, day: date, source: str) -> None:
 # Gap-driven backfill
 # ---------------------------------------------------------------------------
 
+# Ventana en la que un $0,00 todavía puede ser "el proveedor no publicó
+# aún" y no "ese día no se gastó". Es la misma que `gcp_month` ya usa como
+# margen de restatement.
+DIAS_RECHECK_CERO = 45
+
+
 def pending_gaps(db: Session, *, today: date | None = None,
                  days: int = BACKFILL_DAYS) -> list[tuple[date, str]]:
     """Every (day, source) in the window without a successful collection.
@@ -847,6 +878,35 @@ def pending_gaps(db: Session, *, today: date | None = None,
                 CostCollectionRun.status.in_(("ok", "not_configured")))
         .all()
     }
+
+    # UN `ok` CON $0,00 NO ES UN DÍA TERMINADO.
+    #
+    # Los proveedores publican tarde y rellenan hacia atrás. Medido el
+    # 1-sep-2026: la corrida de las 01:26 UTC guardó agosto con $0,00 del 2
+    # en adelante porque el export de facturación de GCP todavía no los
+    # tenía; catorce horas después el MISMO colector devolvía $124 para esos
+    # mismos días. Julio, en paralelo, pasó de $74,20 a $138,90 entre dos
+    # corridas.
+    #
+    # Como el backfill es guiado por huecos y esos días quedaron en `ok`,
+    # nunca se volvían a pedir: agosto se congelaba mal para siempre. El
+    # detector `stale_sources` lo hace VISIBLE; esto lo REPARA.
+    #
+    # Sólo dentro de la ventana de reformulación: `gcp_month` ya asume 45
+    # días de margen para restatements tardías. Más allá de eso un cero es
+    # un cero de verdad y volver a pedirlo sería gastar en las APIs para
+    # siempre.
+    limite_recheck = today - timedelta(days=DIAS_RECHECK_CERO)
+    en_cero = {
+        (r.day, r.source)
+        for r in db.query(CostDaily)
+        .filter(CostDaily.day >= max(first, limite_recheck),
+                CostDaily.day <= last,
+                CostDaily.dim_type == "total",
+                CostDaily.amount_usd == 0)
+        .all()
+    }
+    done -= en_cero
     gaps = []
     d = first
     while d <= last:
