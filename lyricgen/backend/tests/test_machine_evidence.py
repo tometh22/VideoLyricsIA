@@ -226,6 +226,31 @@ def test_reference_selected_output_keeps_named_raw_recognition_family(db):
     validate_machine_evidence(evidence, document.original_segments)
 
 
+def test_pre_anchor_family_is_derived_from_its_own_segments():
+    pre_anchor = [{
+        **SEGMENTS[0],
+        "content_source": "whisperx",
+        "provider_evidence": {
+            "source": "whisperx",
+            "correlated_family": "replicate/whisperx:model-revision",
+        },
+    }]
+    selected = [{
+        **SEGMENTS[0],
+        "content_source": "operator_reference",
+        "provider_evidence": {"source": "operator_reference"},
+    }]
+    evidence = build_machine_evidence({
+        "segments": selected,
+        "_pre_anchor_provider_segments": pre_anchor,
+    })
+    hypothesis = next(
+        item for item in evidence["hypotheses_by_family"]
+        if item["role"] == "pre_anchor"
+    )
+    assert hypothesis["family"] == "replicate/whisperx:model-revision"
+
+
 def test_v3_rejects_unknown_family():
     captured = build_machine_evidence({
         "segments": SEGMENTS,

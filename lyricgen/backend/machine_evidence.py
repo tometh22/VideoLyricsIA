@@ -228,11 +228,18 @@ def build_machine_evidence(result: dict) -> dict:
         "word_stream",
         result.get("_independent_asr_words"),
     )
+    pre_anchor_segments = [
+        row for row in (result.get("_pre_anchor_provider_segments") or [])
+        if isinstance(row, dict)
+    ]
     add(
         "pre_anchor",
-        str(result.get("_provider_asr_family") or primary_family),
+        str(
+            result.get("_provider_asr_family")
+            or _provider_family(pre_anchor_segments)
+        ),
         "segments",
-        result.get("_pre_anchor_provider_segments"),
+        pre_anchor_segments,
     )
     selected_family = _provider_family(selected)
     add("selected", selected_family, "segments", selected)
