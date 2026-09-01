@@ -178,6 +178,38 @@ def _agrupar_en_lineas(words: list[dict]) -> list[list[dict]]:
     return lineas
 
 
+def _raw_provider_words(response: object) -> tuple[list[object], list[dict]]:
+    """Return source rows plus a durable pre-mapping representation."""
+    from recognition_provenance import bounded_provider_string
+    try:
+        source = list(getattr(response, "words", None) or [])
+    except Exception:
+        return [], [{"raw": bounded_provider_string(response)}]
+    raw: list[dict] = []
+    for word in source:
+        if isinstance(word, dict):
+            try:
+                raw.append(dict(word))
+            except Exception:
+                raw.append({"raw": bounded_provider_string(word)})
+            continue
+        try:
+            dumped = word.model_dump()
+        except Exception:
+            dumped = None
+        if isinstance(dumped, dict):
+            raw.append(dumped)
+            continue
+        values = {}
+        for key in ("word", "start", "end"):
+            try:
+                values[key] = getattr(word, key)
+            except Exception:
+                pass
+        raw.append(values or {"raw": bounded_provider_string(word)})
+    return source, raw
+
+
 def _transcribe_window(audio_path: str, ini: float, dur: float,
                        language: str | None = None,
                        job_id: str | None = None, *,
@@ -228,14 +260,31 @@ def _transcribe_window(audio_path: str, ini: float, dur: float,
             # submit the same audio again without the caller being able to
             # reserve or report those extra billed seconds.
             r = OpenAI(timeout=60.0, max_retries=0).audio.transcriptions.create(**kwargs)
+        provider_words, raw_words = _raw_provider_words(r)
+        from recognition_provenance import record_completed
+        record_completed(
+            family="openai/whisper-1",
+            events=raw_words,
+            kind="word_stream",
+            view="bounded_audio_window",
+            transformation=f"{provenance_step}_raw",
+        )
         if recorder:
             recorder.finish(response_summary="succeeded")
         out = []
-        for w in (getattr(r, "words", None) or []):
+        for w in provider_words:
             try:
-                out.append({"word": str(w.word), "start": float(w.start) + ini,
-                            "end": float(w.end) + ini})
-            except (AttributeError, TypeError, ValueError):
+                value = w if isinstance(w, dict) else {
+                    "word": getattr(w, "word"),
+                    "start": getattr(w, "start"),
+                    "end": getattr(w, "end"),
+                }
+                out.append({
+                    "word": str(value["word"]),
+                    "start": float(value["start"]) + ini,
+                    "end": float(value["end"]) + ini,
+                })
+            except (AttributeError, KeyError, TypeError, ValueError):
                 continue
         return out
     except Exception as e:

@@ -125,6 +125,58 @@ def test_wave_submits_every_song_before_reconcile_and_one_failure_does_not_stop_
     assert saves, "cada mutacion debe quedar persistida para poder reanudar"
 
 
+def test_batch_resumes_same_job_after_ambiguous_transcription_response(monkeypatch):
+    api = Api("https://example.test", "token")
+    entry = _entry(7)
+    calls = []
+
+    def fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if method == "POST":
+            raise ub.requests.Timeout("response lost after durable commit")
+        assert (method, path) == ("GET", "/batch/jobs/job-7")
+        return {"job_id": "job-7", "status": "transcribing_queued"}
+
+    monkeypatch.setattr(api, "request", fake_request)
+    result = api.start_transcription(entry, "job-7")
+
+    assert result["resumed_after_ambiguous_response"] is True
+    assert entry.status == "transcribing_queued"
+    assert [call[:2] for call in calls] == [
+        ("POST", "/transcribe-uploaded"),
+        ("GET", "/batch/jobs/job-7"),
+    ]
+    assert calls[0][2]["headers"]["Idempotency-Key"].startswith(
+        "batch-transcribe-"
+    )
+
+
+def test_batch_retries_identical_transcription_request_only_when_not_committed(
+    monkeypatch,
+):
+    api = Api("https://example.test", "token")
+    entry = _entry(8)
+    posts = []
+
+    def fake_request(method, path, **kwargs):
+        if method == "GET":
+            assert path == "/batch/jobs/job-8"
+            return {"job_id": "job-8", "status": "awaiting_upload"}
+        posts.append(kwargs)
+        if len(posts) == 1:
+            raise ub.requests.ConnectionError("connection reset")
+        return {"job_id": "job-8", "status": "transcribing_queued"}
+
+    monkeypatch.setattr(api, "request", fake_request)
+    monkeypatch.setattr(ub.time, "sleep", lambda _seconds: None)
+    result = api.start_transcription(entry, "job-8")
+
+    assert result["status"] == "transcribing_queued"
+    assert len(posts) == 2
+    assert posts[0]["json"] == posts[1]["json"]
+    assert posts[0]["headers"] == posts[1]["headers"]
+
+
 def test_capacity_preflight_fails_before_upload_when_campaign_is_not_enabled(monkeypatch):
     api = Api("https://example.test", "token")
     responses = {

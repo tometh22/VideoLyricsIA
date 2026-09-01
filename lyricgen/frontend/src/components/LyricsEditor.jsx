@@ -717,6 +717,11 @@ export default function LyricsEditor({
   // ahí es un falso alarma (reporte 2026-07-25: el banner aparecía ~30s y
   // recién después se podía escuchar). Este flag distingue "cargando" de
   // "no existe / se agotaron los reintentos".
+  audioSource = null,
+  // When the optimized preview is still being prepared, the original URL is
+  // already usable. Keep this state informational; it must not block text or
+  // timing edits and must not cause the audio element to reload.
+  audioPreviewPending = false,
   audioLoading = false,
   // `temporary` means the signed URL could not be loaded due to API/R2
   // pressure. `missing` is reserved for an explicit 404 from the API.
@@ -3969,6 +3974,9 @@ export default function LyricsEditor({
       `${qualityPartsToReview} ${reviewUnit}`,
     );
   }
+  if (audioPreviewPending && audioSource !== "editor_preview") {
+    confidenceParts.push("Optimizando audio para búsqueda rápida…");
+  }
   if (bgStatus === "done") confidenceParts.push(t("editor.confidence_bg_done") || "Fondo listo");
   else if (bgStatus === "queued" || bgStatus === "generating") confidenceParts.push(t("editor.confidence_bg_generating") || "Generando fondo…");
   else if (bgStatus === "error") confidenceParts.push(t("editor.confidence_bg_error") || "El fondo se genera al aprobar");
@@ -4157,7 +4165,11 @@ export default function LyricsEditor({
             pendingAudioRecoveryRef.current = { time: failedAt, shouldPlay: shouldResume };
             if (failedLocalAudio) setLocalAudioFailed(true);
             if (onRetryAudio) {
-              Promise.resolve(onRetryAudio({ reason: "media_error", mediaErrorCode }))
+              Promise.resolve(onRetryAudio({
+                reason: "media_error",
+                mediaErrorCode,
+                ...(audioSource === "editor_preview" ? { preferOriginal: true } : {}),
+              }))
                 .catch((error) => {
                   console.warn("[editor-audio-renewal] automatic renewal failed", {
                     job_id: transcribeJobId || null,

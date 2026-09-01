@@ -37,7 +37,7 @@ def _business_alerts_enabled() -> bool:
 # All Sentry config now lives in observability.init_sentry() (single
 # source of truth, shared with worker.py).
 
-from fastapi import FastAPI, File, Form, Header, Query, UploadFile, HTTPException, Depends, Request, Response, Body
+from fastapi import BackgroundTasks, FastAPI, File, Form, Header, Query, UploadFile, HTTPException, Depends, Request, Response, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -86,7 +86,7 @@ from auth import (
     is_super_admin,
 )
 import storage
-from machine_evidence import MachineSnapshotMissing
+from machine_evidence import MachineSnapshotMissing, SCHEMA as MACHINE_EVIDENCE_SCHEMA
 from datetime import datetime, timedelta, timezone
 
 from database import (
@@ -117,6 +117,7 @@ from editor import (
     ensure_document,
     dismiss_quality_proposal,
     rebase_operator_suggestions_after_manual_edit,
+    freeze_approval_training_evidence,
     require_machine_snapshot,
     reject_operator_suggestion,
     record_quality_observation,
@@ -2658,9 +2659,10 @@ async def _stream_upload_to_disk(file, dest_path: str, *, max_mb: int = None) ->
 
 def _validate_audio_file_on_disk(filename: str, path: str) -> None:
     """Header-only audio validation that reads the first 16 bytes off
-    disk instead of the full body. Mirrors `_validate_audio_upload` but
-    without the in-memory size check — `_stream_upload_to_disk` handles
-    that on the way in."""
+    disk instead of the full body. Mirrors `_validate_audio_upload` and also
+    checks the materialized size. The latter is authoritative for presigned
+    single-PUT uploads: the API's R2 HEAD is intentionally best-effort and
+    bounded so a slow storage probe cannot hold `/transcribe-uploaded` open."""
     if not filename:
         raise HTTPException(status_code=400, detail="Missing filename.")
     name_lower = filename.lower()
@@ -2668,6 +2670,25 @@ def _validate_audio_file_on_disk(filename: str, path: str) -> None:
         raise HTTPException(
             status_code=400,
             detail="Only MP3 and WAV files are accepted.",
+        )
+    try:
+        size_bytes = os.path.getsize(path)
+    except OSError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not stat uploaded file for validation: {e}",
+        )
+    if size_bytes > MAX_UPLOAD_MB * 1024 * 1024:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File too large ({size_bytes / 1048576:.1f} MB). "
+                f"Max allowed: {MAX_UPLOAD_MB} MB."
+            ),
         )
     try:
         with open(path, "rb") as fh:
@@ -4229,11 +4250,129 @@ class _TranscribeUploadedReq(BaseModel):
     anchor_lyrics: str = Field(default="", max_length=20000)
 
 
+def _model_payload(model: BaseModel) -> dict:
+    """Return one JSON-safe request payload on Pydantic v1 and v2."""
+    if hasattr(model, "model_dump"):
+        return model.model_dump(mode="json", exclude_none=True)
+    return json.loads(model.json(exclude_none=True))
+
+
+def _request_fingerprint(namespace: str, payload: dict) -> str:
+    """Stable, content-only identity for retrying an accepted mutation."""
+    import hashlib
+
+    canonical = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    )
+    return hashlib.sha256(f"{namespace}\n{canonical}".encode("utf-8")).hexdigest()
+
+
+def _idempotency_header_hash(value: str | None) -> str:
+    """Store only a digest of the caller key; empty means legacy caller."""
+    if not value:
+        return ""
+    clean = value.strip()
+    if len(clean) < 8 or len(clean) > 160:
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key must contain between 8 and 160 characters.",
+        )
+    import hashlib
+
+    return hashlib.sha256(clean.encode("utf-8")).hexdigest()
+
+
+def _accepted_job_response(
+    *, job_id: str, status: str, status_url: str,
+    event_id: str | None = None, deduplicated: bool = False,
+    queue_pending: bool = True, extra: dict | None = None,
+) -> JSONResponse:
+    content = {
+        "ok": True,
+        "job_id": job_id,
+        "status": status,
+        "status_url": status_url,
+        "poll_after_ms": 1000,
+        "deduplicated": bool(deduplicated),
+        "queue_pending": bool(queue_pending),
+    }
+    if event_id:
+        content["outbox_event_id"] = event_id
+    if extra:
+        content.update(extra)
+    return JSONResponse(
+        status_code=202,
+        content=content,
+        headers={"Location": status_url, "Retry-After": "1"},
+    )
+
+
+def _dispatch_outbox_after_response(
+    event_id: str, *, edit_publisher=None,
+) -> None:
+    """Best-effort fast publication after the 202 is already on the wire.
+
+    The durable outbox reconciler is authoritative.  This first attempt only
+    removes the normal 0-30 second reconciler delay and must never turn a lost
+    Redis response into a failed HTTP request.
+    """
+    try:
+        from transactional_outbox import dispatch_outbox_event
+
+        delivery = dispatch_outbox_event(
+            event_id, edit_publisher=edit_publisher,
+        )
+        if delivery.get("status") == "dispatched":
+            return
+        logger.warning(
+            "[OUTBOX] post-response delivery pending event=%s status=%s",
+            event_id, delivery.get("status"),
+        )
+    except Exception as exc:  # pragma: no cover - dependency incident path
+        logger.warning(
+            "[OUTBOX] post-response delivery failed event=%s error_type=%s",
+            event_id, type(exc).__name__,
+        )
+    try:
+        from queue_jobs import ensure_job_outbox_reconciler_scheduled
+
+        ensure_job_outbox_reconciler_scheduled()
+    except Exception as exc:  # pragma: no cover - periodic worker is fallback
+        logger.warning(
+            "[OUTBOX] reconciler kick failed event=%s error_type=%s",
+            event_id, type(exc).__name__,
+        )
+
+
+async def _bounded_storage_probe(callable_, *args, timeout_seconds: float = 2.0):
+    """Bound optional R2 probes so storage latency cannot consume the request."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(callable_, *args), timeout=timeout_seconds,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.warning(
+            "[STORAGE] optional preflight probe timed out call=%s timeout=%.1fs",
+            getattr(callable_, "__name__", type(callable_).__name__),
+            timeout_seconds,
+        )
+        return None
+    except Exception as exc:
+        logger.warning(
+            "[STORAGE] optional preflight probe failed call=%s error_type=%s",
+            getattr(callable_, "__name__", type(callable_).__name__),
+            type(exc).__name__,
+        )
+        return None
+
+
 @app.post("/transcribe-uploaded")
 @limiter.limit("60/minute")
 async def transcribe_uploaded(
     request: Request,
     body: _TranscribeUploadedReq,
+    background_tasks: BackgroundTasks,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -4252,18 +4391,127 @@ async def transcribe_uploaded(
             or job_row.user_id != current_user["id"]
             or job_row.tenant_id != current_user["tenant_id"]):
         raise HTTPException(status_code=404, detail="Job not found.")
-    # Idempotent browser retry: once the durable intent exists, do not create
-    # another outbox event or touch the active RQ record. This check must
-    # precede the general allowed-state guard below.
+    _transcription_payload = {
+        "job_id": job_row.job_id,
+        "language": body.language,
+        "artist": job_row.artist or "",
+        "title": job_row.song_title or "",
+        "filename": job_row.filename or "",
+        "tenant_id": job_row.tenant_id or "",
+        "live": bool(body.live),
+        "anchor_lyrics": body.anchor_lyrics or "",
+    }
+    _transcription_fingerprint = _request_fingerprint(
+        "transcription.v1", _transcription_payload,
+    )
+    _transcription_idempotency_hash = _idempotency_header_hash(idempotency_key)
+
+    # Lost-response retry: the durable attempt, rather than the browser
+    # connection, is authoritative.  We accept the exact same request while
+    # it is queued/running/already transcribed and reject a changed anchor or
+    # language instead of silently pretending it was applied.
     if (
-        job_row.status == "transcribing_queued"
-        and job_row.active_transcription_attempt_id
+        job_row.active_transcription_attempt_id
+        and job_row.status in {"transcribing_queued", "transcribing", "transcribed"}
     ):
-        return {
-            "job_id": job_row.job_id,
-            "status": "transcribing_queued",
-            "deduplicated": True,
-        }
+        from database import JobOutboxEvent
+
+        _active_event = db.query(JobOutboxEvent).filter(
+            JobOutboxEvent.id == job_row.active_transcription_attempt_id,
+        ).first()
+        _active_payload = (
+            dict(_active_event.payload or {}) if _active_event is not None else {}
+        )
+        _active_fingerprint = str(
+            _active_payload.get("request_fingerprint") or ""
+        )
+        if not _active_fingerprint and _active_payload.get("transcription_kwargs"):
+            _legacy_kwargs = dict(_active_payload.get("transcription_kwargs") or {})
+            _active_fingerprint = _request_fingerprint(
+                "transcription.v1",
+                {
+                    "job_id": job_row.job_id,
+                    "language": _legacy_kwargs.get("language") or "",
+                    "artist": _legacy_kwargs.get("artist") or "",
+                    "title": _legacy_kwargs.get("title") or "",
+                    "filename": _legacy_kwargs.get("filename") or "",
+                    "tenant_id": _legacy_kwargs.get("tenant_id") or "",
+                    "live": bool(_legacy_kwargs.get("live")),
+                    "anchor_lyrics": _legacy_kwargs.get("anchor_lyrics") or "",
+                },
+            )
+        _active_idempotency_hash = str(
+            _active_payload.get("idempotency_key_hash") or ""
+        )
+        if _active_fingerprint == _transcription_fingerprint:
+            return _accepted_job_response(
+                job_id=job_row.job_id,
+                status=job_row.status,
+                status_url=f"/transcription-status/{job_row.job_id}",
+                event_id=job_row.active_transcription_attempt_id,
+                deduplicated=True,
+                queue_pending=(
+                    _active_event is None
+                    or _active_event.status not in {"dispatched", "processing", "consumed"}
+                ),
+            )
+        _conflict_code = (
+            "idempotency_key_conflict"
+            if _transcription_idempotency_hash
+            and _transcription_idempotency_hash == _active_idempotency_hash
+            else "transcription_request_conflict"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": _conflict_code,
+                "message": (
+                    "A different transcription request is already active for "
+                    "this upload. Create a new upload before changing its lyrics "
+                    "or language."
+                ),
+                "job_id": job_row.job_id,
+                "status_url": f"/transcription-status/{job_row.job_id}",
+            },
+        )
+
+    # The worker normally leaves the attempt attached while moving the row to
+    # ``transcribed_pending``.  If a deployment/reaper cleared that pointer,
+    # an explicitly keyed retry must still replay the durable event rather
+    # than enqueueing a second transcription after the 202 response was lost.
+    if _transcription_idempotency_hash:
+        from database import JobOutboxEvent
+
+        _historical_transcription = (
+            db.query(JobOutboxEvent)
+            .filter(
+                JobOutboxEvent.job_id == job_row.job_id,
+                JobOutboxEvent.event_type == "transcription.enqueue",
+            )
+            .order_by(JobOutboxEvent.created_at.desc())
+            .all()
+        )
+        for _event in _historical_transcription:
+            _event_payload = dict(_event.payload or {})
+            if str(_event_payload.get("idempotency_key_hash") or "") != _transcription_idempotency_hash:
+                continue
+            if str(_event_payload.get("request_fingerprint") or "") != _transcription_fingerprint:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "idempotency_key_conflict",
+                        "message": "Idempotency-Key was already used with a different transcription payload.",
+                        "job_id": job_row.job_id,
+                    },
+                )
+            return _accepted_job_response(
+                job_id=job_row.job_id,
+                status=str(job_row.status or "transcribed_pending"),
+                status_url=f"/transcription-status/{job_row.job_id}",
+                event_id=_event.id,
+                deduplicated=True,
+                queue_pending=_event.status in {"pending", "dispatched", "processing"},
+            )
     # `transcription_failed` added 2026-06-09: honours the reaper's customer-
     # facing "apretá Reintentar para volver a transcribir" promise
     # (reaper.py:_reason_for_transcription). The audio still lives in R2
@@ -4349,8 +4597,9 @@ async def transcribe_uploaded(
     # client that under-declared size_bytes could otherwise land an
     # arbitrarily large object. HEAD is intentionally the only R2 operation
     # on the async request path; the worker owns download + header validation.
-    import asyncio as _asyncio
-    _real_size = await _asyncio.to_thread(storage.head_object_size, _r2_key)
+    _real_size = await _bounded_storage_probe(
+        storage.head_object_size, _r2_key, timeout_seconds=2.0,
+    )
     if _real_size is not None and _real_size > MAX_UPLOAD_MB * 1024 * 1024:
         logger.warning(
             "[UPLOAD] 413 at transcribe: job=%s key=%s real=%.1f MB > %d MB "
@@ -4388,11 +4637,34 @@ async def transcribe_uploaded(
                 _row2.status == "transcribing_queued"
                 and _row2.active_transcription_attempt_id
             ):
-                return {
-                    "job_id": job_id,
-                    "status": "transcribing_queued",
-                    "deduplicated": True,
-                }
+                from database import JobOutboxEvent as _OutboxEvent
+
+                _raced_event = _db2.query(_OutboxEvent).filter(
+                    _OutboxEvent.id == _row2.active_transcription_attempt_id,
+                ).first()
+                _raced_payload = (
+                    dict(_raced_event.payload or {}) if _raced_event else {}
+                )
+                if str(_raced_payload.get("request_fingerprint") or "") != _transcription_fingerprint:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "transcription_request_conflict",
+                            "message": "A different transcription request won the concurrent submission.",
+                            "job_id": job_id,
+                        },
+                    )
+                return _accepted_job_response(
+                    job_id=job_id,
+                    status="transcribing_queued",
+                    status_url=f"/transcription-status/{job_id}",
+                    event_id=_row2.active_transcription_attempt_id,
+                    deduplicated=True,
+                    queue_pending=(
+                        _raced_event is None
+                        or _raced_event.status not in {"dispatched", "processing", "consumed"}
+                    ),
+                )
             if _row2.status not in (
                 "awaiting_upload", "transcribed_pending", "transcription_failed",
             ):
@@ -4424,6 +4696,8 @@ async def transcribe_uploaded(
                 _db2,
                 job=_row2,
                 audio_path=audio_path,
+                request_fingerprint=_transcription_fingerprint,
+                idempotency_key_hash=_transcription_idempotency_hash,
                 transcription_kwargs={
                     "language": body.language,
                     "artist": _row_artist,
@@ -4438,32 +4712,25 @@ async def transcribe_uploaded(
             _db2.commit()
         finally:
             _db2.close()
-        from transactional_outbox import dispatch_outbox_event
-        delivery = dispatch_outbox_event(event_id)
-        if delivery.get("status") != "dispatched":
-            logger.warning(
-                "[OUTBOX] transcription pending job=%s event=%s status=%s",
-                job_id, event_id, delivery.get("status"),
-            )
-            try:
-                from queue_jobs import ensure_job_outbox_reconciler_scheduled
-                ensure_job_outbox_reconciler_scheduled()
-            except Exception as exc:
-                logger.warning("[OUTBOX] transcription reconciler unavailable: %s", exc)
-        # 202 Accepted con el job_id para polling. No incluye segments —
-        # el frontend pollea /transcription-status hasta status=transcribed.
-        return {
-            "job_id": job_id,
-            "status": "transcribing_queued",
-            "queue_pending": delivery.get("status") != "dispatched",
-        }
+        # The HTTP contract ends at the durable commit. Redis/RQ publication is
+        # best-effort after the response and the periodic outbox reconciler is
+        # the crash-safe fallback. This removes the 30-120 s false timeout that
+        # made browsers and the September batch retry already-accepted work.
+        background_tasks.add_task(_dispatch_outbox_after_response, event_id)
+        return _accepted_job_response(
+            job_id=job_id,
+            status="transcribing_queued",
+            status_url=f"/transcription-status/{job_id}",
+            event_id=event_id,
+            queue_pending=True,
+        )
 
     # Legacy sync path (fallback con ASYNC_TRANSCRIBE_ENABLED=0).
     # Unlike the async path this process consumes the file itself, therefore
     # it must still materialize and validate it before entering Whisper.
     os.makedirs(job_dir, exist_ok=True)
     if not os.path.exists(audio_path):
-        _loop = _asyncio.get_event_loop()
+        _loop = asyncio.get_event_loop()
         for _attempt in range(5):
             # boto3 is synchronous; keep it off the uvicorn event loop.
             _ok = await _loop.run_in_executor(
@@ -4472,7 +4739,7 @@ async def transcribe_uploaded(
             if _ok:
                 break
             if _attempt < 4:
-                await _asyncio.sleep(0.5 * (2 ** _attempt))
+                await asyncio.sleep(0.5 * (2 ** _attempt))
         else:
             raise HTTPException(
                 status_code=502,
@@ -4514,6 +4781,8 @@ async def transcribe_uploaded(
             filename=_row_filename,
             live=bool(body.live),
         )
+        from recognition_provenance import resume_from_result
+        resume_from_result(_result)
         from line_evidence import freeze_result_provider_evidence
         _result = freeze_result_provider_evidence(_result)
         # Versión B: si el operador pegó la letra oficial, anclarla con CTC
@@ -5292,6 +5561,8 @@ async def transcribe_endpoint(
         artist=artist, title=title,
         filename=file.filename,
     )
+    from recognition_provenance import resume_from_result
+    resume_from_result(_result)
     from line_evidence import freeze_result_provider_evidence
     _result = freeze_result_provider_evidence(_result)
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
@@ -5717,6 +5988,7 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
             # strips it. Studio WORD_VOTE keeps its pre-existing behavior and
             # does not silently opt into the new live quality policy.
             result["_independent_asr_words"] = witness
+            result["_independent_asr_family"] = "openai/whisper-1"
         stats["independent_verifier"] = _live_verify
         stats["witness_words"] = len(witness)
         stats["witness_words_filtered"] = max(
@@ -5914,9 +6186,7 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                     if isinstance(quality, dict):
                         quality = dict(quality)
                         quality["machine_evidence_required"] = True
-                        quality["machine_evidence_schema"] = (
-                            "machine-transcription-evidence-v1"
-                        )
+                        quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
                         from quality_cache import sha256_file
                         quality["audio_sha256"] = sha256_file(audio_path)
                         quality["evaluated_revision"] = revision
@@ -5948,9 +6218,7 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                         persisted_tenant_id = str(row.tenant_id or "")
                     quality = dict(quality or {})
                     quality["machine_evidence_required"] = True
-                    quality["machine_evidence_schema"] = (
-                        "machine-transcription-evidence-v1"
-                    )
+                    quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
                     row.transcription_quality = quality
                     if isinstance(quality, dict):
                         from quality_shadow import record_shadow_decision
@@ -6211,7 +6479,11 @@ def _make_stem_window_transcriber(
                 check=True, timeout=30,
             )
             from pipeline import _transcribe_via_openai_api as _wx
-            segs = _wx(clip, language=language) or []
+            segs = _wx(
+                clip, language=language,
+                provenance_view="bounded_vocal_window",
+                provenance_transformation="adlib_consensus_raw",
+            ) or []
             return " ".join((s.get("text") or "").strip() for s in segs).strip()
         except Exception as e:
             logger.warning("[ADLIB] window %.1f-%.1f transcribe failed: %s",
@@ -6882,6 +7154,9 @@ async def _run_transcription_for_job(
     tmp_dir = tempfile.mkdtemp()
     tmp_path = audio_path
     _vocal_stem = None   # demucs output path (lazy), cleaned up in finally
+    from recognition_provenance import begin_collection as _begin_recognition
+    from recognition_provenance import end_collection as _end_recognition
+    _recognition_collector, _recognition_token = _begin_recognition()
 
     # Filled after the audio-first ASR exists.  `_emit_segments` reads this
     # state at the single output chokepoint so every downstream branch gets
@@ -6980,6 +7255,13 @@ async def _run_transcription_for_job(
                             recovery_source=None,
                             coverage_warning: bool = False,
                             extra=None):
+            segments = [
+                {
+                    key: value for key, value in segment.items()
+                    if key != "_recognition_family"
+                }
+                for segment in (segments or []) if isinstance(segment, dict)
+            ]
             if source not in VALID_TIMING_SOURCES:
                 logger.error("[EMIT] invalid timing_source=%r — forcing %r "
                              "(job=%s)", source, WHISPER_RAW, job_id)
@@ -7035,6 +7317,11 @@ async def _run_transcription_for_job(
             polished = normalized_polished
             out = {"job_id": job_id, "segments": polished,
                    "reference_lyrics": reference_lyrics}
+            recognition_snapshot = _recognition_collector.snapshot()
+            out["_recognition_hypotheses"] = recognition_snapshot["hypotheses"]
+            out["_recognition_attempt_count"] = recognition_snapshot[
+                "completed_attempt_count"
+            ]
 
             # Language is evaluated at the same single output chokepoint as
             # timing. A bilingual song is valid: preserve multi-label
@@ -7754,6 +8041,7 @@ async def _run_transcription_for_job(
                             _base = await asyncio.to_thread(
                                 _pl.transcribe, audio_path, language=(lang or None),
                                 job_id=job_id, return_words=True,
+                                provenance_view="mix_line_text_base",
                             )
                             # Sustained ad-libs ("uh uh uh") that Whisper forced into
                             # words (e.g. a 21 s block heard as "¿Para qué? ¿Para qué?")
@@ -8986,13 +9274,11 @@ async def _run_transcription_for_job(
                     if not intro_path:
                         return []
                     try:
-                        raw = await loop.run_in_executor(
-                            None,
-                            lambda: transcribe(
-                                intro_path, lang,
-                                lyrics_hint=initial_hint,
-                                return_words=True,
-                            ),
+                        raw = await asyncio.to_thread(
+                            transcribe, intro_path, lang,
+                            lyrics_hint=initial_hint,
+                            return_words=True,
+                            provenance_view="mix_intro",
                         )
                         # Keep only segments that fully sit in the intro
                         # window; defensive against ffmpeg frame-boundary
@@ -9005,13 +9291,11 @@ async def _run_transcription_for_job(
                         return []
 
                 async def _run_body_whisper():
-                    return await loop.run_in_executor(
-                        None,
-                        lambda: transcribe(
-                            transcribe_path, lang,
-                            lyrics_hint=initial_hint,
-                            return_words=True,
-                        ),
+                    return await asyncio.to_thread(
+                        transcribe, transcribe_path, lang,
+                        lyrics_hint=initial_hint,
+                        return_words=True,
+                        provenance_view="song_region",
                     )
 
                 try:
@@ -9250,15 +9534,14 @@ async def _run_transcription_for_job(
                     _e_stem,
                 )
 
-        segments = await loop.run_in_executor(
-            None,
-            lambda: transcribe(
-                _whisper_audio, lang,
-                lyrics_hint=_initial_asr_lyrics_hint(_gemini_pre),
-                return_words=True,
+        segments = await asyncio.to_thread(
+            transcribe, _whisper_audio, lang,
+            lyrics_hint=_initial_asr_lyrics_hint(_gemini_pre),
+            return_words=True,
+            provenance_view=(
+                "vocal_stem" if _whisper_audio != tmp_path else "mix"
             ),
         )
-
         # reference: reuse what Gemini already returned (instant), or wait
         # up to 2s more if it didn't complete within the pre-fetch window.
         reference = ""
@@ -9569,6 +9852,7 @@ async def _run_transcription_for_job(
                          job_id)
         raise
     finally:
+        _end_recognition(_recognition_token)
         # tmp_dir holds intermediate slices (intro/body cuts) only — the
         # main audio (audio_path) is under job_dir and must survive until
         # /generate enqueues it (or the reaper cleans it up).
@@ -10167,7 +10451,9 @@ async def generate_with_segments(
             ).first()
             if approved_version and approved_version.segments == (job_row.segments_json or []):
                 approved_version.is_approved = True
-                approved_version.reason = "approve"
+                if approved_version.reason != "transcription":
+                    approved_version.reason = "approve"
+                freeze_approval_training_evidence(job_row, approved_version)
         except MachineSnapshotMissing as exc:
             raise HTTPException(
                 status_code=409,
@@ -12142,6 +12428,7 @@ async def reject_job(
 async def get_source_audio_url(
     job_id: str,
     request: Request,
+    prefer_original: bool = Query(False),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -12154,15 +12441,22 @@ async def get_source_audio_url(
     editor sessions.
 
     Resolution order:
-      1. `input_r2_key` (original uploaded MP3/WAV) — best quality.
-      2. `s3_keys["video"]` (rendered HD MP4) — fallback when the
+      1. content-addressed editor AAC preview (when ready).
+      2. `input_r2_key` (original uploaded MP3/WAV) — safe fallback and the
+         only source used by the final render.
+      3. `s3_keys["video"]` (rendered HD MP4) — fallback when the
          original is gone (lifecycle GC, very old job, or one of the
          duplicate-job-bug casualties). Browsers play the audio track
          out of an <audio src="...mp4"> just fine, no client change
          needed. The response sets `source="video"` + `fallback=true`
          so the UI can show a "playing audio from rendered video" badge.
-      3. `s3_keys["short"]` (vertical/short MP4) — second fallback.
-      4. Nothing exists → 404 with a re-upload message.
+      4. `s3_keys["short"]` (vertical/short MP4) — second fallback.
+      5. Nothing exists → 404 with a re-upload message.
+
+    ``prefer_original=1`` is a non-persistent client-side escape hatch: if a
+    browser reports that a preview cannot be decoded, it gets a fresh signed
+    URL for the original without disabling preview generation for other
+    editors. It is intentionally not stored in the job row.
 
     HOTFIX FASE 2 — 2026-05-27: previously this only checked
     input_r2_key, so jobs whose original was lost (the duplicate-job
@@ -12186,6 +12480,74 @@ async def get_source_audio_url(
         raise HTTPException(status_code=404, detail="Job not found")
     _audit_cross_tenant_access(db, current_user, job, "source_audio")
 
+    preview_status = "unavailable"
+    preview_pending = False
+    # Do not probe the large master before a ready preview. A transient R2
+    # failure on the master must not delay a cached editor session; the
+    # original is only needed for queueing or fallback.
+    input_available = None
+    # The digest is populated by the transcription worker after validating the
+    # uploaded bytes. If it is absent (legacy rows), do not download a 43 MB
+    # source in the API just to discover it: preserve the old original path.
+    if (
+        not prefer_original
+        and re.fullmatch(r"[0-9a-fA-F]{64}", str(job.input_audio_sha256 or ""))
+    ):
+        from queue_jobs import enqueue_editor_audio_preview
+
+        preview_key = storage.editor_audio_preview_key(job.input_audio_sha256)
+        preview_exists = storage.object_exists(preview_key)
+        if preview_exists:
+            preview_url = storage.generate_signed_url(
+                preview_key,
+                expiry_seconds=3600,
+                response_content_type="audio/mp4",
+            )
+            if preview_url:
+                _audit_media_access(
+                    current_user, job_id, "source_audio",
+                    action="job.source_audio_access", source="editor_preview", request=request,
+                )
+                return {
+                    "url": preview_url,
+                    "expires_in": 3600,
+                    "source": "editor_preview",
+                    "fallback": False,
+                    "preview_status": "ready",
+                }
+            preview_status = "unavailable"
+        else:
+            # Kept below the preview HEAD so a cache hit never depends on the
+            # availability/latency of the original object's HEAD request.
+            input_available = bool(
+                job.input_r2_key and storage.object_exists(job.input_r2_key)
+            )
+            if input_available:
+                try:
+                    queued = enqueue_editor_audio_preview(
+                        job.input_r2_key,
+                        str(job.input_audio_sha256).strip().lower(),
+                        preview_key,
+                    )
+                    preview_status = "pending" if queued.get("status") in {
+                        "queued", "pending",
+                    } else "unavailable"
+                    preview_pending = preview_status == "pending"
+                except Exception as exc:
+                    # Preview is an optimization. Keep the original editor
+                    # path alive when Redis, R2, or the worker fleet is
+                    # degraded.
+                    logger.warning(
+                        "[EDITOR-AUDIO-PREVIEW] enqueue unavailable job=%s reason=%s",
+                        job_id, type(exc).__name__,
+                    )
+                    preview_status = "unavailable"
+
+    if input_available is None:
+        input_available = bool(
+            job.input_r2_key and storage.object_exists(job.input_r2_key)
+        )
+
     # 1. Try the original audio first (best quality, no render artifacts).
     #
     # HOTFIX 2026-05-27: presign is unconditional (it just signs a URL
@@ -12197,7 +12559,7 @@ async def get_source_audio_url(
     # (one-shot per session) and is exactly the diagnostic agus.cafisi
     # needed for his 26 jobs with set-but-DEAD input_r2_key (lifecycle
     # GC after 30 d retention purged the originals).
-    if job.input_r2_key and storage.object_exists(job.input_r2_key):
+    if input_available:
         extension = os.path.splitext(job.input_r2_key)[1].lower()
         content_type = {
             ".wav": "audio/wav",
@@ -12225,6 +12587,9 @@ async def get_source_audio_url(
                 "expires_in": 3600,
                 "source": "input",
                 "fallback": False,
+                "preview_status": preview_status,
+                "preview_pending": preview_pending,
+                "preview_retry_after_seconds": 5 if preview_pending else None,
             }
         # Storage signed-URL helper returned None (storage disabled mid-
         # request, etc.). Fall through to render fallback rather than
@@ -12262,6 +12627,7 @@ async def get_source_audio_url(
                     "expires_in": 3600,
                     "source": source_type,
                     "fallback": True,
+                    "preview_status": "unavailable",
                 }
 
     # 4. Neither original nor any rendered MP4 — operator must re-upload.
@@ -13964,100 +14330,6 @@ async def save_segments(
     previous_segments_for_quality = [
         dict(item) for item in (job.segments_json or []) if isinstance(item, dict)
     ]
-    # Audit log of what changed between prev and new — only when non-empty.
-    # Motivation: operator (Tomas, 2026-05-19) reported "lines change places"
-    # in autosync, and we had ZERO way to reconstruct what happened (only
-    # the final sorted segments_json was persisted). This block writes a
-    # compact diff per save so future complaints are diagnosable.
-    # Capped to keep payload small (20 changed entries max with `truncated`
-    # flag if exceeded).
-    try:
-        from database import AuditLog
-        from correction_learning import hmac_identifier
-
-        def _protected_text_ref(value: str) -> str | None:
-            try:
-                return hmac_identifier("audit_lyric", value)
-            except RuntimeError:
-                # Privacy is fail-closed: lengths/categories remain useful,
-                # but an unkeyed or raw lexical reference is never persisted.
-                return None
-
-        prev_segs = job.segments_json if isinstance(job.segments_json, list) else []
-        # Build id-keyed maps so we can diff by stable _id (frontend assigns
-        # one) — fall back to positional index for legacy rows missing _id.
-        def _key(s, idx):
-            return s.get("_id") if isinstance(s, dict) and "_id" in s else f"idx_{idx}"
-        prev_by_key = { _key(s, i): (i, s) for i, s in enumerate(prev_segs) }
-        new_by_key  = { _key(s, i): (i, s) for i, s in enumerate(segs) }
-        changed = []
-        reorder = []
-        for k, (new_idx, ns) in new_by_key.items():
-            prev = prev_by_key.get(k)
-            if prev is None:
-                continue
-            prev_idx, ps = prev
-            # Field-level diff on the three meaningful values.
-            ps_start = float(ps.get("start") or 0)
-            ns_start = float(ns.get("start") or 0)
-            ps_end = float(ps.get("end") or 0)
-            ns_end = float(ns.get("end") or 0)
-            ps_text = (ps.get("text") or "").strip()
-            ns_text = (ns.get("text") or "").strip()
-            if (abs(ps_start - ns_start) > 0.05 or abs(ps_end - ns_end) > 0.05
-                    or ps_text != ns_text):
-                changed.append({
-                    "id": k,
-                    "prev_start": round(ps_start, 3),
-                    "new_start": round(ns_start, 3),
-                    "prev_end": round(ps_end, 3),
-                    "new_end": round(ns_end, 3),
-                    "text_changed": ps_text != ns_text,
-                    "prev_text_length": len(ps_text),
-                    "new_text_length": len(ns_text),
-                    "prev_text_hmac": _protected_text_ref(ps_text),
-                    "new_text_hmac": _protected_text_ref(ns_text),
-                })
-            if prev_idx != new_idx:
-                reorder.append({"id": k, "from_idx": prev_idx, "to_idx": new_idx})
-
-        if changed or reorder:
-            correction_summary = {
-                "changed_lines": len(changed),
-                "text_changes": sum(
-                    1 for item in changed
-                    if item.get("text_changed")
-                ),
-                "timing_changes": sum(
-                    1 for item in changed
-                    if item.get("prev_start") != item.get("new_start")
-                    or item.get("prev_end") != item.get("new_end")
-                ),
-                "reorders": len(reorder),
-            }
-            truncated = False
-            if len(changed) > 20:
-                changed = changed[:20]
-                truncated = True
-            if len(reorder) > 30:
-                reorder = reorder[:30]
-                truncated = True
-            db.add(AuditLog(
-                user_id=current_user["id"],
-                action="lyrics.segments_diff",
-                detail={
-                    "job_id": job_id,
-                    "n_lines": len(segs),
-                    "changed": changed,
-                    "reorder": reorder,
-                    "correction_summary": correction_summary,
-                    "truncated": truncated,
-                },
-            ))
-    except Exception as e:
-        # Audit logging is best-effort — never break the save flow.
-        logger.warning("[save-segments] audit log failed: %s", e)
-
     job.segments_json = segs
     job.segments_revision = current_revision + 1
     job.transcription_quality = _invalidate_quality_after_editor_save(
@@ -14625,6 +14897,8 @@ async def upload_edit_custom_background(
 async def request_edit(
     job_id: str,
     body: EditJobRequest,
+    background_tasks: BackgroundTasks,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -14641,6 +14915,11 @@ async def request_edit(
     from database import Job as JobModel, AuditLog
     from pipeline import _MAX_EDITS
 
+    _edit_request_fingerprint = _request_fingerprint(
+        "edit.v1", {"job_id": job_id, "body": _model_payload(body)},
+    )
+    _edit_idempotency_hash = _idempotency_header_hash(idempotency_key)
+
     # Fast-path para pestañas/clientes que reenvían el CTA mientras el primer
     # edit ya está corriendo. El SELECT MVCC no espera el row-lock corto de los
     # updates de progreso del worker, a diferencia del FOR UPDATE de abajo:
@@ -14653,7 +14932,100 @@ async def request_edit(
     _probe = _probe_q.first()
     if not _probe:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # A lost 202 can be retried after the worker has already consumed the
+    # outbox event and moved the job back to pending_review/done.  In that
+    # terminal window there is no ``editing`` fast-path to catch the retry,
+    # so replay an explicitly keyed request from the durable outbox instead
+    # of starting a second render.  We intentionally require the caller key
+    # here: without one, posting the same edit again is a legitimate new
+    # variation (not an idempotent retry).
+    if _edit_idempotency_hash:
+        from database import JobOutboxEvent
+
+        _historical_edit = (
+            db.query(JobOutboxEvent)
+            .filter(
+                JobOutboxEvent.job_id == job_id,
+                JobOutboxEvent.event_type == "edit.enqueue",
+            )
+            .order_by(JobOutboxEvent.created_at.desc())
+            .all()
+        )
+        for _event in _historical_edit:
+            _event_payload = dict(_event.payload or {})
+            if str(_event_payload.get("idempotency_key_hash") or "") != _edit_idempotency_hash:
+                continue
+            if str(_event_payload.get("request_fingerprint") or "") != _edit_request_fingerprint:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "idempotency_key_conflict",
+                        "message": "Idempotency-Key was already used with a different edit payload.",
+                        "job_id": job_id,
+                    },
+                )
+            return _accepted_job_response(
+                job_id=job_id,
+                status=str(_probe.status or "pending_review"),
+                status_url=f"/status/{job_id}",
+                event_id=_event.id,
+                deduplicated=True,
+                queue_pending=_event.status in {"pending", "dispatched", "processing"},
+                extra={
+                    "current_step": _probe.current_step,
+                    "progress": _probe.progress,
+                },
+            )
     if _probe.status == "editing":
+        from database import JobOutboxEvent
+
+        _active_edit = (
+            db.query(JobOutboxEvent)
+            .filter(
+                JobOutboxEvent.job_id == job_id,
+                JobOutboxEvent.event_type == "edit.enqueue",
+                JobOutboxEvent.status.in_({
+                    "pending", "dispatched", "processing", "consumed",
+                }),
+            )
+            .order_by(JobOutboxEvent.created_at.desc())
+            .first()
+        )
+        _active_edit_payload = (
+            dict(_active_edit.payload or {}) if _active_edit is not None else {}
+        )
+        _active_edit_fingerprint = str(
+            _active_edit_payload.get("request_fingerprint") or ""
+        )
+        _active_edit_idem = str(
+            _active_edit_payload.get("idempotency_key_hash") or ""
+        )
+        if _active_edit_fingerprint == _edit_request_fingerprint:
+            return _accepted_job_response(
+                job_id=job_id,
+                status="editing",
+                status_url=f"/status/{job_id}",
+                event_id=_active_edit.id,
+                deduplicated=True,
+                queue_pending=_active_edit.status == "pending",
+                extra={
+                    "current_step": _probe.current_step,
+                    "progress": _probe.progress,
+                },
+            )
+        if (
+            _edit_idempotency_hash
+            and _edit_idempotency_hash == _active_edit_idem
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "idempotency_key_conflict",
+                    "message": "Idempotency-Key was already used with a different edit payload.",
+                    "job_id": job_id,
+                },
+            )
         raise HTTPException(
             status_code=409,
             detail={
@@ -14663,6 +15035,63 @@ async def request_edit(
                 "progress": _probe.progress,
             },
         )
+
+    # Preflight storage before taking the mutation row-lock. Probe all usable
+    # sources in parallel and cap the whole dependency wait: a slow R2 HEAD
+    # must not keep Postgres locked or turn an accepted edit into a browser
+    # timeout. `None` is an inconclusive dependency failure, so the worker's
+    # existing two-tier recovery remains authoritative in that case.
+    if storage.is_enabled():
+        _probe_s3 = _probe.s3_keys if isinstance(_probe.s3_keys, dict) else {}
+        _deliverable_keys = [
+            _probe_s3.get(kind) for kind in ("video", "short")
+        ]
+        _audio_source_items = [
+            (kind, key) for kind, key in [
+                ("input", _probe.input_r2_key),
+                *zip(("video", "short"), _deliverable_keys),
+            ] if key
+        ]
+        if not _audio_source_items:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "El audio original ya no está en storage y no hay un video "
+                    "renderizado del cual recuperarlo. Subí el MP3 de nuevo "
+                    "para regenerar el video."
+                ),
+            )
+        _source_results = await asyncio.gather(*(
+            _bounded_storage_probe(
+                storage.object_exists, key, timeout_seconds=2.0,
+            )
+            for _kind, key in _audio_source_items
+        ))
+        _source_by_kind = {
+            kind: result
+            for (kind, _key), result in zip(_audio_source_items, _source_results)
+        }
+        _has_input = _source_by_kind.get("input") is True
+        _has_deliverable = any(
+            _source_by_kind.get(kind) is True for kind in ("video", "short")
+        )
+        if (
+            not _has_input and not _has_deliverable
+            and all(result is False for result in _source_results)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "El audio original ya no está en storage y no hay un video "
+                    "renderizado del cual recuperarlo. Subí el MP3 de nuevo "
+                    "para regenerar el video."
+                ),
+            )
+        if not _has_input and _has_deliverable:
+            logger.info(
+                "[EDIT] job %s: input %r ausente en R2 — el worker recuperará "
+                "el audio del deliverable (tier-2)", job_id, _probe.input_r2_key,
+            )
 
     # with_for_update() toma row-level lock en Postgres para serializar
     # el read-validate-write de edit_count. Sin esto, dos POST /edit del
@@ -14707,6 +15136,49 @@ async def request_edit(
             raise HTTPException(status_code=400, detail="delivery_qc_action_wrong_edit_type")
     _audit_cross_tenant_access(db, current_user, job, "edit", commit=False)
     if job.status == "editing":
+        from database import JobOutboxEvent
+
+        _raced_edit = (
+            db.query(JobOutboxEvent)
+            .filter(
+                JobOutboxEvent.job_id == job_id,
+                JobOutboxEvent.event_type == "edit.enqueue",
+                JobOutboxEvent.status.in_({
+                    "pending", "dispatched", "processing", "consumed",
+                }),
+            )
+            .order_by(JobOutboxEvent.created_at.desc())
+            .first()
+        )
+        _raced_payload = (
+            dict(_raced_edit.payload or {}) if _raced_edit is not None else {}
+        )
+        if str(_raced_payload.get("request_fingerprint") or "") == _edit_request_fingerprint:
+            return _accepted_job_response(
+                job_id=job_id,
+                status="editing",
+                status_url=f"/status/{job_id}",
+                event_id=_raced_edit.id,
+                deduplicated=True,
+                queue_pending=_raced_edit.status == "pending",
+                extra={
+                    "current_step": job.current_step,
+                    "progress": job.progress,
+                },
+            )
+        if (
+            _edit_idempotency_hash
+            and _edit_idempotency_hash
+            == str(_raced_payload.get("idempotency_key_hash") or "")
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "idempotency_key_conflict",
+                    "message": "Idempotency-Key was already used with a different edit payload.",
+                    "job_id": job_id,
+                },
+            )
         raise HTTPException(
             status_code=409,
             detail={
@@ -15303,50 +15775,6 @@ async def request_edit(
         else current_edit_count + 1
     )
 
-    # Pre-flight check that the edit will be able to source its audio.
-    # The worker (run_edit_pipeline) resolves audio in two tiers: the
-    # original input in R2, and — when that was purged (cleanup_old_inputs,
-    # sibling delete) — extracting the track from a rendered deliverable
-    # (video/short). This gate must mirror BOTH tiers: blocking on the
-    # input alone rejected perfectly recoverable edits with "Subí el MP3
-    # de nuevo" (2026-07-10, job 53b9513225b1 "No Hay Santos" — the lyrics
-    # edit that re-stitches a damaged scene timeline was blocked even
-    # though its rendered MP4 was alive and the worker would have
-    # recovered the audio from it). Only 422 when NEITHER tier can work,
-    # which is the case the 2026-05-19 agus.cafisi incident was about.
-    try:
-        import storage as _storage
-        if _storage.is_enabled():
-            _has_input = bool(
-                job.input_r2_key and _storage.object_exists(job.input_r2_key)
-            )
-            _s3 = job.s3_keys if isinstance(job.s3_keys, dict) else {}
-            _has_deliverable = any(
-                _s3.get(_k) and _storage.object_exists(_s3[_k])
-                for _k in ("video", "short")
-            )
-            if not _has_input and not _has_deliverable:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "El audio original ya no está en storage y no hay un "
-                        "video renderizado del cual recuperarlo. "
-                        "Subí el MP3 de nuevo para regenerar el video."
-                    ),
-                )
-            if not _has_input:
-                logger.info(
-                    "[EDIT] job %s: input %r ausente en R2 — el worker recuperará "
-                    "el audio del deliverable (tier-2)", job_id, job.input_r2_key,
-                )
-    except HTTPException:
-        raise
-    except Exception as _exc:
-        logger.warning(
-            "[EDIT] R2 pre-check failed for %s key=%r — proceeding anyway: %s",
-            job_id, job.input_r2_key, _exc,
-        )
-
     _pre_edit_status = job.status
     _pre_edit_completed_at = job.completed_at
     _pre_edit_editing_started_at = job.editing_started_at
@@ -15429,6 +15857,8 @@ async def request_edit(
             "plan": current_user.get("plan", "100"),
             "tenant_id": current_user.get("tenant_id", ""),
             "workload_class": getattr(job, "workload_class", "interactive") or "interactive",
+            "request_fingerprint": _edit_request_fingerprint,
+            "idempotency_key_hash": _edit_idempotency_hash,
         },
     )
     for _qc_action in _delivery_qc_actions:
@@ -15448,21 +15878,14 @@ async def request_edit(
     # The old capture here was a no-op because it read AFTER the
     # job.artist assignment.
     db.commit()
-    from transactional_outbox import dispatch_outbox_event
-    # Pass the already imported publisher explicitly. Besides keeping this
-    # boundary injectable in tests, it makes the first delivery attempt use
-    # the exact same queue adapter as the API process. Reconciliation still
-    # resolves the adapter from ``queue_jobs`` independently.
-    _outbox_delivery = dispatch_outbox_event(
+    # Send 202 after the durable DB commit; Redis delivery happens after the
+    # response. A missing response can therefore be retried by payload hash
+    # without incrementing edit_count, cloning audit rows or forking renders.
+    background_tasks.add_task(
+        _dispatch_outbox_after_response,
         _edit_outbox.id,
         edit_publisher=enqueue_edit,
     )
-    _queue_pending = _outbox_delivery.get("status") != "dispatched"
-    if _queue_pending:
-        logger.warning(
-            "[EDIT-OUTBOX] publication pending job=%s event=%s status=%s",
-            job_id, _edit_outbox.id, _outbox_delivery.get("status"),
-        )
 
     if _approved_editor_version is not None:
         try:
@@ -15474,20 +15897,23 @@ async def request_edit(
                 job_id, exc,
             )
 
-    return {
-        "ok": True,
-        "job_id": job_id,
-        "edit_type": body.edit_type,
-        "edit_count": new_edit_count,
-        "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
-        "edit_limit_exempt": _is_admin,
-        "segments_revision": int(getattr(job, "segments_revision", 0) or 0),
-        "approved_editor_version_id": (
-            _approved_editor_version.id if _approved_editor_version is not None else None
-        ),
-        "queue_pending": _queue_pending,
-        "outbox_event_id": _edit_outbox.id,
-    }
+    return _accepted_job_response(
+        job_id=job_id,
+        status="editing",
+        status_url=f"/status/{job_id}",
+        event_id=_edit_outbox.id,
+        queue_pending=True,
+        extra={
+            "edit_type": body.edit_type,
+            "edit_count": new_edit_count,
+            "edits_remaining": max(0, _MAX_EDITS - new_edit_count),
+            "edit_limit_exempt": _is_admin,
+            "segments_revision": int(getattr(job, "segments_revision", 0) or 0),
+            "approved_editor_version_id": (
+                _approved_editor_version.id if _approved_editor_version is not None else None
+            ),
+        },
+    )
 
 
 class RegenerateSceneRequest(BaseModel):

@@ -9,8 +9,8 @@ ANTES del fix:
 
 DESPUÉS del fix:
     `with_for_update()` toma row lock en Postgres. El segundo request
-    espera a que el primero commit/rollback antes de leer y observa
-    ``status=editing``, por lo que se rechaza con 409 sin publicar otro render.
+    espera a que el primero commit/rollback, reconoce la misma huella y
+    devuelve el mismo intento como 202 deduplicado sin publicar otro render.
 
 WARNING: este test solo es válido en Postgres. En SQLite,
 with_for_update() es no-op y el test daría false-green (pasaría sin
@@ -27,9 +27,11 @@ from database import Job as JobModel
 
 
 @pytest.mark.postgres
-def test_concurrent_edits_respect_max_edits_limit(client, user_token, db):
+def test_concurrent_edits_respect_max_edits_limit(
+    client, user_token, db, monkeypatch,
+):
     """5 requests POST /edit concurrentes (usuario NO-admin); solo una
-    debe iniciar el render. Las demás reciben 409 ``edit_in_progress``.
+    debe iniciar el render. Las demás reciben 202 del intento deduplicado.
 
     Además de serializar ``edit_count``, el lock evita pagar/renderizar tres
     variantes simultáneas sobre la misma revisión. El límite acumulado de tres
@@ -44,6 +46,15 @@ def test_concurrent_edits_respect_max_edits_limit(client, user_token, db):
         "/auth/me", headers={"Authorization": f"Bearer {user_token}"}
     ).json()
     tenant_id = me["tenant_id"]
+
+    # This test measures the row-lock contract, not the asynchronous render.
+    # Letting the accepted request enqueue a real edit against the deliberately
+    # fake audio can race the remaining requests: the worker marks the job
+    # ``error`` and they receive 400 instead of the expected lock/status 409.
+    # A no-op queue keeps the job in ``editing`` and makes the concurrency
+    # assertion deterministic without weakening the product path under test.
+    import main
+    monkeypatch.setattr(main, "enqueue_edit", lambda **kwargs: "test:noop")
 
     # Setup: job en pending_review listo para edits. bg_r2_key_cached
     # y segments_json no None para que pase los checks de
@@ -94,17 +105,16 @@ def test_concurrent_edits_respect_max_edits_limit(client, user_token, db):
     for t in threads:
         t.join(timeout=10.0)
 
-    ok_count = sum(1 for s in statuses if s == 200)
+    accepted_count = sum(1 for s in statuses if s == 202)
     conflict_count = sum(1 for s in statuses if s == 409)
 
-    assert ok_count == 1, (
-        f"esperado un único edit aceptado, hubo {ok_count}. "
-        f"Status codes: {sorted(statuses)}. Race condition no protegida — "
-        f"verificá with_for_update() en main.py:/edit endpoint."
+    assert accepted_count == n_threads, (
+        f"esperado un 202 idempotente por request, hubo {accepted_count}. "
+        f"Status codes: {sorted(statuses)}."
     )
-    assert conflict_count == n_threads - 1, (
-        f"esperado {n_threads - 1} requests rechazados con 409, "
-        f"hubo {conflict_count}. Status codes: {sorted(statuses)}."
+    assert conflict_count == 0, (
+        f"los payloads idénticos no deben verse como conflicto; hubo "
+        f"{conflict_count}. Status codes: {sorted(statuses)}."
     )
 
     db.expire_all()
@@ -118,7 +128,7 @@ def test_concurrent_edits_respect_max_edits_limit(client, user_token, db):
 def test_admin_exempt_from_edit_limit(client, admin_token, db, monkeypatch):
     """Un admin puede editar más allá de _MAX_EDITS. Arrancamos el job
     YA en el límite (edit_count = _MAX_EDITS) y verificamos que el
-    siguiente /edit pasa (200) en vez de 400 'Maximum edit limit'.
+    siguiente /edit pasa (202) en vez de 400 'Maximum edit limit'.
     """
     from pipeline import _MAX_EDITS
 
@@ -154,7 +164,7 @@ def test_admin_exempt_from_edit_limit(client, admin_token, db, monkeypatch):
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "typography", "font": "Arial"},
     )
-    assert res.status_code == 200, (
+    assert res.status_code == 202, (
         f"admin debería poder editar más allá de _MAX_EDITS, "
         f"got {res.status_code}: {res.text}"
     )

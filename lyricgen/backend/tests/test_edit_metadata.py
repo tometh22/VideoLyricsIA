@@ -74,7 +74,7 @@ def _capture_enqueue_calls(monkeypatch):
 
 def test_metadata_updates_db_and_enqueues(client, admin_token, db, monkeypatch):
     """POST con artist + song_title corregidos → DB actualizada antes del
-    enqueue, edit_params lleva los nuevos valores, response 200."""
+    enqueue, edit_params lleva los nuevos valores, response 202."""
     captured = _capture_enqueue_calls(monkeypatch)
     user_id, tenant_id = _admin_identity(db)
     job_id = _create_pending_review_job(db, tenant_id, user_id)
@@ -88,7 +88,7 @@ def test_metadata_updates_db_and_enqueues(client, admin_token, db, monkeypatch):
             "song_title": "Los Abuelos De La Nada",
         },
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
 
     # DB row reflects the new values immediately (handler wrote before commit).
     row = db.query(JobModel).filter(JobModel.job_id == job_id).first()
@@ -102,6 +102,64 @@ def test_metadata_updates_db_and_enqueues(client, admin_token, db, monkeypatch):
     assert edit_params.get("artist") == "Sín Gamulán"
     assert edit_params.get("song_title") == "Los Abuelos De La Nada"
     assert captured[0]["edit_type"] == "metadata"
+
+
+def test_exact_edit_retry_reuses_one_durable_attempt(
+    client, admin_token, db, monkeypatch,
+):
+    """A lost 202 may be retried without a second render or audit mutation."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _create_pending_review_job(db, tenant_id, user_id)
+    headers = {
+        "Authorization": f"Bearer {admin_token}",
+        "Idempotency-Key": "edit-retry-contract-0001",
+    }
+    payload = {"edit_type": "typography", "font": "jost-bold"}
+
+    accepted = client.post(f"/edit/{job_id}", headers=headers, json=payload)
+    duplicate = client.post(f"/edit/{job_id}", headers=headers, json=payload)
+
+    assert accepted.status_code == duplicate.status_code == 202
+    assert accepted.headers["location"] == f"/status/{job_id}"
+    assert duplicate.json()["deduplicated"] is True
+    assert duplicate.json()["outbox_event_id"] == accepted.json()["outbox_event_id"]
+    assert len(captured) == 1
+    assert db.query(JobOutboxEvent).filter(
+        JobOutboxEvent.job_id == job_id,
+        JobOutboxEvent.event_type == "edit.enqueue",
+    ).count() == 1
+    audit_rows = db.query(AuditLog).filter(
+        AuditLog.action == "job.edit_request",
+    ).all()
+    assert sum(
+        1 for row in audit_rows
+        if isinstance(row.detail, dict) and row.detail.get("job_id") == job_id
+    ) == 1
+
+    changed = client.post(
+        f"/edit/{job_id}",
+        headers=headers,
+        json={"edit_type": "typography", "font": "anton"},
+    )
+    assert changed.status_code == 409
+    assert changed.json()["detail"]["code"] == "idempotency_key_conflict"
+    assert len(captured) == 1
+
+    # Simulate a slow client: the worker has already finished before the
+    # browser retries the request whose 202 response was lost. The durable
+    # idempotency record must still replay the original event instead of
+    # scheduling a second render.
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    row.status = "pending_review"
+    row.current_step = "review"
+    row.progress = 100
+    db.commit()
+    late_duplicate = client.post(f"/edit/{job_id}", headers=headers, json=payload)
+    assert late_duplicate.status_code == 202
+    assert late_duplicate.json()["deduplicated"] is True
+    assert late_duplicate.json()["outbox_event_id"] == accepted.json()["outbox_event_id"]
+    assert len(captured) == 1
 
 
 def test_edit_rejected_clears_failed_completion_timestamp(
@@ -124,7 +182,7 @@ def test_edit_rejected_clears_failed_completion_timestamp(
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "metadata", "song_title": "Título corregido"},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     db.expire_all()
     row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
     assert row.status == "editing"
@@ -163,7 +221,7 @@ def test_edit_rejected_preserves_retained_delivery_timestamp(
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "metadata", "song_title": "Título corregido"},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     db.expire_all()
     row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
     completed_at = row.completed_at
@@ -191,7 +249,7 @@ def test_enqueue_fallido_persiste_intento_sin_rebobinar_revision(
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "metadata", "song_title": "Título corregido"},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert res.json()["queue_pending"] is True
     db.expire_all()
     row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
@@ -231,7 +289,7 @@ def test_enqueue_fallido_conserva_evidencia_de_entrega_reabierta(
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "metadata", "song_title": "Título corregido"},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert res.json()["queue_pending"] is True
     db.expire_all()
     row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
@@ -261,7 +319,7 @@ def test_metadata_does_not_consume_edit_slot(client, admin_token, db, monkeypatc
             headers={"Authorization": f"Bearer {admin_token}"},
             json={"edit_type": "metadata", "song_title": f"Tit{i}"},
         )
-        assert res.status_code == 200, (
+        assert res.status_code == 202, (
             f"Iter {i} should succeed regardless of edit_count cap; got {res.status_code}: {res.text}"
         )
         # Flip back to pending_review so the next iter passes the status gate
@@ -375,7 +433,7 @@ def test_metadata_youtube_drift_explicit_opt_in_passes(client, admin_token, db, 
             "allow_youtube_drift": True,
         },
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
 
 
 def test_metadata_status_gate_rejects_transcribing(client, admin_token, db, monkeypatch):
@@ -460,7 +518,7 @@ def test_metadata_audit_log_flags_metadata_only(client, admin_token, db, monkeyp
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "metadata", "artist": "Sín Gamulán"},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
 
     # Find the most recent edit_request audit for this job.
     log = (
@@ -486,7 +544,7 @@ def test_typography_audit_log_metadata_only_false(client, admin_token, db, monke
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "typography", "font": "jost-bold"},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
 
     log = (
         db.query(AuditLog)
@@ -530,7 +588,7 @@ def test_metadata_and_outbox_commit_atomically_on_enqueue_failure(
             "song_title": "Persisted title",
         },
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert res.json()["queue_pending"] is True
 
     db.expire_all()

@@ -72,7 +72,7 @@ def test_worker_deployment_contracts_share_image_without_http_healthcheck():
     }
     expected_queues = {
         "worker.toml": "enterprise,default,canary",
-        "short-worker.toml": "transcription,bg_preview",
+        "short-worker.toml": "transcription,bg_preview,audio_preview",
         "batch-worker.toml": "batch_render",
         "batch-short-worker.toml": "campaign_control,transcription_batch",
     }
@@ -158,6 +158,7 @@ def test_staging_and_production_default_to_strict_7_plus_3(monkeypatch):
         "FLEET_READINESS_STRICT",
         "EXPECTED_WORKER_REPLICAS",
         "EXPECTED_SHORT_WORKER_REPLICAS",
+        "TRANSCRIPTION_QUALITY_QUEUE_ENABLED",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -176,6 +177,7 @@ def test_staging_strict_gate_can_be_disabled_only_explicitly(monkeypatch):
     from observability import _fleet_readiness_config
 
     monkeypatch.setenv("FLEET_READINESS_STRICT", "0")
+    monkeypatch.delenv("TRANSCRIPTION_QUALITY_QUEUE_ENABLED", raising=False)
     strict, expected = _fleet_readiness_config("staging")
     assert strict is False
     assert expected == {"worker": 7, "short_worker": 3}

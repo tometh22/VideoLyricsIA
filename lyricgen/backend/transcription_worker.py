@@ -37,6 +37,8 @@ import logging
 import os
 import re
 
+from machine_evidence import SCHEMA as MACHINE_EVIDENCE_SCHEMA
+
 logger = logging.getLogger("genly.transcription_worker")
 _EXCEPTION_TYPE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
 
@@ -310,6 +312,10 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             r.pop("_asr_words", None)
             r.pop("_independent_asr_words", None)
             r.pop("_pre_anchor_provider_segments", None)
+            r.pop("_recognition_hypotheses", None)
+            r.pop("_recognition_attempt_count", None)
+            r.pop("_primary_asr_family", None)
+            r.pop("_independent_asr_family", None)
         if _stem:
             try:
                 os.unlink(_stem)
@@ -432,11 +438,20 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     # Capture the private recognition streams before removing transport-only
     # keys.  Persistence later binds this to EditorDocument.original_segments
     # in the same transaction that exposes the job to the editor.
+    from recognition_provenance import clear_collection, snapshot_into_result
     from machine_evidence import build_machine_evidence
-    r["_machine_evidence"] = build_machine_evidence(r)
+    try:
+        snapshot_into_result(r)
+        r["_machine_evidence"] = build_machine_evidence(r)
+    finally:
+        clear_collection()
     r.pop("_asr_words", None)
     r.pop("_independent_asr_words", None)
     r.pop("_pre_anchor_provider_segments", None)
+    r.pop("_recognition_hypotheses", None)
+    r.pop("_recognition_attempt_count", None)
+    r.pop("_primary_asr_family", None)
+    r.pop("_independent_asr_family", None)
     return r
 
 
@@ -597,6 +612,8 @@ def run_transcription_job(
                 language=language, artist=artist, title=title, filename=filename,
                 live=live,
             )
+            from recognition_provenance import resume_from_result
+            resume_from_result(r)
             # Immutable provider evidence must exist before anchor CTC or any
             # other timing/content post-pass can replace words and bounds.
             from line_evidence import freeze_result_provider_evidence
@@ -801,9 +818,7 @@ def run_transcription_job(
                 if isinstance(quality, dict):
                     quality = dict(quality)
                     quality["machine_evidence_required"] = True
-                    quality["machine_evidence_schema"] = (
-                        "machine-transcription-evidence-v1"
-                    )
+                    quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
                     quality["audio_sha256"] = source_audio_sha256
                     quality["audio_revision"] = int(row.audio_revision or 0)
                     quality["evaluated_revision"] = current_revision
@@ -845,9 +860,7 @@ def run_transcription_job(
                     else row.transcription_quality or {}
                 )
                 quality["machine_evidence_required"] = True
-                quality["machine_evidence_schema"] = (
-                    "machine-transcription-evidence-v1"
-                )
+                quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
                 row.transcription_quality = quality
                 from machine_evidence import finalize_machine_evidence
                 durable_evidence = finalize_machine_evidence(

@@ -296,6 +296,37 @@ describe("LyricsEditor — recuperación de audio remoto post-mount", () => {
     warn.mockRestore();
   });
 
+  it("pide el original automáticamente si falla el preview AAC", () => {
+    const onRetryAudio = vi.fn().mockResolvedValue(undefined);
+    const props = baseProps({
+      audioUrl: "https://media.example.test/editor-preview.m4a?signature=preview",
+      audioSource: "editor_preview",
+      onRetryAudio,
+    });
+    const { container } = render(<LyricsEditor {...props} />);
+    fireEvent.error(container.querySelector("audio"));
+    expect(onRetryAudio).toHaveBeenCalledWith({
+      reason: "media_error",
+      mediaErrorCode: null,
+      preferOriginal: true,
+    });
+  });
+
+  it("no recarga el audio cuando cambian las lyrics durante un autosave", () => {
+    const source = "https://media.example.test/editor-preview.m4a?signature=stable";
+    const props = baseProps({ audioUrl: source, audioSource: "editor_preview" });
+    const { container, rerender } = render(<LyricsEditor {...props} />);
+    const audio = container.querySelector("audio");
+    const load = vi.fn();
+    Object.defineProperty(audio, "load", { configurable: true, value: load });
+
+    rerender(<LyricsEditor {...props} segments={[{ start: 1, end: 2, text: "edited line" }]} />);
+
+    expect(container.querySelector("audio")).toBe(audio);
+    expect(audio).toHaveAttribute("src", source);
+    expect(load).not.toHaveBeenCalled();
+  });
+
   it("restaura posición e intención de reproducción al cambiar la URL", () => {
     const firstUrl = "https://media.example.test/source.wav?signature=old";
     const nextUrl = "https://media.example.test/source.wav?signature=fresh";

@@ -197,7 +197,7 @@ def test_edit_typography_allowed_with_custom_image_background(client, user_token
             f"/edit/{jid}", headers=auth(user_token),
             json={"edit_type": "typography", "font": "Arial"},
         )
-        assert r.status_code == 200, r.text
+        assert r.status_code == 202, r.text
     finally:
         db.query(JobModel).filter(JobModel.job_id == jid).delete(synchronize_session=False)
         db.commit()

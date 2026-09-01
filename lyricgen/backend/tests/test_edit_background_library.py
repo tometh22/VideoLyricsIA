@@ -108,7 +108,7 @@ def test_swap_forwards_asset_and_does_not_consume_slot(client, admin_token, db, 
             headers={"Authorization": f"Bearer {admin_token}"},
             json={"edit_type": "background_library", "background_id": asset_id},
         )
-        assert res.status_code == 200, res.text
+        assert res.status_code == 202, res.text
         assert len(captured) == 1
         lib = captured[0]["edit_params"].get("library_bg")
         assert lib and lib["asset_id"] == asset_id
@@ -147,7 +147,7 @@ def test_swap_allowed_with_exhausted_edit_quota(client, admin_token, db, monkeyp
             headers={"Authorization": f"Bearer {token}"},
             json={"edit_type": "background_library", "background_id": asset_id},
         )
-        assert res.status_code == 200, res.text
+        assert res.status_code == 202, res.text
     finally:
         _cleanup(db, job_ids=[job_id], asset_ids=[asset_id])
 

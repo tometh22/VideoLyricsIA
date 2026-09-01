@@ -225,6 +225,8 @@ def _one_pass(client, genai, y, sr, dur, who, win_base: int = 0,
         c0, c1 = t, min(dur, t + CHUNK_S)
         clip = y[int(c0 * sr):int(c1 * sr)]
         recorder = None
+        provider_completed = False
+        provider_recorded = False
         try:
             import io as _io
             import soundfile as sf
@@ -262,13 +264,43 @@ def _one_pass(client, genai, y, sr, dur, who, win_base: int = 0,
                 45.0,
                 label=f"perf-text chunk {c0:.0f}-{c1:.0f}s",
             )
-            lines = [l for l in (resp.text or "").splitlines() if l.strip()]
+            provider_completed = True
+            from recognition_provenance import (
+                record_completed,
+                response_text_completion,
+            )
+            raw_text, raw_events = response_text_completion(
+                resp, label="opaque-performance-text-response",
+            )
+            record_completed(
+                family=f"google/{MODEL}",
+                events=raw_events,
+                kind="text",
+                view="performance_audio_window",
+                transformation=(
+                    f"performance_text_raw:window={wi};start={c0:.3f};end={c1:.3f}"
+                ),
+            )
+            provider_recorded = True
+            lines = [line for line in raw_text.splitlines() if line.strip()]
             if recorder:
                 recorder.finish(response_summary=(
                     f"performance_text window={c0:.1f}-{c1:.1f}s "
                     f"lines={len(lines)}"
                 ))
         except Exception as e:
+            if provider_completed and not provider_recorded:
+                from recognition_provenance import record_completed
+                record_completed(
+                    family=f"google/{MODEL}",
+                    events=[],
+                    kind="text",
+                    view="performance_audio_window",
+                    transformation=(
+                        f"performance_text_unreadable:window={wi};"
+                        f"start={c0:.3f};end={c1:.3f}"
+                    ),
+                )
             if recorder:
                 recorder.finish(response_summary=(
                     f"error: performance_text window={c0:.1f}-{c1:.1f}s: "
