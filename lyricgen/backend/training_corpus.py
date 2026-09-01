@@ -24,8 +24,7 @@ LINE_DELTA_SCHEMA = "editor-line-delta-v2"
 TRAINING_PAIR_SCHEMA = "transcription-training-pair-v1"
 TIMING_NOISE_THRESHOLD_S = 0.05
 MAX_ALIGNMENT_CELLS = 250_000
-ALIGNMENT_LOOKAHEAD = 32
-MAX_BANDED_ALIGNMENT_CELLS = 1_000_000
+MAX_BANDED_ALIGNMENT_CELLS = 250_000
 
 
 def _finite_time(value: Any) -> float:
@@ -74,6 +73,16 @@ def _align_unmatched_rows(
         return _align_unmatched_rows_bounded(
             before, after, before_indices, after_indices,
         )
+    return _align_unmatched_rows_exact(
+        before, after, before_indices, after_indices,
+    )
+
+
+def _align_unmatched_rows_exact(
+    before: list[dict], after: list[dict], before_indices: list[int], after_indices: list[int],
+) -> tuple[list[tuple[int, int]], bool]:
+    """Exact Needleman-Wunsch alignment within the declared cell budget."""
+    rows, cols = len(before_indices), len(after_indices)
     gap_cost = 1.0
     costs = [[math.inf] * (cols + 1) for _ in range(rows + 1)]
     steps: list[list[str | None]] = [[None] * (cols + 1) for _ in range(rows + 1)]
@@ -116,143 +125,22 @@ def _align_unmatched_rows(
 def _align_unmatched_rows_bounded(
     before: list[dict], after: list[dict], before_indices: list[int], after_indices: list[int],
 ) -> tuple[list[tuple[int, int]], bool]:
-    """Banded Needleman-Wunsch fallback for unusually large edits.
+    """Align exactly inside the safety budget; otherwise fail closed.
 
-    The previous greedy lookahead could not represent two consecutive gaps:
-    because a substitution costs less than two gaps, it paired an old row with
-    the first newly inserted row and shifted every later label.  This keeps the
-    exact dynamic-programming recurrence, but evaluates only a corridor around
-    the proportional input/output diagonal.  Consecutive insertions and
-    deletions are first-class paths without restoring the quadratic matrix.
+    A bounded band cannot prove that a short insertion/deletion excursion did
+    not occur outside it.  Stable IDs and exact signatures have already been
+    matched before this function is reached, so a larger unmatched product is
+    intrinsically ambiguous.  Excluding that transition from training is safer
+    than manufacturing substitution, insertion, or deletion labels.
     """
     rows, cols = len(before_indices), len(after_indices)
     if not rows or not cols:
         return [], True
-
-    gap_cost = 1.0
-    # Widen just enough for very unbalanced inputs to keep adjacent corridor
-    # rows connected, while retaining O((rows + cols) * lookahead) behaviour.
-    imbalance_step = math.ceil(abs(cols - rows) / max(1, min(rows, cols)))
-    initial_band = min(
-        max(rows, cols), ALIGNMENT_LOOKAHEAD + imbalance_step,
-    )
-
-    # Probe a bounded, evenly spaced sample for unambiguous identity anchors.
-    # This discovers a localized shift even when the best path inside the
-    # initial corridor is a plausible-looking (but wrong) substitution path.
-    probe_count = min(rows, 64)
-    probe_positions = sorted({
-        round(index * (rows - 1) / max(1, probe_count - 1))
-        for index in range(probe_count)
-    })
-    required_band = initial_band
-    confident_anchors = 0
-    for left in probe_positions:
-        best_cost = second_cost = math.inf
-        best_right = -1
-        for right in range(cols):
-            candidate = _row_match_cost(
-                before[before_indices[left]], after[after_indices[right]],
-            )
-            if candidate < best_cost:
-                second_cost = best_cost
-                best_cost, best_right = candidate, right
-            elif candidate < second_cost:
-                second_cost = candidate
-        if best_right < 0:
-            continue
-        if best_cost <= 0.75 and second_cost - best_cost >= 0.15:
-            confident_anchors += 1
-            center = round((left + 1) * cols / rows)
-            required_band = min(
-                max(rows, cols),
-                max(required_band, abs((best_right + 1) - center) + 4),
-            )
-
-    budget_band = min(
-        max(rows, cols),
-        max(0, (MAX_BANDED_ALIGNMENT_CELLS // (rows + 1) - 1) // 2),
-    )
-    if (
-        required_band > budget_band
-        or (max(rows, cols) > ALIGNMENT_LOOKAHEAD and confident_anchors == 0)
-    ):
+    if rows * cols > MAX_BANDED_ALIGNMENT_CELLS:
         return [], False
-
-    def run(band: int) -> tuple[list[tuple[int, int]], bool]:
-        def bounds(left: int) -> tuple[int, int]:
-            center = round(left * cols / rows)
-            return (
-                max(0, center - band),
-                min(cols, center + band),
-            )
-
-        # Only two score rows are retained. Traceback remains bounded by the
-        # corridor, and is discarded/retried if the best path hits its edge.
-        _first_low, first_high = bounds(0)
-        previous = {right: right * gap_cost for right in range(first_high + 1)}
-        steps: dict[tuple[int, int], str] = {
-            (0, right): "insert" for right in range(1, first_high + 1)
-        }
-        row_bounds: list[tuple[int, int]] = [(0, first_high)]
-
-        for left in range(1, rows + 1):
-            low, high = bounds(left)
-            row_bounds.append((low, high))
-            current: dict[int, float] = {}
-            for right in range(low, high + 1):
-                candidates: list[tuple[float, int, str]] = []
-                if right > 0 and right - 1 in previous:
-                    match_cost = _row_match_cost(
-                        before[before_indices[left - 1]],
-                        after[after_indices[right - 1]],
-                    )
-                    if math.isfinite(match_cost):
-                        candidates.append((previous[right - 1] + match_cost, 0, "match"))
-                if right in previous:
-                    candidates.append((previous[right] + gap_cost, 1, "delete"))
-                if right > 0 and right - 1 in current:
-                    candidates.append((current[right - 1] + gap_cost, 2, "insert"))
-                if not candidates:
-                    continue
-                best_cost, _priority, step = min(candidates)
-                current[right] = best_cost
-                steps[(left, right)] = step
-            previous = current
-
-        if cols not in previous:
-            return [], True
-        aligned: list[tuple[int, int]] = []
-        touched_artificial_edge = False
-        left, right = rows, cols
-        while left or right:
-            low, high = row_bounds[left]
-            if (low > 0 and right == low) or (high < cols and right == high):
-                touched_artificial_edge = True
-            step = steps.get((left, right))
-            if step == "match":
-                aligned.append((before_indices[left - 1], after_indices[right - 1]))
-                left -= 1
-                right -= 1
-            elif step == "delete":
-                left -= 1
-            elif step == "insert":
-                right -= 1
-            else:
-                return [], True
-        return list(reversed(aligned)), touched_artificial_edge
-
-    band = required_band
-    while True:
-        aligned, touched_edge = run(band)
-        if not touched_edge:
-            return aligned, True
-        wider_band = min(budget_band, band * 2)
-        if wider_band == band:
-            # Never manufacture training identity when the safe path falls
-            # outside the resource-bounded corridor.
-            return aligned, False
-        band = wider_band
+    return _align_unmatched_rows_exact(
+        before, after, before_indices, after_indices,
+    )
 
 
 def _match_rows(

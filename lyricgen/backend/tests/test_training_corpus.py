@@ -204,6 +204,34 @@ def test_ambiguous_large_alignment_fails_closed_for_training(monkeypatch):
     assert payload["alignment_complete"] is False
 
 
+def test_short_gap_excursion_in_large_edit_fails_closed():
+    before = [
+        {"start": index, "end": index + .5, "text": f"old {index}"}
+        for index in range(1000)
+    ]
+    # The 40-row displacement exists for only five retained rows, so sampled
+    # or fixed-band alignment cannot safely infer it. Every retained row is
+    # also edited to prevent exact-signature matching from hiding the case.
+    after = [
+        {"_id": f"kept-{index}", "start": index + .1, "end": index + .6,
+         "text": f"old {index} edited"}
+        for index in range(1000)
+    ]
+    after[500:500] = [
+        {"_id": f"new-{index}", "start": 500 + index / 10,
+         "end": 500 + index / 10 + .1, "text": f"insert {index}"}
+        for index in range(40)
+    ]
+    del after[545:585]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert payload["alignment_complete"] is False
+
+
 def test_metadata_only_editor_change_is_not_training_noise():
     before = [{"_id": "a", "start": 1, "end": 2, "text": "hola", "pos": {"x": .2}}]
     after = [{"_id": "a", "start": 1.01, "end": 2.01, "text": "hola", "pos": {"x": .9}}]
