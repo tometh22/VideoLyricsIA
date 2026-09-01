@@ -369,6 +369,8 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
     fd, clip = tempfile.mkstemp(prefix="genly_gemini_vocal_", suffix=".wav")
     os.close(fd)
     recorder = None
+    provider_completed = False
+    provider_recorded = False
     prompt = (
         "Transcribí únicamente los eventos vocales audibles en este fragmento. "
         "Cada evento debe ser una frase o ciclo vocal completo: no dividas una "
@@ -439,10 +441,52 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
             timeout_s=60.0,
             label="TARGETED-GEMINI-VERIFY",
         )
-        raw = (response.text or "").strip()
-        payload = json.loads(raw)
+        provider_completed = True
+        from recognition_provenance import (
+            record_completed,
+            response_text_completion,
+        )
+        raw, raw_events = response_text_completion(
+            response, label="opaque-targeted-gemini-response",
+        )
+        raw = raw.strip()
+        if not raw:
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=raw_events,
+                kind="text",
+                view="bounded_vocal_window",
+                transformation="targeted_consensus_empty_or_unreadable",
+            )
+            provider_recorded = True
+            return []
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=([{"text": raw}] if raw else []),
+                kind="text",
+                view="bounded_vocal_window",
+                transformation="targeted_consensus_unparsed_raw",
+            )
+            provider_recorded = True
+            raise
         events = payload.get("events") if isinstance(payload, dict) else None
-        if not isinstance(events, list) or len(events) > 16:
+        if not isinstance(events, list):
+            from recognition_provenance import record_completed
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=([{"text": raw}] if raw else []),
+                kind="text",
+                view="bounded_vocal_window",
+                transformation="targeted_consensus_invalid_shape_raw",
+            )
+            provider_recorded = True
+            return []
+        _record_gemini_event_response(raw, events)
+        provider_recorded = True
+        if len(events) > 16:
             return []
         out = []
         from pipeline import _is_whisper_hallucination
@@ -476,6 +520,14 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
             recorder.finish(response_summary=f"events={len(out)}")
         return out
     except Exception as exc:
+        if provider_completed and not provider_recorded:
+            from recognition_provenance import record_completed
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=[],
+                view="bounded_vocal_window",
+                transformation="targeted_consensus_parse_failed",
+            )
         if recorder:
             recorder.finish(
                 response_summary=f"error:{_safe_error_type(exc)}",
@@ -490,6 +542,34 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
             os.unlink(clip)
         except OSError:
             pass
+
+
+def _record_gemini_event_response(raw: str, events: list) -> None:
+    """Freeze the provider response before semantic row validation.
+
+    A JSON ``events`` list can still contain strings, numbers, or other
+    malformed rows.  The recognition collector intentionally accepts only
+    dictionaries, so passing that list directly would make a completed call
+    look like an empty hypothesis.  Preserve the complete raw response as a
+    text event in that case; downstream parsing may still reject it.
+    """
+    from recognition_provenance import record_completed
+
+    if all(isinstance(event, dict) for event in events):
+        record_completed(
+            family="google/gemini-2.5-flash-audio",
+            events=events,
+            view="bounded_vocal_window",
+            transformation="targeted_consensus_raw",
+        )
+        return
+    record_completed(
+        family="google/gemini-2.5-flash-audio",
+        events=([{"text": raw}] if raw else []),
+        kind="text",
+        view="bounded_vocal_window",
+        transformation="targeted_consensus_malformed_events_raw",
+    )
 
 
 def _word_tokens(text: str) -> list[str]:

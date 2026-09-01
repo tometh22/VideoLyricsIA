@@ -15,8 +15,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-SCHEMA = "machine-transcription-evidence-v2"
-LEGACY_SCHEMAS = {"machine-transcription-evidence-v1"}
+SCHEMA = "machine-transcription-evidence-v3"
+LEGACY_SCHEMAS = {
+    "machine-transcription-evidence-v1",
+    "machine-transcription-evidence-v2",
+}
 
 
 class MachineSnapshotMissing(RuntimeError):
@@ -154,14 +157,21 @@ def _provider_family(segments: list[dict]) -> str:
             continue
         evidence = segment.get("provider_evidence") or {}
         family = str(evidence.get("correlated_family") or "").strip()
-        if family:
+        if family and family.casefold() not in {"unknown", "unknown-primary-asr"}:
             return family[:160]
         provenance = segment.get("content_provenance") or {}
         lineage = provenance.get("lineage") or {}
         family = str(lineage.get("correlated_family") or "").strip()
-        if family:
+        if family and family.casefold() not in {"unknown", "unknown-primary-asr"}:
             return family[:160]
-    return "unknown-primary-asr"
+        source = str(
+            segment.get("content_source")
+            or evidence.get("source")
+            or ""
+        ).strip()
+        if source:
+            return source[:160]
+    return "selected-output"
 
 
 def build_machine_evidence(result: dict) -> dict:
@@ -176,52 +186,102 @@ def build_machine_evidence(result: dict) -> dict:
     selected = [row for row in (result.get("segments") or []) if isinstance(row, dict)]
     hypotheses: list[dict] = []
 
-    def add(role: str, family: str, kind: str, events: Any) -> None:
+    def add(
+        role: str, family: str, kind: str, events: Any,
+        *, allow_empty: bool = False, **metadata: Any,
+    ) -> None:
         rows = [row for row in (events or []) if isinstance(row, dict)]
-        if not rows:
+        if not rows and not allow_empty:
             return
-        hypotheses.append({
+        hypothesis = {
             "role": role,
             "family": str(family or "unknown")[:160],
             "kind": kind,
             "events": _safe_json(rows),
             "event_count": len(rows),
             "events_sha256": snapshot_hash(rows),
-        })
+        }
+        for key in ("view", "transformation"):
+            if metadata.get(key):
+                hypothesis[key] = str(metadata[key])[:160]
+        if type(metadata.get("attempt_id")) is int:
+            hypothesis["attempt_id"] = metadata["attempt_id"]
+        hypotheses.append(hypothesis)
+
+    recognition_attempts = [
+        item for item in (result.get("_recognition_hypotheses") or [])
+        if isinstance(item, dict)
+    ]
+    for index, attempt in enumerate(recognition_attempts):
+        add(
+            "primary" if index == 0 else "candidate",
+            str(attempt.get("family") or ""),
+            str(attempt.get("kind") or "segments"),
+            attempt.get("events"),
+            allow_empty=True,
+            attempt_id=(
+                attempt.get("attempt_id")
+                if type(attempt.get("attempt_id")) is int else index
+            ),
+            view=attempt.get("view"),
+            transformation=attempt.get("transformation"),
+        )
 
     primary_family = str(
         result.get("_primary_asr_family") or _provider_family(selected)
     )
-    add("primary", primary_family, "word_stream", result.get("_asr_words"))
+    if not recognition_attempts:
+        add(
+            "primary", primary_family, "word_stream",
+            result.get("_asr_words"), attempt_id=0,
+        )
     add(
         "independent",
         str(result.get("_independent_asr_family") or "independent-asr"),
         "word_stream",
         result.get("_independent_asr_words"),
     )
+    pre_anchor_segments = [
+        row for row in (result.get("_pre_anchor_provider_segments") or [])
+        if isinstance(row, dict)
+    ]
     add(
         "pre_anchor",
-        str(result.get("_provider_asr_family") or primary_family),
+        str(
+            result.get("_provider_asr_family")
+            or _provider_family(pre_anchor_segments)
+        ),
         "segments",
-        result.get("_pre_anchor_provider_segments"),
+        pre_anchor_segments,
     )
-    add("selected", primary_family, "segments", selected)
+    selected_family = _provider_family(selected)
+    add("selected", selected_family, "segments", selected)
     if not any(item.get("role") == "selected" for item in hypotheses):
         # An empty selected transcription is still the pre-human state even
         # when a raw word family exists. Persist it explicitly, never infer it
         # from another family's events.
         hypotheses.append({
-            "role": "selected", "family": primary_family,
+            "role": "selected", "family": selected_family,
             "kind": "segments", "events": [], "event_count": 0,
             "events_sha256": snapshot_hash([]),
         })
 
+    inferred_attempt_count = sum(
+        item.get("role") in {"primary", "candidate"}
+        for item in hypotheses
+    )
+    reported_attempt_count = result.get("_recognition_attempt_count")
+    if type(reported_attempt_count) is not int:
+        reported_attempt_count = inferred_attempt_count
     return {
         "schema": SCHEMA,
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "hypotheses_by_family": hypotheses,
         "capture": {
-            "primary_present": bool(result.get("_asr_words")),
+            "recognition_attempt_count": reported_attempt_count,
+            "primary_present": bool(
+                recognition_attempts or result.get("_asr_words")
+            ),
             "independent_present": bool(result.get("_independent_asr_words")),
             "pre_anchor_present": bool(result.get("_pre_anchor_provider_segments")),
         },
@@ -252,7 +312,7 @@ def finalize_machine_evidence(
     if not selected_found:
         payload.setdefault("hypotheses_by_family", []).append({
             "role": "selected",
-            "family": "unknown-primary-asr",
+            "family": "selected-output",
             "kind": "segments",
             "events": canonical_selected,
             "event_count": len(canonical_selected),
@@ -277,6 +337,7 @@ def finalize_machine_evidence(
     }
     payload["evidence_sha256"] = snapshot_hash({
         "hypotheses_by_family": payload["hypotheses_by_family"],
+        "capture": payload.get("capture") or {},
         "pre_human": payload["pre_human"],
         "decisions": payload["decisions"],
     })
@@ -298,8 +359,11 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
         raise MachineSnapshotMissing("machine_pre_human_missing")
     if pre_human.get("segments_sha256") != snapshot_hash(original_segments or []):
         raise MachineSnapshotMissing("machine_snapshot_hash_mismatch")
-    if evidence.get("schema") == SCHEMA:
+    evidence_schema = evidence.get("schema")
+    if evidence_schema in {SCHEMA, "machine-transcription-evidence-v2"}:
         selected_matches_snapshot = False
+        named_primary_hypotheses = 0
+        primary_attempt_ids: list[Any] = []
         for hypothesis in hypotheses:
             if not isinstance(hypothesis, dict):
                 raise MachineSnapshotMissing("machine_hypothesis_invalid")
@@ -321,6 +385,14 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
                 or event_hash != snapshot_hash(events)
             ):
                 raise MachineSnapshotMissing("machine_hypothesis_invalid")
+            if evidence_schema == SCHEMA and family.casefold() in {
+                "unknown", "unknown-primary-asr", "independent-asr",
+            }:
+                raise MachineSnapshotMissing("machine_hypothesis_family_unknown")
+            if evidence_schema == SCHEMA and role in {"primary", "candidate"}:
+                named_primary_hypotheses += 1
+                attempt_id = hypothesis.get("attempt_id")
+                primary_attempt_ids.append(attempt_id)
             if role == "selected":
                 if kind != "segments":
                     raise MachineSnapshotMissing("machine_selected_hypothesis_invalid")
@@ -328,13 +400,32 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
                     selected_matches_snapshot = True
         if not selected_matches_snapshot:
             raise MachineSnapshotMissing("machine_selected_hypothesis_missing")
+        if evidence_schema == SCHEMA:
+            capture = evidence.get("capture")
+            if not isinstance(capture, dict):
+                raise MachineSnapshotMissing("machine_capture_summary_missing")
+            attempt_count = capture.get("recognition_attempt_count")
+            if type(attempt_count) is not int or attempt_count < 0:
+                raise MachineSnapshotMissing("machine_recognition_attempt_count_invalid")
+            if attempt_count != named_primary_hypotheses:
+                raise MachineSnapshotMissing("machine_recognition_hypothesis_missing")
+            if any(
+                type(attempt_id) is not int or attempt_id < 0
+                for attempt_id in primary_attempt_ids
+            ):
+                raise MachineSnapshotMissing("machine_recognition_attempt_id_invalid")
+            if sorted(primary_attempt_ids) != list(range(attempt_count)):
+                raise MachineSnapshotMissing("machine_recognition_attempt_id_invalid")
         signal = (evidence.get("decisions") or {}).get("song_quality_signal")
         validate_quality_training_signal(signal)
-        expected_hash = snapshot_hash({
+        hash_payload = {
             "hypotheses_by_family": evidence["hypotheses_by_family"],
             "pre_human": evidence["pre_human"],
             "decisions": evidence["decisions"],
-        })
+        }
+        if evidence_schema == SCHEMA:
+            hash_payload["capture"] = evidence["capture"]
+        expected_hash = snapshot_hash(hash_payload)
         if evidence.get("evidence_sha256") != expected_hash:
             raise MachineSnapshotMissing("machine_evidence_hash_mismatch")
 

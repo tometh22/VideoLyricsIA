@@ -3173,7 +3173,10 @@ def _compress_for_whisper(input_path: str) -> str:
 def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                                 lyrics_hint: str | None = None,
                                 job_id: str | None = None,
-                                return_words: bool = False) -> list[dict]:
+                                return_words: bool = False,
+                                provenance_view: str = "provider_input",
+                                provenance_transformation: str = "full_file_raw",
+                                ) -> list[dict]:
     """Transcribe by calling OpenAI's Whisper API. Returns the same segments
     structure as the local Whisper path. Used in production where loading
     the local model would consume too much worker RAM (~3 GB) and risks OOM.
@@ -3384,9 +3387,90 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         except Exception:
             pass
 
-    raw_segments = response.segments or []
-    raw_words = (getattr(response, "words", None) or []) if return_words else []
     import re as _re
+    from recognition_provenance import bounded_provider_string
+
+    segment_stream_error: dict | None = None
+    try:
+        raw_segments = list(response.segments or [])
+    except Exception as exc:
+        raw_segments = []
+        segment_stream_error = {
+            "raw": bounded_provider_string(response),
+            "serialization_error": type(exc).__name__,
+            "provider_event_type": "segment_stream",
+        }
+    word_stream_error: dict | None = None
+    if return_words:
+        try:
+            raw_words = list(getattr(response, "words", None) or [])
+        except Exception as exc:
+            raw_words = []
+            word_stream_error = {
+                "raw": bounded_provider_string(response),
+                "serialization_error": type(exc).__name__,
+                "provider_event_type": "top_level_words",
+            }
+    else:
+        raw_words = []
+
+    def _raw_word_events(words: list[object]) -> list[dict]:
+        durable: list[dict] = []
+        for word in words:
+            if isinstance(word, dict):
+                try:
+                    durable.append(dict(word))
+                except Exception:
+                    durable.append({"raw": bounded_provider_string(word)})
+                continue
+            try:
+                dumped = word.model_dump()
+            except Exception:
+                dumped = None
+            if isinstance(dumped, dict):
+                durable.append(dumped)
+                continue
+            values = {}
+            for key in ("word", "start", "end"):
+                try:
+                    values[key] = getattr(word, key)
+                except Exception:
+                    pass
+            durable.append(values or {"raw": bounded_provider_string(word)})
+        return durable
+
+    # Freeze both provider streams before assigning words to segments. The
+    # top-level word stream may contain pre-segment or opaque rows that the
+    # display mapper legitimately rejects but the training corpus must retain.
+    raw_provider_events: list[dict] = []
+    if segment_stream_error is not None:
+        raw_provider_events.append(segment_stream_error)
+    for seg in raw_segments:
+        try:
+            raw_provider_events.append({
+                "start": getattr(seg, "start"),
+                "end": getattr(seg, "end"),
+                "text": getattr(seg, "text"),
+                "no_speech_prob": getattr(seg, "no_speech_prob", None),
+                "provider_event_type": "segment",
+            })
+        except Exception:
+            raw_provider_events.append({
+                "raw": bounded_provider_string(seg),
+                "provider_event_type": "segment",
+            })
+    if return_words:
+        raw_provider_events.append(word_stream_error or {
+            "provider_event_type": "top_level_words",
+            "words": _raw_word_events(raw_words),
+        })
+    from recognition_provenance import record_completed
+    record_completed(
+        family="openai/whisper-1",
+        events=raw_provider_events,
+        view=provenance_view,
+        transformation=provenance_transformation,
+    )
 
     # Word granularity returns a flat top-level word list, not per-segment.
     # Walk both lists in parallel to bucket each word into the segment
@@ -3416,10 +3500,27 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
             })
         return bucket
 
-    segments: list[dict] = []
+    provider_segments: list[dict] = []
     for seg in raw_segments:
-        text = (seg.text or "").strip()
-        seg_words = _words_for_segment(seg) if return_words else []
+        try:
+            text = (seg.text or "").strip()
+            seg_words = _words_for_segment(seg) if return_words else []
+            provider_segment = {
+                "start": float(seg.start),
+                "end": float(seg.end),
+                "text": text,
+                "no_speech_prob": float(seg.no_speech_prob or 0.0),
+            }
+            if return_words:
+                provider_segment["words"] = seg_words
+            provider_segments.append(provider_segment)
+        except Exception:
+            provider_segments.append({"raw": bounded_provider_string(seg)})
+
+    segments: list[dict] = []
+    for provider_segment in provider_segments:
+        text = str(provider_segment.get("text") or "").strip()
+        seg_words = provider_segment.get("words") or []
         if not text or len(text) < 3:
             continue
         # Same filters as local path so behavior matches.
@@ -3435,7 +3536,7 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         # Caso Contigo" interlude, audience cheering on live cuts). The
         # operator can prune obvious non-lyrics in the editor; better to
         # surface borderline content than to silently drop it.
-        if (seg.no_speech_prob or 0) > 0.92:
+        if float(provider_segment.get("no_speech_prob") or 0.0) > 0.92:
             logger.info(
                 "[WHISPER-API] Filtered very-low-confidence (chars=%d)",
                 len(text),
@@ -3449,10 +3550,12 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         # them into human line structure before `_emit_segments` strips the
         # raw Whisper payload.
         word_start = (
-            float(seg_words[0]["start"]) if seg_words else float(seg.start)
+            float(seg_words[0]["start"])
+            if seg_words else float(provider_segment["start"])
         )
         word_end = (
-            float(seg_words[-1]["end"]) if seg_words else float(seg.end)
+            float(seg_words[-1]["end"])
+            if seg_words else float(provider_segment["end"])
         )
         out_seg = {
             "start": word_start,
@@ -3665,7 +3768,8 @@ def _build_chunks_from_audio(mp3_path: str) -> list[tuple[float, float]]:
 def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
                            lyrics_hint: str | None = None,
                            job_id: str | None = None,
-                           return_words: bool = False) -> list[dict]:
+                           return_words: bool = False,
+                           provenance_view: str = "provider_input") -> list[dict]:
     """Chunked Whisper API transcription (VAD-split or time-split).
 
     1. Build transcription chunks via _build_chunks_from_audio():
@@ -3687,6 +3791,8 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
         return _transcribe_via_openai_api(
             mp3_path, language=language, lyrics_hint=lyrics_hint,
             job_id=job_id, return_words=return_words,
+            provenance_view=provenance_view,
+            provenance_transformation="vad_single_file_fallback_raw",
         )
 
     logger.info("[VAD-CHUNK] %d chunks to transcribe", len(chunks))
@@ -3746,6 +3852,10 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
                 lyrics_hint=chunk_prompt,
                 job_id=job_id,   # record every chunk for accurate cost tracking
                 return_words=return_words,
+                provenance_view=provenance_view,
+                provenance_transformation=(
+                    f"vad_chunk_raw:index={i};start={c_start:.3f};end={c_end:.3f}"
+                ),
             )
 
             # Offset timestamps by chunk's absolute start time.
@@ -3783,6 +3893,8 @@ def _vad_chunk_transcribe(mp3_path: str, language: str | None = None,
         return _transcribe_via_openai_api(
             mp3_path, language=language, lyrics_hint=lyrics_hint,
             job_id=job_id, return_words=return_words,
+            provenance_view=provenance_view,
+            provenance_transformation="vad_all_chunks_failed_fallback_raw",
         )
 
     logger.info("[VAD-CHUNK] %d total segments from %d chunks", len(all_segments), len(chunks))
@@ -3964,10 +4076,51 @@ def _anchored_recovery_is_safe(
     return True, "ok"
 
 
+def _tag_recognition_family(
+    segments: list[dict], family: str,
+) -> list[dict]:
+    """Attach a transport-only exact model identity to provider rows."""
+    for segment in segments or []:
+        if isinstance(segment, dict):
+            segment["_recognition_family"] = family
+    return segments
+
+
+def _raw_local_whisper_events(result: object) -> list[dict]:
+    """Serialize every local Whisper row before candidate filtering.
+
+    Local Whisper normally returns dictionaries, but malformed rows must not
+    vanish merely because the downstream mapper cannot consume them.  Keep a
+    bounded textual representation for those rows so a completed invocation
+    remains recoverable and auditable.
+    """
+    from recognition_provenance import bounded_provider_string
+    source = result.get("segments") if isinstance(result, dict) else None
+    if not isinstance(source, list):
+        return [] if source is None else [{
+            "raw": bounded_provider_string(source),
+        }]
+    try:
+        source_rows = list(source)
+    except Exception as exc:
+        return [{
+            "raw": bounded_provider_string(source),
+            "serialization_error": type(exc).__name__,
+        }]
+    rows: list[dict] = []
+    for row in source_rows:
+        if isinstance(row, dict):
+            rows.append(row)
+        else:
+            rows.append({"raw": bounded_provider_string(row)})
+    return rows
+
+
 def transcribe(mp3_path: str, language: str = None,
                lyrics_hint: str | None = None,
                job_id: str | None = None,
-               return_words: bool = False) -> list[dict]:
+               return_words: bool = False,
+               provenance_view: str = "provider_input") -> list[dict]:
     """Transcribe an audio file to lyric segments.
 
     Backend selection:
@@ -3985,6 +4138,16 @@ def transcribe(mp3_path: str, language: str = None,
     """
     has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
     logger.info("[transcribe] OPENAI_API_KEY=%s", 'set' if has_key else 'EMPTY')
+
+    def _record(rows: list[dict], family: str, transformation: str) -> None:
+        from recognition_provenance import record_completed
+        record_completed(
+            family=family,
+            events=rows,
+            view=provenance_view,
+            transformation=transformation,
+        )
+
     if has_key:
         vad_disabled = os.environ.get("VAD_CHUNK_ENABLED", "1") == "0"
         vad_first = os.environ.get("TRANSCRIBE_VAD_FIRST", "0") == "1"
@@ -3993,6 +4156,8 @@ def transcribe(mp3_path: str, language: str = None,
             segs = _transcribe_via_openai_api(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
+                provenance_view=provenance_view,
+                provenance_transformation="full_file_raw",
             )
         elif vad_first:
             # Legacy path (pre-2026-06): VAD chunking up front. Kept behind a
@@ -4000,6 +4165,7 @@ def transcribe(mp3_path: str, language: str = None,
             segs = _vad_chunk_transcribe(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
+                provenance_view=provenance_view,
             )
         else:
             # Default: single full-file pass first (best TEXT — avoids the
@@ -4012,6 +4178,8 @@ def transcribe(mp3_path: str, language: str = None,
             segs = _transcribe_via_openai_api(
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
+                provenance_view=provenance_view,
+                provenance_transformation="full_file_raw",
             )
             audio_dur = None
             duration_bad = False
@@ -4039,6 +4207,7 @@ def transcribe(mp3_path: str, language: str = None,
                 vad_segs = _vad_chunk_transcribe(
                     mp3_path, language=language, lyrics_hint=None,
                     job_id=job_id, return_words=return_words,
+                    provenance_view=provenance_view,
                 )
                 vad_duration_bad = False
                 try:
@@ -4066,12 +4235,13 @@ def transcribe(mp3_path: str, language: str = None,
             segs = post_reconcile_cleanup(segs)
         except Exception:
             pass
-        return segs
+        return _tag_recognition_family(segs, "openai/whisper-1")
 
     # --- local Whisper path ---
     audio_path = mp3_path
 
     model = _get_whisper_model("turbo")
+    recognition_family = "openai-whisper/turbo-local"
 
     kwargs = dict(
         word_timestamps=True,
@@ -4083,6 +4253,10 @@ def transcribe(mp3_path: str, language: str = None,
         logger.info("[WHISPER] Forced language: %s", language)
 
     result = model.transcribe(audio_path, **kwargs)
+    _record(
+        _raw_local_whisper_events(result),
+        "openai-whisper/turbo-local", "full_file_raw",
+    )
 
     import re as _re
 
@@ -4129,6 +4303,10 @@ def transcribe(mp3_path: str, language: str = None,
         logger.warning("[WHISPER] WARNING: first seg at %.1fs, retrying", segments[0]['start'])
         kwargs2 = dict(kwargs, initial_prompt="Song lyrics transcription:", no_speech_threshold=0.4)
         result2 = model.transcribe(mp3_path, **kwargs2)
+        _record(
+            _raw_local_whisper_events(result2),
+            "openai-whisper/turbo-local", "late_onset_retry_raw",
+        )
         segments2 = []
         for seg in result2["segments"]:
             text = seg["text"].strip()
@@ -4161,6 +4339,11 @@ def transcribe(mp3_path: str, language: str = None,
             try:
                 large = _get_whisper_model("large-v3")
                 result3 = large.transcribe(audio_path, **kwargs)
+                _record(
+                    _raw_local_whisper_events(result3),
+                    "openai-whisper/large-v3-local",
+                    "sparse_result_retry_raw",
+                )
                 segments3 = []
                 for seg in result3["segments"]:
                     text = seg["text"].strip()
@@ -4187,6 +4370,7 @@ def transcribe(mp3_path: str, language: str = None,
                     logger.info("[WHISPER] large-v3 produced %s segments (turbo: %s); using large-v3",
                                 len(segments3), len(segments))
                     segments = segments3
+                    recognition_family = "openai-whisper/large-v3-local"
             except Exception as e:
                 logger.warning("[WHISPER] large-v3 fallback failed: %s; keeping turbo", e)
 
@@ -4207,7 +4391,25 @@ def transcribe(mp3_path: str, language: str = None,
         logger.info("[WHISPER] filtered %s hallucination/loop segment(s)", _dropped_loops)
 
 
-    return segments
+    return _tag_recognition_family(segments, recognition_family)
+
+
+def transcription_family(segments: list[dict] | None = None) -> str:
+    """Return the exact recognition family selected by ``transcribe``.
+
+    This is training provenance, not a routing hint.  Keep it beside the
+    backend selection above so a future model migration cannot leave durable
+    hypotheses labelled with a stale or guessed family.
+    """
+    for segment in segments or []:
+        if not isinstance(segment, dict):
+            continue
+        family = str(segment.get("_recognition_family") or "").strip()
+        if family:
+            return family
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        return "openai/whisper-1"
+    return "openai-whisper/turbo-local"
 
 
 # ---------------------------------------------------------------------------
@@ -5792,12 +5994,27 @@ def _whisper_quick_text(mp3_path: str, job_id: str | None = None) -> str:
             r = OpenAI().audio.transcriptions.create(
                 model="whisper-1", file=f, response_format="text",
             )
+        from recognition_provenance import (
+            provider_text_completion,
+            record_completed,
+        )
+        text, raw_events = provider_text_completion(
+            r, label="opaque-whisper-quick-text",
+        )
+        text = text.strip()
+        record_completed(
+            family="openai/whisper-1",
+            events=raw_events,
+            kind="text",
+            view="bounded_alignment_window",
+            transformation="reference_alignment_verify",
+        )
         if recorder is not None:
             try:
                 recorder.finish(response_summary="whisper_quick_ok")
             except Exception:
                 pass
-        return (r or "").strip()
+        return text
     except Exception as e:
         logger.warning("[LYRICS] _whisper_quick_text failed: %s", e)
         return ""
@@ -7267,8 +7484,8 @@ def _gemini_cleanup_cache_key(audio_path: str, lrclib_plain: str):
     return (key, audio_hash, hint_hash)
 
 
-def _gemini_cleanup_cache_lookup(cache_key: str) -> str | None:
-    """Return cached cleaned text for `cache_key`, or None on miss."""
+def _gemini_cleanup_cache_lookup(cache_key: str) -> dict | None:
+    """Return a v2 cache payload with raw evidence, or None on miss."""
     try:
         from database import TranscriptionCache, SessionLocal
         import json as _json
@@ -7280,7 +7497,7 @@ def _gemini_cleanup_cache_lookup(cache_key: str) -> str | None:
             if not row:
                 return None
             payload = _json.loads(row.segments)
-            return payload.get("cleaned") if isinstance(payload, dict) else None
+            return payload if isinstance(payload, dict) else None
         finally:
             db.close()
     except Exception as e:
@@ -7289,8 +7506,9 @@ def _gemini_cleanup_cache_lookup(cache_key: str) -> str | None:
 
 
 def _gemini_cleanup_cache_write(cache_key: str, audio_hash: str,
-                                 hint_hash: str, cleaned: str) -> None:
-    """Persist `cleaned` text under `cache_key`. Best-effort."""
+                                 hint_hash: str, cleaned: str,
+                                 *, raw_text: str) -> None:
+    """Persist accepted output and its pre-filter provider response."""
     try:
         from database import TranscriptionCache, SessionLocal
         import json as _json
@@ -7302,7 +7520,11 @@ def _gemini_cleanup_cache_write(cache_key: str, audio_hash: str,
                 engine="gemini_cleanup",
                 language=None,
                 lyrics_hint_hash=hint_hash or None,
-                segments=_json.dumps({"cleaned": cleaned}),
+                segments=_json.dumps({
+                    "schema": "gemini-cleanup-cache-v2",
+                    "raw_text": raw_text,
+                    "cleaned": cleaned,
+                }),
             )
             db.merge(row)
             db.commit()
@@ -7310,6 +7532,36 @@ def _gemini_cleanup_cache_write(cache_key: str, audio_hash: str,
             db.close()
     except Exception as e:
         logger.warning("[GEMINI-CLEAN] cache write failed (%s); ignoring", e)
+
+
+def _record_gemini_audio_completion(
+    response: object,
+    *,
+    view: str,
+    transformation: str,
+) -> str:
+    """Freeze a completed Gemini audio response before any local gate.
+
+    Reading ``response.text`` can itself fail for blocked/malformed provider
+    responses.  Such a call still completed and must increment the independent
+    attempt counter, so record a durable marker and let the caller abstain.
+    """
+    from recognition_provenance import record_completed, response_text_completion
+
+    raw_text, raw_events = response_text_completion(
+        response, label="opaque-gemini-audio-response",
+    )
+    record_completed(
+        family="google/gemini-2.5-flash-audio",
+        events=raw_events,
+        kind="text",
+        view=view,
+        transformation=(
+            transformation if raw_text
+            else f"{transformation}_empty_or_unreadable"
+        ),
+    )
+    return raw_text
 
 
 def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
@@ -7354,9 +7606,30 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     cache_key, audio_hash, hint_hash = _gemini_cleanup_cache_key(audio_path, plain)
     if cache_key:
         cached = _gemini_cleanup_cache_lookup(cache_key)
-        if cached:
+        if (
+            isinstance(cached, dict)
+            and cached.get("schema") == "gemini-cleanup-cache-v2"
+            and isinstance(cached.get("raw_text"), str)
+            and isinstance(cached.get("cleaned"), str)
+            and cached.get("cleaned")
+        ):
+            from recognition_provenance import record_completed
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=(
+                    [{"text": cached["raw_text"]}]
+                    if cached["raw_text"] else []
+                ),
+                kind="text", view="full_audio_with_reference",
+                transformation="gemini_cleanup_cache_hit_raw",
+            )
             logger.info("[GEMINI-CLEAN] cache hit audio_hash=%s (skipped live call)", audio_hash)
-            return cached
+            return cached["cleaned"]
+        if cached is not None:
+            logger.warning(
+                "[GEMINI-CLEAN] legacy/malformed cache lacks raw evidence; "
+                "forcing live recompute"
+            )
 
     try:
         from google import genai
@@ -7437,12 +7710,17 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
             timeout_s=float(timeout_s),
             label="GEMINI-CLEAN",
         )
+        cleaned_raw = _record_gemini_audio_completion(
+            response,
+            view="full_audio_with_reference",
+            transformation="gemini_cleanup_raw",
+        )
+        cleaned = cleaned_raw.strip()
     except Exception as e:
         logger.warning("[GEMINI-CLEAN] Gemini call failed: %s — using lrclib raw", e)
         return None
 
     elapsed = _time.time() - t0
-    cleaned = (response.text or "").strip()
     if not cleaned:
         # Could be safety filter rejection (explicit content) or empty
         # response. Fall back to raw text. Try to surface the reason.
@@ -7522,7 +7800,9 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     )
 
     if cache_key:
-        _gemini_cleanup_cache_write(cache_key, audio_hash, hint_hash, cleaned)
+        _gemini_cleanup_cache_write(
+            cache_key, audio_hash, hint_hash, cleaned, raw_text=cleaned_raw,
+        )
 
     return cleaned
 
@@ -7636,7 +7916,11 @@ def _llm_segment_words(segs: list[dict], *, audio_path: str, artist: str = "",
             ),
             timeout_s=float(timeout_s), label="LLM-SEGMENT",
         )
-        out = (resp.text or "").strip()
+        out = _record_gemini_audio_completion(
+            resp,
+            view="full_audio_word_segmentation",
+            transformation="llm_segment_raw",
+        ).strip()
     except Exception as e:
         logger.warning("[LLM-SEGMENT] failed (%s); keeping whisperX segments", e)
         return segs
@@ -8302,7 +8586,13 @@ def _recover_gap_lyrics(segs: list[dict], *, audio_path: str, artist: str = "",
                     ),
                     timeout_s=float(timeout_s), label="GAP-RECOVER",
                 )
-                out = (resp.text or "").strip()
+                out = _record_gemini_audio_completion(
+                    resp,
+                    view="bounded_vocal_window",
+                    transformation=(
+                        f"gap_recovery_raw:start={c0:.3f};end={c1:.3f}"
+                    ),
+                ).strip()
             except Exception as e:
                 logger.warning("[GAP-RECOVER] Gemini failed on gap %.0f–%.0f: %s",
                                gs, ge, e)

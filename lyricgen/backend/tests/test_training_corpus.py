@@ -379,6 +379,7 @@ def test_training_pair_materializes_machine_gold_families_and_edits(monkeypatch)
     assert pair["pre_human"]["segments"] == original
     assert pair["approved"]["segments"] == approved_segments
     assert pair["hypotheses_by_family"][0]["family"] == "whisper-large-v3"
+    assert pair["machine_capture"]["recognition_attempt_count"] == 1
     assert len(pair["intermediate_line_deltas"]) == 1
 
     # Rotation must not invalidate already captured corrections when the old
@@ -706,7 +707,12 @@ def test_five_new_jobs_are_exportable_end_to_end(db):
 
     assert len(exported) == 5
     assert all(row["complete"] is True for row in exported)
+    assert all(row["schema"] == "transcription-training-pair-v2" for row in exported)
     assert all(len(row["hypotheses_by_family"]) == 3 for row in exported)
+    assert all(
+        row["machine_capture"]["recognition_attempt_count"] == 1
+        for row in exported
+    )
     assert all(len(row["intermediate_line_deltas"]) == 1 for row in exported)
     assert all(row["approved"]["training_approval"] for row in exported)
 

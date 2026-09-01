@@ -1,12 +1,14 @@
 """Tests for pipeline._llm_segment_words (LLM line-segmentation grounded in
 whisperX timing). The Gemini call is mocked — we exercise the parse, the gates,
 the timing mapping and the self-declining behaviour without hitting Vertex."""
+import inspect
 from unittest.mock import MagicMock
 
 import pytest
 
 import pipeline
 import transcription_quality
+from recognition_provenance import begin_collection, end_collection
 
 
 WORDS = [
@@ -102,6 +104,27 @@ def test_self_declines_on_unparseable_output(tiny_audio, monkeypatch):
     _mock_gemini(monkeypatch, "Lo siento, no puedo hacer eso.")  # no [i-j] lines
     out = pipeline._llm_segment_words(SEGS, audio_path=tiny_audio)
     assert out is SEGS
+
+
+def test_unparseable_output_is_frozen_before_llm_segment_filters(
+        tiny_audio, monkeypatch):
+    monkeypatch.setenv("LLM_SEGMENT_ENABLED", "1")
+    raw = "Lo siento, no puedo hacer eso."
+    _mock_gemini(monkeypatch, raw)
+    collector, token = begin_collection()
+    try:
+        out = pipeline._llm_segment_words(SEGS, audio_path=tiny_audio)
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
+
+    assert out is SEGS
+    assert snapshot["completed_attempt_count"] == 1
+    assert snapshot["hypotheses"][0]["events"] == [{"text": raw}]
+    source = inspect.getsource(pipeline._llm_segment_words)
+    assert source.index("_record_gemini_audio_completion(") < source.index(
+        "for ln in out.splitlines()"
+    )
 
 
 def test_self_declines_on_hallucination(tiny_audio, monkeypatch):
