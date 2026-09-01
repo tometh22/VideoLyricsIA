@@ -23,12 +23,16 @@
         "Content-Type",
         "Content-Length",
         "Content-MD5",
+        "Range",
         "x-amz-content-sha256",
         "x-amz-date",
         "x-amz-security-token"
       ],
       "ExposeHeaders": [
-        "ETag"
+        "ETag",
+        "Accept-Ranges",
+        "Content-Length",
+        "Content-Range"
       ],
       "MaxAgeSeconds": 3000
     }

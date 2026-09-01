@@ -1,10 +1,12 @@
 """Redis-backed job queue.
 
-Replaces the fire-and-forget threading.Thread model with a durable queue that
-survives API restarts and bounds concurrency. Two queues by priority:
+Replaces the fire-and-forget threading.Thread model with durable queues that
+survive API restarts and bound concurrency. Render jobs use two queues by
+priority; editor audio previews use their own derivative-only queue:
 
     enterprise  -> UMG and any tenant with plan == "unlimited"
     default     -> everyone else
+    audio_preview -> bounded AAC derivatives for the editor
 
 Workers pick enterprise first. If Redis is unavailable AND we're not in
 production, the helpers fall back to threading.Thread so the dev loop still
@@ -17,7 +19,10 @@ import logging
 import os
 import hashlib
 import re
+import secrets
 import threading
+
+import storage
 
 logger = logging.getLogger("genly.queue")
 
@@ -194,6 +199,13 @@ prewarm_enqueued_total = 0
 _redis = None
 _queue_default = None
 _queue_enterprise = None
+
+EDITOR_AUDIO_PREVIEW_JOB_TIMEOUT = int(
+    os.environ.get("EDITOR_AUDIO_PREVIEW_JOB_TIMEOUT_SECONDS", "900")
+)
+EDITOR_AUDIO_PREVIEW_LOCK_TTL = max(EDITOR_AUDIO_PREVIEW_JOB_TIMEOUT + 300, 600)
+_editor_audio_preview_local_locks: dict[str, threading.Lock] = {}
+_editor_audio_preview_local_locks_guard = threading.Lock()
 
 
 def _init_redis():
@@ -711,6 +723,52 @@ def _active_rq_job(connection, rq_job_id: str):
     return None
 
 
+def _editor_audio_preview_lock_key(audio_sha256: str) -> str:
+    return (
+        "genly:lock:editor-audio-preview:"
+        f"{str(audio_sha256 or '').strip().lower()}:"
+        f"{storage.EDITOR_AUDIO_PREVIEW_FORMAT_VERSION}"
+    )
+
+
+def _acquire_editor_audio_preview_lock(
+    redis_connection, audio_sha256: str,
+) -> str | None:
+    """Acquire one cross-request lock for a digest/version pair."""
+    token = secrets.token_urlsafe(24)
+    if redis_connection is not None:
+        acquired = redis_connection.set(
+            _editor_audio_preview_lock_key(audio_sha256),
+            token,
+            nx=True,
+            ex=EDITOR_AUDIO_PREVIEW_LOCK_TTL,
+        )
+        return token if acquired else None
+    lock_id = _editor_audio_preview_lock_key(audio_sha256)
+    with _editor_audio_preview_local_locks_guard:
+        lock = _editor_audio_preview_local_locks.setdefault(lock_id, threading.Lock())
+    return token if lock.acquire(blocking=False) else None
+
+
+def release_editor_audio_preview_lock(audio_sha256: str, token: str) -> None:
+    """Release only the lock owned by this worker attempt."""
+    redis_connection, _, _ = _init_redis()
+    lock_key = _editor_audio_preview_lock_key(audio_sha256)
+    if redis_connection is not None:
+        # Compare-and-delete prevents a slow/expired worker from deleting a
+        # newer request's lock.
+        redis_connection.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('del', KEYS[1]) else return 0 end",
+            1, lock_key, token,
+        )
+        return
+    with _editor_audio_preview_local_locks_guard:
+        lock = _editor_audio_preview_local_locks.get(lock_key)
+    if lock and lock.locked():
+        lock.release()
+
+
 def _existing_rq_job(connection, rq_job_id: str):
     """Return an RQ record in any state, for outbox event idempotency."""
     try:
@@ -1065,6 +1123,96 @@ def enqueue_bg_preview(
     )
     t.start()
     return f"thread:bgpreview:{job_id}"
+
+
+def enqueue_editor_audio_preview(
+    input_r2_key: str,
+    audio_sha256: str,
+    preview_r2_key: str,
+) -> dict:
+    """Queue one shared editor-audio preview, with concurrency dedupe.
+
+    The endpoint calls this only after authenticating the owning job and
+    probing the original object. No request thread runs ffmpeg. A Redis
+    SETNX lock closes the check-then-enqueue race; the deterministic RQ id
+    also protects against a duplicate enqueue if a request retries.
+    """
+    digest = str(audio_sha256 or "").strip().lower()
+    expected_key = storage.editor_audio_preview_key(digest)
+    if preview_r2_key != expected_key:
+        raise ValueError("preview_r2_key does not match audio_sha256")
+    redis_connection, q_default, _ = _init_redis()
+    if redis_connection is None:
+        # Unlike legacy development paths, this derivative never falls back
+        # to a thread in the API process: ffmpeg belongs exclusively to RQ
+        # workers. The caller will serve the original audio instead.
+        if _ENVIRONMENT in {"production", "prod", "staging"}:
+            raise RuntimeError("editor audio preview queue unavailable")
+        return {"status": "unavailable", "deduplicated": False}
+
+    lock_token = _acquire_editor_audio_preview_lock(redis_connection, digest)
+    rq_job_id = f"editor-audio-preview:{digest}:{storage.EDITOR_AUDIO_PREVIEW_FORMAT_VERSION}"
+    if lock_token is None:
+        return {"status": "pending", "deduplicated": True, "job_id": rq_job_id}
+
+    try:
+        if q_default is not None:
+            from rq import Queue, Retry
+            from audio_preview import run_editor_audio_preview_job
+
+            q = Queue("audio_preview", connection=redis_connection)
+            # An in-flight attempt remains the sole producer. Terminal
+            # records are intentionally retained: if ffmpeg/R2 is broken,
+            # repeated editor polling must not create an unbounded retry loop
+            # (the RQ Retry policy already handles transient worker failures).
+            existing = _existing_rq_job(redis_connection, rq_job_id)
+            if existing is not None:
+                status = existing.get_status(refresh=True)
+                value = str(getattr(status, "value", status) or "").lower()
+                if value in {"queued", "started", "deferred", "scheduled"}:
+                    release_editor_audio_preview_lock(digest, lock_token)
+                    return {
+                        "status": "pending", "deduplicated": True,
+                        "job_id": rq_job_id,
+                    }
+                if value in {
+                    "failed", "finished", "stopped", "canceled", "cancelled",
+                }:
+                    release_editor_audio_preview_lock(digest, lock_token)
+                    return {
+                        "status": "unavailable", "deduplicated": True,
+                        "job_id": rq_job_id,
+                    }
+            # A record with an unknown status is treated as unsafe to replace;
+            # do not risk duplicate work while Redis/RQ is in an ambiguous
+            # state. Missing records are the only enqueue-safe case.
+            if existing is not None:
+                release_editor_audio_preview_lock(digest, lock_token)
+                return {
+                    "status": "pending", "deduplicated": True,
+                    "job_id": rq_job_id,
+                }
+            rq_job = q.enqueue(
+                run_editor_audio_preview_job,
+                args=(input_r2_key, digest, preview_r2_key, lock_token),
+                job_timeout=EDITOR_AUDIO_PREVIEW_JOB_TIMEOUT,
+                result_ttl=RESULT_TTL,
+                failure_ttl=FAILURE_TTL,
+                job_id=rq_job_id,
+                meta=rq_payload_metadata(
+                    "editor_audio_preview", audio_sha256=digest,
+                ),
+                retry=Retry(max=2, interval=30),
+            )
+            return {
+                "status": "queued", "deduplicated": False,
+                "job_id": rq_job.id,
+            }
+
+        raise RuntimeError("editor audio preview queue unavailable")
+    except Exception:
+        release_editor_audio_preview_lock(digest, lock_token)
+        raise
 
 
 _AUDIO_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")

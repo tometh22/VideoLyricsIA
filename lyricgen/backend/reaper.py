@@ -1074,9 +1074,10 @@ _REAPER_ADVISORY_LOCK_KEY = 9118364455199101
 
 # Queues that must ALWAYS have a live RQ consumer. With the Tier-3 segmented
 # fleet, Worker serves enterprise/default and ShortWorker serves
-# transcription/bg_preview — if any pool dies, its queues go unserved.
+# transcription/bg_preview/audio_preview — if any pool dies, its queues go
+# unserved.
 # Env-tunable so a future queue rename/split doesn't need a code change.
-_DEFAULT_EXPECTED_QUEUES = "transcription,bg_preview,enterprise,default"
+_DEFAULT_EXPECTED_QUEUES = "transcription,bg_preview,audio_preview,enterprise,default"
 if os.environ.get("BATCH_CAMPAIGN_ENABLED", "0").strip().lower() in {
     "1", "true", "yes", "on",
 }:

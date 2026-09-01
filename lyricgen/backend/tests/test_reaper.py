@@ -1274,13 +1274,14 @@ def test_find_queues_without_consumer_flags_dead_pool(monkeypatch):
     import rq
 
     monkeypatch.setattr(queue_jobs, "_init_redis", lambda: ("redis", None, None))
-    # Only the render pool alive → transcription + bg_preview have no consumer.
+    # Only the render pool alive → transcription + bg_preview + audio_preview
+    # have no consumer.
     monkeypatch.setattr(rq.Worker, "all",
                         lambda connection=None: [_FakeWorker(["enterprise", "default"])])
     monkeypatch.setattr(_reaper, "_EXPECTED_QUEUES",
-                        ["transcription", "bg_preview", "enterprise", "default"])
+                        ["transcription", "bg_preview", "audio_preview", "enterprise", "default"])
 
-    assert set(find_queues_without_consumer()) == {"transcription", "bg_preview"}
+    assert set(find_queues_without_consumer()) == {"transcription", "bg_preview", "audio_preview"}
 
 
 def test_find_queues_without_consumer_all_served(monkeypatch):
@@ -1290,10 +1291,10 @@ def test_find_queues_without_consumer_all_served(monkeypatch):
     monkeypatch.setattr(queue_jobs, "_init_redis", lambda: ("redis", None, None))
     monkeypatch.setattr(rq.Worker, "all", lambda connection=None: [
         _FakeWorker(["enterprise", "default"]),
-        _FakeWorker(["transcription", "bg_preview"]),
+        _FakeWorker(["transcription", "bg_preview", "audio_preview"]),
     ])
     monkeypatch.setattr(_reaper, "_EXPECTED_QUEUES",
-                        ["transcription", "bg_preview", "enterprise", "default"])
+                        ["transcription", "bg_preview", "audio_preview", "enterprise", "default"])
 
     assert find_queues_without_consumer() == []
 
