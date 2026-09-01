@@ -824,6 +824,12 @@ def _mark_pending(db: Session, day: date, source: str) -> None:
 # Gap-driven backfill
 # ---------------------------------------------------------------------------
 
+# Ventana en la que un $0,00 todavía puede ser "el proveedor no publicó
+# aún" y no "ese día no se gastó". Es la misma que `gcp_month` ya usa como
+# margen de restatement.
+DIAS_RECHECK_CERO = 45
+
+
 def pending_gaps(db: Session, *, today: date | None = None,
                  days: int = BACKFILL_DAYS) -> list[tuple[date, str]]:
     """Every (day, source) in the window without a successful collection.
@@ -847,6 +853,35 @@ def pending_gaps(db: Session, *, today: date | None = None,
                 CostCollectionRun.status.in_(("ok", "not_configured")))
         .all()
     }
+
+    # UN `ok` CON $0,00 NO ES UN DÍA TERMINADO.
+    #
+    # Los proveedores publican tarde y rellenan hacia atrás. Medido el
+    # 1-sep-2026: la corrida de las 01:26 UTC guardó agosto con $0,00 del 2
+    # en adelante porque el export de facturación de GCP todavía no los
+    # tenía; catorce horas después el MISMO colector devolvía $124 para esos
+    # mismos días. Julio, en paralelo, pasó de $74,20 a $138,90 entre dos
+    # corridas.
+    #
+    # Como el backfill es guiado por huecos y esos días quedaron en `ok`,
+    # nunca se volvían a pedir: agosto se congelaba mal para siempre. El
+    # detector `stale_sources` lo hace VISIBLE; esto lo REPARA.
+    #
+    # Sólo dentro de la ventana de reformulación: `gcp_month` ya asume 45
+    # días de margen para restatements tardías. Más allá de eso un cero es
+    # un cero de verdad y volver a pedirlo sería gastar en las APIs para
+    # siempre.
+    limite_recheck = today - timedelta(days=DIAS_RECHECK_CERO)
+    en_cero = {
+        (r.day, r.source)
+        for r in db.query(CostDaily)
+        .filter(CostDaily.day >= max(first, limite_recheck),
+                CostDaily.day <= last,
+                CostDaily.dim_type == "total",
+                CostDaily.amount_usd == 0)
+        .all()
+    }
+    done -= en_cero
     gaps = []
     d = first
     while d <= last:

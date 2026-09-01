@@ -571,3 +571,74 @@ def test_railway_cae_al_uuid_si_no_puede_resolver_nombres(monkeypatch):
     servicios = {r["dim_value"] for r in res.rows if r["dim_type"] == "service"}
     assert servicios == {UUID}
     assert res.status == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Un `ok` con $0,00 no es un día terminado
+# ---------------------------------------------------------------------------
+
+def test_un_dia_ok_pero_en_cero_se_vuelve_a_pedir(db):
+    """Los proveedores publican tarde y rellenan hacia atrás.
+
+    Medido el 1-sep-2026: la corrida de las 01:26 UTC guardó agosto con
+    $0,00 del día 2 en adelante porque el export de facturación de GCP
+    todavía no los tenía; catorce horas después el MISMO colector devolvía
+    $124 para esos mismos días. Julio pasó de $74,20 a $138,90 entre dos
+    corridas.
+
+    Como el backfill es guiado por huecos y esos días quedaron en `ok`,
+    nunca se volvían a pedir. Agosto se congelaba mal para siempre — y el
+    panel lo mostraba como un mes barato.
+    """
+    from database import CostDaily, CostCollectionRun
+
+    hoy = date(2026, 3, 20)
+    ayer = date(2026, 3, 19)
+    for d, monto in ((date(2026, 3, 18), 0.0), (ayer, 7.5)):
+        db.add(CostCollectionRun(day=d, source="gcp", status="ok"))
+        db.add(CostDaily(day=d, source="gcp", grain="day", dim_type="total",
+                         dim_value="total", amount_usd=monto))
+    db.commit()
+    try:
+        huecos = cdc.pending_gaps(db, today=hoy, days=4)
+        assert (date(2026, 3, 18), "gcp") in huecos, "el día en cero no se re-pide"
+        # El día con gasto SÍ está terminado: volver a pedirlo es gastar al pedo.
+        assert (ayer, "gcp") not in huecos
+    finally:
+        for modelo in (CostDaily, CostCollectionRun):
+            db.query(modelo).filter(modelo.source == "gcp",
+                                    modelo.day >= date(2026, 3, 17),
+                                    modelo.day <= hoy).delete(synchronize_session=False)
+        db.commit()
+
+
+def test_un_cero_viejo_ya_no_se_re_pide(db):
+    """Pasada la ventana de reformulación, un cero es un cero de verdad.
+
+    Sin este corte el colector volvería a pedir los mismos días a las APIs
+    para siempre, y varias cobran por consulta.
+    """
+    from database import CostDaily, CostCollectionRun
+
+    # Fechas FIJAS, no derivadas de `DIAS_RECHECK_CERO`: la primera versión
+    # de este test calculaba el día viejo a partir de la constante, así que
+    # al inyectarle un valor absurdo la fecha se movía con él y el test
+    # seguía en verde. Un test que no puede distinguir el bug del arreglo
+    # no es un test.
+    hoy = date(2026, 6, 1)
+    viejo = date(2026, 1, 15)          # 137 días atrás, muy fuera de los 45
+    db.add(CostCollectionRun(day=viejo, source="gcp", status="ok"))
+    db.add(CostDaily(day=viejo, source="gcp", grain="day", dim_type="total",
+                     dim_value="total", amount_usd=0.0))
+    db.commit()
+    try:
+        huecos = cdc.pending_gaps(db, today=hoy, days=150)
+        assert (viejo, "gcp") not in huecos, (
+            "un cero de hace 4 meses no se re-pide: varias APIs cobran por consulta")
+        assert cdc.DIAS_RECHECK_CERO < 137, (
+            "la ventana de re-chequeo tiene que dejar afuera este día")
+    finally:
+        for modelo in (CostDaily, CostCollectionRun):
+            db.query(modelo).filter(modelo.source == "gcp",
+                                    modelo.day == viejo).delete(synchronize_session=False)
+        db.commit()
