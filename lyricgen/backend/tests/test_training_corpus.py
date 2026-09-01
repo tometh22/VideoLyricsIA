@@ -80,6 +80,31 @@ def test_first_id_assignment_aligns_edit_around_new_insertion():
     assert payload["summary"]["reorders"] == 0
 
 
+def test_large_alignment_uses_bounded_fallback_without_corrupting_insert(monkeypatch):
+    import training_corpus
+
+    monkeypatch.setattr(training_corpus, "MAX_ALIGNMENT_CELLS", 1)
+    before = [
+        {"start": 0.0, "end": 1.0, "text": "ola"},
+        {"start": 2.0, "end": 3.0, "text": "world"},
+    ]
+    after = [
+        {"_id": "intro", "start": 0.0, "end": 0.3, "text": "intro"},
+        {"_id": "greeting", "start": 0.3, "end": 1.0, "text": "hola"},
+        {"_id": "world", "start": 2.0, "end": 3.0, "text": "world"},
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert [
+        (row["operation"], row["line_id"])
+        for row in payload["changes"]
+    ] == [("insert", "intro"), ("update", "greeting")]
+
+
 def test_metadata_only_editor_change_is_not_training_noise():
     before = [{"_id": "a", "start": 1, "end": 2, "text": "hola", "pos": {"x": .2}}]
     after = [{"_id": "a", "start": 1.01, "end": 2.01, "text": "hola", "pos": {"x": .9}}]
@@ -217,6 +242,39 @@ def test_training_pair_materializes_machine_gold_families_and_edits():
     )
     assert invalid_hash["complete"] is False
     assert "approval_evidence_hash_mismatch" in invalid_hash["issues"]
+
+    reverted_approval = approval_training_provenance(
+        segments=original, quality=quality, revision=2,
+    )
+    reverted = SimpleNamespace(
+        id="v2-reverted", revision=2, segments=original, reason="approve",
+        is_approved=True, provenance={"training_approval": reverted_approval},
+        created_at=datetime.now(timezone.utc),
+    )
+    intermediate = [{"_id": "a", "start": 0, "end": 1, "text": "temporary"}]
+    outward = SimpleNamespace(
+        id=10,
+        detail=build_line_delta_audit(
+            original, intermediate, job_id=job.job_id,
+            from_revision=0, to_revision=1, checkpoint="draft", text_ref=_ref,
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+    backward = SimpleNamespace(
+        id=11,
+        detail=build_line_delta_audit(
+            intermediate, original, job_id=job.job_id,
+            from_revision=1, to_revision=2, checkpoint="restore", text_ref=_ref,
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+    orphaned = materialize_training_pair(
+        job=job, document=document, versions=[initial, reverted],
+        audits=[outward, backward],
+    )
+    assert orphaned["complete"] is False
+    assert "editor_delta_orphaned:0->1" in orphaned["issues"]
+    assert "editor_delta_orphaned:1->2" in orphaned["issues"]
 
 
 def test_five_new_jobs_are_exportable_end_to_end(db):

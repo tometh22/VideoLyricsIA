@@ -23,6 +23,8 @@ from machine_evidence import (
 LINE_DELTA_SCHEMA = "editor-line-delta-v2"
 TRAINING_PAIR_SCHEMA = "transcription-training-pair-v1"
 TIMING_NOISE_THRESHOLD_S = 0.05
+MAX_ALIGNMENT_CELLS = 250_000
+ALIGNMENT_LOOKAHEAD = 32
 
 
 def _finite_time(value: Any) -> float:
@@ -67,6 +69,10 @@ def _align_unmatched_rows(
 ) -> list[tuple[int, int]]:
     """Needleman-Wunsch alignment for rows that lack a common stable ID."""
     rows, cols = len(before_indices), len(after_indices)
+    if rows * cols > MAX_ALIGNMENT_CELLS:
+        return _align_unmatched_rows_bounded(
+            before, after, before_indices, after_indices,
+        )
     gap_cost = 1.0
     costs = [[math.inf] * (cols + 1) for _ in range(rows + 1)]
     steps: list[list[str | None]] = [[None] * (cols + 1) for _ in range(rows + 1)]
@@ -104,6 +110,54 @@ def _align_unmatched_rows(
         else:  # defensive: only reachable for a malformed DP matrix
             break
     return list(reversed(aligned))
+
+
+def _align_unmatched_rows_bounded(
+    before: list[dict], after: list[dict], before_indices: list[int], after_indices: list[int],
+) -> list[tuple[int, int]]:
+    """Linear-memory, bounded-lookahead fallback for unusually large edits."""
+    aligned: list[tuple[int, int]] = []
+    left = right = 0
+    while left < len(before_indices) and right < len(after_indices):
+        candidates: list[tuple[float, int, str, int]] = []
+        direct = _row_match_cost(
+            before[before_indices[left]], after[after_indices[right]],
+        )
+        # A strong direct match cannot be improved enough by paying a gap.
+        # This keeps the common 5,000-line bulk-ID assignment path linear.
+        if math.isfinite(direct) and direct <= 0.75:
+            aligned.append((before_indices[left], after_indices[right]))
+            left += 1
+            right += 1
+            continue
+        if math.isfinite(direct):
+            candidates.append((direct, 0, "match", 0))
+        for offset in range(1, min(ALIGNMENT_LOOKAHEAD, len(after_indices) - right - 1) + 1):
+            match_cost = _row_match_cost(
+                before[before_indices[left]], after[after_indices[right + offset]],
+            )
+            if math.isfinite(match_cost):
+                candidates.append((offset + match_cost, 1, "insert", offset))
+        for offset in range(1, min(ALIGNMENT_LOOKAHEAD, len(before_indices) - left - 1) + 1):
+            match_cost = _row_match_cost(
+                before[before_indices[left + offset]], after[after_indices[right]],
+            )
+            if math.isfinite(match_cost):
+                candidates.append((offset + match_cost, 2, "delete", offset))
+        if not candidates:
+            # Conflicting stable IDs with no nearby counterpart. Leave the
+            # current before row unmatched and continue in bounded time.
+            left += 1
+            continue
+        _cost, _priority, operation, offset = min(candidates)
+        if operation == "insert":
+            right += offset
+        elif operation == "delete":
+            left += offset
+        aligned.append((before_indices[left], after_indices[right]))
+        left += 1
+        right += 1
+    return aligned
 
 
 def _match_rows(before: list[dict], after: list[dict]) -> tuple[list[tuple], list[int], list[int]]:
@@ -448,6 +502,16 @@ def materialize_training_pair(
             issues.append("editor_delta_revision_invalid")
             continue
         deltas_by_boundary[boundary].append(event)
+    adjacent_boundaries = {
+        (
+            int(getattr(previous, "revision", 0)),
+            int(getattr(current, "revision", 0)),
+        )
+        for previous, current in zip(checkpoint_rows, checkpoint_rows[1:])
+    }
+    for boundary in deltas_by_boundary:
+        if boundary not in adjacent_boundaries:
+            issues.append(f"editor_delta_orphaned:{boundary[0]}->{boundary[1]}")
     for previous, current in zip(checkpoint_rows, checkpoint_rows[1:]):
         previous_segments = list(getattr(previous, "segments", None) or [])
         current_segments = list(getattr(current, "segments", None) or [])
