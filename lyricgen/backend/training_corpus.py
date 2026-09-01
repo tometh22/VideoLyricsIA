@@ -47,6 +47,11 @@ def _signature(row: dict) -> tuple:
     )
 
 
+def _stable_id(row: dict) -> str:
+    value = row.get("_id")
+    return "" if value in (None, "") else str(value)
+
+
 def _text_features(value: Any) -> tuple[str, frozenset[str]]:
     """Return a bounded, reusable representation for legacy-row identity."""
     normalized = _text(value).casefold()
@@ -79,8 +84,8 @@ def _row_match_cost(
     after_text: tuple[str, frozenset[str]] | None = None,
 ) -> float:
     """Cost for monotonic legacy-row alignment; two gaps cost exactly 2."""
-    before_id = str(before.get("_id") or "")
-    after_id = str(after.get("_id") or "")
+    before_id = _stable_id(before)
+    after_id = _stable_id(after)
     if before_id and after_id and before_id != after_id:
         return math.inf
     left = before_text or _text_features(before.get("text"))
@@ -189,11 +194,11 @@ def _match_rows(
     used_before: set[int] = set()
     used_after: set[int] = set()
     before_ids = {
-        str(row.get("_id")): index for index, row in enumerate(before)
-        if row.get("_id") not in (None, "")
+        _stable_id(row): index for index, row in enumerate(before)
+        if _stable_id(row)
     }
     for after_index, row in enumerate(after):
-        row_id = str(row.get("_id") or "")
+        row_id = _stable_id(row)
         before_index = before_ids.get(row_id) if row_id else None
         if before_index is None or before_index in used_before:
             continue
@@ -209,20 +214,20 @@ def _match_rows(
         if after_index in used_after:
             continue
         candidates = by_signature.get(_signature(row)) or []
-        after_id = str(row.get("_id") or "")
+        after_id = _stable_id(row)
         before_index = next((
             index for index in candidates
             if index not in used_before
             and not (
-                str(before[index].get("_id") or "")
+                _stable_id(before[index])
                 and after_id
-                and str(before[index].get("_id")) != after_id
+                and _stable_id(before[index]) != after_id
             )
         ), None)
         if before_index is None:
             continue
         candidates.remove(before_index)
-        before_id = str(before[before_index].get("_id") or "")
+        before_id = _stable_id(before[before_index])
         matched.append((
             before_index, after_index,
             after_id or before_id or f"idx_{before_index}",
@@ -239,8 +244,8 @@ def _match_rows(
         before, after, before_remaining, after_remaining,
     )
     for before_index, after_index in aligned_rows:
-        before_id = str(before[before_index].get("_id") or "")
-        after_id = str(after[after_index].get("_id") or "")
+        before_id = _stable_id(before[before_index])
+        after_id = _stable_id(after[after_index])
         if before_id and after_id and before_id != after_id:
             continue
         row_id = after_id or before_id or f"idx_{before_index}"
@@ -333,7 +338,7 @@ def build_line_delta_audit(
         row = before[before_index]
         changes.append({
             "operation": "delete",
-            "line_id": str(row.get("_id") or f"idx_{before_index}"),
+            "line_id": _stable_id(row) or f"idx_{before_index}",
             "from_index": before_index,
             "to_index": None,
             "before": _line_view(row, text_ref),
@@ -346,7 +351,7 @@ def build_line_delta_audit(
         row = after[after_index]
         changes.append({
             "operation": "insert",
-            "line_id": str(row.get("_id") or f"idx_{after_index}"),
+            "line_id": _stable_id(row) or f"idx_{after_index}",
             "from_index": None,
             "to_index": after_index,
             "before": None,

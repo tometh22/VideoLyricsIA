@@ -80,6 +80,32 @@ def test_first_id_assignment_aligns_edit_around_new_insertion():
     assert payload["summary"]["reorders"] == 0
 
 
+def test_zero_stable_id_survives_duplicate_and_edit_in_same_save():
+    before = [
+        {"_id": 0, "start": 0.0, "end": 1.0, "text": "first line"},
+        {"_id": 1, "start": 2.0, "end": 3.0, "text": "second line"},
+    ]
+    after = [
+        {"_id": 0, "start": 0.0, "end": 1.2, "text": "first edited"},
+        {"_id": "duplicate", "start": 1.1, "end": 2.0, "text": "first line"},
+        {"_id": 1, "start": 2.0, "end": 3.0, "text": "second line"},
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert [
+        (row["operation"], row["line_id"], row["from_index"], row["to_index"])
+        for row in payload["changes"]
+    ] == [
+        ("update", "0", 0, 0),
+        ("insert", "duplicate", None, 1),
+    ]
+    assert payload["alignment_complete"] is True
+
+
 def test_large_alignment_uses_bounded_fallback_without_corrupting_insert(monkeypatch):
     import training_corpus
 
