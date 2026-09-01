@@ -26,9 +26,10 @@ REQUIRED = {
 
 
 def validate_manifest(path: Path) -> list[dict[str, Any]]:
+    """Validate the prepared 498-row sample manifest."""
     rows = read_jsonl(path)
     if not rows:
-        raise ValueError("LoRA manifest is empty")
+        raise ValueError(f"LoRA manifest is empty: {path}")
     for index, row in enumerate(rows):
         missing = REQUIRED - set(row)
         if missing:
@@ -43,6 +44,81 @@ def validate_manifest(path: Path) -> list[dict[str, Any]]:
         if end <= start or end - start > 30.0:
             raise ValueError(f"sample {index} has invalid interval")
     return rows
+
+
+def _historical_rows(
+    paths: list[Path], *, audio_map: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Convert complete exported pairs into trainable rows.
+
+    Historical exports intentionally do not contain audio bytes or paths.  A
+    caller must provide an explicit job_id -> local audio map.  Rows without
+    complete evidence or a verified local mapping are rejected and reported;
+    they are never silently treated as training labels.
+    """
+    accepted: list[dict[str, Any]] = []
+    stats = {"files": 0, "rows": 0, "accepted": 0, "rejected_incomplete": 0,
+             "rejected_missing_audio": 0, "rejected_invalid": 0}
+    mapping = {str(key): str(value) for key, value in (audio_map or {}).items()}
+    for path in paths:
+        stats["files"] += 1
+        for pair in read_jsonl(path):
+            stats["rows"] += 1
+            if pair.get("complete") is not True:
+                stats["rejected_incomplete"] += 1
+                continue
+            job_id = str(pair.get("job_id") or "")
+            audio_value = pair.get("audio_path") or mapping.get(job_id)
+            if not audio_value or not Path(str(audio_value)).is_file():
+                stats["rejected_missing_audio"] += 1
+                continue
+            approved = pair.get("approved") if isinstance(pair.get("approved"), dict) else {}
+            segments = approved.get("segments")
+            if not job_id or not isinstance(segments, list):
+                stats["rejected_invalid"] += 1
+                continue
+            metadata = pair.get("metadata") if isinstance(pair.get("metadata"), dict) else {}
+            artist = str(metadata.get("artist") or "unknown")
+            language = str(metadata.get("language") or "unknown")
+            for index, segment in enumerate(segments):
+                if not isinstance(segment, dict):
+                    stats["rejected_invalid"] += 1
+                    continue
+                text = str(segment.get("text") or "").strip()
+                try:
+                    start, end = float(segment["start"]), float(segment["end"])
+                except (KeyError, TypeError, ValueError):
+                    stats["rejected_invalid"] += 1
+                    continue
+                if not text or end <= start or end - start > 30.0:
+                    stats["rejected_invalid"] += 1
+                    continue
+                accepted.append({
+                    "sample_id": f"historical-{job_id}-{index:04d}",
+                    "song_id": f"historical-{job_id}", "artist": artist,
+                    "audio_path": str(Path(str(audio_value)).resolve()),
+                    "language": language, "difficulty": "unknown", "eval_only": False,
+                    "start_s": start, "end_s": end, "text": text,
+                    "song_split": "train", "artist_split": "train",
+                    "source": "historical_pair",
+                })
+                stats["accepted"] += 1
+    return accepted, stats
+
+
+def load_training_rows(
+    manifest: Path, *, historical_paths: list[Path] | None = None,
+    historical_audio_map: Path | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    rows = validate_manifest(manifest)
+    audio_map: dict[str, str] = {}
+    if historical_audio_map is not None:
+        payload = json.loads(historical_audio_map.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("historical audio map must be a JSON object")
+        audio_map = {str(key): str(value) for key, value in payload.items()}
+    historical, stats = _historical_rows(historical_paths or [], audio_map=audio_map)
+    return rows + historical, stats
 
 
 def _training_rows(rows: list[dict[str, Any]]) -> tuple[list[dict], list[dict], list[dict]]:
@@ -170,6 +246,11 @@ def train(rows: list[dict[str, Any]], output: Path, *, model_name: str = BASE_MO
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--historical-pairs", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--historical-audio-map", type=Path,
+        help="JSON object mapping exported historical job_id to a local audio path",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model", default=BASE_MODEL)
     parser.add_argument("--max-steps", type=int, default=100)
@@ -177,7 +258,12 @@ def main() -> int:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args()
-    rows = validate_manifest(args.manifest.resolve())
+    rows, historical_stats = load_training_rows(
+        args.manifest.resolve(),
+        historical_paths=[path.resolve() for path in args.historical_pairs],
+        historical_audio_map=args.historical_audio_map.resolve()
+        if args.historical_audio_map else None,
+    )
     if args.validate_only:
         train_rows, validation_rows, held_rows = _training_rows(rows)
         report = {
@@ -185,6 +271,7 @@ def main() -> int:
             "train_samples": len(train_rows), "validation_samples": len(validation_rows),
             "leave_artist_out_samples": len(held_rows),
             "canonical_eval_excluded": sum(bool(row.get("eval_only")) for row in rows),
+            "historical": historical_stats,
             "base_model": args.model, "authorization": catalog_training_authorization(),
         }
         _write_report(args.output.resolve(), report)
@@ -193,6 +280,8 @@ def main() -> int:
     report = train(rows, args.output.resolve(), model_name=args.model,
                    max_steps=args.max_steps, rank=args.rank,
                    learning_rate=args.learning_rate)
+    report["historical"] = historical_stats
+    _write_report(args.output.resolve(), report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report.get("status") in {"trained_uncalibrated"} else 2
 

@@ -9,7 +9,7 @@ auditoría; no contiene ni sustituye credenciales.  El modelo solicitado es
 `openai/whisper-large-v3-turbo`.
 
 La preparación local (`scripts/prepare_lora_v1.py`) materializa las 498
-muestras, más los pares históricos que se pasen con `--historical-pairs`. La
+muestras, más los pares históricos que se pasen con `--historical-pairs`.
 Los pares históricos se incorporan únicamente si llevan `complete=true` y
 conservan evidencia de máquina y deltas íntegros. Los exports legacy que no
 cumplen el invariante quedan contabilizados como `historical_pairs_rejected` y
@@ -65,9 +65,16 @@ python3 lyricgen/backend/scripts/prepare_lora_v1.py \
   --expected-samples 498
 python3 lyricgen/backend/scripts/train_lora_v1.py \
   --manifest /ruta/privada/lora-v1-prep/samples.jsonl \
+  --historical-pairs /ruta/privada/lora-v1-prep/historical_pairs.jsonl \
   --output /ruta/privada/lora-v1-run \
   --validate-only
 ```
+
+Si un export histórico completo tiene audio en almacenamiento local, se
+puede pasar además `--historical-audio-map` con un JSON
+`{"job_id":"/ruta/audio.wav"}`. Sin ese mapa los exports SQL no se usan para
+entrenar: contienen letras aprobadas, pero deliberadamente no contienen
+audio, y el comando los contabiliza como `rejected_missing_audio`.
 
 La corrida de GPU se ejecuta sólo con `--validate-only` aprobado, el flag de
 autorización activo y un executor/GPU real. Ninguna clave se guarda en el
