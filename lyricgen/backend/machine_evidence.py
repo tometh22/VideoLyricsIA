@@ -201,9 +201,10 @@ def build_machine_evidence(result: dict) -> dict:
         result.get("_pre_anchor_provider_segments"),
     )
     add("selected", primary_family, "segments", selected)
-    if not hypotheses:
-        # An empty transcription is still a pre-human state that must be
-        # auditable.  Persist an explicit empty selected family, never a null.
+    if not any(item.get("role") == "selected" for item in hypotheses):
+        # An empty selected transcription is still the pre-human state even
+        # when a raw word family exists. Persist it explicitly, never infer it
+        # from another family's events.
         hypotheses.append({
             "role": "selected", "family": primary_family,
             "kind": "segments", "events": [], "event_count": 0,
@@ -275,6 +276,35 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
     if pre_human.get("segments_sha256") != snapshot_hash(original_segments or []):
         raise MachineSnapshotMissing("machine_snapshot_hash_mismatch")
     if evidence.get("schema") == SCHEMA:
+        selected_matches_snapshot = False
+        for hypothesis in hypotheses:
+            if not isinstance(hypothesis, dict):
+                raise MachineSnapshotMissing("machine_hypothesis_invalid")
+            role = hypothesis.get("role")
+            family = hypothesis.get("family")
+            kind = hypothesis.get("kind")
+            events = hypothesis.get("events")
+            event_count = hypothesis.get("event_count")
+            event_hash = hypothesis.get("events_sha256")
+            if (
+                not isinstance(role, str) or not role.strip()
+                or not isinstance(family, str) or not family.strip()
+                or not isinstance(kind, str) or not kind.strip()
+                or not isinstance(events, list)
+                or any(not isinstance(event, dict) for event in events)
+                or type(event_count) is not int
+                or event_count != len(events)
+                or not isinstance(event_hash, str)
+                or event_hash != snapshot_hash(events)
+            ):
+                raise MachineSnapshotMissing("machine_hypothesis_invalid")
+            if role == "selected":
+                if kind != "segments":
+                    raise MachineSnapshotMissing("machine_selected_hypothesis_invalid")
+                if event_hash == pre_human.get("segments_sha256"):
+                    selected_matches_snapshot = True
+        if not selected_matches_snapshot:
+            raise MachineSnapshotMissing("machine_selected_hypothesis_missing")
         signal = (evidence.get("decisions") or {}).get("song_quality_signal")
         validate_quality_training_signal(signal)
         expected_hash = snapshot_hash({

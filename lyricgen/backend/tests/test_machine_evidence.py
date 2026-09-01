@@ -86,6 +86,21 @@ def test_capture_keeps_independent_family_and_machine_decision(db):
     assert evidence["pre_human"]["segment_count"] == 1
 
 
+def test_empty_selected_state_is_explicit_even_with_raw_words():
+    captured = build_machine_evidence({
+        "segments": [],
+        "_primary_asr_family": "whisper-large-v3",
+        "_asr_words": [{"start": 0.1, "end": 0.4, "word": "raw"}],
+    })
+    selected = [
+        item for item in captured["hypotheses_by_family"]
+        if item["role"] == "selected"
+    ]
+    assert len(selected) == 1
+    assert selected[0]["events"] == []
+    assert selected[0]["events_sha256"] == snapshot_hash([])
+
+
 def test_song_signal_rejects_inconsistent_score_risk_and_light():
     valid = quality_training_signal({
         "decision": "review_required", "risk": 0.31,
@@ -165,6 +180,38 @@ def test_nested_scalar_types_in_quality_signal_fail_closed(db):
     db.flush()
 
     with pytest.raises(MachineSnapshotMissing, match="machine_quality_signal_invalid"):
+        require_machine_snapshot(row, document)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (lambda evidence: evidence.update(hypotheses_by_family=[{}]),
+         "machine_hypothesis_invalid"),
+        (lambda evidence: evidence["hypotheses_by_family"][0].update(event_count=99),
+         "machine_hypothesis_invalid"),
+        (lambda evidence: next(
+            item for item in evidence["hypotheses_by_family"]
+            if item["role"] == "selected"
+        ).update(role="primary"),
+         "machine_selected_hypothesis_missing"),
+    ],
+)
+def test_malformed_or_missing_selected_hypotheses_fail_closed(
+    db, mutate, expected,
+):
+    row, document = _job(db, required=True)
+    evidence = _evidence(document)
+    mutate(evidence)
+    evidence["evidence_sha256"] = snapshot_hash({
+        "hypotheses_by_family": evidence["hypotheses_by_family"],
+        "pre_human": evidence["pre_human"],
+        "decisions": evidence["decisions"],
+    })
+    document.machine_evidence = evidence
+    db.flush()
+
+    with pytest.raises(MachineSnapshotMissing, match=expected):
         require_machine_snapshot(row, document)
 
 
