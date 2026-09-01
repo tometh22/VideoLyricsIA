@@ -20,7 +20,7 @@ from correction_learning import (
     privacy_safe_features,
     StaleCorrectionSnapshot,
 )
-from database import CorrectionObservation, EditorVersion, Job, ProductEvent
+from database import AuditLog, CorrectionObservation, EditorVersion, Job, ProductEvent
 from editor import approve_document, ensure_document, save_document
 from evidence_attestation import lyric_snapshot_hash
 
@@ -138,6 +138,22 @@ def test_hmac_normalises_artist_variants_and_requires_generation(monkeypatch):
     monkeypatch.delenv("QUALITY_LEARNING_HMAC_KEY_ID")
     with pytest.raises(RuntimeError, match="key_id"):
         hmac_identifier("artist", "Los Pericos")
+
+
+def test_hmac_retained_generation_survives_active_key_rotation(monkeypatch):
+    from correction_learning import hmac_identifier_for_generation
+
+    old_secret = "old-quality-learning-key-0123456789-ABCDEF"
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY_ID", "generation-2")
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
+    monkeypatch.setenv(
+        "QUALITY_LEARNING_HMAC_KEYRING_JSON",
+        json.dumps({"generation-1": old_secret}),
+    )
+
+    old = hmac_identifier_for_generation("audit_lyric", "texto", "generation-1")
+    current = hmac_identifier("audit_lyric", "texto")
+    assert old and current and old != current
 
 
 @pytest.mark.parametrize("weak_key", ["x", "x" * 64, "placeholder-key"])
@@ -274,6 +290,9 @@ def test_approval_queue_payload_to_worker_observation_is_privacy_safe(
         synchronize_session=False,
     )
     db.query(Job).filter(Job.job_id == job.job_id).delete(synchronize_session=False)
+    db.query(AuditLog).filter(AuditLog.user_id == user.id).delete(
+        synchronize_session=False,
+    )
     from database import User
     db.query(User).filter(User.id == user.id).delete(synchronize_session=False)
     db.commit()

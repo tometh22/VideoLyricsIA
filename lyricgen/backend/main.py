@@ -86,7 +86,7 @@ from auth import (
     is_super_admin,
 )
 import storage
-from machine_evidence import MachineSnapshotMissing
+from machine_evidence import MachineSnapshotMissing, SCHEMA as MACHINE_EVIDENCE_SCHEMA
 from datetime import datetime, timedelta, timezone
 
 from database import (
@@ -117,6 +117,7 @@ from editor import (
     ensure_document,
     dismiss_quality_proposal,
     rebase_operator_suggestions_after_manual_edit,
+    freeze_approval_training_evidence,
     require_machine_snapshot,
     reject_operator_suggestion,
     record_quality_observation,
@@ -5914,9 +5915,7 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                     if isinstance(quality, dict):
                         quality = dict(quality)
                         quality["machine_evidence_required"] = True
-                        quality["machine_evidence_schema"] = (
-                            "machine-transcription-evidence-v1"
-                        )
+                        quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
                         from quality_cache import sha256_file
                         quality["audio_sha256"] = sha256_file(audio_path)
                         quality["evaluated_revision"] = revision
@@ -5948,9 +5947,7 @@ async def _finalize_inline_transcription_quality(result, audio_path: str,
                         persisted_tenant_id = str(row.tenant_id or "")
                     quality = dict(quality or {})
                     quality["machine_evidence_required"] = True
-                    quality["machine_evidence_schema"] = (
-                        "machine-transcription-evidence-v1"
-                    )
+                    quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
                     row.transcription_quality = quality
                     if isinstance(quality, dict):
                         from quality_shadow import record_shadow_decision
@@ -10167,7 +10164,9 @@ async def generate_with_segments(
             ).first()
             if approved_version and approved_version.segments == (job_row.segments_json or []):
                 approved_version.is_approved = True
-                approved_version.reason = "approve"
+                if approved_version.reason != "transcription":
+                    approved_version.reason = "approve"
+                freeze_approval_training_evidence(job_row, approved_version)
         except MachineSnapshotMissing as exc:
             raise HTTPException(
                 status_code=409,
@@ -14044,100 +14043,6 @@ async def save_segments(
     previous_segments_for_quality = [
         dict(item) for item in (job.segments_json or []) if isinstance(item, dict)
     ]
-    # Audit log of what changed between prev and new — only when non-empty.
-    # Motivation: operator (Tomas, 2026-05-19) reported "lines change places"
-    # in autosync, and we had ZERO way to reconstruct what happened (only
-    # the final sorted segments_json was persisted). This block writes a
-    # compact diff per save so future complaints are diagnosable.
-    # Capped to keep payload small (20 changed entries max with `truncated`
-    # flag if exceeded).
-    try:
-        from database import AuditLog
-        from correction_learning import hmac_identifier
-
-        def _protected_text_ref(value: str) -> str | None:
-            try:
-                return hmac_identifier("audit_lyric", value)
-            except RuntimeError:
-                # Privacy is fail-closed: lengths/categories remain useful,
-                # but an unkeyed or raw lexical reference is never persisted.
-                return None
-
-        prev_segs = job.segments_json if isinstance(job.segments_json, list) else []
-        # Build id-keyed maps so we can diff by stable _id (frontend assigns
-        # one) — fall back to positional index for legacy rows missing _id.
-        def _key(s, idx):
-            return s.get("_id") if isinstance(s, dict) and "_id" in s else f"idx_{idx}"
-        prev_by_key = { _key(s, i): (i, s) for i, s in enumerate(prev_segs) }
-        new_by_key  = { _key(s, i): (i, s) for i, s in enumerate(segs) }
-        changed = []
-        reorder = []
-        for k, (new_idx, ns) in new_by_key.items():
-            prev = prev_by_key.get(k)
-            if prev is None:
-                continue
-            prev_idx, ps = prev
-            # Field-level diff on the three meaningful values.
-            ps_start = float(ps.get("start") or 0)
-            ns_start = float(ns.get("start") or 0)
-            ps_end = float(ps.get("end") or 0)
-            ns_end = float(ns.get("end") or 0)
-            ps_text = (ps.get("text") or "").strip()
-            ns_text = (ns.get("text") or "").strip()
-            if (abs(ps_start - ns_start) > 0.05 or abs(ps_end - ns_end) > 0.05
-                    or ps_text != ns_text):
-                changed.append({
-                    "id": k,
-                    "prev_start": round(ps_start, 3),
-                    "new_start": round(ns_start, 3),
-                    "prev_end": round(ps_end, 3),
-                    "new_end": round(ns_end, 3),
-                    "text_changed": ps_text != ns_text,
-                    "prev_text_length": len(ps_text),
-                    "new_text_length": len(ns_text),
-                    "prev_text_hmac": _protected_text_ref(ps_text),
-                    "new_text_hmac": _protected_text_ref(ns_text),
-                })
-            if prev_idx != new_idx:
-                reorder.append({"id": k, "from_idx": prev_idx, "to_idx": new_idx})
-
-        if changed or reorder:
-            correction_summary = {
-                "changed_lines": len(changed),
-                "text_changes": sum(
-                    1 for item in changed
-                    if item.get("text_changed")
-                ),
-                "timing_changes": sum(
-                    1 for item in changed
-                    if item.get("prev_start") != item.get("new_start")
-                    or item.get("prev_end") != item.get("new_end")
-                ),
-                "reorders": len(reorder),
-            }
-            truncated = False
-            if len(changed) > 20:
-                changed = changed[:20]
-                truncated = True
-            if len(reorder) > 30:
-                reorder = reorder[:30]
-                truncated = True
-            db.add(AuditLog(
-                user_id=current_user["id"],
-                action="lyrics.segments_diff",
-                detail={
-                    "job_id": job_id,
-                    "n_lines": len(segs),
-                    "changed": changed,
-                    "reorder": reorder,
-                    "correction_summary": correction_summary,
-                    "truncated": truncated,
-                },
-            ))
-    except Exception as e:
-        # Audit logging is best-effort — never break the save flow.
-        logger.warning("[save-segments] audit log failed: %s", e)
-
     job.segments_json = segs
     job.segments_revision = current_revision + 1
     job.transcription_quality = _invalidate_quality_after_editor_save(
