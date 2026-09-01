@@ -4,7 +4,7 @@ import uuid
 
 import pytest
 
-from database import AuditLog, EditorDocument, EditorVersion, Job
+from database import AuditLog, EditorVersion, Job
 from editor import (
     approve_document,
     attach_machine_evidence,
@@ -19,6 +19,7 @@ from machine_evidence import (
     finalize_machine_evidence,
     quality_training_signal,
     snapshot_hash,
+    validate_machine_evidence,
     validate_quality_training_signal,
 )
 
@@ -99,6 +100,26 @@ def test_empty_selected_state_is_explicit_even_with_raw_words():
     assert len(selected) == 1
     assert selected[0]["events"] == []
     assert selected[0]["events_sha256"] == snapshot_hash([])
+
+
+def test_finalize_binds_selected_to_canonical_durable_segments():
+    raw = [{"start": 0.123456, "end": 1.234567, "text": "line"}]
+    canonical = [{"start": 0.1235, "end": 1.2346, "text": "line"}]
+    captured = build_machine_evidence({"segments": raw})
+    evidence = finalize_machine_evidence(
+        captured,
+        original_segments=canonical,
+        quality={"decision": "review"},
+        audio_sha256="a" * 64,
+        audio_revision=0,
+    )
+    selected = next(
+        item for item in evidence["hypotheses_by_family"]
+        if item["role"] == "selected"
+    )
+    assert selected["events"] == canonical
+    assert selected["events_sha256"] == snapshot_hash(canonical)
+    validate_machine_evidence(evidence, canonical)
 
 
 def test_song_signal_rejects_inconsistent_score_risk_and_light():

@@ -235,13 +235,31 @@ def finalize_machine_evidence(
     if not isinstance(evidence, dict) or evidence.get("schema") != SCHEMA:
         raise ValueError("machine evidence was not captured before persistence")
     payload = deepcopy(_safe_json(evidence))
+    canonical_selected = _safe_json(original_segments or [])
+    selected_found = False
+    for hypothesis in payload.get("hypotheses_by_family") or []:
+        if isinstance(hypothesis, dict) and hypothesis.get("role") == "selected":
+            hypothesis["kind"] = "segments"
+            hypothesis["events"] = canonical_selected
+            hypothesis["event_count"] = len(canonical_selected)
+            hypothesis["events_sha256"] = snapshot_hash(canonical_selected)
+            selected_found = True
+    if not selected_found:
+        payload.setdefault("hypotheses_by_family", []).append({
+            "role": "selected",
+            "family": "unknown-primary-asr",
+            "kind": "segments",
+            "events": canonical_selected,
+            "event_count": len(canonical_selected),
+            "events_sha256": snapshot_hash(canonical_selected),
+        })
     payload["pre_human"] = {
-        "segments_sha256": snapshot_hash(original_segments or []),
-        "segment_count": len(original_segments or []),
+        "segments_sha256": snapshot_hash(canonical_selected),
+        "segment_count": len(canonical_selected),
         "audio_sha256": str(audio_sha256 or "")[:64] or None,
         "audio_revision": max(0, int(audio_revision or 0)),
     }
-    quality_payload = dict(quality or {})
+    quality_payload = dict(quality) if isinstance(quality, dict) else {}
     payload["decisions"] = {
         "quality": _safe_json(quality_payload),
         "song_quality_signal": quality_training_signal(quality_payload),
