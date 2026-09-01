@@ -24,11 +24,16 @@ class MachineSnapshotMissing(RuntimeError):
 
 
 def _safe_json(value: Any) -> Any:
-    """Clone provider payloads while making non-finite numbers JSON-safe."""
+    """Clone payloads into the canonical representation stored by JSONB."""
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):
-        return value if math.isfinite(value) else None
+        if not math.isfinite(value):
+            return None
+        # PostgreSQL JSONB normalizes IEEE negative zero to positive zero.
+        # Hash that same canonical representation so a database round-trip
+        # cannot invalidate otherwise immutable evidence.
+        return 0.0 if value == 0.0 else value
     if isinstance(value, dict):
         return {str(key): _safe_json(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
