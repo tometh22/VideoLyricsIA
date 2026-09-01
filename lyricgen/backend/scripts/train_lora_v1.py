@@ -123,15 +123,25 @@ def load_training_rows(
 
 def _training_rows(rows: list[dict[str, Any]]) -> tuple[list[dict], list[dict], list[dict]]:
     # The canonical 23 are never used for training.  They remain available to
-    # evaluate the resulting adapter with a separate inference manifest.
+    # evaluate the resulting adapter with a separate inference manifest.  The
+    # held-artist fold is also removed from train/validation; merely counting
+    # it as "reserved" would leak the advertised leave-artist-out split.
     usable = [row for row in rows if not bool(row.get("eval_only"))]
     songs = sorted({str(row["song_id"]) for row in usable})
     validation = set(songs[::5] or songs[-1:])
-    train = [row for row in usable if str(row["song_id"]) not in validation]
-    valid = [row for row in usable if str(row["song_id"]) in validation]
     artists = sorted({str(row.get("artist") or "unknown") for row in usable})
     held_artist = artists[::5]
     held = [row for row in usable if str(row.get("artist") or "unknown") in held_artist]
+    train = [
+        row for row in usable
+        if str(row["song_id"]) not in validation
+        and str(row.get("artist") or "unknown") not in held_artist
+    ]
+    valid = [
+        row for row in usable
+        if str(row["song_id"]) in validation
+        and str(row.get("artist") or "unknown") not in held_artist
+    ]
     return train, valid, held
 
 

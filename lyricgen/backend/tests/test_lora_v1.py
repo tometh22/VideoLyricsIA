@@ -4,7 +4,7 @@ import json
 
 from lora_v1 import data_improvement_curve, evaluate_predictions, song_bootstrap, word_error_rate
 from scripts.evaluate_lora_v1 import _canonical_ids
-from scripts.train_lora_v1 import load_training_rows
+from scripts.train_lora_v1 import _training_rows, load_training_rows
 
 
 def _rows(hypotheses):
@@ -75,3 +75,14 @@ def test_historical_pairs_require_complete_evidence_and_audio_map(tmp_path):
     assert rows[-1]["source"] == "historical_pair"
     assert stats["rejected_incomplete"] == 1
     assert stats["accepted"] == 1
+
+
+def test_leave_artist_out_rows_are_not_in_train_or_validation():
+    rows = [
+        {"song_id": f"s{i}", "artist": artist, "eval_only": False}
+        for i, artist in enumerate(("a", "a", "b", "c", "d"))
+    ]
+    train, validation, held = _training_rows(rows)
+    held_artists = {row["artist"] for row in held}
+    assert held_artists
+    assert all(row["artist"] not in held_artists for row in train + validation)
