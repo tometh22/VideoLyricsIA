@@ -401,10 +401,20 @@ def _map_provider_words(words) -> list[dict]:
 def _raw_provider_words(words) -> list[dict]:
     """Serialize every completed provider word, including opaque rows."""
     from recognition_provenance import bounded_provider_string
+    try:
+        source = list(words or [])
+    except Exception as exc:
+        return [{
+            "raw": bounded_provider_string(words),
+            "serialization_error": type(exc).__name__,
+        }]
     raw: list[dict] = []
-    for word in words or []:
+    for word in source:
         if isinstance(word, dict):
-            raw.append(dict(word))
+            try:
+                raw.append(dict(word))
+            except Exception:
+                raw.append({"raw": bounded_provider_string(word)})
             continue
         try:
             dumped = word.model_dump()

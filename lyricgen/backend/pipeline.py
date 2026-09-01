@@ -3387,16 +3387,41 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
         except Exception:
             pass
 
-    raw_segments = list(response.segments or [])
-    raw_words = list(getattr(response, "words", None) or []) if return_words else []
     import re as _re
+    from recognition_provenance import bounded_provider_string
+
+    segment_stream_error: dict | None = None
+    try:
+        raw_segments = list(response.segments or [])
+    except Exception as exc:
+        raw_segments = []
+        segment_stream_error = {
+            "raw": bounded_provider_string(response),
+            "serialization_error": type(exc).__name__,
+            "provider_event_type": "segment_stream",
+        }
+    word_stream_error: dict | None = None
+    if return_words:
+        try:
+            raw_words = list(getattr(response, "words", None) or [])
+        except Exception as exc:
+            raw_words = []
+            word_stream_error = {
+                "raw": bounded_provider_string(response),
+                "serialization_error": type(exc).__name__,
+                "provider_event_type": "top_level_words",
+            }
+    else:
+        raw_words = []
 
     def _raw_word_events(words: list[object]) -> list[dict]:
-        from recognition_provenance import bounded_provider_string
         durable: list[dict] = []
         for word in words:
             if isinstance(word, dict):
-                durable.append(dict(word))
+                try:
+                    durable.append(dict(word))
+                except Exception:
+                    durable.append({"raw": bounded_provider_string(word)})
                 continue
             try:
                 dumped = word.model_dump()
@@ -3418,7 +3443,8 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
     # top-level word stream may contain pre-segment or opaque rows that the
     # display mapper legitimately rejects but the training corpus must retain.
     raw_provider_events: list[dict] = []
-    from recognition_provenance import bounded_provider_string
+    if segment_stream_error is not None:
+        raw_provider_events.append(segment_stream_error)
     for seg in raw_segments:
         try:
             raw_provider_events.append({
@@ -3434,7 +3460,7 @@ def _transcribe_via_openai_api(mp3_path: str, language: str | None = None,
                 "provider_event_type": "segment",
             })
     if return_words:
-        raw_provider_events.append({
+        raw_provider_events.append(word_stream_error or {
             "provider_event_type": "top_level_words",
             "words": _raw_word_events(raw_words),
         })
@@ -4074,8 +4100,15 @@ def _raw_local_whisper_events(result: object) -> list[dict]:
         return [] if source is None else [{
             "raw": bounded_provider_string(source),
         }]
+    try:
+        source_rows = list(source)
+    except Exception as exc:
+        return [{
+            "raw": bounded_provider_string(source),
+            "serialization_error": type(exc).__name__,
+        }]
     rows: list[dict] = []
-    for row in source:
+    for row in source_rows:
         if isinstance(row, dict):
             rows.append(row)
         else:

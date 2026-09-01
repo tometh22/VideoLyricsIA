@@ -54,14 +54,26 @@ def test_raw_provider_words_preserves_opaque_rows_before_mapping():
         def __str__(self):
             raise RuntimeError("SDK object cannot be stringified")
 
+    class HostileWordDict(dict):
+        def keys(self):
+            raise RuntimeError("SDK mapping cannot be copied")
+
+        def __iter__(self):
+            raise RuntimeError("SDK mapping cannot be copied")
+
+        def __str__(self):
+            raise RuntimeError("SDK mapping cannot be stringified")
+
     raw = _raw_provider_words([
         {"word": "hola", "start": 1.0, "end": 1.4},
         OpaqueWord(),
+        HostileWordDict(word="hostile", start=2.0, end=2.4),
     ])
 
     assert raw == [
         {"word": "hola", "start": 1.0, "end": 1.4},
         {"raw": "<opaque-provider-value-OpaqueWord>"},
+        {"raw": "<opaque-provider-value-HostileWordDict>"},
     ]
 
 

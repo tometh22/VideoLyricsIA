@@ -114,10 +114,18 @@ def test_raw_provider_segments_preserves_rows_the_mapper_rejects():
         def __str__(self):
             raise RuntimeError("SDK object cannot be stringified")
 
+    class HostileRowDict(dict):
+        def __deepcopy__(self, _memo):
+            raise RuntimeError("SDK mapping cannot be copied")
+
+        def __str__(self):
+            raise RuntimeError("SDK mapping cannot be stringified")
+
     output = {"segments": [
         {"start": 0, "end": 1, "text": "   "},
         {"start": "bad", "end": 2, "text": "unmappable"},
         OpaqueRow(),
+        HostileRowDict(start=2, end=3, text=""),
         {"start": 2, "end": 3, "text": "usable"},
     ]}
 
@@ -126,6 +134,7 @@ def test_raw_provider_segments_preserves_rows_the_mapper_rejects():
         {"start": 0, "end": 1, "text": "   "},
         {"start": "bad", "end": 2, "text": "unmappable"},
         {"raw": "<opaque-provider-value-OpaqueRow>"},
+        {"raw": "<opaque-provider-value-HostileRowDict>"},
         {"start": 2, "end": 3, "text": "usable"},
     ]
 

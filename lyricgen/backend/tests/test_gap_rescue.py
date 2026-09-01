@@ -134,17 +134,29 @@ def test_gap_rescue_preserves_malformed_provider_word_before_mapping():
         def __str__(self):
             raise RuntimeError("SDK object cannot be stringified")
 
+    class HostileWordDict(dict):
+        def keys(self):
+            raise RuntimeError("SDK mapping cannot be copied")
+
+        def __iter__(self):
+            raise RuntimeError("SDK mapping cannot be copied")
+
+        def __str__(self):
+            raise RuntimeError("SDK mapping cannot be stringified")
+
     source, raw = gr._raw_provider_words(SimpleNamespace(words=[
         SimpleNamespace(word="bien", start=0.1, end=0.5),
         SimpleNamespace(word="mal", start="not-a-time", end=1.0),
         OpaqueWord(),
+        HostileWordDict(word="hostile", start=2.0, end=2.4),
     ]))
 
-    assert len(source) == 3
+    assert len(source) == 4
     assert raw == [
         {"word": "bien", "start": 0.1, "end": 0.5},
         {"word": "mal", "start": "not-a-time", "end": 1.0},
         {"raw": "<opaque-provider-value-OpaqueWord>"},
+        {"raw": "<opaque-provider-value-HostileWordDict>"},
     ]
 
 

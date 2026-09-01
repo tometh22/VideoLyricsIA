@@ -826,8 +826,8 @@ def _map_segments(output) -> list[dict]:
     return segs
 
 
-def _raw_provider_segments(output) -> list[dict]:
-    """Preserve every Replicate segment row before mapping or filtering."""
+def _raw_provider_segments_unchecked(output) -> list[dict]:
+    """Serialize the normal Replicate output shape before mapping."""
     from recognition_provenance import bounded_provider_string
     if isinstance(output, dict):
         if "segments" not in output:
@@ -853,6 +853,18 @@ def _raw_provider_segments(output) -> list[dict]:
         else:
             rows.append({"raw": bounded_provider_string(row)})
     return rows
+
+
+def _raw_provider_segments(output) -> list[dict]:
+    """Preserve every Replicate row; hostile SDK containers never escape."""
+    from recognition_provenance import bounded_provider_string
+    try:
+        return _raw_provider_segments_unchecked(output)
+    except Exception as exc:
+        return [{
+            "raw": bounded_provider_string(output),
+            "serialization_error": type(exc).__name__,
+        }]
 
 
 def _filter_ghosts(segs: list[dict]) -> list[dict]:

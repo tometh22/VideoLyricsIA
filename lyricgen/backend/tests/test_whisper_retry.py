@@ -184,12 +184,23 @@ def test_word_granularity_freezes_complete_top_level_provider_stream(
         def __str__(self):
             raise RuntimeError("SDK object cannot be stringified")
 
+    class HostileWordDict(dict):
+        def keys(self):
+            raise RuntimeError("SDK mapping cannot be copied")
+
+        def __iter__(self):
+            raise RuntimeError("SDK mapping cannot be copied")
+
+        def __str__(self):
+            raise RuntimeError("SDK mapping cannot be stringified")
+
     response = _stub_whisper_word_response()
     response.words = [
         MagicMock(word="intro", start=-0.5, end=-0.1),
         *response.words,
         MagicMock(word="later", start=6.0, end=6.2),
         OpaqueWord(),
+        HostileWordDict(word="hostile", start=7.0, end=7.2),
     ]
     patched_transcribe([response])
 
@@ -213,10 +224,13 @@ def test_word_granularity_freezes_complete_top_level_provider_stream(
     events = snapshot["hypotheses"][0]["events"]
     word_stream = events[-1]
     assert word_stream["provider_event_type"] == "top_level_words"
-    assert len(word_stream["words"]) == 5
+    assert len(word_stream["words"]) == 6
     assert word_stream["words"][0]["word"] == "intro"
-    assert word_stream["words"][-1] == {
+    assert word_stream["words"][-2] == {
         "raw": "<opaque-provider-value-OpaqueWord>",
+    }
+    assert word_stream["words"][-1] == {
+        "raw": "<opaque-provider-value-HostileWordDict>",
     }
 
 

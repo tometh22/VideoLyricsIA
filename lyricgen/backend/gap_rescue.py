@@ -188,7 +188,10 @@ def _raw_provider_words(response: object) -> tuple[list[object], list[dict]]:
     raw: list[dict] = []
     for word in source:
         if isinstance(word, dict):
-            raw.append(dict(word))
+            try:
+                raw.append(dict(word))
+            except Exception:
+                raw.append({"raw": bounded_provider_string(word)})
             continue
         try:
             dumped = word.model_dump()
