@@ -369,6 +369,30 @@ def test_training_pair_materializes_machine_gold_families_and_edits():
     assert invalid_summary["complete"] is False
     assert "editor_delta_content_mismatch:0->1" in invalid_summary["issues"]
 
+    malformed_summary = deepcopy(delta)
+    malformed_summary["summary"]["timing_changes"] = {"not": "a number"}
+    malformed_summary_audit = SimpleNamespace(
+        id=13, detail=malformed_summary, created_at=datetime.now(timezone.utc),
+    )
+    malformed_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[malformed_summary_audit],
+    )
+    assert malformed_pair["complete"] is False
+    assert "editor_delta_content_mismatch:0->1" in malformed_pair["issues"]
+
+    malformed_changes = deepcopy(delta)
+    malformed_changes["changes"] = 7
+    malformed_changes_audit = SimpleNamespace(
+        id=14, detail=malformed_changes, created_at=datetime.now(timezone.utc),
+    )
+    malformed_changes_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[malformed_changes_audit],
+    )
+    assert malformed_changes_pair["complete"] is False
+    assert "editor_delta_content_mismatch:0->1" in malformed_changes_pair["issues"]
+
     after_approval_segments = [
         {"_id": "a", "start": 0, "end": 1.4, "text": "hola otra vez"},
     ]

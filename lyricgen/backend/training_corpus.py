@@ -399,18 +399,37 @@ def _approved_version(versions: Iterable[Any]) -> Any | None:
 
 def _delta_content_projection(detail: dict) -> dict:
     """Canonical, privacy-safe delta content used to verify the audit chain."""
+
+    def strict_int(value: Any) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    def strict_number(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+
     projected = []
-    for raw_change in detail.get("changes") or []:
-        change = dict(raw_change or {})
+    raw_changes = detail.get("changes")
+    changes = raw_changes if isinstance(raw_changes, list) else [None]
+    for raw_change in changes:
+        if not isinstance(raw_change, dict):
+            projected.append({"invalid_change": True})
+            continue
+        change = raw_change
 
         def line(value: Any) -> dict | None:
-            if not isinstance(value, dict):
+            if value is None:
                 return None
+            if not isinstance(value, dict):
+                return {"invalid_line": True}
             return {
-                "start": _finite_time(value.get("start")),
-                "end": _finite_time(value.get("end")),
-                "text_length": int(value.get("text_length") or 0),
+                "start": strict_number(value.get("start")),
+                "end": strict_number(value.get("end")),
+                "text_length": strict_int(value.get("text_length")),
             }
+
+        fields = change.get("fields")
 
         projected.append({
             "operation": change.get("operation"),
@@ -419,24 +438,25 @@ def _delta_content_projection(detail: dict) -> dict:
             "to_index": change.get("to_index"),
             "before": line(change.get("before")),
             "after": line(change.get("after")),
-            "fields": dict(change.get("fields") or {}),
+            "fields": dict(fields) if isinstance(fields, dict) else {"invalid": True},
             "start_delta_ms": change.get("start_delta_ms"),
             "end_delta_ms": change.get("end_delta_ms"),
         })
-    summary = dict(detail.get("summary") or {})
+    raw_summary = detail.get("summary")
+    summary = raw_summary if isinstance(raw_summary, dict) else {}
     return {
-        "before_line_count": int(detail.get("before_line_count") or 0),
-        "after_line_count": int(detail.get("after_line_count") or 0),
+        "before_line_count": strict_int(detail.get("before_line_count")),
+        "after_line_count": strict_int(detail.get("after_line_count")),
         "changes": projected,
         "summary": {
-            key: int(summary.get(key) or 0)
+            key: strict_int(summary.get(key))
             for key in (
                 "changed_lines", "text_changes", "timing_changes",
                 "insertions", "deletions", "reorders",
             )
         },
-        "timing_noise_threshold_ms": float(
-            detail.get("timing_noise_threshold_ms") or 0.0
+        "timing_noise_threshold_ms": strict_number(
+            detail.get("timing_noise_threshold_ms")
         ),
         "alignment_complete": detail.get("alignment_complete") is True,
     }
