@@ -331,7 +331,7 @@ def test_unenrolled_job_keeps_only_bounded_operational_audit():
     assert "before" not in str(audit.detail) and "after" not in str(audit.detail)
 
 
-def test_training_pair_materializes_machine_gold_families_and_edits():
+def test_training_pair_materializes_machine_gold_families_and_edits(monkeypatch):
     original = [{"_id": "a", "start": 0, "end": 1, "text": "ola"}]
     approved_segments = [{"_id": "a", "start": 0, "end": 1.2, "text": "hola"}]
     quality = {
@@ -380,6 +380,21 @@ def test_training_pair_materializes_machine_gold_families_and_edits():
     assert pair["approved"]["segments"] == approved_segments
     assert pair["hypotheses_by_family"][0]["family"] == "whisper-large-v3"
     assert len(pair["intermediate_line_deltas"]) == 1
+
+    # Rotation must not invalidate already captured corrections when the old
+    # verification-only generation remains in the private keyring.
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY_ID", "test-v2")
+    monkeypatch.setenv(
+        "QUALITY_LEARNING_HMAC_KEY", "new-quality-test-key-0123456789-ABCDEF",
+    )
+    monkeypatch.setenv(
+        "QUALITY_LEARNING_HMAC_KEYRING_JSON",
+        '{"test-v1":"quality-test-key-0123456789-ABCDEF"}',
+    )
+    after_rotation = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved], audits=[audit],
+    )
+    assert after_rotation["complete"] is True
 
     corrupt_text_reference = deepcopy(delta)
     corrupt_text_reference["changes"][0]["before"]["text_hmac"] = "0" * 64

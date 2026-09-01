@@ -298,6 +298,7 @@ def build_line_delta_audit(
     checkpoint: str,
     text_ref: Callable[[str], str | None],
     timing_noise_threshold_s: float = TIMING_NOISE_THRESHOLD_S,
+    hmac_key_id: str | None = None,
 ) -> dict | None:
     """Return a complete, untruncated material delta or ``None`` for UI noise."""
     before = [dict(row) for row in (before_value or []) if isinstance(row, dict)]
@@ -385,12 +386,19 @@ def build_line_delta_audit(
     ))
     if not changes:
         return None
+    if hmac_key_id is None:
+        try:
+            from correction_learning import current_hmac_key_id
+            hmac_key_id = current_hmac_key_id()
+        except RuntimeError:
+            hmac_key_id = None
     return {
         "schema": LINE_DELTA_SCHEMA,
         "job_id": str(job_id),
         "from_revision": int(from_revision),
         "to_revision": int(to_revision),
         "checkpoint": str(checkpoint or "unknown")[:32],
+        "hmac_key_id": hmac_key_id,
         "before_line_count": len(before),
         "after_line_count": len(after),
         "changes": changes,
@@ -476,6 +484,8 @@ def _delta_content_projection(detail: dict) -> dict:
     return {
         "from_revision": strict_int(detail.get("from_revision")),
         "to_revision": strict_int(detail.get("to_revision")),
+        "hmac_key_id": detail.get("hmac_key_id")
+        if isinstance(detail.get("hmac_key_id"), str) else None,
         "before_line_count": strict_int(detail.get("before_line_count")),
         "after_line_count": strict_int(detail.get("after_line_count")),
         "changes": projected,
@@ -660,12 +670,15 @@ def materialize_training_pair(
         )
         matches = deltas_by_boundary.get(boundary, [])
         text_reference_unverifiable = False
+        delta_hmac_key_id = matches[0].get("hmac_key_id") if len(matches) == 1 else None
 
         def expected_text_ref(value: str) -> str | None:
             nonlocal text_reference_unverifiable
             try:
-                from correction_learning import hmac_identifier
-                reference = hmac_identifier("audit_lyric", value)
+                from correction_learning import hmac_identifier_for_generation
+                reference = hmac_identifier_for_generation(
+                    "audit_lyric", value, str(delta_hmac_key_id or ""),
+                )
             except Exception:
                 text_reference_unverifiable = True
                 return None
@@ -682,6 +695,7 @@ def materialize_training_pair(
             to_revision=int(getattr(current, "revision", 0)),
             checkpoint="export_validation",
             text_ref=expected_text_ref,
+            hmac_key_id=delta_hmac_key_id,
         )
         if text_reference_unverifiable:
             issues.append(
