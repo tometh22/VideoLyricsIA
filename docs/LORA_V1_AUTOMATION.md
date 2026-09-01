@@ -43,8 +43,8 @@ WER global como único resultado. Los reportes mantienen
 
 `scripts/evaluate_t4_95.py` evalúa únicamente la población de 95 finales
 tempranos y un control de no-daño. Es replay-only, informa mejora de target y
-daños de control (>150 ms), y nunca muta timestamps. La extensión T4 no entra
-en producción por este script.
+daños de control (>150 ms), además de media/CI bootstrap y desglose por
+canción. La extensión T4 no entra en producción por este script.
 
 ## Triggers sin duplicados
 
