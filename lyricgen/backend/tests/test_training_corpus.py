@@ -46,12 +46,38 @@ def test_line_delta_is_complete_and_filters_sub_50ms_jitter():
     assert len(payload["changes"]) == 26
     assert payload["summary"]["deletions"] == 1
     assert payload["summary"]["insertions"] == 1
+    assert payload["summary"]["reorders"] == 0
     first = next(row for row in payload["changes"] if row["line_id"] == "line-0")
     assert first["before"]["start"] == 0.0
     assert first["after"]["start"] == 0.0037
     assert first["fields"]["start"] is False
     assert first["start_delta_ms"] == 0.0
     assert first["fields"]["end"] is True
+
+
+def test_first_id_assignment_aligns_edit_around_new_insertion():
+    before = [
+        {"start": 0.0, "end": 1.0, "text": "ola"},
+        {"start": 2.0, "end": 3.0, "text": "world"},
+    ]
+    after = [
+        {"_id": "intro", "start": 0.0, "end": 0.3, "text": "intro"},
+        {"_id": "greeting", "start": 0.3, "end": 1.0, "text": "hola"},
+        {"_id": "world", "start": 2.0, "end": 3.0, "text": "world"},
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    updates = [row for row in payload["changes"] if row["operation"] == "update"]
+    inserts = [row for row in payload["changes"] if row["operation"] == "insert"]
+    assert [(row["line_id"], row["from_index"], row["to_index"]) for row in updates] == [
+        ("greeting", 0, 1),
+    ]
+    assert [row["line_id"] for row in inserts] == ["intro"]
+    assert payload["summary"]["reorders"] == 0
 
 
 def test_metadata_only_editor_change_is_not_training_noise():
@@ -279,3 +305,16 @@ def test_require_complete_fails_when_requested_sample_count_is_short():
     assert _required_export_failed({"rows": 4, "incomplete_rows": 0}, 5) is True
     assert _required_export_failed({"rows": 5, "incomplete_rows": 1}, 5) is True
     assert _required_export_failed({"rows": 5, "incomplete_rows": 0}, 5) is False
+
+
+def test_private_export_writer_tightens_existing_file_before_payload(tmp_path):
+    from scripts.export_training_pairs import _write_private
+
+    target = tmp_path / "pairs.jsonl"
+    target.write_text("old", encoding="utf-8")
+    target.chmod(0o644)
+
+    _write_private(target, b"private lyrics\n")
+
+    assert target.read_bytes() == b"private lyrics\n"
+    assert target.stat().st_mode & 0o777 == 0o600

@@ -47,6 +47,25 @@ def _required_export_failed(manifest: dict, requested_rows: int) -> bool:
     )
 
 
+def _write_private(path: Path, payload: bytes) -> None:
+    """Write tenant-private bytes only after the descriptor is mode 0600."""
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        # O_CREAT's mode does not change a pre-existing permissive file.
+        # Tighten the open descriptor before a single new byte is written.
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = -1
+            handle.write(payload)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _job_audits(db, job_id: str) -> list[AuditLog]:
     query = db.query(AuditLog).filter(
         AuditLog.action == "lyrics.segments_diff",
@@ -119,8 +138,7 @@ def main() -> int:
         for row in rows
     ]
     payload = ("\n".join(encoded_rows) + ("\n" if encoded_rows else "")).encode("utf-8")
-    args.output.write_bytes(payload)
-    os.chmod(args.output, 0o600)
+    _write_private(args.output, payload)
     digest = hashlib.sha256(payload).hexdigest()
     manifest = {
         "schema": "transcription-training-export-manifest-v1",
@@ -134,11 +152,10 @@ def main() -> int:
         "contains_audio": False,
     }
     manifest_path = args.output.with_suffix(args.output.suffix + ".manifest.json")
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    _write_private(
+        manifest_path,
+        (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
     )
-    os.chmod(manifest_path, 0o600)
     print(json.dumps(manifest, separators=(",", ":")))
     if args.require_complete and _required_export_failed(manifest, requested_rows):
         return 2

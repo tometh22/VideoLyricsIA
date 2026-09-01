@@ -17,7 +17,9 @@ from machine_evidence import (
     SCHEMA,
     build_machine_evidence,
     finalize_machine_evidence,
+    quality_training_signal,
     snapshot_hash,
+    validate_quality_training_signal,
 )
 
 
@@ -82,6 +84,23 @@ def test_capture_keeps_independent_family_and_machine_decision(db):
         "policy_version": "v-test",
     }
     assert evidence["pre_human"]["segment_count"] == 1
+
+
+def test_song_signal_rejects_inconsistent_score_risk_and_light():
+    valid = quality_training_signal({
+        "decision": "review_required", "risk": 0.31,
+        "policy_version": "lyrics-quality-v6",
+    })
+    validate_quality_training_signal(valid)
+
+    for mutation in (
+        {"score": None},
+        {"risk": "not-a-number"},
+        {"traffic_light": "green", "risk": 0.9},
+    ):
+        invalid = {**valid, **mutation}
+        with pytest.raises(MachineSnapshotMissing, match="inconsistent"):
+            validate_quality_training_signal(invalid)
 
 
 def test_required_job_cannot_be_approved_without_machine_snapshot(db):

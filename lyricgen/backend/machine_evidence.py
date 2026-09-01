@@ -113,18 +113,29 @@ def validate_quality_training_signal(signal: Any) -> None:
         raise MachineSnapshotMissing("machine_quality_signal_missing")
     if signal.get("traffic_light") not in {"green", "yellow", "red"}:
         raise MachineSnapshotMissing("machine_quality_signal_invalid")
-    score = signal.get("score")
-    if score is not None and (
-        not isinstance(score, (int, float))
-        or isinstance(score, bool)
-        or not math.isfinite(float(score))
-        or not 0.0 <= float(score) <= 100.0
-    ):
-        raise MachineSnapshotMissing("machine_quality_score_invalid")
-    if signal.get("score_source") not in {
-        "quality_score", "risk_derived", "unavailable",
-    }:
+    score_source = signal.get("score_source")
+    if score_source not in {"quality_score", "risk_derived", "unavailable"}:
         raise MachineSnapshotMissing("machine_quality_score_source_invalid")
+    if score_source == "quality_score":
+        reconstruction = {
+            "decision": signal.get("verdict"),
+            "score": signal.get("raw_score"),
+            "risk": signal.get("risk"),
+            "policy_version": signal.get("policy_version"),
+        }
+    elif score_source == "risk_derived":
+        reconstruction = {
+            "decision": signal.get("verdict"),
+            "risk": signal.get("risk"),
+            "policy_version": signal.get("policy_version"),
+        }
+    else:
+        reconstruction = {
+            "decision": signal.get("verdict"),
+            "policy_version": signal.get("policy_version"),
+        }
+    if quality_training_signal(reconstruction) != signal:
+        raise MachineSnapshotMissing("machine_quality_signal_inconsistent")
 
 
 def _provider_family(segments: list[dict]) -> str:

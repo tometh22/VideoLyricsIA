@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from difflib import SequenceMatcher
 from typing import Any, Callable, Iterable
 
 from machine_evidence import (
@@ -44,6 +45,67 @@ def _signature(row: dict) -> tuple:
     )
 
 
+def _row_match_cost(before: dict, after: dict) -> float:
+    """Cost for monotonic legacy-row alignment; two gaps cost exactly 2."""
+    before_id = str(before.get("_id") or "")
+    after_id = str(after.get("_id") or "")
+    if before_id and after_id and before_id != after_id:
+        return math.inf
+    left, right = _text(before.get("text")).casefold(), _text(after.get("text")).casefold()
+    similarity = 1.0 if left == right else SequenceMatcher(None, left, right).ratio()
+    timing_distance = (
+        abs(_finite_time(before.get("start")) - _finite_time(after.get("start")))
+        + abs(_finite_time(before.get("end")) - _finite_time(after.get("end")))
+    )
+    # Text carries most of the identity; timing breaks ties without preventing
+    # a legitimate line from moving after an insertion.
+    return min(1.999, (1.0 - similarity) * 1.5 + min(timing_distance / 2.0, 1.0) * 0.5)
+
+
+def _align_unmatched_rows(
+    before: list[dict], after: list[dict], before_indices: list[int], after_indices: list[int],
+) -> list[tuple[int, int]]:
+    """Needleman-Wunsch alignment for rows that lack a common stable ID."""
+    rows, cols = len(before_indices), len(after_indices)
+    gap_cost = 1.0
+    costs = [[math.inf] * (cols + 1) for _ in range(rows + 1)]
+    steps: list[list[str | None]] = [[None] * (cols + 1) for _ in range(rows + 1)]
+    costs[0][0] = 0.0
+    for left in range(1, rows + 1):
+        costs[left][0] = left * gap_cost
+        steps[left][0] = "delete"
+    for right in range(1, cols + 1):
+        costs[0][right] = right * gap_cost
+        steps[0][right] = "insert"
+    for left in range(1, rows + 1):
+        for right in range(1, cols + 1):
+            match_cost = _row_match_cost(
+                before[before_indices[left - 1]], after[after_indices[right - 1]],
+            )
+            candidates = [
+                (costs[left - 1][right - 1] + match_cost, 0, "match"),
+                (costs[left - 1][right] + gap_cost, 1, "delete"),
+                (costs[left][right - 1] + gap_cost, 2, "insert"),
+            ]
+            best_cost, _priority, step = min(candidates)
+            costs[left][right], steps[left][right] = best_cost, step
+    aligned: list[tuple[int, int]] = []
+    left, right = rows, cols
+    while left or right:
+        step = steps[left][right]
+        if step == "match":
+            aligned.append((before_indices[left - 1], after_indices[right - 1]))
+            left -= 1
+            right -= 1
+        elif step == "delete":
+            left -= 1
+        elif step == "insert":
+            right -= 1
+        else:  # defensive: only reachable for a malformed DP matrix
+            break
+    return list(reversed(aligned))
+
+
 def _match_rows(before: list[dict], after: list[dict]) -> tuple[list[tuple], list[int], list[int]]:
     """Match stable IDs first, then exact content, then positional legacy rows."""
     matched: list[tuple[int, int, str]] = []
@@ -70,21 +132,34 @@ def _match_rows(before: list[dict], after: list[dict]) -> tuple[list[tuple], lis
         if after_index in used_after:
             continue
         candidates = by_signature.get(_signature(row)) or []
-        while candidates and candidates[0] in used_before:
-            candidates.pop(0)
-        if not candidates:
+        after_id = str(row.get("_id") or "")
+        before_index = next((
+            index for index in candidates
+            if index not in used_before
+            and not (
+                str(before[index].get("_id") or "")
+                and after_id
+                and str(before[index].get("_id")) != after_id
+            )
+        ), None)
+        if before_index is None:
             continue
-        before_index = candidates.pop(0)
-        matched.append((before_index, after_index, f"idx_{before_index}"))
+        candidates.remove(before_index)
+        before_id = str(before[before_index].get("_id") or "")
+        matched.append((
+            before_index, after_index,
+            after_id or before_id or f"idx_{before_index}",
+        ))
         used_before.add(before_index)
         used_after.add(after_index)
 
-    # Initial machine rows frequently acquire frontend IDs on first save.
-    # Pair remaining rows by position only when at least one side has no ID;
-    # never override two conflicting stable IDs.
-    for before_index, after_index in zip(
-        [i for i in range(len(before)) if i not in used_before],
-        [i for i in range(len(after)) if i not in used_after],
+    # Initial machine rows frequently acquire frontend IDs on first save. A
+    # positional zip corrupts labels when that same save inserts a new line,
+    # so align the unmatched sequences and let gaps represent insert/delete.
+    before_remaining = [i for i in range(len(before)) if i not in used_before]
+    after_remaining = [i for i in range(len(after)) if i not in used_after]
+    for before_index, after_index in _align_unmatched_rows(
+        before, after, before_remaining, after_remaining,
     ):
         before_id = str(before[before_index].get("_id") or "")
         after_id = str(after[after_index].get("_id") or "")
@@ -226,7 +301,10 @@ def build_line_delta_audit(
             ),
             "insertions": sum(row["operation"] == "insert" for row in changes),
             "deletions": sum(row["operation"] == "delete" for row in changes),
-            "reorders": sum(bool(row["fields"]["order"]) for row in changes),
+            "reorders": sum(
+                bool(row["fields"]["order"])
+                for row in changes if row["operation"] == "update"
+            ),
         },
         "timing_noise_threshold_ms": round(timing_noise_threshold_s * 1000, 3),
         "truncated": False,
