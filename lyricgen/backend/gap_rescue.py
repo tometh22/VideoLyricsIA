@@ -237,6 +237,14 @@ def _transcribe_window(audio_path: str, ini: float, dur: float,
                             "end": float(w.end) + ini})
             except (AttributeError, TypeError, ValueError):
                 continue
+        from recognition_provenance import record_completed
+        record_completed(
+            family="openai/whisper-1",
+            events=out,
+            kind="word_stream",
+            view="bounded_audio_window",
+            transformation=provenance_step,
+        )
         return out
     except Exception as e:
         if recorder:

@@ -369,6 +369,7 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
     fd, clip = tempfile.mkstemp(prefix="genly_gemini_vocal_", suffix=".wav")
     os.close(fd)
     recorder = None
+    provider_completed = False
     prompt = (
         "Transcribí únicamente los eventos vocales audibles en este fragmento. "
         "Cada evento debe ser una frase o ciclo vocal completo: no dividas una "
@@ -439,10 +440,18 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
             timeout_s=60.0,
             label="TARGETED-GEMINI-VERIFY",
         )
+        provider_completed = True
         raw = (response.text or "").strip()
         payload = json.loads(raw)
         events = payload.get("events") if isinstance(payload, dict) else None
         if not isinstance(events, list) or len(events) > 16:
+            from recognition_provenance import record_completed
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=[],
+                view="bounded_vocal_window",
+                transformation="targeted_consensus",
+            )
             return []
         out = []
         from pipeline import _is_whisper_hallucination
@@ -474,8 +483,23 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
         out.sort(key=lambda event: event["start"])
         if recorder:
             recorder.finish(response_summary=f"events={len(out)}")
+        from recognition_provenance import record_completed
+        record_completed(
+            family="google/gemini-2.5-flash-audio",
+            events=out,
+            view="bounded_vocal_window",
+            transformation="targeted_consensus",
+        )
         return out
     except Exception as exc:
+        if provider_completed:
+            from recognition_provenance import record_completed
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=[],
+                view="bounded_vocal_window",
+                transformation="targeted_consensus_parse_failed",
+            )
         if recorder:
             recorder.finish(
                 response_summary=f"error:{_safe_error_type(exc)}",

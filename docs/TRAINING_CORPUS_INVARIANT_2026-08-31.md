@@ -11,9 +11,12 @@ A new job is a complete transcription-training sample only when it has all of:
 5. every material line delta in `audit_log`, revision-bound and untruncated.
 
 `scripts/export_training_pairs.py` materializes that contract as private JSONL
-plus a SHA-256 manifest. It is SELECT-only, never estimates missing history,
-and exits non-zero with `--require-complete` if any selected sample is weak.
-The JSONL contains raw lyrics and must not leave approved private storage.
+(`transcription-training-pair-v2`) plus a SHA-256 manifest. It is SELECT-only,
+never estimates missing history, and exits non-zero with `--require-complete`
+if any selected sample is weak. Each row includes the immutable machine capture
+summary (including the independent recognition-attempt count), so missing raw
+provider output remains detectable after export. The JSONL contains raw lyrics
+and must not leave approved private storage.
 
 ## Timing labels and UI noise
 

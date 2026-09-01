@@ -186,9 +186,12 @@ def build_machine_evidence(result: dict) -> dict:
     selected = [row for row in (result.get("segments") or []) if isinstance(row, dict)]
     hypotheses: list[dict] = []
 
-    def add(role: str, family: str, kind: str, events: Any, **metadata: Any) -> None:
+    def add(
+        role: str, family: str, kind: str, events: Any,
+        *, allow_empty: bool = False, **metadata: Any,
+    ) -> None:
         rows = [row for row in (events or []) if isinstance(row, dict)]
-        if not rows:
+        if not rows and not allow_empty:
             return
         hypothesis = {
             "role": role,
@@ -201,6 +204,8 @@ def build_machine_evidence(result: dict) -> dict:
         for key in ("view", "transformation"):
             if metadata.get(key):
                 hypothesis[key] = str(metadata[key])[:160]
+        if type(metadata.get("attempt_id")) is int:
+            hypothesis["attempt_id"] = metadata["attempt_id"]
         hypotheses.append(hypothesis)
 
     recognition_attempts = [
@@ -213,6 +218,11 @@ def build_machine_evidence(result: dict) -> dict:
             str(attempt.get("family") or ""),
             str(attempt.get("kind") or "segments"),
             attempt.get("events"),
+            allow_empty=True,
+            attempt_id=(
+                attempt.get("attempt_id")
+                if type(attempt.get("attempt_id")) is int else index
+            ),
             view=attempt.get("view"),
             transformation=attempt.get("transformation"),
         )
@@ -221,7 +231,10 @@ def build_machine_evidence(result: dict) -> dict:
         result.get("_primary_asr_family") or _provider_family(selected)
     )
     if not recognition_attempts:
-        add("primary", primary_family, "word_stream", result.get("_asr_words"))
+        add(
+            "primary", primary_family, "word_stream",
+            result.get("_asr_words"), attempt_id=0,
+        )
     add(
         "independent",
         str(result.get("_independent_asr_family") or "independent-asr"),
@@ -253,15 +266,19 @@ def build_machine_evidence(result: dict) -> dict:
             "events_sha256": snapshot_hash([]),
         })
 
+    inferred_attempt_count = sum(
+        item.get("role") in {"primary", "candidate"}
+        for item in hypotheses
+    )
+    reported_attempt_count = result.get("_recognition_attempt_count")
+    if type(reported_attempt_count) is not int:
+        reported_attempt_count = inferred_attempt_count
     return {
         "schema": SCHEMA,
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "hypotheses_by_family": hypotheses,
         "capture": {
-            "recognition_attempt_count": sum(
-                item.get("role") in {"primary", "candidate"}
-                for item in hypotheses
-            ),
+            "recognition_attempt_count": reported_attempt_count,
             "primary_present": bool(
                 recognition_attempts or result.get("_asr_words")
             ),
@@ -345,6 +362,7 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
     if evidence.get("schema") == SCHEMA:
         selected_matches_snapshot = False
         named_primary_hypotheses = 0
+        primary_attempt_ids: list[Any] = []
         for hypothesis in hypotheses:
             if not isinstance(hypothesis, dict):
                 raise MachineSnapshotMissing("machine_hypothesis_invalid")
@@ -372,6 +390,8 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
                 raise MachineSnapshotMissing("machine_hypothesis_family_unknown")
             if role in {"primary", "candidate"}:
                 named_primary_hypotheses += 1
+                attempt_id = hypothesis.get("attempt_id")
+                primary_attempt_ids.append(attempt_id)
             if role == "selected":
                 if kind != "segments":
                     raise MachineSnapshotMissing("machine_selected_hypothesis_invalid")
@@ -387,6 +407,13 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
             raise MachineSnapshotMissing("machine_recognition_attempt_count_invalid")
         if attempt_count != named_primary_hypotheses:
             raise MachineSnapshotMissing("machine_recognition_hypothesis_missing")
+        if any(
+            type(attempt_id) is not int or attempt_id < 0
+            for attempt_id in primary_attempt_ids
+        ):
+            raise MachineSnapshotMissing("machine_recognition_attempt_id_invalid")
+        if sorted(primary_attempt_ids) != list(range(attempt_count)):
+            raise MachineSnapshotMissing("machine_recognition_attempt_id_invalid")
         signal = (evidence.get("decisions") or {}).get("song_quality_signal")
         validate_quality_training_signal(signal)
         expected_hash = snapshot_hash({

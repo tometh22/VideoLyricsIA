@@ -3977,7 +3977,8 @@ def _tag_recognition_family(
 def transcribe(mp3_path: str, language: str = None,
                lyrics_hint: str | None = None,
                job_id: str | None = None,
-               return_words: bool = False) -> list[dict]:
+               return_words: bool = False,
+               provenance_view: str = "provider_input") -> list[dict]:
     """Transcribe an audio file to lyric segments.
 
     Backend selection:
@@ -3995,6 +3996,16 @@ def transcribe(mp3_path: str, language: str = None,
     """
     has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
     logger.info("[transcribe] OPENAI_API_KEY=%s", 'set' if has_key else 'EMPTY')
+
+    def _record(rows: list[dict], family: str, transformation: str) -> None:
+        from recognition_provenance import record_completed
+        record_completed(
+            family=family,
+            events=rows,
+            view=provenance_view,
+            transformation=transformation,
+        )
+
     if has_key:
         vad_disabled = os.environ.get("VAD_CHUNK_ENABLED", "1") == "0"
         vad_first = os.environ.get("TRANSCRIBE_VAD_FIRST", "0") == "1"
@@ -4004,6 +4015,7 @@ def transcribe(mp3_path: str, language: str = None,
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
             )
+            _record(segs, "openai/whisper-1", "full_file")
         elif vad_first:
             # Legacy path (pre-2026-06): VAD chunking up front. Kept behind a
             # flag so we can A/B or revert without a deploy.
@@ -4011,6 +4023,7 @@ def transcribe(mp3_path: str, language: str = None,
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
             )
+            _record(segs, "openai/whisper-1", "vad_chunks")
         else:
             # Default: single full-file pass first (best TEXT — avoids the
             # chunk-boundary mishears VAD introduces), then fall back to VAD
@@ -4023,6 +4036,7 @@ def transcribe(mp3_path: str, language: str = None,
                 mp3_path, language=language, lyrics_hint=lyrics_hint,
                 job_id=job_id, return_words=return_words,
             )
+            _record(segs, "openai/whisper-1", "full_file")
             audio_dur = None
             duration_bad = False
             duration_reason = ""
@@ -4049,6 +4063,10 @@ def transcribe(mp3_path: str, language: str = None,
                 vad_segs = _vad_chunk_transcribe(
                     mp3_path, language=language, lyrics_hint=None,
                     job_id=job_id, return_words=return_words,
+                )
+                _record(
+                    vad_segs, "openai/whisper-1",
+                    "vad_chunks_retry",
                 )
                 vad_duration_bad = False
                 try:
@@ -4135,6 +4153,8 @@ def transcribe(mp3_path: str, language: str = None,
             ]
         segments.append(out_seg)
 
+    _record(segments, "openai-whisper/turbo-local", "full_file")
+
     # Safety net: retry if first segment starts very late
     if segments and segments[0]["start"] > 30:
         logger.warning("[WHISPER] WARNING: first seg at %.1fs, retrying", segments[0]['start'])
@@ -4158,6 +4178,10 @@ def transcribe(mp3_path: str, language: str = None,
                     for w in words if (w.get("word") or "").strip()
                 ]
             segments2.append(out_seg)
+        _record(
+            segments2, "openai-whisper/turbo-local",
+            "late_onset_retry",
+        )
         if segments2 and segments2[0]["start"] < segments[0]["start"]:
             segments = segments2
 
@@ -4194,6 +4218,10 @@ def transcribe(mp3_path: str, language: str = None,
                             for w in words if (w.get("word") or "").strip()
                         ]
                     segments3.append(out_seg)
+                _record(
+                    segments3, "openai-whisper/large-v3-local",
+                    "sparse_result_retry",
+                )
                 if len(segments3) > len(segments):
                     logger.info("[WHISPER] large-v3 produced %s segments (turbo: %s); using large-v3",
                                 len(segments3), len(segments))

@@ -6880,6 +6880,9 @@ async def _run_transcription_for_job(
     tmp_dir = tempfile.mkdtemp()
     tmp_path = audio_path
     _vocal_stem = None   # demucs output path (lazy), cleaned up in finally
+    from recognition_provenance import begin_collection as _begin_recognition
+    from recognition_provenance import end_collection as _end_recognition
+    _recognition_collector, _recognition_token = _begin_recognition()
 
     # Filled after the audio-first ASR exists.  `_emit_segments` reads this
     # state at the single output chokepoint so every downstream branch gets
@@ -6950,35 +6953,6 @@ async def _run_transcription_for_job(
                     )
                 )
             )
-
-        # Every recognition run that actually happened must survive the
-        # reference/reconcile/formatting cascade.  The selected editor output
-        # is often catalogue text, so reconstructing ASR from it afterwards is
-        # impossible.  Keep the raw provider rows privately until the worker
-        # freezes machine evidence, then remove the transport key.
-        _recognition_hypotheses: list[dict] = []
-
-        def _remember_recognition(events, family: str, *, view: str) -> None:
-            from copy import deepcopy
-
-            rows = [deepcopy(row) for row in (events or []) if isinstance(row, dict)]
-            exact_families = {
-                str(row.pop("_recognition_family", "") or "").strip()
-                for row in rows
-            } - {""}
-            family_name = (
-                next(iter(exact_families))
-                if len(exact_families) == 1
-                else str(family or "").strip()
-            )
-            if not rows or not family_name:
-                return
-            _recognition_hypotheses.append({
-                "family": family_name,
-                "kind": "segments",
-                "events": rows,
-                "view": str(view or "unknown")[:64],
-            })
 
         # ─── single chokepoint for every segments-bearing return ──────
         # `_emit_segments` is the ONE allowed exit point of this
@@ -7069,11 +7043,11 @@ async def _run_transcription_for_job(
             polished = normalized_polished
             out = {"job_id": job_id, "segments": polished,
                    "reference_lyrics": reference_lyrics}
-            if _recognition_hypotheses:
-                from copy import deepcopy
-                out["_recognition_hypotheses"] = deepcopy(
-                    _recognition_hypotheses
-                )
+            recognition_snapshot = _recognition_collector.snapshot()
+            out["_recognition_hypotheses"] = recognition_snapshot["hypotheses"]
+            out["_recognition_attempt_count"] = recognition_snapshot[
+                "completed_attempt_count"
+            ]
 
             # Language is evaluated at the same single output chokepoint as
             # timing. A bilingual song is valid: preserve multi-label
@@ -7644,12 +7618,6 @@ async def _run_transcription_for_job(
                     _wx_segs = None
 
                 if _wx_segs:
-                    _remember_recognition(
-                        _wx_segs, _wx_mod.recognition_family(),
-                        view="vocal_stem",
-                    )
-
-                if _wx_segs:
                     # Generic hallucination filter (mega-segment, fuzzy
                     # intra-loops, ¡Karol!×174 family). Pure structural
                     # check on whisperX output — runs regardless of
@@ -7799,6 +7767,7 @@ async def _run_transcription_for_job(
                             _base = await asyncio.to_thread(
                                 _pl.transcribe, audio_path, language=(lang or None),
                                 job_id=job_id, return_words=True,
+                                provenance_view="mix_line_text_base",
                             )
                             # Sustained ad-libs ("uh uh uh") that Whisper forced into
                             # words (e.g. a 21 s block heard as "¿Para qué? ¿Para qué?")
@@ -8805,12 +8774,6 @@ async def _run_transcription_for_job(
                     # + lrclib plain gives canonical text (no hallucinations).
                     try:
                         wx_warm_segs = await wx_warm_task
-                        if wx_warm_segs:
-                            _remember_recognition(
-                                wx_warm_segs,
-                                whisperx_transcribe.recognition_family(),
-                                view="vocal_stem",
-                            )
                         if wx_warm_segs and len(wx_warm_segs) >= 2:
                             from pipeline import _filter_whisper_hallucinations
                             wx_warm_segs, _ = _filter_whisper_hallucinations(wx_warm_segs)
@@ -9037,13 +9000,11 @@ async def _run_transcription_for_job(
                     if not intro_path:
                         return []
                     try:
-                        raw = await loop.run_in_executor(
-                            None,
-                            lambda: transcribe(
-                                intro_path, lang,
-                                lyrics_hint=initial_hint,
-                                return_words=True,
-                            ),
+                        raw = await asyncio.to_thread(
+                            transcribe, intro_path, lang,
+                            lyrics_hint=initial_hint,
+                            return_words=True,
+                            provenance_view="mix_intro",
                         )
                         # Keep only segments that fully sit in the intro
                         # window; defensive against ffmpeg frame-boundary
@@ -9056,13 +9017,11 @@ async def _run_transcription_for_job(
                         return []
 
                 async def _run_body_whisper():
-                    return await loop.run_in_executor(
-                        None,
-                        lambda: transcribe(
-                            transcribe_path, lang,
-                            lyrics_hint=initial_hint,
-                            return_words=True,
-                        ),
+                    return await asyncio.to_thread(
+                        transcribe, transcribe_path, lang,
+                        lyrics_hint=initial_hint,
+                        return_words=True,
+                        provenance_view="song_region",
                     )
 
                 try:
@@ -9103,13 +9062,6 @@ async def _run_transcription_for_job(
                             ]
                         return out
                     segments = [_shift(s) for s in segments]
-
-                from pipeline import transcription_family as _transcription_family
-                _remember_recognition(
-                    intro_segments + segments,
-                    _transcription_family(intro_segments + segments),
-                    view="mix_intro_plus_song" if intro_segments else "song_region",
-                )
 
                 # LRCLib-plain aligner: re-bucket Whisper words against
                 # LRCLib's human-curated line structure. The renderer
@@ -9308,20 +9260,14 @@ async def _run_transcription_for_job(
                     _e_stem,
                 )
 
-        segments = await loop.run_in_executor(
-            None,
-            lambda: transcribe(
-                _whisper_audio, lang,
-                lyrics_hint=_initial_asr_lyrics_hint(_gemini_pre),
-                return_words=True,
+        segments = await asyncio.to_thread(
+            transcribe, _whisper_audio, lang,
+            lyrics_hint=_initial_asr_lyrics_hint(_gemini_pre),
+            return_words=True,
+            provenance_view=(
+                "vocal_stem" if _whisper_audio != tmp_path else "mix"
             ),
         )
-        from pipeline import transcription_family as _transcription_family
-        _remember_recognition(
-            segments, _transcription_family(segments),
-            view=("vocal_stem" if _whisper_audio != tmp_path else "mix"),
-        )
-
         # reference: reuse what Gemini already returned (instant), or wait
         # up to 2s more if it didn't complete within the pre-fetch window.
         reference = ""
@@ -9449,11 +9395,6 @@ async def _run_transcription_for_job(
                     reference,
                 )
                 if wx_segs:
-                    _remember_recognition(
-                        wx_segs, whisperx_transcribe.recognition_family(),
-                        view="vocal_stem",
-                    )
-                if wx_segs:
                     from pipeline import _filter_whisper_hallucinations as _fwh
                     wx_segs, _ = _fwh(wx_segs)
                     # Same adlib-split guard as the no-reference whisperX path.
@@ -9564,11 +9505,6 @@ async def _run_transcription_for_job(
                     whisperx_transcribe.transcribe_whisperx, _aa, lang,
                 )
                 if wx_segs:
-                    _remember_recognition(
-                        wx_segs, whisperx_transcribe.recognition_family(),
-                        view="vocal_stem",
-                    )
-                if wx_segs:
                     from pipeline import _filter_whisper_hallucinations as _fwh
                     wx_segs, _ = _fwh(wx_segs)
                     # Split adlib mega-blocks (e.g. "uh, uh, uh…" × 26s) BEFORE
@@ -9642,6 +9578,7 @@ async def _run_transcription_for_job(
                          job_id)
         raise
     finally:
+        _end_recognition(_recognition_token)
         # tmp_dir holds intermediate slices (intro/body cuts) only — the
         # main audio (audio_path) is under job_dir and must survive until
         # /generate enqueues it (or the reaper cleans it up).

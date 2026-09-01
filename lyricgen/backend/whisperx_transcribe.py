@@ -965,7 +965,9 @@ def _apply_lead_in(segs: list[dict], *, lead_ms: int | None = None) -> list[dict
 
 
 def transcribe_whisperx(audio_path: str, language: str | None = None,
-                        lyrics_hint: str | None = None) -> list[dict] | None:
+                        lyrics_hint: str | None = None,
+                        provenance_view: str = "alignment_audio",
+                        ) -> list[dict] | None:
     """Transcribe `audio_path` with whisperX. Returns segments with word
     stamps, or None (disabled / failure / empty). Never raises.
 
@@ -1004,6 +1006,13 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     if cache_key:
         cached_segs = _cache_lookup(cache_key, expected_audio_hash=audio_hash)
         if cached_segs is not None:
+            from recognition_provenance import record_completed
+            record_completed(
+                family=recognition_family(),
+                events=cached_segs,
+                view=provenance_view,
+                transformation="cache_hit",
+            )
             logger.info(
                 "[WHISPERX] cache hit audio_hash=%s (%d segs, $0 + 0 s vs ~75-180 s + $0.005)",
                 audio_hash, len(cached_segs),
@@ -1084,6 +1093,13 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
         return None
 
     segs = _map_segments(output)
+    from recognition_provenance import record_completed
+    record_completed(
+        family=recognition_family(),
+        events=segs,
+        view=provenance_view,
+        transformation="replicate_raw",
+    )
     raw_n = len(segs)
     segs = _vad_split_adlib_segments(segs, audio_path, language)
     segs = _correct_post_adlib_timing(segs, audio_path)

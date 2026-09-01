@@ -31,11 +31,14 @@ observe mode its raw score is intentionally null; the evidence therefore keeps
 both that null and an explicitly labelled `risk_derived` score instead of
 silently inventing a calibrated score.
 
-The v3 producer freezes every completed recognition output before catalogue
-reconciliation or formatting. Each raw stream carries its exact provider/model
-family and audio view; the selected editor output is recorded separately. The
-attempt summary is part of the immutable evidence hash, and a completed attempt
-without a named hypothesis blocks approval/export.
+The v3 producer freezes every completed recognition output at its recognition
+route/provider boundary, before catalogue reconciliation, retry selection or formatting. Each
+raw stream carries an invocation id, exact provider/model family, audio view and
+transformation; rejected full-file/VAD/local-model retries remain separate, as
+do concurrent intro and body runs. The selected editor output is recorded
+separately. An invocation-level counter is part of the immutable evidence hash,
+and any completed attempt without a named durable hypothesis blocks
+approval/export.
 
 If capture, validation or persistence fails, the transaction does not expose
 the job to the editor and the transcription becomes `transcription_failed`.

@@ -313,6 +313,7 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             r.pop("_independent_asr_words", None)
             r.pop("_pre_anchor_provider_segments", None)
             r.pop("_recognition_hypotheses", None)
+            r.pop("_recognition_attempt_count", None)
             r.pop("_primary_asr_family", None)
             r.pop("_independent_asr_family", None)
         if _stem:
@@ -443,6 +444,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     r.pop("_independent_asr_words", None)
     r.pop("_pre_anchor_provider_segments", None)
     r.pop("_recognition_hypotheses", None)
+    r.pop("_recognition_attempt_count", None)
     r.pop("_primary_asr_family", None)
     r.pop("_independent_asr_family", None)
     return r

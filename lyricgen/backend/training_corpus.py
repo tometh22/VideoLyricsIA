@@ -20,7 +20,7 @@ from machine_evidence import (
 
 
 LINE_DELTA_SCHEMA = "editor-line-delta-v2"
-TRAINING_PAIR_SCHEMA = "transcription-training-pair-v1"
+TRAINING_PAIR_SCHEMA = "transcription-training-pair-v2"
 TIMING_NOISE_THRESHOLD_S = 0.05
 MAX_ALIGNMENT_CELLS = 250_000
 MAX_BANDED_ALIGNMENT_CELLS = 250_000
@@ -719,6 +719,8 @@ def materialize_training_pair(
     pre_human = raw_pre_human if isinstance(raw_pre_human, dict) else {}
     raw_hypotheses = evidence.get("hypotheses_by_family")
     hypotheses = list(raw_hypotheses) if isinstance(raw_hypotheses, list) else []
+    raw_capture = evidence.get("capture")
+    machine_capture = dict(raw_capture) if isinstance(raw_capture, dict) else {}
     raw_decisions = evidence.get("decisions")
     decisions = dict(raw_decisions) if isinstance(raw_decisions, dict) else {}
     return {
@@ -738,6 +740,7 @@ def materialize_training_pair(
             "audio_revision": pre_human.get("audio_revision"),
         },
         "hypotheses_by_family": hypotheses,
+        "machine_capture": machine_capture,
         "machine_decisions": decisions,
         "approved": ({
             "version_id": str(getattr(approved, "id", "")),

@@ -298,6 +298,23 @@ def test_v3_attempt_counter_must_equal_durable_primary_hypotheses():
         validate_machine_evidence(evidence, SEGMENTS)
 
 
+def test_v3_blocks_collector_count_when_hypothesis_serialization_was_lost():
+    captured = build_machine_evidence({
+        "segments": SEGMENTS,
+        "_recognition_hypotheses": [],
+        "_recognition_attempt_count": 1,
+    })
+    evidence = finalize_machine_evidence(
+        captured,
+        original_segments=SEGMENTS,
+        quality={"decision": "review"},
+        audio_sha256="a" * 64,
+        audio_revision=1,
+    )
+    with pytest.raises(MachineSnapshotMissing, match="hypothesis_missing"):
+        validate_machine_evidence(evidence, SEGMENTS)
+
+
 def test_snapshot_hash_mismatch_blocks_approval(db):
     row, document = _job(db, required=True)
     evidence = _evidence(document)
