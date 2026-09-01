@@ -442,11 +442,27 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
             label="TARGETED-GEMINI-VERIFY",
         )
         provider_completed = True
-        raw = (response.text or "").strip()
+        from recognition_provenance import (
+            record_completed,
+            response_text_completion,
+        )
+        raw, raw_events = response_text_completion(
+            response, label="opaque-targeted-gemini-response",
+        )
+        raw = raw.strip()
+        if not raw:
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=raw_events,
+                kind="text",
+                view="bounded_vocal_window",
+                transformation="targeted_consensus_empty_or_unreadable",
+            )
+            provider_recorded = True
+            return []
         try:
             payload = json.loads(raw)
         except Exception:
-            from recognition_provenance import record_completed
             record_completed(
                 family="google/gemini-2.5-flash-audio",
                 events=([{"text": raw}] if raw else []),

@@ -5994,10 +5994,17 @@ def _whisper_quick_text(mp3_path: str, job_id: str | None = None) -> str:
             r = OpenAI().audio.transcriptions.create(
                 model="whisper-1", file=f, response_format="text",
             )
-        from recognition_provenance import record_completed
+        from recognition_provenance import (
+            provider_text_completion,
+            record_completed,
+        )
+        text, raw_events = provider_text_completion(
+            r, label="opaque-whisper-quick-text",
+        )
+        text = text.strip()
         record_completed(
             family="openai/whisper-1",
-            events=([{"text": str(r or "").strip()}] if str(r or "").strip() else []),
+            events=raw_events,
             kind="text",
             view="bounded_alignment_window",
             transformation="reference_alignment_verify",
@@ -6007,7 +6014,7 @@ def _whisper_quick_text(mp3_path: str, job_id: str | None = None) -> str:
                 recorder.finish(response_summary="whisper_quick_ok")
             except Exception:
                 pass
-        return (r or "").strip()
+        return text
     except Exception as e:
         logger.warning("[LYRICS] _whisper_quick_text failed: %s", e)
         return ""
@@ -7537,23 +7544,22 @@ def _record_gemini_audio_completion(
 
     Reading ``response.text`` can itself fail for blocked/malformed provider
     responses.  Such a call still completed and must increment the independent
-    attempt counter, so record an explicit empty hypothesis before re-raising.
+    attempt counter, so record a durable marker and let the caller abstain.
     """
-    from recognition_provenance import record_completed
+    from recognition_provenance import record_completed, response_text_completion
 
-    try:
-        raw_text = str(getattr(response, "text") or "")
-    except Exception:
-        record_completed(
-            family="google/gemini-2.5-flash-audio",
-            events=[], kind="text", view=view,
-            transformation=f"{transformation}_unreadable",
-        )
-        raise
+    raw_text, raw_events = response_text_completion(
+        response, label="opaque-gemini-audio-response",
+    )
     record_completed(
         family="google/gemini-2.5-flash-audio",
-        events=([{"text": raw_text}] if raw_text else []),
-        kind="text", view=view, transformation=transformation,
+        events=raw_events,
+        kind="text",
+        view=view,
+        transformation=(
+            transformation if raw_text
+            else f"{transformation}_empty_or_unreadable"
+        ),
     )
     return raw_text
 

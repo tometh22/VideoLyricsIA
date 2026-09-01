@@ -265,11 +265,16 @@ def _one_pass(client, genai, y, sr, dur, who, win_base: int = 0,
                 label=f"perf-text chunk {c0:.0f}-{c1:.0f}s",
             )
             provider_completed = True
-            raw_text = str(resp.text or "")
-            from recognition_provenance import record_completed
+            from recognition_provenance import (
+                record_completed,
+                response_text_completion,
+            )
+            raw_text, raw_events = response_text_completion(
+                resp, label="opaque-performance-text-response",
+            )
             record_completed(
                 family=f"google/{MODEL}",
-                events=([{"text": raw_text}] if raw_text else []),
+                events=raw_events,
                 kind="text",
                 view="performance_audio_window",
                 transformation=(

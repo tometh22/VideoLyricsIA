@@ -8,7 +8,9 @@ from recognition_provenance import (
     bounded_provider_string,
     clear_collection,
     end_collection,
+    provider_text_completion,
     record_completed,
+    response_text_completion,
     resume_from_result,
     snapshot_into_result,
 )
@@ -23,6 +25,39 @@ def test_bounded_provider_string_never_raises_for_opaque_sdk_values():
     assert bounded_provider_string(Unprintable()) == (
         "<opaque-provider-value-Unprintable>"
     )
+
+
+def test_provider_text_completion_preserves_unprintable_success():
+    class Unprintable:
+        def __str__(self):
+            raise RuntimeError("cannot stringify")
+
+    text, events = provider_text_completion(
+        Unprintable(), label="opaque-test-text",
+    )
+
+    assert text == ""
+    assert events == [{
+        "raw": "<opaque-test-text-Unprintable>",
+        "serialization_error": "RuntimeError",
+    }]
+
+
+def test_response_text_completion_preserves_hostile_attribute():
+    class HostileResponse:
+        @property
+        def text(self):
+            raise ValueError("blocked response")
+
+    text, events = response_text_completion(
+        HostileResponse(), label="opaque-test-response",
+    )
+
+    assert text == ""
+    assert events == [{
+        "raw": "<opaque-test-response-HostileResponse>",
+        "serialization_error": "ValueError",
+    }]
 
 
 def test_transport_marker_records_exact_selected_local_model(monkeypatch):

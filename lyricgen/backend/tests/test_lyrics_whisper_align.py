@@ -23,6 +23,7 @@ from lyrics_whisper_align import (  # noqa: E402
     _build_segments,
     _lev_similarity,
     _map_provider_words,
+    _provider_response_words,
     _raw_provider_words,
     whisper_word_align,
     MIN_ANCHOR_RATIO,
@@ -77,9 +78,26 @@ def test_raw_provider_words_preserves_opaque_rows_before_mapping():
     ]
 
 
+def test_provider_response_words_preserves_hostile_stream_getter():
+    class HostileResponse:
+        @property
+        def words(self):
+            raise RuntimeError("deferred SDK failure")
+
+    words, raw = _provider_response_words(HostileResponse())
+
+    assert words == []
+    assert raw == [{
+        "raw": "<opaque-whisper-word-response-HostileResponse>",
+        "serialization_error": "RuntimeError",
+    }]
+
+
 def test_alignment_records_raw_words_before_selection_mapping():
     source = inspect.getsource(whisper_word_align)
-    raw_index = source.index("raw_word_dicts = _raw_provider_words(words)")
+    raw_index = source.index(
+        "words, raw_word_dicts = _provider_response_words(response)"
+    )
     record_index = source.index("record_completed(", raw_index)
     map_index = source.index("word_dicts = _map_provider_words(words)")
     assert raw_index < record_index < map_index

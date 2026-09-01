@@ -27,6 +27,45 @@ def bounded_provider_string(
         return f"<{label}-{type(value).__name__}>"
 
 
+def provider_text_completion(
+    value: Any,
+    *,
+    label: str = "opaque-provider-text",
+) -> tuple[str, list[dict]]:
+    """Freeze a provider text value without trusting its SDK wrapper.
+
+    Some SDK response objects defer conversion until ``str()``.  A completed
+    recognition call must remain durable even when that conversion fails, so
+    return a bounded marker event instead of letting the accessor erase the
+    attempt from the training sample.
+    """
+    try:
+        text = "" if value is None else str(value)
+    except Exception as exc:
+        return "", [{
+            "raw": f"<{label}-{type(value).__name__}>",
+            "serialization_error": type(exc).__name__,
+        }]
+    return text, [{"text": text}]
+
+
+def response_text_completion(
+    response: Any,
+    *,
+    attribute: str = "text",
+    label: str = "opaque-provider-response",
+) -> tuple[str, list[dict]]:
+    """Read a text attribute while preserving an unreadable completion."""
+    try:
+        value = getattr(response, attribute)
+    except Exception as exc:
+        return "", [{
+            "raw": f"<{label}-{type(response).__name__}>",
+            "serialization_error": type(exc).__name__,
+        }]
+    return provider_text_completion(value, label=label)
+
+
 class RecognitionCollector:
     def __init__(
         self,

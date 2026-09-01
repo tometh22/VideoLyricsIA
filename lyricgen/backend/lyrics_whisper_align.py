@@ -433,6 +433,22 @@ def _raw_provider_words(words) -> list[dict]:
     return raw
 
 
+def _provider_response_words(response) -> tuple[list, list[dict]]:
+    """Read an SDK word stream without losing a completed attempt."""
+    try:
+        provider_words = getattr(response, "words", None)
+        words = list(provider_words or [])
+        return words, _raw_provider_words(words)
+    except Exception as exc:
+        return [], [{
+            "raw": (
+                "<opaque-whisper-word-response-"
+                f"{type(response).__name__}>"
+            ),
+            "serialization_error": type(exc).__name__,
+        }]
+
+
 def whisper_word_align(
     audio_path: str,
     cleaned_lines: list[str],
@@ -515,8 +531,7 @@ def whisper_word_align(
             logger.warning("[WHISPER-ALIGN] Whisper API failed: %s", str(e)[:200])
             return None
 
-        words = getattr(response, "words", None) or []
-        raw_word_dicts = _raw_provider_words(words)
+        words, raw_word_dicts = _provider_response_words(response)
         from recognition_provenance import record_completed
         record_completed(
             family="openai/whisper-1",
