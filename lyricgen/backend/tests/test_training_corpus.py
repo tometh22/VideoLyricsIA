@@ -105,6 +105,46 @@ def test_large_alignment_uses_bounded_fallback_without_corrupting_insert(monkeyp
     ] == [("insert", "intro"), ("update", "greeting")]
 
 
+def test_bounded_alignment_preserves_multiple_consecutive_gaps(monkeypatch):
+    import training_corpus
+
+    monkeypatch.setattr(training_corpus, "MAX_ALIGNMENT_CELLS", 1)
+    before = [
+        {"start": 0.0, "end": 1.0, "text": "first original"},
+        {"start": 2.0, "end": 3.0, "text": "second original"},
+        {"start": 4.0, "end": 5.0, "text": "third original"},
+        {"start": 6.0, "end": 7.0, "text": "fourth original"},
+    ]
+    after = [
+        {"_id": "new-a", "start": -1.0, "end": -0.7, "text": "new a"},
+        {"_id": "new-b", "start": -0.6, "end": -0.3, "text": "new b"},
+        {"_id": "first", "start": 0.1, "end": 1.1, "text": "first edited"},
+        {"_id": "second", "start": 2.0, "end": 3.0, "text": "second original"},
+        # An old row is deleted here; the tail must still retain identity.
+        {"_id": "tail", "start": 6.1, "end": 7.1, "text": "fourth edited"},
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    updates = {
+        row["line_id"]: (row["from_index"], row["to_index"])
+        for row in payload["changes"] if row["operation"] == "update"
+    }
+    inserts = {
+        row["line_id"] for row in payload["changes"] if row["operation"] == "insert"
+    }
+    deletes = {
+        row["from_index"] for row in payload["changes"] if row["operation"] == "delete"
+    }
+    assert updates == {"first": (0, 2), "tail": (3, 4)}
+    assert inserts == {"new-a", "new-b"}
+    assert deletes == {2}
+    assert payload["summary"]["reorders"] == 0
+
+
 def test_metadata_only_editor_change_is_not_training_noise():
     before = [{"_id": "a", "start": 1, "end": 2, "text": "hola", "pos": {"x": .2}}]
     after = [{"_id": "a", "start": 1.01, "end": 2.01, "text": "hola", "pos": {"x": .9}}]

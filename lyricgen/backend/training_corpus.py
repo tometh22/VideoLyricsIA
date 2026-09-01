@@ -115,49 +115,82 @@ def _align_unmatched_rows(
 def _align_unmatched_rows_bounded(
     before: list[dict], after: list[dict], before_indices: list[int], after_indices: list[int],
 ) -> list[tuple[int, int]]:
-    """Linear-memory, bounded-lookahead fallback for unusually large edits."""
-    aligned: list[tuple[int, int]] = []
-    left = right = 0
-    while left < len(before_indices) and right < len(after_indices):
-        candidates: list[tuple[float, int, str, int]] = []
-        direct = _row_match_cost(
-            before[before_indices[left]], after[after_indices[right]],
+    """Banded Needleman-Wunsch fallback for unusually large edits.
+
+    The previous greedy lookahead could not represent two consecutive gaps:
+    because a substitution costs less than two gaps, it paired an old row with
+    the first newly inserted row and shifted every later label.  This keeps the
+    exact dynamic-programming recurrence, but evaluates only a corridor around
+    the proportional input/output diagonal.  Consecutive insertions and
+    deletions are first-class paths without restoring the quadratic matrix.
+    """
+    rows, cols = len(before_indices), len(after_indices)
+    if not rows or not cols:
+        return []
+
+    gap_cost = 1.0
+    # Widen just enough for very unbalanced inputs to keep adjacent corridor
+    # rows connected, while retaining O((rows + cols) * lookahead) behaviour.
+    imbalance_step = math.ceil(abs(cols - rows) / max(1, min(rows, cols)))
+    band = ALIGNMENT_LOOKAHEAD + imbalance_step
+
+    def bounds(left: int) -> tuple[int, int]:
+        center = round(left * cols / rows)
+        return (
+            max(0, center - band),
+            min(cols, center + band),
         )
-        # A strong direct match cannot be improved enough by paying a gap.
-        # This keeps the common 5,000-line bulk-ID assignment path linear.
-        if math.isfinite(direct) and direct <= 0.75:
-            aligned.append((before_indices[left], after_indices[right]))
-            left += 1
-            right += 1
-            continue
-        if math.isfinite(direct):
-            candidates.append((direct, 0, "match", 0))
-        for offset in range(1, min(ALIGNMENT_LOOKAHEAD, len(after_indices) - right - 1) + 1):
-            match_cost = _row_match_cost(
-                before[before_indices[left]], after[after_indices[right + offset]],
-            )
-            if math.isfinite(match_cost):
-                candidates.append((offset + match_cost, 1, "insert", offset))
-        for offset in range(1, min(ALIGNMENT_LOOKAHEAD, len(before_indices) - left - 1) + 1):
-            match_cost = _row_match_cost(
-                before[before_indices[left + offset]], after[after_indices[right]],
-            )
-            if math.isfinite(match_cost):
-                candidates.append((offset + match_cost, 2, "delete", offset))
-        if not candidates:
-            # Conflicting stable IDs with no nearby counterpart. Leave the
-            # current before row unmatched and continue in bounded time.
-            left += 1
-            continue
-        _cost, _priority, operation, offset = min(candidates)
-        if operation == "insert":
-            right += offset
-        elif operation == "delete":
-            left += offset
-        aligned.append((before_indices[left], after_indices[right]))
-        left += 1
-        right += 1
-    return aligned
+
+    # Only two score rows are retained. Traceback directions are one byte-ish
+    # Python strings per corridor cell, bounded by O((rows + cols) * band).
+    first_low, first_high = bounds(0)
+    previous = {
+        right: right * gap_cost for right in range(first_low, first_high + 1)
+    }
+    steps: dict[tuple[int, int], str] = {
+        (0, right): "insert" for right in range(1, first_high + 1)
+    }
+
+    for left in range(1, rows + 1):
+        low, high = bounds(left)
+        current: dict[int, float] = {}
+        for right in range(low, high + 1):
+            candidates: list[tuple[float, int, str]] = []
+            if right > 0 and right - 1 in previous:
+                match_cost = _row_match_cost(
+                    before[before_indices[left - 1]],
+                    after[after_indices[right - 1]],
+                )
+                if math.isfinite(match_cost):
+                    candidates.append((previous[right - 1] + match_cost, 0, "match"))
+            if right in previous:
+                candidates.append((previous[right] + gap_cost, 1, "delete"))
+            if right > 0 and right - 1 in current:
+                candidates.append((current[right - 1] + gap_cost, 2, "insert"))
+            if not candidates:
+                continue
+            best_cost, _priority, step = min(candidates)
+            current[right] = best_cost
+            steps[(left, right)] = step
+        previous = current
+
+    if cols not in previous:  # defensive; bounds() is designed to include it
+        return []
+    aligned: list[tuple[int, int]] = []
+    left, right = rows, cols
+    while left or right:
+        step = steps.get((left, right))
+        if step == "match":
+            aligned.append((before_indices[left - 1], after_indices[right - 1]))
+            left -= 1
+            right -= 1
+        elif step == "delete":
+            left -= 1
+        elif step == "insert":
+            right -= 1
+        else:
+            return []
+    return list(reversed(aligned))
 
 
 def _match_rows(before: list[dict], after: list[dict]) -> tuple[list[tuple], list[int], list[int]]:
