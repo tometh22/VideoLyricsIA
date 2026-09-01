@@ -27,6 +27,9 @@ TRIGGER_SPECS: dict[str, dict[str, Any]] = {
         "threshold_default": 200,
         "enabled_env": "REALIGN_SELECTOR_AUTORUN_ENABLED",
         "job_function": "run_realign_selector_trigger",
+        # T4 is intentionally not a second milestone. The selector job owns
+        # both pieces of the same occurrence/timing problem at 200 songs.
+        "companion_triggers": ("t4_95",),
     },
     "agent_d1": {
         "threshold_env": "AGENT_D1_TRIGGER_SONGS",
@@ -130,6 +133,7 @@ def _enqueue_research_job(trigger_type: str, bucket: int, count: int) -> str:
         job_id=rq_id,
         meta=queue_jobs.rq_payload_metadata(
             "research_trigger", trigger_type=trigger_type, bucket=bucket,
+            companion_triggers=list(spec.get("companion_triggers", ())),
         ),
     )
     return queued.id
@@ -176,6 +180,7 @@ def schedule_due_triggers(*, reason: str = "approval") -> dict[str, Any]:
                     "trigger_type": trigger_type, "bucket": bucket,
                     "threshold": threshold, "corpus_songs": count,
                     "rq_job_id": rq_id, "reason": reason,
+                    "companion_triggers": list(spec.get("companion_triggers", ())),
                     "authorization": authorization if trigger_type == "lora_retraining" else None,
                 }
                 db.add(AuditLog(
@@ -191,7 +196,13 @@ def schedule_due_triggers(*, reason: str = "approval") -> dict[str, Any]:
         db.close()
 
 
-def _run_configured_command(kind: str, bucket: int, count: int) -> dict[str, Any]:
+def _run_configured_command(
+    kind: str,
+    bucket: int,
+    count: int,
+    *,
+    companion_triggers: tuple[str, ...] = (),
+) -> dict[str, Any]:
     """Run an explicitly configured offline executor, never an implicit shell.
 
     The worker image does not contain the 2.6GB private golden set.  A trigger
@@ -207,13 +218,20 @@ def _run_configured_command(kind: str, bucket: int, count: int) -> dict[str, Any
         return {
             "status": "blocked_executor_missing", "trigger_type": kind,
             "bucket": bucket, "corpus_songs": count,
+            "companion_triggers": list(companion_triggers),
         }
     if not os.path.isabs(command):
-        return {"status": "blocked_executor_not_absolute", "trigger_type": kind}
+        return {
+            "status": "blocked_executor_not_absolute", "trigger_type": kind,
+            "companion_triggers": list(companion_triggers),
+        }
+    args = [command, "--trigger", kind, "--bucket", str(bucket),
+            "--corpus-songs", str(count)]
+    for companion in companion_triggers:
+        args.extend(("--companion-trigger", companion))
     try:
         completed = subprocess.run(
-            [command, "--trigger", kind, "--bucket", str(bucket),
-             "--corpus-songs", str(count)],
+            args,
             check=False, capture_output=True, text=True,
             timeout=int(os.environ.get("RESEARCH_TRIGGER_EXECUTOR_TIMEOUT", "21600")),
         )
@@ -223,6 +241,7 @@ def _run_configured_command(kind: str, bucket: int, count: int) -> dict[str, Any
     payload: dict[str, Any] = {
         "status": "completed" if completed.returncode == 0 else "executor_failed",
         "trigger_type": kind, "bucket": bucket, "returncode": completed.returncode,
+        "companion_triggers": list(companion_triggers),
     }
     try:
         output = json.loads(completed.stdout or "{}")
@@ -238,7 +257,13 @@ def run_lora_retraining_trigger(bucket: int, corpus_songs: int) -> dict[str, Any
 
 
 def run_realign_selector_trigger(bucket: int, corpus_songs: int) -> dict[str, Any]:
-    return _run_configured_command("realign_selector", bucket, corpus_songs)
+    # One RQ milestone and one executor cover selector + T4-95. Keeping T4
+    # as a companion prevents duplicate 200-song jobs and makes the shared
+    # occurrence/timing calibration boundary explicit.
+    return _run_configured_command(
+        "realign_selector", bucket, corpus_songs,
+        companion_triggers=("t4_95",),
+    )
 
 
 def run_agent_d1_trigger(bucket: int, corpus_songs: int) -> dict[str, Any]:

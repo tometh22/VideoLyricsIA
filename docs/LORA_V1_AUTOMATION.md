@@ -46,7 +46,10 @@ WER global como único resultado. Los reportes mantienen
 `scripts/evaluate_t4_95.py` evalúa únicamente la población de 95 finales
 tempranos y un control de no-daño. Es replay-only, informa mejora de target y
 daños de control (>150 ms), además de media/CI bootstrap y desglose por
-canción. La extensión T4 no entra en producción por este script.
+canción. La extensión T4 no entra en producción por este script. La serie de
+variantes ya probadas y su cierre están en
+[`docs/T4_SERIES_CLOSURE.md`](T4_SERIES_CLOSURE.md); no se agregan variantes
+antes de 200 canciones capturadas.
 
 ## Triggers sin duplicados
 
@@ -56,7 +59,8 @@ worker cuenta jobs distintos con snapshot pre-humano y aprobación. Con:
 * `LORA_V1_AUTORETRAIN_ENABLED=1` y `CORPUS_RETRAIN_EVERY_SONGS=100` solicita
   un run en cada bucket de 100.
 * `REALIGN_SELECTOR_AUTORUN_ENABLED=1` y
-  `REALIGN_SELECTOR_TRIGGER_SONGS=200` solicita el selector.
+  `REALIGN_SELECTOR_TRIGGER_SONGS=200` solicita un único job que incluye el
+  selector y el companion `t4_95`; T4 no tiene un trigger independiente.
 * `AGENT_D1_AUTORUN_ENABLED=1` y `AGENT_D1_TRIGGER_SONGS=100` solicita D1.
 
 Cada bucket tiene un RQ id determinista y una fila `AuditLog`; un retry o
