@@ -128,9 +128,15 @@ def _training_rows(rows: list[dict[str, Any]]) -> tuple[list[dict], list[dict], 
     # it as "reserved" would leak the advertised leave-artist-out split.
     usable = [row for row in rows if not bool(row.get("eval_only"))]
     songs = sorted({str(row["song_id"]) for row in usable})
-    validation = set(songs[::5] or songs[-1:])
+    validation = {
+        str(row["song_id"]) for row in usable
+        if str(row.get("song_split") or "") == "validation"
+    } or set(songs[::5] or songs[-1:])
     artists = sorted({str(row.get("artist") or "unknown") for row in usable})
-    held_artist = artists[::5]
+    held_artist = {
+        str(row.get("artist") or "unknown") for row in usable
+        if str(row.get("artist_split") or "") == "leave_artist_out"
+    } or set(artists[::5])
     held = [row for row in usable if str(row.get("artist") or "unknown") in held_artist]
     train = [
         row for row in usable
