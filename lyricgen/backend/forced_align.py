@@ -115,14 +115,29 @@ def _safe_provider_value(value: Any, *, _seen: set[int] | None = None) -> Any:
             dumped = None
         if dumped is not None and dumped is not value:
             return _safe_provider_value(dumped, _seen=seen)
-        return {"raw": str(value)[:2000]}
+        try:
+            opaque = str(value)[:2000]
+        except Exception:
+            opaque = f"<opaque-provider-{type(value).__name__}>"
+        return {"raw": opaque}
     finally:
         seen.discard(identity)
 
 
 def _raw_replicate_events(output: Any) -> list[dict]:
     """Wrap one completed Replicate payload as one durable provider event."""
-    return [{"provider_output": _safe_provider_value(output)}]
+    try:
+        durable = _safe_provider_value(output)
+    except Exception as exc:
+        # Evidence serialization must never turn a completed provider call
+        # into a failed alignment/retry.  The collector still receives an
+        # explicit row (and increments independently); any later inability to
+        # persist it creates the count mismatch that blocks approval/export.
+        durable = {
+            "raw": "<provider-output-serialization-error>",
+            "serialization_error": type(exc).__name__,
+        }
+    return [{"provider_output": durable}]
 
 
 def _call_with_budget(model: str, input_factory, *,

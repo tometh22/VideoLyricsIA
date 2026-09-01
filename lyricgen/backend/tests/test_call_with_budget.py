@@ -75,12 +75,20 @@ def test_completed_output_is_frozen_before_forced_alignment_mapping(monkeypatch)
         def __str__(self):
             return "opaque-replicate-wordstamp"
 
+    class UnprintableMetadata:
+        def model_dump(self):
+            raise ValueError("malformed Replicate metadata")
+
+        def __str__(self):
+            raise RuntimeError("SDK object cannot be stringified")
+
     provider_output = {
         "wordstamps": [
             {"word": "hola", "start": 1.0, "end": 1.4},
             OpaqueWordstamp(),
         ],
         "language": "es",
+        "metadata": UnprintableMetadata(),
     }
     monkeypatch.setattr("replicate.run", lambda *a, **kw: provider_output)
 
@@ -107,6 +115,9 @@ def test_completed_output_is_frozen_before_forced_alignment_mapping(monkeypatch)
     assert frozen["wordstamps"][0]["word"] == "hola"
     assert frozen["wordstamps"][1] == {
         "raw": "opaque-replicate-wordstamp",
+    }
+    assert frozen["metadata"] == {
+        "raw": "<opaque-provider-UnprintableMetadata>",
     }
 
 
