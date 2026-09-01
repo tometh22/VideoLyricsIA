@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import sys
@@ -180,14 +181,65 @@ class Api:
         return self.wait_for_transcription(entry, job_id, poll_seconds)
 
     def start_transcription(self, entry: AudioManifestEntry, job_id: str) -> dict:
-        result = self.request("POST", "/transcribe-uploaded", json={
+        payload = {
             "job_id": job_id,
             "language": "es",
             "artist": entry.artist,
             "title": entry.title,
             "live": bool(entry.version),
-        })
+        }
+        canonical = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        )
+        idem_key = "batch-transcribe-" + hashlib.sha256(
+            canonical.encode("utf-8"),
+        ).hexdigest()
+
+        result = None
+        last_error = None
+        for attempt in range(3):
+            try:
+                result = self.request(
+                    "POST", "/transcribe-uploaded", json=payload,
+                    headers={"Idempotency-Key": idem_key},
+                )
+                break
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                # The server may have committed its outbox before the HTTP
+                # response was lost. Reconcile the durable job before retrying
+                # the exact same hash; never create a second upload/job.
+                last_error = exc
+                try:
+                    existing = self.request("GET", f"/batch/jobs/{job_id}")
+                except (requests.Timeout, requests.ConnectionError, BatchError):
+                    existing = {}
+                server_status = str(existing.get("status") or "")
+                if server_status in {
+                    "transcribing_queued", "transcribing", "transcribed",
+                    "transcribed_pending", "queued", "processing",
+                    "pending_review", "done",
+                }:
+                    result = {
+                        "job_id": job_id,
+                        "status": server_status,
+                        "deduplicated": True,
+                        "resumed_after_ambiguous_response": True,
+                    }
+                    break
+                if server_status and server_status != "awaiting_upload":
+                    raise BatchError(
+                        f"ambiguous transcription submit ended as {server_status}: "
+                        f"{entry.filename}"
+                    ) from exc
+                if attempt < 2:
+                    time.sleep(0.5 * (2 ** attempt))
+        if result is None:
+            raise BatchError(
+                f"transcription submit response remained ambiguous for {entry.filename}"
+            ) from last_error
         entry.status = result.get("status") or "transcribing_queued"
+        if entry.status == "transcribed_pending":
+            entry.status = "transcribed"
         return result
 
     def wait_for_transcription(self, entry: AudioManifestEntry, job_id: str,

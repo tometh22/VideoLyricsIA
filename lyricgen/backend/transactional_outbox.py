@@ -201,6 +201,8 @@ def create_transcription_outbox_event(
     job,
     audio_path: str,
     transcription_kwargs: dict[str, Any],
+    request_fingerprint: str = "",
+    idempotency_key_hash: str = "",
 ):
     """Commit-ready intent for a transcription invocation."""
     event = create_outbox_event(
@@ -211,6 +213,8 @@ def create_transcription_outbox_event(
         payload={
             "audio_path": audio_path,
             "transcription_kwargs": dict(transcription_kwargs),
+            "request_fingerprint": str(request_fingerprint)[:64],
+            "idempotency_key_hash": str(idempotency_key_hash)[:64],
         },
     )
     job.active_transcription_attempt_id = event.id

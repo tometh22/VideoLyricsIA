@@ -123,8 +123,8 @@ def test_lyrics_edit_proceeds_with_allow_youtube_drift(
             "allow_youtube_drift": True,
         },
     )
-    assert res.status_code == 200, (
-        f"esperado 200 con opt-in, hubo {res.status_code}. Body: {res.text}"
+    assert res.status_code == 202, (
+        f"esperado 202 con opt-in, hubo {res.status_code}. Body: {res.text}"
     )
     body = res.json()
     assert body["ok"] is True
@@ -154,8 +154,8 @@ def test_lyrics_edit_no_youtube_data_skips_guard(
             "segments": [{"start": 0.25, "end": 1.25, "text": "hola"}],
         },
     )
-    assert res.status_code == 200, (
-        f"esperado 200 sin youtube_data, hubo {res.status_code}. Body: {res.text}"
+    assert res.status_code == 202, (
+        f"esperado 202 sin youtube_data, hubo {res.status_code}. Body: {res.text}"
     )
     db.expire_all()
     fresh = db.query(JobModel).filter(JobModel.job_id == job_id).first()

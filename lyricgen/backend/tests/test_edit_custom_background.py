@@ -125,7 +125,7 @@ def test_custom_as_is_forwards_and_does_not_consume_slot(client, admin_token, db
             headers={"Authorization": f"Bearer {admin_token}"},
             json={"edit_type": "custom", "custom_background_r2_key": key},
         )
-        assert res.status_code == 200, res.text
+        assert res.status_code == 202, res.text
         assert len(captured) == 1
         cbg = captured[0]["edit_params"].get("custom_bg")
         assert cbg and cbg["bg_r2_key"] == key
@@ -154,7 +154,7 @@ def test_custom_animated_consumes_slot_and_runs_veo_step(client, admin_token, db
                 "animate_image": True,
             },
         )
-        assert res.status_code == 200, res.text
+        assert res.status_code == 202, res.text
         cbg = captured[0]["edit_params"].get("custom_bg")
         assert cbg["animate_image"] is True
         db.expire_all()

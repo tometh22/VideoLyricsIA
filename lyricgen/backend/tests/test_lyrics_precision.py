@@ -265,7 +265,7 @@ def test_edit_lyrics_accepted_on_terminal_video_states(
         headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"},
         json={"edit_type": "lyrics", "segments": new_segments},
     )
-    assert r.status_code == 200, f"status={source_status} should accept lyrics edit, got {r.status_code}: {r.text}"
+    assert r.status_code == 202, f"status={source_status} should accept lyrics edit, got {r.status_code}: {r.text}"
     assert captured["edit_type"] == "lyrics"
     assert len(captured["edit_params"]["segments"]) == 2
     assert captured["edit_params"]["segments"][0]["text"] == "Fixed"
@@ -406,7 +406,7 @@ def test_edit_lyrics_falls_back_to_render_params_background_id(
         headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"},
         json={"edit_type": "lyrics", "segments": [{"start": 0, "end": 2, "text": "y"}]},
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
     assert captured["edit_type"] == "lyrics"
     _cleanup(db)
     db.delete(asset)
@@ -449,7 +449,7 @@ def test_edit_metadata_falls_back_to_render_params_background_id(
         headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"},
         json={"edit_type": "metadata", "song_title": "Title With Typo Fixed"},
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
     assert captured["edit_type"] == "metadata"
     _cleanup(db)
     db.delete(asset)
@@ -481,7 +481,7 @@ def test_edit_lyrics_does_not_break_existing_typography_path(client, user_token,
         headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"},
         json={"edit_type": "typography", "font": "anton"},
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
     assert captured["edit_type"] == "typography"
     assert captured["edit_params"]["font"] == "anton"
     # No segments leakage from lyrics path into typography params

@@ -8,11 +8,12 @@ from scripts.preflight import edit_smoke
 
 
 class _Response:
-    def __init__(self, payload=None, status_code=200, text=""):
+    def __init__(self, payload=None, status_code=200, text="", headers=None):
         self._payload = payload or {}
         self.status_code = status_code
         self.ok = status_code < 400
         self.text = text
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
@@ -64,7 +65,20 @@ def test_edit_smoke_uses_current_presigned_upload_flow(monkeypatch):
             })
         if url.endswith("/transcribe-uploaded"):
             assert kwargs["json"]["job_id"] == "smokejob123"
-            return _Response({"status": "transcribing"})
+            retry = sum(
+                1 for method, called_url, _ in calls
+                if method == "POST" and called_url.endswith("/transcribe-uploaded")
+            ) > 1
+            return _Response(
+                {
+                    "status": "transcribing",
+                    "status_url": "/transcription-status/smokejob123",
+                    "outbox_event_id": "transcribe-event-1",
+                    "deduplicated": retry,
+                },
+                status_code=202,
+                headers={"Location": "/transcription-status/smokejob123"},
+            )
         if url.endswith("/generate"):
             fields = kwargs["files"]
             assert fields["job_id"] == (None, "smokejob123")
@@ -80,7 +94,20 @@ def test_edit_smoke_uses_current_presigned_upload_flow(monkeypatch):
             ]
             return _Response({"count": 2, "revision": 1})
         if url.endswith("/edit/smokejob123"):
-            return _Response({"status": "editing"})
+            retry = sum(
+                1 for method, called_url, _ in calls
+                if method == "POST" and called_url.endswith("/edit/smokejob123")
+            ) > 1
+            return _Response(
+                {
+                    "status": "editing",
+                    "status_url": "/status/smokejob123",
+                    "outbox_event_id": "edit-event-1",
+                    "deduplicated": retry,
+                },
+                status_code=202,
+                headers={"Location": "/status/smokejob123"},
+            )
         raise AssertionError(f"unexpected POST {url}")
 
     def put(url, **kwargs):
@@ -145,8 +172,10 @@ def test_timing_only_edit_requires_machine_text_and_preserves_other_rows():
 
 def test_edit_smoke_accepts_fail_closed_quality_gate_in_staging(monkeypatch):
     segments = [{"start": 0.0, "end": 1.0, "text": "smoke"}]
+    transcribe_calls = 0
 
     def post(url, **kwargs):
+        nonlocal transcribe_calls
         if url.endswith("/auth/login"):
             return _Response({"token": "test-token"})
         if url.endswith("/upload-url"):
@@ -156,7 +185,17 @@ def test_edit_smoke_accepts_fail_closed_quality_gate_in_staging(monkeypatch):
                 "use_multipart": False,
             })
         if url.endswith("/transcribe-uploaded"):
-            return _Response({"status": "transcribing"})
+            transcribe_calls += 1
+            return _Response(
+                {
+                    "status": "transcribing",
+                    "status_url": "/transcription-status/qualitysmoke1",
+                    "outbox_event_id": "transcribe-event-1",
+                    "deduplicated": transcribe_calls > 1,
+                },
+                status_code=202,
+                headers={"Location": "/transcription-status/qualitysmoke1"},
+            )
         if url.endswith("/jobs/qualitysmoke1/save-segments"):
             return _Response({"count": 1, "revision": 1})
         if url.endswith("/generate"):
@@ -190,8 +229,10 @@ def test_edit_smoke_accepts_fail_closed_quality_gate_in_staging(monkeypatch):
 def test_edit_smoke_accepts_asynchronous_quality_gate_in_staging(monkeypatch):
     segments = [{"start": 0.0, "end": 1.0, "text": "smoke"}]
     posts = []
+    transcribe_calls = 0
 
     def post(url, **kwargs):
+        nonlocal transcribe_calls
         posts.append(url)
         if url.endswith("/auth/login"):
             return _Response({"token": "test-token"})
@@ -202,7 +243,17 @@ def test_edit_smoke_accepts_asynchronous_quality_gate_in_staging(monkeypatch):
                 "use_multipart": False,
             })
         if url.endswith("/transcribe-uploaded"):
-            return _Response({"status": "transcribing"})
+            transcribe_calls += 1
+            return _Response(
+                {
+                    "status": "transcribing",
+                    "status_url": "/transcription-status/qualitysmoke3",
+                    "outbox_event_id": "transcribe-event-1",
+                    "deduplicated": transcribe_calls > 1,
+                },
+                status_code=202,
+                headers={"Location": "/transcription-status/qualitysmoke3"},
+            )
         if url.endswith("/jobs/qualitysmoke3/save-segments"):
             return _Response({"count": 1, "revision": 1})
         if url.endswith("/generate"):
@@ -237,8 +288,10 @@ def test_edit_smoke_accepts_asynchronous_quality_gate_in_staging(monkeypatch):
 
 def test_edit_smoke_does_not_hide_unknown_generate_conflict(monkeypatch):
     segments = [{"start": 0.0, "end": 1.0, "text": "smoke"}]
+    transcribe_calls = 0
 
     def post(url, **kwargs):
+        nonlocal transcribe_calls
         if url.endswith("/auth/login"):
             return _Response({"token": "test-token"})
         if url.endswith("/upload-url"):
@@ -248,7 +301,17 @@ def test_edit_smoke_does_not_hide_unknown_generate_conflict(monkeypatch):
                 "use_multipart": False,
             })
         if url.endswith("/transcribe-uploaded"):
-            return _Response({"status": "transcribing"})
+            transcribe_calls += 1
+            return _Response(
+                {
+                    "status": "transcribing",
+                    "status_url": "/transcription-status/qualitysmoke2",
+                    "outbox_event_id": "transcribe-event-1",
+                    "deduplicated": transcribe_calls > 1,
+                },
+                status_code=202,
+                headers={"Location": "/transcription-status/qualitysmoke2"},
+            )
         if url.endswith("/jobs/qualitysmoke2/save-segments"):
             return _Response({"count": 1, "revision": 1})
         if url.endswith("/generate"):
