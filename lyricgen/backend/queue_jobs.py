@@ -299,6 +299,23 @@ def _pick_queue(plan: str, tenant_id: str = ""):
     return q_default
 
 
+def _pick_workload_queue(
+    workload_class: str,
+    *,
+    interactive_queue: str,
+    plan: str = "100",
+    tenant_id: str = "",
+):
+    """Server-owned batch routing; public payloads never select a queue."""
+    if workload_class != "batch":
+        return _pick_queue(plan, tenant_id=tenant_id)
+    _, q_default, _ = _init_redis()
+    if q_default is None:
+        return None
+    from rq import Queue
+    return Queue(interactive_queue, connection=q_default.connection)
+
+
 def _capture_job_failure(layer: str, job_id_db: str, type_, value) -> None:
     """Send a tagged Sentry event for a permanently-failed RQ job.
 
@@ -377,6 +394,11 @@ def transcription_failure_callback(job, connection, type_, value, traceback) -> 
         # the SIGKILL case where transcription_worker's in-process capture
         # never got the chance to run.
         _capture_job_failure("transcription", job_id_db, type_, value)
+        try:
+            from ops_metrics import increment
+            increment(f"{meta.get('workload_class') or 'interactive'}_transcription_failed")
+        except Exception:
+            pass
         is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
         from error_taxonomy import public_error
         if is_abandoned:
@@ -480,6 +502,11 @@ def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
         # Surface to Sentry tagged with job/tenant — a permanently-dead
         # render is always incident-worthy, doubly so for a B2B tenant.
         _capture_job_failure("render_pipeline", job_id_db, type_, value)
+        try:
+            from ops_metrics import increment
+            increment(f"{meta.get('workload_class') or 'interactive'}_render_failed")
+        except Exception:
+            pass
         # Guardrail "nunca degradar": si el reintento automático no alcanzó a
         # generar el fondo real, NO dejamos el job en "error" crudo — lo
         # marcamos para que la UI muestre una tarjeta accionable (reintentar /
@@ -589,7 +616,10 @@ def cancel_rq_job(job_id: str) -> bool:
         # terminal state, and jobs.update_job's terminal-state guard would
         # silently discard the result (incident 2026-05-26).
         all_queues = [q_default, q_enterprise]
-        for extra_name in ("transcription", "transcription_quality", "bg_preview"):
+        for extra_name in (
+            "transcription", "transcription_batch", "transcription_quality",
+            "bg_preview", "batch_render", "campaign_control",
+        ):
             try:
                 all_queues.append(_Q(extra_name, connection=r))
             except Exception:
@@ -757,6 +787,7 @@ def enqueue_pipeline(
     tenant_id: str = "",
     publication_id: str | None = None,
     publication_dedupe_key: str | None = None,
+    workload_class: str = "interactive",
     **kwargs,
 ) -> str:
     """Enqueue a run_pipeline job. Returns RQ job id (or 'thread:<job_id>' in
@@ -772,7 +803,12 @@ def enqueue_pipeline(
     # execute a v2-produced job during the bounded cutover. Metadata is the
     # new source for v2 workers; the legacy argument remains for N-1.
     kwargs["background_policy_fingerprint"] = policy_fingerprint
-    q = _pick_queue(plan, tenant_id=tenant_id)
+    q = _pick_workload_queue(
+        workload_class,
+        interactive_queue="batch_render",
+        plan=plan,
+        tenant_id=tenant_id,
+    )
     if q is not None:
         from rq import Retry
         if publication_id:
@@ -825,11 +861,17 @@ def enqueue_pipeline(
             meta=rq_payload_metadata(
                 "pipeline", background_policy_fingerprint=policy_fingerprint,
                 db_job_id=job_id,
+                workload_class=workload_class,
                 outbox_event_id=publication_id,
             ),
             retry=retry,
             on_failure=pipeline_failure_callback,
         )
+        try:
+            from ops_metrics import increment
+            increment(f"{workload_class}_render_enqueued")
+        except Exception:
+            pass
         return rq_job.id
 
     # Redis-less path. In production this would silently bypass JOB_TIMEOUT,
@@ -880,6 +922,7 @@ def enqueue_transcription(
     anchor_lyrics: str = "",
     publication_id: str | None = None,
     publication_dedupe_key: str | None = None,
+    workload_class: str = "interactive",
 ) -> str:
     """Enqueue una transcripción en la queue `transcription` (alta prioridad,
     drenada por el mismo worker container que enterprise/default).
@@ -902,7 +945,8 @@ def enqueue_transcription(
         # cambiar la inicialización (que no la incluye por compat con workers
         # existentes que no la conocen).
         from rq import Queue, Retry
-        q = Queue("transcription", connection=_redis)
+        queue_name = "transcription_batch" if workload_class == "batch" else "transcription"
+        q = Queue(queue_name, connection=_redis)
         transcription_kwargs = {
             "language": language, "artist": artist, "title": title,
             "filename": filename, "live": live,
@@ -947,6 +991,7 @@ def enqueue_transcription(
             job_id=rq_job_id,
             meta=rq_payload_metadata(
                 "transcription", db_job_id=job_id,
+                workload_class=workload_class,
                 outbox_event_id=publication_id,
             ),
             retry=retry,
@@ -958,6 +1003,11 @@ def enqueue_transcription(
             # `transcription_failed` so the operator sees a real error.
             on_failure=transcription_failure_callback,
         )
+        try:
+            from ops_metrics import increment
+            increment(f"{workload_class}_transcription_enqueued")
+        except Exception:
+            pass
         return rq_job.id
 
     # Dev fallback (sin Redis): thread daemon, idéntico al de enqueue_pipeline.
@@ -1855,6 +1905,11 @@ def edit_failure_callback(job, connection, type_, value, traceback) -> None:
             return
         # Surface to Sentry tagged with job/tenant before the DB write.
         _capture_job_failure("edit", rq_job_id, type_, value)
+        try:
+            from ops_metrics import increment
+            increment(f"{meta.get('workload_class') or 'interactive'}_edit_failed")
+        except Exception:
+            pass
         # Guardrail "nunca degradar" (ver pipeline_failure_callback): un edit
         # cuyo fondo no se pudo generar no cae a "error" crudo — se marca para
         # la tarjeta accionable. El video anterior sigue intacto en R2.
@@ -1896,6 +1951,7 @@ def enqueue_edit(
     tenant_id: str = "",
     publication_id: str = "",
     publication_dedupe_key: str = "",
+    workload_class: str = "interactive",
 ) -> str:
     """Enqueue a run_edit_pipeline job (partial re-render).
 
@@ -1913,7 +1969,12 @@ def enqueue_edit(
     _require_submissions_open()
     from background_policy import runtime_rollout_fingerprint
     _policy_fingerprint = runtime_rollout_fingerprint()
-    q = _pick_queue(plan, tenant_id=tenant_id)
+    q = _pick_workload_queue(
+        workload_class,
+        interactive_queue="batch_render",
+        plan=plan,
+        tenant_id=tenant_id,
+    )
     if q is not None:
         from rq import Retry
         from pipeline import run_edit_pipeline
@@ -1972,12 +2033,18 @@ def enqueue_edit(
             meta=rq_payload_metadata(
                 "edit", background_policy_fingerprint=_policy_fingerprint,
                 domain_job_id=job_id,
+                workload_class=workload_class,
                 outbox_event_id=publication_id or None,
                 outbox_dedupe_key=publication_dedupe_key or None,
             ),
             retry=retry,
             on_failure=edit_failure_callback,
         )
+        try:
+            from ops_metrics import increment
+            increment(f"{workload_class}_edit_enqueued")
+        except Exception:
+            pass
         return rq_job.id
 
     if _ENVIRONMENT == "production":
@@ -2057,12 +2124,23 @@ def enqueue_drive_delivery(transfer_id: str, plan: str = "100") -> str:
 
 
 def queue_depth() -> dict:
-    """Return {'default': n, 'enterprise': n, 'backend': 'redis'|'threads'}."""
-    _, q_default, q_enterprise = _init_redis()
+    """Return queue depth split by latency-sensitive and batch workloads."""
+    redis, q_default, q_enterprise = _init_redis()
     if q_default is None:
-        return {"default": 0, "enterprise": 0, "backend": "threads"}
-    return {
+        return {
+            "default": 0, "enterprise": 0, "transcription": 0,
+            "bg_preview": 0, "transcription_batch": 0,
+            "batch_render": 0, "campaign_control": 0, "backend": "threads",
+        }
+    from rq import Queue
+    result = {
         "default": len(q_default),
         "enterprise": len(q_enterprise),
-        "backend": "redis",
     }
+    for name in (
+        "transcription", "bg_preview", "transcription_batch",
+        "batch_render", "campaign_control",
+    ):
+        result[name] = len(Queue(name, connection=redis))
+    result["backend"] = "redis"
+    return result

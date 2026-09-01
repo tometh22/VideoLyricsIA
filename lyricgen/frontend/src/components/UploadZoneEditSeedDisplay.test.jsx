@@ -233,6 +233,39 @@ describe("el sticky no se contamina editando", () => {
   });
 });
 
+describe("review de creación: la tipografía visible llega al submit", () => {
+  afterEach(() => { cleanup(); localStorage.clear(); });
+
+  it("propaga minúsculas directamente aunque no sea editMode", () => {
+    // Incidente real c6553b32b6c1: el control cambió a `lower`, pero App
+    // dependía de reconciliar files[] por File.name para actualizar el
+    // currentReview. En una review restaurada/server-backed ese join puede no
+    // existir; el POST terminó sin text_case y el render heredó `upper`.
+    const seen = [];
+    render(
+      <UploadZone
+        files={[]}
+        onFiles={() => {}}
+        user={{ role: "admin", features: {} }}
+        allHaveArtist
+        hasReviewableContent
+        onStartReview={() => {}}
+        onGenerateDirect={() => {}}
+        onUploadAdvance={() => {}}
+        onEditFieldChange={(field, value) => seen.push([field, value])}
+      />,
+    );
+
+    goStep(4);
+    const lower = document.querySelector('[data-text-case="lower"]');
+    expect(lower).not.toBeNull();
+    fireEvent.click(lower);
+
+    expect(lower.getAttribute("aria-pressed")).toBe("true");
+    expect(seen).toContainEqual(["textCase", "lower"]);
+  });
+});
+
 describe("los colores de letra no se ofrecen en edición (editables e ignorados)", () => {
   afterEach(() => { cleanup(); localStorage.clear(); });
 

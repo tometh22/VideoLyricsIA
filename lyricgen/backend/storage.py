@@ -588,6 +588,30 @@ def presign_put_url(
     return {"url": url, "key": key, "expires_in": expiry_seconds}
 
 
+def presign_put_object_key(
+    key: str,
+    *,
+    content_type: Optional[str] = None,
+    expiry_seconds: int = 900,
+) -> Optional[dict]:
+    """Sign an already-scoped object key.
+
+    Campaign audio is registered before a Job exists, so it cannot use the
+    historical ``inputs/<tenant>/<job>`` key builder. Callers must construct
+    and tenant-scope the key; this helper only signs it.
+    """
+    client = _get_client()
+    if client is None:
+        return None
+    params = {"Bucket": R2_BUCKET, "Key": key}
+    if content_type:
+        params["ContentType"] = content_type
+    url = client.generate_presigned_url(
+        "put_object", Params=params, ExpiresIn=expiry_seconds,
+    )
+    return {"url": url, "key": key, "expires_in": expiry_seconds}
+
+
 def multipart_init(
     tenant_id: str,
     job_id: str,
@@ -626,6 +650,29 @@ def multipart_init(
         )
         return None
     return {"upload_id": resp["UploadId"], "key": key}
+
+
+def multipart_init_object_key(
+    key: str,
+    *,
+    content_type: Optional[str] = None,
+) -> Optional[dict]:
+    """Begin multipart upload for a pre-scoped campaign object key."""
+    client = _get_client()
+    if client is None:
+        return None
+    args = {"Bucket": R2_BUCKET, "Key": key}
+    if content_type:
+        args["ContentType"] = content_type
+    try:
+        response = client.create_multipart_upload(**args)
+    except Exception as exc:
+        logger.error(
+            "campaign multipart_init failed key=%s: %s", key, exc,
+            exc_info=True,
+        )
+        return None
+    return {"upload_id": response["UploadId"], "key": key}
 
 
 def multipart_presign_part(
@@ -858,6 +905,40 @@ def multipart_last_activity(key: str, upload_id: str):
         )
         return None
     return newest
+
+
+def multipart_list_parts(key: str, upload_id: str) -> Optional[list[dict]]:
+    """Return completed parts, or ``None`` when the upload no longer exists.
+
+    An empty list is a valid newly-created upload. ``None`` lets the campaign
+    API replace an expired/aborted upload id instead of handing the local
+    uploader presigned URLs that can never succeed.
+    """
+    client = _get_client()
+    if client is None:
+        return None
+    marker = 0
+    completed: list[dict] = []
+    try:
+        while True:
+            response = client.list_parts(
+                Bucket=R2_BUCKET, Key=key, UploadId=upload_id,
+                MaxParts=1000, PartNumberMarker=marker,
+            )
+            completed.extend({
+                "part_number": int(part["PartNumber"]),
+                "etag": str(part["ETag"]).strip('"'),
+                "size": int(part.get("Size") or 0),
+            } for part in response.get("Parts", []))
+            if not response.get("IsTruncated"):
+                break
+            marker = int(response.get("NextPartNumberMarker") or 0)
+            if not marker:
+                break
+    except Exception as exc:
+        logger.warning("[R2] could not list resumable parts key=%s: %s", key, exc)
+        return None
+    return completed
 
 
 def head_object_size(key: str) -> Optional[int]:

@@ -324,6 +324,14 @@ def _schedule_worker_maintenance(queue_names: list[str]) -> dict[str, bool]:
         except Exception as exc:
             scheduled["job_outbox"] = False
             logger.warning("[WORKER] job outbox scheduler unavailable: %s", exc)
+    if "campaign_control" in queue_names:
+        try:
+            from batch_campaigns import ensure_campaign_reconciler_scheduled
+            ensure_campaign_reconciler_scheduled()
+            scheduled["batch_campaigns"] = True
+        except Exception as exc:
+            scheduled["batch_campaigns"] = False
+            logger.warning("[WORKER] batch campaign scheduler unavailable: %s", exc)
     return scheduled
 
 

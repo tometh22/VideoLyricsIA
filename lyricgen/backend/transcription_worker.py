@@ -866,11 +866,17 @@ def run_transcription_job(
             _persist_db.commit()
             persisted_revision = current_revision
             persisted_tenant_id = str(row.tenant_id or "")
+            persisted_workload_class = str(row.workload_class or "interactive")
             persisted_hash = (
                 quality.get("segments_hash") if isinstance(quality, dict) else None
             )
         finally:
             _persist_db.close()
+        try:
+            from ops_metrics import increment
+            increment(f"{persisted_workload_class}_transcription_completed")
+        except Exception:
+            pass
         # Quality analysis is isolated from the latency-sensitive
         # transcription/bg_preview fleet.  It is suggestion-only and OCC-bound
         # to the exact revision/hash persisted above.

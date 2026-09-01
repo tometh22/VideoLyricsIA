@@ -544,6 +544,20 @@ class Job(Base):
     job_id = Column(String(12), unique=True, nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     tenant_id = Column(String(100), nullable=False, index=True)
+    # Workload isolation. Existing rows and all ordinary wizard uploads stay
+    # interactive; campaign-created rows are marked batch by the server and
+    # route to dedicated RQ fleets. Clients never choose this value.
+    workload_class = Column(
+        String(16), nullable=False, default="interactive",
+        server_default="interactive", index=True,
+    )
+    campaign_id = Column(
+        String(12), ForeignKey("batch_campaigns.id"), nullable=True, index=True,
+    )
+    campaign_item_id = Column(
+        String(36), ForeignKey("batch_campaign_items.id"), nullable=True,
+        unique=True, index=True,
+    )
     artist = Column(String(255), nullable=False)
     song_title = Column(String(500), nullable=True)
     style = Column(String(50), default="oscuro")
@@ -747,6 +761,9 @@ class Job(Base):
             "style": self.style,
             "filename": self.filename,
             "tenant_id": self.tenant_id,
+            "workload_class": self.workload_class or "interactive",
+            "campaign_id": self.campaign_id,
+            "campaign_item_id": self.campaign_item_id,
             "status": self.status,
             "current_step": self.current_step,
             "progress": self.progress,
@@ -814,6 +831,9 @@ class Job(Base):
             "artist": self.artist,
             "song_title": self.song_title,
             "filename": self.filename,
+            "workload_class": self.workload_class or "interactive",
+            "campaign_id": self.campaign_id,
+            "campaign_item_id": self.campaign_item_id,
             "delivery_profile": self.delivery_profile,
             "umg_spec": self.umg_spec,
             "prores_ready": (
@@ -839,6 +859,83 @@ class Job(Base):
         }
 
 
+class BatchCampaign(Base):
+    """Tenant-scoped durable container for a high-volume audio campaign."""
+
+    __tablename__ = "batch_campaigns"
+    __table_args__ = (
+        Index("ix_batch_campaigns_tenant_created", "tenant_id", text("created_at DESC")),
+    )
+
+    id = Column(String(12), primary_key=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String(160), nullable=False)
+    status = Column(String(20), nullable=False, default="active", server_default="active")
+    expected_count = Column(Integer, nullable=False, default=0, server_default="0")
+    default_render_params = Column(JSONB, nullable=False, default=dict, server_default="{}")
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class BatchCampaignItem(Base):
+    """One source audio registered before a Job is promoted for transcription."""
+
+    __tablename__ = "batch_campaign_items"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "sha256", name="uq_batch_item_campaign_sha"),
+        UniqueConstraint("campaign_id", "technical_code", name="uq_batch_item_campaign_code"),
+        Index("ix_batch_items_campaign_upload", "campaign_id", "upload_state", "ordinal"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    campaign_id = Column(
+        String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    tenant_id = Column(String(100), nullable=False, index=True)
+    ordinal = Column(Integer, nullable=False)
+    filename = Column(String(500), nullable=False)
+    title = Column(String(500), nullable=True)
+    artist = Column(String(255), nullable=True)
+    technical_code = Column(String(64), nullable=True)
+    size_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    duration_seconds = Column(Float, nullable=True)
+    sha256 = Column(String(64), nullable=False)
+    metadata_error = Column(String(255), nullable=True)
+    upload_state = Column(String(20), nullable=False, default="registered", server_default="registered")
+    upload_key = Column(Text, nullable=True)
+    multipart_upload_id = Column(Text, nullable=True)
+    upload_error = Column(String(500), nullable=True)
+    upload_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    uploaded_at = Column(DateTime(timezone=True), nullable=True)
+    render_overrides = Column(JSONB, nullable=False, default=dict, server_default="{}")
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class BatchUploadSession(Base):
+    """Short-lived, campaign-only credential exchanged from a pairing code."""
+
+    __tablename__ = "batch_upload_sessions"
+
+    id = Column(String(36), primary_key=True)
+    campaign_id = Column(
+        String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    tenant_id = Column(String(100), nullable=False, index=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    code_hash = Column(String(64), nullable=False, unique=True, index=True)
+    token_hash = Column(String(64), nullable=True, unique=True, index=True)
+    code_expires_at = Column(DateTime(timezone=True), nullable=False)
+    token_expires_at = Column(DateTime(timezone=True), nullable=True)
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class EditorDocument(Base):
     """Durable editor working copy layered over the legacy Job snapshot."""
     __tablename__ = "editor_documents"
@@ -853,6 +950,9 @@ class EditorDocument(Base):
     updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     lock_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Browser-tab identity. User id alone cannot distinguish two tabs opened
+    # by the same reviewer, so both used to believe they owned one document.
+    lock_session_id = Column(String(64), nullable=True)
     lock_expires_at = Column(DateTime(timezone=True), nullable=True)
     # Raw proposal text is intentionally tenant-scoped in the editor layer;
     # analytics/quality JSON stores only hashes and aggregate diagnostics.

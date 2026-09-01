@@ -540,12 +540,18 @@ export default function UploadZone({
       return next;
     });
     onFiles((prev) => prev.map((f) => ({ ...f, [field]: value })));
-    // QA fix 2026-05-27: en edit mode files=[] así que el fan-out de
-    // arriba es no-op. Sin esto, los cambios de background_hint /
-    // movement / effect / typography que el operador hace en steps 2-4
-    // nunca llegan a currentReview, y submitEdit (handleApproveLyrics)
-    // los pierde al computar el diff. App.jsx mapea field→currentReview.
-    if (editMode && onEditFieldChange) {
+    // El review que se está mostrando es también una fuente de submit, tanto
+    // al CREAR como al EDITAR. El fan-out a `files[]` no alcanza: reviews
+    // restauradas o server-backed pueden no conservar el mismo objeto File y
+    // el join por file.name de App no encuentra nada. En ese caso el control
+    // cambia visualmente en el wizard pero currentReview conserva el valor
+    // viejo (incidente real: se eligió `lower` dos veces y el POST salió sin
+    // text_case, por lo que el render heredó `upper`).
+    //
+    // Propagamos siempre. Antes de que exista currentReview, el callback de
+    // App es un no-op; durante review escribe el valor elegido directamente y
+    // elimina la dependencia del efecto de reconciliación por filename.
+    if (onEditFieldChange) {
       onEditFieldChange(field, value);
     }
     // UI v1.1 (2026-05-30): when the operator touches a Portada field,
@@ -2727,6 +2733,8 @@ export default function UploadZone({
               <button
                 key={opt.code}
                 type="button"
+                aria-pressed={batchDefaults.textCase === opt.code}
+                data-text-case={opt.code}
                 title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                 onClick={() => updateBatchDefault("textCase", opt.code)}
                 onMouseEnter={() => setHoverCaseBatch(opt.code)}
@@ -4559,6 +4567,8 @@ export default function UploadZone({
                           <button
                             key={opt.code}
                             type="button"
+                            aria-pressed={batchDefaults.textCase === opt.code}
+                            data-text-case={opt.code}
                             title={opt.code === "sentence" ? `${opt.label} · ${t("announce.typocase_tagline")}` : opt.label}
                             onClick={() => updateBatchDefault("textCase", opt.code)}
                             onMouseEnter={() => setHoverCaseBatch(opt.code)}

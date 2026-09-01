@@ -360,9 +360,26 @@ def test_railway_prices_usage_metrics_against_real_invoice(monkeypatch):
     assert by_measure["MEMORY_USAGE_GB"]["cost"] > 80
 
 
-def test_railway_uses_actual_days_in_month(monkeypatch):
-    """A fixed 43200-minute divisor would misprice every month that isn't
-    30 days — February would come out ~7% high."""
+def test_railway_cobra_contra_un_mes_facturable_fijo_de_30_dias(monkeypatch):
+    """El mismo consumo cuesta lo mismo, tenga el mes 28, 30 o 31 días.
+
+    Este test decía lo contrario. Afirmaba que "un divisor fijo de 43200
+    valorizaría mal todo mes que no tenga 30 días — febrero saldría ~7% alto"
+    y exigía `feb > jul`. Estaba al revés, y lo demuestra el propio Bill
+    Breakdown de Railway (ciclo 20-jul→20-ago-2026), que coincide a 7 cifras
+    con dividir la tarifa mensual por 43200:
+
+        memoria  101,9424 / 440390,97 GB-min = 0,000231482 = 10 / 43200
+        cpu       11,3129 /  24435,87 vCPU-min = 0,000462963 = 20 / 43200
+        volumen    1,3267 / 382099,00 GB-min = 0,000003472 = 0,15 / 43200
+
+    Railway no normaliza por el largo del mes: cobra por unidad-minuto
+    consumida. Un mes de 31 días con la misma carga sale 3,3% más caro que
+    uno de 30, y eso es correcto, no un error de redondeo.
+
+    El costo de tener esto al revés no era teórico: el test verde protegía
+    un ±3% permanente en la línea más grande del panel después de GCP.
+    """
     usage = [{"measurement": "MEMORY_USAGE_GB", "value": 100000.0}]
 
     class _Resp:
@@ -375,10 +392,13 @@ def test_railway_uses_actual_days_in_month(monkeypatch):
     monkeypatch.setattr(billing_sources.requests, "post",
                         lambda *a, **k: _Resp())
 
-    feb = billing_sources.fetch_railway("2026-02")   # 28 days
-    jul = billing_sources.fetch_railway("2026-07")   # 31 days
-    # Same raw GB-minutes over a shorter month = more GB-months = costlier.
-    assert feb.amount_usd > jul.amount_usd
+    feb = billing_sources.fetch_railway("2026-02")   # 28 días
+    jul = billing_sources.fetch_railway("2026-07")   # 31 días
+    assert feb.amount_usd == pytest.approx(jul.amount_usd), (
+        "el largo del mes no puede cambiar el precio de los mismos GB-minuto")
+    # Y el importe es el de la factura: GB-min × ($10 / 43200).
+    # `fetch_railway` redondea a centavos.
+    assert feb.amount_usd == pytest.approx(100000.0 * 10.0 / 43200, abs=0.01)
 
 
 def test_railway_empty_usage_is_incomplete_not_fake_zero(monkeypatch):

@@ -94,6 +94,10 @@ def create_job(
     initial_status: str = "processing",
     song_title: str = "",
     input_r2_key: Optional[str] = None,
+    workload_class: str = "interactive",
+    campaign_id: Optional[str] = None,
+    campaign_item_id: Optional[str] = None,
+    commit: bool = True,
 ) -> str:
     """Create a new job and return its ID.
 
@@ -141,9 +145,15 @@ def create_job(
         ),
         progress=0,
         input_r2_key=input_r2_key,
+        workload_class=("batch" if workload_class == "batch" else "interactive"),
+        campaign_id=campaign_id,
+        campaign_item_id=campaign_item_id,
     )
     db.add(job)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return job_id
 
 
@@ -785,6 +795,7 @@ def get_all_jobs(
     tenant_id: str = "default",
     limit: int = 200,
     user_id: int = None,
+    include_batch: bool = False,
 ) -> list[dict]:
     """Return all jobs for a tenant, sorted by creation time (newest first).
 
@@ -808,6 +819,11 @@ def get_all_jobs(
         # independently of status, so they can never leak into Historial.
         ~Job.filename.startswith("bgpreview_"),
     )
+    if not include_batch:
+        # Campaigns have their own paginated panel. Keeping them out of the
+        # legacy 200-row history prevents a 600-song manifest from hiding an
+        # operator's ordinary videos without changing the existing contract.
+        query = query.filter(Job.workload_class != "batch")
     if tenant_id is not None:
         query = query.filter(Job.tenant_id == tenant_id)
     else:

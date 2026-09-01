@@ -235,6 +235,7 @@ def _publish(
             edit_params=dict(payload.get("edit_params") or {}),
             plan=str(payload.get("plan") or "100"),
             tenant_id=str(payload.get("tenant_id") or ""),
+            workload_class=str(payload.get("workload_class") or "interactive"),
             publication_id=str(event.id),
             publication_dedupe_key=str(event.dedupe_key),
         )

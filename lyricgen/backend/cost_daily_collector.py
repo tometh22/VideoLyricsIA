@@ -80,16 +80,6 @@ class DayResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _month_minutes(d: date) -> int:
-    """Minutes in the calendar month `d` belongs to.
-
-    The denominator for every Railway unit-minute → unit-month conversion.
-    Using the window length instead is the 26.9x bug described above; using
-    a fixed 43200 skews every month that is not 30 days.
-    """
-    return calendar.monthrange(d.year, d.month)[1] * 24 * 60
-
-
 def _row(dim_type: str, dim_value: str, amount: float | None, *,
          qty: float | None = None, unit: str | None = None,
          behavior: str | None = None, basis: str = "measured",
@@ -132,6 +122,47 @@ def _check_dims_sum_to_total(rows: list[dict], source: str, day: date) -> None:
 # ---------------------------------------------------------------------------
 # Per-source daily collectors
 # ---------------------------------------------------------------------------
+
+_RAILWAY_SERVICE_NAMES: dict[str, str] = {}
+
+
+def _railway_service_names(token: str, project_id: str) -> dict[str, str]:
+    """`serviceId` → nombre legible, cacheado por proceso.
+
+    La query de `usage` sólo trae `tags { serviceId }`, un UUID. Guardarlo
+    tal cual dejaba la tabla con `bdf24933-a1ab-…: $144,44`, que no responde
+    la pregunta para la que existe el desglose: cuánto del "fijo" es `api`
+    —residente, no escala con los renders— y cuánto son los workers.
+    Verificado contra el proyecto real: los seis UUID del desglose de julio
+    resuelven a Worker, ShortWorker, api, Postgres, Redis y Sentinel.
+
+    Si la consulta falla se devuelve `{}` y el llamador cae al UUID: un
+    nombre faltante no puede tirar abajo la recolección del gasto.
+    """
+    import requests
+
+    if _RAILWAY_SERVICE_NAMES:
+        return _RAILWAY_SERVICE_NAMES
+    query = ("query($id:String!){project(id:$id){services{edges{node"
+             "{id name}}}}}")
+    try:
+        r = requests.post(
+            "https://backboard.railway.com/graphql/v2",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+            json={"query": query, "variables": {"id": project_id}},
+            timeout=bs.HTTP_TIMEOUT)
+        r.raise_for_status()
+        edges = (((r.json().get("data") or {}).get("project") or {})
+                 .get("services") or {}).get("edges") or []
+    except Exception:                                          # noqa: BLE001
+        return {}
+    for e in edges:
+        node = e.get("node") or {}
+        if node.get("id") and node.get("name"):
+            _RAILWAY_SERVICE_NAMES[node["id"]] = node["name"]
+    return _RAILWAY_SERVICE_NAMES
+
 
 def _railway_day(day: date) -> DayResult:
     """Railway usage for one day, priced against the MONTH's minutes.
@@ -191,29 +222,37 @@ def _railway_day(day: date) -> DayResult:
         return DayResult("railway", day, "error", [],
                          "la API no devolvió uso para ese día")
 
-    minutes = _month_minutes(day)
+    nombres = _railway_service_names(token, project_id) if project_id else {}
     per_service: dict[str, float] = {}
     per_measure: dict[str, tuple[float, float, str]] = {}
     for entry in usage:
         m = entry.get("measurement", "")
         raw = float(entry.get("value") or 0.0)
-        svc = (entry.get("tags") or {}).get("serviceId") or "(sin servicio)"
+        svc_id = (entry.get("tags") or {}).get("serviceId") or ""
+        # Nombre si se pudo resolver; si no, el UUID crudo antes que perder
+        # la fila.
+        svc = nombres.get(svc_id) or svc_id or "(sin servicio)"
         if m == "NETWORK_TX_GB":
             cost, units, unit = raw * bs.RAILWAY_USD_PER_EGRESS_GB, raw, "GB"
         else:
-            rate = bs.RAILWAY_RATES_PER_UNIT_MONTH.get(m)
+            rate = bs.RAILWAY_RATES_PER_UNIT_MINUTE.get(m)
             if rate is None:
                 continue
-            # ← el fix: minutos del MES, no de la ventana
-            units = raw / minutes
-            cost, unit = units * rate, "unidad-mes"
+            # La métrica YA viene en unidad-minutos y la tarifa es por
+            # unidad-minuto: no hay ninguna división por ventana, así que
+            # tampoco hay forma de equivocarla. La versión original dividía
+            # por los minutos de la VENTANA (26,9x de más en grano diario);
+            # la siguiente por los del MES, que corregía el 26,9x pero
+            # dejaba ±3% según el mes tuviera 28, 30 o 31 días.
+            units, cost, unit = raw, raw * rate, "unidad-minuto"
         per_service[svc] = per_service.get(svc, 0.0) + cost
         prev = per_measure.get(m, (0.0, 0.0, unit))
         per_measure[m] = (prev[0] + cost, prev[1] + units, unit)
 
     total = sum(per_service.values())
     rows = [_row("total", "total", total, behavior="fijo", estimate=True,
-                 detail=f"métricas × tarifas publicadas ÷ {minutes} min del mes")]
+                 detail="métricas unidad-minuto × tarifas por minuto del "
+                        "Bill Breakdown de Railway")]
     # Por MEDICIÓN: memoria/CPU/disco vs egress.
     for m, (cost, units, unit) in per_measure.items():
         # El compute es capacidad residente: se acumula haya o no renders,
@@ -237,10 +276,21 @@ def _openai_day(day: date) -> DayResult:
 
     Two traps, both already hit in practice:
 
-    1. The window is inclusive of the bucket that starts at `end_time`.
-       Passing `end = D+1 00:00` therefore returns D *and* D+1, so summing
-       days double-counts. Measured on the real org: July with the inclusive
-       boundary reported $567 instead of $492. `end` is D 23:59:59.
+    1. **La ventana se recorta a buckets COMPLETOS.** El bucket diario va de
+       `D 00:00` a `D+1 00:00`; con `end = D 23:59:59` no entra entero y la
+       API devuelve **cero buckets**. Verificado contra la organización real
+       el 20-ago-2026: `end=23:59:59` → sin buckets ($0); `end=D+1 00:00` →
+       un bucket, $0,1138.
+
+       Ese `23:59:59` venía de arreglar el problema opuesto —una ventana de
+       varios días devuelve también el bucket que ARRANCA en `end_time`, y
+       sumar días duplicaba—, pero se pasó de largo: el colector guardó
+       $0,00 todos los días de julio y agosto contra una factura de $19,41.
+
+       La forma correcta no es achicar la ventana sino **quedarse con el
+       bucket del día pedido**: se pide hasta `D+1 00:00` y se descarta
+       cualquier bucket que no arranque en `D`. Así el no-doble-conteo no
+       depende de cómo la API interprete el borde.
     2. The GenLy subtotal is isolated by a substring filter over line items,
        and the org is shared. If OpenAI renames a line (they already went
        `whisper-1` → `gpt-4o-transcribe`), the filter matches nothing and
@@ -255,10 +305,10 @@ def _openai_day(day: date) -> DayResult:
         return DayResult("openai", day, "not_configured", [],
                          "falta OPENAI_ADMIN_KEY (la key sk-proj no lee facturación)")
 
-    start_ts = int(datetime(day.year, day.month, day.day,
-                            tzinfo=timezone.utc).timestamp())
-    end_ts = int(datetime(day.year, day.month, day.day, 23, 59, 59,
-                          tzinfo=timezone.utc).timestamp())
+    inicio_dia = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    inicio_siguiente = inicio_dia + timedelta(days=1)
+    start_ts = int(inicio_dia.timestamp())
+    end_ts = int(inicio_siguiente.timestamp())
     params = {"start_time": start_ts, "end_time": end_ts,
               "bucket_width": "1d", "limit": 7, "group_by": "line_item"}
     project_id = os.environ.get("OPENAI_PROJECT_ID", "").strip()
@@ -278,6 +328,11 @@ def _openai_day(day: date) -> DayResult:
             r.raise_for_status()
             payload = r.json()
             for bucket in payload.get("data", []) or []:
+                # Sólo el bucket del día pedido. Una ventana que llega a
+                # `D+1 00:00` puede traer también el que arranca ahí.
+                inicio = bucket.get("start_time")
+                if inicio is not None and not (start_ts <= int(inicio) < end_ts):
+                    continue
                 for res in bucket.get("results", []) or []:
                     line = res.get("line_item") or "(sin line_item)"
                     amt = float((res.get("amount") or {}).get("value") or 0.0)

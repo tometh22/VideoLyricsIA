@@ -41,8 +41,9 @@ class _FakeRedis:
         self._prune(key)
         if script == sem._COUNT_LUA:
             return len(self.zsets[key])
-        lease, ttl, cap = args
-        if len(self.zsets[key]) >= int(cap):
+        lease, ttl, cap, is_batch, batch_cap = args
+        batch_count = sum(str(member).startswith("batch:") for member in self.zsets[key])
+        if len(self.zsets[key]) >= int(cap) or (int(is_batch) and batch_count >= int(batch_cap)):
             return -len(self.zsets[key])
         self.zsets[key][lease] = self.now + float(ttl)
         return len(self.zsets[key])
@@ -131,4 +132,15 @@ def test_in_flight_reporta_para_el_dashboard(redis_fake, monkeypatch):
     monkeypatch.setattr(sem, "_MAX", 3)
     sem.acquire()
     sem.acquire()
+    assert sem.in_flight() == 2
+
+
+def test_batch_usa_como_max_un_slot_y_reserva_otro_para_interactivo(redis_fake, monkeypatch):
+    monkeypatch.setattr(sem, "_MAX", 2)
+    monkeypatch.setattr(sem, "_BATCH_MAX", 1)
+    monkeypatch.setenv("WORKLOAD_CLASS", "batch")
+    assert sem.acquire()
+    assert sem.acquire(wait_max_s=0.03) is None
+    monkeypatch.setenv("WORKLOAD_CLASS", "interactive")
+    assert sem.acquire(wait_max_s=0.03)
     assert sem.in_flight() == 2
