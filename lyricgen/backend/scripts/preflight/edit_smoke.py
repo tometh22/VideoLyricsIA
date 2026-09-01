@@ -73,6 +73,29 @@ def _fail(msg: str) -> int:
     return 1
 
 
+def _timing_only_edit(segments: list[dict]) -> list[dict]:
+    """Move one real machine line while preserving every other line."""
+    if not segments or not all(isinstance(row, dict) for row in segments):
+        raise ValueError("la transcripción no produjo líneas de máquina")
+    first = segments[0]
+    if not str(first.get("text") or "").strip():
+        raise ValueError("la primera línea de máquina no contiene texto")
+    try:
+        start = float(first["start"])
+        end = float(first["end"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("la primera línea no tiene timing válido") from exc
+    shifted_start = round(start + 0.1, 4)
+    if shifted_start >= end:
+        shifted_start = round(max(0.0, start - 0.1), 4)
+    if shifted_start == start or shifted_start >= end:
+        raise ValueError("la primera línea es demasiado corta para el delta")
+
+    edited = [dict(row) for row in segments]
+    edited[0]["start"] = shifted_start
+    return edited
+
+
 _QUALITY_GATE_CODES = {
     "transcription_quality_unavailable",
     "transcription_quality_analysis_incomplete",
@@ -253,15 +276,10 @@ def main() -> int:
     # deja un delta de timing real entre la hipótesis de máquina y la versión
     # que /generate congela como aprobada. Guardarlo después de /generate no
     # sirve para entrenamiento: sería contaminación posterior a la aprobación.
-    first_segment = segments[0] if segments else {}
-    edited_segments = [{
-        "start": 0.2,
-        "end": 1.4,
-        "text": str(
-            first_segment.get("text")
-            or "estrechez de corazón (smoke)"
-        ),
-    }]
+    try:
+        edited_segments = _timing_only_edit(segments)
+    except ValueError as exc:
+        return _fail(f"fixture no apto para delta de timing: {exc}")
     r = requests.post(
         f"{api}/jobs/{job_id}/save-segments", headers=headers,
         json={"segments": edited_segments}, timeout=30,

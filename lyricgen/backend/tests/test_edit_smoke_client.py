@@ -30,7 +30,10 @@ def _install_common_smoke_mocks(monkeypatch, post, get):
 
 def test_edit_smoke_uses_current_presigned_upload_flow(monkeypatch):
     calls = []
-    segments = [{"start": 0.0, "end": 1.0, "text": "smoke"}]
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "smoke"},
+        {"start": 1.1, "end": 1.9, "text": "line two"},
+    ]
 
     def post(url, **kwargs):
         calls.append(("POST", url, kwargs))
@@ -51,14 +54,16 @@ def test_edit_smoke_uses_current_presigned_upload_flow(monkeypatch):
             fields = kwargs["files"]
             assert fields["job_id"] == (None, "smokejob123")
             assert "smoke" in fields["segments_json"][1]
+            assert "line two" in fields["segments_json"][1]
             assert fields["base_revision"] == (None, "1")
             return _Response({"status": "queued"})
         if url.endswith("/jobs/smokejob123/save-segments"):
             saved_segments = kwargs["json"]["segments"]
-            assert saved_segments == [{
-                "start": 0.2, "end": 1.4, "text": "smoke",
-            }]
-            return _Response({"count": 1, "revision": 1})
+            assert saved_segments == [
+                {"start": 0.1, "end": 1.0, "text": "smoke"},
+                {"start": 1.1, "end": 1.9, "text": "line two"},
+            ]
+            return _Response({"count": 2, "revision": 1})
         if url.endswith("/edit/smokejob123"):
             return _Response({"status": "editing"})
         raise AssertionError(f"unexpected POST {url}")
@@ -100,6 +105,27 @@ def test_edit_smoke_uses_current_presigned_upload_flow(monkeypatch):
     assert "https://api.example/upload-url" in called_urls
     assert "https://api.example/transcribe-uploaded" in called_urls
     assert "https://api.example/generate" in called_urls
+
+
+def test_timing_only_edit_requires_machine_text_and_preserves_other_rows():
+    original = [
+        {"start": 0.0, "end": 1.0, "text": "one"},
+        {"start": 1.1, "end": 2.0, "text": "two"},
+    ]
+    edited = edit_smoke._timing_only_edit(original)
+    assert edited == [
+        {"start": 0.1, "end": 1.0, "text": "one"},
+        {"start": 1.1, "end": 2.0, "text": "two"},
+    ]
+    assert original[0]["start"] == 0.0
+
+    for invalid in ([], [{"start": 0.0, "end": 1.0, "text": ""}]):
+        try:
+            edit_smoke._timing_only_edit(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid machine rows must fail closed")
 
 
 def test_edit_smoke_accepts_fail_closed_quality_gate_in_staging(monkeypatch):
