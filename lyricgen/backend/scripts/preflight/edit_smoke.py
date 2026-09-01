@@ -247,6 +247,37 @@ def main() -> int:
     )
     if not r.ok:
         return _fail(f"/transcribe-uploaded {r.status_code}: {r.text[:300]}")
+    if r.status_code != 202 or not r.headers.get("Location"):
+        return _fail(
+            "/transcribe-uploaded no devolvió el contrato 202+Location: "
+            f"{r.status_code} {r.text[:300]}"
+        )
+    _transcription_acceptance = r.json()
+    if _transcription_acceptance.get("status_url") != f"/transcription-status/{job_id}":
+        return _fail("/transcribe-uploaded status_url inconsistente")
+    # Exercise the lost-response retry contract before polling. The same key
+    # must return the same durable event and must not enqueue a second job.
+    duplicate = requests.post(
+        f"{api}/transcribe-uploaded",
+        headers={
+            **headers,
+            "Idempotency-Key": f"edit-smoke-transcribe-{job_id}",
+        },
+        json={
+            "job_id": job_id,
+            "language": "es",
+            "artist": _ARTIST,
+            "title": _TITLE,
+        },
+        timeout=15,
+    )
+    if not duplicate.ok or duplicate.status_code != 202:
+        return _fail(f"/transcribe-uploaded retry {duplicate.status_code}: {duplicate.text[:300]}")
+    if (
+        not duplicate.json().get("deduplicated")
+        or duplicate.json().get("outbox_event_id") != _transcription_acceptance.get("outbox_event_id")
+    ):
+        return _fail("/transcribe-uploaded retry no reutilizó el evento durable")
     print(f"[edit-smoke] job {job_id} subido — esperando transcripción…")
 
     transcription_deadline = time.time() + args.render_timeout
@@ -388,6 +419,32 @@ def main() -> int:
     )
     if not r.ok:
         return _fail(f"/edit {r.status_code}: {r.text[:300]}")
+    if r.status_code != 202 or not r.headers.get("Location"):
+        return _fail(f"/edit no devolvió el contrato 202+Location: {r.status_code}")
+    _edit_acceptance = r.json()
+    if _edit_acceptance.get("status_url") != f"/status/{job_id}":
+        return _fail("/edit status_url inconsistente")
+    duplicate = requests.post(
+        f"{api}/edit/{job_id}",
+        headers={
+            **headers,
+            "Idempotency-Key": (
+                "edit-smoke-edit-"
+                + hashlib.sha256(
+                    f"{job_id}:{_TITLE}:metadata".encode("utf-8"),
+                ).hexdigest()
+            ),
+        },
+        json={"edit_type": "metadata", "song_title": f"{_TITLE} · editado"},
+        timeout=15,
+    )
+    if not duplicate.ok or duplicate.status_code != 202:
+        return _fail(f"/edit retry {duplicate.status_code}: {duplicate.text[:300]}")
+    if (
+        not duplicate.json().get("deduplicated")
+        or duplicate.json().get("outbox_event_id") != _edit_acceptance.get("outbox_event_id")
+    ):
+        return _fail("/edit retry no reutilizó el evento durable")
     print("[edit-smoke] edit aceptado — esperando re-render…")
     try:
         st = wait_for({"pending_review", "done"}, "edit")
