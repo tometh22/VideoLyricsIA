@@ -111,3 +111,20 @@ def test_deprecated_sources_not_emitted_by_orchestrator():
         bad_pattern = f'set_timing_source(job_id, "{dep}")'
         assert bad_pattern not in src, \
             f"Deprecated timing_source {dep!r} appears in main.py — Bug regression"
+
+
+def test_orchestrator_freezes_raw_recognition_before_selected_output():
+    """Training provenance must survive catalogue reconciliation privately."""
+    src = _MAIN_PATH.read_text()
+    assert "_recognition_hypotheses" in src
+    assert "_recognition_collector.snapshot()" in src
+    assert 'out["_recognition_hypotheses"]' in src
+    assert 'out["_recognition_attempt_count"]' in src
+    assert 'if key != "_recognition_family"' in src
+    orchestrator = ast.get_source_segment(
+        src, _find_orchestrator(ast.parse(src)),
+    )
+    assert "run_in_executor" not in orchestrator, (
+        "recognizers must use asyncio.to_thread so the per-job provenance "
+        "context reaches provider wrappers"
+    )

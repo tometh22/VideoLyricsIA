@@ -4515,6 +4515,8 @@ async def transcribe_uploaded(
             filename=_row_filename,
             live=bool(body.live),
         )
+        from recognition_provenance import resume_from_result
+        resume_from_result(_result)
         from line_evidence import freeze_result_provider_evidence
         _result = freeze_result_provider_evidence(_result)
         # Versión B: si el operador pegó la letra oficial, anclarla con CTC
@@ -5293,6 +5295,8 @@ async def transcribe_endpoint(
         artist=artist, title=title,
         filename=file.filename,
     )
+    from recognition_provenance import resume_from_result
+    resume_from_result(_result)
     from line_evidence import freeze_result_provider_evidence
     _result = freeze_result_provider_evidence(_result)
     _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
@@ -5718,6 +5722,7 @@ async def _maybe_word_vote(result, audio_path: str, job_id: str,
             # strips it. Studio WORD_VOTE keeps its pre-existing behavior and
             # does not silently opt into the new live quality policy.
             result["_independent_asr_words"] = witness
+            result["_independent_asr_family"] = "openai/whisper-1"
         stats["independent_verifier"] = _live_verify
         stats["witness_words"] = len(witness)
         stats["witness_words_filtered"] = max(
@@ -6208,7 +6213,11 @@ def _make_stem_window_transcriber(
                 check=True, timeout=30,
             )
             from pipeline import _transcribe_via_openai_api as _wx
-            segs = _wx(clip, language=language) or []
+            segs = _wx(
+                clip, language=language,
+                provenance_view="bounded_vocal_window",
+                provenance_transformation="adlib_consensus_raw",
+            ) or []
             return " ".join((s.get("text") or "").strip() for s in segs).strip()
         except Exception as e:
             logger.warning("[ADLIB] window %.1f-%.1f transcribe failed: %s",
@@ -6879,6 +6888,9 @@ async def _run_transcription_for_job(
     tmp_dir = tempfile.mkdtemp()
     tmp_path = audio_path
     _vocal_stem = None   # demucs output path (lazy), cleaned up in finally
+    from recognition_provenance import begin_collection as _begin_recognition
+    from recognition_provenance import end_collection as _end_recognition
+    _recognition_collector, _recognition_token = _begin_recognition()
 
     # Filled after the audio-first ASR exists.  `_emit_segments` reads this
     # state at the single output chokepoint so every downstream branch gets
@@ -6977,6 +6989,13 @@ async def _run_transcription_for_job(
                             recovery_source=None,
                             coverage_warning: bool = False,
                             extra=None):
+            segments = [
+                {
+                    key: value for key, value in segment.items()
+                    if key != "_recognition_family"
+                }
+                for segment in (segments or []) if isinstance(segment, dict)
+            ]
             if source not in VALID_TIMING_SOURCES:
                 logger.error("[EMIT] invalid timing_source=%r — forcing %r "
                              "(job=%s)", source, WHISPER_RAW, job_id)
@@ -7032,6 +7051,11 @@ async def _run_transcription_for_job(
             polished = normalized_polished
             out = {"job_id": job_id, "segments": polished,
                    "reference_lyrics": reference_lyrics}
+            recognition_snapshot = _recognition_collector.snapshot()
+            out["_recognition_hypotheses"] = recognition_snapshot["hypotheses"]
+            out["_recognition_attempt_count"] = recognition_snapshot[
+                "completed_attempt_count"
+            ]
 
             # Language is evaluated at the same single output chokepoint as
             # timing. A bilingual song is valid: preserve multi-label
@@ -7751,6 +7775,7 @@ async def _run_transcription_for_job(
                             _base = await asyncio.to_thread(
                                 _pl.transcribe, audio_path, language=(lang or None),
                                 job_id=job_id, return_words=True,
+                                provenance_view="mix_line_text_base",
                             )
                             # Sustained ad-libs ("uh uh uh") that Whisper forced into
                             # words (e.g. a 21 s block heard as "¿Para qué? ¿Para qué?")
@@ -8983,13 +9008,11 @@ async def _run_transcription_for_job(
                     if not intro_path:
                         return []
                     try:
-                        raw = await loop.run_in_executor(
-                            None,
-                            lambda: transcribe(
-                                intro_path, lang,
-                                lyrics_hint=initial_hint,
-                                return_words=True,
-                            ),
+                        raw = await asyncio.to_thread(
+                            transcribe, intro_path, lang,
+                            lyrics_hint=initial_hint,
+                            return_words=True,
+                            provenance_view="mix_intro",
                         )
                         # Keep only segments that fully sit in the intro
                         # window; defensive against ffmpeg frame-boundary
@@ -9002,13 +9025,11 @@ async def _run_transcription_for_job(
                         return []
 
                 async def _run_body_whisper():
-                    return await loop.run_in_executor(
-                        None,
-                        lambda: transcribe(
-                            transcribe_path, lang,
-                            lyrics_hint=initial_hint,
-                            return_words=True,
-                        ),
+                    return await asyncio.to_thread(
+                        transcribe, transcribe_path, lang,
+                        lyrics_hint=initial_hint,
+                        return_words=True,
+                        provenance_view="song_region",
                     )
 
                 try:
@@ -9247,15 +9268,14 @@ async def _run_transcription_for_job(
                     _e_stem,
                 )
 
-        segments = await loop.run_in_executor(
-            None,
-            lambda: transcribe(
-                _whisper_audio, lang,
-                lyrics_hint=_initial_asr_lyrics_hint(_gemini_pre),
-                return_words=True,
+        segments = await asyncio.to_thread(
+            transcribe, _whisper_audio, lang,
+            lyrics_hint=_initial_asr_lyrics_hint(_gemini_pre),
+            return_words=True,
+            provenance_view=(
+                "vocal_stem" if _whisper_audio != tmp_path else "mix"
             ),
         )
-
         # reference: reuse what Gemini already returned (instant), or wait
         # up to 2s more if it didn't complete within the pre-fetch window.
         reference = ""
@@ -9566,6 +9586,7 @@ async def _run_transcription_for_job(
                          job_id)
         raise
     finally:
+        _end_recognition(_recognition_token)
         # tmp_dir holds intermediate slices (intro/body cuts) only — the
         # main audio (audio_path) is under job_dir and must survive until
         # /generate enqueues it (or the reaper cleans it up).

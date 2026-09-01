@@ -379,6 +379,76 @@ def _build_segments(
     return segments
 
 
+def _map_provider_words(words) -> list[dict]:
+    """Map the completed Whisper payload before any alignment declines."""
+    mapped: list[dict] = []
+    for word in words or []:
+        try:
+            if isinstance(word, dict):
+                text = word.get("word")
+                start = word.get("start")
+                end = word.get("end")
+            else:
+                text = getattr(word, "word", None)
+                start = getattr(word, "start", None)
+                end = getattr(word, "end", None)
+            mapped.append({"word": text, "start": start, "end": end})
+        except Exception:
+            continue
+    return mapped
+
+
+def _raw_provider_words(words) -> list[dict]:
+    """Serialize every completed provider word, including opaque rows."""
+    from recognition_provenance import bounded_provider_string
+    try:
+        source = list(words or [])
+    except Exception as exc:
+        return [{
+            "raw": bounded_provider_string(words),
+            "serialization_error": type(exc).__name__,
+        }]
+    raw: list[dict] = []
+    for word in source:
+        if isinstance(word, dict):
+            try:
+                raw.append(dict(word))
+            except Exception:
+                raw.append({"raw": bounded_provider_string(word)})
+            continue
+        try:
+            dumped = word.model_dump()
+        except Exception:
+            dumped = None
+        if isinstance(dumped, dict):
+            raw.append(dumped)
+            continue
+        values = {}
+        for key in ("word", "start", "end"):
+            try:
+                values[key] = getattr(word, key)
+            except Exception:
+                pass
+        raw.append(values or {"raw": bounded_provider_string(word)})
+    return raw
+
+
+def _provider_response_words(response) -> tuple[list, list[dict]]:
+    """Read an SDK word stream without losing a completed attempt."""
+    try:
+        provider_words = getattr(response, "words", None)
+        words = list(provider_words or [])
+        return words, _raw_provider_words(words)
+    except Exception as exc:
+        return [], [{
+            "raw": (
+                "<opaque-whisper-word-response-"
+                f"{type(response).__name__}>"
+            ),
+            "serialization_error": type(exc).__name__,
+        }]
+
+
 def whisper_word_align(
     audio_path: str,
     cleaned_lines: list[str],
@@ -461,10 +531,19 @@ def whisper_word_align(
             logger.warning("[WHISPER-ALIGN] Whisper API failed: %s", str(e)[:200])
             return None
 
-        words = getattr(response, "words", None) or []
+        words, raw_word_dicts = _provider_response_words(response)
+        from recognition_provenance import record_completed
+        record_completed(
+            family="openai/whisper-1",
+            events=raw_word_dicts,
+            kind="word_stream",
+            view="alignment_audio",
+            transformation="whisper_word_align_raw",
+        )
         if not words:
             logger.warning("[WHISPER-ALIGN] response had no word stamps")
             return None
+        word_dicts = _map_provider_words(words)
 
         # Provenance recording (best effort).
         if job_id:
@@ -490,14 +569,6 @@ def whisper_word_align(
         if not cleaned_tokens:
             logger.warning("[WHISPER-ALIGN] cleaned tokenization empty")
             return None
-
-        # Convert words to dict form so downstream handles both shapes.
-        word_dicts = [
-            {"word": getattr(w, "word", None) or w.get("word"),
-             "start": getattr(w, "start", None) or w.get("start"),
-             "end": getattr(w, "end", None) or w.get("end")}
-            for w in words
-        ]
 
         cleaned_to_whisper = _dp_align_tokens(cleaned_tokens, word_dicts)
         anchored_lines = len({
