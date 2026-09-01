@@ -32,13 +32,14 @@ Uso:
 from __future__ import annotations
 
 import argparse
-import io
+import base64
 import json
 import os
 import struct
 import sys
 import time
-import wave
+import zlib
+from pathlib import Path
 
 import requests
 
@@ -47,15 +48,15 @@ _TITLE = "Estrechez de Corazón (smoke)"
 _ARTIST = "Los Prisioneros - smoke"  # separador ASCII: el tag va en latin-1
 
 
-def _accented_wav_bytes(seconds: int = 2) -> bytes:
-    """WAV PCM válido + chunk LIST/INFO con metadata latin-1."""
-    raw = io.BytesIO()
-    with wave.open(raw, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(8000)
-        w.writeframes(b"\x00\x00" * (8000 * seconds))
-    data = bytearray(raw.getvalue())
+def _accented_wav_bytes() -> bytes:
+    """Voiced WAV fixture + LIST/INFO metadata encoded as latin-1."""
+    fixture = (
+        Path(__file__).with_name("fixtures")
+        / "voiced_smoke.wav.zlib.b64"
+    )
+    data = bytearray(zlib.decompress(base64.b64decode(fixture.read_bytes())))
+    if not data.startswith(b"RIFF") or data[8:12] != b"WAVE":
+        raise RuntimeError("voiced smoke fixture is not a RIFF/WAVE file")
 
     def sub(cid: bytes, text: str) -> bytes:
         b = text.encode("latin-1") + b"\x00"

@@ -1,5 +1,9 @@
 """Contract tests for the post-deploy edit smoke API client."""
 
+from array import array
+import io
+import wave
+
 from scripts.preflight import edit_smoke
 
 
@@ -26,6 +30,17 @@ def _install_common_smoke_mocks(monkeypatch, post, get):
     monkeypatch.setattr(edit_smoke.requests, "post", post)
     monkeypatch.setattr(edit_smoke.requests, "put", put)
     monkeypatch.setattr(edit_smoke.requests, "get", get)
+
+
+def test_voiced_fixture_has_pcm_energy_and_latin1_metadata():
+    payload = edit_smoke._accented_wav_bytes()
+    with wave.open(io.BytesIO(payload), "rb") as wav:
+        samples = array("h", wav.readframes(wav.getnframes()))
+        assert wav.getframerate() == 8000
+        assert wav.getnchannels() == 1
+        assert wav.getnframes() > 8000
+    assert max(abs(sample) for sample in samples) > 100
+    assert b"Estrechez de Coraz\xf3n" in payload
 
 
 def test_edit_smoke_uses_current_presigned_upload_flow(monkeypatch):
