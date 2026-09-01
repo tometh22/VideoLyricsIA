@@ -460,6 +460,19 @@ def test_training_pair_materializes_machine_gold_families_and_edits():
     assert invalid_signal["complete"] is False
     assert "machine_quality_signal_invalid" in invalid_signal["issues"]
 
+    malformed_signal = deepcopy(approval)
+    malformed_signal["song_quality_signal"]["traffic_light"] = {"bad": "value"}
+    malformed_signal["evidence_sha256"] = snapshot_hash({
+        key: value for key, value in malformed_signal.items()
+        if key != "evidence_sha256"
+    })
+    approved.provenance = {"training_approval": malformed_signal}
+    malformed_quality = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved], audits=[audit],
+    )
+    assert malformed_quality["complete"] is False
+    assert "machine_quality_signal_invalid" in malformed_quality["issues"]
+
     corrupt_hash = deepcopy(approval)
     corrupt_hash["evidence_sha256"] = "0" * 64
     approved.provenance = {"training_approval": corrupt_hash}

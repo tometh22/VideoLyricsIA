@@ -537,6 +537,8 @@ def materialize_training_pair(
             )
         except MachineSnapshotMissing as exc:
             issues.append(str(exc))
+        except Exception:
+            issues.append("machine_quality_signal_invalid")
 
     approved_revision = int(getattr(approved, "revision", -1)) if approved else -1
     delta_events = []
