@@ -25,6 +25,14 @@ adaptador entrenado es siempre `additional_consensus_family`. No hay reemplazo
 del Whisper base: la sustitución requiere dos evaluaciones consecutivas con
 CI por canción y una decisión explícita posterior.
 
+Para producir las dos entradas del replay se ejecuta
+`scripts/run_lora_v1_inference.py` dos veces: una sin `--adapter` (baseline) y
+otra con el directorio `adapter` de la corrida. Luego
+`scripts/evaluate_lora_v1.py` calcula WER por canción, las particiones
+fácil/difícil, bootstrap e intervalo de confianza. Una corrida marcada
+`trained_uncalibrated` o un smoke test nunca se puede pasar a
+`lora_family.load_verified_family`.
+
 ## Evaluación y gates
 
 `scripts/evaluate_lora_v1.py` consume predicciones separadas de baseline y
