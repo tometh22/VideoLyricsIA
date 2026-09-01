@@ -102,6 +102,24 @@ def test_empty_selected_state_is_explicit_even_with_raw_words():
     assert selected[0]["events_sha256"] == snapshot_hash([])
 
 
+def test_snapshot_hash_canonicalizes_negative_zero_for_jsonb_roundtrip():
+    before_jsonb = {
+        "quality": {
+            "delivery_repair_shadow": {
+                "t4_word_line_boundaries": {
+                    "rows": [{"wrapper_padding_s": -0.0}],
+                },
+            },
+        },
+    }
+    after_jsonb = deepcopy(before_jsonb)
+    after_jsonb["quality"]["delivery_repair_shadow"][
+        "t4_word_line_boundaries"
+    ]["rows"][0]["wrapper_padding_s"] = 0.0
+
+    assert snapshot_hash(before_jsonb) == snapshot_hash(after_jsonb)
+
+
 def test_finalize_binds_selected_to_canonical_durable_segments():
     raw = [{"start": 0.123456, "end": 1.234567, "text": "line"}]
     canonical = [{"start": 0.1235, "end": 1.2346, "text": "line"}]
