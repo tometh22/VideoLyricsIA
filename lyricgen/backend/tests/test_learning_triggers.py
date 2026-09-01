@@ -16,4 +16,3 @@ def test_trigger_thresholds_are_explicit(monkeypatch):
     monkeypatch.setenv("CORPUS_RETRAIN_EVERY_SONGS", "100")
     assert TRIGGER_SPECS["lora_retraining"]["threshold_env"] == "CORPUS_RETRAIN_EVERY_SONGS"
     assert env_enabled("LORA_V1_AUTORETRAIN_ENABLED") is False
-
