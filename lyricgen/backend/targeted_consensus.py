@@ -198,6 +198,10 @@ def _stream_family_map(result: dict | None = None) -> dict[str, str]:
         "mix": targeted,
         "primary": primary,
         "witness": str(result.get("_independent_asr_family") or "").strip(),
+        # LoRA-v1 is deliberately an optional *additional* family.  It is
+        # populated only by lora_family.attach_hypothesis after an attested
+        # evaluation report; absent/unknown metadata cannot create a vote.
+        "lora": str(result.get("_lora_asr_family") or "").strip(),
     }
 
 
@@ -205,6 +209,7 @@ def choose_consensus(stem_words: list[dict], mix_words: list[dict],
                      primary_words: list[dict], *,
                      slowed_words: list[dict] | None = None,
                      witness_words: list[dict] | None = None,
+                     lora_words: list[dict] | None = None,
                      stream_families: dict[str, str] | None = None,
                      threshold: float = 0.72):
     """Return the agreed word stream and evidence, or ``(None, ...)``.
@@ -217,6 +222,7 @@ def choose_consensus(stem_words: list[dict], mix_words: list[dict],
         "stem": stem_words, "slowed_stem": slowed_words or [],
         "mix": mix_words, "primary": primary_words,
         "witness": witness_words or [],
+        "lora": lora_words or [],
     }
     texts = {name: _text(words) for name, words in streams.items()}
     families = {
@@ -235,7 +241,7 @@ def choose_consensus(stem_words: list[dict], mix_words: list[dict],
     best = None
     family_rejections = 0
     for isolated in ("stem", "slowed_stem"):
-        for independent in ("primary", "witness", "mix"):
+        for independent in ("primary", "witness", "mix", "lora"):
             if isolated not in eligible or independent not in eligible:
                 continue
             isolated_family = families.get(isolated, "")
@@ -1056,6 +1062,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         primary = result.get("_asr_words") or []
         independent_witness = result.get("_independent_asr_words") or []
         stream_families = _stream_family_map(result)
+        lora_words = result.get("_lora_asr_words") or []
         segments = [dict(s) for s in (result.get("segments") or [])]
         stats["attempted"] = True
         started_at = time.monotonic()
@@ -1511,8 +1518,10 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 pw = _words_in(primary, a, b)
                 iw = _words_in(independent_witness, a, b)
                 sloww = _words_in(slowed_words, a, b)
+                lw = _words_in(lora_words, a, b)
                 agreed, evidence = choose_consensus(
                     sw, mw, pw, slowed_words=sloww, witness_words=iw,
+                    lora_words=lw,
                     stream_families=stream_families,
                 )
                 if not agreed or not _safe_line(agreed):
@@ -1582,6 +1591,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                         mix_group, primary_group,
                         slowed_words=group if is_slow_group else slow_group,
                         witness_words=witness_group,
+                        lora_words=_words_in(lora_words, a, b, pad=0.6),
                         stream_families=stream_families,
                     )
                     matched_gemini = None

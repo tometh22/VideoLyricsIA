@@ -316,6 +316,14 @@ def _schedule_worker_maintenance(queue_names: list[str]) -> dict[str, bool]:
             except Exception as exc:
                 scheduled[name] = False
                 logger.warning("[WORKER] %s scheduler unavailable: %s", name, exc)
+        # Keep this new scheduler out of the legacy health result shape: older
+        # admin callers compare the two established keys exactly. Its own RQ
+        # id/audit row is the source of truth for research trigger status.
+        try:
+            import queue_jobs
+            queue_jobs.ensure_learning_triggers_scheduled()
+        except Exception as exc:
+            logger.warning("[WORKER] learning trigger scheduler unavailable: %s", exc)
     if "default" in queue_names:
         try:
             from queue_jobs import ensure_job_outbox_reconciler_scheduled

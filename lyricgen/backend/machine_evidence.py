@@ -241,6 +241,15 @@ def build_machine_evidence(result: dict) -> dict:
         "word_stream",
         result.get("_independent_asr_words"),
     )
+    # Optional LoRA-v1 witness.  It is never selected here; the targeted
+    # consensus may use it only as an additional family after attestation.
+    add(
+        "candidate",
+        str(result.get("_lora_asr_family") or ""),
+        "word_stream",
+        result.get("_lora_asr_words"),
+        view="lora_v1",
+    )
     pre_anchor_segments = [
         row for row in (result.get("_pre_anchor_provider_segments") or [])
         if isinstance(row, dict)
