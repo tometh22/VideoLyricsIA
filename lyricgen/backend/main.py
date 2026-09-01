@@ -11658,7 +11658,7 @@ _DATA_POLICY = {
             "data_not_sent": ["Audio files", "Lyrics text", "Artist name"],
         },
         {
-            "api": "Imagen 4 (imagen-4.0-generate-001)",
+            "api": "Gemini 2.5 Flash Image (gemini-2.5-flash-image)",
             "purpose": "Image background generation (fallback)",
             "data_sent": ["AI-generated scene description prompt (no artist/lyrics data)"],
             "data_not_sent": ["Audio files", "Lyrics text", "Artist name"],

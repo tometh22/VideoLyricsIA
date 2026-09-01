@@ -71,9 +71,20 @@ class VeoVideoProvider(VideoProvider):
 
 
 class ImagenImageProvider(ImageProvider):
-    """Google Imagen 4 via Vertex AI."""
-    name = "imagen-4.0-generate-001"
+    """Google still-image generation via Vertex AI.
+
+    Named "Imagen" for backwards compatibility with the IMAGE_PROVIDER env
+    var and the registry key, but the model underneath is resolved at call
+    time: Vertex stopped serving the Imagen publisher-model family to our
+    project on 2026-07-16 (404 in every region), so the effective model is
+    now `gemini-2.5-flash-image`. See `pipeline._resolve_still_image_model`.
+    """
     provider = "google_vertex"
+
+    @property
+    def name(self):
+        from pipeline import _resolve_still_image_model
+        return _resolve_still_image_model()
 
     def generate_image(self, prompt, output_path, job_id=None, aspect_ratio="16:9"):
         from pipeline import _generate_imagen_image
