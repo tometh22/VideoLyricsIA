@@ -53,7 +53,7 @@ def quality_training_signal(quality: dict | None) -> dict:
     can distinguish them through ``score_source`` instead of silently treating
     a missing score as zero.
     """
-    payload = dict(quality or {})
+    payload = dict(quality) if isinstance(quality, dict) else {}
     decision = str(payload.get("decision") or payload.get("verdict") or "unknown")[:32]
     raw_score = payload.get("score")
     risk = payload.get("risk")
@@ -111,10 +111,15 @@ def validate_quality_training_signal(signal: Any) -> None:
     """Validate the persisted song-level calibration label without inventing it."""
     if not isinstance(signal, dict) or signal.get("schema") != "song-quality-signal-v1":
         raise MachineSnapshotMissing("machine_quality_signal_missing")
-    if signal.get("traffic_light") not in {"green", "yellow", "red"}:
+    traffic_light = signal.get("traffic_light")
+    if not isinstance(traffic_light, str) or traffic_light not in {
+        "green", "yellow", "red",
+    }:
         raise MachineSnapshotMissing("machine_quality_signal_invalid")
     score_source = signal.get("score_source")
-    if score_source not in {"quality_score", "risk_derived", "unavailable"}:
+    if not isinstance(score_source, str) or score_source not in {
+        "quality_score", "risk_derived", "unavailable",
+    }:
         raise MachineSnapshotMissing("machine_quality_score_source_invalid")
     if score_source == "quality_score":
         reconstruction = {
@@ -264,7 +269,9 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
         raise MachineSnapshotMissing("machine_hypotheses_missing")
     if not isinstance(evidence.get("decisions"), dict):
         raise MachineSnapshotMissing("machine_decisions_missing")
-    pre_human = evidence.get("pre_human") or {}
+    pre_human = evidence.get("pre_human")
+    if not isinstance(pre_human, dict):
+        raise MachineSnapshotMissing("machine_pre_human_missing")
     if pre_human.get("segments_sha256") != snapshot_hash(original_segments or []):
         raise MachineSnapshotMissing("machine_snapshot_hash_mismatch")
     if evidence.get("schema") == SCHEMA:

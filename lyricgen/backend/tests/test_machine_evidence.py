@@ -139,6 +139,35 @@ def test_snapshot_hash_mismatch_blocks_approval(db):
         require_machine_snapshot(row, document)
 
 
+def test_scalar_pre_human_evidence_fails_closed_without_500(db):
+    row, document = _job(db, required=True)
+    evidence = _evidence(document)
+    evidence["pre_human"] = "corrupt"
+    document.machine_evidence = evidence
+    db.flush()
+
+    with pytest.raises(MachineSnapshotMissing, match="machine_pre_human_missing"):
+        require_machine_snapshot(row, document)
+
+
+def test_nested_scalar_types_in_quality_signal_fail_closed(db):
+    row, document = _job(db, required=True)
+    evidence = _evidence(document)
+    evidence["decisions"]["song_quality_signal"]["traffic_light"] = {
+        "not": "a scalar",
+    }
+    evidence["evidence_sha256"] = snapshot_hash({
+        "hypotheses_by_family": evidence["hypotheses_by_family"],
+        "pre_human": evidence["pre_human"],
+        "decisions": evidence["decisions"],
+    })
+    document.machine_evidence = evidence
+    db.flush()
+
+    with pytest.raises(MachineSnapshotMissing, match="machine_quality_signal_invalid"):
+        require_machine_snapshot(row, document)
+
+
 def test_approval_freezes_song_signal_on_exact_version(db):
     row, document = _job(db, required=True)
     row.transcription_quality = {
