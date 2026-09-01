@@ -370,6 +370,7 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
     os.close(fd)
     recorder = None
     provider_completed = False
+    provider_recorded = False
     prompt = (
         "Transcribí únicamente los eventos vocales audibles en este fragmento. "
         "Cada evento debe ser una frase o ciclo vocal completo: no dividas una "
@@ -442,16 +443,40 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
         )
         provider_completed = True
         raw = (response.text or "").strip()
-        payload = json.loads(raw)
-        events = payload.get("events") if isinstance(payload, dict) else None
-        if not isinstance(events, list) or len(events) > 16:
+        try:
+            payload = json.loads(raw)
+        except Exception:
             from recognition_provenance import record_completed
             record_completed(
                 family="google/gemini-2.5-flash-audio",
-                events=[],
+                events=([{"text": raw}] if raw else []),
+                kind="text",
                 view="bounded_vocal_window",
-                transformation="targeted_consensus",
+                transformation="targeted_consensus_unparsed_raw",
             )
+            provider_recorded = True
+            raise
+        events = payload.get("events") if isinstance(payload, dict) else None
+        if not isinstance(events, list):
+            from recognition_provenance import record_completed
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=([{"text": raw}] if raw else []),
+                kind="text",
+                view="bounded_vocal_window",
+                transformation="targeted_consensus_invalid_shape_raw",
+            )
+            provider_recorded = True
+            return []
+        from recognition_provenance import record_completed
+        record_completed(
+            family="google/gemini-2.5-flash-audio",
+            events=events,
+            view="bounded_vocal_window",
+            transformation="targeted_consensus_raw",
+        )
+        provider_recorded = True
+        if len(events) > 16:
             return []
         out = []
         from pipeline import _is_whisper_hallucination
@@ -483,16 +508,9 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
         out.sort(key=lambda event: event["start"])
         if recorder:
             recorder.finish(response_summary=f"events={len(out)}")
-        from recognition_provenance import record_completed
-        record_completed(
-            family="google/gemini-2.5-flash-audio",
-            events=out,
-            view="bounded_vocal_window",
-            transformation="targeted_consensus",
-        )
         return out
     except Exception as exc:
-        if provider_completed:
+        if provider_completed and not provider_recorded:
             from recognition_provenance import record_completed
             record_completed(
                 family="google/gemini-2.5-flash-audio",

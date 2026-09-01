@@ -21,9 +21,23 @@ from lyrics_whisper_align import (  # noqa: E402
     _tokens_with_line,
     _build_segments,
     _lev_similarity,
+    _map_provider_words,
     MIN_ANCHOR_RATIO,
     MIN_SEG_DUR_S,
 )
+
+
+def test_provider_word_mapping_preserves_empty_completion_and_sdk_objects():
+    assert _map_provider_words([]) == []
+    sdk_word = type("Word", (), {
+        "word": "hola", "start": 1.0, "end": 1.4,
+    })()
+    assert _map_provider_words([sdk_word, {
+        "word": "mundo", "start": 1.5, "end": 2.0,
+    }]) == [
+        {"word": "hola", "start": 1.0, "end": 1.4},
+        {"word": "mundo", "start": 1.5, "end": 2.0},
+    ]
 
 
 # ──────────────────────────────────────────────────────────────────────

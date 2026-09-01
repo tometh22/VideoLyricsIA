@@ -379,6 +379,25 @@ def _build_segments(
     return segments
 
 
+def _map_provider_words(words) -> list[dict]:
+    """Map the completed Whisper payload before any alignment declines."""
+    mapped: list[dict] = []
+    for word in words or []:
+        try:
+            if isinstance(word, dict):
+                text = word.get("word")
+                start = word.get("start")
+                end = word.get("end")
+            else:
+                text = getattr(word, "word", None)
+                start = getattr(word, "start", None)
+                end = getattr(word, "end", None)
+            mapped.append({"word": text, "start": start, "end": end})
+        except Exception:
+            continue
+    return mapped
+
+
 def whisper_word_align(
     audio_path: str,
     cleaned_lines: list[str],
@@ -462,6 +481,15 @@ def whisper_word_align(
             return None
 
         words = getattr(response, "words", None) or []
+        word_dicts = _map_provider_words(words)
+        from recognition_provenance import record_completed
+        record_completed(
+            family="openai/whisper-1",
+            events=word_dicts,
+            kind="word_stream",
+            view="alignment_audio",
+            transformation="whisper_word_align_raw",
+        )
         if not words:
             logger.warning("[WHISPER-ALIGN] response had no word stamps")
             return None
@@ -490,22 +518,6 @@ def whisper_word_align(
         if not cleaned_tokens:
             logger.warning("[WHISPER-ALIGN] cleaned tokenization empty")
             return None
-
-        # Convert words to dict form so downstream handles both shapes.
-        word_dicts = [
-            {"word": getattr(w, "word", None) or w.get("word"),
-             "start": getattr(w, "start", None) or w.get("start"),
-             "end": getattr(w, "end", None) or w.get("end")}
-            for w in words
-        ]
-        from recognition_provenance import record_completed
-        record_completed(
-            family="openai/whisper-1",
-            events=word_dicts,
-            kind="word_stream",
-            view="alignment_audio",
-            transformation="whisper_word_align",
-        )
 
         cleaned_to_whisper = _dp_align_tokens(cleaned_tokens, word_dicts)
         anchored_lines = len({

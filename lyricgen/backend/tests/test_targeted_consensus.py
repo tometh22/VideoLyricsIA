@@ -1,4 +1,5 @@
 import logging
+import inspect
 
 import targeted_consensus as tc
 import quality_mutation
@@ -584,6 +585,14 @@ def test_gemini_event_schema_is_bounded_to_vocal_events():
     assert item["properties"]["kind"]["enum"] == [
         "sung", "vocalization", "speech",
     ]
+
+
+def test_gemini_provenance_freezes_raw_events_before_candidate_filters():
+    source = inspect.getsource(tc._transcribe_gemini_events)
+    raw_record = source.index("events=events")
+    candidate_filter = source.index("for event in events")
+    assert raw_record < candidate_filter
+    assert "events=out" not in source
 
 
 def test_structural_repair_is_suggestion_only_in_observe_mode():
