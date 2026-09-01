@@ -37,6 +37,8 @@ import logging
 import os
 import re
 
+from machine_evidence import SCHEMA as MACHINE_EVIDENCE_SCHEMA
+
 logger = logging.getLogger("genly.transcription_worker")
 _EXCEPTION_TYPE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
 
@@ -801,9 +803,7 @@ def run_transcription_job(
                 if isinstance(quality, dict):
                     quality = dict(quality)
                     quality["machine_evidence_required"] = True
-                    quality["machine_evidence_schema"] = (
-                        "machine-transcription-evidence-v1"
-                    )
+                    quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
                     quality["audio_sha256"] = source_audio_sha256
                     quality["audio_revision"] = int(row.audio_revision or 0)
                     quality["evaluated_revision"] = current_revision
@@ -845,9 +845,7 @@ def run_transcription_job(
                     else row.transcription_quality or {}
                 )
                 quality["machine_evidence_required"] = True
-                quality["machine_evidence_schema"] = (
-                    "machine-transcription-evidence-v1"
-                )
+                quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
                 row.transcription_quality = quality
                 from machine_evidence import finalize_machine_evidence
                 durable_evidence = finalize_machine_evidence(

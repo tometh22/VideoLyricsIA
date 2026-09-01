@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-SCHEMA = "machine-transcription-evidence-v1"
+SCHEMA = "machine-transcription-evidence-v2"
+LEGACY_SCHEMAS = {"machine-transcription-evidence-v1"}
 
 
 class MachineSnapshotMissing(RuntimeError):
@@ -41,6 +42,105 @@ def snapshot_hash(value: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def quality_training_signal(quality: dict | None) -> dict:
+    """Freeze the song-level traffic light used by calibration.
+
+    Quality v6 deliberately leaves ``score`` null while calibration is in
+    observe mode.  The underlying risk is still a bounded song-level signal,
+    so persist both the raw score and an explicit derived score.  Consumers
+    can distinguish them through ``score_source`` instead of silently treating
+    a missing score as zero.
+    """
+    payload = dict(quality) if isinstance(quality, dict) else {}
+    decision = str(payload.get("decision") or payload.get("verdict") or "unknown")[:32]
+    raw_score = payload.get("score")
+    risk = payload.get("risk")
+
+    score = None
+    score_source = "unavailable"
+    if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool):
+        value = float(raw_score)
+        if math.isfinite(value):
+            score = round(max(0.0, min(100.0, value)), 3)
+            score_source = "quality_score"
+    if score is None and isinstance(risk, (int, float)) and not isinstance(risk, bool):
+        value = float(risk)
+        if math.isfinite(value):
+            risk = round(max(0.0, min(1.0, value)), 6)
+            score = round(100.0 * (1.0 - risk), 3)
+            score_source = "risk_derived"
+        else:
+            risk = None
+    elif not isinstance(risk, (int, float)) or isinstance(risk, bool):
+        risk = None
+    else:
+        risk = round(max(0.0, min(1.0, float(risk))), 6)
+
+    hard_red = decision in {
+        "unsafe", "fail", "failed", "blocked", "retry_failed",
+    }
+    if hard_red or (risk is not None and risk >= 0.75):
+        traffic_light = "red"
+    elif decision in {"pass", "approved", "safe"} and (
+        score is None or score >= 90.0
+    ):
+        traffic_light = "green"
+    else:
+        traffic_light = "yellow"
+    return {
+        "schema": "song-quality-signal-v1",
+        "traffic_light": traffic_light,
+        "verdict": decision,
+        "score": score,
+        "score_source": score_source,
+        "raw_score": (
+            round(float(raw_score), 3)
+            if isinstance(raw_score, (int, float))
+            and not isinstance(raw_score, bool)
+            and math.isfinite(float(raw_score))
+            else None
+        ),
+        "risk": risk,
+        "policy_version": str(payload.get("policy_version") or "unknown")[:64],
+    }
+
+
+def validate_quality_training_signal(signal: Any) -> None:
+    """Validate the persisted song-level calibration label without inventing it."""
+    if not isinstance(signal, dict) or signal.get("schema") != "song-quality-signal-v1":
+        raise MachineSnapshotMissing("machine_quality_signal_missing")
+    traffic_light = signal.get("traffic_light")
+    if not isinstance(traffic_light, str) or traffic_light not in {
+        "green", "yellow", "red",
+    }:
+        raise MachineSnapshotMissing("machine_quality_signal_invalid")
+    score_source = signal.get("score_source")
+    if not isinstance(score_source, str) or score_source not in {
+        "quality_score", "risk_derived", "unavailable",
+    }:
+        raise MachineSnapshotMissing("machine_quality_score_source_invalid")
+    if score_source == "quality_score":
+        reconstruction = {
+            "decision": signal.get("verdict"),
+            "score": signal.get("raw_score"),
+            "risk": signal.get("risk"),
+            "policy_version": signal.get("policy_version"),
+        }
+    elif score_source == "risk_derived":
+        reconstruction = {
+            "decision": signal.get("verdict"),
+            "risk": signal.get("risk"),
+            "policy_version": signal.get("policy_version"),
+        }
+    else:
+        reconstruction = {
+            "decision": signal.get("verdict"),
+            "policy_version": signal.get("policy_version"),
+        }
+    if quality_training_signal(reconstruction) != signal:
+        raise MachineSnapshotMissing("machine_quality_signal_inconsistent")
 
 
 def _provider_family(segments: list[dict]) -> str:
@@ -101,9 +201,10 @@ def build_machine_evidence(result: dict) -> dict:
         result.get("_pre_anchor_provider_segments"),
     )
     add("selected", primary_family, "segments", selected)
-    if not hypotheses:
-        # An empty transcription is still a pre-human state that must be
-        # auditable.  Persist an explicit empty selected family, never a null.
+    if not any(item.get("role") == "selected" for item in hypotheses):
+        # An empty selected transcription is still the pre-human state even
+        # when a raw word family exists. Persist it explicitly, never infer it
+        # from another family's events.
         hypotheses.append({
             "role": "selected", "family": primary_family,
             "kind": "segments", "events": [], "event_count": 0,
@@ -134,15 +235,34 @@ def finalize_machine_evidence(
     if not isinstance(evidence, dict) or evidence.get("schema") != SCHEMA:
         raise ValueError("machine evidence was not captured before persistence")
     payload = deepcopy(_safe_json(evidence))
+    canonical_selected = _safe_json(original_segments or [])
+    selected_found = False
+    for hypothesis in payload.get("hypotheses_by_family") or []:
+        if isinstance(hypothesis, dict) and hypothesis.get("role") == "selected":
+            hypothesis["kind"] = "segments"
+            hypothesis["events"] = canonical_selected
+            hypothesis["event_count"] = len(canonical_selected)
+            hypothesis["events_sha256"] = snapshot_hash(canonical_selected)
+            selected_found = True
+    if not selected_found:
+        payload.setdefault("hypotheses_by_family", []).append({
+            "role": "selected",
+            "family": "unknown-primary-asr",
+            "kind": "segments",
+            "events": canonical_selected,
+            "event_count": len(canonical_selected),
+            "events_sha256": snapshot_hash(canonical_selected),
+        })
     payload["pre_human"] = {
-        "segments_sha256": snapshot_hash(original_segments or []),
-        "segment_count": len(original_segments or []),
+        "segments_sha256": snapshot_hash(canonical_selected),
+        "segment_count": len(canonical_selected),
         "audio_sha256": str(audio_sha256 or "")[:64] or None,
         "audio_revision": max(0, int(audio_revision or 0)),
     }
-    quality_payload = dict(quality or {})
+    quality_payload = dict(quality) if isinstance(quality, dict) else {}
     payload["decisions"] = {
         "quality": _safe_json(quality_payload),
+        "song_quality_signal": quality_training_signal(quality_payload),
         "route": str(
             quality_payload.get("route")
             or quality_payload.get("decision") or "unknown"
@@ -159,14 +279,73 @@ def finalize_machine_evidence(
 
 
 def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
-    if not isinstance(evidence, dict) or evidence.get("schema") != SCHEMA:
+    if not isinstance(evidence, dict) or evidence.get("schema") not in {
+        SCHEMA, *LEGACY_SCHEMAS,
+    }:
         raise MachineSnapshotMissing("machine_snapshot_missing")
     hypotheses = evidence.get("hypotheses_by_family")
     if not isinstance(hypotheses, list) or not hypotheses:
         raise MachineSnapshotMissing("machine_hypotheses_missing")
     if not isinstance(evidence.get("decisions"), dict):
         raise MachineSnapshotMissing("machine_decisions_missing")
-    pre_human = evidence.get("pre_human") or {}
+    pre_human = evidence.get("pre_human")
+    if not isinstance(pre_human, dict):
+        raise MachineSnapshotMissing("machine_pre_human_missing")
     if pre_human.get("segments_sha256") != snapshot_hash(original_segments or []):
         raise MachineSnapshotMissing("machine_snapshot_hash_mismatch")
+    if evidence.get("schema") == SCHEMA:
+        selected_matches_snapshot = False
+        for hypothesis in hypotheses:
+            if not isinstance(hypothesis, dict):
+                raise MachineSnapshotMissing("machine_hypothesis_invalid")
+            role = hypothesis.get("role")
+            family = hypothesis.get("family")
+            kind = hypothesis.get("kind")
+            events = hypothesis.get("events")
+            event_count = hypothesis.get("event_count")
+            event_hash = hypothesis.get("events_sha256")
+            if (
+                not isinstance(role, str) or not role.strip()
+                or not isinstance(family, str) or not family.strip()
+                or not isinstance(kind, str) or not kind.strip()
+                or not isinstance(events, list)
+                or any(not isinstance(event, dict) for event in events)
+                or type(event_count) is not int
+                or event_count != len(events)
+                or not isinstance(event_hash, str)
+                or event_hash != snapshot_hash(events)
+            ):
+                raise MachineSnapshotMissing("machine_hypothesis_invalid")
+            if role == "selected":
+                if kind != "segments":
+                    raise MachineSnapshotMissing("machine_selected_hypothesis_invalid")
+                if event_hash == pre_human.get("segments_sha256"):
+                    selected_matches_snapshot = True
+        if not selected_matches_snapshot:
+            raise MachineSnapshotMissing("machine_selected_hypothesis_missing")
+        signal = (evidence.get("decisions") or {}).get("song_quality_signal")
+        validate_quality_training_signal(signal)
+        expected_hash = snapshot_hash({
+            "hypotheses_by_family": evidence["hypotheses_by_family"],
+            "pre_human": evidence["pre_human"],
+            "decisions": evidence["decisions"],
+        })
+        if evidence.get("evidence_sha256") != expected_hash:
+            raise MachineSnapshotMissing("machine_evidence_hash_mismatch")
 
+
+def approval_training_provenance(
+    *, segments: list[dict], quality: dict | None, revision: int,
+) -> dict:
+    """Immutable label-side evidence attached to an approved editor version."""
+    payload = {
+        "schema": "training-approval-evidence-v1",
+        "revision": int(revision),
+        "segments_sha256": snapshot_hash(segments or []),
+        "song_quality_signal": quality_training_signal(quality),
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+    payload["evidence_sha256"] = snapshot_hash({
+        key: value for key, value in payload.items() if key != "evidence_sha256"
+    })
+    return payload

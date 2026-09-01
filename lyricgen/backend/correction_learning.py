@@ -264,10 +264,37 @@ def hmac_identifier(kind: str, value: Any) -> str | None:
     """Pseudonymise an identifier before it enters analytics or RQ."""
     if value is None or str(value) == "":
         return None
-    secret = os.environ.get("QUALITY_LEARNING_HMAC_KEY", "").strip()
+    return hmac_identifier_for_generation(kind, value, current_hmac_key_id())
+
+
+def hmac_identifier_for_generation(kind: str, value: Any, key_id: str) -> str | None:
+    """Pseudonymise with a named retained key generation.
+
+    The active generation remains in the two original environment variables.
+    Older secrets may be retained only for corpus verification in
+    ``QUALITY_LEARNING_HMAC_KEYRING_JSON`` as ``{"generation": "secret"}``.
+    """
+    if value is None or str(value) == "":
+        return None
+    generation = str(key_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", generation):
+        raise RuntimeError("quality_learning_hmac_key_id_missing_or_invalid")
+    active_generation = os.environ.get("QUALITY_LEARNING_HMAC_KEY_ID", "").strip()
+    secret = ""
+    if generation == active_generation:
+        secret = os.environ.get("QUALITY_LEARNING_HMAC_KEY", "").strip()
+    if not secret:
+        try:
+            retained = json.loads(
+                os.environ.get("QUALITY_LEARNING_HMAC_KEYRING_JSON", "{}") or "{}"
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            retained = {}
+        if isinstance(retained, dict):
+            candidate = retained.get(generation)
+            secret = candidate.strip() if isinstance(candidate, str) else ""
     if strong_hmac_secret_bytes(secret) is None:
-        raise RuntimeError("quality_learning_hmac_key_missing_or_weak")
-    current_hmac_key_id()
+        raise RuntimeError("quality_learning_hmac_generation_missing_or_weak")
     normalised = (
         _normalise_entity_identifier(value)
         if kind in {"artist", "song"} else _normalise_identifier(value)

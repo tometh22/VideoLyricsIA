@@ -13,7 +13,7 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from database import EditorDocument, EditorVersion, Job, User
+from database import AuditLog, EditorDocument, EditorVersion, Job, User
 from segment_timing import canonicalize_editor_segments
 
 EDITOR_REASONS = {
@@ -224,7 +224,8 @@ def _ensure_version(
             raise RuntimeError("editor_version_content_mismatch")
         if approved:
             existing.is_approved = True
-            existing.reason = "approve"
+            if existing.reason != "transcription":
+                existing.reason = "approve"
         if provenance and existing.provenance is None:
             existing.provenance = provenance
         return existing
@@ -239,6 +240,12 @@ def _ensure_version(
 
 
 def _prune_versions(db: Session, document: EditorDocument) -> None:
+    # Jobs enrolled in the machine-evidence invariant are training samples.
+    # Pruning their checkpoints would make the operator path impossible to
+    # replay (the first real live edit hit this at revision 51).  Historical
+    # jobs keep the bounded UI-history behaviour.
+    if isinstance(document.machine_evidence, dict):
+        return
     drafts = (
         db.query(EditorVersion)
         .filter(
@@ -251,6 +258,124 @@ def _prune_versions(db: Session, document: EditorDocument) -> None:
     )
     for stale in drafts[50:]:
         db.delete(stale)
+
+
+def _record_training_delta(
+    db: Session,
+    *,
+    job: Job,
+    user_id: int,
+    previous: list[dict],
+    current: list[dict],
+    from_revision: int,
+    to_revision: int,
+    checkpoint: str,
+) -> bool:
+    """Persist one complete material edit for evidence-enrolled jobs."""
+    from correction_learning import hmac_identifier
+
+    def protected_text_ref(value: str) -> str | None:
+        try:
+            return hmac_identifier("audit_lyric", value)
+        except RuntimeError:
+            return None
+
+    # Historical jobs cannot satisfy the machine-snapshot invariant and are
+    # ineligible for training export. Keep their cheap bounded operational
+    # signal (admin funnel/activity depend on it), but never run the corpus
+    # aligner or persist unbounded per-line data for those frequent autosaves.
+    if not bool(getattr(job, "machine_snapshot_required", False)):
+        before_by_id = {
+            str(row.get("_id") if row.get("_id") not in (None, "") else f"idx_{index}"):
+            (index, row)
+            for index, row in enumerate(previous)
+        }
+        changed: list[dict] = []
+        reordered: list[dict] = []
+        changed_count = text_count = timing_count = reorder_count = 0
+        for index, row in enumerate(current):
+            row_id = str(
+                row.get("_id") if row.get("_id") not in (None, "") else f"idx_{index}"
+            )
+            old = before_by_id.get(row_id)
+            if old is None:
+                continue
+            old_index, old_row = old
+            try:
+                old_start, new_start = float(old_row.get("start") or 0), float(row.get("start") or 0)
+                old_end, new_end = float(old_row.get("end") or 0), float(row.get("end") or 0)
+            except (TypeError, ValueError):
+                old_start = new_start = old_end = new_end = 0.0
+            old_text = str(old_row.get("text") or "").strip()
+            new_text = str(row.get("text") or "").strip()
+            text_changed = old_text != new_text
+            timing_changed = (
+                abs(old_start - new_start) > 0.05
+                or abs(old_end - new_end) > 0.05
+            )
+            if text_changed or timing_changed:
+                changed_count += 1
+                text_count += int(text_changed)
+                timing_count += int(timing_changed)
+                if len(changed) < 20:
+                    changed.append({
+                        "id": row_id,
+                        "prev_start": round(old_start, 3),
+                        "new_start": round(new_start, 3),
+                        "prev_end": round(old_end, 3),
+                        "new_end": round(new_end, 3),
+                        "text_changed": text_changed,
+                        "prev_text_length": len(old_text),
+                        "new_text_length": len(new_text),
+                        "prev_text_hmac": protected_text_ref(old_text),
+                        "new_text_hmac": protected_text_ref(new_text),
+                    })
+            if old_index != index:
+                reorder_count += 1
+                if len(reordered) < 30:
+                    reordered.append({
+                        "id": row_id, "from_idx": old_index, "to_idx": index,
+                    })
+        if not changed_count and not reorder_count:
+            return False
+        db.add(AuditLog(
+            user_id=user_id,
+            action="lyrics.segments_diff",
+            detail={
+                "job_id": job.job_id,
+                "n_lines": len(current),
+                "changed": changed,
+                "reorder": reordered,
+                "correction_summary": {
+                    "changed_lines": changed_count,
+                    "text_changes": text_count,
+                    "timing_changes": timing_count,
+                    "reorders": reorder_count,
+                },
+                "truncated": changed_count > len(changed) or reorder_count > len(reordered),
+            },
+        ))
+        return True
+
+    from training_corpus import build_line_delta_audit
+
+    detail = build_line_delta_audit(
+        previous,
+        current,
+        job_id=job.job_id,
+        from_revision=from_revision,
+        to_revision=to_revision,
+        checkpoint=checkpoint,
+        text_ref=protected_text_ref,
+    )
+    if detail is None:
+        return False
+    db.add(AuditLog(
+        user_id=user_id,
+        action="lyrics.segments_diff",
+        detail=detail,
+    ))
+    return True
 
 
 def _next_revision(db: Session, document: EditorDocument, *candidates: int) -> int:
@@ -1504,6 +1629,8 @@ def save_document(
             _prune_versions(db, document)
         db.flush()
         return document, version, False
+    previous_segments = [dict(item) for item in (document.current_segments or [])]
+    previous_revision = int(document.revision or 0)
     document.current_segments = normalized
     document.revision += 1
     document.updated_by = user_id
@@ -1513,10 +1640,25 @@ def save_document(
     # Any ordinary edit makes a raw proposal stale. Quality-proposal apply
     # writes a text-free tombstone after save_document returns.
     document.quality_proposal = None
+    _record_training_delta(
+        db,
+        job=job,
+        user_id=user_id,
+        previous=previous_segments,
+        current=normalized,
+        from_revision=previous_revision,
+        to_revision=int(document.revision),
+        checkpoint=reason,
+    )
     version = None
-    if reason != "draft":
+    # For evidence-enrolled jobs even the fast 800 ms draft is part of the
+    # recoverable operator path.  Store it as an autosave checkpoint so the
+    # raw tenant-private text is replayable without leaking it into AuditLog.
+    persist_training_draft = bool(getattr(job, "machine_snapshot_required", False))
+    if reason != "draft" or persist_training_draft:
         version = _ensure_version(
-            db, document, document.revision, normalized, user_id, reason,
+            db, document, document.revision, normalized, user_id,
+            "autosave" if reason == "draft" else reason,
             approved=reason == "approve",
         )
         _prune_versions(db, document)
@@ -1622,11 +1764,24 @@ def sync_legacy_snapshot(
         return document
     if revision <= document.revision:
         raise RuntimeError("editor_revision_conflict")
+    job = db.query(Job).filter(Job.job_id == document.job_id).with_for_update().one()
+    previous_segments = [dict(item) for item in (document.current_segments or [])]
+    previous_revision = int(document.revision or 0)
     document.current_segments = normalized
     document.revision = revision
     document.updated_by = user_id
     document.updated_at = now_utc()
     _ensure_version(db, document, revision, normalized, user_id, "autosave")
+    _record_training_delta(
+        db,
+        job=job,
+        user_id=user_id,
+        previous=previous_segments,
+        current=normalized,
+        from_revision=previous_revision,
+        to_revision=revision,
+        checkpoint="legacy_autosave",
+    )
     _prune_versions(db, document)
     db.flush()
     return document
@@ -1723,8 +1878,31 @@ def approve_document(
         user_id, "approve", approved=True,
     )
     version.is_approved = True
-    version.reason = "approve"
+    if version.reason != "transcription":
+        version.reason = "approve"
+    freeze_approval_training_evidence(job, version)
     job.segments_json = normalize_segments(document.current_segments)
     job.segments_revision = document.revision
     db.flush()
     return document, version
+
+
+def freeze_approval_training_evidence(job: Job, version: EditorVersion) -> None:
+    """Attach the quality traffic light to the exact approved lyric version."""
+    from machine_evidence import approval_training_provenance, snapshot_hash
+
+    existing = dict(version.provenance or {})
+    frozen = dict(existing.get("training_approval") or {})
+    if (
+        frozen.get("schema") == "training-approval-evidence-v1"
+        and frozen.get("segments_sha256") == snapshot_hash(list(version.segments or []))
+    ):
+        return
+    version.provenance = {
+        **existing,
+        "training_approval": approval_training_provenance(
+            segments=list(version.segments or []),
+            quality=getattr(job, "transcription_quality", None),
+            revision=int(version.revision),
+        ),
+    }

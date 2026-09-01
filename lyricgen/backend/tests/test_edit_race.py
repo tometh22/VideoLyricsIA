@@ -27,7 +27,9 @@ from database import Job as JobModel
 
 
 @pytest.mark.postgres
-def test_concurrent_edits_respect_max_edits_limit(client, user_token, db):
+def test_concurrent_edits_respect_max_edits_limit(
+    client, user_token, db, monkeypatch,
+):
     """5 requests POST /edit concurrentes (usuario NO-admin); solo una
     debe iniciar el render. Las demás reciben 409 ``edit_in_progress``.
 
@@ -44,6 +46,15 @@ def test_concurrent_edits_respect_max_edits_limit(client, user_token, db):
         "/auth/me", headers={"Authorization": f"Bearer {user_token}"}
     ).json()
     tenant_id = me["tenant_id"]
+
+    # This test measures the row-lock contract, not the asynchronous render.
+    # Letting the accepted request enqueue a real edit against the deliberately
+    # fake audio can race the remaining requests: the worker marks the job
+    # ``error`` and they receive 400 instead of the expected lock/status 409.
+    # A no-op queue keeps the job in ``editing`` and makes the concurrency
+    # assertion deterministic without weakening the product path under test.
+    import main
+    monkeypatch.setattr(main, "enqueue_edit", lambda **kwargs: "test:noop")
 
     # Setup: job en pending_review listo para edits. bg_r2_key_cached
     # y segments_json no None para que pase los checks de
