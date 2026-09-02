@@ -39,6 +39,10 @@ def main() -> int:
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--canonical-cohort", type=Path, required=True)
+    parser.add_argument(
+        "--additional-exact-cohort", type=Path,
+        help="optional song-id file for new raw_quality=exact songs (v2)",
+    )
     parser.add_argument("--training-report", type=Path,
                         help="optional run_report.json to bind the adapter artifact")
     parser.add_argument("--output", type=Path, required=True)
@@ -46,14 +50,24 @@ def main() -> int:
     canonical = _canonical_ids(args.canonical_cohort)
     if canonical is None or len(canonical) != CANONICAL_COHORT_SIZE:
         raise ValueError(f"canonical cohort must contain exactly {CANONICAL_COHORT_SIZE} songs")
+    additional_exact = _canonical_ids(args.additional_exact_cohort) or set()
+    evaluation_song_ids = canonical | additional_exact
     baseline = read_jsonl(args.baseline.resolve())
     candidate = read_jsonl(args.candidate.resolve())
-    evaluation = evaluate_predictions(baseline, candidate, canonical_song_ids=canonical)
+    evaluation = evaluate_predictions(
+        baseline, candidate, canonical_song_ids=evaluation_song_ids,
+    )
     evaluation["data_improvement_curve"] = data_improvement_curve(
-        baseline, candidate, canonical_song_ids=canonical,
+        baseline, candidate, canonical_song_ids=evaluation_song_ids,
     )
     evaluation["evaluation_policy"] = {
-        "cohort": "canonical_exact_23", "song_bootstrap_ci": True,
+        "cohort": (
+            "canonical_exact_23_plus_new_exact"
+            if additional_exact else "canonical_exact_23"
+        ),
+        "canonical_song_count": len(canonical),
+        "additional_exact_song_count": len(additional_exact),
+        "song_bootstrap_ci": True,
         "easy_difficult_split": True, "global_wer_only": False,
         "additional_family_only": True, "replacement_after_consecutive_evals": 2,
     }
@@ -61,7 +75,7 @@ def main() -> int:
     # consensus witness.  It is deliberately not a superiority gate: the
     # base Whisper remains authoritative until two consecutive evaluations
     # prove sustained improvement.
-    complete_replay = evaluation.get("songs") == len(canonical)
+    complete_replay = evaluation.get("songs") == len(evaluation_song_ids)
     evaluation["pipeline_validated"] = complete_replay
     evaluation["evaluation_passed"] = complete_replay
     evaluation["gate"] = {

@@ -238,7 +238,7 @@ def _release() -> str:
 
 
 def _snapshot(job_id: str):
-    from database import Job, SessionLocal
+    from database import EditorDocument, Job, SessionLocal
     from sqlalchemy import func
 
     db = SessionLocal()
@@ -246,6 +246,10 @@ def _snapshot(job_id: str):
         row = db.query(Job).filter(Job.job_id == job_id).first()
         if row is None:
             return None
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == row.job_id,
+            EditorDocument.tenant_id == row.tenant_id,
+        ).first()
         # Bounded same-artist vocabulary is a decoding hint, never evidence.
         # It can help names/slang already present in this tenant's approved
         # catalogue, but a suggestion still requires independent audio
@@ -283,6 +287,15 @@ def _snapshot(job_id: str):
         return {
             "revision": int(row.segments_revision or 0),
             "segments": [dict(item) for item in (row.segments_json or [])],
+            # The immutable machine snapshot carries the LoRA word stream
+            # after the worker removes transport-only keys.  Quality replay
+            # must be able to compare the attested family with/without it.
+            "machine_evidence": (
+                dict(document.machine_evidence)
+                if document is not None
+                and isinstance(document.machine_evidence, dict)
+                else None
+            ),
             "quality": dict(row.transcription_quality or {}),
             "input_r2_key": row.input_r2_key,
             "audio_revision": int(row.audio_revision or 0),
@@ -299,7 +312,9 @@ def _snapshot(job_id: str):
         db.close()
 
 
-def _attested_asr_context(segments: list[dict]) -> dict:
+def _attested_asr_context(
+    segments: list[dict], machine_evidence: dict | None = None,
+) -> dict:
     """Recover provider-family witnesses without trusting segment labels.
 
     New transcriptions persist word timing plus an HMAC-attested provenance
@@ -366,12 +381,36 @@ def _attested_asr_context(segments: list[dict]) -> dict:
     )
     primary = ranked[0] if ranked else ("", [])
     independent = ranked[1] if len(ranked) > 1 else ("", [])
-    return {
+    context = {
         "_asr_words": primary[1],
         "_primary_asr_family": primary[0],
         "_independent_asr_words": independent[1],
         "_independent_asr_family": independent[0],
     }
+    # LoRA is persisted as a private hypothesis, not on editable segment
+    # rows.  Accept only the exact attested family and a matching snapshot
+    # hash; user-edited text can therefore never manufacture a witness.
+    if isinstance(machine_evidence, dict):
+        from machine_evidence import snapshot_hash
+
+        for hypothesis in machine_evidence.get("hypotheses_by_family") or []:
+            if not isinstance(hypothesis, dict):
+                continue
+            family = str(hypothesis.get("family") or "").strip()
+            if family != "openai_whisper_large_v3_turbo_lora_v1":
+                continue
+            events = hypothesis.get("events")
+            if (
+                hypothesis.get("kind") != "word_stream"
+                or not isinstance(events, list)
+                or hypothesis.get("events_sha256") != snapshot_hash(events)
+            ):
+                continue
+            words = [item for item in events if isinstance(item, dict)]
+            context["_lora_asr_words"] = words
+            context["_lora_asr_family"] = family
+            break
+    return context
 
 
 def _queue_wait_seconds() -> float | None:
@@ -1268,7 +1307,9 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 "1", "true", "yes", "on",
             }:
                 from targeted_consensus import reprocess
-                asr_context = _attested_asr_context(snapshot["segments"])
+                asr_context = _attested_asr_context(
+                    snapshot["segments"], snapshot.get("machine_evidence"),
+                )
                 if snapshot.get("artist_lexicon_prompt"):
                     asr_context["_artist_lexicon_prompt"] = snapshot[
                         "artist_lexicon_prompt"

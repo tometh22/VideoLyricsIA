@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import tempfile
 import time
 from typing import Any
 
@@ -29,11 +30,158 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _runtime_cache_dir() -> Path:
+    configured = os.environ.get(
+        "LORA_V1_RUNTIME_CACHE_DIR", "/tmp/genly-lora-v1",
+    ).strip()
+    return Path(configured or "/tmp/genly-lora-v1")
+
+
+def _r2_client():
+    """Build a private R2 client only when the staging artifact bridge is set.
+
+    Runtime deployments may use a Railway volume instead.  The R2 bridge is
+    deliberately opt-in, uses the existing private bucket credentials, and is
+    never reached while the family flag is disabled.
+    """
+    endpoint = os.environ.get("R2_ENDPOINT_URL", "").strip()
+    access_key = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+    secret_key = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+    if not endpoint or not access_key or not secret_key:
+        return None
+    try:
+        import boto3
+        return boto3.client(
+            "s3", endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name="auto",
+        )
+    except Exception:
+        return None
+
+
+def _download_r2_object(client, key: str, destination: Path) -> bool:
+    bucket = os.environ.get("R2_BUCKET", "").strip()
+    if not bucket or not key:
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".part",
+        dir=str(destination.parent),
+    )
+    os.close(fd)
+    try:
+        client.download_file(bucket, key, temporary)
+        os.replace(temporary, destination)
+        return True
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return False
+
+
+def _materialize_report() -> Path | None:
+    key = os.environ.get("LORA_V1_EVAL_REPORT_R2_KEY", "").strip()
+    if not key:
+        return None
+    target = _runtime_cache_dir() / "evaluation.json"
+    if target.is_file():
+        return target
+    client = _r2_client()
+    if client is None or not _download_r2_object(client, key, target):
+        return None
+    return target
+
+
+def _materialize_adapter(expected_sha: str = "") -> Path | None:
+    prefix = os.environ.get("LORA_V1_ADAPTER_R2_PREFIX", "").strip()
+    if not prefix:
+        return None
+    root = _runtime_cache_dir() / "adapter"
+    marker = root / ".complete"
+    model_file = root / "adapter_model.safetensors"
+    if marker.is_file() and model_file.is_file():
+        if not expected_sha or _sha256(model_file) == expected_sha:
+            return root
+    client = _r2_client()
+    bucket = os.environ.get("R2_BUCKET", "").strip()
+    if client is None or not bucket:
+        return None
+    try:
+        response = client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        objects = response.get("Contents") or []
+    except Exception:
+        return None
+    if not objects:
+        return None
+    # Download into a fresh directory so a partial deployment can never be
+    # mistaken for a complete adapter after a process restart.
+    staging = root.with_name(f".{root.name}.staging")
+    try:
+        if staging.exists():
+            for item in sorted(staging.rglob("*"), reverse=True):
+                if item.is_file() or item.is_symlink():
+                    item.unlink()
+                elif item.is_dir():
+                    item.rmdir()
+        staging.mkdir(parents=True, exist_ok=True)
+        downloaded = 0
+        prefix_value = prefix.rstrip("/") + "/"
+        for item in objects:
+            key = str(item.get("Key") or "")
+            relative = key[len(prefix_value):] if key.startswith(prefix_value) else ""
+            relative_path = Path(relative)
+            if (
+                not relative
+                or relative_path.is_absolute()
+                or ".." in relative_path.parts
+            ):
+                continue
+            if _download_r2_object(client, key, staging / relative_path):
+                downloaded += 1
+        staged_model = staging / "adapter_model.safetensors"
+        if downloaded == 0 or not staged_model.is_file():
+            return None
+        if expected_sha and _sha256(staged_model) != expected_sha:
+            return None
+        if root.exists():
+            for item in sorted(root.rglob("*"), reverse=True):
+                if item.is_file() or item.is_symlink():
+                    item.unlink()
+                elif item.is_dir():
+                    item.rmdir()
+            root.rmdir()
+        os.replace(staging, root)
+        marker.write_text(expected_sha or _sha256(model_file), encoding="ascii")
+        return root
+    except Exception:
+        return None
+    finally:
+        if staging.exists() and staging != root:
+            for item in sorted(staging.rglob("*"), reverse=True):
+                try:
+                    if item.is_file() or item.is_symlink():
+                        item.unlink()
+                    elif item.is_dir():
+                        item.rmdir()
+                except OSError:
+                    pass
+            try:
+                staging.rmdir()
+            except OSError:
+                pass
+
+
 def load_verified_family(report_path: str | os.PathLike[str] | None = None) -> dict[str, Any] | None:
     """Return an attested family descriptor or ``None`` (fail closed)."""
     if not _enabled():
         return None
     path = Path(report_path or os.environ.get("LORA_V1_EVAL_REPORT", "").strip())
+    if not path.is_file():
+        path = _materialize_report() or path
     if not path.is_file():
         return None
     try:
@@ -65,14 +213,16 @@ def load_verified_family(report_path: str | os.PathLike[str] | None = None) -> d
     # research pod.  The report remains the source of truth for the expected
     # SHA-256; the explicit path override only changes where that bytestring
     # is read from.  Never accept a path from a job payload.
+    expected = report.get("adapter_sha256") or (report.get("candidate_artifact") or {}).get("sha256")
     artifact = (
         os.environ.get("LORA_V1_ADAPTER_PATH", "").strip()
         or report.get("adapter_path")
         or (report.get("candidate_artifact") or {}).get("path")
     )
+    if artifact and not Path(artifact).exists():
+        artifact = str(_materialize_adapter(str(expected or "")) or artifact)
     if not artifact or not Path(artifact).exists():
         return None
-    expected = report.get("adapter_sha256") or (report.get("candidate_artifact") or {}).get("sha256")
     if expected:
         candidate = Path(artifact)
         if candidate.is_file():
