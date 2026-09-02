@@ -316,6 +316,9 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             r.pop("_recognition_attempt_count", None)
             r.pop("_primary_asr_family", None)
             r.pop("_independent_asr_family", None)
+            r.pop("_lora_asr_words", None)
+            r.pop("_lora_asr_family", None)
+            r.pop("_lora_family_role", None)
         if _stem:
             try:
                 os.unlink(_stem)
@@ -425,6 +428,21 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         from lyric_content_policy import EDITORIAL_POLICY_ID
         final_metrics["editorial_policy_id"] = EDITORIAL_POLICY_ID
     final_metrics["language"] = str(language or "unknown")[:16]
+    # Persist the paired LoRA↔base disagreement as a song-level routing
+    # feature. It is computed before internal witness streams are stripped,
+    # uses no reference lyrics, and remains advisory until calibration signs
+    # the router gate.
+    try:
+        from lora_family import song_disagreement_score
+        router_signal = song_disagreement_score(
+            r.get("_asr_words") or [], r.get("_lora_asr_words") or [],
+        )
+        if router_signal is not None:
+            final_metrics["difficulty_router"] = router_signal
+    except Exception:
+        # Optional telemetry must never make a valid transcription fail.
+        # Missing witnesses force router abstention rather than agreement.
+        pass
     final["metrics"] = final_metrics
     r["transcription_quality"] = final
     if final["decision"] == "pass":
@@ -452,6 +470,9 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     r.pop("_recognition_attempt_count", None)
     r.pop("_primary_asr_family", None)
     r.pop("_independent_asr_family", None)
+    r.pop("_lora_asr_words", None)
+    r.pop("_lora_asr_family", None)
+    r.pop("_lora_family_role", None)
     return r
 
 
@@ -486,7 +507,7 @@ def run_transcription_job(
         _looks_live, _maybe_anchor_align, _maybe_ctc_retime,
         _maybe_adlib_filter, _maybe_chorus_snap, _maybe_gap_rescue,
         _maybe_phrase_segment, _maybe_repetition_reconcile,
-        _maybe_timing_consistency, _maybe_word_vote,
+        _maybe_timing_consistency, _maybe_word_vote, _maybe_lora_family,
         _resolve_postprocess_language, _run_transcription_for_job,
     )
     from jobs import update_job
@@ -655,6 +676,7 @@ def run_transcription_job(
             )
             r = _maybe_repetition_reconcile(r, job_id)
             r = await _maybe_gap_rescue(r, audio_path, job_id, _post_lang)
+            r = await _maybe_lora_family(r, audio_path, job_id, _post_lang)
             r = await _maybe_word_vote(
                 r, audio_path, job_id, _post_lang,
                 live_hint=live or _looks_live(title, filename),

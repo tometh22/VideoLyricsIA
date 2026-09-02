@@ -114,6 +114,50 @@ def test_attested_asr_context_connects_persisted_words_by_independent_family(
     assert quality_jobs._attested_asr_context([second])["_asr_words"] == []
 
 
+def test_attested_asr_context_recovers_lora_from_immutable_machine_snapshot():
+    from machine_evidence import snapshot_hash
+
+    words = [{"word": "hola", "start": 1.0, "end": 1.4}]
+    evidence = {
+        "hypotheses_by_family": [{
+            "role": "candidate",
+            "family": "openai_whisper_large_v3_turbo_lora_v1",
+            "kind": "word_stream",
+            "events": words,
+            "event_count": len(words),
+            "events_sha256": snapshot_hash(words),
+        }],
+    }
+
+    context = quality_jobs._attested_asr_context([], evidence)
+
+    assert context["_lora_asr_family"] == (
+        "openai_whisper_large_v3_turbo_lora_v1"
+    )
+    assert context["_lora_asr_words"] == words
+
+    evidence["hypotheses_by_family"][0]["events"][0]["word"] = "forged"
+    assert quality_jobs._attested_asr_context([], evidence).get(
+        "_lora_asr_words"
+    ) is None
+
+
+def test_lora_shadow_counters_survive_quality_sanitizer():
+    payload = {
+        "lora_shadow": {
+            "enabled": True,
+            "comparisons": 3,
+            "with_consensus": 2,
+            "without_consensus": 1,
+            "lora_contributed_lines": 2,
+            "new_consensus_lines": 1,
+            "lost_consensus_lines": 0,
+        },
+    }
+    sanitized = quality_jobs._sanitize_analytical_evidence(payload)
+    assert sanitized == payload
+
+
 def test_failure_callback_persists_only_error_type_not_provider_message(
         monkeypatch, caplog):
     secret = "PRIVATE_LYRIC_IN_PROVIDER_EXCEPTION"

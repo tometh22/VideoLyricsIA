@@ -124,6 +124,37 @@ def test_ventana_whisper_registra_provenance_del_job(monkeypatch):
     assert captured["summary"] == "succeeded"
 
 
+def test_ventana_whisper_applies_bounded_artist_lexicon_prompt(monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+    import openai
+
+    captured = {}
+
+    class _Transcriptions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(words=[])
+
+    class _Client:
+        audio = SimpleNamespace(transcriptions=_Transcriptions())
+
+        def __init__(self, **_kwargs):
+            pass
+
+    def _ffmpeg(cmd, **_kwargs):
+        Path(cmd[-1]).write_bytes(b"audio")
+
+    monkeypatch.setattr("subprocess.run", _ffmpeg)
+    monkeypatch.setattr(openai, "OpenAI", _Client)
+    gr._transcribe_window(
+        "song.wav", 0.0, 2.0, language="es",
+        prompt="Vocabulario posible del catálogo: Legalícenla, Intoxicados",
+    )
+    assert captured["prompt"].startswith("Vocabulario posible")
+    assert len(captured["prompt"]) <= 850
+
+
 def test_gap_rescue_preserves_malformed_provider_word_before_mapping():
     from types import SimpleNamespace
 

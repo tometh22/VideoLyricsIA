@@ -66,6 +66,18 @@ def run_correction_observation_job(job_id: str, approved_version_id: str,
             }
             row.metrics = metrics
         db.commit()
+        # Milestone triggers are deliberately best-effort: the correction
+        # observation is already durable, and a Redis/executor outage must not
+        # turn a successful approval into a failed learning capture.
+        try:
+            from learning_triggers import trigger_after_capture
+            trigger_after_capture()
+        except Exception as exc:
+            import logging
+            logging.getLogger("genly.quality_learning").warning(
+                "[LEARNING-TRIGGERS] post-capture hook failed error_type=%s",
+                type(exc).__name__,
+            )
         return {
             "observation_id": row.id, "label_tier": row.label_tier,
             "mutated_segments": False,
@@ -112,6 +124,13 @@ def run_daily_quality_learning() -> dict:
             detail=result,
         ))
         db.commit()
+        try:
+            from learning_triggers import trigger_after_capture
+            result["learning_triggers"] = trigger_after_capture()
+        except Exception as exc:
+            result["learning_triggers"] = {
+                "status": "trigger_hook_failed", "error_type": type(exc).__name__,
+            }
         try:
             from queue_jobs import ensure_daily_quality_learning_scheduled
             result["next_job_id"] = ensure_daily_quality_learning_scheduled()

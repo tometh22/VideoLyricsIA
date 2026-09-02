@@ -36,6 +36,9 @@ requests>=2.28.0,<3.0.0
 # push sin que ningún camino de código las tocara.
 transformers>=4.38.0,<5.0.0
 safetensors>=0.4.0,<1.0.0
+# Optional LoRA-v1 runtime.  It is imported lazily and remains inert unless
+# an attested adapter is mounted and LORA_V1_FAMILY_ENABLED=1.
+peft==0.20.0
 # --- SaaS infrastructure ---
 sqlalchemy>=2.0.0,<3.0.0
 psycopg2-binary>=2.9.0,<3.0.0

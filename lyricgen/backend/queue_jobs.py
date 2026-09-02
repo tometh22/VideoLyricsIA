@@ -1722,6 +1722,39 @@ def ensure_daily_quality_learning_scheduled() -> str | None:
     return queued.id
 
 
+def ensure_learning_triggers_scheduled() -> str | None:
+    """Wake the count-based research trigger reconciler periodically.
+
+    The reconciler is intentionally lightweight; it only counts immutable
+    approvals and schedules deterministic milestone jobs.  It does not run a
+    model or mutate a Job.  Capture hooks provide prompt scheduling, while
+    this wake-up covers approvals captured while Redis was unavailable.
+    """
+    if not transcription_quality_queue_enabled():
+        return None
+    _init_redis()
+    if _redis is None:
+        return None
+    from datetime import datetime, timedelta, timezone
+    from rq import Queue
+    from learning_triggers import run_learning_trigger_reconciler
+
+    interval_s = max(60, int(os.environ.get("LEARNING_TRIGGER_RECONCILE_SECONDS", "900")))
+    due = datetime.now(timezone.utc) + timedelta(seconds=interval_s)
+    bucket = int(due.timestamp()) // interval_s
+    rq_id = f"learning-trigger-reconciler:{bucket}"
+    active = _active_rq_job(_redis, rq_id)
+    if active is not None:
+        return active.id
+    _evict_stale_rq_job(_redis, rq_id)
+    queued = Queue("transcription_quality", connection=_redis).enqueue_in(
+        timedelta(seconds=interval_s), run_learning_trigger_reconciler,
+        job_timeout=120, result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL,
+        job_id=rq_id, meta=rq_payload_metadata("learning_trigger_reconciler"),
+    )
+    return queued.id
+
+
 def ensure_quality_pending_reconciler_scheduled() -> str | None:
     """Schedule a periodic outbox repair for pending-before-publish crashes."""
     if not transcription_quality_queue_enabled():
