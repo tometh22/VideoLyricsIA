@@ -271,3 +271,44 @@ def test_run_stops_after_canary_until_explicit_continue(monkeypatch, tmp_path):
     assert ub.run(args) == 0
     assert waves == [["Song 1"]]
     assert entries[1].status == "pending"
+
+
+def test_presigned_put_never_carries_api_authorization(tmp_path, monkeypatch):
+    """R2 rejects query-signed PUTs that also carry Authorization (400)."""
+    import universal_batch
+    from batch_manifest import AudioManifestEntry
+
+    api = universal_batch.Api("https://api.test", "secret-token")
+    calls = []
+
+    class _Resp:
+        status_code = 200
+        headers = {"ETag": '"abc"'}
+
+    def fake_put(url, **kwargs):
+        calls.append((url, kwargs))
+        return _Resp()
+
+    monkeypatch.setattr(universal_batch.requests, "put", fake_put)
+    monkeypatch.setattr(
+        api.session, "put",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("session.put used for R2")),
+    )
+    wav = tmp_path / "Song_Artist_ISRC.wav"
+    wav.write_bytes(b"RIFF" + b"\0" * 64)
+    entry = AudioManifestEntry(
+        source_path=str(wav), filename=wav.name, title="Song", artist="Artist",
+        lookup_title="Song", version="", technical_code="ISRC",
+        fuzzy_lookup=False, size_bytes=68, sha256="x" * 64,
+        duration_seconds=None,
+    )
+    monkeypatch.setattr(api, "request", lambda method, path, **kw: {
+        "job_id": "job1", "use_multipart": False, "upload_url": "https://r2.test/k?X-Amz-Signature=s",
+    })
+
+    assert api.upload_audio(entry) == "job1"
+    assert len(calls) == 1
+    url, kwargs = calls[0]
+    assert url.startswith("https://r2.test/")
+    assert "Authorization" not in {k.title() for k in kwargs.get("headers", {})}
+    assert "secret-token" not in str(kwargs.get("headers"))
