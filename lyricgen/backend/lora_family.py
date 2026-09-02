@@ -37,6 +37,12 @@ def _runtime_cache_dir() -> Path:
     return Path(configured or "/tmp/genly-lora-v1")
 
 
+# API and worker requests can start together on a cold container.  Serializing
+# the report/adapter materialization prevents two R2 downloads from deleting
+# each other's staging directory; model inference has its own lock below.
+_ARTIFACT_MATERIALIZE_LOCK = threading.Lock()
+
+
 def _r2_client():
     """Build a private R2 client only when the staging artifact bridge is set.
 
@@ -181,7 +187,8 @@ def load_verified_family(report_path: str | os.PathLike[str] | None = None) -> d
         return None
     path = Path(report_path or os.environ.get("LORA_V1_EVAL_REPORT", "").strip())
     if not path.is_file():
-        path = _materialize_report() or path
+        with _ARTIFACT_MATERIALIZE_LOCK:
+            path = _materialize_report() or path
     if not path.is_file():
         return None
     try:
@@ -220,7 +227,8 @@ def load_verified_family(report_path: str | os.PathLike[str] | None = None) -> d
         or (report.get("candidate_artifact") or {}).get("path")
     )
     if artifact and not Path(artifact).exists():
-        artifact = str(_materialize_adapter(str(expected or "")) or artifact)
+        with _ARTIFACT_MATERIALIZE_LOCK:
+            artifact = str(_materialize_adapter(str(expected or "")) or artifact)
     if not artifact or not Path(artifact).exists():
         return None
     if expected:
