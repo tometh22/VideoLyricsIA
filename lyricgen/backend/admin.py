@@ -1,20 +1,32 @@
 """Admin panel API for GenLy AI."""
 
+import asyncio
+import hashlib
 import logging
 import os
 import shutil
+import subprocess
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from sqlalchemy import func
+from pydantic import BaseModel, Field
+from sqlalchemy import case, func, text
 from sqlalchemy.orm import Session
 
-from auth import get_current_user, PLANS, pwd_context, validate_password_strength
-from database import User, Job, Invoice, AuditLog, AIProvenance, BackgroundAsset, get_db
+from auth import (
+    get_current_user,
+    PLANS,
+    pwd_context,
+    telemetry_enabled,
+    validate_password_strength,
+    is_explicitly_local_environment,
+    is_super_admin,
+)
+from database import User, Job, Invoice, AuditLog, AIProvenance, AssetUsage, BackgroundAsset, UserSession, LoginSession, DeletedJobLyricsArchive, get_db
+from error_taxonomy import classify_error
 
 BACKGROUNDS_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "backgrounds", "library")
 os.makedirs(BACKGROUNDS_DIR, exist_ok=True)
@@ -29,6 +41,126 @@ def require_admin(current_user: dict = Depends(get_current_user)):
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
+
+
+# _super_admin_allowlist vive en auth.py (se movió para computar el flag
+# is_super_admin en get_current_user sin import circular); se re-importa
+# arriba para mantener compatibilidad con quien lo use desde admin.
+
+
+def require_super_admin(current_user: dict = Depends(get_current_user)):
+    """Admin + allowlist opcional para vistas de observabilidad de usuarios.
+
+    La actividad por usuario (qué hace cada operador, sus errores, su
+    tiempo de uso) es información operativa de la plataforma, no del
+    cliente: un admin local de un tenant no debería verla. Cuando
+    SUPER_ADMIN_USERS está seteado (ej. en prod:
+    "tomas@epical.digital,agus.cafisi"), solo esos usuarios —
+    identificados por username o email — pasan. Sin la var, dev/tests
+    conservan el fallback de admin; cualquier entorno desplegado o
+    desconocido falla cerrado.
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if not is_super_admin(
+        current_user.get("username"),
+        current_user.get("email"),
+        current_user.get("role"),
+    ):
+        raise HTTPException(status_code=403, detail="Super admin access required")
+    return current_user
+
+
+def _requires_durable_background_storage() -> bool:
+    """Only explicitly local environments may persist catalogue files locally."""
+    return not is_explicitly_local_environment()
+
+
+class SubmissionsControlRequest(BaseModel):
+    paused: bool
+    reason: str = Field(default="", max_length=500)
+    until: Optional[datetime] = None
+    retry_after: int = Field(default=60, ge=1, le=3600)
+
+
+class GlobalLogoutRequest(BaseModel):
+    confirmation: str
+    reason: str = Field(default="security cutover", max_length=500)
+
+
+@router.get("/ops/submissions")
+def get_submissions_control(
+    admin: dict = Depends(require_super_admin),
+):
+    from ops_control import get_submissions_state
+    return get_submissions_state()
+
+
+@router.put("/ops/submissions")
+def update_submissions_control(
+    body: SubmissionsControlRequest,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from ops_control import set_submissions_state
+    try:
+        state = set_submissions_state(
+            paused=body.paused,
+            reason=body.reason,
+            until=body.until,
+            retry_after=body.retry_after,
+        )
+    except Exception as exc:
+        logger.exception("Could not update submissions control")
+        raise HTTPException(status_code=503, detail="Operations control unavailable") from exc
+    db.add(AuditLog(
+        user_id=admin.get("id"),
+        action="ops.submissions.updated",
+        detail={
+            "paused": state["paused"],
+            "reason": state["reason"],
+            "until": state.get("until"),
+            "retry_after": state["retry_after"],
+        },
+    ))
+    db.commit()
+    return state
+
+
+@router.post("/ops/logout-all")
+def logout_all_users(
+    body: GlobalLogoutRequest,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Irreversibly invalidate every browser access token and session."""
+    if body.confirmation != "LOGOUT_ALL_USERS":
+        raise HTTPException(status_code=400, detail="Explicit confirmation required")
+    now = datetime.now(timezone.utc)
+    users_updated = db.query(User).update(
+        {User.auth_version: User.auth_version + 1},
+        synchronize_session=False,
+    )
+    sessions_revoked = (
+        db.query(LoginSession)
+        .filter(LoginSession.revoked_at.is_(None))
+        .update({LoginSession.revoked_at: now}, synchronize_session=False)
+    )
+    db.add(AuditLog(
+        user_id=admin.get("id"),
+        action="auth.global_logout",
+        detail={
+            "reason": body.reason,
+            "users_updated": users_updated,
+            "sessions_revoked": sessions_revoked,
+        },
+    ))
+    db.commit()
+    return {
+        "ok": True,
+        "users_updated": users_updated,
+        "sessions_revoked": sessions_revoked,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +307,16 @@ class CreateUserRequest(BaseModel):
     # If true, the user keeps generating past plan monthly limit and we
     # invoice the overage out-of-band. Default False = hard wall at limit.
     allow_overage: bool = False
+    # UMG Guideline 5: gate for AI tool usage. Default False keeps the
+    # current "auth-after-create" workflow intact. When True, the same
+    # transaction sets ai_authorized_at/by so the operator doesn't have
+    # to follow up with a separate authorize-ai call.
+    ai_authorized: bool = False
+    # Cuenta de facturación compartida entre tenants. Ej: usuarios de
+    # universal_argentina y universal_chile con billing_group
+    # "universal_music" consumen del mismo plan mensual aunque no se vean
+    # los videos entre sí. Vacío = sin grupo (cuota por tenant).
+    billing_group: str = ""
 
 
 @router.post("/users")
@@ -183,9 +325,29 @@ async def create_user_admin(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Create a new user (admin)."""
+    """Create a new user (admin).
+
+    Note: the admin form defaults `ai_authorized=False` (opposite of the
+    public `/auth/register` default) because admin-created accounts
+    typically belong to regulated tenants like UMG that require an
+    explicit auth step. To create with AI enabled, pass
+    `ai_authorized=True` — the same transaction stamps the audit fields.
+    """
     from auth import create_user
     try:
+        # enforce_reserved=False because this endpoint IS the
+        # "admin seeding script" path that auth.create_user's docstring
+        # documents as needing the bypass. The reserved-tenant guard
+        # (and the sibling "tenant already exists" collision check) are
+        # there to stop self-registered users from squatting on
+        # reserved tenant names ("umg", "warner") or attaching
+        # themselves to an existing tenant via /auth/register. When the
+        # ADMIN is the one assigning the tenant — like here, when
+        # placing UMG operators into tenant_id="umusic" — both checks
+        # are unwanted: it's a deliberate team-workspace assignment.
+        # Without this, admin-managed teams can only ever have one user
+        # (whoever was created first claims the tenant; later users in
+        # the same team get rejected with "Tenant 'X' already exists").
         user = create_user(
             db,
             username=body.username,
@@ -194,9 +356,23 @@ async def create_user_admin(
             role=body.role,
             plan=body.plan_id,
             tenant_id=body.tenant_id.strip() or None,
+            ai_authorized=body.ai_authorized,
+            enforce_reserved=False,
         )
+        _post_create_dirty = False
         if body.allow_overage:
             user.allow_overage = True
+            _post_create_dirty = True
+        if body.ai_authorized:
+            # Stamp audit fields so the authorization is attributable to
+            # the admin that created the user, mirroring authorize-ai.
+            user.ai_authorized_at = datetime.now(timezone.utc)
+            user.ai_authorized_by = admin["id"]
+            _post_create_dirty = True
+        if body.billing_group.strip():
+            user.billing_group = body.billing_group.strip().lower()
+            _post_create_dirty = True
+        if _post_create_dirty:
             db.commit()
             db.refresh(user)
         return user.to_dict()
@@ -263,6 +439,13 @@ class UpdateUserRequest(BaseModel):
     # B2B / overage opt-in. True = user can keep generating past plan
     # monthly limit (extra videos invoice out-of-band).
     allow_overage: Optional[bool] = None
+    # Mover al usuario a otro workspace (tenant). Si move_jobs es True
+    # (default), sus videos se mueven con él — así no pierde su historial.
+    tenant_id: Optional[str] = None
+    move_jobs: bool = True
+    # Cuenta de facturación compartida. String vacío = sacar del grupo
+    # (volver a cuota por tenant). None = sin cambios.
+    billing_group: Optional[str] = None
 
 
 @router.patch("/users/{user_id}")
@@ -272,7 +455,7 @@ async def update_user_admin(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Update a user's plan, role, or status."""
+    """Update a user's plan, role, status, workspace (tenant) or billing group."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -301,18 +484,89 @@ async def update_user_admin(
     if body.allow_overage is not None:
         user.allow_overage = bool(body.allow_overage)
 
+    # Cambio de workspace (tenant). El admin mueve usuarios entre equipos
+    # (ej. reorganización de Universal en AR/CL). Por default los jobs del
+    # usuario se mueven con él para que conserve su historial — sin esto,
+    # sus videos quedan huérfanos en el tenant viejo (solo visibles para
+    # admins) y su Historial aparece vacío.
+    moved_jobs = 0
+    old_tenant = user.tenant_id
+    if body.tenant_id is not None and body.tenant_id.strip():
+        new_tenant = body.tenant_id.strip().lower().replace(" ", "_")
+        if new_tenant != user.tenant_id:
+            user.tenant_id = new_tenant
+            if body.move_jobs:
+                moved_jobs = (
+                    db.query(Job)
+                    .filter(Job.user_id == user.id, Job.tenant_id == old_tenant)
+                    .update({Job.tenant_id: new_tenant}, synchronize_session=False)
+                )
+
+    # Cuenta de facturación: "" = sacar del grupo, no-vacío = asignar.
+    if body.billing_group is not None:
+        group = body.billing_group.strip().lower()
+        user.billing_group = group or None
+
     db.commit()
     db.refresh(user)
 
     # Audit
+    detail = {"target_user": user_id, "changes": body.model_dump(exclude_none=True)}
+    if moved_jobs:
+        detail["moved_jobs"] = moved_jobs
+        detail["old_tenant"] = old_tenant
     db.add(AuditLog(
         user_id=admin["id"],
         action="admin.update_user",
-        detail={"target_user": user_id, "changes": body.model_dump(exclude_none=True)},
+        detail=detail,
     ))
     db.commit()
 
     return user.to_dict()
+
+
+@router.delete("/users/{user_id}")
+async def delete_user_admin(
+    user_id: int,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Soft-delete a user: deactivate + anonymise (same contract as the
+    self-service /auth/account DELETE).
+
+    Hard delete es imposible sin romper FKs (jobs, invoices, audit apuntan
+    a users.id sin CASCADE) y además borraría el rastro de auditoría. El
+    soft-delete deja la fila pero:
+      - is_active=False → no puede loguearse, no aparece en vistas activas
+      - username → deleted_{id}, email → NULL → datos personales fuera
+
+    Guards:
+      - Un admin no puede borrarse a sí mismo (lockout accidental).
+      - No se puede borrar a otro admin — primero hay que degradarlo a
+        user (PATCH role) y después borrarlo. Dos pasos a propósito.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.id == admin["id"]:
+        raise HTTPException(status_code=400, detail="No podés borrar tu propia cuenta de admin.")
+    if user.role == "admin":
+        raise HTTPException(
+            status_code=400,
+            detail="No se puede borrar un admin. Primero degradalo a user (PATCH role) y después borralo.",
+        )
+
+    old_username = user.username
+    user.is_active = False
+    user.email = None
+    user.username = f"deleted_{user.id}"
+    db.add(AuditLog(
+        user_id=admin["id"],
+        action="admin.delete_user",
+        detail={"target_user": user_id, "old_username": old_username, "tenant_id": user.tenant_id},
+    ))
+    db.commit()
+    return {"ok": True, "user_id": user_id, "deleted": True}
 
 
 # ---------------------------------------------------------------------------
@@ -403,19 +657,69 @@ async def list_all_jobs(
 ):
     """List all jobs across all tenants. Optional tenant_id filter so the
     admin can drill into a specific customer (e.g. UMG) and watch their
-    pipeline live."""
-    query = db.query(Job).order_by(Job.created_at.desc())
+    pipeline live.
+
+    Cada job incluye `username` (outer join con users) — el pipeline del
+    admin necesita mostrar QUIÉN creó cada video, no solo el tenant.
+
+    Los jobs de preview de fondo (bg_preview_*) se EXCLUYEN por default:
+    son artefactos internos del wizard, no videos del usuario — en el
+    pipeline aparecían como "duplicados" de cada video real (confusión
+    reportada por el operador 2026-06-02). Para verlos: filtrar por su
+    status explícito (?status=bg_preview_done).
+    """
+    from jobs import _BG_PREVIEW_STATUSES
+
+    query = (
+        db.query(Job, User.username)
+        .outerjoin(User, Job.user_id == User.id)
+        .order_by(Job.created_at.desc())
+    )
     if status:
         query = query.filter(Job.status == status)
+    else:
+        # Sin filtro de status explícito → esconder los previews fantasma.
+        query = query.filter(~Job.status.in_(_BG_PREVIEW_STATUSES))
     if tenant_id:
         query = query.filter(Job.tenant_id == tenant_id)
 
     total = query.count()
-    jobs = query.offset(offset).limit(limit).all()
+    rows = query.offset(offset).limit(limit).all()
 
     return {
         "total": total,
-        "jobs": [j.to_dict() for j in jobs],
+        "jobs": [{**job.to_dict(), "username": username} for job, username in rows],
+    }
+
+
+@router.get("/deleted-job-lyrics-archive")
+async def list_deleted_job_lyrics_archive(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    limit: int = Query(50, le=500),
+    offset: int = Query(0, ge=0),
+    tenant_id: str = Query(""),
+):
+    """Read-only audit view over `deleted_job_lyrics_archive`.
+
+    Every row here is a hand-corrected lyric that would otherwise have
+    been lost forever when its (stuck/failed) job was hard-deleted via
+    delete_job/bulk_delete_jobs — see DeletedJobLyricsArchive for the
+    incident this backstops. Sorted newest-first so a recent bulk cleanup
+    shows up at the top.
+    """
+    query = db.query(DeletedJobLyricsArchive).order_by(
+        DeletedJobLyricsArchive.archived_at.desc(),
+    )
+    if tenant_id:
+        query = query.filter(DeletedJobLyricsArchive.tenant_id == tenant_id)
+
+    total = query.count()
+    rows = query.offset(offset).limit(limit).all()
+
+    return {
+        "total": total,
+        "entries": [row.to_dict() for row in rows],
     }
 
 
@@ -476,7 +780,7 @@ async def list_audit_log(
 # ---------------------------------------------------------------------------
 
 @router.get("/cost")
-async def admin_cost_dashboard(
+def admin_cost_dashboard(
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
     since_days: int = Query(30, ge=1, le=365),
@@ -487,7 +791,10 @@ async def admin_cost_dashboard(
     spend descending. Use this to spot tenants approaching cap, to validate
     pricing assumptions, and as the data source for cost alerts.
     """
-    from provenance import tenant_cost_summary
+    from provenance import rates_for_window, tenant_cost_summary
+
+    since = datetime.now(timezone.utc) - timedelta(days=since_days)
+    rates = rates_for_window(db, since)
 
     tenant_ids = [
         row[0]
@@ -498,7 +805,12 @@ async def admin_cost_dashboard(
     grand_total = 0.0
     grand_calls = 0
     for tid in tenant_ids:
-        s = tenant_cost_summary(db, tenant_id=tid, since_days=since_days)
+        s = tenant_cost_summary(
+            db,
+            tenant_id=tid,
+            since_days=since_days,
+            rates=rates,
+        )
         summaries.append(s)
         grand_total += s["total_cost"]
         grand_calls += s["total_calls"]
@@ -513,8 +825,1727 @@ async def admin_cost_dashboard(
     }
 
 
+@router.get("/margin")
+def admin_margin_dashboard(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    since_days: int = Query(30, ge=1, le=365),
+    revenue_per_video_usd: float = Query(8.0, ge=0, le=10000),
+    since: str = Query("", description="YYYY-MM-DD; gana sobre since_days"),
+    until: str = Query("", description="YYYY-MM-DD inclusive"),
+):
+    """Global margin dashboard for the operator. Returns total AI spend,
+    per-provider breakdown (veo/gemini/whisper/...), video counts
+    (done/pending/rejected/error), cost-per-deliverable and a margin
+    estimate against `revenue_per_video_usd` (default $8 reflects the
+    current Universal contract: $2,000 / 250 videos). Tighter window =
+    fresher signal but noisier, looser window = stable averages.
+
+    `since`/`until` dan una ventana EXPLÍCITA. `since_days` cuenta hacia
+    atrás desde hoy y por eso nunca puede alinearse con un mes calendario,
+    que es la unidad en la que facturan los proveedores: el panel de costos
+    lo ponía al lado del gasto facturado de julio mientras esto medía
+    jul-ago. Sin `since` el comportamiento es el de siempre.
+    """
+    from datetime import datetime, timedelta, timezone
+    from provenance import cost_dashboard_global
+
+    def _dia(valor: str, campo: str):
+        if not valor.strip():
+            return None
+        try:
+            d = datetime.strptime(valor.strip(), "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(400, f"{campo} inválido, se espera YYYY-MM-DD")
+        return d.replace(tzinfo=timezone.utc)
+
+    desde = _dia(since, "since")
+    # `until` llega como un día INCLUSIVE (así lo piensa quien lo escribe);
+    # la comparación es `< until`, así que se corre un día.
+    hasta = _dia(until, "until")
+    if hasta is not None:
+        hasta = hasta + timedelta(days=1)
+    if desde is not None and hasta is not None and hasta <= desde:
+        raise HTTPException(400, "until tiene que ser >= since")
+
+    return cost_dashboard_global(
+        db,
+        since_days=since_days,
+        revenue_per_video_usd=revenue_per_video_usd,
+        since=desde,
+        until=hasta,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Real invoiced cost (billing_sources) + reconciliation vs the model
+# ---------------------------------------------------------------------------
+
+def _cost_snapshot_is_usable(period: str, row, billing_sources) -> bool:
+    """Whether a stored amount may be treated as a complete invoice.
+
+    An ``ok`` row captured while a month was still accruing is a useful
+    checkpoint, but it is not a closed-month invoice.  Open-period snapshots
+    are therefore always provisional; for a closed month require the
+    source-specific post-close capture boundary used by ``/cost/refresh``.
+    """
+    if row.status != "ok" or row.amount_usd is None:
+        return False
+    if period >= billing_sources.current_period():
+        return False
+    return billing_sources.snapshot_is_final(
+        period, row.source, row.fetched_at,
+    )
+
+@router.post("/cost/refresh")
+def admin_cost_refresh(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = mes actual"),
+    only: str = Query("", description="fuentes separadas por coma"),
+):
+    """Pull real cost from every configured provider and persist it.
+
+    Providers only expose a rolling window (Railway shows the open cycle,
+    Replicate paginates predictions that age out), so an un-snapshotted
+    month becomes unrecoverable — run this at least once after each month
+    closes. Safe to re-run: rows are upserted on (period, source).
+
+    **Deliberately `def`, not `async def`.** `billing_sources` uses blocking
+    `requests` calls, and Replicate paginates up to 50 pages at 30 s timeout
+    each — worst case several minutes. Inside an `async def` that runs on the
+    event loop and stalls EVERY other request the process is serving; with
+    2 api replicas that is half the API frozen. FastAPI runs a plain `def`
+    endpoint in its threadpool, so the blocking I/O stays off the loop.
+    """
+    import billing_sources
+    from database import CostSnapshot
+
+    period = period.strip() or billing_sources.current_period()
+    names = [s.strip() for s in only.split(",") if s.strip()] or None
+    try:
+        result = billing_sources.fetch_all(period=period, only=names)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    for entry in result["sources"]:
+        row = (
+            db.query(CostSnapshot)
+            .filter(CostSnapshot.period == period,
+                    CostSnapshot.source == entry["source"])
+            .one_or_none()
+        )
+        if row is None:
+            row = CostSnapshot(period=period, source=entry["source"])
+            db.add(row)
+        # A healthy *final* closed-month snapshot is immutable. An in-month
+        # capture is provisional for usage sources: GCP exports lag and
+        # Railway keeps accruing through the boundary, so the first mature
+        # post-close refresh must be allowed to replace it. Rolling APIs can
+        # later return a superficially successful empty window (Replicate
+        # returns ok/$0), hence the source-aware finalization boundary.
+        _empty_window_would_erase_spend = (
+            row.amount_usd is not None
+            and row.amount_usd > 0
+            and entry["status"] == "ok"
+            and float(entry["amount_usd"] or 0) == 0
+            and not entry.get("breakdown")
+        )
+        _stored_snapshot_is_final = billing_sources.snapshot_is_final(
+            period, entry["source"], row.fetched_at,
+        )
+        if (
+            period < billing_sources.current_period()
+            and row.status == "ok"
+            and row.amount_usd is not None
+            and (
+                _stored_snapshot_is_final
+                # Rolling provider history (notably Replicate and Railway)
+                # may already be empty before the post-close finalization
+                # date. Cumulative positive monthly spend cannot legitimately
+                # become an exact zero with no line-item evidence.
+                or _empty_window_would_erase_spend
+            )
+        ):
+            entry["kept_previous"] = True
+            entry["previous_amount_usd"] = row.amount_usd
+            entry["discarded_refresh_amount_usd"] = entry["amount_usd"]
+            entry["amount_usd"] = row.amount_usd
+            entry["status"] = row.status
+            entry["detail"] = row.detail
+            entry["is_estimate"] = row.is_estimate
+            entry["breakdown"] = row.breakdown or []
+            if not _stored_snapshot_is_final:
+                # The positive checkpoint is safer than erasing it, but an
+                # empty provider window cannot finalize a capture made while
+                # spend was still accruing. Keep the durable floor and make
+                # this response explicitly non-quoteable.
+                entry["retained_amount_usd"] = row.amount_usd
+                entry["amount_usd"] = None
+                entry["status"] = "stale"
+                entry["detail"] = (
+                    "refresh devolvió una ventana vacía; snapshot previo "
+                    "conservado pero todavía provisional"
+                )
+                entry["stale"] = True
+            continue
+        # Un refresh fallido NO pisa un snapshot sano. Las fuentes son
+        # ventanas móviles: GitHub sólo puede consultar el ciclo vigente, así
+        # que re-refrescar julio en agosto devuelve su error deliberado y
+        # borraba el valor bueno capturado cuando julio ERA el mes actual —
+        # un dato que ya no se puede volver a pedir. El intento fallido se
+        # reporta igual (va en `result`, y queda en `detail`), pero el número
+        # sobrevive.
+        if (entry["status"] != "ok" and row.status == "ok"
+                and row.amount_usd is not None):
+            failed_status = entry["status"]
+            failed_detail = entry["detail"]
+            entry["kept_previous"] = True
+            entry["previous_amount_usd"] = row.amount_usd
+            entry["discarded_refresh_status"] = failed_status
+            entry["discarded_refresh_detail"] = failed_detail
+            row.detail = (
+                f"{row.detail or ''} | refresh {datetime.now(timezone.utc):%Y-%m-%d}: "
+                f"{failed_status} ({failed_detail}) — se conservó el valor anterior"
+            ).strip(" |")
+            if (
+                period == billing_sources.current_period()
+                or not billing_sources.snapshot_is_final(
+                    period, entry["source"], row.fetched_at,
+                )
+            ):
+                # The saved value is still useful as a checkpoint, but an
+                # open-month capture remains provisional even after the
+                # calendar rolls over. Only a successful post-close refresh
+                # can cross this source's finalization boundary. Do not turn
+                # its first failed finalization attempt into a seemingly
+                # complete stale total.
+                entry["retained_amount_usd"] = row.amount_usd
+                entry["amount_usd"] = None
+                entry["status"] = failed_status
+                entry["detail"] = (
+                    f"{failed_detail} — snapshot previo conservado pero stale"
+                )
+                entry["stale"] = True
+                continue
+            entry["amount_usd"] = row.amount_usd
+            entry["status"] = row.status
+            entry["detail"] = row.detail
+            entry["is_estimate"] = row.is_estimate
+            entry["breakdown"] = row.breakdown or []
+            continue
+        row.amount_usd = entry["amount_usd"]
+        row.status = entry["status"]
+        row.detail = entry["detail"]
+        row.is_estimate = bool(entry["is_estimate"])
+        row.breakdown = entry["breakdown"]
+        row.fetched_at = datetime.now(timezone.utc)
+    db.commit()
+    # `fetch_all` computed its aggregates before immutable/healthy historical
+    # rows were restored above. Rebuild every summary field from the final
+    # entries so the response cannot say a restored `ok` source is errored or
+    # incomplete at the same time.
+    configured = [
+        entry["source"] for entry in result["sources"]
+        if entry["status"] == "ok" and entry["amount_usd"] is not None
+    ]
+    not_configured = [
+        entry["source"] for entry in result["sources"]
+        if entry["status"] == "not_configured"
+    ]
+    errored = [
+        entry["source"] for entry in result["sources"]
+        if entry["status"] not in ("ok", "not_configured")
+        or (entry["status"] == "ok" and entry["amount_usd"] is None)
+    ]
+    # `only=` is an operational refresh scope, never proof that the monthly
+    # total is complete. Even a healthy `only=fixed` response omits every
+    # provider API and must remain explicitly partial/non-quoteable.
+    not_requested = (
+        [source for source in billing_sources.SOURCES if source not in names]
+        if names is not None else []
+    )
+    result.update({
+        "total_usd": round(sum(
+            float(entry["amount_usd"])
+            for entry in result["sources"]
+            if entry["status"] == "ok" and entry["amount_usd"] is not None
+        ), 2),
+        "configured": configured,
+        "not_configured": not_configured,
+        "errored": errored,
+        "not_requested": not_requested,
+        "partial": bool(not_requested),
+        "complete": not not_configured and not errored and not not_requested,
+    })
+    if period >= billing_sources.current_period():
+        # A successful refresh proves provider coverage, not finality. The
+        # durable rows remain useful month-to-date checkpoints, while the
+        # response must not present an accruing period as a closed invoice.
+        result.update({
+            "complete": False,
+            "provisional": True,
+            "detail": (
+                "snapshot del período abierto; el gasto todavía puede "
+                "acumularse y requiere refresh post-cierre"
+            ),
+        })
+
+    return result
+
+
+@router.get("/cost/real")
+def admin_cost_real(          # `def`, no `async def`: con live=true hace HTTP
+    admin: dict = Depends(require_admin),   # bloqueante (ver /cost/refresh).
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = mes actual"),
+    live: bool = Query(False, description="consultar las APIs en vez de leer el snapshot"),
+):
+    """Invoiced cost for a month, per provider.
+
+    Reads the persisted snapshot by default (fast, and the only option for
+    closed months). `live=true` re-queries the provider APIs without
+    writing anything — use it to sanity-check before refreshing.
+
+    `complete=false` means at least one source is unconfigured or errored,
+    so `total_usd` is a floor, not the real total. Don't divide by video
+    count and quote the result until it's true.
+    """
+    import billing_sources
+    from database import CostSnapshot
+
+    period = period.strip() or billing_sources.current_period()
+    try:
+        billing_sources._period_bounds(period)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if live:
+        result = billing_sources.fetch_all(period=period)
+        if period >= billing_sources.current_period():
+            # Healthy provider calls only prove source coverage. They cannot
+            # turn month-to-date usage into a closed invoice while spend is
+            # still accruing.
+            result.update({
+                "complete": False,
+                "provisional": True,
+                "detail": (
+                    "totales live del período abierto; el gasto todavía "
+                    "puede acumularse y no constituye una factura cerrada"
+                ),
+            })
+        return {**result, "source_of_truth": "live"}
+
+    # `rate_calibration` guarda tarifas, no gasto: su `amount_usd` es NULL a
+    # propósito. Contarla como una fuente de facturación la mandaba al balde
+    # de "errored" y dejaba `complete=false` para siempre, escondiendo si
+    # faltaba de verdad alguna factura.
+    rows = (
+        db.query(CostSnapshot)
+        .filter(CostSnapshot.period == period)
+        .filter(CostSnapshot.source.in_(tuple(billing_sources.SOURCES)))
+        .all()
+    )
+    if not rows:
+        return {
+            "period": period, "total_usd": 0.0, "sources": [],
+            "configured": [], "not_configured": list(billing_sources.SOURCES),
+            "errored": [], "complete": False, "source_of_truth": "snapshot",
+            "detail": "sin snapshot para este período — corré POST /admin/cost/refresh",
+        }
+
+    sources, total, ok, missing, errored = [], 0.0, [], [], []
+    for r in rows:
+        usable = _cost_snapshot_is_usable(period, r, billing_sources)
+        source = {
+            "source": r.source, "period": r.period, "amount_usd": r.amount_usd,
+            "status": r.status, "detail": r.detail,
+            "is_estimate": r.is_estimate, "breakdown": r.breakdown or [],
+            "fetched_at": r.fetched_at.isoformat() if r.fetched_at else None,
+        }
+        if usable:
+            total += r.amount_usd
+            ok.append(r.source)
+        elif r.status == "ok" and r.amount_usd is not None:
+            # Preserve the checkpoint for diagnostics without letting callers
+            # sum or quote it as a completed invoice.
+            source.update({
+                "amount_usd": None,
+                "status": "provisional",
+                "retained_amount_usd": r.amount_usd,
+                "stale": True,
+                "detail": (
+                    f"{r.detail or 'snapshot'} — captura previa al cierre; "
+                    "requiere refresh post-cierre"
+                ),
+            })
+            errored.append(r.source)
+        elif r.status == "not_configured":
+            missing.append(r.source)
+        else:
+            errored.append(r.source)
+        sources.append(source)
+    missing += [s for s in billing_sources.SOURCES
+                if s not in {r.source for r in rows}]
+    sources.sort(key=lambda s: -(
+        s["amount_usd"] or s.get("retained_amount_usd") or 0
+    ))
+
+    return {
+        "period": period, "total_usd": round(total, 2), "sources": sources,
+        "configured": ok, "not_configured": missing, "errored": errored,
+        "complete": not missing and not errored,
+        "source_of_truth": "snapshot",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Panel de costos DIARIO
+# ---------------------------------------------------------------------------
+# `/cost/real` responde "cuánto facturó el proveedor este MES". Lo de abajo
+# responde lo mismo por día/semana, que es lo que hace falta para ver una
+# tendencia o el efecto de un cambio tres días después de shipearlo.
+
+
+@router.get("/costs/series")
+def admin_costs_series(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    since: str = Query(..., description="YYYY-MM-DD inclusive"),
+    until: str = Query(..., description="YYYY-MM-DD inclusive"),
+    granularity: str = Query("day", description="day|week|month"),
+    group_by: str = Query("source", description="source|behavior|sku"),
+):
+    """Serie de costo con su cobertura al lado.
+
+    `coverage.complete=false` significa que faltan celdas (día, fuente): el
+    total es un PISO. El frontend tiene que pintar esos días como faltantes
+    y nunca como cero — un día que el proveedor no contestó se dibuja igual
+    que un día barato, y esa es exactamente la falla que este panel existe
+    para no tener.
+    """
+    from datetime import date as _date
+
+    import cost_series
+
+    try:
+        d0, d1 = _date.fromisoformat(since), _date.fromisoformat(until)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="fechas en formato YYYY-MM-DD")
+    if d1 < d0:
+        raise HTTPException(status_code=422, detail="until no puede ser anterior a since")
+    if (d1 - d0).days > 400:
+        raise HTTPException(status_code=422, detail="rango máximo 400 días")
+    try:
+        return cost_series.series(db, d0, d1, granularity=granularity,
+                                  group_by=group_by)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@router.get("/costs/coverage")
+def admin_costs_coverage(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    since: str = Query(...), until: str = Query(...),
+):
+    """Qué (día, fuente) falta. El endpoint que mira el watchdog."""
+    from datetime import date as _date
+
+    import cost_series
+
+    try:
+        d0, d1 = _date.fromisoformat(since), _date.fromisoformat(until)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="fechas en formato YYYY-MM-DD")
+    return cost_series.coverage(db, d0, d1)
+
+
+@router.post("/costs/collect")
+def admin_costs_collect(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    days: int = Query(35, ge=1, le=400),
+):
+    """Rellena los huecos de los últimos `days`. Idempotente.
+
+    **`def`, no `async def`, a propósito.** El colector hace HTTP bloqueante
+    (BigQuery, Cloudflare, Railway, OpenAI, Replicate). Dentro de un
+    `async def` eso corre en el event loop y congela TODAS las demás
+    requests del proceso; con 2 réplicas × 2 workers, un cuarto de la API.
+    FastAPI corre un `def` en su threadpool y la I/O bloqueante queda fuera
+    del loop. Mismo razonamiento que `/cost/refresh`.
+
+    Es un disparador manual: el camino normal es el cron. Existe para
+    reparar a mano después de un outage sin esperar a la próxima corrida.
+
+    Mismo gate de entorno que `scripts/collect_costs.py`, y por la misma
+    razón: staging tiene TODAS las credenciales de facturación y comparte
+    proyecto GCP, bucket R2 y proyecto Railway con producción. Sin el gate,
+    apretar este botón en staging carga la factura entera de la cuenta en
+    la base de staging, y los dos paneles pasan a reclamar el mismo gasto.
+    El gate estaba en el cron y faltaba acá.
+    """
+    import cost_daily_collector
+
+    env = os.environ.get("ENVIRONMENT", "").strip().lower()
+    if env != "production" and os.environ.get("COST_COLLECTOR_FORCE") != "1":
+        raise HTTPException(
+            status_code=409,
+            detail=(f"ENVIRONMENT={env!r} no es production. Staging comparte "
+                    "proyecto GCP, bucket R2 y proyecto Railway con prod: "
+                    "colectar acá haría que ambos paneles reclamen el gasto "
+                    "entero de la cuenta. COST_COLLECTOR_FORCE=1 para forzar."),
+        )
+    return cost_daily_collector.run_backfill(db, days=days)
+
+
+@router.get("/cost/unit-economics")
+def admin_cost_unit_economics(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = mes actual"),
+    price_per_video_usd: float = Query(13.50, ge=0, le=10000),
+):
+    """The number to price against: real invoiced cost ÷ videos delivered.
+
+    This is the endpoint the 2026-08 audit was built for. Two traps it
+    closes:
+
+    1. **Denominator.** Cost is divided by videos actually DELIVERED
+       (done + pending_review), never by jobs created. Dividing $199.53 of
+       jun-2026 Google Cloud by 173 created jobs gives $1.15/video; by the
+       65 that shipped it is $3.07. The second one is real — the discarded
+       previews cost money too.
+    2. **Completeness.** `cost_complete` propagates from /cost/real. When
+       false, `cost_per_delivered` is a floor and is labelled as such.
+    """
+    import billing_sources
+    from database import CostSnapshot
+    from provenance import (
+        cost_waste_breakdown,
+        delivered_job_filter,
+        merge_waste_breakdowns,
+        rates_for_window,
+    )
+
+    period = period.strip() or billing_sources.current_period()
+    try:
+        start, end = billing_sources._period_bounds(period)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Igual que en /cost/real: `rate_calibration` no es una fuente de gasto.
+    rows = (db.query(CostSnapshot)
+              .filter(CostSnapshot.period == period)
+              .filter(CostSnapshot.source.in_(tuple(billing_sources.SOURCES)))
+              .all())
+    usable_rows = [
+        r for r in rows
+        if _cost_snapshot_is_usable(period, r, billing_sources)
+    ]
+    real_total = sum(r.amount_usd for r in usable_rows)
+    have = {
+        r.source for r in usable_rows
+    }
+    cost_complete = have >= set(billing_sources.SOURCES)
+
+    start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+    next_day = end + timedelta(days=1)
+    end_dt = datetime(next_day.year, next_day.month, next_day.day,
+                      tzinfo=timezone.utc)
+    # The invoice covers BOTH environments (shared GCP project, R2 bucket
+    # and Railway project), so the denominator has to as well. Counting
+    # only the local environment would divide two-env spend by one-env
+    # output — and since managed UMG production runs in staging, on prod
+    # that inflates cost-per-video by roughly an order of magnitude.
+    from database import scoped_peer_db
+
+    def _count(session):
+        # Los ENTREGADOS se cuentan por `completed_at`, no por `created_at`:
+        # una canción arrancada el 30 de junio y terminada el 2 de julio
+        # pertenece al costo de julio, que es cuando se gastó y cuando se
+        # factura. `coalesce` cubre filas viejas sin el campo.
+        entregado_en = func.coalesce(Job.completed_at, Job.created_at)
+        # During an edit the current status is transiently `editing` (or may
+        # finish as `error`), but a retained completion timestamp older than
+        # editing_started_at proves the video had already shipped. A rejected
+        # job reopened by the fixed /edit path clears completed_at first; if
+        # that rescue fails, its new failure timestamp is after editing_started_at
+        # and therefore does not masquerade as a delivery.
+        delivered = int(
+            session.query(func.count(Job.id))
+            .filter(entregado_en >= start_dt, entregado_en < end_dt)
+            .filter(delivered_job_filter())
+            .scalar() or 0
+        )
+        # Los CREADOS sí van por created_at — es literalmente eso lo que mide.
+        created = int(
+            session.query(func.count(Job.id))
+            .filter(Job.created_at >= start_dt, Job.created_at < end_dt)
+            .scalar() or 0
+        )
+        # DE CLIENTE: los mismos entregados, menos CI e I+D interno.
+        #
+        # La clasificación NO se reimplementa acá. Filtrar por
+        # `tenant not in TEAM_TENANTS` parece razonable y descarta el 100%
+        # de las entregas reales: la producción gestionada de UMG corre bajo
+        # `agus77`, `default`, `omg`, `genly` y `tomas@epical.digital`, no
+        # bajo `universal_*`. Medido en ago-2026, ese filtro dejaba 23
+        # canciones de las ≥77 entregadas — el KPI que la pantalla rotula
+        # "el correcto" salía 3,35x arriba del costo real.
+        #
+        # Lo que las distingue de I+D interno es el PORTAL: si la canción
+        # está en `deliveries`, se entregó y se cobró. Por eso el orden de
+        # `clave_facturable` es el mismo de `classify_job`.
+        import cost_attribution as ca
+
+        filas = (
+            session.query(Job.job_id, Job.tenant_id, Job.artist, Job.song_title)
+            .filter(entregado_en >= start_dt, entregado_en < end_dt)
+            .filter(delivered_job_filter())
+            .all()
+        )
+        claves = [
+            ca.clave_facturable(
+                f.tenant_id,
+                # `song_key` cae al job_id cuando artista Y título están
+                # vacíos: sin eso los 31 jobs sin metadata de prod colapsan
+                # en UNA canción que se lleva toda la factura.
+                ca.song_key(f.artist, f.song_title, f.job_id),
+                umg_keys,
+            )
+            for f in filas
+        ]
+        de_cliente = [k for k in claves if k is not None]
+        # La unidad facturable es la CANCIÓN, no el job: una canción
+        # entregada arrastra ~2,87 jobs (variantes, re-renders, ediciones).
+        return delivered, created, len(de_cliente), set(de_cliente)
+
+    # Ventana EXPLÍCITA del mes pedido. Con `since_days` la ventana termina
+    # hoy, así que pedir junio en agosto medía jul-ago y lo comparaba contra
+    # la factura de junio.
+    # Las canciones del portal de entregas. Es la única fuente que sabe que
+    # una canción bajo una cuenta del equipo fue trabajo cobrado y no I+D.
+    # El portal vive en producción; `scoped_deliveries_db` rutea solo.
+    import cost_attribution as ca
+    from database import scoped_deliveries_db
+
+    try:
+        with scoped_deliveries_db() as portal_db:
+            umg_keys = set(ca.collect_portal_songs(portal_db)["songs"])
+    except Exception:
+        # Sin portal el denominador queda SUBESTIMADO (la producción
+        # gestionada se descarta como interna), lo que sobre-estima el costo
+        # por canción. Se avisa en la respuesta en vez de fallar la página.
+        umg_keys = set()
+    portal_disponible = bool(umg_keys)
+
+    delivered, created, cliente_jobs, canciones = _count(db)
+    counted_environments = 1
+    # Una sola base de valuación para los dos entornos: la calibración vive
+    # en la base local y la peer no la tiene, así que dejarla cargar la suya
+    # valuaba su mitad a precio de lista y el `waste_ratio` mezclado salía de
+    # dos tarifas distintas para el mismo Veo.
+    _waste_rates = rates_for_window(db, start_dt, end_dt)
+    waste_parts = [cost_waste_breakdown(db, start=start_dt, end=end_dt,
+                                        rates=_waste_rates)]
+    with scoped_peer_db() as peer:
+        if peer is not None:
+            d2, c2, cj2, cc2 = _count(peer)
+            delivered += d2
+            created += c2
+            cliente_jobs += cj2
+            # UNIÓN, no suma: una canción de producción gestionada puede
+            # tener jobs en los dos entornos y es UNA sola entrega. Sumar
+            # los conteos la contaría dos veces y bajaría el costo a la
+            # mitad. La clave incluye el tenant, así que dos sellos
+            # distintos con el mismo tema siguen siendo dos.
+            canciones |= cc2
+            counted_environments = 2
+            # El desperdicio también sale de los DOS entornos: la producción
+            # gestionada de UMG corre en staging, así que un subárbol local
+            # al lado de totales de dos entornos describía una porción del
+            # negocio con cara de describirlo entero.
+            waste_parts.append(
+                cost_waste_breakdown(peer, start=start_dt, end=end_dt,
+                                     rates=_waste_rates))
+    waste = merge_waste_breakdowns(*waste_parts)
+
+    # SIN NINGÚN SNAPSHOT no se divide.
+    #
+    # `cost_snapshots` está vacía en las dos bases —/cost/refresh nunca se
+    # corrió—, así que `real_total` es 0 y esto devolvía
+    # `cost_per_delivered = 0.0` y por lo tanto **margen 100%**, con el
+    # `cost_complete: false` viajando en un campo aparte que nadie mira.
+    # Un 0.0 con nota al pie se lee como buena noticia; un null obliga a
+    # mirar por qué.
+    #
+    # Con dato PARCIAL sí se divide, y el margen se sigue calculando: el
+    # contrato existente lo hace a propósito (ver el test de esta misma
+    # suite que asserta margen negativo con cost_complete=false). Un costo
+    # parcial es un piso, así que el margen que sale es optimista — lo
+    # señala `cost_per_delivered_is_floor` en vez de callarlo.
+    #
+    # Negarse también con dato parcial sería peor que el bug: `github` no
+    # está configurado en ningún entorno, así que `cost_complete` nunca
+    # llega a true y el endpoint quedaría mudo para siempre.
+    cliente_canciones = len(canciones)
+    sin_dato = real_total <= 0
+    if sin_dato:
+        cost_per_delivered = None
+        cost_per_created = None
+        cost_per_client_song = None
+    else:
+        cost_per_delivered = round(real_total / delivered, 4) if delivered else None
+        # Kept only to show the operator how misleading it is next to the real
+        # one — it is the number the old internal doc quoted.
+        cost_per_created = round(real_total / created, 4) if created else None
+        # EL HONESTO: la factura entera dividida por las canciones de
+        # cliente. La factura del proveedor no distingue quién la causó, así
+        # que el gasto de CI y de I+D se reparte entre los videos vendidos —
+        # que es exactamente lo que pasa en el estado de resultados.
+        cost_per_client_song = (
+            round(real_total / cliente_canciones, 4) if cliente_canciones else None
+        )
+    # El margen va contra el costo por CANCIÓN DE CLIENTE. Calcularlo sobre
+    # `cost_per_delivered` —el denominador que este mismo endpoint rotula
+    # como equivocado— hacía que la API y la pantalla dieran márgenes
+    # distintos para el mismo período, y los consumidores no-UI
+    # (`scripts/umg_cost_report.py`, el smoke diario) tomaban el viejo.
+    puede_calcular_margen = cost_per_client_song is not None
+
+    return {
+        "period": period,
+        "real_cost_usd": round(real_total, 2),
+        "cost_complete": cost_complete,
+        "missing_sources": sorted(set(billing_sources.SOURCES) - have),
+        # CUATRO denominadores, con nombre, porque difieren hasta 2,8x y
+        # confundirlos es el error más caro de esta pantalla.
+        "videos_delivered": delivered,          # jobs entregados, incluye CI
+        "videos_created": created,              # jobs creados (engañoso)
+        "delivered_client_jobs": cliente_jobs,  # entregados sin CI ni internos
+        "delivered_client_songs": cliente_canciones,   # ← el que hay que usar
+        "denominator_note": (
+            "videos_delivered incluye barridos de CI (preflight_*, "
+            "golden_render_bot). delivered_client_songs es la unidad "
+            "facturable: una canción arrastra ~2,87 jobs."
+        ),
+        # 1 = only this environment was counted while the invoice covers
+        # both; the cost per video is then overstated. Check before quoting.
+        "counted_environments": counted_environments,
+        "cost_per_delivered": cost_per_delivered,
+        "cost_per_created_MISLEADING": cost_per_created,
+        # El que hay que usar para cotizar: factura ÷ canciones de cliente.
+        "cost_per_client_song": cost_per_client_song,
+        "price_per_video_usd": price_per_video_usd,
+        # Null cuando el costo está incompleto: un margen calculado sobre un
+        # costo parcial sale inflado y es el número que se copia para cotizar.
+        "margin_per_video": (
+            round(price_per_video_usd - cost_per_client_song, 4)
+            if puede_calcular_margen else None
+        ),
+        "margin_pct": (
+            round((price_per_video_usd - cost_per_client_song)
+                  / price_per_video_usd, 4)
+            if puede_calcular_margen and price_per_video_usd else None
+        ),
+        "cost_per_delivered_is_floor": (
+            cost_per_delivered is not None and not cost_complete
+        ),
+        "waste": waste,
+        # Sin portal la producción gestionada de UMG se descarta como I+D
+        # interno y el denominador queda corto → el costo por canción sale
+        # SOBRE-estimado. Es lo contrario del error que uno esperaría.
+        "portal_disponible": portal_disponible,
+        "note": (
+            "margin_per_video usa cost_per_client_song (factura ÷ canciones "
+            "de cliente), no cost_per_delivered, que incluye barridos de CI. "
+            "Sin ningún snapshot de costo sale null: 0/N daría margen 100%. "
+            "Con datos PARCIALES sí se divide y el margen sale optimista — "
+            "lo marca cost_per_delivered_is_floor. `github` no está "
+            "configurado en ningún entorno, así que cost_complete nunca "
+            "llega a true y negarse con dato parcial dejaría el endpoint "
+            "mudo para siempre. Corré POST /admin/cost/refresh."
+        ),
+    }
+
+
+@router.get("/cost/reconcile")
+def admin_cost_reconcile(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = mes actual"),
+):
+    """Modeled AI cost (provenance × rate table) vs what the provider billed.
+
+    The rate table in provenance.py is an estimate. This is how we know
+    whether it still holds: jun-2026 reconciled at $163 modeled vs $199.53
+    invoiced (-18%), the gap being staging usage plus real Imagen/Gemini
+    token pricing. If `variance_pct` drifts much beyond that, the rates
+    need recalibrating — a silently-wrong rate table is worse than none,
+    because per-tenant cost attribution inherits the error.
+
+    Only compares AI providers (gcp/openai/replicate); Railway, R2 and the
+    flat subscriptions never flow through `record_ai_call`, so the model
+    has nothing to say about them.
+    """
+    import billing_sources
+    from database import CostSnapshot
+    from provenance import cost_for_record
+
+    period = period.strip() or billing_sources.current_period()
+    try:
+        start, end = billing_sources._period_bounds(period)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    AI_SOURCES = ("gcp", "openai", "replicate")
+    rows = (
+        db.query(CostSnapshot)
+        .filter(CostSnapshot.period == period,
+                CostSnapshot.source.in_(AI_SOURCES))
+        .all()
+    )
+    import cost_attribution as ca
+
+    invoiced = 0.0
+    for row in rows:
+        if not _cost_snapshot_is_usable(period, row, billing_sources):
+            continue
+        amount = float(row.amount_usd)
+        if row.source == "gcp":
+            amount, _shared = ca.split_gcp_invoice(
+                amount, row.breakdown or [])
+        invoiced += amount
+    have = {
+        r.source for r in rows
+        if _cost_snapshot_is_usable(period, r, billing_sources)
+    }
+
+    # `cost_dashboard_global` measures a window ending NOW, so asking it
+    # for "30 days" while comparing against June's invoice compared two
+    # disjoint months. Sum the calendar period directly instead — the
+    # whole point of this endpoint is that the two sides line up, and the
+    # note tells the operator to recalibrate the rate table from the
+    # result.
+    from provenance import billable_filter
+    from database import AIProvenance
+
+    start_dt = datetime(start.year, start.month, start.day,
+                        tzinfo=timezone.utc)
+    next_day = end + timedelta(days=1)
+    end_dt = datetime(next_day.year, next_day.month, next_day.day,
+                      tzinfo=timezone.utc)
+
+    def _modeled(session):
+        rows = (
+            session.query(AIProvenance.tool_name, AIProvenance.tool_provider,
+                          func.count(AIProvenance.id))
+            .filter(AIProvenance.created_at >= start_dt,
+                    AIProvenance.created_at < end_dt)
+            .filter(billable_filter())
+            .group_by(AIProvenance.tool_name, AIProvenance.tool_provider)
+            .all()
+        )
+        total = 0.0
+        by_tool = []
+        for tool_name, tool_provider, calls in rows:
+            cost = calls * cost_for_record(tool_name, tool_provider)
+            total += cost
+            by_tool.append({"tool_name": tool_name,
+                            "tool_provider": tool_provider,
+                            "calls": calls, "cost": round(cost, 4)})
+        return total, by_tool
+
+    modeled, by_tool = _modeled(db)
+    # The invoice is for the shared GCP project, i.e. both environments.
+    from database import scoped_peer_db
+    counted_environments = 1
+    with scoped_peer_db() as peer:
+        if peer is not None:
+            peer_total, peer_tools = _modeled(peer)
+            modeled += peer_total
+            by_tool += peer_tools
+            counted_environments = 2
+    by_tool.sort(key=lambda r: -r["cost"])
+
+    variance = invoiced - modeled
+    return {
+        "period": period,
+        "modeled_usd": round(modeled, 2),
+        "invoiced_usd": round(invoiced, 2),
+        "variance_usd": round(variance, 2),
+        "variance_pct": (round(variance / modeled, 4) if modeled else None),
+        "invoiced_sources_present": sorted(have),
+        "invoiced_sources_missing": sorted(set(AI_SOURCES) - have),
+        "calibration_factor": (
+            round(invoiced / modeled, 4) if modeled else None
+        ),
+        "by_tool_modeled": by_tool,
+        "counted_environments": counted_environments,
+        "note": (
+            "calibration_factor >1 = el modelo subestima; es una señal "
+            "diagnóstica, no una tarifa. Recalibrá el período y su mix de "
+            "SKU con POST /admin/cost/calibrate-rates?period=YYYY-MM, y "
+            "verificá el resultado en GET /admin/cost/rates?period=YYYY-MM. "
+            "Ambos lados cubren el MISMO mes calendario. Si "
+            "counted_environments=1 el modelo mide un solo entorno "
+            "mientras la factura cubre los dos (proyecto GCP compartido), "
+            "así que el factor va a salir alto: configurá PEER_DATABASE_URL "
+            "antes de recalibrar nada."
+        ),
+    }
+
+
+def _run_attribution(db, period: str | None):
+    """Shared helper for the attribution endpoints.
+
+    Collects from the local environment plus the peer one (staging↔prod)
+    when `PEER_DATABASE_URL` is configured. Managed UMG production runs in
+    staging under team accounts while Universal's self-service runs in
+    prod, so a single-environment answer is always partial — the caller
+    gets `environments` and `single_environment` so it can say so instead
+    of quietly under-reporting.
+    """
+    import cost_attribution as ca
+    from database import PEER_DATABASE_URL, scoped_deliveries_db, scoped_peer_db
+
+    if period:
+        try:
+            ca.period_bounds(period)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    with scoped_peer_db() as peer:
+        sessions = {"local": db}
+        if peer is not None:
+            sessions["peer"] = peer
+
+        # The deliveries portal is prod-backed; `scoped_deliveries_db` already
+        # routes there and guarantees the session is returned to the pool.
+        with scoped_deliveries_db() as portal_db:
+            portal = ca.collect_portal_songs(portal_db)
+
+        # Una sola calibración para TODOS los entornos. La leemos de `db`
+        # porque es la base contra la que se corre `/cost/calibrate-rates`;
+        # la peer es de sólo lectura y no tiene el snapshot, así que dejarla
+        # cargar la suya valuaba las mismas llamadas a precio de lista y el
+        # informe mezclaba dos tarifas para el mismo Veo.
+        rates = {}
+        if period:
+            from rate_calibration import load_applied_rates
+            rates = load_applied_rates(db, period)
+
+        jobs_by_env = {
+            env: ca.collect_jobs(s, env, period=period, rates=rates)
+            for env, s in sessions.items()
+        }
+        all_time_keys: set[str] = set()
+        if period:
+            for s in sessions.values():
+                all_time_keys |= ca.collect_song_keys(s)
+
+        result = ca.build_attribution(
+            jobs_by_env, portal, period=period,
+            all_time_song_keys=all_time_keys if period else None,
+        )
+        result["single_environment"] = peer is None
+        if peer is None:
+            result["warning"] = (
+                "PEER_DATABASE_URL no configurada: solo se midió este "
+                "entorno. La producción gestionada de UMG corre en STAGING, "
+                "así que el costo puede quedar muy subestimado."
+            )
+        result["peer_configured"] = bool(PEER_DATABASE_URL)
+        return result
+
+
+@router.get("/cost/umg")
+def admin_cost_umg(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = todo el histórico"),
+    revenue_usd: float = Query(0.0, ge=0, le=1_000_000,
+                               description="ingreso del período, para el margen"),
+    basis: str = Query("cost", pattern="^(cost|jobs)$"),
+    top: int = Query(25, ge=1, le=500),
+):
+    """Costo real por canción entregada a Universal (niveles 1 y 2).
+
+    Nivel 1 es el costo directo de IA de las canciones que UMG pidió —
+    las del portal `umg.genly.pro` más las de los tenants `universal_*` —
+    contando TODOS los jobs de cada canción (variantes, re-renders,
+    ediciones), que es lo que realmente se pagó por entregarla.
+
+    Nivel 2 suma la parte prorrateada de infraestructura compartida, y sale
+    solo si hay snapshots de facturación del período (POST /admin/cost/refresh).
+
+    El denominador es la CANCIÓN, no el job: un entregable lleva ~2,4 jobs,
+    así que el costo por job subestima ~2,4x lo que cuesta entregar.
+    """
+    import billing_sources
+    from database import CostSnapshot
+
+    period = period.strip() or None
+    result = _run_attribution(db, period)
+
+    # Trim the per-song detail; the full list is large and the caller
+    # almost always wants the expensive tail.
+    songs = result["umg"]["by_song"]
+    result["umg"]["by_song_truncated"] = len(songs) > top
+    result["umg"]["by_song"] = songs[:top]
+
+    # Level 2 needs the real invoices for the period.
+    if period:
+        rows = (
+            db.query(CostSnapshot)
+            .filter(CostSnapshot.period == period,
+                    CostSnapshot.source.in_(tuple(billing_sources.SOURCES)))
+            .all()
+        )
+        usable_rows = [
+            r for r in rows
+            if _cost_snapshot_is_usable(period, r, billing_sources)
+        ]
+        invoices = {r.source: r.amount_usd for r in usable_rows}
+        invoice_breakdowns = {
+            r.source: (r.breakdown or []) for r in usable_rows
+        }
+        if invoices:
+            import cost_attribution as ca
+            ca.add_total_cost(
+                result, invoices,
+                revenue_usd=revenue_usd or None, basis=basis,
+                invoice_breakdowns=invoice_breakdowns,
+            )
+            missing = sorted(set(billing_sources.SOURCES) - set(invoices))
+            result["umg_total"]["invoices_missing_sources"] = missing
+            result["umg_total"]["invoices_complete"] = not missing
+        else:
+            result["umg_total_unavailable"] = (
+                f"sin snapshots de facturación para {period} — corré "
+                f"POST /admin/cost/refresh?period={period}"
+            )
+    return result
+
+
+@router.post("/cost/calibrate-rates")
+def admin_calibrate_rates(    # `def`: consulta BigQuery, que bloquea hasta
+    admin: dict = Depends(require_admin),   # BILLING_HTTP_TIMEOUT segundos.
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = mes actual"),
+    dry_run: bool = Query(False, description="calcular sin guardar"),
+):
+    """Deriva la tarifa REAL por llamada desde la factura y la persiste.
+
+    Ningún proveedor de IA devuelve el costo en la respuesta, así que la
+    única fuente real es la factura:
+
+        tarifa real = costo facturado del SKU ÷ llamadas facturables medidas
+
+    Medido: Veo estaba cargado a $0,80 de lista y la factura da ~$0,62 —
+    el panel sobreestimaba ~25%, y ese error se propagaba al costo por
+    canción, al margen por tenant y al tamaño del desperdicio.
+
+    Requiere `PEER_DATABASE_URL`: staging y prod comparten el proyecto de
+    GCP, así que la factura cubre los dos entornos y contar uno solo
+    duplicaría la tarifa. Sin peer, se niega a calibrar en vez de guardar
+    un número mal.
+
+    Necesita también el export de facturación a BigQuery configurado
+    (`GCP_BILLING_BQ_*`) — es el único lugar con granularidad de SKU.
+    """
+    import billing_sources
+    import rate_calibration as rc
+    from database import PEER_DATABASE_URL, scoped_peer_db
+
+    period = period.strip() or billing_sources.current_period()
+    try:
+        rc_period_check = billing_sources._period_bounds(period)
+        del rc_period_check
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # GCP's export lags the usage it describes. A current/open month (or a
+    # just-closed month still inside that lag) can be useful as a preview but
+    # must never overwrite the estimated rate used by dashboards.
+    rates_are_final = billing_sources.snapshot_is_final(
+        period, "gcp", datetime.now(timezone.utc),
+    )
+
+    gcp = billing_sources.fetch_gcp(period)
+    if gcp.status != "ok":
+        return {
+            "period": period, "calibrated": False,
+            "reason": f"sin factura de GCP utilizable: {gcp.detail}",
+            "hint": ("configurá el export de facturación a BigQuery "
+                     "(GCP_BILLING_BQ_*). No es retroactivo."),
+        }
+
+    invoiced = billing_sources.gcp_cost_by_tool(gcp)
+
+    with scoped_peer_db() as peer:
+        if peer is None:
+            return {
+                "period": period, "calibrated": False,
+                "reason": ("falta PEER_DATABASE_URL. La factura de GCP cubre "
+                           "staging Y prod (mismo proyecto); calibrar con un "
+                           "solo entorno duplicaría la tarifa."),
+                "invoiced_by_tool": invoiced,
+            }
+        sessions = {"local": db, "peer": peer}
+        result = rc.derive_rates(sessions, invoiced, period)
+
+    result["invoiced_by_tool"] = invoiced
+    result["gcp_total_usd"] = gcp.amount_usd
+    if not rates_are_final:
+        result["provisional"] = True
+        result["provisional_applied"] = dict(result.get("applied") or {})
+        result["applied"] = {}
+        result["stored"] = False
+        result["reason"] = (
+            "mes abierto o dentro del rezago de finalización de GCP; "
+            "las tarifas se muestran como provisionales y no se aplican"
+        )
+    elif not dry_run:
+        result["stored"] = rc.store_rates(db, period, result)
+        result["provisional"] = False
+    else:
+        result["stored"] = False
+        result["provisional"] = False
+    result["calibrated"] = bool(result.get("applied"))
+    return result
+
+
+@router.get("/cost/rates")
+def admin_cost_rates(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = mes actual"),
+):
+    """Qué tarifa está usando el panel para cada herramienta, y de dónde sale.
+
+    `source: "factura"` = derivada del gasto real de ese mes.
+    `source: "estimada"` = tarifa de lista de COST_PER_CALL, porque todavía
+    no hay factura calibrada. La distinción importa: la estimada de Veo
+    venía ~25% alta.
+    """
+    import billing_sources
+    import rate_calibration as rc
+    from provenance import COST_PER_CALL
+
+    period = period.strip() or billing_sources.current_period()
+    calibrated = rc.load_applied_rates(db, period)
+
+    rows = []
+    for (name, provider), estimated in sorted(COST_PER_CALL.items()):
+        real = rc.rate_for_tool(name, calibrated)
+        rows.append({
+            "tool_name": name, "provider": provider,
+            "rate_in_use": real if real is not None else estimated,
+            "source": "factura" if real is not None else "estimada",
+            "estimated_rate": estimated,
+            "calibrated_rate": real,
+            "drift": (round(real / estimated, 3)
+                      if real is not None and estimated else None),
+        })
+    rows.sort(key=lambda r: -r["rate_in_use"])
+    return {
+        "period": period,
+        "calibrated_tools": sorted(calibrated),
+        "rates": rows,
+        "note": ("'estimada' es tarifa de lista y puede desviarse: Veo "
+                 "estaba a $0,80 y la factura da ~$0,62. Corré "
+                 f"POST /admin/cost/calibrate-rates?period={period}"),
+    }
+
+
+@router.get("/quality/change-requests")
+def admin_change_requests(
+    admin: dict = Depends(require_admin),
+    period: str = Query("", description="YYYY-MM; vacío = todo el histórico"),
+    include_raw: bool = Query(False, description="devolver los comentarios crudos"),
+):
+    """Qué nos pide cambiar el cliente, clasificado.
+
+    La única medición directa de calidad que existe: todo lo demás (ediciones
+    del operador, tasa de rechazo) mide trabajo interno, que es un supuesto
+    sobre lo que el cliente quiere. Esto es lo que el cliente escribió.
+
+    `requests_per_delivery` es el indicador a seguir mes a mes — el retrabajo
+    es la línea de costo que define el margen del contrato llave en mano.
+
+    La tabla vive en la base de PROD (el portal es prod-backed) aunque la
+    producción gestionada corra en staging; `get_deliveries_db` ya rutea bien
+    desde los dos entornos.
+    """
+    import change_request_stats as crs
+    from database import Delivery, DeliveryChangeRequest, scoped_deliveries_db
+
+    with scoped_deliveries_db() as ddb:
+        q = ddb.query(DeliveryChangeRequest)
+        dq = ddb.query(func.count(Delivery.id)).filter(
+            Delivery.removed_at.is_(None))
+        if period.strip():
+            try:
+                start, end = _month_bounds(period.strip())
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            q = q.filter(DeliveryChangeRequest.submitted_at >= start,
+                         DeliveryChangeRequest.submitted_at < end)
+            dq = dq.filter(Delivery.added_at >= start, Delivery.added_at < end)
+
+        rows = q.order_by(DeliveryChangeRequest.submitted_at).all()
+        result = crs.summarize(rows, deliveries_total=int(dq.scalar() or 0))
+        result["period"] = period.strip() or None
+        if include_raw:
+            result["raw"] = [
+                {"id": r.id, "comment": r.comment,
+                 "submitted_at": r.submitted_at.isoformat() if r.submitted_at else None,
+                 "resolved": r.resolved_at is not None,
+                 "categories": crs.classify(r.comment or ""),
+                 "noise": crs.is_noise(r.comment or "")}
+                for r in rows
+            ]
+        return result
+
+
+def _month_bounds(period: str):
+    """"YYYY-MM" -> (inicio, fin exclusivo) en UTC."""
+    year, month = (int(x) for x in period.split("-", 1))
+    if not 1 <= month <= 12:
+        raise ValueError(f"período inválido: {period!r}")
+    start = datetime(year, month, 1, tzinfo=timezone.utc)
+    end = datetime(year + (month == 12), (month % 12) + 1, 1,
+                   tzinfo=timezone.utc)
+    return start, end
+
+
+# ---------------------------------------------------------------------------
+# Correction learning — global, anonymised and super-admin only.
+# ---------------------------------------------------------------------------
+
+class QualityLearningActionRequest(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500)
+    expected_version: int = Field(..., ge=1)
+    idempotency_key: str = Field(..., min_length=8, max_length=100)
+
+
+def _require_quality_learning_flag(name: str) -> None:
+    if os.environ.get(name, "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "quality_learning_disabled", "flag": name},
+        )
+
+
+def _pattern_payload(row) -> dict:
+    evidence = dict(row.evidence or {})
+    safe_evidence = {
+        key: evidence[key] for key in (
+            "association_only", "group_positive", "group_total",
+            "other_positive", "other_total", "thresholds",
+        ) if key in evidence
+    }
+    return {
+        "id": row.id, "category": row.category,
+        "context_key": row.context_key, "status": row.status,
+        "support_jobs": row.support_jobs,
+        "support_tenants": row.support_tenants,
+        "support_artists": row.support_artists,
+        "baseline_rate": row.baseline_rate,
+        "observed_rate": row.observed_rate,
+        "relative_risk": row.relative_risk,
+        "ci_95": [row.ci_low, row.ci_high],
+        "impact_seconds": row.impact_seconds,
+        "evidence": safe_evidence, "version": row.version,
+        "first_seen_at": row.first_seen_at.isoformat() if row.first_seen_at else None,
+        "last_seen_at": row.last_seen_at.isoformat() if row.last_seen_at else None,
+    }
+
+
+def _proposal_payload(row, experiments: list | None = None) -> dict:
+    return {
+        "id": row.id, "pattern_id": row.pattern_id,
+        "proposal_type": row.proposal_type, "title": row.title,
+        "hypothesis": row.hypothesis, "status": row.status,
+        "version": row.version, "candidate_config": row.candidate_config or {},
+        "expected_impact": row.expected_impact or {},
+        "validation_summary": row.validation_summary,
+        "ready_artifact": row.ready_artifact,
+        "decision_reason": row.decision_reason,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "experiments": [
+            {
+                "id": item.id, "status": item.status,
+                "metrics": item.metrics or {},
+                "failure_reason": item.failure_reason,
+                "benchmark_report_hash": item.benchmark_report_hash,
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+                "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+            }
+            for item in (experiments or [])
+        ],
+    }
+
+
+@router.get("/quality-learning/summary")
+def quality_learning_summary(
+    days: int = Query(90, ge=1, le=3650),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from correction_learning import model_readiness, public_observation_summary
+    from database import (
+        CorrectionObservation, ProductEvent, QualityFixProposal, QualityPattern,
+    )
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = db.query(CorrectionObservation).filter(
+        CorrectionObservation.created_at >= since,
+    ).all()
+    proposal_counts = dict(db.query(
+        QualityFixProposal.status, func.count(QualityFixProposal.id),
+    ).group_by(QualityFixProposal.status).all())
+    pattern_counts = dict(db.query(
+        QualityPattern.status, func.count(QualityPattern.id),
+    ).group_by(QualityPattern.status).all())
+    suggestion_rows = db.query(ProductEvent).filter(
+        ProductEvent.created_at >= since,
+        ProductEvent.name.in_({
+            "editor_operator_suggestions_shown",
+            "editor_operator_suggestion_decision",
+        }),
+    ).all()
+    suggestion_types = {
+        kind: {"shown": 0, "accepted": 0, "rejected": 0, "manual": 0}
+        for kind in ("timing", "text", "vocalization")
+    }
+    suggestion_jobs = set()
+    severe_timing_accepted = 0
+    severe_timing_manual = 0
+    for event in suggestion_rows:
+        properties = event.properties or {}
+        if event.job_id:
+            suggestion_jobs.add(event.job_id)
+        if event.name == "editor_operator_suggestions_shown":
+            for kind in suggestion_types:
+                value = properties.get(f"{kind}_count")
+                if isinstance(value, (int, float)):
+                    suggestion_types[kind]["shown"] += max(0, int(value))
+            continue
+        kind = str(properties.get("suggestion_type") or "")
+        decision = str(properties.get("decision") or "")
+        if kind in suggestion_types:
+            if decision in {"accepted", "rejected"}:
+                suggestion_types[kind][decision] += 1
+            elif decision == "manual_override":
+                suggestion_types[kind]["manual"] += 1
+        try:
+            impact_ms = float(properties.get("impact_ms") or 0)
+        except (TypeError, ValueError):
+            impact_ms = 0.0
+        if (
+            kind == "timing" and decision == "accepted"
+            and impact_ms >= 1000
+        ):
+            severe_timing_accepted += 1
+        if (
+            kind == "timing" and decision == "manual_override"
+            and impact_ms >= 1000
+        ):
+            severe_timing_manual += 1
+    for values in suggestion_types.values():
+        decided = values["accepted"] + values["rejected"]
+        values["decided"] = decided
+        values["acceptance_rate"] = (
+            round(values["accepted"] / decided, 4) if decided else None
+        )
+        values["sanity_gate_met"] = bool(
+            decided >= 10 and values["accepted"] / decided >= 0.70
+        ) if decided else False
+    return {
+        "period_days": days,
+        "observations": public_observation_summary(rows),
+        "patterns": pattern_counts, "proposals": proposal_counts,
+        "model_readiness": model_readiness(db),
+        "operator_suggestions": {
+            "songs": len(suggestion_jobs),
+            "by_type": suggestion_types,
+            "severe_timing_accepted": severe_timing_accepted,
+            "severe_timing_manual": severe_timing_manual,
+            "severe_timing_resolved": (
+                severe_timing_accepted + severe_timing_manual
+            ),
+            "automatic_apply_allowed": False,
+        },
+        "privacy": {
+            "raw_lyrics_exposed": False, "raw_audio_exposed": False,
+            "minimum_pattern_jobs": 10, "minimum_pattern_tenants": 3,
+            "minimum_pattern_artists": 3,
+        },
+    }
+
+
+@router.get("/quality-learning/patterns")
+def quality_learning_patterns(
+    status: str = Query(""),
+    limit: int = Query(100, ge=1, le=500),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from database import QualityPattern
+    query = db.query(QualityPattern)
+    if status:
+        query = query.filter(QualityPattern.status == status)
+    rows = query.order_by(
+        QualityPattern.impact_seconds.desc(), QualityPattern.support_jobs.desc(),
+    ).limit(limit).all()
+    return {"patterns": [_pattern_payload(row) for row in rows]}
+
+
+@router.get("/quality-learning/patterns/{pattern_id}")
+def quality_learning_pattern_detail(
+    pattern_id: str,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from database import QualityFixProposal, QualityPattern
+    row = db.query(QualityPattern).filter(QualityPattern.id == pattern_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Pattern not found")
+    proposals = db.query(QualityFixProposal).filter(
+        QualityFixProposal.pattern_id == pattern_id,
+    ).order_by(QualityFixProposal.created_at.desc()).all()
+    return {
+        **_pattern_payload(row),
+        "proposals": [_proposal_payload(proposal) for proposal in proposals],
+    }
+
+
+@router.get("/quality-learning/proposals")
+def quality_learning_proposals(
+    status: str = Query(""),
+    limit: int = Query(100, ge=1, le=500),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from database import QualityExperimentRun, QualityFixProposal
+    query = db.query(QualityFixProposal)
+    if status:
+        query = query.filter(QualityFixProposal.status == status)
+    proposals = query.order_by(QualityFixProposal.updated_at.desc()).limit(limit).all()
+    proposal_ids = [row.id for row in proposals]
+    runs = db.query(QualityExperimentRun).filter(
+        QualityExperimentRun.proposal_id.in_(proposal_ids),
+    ).order_by(QualityExperimentRun.created_at.desc()).all() if proposal_ids else []
+    by_proposal: dict[str, list] = {}
+    for run in runs:
+        by_proposal.setdefault(run.proposal_id, []).append(run)
+    return {
+        "proposals": [
+            _proposal_payload(row, by_proposal.get(row.id, [])) for row in proposals
+        ],
+    }
+
+
+def _proposal_for_action(db: Session, proposal_id: str,
+                         body: QualityLearningActionRequest):
+    from database import QualityFixProposal
+    # Serialize the same idempotency key across proposals before scanning or
+    # mutating. The DB unique index remains the last line of defense; this lock
+    # turns a concurrent collision into a deterministic 409 instead of a 500.
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        lock_id = int.from_bytes(
+            hashlib.sha256(body.idempotency_key.encode("utf-8")).digest()[:8],
+            "big", signed=True,
+        )
+        db.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": lock_id})
+    historical = db.query(QualityFixProposal).all()
+    for candidate in historical:
+        keys = candidate.action_idempotency_keys or []
+        if body.idempotency_key in keys:
+            if candidate.id != proposal_id:
+                raise HTTPException(status_code=409, detail="Idempotency key already used")
+            return candidate, True
+    reused = db.query(QualityFixProposal).filter(
+        QualityFixProposal.last_idempotency_key == body.idempotency_key,
+    ).first()
+    if reused:
+        if reused.id != proposal_id:
+            raise HTTPException(status_code=409, detail="Idempotency key already used")
+        return reused, True
+    proposal = db.query(QualityFixProposal).filter(
+        QualityFixProposal.id == proposal_id,
+    ).with_for_update().first()
+    if not proposal:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    if body.idempotency_key in (proposal.action_idempotency_keys or []):
+        return proposal, True
+    if int(proposal.version or 0) != body.expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "stale_proposal", "current_version": proposal.version},
+        )
+    return proposal, False
+
+
+def _remember_proposal_action(proposal, idempotency_key: str) -> None:
+    keys = list(proposal.action_idempotency_keys or [])
+    if idempotency_key not in keys:
+        keys.append(idempotency_key)
+    proposal.action_idempotency_keys = keys[-100:]
+    proposal.last_idempotency_key = idempotency_key
+
+
+@router.post("/quality-learning/proposals/{proposal_id}/validate")
+def validate_quality_learning_proposal(
+    proposal_id: str,
+    body: QualityLearningActionRequest,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from correction_learning import sha256_json, validate_proposal_config
+    from database import AuditLog, QualityExperimentRun, QualityPattern
+    _require_quality_learning_flag("QUALITY_LEARNING_PROPOSALS_ENABLED")
+    _require_quality_learning_flag("QUALITY_LEARNING_ABLATIONS_ENABLED")
+    proposal, reused = _proposal_for_action(db, proposal_id, body)
+    if reused:
+        return _proposal_payload(proposal)
+    if proposal.status not in {"draft", "failed", "blocked"}:
+        raise HTTPException(status_code=409, detail="Proposal cannot be validated in this state")
+    pattern = db.query(QualityPattern).filter(
+        QualityPattern.id == proposal.pattern_id,
+    ).with_for_update().one()
+    if pattern.status != "correlated":
+        raise HTTPException(status_code=409, detail="Source pattern is no longer qualified")
+    try:
+        config = validate_proposal_config(proposal.candidate_config or {})
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    experiment = QualityExperimentRun(
+        id=str(uuid.uuid4()), proposal_id=proposal.id, status="queued",
+        candidate_config_hash=sha256_json(config), metrics={"render": False},
+        created_at=datetime.now(timezone.utc),
+    )
+    proposal.status = "validating"
+    proposal.decision_reason = body.reason
+    _remember_proposal_action(proposal, body.idempotency_key)
+    proposal.version += 1
+    proposal.updated_at = datetime.now(timezone.utc)
+    db.add(experiment)
+    db.add(AuditLog(
+        user_id=admin.get("id"), action="quality_learning.proposal.validate",
+        detail={
+            "proposal_id": proposal.id, "experiment_id": experiment.id,
+            "reason": body.reason, "candidate_config_sha256": experiment.candidate_config_hash,
+            "render": False, "idempotency_key": body.idempotency_key,
+        },
+    ))
+    db.commit()
+    try:
+        from queue_jobs import enqueue_quality_proposal_validation
+        enqueue_quality_proposal_validation(proposal.id, experiment.id)
+    except Exception as exc:
+        proposal.status = "blocked"
+        proposal.validation_summary = {"passed": False, "reason": str(exc)[:500]}
+        experiment.status = "blocked"
+        experiment.failure_reason = str(exc)[:500]
+        experiment.completed_at = datetime.now(timezone.utc)
+        proposal.version += 1
+        db.add(AuditLog(
+            user_id=admin.get("id"),
+            action="quality_learning.validation.enqueue_blocked",
+            detail={
+                "proposal_id": proposal.id,
+                "experiment_id": experiment.id,
+                "reason": str(exc)[:500],
+            },
+        ))
+        db.commit()
+        raise HTTPException(status_code=503, detail="Validation queue unavailable") from exc
+    return _proposal_payload(proposal, [experiment])
+
+
+@router.post("/quality-learning/proposals/{proposal_id}/approve")
+def approve_quality_learning_proposal(
+    proposal_id: str,
+    body: QualityLearningActionRequest,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from correction_learning import sha256_json
+    from database import AuditLog, QualityPattern
+    from evidence_attestation import sign_artifact
+    _require_quality_learning_flag("QUALITY_LEARNING_PROPOSALS_ENABLED")
+    proposal, reused = _proposal_for_action(db, proposal_id, body)
+    if reused:
+        return _proposal_payload(proposal)
+    if proposal.status != "ready" or not (proposal.validation_summary or {}).get("passed"):
+        raise HTTPException(status_code=409, detail="Only a passed, ready proposal can be approved")
+    pattern = db.query(QualityPattern).filter(
+        QualityPattern.id == proposal.pattern_id,
+    ).with_for_update().one()
+    if pattern.status != "confirmed":
+        raise HTTPException(status_code=409, detail="Source pattern is no longer qualified")
+    private_key = os.environ.get("QUALITY_LEARNING_SIGNING_PRIVATE_KEY", "").strip()
+    key_id = os.environ.get("QUALITY_LEARNING_SIGNING_KEY_ID", "").strip()
+    if not private_key or not key_id:
+        raise HTTPException(status_code=503, detail="Quality learning signer unavailable")
+    artifact = sign_artifact({
+        "schema": "quality-fix-ready-v1", "proposal_id": proposal.id,
+        "pattern_id": proposal.pattern_id,
+        "candidate_config_sha256": sha256_json(proposal.candidate_config or {}),
+        "benchmark_report_sha256": (
+            proposal.validation_summary or {}
+        ).get("benchmark_report_hash"),
+        "status": "ready_for_implementation", "runtime_mutated": False,
+        "approved_at": datetime.now(timezone.utc).isoformat(),
+        "approved_by": str(admin.get("id")),
+    }, private_key, key_id)
+    proposal.status = "approved"
+    proposal.ready_artifact = artifact
+    proposal.approved_by = admin.get("id")
+    proposal.decision_reason = body.reason
+    _remember_proposal_action(proposal, body.idempotency_key)
+    proposal.version += 1
+    proposal.updated_at = datetime.now(timezone.utc)
+    db.add(AuditLog(
+        user_id=admin.get("id"), action="quality_learning.proposal.approve",
+        detail={
+            "proposal_id": proposal.id, "reason": body.reason,
+            "artifact_sha256": artifact["attestation"]["payload_sha256"],
+            "runtime_mutated": False, "idempotency_key": body.idempotency_key,
+        },
+    ))
+    db.commit()
+    return _proposal_payload(proposal)
+
+
+@router.post("/quality-learning/proposals/{proposal_id}/reject")
+def reject_quality_learning_proposal(
+    proposal_id: str,
+    body: QualityLearningActionRequest,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    from database import AuditLog
+    proposal, reused = _proposal_for_action(db, proposal_id, body)
+    if reused:
+        return _proposal_payload(proposal)
+    if proposal.status in {"approved", "rejected", "superseded"}:
+        raise HTTPException(status_code=409, detail="Proposal is already terminal")
+    proposal.status = "rejected"
+    proposal.decision_reason = body.reason
+    _remember_proposal_action(proposal, body.idempotency_key)
+    proposal.version += 1
+    proposal.updated_at = datetime.now(timezone.utc)
+    db.add(AuditLog(
+        user_id=admin.get("id"), action="quality_learning.proposal.reject",
+        detail={
+            "proposal_id": proposal.id, "reason": body.reason,
+            "idempotency_key": body.idempotency_key,
+        },
+    ))
+    db.commit()
+    return _proposal_payload(proposal)
+
+
+@router.get("/cost/business")
+def admin_cost_business(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query("", description="YYYY-MM; vacío = todo el histórico"),
+):
+    """A qué se fue cada dólar del negocio (nivel 3).
+
+    Clasifica TODO el gasto de ambos entornos: producción de UMG, otros
+    clientes, automatización/CI (golden_render_bot, smokes, e2e) e I+D
+    interno. Sirve para separar costo de bienes vendidos de costo de
+    operar — lo segundo no se le carga al precio del cliente.
+
+    El orden de clasificación importa y está fijado por tests: un job del
+    render bot que reprocesa una canción real del catálogo cuenta como CI,
+    nunca como producción del cliente.
+    """
+    result = _run_attribution(db, period.strip() or None)
+    # The per-song detail belongs to /cost/umg; keep this response about
+    # the business-wide split.
+    result["umg"].pop("by_song", None)
+    return result
+
+
+@router.get("/cost/by-video-type")
+def admin_cost_by_video_type(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+    period: str = Query(..., description="YYYY-MM, obligatorio"),
+    labor_rate_usd_per_hour: float = Query(
+        10.0, gt=0, le=1000,
+        description="tarifa para convertir minutos activos de edición a USD",
+    ),
+    price_lyric_veo_usd: float | None = Query(
+        None, ge=0, description="precio/video del tier lyric_veo, para margen",
+    ),
+    price_lyric_static_usd: float | None = Query(
+        None, ge=0, description="precio/video del tier lyric_static, para margen",
+    ),
+    price_art_track_usd: float | None = Query(
+        None, ge=0, description="precio/video de Art Track, para margen",
+    ),
+):
+    """Costo y margen por TIPO de video: lyric_veo / lyric_static / art_track.
+
+    El contrato de Universal no es un precio único: 400 lyric videos/mes a
+    $6 (con la mitad obligada a fondo de foto fija en vez de Veo, como
+    palanca de costo) + 250 Art Tracks/mes a $4 (sin Veo, sin editor de
+    letra). Esta es la primera vista que separa el costo de esos 3
+    productos — hasta ahora solo existía agregado por tenant/canción.
+
+    Sólo de lectura, no cambia nada de producción: agrega sobre
+    `Job.render_params`, `AIProvenance` y `ProductEvent` ya existentes.
+
+    Limitaciones (ver docstring de `cost_by_video_type.py`):
+    - Clasificación de tipo NO es una columna: sale de dos booleanos en
+      `render_params` (`art_track`, `background_ai_generated`). Jobs
+      anteriores a esa instrumentación no la tienen y se cuentan aparte en
+      `unknown`, nunca forzados a una categoría.
+    - `labor_minutes_*` de `art_track` normalmente sale en `null`: ese flujo
+      no abre el editor de letra, así que nunca emite el evento del que sale
+      el dato. No es un hueco de telemetría, es que el producto no tiene esa
+      mano de obra.
+    - Sólo mide el entorno de `db` (no hace merge staging↔prod como
+      `/cost/umg`). La producción gestionada de UMG corre en staging.
+    """
+    import cost_by_video_type as cbvt
+
+    try:
+        from cost_attribution import period_bounds
+        period_bounds(period)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    prices = {}
+    if price_lyric_veo_usd is not None:
+        prices[cbvt.CAT_LYRIC_VEO] = price_lyric_veo_usd
+    if price_lyric_static_usd is not None:
+        prices[cbvt.CAT_LYRIC_STATIC] = price_lyric_static_usd
+    if price_art_track_usd is not None:
+        prices[cbvt.CAT_ART_TRACK] = price_art_track_usd
+
+    return cbvt.build_cost_by_video_type(
+        db, period, labor_rate_usd_per_hour=labor_rate_usd_per_hour,
+        prices_usd=prices or None,
+    )
+
+
+# NOTE: this catch-all must stay AFTER every literal /cost/<name> route.
+# FastAPI matches in registration order, so declaring it earlier made
+# `/admin/cost/real` resolve here with tenant_id="real" — a 200 with an
+# empty cost summary instead of the real-invoice payload.
 @router.get("/cost/{tenant_id}")
-async def admin_tenant_cost(
+def admin_tenant_cost(
     tenant_id: str,
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
@@ -563,17 +2594,490 @@ async def list_all_provenance(
 
 
 # ---------------------------------------------------------------------------
+# Per-user activity observability
+# ---------------------------------------------------------------------------
+
+# Job statuses that count as "still moving through the pipeline" for the
+# activity rollup. Mirrors the status set used by the dashboard; keep in
+# sync if new intermediate statuses are added.
+_ACTIVITY_IN_PROGRESS_STATUSES = (
+    "processing", "queued", "transcribed_pending", "transcribed",
+    "pending_review", "editing", "awaiting_upload",
+)
+_ACTIVITY_FAILED_STATUSES = ("error", "validation_failed")
+
+# AuditLog actions that represent rework: the user (or reviewer) had to go
+# back over something the pipeline already produced. Used by /activity to
+# quantify friction per user without new tracking.
+_ACTIVITY_EDIT_ACTION = "job.edit_request"
+_ACTIVITY_RETRY_ACTION = "job.retry"
+_ACTIVITY_SEGMENTS_ACTION = "lyrics.segments_diff"
+_ACTIVITY_DOWNLOAD_ACTION = "job.download"
+
+
+def _activity_window(since_days: int) -> datetime:
+    return datetime.now(timezone.utc) - timedelta(days=since_days)
+
+
+@router.get("/activity")
+async def admin_activity(
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+    since_days: int = Query(30, ge=1, le=365),
+):
+    """Per-user activity rollup across all tenants.
+
+    One row per user with everything the operator needs to answer "who is
+    actually using the app and how is it going for them": video counts by
+    outcome, errors, rework signals (edits / retries / variants /
+    re-created jobs), background source split (library vs AI-generated)
+    and estimated AI cost. All derived from existing tables — Job,
+    AuditLog, AssetUsage, AIProvenance — no extra tracking.
+    """
+    from provenance import cost_for_record
+
+    since = _activity_window(since_days)
+
+    # Excluir jobs de preview de fondo (bg_preview_*): son auxiliares del
+    # wizard, no videos que el usuario haya pedido.
+    real_jobs = ~Job.status.like("bg_preview%")
+
+    # --- 1. Video counts + last job activity, one GROUP BY ---------------
+    video_rows = (
+        db.query(
+            Job.user_id,
+            func.count(Job.id).label("total"),
+            func.sum(case((Job.status == "done", 1), else_=0)).label("done"),
+            # Aprobado = aprobado Y todavía en done. Un video aprobado que
+            # después volvió a edición ya no cuenta — si no, "aprobados"
+            # puede superar a "terminados" y confunde (visto en staging).
+            func.sum(case(((Job.approved_at.isnot(None)) & (Job.status == "done"), 1), else_=0)).label("approved"),
+            func.sum(case((Job.status.in_(_ACTIVITY_FAILED_STATUSES), 1), else_=0)).label("failed"),
+            func.sum(case((Job.status.in_(_ACTIVITY_IN_PROGRESS_STATUSES), 1), else_=0)).label("in_progress"),
+            func.max(func.coalesce(Job.last_user_activity_at, Job.created_at)).label("last_job_activity"),
+        )
+        .filter(Job.created_at >= since, real_jobs)
+        .group_by(Job.user_id)
+        .all()
+    )
+    videos_by_user = {}
+    last_activity_by_user = {}
+    for r in video_rows:
+        videos_by_user[r.user_id] = {
+            "total": int(r.total or 0),
+            "done": int(r.done or 0),
+            "approved": int(r.approved or 0),
+            "failed": int(r.failed or 0),
+            "in_progress": int(r.in_progress or 0),
+        }
+        last_activity_by_user[r.user_id] = r.last_job_activity
+
+    # --- 2. Recent error messages (bounded), bucketed per user -----------
+    # También clasifica cada error en categoría (veo/render/upload/...):
+    # usa la columna error_category cuando el pipeline la pobló, y cae al
+    # clasificador de texto para rows históricas. El límite de 200 cubre
+    # de sobra el volumen de errores de una ventana de 90 días al volumen
+    # actual; si algún día se queda corto, la categoría sub-reporta pero
+    # nunca rompe.
+    error_rows = (
+        db.query(Job.user_id, Job.job_id, Job.song_title, Job.artist, Job.error,
+                 Job.error_category, Job.status, Job.created_at)
+        .filter(Job.status.in_(_ACTIVITY_FAILED_STATUSES), Job.created_at >= since)
+        .order_by(Job.created_at.desc())
+        .limit(200)
+        .all()
+    )
+    errors_by_user = {}
+    error_categories_by_user = {}
+    errors_by_category_global = {}
+    for r in error_rows:
+        category = r.error_category or classify_error(r.error)
+        cat_bucket = error_categories_by_user.setdefault(r.user_id, {})
+        cat_bucket[category] = cat_bucket.get(category, 0) + 1
+        errors_by_category_global[category] = errors_by_category_global.get(category, 0) + 1
+        bucket = errors_by_user.setdefault(r.user_id, [])
+        if len(bucket) < 3:
+            bucket.append({
+                "job_id": r.job_id,
+                "artist": r.artist,
+                "song_title": r.song_title,
+                "status": r.status,
+                "error": (r.error or "")[:300],
+                "category": category,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            })
+
+    # --- 3. Rework from Job columns: variants + partial re-renders -------
+    rework_rows = (
+        db.query(
+            Job.user_id,
+            func.sum(case((Job.parent_job_id.isnot(None), 1), else_=0)).label("variants"),
+            func.sum(case((Job.edit_count > 0, 1), else_=0)).label("rerendered_jobs"),
+            func.sum(Job.edit_count).label("total_edits"),
+        )
+        .filter(Job.created_at >= since, real_jobs)
+        .group_by(Job.user_id)
+        .all()
+    )
+    rework_by_user = {
+        r.user_id: {
+            "variants": int(r.variants or 0),
+            "rerendered_jobs": int(r.rerendered_jobs or 0),
+            "total_edits": int(r.total_edits or 0),
+        }
+        for r in rework_rows
+    }
+
+    # --- 4. Rework from AuditLog: edit types, retries, manual lyric edits.
+    # El detail es JSONB; lo leemos en Python (y no con operadores JSON de
+    # SQL) para que el mismo código corra igual en SQLite (tests locales)
+    # y Postgres (CI / prod).
+    audit_rows = (
+        db.query(AuditLog.user_id, AuditLog.action, AuditLog.detail)
+        .filter(
+            AuditLog.action.in_((
+                _ACTIVITY_EDIT_ACTION,
+                _ACTIVITY_RETRY_ACTION,
+                _ACTIVITY_SEGMENTS_ACTION,
+            )),
+            AuditLog.created_at >= since,
+        )
+        .all()
+    )
+    audit_rework_by_user = {}
+    for user_id, action, detail in audit_rows:
+        if user_id is None:
+            continue
+        agg = audit_rework_by_user.setdefault(user_id, {
+            "edits_lyrics": 0, "edits_typography": 0, "edits_background": 0,
+            "edits_metadata": 0, "retries": 0, "corrected_jobs": set(),
+        })
+        if action == _ACTIVITY_RETRY_ACTION:
+            agg["retries"] += 1
+        elif action == _ACTIVITY_SEGMENTS_ACTION:
+            # Correcciones manuales de letra: contamos JOBS distintos, no
+            # eventos. El editor de letras autoguarda (un evento
+            # lyrics.segments_diff por save) → contar eventos infla el
+            # número a miles y lo vuelve inútil (bug visto en staging
+            # 2026-06-02: "Retrabajos: 1011"). La pregunta que responde
+            # esta métrica es "¿cuántos videos necesitaron corrección
+            # manual?", no "¿cuántas veces se guardó?".
+            agg["corrected_jobs"].add((detail or {}).get("job_id") or "?")
+        elif action == _ACTIVITY_EDIT_ACTION:
+            edit_type = ((detail or {}).get("edit_type") or "").strip()
+            key = f"edits_{edit_type}"
+            if key in agg:
+                agg[key] += 1
+    # set de job_ids → count para serializar a JSON
+    for agg in audit_rework_by_user.values():
+        agg["corrected_jobs"] = len(agg["corrected_jobs"])
+
+    # --- 5. Abandoned-and-recreated heuristic -----------------------------
+    # Mismo usuario, misma (artist, song_title), más de un job y al menos
+    # uno que nunca llegó a done → señal de que descartó un intento y
+    # arrancó de nuevo.
+    recreated_rows = (
+        db.query(
+            Job.user_id,
+            func.count(Job.id).label("n"),
+            func.sum(case((Job.status == "done", 1), else_=0)).label("done_n"),
+        )
+        .filter(Job.created_at >= since, real_jobs, Job.parent_job_id.is_(None))
+        .group_by(Job.user_id, Job.artist, Job.song_title)
+        .having(func.count(Job.id) > 1)
+        .all()
+    )
+    recreated_by_user = {}
+    for r in recreated_rows:
+        if int(r.n or 0) > int(r.done_n or 0):
+            recreated_by_user[r.user_id] = recreated_by_user.get(r.user_id, 0) + 1
+
+    # --- 6. Backgrounds: library usage ------------------------------------
+    library_rows = (
+        db.query(AssetUsage.user_id, func.count(AssetUsage.id))
+        .filter(AssetUsage.used_at >= since)
+        .group_by(AssetUsage.user_id)
+        .all()
+    )
+    library_by_user = {uid: int(n or 0) for uid, n in library_rows}
+
+    # --- 7. Backgrounds AI-generated + AI cost, via provenance ------------
+    prov_rows = (
+        db.query(
+            Job.user_id,
+            AIProvenance.tool_name,
+            AIProvenance.tool_provider,
+            AIProvenance.step,
+            func.count(AIProvenance.id).label("calls"),
+        )
+        .join(Job, Job.job_id == AIProvenance.job_id)
+        .filter(AIProvenance.created_at >= since)
+        .group_by(Job.user_id, AIProvenance.tool_name, AIProvenance.tool_provider, AIProvenance.step)
+        .all()
+    )
+    ai_bg_by_user = {}
+    ai_cost_by_user = {}
+    for user_id, tool_name, tool_provider, step, calls in prov_rows:
+        calls = int(calls or 0)
+        if step in ("video_bg", "image_bg"):
+            ai_bg_by_user[user_id] = ai_bg_by_user.get(user_id, 0) + calls
+        ai_cost_by_user[user_id] = (
+            ai_cost_by_user.get(user_id, 0.0)
+            + calls * cost_for_record(tool_name, tool_provider)
+        )
+
+    # --- 8. Last activity also considers audit actions (downloads, edits,
+    #        logins) so "last seen" isn't blind to non-job actions. --------
+    audit_last_rows = (
+        db.query(AuditLog.user_id, func.max(AuditLog.created_at))
+        .filter(AuditLog.created_at >= since, AuditLog.user_id.isnot(None))
+        .group_by(AuditLog.user_id)
+        .all()
+    )
+    for uid, last_audit in audit_last_rows:
+        prev = last_activity_by_user.get(uid)
+        if prev is None or (last_audit is not None and last_audit > prev):
+            last_activity_by_user[uid] = last_audit
+
+    # --- 9. Sesiones (tiempo en app + online ahora), solo con telemetría --
+    # Agregado en Python y no en SQL: el volumen es mínimo (una row por
+    # sesión, no por heartbeat) y así el cálculo de duraciones es idéntico
+    # en SQLite (tests) y Postgres (prod), sin func.extract dialect-specific.
+    sessions_by_user = {}
+    telemetry_on = telemetry_enabled()
+    if telemetry_on:
+        now = datetime.now(timezone.utc)
+        today_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        week_ago = now - timedelta(days=7)
+        online_cutoff = now - timedelta(minutes=3)
+        sess_rows = (
+            db.query(UserSession)
+            .filter(UserSession.last_seen_at >= week_ago)
+            .all()
+        )
+        for s in sess_rows:
+            # SQLite (tests) devuelve datetimes naive aunque la columna sea
+            # timezone=True; Postgres devuelve aware. Mismo guard que reaper.py.
+            started_at = s.started_at
+            last_seen_at = s.last_seen_at
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            if last_seen_at.tzinfo is None:
+                last_seen_at = last_seen_at.replace(tzinfo=timezone.utc)
+            agg = sessions_by_user.setdefault(s.user_id, {
+                "online": False,
+                "last_seen_at": None,
+                "seconds_today": 0,
+                "seconds_week": 0,
+                "sessions_week": 0,
+            })
+            duration = max(0.0, (last_seen_at - started_at).total_seconds())
+            agg["sessions_week"] += 1
+            agg["seconds_week"] += int(duration)
+            if last_seen_at >= today_start:
+                # Clip de la sesión a la ventana de hoy para que una sesión
+                # que arrancó ayer no cuente sus horas de ayer como de hoy.
+                start_today = max(started_at, today_start)
+                agg["seconds_today"] += int(max(0.0, (last_seen_at - start_today).total_seconds()))
+            if last_seen_at >= online_cutoff:
+                agg["online"] = True
+            prev_seen = agg["last_seen_at"]
+            seen_iso = last_seen_at.isoformat()
+            if prev_seen is None or seen_iso > prev_seen:
+                agg["last_seen_at"] = seen_iso
+            # La sesión también cuenta como "última actividad" del usuario.
+            prev_act = last_activity_by_user.get(s.user_id)
+            if prev_act is not None and prev_act.tzinfo is None:
+                prev_act = prev_act.replace(tzinfo=timezone.utc)
+            if prev_act is None or last_seen_at > prev_act:
+                last_activity_by_user[s.user_id] = last_seen_at
+
+    # --- Stitch ------------------------------------------------------------
+    users = db.query(User).all()
+    empty_videos = {"total": 0, "done": 0, "approved": 0, "failed": 0, "in_progress": 0}
+    empty_rework = {"variants": 0, "rerendered_jobs": 0, "total_edits": 0}
+    empty_audit = {
+        "edits_lyrics": 0, "edits_typography": 0, "edits_background": 0,
+        "edits_metadata": 0, "retries": 0, "corrected_jobs": 0,
+    }
+    result = []
+    for u in users:
+        last_activity = last_activity_by_user.get(u.id)
+        rework = dict(empty_rework, **rework_by_user.get(u.id, {}))
+        rework.update(dict(empty_audit, **audit_rework_by_user.get(u.id, {})))
+        rework["abandoned_recreated"] = recreated_by_user.get(u.id, 0)
+        result.append({
+            "user_id": u.id,
+            "username": u.username,
+            "email": u.email,
+            "tenant_id": u.tenant_id,
+            "plan": u.plan_id,
+            "role": u.role,
+            "is_active": u.is_active,
+            "last_activity": last_activity.isoformat() if last_activity else None,
+            "videos": videos_by_user.get(u.id, dict(empty_videos)),
+            "errors": {
+                "count": videos_by_user.get(u.id, empty_videos)["failed"],
+                "recent": errors_by_user.get(u.id, []),
+                "by_category": error_categories_by_user.get(u.id, {}),
+            },
+            "rework": rework,
+            "backgrounds": {
+                "library": library_by_user.get(u.id, 0),
+                "ai_generated": ai_bg_by_user.get(u.id, 0),
+            },
+            "ai_cost_usd": round(ai_cost_by_user.get(u.id, 0.0), 2),
+            # None cuando la telemetría está apagada o el usuario no tuvo
+            # sesiones esta semana — el frontend lee con optional chaining.
+            "sessions": sessions_by_user.get(u.id) if telemetry_on else None,
+        })
+
+    # Usuarios con actividad primero (más reciente arriba); los que nunca
+    # hicieron nada en la ventana van al final.
+    result.sort(key=lambda r: r["last_activity"] or "", reverse=True)
+
+    return {
+        "since_days": since_days,
+        "since": since.isoformat(),
+        "users": result,
+        # Breakdown global de errores por categoría (para los chips del tab).
+        "errors_by_category": errors_by_category_global,
+        # Si está apagada, el frontend muestra "tracking deshabilitado" en
+        # vez de columnas de tiempo en cero.
+        "telemetry_enabled": telemetry_on,
+    }
+
+
+@router.get("/activity/{user_id}")
+async def admin_activity_detail(
+    user_id: int,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+    since_days: int = Query(30, ge=1, le=365),
+):
+    """Drill-down for one user: job timeline, downloads and rework events."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    since = _activity_window(since_days)
+
+    jobs = (
+        db.query(Job)
+        .filter(Job.user_id == user_id, Job.created_at >= since, ~Job.status.like("bg_preview%"))
+        .order_by(Job.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    # Resumen de la config elegida por job (render_params) + fuente del
+    # fondo — backs la columna "elecciones" del perfil de usuario en
+    # Insights. Aditivo: el shape histórico no cambia.
+    from admin_insights import background_source_map, job_choices, user_detail_extras
+    bg_sources = background_source_map(db, [j.job_id for j in jobs])
+    job_rows = []
+    for j in jobs:
+        choices = job_choices(j)
+        if choices is not None:
+            choices["background_source"] = bg_sources.get(j.job_id, "other")
+        job_rows.append({
+            "job_id": j.job_id,
+            "artist": j.artist,
+            "song_title": j.song_title,
+            "status": j.status,
+            "current_step": j.current_step,
+            "error": (j.error or "")[:300] if j.error else None,
+            "timing_source": j.timing_source,
+            "edit_count": j.edit_count or 0,
+            "parent_job_id": j.parent_job_id,
+            "approved_at": j.approved_at.isoformat() if j.approved_at else None,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+            "choices": choices,
+        })
+
+    audit_events = (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.user_id == user_id,
+            AuditLog.created_at >= since,
+            AuditLog.action.in_((
+                _ACTIVITY_DOWNLOAD_ACTION,
+                _ACTIVITY_EDIT_ACTION,
+                _ACTIVITY_RETRY_ACTION,
+                _ACTIVITY_SEGMENTS_ACTION,
+                "job.variant_created",
+                "job.approve",
+                "job.reject",
+            )),
+        )
+        .order_by(AuditLog.created_at.desc())
+        .limit(200)
+        .all()
+    )
+    downloads = []
+    rework_events = []
+    for e in audit_events:
+        row = {
+            "action": e.action,
+            "detail": e.detail,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+        }
+        if e.action == _ACTIVITY_DOWNLOAD_ACTION:
+            downloads.append(row)
+        else:
+            rework_events.append(row)
+
+    return {
+        "user": user.to_dict(),
+        "since_days": since_days,
+        "jobs": job_rows,
+        "downloads": downloads,
+        "events": rework_events,
+        # sessions (null sin TELEMETRY_ENABLED) / logins / library_usage —
+        # consumidos por UserProfileView del panel Insights.
+        **user_detail_extras(db, user_id, since),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Background Asset Library
 # ---------------------------------------------------------------------------
 
 @router.get("/backgrounds")
 async def list_backgrounds(
-    admin: dict = Depends(require_admin),
+    owner_tenant_id: Optional[str] = Query(None),
+    admin: dict = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
-    """List all background assets."""
-    assets = db.query(BackgroundAsset).order_by(BackgroundAsset.created_at.desc()).all()
+    """List all background assets.
+
+    `owner_tenant_id` filters: pass a tenant string to see only that
+    tenant's exclusive assets, or "__global__" to see only global ones
+    (owner_tenant_id IS NULL). Omit to see everything.
+    """
+    q = db.query(BackgroundAsset)
+    if owner_tenant_id == "__global__":
+        q = q.filter(BackgroundAsset.owner_tenant_id.is_(None))
+    elif owner_tenant_id:
+        q = q.filter(BackgroundAsset.owner_tenant_id == owner_tenant_id)
+    assets = q.order_by(BackgroundAsset.created_at.desc()).all()
     return [a.to_dict() for a in assets]
+
+
+@router.get("/background-tenants")
+async def list_background_tenants(
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """List the tenants that have at least one user, plus the special
+    "global" entry. Used by the admin upload UI to populate the
+    "Assign to tenant" dropdown without us hardcoding the UMG name."""
+    tenants = [
+        t[0]
+        for t in db.query(User.tenant_id).distinct().order_by(User.tenant_id).all()
+        if t[0]
+    ]
+    return {"tenants": tenants}
 
 
 @router.post("/backgrounds")
@@ -581,7 +3085,8 @@ async def upload_background(
     file: UploadFile = File(...),
     name: str = Form(...),
     tags: str = Form(""),
-    admin: dict = Depends(require_admin),
+    owner_tenant_id: str = Form(""),
+    admin: dict = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
     """Upload a new pre-approved background asset.
@@ -597,6 +3102,12 @@ async def upload_background(
 
     Either way the read path in main.py supports both shapes — the
     `library/` prefix is the signal.
+
+    `owner_tenant_id` (optional form field): if provided, the asset is
+    locked to that tenant — only users of that tenant (and admins) will
+    see it in /backgrounds. Empty string means "global / visible to
+    everyone", which is the right default for fallback assets but the
+    wrong default for paying clients like UMG.
     """
     import storage
 
@@ -612,24 +3123,87 @@ async def upload_background(
     with open(local_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
+    # Validate bytes before the object becomes visible in the catalogue.
+    # The old endpoint trusted only the extension, which allowed the test
+    # fixtures (zero-filled ``.mp4`` files) and malformed uploads to become
+    # selectable production backgrounds.
+    from main import _validate_background_file_on_disk
+    _validate_background_file_on_disk(file.filename, local_path)
+    try:
+        probe = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "ffmpeg", "-nostdin", "-v", "error", "-xerror",
+                "-i", local_path,
+                "-map", "0:v:0",
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        try:
+            os.unlink(local_path)
+        except OSError:
+            pass
+        logger.error("Background validation infrastructure failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Background validation is temporarily unavailable.",
+        ) from exc
+    if probe.returncode != 0:
+        try:
+            os.unlink(local_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=400,
+            detail="File could not be decoded as supported background media.",
+        )
+
     stored_filename = unique_basename
-    if storage.is_enabled():
+    storage_enabled = storage.is_enabled()
+    if not storage_enabled and _requires_durable_background_storage():
+        try:
+            os.unlink(local_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=503,
+            detail="Background storage is not configured.",
+        )
+    if storage_enabled:
         r2_key = f"library/{unique_basename}"
         try:
-            storage.upload_file(local_path, r2_key)
+            uploaded_key = storage.upload_file(local_path, r2_key)
+            if uploaded_key != r2_key:
+                raise RuntimeError("R2 upload did not confirm the object key")
             stored_filename = r2_key  # the `library/` prefix is the signal
             os.unlink(local_path)
         except Exception as e:
             logger.error(f"Failed to upload library asset to R2: {e}")
-            # Keep the local copy as a fallback. Filename stays as the
-            # bare basename so the read path uses the disk branch.
+            # A local fallback is not durable across Railway replicas or
+            # deploys. Fail closed and never create a DB row pointing at one
+            # container's ephemeral filesystem.
+            try:
+                os.unlink(local_path)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=503,
+                detail="Background storage is temporarily unavailable.",
+            ) from e
 
+    tenant_scope = (owner_tenant_id or "").strip() or None
     asset = BackgroundAsset(
         name=name,
         filename=stored_filename,
         file_type=file_type,
         tags=tags.strip() if tags.strip() else None,
         uploaded_by=admin["id"],
+        owner_tenant_id=tenant_scope,
     )
     db.add(asset)
     db.commit()
@@ -638,7 +3212,12 @@ async def upload_background(
     db.add(AuditLog(
         user_id=admin["id"],
         action="admin.upload_background",
-        detail={"asset_id": asset.id, "name": name, "storage": "r2" if stored_filename.startswith("library/") else "local"},
+        detail={
+            "asset_id": asset.id,
+            "name": name,
+            "owner_tenant_id": tenant_scope,
+            "storage": "r2" if stored_filename.startswith("library/") else "local",
+        },
     ))
     db.commit()
 
@@ -648,7 +3227,7 @@ async def upload_background(
 @router.delete("/backgrounds/{asset_id}")
 async def delete_background(
     asset_id: int,
-    admin: dict = Depends(require_admin),
+    admin: dict = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
     """Delete a background asset (DB row + the underlying object)."""
@@ -659,12 +3238,21 @@ async def delete_background(
         raise HTTPException(status_code=404, detail="Asset not found")
 
     # Delete the underlying object — R2 if it lives there, local disk otherwise.
-    if asset.filename.startswith("library/") and storage.is_enabled():
+    if asset.filename.startswith("library/"):
+        if not storage.is_enabled():
+            raise HTTPException(
+                status_code=503,
+                detail="Background storage is not configured.",
+            )
         try:
             client = storage._get_client()
             client.delete_object(Bucket=storage.R2_BUCKET, Key=asset.filename)
         except Exception as e:
-            logger.warning(f"Failed to delete R2 object {asset.filename}: {e}")
+            logger.error(f"Failed to delete R2 object {asset.filename}: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail="Background storage is temporarily unavailable.",
+            ) from e
     else:
         file_path = os.path.join(BACKGROUNDS_DIR, asset.filename)
         if os.path.exists(file_path):
@@ -686,7 +3274,7 @@ async def delete_background(
 
 @router.post("/cleanup-inputs")
 async def cleanup_inputs(
-    retention_days: int = Query(30, ge=1, le=365),
+    retention_days: int = Query(365, ge=1, le=3650),
     apply: bool = Query(False),
     admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
@@ -695,10 +3283,52 @@ async def cleanup_inputs(
     window. Inputs live under the `inputs/` prefix; deliverables and
     caches are not touched.
 
-    Default is dry-run (apply=false) so the admin sees what would be
-    deleted before doing it. Pass apply=true to actually delete.
+    HARDENED 2026-05-27 after the agus.cafisi incident (26 input audios
+    lost to this exact endpoint between 5/11 and 5/18, no audit trail at
+    the time). Three changes:
+      1. `apply=true` requires the env var ALLOW_INPUT_CLEANUP=true.
+         Default state is "the endpoint is disabled in delete mode" —
+         accidental clicks now return 503 instead of nuking audios.
+         If you ever need it, set the var in Railway dashboard, run
+         the endpoint, then UNSET the var to relock.
+      2. Default retention bumped 30 → 365 d. Storing 50 MB audios on
+         R2 costs ~$0.0075/audio/year — keeping them indefinitely is
+         orders of magnitude cheaper than recovering ONE lost UMG
+         project. Max raised to 10 years for flexibility.
+      3. Sentry capture_message fires on apply=true so the operator
+         sees the action in observability even if they ignore the
+         audit log.
+
+    Default is still dry-run (apply=false) — gives the admin a preview
+    of what WOULD be deleted before flipping the lock.
     """
+    import os
     import storage
+
+    if apply:
+        if os.environ.get("ALLOW_INPUT_CLEANUP", "").strip().lower() != "true":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Input cleanup is disabled by default. To enable: set "
+                    "env var ALLOW_INPUT_CLEANUP=true in Railway dashboard, "
+                    "deploy, run this endpoint, then UNSET the var immediately "
+                    "to relock. See the 2026-05-27 agus.cafisi incident."
+                ),
+            )
+        # Sentry breadcrumb for delete-mode invocations. Even with the
+        # env-var guard, we want this action to scream in observability
+        # so a future repeat of the incident is visible within seconds.
+        try:
+            import sentry_sdk
+            sentry_sdk.capture_message(
+                f"[ADMIN-CLEANUP-INPUTS] user_id={admin['id']} "
+                f"retention_days={retention_days} prefix=inputs/",
+                level="warning",
+            )
+        except Exception:
+            pass
+
     report = storage.cleanup_old_inputs(
         retention_days=retention_days,
         apply=apply,
@@ -716,3 +3346,144 @@ async def cleanup_inputs(
     ))
     db.commit()
     return report
+
+
+# ---------------------------------------------------------------------------
+# Métricas de decisión — Fases 1+2 del panel world-class (2026-06-11).
+# Lógica en admin_metrics.py; acá solo routing + gates.
+# ---------------------------------------------------------------------------
+
+@router.get("/metrics/timeseries")
+async def admin_metrics_timeseries(
+    days: int = Query(28, ge=7, le=90),
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Series por día/tenant (creados, aprobados, retrabajos, costo IA).
+    El frontend deriva los deltas WoW de las dos ventanas de 7 días."""
+    from admin_metrics import metrics_timeseries
+    return metrics_timeseries(db, days=days)
+
+
+@router.get("/metrics/funnel")
+async def admin_metrics_funnel(
+    days: int = Query(7, ge=1, le=28),
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Funnel operativo con conversión y p50/p95 por etapa."""
+    from admin_metrics import metrics_funnel
+    return metrics_funnel(db, days=days)
+
+
+@router.get("/metrics/economics")
+async def admin_metrics_economics(
+    days: int = Query(28, ge=7, le=90),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Margen por tenant (revenue del plan vs costo IA real). Información
+    de negocio sensible → gate super-admin (SUPER_ADMIN_USERS)."""
+    from admin_metrics import metrics_economics
+    return metrics_economics(db, days=days)
+
+
+@router.get("/metrics/health")
+async def admin_metrics_health(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Health score 0-100 por tenant con componentes (uso WoW, first-pass,
+    retrabajo, errores). Los umbrales de alerta viven en admin_metrics."""
+    from admin_metrics import metrics_health
+    return metrics_health(db)
+
+
+# ---------------------------------------------------------------------------
+# Insights de comportamiento — panel CEO (2026-06-10). Lógica en
+# admin_insights.py; acá solo routing + gates. TODO super-admin: es
+# observabilidad de usuarios, no del tenant.
+# ---------------------------------------------------------------------------
+
+@router.get("/insights/adoption")
+async def admin_insights_adoption(
+    days: int = Query(30, ge=1, le=365),
+    tenant_id: Optional[str] = Query(None),
+    user_id: Optional[int] = Query(None),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Qué features usa la gente (agregación de Job.render_params): animaciones,
+    transiciones, efectos, tipografías, estilos, fuente del fondo. Un solo
+    endpoint para los 3 niveles vía tenant_id/user_id."""
+    from admin_insights import insights_adoption
+    return insights_adoption(db, days=days, tenant_id=tenant_id, user_id=user_id)
+
+
+@router.get("/insights/overview")
+async def admin_insights_overview(
+    days: int = Query(30, ge=1, le=365),
+    tenant_id: Optional[str] = Query(None),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """KPIs de uso/calidad/costo + ranking de tenants y usuarios para el
+    drill-down del panel Insights."""
+    from admin_insights import insights_overview
+    return insights_overview(db, days=days, tenant_id=tenant_id)
+
+
+@router.get("/insights/wizard")
+async def admin_insights_wizard(
+    days: int = Query(30, ge=1, le=365),
+    tenant_id: Optional[str] = Query(None),
+    user_id: Optional[int] = Query(None),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Funnel del wizard desde ui_events (pasos alcanzados, abandono,
+    conversión a generate). {empty: true} hasta que la telemetría acumule."""
+    from admin_insights import insights_wizard
+    return insights_wizard(db, days=days, tenant_id=tenant_id, user_id=user_id)
+
+
+@router.get("/insights/feature/{feature}")
+async def admin_insights_feature_detail(
+    feature: str,
+    value: str = Query(..., max_length=120),
+    days: int = Query(30, ge=1, le=365),
+    tenant_id: Optional[str] = Query(None),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Drill de una barra de adopción: qué usuarios y videos usan ese
+    valor de la feature (whitelist en admin_insights)."""
+    from admin_insights import insights_feature_detail
+    return insights_feature_detail(db, feature, value, days=days, tenant_id=tenant_id)
+
+
+@router.get("/insights/job/{job_id}")
+async def admin_insights_job_detail(
+    job_id: str,
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Ficha completa de un video: parámetros, llamadas IA con costo,
+    eventos y error."""
+    from admin_insights import insights_job_detail
+    detail = insights_job_detail(db, job_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return detail
+
+
+@router.get("/insights/user/{user_id}/events")
+async def admin_insights_user_events(
+    user_id: int,
+    days: int = Query(30, ge=1, le=365),
+    admin: dict = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """Sesiones de wizard del usuario, reconstruidas desde ui_events."""
+    from admin_insights import insights_user_events
+    return insights_user_events(db, user_id, days=days)

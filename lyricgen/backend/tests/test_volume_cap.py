@@ -10,7 +10,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi import HTTPException
 
-from main import _enforce_daily_volume_cap, DEFAULT_DAILY_CAP
+from main import (
+    DEFAULT_DAILY_CAP,
+    _enforce_daily_volume_cap,
+    _enforce_tenant_backlog,
+)
 
 
 def _seed_jobs(db, *, tenant_id: str, count: int, hours_ago: float = 0):
@@ -37,9 +41,25 @@ def _seed_jobs(db, *, tenant_id: str, count: int, hours_ago: float = 0):
     db.flush()
 
 
-def test_cap_default_is_50():
-    """Sanity check on the system default — premise #5 of the design doc."""
-    assert DEFAULT_DAILY_CAP == 50
+def test_cap_default_value():
+    """Sanity check on the system default — 2026-05-24 bumped 50 → 500 con
+    env override DAILY_VOLUME_CAP. El default histórico (50/day) se saturaba
+    en smoke tests del operador. 500 sigue siendo un techo razonable: 100
+    videos × ~$1.5 Veo = $150/día max."""
+    assert DEFAULT_DAILY_CAP >= 50  # nunca por debajo del piso histórico
+    # En el branch principal sin env override, default es 500.
+    import os
+    if not os.environ.get("DAILY_VOLUME_CAP"):
+        assert DEFAULT_DAILY_CAP == 500
+
+
+def test_unlimited_plan_bypasses_cap(db):
+    """Plan='unlimited' no tiene cap diario por definición. Seedeamos MUCHOS
+    jobs (10× el default) y verificamos que el guard no levanta 429."""
+    _seed_jobs(db, tenant_id="cap-unlimited", count=DEFAULT_DAILY_CAP * 10)
+    user = {"id": 999, "tenant_id": "cap-unlimited", "plan": "unlimited"}
+    # Should NOT raise — unlimited bypassea
+    _enforce_daily_volume_cap(db, user)
 
 
 def test_under_cap_does_not_raise(db):
@@ -134,3 +154,85 @@ def test_user_specific_cap_used_when_set(db):
     with pytest.raises(HTTPException) as exc:
         _enforce_daily_volume_cap(db, user_dict)
     assert exc.value.status_code == 429
+
+
+def test_campaign_scope_raises_daily_cap_without_changing_global_default(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_SCOPES", "universal_music")
+    monkeypatch.setenv("BATCH_DAILY_VOLUME_CAP", "1000")
+    _seed_jobs(db, tenant_id="campaign-daily", count=DEFAULT_DAILY_CAP)
+    user = {
+        "id": 999,
+        "tenant_id": "campaign-daily",
+        "billing_group": "universal_music",
+    }
+    _enforce_daily_volume_cap(db, user)
+
+
+def test_campaign_scope_gets_bounded_backlog_window(db, monkeypatch):
+    from database import Job
+
+    monkeypatch.setenv("BATCH_CAMPAIGN_SCOPES", "campaign-backlog")
+    monkeypatch.setenv("BATCH_USER_BACKLOG_LIMIT", "30")
+    monkeypatch.setenv("BATCH_TENANT_BACKLOG_LIMIT", "30")
+    user = {"id": 1, "tenant_id": "campaign-backlog", "role": "user"}
+    for index in range(10):
+        db.add(Job(
+            job_id=f"camp{index:08d}"[:12],
+            user_id=1,
+            tenant_id="campaign-backlog",
+            artist="Test",
+            filename=f"{index}.wav",
+            status="pending_review",
+        ))
+    # El mismo ID histórico puede tener jobs de otro tenant (por migración o
+    # fixtures compartidas). No deben consumir la ventana de esta campaña.
+    for index in range(30):
+        db.add(Job(
+            job_id=f"other{index:06d}"[:12],
+            user_id=1,
+            tenant_id="another-tenant",
+            artist="Test",
+            filename=f"other-{index}.wav",
+            status="pending_review",
+        ))
+    db.flush()
+    _enforce_tenant_backlog(db, user)
+
+
+def test_non_campaign_scope_keeps_regular_backlog_limit(db, monkeypatch):
+    from database import Job
+    from main import USER_BACKLOG_LIMIT
+
+    monkeypatch.setenv("BATCH_CAMPAIGN_SCOPES", "somebody-else")
+    user = {"id": 1, "tenant_id": "regular-backlog", "role": "user"}
+    for index in range(USER_BACKLOG_LIMIT):
+        db.add(Job(
+            job_id=f"regu{index:08d}"[:12],
+            user_id=1,
+            tenant_id="regular-backlog",
+            artist="Test",
+            filename=f"{index}.wav",
+            status="pending_review",
+        ))
+    db.flush()
+    with pytest.raises(HTTPException) as exc:
+        _enforce_tenant_backlog(db, user)
+    assert exc.value.status_code == 429
+
+
+def test_batch_capacity_endpoint_exposes_effective_campaign_window(
+    client, user_token, monkeypatch,
+):
+    from tests.conftest import auth
+
+    me = client.get("/auth/me", headers=auth(user_token)).json()
+    monkeypatch.setenv("BATCH_CAMPAIGN_SCOPES", me["tenant_id"])
+    monkeypatch.setenv("BATCH_USER_BACKLOG_LIMIT", "30")
+    monkeypatch.setenv("BATCH_TENANT_BACKLOG_LIMIT", "40")
+    response = client.get("/batch/capacity", headers=auth(user_token))
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["campaign_enabled"] is True
+    assert payload["user_backlog"]["limit"] == 30
+    assert payload["tenant_backlog"]["limit"] == 40
+    assert payload["daily"]["limit"] == 1200

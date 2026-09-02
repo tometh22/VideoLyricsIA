@@ -1,12 +1,85 @@
 """Job management — PostgreSQL backed."""
 
+import logging
 import uuid
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from sqlalchemy import or_
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+import storage
 from database import Job, get_db
+from job_states import (
+    FAILURE_TERMINAL_STATUSES,
+    SUCCESS_TERMINAL_STATUSES,
+    TERMINAL_STATUSES,
+    can_background_transition,
+)
+
+_logger = logging.getLogger("genly.jobs")
+
+_CURRENT_JOB_ATTEMPT: ContextVar[tuple[str, str] | None] = ContextVar(
+    "genly_current_job_attempt", default=None,
+)
+
+
+@contextmanager
+def bind_job_attempt(kind: str, attempt_id: str):
+    """Fence all update_job writes performed by one outbox consumer."""
+    if kind not in {"pipeline", "transcription"}:
+        raise ValueError(f"unsupported job attempt kind {kind!r}")
+    token = _CURRENT_JOB_ATTEMPT.set((kind, str(attempt_id)))
+    try:
+        yield
+    finally:
+        _CURRENT_JOB_ATTEMPT.reset(token)
+
+
+def _report_shared_input_delete_attempt(job: Job, caller: str) -> None:
+    """Record a guarded input-delete attempt without alerting on normal deletes."""
+    _logger.warning(
+        "[R2-DELETE-INPUT] skipped shared key=%r job=%s caller=%s",
+        job.input_r2_key, job.job_id, caller,
+        extra={
+            "event": "r2_input_delete_skipped_shared",
+            "key": job.input_r2_key,
+            "job_id": job.job_id,
+            "caller": caller,
+        },
+    )
+    try:
+        import sentry_sdk
+        with sentry_sdk.push_scope() as scope:
+            scope.fingerprint = ["r2-delete-input-shared", caller]
+            scope.set_tag("event", "r2.input_delete_shared")
+            scope.set_tag("r2.caller", caller)
+            scope.set_extra("r2.key", job.input_r2_key)
+            scope.set_extra("job_id", job.job_id)
+            sentry_sdk.capture_message(
+                f"[R2-DELETE-INPUT] skipped: shared reference via {caller}",
+                level="warning",
+            )
+    except Exception:
+        # A guard/alert failure must never block deletion of the DB row.
+        pass
+
+# Postgres on Railway occasionally drops idle connections in ways that
+# pool_pre_ping + TCP keepalives don't fully prevent — the drop happens
+# AFTER the pre-ping and BEFORE the actual query, a narrow race we can
+# only catch by retrying. Markers cover the SQLAlchemy/psycopg2 strings
+# we've actually observed in production logs on /upload-part-proxy. Kept
+# in sync with main.py:_TRANSIENT_DB_MARKERS — both lists are short, so
+# the duplication is cheaper than a new shared module.
+_TRANSIENT_DB_MARKERS = (
+    "SSL connection has been closed",
+    "server closed the connection",
+    "connection already closed",
+    "could not connect to server",
+)
 
 
 def create_job(
@@ -21,6 +94,10 @@ def create_job(
     initial_status: str = "processing",
     song_title: str = "",
     input_r2_key: Optional[str] = None,
+    workload_class: str = "interactive",
+    campaign_id: Optional[str] = None,
+    campaign_item_id: Optional[str] = None,
+    commit: bool = True,
 ) -> str:
     """Create a new job and return its ID.
 
@@ -30,12 +107,20 @@ def create_job(
       - "transcribed_pending": user has called /transcribe; the audio is
         persisted but the user is still editing lyrics. /generate will
         flip the row to processing/queued once the segments come in.
+      - "transcribing": synchronous legacy /transcribe is still producing
+        and atomically freezing its mandatory pre-human evidence. The job is
+        deliberately not editor-ready in this state.
       - "awaiting_upload": browser is still PUTting bytes directly to
         R2 via a presigned URL. /transcribe-uploaded promotes to
         transcribed_pending once the upload completes.
+      - "bg_preview_queued": background-preview "ghost" job (Capa C feature
+        2026-05-24) — no audio, no transcription, just a tracking row so
+        the wizard can poll the pre-render status of the Veo background.
+        The worker promotes to "bg_preview_done" / "bg_preview_failed".
     """
     valid_states = (
-        "processing", "queued", "transcribed_pending", "awaiting_upload",
+        "processing", "queued", "transcribing", "transcribed_pending",
+        "awaiting_upload", "bg_preview_queued",
     )
     if initial_status not in valid_states:
         raise ValueError(f"unsupported initial_status {initial_status!r}")
@@ -54,30 +139,61 @@ def create_job(
         current_step=(
             "whisper" if initial_status == "processing"
             else "queued" if initial_status == "queued"
+            else "transcribing" if initial_status == "transcribing"
             else "uploading" if initial_status == "awaiting_upload"
             else "editing"
         ),
         progress=0,
         input_r2_key=input_r2_key,
+        workload_class=("batch" if workload_class == "batch" else "interactive"),
+        campaign_id=campaign_id,
+        campaign_item_id=campaign_item_id,
     )
     db.add(job)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return job_id
 
 
 def get_job(
     db: Session,
     job_id: str,
+    *,
     tenant_id: str = None,
     user_id: int = None,
 ) -> Optional[dict]:
     """Return a job dict or None if not found.
 
-    Pass user_id (in addition to tenant_id) for self-serve callers — it
-    closes the IDOR where many self-registered users land in
-    tenant_id="default" (e.g. the admin tenant) and could otherwise see
-    each other's jobs by enumerating job_ids.
+    TENANT-ISOLATION CONTRACT (UMG-launch hardening 2026-06-01):
+
+    - `tenant_id` MUST be passed by every user-facing endpoint — it is
+      the isolation boundary between customers. The standard pattern is
+      `get_job(db, job_id, **_job_scope(current_user))` (main.py), which
+      always supplies it. Omitting it returns the job regardless of
+      which tenant owns it.
+    - `user_id` SHOULD additionally be passed for self-serve callers — it
+      closes the IDOR where many self-registered users land in
+      tenant_id="default" (e.g. the admin tenant) and could otherwise see
+      each other's jobs by enumerating job_ids.
+    - Internal/worker code that legitimately needs an unscoped row read
+      should use `get_job_model()` instead, so an unscoped get_job() call
+      always means "someone forgot the tenant filter" — we log it loudly
+      below.
+
+    Both filters are keyword-only so a future positional call can't
+    silently pass tenant_id into the wrong slot.
     """
+    if tenant_id is None and user_id is None:
+        # Not an exception — admin paths may make legitimate global
+        # lookups — but loud enough that an unscoped call added to a
+        # user-facing endpoint shows up in logs/review immediately.
+        _logger.warning(
+            "get_job(%s) called without tenant/user scope — global lookup "
+            "(use get_job_model() for intentional internal reads)",
+            job_id,
+        )
     query = db.query(Job).filter(Job.job_id == job_id)
     if tenant_id:
         query = query.filter(Job.tenant_id == tenant_id)
@@ -92,10 +208,462 @@ def get_job_model(db: Session, job_id: str) -> Optional[Job]:
     return db.query(Job).filter(Job.job_id == job_id).first()
 
 
-_DELETABLE_STATUSES = {"processing", "queued", "error", "validation_failed"}
+def get_job_model_resilient(
+    db: Session, job_id: str, max_attempts: int = 3
+) -> Optional[Job]:
+    """Same as get_job_model but retries once on transient Postgres SSL drops.
+
+    The global DbTransientRetryMiddleware (main.py) can't recover the
+    upload-proxy endpoints because each multipart part body is 8 MB and
+    the middleware refuses to buffer anything over 1 MiB for replay.
+    The result is a 500 → frontend retry from byte 0 → user sees the
+    progress bar fall to ~0% (concurrency=4, all four in-flight parts
+    can fail together on one connection drop).
+
+    We do the retry inline, BEFORE reading the body, so no replay is
+    needed. On a transient OperationalError we rollback (which marks
+    the connection invalid; SQLAlchemy will check out a fresh one) and
+    retry the query. Non-transient errors propagate unchanged.
+
+    Observed in prod 2026-05-14:
+        sqlalchemy.exc.OperationalError: (psycopg2.OperationalError)
+        SSL connection has been closed unexpectedly
+    on POST /upload-part-proxy, 5 times across recent uploads.
+    """
+    last_err: Optional[OperationalError] = None
+    for attempt in range(max_attempts):
+        try:
+            return get_job_model(db, job_id)
+        except OperationalError as e:
+            if not any(m in str(e) for m in _TRANSIENT_DB_MARKERS):
+                raise
+            last_err = e
+            try:
+                db.rollback()
+            except OperationalError:
+                # Rollback against an already-dead connection can throw
+                # the same error. SQLAlchemy still invalidates the conn
+                # so the next checkout is fresh — swallow this one.
+                pass
+    # Exhausted retries — propagate the last transient error so the
+    # caller (and global middleware) sees the real cause.
+    assert last_err is not None
+    raise last_err
 
 
-def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
+def touch_user_activity(db: Session, job: Job) -> None:
+    """Bump last_user_activity_at = now(). Caller commits.
+
+    Used as the staleness anchor for find_abandoned_transcribed: any
+    authenticated user touch on the job (POST /save-segments, GET /status,
+    etc) refreshes the timestamp, so the reaper only barre genuinely
+    abandoned sessions instead of slow batch-edit sessions.
+    """
+    from datetime import datetime, timezone
+    job.last_user_activity_at = datetime.now(timezone.utc)
+    # A draft may have been soft-superseded by a duplicate wizard request
+    # whose response won the network race.  The explicit ID the browser is
+    # still using is authoritative: revive it instead of leaving a perfectly
+    # valid editor/generate flow hidden from history.  Hard deletion used to
+    # make this race unrecoverable (the browser kept the losing ID and later
+    # /generate returned job_not_found).
+    job.archived_at = None
+
+
+def set_timing_source(job_id: str, source: str) -> None:
+    """Record which engine produced a job's lyric timing (forced_align /
+    lrclib_synced / gemini_aligner / whisper) for observability. Best-effort
+    with its own short-lived session so it never holds the request
+    connection or breaks the transcription path on failure.
+
+    SECURITY/CORRECTNESS (audit 2026-05-24):
+    - **Job-missing guard**: log a WARNING if no row matches `job_id` so
+      a typo or DB inconsistency doesn't silently produce a no-op. Bug D
+      (Cosas Mías auto-recovery) showed that a missing log + missing
+      write makes orphan `timing_source=NULL` rows indistinguishable
+      from a happy job.
+    - **Terminal guard**: do NOT overwrite when the job is already in a
+      terminal state (`error`, `done`, etc.). A race with the reaper /
+      worker can leave a job tagged successful in a row that the reaper
+      already marked failed — confusing telemetry forever.
+    """
+    _logger = logging.getLogger("genly")
+    try:
+        from database import SessionLocal
+        s = SessionLocal()
+        try:
+            j = s.query(Job).filter(Job.job_id == job_id).first()
+            if j is None:
+                _logger.warning(
+                    "[TIMING] set_timing_source(%s, %s): no job row — possible orphan",
+                    job_id, source,
+                )
+                return
+            # Terminal-state guard. Status values declared terminal at this
+            # layer; mirror `update_job`'s terminal set so a reaper-killed
+            # job stays consistent.
+            if getattr(j, "status", None) in ("error", "transcription_failed"):
+                _logger.warning(
+                    "[TIMING] set_timing_source(%s, %s) skipped — job is in terminal state %r",
+                    job_id, source, j.status,
+                )
+                return
+            j.timing_source = source
+            s.commit()
+        finally:
+            s.close()
+    except Exception as e:
+        # Surface set-timing failures as warning, not debug — bug D
+        # taught us that silent debug is the same as no log at all.
+        _logger.warning("[TIMING] set_timing_source failed for %s: %s", job_id, e)
+
+
+# Estados terminales que cuentan como "intento fallido" para el archivado.
+# `done` y `pending_review` quedan AFUERA siempre: son entregables o trabajo
+# en revisión — jamás se archivan automáticamente.
+_ARCHIVABLE_FAILED_STATUSES = (
+    "error", "rejected", "validation_failed", "transcription_failed",
+)
+
+
+def archive_failed_attempts(db: Session, *, keep_job) -> int:
+    """Marca archived_at en los intentos FALLIDOS previos del mismo audio.
+
+    Fase 1 (2026-06-10): identidad = user_id + tenant_id + filename exacto.
+    (Fase 2 prevista: identidad por hash de contenido del audio, calculado
+    por el worker — cubre renombres tipo "Catupecu" vs "Catupecu Machu".)
+
+    Se invoca cuando `keep_job` llega a `done` (aprobación del operador):
+    los reintentos fallidos que llevaron a ese éxito dejan de ensuciar la
+    historia. A diferencia de supersede_sibling_drafts, acá NO se borra
+    nada — audit trail UMG intacto, el cliente los ve con el toggle
+    "mostrar archivados".
+
+    Reglas:
+      - Solo estados de _ARCHIVABLE_FAILED_STATUSES.
+      - Solo intentos ANTERIORES (created_at < keep_job.created_at): un
+        fallo posterior al éxito es información nueva, no ruido.
+      - Idempotente: archived_at IS NULL filtra los ya archivados.
+
+    Returns: cantidad de filas archivadas. El caller commitea (misma tx
+    que la aprobación, así un rollback no deja estados a medias).
+    """
+    if not keep_job or not keep_job.filename:
+        return 0
+    now = datetime.now(timezone.utc)
+    siblings = (
+        db.query(Job)
+        .filter(Job.user_id == keep_job.user_id,
+                Job.tenant_id == keep_job.tenant_id)
+        .filter(Job.job_id != keep_job.job_id)
+        .filter(Job.filename == keep_job.filename)
+        .filter(Job.status.in_(_ARCHIVABLE_FAILED_STATUSES))
+        .filter(Job.archived_at.is_(None))
+        .filter(Job.created_at < keep_job.created_at)
+        .all()
+    )
+    for sib in siblings:
+        sib.archived_at = now
+    if siblings:
+        logging.getLogger("genly").info(
+            "[ARCHIVE] %s intento(s) fallido(s) archivados bajo %s (%r)",
+            len(siblings), keep_job.job_id, keep_job.filename,
+        )
+    return len(siblings)
+
+
+def supersede_sibling_drafts(
+    db: Session, *, keep_job_id: str, user_id: int, tenant_id: str,
+    filename: str, window_min: int = 20, active_within_min: int = 20,
+) -> int:
+    """Soft-archive sibling DRAFT jobs for the same upload attempt.
+
+    Never hard-delete a wizard draft here.  Back-to-back upload requests can
+    complete out of order, so the browser may legitimately continue with the
+    ID that this helper considers the older sibling.  Keeping the row makes
+    that response race harmless: a later authenticated touch revives the ID.
+
+    Select sibling DRAFT jobs (transcribed_pending / awaiting_upload) for
+    the same user + same filename created within `window_min`, excluding
+    `keep_job_id`.
+
+    Why: the wizard's generate flow can re-upload the audio (new job row)
+    instead of reusing the transcribe job, leaving an orphan
+    transcribed_pending row that shows up as a phantom "2nd job". This
+    hides that orphan at generate time. Time-windowed (default 20 min) so
+    it never touches an INTENTIONAL re-upload of the same song hours later.
+    Returns the number of rows archived. Caller need not commit (we do).
+
+    Guard (incidents 2026-06-26 and 2026-08-18): recent activity still avoids
+    hiding the active row.  Stale/untouched siblings are only archived, never
+    deleted; this preserves Job.segments_json, EditorDocument, immutable
+    EditorVersion history and the R2 key even when the browser response order
+    differs from request order.
+    """
+    if not filename:
+        return 0
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=window_min)
+    active_cutoff = now - timedelta(minutes=active_within_min)
+    siblings = (
+        db.query(Job)
+        .filter(Job.user_id == user_id, Job.tenant_id == tenant_id)
+        .filter(Job.job_id != keep_job_id)
+        .filter(Job.filename == filename)
+        .filter(Job.status.in_(("transcribed_pending", "awaiting_upload")))
+        .filter(Job.archived_at.is_(None))
+        .filter(Job.created_at >= cutoff)
+        .filter(or_(
+            Job.last_user_activity_at.is_(None),
+            Job.last_user_activity_at < active_cutoff,
+        ))
+        .all()
+    )
+    n = 0
+    for sib in siblings:
+        sib.archived_at = now
+        n += 1
+    if n:
+        db.commit()
+        logging.getLogger("genly").info(
+            "[DEDUP] soft-archived %s sibling draft(s) of %s for %r",
+            n, keep_job_id, filename,
+        )
+    return n
+
+
+def input_audio_is_shared(db: Session, job: Job) -> bool:
+    """Return True iff at least one OTHER job in the DB references
+    `job.input_r2_key`. Used as a guard before deleting an input audio
+    file in R2 — variants and edit-side jobs may share the parent's
+    audio key (the upload is done once, then forked).
+    Conservative on DB error: returns True (treat as shared, skip delete).
+    Losing audio is worse than leaving an orphan in R2 — the
+    `cleanup_old_inputs` script (30 d retention) is the long-stop.
+
+    Exposed at module level so the reaper paths (reaper.py) can reuse
+    the exact same guard as `_delete_r2_objects` below, instead of
+    duplicating the sibling-count logic and drifting.
+    """
+    if not job.input_r2_key:
+        return False
+    try:
+        others = (
+            db.query(Job)
+            .filter(Job.input_r2_key == job.input_r2_key)
+            .filter(Job.job_id != job.job_id)
+            .count()
+        )
+        return others > 0
+    except Exception as exc:
+        _logger.warning(
+            "Could not count siblings for %s; treating as shared (skip delete): %s",
+            job.job_id, exc,
+        )
+        return True
+
+
+def _delete_r2_objects(db: Session, job: Job) -> None:
+    """Best-effort delete R2 objects tied to a job.
+
+    Output keys (s3_keys: video, short, thumbnail, umg_master, umg_short)
+    are per-job and always safe to delete with the row.
+
+    input_r2_key is SHARED across the parent job and every variant/edit
+    spawned from it (see main.py:create_variant — variants copy the
+    parent's input_r2_key to skip re-upload). Deleting it when a sibling
+    still references the same audio breaks every "Reintentar sin
+    re-subir" the operator might click on those other jobs, with the
+    cryptic "Could not download source audio from R2" message. The
+    2026-05-19 agus.cafisi incident on staging — operator deleted one
+    failed variant of "Una Vez Más", and the next retry of a sibling
+    variant 404'd on R2.
+
+    The fix: count how many OTHER live jobs share the same
+    input_r2_key, and skip the R2 delete if any do. The audio gets
+    garbage-collected when the last referencing job is deleted. The
+    `cleanup_old_inputs` script (retention 30 d) is the long-stop for
+    keys whose last-reference deletion was somehow missed.
+
+    Called before the DB row is removed so the reference check counts
+    the row we're about to delete as the one self-excluded by job_id.
+    Errors are swallowed — R2 cleanup must never block the DB delete.
+    """
+    keys: list[str] = []
+    if job.input_r2_key:
+        if not input_audio_is_shared(db, job):
+            keys.append(job.input_r2_key)
+        else:
+            _report_shared_input_delete_attempt(job, "jobs._delete_r2_objects")
+    s3 = job.s3_keys or {}
+    if isinstance(s3, dict):
+        keys.extend(v for v in s3.values() if isinstance(v, str) and v)
+    for key in keys:
+        try:
+            storage.delete_object(key)
+        except Exception as exc:
+            _logger.warning("R2 delete failed key=%r: %s", key, exc)
+
+
+# Estados que el operador puede borrar desde la UI. La idea: cualquier
+# estado "en progreso o atascado" es deletable; solo protegemos done /
+# pending_review por audit trail + workflow.
+#
+# Caso real que motivó incluir "editing" y "transcribed_pending": un job
+# que entra a edit_pipeline y el worker muere (timeout, OOM, deploy) se
+# queda colgado en status="editing" para siempre porque no hay heartbeat
+# de auto-fail. Sin esto, el operador no puede limpiar la fila y termina
+# pidiendo al admin que actualice la DB a mano.
+_DELETABLE_STATUSES = {
+    "processing", "queued", "error", "validation_failed",
+    "editing",              # edit pipeline corriendo o colgada
+    "transcribed_pending",  # tras pérdida de wizard state
+}
+
+
+def _archive_veo_budget_spend(db: Session, job_rows: list[Job]) -> None:
+    """Preserve paid Veo usage before deleting its owning job/provenance.
+
+    The inserts share the deletion transaction. If archival cannot be made
+    durable, the job is not deleted: silently resetting a paid ceiling is a
+    worse failure mode than asking the operator to retry cleanup.
+    """
+    from cost_attribution import song_key
+    from database import AIProvenance, VeoBudgetLedger
+    from provenance import billable_filter
+    from sqlalchemy import text as sql_text
+    from veo_budget import advisory_lock_key, scope_hash, submission_lock_key
+
+    if not job_rows:
+        return
+    jobs_by_id = {job.job_id: job for job in job_rows}
+    scopes_by_job = {
+        job.job_id: scope_hash(
+            job.tenant_id,
+            song_key(job.artist, job.song_title, job.job_id),
+        )
+        for job in job_rows
+    }
+    # Keep the two-statement live+ledger read in _veo_budget_exceeded from
+    # straddling this transaction's move and briefly counting every call
+    # twice. Sorted acquisition also prevents two overlapping bulk deletions
+    # from deadlocking when they touch the same scopes in a different order.
+    bind = getattr(db, "bind", None)
+    dialect = getattr(getattr(bind, "dialect", None), "name", "")
+    if dialect == "postgresql":
+        lock_keys = {
+            advisory_lock_key(digest)
+            for digest in scopes_by_job.values()
+        }
+        # A worker takes the same per-job lock for the final existence check
+        # and keeps it until Vertex answers the submission request. If delete
+        # wins while auth is running, the worker observes the committed delete
+        # and aborts; if submission already started, deletion waits until its
+        # billable reservation is safe to archive.
+        lock_keys.update(
+            submission_lock_key(job.tenant_id, job.job_id)
+            for job in job_rows
+        )
+        for lock_key in sorted(lock_keys):
+            db.execute(
+                sql_text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": lock_key},
+            )
+    paid_rows = (
+        db.query(AIProvenance)
+        .filter(AIProvenance.job_id.in_(list(jobs_by_id)))
+        .filter(AIProvenance.tool_name.like("veo%"))
+        .filter(billable_filter())
+        .all()
+    )
+    for row in paid_rows:
+        db.add(VeoBudgetLedger(
+            scope_hash=scopes_by_job[row.job_id],
+            source_provenance_id=row.id,
+            provider_call_at=row.created_at or datetime.now(timezone.utc),
+        ))
+
+
+def _archive_deleted_job_lyrics(
+    db: Session, job_rows: list[Job], deleted_by_user_id: Optional[int] = None,
+) -> None:
+    """Copy any human-edited lyrics for jobs about to be hard-deleted into
+    `deleted_job_lyrics_archive`, before the ON DELETE CASCADE on
+    editor_documents/editor_versions removes them along with the Job row.
+
+    Incident (audited 2026-08-24): 137 jobs carrying real operator lyric
+    corrections were hard-deleted via this cleanup flow with no recoverable
+    trace of which song they belonged to — editor_documents/editor_versions
+    cascade with the Job, and by the time anyone notices, the Job row's
+    artist/song_title are gone too. This copies exactly that missing
+    context BEFORE the delete, into a table with no FK back to jobs.job_id,
+    so it survives the delete it was taken ahead of.
+
+    Best-effort and additive only: writes in the same transaction as the
+    delete (so a rollback of the delete rolls this back too) but never
+    raises to block it, and only inserts a row when there's actually
+    something to recover — a non-empty `editor_documents.current_segments`
+    (preferred: the operator's latest working copy), or failing that the
+    most recent `editor_versions` checkpoint. Jobs nobody ever touched in
+    the editor produce no row here; this is a safety net for lost human
+    work, not a full audit log of every deletion.
+    """
+    from database import DeletedJobLyricsArchive, EditorDocument, EditorVersion
+
+    if not job_rows:
+        return
+    job_ids = [j.job_id for j in job_rows]
+
+    docs_by_job = {
+        d.job_id: d
+        for d in (
+            db.query(EditorDocument)
+            .filter(EditorDocument.job_id.in_(job_ids))
+            .order_by(EditorDocument.job_id)
+            .all()
+        )
+    }
+    latest_version_by_job: dict = {}
+    for v in (
+        db.query(EditorVersion)
+        .filter(EditorVersion.job_id.in_(job_ids))
+        .order_by(EditorVersion.job_id, EditorVersion.created_at.desc())
+        .all()
+    ):
+        # First hit per job_id wins — rows arrive ordered by created_at DESC.
+        latest_version_by_job.setdefault(v.job_id, v)
+
+    now = datetime.now(timezone.utc)
+    for job in job_rows:
+        doc = docs_by_job.get(job.job_id)
+        segments = None
+        source = None
+        if doc is not None and doc.current_segments:
+            segments = doc.current_segments
+            source = "editor_documents"
+        else:
+            version = latest_version_by_job.get(job.job_id)
+            if version is not None and version.segments:
+                segments = version.segments
+                source = "editor_versions"
+        if segments is None:
+            continue
+        db.add(DeletedJobLyricsArchive(
+            job_id=job.job_id,
+            tenant_id=job.tenant_id,
+            artist=job.artist,
+            song_title=job.song_title,
+            job_status_at_deletion=job.status,
+            segments=segments,
+            source=source,
+            archived_at=now,
+            deleted_by_user_id=deleted_by_user_id,
+        ))
+
+
+def delete_job(
+    db: Session, job_id: str, tenant_id: str, deleted_by_user_id: Optional[int] = None,
+) -> tuple[bool, str]:
     """Hard-delete a job row owned by `tenant_id`. Returns (ok, reason).
 
     Safety: only stuck/failed jobs can be deleted — done/pending_review jobs
@@ -116,13 +684,24 @@ def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
         return False, "not_found"
     if job.status not in _DELETABLE_STATUSES:
         return False, f"protected_status:{job.status}"
+    _archive_veo_budget_spend(db, [job])
+    _archive_deleted_job_lyrics(db, [job], deleted_by_user_id)
     db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
     db.delete(job)
     db.commit()
+
+    # R2 is remote, best-effort I/O.  The archive helper above may hold
+    # advisory locks that serialize a Veo submission for this song/job; never
+    # keep those transaction locks while waiting on object-storage timeouts.
+    # The committed delete also makes the sibling check see exactly the jobs
+    # that still reference the input audio.
+    _delete_r2_objects(db, job)
     return True, "ok"
 
 
-def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
+def bulk_delete_jobs(
+    db: Session, job_ids: list[str], tenant_id: str, deleted_by_user_id: Optional[int] = None,
+) -> dict:
     """Delete many jobs in one transaction. Returns {deleted: [...], skipped: {id: reason}}.
 
     Skipped reasons: 'not_found', 'protected_status:<status>'. The endpoint
@@ -154,12 +733,61 @@ def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
             deletable_ids.append(r.job_id)
 
     if deletable_ids:
+        # Collect R2 keys from already-fetched rows BEFORE the bulk DELETE
+        # removes them — the bulk query returns no data after deletion.
+        deletable_set = set(deletable_ids)
+        r2_rows = [r for r in rows if r.job_id in deletable_set]
+
+        _archive_veo_budget_spend(db, r2_rows)
+        _archive_deleted_job_lyrics(db, r2_rows, deleted_by_user_id)
         db.query(AIProvenance).filter(AIProvenance.job_id.in_(deletable_ids)).delete(synchronize_session=False)
         db.query(Job).filter(Job.tenant_id == tenant_id, Job.job_id.in_(deletable_ids)).delete(synchronize_session=False)
         db.commit()
         deleted = deletable_ids
 
+        # Best-effort R2 cleanup after successful DB commit. The bulk
+        # DELETE above has already removed every job_id in `r2_rows`
+        # from the DB, so the sibling-count inside _delete_r2_objects
+        # only sees siblings OUTSIDE this bulk batch. That's the right
+        # behavior: if the operator nuked every variant of an audio in
+        # one click, the audio gets reclaimed; if any sibling was left
+        # behind, it stays protected.
+        for r in r2_rows:
+            _delete_r2_objects(db, r)
+
     return {"deleted": deleted, "skipped": skipped}
+
+
+# bg_preview ghost jobs (Capa C 2026-05-24) tracking-only rows the wizard
+# polls while pre-rendering the Veo background during lyrics edit. They
+# share the jobs table with real renders for status polling, but the user
+# never asked for them as a "video" — they shadow the real job and
+# duplicate the song in Historial (e.g. "Hermanos De Sangre" appears with
+# status `bg_preview_done` next to the real one in `processing`). Filter
+# them at the user-facing read boundary. Admin paths use
+# `get_all_jobs_admin` and still see ghosts for debugging.
+_BG_PREVIEW_STATUSES = (
+    "bg_preview_queued", "bg_preview_running",
+    "bg_preview_done", "bg_preview_failed",
+)
+
+# CI/E2E/load-test accounts staging QA scripts create against the real
+# staging DB (not a mocked test DB) — smoke checks, preflight bots, visual
+# regression variants, load-test probes. All are IANA-reserved special-use
+# TLDs (`.local`/`.test`, RFC 6761) or this codebase's own bot-account
+# convention (`golden.local`), so they can never collide with a real
+# customer. Deliberately excludes `test.com`: that's the pytest suite's own
+# `_register`/`_make_user` fixture convention (tests/*.py), so blocking it
+# here would also hide real ephemeral-but-legitimate accounts, not just
+# staging QA noise — see test_admin_history_is_cross_tenant.
+# Incident 2026-08-19: an admin's Historial (cross-tenant global view) was
+# dominated by a preflight bot re-running every few hours, burying a real
+# customer's job under 100+ synthetic rows on the first page — the operator
+# reported "no lo encuentro" even though the job was live and untouched.
+_SYNTHETIC_EMAIL_DOMAINS = (
+    "test.local", "test.genly.local",
+    "pentest.local", "synthetic.genly.test", "golden.local",
+)
 
 
 def get_all_jobs(
@@ -167,12 +795,46 @@ def get_all_jobs(
     tenant_id: str = "default",
     limit: int = 200,
     user_id: int = None,
+    include_batch: bool = False,
 ) -> list[dict]:
     """Return all jobs for a tenant, sorted by creation time (newest first).
 
     Pass user_id for self-serve callers — see get_job() for rationale.
+
+    `tenant_id=None` = SIN filtro de tenant (mismo contrato que get_job):
+    es el scope cross-tenant de los admins de plataforma. Bug 2026-07-03:
+    el scope admin pasaba kwargs vacíos y este parámetro caía en su
+    default literal "default" — los admins veían el historial del tenant
+    "default" (frizado el 02-jun) en vez del propio/global, o sea
+    "faltan los últimos videos".
+
+    Excludes bg_preview ghost rows. Admin callers should use
+    `get_all_jobs_admin` if they need them.
     """
-    query = db.query(Job).filter(Job.tenant_id == tenant_id)
+    query = db.query(Job).filter(
+        ~Job.status.in_(_BG_PREVIEW_STATUSES),
+        # Defense in depth for preview rows that were created by an older
+        # worker and got stranded in a generic terminal state such as
+        # validation_failed. Filename identifies their tracking-only nature
+        # independently of status, so they can never leak into Historial.
+        ~Job.filename.startswith("bgpreview_"),
+    )
+    if not include_batch:
+        # Campaigns have their own paginated panel. Keeping them out of the
+        # legacy 200-row history prevents a 600-song manifest from hiding an
+        # operator's ordinary videos without changing the existing contract.
+        query = query.filter(Job.workload_class != "batch")
+    if tenant_id is not None:
+        query = query.filter(Job.tenant_id == tenant_id)
+    else:
+        # Cross-tenant admin view only (see _SYNTHETIC_EMAIL_DOMAINS above).
+        # A tenant-scoped read (tenant_id set) never hits this — a synthetic
+        # tenant's own operator (or its CI script) still sees its own jobs.
+        from database import User
+        _synthetic_user_ids = db.query(User.id).filter(
+            or_(*(User.email.ilike(f"%@{d}") for d in _SYNTHETIC_EMAIL_DOMAINS))
+        )
+        query = query.filter(~Job.user_id.in_(_synthetic_user_ids))
     if user_id is not None:
         query = query.filter(Job.user_id == user_id)
     jobs = (
@@ -183,16 +845,45 @@ def get_all_jobs(
     return [j.to_list_dict() for j in jobs]
 
 
-_TERMINAL_STATUSES = ("done", "error", "rejected", "validation_failed")
+# Backwards-compatible aliases for callers/tests that imported the old private
+# names. The values now come from the canonical state module.
+_TERMINAL_STATUSES = TERMINAL_STATUSES
+# Sub-partition of terminal statuses by outcome. The pipeline writes
+# done/pending_review only after deliverables actually land in R2; once
+# that ground truth is in the row, NO failure-shaped status ever
+# downgrades it. This is the system-wide answer to the test case "callback
+# does not clobber terminal states" — any late-firing error path (RQ
+# failure callback that races a successful commit, reaper that races a
+# completing worker, edit failure that ran after the worker recovered)
+# now bounces off this guard inside update_job instead of having to
+# re-check the row in every call site.
+_SUCCESS_TERMINAL_STATUSES = SUCCESS_TERMINAL_STATUSES
+_FAILURE_TARGET_STATUSES = FAILURE_TERMINAL_STATUSES
 
 
 def update_job(job_id: str, **kwargs) -> None:
     """Update fields on an existing job. Creates its own DB session for thread safety.
 
-    A status update that targets a non-terminal state is REFUSED for jobs
-    already in a terminal state. This guards against:
-      - A stale worker thread flushing progress=55 / status="processing"
-        after a reaper marked the job error → resurrects a closed job.
+    A status update that targets a non-terminal state is IGNORED for jobs
+    already in a terminal state — but the OTHER fields in the same kwargs
+    are still applied. Pre-audit 2026-05-26 the whole call was dropped,
+    which silently lost data on the race:
+
+      T0  reaper marks status="error" (transcription took >120 min)
+      T1  worker actually finishes 30 s later and calls
+          update_job(status="transcribed_pending",
+                     segments_json=[...],
+                     current_step="editing")
+      T2  guard sees row.status="error" + target non-terminal → early return
+          → segments_json dropped → operator retries → Whisper runs again
+          from scratch, $0.006 + 15 min wasted.
+
+    Now we only strip the status key (and the dependent current_step /
+    progress when status was the trigger) and keep persisting the rest.
+
+    This guards against:
+      - A stale worker thread flushing status="processing" after a reaper
+        marked the job error → resurrects a closed job.
       - Two workers picking the same job and both calling
         update_job(status="processing") → double-processing.
 
@@ -207,17 +898,85 @@ def update_job(job_id: str, **kwargs) -> None:
 
     db = SessionLocal()
     try:
-        job = db.query(Job).filter(Job.job_id == job_id).first()
+        # CORRECTNESS (audit 2026-05-24): take a row lock so concurrent
+        # `update_job` calls serialize. Without `with_for_update()`,
+        # two callers can read the same row, modify different fields,
+        # and last-writer-wins clobbers the other's changes. Real-world
+        # impact: `_step(progress=55)` racing the swap-retry
+        # `update_job(artist=X, song_title=Y)` would lose either the
+        # progress or the corrected metadata.
+        job = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
         if not job:
             return
 
-        # Refuse non-terminal mutations of terminal jobs.
+        attempt = _CURRENT_JOB_ATTEMPT.get()
+        if attempt is not None:
+            kind, attempt_id = attempt
+            column = f"active_{kind}_attempt_id"
+            if str(getattr(job, column, "") or "") != attempt_id:
+                _logger.warning(
+                    "[%s-fence] ignored stale update job=%s attempt=%s active=%s",
+                    kind, job_id, attempt_id, getattr(job, column, None),
+                )
+                return
+
+        # Terminal-state guard (split form): drop only the status field
+        # (and current_step, which is the user-facing description of that
+        # status) so the rest of the payload — segments_json, files,
+        # render_params, etc. — still lands. See docstring for the lost-
+        # transcription incident this fixes.
+        if not can_background_transition(job.status, target_status):
+            kwargs.pop("status", None)
+            kwargs.pop("current_step", None)
+            # Don't touch progress either — it's tied to the status flow.
+            kwargs.pop("progress", None)
+            if not kwargs:
+                return
+
+        # Success-vs-failure guard: never let a failure-shaped status
+        # downgrade a row that's already in a success-shaped terminal.
+        # Concrete race this protects: RQ pipeline_failure_callback fires
+        # 200 ms after the worker commits status="done"; without this
+        # guard, the callback's status="error" would clobber the success.
+        # The reaper has its own re-fetch-with-lock guard for the same
+        # reason; this is the analogous defense for the failure callbacks
+        # that route through update_job.
         if (
-            job.status in _TERMINAL_STATUSES
-            and not target_is_terminal
-            and target_status is not None
+            target_status in _FAILURE_TARGET_STATUSES
+            and job.status in _SUCCESS_TERMINAL_STATUSES
         ):
-            return
+            kwargs.pop("status", None)
+            kwargs.pop("error", None)
+            # error_category viaja junto con error — si el error se descarta
+            # (el job ya terminó bien), la categoría también.
+            kwargs.pop("error_category", None)
+            kwargs.pop("error_code", None)
+            kwargs.pop("current_step", None)
+            kwargs.pop("completed_at", None)
+            if not kwargs:
+                return
+
+        # Once an operator has produced a versioned editor save, worker-side
+        # transcription/post-processing must not silently replace it. Explicit
+        # editor writes use the CAS paths in main.py; background workers may
+        # only repeat the exact persisted snapshot.
+        if (
+            "segments_json" in kwargs
+            and int(getattr(job, "segments_revision", 0) or 0) > 0
+            and kwargs["segments_json"] != job.segments_json
+        ):
+            _logger.warning(
+                "[segments-occ] ignored background overwrite job=%s revision=%s",
+                job_id, job.segments_revision,
+            )
+            kwargs.pop("segments_json", None)
+            if not kwargs:
+                return
 
         for key, value in kwargs.items():
             if key == "files":
@@ -231,11 +990,32 @@ def update_job(job_id: str, **kwargs) -> None:
                         job.thumbnail_url = value["thumbnail_url"]
             elif key == "youtube":
                 job.youtube_data = value
+            elif key == "youtube_short":
+                job.youtube_short_data = value
             elif hasattr(job, key):
                 setattr(job, key, value)
 
-        # Mark completed_at when pipeline finishes (done or pending_review)
-        if kwargs.get("status") in ("done", "pending_review") and not job.completed_at:
+        # Heartbeat for the reaper. Any progress update means the worker is
+        # alive (even when progress is the same value as before — the call
+        # itself proves liveness). reaper.find_stalled_renders flips a
+        # processing job to error when this timestamp goes stale, catching
+        # workers SIGKILLed during non-AI steps where there is no in-flight
+        # AIProvenance row to anchor find_orphan_polling_jobs.
+        if "progress" in kwargs:
+            job.last_progress_at = datetime.now(timezone.utc)
+
+        # Mark completed_at on any terminal transition (done, pending_review,
+        # error, rejected, validation_failed). Used by the frontend to show
+        # the "took X minutes" duration; also matters for forensics — without
+        # it, an error job has no end timestamp and you can't tell whether
+        # it died in 5 s or 45 min. Pre-2026-05-26 only done/pending_review
+        # set this; the reaper and pipeline_failure_callback set it inline
+        # in their direct UPDATEs, but the migration to update_job needs
+        # the helper to do it consistently.
+        if (
+            kwargs.get("status") in _TERMINAL_STATUSES
+            and not job.completed_at
+        ):
             job.completed_at = datetime.now(timezone.utc)
 
         db.commit()
@@ -261,6 +1041,178 @@ def get_all_jobs_admin(db: Session, limit: int = 500, offset: int = 0) -> list[d
         .all()
     )
     return [j.to_dict() for j in jobs]
+
+
+def heartbeat(job_id: str) -> bool:
+    """U10 (audit 2026-05-25): bump Job.last_progress_at = NOW() sin
+    cambiar ningún otro campo. Ligero, atomic, idempotent.
+
+    Uso: workers en steps largos sin update_job() natural (Veo polling
+    de hasta 10min, retry loops). Le dice al reaper "estoy vivo".
+
+    Best-effort: cualquier excepción se traga (heartbeat no debe romper
+    el render).
+    """
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if not job:
+            return False
+        job.last_progress_at = datetime.now(timezone.utc)
+        db.commit()
+        return True
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        db.close()
+
+
+def merge_render_params(job_id: str, new_params: dict) -> bool:
+    """Atomic merge de `new_params` en Job.render_params (dict JSONB).
+
+    Resuelve el race U5 (audit 2026-05-25): 2 edits concurrentes al
+    mismo job (operator A toca typography, operator B toca background)
+    leen render_params al inicio del endpoint, mutan local, ambos
+    commitean. Last-writer-wins → la modificación del primero se pierde.
+
+    El mismo patrón ocurre en pipeline.py:703 (Capa C bg_preview merge)
+    si el worker corre concurrente al /edit endpoint.
+
+    Una sola tx con SELECT FOR UPDATE garantiza que el read + merge +
+    write sean atómicos respecto a otros callers. Postgres serializa
+    los waiters en el lock.
+
+    Args:
+        job_id: target job
+        new_params: dict con las keys/values a mergear en render_params.
+                    Keys con valor None NO se mergean (NO_OP — para que
+                    los callers puedan pasar dicts con keys opcionales).
+
+    Returns:
+        True si actualizó (o no-op idempotente), False si el job no existe.
+    """
+    if not new_params:
+        return True
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        job = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
+        if not job:
+            return False
+        existing = dict(job.render_params or {})
+        changed = False
+        for k, v in new_params.items():
+            if v is None:
+                continue
+            if existing.get(k) != v:
+                existing[k] = v
+                changed = True
+        if changed:
+            job.render_params = existing
+            db.commit()
+        return True
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        db.close()
+
+
+def merge_s3_keys(job_id: str, file_type: str, key: str) -> bool:
+    """Atomic merge de un (file_type → key) en Job.s3_keys.
+
+    Resuelve el race U1 (audit 2026-05-25): dos prewarm workers
+    (umg_master + umg_short) ambos snapshotean s3_keys=None ANTES del
+    transcode (60-300s), luego compiten al final por escribir su key.
+    El read-modify-write fuera de la misma tx + el setattr() de
+    update_job pisa el otro. Prod 2026-05-12: 8/18 jobs UMG perdieron
+    una key, reconciliados a mano por SQL.
+
+    Una sola tx con SELECT FOR UPDATE: read y write atómicos.
+    Returns True si actualizó, False si el job no existe.
+    """
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        job = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
+        if not job:
+            return False
+        current = dict(job.s3_keys or {})
+        if current.get(file_type) == key:
+            return True
+        current[file_type] = key
+        job.s3_keys = current
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def remove_s3_keys(job_id: str, file_types: list[str]) -> bool:
+    """Atomically drop one or more (file_type → key) entries from Job.s3_keys.
+
+    Counterpart to `merge_s3_keys`. Used by run_edit_pipeline to invalidate
+    the lazy ProRes derivatives (umg_master / umg_short) after a re-render:
+    the .mov is NOT regenerated by the edit (it's lazy-transcoded from
+    lyric_video.mp4 at download time), so a stale s3_keys["umg_master"]
+    would keep serving the pre-edit cut on /download/{id}/umg_master while
+    the freshly re-rendered MP4 download serves the new cut. The prior key
+    is preserved as {key}.vN by _snapshot_previous_deliverables, so dropping
+    it here does not lose the rollback path.
+
+    SELECT FOR UPDATE so a concurrent merge_s3_keys (e.g. a prewarm worker)
+    can't race-restore the key between our read and write.
+
+    Returns True if the row exists (whether or not any key was present),
+    False if the job is gone.
+    """
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        job = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update()
+            .first()
+        )
+        if not job:
+            return False
+        current = dict(job.s3_keys or {})
+        changed = False
+        for ft in file_types:
+            if ft in current:
+                del current[ft]
+                changed = True
+        if changed:
+            job.s3_keys = current
+            db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def get_jobs_stats(db: Session, tenant_id: str = None) -> dict:

@@ -1,0 +1,27 @@
+# Railway Config-as-Code for the FastAPI service.
+# Dashboard contract: Root Directory=/lyricgen, Config File=/railway/api.toml.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+watchPatterns = [
+    "lyricgen/backend/**",
+    "lyricgen/frontend/**",
+    "lyricgen/assets/**",
+    "lyricgen/Dockerfile",
+    "railway/api.toml",
+]
+
+[deploy]
+preDeployCommand = ["bash /app/backend/scripts/prod_migrate.sh"]
+startCommand = "sh -c 'export QUALITY_V6_PROPOSALS_ENABLED=\"${QUALITY_V6_PROPOSALS_ENABLED:-0}\" QUALITY_V6_MODEL_ENABLED=\"${QUALITY_V6_MODEL_ENABLED:-0}\"; python /app/backend/scripts/require_api_schema.py && exec uvicorn main:app --host 0.0.0.0 --port \"$PORT\" --workers 2 --app-dir /app/backend'"
+# Deploys are rolling: the new API starts before every worker advertises the
+# new release SHA. `/health/deploy` still hard-fails on DB/Redis, but treats
+# that expected rollout mismatch as degraded. `/health/ready` remains the
+# strict post-deploy fleet-coherence gate used by operations.
+healthcheckPath = "/health/deploy"
+healthcheckTimeout = 90
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+numReplicas = 2
+drainingSeconds = 1200

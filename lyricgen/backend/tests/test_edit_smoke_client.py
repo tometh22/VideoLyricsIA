@@ -1,0 +1,375 @@
+"""Contract tests for the post-deploy edit smoke API client."""
+
+from array import array
+import io
+import wave
+
+from scripts.preflight import edit_smoke
+
+
+class _Response:
+    def __init__(self, payload=None, status_code=200, text="", headers=None):
+        self._payload = payload or {}
+        self.status_code = status_code
+        self.ok = status_code < 400
+        self.text = text
+        self.headers = headers or {}
+
+    def json(self):
+        return self._payload
+
+
+def _install_common_smoke_mocks(monkeypatch, post, get):
+    def put(url, **kwargs):
+        assert url == "https://r2.example/upload"
+        assert kwargs["headers"] == {"Content-Type": "audio/wav"}
+        assert kwargs["data"].startswith(b"RIFF")
+        return _Response()
+
+    monkeypatch.setenv("PREFLIGHT_USERNAME", "smoke-user")
+    monkeypatch.setenv("PREFLIGHT_PASSWORD", "smoke-password")
+    monkeypatch.setattr(edit_smoke.requests, "post", post)
+    monkeypatch.setattr(edit_smoke.requests, "put", put)
+    monkeypatch.setattr(edit_smoke.requests, "get", get)
+
+
+def test_voiced_fixture_has_pcm_energy_and_latin1_metadata():
+    payload = edit_smoke._accented_wav_bytes()
+    with wave.open(io.BytesIO(payload), "rb") as wav:
+        samples = array("h", wav.readframes(wav.getnframes()))
+        assert wav.getframerate() == 8000
+        assert wav.getnchannels() == 1
+        assert wav.getnframes() > 8000
+    assert max(abs(sample) for sample in samples) > 100
+    assert b"Estrechez de Coraz\xf3n" in payload
+
+
+def test_edit_smoke_uses_current_presigned_upload_flow(monkeypatch):
+    calls = []
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "smoke"},
+        {"start": 1.1, "end": 1.9, "text": "line two"},
+    ]
+
+    def post(url, **kwargs):
+        calls.append(("POST", url, kwargs))
+        if url.endswith("/auth/login"):
+            return _Response({"token": "test-token"})
+        if url.endswith("/upload-url"):
+            assert kwargs["json"]["content_type"] == "audio/wav"
+            assert kwargs["json"]["size_bytes"] > 0
+            return _Response({
+                "job_id": "smokejob123",
+                "upload_url": "https://r2.example/upload",
+                "use_multipart": False,
+            })
+        if url.endswith("/transcribe-uploaded"):
+            assert kwargs["json"]["job_id"] == "smokejob123"
+            retry = sum(
+                1 for method, called_url, _ in calls
+                if method == "POST" and called_url.endswith("/transcribe-uploaded")
+            ) > 1
+            return _Response(
+                {
+                    "status": "transcribing",
+                    "status_url": "/transcription-status/smokejob123",
+                    "outbox_event_id": "transcribe-event-1",
+                    "deduplicated": retry,
+                },
+                status_code=202,
+                headers={"Location": "/transcription-status/smokejob123"},
+            )
+        if url.endswith("/generate"):
+            fields = kwargs["files"]
+            assert fields["job_id"] == (None, "smokejob123")
+            assert "smoke" in fields["segments_json"][1]
+            assert "line two" in fields["segments_json"][1]
+            assert fields["base_revision"] == (None, "1")
+            return _Response({"status": "queued"})
+        if url.endswith("/jobs/smokejob123/save-segments"):
+            saved_segments = kwargs["json"]["segments"]
+            assert saved_segments == [
+                {"start": 0.1, "end": 1.0, "text": "smoke"},
+                {"start": 1.1, "end": 1.9, "text": "line two"},
+            ]
+            return _Response({"count": 2, "revision": 1})
+        if url.endswith("/edit/smokejob123"):
+            retry = sum(
+                1 for method, called_url, _ in calls
+                if method == "POST" and called_url.endswith("/edit/smokejob123")
+            ) > 1
+            return _Response(
+                {
+                    "status": "editing",
+                    "status_url": "/status/smokejob123",
+                    "outbox_event_id": "edit-event-1",
+                    "deduplicated": retry,
+                },
+                status_code=202,
+                headers={"Location": "/status/smokejob123"},
+            )
+        raise AssertionError(f"unexpected POST {url}")
+
+    def put(url, **kwargs):
+        calls.append(("PUT", url, kwargs))
+        assert url == "https://r2.example/upload"
+        assert kwargs["headers"] == {"Content-Type": "audio/wav"}
+        assert kwargs["data"].startswith(b"RIFF")
+        return _Response()
+
+    def get(url, **kwargs):
+        calls.append(("GET", url, kwargs))
+        if url.endswith("/transcription-status/smokejob123"):
+            return _Response({"status": "transcribed", "segments": segments})
+        if url.endswith("/status/smokejob123"):
+            return _Response({
+                "status": "pending_review",
+                "current_step": "done",
+                "progress": 100,
+                "error": None,
+            })
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setenv("PREFLIGHT_USERNAME", "smoke-user")
+    monkeypatch.setenv("PREFLIGHT_PASSWORD", "smoke-password")
+    monkeypatch.setattr(edit_smoke.requests, "post", post)
+    monkeypatch.setattr(edit_smoke.requests, "put", put)
+    monkeypatch.setattr(edit_smoke.requests, "get", get)
+    monkeypatch.setattr(
+        edit_smoke.sys,
+        "argv",
+        ["edit_smoke", "--api-url", "https://api.example"],
+    )
+
+    assert edit_smoke.main() == 0
+    called_urls = [url for _method, url, _kwargs in calls]
+    assert "https://api.example/upload" not in called_urls
+    assert "https://api.example/upload-url" in called_urls
+    assert "https://api.example/transcribe-uploaded" in called_urls
+    assert "https://api.example/generate" in called_urls
+
+
+def test_timing_only_edit_requires_machine_text_and_preserves_other_rows():
+    original = [
+        {"start": 0.0, "end": 1.0, "text": "one"},
+        {"start": 1.1, "end": 2.0, "text": "two"},
+    ]
+    edited = edit_smoke._timing_only_edit(original)
+    assert edited == [
+        {"start": 0.1, "end": 1.0, "text": "one"},
+        {"start": 1.1, "end": 2.0, "text": "two"},
+    ]
+    assert original[0]["start"] == 0.0
+
+    for invalid in ([], [{"start": 0.0, "end": 1.0, "text": ""}]):
+        try:
+            edit_smoke._timing_only_edit(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid machine rows must fail closed")
+
+
+def test_edit_smoke_accepts_fail_closed_quality_gate_in_staging(monkeypatch):
+    segments = [{"start": 0.0, "end": 1.0, "text": "smoke"}]
+    transcribe_calls = 0
+
+    def post(url, **kwargs):
+        nonlocal transcribe_calls
+        if url.endswith("/auth/login"):
+            return _Response({"token": "test-token"})
+        if url.endswith("/upload-url"):
+            return _Response({
+                "job_id": "qualitysmoke1",
+                "upload_url": "https://r2.example/upload",
+                "use_multipart": False,
+            })
+        if url.endswith("/transcribe-uploaded"):
+            transcribe_calls += 1
+            return _Response(
+                {
+                    "status": "transcribing",
+                    "status_url": "/transcription-status/qualitysmoke1",
+                    "outbox_event_id": "transcribe-event-1",
+                    "deduplicated": transcribe_calls > 1,
+                },
+                status_code=202,
+                headers={"Location": "/transcription-status/qualitysmoke1"},
+            )
+        if url.endswith("/jobs/qualitysmoke1/save-segments"):
+            return _Response({"count": 1, "revision": 1})
+        if url.endswith("/generate"):
+            return _Response(
+                {
+                    "code": "transcription_quality_review_required",
+                    "transcription_quality": {"decision": "review_required"},
+                },
+                status_code=409,
+            )
+        raise AssertionError(f"unexpected POST {url}")
+
+    def get(url, **kwargs):
+        if url.endswith("/transcription-status/qualitysmoke1"):
+            return _Response({"status": "transcribed", "segments": segments})
+        raise AssertionError(f"unexpected GET {url}")
+
+    _install_common_smoke_mocks(monkeypatch, post, get)
+    monkeypatch.setattr(
+        edit_smoke.sys,
+        "argv",
+        [
+            "edit_smoke", "--api-url", "https://api.example",
+            "--allow-quality-gate-block",
+        ],
+    )
+
+    assert edit_smoke.main() == 0
+
+
+def test_edit_smoke_accepts_asynchronous_quality_gate_in_staging(monkeypatch):
+    segments = [{"start": 0.0, "end": 1.0, "text": "smoke"}]
+    posts = []
+    transcribe_calls = 0
+
+    def post(url, **kwargs):
+        nonlocal transcribe_calls
+        posts.append(url)
+        if url.endswith("/auth/login"):
+            return _Response({"token": "test-token"})
+        if url.endswith("/upload-url"):
+            return _Response({
+                "job_id": "qualitysmoke3",
+                "upload_url": "https://r2.example/upload",
+                "use_multipart": False,
+            })
+        if url.endswith("/transcribe-uploaded"):
+            transcribe_calls += 1
+            return _Response(
+                {
+                    "status": "transcribing",
+                    "status_url": "/transcription-status/qualitysmoke3",
+                    "outbox_event_id": "transcribe-event-1",
+                    "deduplicated": transcribe_calls > 1,
+                },
+                status_code=202,
+                headers={"Location": "/transcription-status/qualitysmoke3"},
+            )
+        if url.endswith("/jobs/qualitysmoke3/save-segments"):
+            return _Response({"count": 1, "revision": 1})
+        if url.endswith("/generate"):
+            return _Response({"status": "queued"})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def get(url, **kwargs):
+        if url.endswith("/transcription-status/qualitysmoke3"):
+            return _Response({"status": "transcribed", "segments": segments})
+        if url.endswith("/status/qualitysmoke3"):
+            return _Response({
+                "status": "transcribed_pending",
+                "current_step": "quality_review",
+                "progress": 20,
+                "error": "transcription_quality_review_required",
+            })
+        raise AssertionError(f"unexpected GET {url}")
+
+    _install_common_smoke_mocks(monkeypatch, post, get)
+    monkeypatch.setattr(
+        edit_smoke.sys,
+        "argv",
+        [
+            "edit_smoke", "--api-url", "https://api.example",
+            "--allow-quality-gate-block",
+        ],
+    )
+
+    assert edit_smoke.main() == 0
+    assert any(url.endswith("/save-segments") for url in posts)
+
+
+def test_edit_smoke_does_not_hide_unknown_generate_conflict(monkeypatch):
+    segments = [{"start": 0.0, "end": 1.0, "text": "smoke"}]
+    transcribe_calls = 0
+
+    def post(url, **kwargs):
+        nonlocal transcribe_calls
+        if url.endswith("/auth/login"):
+            return _Response({"token": "test-token"})
+        if url.endswith("/upload-url"):
+            return _Response({
+                "job_id": "qualitysmoke2",
+                "upload_url": "https://r2.example/upload",
+                "use_multipart": False,
+            })
+        if url.endswith("/transcribe-uploaded"):
+            transcribe_calls += 1
+            return _Response(
+                {
+                    "status": "transcribing",
+                    "status_url": "/transcription-status/qualitysmoke2",
+                    "outbox_event_id": "transcribe-event-1",
+                    "deduplicated": transcribe_calls > 1,
+                },
+                status_code=202,
+                headers={"Location": "/transcription-status/qualitysmoke2"},
+            )
+        if url.endswith("/jobs/qualitysmoke2/save-segments"):
+            return _Response({"count": 1, "revision": 1})
+        if url.endswith("/generate"):
+            return _Response({"code": "stale_revision"}, status_code=409)
+        raise AssertionError(f"unexpected POST {url}")
+
+    def get(url, **kwargs):
+        if url.endswith("/transcription-status/qualitysmoke2"):
+            return _Response({"status": "transcribed", "segments": segments})
+        raise AssertionError(f"unexpected GET {url}")
+
+    _install_common_smoke_mocks(monkeypatch, post, get)
+    monkeypatch.setattr(
+        edit_smoke.sys,
+        "argv",
+        [
+            "edit_smoke", "--api-url", "https://api.example",
+            "--allow-quality-gate-block",
+        ],
+    )
+
+    assert edit_smoke.main() == 1
+
+
+def test_edit_smoke_only_accepts_known_quality_status_errors():
+    assert edit_smoke._status_quality_gate_code({
+        "error": (
+            "La letra requiere revisión de calidad antes de renderizar "
+            "(transcription_quality_analysis_incomplete)."
+        ),
+    }) == "transcription_quality_analysis_incomplete"
+    assert edit_smoke._status_quality_gate_code({
+        "error": "render_failed: transcription provider unavailable",
+    }) is None
+
+
+def test_delivery_qc_contract_requires_fresh_current_render():
+    status = {
+        "segments_revision": 3,
+        "edit_count": 2,
+        "delivery_qc": {
+            "status": "COMPLETE",
+            "mode": "observe",
+            "generated_at": "2026-08-28T12:00:00+00:00",
+            "segments_hash": "abc123",
+            "segments_revision": 3,
+            "render_identity": {"edit_count": 2},
+            "technical": {
+                "video": {"codec": "h264"},
+                "audio_streams": 1,
+            },
+            "approval": {"blocked": False, "can_approve": True},
+        },
+    }
+    assert edit_smoke._delivery_qc_contract_error(status) is None
+
+    status["delivery_qc"]["status"] = "STALE"
+    assert "no está fresco" in edit_smoke._delivery_qc_contract_error(status)
+    status["delivery_qc"]["status"] = "COMPLETE"
+    status["delivery_qc"]["render_identity"]["edit_count"] = 1
+    assert "otro render/edit" in edit_smoke._delivery_qc_contract_error(status)

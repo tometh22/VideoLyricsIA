@@ -1,0 +1,274 @@
+[
+ {
+  "i": 0,
+  "start": 8.24,
+  "end": 13.28,
+  "text": "Dentro de tu piel se esconden los indicios",
+  "adlib": false,
+  "lr": 0.038,
+  "heard": "Dentro de tu piel se esconden los indicios de que..."
+ },
+ {
+  "i": 1,
+  "start": 13.29,
+  "end": 15.75,
+  "text": "De que nada es perfecto",
+  "adlib": false,
+  "lr": -0.003,
+  "heard": "de que nada es perfecto"
+ },
+ {
+  "i": 2,
+  "start": 16.6,
+  "end": 21.700000000000003,
+  "text": "Iluminados por el fuego que dejaste arder",
+  "adlib": false,
+  "lr": 0.093,
+  "heard": "Iluminados por el fuego que dejaste arder"
+ },
+ {
+  "i": 3,
+  "start": 23.9,
+  "end": 28.9,
+  "text": "¿Para qué, para qué tus santos de papel?",
+  "adlib": false,
+  "lr": 0.008,
+  "heard": "¿Para qué? ¿Para qué tus santos de papel?"
+ },
+ {
+  "i": 4,
+  "start": 31.78,
+  "end": 33.37,
+  "text": "¿Para qué?",
+  "adlib": false,
+  "lr": -0.006,
+  "heard": "Parque"
+ },
+ {
+  "i": 5,
+  "start": 33.74,
+  "end": 37.85,
+  "text": "¿Para qué, para qué tus santos de papel?",
+  "adlib": false,
+  "lr": -0.514,
+  "heard": "¿Para qué tus santos de papel?"
+ },
+ {
+  "i": 6,
+  "start": 40.66,
+  "end": 45.66,
+  "text": "Como tantos, vas buscando las respuestas",
+  "adlib": false,
+  "lr": 0.098,
+  "heard": "¿Cómo tantos vas buscando las respuestas que necesitas?"
+ },
+ {
+  "i": 7,
+  "start": 45.79,
+  "end": 48.59,
+  "text": "Que nada te responden",
+  "adlib": false,
+  "lr": 0.106,
+  "heard": "Que nada te responde"
+ },
+ {
+  "i": 8,
+  "start": 49.14,
+  "end": 54.14,
+  "text": "Acariciando tus ideas, algo en qué creer",
+  "adlib": false,
+  "lr": -0.004,
+  "heard": "Acariciando tus ideas Algo en que creer"
+ },
+ {
+  "i": 9,
+  "start": 56.2,
+  "end": 61.16,
+  "text": "¿Para qué, para qué tus santos de papel?",
+  "adlib": false,
+  "lr": -0.19,
+  "heard": "¿Para qué? ¿Para qué tus santos te maten?"
+ },
+ {
+  "i": 10,
+  "start": 61.17,
+  "end": 61.79,
+  "text": "¿Para qué?",
+  "adlib": false,
+  "lr": -2.559,
+  "heard": "¡Gracias!"
+ },
+ {
+  "i": 11,
+  "start": 64.32,
+  "end": 69.14,
+  "text": "¿Para qué, para qué tus santos de papel?",
+  "adlib": false,
+  "lr": -0.209,
+  "heard": "¿Para qué? ¿Para qué tus santos..."
+ },
+ {
+  "i": 12,
+  "start": 69.15,
+  "end": 69.38,
+  "text": "Uh, uh, uh, uh,",
+  "adlib": true,
+  "lr": -7.049
+ },
+ {
+  "i": 13,
+  "start": 69.39,
+  "end": 70.04,
+  "text": "Uh, uh, uh, uh,",
+  "adlib": true,
+  "lr": -2.584
+ },
+ {
+  "i": 14,
+  "start": 70.05,
+  "end": 70.22,
+  "text": "Uh, uh, uh",
+  "adlib": true,
+  "lr": -8.338
+ },
+ {
+  "i": 15,
+  "start": 70.23,
+  "end": 73.73,
+  "text": "¿Para qué? ¿Para qué?",
+  "adlib": false,
+  "lr": -0.948,
+  "heard": "¡Gracias por ver el vídeo!"
+ },
+ {
+  "i": 16,
+  "start": 74.34,
+  "end": 75.28,
+  "text": "Uh, uh, uh, uh,",
+  "adlib": true,
+  "lr": -3.597
+ },
+ {
+  "i": 17,
+  "start": 75.29,
+  "end": 78.79,
+  "text": "Uh, uh, uh, uh,",
+  "adlib": true,
+  "lr": -0.287
+ },
+ {
+  "i": 18,
+  "start": 82.81,
+  "end": 84.06,
+  "text": "Uh, uh, uh, uh,",
+  "adlib": true,
+  "lr": -1.675
+ },
+ {
+  "i": 19,
+  "start": 84.07,
+  "end": 85.41,
+  "text": "Uh, uh, uh, uh,",
+  "adlib": true,
+  "lr": -1.887
+ },
+ {
+  "i": 20,
+  "start": 85.42,
+  "end": 88.3,
+  "text": "Tus santos de papel",
+  "adlib": false,
+  "lr": -0.562,
+  "heard": "Subtítulos realizados por la comunidad de Amara.org"
+ },
+ {
+  "i": 21,
+  "start": 102.74,
+  "end": 106.24,
+  "text": "Tomás del miedo tu don",
+  "adlib": false,
+  "lr": -0.369,
+  "heard": "Más que el miedo, tu dolor"
+ },
+ {
+  "i": 22,
+  "start": 109.82,
+  "end": 113.32,
+  "text": "Frágil espejo de vos",
+  "adlib": false,
+  "lr": -0.048,
+  "heard": "frágil espejo."
+ },
+ {
+  "i": 23,
+  "start": 117.94,
+  "end": 121.44,
+  "text": "Tomás del miedo tu don",
+  "adlib": false,
+  "lr": -0.068,
+  "heard": "Tomas del miedo"
+ },
+ {
+  "i": 24,
+  "start": 126.1,
+  "end": 129.6,
+  "text": "Frágil espejo de vos.",
+  "adlib": false,
+  "lr": -0.143,
+  "heard": "FRAGILEZ PEOPLE"
+ },
+ {
+  "i": 25,
+  "start": 133.72,
+  "end": 138.72,
+  "text": "¿Para qué, para qué tus santos de papel?",
+  "adlib": false,
+  "lr": -0.049,
+  "heard": "¿Para qué? ¿Para qué tus saldos de papel?"
+ },
+ {
+  "i": 26,
+  "start": 141.56,
+  "end": 143.13,
+  "text": "¿Para qué?",
+  "adlib": false,
+  "lr": -0.127,
+  "heard": "Subtítulos realizados por la comunidad de Amara.org"
+ },
+ {
+  "i": 27,
+  "start": 143.6,
+  "end": 146.66,
+  "text": "¿Para qué, para qué tus santos de papel?",
+  "adlib": false,
+  "lr": -0.69,
+  "heard": "para que tu salgas de papel"
+ },
+ {
+  "i": 28,
+  "start": 146.67,
+  "end": 149.03,
+  "text": "¿Para qué?",
+  "adlib": false,
+  "lr": -0.531,
+  "heard": "¡Boneeeeeeeer!"
+ },
+ {
+  "i": 29,
+  "start": 149.72,
+  "end": 154.72,
+  "text": "¿Para qué, para qué tus santos de papel?",
+  "adlib": false,
+  "lr": 0.013,
+  "heard": "¿Para qué? ¿Para qué tus saltos de papel?"
+ },
+ {
+  "i": 30,
+  "start": 157.88,
+  "end": 162.28,
+  "text": "¿Para qué, para qué no hay santos?",
+  "adlib": false,
+  "lr": -0.238,
+  "heard": "Para que, para que no hay santos"
+ }
+]

@@ -1,0 +1,150 @@
+"""Unit tests for vocal_sep — the pure / gating parts (no Replicate network)."""
+
+import os
+import sys
+import types
+from unittest.mock import MagicMock
+
+import vocal_sep as vs
+
+
+class _SucceededPrediction:
+    """Prediction ya terminada, para el camino `predictions.create + poll`."""
+
+    def __init__(self, output):
+        self.status = "succeeded"
+        self.logs = ""
+        self.error = None
+        self.output = output
+
+    def reload(self):
+        pass
+
+    def cancel(self):
+        pass
+
+
+def _fake_replicate(monkeypatch, *, run):
+    """Inject a stand-in `replicate` module (the SDK isn't installed in the
+    test venv; prod has it). `run` is the callable / mock for replicate.run.
+
+    Desde el fix del presupuesto (incidente 2026-08-26/28) `call_with_budget`
+    va SIEMPRE por `predictions.create + poll` — el único camino que corta en
+    el deadline — así que los modelos pinneados ya no pasan por
+    `replicate.run`. Derivamos `predictions.create` del MISMO `run` para que
+    cada test siga declarando su output en un solo lugar (y para que un `run`
+    con `side_effect` que lanza siga propagando el fallo igual)."""
+    fake = types.ModuleType("replicate")
+    fake.run = run
+
+    def _create(version, input):
+        return _SucceededPrediction(run(version, input=input))
+
+    fake.predictions = types.SimpleNamespace(create=_create)
+    monkeypatch.setitem(sys.modules, "replicate", fake)
+
+
+def test_is_enabled_requires_flag_and_token(monkeypatch):
+    monkeypatch.delenv("VOCAL_SEP_ENABLED", raising=False)
+    monkeypatch.delenv("REPLICATE_API_TOKEN", raising=False)
+    assert vs.is_enabled() is False
+    monkeypatch.setenv("VOCAL_SEP_ENABLED", "1")
+    assert vs.is_enabled() is False           # flag on, no token
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_x")
+    assert vs.is_enabled() is True
+    monkeypatch.setenv("VOCAL_SEP_ENABLED", "0")
+    assert vs.is_enabled() is False           # token, flag off
+
+
+def test_pick_vocals_from_dict():
+    assert vs._pick_vocals({"vocals": "u://v", "drums": "u://d"}) == "u://v"
+    assert vs._pick_vocals({"voice": "u://v"}) == "u://v"
+
+
+def test_pick_vocals_missing_returns_none():
+    assert vs._pick_vocals({"drums": "u://d", "bass": "u://b"}) is None
+    assert vs._pick_vocals(None) is None
+
+
+def test_pick_vocals_bare_output_passthrough():
+    # Some forks emit only the vocal stem as a single value.
+    assert vs._pick_vocals("u://only-vocals") == "u://only-vocals"
+
+
+def test_separate_vocals_none_when_disabled(monkeypatch, tmp_path):
+    monkeypatch.delenv("VOCAL_SEP_ENABLED", raising=False)
+    f = tmp_path / "a.mp3"
+    f.write_bytes(b"x")
+    assert vs.separate_vocals(str(f)) is None
+
+
+def test_separate_vocals_none_when_file_missing(monkeypatch):
+    monkeypatch.setenv("VOCAL_SEP_ENABLED", "1")
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_x")
+    assert vs.separate_vocals("/no/such/file.mp3") is None
+
+
+def test_separate_vocals_downloads_stem_via_read(monkeypatch, tmp_path):
+    monkeypatch.setenv("VOCAL_SEP_ENABLED", "1")
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_x")
+    src = tmp_path / "song.mp3"
+    src.write_bytes(b"fake-mp3")
+
+    # FileOutput-like object exposing .read()
+    fake_vocals = MagicMock()
+    fake_vocals.read.return_value = b"WAVDATA" * 100
+    _fake_replicate(monkeypatch, run=MagicMock(return_value={"vocals": fake_vocals}))
+    # validate_stem (post-PR-279 hardening) would reject this fake 700-byte
+    # blob — bypass it so this test stays focused on the download/read path.
+    # The validator itself has its own test file (test_validate_stem.py).
+    monkeypatch.setattr(vs, "validate_stem", lambda p: (True, "ok"))
+    out = vs.separate_vocals(str(src))
+    assert out is not None
+    assert os.path.exists(out)
+    assert os.path.getsize(out) > 0
+    os.unlink(out)
+
+
+def test_separate_vocals_none_on_replicate_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("VOCAL_SEP_ENABLED", "1")
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_x")
+    src = tmp_path / "song.mp3"
+    src.write_bytes(b"fake")
+    _fake_replicate(monkeypatch, run=MagicMock(side_effect=RuntimeError("boom")))
+    degraded = MagicMock()
+    monkeypatch.setattr(vs, "_marcar_degradacion", degraded)
+    assert vs.separate_vocals(str(src)) is None
+    degraded.assert_called_once_with(str(src), "vocal_sep_unavailable")
+
+
+def test_separate_vocals_releases_global_slot_on_failure(monkeypatch, tmp_path):
+    """El slot global no se pierde si Replicate falla o agota presupuesto."""
+    monkeypatch.setenv("VOCAL_SEP_ENABLED", "1")
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_x")
+    src = tmp_path / "song.mp3"
+    src.write_bytes(b"fake")
+    _fake_replicate(monkeypatch, run=MagicMock(side_effect=RuntimeError("boom")))
+
+    import demucs_semaphore
+    acquire = MagicMock(return_value="lease-1")
+    release = MagicMock()
+    monkeypatch.setattr(demucs_semaphore, "acquire", acquire)
+    monkeypatch.setattr(demucs_semaphore, "release", release)
+    monkeypatch.setattr(vs, "_marcar_degradacion", MagicMock())
+
+    assert vs.separate_vocals(str(src)) is None
+    acquire.assert_called_once_with()
+    release.assert_called_once_with("lease-1")
+
+
+def test_missing_vocal_output_is_visible_degradation(monkeypatch, tmp_path):
+    monkeypatch.setenv("VOCAL_SEP_ENABLED", "1")
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_x")
+    src = tmp_path / "song.mp3"
+    src.write_bytes(b"fake")
+    _fake_replicate(monkeypatch, run=MagicMock(return_value={"drums": "u://d"}))
+    degraded = MagicMock()
+    monkeypatch.setattr(vs, "_marcar_degradacion", degraded)
+
+    assert vs.separate_vocals(str(src)) is None
+    degraded.assert_called_once_with(str(src), "demucs_output_missing_vocals")

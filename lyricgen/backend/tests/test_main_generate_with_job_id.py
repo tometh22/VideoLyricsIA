@@ -11,6 +11,7 @@ import io
 import json
 import os
 import struct
+from datetime import datetime, timezone
 
 import pytest
 
@@ -111,11 +112,26 @@ def test_generate_reuses_persisted_audio_when_job_id_provided(
 
     job_id = _seed_transcribed_pending(user_id, tenant_id)
 
+    # Simulate a duplicate upload request that soft-superseded this ID before
+    # its HTTP response reached the browser.  Explicit reuse must revive it.
+    s = SessionLocal()
+    try:
+        from database import Job
+        row = s.query(Job).filter(Job.job_id == job_id).one()
+        row.archived_at = datetime.now(timezone.utc)
+        s.commit()
+    finally:
+        s.close()
+
     captured = {}
     def _fake_enqueue(**kwargs):
         captured.update(kwargs)
         return "thread:fake"
     monkeypatch.setattr("main.enqueue_pipeline", _fake_enqueue)
+    # This test exercises persisted-audio reuse, not host resource pressure.
+    # Do not let the developer machine's current RAM usage turn it into a
+    # nondeterministic 503; memory-gate behavior has dedicated tests.
+    monkeypatch.setattr("main._enforce_memory_pressure", lambda: None)
 
     res = client.post(
         "/generate",
@@ -135,11 +151,40 @@ def test_generate_reuses_persisted_audio_when_job_id_provided(
     assert body["job_id"] == job_id
     assert body["status"] == "queued"
 
+    state_db = SessionLocal()
+    try:
+        from database import Job
+        assert state_db.query(Job).filter(Job.job_id == job_id).one().archived_at is None
+    finally:
+        state_db.close()
+
     # The pipeline should have been enqueued with the same job_id and the
     # audio path that /transcribe persisted — no new upload took place.
     assert captured["job_id"] == job_id
     assert captured["mp3_path"].endswith("song.wav")
     assert captured["segments_override"] == [{"start": 0, "end": 1, "text": "test"}]
+    assert captured["song_title"] == "No Tengo Ganas"
+
+    # Approval persists the exact submitted snapshot as an immutable editor
+    # version even for legacy clients that omit base_revision.
+    from database import EditorVersion
+    version_db = SessionLocal()
+    try:
+        approved = version_db.query(EditorVersion).filter(
+            EditorVersion.job_id == job_id,
+            EditorVersion.is_approved.is_(True),
+        ).one()
+        assert approved.reason == "approve"
+        assert approved.segments == [{"start": 0, "end": 1, "text": "test"}]
+    finally:
+        version_db.close()
+
+    # The status payload feeds the render/detail UI. It must expose the
+    # structured title as well as the upload filename so the UI never has to
+    # infer the song name from a potentially unrelated raw filename.
+    status_res = client.get(f"/status/{job_id}", headers=auth(token))
+    assert status_res.status_code == 200, status_res.text
+    assert status_res.json()["song_title"] == "No Tengo Ganas"
 
 
 def test_generate_with_job_id_rejects_other_users_jobs(client, monkeypatch):
@@ -175,6 +220,8 @@ def test_generate_with_job_id_rejects_other_users_jobs(client, monkeypatch):
         headers=auth(token_b),
     )
     assert res.status_code == 404
+    # Stable machine-readable code the frontend keys off (audit 2026-07-27).
+    assert res.json()["code"] == "job_not_found"
 
 
 def test_generate_with_job_id_rejects_already_promoted_jobs(client, monkeypatch):
@@ -219,6 +266,44 @@ def test_generate_with_job_id_rejects_already_promoted_jobs(client, monkeypatch)
         headers=auth(token),
     )
     assert res.status_code == 409
+    assert res.json()["code"] == "job_not_generatable"
+
+
+def test_generate_editor_selector_without_feature_is_not_reported_as_missing_job(client, monkeypatch):
+    """A feature-gate mismatch must not make the UI discard a real job.
+
+    The old 404 looked identical to a reaped temporary job in the browser,
+    which surfaced a false "session expired" message after lyric approval.
+    """
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.delenv("EDITOR_V2_GLOBALLY_ENABLED", raising=False)
+    monkeypatch.delenv("EDITOR_V2_TENANTS", raising=False)
+    username, token = _make_user(client)
+
+    from database import SessionLocal, User
+
+    s = SessionLocal()
+    try:
+        user = s.query(User).filter(User.username == username).first()
+        user_id, tenant_id = user.id, user.tenant_id
+    finally:
+        s.close()
+    job_id = _seed_transcribed_pending(user_id, tenant_id)
+
+    res = client.post(
+        "/generate",
+        data={
+            "job_id": job_id,
+            "artist": "Intoxicados",
+            "segments_json": "[]",
+            "editor_revision": "0",
+            "delivery_profile": "youtube",
+        },
+        headers=auth(token),
+    )
+
+    assert res.status_code == 409
+    assert res.json()["code"] == "editor_not_enabled"
 
 
 def test_generate_legacy_path_still_accepts_full_upload(client, monkeypatch):

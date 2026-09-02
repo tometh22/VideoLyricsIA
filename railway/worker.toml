@@ -1,0 +1,20 @@
+# Railway Config-as-Code for the heavy render worker fleet.
+# Dashboard contract: Root Directory=/lyricgen, Config File=/railway/worker.toml,
+# QUEUES=enterprise,default,canary and RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile.worker"
+watchPatterns = [
+    "lyricgen/backend/**",
+    "lyricgen/assets/**",
+    "lyricgen/Dockerfile.worker",
+    "railway/worker.toml",
+]
+
+[deploy]
+startCommand = "sh -c 'python backend/scripts/require_worker_schema.py && exec env QUEUES=enterprise,default,canary python backend/worker.py'"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+numReplicas = 7
+drainingSeconds = 1200

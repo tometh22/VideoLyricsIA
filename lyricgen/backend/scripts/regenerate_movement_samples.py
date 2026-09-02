@@ -25,6 +25,11 @@ from credentials_bootstrap import bootstrap_vertex_credentials
 bootstrap_vertex_credentials()
 
 from pipeline import _generate_veo_video
+from internal_tracking import (
+    INTERNAL_TRACKING_TENANT,
+    ensure_internal_tracking_job,
+    internal_tracking_job_id,
+)
 
 
 # Hand-picked prompts that demonstrate each style cleanly. Each is short,
@@ -60,9 +65,11 @@ SAMPLES = [
     {
         "style": "animado",
         "prompt": (
-            "Stylised 2D animated illustration of a basketball spinning slowly "
-            "above an empty court, flat shapes, deliberate cartoon-like motion, "
-            "saturated colors. NOT photorealistic."
+            "Stylised 2D illustrated basketball court. One basketball makes a "
+            "clean seamless arc toward the hoop; the camera and every other "
+            "element remain perfectly still. Flat shapes, saturated colors, "
+            "no smoke, rain, fog, particles or generic atmospheric motion. "
+            "NOT photorealistic."
         ),
     },
 ]
@@ -72,6 +79,25 @@ OUT_DIR = os.path.join(
     "frontend", "public", "movement_samples",
 )
 os.makedirs(OUT_DIR, exist_ok=True)
+
+_TRACKING_TENANT = INTERNAL_TRACKING_TENANT
+
+
+def _tracking_job_id(style: str) -> str:
+    """Stable, FK-valid 12-char identity used by provenance and the cap."""
+    return internal_tracking_job_id(f"movement-sample:{style}")
+
+
+def _ensure_tracking_job(style: str, db=None) -> str:
+    """Create the persistent Job row required by AIProvenance.
+
+    The sample generator used synthetic IDs longer than ``jobs.job_id`` and
+    with no parent row, so PostgreSQL rejected every provenance reservation.
+    A stable internal job per style makes both attribution and the rolling Veo
+    ceiling durable across script runs.
+    """
+    return ensure_internal_tracking_job(
+        f"movement-sample:{style}", db=db, style=style)
 
 
 def _post_process(raw_path: str, final_path: str) -> bool:
@@ -99,15 +125,17 @@ def main():
     for entry in SAMPLES:
         style = entry["style"]
         prompt = entry["prompt"]
+        tracking_job_id = _ensure_tracking_job(style)
         print(f"\n=== Generating sample for {style!r} ===")
         print(f"  prompt: {prompt[:90]}…")
         raw = f"/tmp/veo_sample_{style}.mp4"
         final = os.path.join(OUT_DIR, f"{style}.mp4")
         try:
             t0 = _time.time()
-            _generate_veo_video(prompt, raw, job_id=f"sample-{style}",
+            _generate_veo_video(prompt, raw, job_id=tracking_job_id,
                                 cache_namespace=f"sample|{style}",
-                                movement_style=style)
+                                movement_style=style,
+                                require_persistent_tracking=True)
             elapsed = _time.time() - t0
             print(f"  Veo OK in {elapsed:.1f} s; raw={os.path.getsize(raw)/1e6:.1f} MB")
             if _post_process(raw, final):
