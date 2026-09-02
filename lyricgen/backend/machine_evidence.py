@@ -243,8 +243,17 @@ def build_machine_evidence(result: dict) -> dict:
     )
     # Optional LoRA-v1 witness.  It is never selected here; the targeted
     # consensus may use it only as an additional family after attestation.
+    # It is recorded under its own role, NOT as ``candidate``: primary and
+    # candidate hypotheses are the pipeline's recognition attempts and must
+    # carry contiguous ``attempt_id`` values that match the recognition
+    # collector's count. The LoRA family runs outside that collector, so
+    # filing it as a candidate made ``validate_machine_evidence`` raise
+    # ``machine_recognition_attempt_id_invalid`` for every song where the
+    # adapter attached words, failing the transcription at final persistence
+    # (first staging canary, 2026-09-02). Consumers locate it by family and
+    # kind (see quality_jobs._attested_asr_context), never by role.
     add(
-        "candidate",
+        "additional_family",
         str(result.get("_lora_asr_family") or ""),
         "word_stream",
         result.get("_lora_asr_words"),
