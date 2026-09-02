@@ -295,6 +295,10 @@ def _record_lora_shadow(stats: dict, *, lora_words: list[dict],
         "lora_contributed_lines": 0, "new_consensus_lines": 0,
         "lost_consensus_lines": 0,
     })
+    # The stats template pre-seeds ``enabled: False`` so a song without LoRA
+    # words reports the shadow as inactive; setdefault therefore never flips
+    # it. Any recorded comparison means the witness was present.
+    shadow["enabled"] = True
     shadow["comparisons"] += 1
     with_pass = bool(with_agreed)
     without_pass = bool(without_agreed)
