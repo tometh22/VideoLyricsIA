@@ -57,12 +57,22 @@ def _num(value: Any) -> float | None:
     return value if value == value else None
 
 
-def song_verdict(quality: dict | None) -> dict[str, Any]:
-    """Pure rule: quality payload -> {color, reasons, inputs, rank_key}."""
+def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, Any]:
+    """Pure rule: quality payload -> {color, reasons, inputs, rank_key}.
+
+    ``paired`` optionally supplies the pilot-scale disagreement (turbo base vs
+    turbo+LoRA on identical chunks, see paired_disagreement_offline.py). When
+    given it replaces the runtime ``difficulty_router`` score, which compares
+    WhisperX against LoRA and is not on the pilot's scale.
+    """
     quality = quality if isinstance(quality, dict) else {}
     metrics = quality.get("metrics") if isinstance(quality.get("metrics"), dict) else {}
     router = metrics.get("difficulty_router") if isinstance(metrics.get("difficulty_router"), dict) else {}
+    disagreement_source = "runtime_difficulty_router"
     disagreement = _num(router.get("score"))
+    if isinstance(paired, dict) and _num(paired.get("disagreement")) is not None:
+        disagreement = _num(paired.get("disagreement"))
+        disagreement_source = str(paired.get("source") or "paired_offline")
     coverage = _num(metrics.get("audio_coverage"))
     is_live = bool(metrics.get("is_live"))
     unsafe = [w for w in (quality.get("unsafe_windows") or []) if isinstance(w, dict)]
@@ -72,7 +82,8 @@ def song_verdict(quality: dict | None) -> dict[str, Any]:
     windows_resolved = int(_num(retry.get("windows_resolved")) or 0)
 
     inputs = {
-        "disagreement": disagreement, "audio_coverage": coverage,
+        "disagreement": disagreement, "disagreement_source": disagreement_source,
+        "audio_coverage": coverage,
         "is_live": is_live, "unsafe_windows": len(unsafe),
         "windows_resolved": windows_resolved, "decision": decision,
         "analysis_status": analysis_status,
@@ -161,7 +172,13 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="re-emit even if a verdict for this rule exists")
     parser.add_argument("--output", help="write the ranked queues as JSON")
     parser.add_argument("--editor-base", default=os.environ.get("SEMAFORO_EDITOR_BASE", "https://staging.genly.pro/edit-lyrics/"))
+    parser.add_argument("--disagreement-file", help="JSON from paired_disagreement_offline.py (keyed by sha256, with job_id)")
     args = parser.parse_args()
+    paired_by_job: dict[str, dict] = {}
+    if args.disagreement_file:
+        for row in json.load(open(args.disagreement_file)).values():
+            if isinstance(row, dict) and row.get("job_id"):
+                paired_by_job[str(row["job_id"])] = row
     if not (args.tenant or args.job_ids):
         parser.error("--tenant or --job-id is required")
 
@@ -173,7 +190,7 @@ def main() -> int:
         emitted_at = datetime.now(timezone.utc).isoformat()
         rows = []
         for job in jobs:
-            verdict = song_verdict(job.transcription_quality)
+            verdict = song_verdict(job.transcription_quality, paired_by_job.get(job.job_id))
             prior = existing.get(job.job_id)
             reused = bool(prior) and not args.force
             record = {

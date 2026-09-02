@@ -65,3 +65,12 @@ def test_low_coverage_is_red_partial_is_yellow():
     assert m.song_verdict(_quality(metrics={"audio_coverage": 0.85}))["color"] == "red"
     v = m.song_verdict(_quality(metrics={"audio_coverage": 0.95}))
     assert v["color"] == "yellow" and "coverage_partial" in v["reasons"]
+
+
+def test_paired_disagreement_overrides_runtime_router_and_is_recorded():
+    m = _load()
+    q = _quality(metrics={"difficulty_router": {"score": 0.30}})
+    assert m.song_verdict(q)["color"] == "red"
+    v = m.song_verdict(q, {"disagreement": 0.01, "source": "paired_turbo_base_vs_lora_offline"})
+    assert v["color"] == "green"
+    assert v["inputs"]["disagreement_source"] == "paired_turbo_base_vs_lora_offline"
