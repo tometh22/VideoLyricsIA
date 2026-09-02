@@ -214,3 +214,5 @@ es adoptado):
 Los contadores se agregan por canción durante las primeras 30–50 canciones
 reales. El adaptador no muta la salida por sí solo: sigue siendo una familia
 adicional, y una sugerencia sólo llega al editor si pasa el consenso vigente.
+El reporte operativo es de solo lectura: `python
+lyricgen/backend/scripts/report_lora_shadow.py --limit 50 --json`.
