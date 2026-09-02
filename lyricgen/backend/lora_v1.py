@@ -19,6 +19,11 @@ from typing import Any, Iterable
 SCHEMA_VERSION = 1
 BASE_MODEL = "openai/whisper-large-v3-turbo"
 CANONICAL_COHORT_SIZE = 23
+# v2 policy: reconstructed/difficult rows are shown to the trainer three
+# times (the original plus two repeats).  The first adapter remains v1 and
+# is not retroactively reweighted.
+V2_DIFFICULTY_OVERSAMPLE_RATIO = 3
+V2_TRIGGER_SONGS = 100
 
 
 def sha256_bytes(data: bytes) -> str:

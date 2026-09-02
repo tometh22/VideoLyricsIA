@@ -119,6 +119,30 @@ completo de evaluación y verifica el SHA-256 del adaptador; nunca permite
 reemplazar Whisper base. El reemplazo requeriría dos evaluaciones consecutivas
 con CI por canción.
 
+## V2: política fijada para el trigger de 100 canciones
+
+El diagnóstico direccional sobre las 18 canciones `reconstructed` (WER
+31,10% → 10,68%, −65,67% relativo; 15 mejoran, una igual y dos empeoran;
+IC bootstrap de la diferencia [+4,37; +46,20] pp) es la justificación para
+dar más peso a la cola difícil en v2. Es evidencia de dirección, no un gate:
+esas canciones no son una cohorte `exact` histórica comparable.
+
+Cuando `CORPUS_RETRAIN_EVERY_SONGS=100` dispare v2:
+
+* el entrenamiento repite las muestras marcadas `difficulty=difficult` a
+  razón 3:1 (`--difficulty-oversample 3`); validación y leave-artist-out se
+  seleccionan antes y nunca se sobremuestrean;
+* la evaluación incluye la cohorte canónica de 23 más todas las canciones
+  nuevas `raw_quality=exact` disponibles (`--additional-exact-cohort`), con
+  CI bootstrap por canción y partición fácil/difícil;
+* el adaptador sigue entrando como familia adicional. Dos evaluaciones
+  consecutivas con CI son requisito para cualquier decisión de reemplazo.
+
+El script de entrenamiento deja en `run_report.json` el factor solicitado,
+las filas difíciles y las filas efectivas. El evaluador deja explícitos los
+conteos de la cohorte canónica y de las canciones exactas nuevas, evitando que
+un WER de una condición aislada se confunda con el baseline end-to-end.
+
 ## Enlace opcional en staging (fail-closed)
 
 El puente de runtime ya está conectado en los caminos API multipart, legacy y
@@ -130,6 +154,21 @@ LORA_V1_FAMILY_ENABLED=1
 LORA_V1_EVAL_REPORT=/secure-mounted/lora-v1/evaluation.json
 LORA_V1_ADAPTER_PATH=/secure-mounted/lora-v1/adapter
 ```
+
+En staging también puede usarse el puente privado R2, cuando no hay volumen
+Railway disponible:
+
+```sh
+LORA_V1_FAMILY_ENABLED=1
+LORA_V1_EVAL_REPORT_R2_KEY=runtime/lora-v1/evaluation.json
+LORA_V1_ADAPTER_R2_PREFIX=runtime/lora-v1/adapter/
+LORA_V1_RUNTIME_CACHE_DIR=/tmp/genly-lora-v1
+```
+
+El proceso descarga reporte y adapter atómicamente, comprueba el SHA-256 del
+`adapter_model.safetensors` declarado por el reporte y continúa con Whisper si
+alguna pieza falta o no coincide. Las credenciales R2 son variables del
+servicio; nunca se guardan en el repo, en el reporte ni en Murmur.
 
 `LORA_V1_ADAPTER_PATH` sólo cambia dónde se leen los bytes; el reporte sigue
 siendo la autoridad y su SHA-256 debe coincidir. Si falta el montaje, la
@@ -155,3 +194,21 @@ material reconstruido/no canónico que en la cohorte exacta, pero no es un gate:
 el manifest clasifica `reconstructed` como `easy` para entrenamiento y no hay
 una partición `difficult` histórica comparable. La etiqueta correcta para
 calibración de v2 es, por ahora, `raw_quality=reconstructed`, no “difícil”.
+
+## Segunda evaluación en staging: sombra LoRA con/sin
+
+Cada replay de `targeted_consensus` que tenga una hipótesis LoRA atestada
+calcula una comparación apareada sin volver a llamar a ASR. En la misma
+ventana se ejecuta el consenso con el testigo `lora` y se repite quitándolo;
+el resultado se persiste en `postpass_stats.lora_shadow`:
+
+* `comparisons`, `with_consensus` y `without_consensus` describen la población;
+* `lora_contributed_lines` cuenta líneas en las que la decisión ganadora usa
+  LoRA;
+* `new_consensus_lines` es la métrica principal: consenso con LoRA que no
+  existe sin LoRA;
+* `lost_consensus_lines` vigila regresiones de la familia adicional.
+
+Los contadores se agregan por canción durante las primeras 30–50 canciones
+reales. El adaptador no muta la salida por sí solo: sigue siendo una familia
+adicional, y una sugerencia sólo llega al editor si pasa el consenso vigente.

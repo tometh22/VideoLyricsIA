@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from lora_family import attach_hypothesis, load_verified_family
-from targeted_consensus import choose_consensus
+from targeted_consensus import _record_lora_shadow, choose_consensus
 
 
 def _words(text):
@@ -101,3 +101,24 @@ def test_transcribe_words_is_fail_closed_when_disabled(monkeypatch, tmp_path):
     assert words == []
     assert stats["status"] == "declined"
     assert stats["reason"] == "not_attested_or_disabled"
+
+
+def test_lora_shadow_counts_only_new_consensus_attribution():
+    stats = {}
+    words = _words("hola mundo")
+    _record_lora_shadow(
+        stats,
+        lora_words=words,
+        with_agreed=words,
+        with_evidence={"sources": ["stem", "lora"]},
+        without_agreed=None,
+        without_evidence={},
+    )
+
+    shadow = stats["lora_shadow"]
+    assert shadow["comparisons"] == 1
+    assert shadow["with_consensus"] == 1
+    assert shadow["without_consensus"] == 0
+    assert shadow["lora_contributed_lines"] == 1
+    assert shadow["new_consensus_lines"] == 1
+    assert shadow["lost_consensus_lines"] == 0

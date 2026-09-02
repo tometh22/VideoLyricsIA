@@ -18,7 +18,9 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 from learning_triggers import catalog_training_authorization  # noqa: E402
-from lora_v1 import BASE_MODEL, read_jsonl, sha256_file  # noqa: E402
+from lora_v1 import (  # noqa: E402
+    BASE_MODEL, V2_DIFFICULTY_OVERSAMPLE_RATIO, read_jsonl, sha256_file,
+)
 
 REQUIRED = {
     "sample_id", "song_id", "audio_path", "start_s", "end_s", "text", "language",
@@ -151,6 +153,35 @@ def _training_rows(rows: list[dict[str, Any]]) -> tuple[list[dict], list[dict], 
     return train, valid, held
 
 
+def _oversample_difficult_rows(
+    rows: list[dict[str, Any]], ratio: int = 1,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Repeat only training rows from the difficult queue for LoRA-v2.
+
+    Validation and leave-artist-out rows are selected before this function is
+    called, so weighting cannot leak evaluation songs or artists.  A ratio of
+    one is an exact no-op for v1.
+    """
+    factor = max(1, int(ratio))
+    difficult = [
+        row for row in rows
+        if str(row.get("difficulty") or "").strip().lower() == "difficult"
+    ]
+    if factor <= 1 or not difficult:
+        return list(rows), {
+            "requested_ratio": factor, "difficult_rows": len(difficult),
+            "added_rows": 0, "effective_rows": len(rows),
+        }
+    repeated = list(rows)
+    for repeat in range(1, factor):
+        repeated.extend({**row, "oversample_index": repeat} for row in difficult)
+    return repeated, {
+        "requested_ratio": factor, "difficult_rows": len(difficult),
+        "added_rows": len(difficult) * (factor - 1),
+        "effective_rows": len(repeated),
+    }
+
+
 def _write_report(output: Path, report: dict[str, Any]) -> None:
     output.mkdir(parents=True, exist_ok=True)
     (output / "run_report.json").write_text(
@@ -159,7 +190,8 @@ def _write_report(output: Path, report: dict[str, Any]) -> None:
 
 
 def train(rows: list[dict[str, Any]], output: Path, *, model_name: str = BASE_MODEL,
-          max_steps: int = 100, rank: int = 8, learning_rate: float = 1e-4) -> dict[str, Any]:
+          max_steps: int = 100, rank: int = 8, learning_rate: float = 1e-4,
+          difficulty_oversample: int = 1) -> dict[str, Any]:
     authorization = catalog_training_authorization()
     if not authorization["authorized"]:
         report = {
@@ -169,6 +201,9 @@ def train(rows: list[dict[str, Any]], output: Path, *, model_name: str = BASE_MO
         _write_report(output, report)
         return report
     train_rows, validation_rows, held_rows = _training_rows(rows)
+    train_rows, oversample_stats = _oversample_difficult_rows(
+        train_rows, difficulty_oversample,
+    )
     if not train_rows:
         raise ValueError("no non-eval training rows remain")
     try:
@@ -247,6 +282,7 @@ def train(rows: list[dict[str, Any]], output: Path, *, model_name: str = BASE_MO
         "base_model": model_name, "lora_rank": rank, "max_steps": max_steps,
         "train_samples": len(train_rows), "validation_samples_reserved": len(validation_rows),
         "leave_artist_out_samples_reserved": len(held_rows),
+        "difficulty_oversample": oversample_stats,
         "train_loss": float(result.training_loss), "adapter_path": str(adapter),
         "adapter_sha256": sha256_file(adapter / "adapter_model.safetensors")
         if (adapter / "adapter_model.safetensors").is_file() else None,
@@ -272,6 +308,11 @@ def main() -> int:
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--difficulty-oversample", type=int, default=1,
+        help=("repeat difficult training rows; v2 policy uses "
+              f"{V2_DIFFICULTY_OVERSAMPLE_RATIO}:1"),
+    )
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args()
     rows, historical_stats = load_training_rows(
@@ -282,6 +323,9 @@ def main() -> int:
     )
     if args.validate_only:
         train_rows, validation_rows, held_rows = _training_rows(rows)
+        _effective_train_rows, oversample_stats = _oversample_difficult_rows(
+            train_rows, args.difficulty_oversample,
+        )
         report = {
             "status": "validated", "samples": len(rows),
             "train_samples": len(train_rows), "validation_samples": len(validation_rows),
@@ -289,13 +333,15 @@ def main() -> int:
             "canonical_eval_excluded": sum(bool(row.get("eval_only")) for row in rows),
             "historical": historical_stats,
             "base_model": args.model, "authorization": catalog_training_authorization(),
+            "difficulty_oversample": oversample_stats,
         }
         _write_report(args.output.resolve(), report)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     report = train(rows, args.output.resolve(), model_name=args.model,
                    max_steps=args.max_steps, rank=args.rank,
-                   learning_rate=args.learning_rate)
+                   learning_rate=args.learning_rate,
+                   difficulty_oversample=args.difficulty_oversample)
     report["historical"] = historical_stats
     _write_report(args.output.resolve(), report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
