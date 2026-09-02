@@ -11,7 +11,7 @@ import { tierForLength } from "../lib/lyricTiers";
 import { resolveLegacyDraft } from "../lib/reviewRecovery";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
-import { reseedPreservingIds } from "../lib/segmentIds";
+import { reseedPreservingIds, mintSegmentId } from "../lib/segmentIds";
 import {
   clampBlockShiftDelta,
   shiftBlockWithinDuration,
@@ -2968,12 +2968,14 @@ export default function LyricsEditor({
         result.push({
           ...seg,
           _id: nextId++,
+          segment_id: mintSegmentId(),
           text: lineA,
           end: Math.max(seg.start + 0.3, midTime - gap),
         });
         result.push({
           ...seg,
           _id: nextId++,
+          segment_id: mintSegmentId(),
           text: lineB,
           start: Math.min(seg.end - 0.3, midTime),
           end: seg.end,
@@ -3156,12 +3158,14 @@ export default function LyricsEditor({
           const bStart = firstWordStart(r.wordsB);
           const bEnd = lastWordEnd(r.wordsB);
           const s1 = {
-            ...seg, _id: nextId1, text: r.textA, words: r.wordsA,
+            ...seg, _id: nextId1, segment_id: mintSegmentId(),
+            text: r.textA, words: r.wordsA,
             start: aStart != null ? aStart : seg.start,
             end: aEnd != null ? aEnd : seg.end,
           };
           const s2 = {
-            ...seg, _id: nextId2, text: r.textB, words: r.wordsB,
+            ...seg, _id: nextId2, segment_id: mintSegmentId(),
+            text: r.textB, words: r.wordsB,
             start: bStart != null ? bStart : s1.end + 0.05,
             end: bEnd != null ? bEnd : seg.end,
           };
@@ -3204,8 +3208,8 @@ export default function LyricsEditor({
       const midTime = seg.start + (seg.end - seg.start) * ratio;
       const gap = 0.05;
       const { words: _dropWords, ...segNoWords } = seg;
-      const s1 = { ...segNoWords, _id: nextId1, text: part1, end: Math.max(seg.start + 0.3, midTime - gap) };
-      const s2 = { ...segNoWords, _id: nextId2, text: part2, start: Math.min(seg.end - 0.3, midTime), end: seg.end };
+      const s1 = { ...segNoWords, _id: nextId1, segment_id: mintSegmentId(), text: part1, end: Math.max(seg.start + 0.3, midTime - gap) };
+      const s2 = { ...segNoWords, _id: nextId2, segment_id: mintSegmentId(), text: part2, start: Math.min(seg.end - 0.3, midTime), end: seg.end };
       return [...prev.slice(0, idx), s1, s2, ...prev.slice(idx + 1)];
     });
   };
@@ -3254,7 +3258,10 @@ export default function LyricsEditor({
       const newStart = Math.min(duration || orig.end + segDur, orig.end);
       const newEnd = Math.min(duration || newStart + segDur, newStart + segDur);
       const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
-      const dup = { ...orig, _id: nextId, start: newStart, end: newEnd };
+      const dup = {
+        ...orig, _id: nextId, segment_id: mintSegmentId(),
+        start: newStart, end: newEnd,
+      };
       return [...prev.slice(0, idx + 1), dup, ...prev.slice(idx + 1)];
     });
     setFlushCounter((c) => c + 1);
@@ -3297,7 +3304,10 @@ export default function LyricsEditor({
         baseStart + segDur,
       );
       const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
-      const inserted = { _id: nextId, start: baseStart, end: baseEnd, text: "" };
+      const inserted = {
+        _id: nextId, segment_id: mintSegmentId(),
+        start: baseStart, end: baseEnd, text: "",
+      };
       // Keep `edited` sorted by start so syncCursor / neighbour clamp /
       // /save-segments autosave all see a monotonic timeline. The
       // backend also sorts (#184) but doing it here keeps the UI's
@@ -3329,7 +3339,9 @@ export default function LyricsEditor({
         if (e <= s) e = s + 0.5;
       }
       const nextId = prev.reduce((m, x) => Math.max(m, x._id), -1) + 1;
-      const inserted = { _id: nextId, start: s, end: e, text: "" };
+      const inserted = {
+        _id: nextId, segment_id: mintSegmentId(), start: s, end: e, text: "",
+      };
       return [...prev, inserted].sort((a, b) => a.start - b.start);
     });
     setFlushCounter((c) => c + 1);
