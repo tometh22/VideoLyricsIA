@@ -125,6 +125,21 @@ class Api:
                 last_report = now
             time.sleep(max(1.0, poll_seconds))
 
+    def _put_presigned(self, url: str, body) -> requests.Response:
+        """PUT bytes to a presigned R2/S3 URL.
+
+        Deliberately NOT ``self.session``: the session carries the API's
+        ``Authorization: Bearer`` header, and S3-compatible storage rejects a
+        query-string-signed request that also carries an Authorization header
+        with ``400 InvalidArgument`` ("only one auth mechanism allowed"). Every
+        WAV above the 16 MB multipart threshold failed on part 1 because of
+        this before the first staging canary ran.
+        """
+        return requests.put(
+            url, data=body, headers={"Content-Type": "audio/wav"},
+            timeout=max(self.timeout, 900),
+        )
+
     def upload_audio(self, entry: AudioManifestEntry) -> str:
         path = Path(entry.source_path)
         ticket = self.request("POST", "/upload-url", json={
@@ -137,9 +152,7 @@ class Api:
         job_id = ticket["job_id"]
         if not ticket.get("use_multipart"):
             with path.open("rb") as body:
-                put = self.session.put(ticket["upload_url"], data=body,
-                                       headers={"Content-Type": "audio/wav"},
-                                       timeout=max(self.timeout, 900))
+                put = self._put_presigned(ticket["upload_url"], body)
             if put.status_code >= 300:
                 raise BatchError(f"R2 PUT failed for {entry.filename}: {put.status_code}")
             return job_id
@@ -162,9 +175,7 @@ class Api:
                         json={"job_id": job_id, "part_number": part_number},
                     )["url"]
                 body = fh.read(part_size)
-                put = self.session.put(signed[part_number], data=body,
-                                       headers={"Content-Type": "audio/wav"},
-                                       timeout=max(self.timeout, 900))
+                put = self._put_presigned(signed[part_number], body)
                 if put.status_code >= 300:
                     raise BatchError(f"R2 part {part_number} failed for {entry.filename}: {put.status_code}")
                 etag = put.headers.get("ETag") or put.headers.get("Etag")
