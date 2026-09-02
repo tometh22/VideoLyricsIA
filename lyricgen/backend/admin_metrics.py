@@ -20,7 +20,13 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import AIProvenance, AuditLog, Job, User
-from provenance import cost_for_record
+from provenance import (
+    _provenance_month_columns,
+    _rates_for_month,
+    billable_filter,
+    cost_for_record,
+    rates_for_window,
+)
 
 logger = logging.getLogger("genly.admin_metrics")
 
@@ -118,12 +124,20 @@ def metrics_timeseries(db: Session, days: int = 28) -> dict:
                  AIProvenance.tool_provider, Job.tenant_id)
         .join(Job, Job.job_id == AIProvenance.job_id)
         .filter(AIProvenance.created_at >= since)
+        # MISMO costo que /admin/margin. Sin estos dos, "Costo IA" valía una
+        # cosa en Rendimiento e Insights y otra en Gestión → Costos, sin que
+        # nada en pantalla lo dijera. Medido en jul-2026: la tarifa de lista
+        # de Veo ($0,10) contra la derivada de la factura ($0,292116) —
+        # 2,9x abajo; gemini al revés, 7x arriba.
+        .filter(billable_filter())
         .all()
     )
+    _rates = rates_for_window(db, since)
     for created_at, tool, provider, tenant in prov_rows:
+        mes = _rates_for_month(_rates, created_at.year, created_at.month)
         series[_day_key(created_at)][tenant]["ai_cost_usd"] = round(
             series[_day_key(created_at)][tenant]["ai_cost_usd"]
-            + cost_for_record(tool, provider), 4,
+            + cost_for_record(tool, provider, mes), 4,
         )
 
     return {"days": days, "series": {d: dict(t) for d, t in sorted(series.items())}}
@@ -227,15 +241,24 @@ def metrics_economics(db: Session, days: int = 28) -> dict:
     since = _utcnow() - timedelta(days=days)
 
     cost_by_tenant = defaultdict(float)
-    for tool, provider, tenant, calls in (
+    # Agrupado por MES además de por herramienta: la tarifa calibrada es
+    # mensual, y una ventana de 90 días cruza tres. Aplicar la del primer
+    # mes a todo el rango valúa mal casi todo el período.
+    _rates = rates_for_window(db, since)
+    _y, _m = _provenance_month_columns()
+    for tool, provider, tenant, anio, mes_num, calls in (
         db.query(AIProvenance.tool_name, AIProvenance.tool_provider,
-                 Job.tenant_id, func.count(AIProvenance.id))
+                 Job.tenant_id, _y, _m, func.count(AIProvenance.id))
         .join(Job, Job.job_id == AIProvenance.job_id)
         .filter(AIProvenance.created_at >= since)
-        .group_by(AIProvenance.tool_name, AIProvenance.tool_provider, Job.tenant_id)
+        .filter(billable_filter())
+        .group_by(AIProvenance.tool_name, AIProvenance.tool_provider,
+                  Job.tenant_id, _y, _m)
         .all()
     ):
-        cost_by_tenant[tenant] += int(calls or 0) * cost_for_record(tool, provider)
+        tarifas = _rates_for_month(_rates, anio, mes_num)
+        cost_by_tenant[tenant] += (
+            int(calls or 0) * cost_for_record(tool, provider, tarifas))
 
     approved_by_tenant = dict(
         db.query(Job.tenant_id, func.count(Job.job_id))
