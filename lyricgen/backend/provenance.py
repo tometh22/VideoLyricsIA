@@ -96,6 +96,14 @@ COST_PER_CALL: dict[tuple[str, str], float] = {
     ("imagen-4.0-generate-001", "google_vertex"): 0.04,
     ("imagen-4.0-fast-generate-001", "google_vertex"): 0.02,
     ("imagen-4.0-ultra-generate-001", "google_vertex"): 0.06,
+    # Still-image default since 2026-09-01: Vertex stopped serving the whole
+    # Imagen family to our project (404), so `foto-parallax` / `foto_viva` /
+    # `bg_mode=imagen` now render the still with Gemini's native image model.
+    # Billed as output tokens — one 16:9 still is a flat 1290 tokens at
+    # $30/1M (measured against the live API), i.e. $0.0387. Cheaper than the
+    # Imagen 4 standard tier it replaces, so this is a small cost win, not a
+    # regression.
+    ("gemini-2.5-flash-image", "google_vertex"): 0.039,
     # Gemini text/multimodal — averaged across our prompt sizes
     ("gemini-2.5-flash", "google_vertex"): 0.01,
     ("gemini-2.5-flash-lite", "google_vertex"): 0.005,

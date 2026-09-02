@@ -65,6 +65,28 @@ BACKFILL_DAYS = int(os.environ.get("COST_BACKFILL_DAYS", "35"))
 # fabrication. `fixed` is monthly by nature — see `_fixed_month`.
 DAILY_SOURCES = ("gcp", "railway", "r2", "openai", "replicate")
 
+# POR QUÉ RAILWAY NO TRAE SU LÍNEA "AGENT USAGE" ACÁ
+# --------------------------------------------------
+# La factura de Railway tiene seis líneas; `_railway_day` modela cinco.
+# La sexta (Agent Usage, US$5,07 del ciclo 20-jul→20-ago-2026) sale de la
+# query `agentUsage`, que es un CONTADOR ACUMULADO DEL CICLO ABIERTO: no
+# acepta rango de fechas, no desglosa por servicio y no se puede volver a
+# pedir una vez que el ciclo cerró. Los detalles y la evidencia están en
+# `billing_sources`, arriba de `railway_agent_usage`.
+#
+# Se podría fingir una serie diaria restando el contador de ayer contra el
+# de hoy. Sería mentira en tres formas distintas, todas del tipo que este
+# archivo existe para evitar:
+#   * el backfill de 35 días no puede reconstruir nada — escribiría el
+#     contador de HOY sobre 35 días del pasado;
+#   * un día que el colector no corrió no se recupera nunca, y su consumo
+#     se le carga entero al primer día que sí corre;
+#   * no hay `serviceId`, así que la dimensión `service` necesitaría un
+#     servicio inventado o dejaría de sumar el total (ver
+#     `_check_dims_sum_to_total`).
+# El número se captura una vez por mes en el snapshot de `fetch_railway`,
+# marcado como excluido del total. Es la única granularidad que existe.
+
 
 @dataclass
 class DayResult:
