@@ -57,3 +57,20 @@ def test_shadow_report_aggregates_only_observed_songs(monkeypatch):
     assert report["totals"]["new_consensus_lines"] == 1
     assert report["totals"]["new_consensus_rate"] == 0.5
     assert report["replacement_allowed"] is False
+
+
+def test_record_lora_shadow_marks_enabled_even_when_template_preseeded_false():
+    """reprocess() pre-seeds lora_shadow with enabled=False; a comparison must flip it."""
+    from targeted_consensus import _record_lora_shadow
+
+    stats = {"lora_shadow": {
+        "enabled": False, "comparisons": 0, "with_consensus": 0,
+        "without_consensus": 0, "lora_contributed_lines": 0,
+        "new_consensus_lines": 0, "lost_consensus_lines": 0,
+    }}
+    _record_lora_shadow(
+        stats, lora_words=[{"word": "hola", "start": 1.0, "end": 1.3}],
+        with_agreed=[], with_evidence={}, without_agreed=[], without_evidence={},
+    )
+    assert stats["lora_shadow"]["enabled"] is True
+    assert stats["lora_shadow"]["comparisons"] == 1
