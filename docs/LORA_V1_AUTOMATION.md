@@ -200,7 +200,9 @@ calibración de v2 es, por ahora, `raw_quality=reconstructed`, no “difícil”
 Cada replay de `targeted_consensus` que tenga una hipótesis LoRA atestada
 calcula una comparación apareada sin volver a llamar a ASR. En la misma
 ventana se ejecuta el consenso con el testigo `lora` y se repite quitándolo;
-el resultado se persiste en `postpass_stats.lora_shadow`:
+el resultado se persiste en `transcription_quality.retry.lora_shadow`
+(y en los diagnósticos `postpass_stats.targeted_consensus` cuando el replay
+es adoptado):
 
 * `comparisons`, `with_consensus` y `without_consensus` describen la población;
 * `lora_contributed_lines` cuenta líneas en las que la decisión ganadora usa
