@@ -255,8 +255,11 @@ def _snapshot(job_id: str):
         # catalogue, but a suggestion still requires independent audio
         # consensus before it reaches the operator.
         lexicon_terms: list[str] = []
+        lexicon_enabled = os.environ.get(
+            "ARTIST_LEXICON_RAG_ENABLED", "0",
+        ).strip().lower() in {"1", "true", "yes", "on"}
         artist = str(row.artist or "").strip()
-        if artist:
+        if artist and lexicon_enabled:
             catalog_rows = db.query(Job.segments_json).filter(
                 Job.tenant_id == row.tenant_id,
                 Job.job_id != row.job_id,
@@ -307,6 +310,7 @@ def _snapshot(job_id: str):
                 + ", ".join(lexicon_terms)
             )[:850] if lexicon_terms else "",
             "artist_lexicon_terms": len(lexicon_terms),
+            "artist_lexicon_enabled": lexicon_enabled,
         }
     finally:
         db.close()
@@ -1331,6 +1335,9 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 retry_stats.update(provider_stats)
                 retry_stats["artist_lexicon_terms"] = int(
                     snapshot.get("artist_lexicon_terms") or 0
+                )
+                retry_stats["artist_lexicon_enabled"] = bool(
+                    snapshot.get("artist_lexicon_enabled")
                 )
                 retry_stats["mutated_segments"] = False
 

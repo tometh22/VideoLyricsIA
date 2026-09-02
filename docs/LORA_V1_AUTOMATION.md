@@ -216,3 +216,37 @@ reales. El adaptador no muta la salida por sí solo: sigue siendo una familia
 adicional, y una sugerencia sólo llega al editor si pasa el consenso vigente.
 El reporte operativo es de solo lectura: `python
 lyricgen/backend/scripts/report_lora_shadow.py --limit 50 --json`.
+
+## Router de dificultad por desacuerdo LoRA↔base (piloto 2026-09-02)
+
+El piloto offline combina las 23 canciones canónicas y las 18 reconstruidas.
+Para cada canción calcula la distancia de edición ponderada entre las dos
+secuencias de hipótesis, ignorando mayúsculas y puntuación. El WER se usa sólo
+para etiquetar dificultad durante la evaluación; el score de runtime no lee
+letras de referencia (`runtime_uses_gold=false`).
+
+Resultado reproducible con
+`scripts/pilot_lora_disagreement_router.py`: 41 canciones, 27 con WER base
+>10%, AUC **0,971** (bootstrap 95%: **0,918–1,000**) y correlación de Pearson
+**0,900**. Supera el gate exploratorio AUC ≥0,70, pero sigue siendo un piloto:
+debe recalibrarse con leave-one-song-out sobre canciones nuevas antes de
+ordenar automáticamente una cola.
+
+En runtime, `transcription_worker` persiste el score gold-free en
+`transcription_quality.metrics.difficulty_router` cuando ambas familias están
+disponibles. Si falta cualquiera de los testigos, el campo no se escribe y el
+router se abstiene. El score es una señal de semáforo, no una autorización de
+autocorrección.
+
+## Léxico por artista
+
+El flujo de calidad ya recupera hasta 120 términos de canciones aprobadas del
+mismo artista (excluyendo el job actual), los registra como
+`artist_lexicon_terms` y los usa como `initial_prompt` únicamente en las
+ventanas de consenso. No se incorporan hipótesis crudas ni referencias del
+propio tema, y la decisión final sigue requiriendo dos familias acústicas.
+La bandera independiente `ARTIST_LEXICON_RAG_ENABLED=1` queda preparada en
+staging; apagada, el flujo no consulta el catálogo. La evaluación
+leave-one-song-out y el gate de −10% WER para artistas con al menos dos temas
+quedan pendientes de la cohorte real; no se activa como reemplazo global antes
+de medirlos.

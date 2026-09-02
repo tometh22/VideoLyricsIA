@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import threading
 import tempfile
 import time
@@ -262,6 +263,66 @@ def attach_hypothesis(result: dict[str, Any], words: list[dict[str, Any]], *, re
     result["_lora_asr_family"] = family["family"]
     result["_lora_family_role"] = family["role"]
     return True
+
+
+_ROUTER_TOKEN_RE = re.compile(r"[\wÀ-ÿ]+(?:['’][\wÀ-ÿ]+)?", re.UNICODE)
+
+
+def _router_tokens(words: list[dict[str, Any]] | None) -> list[str]:
+    values: list[str] = []
+    for item in words or []:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("word") or item.get("text") or ""
+        values.extend(
+            token.casefold() for token in _ROUTER_TOKEN_RE.findall(str(text))
+        )
+    return values
+
+
+def _router_edit_distance(left: list[str], right: list[str]) -> int:
+    previous = list(range(len(right) + 1))
+    for index, value in enumerate(left, 1):
+        current = [index]
+        for other_index, other in enumerate(right, 1):
+            current.append(min(
+                current[-1] + 1,
+                previous[other_index] + 1,
+                previous[other_index - 1] + (value != other),
+            ))
+        previous = current
+    return previous[-1]
+
+
+def song_disagreement_score(
+    base_words: list[dict[str, Any]] | None,
+    lora_words: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Return the persisted LoRA↔base difficulty score for one song.
+
+    This is deliberately a paired-model signal, not a quality verdict: it
+    never reads a reference lyric and it does not mutate the selected output.
+    ``None`` means one of the witnesses was unavailable, so the router must
+    abstain rather than treat missing inference as agreement.
+    """
+    if not isinstance(base_words, list) or not isinstance(lora_words, list):
+        return None
+    base = _router_tokens(base_words)
+    lora = _router_tokens(lora_words)
+    if not base or not lora:
+        return None
+    denominator = max(len(base), len(lora), 1)
+    edits = _router_edit_distance(base, lora)
+    return {
+        "score": round(min(1.0, edits / denominator), 6),
+        "base_tokens": len(base),
+        "lora_tokens": len(lora),
+        "comparison_tokens": denominator,
+        "edit_count": edits,
+        "source": "paired_asr_disagreement",
+        "gold_free": True,
+        "abstain_without_both_families": True,
+    }
 
 
 # Model loading is intentionally process-local.  The production pipeline may
