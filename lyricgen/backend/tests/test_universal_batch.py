@@ -312,3 +312,40 @@ def test_presigned_put_never_carries_api_authorization(tmp_path, monkeypatch):
     assert url.startswith("https://r2.test/")
     assert "Authorization" not in {k.title() for k in kwargs.get("headers", {})}
     assert "secret-token" not in str(kwargs.get("headers"))
+
+
+def test_presigned_put_retries_transient_transport_errors(monkeypatch):
+    import universal_batch
+
+    api = universal_batch.Api("https://api.test", "tok")
+    calls = {"n": 0}
+
+    class _Resp:
+        status_code = 200
+        headers = {"ETag": '"abc"'}
+
+    def flaky_put(url, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise universal_batch.requests.ConnectionError("Broken pipe")
+        assert kwargs["data"] == b"bytes"
+        return _Resp()
+
+    monkeypatch.setattr(universal_batch.requests, "put", flaky_put)
+    monkeypatch.setattr(universal_batch.time, "sleep", lambda *_: None)
+    assert api._put_presigned("https://r2.test/k?sig", b"bytes").status_code == 200
+    assert calls["n"] == 3
+
+
+def test_presigned_put_gives_up_after_bounded_retries(monkeypatch):
+    import pytest
+    import universal_batch
+
+    api = universal_batch.Api("https://api.test", "tok")
+    monkeypatch.setattr(
+        universal_batch.requests, "put",
+        lambda *a, **k: (_ for _ in ()).throw(universal_batch.requests.ConnectionError("down")),
+    )
+    monkeypatch.setattr(universal_batch.time, "sleep", lambda *_: None)
+    with pytest.raises(universal_batch.BatchError):
+        api._put_presigned("https://r2.test/k?sig", b"bytes")
