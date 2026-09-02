@@ -135,10 +135,24 @@ class Api:
         WAV above the 16 MB multipart threshold failed on part 1 because of
         this before the first staging canary ran.
         """
-        return requests.put(
-            url, data=body, headers={"Content-Type": "audio/wav"},
-            timeout=max(self.timeout, 900),
-        )
+        # A presigned PUT is idempotent (single object or a numbered multipart
+        # part), so transient transport failures are safe to retry. The first
+        # staging canary lost 2/15 uploads to BrokenPipe under 5-way
+        # concurrency; without this the song is marked error and needs a
+        # manual --retry-errors pass.
+        payload = body.read() if hasattr(body, "read") else body
+        last_exc: Exception | None = None
+        for attempt in range(4):
+            try:
+                return requests.put(
+                    url, data=payload, headers={"Content-Type": "audio/wav"},
+                    timeout=max(self.timeout, 900),
+                )
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_exc = exc
+                if attempt < 3:
+                    time.sleep(1.5 * (2 ** attempt))
+        raise BatchError(f"presigned PUT failed after retries: {last_exc!r}")
 
     def upload_audio(self, entry: AudioManifestEntry) -> str:
         path = Path(entry.source_path)
