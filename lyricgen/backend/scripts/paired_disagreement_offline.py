@@ -60,7 +60,11 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _chunks(audio_path: Path, chunk_s: float = 30.0):
+def _chunks(audio_path: Path, chunk_s: float = 30.0, windows: list | None = None):
+    """Yield 16 kHz mono chunks. With ``windows`` ([[start, end], ...] in
+    seconds) only those vocal spans are decoded, which is what the router
+    pilot did; whole-file chunking hallucinates on instrumental passages
+    ("Música Música…", "¡Suscríbete al canal!") and inflates the score."""
     import librosa
     import soundfile as sf
     audio, sr = sf.read(str(audio_path), always_2d=True)
@@ -68,6 +72,14 @@ def _chunks(audio_path: Path, chunk_s: float = 30.0):
     if sr != 16000:
         mono = librosa.resample(mono, orig_sr=sr, target_sr=16000)
     step = int(chunk_s * 16000)
+    if windows:
+        for start, end in windows:
+            a, b = max(0, int(float(start) * 16000)), min(len(mono), int(float(end) * 16000))
+            for offset in range(a, b, step):
+                chunk = mono[offset:min(offset + step, b)]
+                if len(chunk) >= 1600:
+                    yield chunk
+        return
     for offset in range(0, len(mono), step):
         chunk = mono[offset:offset + step]
         if len(chunk) >= 1600:
@@ -79,13 +91,14 @@ def _decode(asr, chunk, generate_kwargs) -> str:
     return str(out.get("text") or "") if isinstance(out, dict) else ""
 
 
-def song_pair(asr, model, torch, audio_path: Path, language: str) -> dict:
-    generate_kwargs = {"task": "transcribe"}
+def song_pair(asr, model, torch, audio_path: Path, language: str,
+              vocal_windows: list | None = None, max_new_tokens: int = 128) -> dict:
+    generate_kwargs = {"task": "transcribe", "max_new_tokens": int(max_new_tokens)}
     if language and language not in {"auto", "unknown", "none"}:
         generate_kwargs["language"] = language
     windows = edits = comparison = 0
     with torch.inference_mode():
-        for chunk in _chunks(audio_path):
+        for chunk in _chunks(audio_path, windows=vocal_windows):
             with_lora = _decode(asr, chunk, generate_kwargs)
             with model.disable_adapter():
                 base = _decode(asr, chunk, generate_kwargs)
@@ -97,6 +110,7 @@ def song_pair(asr, model, torch, audio_path: Path, language: str) -> dict:
         "windows": windows, "edits": edits, "comparison_tokens": comparison,
         "disagreement": round(edits / max(comparison, 1), 6),
         "source": "paired_turbo_base_vs_lora_offline",
+        "vocal_windows_only": bool(vocal_windows), "max_new_tokens": int(max_new_tokens),
     }
 
 
@@ -107,7 +121,13 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--language", default="es")
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--windows-file", help="JSON {sha256: {windows: [[start, end], ...]}} of vocal spans (gold-free, e.g. from persisted machine segments)")
+    parser.add_argument("--max-new-tokens", type=int, default=128, help="pilot default; bounds hallucination loops")
     args = parser.parse_args()
+    windows_by_sha: dict[str, list] = {}
+    if args.windows_file:
+        for sha, row in json.load(open(args.windows_file)).items():
+            windows_by_sha[sha] = list((row or {}).get("windows") or [])
 
     from lora_family import _load_runtime_model, load_verified_family
     family = load_verified_family()
@@ -133,7 +153,8 @@ def main() -> int:
         if sha in results:
             continue
         started = time.monotonic()
-        pair = song_pair(asr, model, torch, path, args.language)
+        pair = song_pair(asr, model, torch, path, args.language,
+                         vocal_windows=windows_by_sha.get(sha), max_new_tokens=args.max_new_tokens)
         pair.update({"filename": path.name, "sha256": sha, **sha_to_job.get(sha, {}),
                      "elapsed_s": round(time.monotonic() - started, 1)})
         results[sha] = pair
