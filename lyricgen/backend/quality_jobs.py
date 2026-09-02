@@ -686,6 +686,12 @@ _ANALYTICAL_KEYS = frozenset({
     "structural_hybrid_attempts", "structural_hybrid_accepts",
     "strong_unassigned_events", "unassigned_events", "viable_hypotheses",
     "authorized_windows", "candidates", "invalid_candidates",
+    # Paired LoRA-v1 shadow attribution (with/without the additional family).
+    # Keep these counters in the analytical allow-list so the quality row can
+    # be aggregated over the first 30–50 real songs.
+    "lora_shadow", "lora_contributed_lines", "new_consensus_lines",
+    "lost_consensus_lines", "with_consensus", "without_consensus",
+    "comparisons", "enabled",
     "start", "end", "core_start", "core_end", "duration", "margin",
     "phase_margin", "max_phase_delta", "median_phase_delta", "starts",
     "raw_score", "score", "confidence", "probability", "coverage",
