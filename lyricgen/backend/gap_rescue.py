@@ -213,6 +213,7 @@ def _raw_provider_words(response: object) -> tuple[list[object], list[dict]]:
 def _transcribe_window(audio_path: str, ini: float, dur: float,
                        language: str | None = None,
                        job_id: str | None = None, *,
+                       prompt: str | None = None,
                        provenance_step: str = "gap_rescue") -> list[dict]:
     """Recorta [ini, ini+dur] y lo transcribe con whisper-1 pidiendo
     timestamps por PALABRA. Devuelve words en el marco temporal del audio
@@ -243,6 +244,11 @@ def _transcribe_window(audio_path: str, ini: float, dur: float,
             }
             if language:
                 kwargs["language"] = language
+            if prompt and prompt.strip():
+                # Artist RAG is a bounded vocabulary hint only.  It is never
+                # treated as reference text and the consensus/audio checks
+                # remain the authority for any suggested lyric.
+                kwargs["prompt"] = prompt.strip()[:850]
             if job_id:
                 from provenance import record_ai_call
                 recorder = record_ai_call(

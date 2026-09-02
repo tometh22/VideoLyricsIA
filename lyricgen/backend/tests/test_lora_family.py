@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 
-from lora_family import attach_hypothesis, load_verified_family
+from lora_family import (
+    attach_hypothesis,
+    load_verified_family,
+    song_disagreement_score,
+)
 from targeted_consensus import _record_lora_shadow, choose_consensus
 
 
@@ -122,3 +126,13 @@ def test_lora_shadow_counts_only_new_consensus_attribution():
     assert shadow["lora_contributed_lines"] == 1
     assert shadow["new_consensus_lines"] == 1
     assert shadow["lost_consensus_lines"] == 0
+
+
+def test_song_disagreement_score_is_gold_free_and_abstains_without_both_families():
+    base = _words("hola mundo")
+    lora = _words("hola ruido")
+    score = song_disagreement_score(base, lora)
+    assert score["score"] == 0.5
+    assert score["source"] == "paired_asr_disagreement"
+    assert score["gold_free"] is True
+    assert song_disagreement_score(base, []) is None

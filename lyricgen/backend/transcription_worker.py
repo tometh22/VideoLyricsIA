@@ -428,6 +428,21 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         from lyric_content_policy import EDITORIAL_POLICY_ID
         final_metrics["editorial_policy_id"] = EDITORIAL_POLICY_ID
     final_metrics["language"] = str(language or "unknown")[:16]
+    # Persist the paired LoRA↔base disagreement as a song-level routing
+    # feature. It is computed before internal witness streams are stripped,
+    # uses no reference lyrics, and remains advisory until calibration signs
+    # the router gate.
+    try:
+        from lora_family import song_disagreement_score
+        router_signal = song_disagreement_score(
+            r.get("_asr_words") or [], r.get("_lora_asr_words") or [],
+        )
+        if router_signal is not None:
+            final_metrics["difficulty_router"] = router_signal
+    except Exception:
+        # Optional telemetry must never make a valid transcription fail.
+        # Missing witnesses force router abstention rather than agreement.
+        pass
     final["metrics"] = final_metrics
     r["transcription_quality"] = final
     if final["decision"] == "pass":
