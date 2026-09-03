@@ -95,6 +95,22 @@ def test_reconciler_respects_30_active_and_50_ready_windows(db):
     ))
 
 
+def test_campaign_transcription_uses_auto_language_for_initial_and_retry(db):
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    item.title = "Sisters (Live)"
+    db.commit()
+
+    first = batch._batch_transcription_kwargs(campaign, item)
+    retry = batch._batch_transcription_kwargs(campaign, item)
+
+    assert first == retry
+    assert first["language"] == ""
+    assert first["live"] is True
+
+
 def test_reconciler_reserves_ready_buffer_for_active_transcriptions(db):
     campaign = _campaign(db, 80)
     batch._promote_campaign(db, campaign)

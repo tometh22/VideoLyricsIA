@@ -5,7 +5,9 @@ import pytest
 
 from batch_manifest import AudioManifestEntry, build_manifest, parse_audio_filename
 from batch_profiles import RenderProfileError, normalize_render_profile, pipeline_fields
-from universal_batch import Api, BatchError, process_wave, select_backgrounds
+from universal_batch import (
+    Api, BatchError, _resolved_language, process_wave, select_backgrounds,
+)
 import universal_batch as ub
 
 
@@ -67,6 +69,50 @@ def _entry(index: int) -> AudioManifestEntry:
         sha256=f"sha-{index}",
         duration_seconds=180.0,
     )
+
+
+def test_batch_transcription_requests_audio_auto_language(monkeypatch):
+    calls = []
+    api = Api("https://api.example", "token")
+    monkeypatch.setattr(
+        api,
+        "request",
+        lambda method, path, **kwargs: calls.append((method, path, kwargs))
+        or {"status": "transcribing_queued"},
+    )
+    entry = _entry(1)
+    entry.version = "live"
+
+    api.start_transcription(entry, "job123456789")
+
+    body = calls[0][2]["json"]
+    assert body["language"] == ""
+    assert body["live"] is True
+
+
+def test_batch_manifest_persists_confirmed_language(monkeypatch):
+    api = Api("https://api.example", "token")
+    monkeypatch.setattr(api, "request", lambda *_args, **_kwargs: {
+        "status": "transcribed",
+        "segments": [],
+        "transcription_quality": {"metrics": {"language": "en"}},
+    })
+    entry = _entry(2)
+
+    assert api.wait_for_transcription(entry, "job123456789", 0) == []
+    assert entry.search_result["language"] == "en"
+    assert entry.search_result["language_requested"] == "auto"
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ({"detected_language": "en"}, "en"),
+    ({"language": "pt"}, "pt"),
+    ({"transcription_quality": {"metrics": {"language": "fr"}}}, "fr"),
+    ({"detected_languages": ["en", "es"], "mixed_language": True}, None),
+    ({"transcription_quality": {"metrics": {"language": "unknown"}}}, None),
+])
+def test_resolved_language_never_invents_a_forced_fallback(payload, expected):
+    assert _resolved_language(payload) == expected
 
 
 def test_background_pool_cycles_for_campaigns_larger_than_library():

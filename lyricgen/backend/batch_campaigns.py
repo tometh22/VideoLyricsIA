@@ -748,6 +748,27 @@ def claim_next_review(
     return {"job_id": None, "empty": True}
 
 
+def _batch_transcription_kwargs(
+    campaign: BatchCampaign,
+    item: BatchCampaignItem,
+) -> dict[str, Any]:
+    """Build one audio-first transcription request for every campaign path."""
+    title = item.title or ""
+    lowered_title = title.lower()
+    return {
+        # Empty means provider auto-LID.  The worker confirms the language on
+        # the vocal stem and deliberately keeps mixed-language input unforced.
+        "language": "",
+        "artist": item.artist or "",
+        "title": title,
+        "filename": item.filename,
+        "tenant_id": campaign.tenant_id,
+        "live": "live" in lowered_title or "en vivo" in lowered_title,
+        "anchor_lyrics": "",
+        "workload_class": "batch",
+    }
+
+
 def _promote_campaign(db: Session, campaign: BatchCampaign) -> list[str]:
     active_trans = db.query(func.count(Job.id)).filter(
         Job.tenant_id == campaign.tenant_id,
@@ -806,16 +827,7 @@ def _promote_campaign(db: Session, campaign: BatchCampaign) -> list[str]:
             db,
             job=job,
             audio_path=audio_path,
-            transcription_kwargs={
-                "language": "es",
-                "artist": item.artist or "",
-                "title": item.title or "",
-                "filename": item.filename,
-                "tenant_id": campaign.tenant_id,
-                "live": "live" in (item.title or "").lower() or "en vivo" in (item.title or "").lower(),
-                "anchor_lyrics": "",
-                "workload_class": "batch",
-            },
+            transcription_kwargs=_batch_transcription_kwargs(campaign, item),
         )
         event_ids.append(event.id)
     if items:
@@ -954,12 +966,7 @@ def retry_campaign_item(
             db,
             job=job,
             audio_path=audio_path,
-            transcription_kwargs={
-                "language": "es", "artist": item.artist or "",
-                "title": item.title or "", "filename": item.filename,
-                "tenant_id": campaign.tenant_id, "live": False,
-                "anchor_lyrics": "", "workload_class": "batch",
-            },
+            transcription_kwargs=_batch_transcription_kwargs(campaign, item),
         )
         db.commit()
         from transactional_outbox import dispatch_outbox_event
