@@ -8,6 +8,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -826,4 +827,95 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
         snap["operational_metrics"] = ops_metrics_snapshot()
     except Exception:
         snap["operational_metrics"] = {}
+    snap["quality_gates"] = quality_gates_snapshot(snap)
+    if snap["quality_gates"].get("state") == "red":
+        snap.setdefault("degraded_reasons", [])
+        for reason in snap["quality_gates"].get("reasons") or []:
+            if reason not in snap["degraded_reasons"]:
+                snap["degraded_reasons"].append(reason)
     return snap
+
+
+def quality_gates_snapshot(snap: dict | None = None) -> dict:
+    """Estado ROJO/VERDE de las compuertas de calidad, visible en /health.
+
+    Existe porque el replay de calidad estuvo muerto 21 días en staging y desde
+    siempre en producción mientras /health decía ``ok``: sin calibración el
+    score queda en null y la decisión nunca puede ser ``pass``; sin artefactos
+    fijados las propuestas de las amarillas nunca se autorizan; y si el token de
+    runtime difiere entre el servicio que encola y el quality-worker, cada
+    replay se descarta en 4 segundos sin una sola línea de log.
+
+    Nunca cambia el ``status`` general: un deploy no se puede caer por esto
+    (Railway espera /health). Lo que hace es dejar de ser invisible.
+    """
+    reasons: list[str] = []
+    payload: dict = {"state": "green", "reasons": reasons}
+    try:
+        from transcription_quality import (
+            POLICY_VERSION, calibration_identity, runtime_identity,
+        )
+        calibration = calibration_identity()
+        identity = runtime_identity()
+        payload["policy_version"] = POLICY_VERSION
+        payload["calibrated"] = bool(calibration.get("calibrated"))
+        payload["calibration_id"] = calibration.get("calibration_id")
+        payload["pipeline_config_fingerprint"] = identity.get("pipeline_config_fingerprint")
+        if not calibration.get("calibrated"):
+            reasons.append("quality_calibration_unavailable")
+    except Exception:
+        payload["calibrated"] = None
+        reasons.append("quality_calibration_unreadable")
+    try:
+        from queue_jobs import _transcription_quality_runtime_token
+        payload["runtime_token"] = _transcription_quality_runtime_token()
+    except Exception:
+        payload["runtime_token"] = None
+        reasons.append("runtime_token_unavailable")
+    # Propuestas de las amarillas: mismo criterio que
+    # quality_v6_calibration (kill switch + artefactos fijados con su sha256).
+    # Se evalúa acá directo para no fabricar un objeto de certificación falso.
+    try:
+        blockers: list[str] = []
+        if os.environ.get("QUALITY_V6_PROPOSALS_ENABLED", "0").strip().lower() not in {
+            "1", "true", "yes", "on",
+        }:
+            blockers.append("proposal_kill_switch_off")
+        pinned = {
+            "QUALITY_V6_DATASET_MANIFEST_PATH": os.environ.get("QUALITY_V6_DATASET_MANIFEST_PATH", "").strip(),
+            "QUALITY_V6_DATASET_MANIFEST_SHA256": os.environ.get("QUALITY_V6_DATASET_MANIFEST_SHA256", "").strip().lower(),
+            "QUALITY_V6_CALIBRATION_PATH": os.environ.get("QUALITY_V6_CALIBRATION_PATH", "").strip(),
+            "QUALITY_V6_CALIBRATION_SHA256": os.environ.get("QUALITY_V6_CALIBRATION_SHA256", "").strip().lower(),
+        }
+        missing = [name for name, value in pinned.items() if not value]
+        if missing or not all(
+            re.fullmatch(r"[0-9a-f]{64}", pinned[name])
+            for name in ("QUALITY_V6_DATASET_MANIFEST_SHA256", "QUALITY_V6_CALIBRATION_SHA256")
+            if pinned[name]
+        ):
+            blockers.append("pinned_artifacts_missing")
+        payload["quality_v6_proposals"] = {
+            "authorized": not blockers, "blockers": blockers, "missing_env": missing,
+        }
+        if blockers:
+            reasons.append("quality_v6_proposals_blocked")
+    except Exception:
+        payload["quality_v6_proposals"] = {"authorized": None, "blockers": []}
+    # Paridad de flota: cada worker publica su token; si no coinciden, el
+    # replay se descarta silenciosamente (runtime_identity_mismatch).
+    try:
+        rows = (snap or {}).get("worker_releases") or []
+        tokens = {
+            str(row.get("runtime_token"))
+            for row in rows if isinstance(row, dict) and row.get("runtime_token")
+        }
+        if payload.get("runtime_token"):
+            tokens.add(str(payload["runtime_token"]))
+        payload["fleet_runtime_tokens"] = sorted(tokens)
+        payload["fleet_runtime_token_match"] = len(tokens) <= 1
+        if len(tokens) > 1:
+            reasons.append("fleet_runtime_token_mismatch")
+    except Exception:
+        payload["fleet_runtime_token_match"] = None
+    payload["state"] = "red" if reasons else "green"
+    return payload
