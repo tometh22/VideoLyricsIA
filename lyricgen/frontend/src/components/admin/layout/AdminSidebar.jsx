@@ -1,6 +1,19 @@
-// Sub-navegación del Admin Panel v2: 4 secciones, cada una con sub-vistas.
-// Reemplaza las 9 tabs horizontales del monolito — agrupadas por intención
-// (¿qué vengo a hacer?) y no por orden de aparición histórico.
+// Navegación del Admin: 4 secciones agrupadas por intención (¿qué vengo a
+// hacer?), no por orden histórico de aparición.
+//
+// POR QUÉ LA COLUMNA ES PLANA
+// Antes cada ítem ocupaba dos líneas —label + una descripción que se lee
+// una vez y pesa para siempre— y las sub-vistas se anidaban indentadas
+// debajo del ítem activo. Con Gestión abierta la columna tenía 10 destinos
+// y la sección activa se perdía entre sus propios hijos.
+//
+// Ahora la columna lista SÓLO las 4 secciones, en una línea cada una. Las
+// sub-vistas pasaron a `SubTabs`, una fila horizontal arriba del contenido:
+// se leen de un golpe, no empujan el resto hacia abajo, y el nivel
+// "¿dónde estoy?" queda separado del "¿qué parte miro?".
+//
+// La descripción de cada sección sobrevive como `title` del botón: sigue
+// disponible para quien la necesite, sin ocupar la pantalla del que ya sabe.
 //
 // badges: { [sectionId]: number } — contadores vivos (CRs pendientes, jobs
 // colgados) que el shell calcula desde el contexto.
@@ -80,10 +93,70 @@ const NAV = [
 ];
 
 // Sub-tab default de cada sección (la primera).
+/** Los ids de sección válidos. Se derivan del NAV para que no exista una
+ * segunda lista que se olvide de actualizar. */
+export const SECCIONES = new Set(NAV.map((n) => n.id));
+
+/** ¿`subTab` existe dentro de `sectionId`?
+ *
+ * Lo usa la restauración de navegación: un destino guardado puede apuntar a
+ * una sub-vista que ya no existe. Pasó de verdad cuando se eliminó
+ * `gestion/infra` al consolidar Costos.
+ */
+export function subTabValida(sectionId, subTab) {
+  const s = NAV.find((n) => n.id === sectionId);
+  return Boolean(s?.subTabs?.some((t) => t.id === subTab));
+}
+
 export function defaultSubTab(sectionId) {
   const section = NAV.find((s) => s.id === sectionId);
   return section?.subTabs?.[0]?.id ?? null;
 }
+
+/** Las sub-vistas de una sección, como fila horizontal arriba del contenido.
+ *
+ * Vive acá y no en cada sección porque el NAV es la única fuente de verdad
+ * de qué sub-vistas existen: tenerlas en dos lados fue justamente lo que
+ * dejó a `Insights` diciendo en su encabezado "una sola vista, sin
+ * sub-tabs" mientras el nav definía cinco.
+ *
+ * Devuelve `null` cuando la sección no tiene sub-vistas, así el contenido
+ * sube y no queda una barra vacía ocupando lugar.
+ */
+export function SubTabs({ section, subTab, onNavigate }) {
+  const item = NAV.find((n) => n.id === section);
+  if (!item?.subTabs?.length) return null;
+  return (
+    <div
+      role="tablist"
+      aria-label={`Vistas de ${item.label}`}
+      className="flex items-center gap-1 flex-wrap border-b border-white/[0.06] mb-5 -mt-1"
+    >
+      {item.subTabs.map((st) => {
+        const activo = subTab === st.id;
+        return (
+          <button
+            key={st.id}
+            type="button"
+            role="tab"
+            aria-selected={activo}
+            onClick={() => onNavigate(section, st.id)}
+            // El subrayado marca el activo en vez de un fondo: es más
+            // liviano que una píldora y no compite con los KPIs de abajo.
+            className={`px-3 py-2 text-caption -mb-px border-b-2 transition-colors duration-brand ${
+              activo
+                ? "border-brand text-white"
+                : "border-transparent text-gray-500 hover:text-gray-200"
+            }`}
+          >
+            {st.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 
 export default function AdminSidebar({ section, subTab, onNavigate, badges = {}, showInsights = false }) {
   const items = NAV.filter((item) => item.id !== "insights" || showInsights);
@@ -97,18 +170,16 @@ export default function AdminSidebar({ section, subTab, onNavigate, badges = {},
               type="button"
               onClick={() => onNavigate(item.id, defaultSubTab(item.id))}
               aria-current={isActive ? "page" : undefined}
-              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-button text-left transition-colors duration-brand ${
+              title={item.description}
+              className={`w-full flex items-center gap-3 px-3 py-2 rounded-button text-left transition-colors duration-brand ${
                 isActive
                   ? "bg-brand/15 ring-1 ring-brand/30 text-white"
                   : "text-gray-400 hover:text-white hover:bg-white/[0.03]"
               }`}
             >
               <span className={isActive ? "text-brand-light" : "text-gray-500"}>{item.icon}</span>
-              <span className="flex-1 min-w-0">
-                <span className="block text-ui font-medium leading-tight">{item.label}</span>
-                <span className="block text-section text-gray-600 mt-0.5 normal-case tracking-normal">
-                  {item.description}
-                </span>
+              <span className="flex-1 min-w-0 text-ui font-medium leading-tight">
+                {item.label}
               </span>
               {badges[item.id] > 0 && (
                 <span className="shrink-0 min-w-[1.25rem] text-center text-section font-bold rounded-full px-1.5 py-0.5 bg-amber-500/20 text-amber-300">
@@ -116,26 +187,6 @@ export default function AdminSidebar({ section, subTab, onNavigate, badges = {},
                 </span>
               )}
             </button>
-            {/* Sub-tabs visibles solo en la sección activa */}
-            {isActive && item.subTabs && (
-              <div className="mt-1 mb-2 ml-9 space-y-0.5">
-                {item.subTabs.map((st) => (
-                  <button
-                    key={st.id}
-                    type="button"
-                    onClick={() => onNavigate(item.id, st.id)}
-                    aria-pressed={subTab === st.id}
-                    className={`block w-full text-left px-3 py-1.5 rounded-md text-caption transition-colors duration-brand ${
-                      subTab === st.id
-                        ? "text-white bg-white/[0.05]"
-                        : "text-gray-500 hover:text-gray-300"
-                    }`}
-                  >
-                    {st.label}
-                  </button>
-                ))}
-              </div>
-            )}
           </div>
         );
       })}

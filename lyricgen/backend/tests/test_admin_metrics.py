@@ -4,6 +4,7 @@ Series temporales, funnel con percentiles, unit economics por tenant,
 health score y alertas de negocio — todo computado de Job + AuditLog +
 AIProvenance sembrados en la DB de test.
 """
+import pytest
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -218,3 +219,116 @@ def test_is_internal_tenant_excluye_ci_smoke():
     assert _is_internal_tenant("universal_argentina") is False
     assert _is_internal_tenant("") is False
     assert _is_internal_tenant(None) is False
+
+
+# ---------------------------------------------------------------------------
+# "Costo IA" tiene que valer lo mismo en todo el admin
+# ---------------------------------------------------------------------------
+#
+# Antes había dos caminos con reglas distintas para el MISMO concepto:
+#
+#   admin_metrics.py  → Rendimiento, Insights   sin billable_filter, tarifa de lista
+#   provenance.py     → Gestión → Costos        con billable_filter y tarifa calibrada
+#
+# Medido en jul-2026 contra la factura real de GCP ($142,87, veo $140,80):
+#
+#   veo-3.1-fast   lista $0,80/llamada   real $0,292116   → lista 2,7x ARRIBA
+#   gemini         lista $0,013492       real $0,001885   → lista 7,2x arriba
+#
+# Las 527 llamadas a Veo de julio valuadas a lista dan $421,60 contra los
+# $140,80 que efectivamente facturó Google. O sea: Rendimiento e Insights
+# mostraban ~3x MÁS costo del real, y Gestión → Costos el número correcto,
+# sin que nada en pantalla dijera que eran métodos distintos.
+
+def test_el_costo_ia_ignora_las_filas_no_facturables(db):
+    """Un cache hit no gastó plata y no puede sumar al costo."""
+    from datetime import datetime, timedelta, timezone
+    from database import AIProvenance, Job
+    import admin_metrics
+    from provenance import CACHE_HIT_PREFIX
+
+    tenant = "metrics-billable-test"
+    ahora = datetime.now(timezone.utc) - timedelta(days=1)
+    db.query(Job).filter(Job.tenant_id == tenant).delete(synchronize_session=False)
+    db.add(Job(job_id="mb1", user_id=1, tenant_id=tenant, artist="A",
+               filename="a.mp3", status="done", created_at=ahora))
+    db.flush()
+    for jid, resumen in (("p-real", "ok"), ("p-cache", f"{CACHE_HIT_PREFIX} reuse")):
+        db.add(AIProvenance(job_id="mb1", step="video_bg",
+                            tool_name="veo-3.1-fast-generate-001",
+                            tool_provider="google_vertex", prompt_sent="x",
+                            response_summary=resumen, created_at=ahora))
+    db.commit()
+    try:
+        econ = admin_metrics.metrics_economics(db, days=7)
+        fila = next((t for t in econ["tenants"] if t["tenant_id"] == tenant), None)
+        assert fila is not None, "el tenant no aparece"
+        una_llamada = fila["ai_cost_usd"]
+
+        # Con el cache hit contado serían DOS llamadas. Que valga una sola
+        # es la propiedad: el reuso es un ahorro, no un gasto.
+        from provenance import cost_for_record
+        assert una_llamada == pytest.approx(
+            cost_for_record("veo-3.1-fast-generate-001", "google_vertex"), abs=0.01)
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == "mb1").delete(
+            synchronize_session=False)
+        db.query(Job).filter(Job.tenant_id == tenant).delete(synchronize_session=False)
+        db.commit()
+
+
+def test_el_costo_ia_usa_la_tarifa_calibrada_no_la_de_lista(db):
+    """Si hay calibración de la factura, manda ella.
+
+    Sin esto, el módulo de calibración es decorativo: se guarda una tarifa
+    "real" que ninguna pantalla usa. Es exactamente lo que pasaba —
+    `cost_snapshots` en producción tiene 0 filas y todo el admin caía a
+    lista.
+    """
+    from datetime import datetime, timedelta, timezone
+    from database import AIProvenance, CostSnapshot, Job
+    import admin_metrics
+    import rate_calibration as rc
+
+    tenant = "metrics-calib-test"
+    ahora = datetime.now(timezone.utc) - timedelta(days=1)
+    period = f"{ahora.year:04d}-{ahora.month:02d}"
+    TARIFA = 0.292116          # la derivada de la factura de julio
+
+    db.query(Job).filter(Job.tenant_id == tenant).delete(synchronize_session=False)
+    db.query(CostSnapshot).filter(CostSnapshot.period == period,
+                                  CostSnapshot.source == "rate_calibration"
+                                  ).delete(synchronize_session=False)
+    db.add(Job(job_id="mc1", user_id=1, tenant_id=tenant, artist="A",
+               filename="a.mp3", status="done", created_at=ahora))
+    db.flush()
+    db.add(AIProvenance(job_id="mc1", step="video_bg",
+                        tool_name="veo-3.1-fast-generate-001",
+                        tool_provider="google_vertex", prompt_sent="x",
+                        response_summary="ok", created_at=ahora))
+    db.commit()
+    # Forma REAL de lo que produce `derive_rates`: `load_applied_rates` lee
+    # de `breakdown`, no de `applied`, y exige status ok + derived_rate.
+    rc.store_rates(db, period, {
+        "applied": {"veo": TARIFA},
+        "rates": [{"tool": "veo", "status": "ok", "derived_rate": TARIFA,
+                   "calls": 527, "invoiced_usd": 140.80}],
+    })
+    db.commit()
+    try:
+        econ = admin_metrics.metrics_economics(db, days=7)
+        fila = next(t for t in econ["tenants"] if t["tenant_id"] == tenant)
+        # `metrics_economics` redondea a centavos, así que se compara contra
+        # la calibrada redondeada. Lo que importa es que NO sea la de lista
+        # ($0,80): esa diferencia es 2,7x y no se pierde en el redondeo.
+        assert fila["ai_cost_usd"] == pytest.approx(round(TARIFA, 2), abs=0.005), (
+            f"usó la tarifa de lista en vez de la calibrada: {fila['ai_cost_usd']}")
+        assert fila["ai_cost_usd"] < 0.5, "sigue valuando a precio de lista"
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == "mc1").delete(
+            synchronize_session=False)
+        db.query(Job).filter(Job.tenant_id == tenant).delete(synchronize_session=False)
+        db.query(CostSnapshot).filter(CostSnapshot.period == period,
+                                      CostSnapshot.source == "rate_calibration"
+                                      ).delete(synchronize_session=False)
+        db.commit()
