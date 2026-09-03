@@ -13122,6 +13122,13 @@ class EditorConflictRequest(BaseModel):
 class EditorActivityHeartbeatRequest(BaseModel):
     session_id: str = Field(min_length=16, max_length=100)
     activity_seq: int = Field(ge=0, le=10_000_000)
+    # Tarea en curso. Sirve para repartir los minutos de revisor entre buscar,
+    # texto y timing, que es lo único que dice dónde se va el p90. El patrón
+    # cierra el vocabulario: el cliente no puede inventar categorías.
+    task: str = Field(
+        default="unknown",
+        pattern=r"^(listen|search|text|timing|vocalization|export|unknown)$",
+    )
 
 
 class ProductEventItem(BaseModel):
@@ -13629,6 +13636,7 @@ async def editor_activity_heartbeat(
         properties={
             "session_id": body.session_id,
             "activity_seq": body.activity_seq,
+            "task": body.task,
             "revision": int(document.revision or 0),
             "snapshot_sha256": lyric_snapshot_hash(document.current_segments or []),
             "pipeline_release": str(
