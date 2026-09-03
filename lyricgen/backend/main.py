@@ -635,6 +635,22 @@ def on_startup():
     auto-flipped to error every 5 min — no manual cleanup, owner gets
     a digest email + Sentry alert per pass."""
     init_db()
+    # Compuertas de calidad al arrancar: si falta la calibración o los
+    # artefactos fijados, el servicio lo dice una vez en el log en vez de
+    # devolver score null en silencio durante semanas.
+    try:
+        from observability import quality_gates_snapshot
+        _gates = quality_gates_snapshot()
+        if _gates.get("state") == "red":
+            logger.warning(
+                "[QUALITY-GATES] state=red reasons=%s calibrated=%s runtime_token=%s",
+                ",".join(_gates.get("reasons") or []),
+                _gates.get("calibrated"), _gates.get("runtime_token"),
+            )
+        else:
+            logger.info("[QUALITY-GATES] state=green token=%s", _gates.get("runtime_token"))
+    except Exception:
+        pass
     db = next(get_db())
     try:
         ensure_default_admin(db)
