@@ -17,7 +17,13 @@ const NAV = [
         <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
       </svg>
     ),
-    subTabs: null,
+    // "Estado público" cuelga de acá y no de Gestión a propósito: redactar
+    // un incidente es parte del triaje en vivo, no de la administración.
+    // Cuando algo se rompe, el operador ya está en esta sección.
+    subTabs: [
+      { id: "pipeline", label: "Pipeline en vivo" },
+      { id: "estado-publico", label: "Estado público" },
+    ],
   },
   {
     // ¿Mejor o peor que antes? — salud por cuenta, funnel, KPIs WoW.

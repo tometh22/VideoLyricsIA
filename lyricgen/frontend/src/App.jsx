@@ -46,10 +46,15 @@ const SearchPalette = lazy(() => import("./components/SearchPalette"));
 // /variant no lleva segments y el autosave del editor le escribiría al
 // job padre). Ver components/VariantLyricsSummary.jsx.
 const VariantLyricsSummary = lazy(() => import("./components/VariantLyricsSummary"));
+// Página pública de estado del servicio. Lazy y fuera de AppShell: la abre
+// gente sin login (y sin token válido, si el outage es de auth) y no tiene
+// que arrastrar el bundle del workspace. Ver components/StatusPage.jsx.
+const StatusPage = lazy(() => import("./components/StatusPage"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
 import GiftCreditsBanner from "./components/GiftCreditsBanner";
+import ServiceStatusBanner from "./components/ServiceStatusBanner";
 import { useAlert } from "./components/AlertProvider";
 import { ACTIVE_STATUSES, isTerminalStatus } from "./lib/jobStatus";
 import {
@@ -652,6 +657,11 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
           onToggleNavigation={() => setSidebarOpen(!sidebarOpen)}
           navigationOpen={sidebarOpen}
         />
+
+        {/* Incidente de plataforma. Va PRIMERO: si el servicio está caído,
+            eso explica el error que el usuario está viendo mejor que
+            cualquier otro aviso de la pantalla. */}
+        <ServiceStatusBanner />
 
         {/* Dunning banner — sits above content, below the top bar */}
         <PastDueBanner user={user} />
@@ -5652,6 +5662,18 @@ export default function App() {
                   resetToken={resetToken}
                   onResetComplete={() => setResetToken(null)}
                 />
+          }
+        />
+        {/* Estado del servicio: público, sin JWT y FUERA de <RequireAuth>
+            a propósito. Si el outage es de login, el cliente igual tiene
+            que poder abrir esta página — es el único momento en que de
+            verdad la necesita. */}
+        <Route
+          path="/status"
+          element={
+            <Suspense fallback={<RouteSuspenseFallback />}>
+              <StatusPage />
+            </Suspense>
           }
         />
         <Route
