@@ -1,0 +1,48 @@
+{
+ "schema": "lora-v1-archive-v1",
+ "status": "archived",
+ "archived_at": "2026-09-03",
+ "adapter_sha256": "b1409aff1a58d96ce967a83e1a31a2c0f2d506de09d03ea8d269fb5af0853ab5",
+ "base_model": "openai/whisper-large-v3-turbo",
+ "reason": "Sobre 11 canciones de holdout (rol eval_holdout, nunca vistas en entrenamiento) empeoro el WER; el -12,6% de agosto se midio con artistas del train set y lo explicaban dos outliers de bucles de repeticion.",
+ "holdout_evaluation": {
+  "date": "2026-09-03",
+  "cohort": "eval_holdout",
+  "n": 11,
+  "studio": {
+   "n": 7,
+   "delta_wer": 0.1491,
+   "ci95": [
+    -0.003,
+    0.3652
+   ],
+   "songs_better": 2
+  },
+  "live": {
+   "n": 4,
+   "delta_wer": 0.3392,
+   "ci95": [
+    0.1235,
+    0.5173
+   ],
+   "songs_better": 0
+  },
+  "condition": "turbo base vs turbo+LoRA, ASR local sobre la mezcla, gold = entrega aprobada del mismo audio, IC 95% bootstrap por cancion",
+  "delta_wer_candidate_minus_baseline": 0.2182,
+  "ci95": [
+   0.0769,
+   0.384
+  ],
+  "crosses_zero": false,
+  "songs_better": 2,
+  "delta_wer_baseline_minus_candidate": -0.2182,
+  "source": "riyadh/.context/sprint-72h/rol3-ablacion-resultados-20260903.md"
+ },
+ "mechanism": "intact: lora_family.py, prepare/train/evaluate scripts and the runtime family remain; only the adapter is archived",
+ "retraining_trigger": {
+  "threshold_train_role_songs": 300,
+  "leave_artist_out": "normalized artist keys (lora_v1.normalize_artist)",
+  "gate": "lora_v1.holdout_gate: CI 95% per-song of (baseline - candidate) must not cross zero and cohort must have no train songs",
+  "baseline_to_beat": "any candidate with ci_low > 0 beats the archived adapter (which scored -0.2182)"
+ }
+}
