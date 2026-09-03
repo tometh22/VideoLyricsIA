@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from "react";
+import { classifyTask, isEditableTarget, readTaskAttr } from "../editorTaskClock";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
@@ -1047,6 +1048,9 @@ export default function LyricsEditor({
   const activeClockStorageKey = transcribeJobId
     ? `genly_active_edit:${draftTenant}:${draftOwner || "anonymous"}:${transcribeJobId}`
     : null;
+  // Espejo de isPlaying para los listeners globales del reloj, que se montan
+  // antes de que exista el estado del reproductor.
+  const isPlayingRef = useRef(false);
   const editorActiveClockRef = useRef(null);
   if (!editorActiveClockRef.current) {
     let persistedMs = 0;
@@ -1064,6 +1068,7 @@ export default function LyricsEditor({
       lastTickMs: now,
       lastActivityMs: now,
       active: visible && focused,
+      task: "unknown",
     };
   }
   const persistActiveClock = useCallback(() => {
@@ -1088,10 +1093,17 @@ export default function LyricsEditor({
   }, [activeClockStorageKey]);
   useEffect(() => {
     if (typeof window === "undefined" || typeof document === "undefined") return undefined;
-    const activity = () => {
+    const activity = (event) => {
       readActiveEditMs();
       const now = Date.now();
       const clock = editorActiveClockRef.current;
+      const target = event?.target || null;
+      clock.task = classifyTask({
+        taskAttr: readTaskAttr(target),
+        editable: isEditableTarget(target),
+        isPlaying: isPlayingRef.current,
+        interactedRecently: true,
+      });
       clock.lastActivityMs = now;
       clock.lastTickMs = now;
       clock.active = document.visibilityState !== "hidden"
@@ -1198,6 +1210,11 @@ export default function LyricsEditor({
             body: JSON.stringify({
               session_id: editorSessionIdRef.current,
               activity_seq: nextSequence,
+              // Con interacción reciente vale la tarea que se estaba haciendo;
+              // sin ella, lo que está pasando es escuchar (o nada).
+              task: now - clock.lastActivityMs < 5000
+                ? clock.task
+                : classifyTask({ isPlaying: isPlayingRef.current }),
             }),
           },
         );
@@ -1773,6 +1790,7 @@ export default function LyricsEditor({
   const lastPublishedActiveIdRef = useRef(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
+  useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [audioError, setAudioError] = useState(false);
