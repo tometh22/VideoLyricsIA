@@ -432,6 +432,24 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     # feature. It is computed before internal witness streams are stripped,
     # uses no reference lyrics, and remains advisory until calibration signs
     # the router gate.
+    # Contador de llamadas reales al ASR vs cache hits. La procedencia ya
+    # distingue "replicate_raw" de "cache_hit_raw"; acá se agrega para que
+    # cualquier reporte pueda declarar si el ASR corrió, sin auditar a mano.
+    try:
+        asr_calls = {"whisperx_real_calls": 0, "whisperx_cache_hits": 0}
+        for hypothesis in (r.get("_recognition_hypotheses") or []):
+            if not isinstance(hypothesis, dict):
+                continue
+            transformation = str(hypothesis.get("transformation") or "")
+            if transformation == "cache_hit_raw":
+                asr_calls["whisperx_cache_hits"] += 1
+            elif transformation == "replicate_raw":
+                asr_calls["whisperx_real_calls"] += 1
+        asr_calls["asr_actually_ran"] = asr_calls["whisperx_real_calls"] > 0
+        final_metrics["asr_calls"] = asr_calls
+    except Exception:
+        pass
+
     try:
         from lora_family import song_disagreement_score
         router_signal = song_disagreement_score(
