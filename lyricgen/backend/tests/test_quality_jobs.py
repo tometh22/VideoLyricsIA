@@ -418,6 +418,62 @@ def test_quality_persist_discards_same_hash_from_older_audio_revision(db):
     assert row.active_quality_attempt_id is None
 
 
+def test_quality_persist_preserves_batch_reference_and_human_approval(db):
+    tenant = f"quality_batch_{uuid.uuid4().hex[:8]}"
+    user = create_user(
+        db, f"quality_batch_{uuid.uuid4().hex[:8]}", "testpass12345", None,
+        tenant_id=tenant,
+    )
+    job_id = uuid.uuid4().hex[:12]
+    segments = [{"start": 1.0, "end": 2.0, "text": "line"}]
+    content_hash = tq.segments_hash(segments)
+    reference = {
+        "schema": "batch-reference-hypothesis-v1",
+        "audio_sha256": "a" * 64,
+        "audio_revision": 1,
+        "review_status": "human_line_review_approved",
+    }
+    approval = {
+        "schema": "batch-pre-background-approval-v1",
+        "segments_sha256": content_hash,
+        "lyrics_confirmed": True,
+        "timings_confirmed": True,
+    }
+    db.add(Job(
+        job_id=job_id, user_id=user.id, tenant_id=tenant,
+        artist="Artist", song_title="Song", filename="song.wav",
+        style="oscuro", status="lyrics_approved",
+        current_step="lyrics_and_timing_approved",
+        delivery_profile="youtube", segments_json=segments,
+        segments_revision=2, input_audio_sha256="a" * 64,
+        audio_revision=1, active_quality_attempt_id="attempt-current",
+        transcription_quality={
+            "analysis_status": "pending",
+            "reference_hypothesis": reference,
+            "pre_background_approval": approval,
+        },
+    ))
+    db.commit()
+
+    candidate = tq.evaluate(segments, None)
+    assert "reference_hypothesis" not in candidate
+    assert "pre_background_approval" not in candidate
+    persisted = quality_jobs._persist_if_current(
+        job_id, 2, content_hash, candidate,
+        expected_audio_revision=1,
+        expected_audio_sha256="a" * 64,
+        analysis_attempt_id="attempt-current",
+    )
+
+    assert persisted is True
+    db.expire_all()
+    row = db.query(Job).filter(Job.job_id == job_id).one()
+    assert row.transcription_quality["reference_hypothesis"] == reference
+    assert row.transcription_quality["pre_background_approval"] == approval
+    assert row.transcription_quality["analysis_status"] == "complete"
+    assert row.active_quality_attempt_id is None
+
+
 def test_ctc_mapping_cannot_resolve_content_without_independent_attestation(
         monkeypatch):
     stem_hash = "a" * 64
