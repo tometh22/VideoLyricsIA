@@ -1930,7 +1930,8 @@ export default function LyricsEditor({
   });
   useEffect(() => {
     if (!lineReviewKey) return;
-    localStorage.setItem(lineReviewKey, JSON.stringify(reviewedLineIds));
+    try { localStorage.setItem(lineReviewKey, JSON.stringify(reviewedLineIds)); }
+    catch { /* autosave remains authoritative if browser storage is full */ }
   }, [lineReviewKey, reviewedLineIds]);
   const markLineReviewed = useCallback((id) => {
     if (!id) return;
