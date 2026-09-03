@@ -95,6 +95,41 @@ def test_reviewer_cannot_decide_another_tenants_issue(
     assert response.status_code == 404
 
 
+def test_mandatory_check_requires_signed_manual_resolution(client, user_token, db):
+    owner = _me(client, user_token)
+    job = _job(db, owner)
+    report = dict(job.delivery_qc)
+    report["summary"] = {"open_count": 1, "fail_count": 1, "warn_count": 0}
+    report["issues"][0].update({
+        "severity": "FAIL",
+        "code": "UMG_BLACK_BARS",
+        "manual_verification_required": True,
+    })
+    job.delivery_qc = report
+    db.commit()
+
+    rejected = client.post(
+        f"/jobs/{job.job_id}/delivery-qc/issues/issue-1/decision",
+        headers={"Authorization": f"Bearer {user_token}"},
+        json={"decision": "acknowledged"},
+    )
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"] == (
+        "mandatory_reviewer_check_requires_signed_manual_resolution"
+    )
+
+    signed = client.post(
+        f"/jobs/{job.job_id}/delivery-qc/issues/issue-1/decision",
+        headers={"Authorization": f"Bearer {user_token}"},
+        json={"decision": "resolved_manual", "reason": "full_video_reviewed"},
+    )
+    assert signed.status_code == 200, signed.text
+    issue = signed.json()["delivery_qc"]["issues"][0]
+    assert issue["status"] == "RESOLVED_MANUAL"
+    assert issue["operator_decision"]["reviewer_name"]
+    assert issue["operator_decision"]["decided_at"]
+
+
 def test_external_qc_result_is_admin_only_and_persists(
     client, admin_token, user_token, db,
 ):

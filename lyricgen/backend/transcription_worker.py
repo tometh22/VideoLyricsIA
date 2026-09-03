@@ -33,6 +33,7 @@ elige entre este path async y el legacy sync. Default a env de staging primero.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 import os
 import re
@@ -504,6 +505,8 @@ def run_transcription_job(
     filename: str = "",
     live: bool = False,
     anchor_lyrics: str = "",
+    reference_required: bool = False,
+    workload_class: str = "interactive",
 ) -> dict:
     """RQ entry point — sync wrapper around `_run_transcription_for_job`.
 
@@ -649,7 +652,8 @@ def run_transcription_job(
             r = await _run_transcription_for_job(
                 None, None, job_id, audio_path,
                 language=language, artist=artist, title=title, filename=filename,
-                live=live,
+                live=live, reference_required=reference_required,
+                workload_class=workload_class,
             )
             from recognition_provenance import resume_from_result
             resume_from_result(r)
@@ -791,7 +795,7 @@ def run_transcription_job(
         # frontend (main.py:2778), so the editor sees `transcribed` and
         # `/generate` sees `transcribed_pending`. Same observable
         # behaviour as the legacy path, no frontend change needed.
-        from database import Job, SessionLocal
+        from database import AuditLog, Job, SessionLocal
         _persist_db = SessionLocal()
         try:
             row = (
@@ -901,6 +905,24 @@ def run_transcription_job(
                 )
                 quality["machine_evidence_required"] = True
                 quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
+                if reference_required:
+                    candidate = result.get("reference_hypothesis_candidate") or {}
+                    from reference_hypothesis import build as build_reference_hypothesis
+                    hypothesis = build_reference_hypothesis(
+                        text=str(candidate.get("text") or reference_lyrics or ""),
+                        provider=str(candidate.get("provider") or "unknown"),
+                        audio_sha256=source_audio_sha256,
+                        audio_revision=int(row.audio_revision or 0),
+                        source_kind=str(candidate.get("source_kind") or "unknown"),
+                        complete_audio_verified=bool(
+                            candidate.get("complete_audio_verified")
+                        ),
+                        attestation=candidate.get("attestation") or {},
+                        source_version=candidate.get("source_version") or {},
+                    )
+                    if not hypothesis["reference_text"]:
+                        raise RuntimeError("batch_reference_hypothesis_missing")
+                    quality["reference_hypothesis"] = hypothesis
                 row.transcription_quality = quality
                 from machine_evidence import finalize_machine_evidence
                 durable_evidence = finalize_machine_evidence(
@@ -916,6 +938,32 @@ def run_transcription_job(
                 require_machine_snapshot(row, document)
                 row.status = "transcribed_pending"
                 row.current_step = "editing"
+                if str(row.workload_class or workload_class) == "batch":
+                    # The review queue must be ordered before a human opens
+                    # it. Persist the blind v2 verdict atomically with the
+                    # transcription instead of relying on an operator script.
+                    from scripts.emit_song_semaforo import ACTION, song_verdict
+                    existing_verdict = next((
+                        log for log in _persist_db.query(AuditLog).filter(
+                            AuditLog.action == ACTION,
+                        ).order_by(AuditLog.id.desc()).limit(1000).all()
+                        if str((log.detail or {}).get("job_id") or "") == job_id
+                    ), None)
+                    if existing_verdict is None:
+                        verdict = song_verdict(quality)
+                        _persist_db.add(AuditLog(
+                            user_id=None,
+                            action=ACTION,
+                            detail={
+                                "job_id": job_id,
+                                "filename": row.filename,
+                                "tenant_id": row.tenant_id,
+                                "job_status": row.status,
+                                **verdict,
+                                "emitted_at": datetime.now(timezone.utc).isoformat(),
+                                "blind_review": True,
+                            },
+                        ))
             _persist_db.commit()
             persisted_revision = current_revision
             persisted_tenant_id = str(row.tenant_id or "")
@@ -950,9 +998,9 @@ def run_transcription_job(
                     "[QUALITY-QUEUE] enqueue declined job=%s error_type=%s",
                     job_id, _safe_exception_code(enqueue_exc),
                 )
-        # reference_lyrics no tiene columna en el modelo Job (defer a otro PR
-        # si el editor lo necesita post-transcribe). Lo dejo en el log para
-        # diagnóstico mientras tanto.
+        # The batch reference is persisted inside transcription_quality and
+        # bound to audio SHA/revision above.  The legacy top-level text remains
+        # response-only for backwards compatibility.
         if reference_lyrics:
             logger.info("[TRANSCRIBE-WORKER] job=%s ref_lyrics=%d chars (no persistido aún)",
                         job_id, len(reference_lyrics))

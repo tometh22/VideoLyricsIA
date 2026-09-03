@@ -20,6 +20,7 @@ import JobSettingsCard from "./JobSettingsCard";
 import { SingleGeneratingHero } from "./BatchProgress";
 import { hasArtTrackAccess } from "../lib/artTrackAccess";
 import { reviewJobPath } from "../lib/reviewJobRoute";
+import { editorSessionHeaders } from "../lib/editorSession";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -405,6 +406,32 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [reviewNotes, setReviewNotes] = useState("");
   const [approving, setApproving] = useState(false);
   const [retrying, setRetrying] = useState(false);
+
+  useEffect(() => {
+    if (!job?.campaign_id || job?.status !== "pending_review") return undefined;
+    let stopped = false;
+    const heartbeat = async () => {
+      try {
+        await fetch(`${API}/editor/${job.job_id}/lock/heartbeat`, {
+          method: "POST",
+          headers: { ...authHeaders(), ...editorSessionHeaders() },
+        });
+      } catch {
+        // The visible queue remains authoritative; the next heartbeat retries.
+      }
+    };
+    heartbeat();
+    const timer = window.setInterval(() => { if (!stopped) heartbeat(); }, 20_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+      fetch(`${API}/editor/${job.job_id}/lock`, {
+        method: "DELETE",
+        headers: { ...authHeaders(), ...editorSessionHeaders() },
+        keepalive: true,
+      }).catch(() => {});
+    };
+  }, [job?.campaign_id, job?.job_id, job?.status]);
 
   // "Enviar a UMG" button state. Gated by role=admin AND status=done — we
   // resolve the role at render time from localStorage so we don't need to
@@ -1572,6 +1599,18 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           description: refreshError?.message || t("detail.refresh_error_description"),
           tone: "warning",
         });
+      }
+      if (job.campaign_id) {
+        await fetch(`${API}/editor/${job.job_id}/lock`, {
+          method: "DELETE",
+          headers: { ...authHeaders(), ...editorSessionHeaders() },
+        });
+        const nextRes = await fetch(
+          `${API}/batch/campaigns/${job.campaign_id}/review-queue/next?stage=final`,
+          { method: "POST", headers: { ...authHeaders(), ...editorSessionHeaders() } },
+        );
+        const next = await nextRes.json().catch(() => ({}));
+        navigate(nextRes.ok && next.job_id ? (next.open_path || `/videos/${next.job_id}`) : `/campaigns/${job.campaign_id}`);
       }
     } catch (err) {
       alert({

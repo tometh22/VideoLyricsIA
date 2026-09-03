@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Idempotent, wave-limited Universal staging batch runner.
 
-The runner is intentionally an API client.  It never writes the deliveries
-table or calls portal endpoints; it only uploads audio, transcribes, and
-queues `/generate` jobs for the authenticated staging tenant.
+This legacy API client is retained only as a render-resume bridge for manifests
+that already contain campaign job ids. Campaign upload/transcription belongs to
+``scripts/campaign_uploader.py``; routing those files through the ordinary
+``/upload-url`` endpoint would lose the campaign and approval guarantees.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import hashlib
 import json
@@ -25,7 +27,9 @@ from batch_manifest import AudioManifestEntry, build_manifest, load_manifest, wr
 from batch_profiles import normalize_render_profile
 
 
-TERMINAL = {"pending_review", "done", "error", "rejected", "validation_failed"}
+TRANSCRIPTION_TERMINAL = {"lyrics_review_pending", "lyrics_approved"}
+RENDER_TERMINAL = {"pending_review", "done", "error", "rejected", "validation_failed"}
+TERMINAL = TRANSCRIPTION_TERMINAL | RENDER_TERMINAL
 DEFAULT_EXPECTED_COUNT = 30
 
 
@@ -57,16 +61,151 @@ class BatchError(RuntimeError):
     pass
 
 
+def _jwt_exp(token: str) -> float | None:
+    """Read an exp hint without trusting it for authentication decisions."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        value = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        return float(value["exp"])
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+class AuthSession:
+    """Thread-safe campaign authentication with proactive and 401 recovery.
+
+    A valid JWT can be refreshed through ``/auth/refresh`` before expiry.  If
+    the server rejects it (expired/revoked), campaign credentials are required
+    to re-login. Secrets are accepted from environment variables only; they
+    are never placed in the manifest or error messages.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        username: str = "",
+        password: str = "",
+        refresh_margin_seconds: int = 21600,
+        force_expire_after_requests: int = 0,
+        timeout: int = 120,
+    ):
+        self.base = base_url.rstrip("/")
+        self._token = token
+        self._username = username
+        self._password = password
+        self._refresh_margin = max(60, int(refresh_margin_seconds))
+        self._force_after = max(0, int(force_expire_after_requests))
+        self._request_count = 0
+        self._forced_once = False
+        self._lock = threading.RLock()
+        self.timeout = timeout
+        self.events: list[str] = []
+
+    def _login_locked(self) -> None:
+        if not self._username or not self._password:
+            raise BatchError(
+                "campaign authentication cannot recover: set "
+                "STAGING_BATCH_USERNAME and STAGING_BATCH_PASSWORD"
+            )
+        response = requests.post(
+            self.base + "/auth/login",
+            json={"username": self._username, "password": self._password},
+            timeout=min(self.timeout, 30),
+        )
+        if response.status_code >= 400:
+            raise BatchError(
+                f"campaign authentication login failed: HTTP {response.status_code}"
+            )
+        token = response.json().get("token")
+        if not token:
+            raise BatchError("campaign authentication login returned no token")
+        self._token = str(token)
+        self.events.append("login")
+
+    def _refresh_locked(self) -> bool:
+        if not self._token:
+            return False
+        response = requests.post(
+            self.base + "/auth/refresh",
+            headers={"Authorization": f"Bearer {self._token}"},
+            timeout=min(self.timeout, 30),
+        )
+        if response.status_code >= 400:
+            return False
+        token = response.json().get("token")
+        if not token:
+            return False
+        self._token = str(token)
+        self.events.append("refresh")
+        return True
+
+    def _ensure_token_locked(self) -> None:
+        if not self._token:
+            self._login_locked()
+            return
+        expires_at = _jwt_exp(self._token)
+        if expires_at is not None and expires_at - time.time() <= self._refresh_margin:
+            if not self._refresh_locked():
+                self._login_locked()
+
+    def authorization(self) -> tuple[str, bool]:
+        with self._lock:
+            self._ensure_token_locked()
+            self._request_count += 1
+            if (
+                self._force_after
+                and not self._forced_once
+                and self._request_count >= self._force_after
+            ):
+                self._forced_once = True
+                self.events.append("forced_expiry")
+                return "forced-expired-canary-token", True
+            return self._token, False
+
+    def recover_401(self, failed_token: str) -> None:
+        with self._lock:
+            # Another worker may already have replaced the rejected token.
+            if self._token and failed_token != self._token:
+                self.events.append("recovered_401")
+                return
+            if not self._refresh_locked():
+                self._login_locked()
+            self.events.append("recovered_401")
+
+
 class Api:
-    def __init__(self, base_url: str, token: str, timeout: int = 120):
+    def __init__(
+        self,
+        base_url: str,
+        token: str = "",
+        timeout: int = 120,
+        *,
+        auth: AuthSession | None = None,
+    ):
         self.base = base_url.rstrip("/")
         self.session = requests.Session()
-        self.session.headers.update({"Authorization": f"Bearer {token}"})
+        self.auth = auth or AuthSession(self.base, token, timeout=timeout)
         self.timeout = timeout
 
     def request(self, method: str, path: str, **kwargs) -> Any:
-        response = self.session.request(method, self.base + path,
-                                        timeout=self.timeout, **kwargs)
+        token, _forced = self.auth.authorization()
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers["Authorization"] = f"Bearer {token}"
+        response = self.session.request(
+            method, self.base + path, timeout=self.timeout,
+            headers=headers, **kwargs,
+        )
+        if response.status_code == 401:
+            self.auth.recover_401(token)
+            retry_token, _ = self.auth.authorization()
+            headers["Authorization"] = f"Bearer {retry_token}"
+            response = self.session.request(
+                method, self.base + path, timeout=self.timeout,
+                headers=headers, **kwargs,
+            )
         if response.status_code >= 400:
             try:
                 detail = response.json()
@@ -311,7 +450,9 @@ class Api:
                     "detected_languages": result.get("detected_languages") or [],
                     "mixed_language": bool(result.get("mixed_language")),
                 }
-                entry.status = "transcribed"
+                # Stage 1 ends here. Background selection and /generate are
+                # forbidden until a reviewer signs the exact lyrics/timings.
+                entry.status = "lyrics_review_pending"
                 return result.get("segments") or []
             if status == "transcription_failed":
                 raise BatchError(result.get("error") or "transcription failed")
@@ -469,8 +610,11 @@ def _submit_transcription(api: Api, entry: AudioManifestEntry, save) -> bool:
     toda la flota. El runner viejo esperaba el render completo de la primera
     cancion antes de siquiera crear la segunda.
     """
-    if entry.status in {"pending_review", "done", "queued", "processing",
-                        "transcribing", "transcribing_queued", "transcribed"}:
+    if entry.status in {
+        "lyrics_review_pending", "lyrics_approved", "pending_review", "done",
+        "queued", "processing", "transcribing", "transcribing_queued",
+        "transcribed",
+    }:
         return True
     if entry.status in TERMINAL:
         if entry.status not in {"pending_review", "done"}:
@@ -512,27 +656,56 @@ def _submit_transcription(api: Api, entry: AudioManifestEntry, save) -> bool:
     return True
 
 
-def _reconcile_entry(api: Api, entry: AudioManifestEntry,
-                     poll_seconds: float, save) -> bool:
-    """Lleva una cancion ya enviada a su estado terminal."""
-    if entry.status in {"pending_review", "done"}:
-        return True
-    if entry.status in {"queued", "processing"} and entry.job_id:
-        api.wait_for_render(entry, entry.job_id, poll_seconds)
-        save()
-        if entry.status not in {"pending_review", "done"}:
-            raise BatchError(entry.error or f"render ended as {entry.status}")
+def _reconcile_transcription_entry(
+    api: Api,
+    entry: AudioManifestEntry,
+    poll_seconds: float,
+    save,
+) -> bool:
+    """Stop at lyrics/timing review; never choose or generate a background."""
+    if entry.status in {"lyrics_review_pending", "lyrics_approved"}:
         return True
     if not entry.job_id:
         return False
     if entry.status == "transcribed":
         detail = api.request("GET", f"/batch/jobs/{entry.job_id}")
-        segments = detail.get("segments_json") or []
-    elif entry.status in {"transcribing", "transcribing_queued", "uploading"}:
-        segments = api.wait_for_transcription(entry, entry.job_id, poll_seconds)
+        server_status = str(detail.get("status") or "")
+        entry.status = (
+            "lyrics_approved" if server_status == "lyrics_approved"
+            else "lyrics_review_pending"
+        )
         save()
-    else:
-        return False
+        return True
+    elif entry.status in {"transcribing", "transcribing_queued", "uploading"}:
+        api.wait_for_transcription(entry, entry.job_id, poll_seconds)
+        save()
+        return entry.status == "lyrics_review_pending"
+    return False
+
+
+def _render_approved_entry(
+    api: Api,
+    entry: AudioManifestEntry,
+    poll_seconds: float,
+    save,
+) -> bool:
+    """Render only a server-authoritative, reviewer-approved revision."""
+    if not entry.job_id:
+        raise BatchError(f"missing job id for {entry.filename}")
+    detail = api.request("GET", f"/batch/jobs/{entry.job_id}")
+    server_status = str(detail.get("status") or "")
+    if server_status in {"pending_review", "done"}:
+        entry.status = server_status
+        save()
+        return True
+    if server_status != "lyrics_approved":
+        entry.status = "lyrics_review_pending"
+        save()
+        raise BatchError(
+            f"{entry.filename} is not lyrics_approved (server={server_status!r})"
+        )
+    entry.status = "lyrics_approved"
+    segments = detail.get("segments_json") or []
     api.generate(entry, entry.job_id, segments, poll_seconds)
     save()
     if entry.status not in {"pending_review", "done"}:
@@ -547,8 +720,31 @@ def process_wave(
     poll_seconds: float,
     concurrency: int,
     save,
+    stage: str = "transcription",
 ) -> list[AudioManifestEntry]:
-    """Encola toda la ola y luego reconcilia; un fallo no mata las demas."""
+    """Run one explicit stage; a failure in one song does not stop peers."""
+    if stage == "render":
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            rendered = {
+                pool.submit(
+                    _render_approved_entry,
+                    api_factory(),
+                    entry,
+                    poll_seconds,
+                    save,
+                ): entry
+                for entry in wave
+            }
+            for future in concurrent.futures.as_completed(rendered):
+                entry = rendered[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    _mark_error(entry, exc, save)
+        return wave
+    if stage != "transcription":
+        raise BatchError(f"unsupported stage: {stage}")
+
     candidates: list[AudioManifestEntry] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
         submitted = {
@@ -566,7 +762,8 @@ def process_wave(
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
         reconciled = {
             pool.submit(
-                _reconcile_entry, api_factory(), entry, poll_seconds, save,
+                _reconcile_transcription_entry,
+                api_factory(), entry, poll_seconds, save,
             ): entry
             for entry in candidates
         }
@@ -579,9 +776,73 @@ def process_wave(
     return wave
 
 
+def _assert_wave_approved(api: Api, wave: list[AudioManifestEntry]) -> None:
+    """Fail before background lookup unless every song is reviewer-approved."""
+    unapproved: list[str] = []
+    for entry in wave:
+        if not entry.job_id:
+            unapproved.append(f"{entry.filename}:missing_job")
+            continue
+        detail = api.request("GET", f"/batch/jobs/{entry.job_id}")
+        server_status = str(detail.get("status") or "")
+        if server_status in {"pending_review", "done"}:
+            # A resumed render wave may contain songs that already completed.
+            # They satisfy the pre-background gate without being rendered a
+            # second time.
+            entry.status = server_status
+        elif server_status != "lyrics_approved":
+            unapproved.append(f"{entry.filename}:{server_status or 'unknown'}")
+        else:
+            entry.status = "lyrics_approved"
+    if unapproved:
+        raise BatchError(
+            "background/render stage blocked; lyrics/timings are not approved: "
+            + ", ".join(unapproved)
+        )
+
+
+def _stage_counts(entries: list[AudioManifestEntry]) -> dict[str, int]:
+    counts = {
+        "not_uploaded": 0,
+        "transcribing": 0,
+        "lyrics_review_pending": 0,
+        "lyrics_approved": 0,
+        "rendering": 0,
+        "final_review_pending": 0,
+        "done": 0,
+        "error": 0,
+    }
+    for entry in entries:
+        status = str(entry.status or "pending")
+        if status in {"pending", "uploading"}:
+            key = "not_uploaded"
+        elif status in {"transcribing", "transcribing_queued", "transcribed"}:
+            key = "transcribing"
+        elif status == "lyrics_review_pending":
+            key = status
+        elif status == "lyrics_approved":
+            key = status
+        elif status in {"queued", "processing"}:
+            key = "rendering"
+        elif status == "pending_review":
+            key = "final_review_pending"
+        elif status == "done":
+            key = "done"
+        else:
+            key = "error"
+        counts[key] += 1
+    return counts
+
+
 def run(args: argparse.Namespace) -> int:
     if args.wave_size < 1 or args.concurrency < 1:
         raise BatchError("wave-size and concurrency must be positive")
+    stage = getattr(args, "stage", "")
+    if stage != "render":
+        raise BatchError(
+            "legacy universal_batch transcription is disabled: use "
+            "scripts/campaign_uploader.py so every job is campaign-bound"
+        )
     entries = build_manifest(args.folder)
     manifest_path = Path(args.manifest)
     if manifest_path.exists() and args.resume:
@@ -603,43 +864,60 @@ def run(args: argparse.Namespace) -> int:
     if len(entries) != args.expected_count and not args.allow_count_mismatch:
         print("REFUSING TO CREATE JOBS: WAV count does not match expected_count", file=sys.stderr)
         return 2
-    api = Api(args.api_base, args.token)
-    jobs_to_create = sum(
-        entry.status not in {"pending_review", "done", "error"}
-        for entry in entries
+    auth = AuthSession(
+        args.api_base,
+        args.token,
+        username=getattr(args, "username", ""),
+        password=getattr(args, "password", ""),
+        refresh_margin_seconds=getattr(args, "refresh_margin_seconds", 21600),
+        force_expire_after_requests=getattr(
+            args, "force_token_expiry_after_requests", 0,
+        ),
     )
-    api.validate_capacity(
-        expected_count=jobs_to_create, wave_size=args.wave_size,
-    )
-    assets = select_backgrounds(api, len(entries))
-    assign_profiles(entries, assets)
-    store.save()
-
+    api = Api(args.api_base, auth=auth)
+    # Render resume creates no jobs. Daily/backlog creation limits already
+    # accounted for these campaign jobs during manifest upload.
     def _api_factory():
         # requests.Session no garantiza thread-safety; cada task usa la suya.
-        return Api(args.api_base, args.token)
+        return Api(args.api_base, auth=auth)
 
     canary_size = min(args.canary_size, len(entries))
     if canary_size:
-        api.wait_for_backlog_capacity(
-            needed=sum(
-                entry.status not in {"pending_review", "done"}
-                for entry in entries[:canary_size]
-            ),
-            poll_seconds=args.capacity_poll_seconds,
-            max_wait_seconds=args.capacity_wait_seconds,
-        )
+        canary = entries[:canary_size]
+        if stage == "render":
+            # This check intentionally happens before /backgrounds. All ten
+            # exact revisions must be approved as a unit before any visual
+            # work starts.
+            _assert_wave_approved(api, canary)
+            assets = select_backgrounds(api, len(canary))
+            assign_profiles(canary, assets)
+            store.save()
         process_wave(
-            entries[:canary_size], api_factory=_api_factory,
+            canary, api_factory=_api_factory,
             poll_seconds=args.poll_seconds, concurrency=args.concurrency,
-            save=store.save,
+            save=store.save, stage=stage,
         )
-        canary_statuses = [entry.status for entry in entries[:canary_size]]
-        if any(status != "pending_review" for status in canary_statuses):
+        canary_statuses = [entry.status for entry in canary]
+        expected_status = (
+            {"lyrics_review_pending", "lyrics_approved"}
+            if stage == "transcription"
+            else {"pending_review", "done"}
+        )
+        if any(status not in expected_status for status in canary_statuses):
             print(f"CANARY FAILED: statuses={canary_statuses}; refusing remaining waves", file=sys.stderr)
             store.save()
             return 3
-        print(f"canary complete: {canary_size}/{len(entries)}")
+        print(
+            f"canary {stage} complete: {canary_size}/{len(entries)}; "
+            f"stage_counts={json.dumps(_stage_counts(entries), sort_keys=True)}"
+        )
+        if getattr(args, "force_token_expiry_after_requests", 0):
+            required = {"forced_expiry", "recovered_401"}
+            if not required.issubset(auth.events):
+                raise BatchError(
+                    "forced token expiry did not produce a confirmed 401 recovery"
+                )
+            print("auth resilience: forced expiry -> 401 -> automatic recovery: confirmed")
         if canary_size < len(entries) and not args.continue_after_canary:
             print(
                 "stopped after canary; inspect gates, then rerun with "
@@ -648,24 +926,21 @@ def run(args: argparse.Namespace) -> int:
             return 0
     for offset in range(canary_size, len(entries), args.wave_size):
         wave = entries[offset: offset + args.wave_size]
-        needed = sum(
-            entry.status not in {"pending_review", "done"} for entry in wave
-        )
-        if needed:
-            api.wait_for_backlog_capacity(
-                needed=needed,
-                poll_seconds=args.capacity_poll_seconds,
-                max_wait_seconds=args.capacity_wait_seconds,
-            )
+        if stage == "render":
+            _assert_wave_approved(api, wave)
+            assets = select_backgrounds(api, len(wave))
+            assign_profiles(wave, assets)
+            store.save()
         process_wave(
             wave, api_factory=_api_factory, poll_seconds=args.poll_seconds,
-            concurrency=args.concurrency, save=store.save,
+            concurrency=args.concurrency, save=store.save, stage=stage,
         )
         print(f"wave complete: {min(offset + args.wave_size, len(entries))}/{len(entries)}")
-    failures = [
-        entry for entry in entries
-        if entry.status not in {"pending_review", "done"}
-    ]
+    accepted = (
+        {"lyrics_review_pending", "lyrics_approved"}
+        if stage == "transcription" else {"pending_review", "done"}
+    )
+    failures = [entry for entry in entries if entry.status not in accepted]
     if failures:
         print(
             f"batch complete with {len(failures)} failed song(s); "
@@ -698,16 +973,47 @@ def main() -> int:
     parser.add_argument("--allow-count-mismatch", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--retry-errors", action="store_true")
+    parser.add_argument(
+        "--stage", choices=("render",), required=True,
+        help=(
+            "resume rendering campaign-bound jobs after lyrics_approved; "
+            "use scripts/campaign_uploader.py for upload/transcription"
+        ),
+    )
     parser.add_argument("--wave-size", type=int, default=30)
     parser.add_argument("--concurrency", type=int, default=5)
-    parser.add_argument("--canary-size", type=int, default=30)
+    parser.add_argument("--canary-size", type=int, default=10)
     parser.add_argument("--continue-after-canary", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--capacity-poll-seconds", type=float, default=30.0)
     parser.add_argument("--capacity-wait-seconds", type=float, default=86400.0)
+    parser.add_argument(
+        "--username", default=(
+            os.environ.get("STAGING_BATCH_USERNAME", "")
+            or os.environ.get("STAGING_BATCH_USER", "")
+        ),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--password", default=os.environ.get("STAGING_BATCH_PASSWORD", ""),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--refresh-margin-seconds", type=int, default=21600)
+    parser.add_argument(
+        "--force-token-expiry-after-requests", type=int, default=0,
+        help="canary-only auth resilience proof; requires campaign credentials",
+    )
     args = parser.parse_args()
-    if not args.token:
-        parser.error("--token or STAGING_BATCH_TOKEN is required")
+    if not args.token and not (args.username and args.password):
+        parser.error(
+            "STAGING_BATCH_TOKEN or both STAGING_BATCH_USERNAME/"
+            "STAGING_BATCH_PASSWORD are required"
+        )
+    if args.force_token_expiry_after_requests and not (args.username and args.password):
+        parser.error(
+            "forced expiry proof requires STAGING_BATCH_USERNAME and "
+            "STAGING_BATCH_PASSWORD for automatic recovery"
+        )
     return run(args)
 
 
