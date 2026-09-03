@@ -13012,6 +13012,96 @@ def _frame_pair_discontinuity(frame_a, frame_b) -> float:
     return 0.5 * mae + 0.5 * (hist_d / 3.0)
 
 
+def _measure_letterbox(video_path: str) -> dict:
+    """¿El clip tiene barras negras horneadas? Determinístico, sin LLM.
+
+    El bloque anti-letterbox del prompt de Veo existe desde el incidente de
+    2026-07-07 ("Seguir Viviendo Sin Tu Amor"/Spinetta) y su propio comentario
+    dice que el fallo era ESTOCÁSTICO — "un video sí y otro no". Un negativo que
+    falla a veces necesita que alguien mida la salida.
+
+    Usa `cropdetect` de ffmpeg sobre una pasada corta y compara el rectángulo
+    detectado contra el frame completo. Fail-open: ante cualquier error devuelve
+    `has_bars=False` — un bug acá no puede tirar un fondo bueno (mismo contrato
+    que _bg_scene_discontinuity y el relevance score).
+
+    OJO: mide el CLIP DE FONDO, no el master. El letterbox 2.39:1 de
+    `frame_format="cine"` es una opción consciente del operador que se aplica
+    después, sobre el video terminado, y no debe confundirse con esto.
+    """
+    try:
+        import bg_frame_checks
+
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
+             video_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        dims = (probe.stdout or "").strip().split("x")
+        if len(dims) < 2:
+            return {"has_bars": False, "reason": "sin dimensiones"}
+        width, height = int(dims[0]), int(dims[1])
+
+        # cropdetect escribe su estimación en stderr, un `crop=` por frame.
+        # `reset=0` acumula sobre toda la pasada en vez de reiniciar.
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", video_path,
+             "-vf", "cropdetect=limit=24:round=2:reset=0",
+             "-frames:v", "48", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=90,
+        )
+        crop = bg_frame_checks.parse_cropdetect(proc.stderr)
+        return bg_frame_checks.letterbox_report(crop, width, height)
+    except Exception as e:  # noqa: BLE001 — medir nunca tumba un render
+        _raise_if_job_timeout(e)
+        logger.debug("[BG][LETTERBOX] medición falló: %s", e)
+        return {"has_bars": False, "reason": f"error: {e}"}
+
+
+def _scene_light_signature(video_path: str, key: str = "") -> dict | None:
+    """Firma de luz (luminancia + calidez) de un frame medio del clip.
+
+    Se toma el frame del MEDIO y no el primero: el primero suele venir de un
+    fundido de entrada y no representa la luz de la escena.
+    """
+    if not video_path or not os.path.exists(video_path):
+        return None
+    tmp_png = None
+    try:
+        import tempfile as _tf
+
+        import bg_frame_checks
+        from PIL import Image as _Img
+
+        with _tf.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            tmp_png = f.name
+        try:
+            _dur = _audio_duration(video_path) or 0.0
+        except Exception:
+            _dur = 0.0
+        _seek = ["-ss", f"{max(0.0, _dur / 2.0):.2f}"] if _dur else []
+        run_checked(
+            ["ffmpeg", "-y", "-loglevel", "error", *_seek, "-i", video_path,
+             "-frames:v", "1", "-vf", "scale=64:36", tmp_png],
+            label="ffmpeg-scene-light", timeout=60, output_path=tmp_png,
+        )
+        with _Img.open(tmp_png) as im:
+            sig = bg_frame_checks.light_signature(list(im.convert("RGB").getdata()))
+        sig["key"] = key
+        return sig
+    except Exception as e:  # noqa: BLE001 — fail-open
+        _raise_if_job_timeout(e)
+        logger.debug("[SCENES][LIGHT] firma falló para %s: %s", key, e)
+        return None
+    finally:
+        if tmp_png and os.path.exists(tmp_png):
+            try:
+                os.unlink(tmp_png)
+            except OSError:
+                pass
+
+
 def _bg_scene_discontinuity(video_path: str) -> float:
     """Mide si el clip de fondo contiene un cambio de escena (0.0-1.0).
 
@@ -13760,6 +13850,9 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
         "texture": "clean modern digital grade, fine subtle grain, soft cinematic depth of field",
         "camera": "slow, deliberate camera language",
         "motif": "a single recurring light source tying the scenes together",
+        # Sin esto, el fallback dejaba la hora del día librada a cada escena y
+        # multi-escena podía ir de día a noche dentro de la misma canción.
+        "light": "one single consistent time of day for the whole video, even soft light",
     }
     if _v4_semantics and creative_mode == "prompt_literal":
         # Literal means no Gemini rewrite. The same raw direction is used for
@@ -13782,10 +13875,21 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
             "the scene engine from the song itself, so DON'T impose a fixed "
             "aesthetic. Respond ONLY with a JSON object with exactly these string "
             "keys: world (the setting/environment family), palette (colors + "
-            "lighting), texture (a light grade/mood note, kept neutral), camera "
-            "(a light note on the camera language), motif (one recurring visual "
-            "element). Keep each value under 25 words. No text/letters/logos "
-            "in the described world. "
+            "lighting), light (the TIME OF DAY and light state shared by every "
+            "scene — e.g. 'late afternoon, low warm sun from the west' or "
+            "'overcast midday, flat grey light'; be concrete about the moment, "
+            "never a range), texture (a light grade/mood note, kept neutral), "
+            "camera (a light note on the camera language), motif (one recurring "
+            "visual element). Keep each value under 25 words. No text/letters/"
+            "logos in the described world. "
+            # `light` es obligatoria y explícita porque la regla del producto es
+            # que la iluminación no cambie durante la canción: si es atardecer,
+            # se mantiene el atardecer. `palette` no alcanzaba — describe colores,
+            # no un momento del día — y multi-escena genera cada escena por
+            # separado, así que sin esto el verso podía salir a mediodía y el
+            # coro de noche.
+            "The `light` value is a HARD CONSTRAINT: every scene of this video "
+            "happens at that same moment, with the same light. "
             # Prohibición factual (no es un patrón — evita un bug): nombrar un
             # formato/calibre de film hace que Veo dibuje el fotograma físico
             # (incidente 2026-06-19, "16mm film grain" → sprockets + marco negro).
@@ -13950,7 +14054,8 @@ def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
                           style, custom_colors, job_id, allow_people,
                           *, match_lyrics=True, operator_prompt=None,
                           bg_verbatim=False, creative_mode=None,
-                          atmospherics_policy=None, anchors=None):
+                          atmospherics_policy=None, anchors=None,
+                          shared_light=None):
     """Fabrica la callable que scenes.build_scene_plan usa por escena.
 
     ``operator_prompt`` is the only user-authored value. The callable argument
@@ -13972,13 +14077,21 @@ def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
         scene_planner=True,
     )
 
+    import bg_frame_checks as _bgfc
+    _light_line = _bgfc.shared_light_directive(shared_light)
+
     def prompt_fn(background_hint="", movement_style="", section_type="", energy=0.0):
+        # La luz compartida se antepone al contexto de escena para que TODAS las
+        # escenas hereden el mismo momento del día. La biblia ya comparte
+        # `palette`, pero una paleta no fija una hora: dos escenas pueden
+        # compartir colores y estar una al mediodía y otra de noche.
+        _ctx = f"{_light_line} {background_hint}".strip() if _light_line else background_hint
         return _get_unique_prompt(
             lyrics_text=lyrics_text, artist=artist, job_id=job_id,
             song_title=song_title, genre=genre, concept=concept,
             movement_style=movement_style, match_lyrics=_scene_match_lyrics,
             background_hint=operator_prompt,
-            scene_context=background_hint,
+            scene_context=_ctx,
             bg_verbatim=bg_verbatim,
             palette_style=style, custom_colors=custom_colors,
             allow_people=allow_people, creative_mode=creative_mode,
@@ -14506,7 +14619,8 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       bg_verbatim=bg_verbatim,
                                       creative_mode=creative_mode,
                                       atmospherics_policy=atmospherics_policy,
-                                      anchors=_scene_anchors)
+                                      anchors=_scene_anchors,
+                                      shared_light=(bible or {}).get("light"))
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
                                     song_title=song_title, style=style_hint,
                                     operator_movement=_normalize_movement_style(movement_style))
@@ -14533,6 +14647,54 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
     # badge a nivel job sin abrir el filmstrip.
     _failed = sum(1 for s in plan.get("scenes", []) if s.get("status") == "failed")
     plan["degraded"] = {"failed": _failed, "total": len(plan.get("scenes", []))}
+    # Coherencia de luz entre escenas. La regla del producto es que la
+    # iluminación no cambie durante la canción: si es atardecer, se mantiene el
+    # atardecer. El fondo único está a salvo por construcción (un clip de 4-8s
+    # loopeado en palíndromo vuelve siempre a su punto de partida), pero acá cada
+    # escena es una generación Veo separada y sólo compartían una `palette`
+    # blanda. Se compara la luz entre escenas CONTIGUAS en el orden en que se
+    # ven, que es donde el ojo registra el salto.
+    #
+    # Fail-open y sólo observación: bloquear el render por esto sería peor que
+    # un salto de luz que la review humana atrapa. Queda en el plan (lo lee el
+    # filmstrip) y en Sentry agrupado.
+    try:
+        import bg_frame_checks as _bgfc
+        _sigs = []
+        for _sec in _scenes.sections_from_plan(plan):
+            _clip = clip_for_key.get(_sec.recurrence_key)
+            if not _clip:
+                continue
+            if _sigs and _sigs[-1].get("key") == _sec.recurrence_key:
+                continue  # el coro repetido es EL MISMO clip: no es un corte
+            _sig = _scene_light_signature(_clip, key=_sec.recurrence_key)
+            if _sig:
+                _sigs.append(_sig)
+        _light = _bgfc.lighting_consistency(_sigs)
+        plan["light_consistency"] = _light
+        if not _light["consistent"]:
+            logger.warning(
+                "[SCENES][LIGHT] salto de iluminación entre escenas job=%s "
+                "peor=%.1f entre %s — revisar antes de aprobar: %s",
+                job_id, _light["worst_delta"], _light["worst_pair"],
+                _light["offenders"][:3],
+            )
+            try:
+                import sentry_sdk
+                with sentry_sdk.push_scope() as _scope:
+                    _scope.fingerprint = ["scenes-light-jump"]
+                    _scope.set_extra("job_id", job_id)
+                    _scope.set_extra("light_consistency", _light)
+                    sentry_sdk.capture_message(
+                        "Multi-escena con salto de iluminación", level="warning")
+            except Exception:
+                pass
+        else:
+            logger.info("[SCENES][LIGHT] luz coherente en %d escenas (peor salto %.1f)",
+                        _light["scenes"], _light["worst_delta"])
+    except Exception as e:  # noqa: BLE001 — medir nunca tumba un render
+        _raise_if_job_timeout(e)
+        logger.debug("[SCENES][LIGHT] medición falló: %s", e)
     # Audit LOW: persistir la duración usada como fuente única, así el re-stitch
     # de un edit/regen no difiere por un frame entre _audio_duration y ffprobe.
     plan["audio_duration"] = float(audio_duration or 0.0)
@@ -15163,6 +15325,17 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # produce un fondo que alterna escenas todo el video al
             # loopearse. El relevance score no lo ve (mira UN frame).
             discont = _bg_scene_discontinuity(bg_path)
+            # Franjas negras horneadas por Veo. El negativo del prompt existe
+            # desde el incidente Spinetta (2026-07-07) y falla de forma
+            # estocástica, así que acá se MIDE la salida. Comparte el único slot
+            # de re-roll con el corte de escena: si el clip vino con barras, el
+            # mismo do-over lo vuelve a pedir.
+            _bars = _measure_letterbox(bg_path)
+            if _bars.get("has_bars"):
+                logger.warning(
+                    "[BG][LETTERBOX] el clip trae %s (job=%s) — 16:9 incompleto",
+                    _bars.get("reason"), job_id,
+                )
             if discont >= _BG_SCENE_CUT_THRESHOLD:
                 logger.warning(
                     "[BG][SCENE-CUT] discontinuidad %.3f >= %.2f en %s (job=%s) — "
@@ -15229,7 +15402,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     _anchor_cov["covered"], _anchor_cov["total"], job_id,
                 )
             _needs_retry = (
-                (score < 7) or (discont >= _BG_SCENE_CUT_THRESHOLD) or _anchors_thin
+                (score < 7) or (discont >= _BG_SCENE_CUT_THRESHOLD)
+                or _anchors_thin or bool(_bars.get("has_bars"))
             )
             if _needs_retry and not quality_retry_used and not bg_verbatim:
                 quality_retry_used = True
@@ -15258,6 +15432,22 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 continue
             if score < 7:
                 logger.warning("[BG] Score %s < 7 after retry — accepting best available result", score)
+            if _bars.get("has_bars"):
+                logger.warning(
+                    "[BG][LETTERBOX] aceptando clip con %s tras el re-roll "
+                    "(job=%s) — revisar el 16:9 antes de aprobar",
+                    _bars.get("reason"), job_id,
+                )
+                try:
+                    import sentry_sdk
+                    with sentry_sdk.push_scope() as _scope:
+                        _scope.fingerprint = ["bg-letterbox"]
+                        _scope.set_extra("job_id", job_id)
+                        _scope.set_extra("letterbox", _bars)
+                        sentry_sdk.capture_message(
+                            "Fondo con franjas negras horneadas", level="warning")
+                except Exception:
+                    pass
             if discont >= _BG_SCENE_CUT_THRESHOLD:
                 # Aceptamos igual (fail-open: bloquear el render es peor que
                 # un fondo feo que la review humana atrapa), pero el operador
