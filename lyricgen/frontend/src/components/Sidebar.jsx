@@ -5,6 +5,8 @@ import BrandLockup from "./BrandLockup";
 import GenlyLogo from "./GenlyLogo";
 import { IS_PRODUCTION, APP_ENV } from "../env";
 import UsageBadge from "./UsageBadge";
+import { useServiceStatusSummary } from "../hooks/useServiceStatusSummary";
+import { statusLabelKey, statusStyle } from "../lib/serviceStatus";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -36,6 +38,38 @@ const ITEMS_BASE = (t) => [
 // browser's default link behaviour and route through onNav.
 function _isPlainLeftClick(e) {
   return e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
+}
+
+// Punto de estado del sistema, abajo del sidebar.
+//
+// Hasta ago-2026 este punto estaba HARDCODEADO en verde con el texto
+// "Sistema operativo": decía lo mismo durante un outage total. Un
+// indicador que no puede mostrar malas noticias no es un indicador, es
+// decoración —y encima entrenaba a no mirarlo—. Ahora lee el mismo
+// `/service-status/summary` que la barra de incidente (poll compartido) y
+// linkea a la página pública.
+//
+// Si el endpoint no contesta, se cae al texto neutro en gris en vez de
+// afirmar verde: no saber no es estar bien.
+function SystemStatusDot({ open }) {
+  const { t } = useI18n();
+  const summary = useServiceStatusSummary();
+  const indicator = summary?.indicator || "unknown";
+  const style = statusStyle(indicator);
+  const label = indicator === "operational"
+    ? t("nav.system_ok")
+    : (t(statusLabelKey(indicator)) || t("nav.system_ok"));
+
+  return (
+    <Link
+      to="/status"
+      className="app-sidebar__health"
+      title={`${label} — ${t("service_status.nav_link")}`}
+    >
+      <div className={`w-2 h-2 rounded-full ${style.dot}`} />
+      {open && <span className={indicator === "operational" ? "" : style.text}>{label}</span>}
+    </Link>
+  );
 }
 
 export default function Sidebar({ onNav, activeView, open, onToggle, user, onLogout }) {
@@ -172,10 +206,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
 
       {/* User & logout */}
       <div className={`app-sidebar__footer ${open ? "" : "is-compact"}`}>
-        <div className="app-sidebar__health" title={t("nav.system_ok")}>
-          <div className="w-2 h-2 rounded-full bg-accent" />
-          {open && <span>{t("nav.system_ok")}</span>}
-        </div>
+        <SystemStatusDot open={open} />
         {user && (
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 min-w-0">
