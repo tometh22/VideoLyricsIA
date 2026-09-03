@@ -497,6 +497,18 @@ def _persist_if_current(job_id: str, expected_revision: int,
         previous = dict(row.transcription_quality or {})
         ack = previous.get("acknowledgement")
         quality = dict(quality)
+        # The quality replay is analytical and may finish after the
+        # transcription worker has attached the batch reference contract (or
+        # even after a reviewer has approved it).  Replacing the JSON blob
+        # must not erase those durable, operator-facing gates.  They are
+        # produced outside the replay and are therefore authoritative over
+        # any same-named field in the analytical result.
+        for durable_key in (
+            "reference_hypothesis",
+            "pre_background_approval",
+        ):
+            if durable_key in previous:
+                quality[durable_key] = previous[durable_key]
         quality["analysis_status"] = (
             "failed" if quality.get("decision") == "retry_failed" else "complete"
         )
