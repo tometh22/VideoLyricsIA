@@ -920,6 +920,7 @@ def enqueue_transcription(
     live: bool = False,
     tenant_id: str = "",
     anchor_lyrics: str = "",
+    reference_required: bool = False,
     publication_id: str | None = None,
     publication_dedupe_key: str | None = None,
     workload_class: str = "interactive",
@@ -951,6 +952,8 @@ def enqueue_transcription(
             "language": language, "artist": artist, "title": title,
             "filename": filename, "live": live,
             "anchor_lyrics": anchor_lyrics,
+            "reference_required": reference_required,
+            "workload_class": workload_class,
         }
         if publication_id:
             from transactional_outbox import run_outbox_transcription as target
@@ -1023,6 +1026,8 @@ def enqueue_transcription(
         "language": language, "artist": artist, "title": title,
         "filename": filename, "live": live,
         "anchor_lyrics": anchor_lyrics,
+        "reference_required": reference_required,
+        "workload_class": workload_class,
     }
     if publication_id:
         from transactional_outbox import run_outbox_transcription as target
