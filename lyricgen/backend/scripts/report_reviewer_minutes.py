@@ -55,6 +55,27 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return ordered[index]
 
 
+TASKS = ("listen", "search", "text", "timing", "vocalization", "export", "unknown")
+
+
+def task_seconds(samples: list[tuple[datetime, str]], max_gap_s: float) -> dict[str, float]:
+    """Reparte los segundos activos por tarea.
+
+    Mismo criterio que el total: sólo huecos <= max_gap entre latidos
+    consecutivos, agregando todas las sesiones. El hueco se le atribuye a la
+    tarea del latido MÁS NUEVO: si el revisor pasó de escuchar a escribir, ese
+    tramo ya era de escritura.
+    """
+    ordered = sorted(samples, key=lambda item: item[0])
+    totals: dict[str, float] = {}
+    for (left, _), (right, task) in zip(ordered, ordered[1:]):
+        gap = (right - left).total_seconds()
+        if 0 < gap <= max_gap_s:
+            key = task if task in TASKS else "unknown"
+            totals[key] = totals.get(key, 0.0) + gap
+    return totals
+
+
 def active_seconds(timestamps: list[datetime], max_gap_s: float) -> float:
     """Suma de huecos <= max_gap entre latidos consecutivos, sin importar sesión."""
     if not timestamps:
@@ -98,6 +119,7 @@ def main() -> int:
             .all()
         )
         by_job: dict[tuple[str, int | None], list[datetime]] = defaultdict(list)
+        by_task: dict[tuple[str, int | None], list[tuple[datetime, str]]] = defaultdict(list)
         sessions: dict[str, set[str]] = defaultdict(set)
         for event in events:
             job_id = str(event.job_id or "")
@@ -108,7 +130,11 @@ def main() -> int:
                 continue
             if when.tzinfo is None:
                 when = when.replace(tzinfo=timezone.utc)
-            by_job[(job_id, event.user_id)].append(when.astimezone(timezone.utc))
+            when = when.astimezone(timezone.utc)
+            by_job[(job_id, event.user_id)].append(when)
+            by_task[(job_id, event.user_id)].append(
+                (when, str((event.properties or {}).get("task") or "unknown")),
+            )
             sessions[job_id].add(str((event.properties or {}).get("session_id") or ""))
 
         job_ids = sorted({key[0] for key in by_job})
@@ -151,6 +177,12 @@ def main() -> int:
                 "span_minutes": round(
                     (max(stamps) - min(stamps)).total_seconds() / 60.0, 2,
                 ),
+                "task_minutes": {
+                    key: round(value / 60.0, 2)
+                    for key, value in sorted(
+                        task_seconds(by_task[(job_id, user_id)], args.max_gap_s).items(),
+                    )
+                },
                 "minutes_per_line": (
                     round(seconds / 60.0 / len(segments), 3) if segments else None
                 ),
@@ -170,9 +202,24 @@ def main() -> int:
             "total_minutes": round(sum(minutes), 1),
         }
 
+    def task_totals(subset: list[dict]) -> dict:
+        totals: dict[str, float] = {}
+        for row in subset:
+            for key, value in (row.get("task_minutes") or {}).items():
+                totals[key] = totals.get(key, 0.0) + value
+        grand = sum(totals.values())
+        return {
+            key: {"minutes": round(value, 1),
+                  "share": round(value / grand, 3) if grand else None}
+            for key, value in sorted(totals.items(), key=lambda kv: -kv[1])
+        }
+
     summary = {
         "since": since.isoformat(),
         "max_gap_s": args.max_gap_s,
+        "task_minutes_all": task_totals(rows),
+        "task_minutes_studio": task_totals([r for r in rows if not r["live"]]),
+        "task_minutes_live": task_totals([r for r in rows if r["live"]]),
         "all": aggregate(rows),
         "studio": aggregate([row for row in rows if not row["live"]]),
         "live": aggregate([row for row in rows if row["live"]]),

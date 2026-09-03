@@ -59,3 +59,34 @@ def test_live_detection_falls_back_to_filename():
     assert report._LIVE_RE.search("Los Pericos_Boulevard (Live).wav")
     assert report._LIVE_RE.search("Bersuit - Un Pacto (En Vivo).mp3")
     assert not report._LIVE_RE.search("Gondwana - Felicidad.wav")
+
+
+def test_task_seconds_splits_by_task_across_sessions():
+    """El desglose por tarea usa el mismo criterio que el total."""
+    beats = [
+        (BASE + timedelta(seconds=0), "listen"),
+        (BASE + timedelta(seconds=15), "listen"),
+        (BASE + timedelta(seconds=30), "text"),
+        (BASE + timedelta(seconds=45), "timing"),
+    ]
+    assert report.task_seconds(beats, 25.0) == {"listen": 15.0, "text": 15.0, "timing": 15.0}
+
+
+def test_task_seconds_attributes_the_gap_to_the_newer_beat():
+    beats = [(BASE, "listen"), (BASE + timedelta(seconds=15), "text")]
+    assert report.task_seconds(beats, 25.0) == {"text": 15.0}
+
+
+def test_task_seconds_drops_long_gaps_and_unknown_labels():
+    beats = [
+        (BASE, "text"),
+        (BASE + timedelta(seconds=600), "text"),
+        (BASE + timedelta(seconds=615), "inventada"),
+    ]
+    assert report.task_seconds(beats, 25.0) == {"unknown": 15.0}
+
+
+def test_task_seconds_handles_unordered_and_empty_input():
+    beats = [(BASE + timedelta(seconds=15), "text"), (BASE, "listen")]
+    assert report.task_seconds(beats, 25.0) == {"text": 15.0}
+    assert report.task_seconds([], 25.0) == {}
