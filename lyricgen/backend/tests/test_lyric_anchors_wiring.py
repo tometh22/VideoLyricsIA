@@ -231,7 +231,9 @@ def test_imagen_pide_foto_y_saca_el_movimiento():
 def test_el_compositor_anclado_pide_el_formato_largo_y_los_negativos():
     src = _SRC[_SRC.find("_ANCHORED_SCENE_STRUCTURE = "):
                _SRC.find("def _extract_lyric_anchors")]
-    assert "260 a 360 palabras" in src
+    # 240-320 (era 260-360): medido sobre 12 canciones reales, el compositor
+    # promediaba 396 palabras, por encima del techo.
+    assert "240 a 320 palabras" in src
     assert "negativos" in src
     # Los seis bloques del formato objetivo.
     for bloque in ("LUGAR", "INVENTARIO", "LA AUSENCIA", "LUZ Y ATMÓSFERA",

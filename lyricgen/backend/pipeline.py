@@ -9719,7 +9719,7 @@ que una metáfora bonita que podría ser de cualquier canción.
 {_styling}
 REGLAS DURAS
 - "style" siempre "{_style_value}".
-- "prompt" de 260 a 360 palabras. Denso y concreto. Sin adjetivos vagos
+- "prompt" de 240 a 320 palabras. Denso y concreto. Sin adjetivos vagos
   ("hermoso", "increíble", "impresionante") y sin frases de relleno.
 - Cámara: {clause2}. Cuando la cámara está fija, las fuentes de movimiento
   salen de los OBJETOS y del LUGAR de las anclas (lo que el viento mueve ahí, lo

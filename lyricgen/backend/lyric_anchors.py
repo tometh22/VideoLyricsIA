@@ -122,11 +122,23 @@ Respondé SOLO con un objeto JSON con exactamente estas claves:
                 null si la letra es abstracta y no ancla en ningún lado.
   "linea_lugar": string o null. La línea EXACTA de la letra de donde sale el lugar.
   "objetos":    array de 5 a 10 objetos. Cada uno {"objeto": "...", "linea": "..."}.
-                "objeto" es un sustantivo CONCRETO Y VISIBLE (algo que una cámara
-                podría filmar): una silla, una botella, un teléfono, la lluvia,
-                una bandera, un colectivo. NO emociones, NO conceptos, NO
-                adjetivos. "linea" es la línea exacta de la letra donde aparece.
-                Preferí lo que la canción menciona literalmente.
+                "objeto" es un sustantivo CONCRETO Y FILMABLE: una silla, una
+                botella, un teléfono, la lluvia, una bandera, un colectivo.
+
+                EXCLUÍ SIEMPRE, aunque estén en la letra (la escena final no
+                puede mostrarlos y contarlos como ancla sólo ensucia la medición):
+                  · personas, nombres propios de personas y partes del cuerpo
+                    (piel, ojos, manos, brazos, pupilas, carne, garras)
+                  · marcas, apps, logos y todo lo que se vea como texto legible
+                    (Instagram, Coca-Cola, un cartel con letras)
+                  · abstracciones y cosas sin forma fija (el vacío, la herida,
+                    el alma, un ángel, el cielo, las estrellas, el destino)
+                Si la letra habla de una persona o de una marca, extraé en su
+                lugar el OBJETO o el LUGAR que la rodea —lo que dejó, dónde
+                estaba, qué la acompaña— que sí se puede filmar.
+
+                "linea" es la línea exacta de la letra donde aparece. Preferí
+                lo que la canción menciona literalmente.
   "situacion":  string. Una frase: qué está pasando, o qué acaba de pasar, en la
                 canción. Es la narrativa, no el clima emocional.
   "registro":   string. El tono emocional, usando el vocabulario de la canción
@@ -258,7 +270,10 @@ def verify_anchors(anchors: dict[str, Any] | None, lyrics_text: str) -> dict[str
             return True  # sin cita: se conserva, no se puede refutar
         return needle in haystack
 
-    kept = [a for a in anchors.get("objetos", []) if _cited(a.get("linea"))]
+    kept = [
+        a for a in anchors.get("objetos", [])
+        if _cited(a.get("linea")) and is_renderable(a.get("objeto", ""))
+    ]
     result = dict(anchors)
     result["objetos"] = kept
     if anchors.get("lugar") and not _cited(anchors.get("linea_lugar")):
@@ -269,6 +284,38 @@ def verify_anchors(anchors: dict[str, Any] | None, lyrics_text: str) -> dict[str
     if not result["lugar"] and not result["objetos"]:
         return None
     return result
+
+
+# Cinturón local sobre la exclusión que ya pide el prompt del extractor. Medido
+# sobre 12 canciones reales de staging: el 24% de las anclas extraídas eran cosas
+# que los rieles del propio pipeline prohíben dibujar (partes del cuerpo, personas,
+# marcas, abstracciones). Contarlas infla el denominador de la cobertura, hace que
+# el compositor "falle" por obedecer compliance, y dispara re-rolls que cuestan
+# plata y no arreglan nada. Caso testigo: Luciano Pereyra "Eres Perfecta" quedó
+# 1/7 porque 6 de sus 7 anclas eran piel, estrellas, Instagram, perfil, Cristóbal
+# Colón y doctor.
+_UNRENDERABLE_TERMS = frozenset("""
+piel ojos ojo pupilas manos mano brazos brazo carne garras cuerpo cuerpos cara
+caras rostro rostros cabeza cabezas dedos labios boca pelo sangre corazon alma
+espiritu angel angeles dios diablo fantasma
+vacio nada destino tiempo suerte miedo amor odio dolor herida heridas sueno
+suenos recuerdo recuerdos silencio verdad mentira vida muerte libertad
+cielo estrellas estrella luna sol universo infinito
+gente personas persona nadie alguien todos
+""".split())
+
+
+def is_renderable(term: str) -> bool:
+    """False para anclas que la escena final tiene prohibido mostrar.
+
+    Se evalúa sobre los tokens de contenido: "las estrellas" y "estrellas" caen
+    igual, y "una estrella de mar" NO cae (tiene un token de contenido que no
+    está en la lista, así que no es un match total).
+    """
+    tokens = _content_tokens(term)
+    if not tokens:
+        return False
+    return not all(tok in _UNRENDERABLE_TERMS for tok in tokens)
 
 
 def anchor_terms(anchors: dict[str, Any] | None) -> list[str]:

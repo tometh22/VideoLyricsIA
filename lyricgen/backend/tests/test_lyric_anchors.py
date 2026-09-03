@@ -227,3 +227,46 @@ def test_request_trunca_pero_muy_por_encima_del_compositor():
 
 def test_request_marca_la_ausencia_de_letra():
     assert "[sin letra disponible]" in la.build_extraction_request("a", "b", "  ")
+
+
+# ── Anclas irrenderizables ─────────────────────────────────────────────────
+# Medido sobre 12 canciones reales de staging: el 24% de las anclas extraídas
+# eran cosas que los rieles del propio pipeline prohíben dibujar. Contarlas
+# hacía que el compositor "fallara" por obedecer compliance.
+def test_partes_del_cuerpo_y_abstracciones_no_son_anclas():
+    for term in ("piel", "ojos", "las manos", "el vacío", "la herida",
+                 "las estrellas", "un ángel", "el alma", "gente"):
+        assert la.is_renderable(term) is False, term
+
+
+def test_objetos_filmables_si_son_anclas():
+    for term in ("una botella", "vereda", "farol oxidado", "colectivo",
+                 "estrella de mar", "silla plástica"):
+        assert la.is_renderable(term) is True, term
+
+
+def test_verify_descarta_las_irrenderizables():
+    anchors = _payload(objetos=[
+        {"objeto": "bandera", "linea": "con una bandera y un megafono roto"},
+        {"objeto": "piel", "linea": "quedaron papeles y una silla vacia"},
+        {"objeto": "el vacío", "linea": "nadie limpia lo que dejamos"},
+    ])
+    kept = la.verify_anchors(anchors, LETRA)
+    assert [o["objeto"] for o in kept["objetos"]] == ["bandera"]
+
+
+def test_la_cobertura_no_castiga_por_obedecer_compliance():
+    """Caso testigo Luciano Pereyra "Eres Perfecta": 6 de 7 anclas eran piel,
+    estrellas, Instagram, perfil, Cristóbal Colón y doctor. El compositor no
+    podía dibujar casi ninguna, y la cobertura daba 1/7 → re-roll inútil."""
+    anchors = _payload(lugar="el barrio", linea_lugar="Vengo a buscarte a la Plaza de Mayo",
+                       objetos=[
+                           {"objeto": "piel", "linea": "quedaron papeles y una silla vacia"},
+                           {"objeto": "estrellas", "linea": "nadie limpia lo que dejamos"},
+                           {"objeto": "silla", "linea": "quedaron papeles y una silla vacia"},
+                       ])
+    kept = la.verify_anchors(anchors, LETRA)
+    cov = la.anchor_coverage("el barrio con una silla vacía en la vereda", kept)
+    # Sólo cuentan lugar + silla; piel y estrellas ya no inflan el denominador.
+    assert cov["total"] == 2 and cov["covered"] == 2
+    assert la.coverage_is_sufficient(cov) is True
