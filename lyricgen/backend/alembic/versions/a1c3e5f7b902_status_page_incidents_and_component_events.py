@@ -1,7 +1,7 @@
 """status page: incidentes públicos, timeline append-only y tramos de sonda
 
 Revision ID: a1c3e5f7b902
-Revises: e8b4c2d6f0a3
+Revises: f9a0b1c2d3e4
 Create Date: 2026-09-03 15:40:00.000000
 
 Backs `status_page.py`: la página pública /status y la barra horizontal de
@@ -36,7 +36,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "a1c3e5f7b902"
-down_revision: Union[str, Sequence[str], None] = "e8b4c2d6f0a3"
+down_revision: Union[str, Sequence[str], None] = "f9a0b1c2d3e4"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
