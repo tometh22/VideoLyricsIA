@@ -16,6 +16,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -1033,35 +1034,73 @@ def _queue_state(stage: str, job: Job | None, document: EditorDocument | None) -
     return "failed" if job.status in _FAILURE else "pending"
 
 
-def _review_minutes_today(db: Session, job_ids: list[str]) -> dict[str, Any]:
+def _review_minutes_by_job(
+    db: Session,
+    job_ids: list[str],
+    *,
+    since: datetime | None = None,
+) -> dict[str, float]:
     if not job_ids:
-        return {"average": None, "total": 0.0, "songs": 0}
-    today = _now().replace(hour=0, minute=0, second=0, microsecond=0)
-    events = db.query(ProductEvent).filter(
+        return {}
+    query = db.query(ProductEvent).filter(
         ProductEvent.name == "editor_activity_heartbeat",
         ProductEvent.job_id.in_(job_ids),
-        ProductEvent.created_at >= today,
-    ).order_by(ProductEvent.created_at.asc()).all()
+    )
+    if since is not None:
+        query = query.filter(ProductEvent.created_at >= since)
+    events = query.order_by(ProductEvent.created_at.asc()).all()
     stamps: dict[tuple[str, int | None], list[datetime]] = {}
     for event in events:
         when = _aware(event.occurred_at or event.created_at)
         if when is not None:
             stamps.setdefault((str(event.job_id), event.user_id), []).append(when)
-    minutes: list[float] = []
-    for values in stamps.values():
+    seconds_by_job: dict[str, float] = {}
+    for (job_id, _user_id), values in stamps.items():
         seconds = sum(
             gap for gap in (
                 (right - left).total_seconds()
                 for left, right in zip(values, values[1:])
             ) if 0 < gap <= 25.0
         )
-        minutes.append((seconds if seconds > 0 else 15.0) / 60.0)
+        seconds_by_job[job_id] = seconds_by_job.get(job_id, 0.0) + (
+            seconds if seconds > 0 else 15.0
+        )
+    return {
+        job_id: round(seconds / 60.0, 2)
+        for job_id, seconds in seconds_by_job.items()
+    }
+
+
+def _review_minutes_today(db: Session, job_ids: list[str]) -> dict[str, Any]:
+    today = _now().replace(hour=0, minute=0, second=0, microsecond=0)
+    minutes_by_job = _review_minutes_by_job(db, job_ids, since=today)
+    minutes = list(minutes_by_job.values())
     return {
         "average": round(sum(minutes) / len(minutes), 2) if minutes else None,
         "total": round(sum(minutes), 2),
         "songs": len(minutes),
         "source": "editor_activity_heartbeat_v1",
     }
+
+
+_REFERENCE_LINK_KINDS = frozenset({
+    "fan_site", "aggregator", "official_artist_site", "official_channel",
+})
+
+
+def _review_reference_links(overrides: dict[str, Any]) -> list[dict[str, str]]:
+    """Expose inert reviewer pointers; never retrieve or process their text."""
+    rows = overrides.get("review_reference_links") or []
+    result: list[dict[str, str]] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        kind = str(row.get("kind") or "").strip().lower()
+        url = str(row.get("url") or "").strip()
+        parsed = urlparse(url)
+        if kind in _REFERENCE_LINK_KINDS and parsed.scheme == "https" and parsed.netloc:
+            result.append({"kind": kind, "url": url})
+    return result[:10]
 
 
 @router.get("/campaigns/{campaign_id}/review-queue")
@@ -1103,6 +1142,7 @@ def review_queue(
         50, min(80, int(_number(queue_config.get("calibration_target"), 50))),
     )
     confidence_gate_passed = bool(queue_config.get("confidence_gate_passed"))
+    active_minutes = _review_minutes_by_job(db, job_ids)
     rows: list[dict[str, Any]] = []
     for item, job in pairs:
         document = documents.get(job.job_id) if job else None
@@ -1140,6 +1180,7 @@ def review_queue(
             "version": title_version,
             "background_mode": bg_mode,
             "duration_seconds": item.duration_seconds,
+            "active_minutes": active_minutes.get(job.job_id, 0.0) if job else 0.0,
             "state": queue_state,
             "reviewer_user_id": document.lock_user_id if document else None,
             "reviewer_name": (
@@ -1156,10 +1197,16 @@ def review_queue(
                 else verdict.get("disagreement") or verdict.get("score"),
             ),
             "reference": {
+                "available": reference.get("availability") != "unavailable",
                 "provider": (reference.get("source") or {}).get("provider"),
                 "source_kind": (reference.get("source") or {}).get("kind"),
                 "status": reference.get("review_status"),
                 "line_count": reference.get("line_count"),
+                "manual_full_review_required": bool(
+                    quality.get("manual_full_review_required")
+                    or reference.get("availability") == "unavailable"
+                ),
+                "external_links": _review_reference_links(overrides),
             },
             "open_path": (
                 f"/review/{job.job_id}" if stage == "lyrics" and job
@@ -1463,6 +1510,9 @@ def context_for_job(db: Session, job: Job) -> dict[str, Any] | None:
         "campaign_status": campaign.status if campaign else None,
         "default_render_params": campaign.default_render_params if campaign else {},
         "render_overrides": item.render_overrides if item else {},
+        "review_reference_links": _review_reference_links(
+            dict(item.render_overrides or {}) if item else {},
+        ),
     }
 
 
