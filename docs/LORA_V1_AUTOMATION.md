@@ -250,3 +250,32 @@ staging; apagada, el flujo no consulta el catálogo. La evaluación
 leave-one-song-out y el gate de −10% WER para artistas con al menos dos temas
 quedan pendientes de la cohorte real; no se activa como reemplazo global antes
 de medirlos.
+
+## Estado 2026-09-03: LoRA v1 ARCHIVADO (mecanismo intacto)
+
+Sobre 11 canciones con rol `eval_holdout` (nunca vistas en entrenamiento), gold = entrega
+aprobada del mismo audio, IC 95% bootstrap por canción:
+
+| cohorte | Δ WER (LoRA − base) | IC 95% | mejora en |
+|---|---|---|---|
+| todas (11) | **+0,2182** | [+0,0769, +0,3840] | 2/11 |
+| vivo (4) | +0,3392 | [+0,1235, +0,5173] | 0/4 |
+| estudio (7) | +0,1491 | [−0,0030, +0,3652] | 2/7 |
+
+El −12,6% relativo de agosto se midió sobre canciones cuyos artistas estaban en el train set y lo
+explicaban dos outliers de bucles de repetición. Fuente: `riyadh/.context/sprint-72h/rol3-ablacion-resultados-20260903.md`.
+
+Qué cambia en código (`data/lora_v1_archive.json` es la fuente de verdad):
+
+- **Trigger de reentrenamiento a 300 canciones de rol `train`** (`learning_triggers.py`, cuenta
+  `train_role_song_count`, no el corpus entero). Antes: 100 canciones de cualquier rol.
+- **Leave-artist-out con claves normalizadas** (`lora_v1.normalize_artist` + `ARTIST_ALIASES`):
+  "Los Pericos" / "LosPericos" / "Pericos" y "Bersuit" / "Bersuit Vergarabat" ya van al mismo fold.
+- **Compuerta de holdout con IC** (`lora_v1.holdout_gate`, emitida por `evaluate_lora_v1.py` como
+  `holdout_gate`): pasa sólo si el IC 95% por canción de (baseline − candidato) **no cruza cero** y la
+  cohorte no tiene canciones `train`. Baseline a superar: cualquier IC positivo ya supera al adaptador
+  archivado, que dio −0,2182.
+- **El runtime la exige**: `lora_family.load_verified_family` devuelve `None` si el reporte no trae
+  `holdout_gate.passed == true`. El `evaluation.json` de v1 no lo trae, así que ese adaptador ya no
+  carga aunque `LORA_V1_FAMILY_ENABLED` vuelva a 1. Ninguna familia entrenada vuelve al consenso
+  sin pasar holdout con IC.

@@ -39,6 +39,7 @@ def test_attested_family_is_additional_only(monkeypatch, tmp_path):
     report.write_text(json.dumps({
         "pipeline_validated": True,
         "evaluation_passed": True,
+        "holdout_gate": {"passed": True, "ci_low": 0.01, "ci_high": 0.09, "songs": 11},
         "adapter_path": str(artifact),
         "adapter_sha256": hashlib.sha256(b"adapter").hexdigest(),
         "replacement_gate": {
@@ -65,6 +66,7 @@ def test_evaluation_gate_report_is_accepted(monkeypatch, tmp_path):
     report = tmp_path / "evaluation.json"
     report.write_text(json.dumps({
         "pipeline_validated": True, "evaluation_passed": True,
+        "holdout_gate": {"passed": True, "ci_low": 0.01, "ci_high": 0.09, "songs": 11},
         "adapter_path": str(artifact),
         "adapter_sha256": hashlib.sha256(b"adapter").hexdigest(),
         "gate": {"passed": True, "additional_family_only": True,
@@ -84,6 +86,7 @@ def test_attested_adapter_can_be_mounted_at_different_path(monkeypatch, tmp_path
     report = tmp_path / "evaluation.json"
     report.write_text(json.dumps({
         "pipeline_validated": True, "evaluation_passed": True,
+        "holdout_gate": {"passed": True, "ci_low": 0.01, "ci_high": 0.09, "songs": 11},
         "adapter_path": "/research-pod/no-longer-mounted/adapter",
         "adapter_sha256": hashlib.sha256(b"adapter").hexdigest(),
         "replacement_gate": {
@@ -136,3 +139,32 @@ def test_song_disagreement_score_is_gold_free_and_abstains_without_both_families
     assert score["source"] == "paired_asr_disagreement"
     assert score["gold_free"] is True
     assert song_disagreement_score(base, []) is None
+
+
+def test_family_without_holdout_gate_does_not_load(tmp_path, monkeypatch):
+    """LoRA v1 archivado: un evaluation.json sin holdout_gate no atesta nada,
+    aunque LORA_V1_FAMILY_ENABLED vuelva a 1. 'evaluation_passed' solo decia
+    que se decodificaron las 23; no que mejoro sobre holdout."""
+    import json
+    import lora_family
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_model.safetensors").write_bytes(b"x")
+    report = tmp_path / "evaluation.json"
+    report.write_text(json.dumps({
+        "pipeline_validated": True, "evaluation_passed": True,
+        "gate": {"passed": True, "additional_family_only": True,
+                 "runtime_replacement_allowed": False},
+        "adapter_path": str(adapter),
+    }))
+    monkeypatch.setenv("LORA_V1_FAMILY_ENABLED", "1")
+    assert lora_family.load_verified_family(report) is None
+
+    report.write_text(json.dumps({
+        "pipeline_validated": True, "evaluation_passed": True,
+        "gate": {"passed": True, "additional_family_only": True,
+                 "runtime_replacement_allowed": False},
+        "holdout_gate": {"passed": False, "reasons": ["ci_crosses_zero_or_worse"]},
+        "adapter_path": str(adapter),
+    }))
+    assert lora_family.load_verified_family(report) is None

@@ -104,6 +104,14 @@ def main() -> int:
                 evaluation[key] = training_report[key]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     evaluation["cohort_role_split"] = cohort_role_split
+    # Ninguna familia entrenada vuelve al consenso sin pasar holdout con IC.
+    from lora_v1 import holdout_gate
+    archive_path = BACKEND / "data" / "lora_v1_archive.json"
+    baseline_delta = None
+    if archive_path.is_file():
+        baseline_delta = (json.loads(archive_path.read_text(encoding="utf-8"))
+                          .get("holdout_evaluation", {}).get("delta_wer_baseline_minus_candidate"))
+    evaluation["holdout_gate"] = holdout_gate(evaluation, baseline_delta_wer=baseline_delta)
     args.output.write_text(json.dumps(evaluation, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(evaluation, ensure_ascii=False, indent=2))
     return 0

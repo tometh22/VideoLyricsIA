@@ -30,3 +30,18 @@ def test_t4_uses_the_selector_executor_once(monkeypatch):
     result = run_realign_selector_trigger(bucket=1, corpus_songs=200)
     assert result["status"] == "blocked_executor_missing"
     assert result["companion_triggers"] == ["t4_95"]
+
+
+def test_lora_retraining_trigger_is_300_train_role_songs():
+    """Archivo de LoRA v1: el trigger sube a 300 y cuenta solo rol train."""
+    import learning_triggers as lt
+    spec = lt.TRIGGER_SPECS["lora_retraining"]
+    assert spec["threshold_default"] == 300
+    assert spec["count"] == "train_role_songs"
+    assert spec["baseline_to_beat"] == "data/lora_v1_archive.json"
+    import json
+    from pathlib import Path
+    archive = json.loads((Path(lt.__file__).parent / "data" / "lora_v1_archive.json").read_text())
+    assert archive["status"] == "archived"
+    assert archive["holdout_evaluation"]["delta_wer_candidate_minus_baseline"] == 0.2182
+    assert archive["retraining_trigger"]["threshold_train_role_songs"] == 300

@@ -143,12 +143,15 @@ def prepare_manifest(
     generator.shuffle(song_ids)
     validation_ids = set(song_ids[: max(1, round(0.20 * len(song_ids)))])
     # Largest artist groups form the leave-artist-out fold, deterministically.
+    # Los nombres se normalizan antes de agrupar: "Bersuit" / "Bersuit
+    # Vergarabat" / "LosPericos" / "Los Pericos" eran artistas distintos para
+    # el fold y por eso el leave-artist-out de v1 filtraba (auditoría 2026-09-03).
     counts: dict[str, int] = defaultdict(int)
     for song in songs:
-        counts[song["artist"]] += 1
+        counts[normalize_artist(song["artist"])] += 1
     held_artists: set[str] = set()
     held_songs = 0
-    for artist in sorted(counts, key=lambda name: (-counts[name], name.casefold())):
+    for artist in sorted(counts, key=lambda name: (-counts[name], name)):
         if held_songs >= max(1, round(0.20 * len(songs))):
             break
         held_artists.add(artist)
@@ -165,7 +168,7 @@ def prepare_manifest(
                 "raw_quality": song["raw_quality"], "job_origin": song["job_origin"],
                 "difficulty": difficulty, "eval_only": song["eval_only"], **chunk,
                 "song_split": "validation" if song["song_id"] in validation_ids else "train",
-                "artist_split": "leave_artist_out" if song["artist"] in held_artists else "train",
+                "artist_split": "leave_artist_out" if normalize_artist(song["artist"]) in held_artists else "train",
             })
     # Registro de roles: ninguna canción marcada como holdout de evaluación
     # puede entrar al dataset. Antes esto dependía sólo de ``eval_only``, que
@@ -403,3 +406,65 @@ def data_improvement_curve(
             "relative_improvement": improvement,
         })
     return curve
+
+
+# Variantes de nombre de una misma banda que ninguna regla ortográfica puede
+# unir. Salen de la auditoría del 2026-09-03 sobre el manifest de LoRA v1
+# ("Bersuit" vs "Bersuit Vergarabat", "MercedesSosa", "Paez y Spinetta").
+# Es un mapa explícito a propósito: se audita, no se adivina.
+ARTIST_ALIASES = {
+    "bersuitvergarabat": "bersuit",
+    "paezyspinetta": "fitopaez",
+    "fitopaezyspinetta": "fitopaez",
+    "spinetta": "spinetta",
+}
+
+
+def normalize_artist(name: str) -> str:
+    """Clave de artista para el leave-artist-out.
+
+    Sin tildes, sin featuring, sin artículo inicial, sin espacios ni puntuación,
+    y con el mapa de alias explícito de arriba. "Los Pericos", "LosPericos" y
+    "Pericos" caen en la misma clave; "Bersuit Vergarabat" y "Bersuit" también,
+    por alias. Antes cada grafía era un artista distinto para el fold y el
+    leave-artist-out de v1 filtraba."""
+    import re
+    import unicodedata
+    text = unicodedata.normalize("NFKD", str(name or ""))
+    text = "".join(c for c in text if not unicodedata.combining(c)).casefold()
+    text = re.sub(r"\s*(ft\.?|feat\.?|&|and)\s.*$", "", text)
+    key = re.sub(r"[^a-z0-9]+", "", text)
+    # Artículo inicial pegado o separado ("los pericos", "lospericos").
+    key = re.sub(r"^(los|las|the)(?=[a-z]{4,})", "", key)
+    key = re.sub(r"^(el|la)(?=[a-z]{5,})", "", key)
+    return ARTIST_ALIASES.get(key, key)
+
+
+def holdout_gate(evaluation: dict, *, baseline_delta_wer: float | None = None) -> dict:
+    """Compuerta para que una familia entrenada vuelva al consenso.
+
+    Pasa sólo si la mejora sobre el holdout (baseline − candidato, positivo =
+    mejora) tiene un IC 95% por canción que NO cruza cero, y si la cohorte no
+    contiene canciones de entrenamiento. ``baseline_delta_wer`` es el número a
+    superar que dejó el adaptador archivado (LoRA v1: −0,2182, es decir, EMPEORÓ
+    0,2182); cualquier candidato con IC positivo ya lo supera, se registra para
+    que el reporte lo declare.
+    """
+    boot = dict(evaluation.get("song_delta_bootstrap") or {})
+    roles = dict(evaluation.get("cohort_role_split") or {})
+    ci_low = boot.get("ci_low")
+    reasons = []
+    if not boot.get("songs"):
+        reasons.append("holdout_bootstrap_missing")
+    if roles.get("train"):
+        reasons.append("cohort_contains_train_songs")
+    if isinstance(ci_low, (int, float)) and ci_low <= 0:
+        reasons.append("ci_crosses_zero_or_worse")
+    return {
+        "schema": "lora-holdout-gate-v1",
+        "passed": not reasons,
+        "reasons": reasons,
+        "estimate": boot.get("estimate"), "ci_low": ci_low, "ci_high": boot.get("ci_high"),
+        "songs": boot.get("songs"), "cohort_role_split": roles,
+        "baseline_to_beat_delta_wer": baseline_delta_wer,
+    }

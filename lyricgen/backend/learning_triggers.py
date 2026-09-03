@@ -18,9 +18,16 @@ _TRUE = {"1", "true", "yes", "on"}
 TRIGGER_SPECS: dict[str, dict[str, Any]] = {
     "lora_retraining": {
         "threshold_env": "CORPUS_RETRAIN_EVERY_SONGS",
-        "threshold_default": 100,
+        # 2026-09-03: LoRA v1 quedó ARCHIVADO. Sobre 11 canciones de holdout
+        # que nunca vio empeoró el WER +0,2182 (IC 95% [+0,0769, +0,3840], sin
+        # cruzar cero). El reentrenamiento vuelve recién con 300 canciones de
+        # rol `train` en el registro de roles, leave-artist-out real, y sólo
+        # entra al consenso si pasa el holdout con IC (ver data/lora_v1_archive.json).
+        "threshold_default": 300,
+        "count": "train_role_songs",
         "enabled_env": "LORA_V1_AUTORETRAIN_ENABLED",
         "job_function": "run_lora_retraining_trigger",
+        "baseline_to_beat": "data/lora_v1_archive.json",
     },
     "realignment_selector": {
         "threshold_env": "REALIGN_SELECTOR_TRIGGER_SONGS",
@@ -84,6 +91,27 @@ def corpus_song_count(db) -> int:
         EditorVersion.is_approved.is_(True),
     ).scalar()
     return int(value or 0)
+
+
+def train_role_song_count(db) -> int:
+    """Como corpus_song_count, pero SÓLO canciones con rol ``train``.
+
+    Una canción de holdout aprobada no acerca el trigger de reentrenamiento:
+    no puede entrar al dataset. Sin registro, o para canciones sin rol, no se
+    cuenta nada (no se asume rol por defecto)."""
+    from sqlalchemy import func
+    from database import EditorVersion, Job
+    try:
+        from song_roles import role_for_job
+    except ImportError:  # pragma: no cover
+        return 0
+    rows = db.query(func.distinct(Job.job_id)).join(
+        EditorVersion, EditorVersion.job_id == Job.job_id,
+    ).filter(
+        Job.machine_snapshot_required.is_(True),
+        EditorVersion.is_approved.is_(True),
+    ).all()
+    return sum(1 for (job_id,) in rows if role_for_job(str(job_id)) == "train")
 
 
 def _scheduled_buckets(db, trigger_type: str) -> set[int]:
@@ -161,7 +189,11 @@ def schedule_due_triggers(*, reason: str = "approval") -> dict[str, Any]:
             if not enabled:
                 continue
             threshold = _threshold(spec)
-            due_bucket = count // threshold
+            trigger_count = count
+            if spec.get("count") == "train_role_songs":
+                trigger_count = train_role_song_count(db)
+                result["train_role_songs"] = trigger_count
+            due_bucket = trigger_count // threshold
             if due_bucket < 1:
                 continue
             scheduled = _scheduled_buckets(db, trigger_type)
@@ -179,6 +211,8 @@ def schedule_due_triggers(*, reason: str = "approval") -> dict[str, Any]:
                 detail = {
                     "trigger_type": trigger_type, "bucket": bucket,
                     "threshold": threshold, "corpus_songs": count,
+                    "trigger_count": trigger_count,
+                    "baseline_to_beat": spec.get("baseline_to_beat"),
                     "rq_job_id": rq_id, "reason": reason,
                     "companion_triggers": list(spec.get("companion_triggers", ())),
                     "authorization": authorization if trigger_type == "lora_retraining" else None,

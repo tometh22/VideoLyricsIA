@@ -86,3 +86,43 @@ def test_leave_artist_out_rows_are_not_in_train_or_validation():
     held_artists = {row["artist"] for row in held}
     assert held_artists
     assert all(row["artist"] not in held_artists for row in train + validation)
+
+
+def test_normalize_artist_merges_spelling_variants():
+    from lora_v1 import normalize_artist
+    assert normalize_artist("Los Pericos") == normalize_artist("LosPericos") == normalize_artist("Pericos")
+    assert normalize_artist("Bersuit Vergarabat") == normalize_artist("Bersuit")  # via ARTIST_ALIASES
+    assert normalize_artist("Luciano Pereyra Ft. Greeicy") == normalize_artist("luciano pereyra")
+    assert normalize_artist("Fito Páez & Spinetta") == normalize_artist("Fito Paez")
+    assert normalize_artist("") == ""
+
+
+def test_holdout_gate_requires_ci_above_zero_and_no_train_songs():
+    from lora_v1 import holdout_gate
+    ok = holdout_gate({
+        "song_delta_bootstrap": {"estimate": 0.05, "ci_low": 0.01, "ci_high": 0.09, "songs": 11},
+        "cohort_role_split": {"train": 0, "val": 1, "eval_holdout": 10, "unknown": 0},
+    }, baseline_delta_wer=-0.2182)
+    assert ok["passed"] is True and ok["baseline_to_beat_delta_wer"] == -0.2182
+
+    cruza = holdout_gate({
+        "song_delta_bootstrap": {"estimate": 0.05, "ci_low": -0.02, "ci_high": 0.12, "songs": 11},
+        "cohort_role_split": {"train": 0, "val": 0, "eval_holdout": 11, "unknown": 0},
+    })
+    assert cruza["passed"] is False and "ci_crosses_zero_or_worse" in cruza["reasons"]
+
+    # El LoRA v1 real: empeoro (baseline - candidato negativo) -> no pasa.
+    v1 = holdout_gate({
+        "song_delta_bootstrap": {"estimate": -0.2182, "ci_low": -0.3840, "ci_high": -0.0769, "songs": 11},
+        "cohort_role_split": {"train": 0, "val": 1, "eval_holdout": 10, "unknown": 0},
+    })
+    assert v1["passed"] is False
+
+    contaminado = holdout_gate({
+        "song_delta_bootstrap": {"estimate": 0.3, "ci_low": 0.2, "ci_high": 0.4, "songs": 41},
+        "cohort_role_split": {"train": 13, "val": 5, "eval_holdout": 23, "unknown": 0},
+    })
+    assert contaminado["passed"] is False and "cohort_contains_train_songs" in contaminado["reasons"]
+
+    vacio = holdout_gate({})
+    assert vacio["passed"] is False and "holdout_bootstrap_missing" in vacio["reasons"]

@@ -217,6 +217,13 @@ def load_verified_family(report_path: str | os.PathLike[str] | None = None) -> d
     )
     if not evaluation_passed:
         return None
+    # 2026-09-03: "evaluation_passed" sólo decía "se decodificaron las 23". Una
+    # familia entrenada entra al consenso únicamente si además pasó el holdout
+    # con IC 95% por canción que no cruza cero (lora_v1.holdout_gate). El
+    # evaluation.json de LoRA v1 no lo tiene: por eso ese adaptador ya no carga
+    # aunque alguien vuelva a poner LORA_V1_FAMILY_ENABLED=1.
+    if (report.get("holdout_gate") or {}).get("passed") is not True:
+        return None
     # Deployments may mount the attested adapter at a different path than the
     # research pod.  The report remains the source of truth for the expected
     # SHA-256; the explicit path override only changes where that bytestring
