@@ -29,6 +29,30 @@ TERMINAL = {"pending_review", "done", "error", "rejected", "validation_failed"}
 DEFAULT_EXPECTED_COUNT = 30
 
 
+def _resolved_language(result: dict[str, Any]) -> str | None:
+    """Return only a worker-confirmed language for the batch manifest.
+
+    Mixed or unavailable LID is an explicit abstention.  The runner must not
+    turn either case into a Spanish fallback because that would re-introduce
+    the cross-language omission this path is designed to prevent.
+    """
+    detected_languages = result.get("detected_languages")
+    if result.get("mixed_language") or (
+        isinstance(detected_languages, (list, tuple, set))
+        and len({str(value).strip().lower() for value in detected_languages if value}) > 1
+    ):
+        return None
+    direct = result.get("detected_language") or result.get("language")
+    if isinstance(direct, str) and direct.strip().lower() not in {"", "unknown"}:
+        return direct.strip().lower()
+    quality = result.get("transcription_quality")
+    metrics = quality.get("metrics") if isinstance(quality, dict) else None
+    value = metrics.get("language") if isinstance(metrics, dict) else None
+    if isinstance(value, str) and value.strip().lower() not in {"", "unknown"}:
+        return value.strip().lower()
+    return None
+
+
 class BatchError(RuntimeError):
     pass
 
@@ -208,7 +232,10 @@ class Api:
     def start_transcription(self, entry: AudioManifestEntry, job_id: str) -> dict:
         payload = {
             "job_id": job_id,
-            "language": "es",
+            # Empty means provider auto-LID.  Never force a campaign-wide
+            # language: the worker confirms LID from the isolated vocal stem
+            # and abstains for mixed-language recordings.
+            "language": "",
             "artist": entry.artist,
             "title": entry.title,
             "live": bool(entry.version),
@@ -278,6 +305,11 @@ class Api:
                     "reference_lyrics": result.get("reference_lyrics"),
                     "coverage_warning": result.get("coverage_warning"),
                     "timing_source": result.get("timing_source"),
+                    "language_requested": "auto",
+                    "language": _resolved_language(result),
+                    "detected_language": result.get("detected_language"),
+                    "detected_languages": result.get("detected_languages") or [],
+                    "mixed_language": bool(result.get("mixed_language")),
                 }
                 entry.status = "transcribed"
                 return result.get("segments") or []
