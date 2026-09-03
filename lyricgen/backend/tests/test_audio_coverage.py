@@ -94,10 +94,16 @@ def test_separa_zonas_distintas():
 def test_summarize_es_serializable_y_completo():
     words = _palabras(10, 20) + _palabras(60, 80)
     s = summarize([_seg(9.5, 20.5)], words)
-    assert set(s) == {"audio_coverage", "uncovered_spans",
+    assert set(s) == {"audio_coverage", "asr_word_coverage", "voiced_coverage",
+                      "voiced_total_s", "uncovered_spans",
                       "uncovered_seconds", "worst_span_s", "text_mismatches",
                       "voiced_gaps", "voiced_gap_s"}
-    assert all(isinstance(v, (int, float)) for v in s.values())
+    # voiced_coverage es None sin stem: falta de evidencia no es cobertura.
+    assert s["voiced_coverage"] is None
+    assert all(
+        isinstance(v, (int, float))
+        for k, v in s.items() if k != "voiced_coverage"
+    )
     assert s["uncovered_spans"] == 1
     assert 18 <= s["worst_span_s"] <= 21
     assert s["audio_coverage"] < 0.5
