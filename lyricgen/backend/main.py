@@ -165,6 +165,48 @@ app = FastAPI(
     redoc_url=None,
 )
 
+
+def _parse_scene_prompts_json(raw: str | None):
+    """Parse the structured storyboard contract and fail closed.
+
+    A malformed storyboard must never silently turn into a generic scene
+    plan: that spends provider credits while ignoring the operator's brief.
+    The pipeline accepts a list or ``{"shared": ..., "scenes": ...}``.
+    """
+    if not raw or not raw.strip():
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="scene_prompts_json must be valid JSON",
+        ) from exc
+    if isinstance(value, list):
+        count = sum(isinstance(item, str) and item.strip() for item in value)
+    elif isinstance(value, dict):
+        scenes = value.get("scenes")
+        if isinstance(scenes, list):
+            count = sum(isinstance(item, str) and item.strip() for item in scenes)
+        elif isinstance(scenes, dict):
+            count = sum(
+                isinstance(item, str) and item.strip()
+                for item in scenes.values()
+            )
+        else:
+            count = 0
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="scene_prompts_json must be an array or object",
+        )
+    if count < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="scene_prompts_json must contain at least two non-empty scenes",
+        )
+    return value
+
 # --- Rate limiting (120 req/min default per IP via SlowAPIMiddleware) ---
 from slowapi.middleware import SlowAPIMiddleware
 
@@ -5263,6 +5305,11 @@ async def upload(
     # Add-on premium "Escenas" (multi-escena). Parity con /generate; la
     # elegibilidad se valida con has_scenes_access antes de forwardear.
     enable_scenes: bool = Form(False),
+    # Optional operator-authored per-scene prompt contract. A JSON list is
+    # matched to unique scenes in order; an object may include shared text and
+    # recurrence-keyed prompts. Legacy numbered blocks in background_hint are
+    # parsed by the pipeline too.
+    scene_prompts_json: str = Form("", max_length=60000),
     # Title-card customization (Full Rotor v1). Defaults = historical look.
     title_template: str = Form("auto", max_length=16),
     title_size: str = Form("1.0", max_length=8),
@@ -5282,6 +5329,7 @@ async def upload(
     the upload memory + bandwidth cost. Removal: 2026-08-01.
     """
     background_mode = background_mode if background_mode in ("as_is", "variation") else "as_is"
+    scene_prompts = _parse_scene_prompts_json(scene_prompts_json)
     _set_deprecation_headers(response, "/upload")
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename.")
@@ -5465,6 +5513,7 @@ async def upload(
         custom_colors=(custom_colors.strip() or ""),
         # Escenas (multi-escena): opt-in AND elegibilidad real (parity /generate).
         enable_scenes=bool(enable_scenes) and has_scenes_access(current_user),
+        scene_prompts=scene_prompts,
         title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),
@@ -9998,6 +10047,11 @@ async def generate_with_segments(
     # forwardearlo al pipeline (un usuario sin acceso que mande el flag igual
     # cae al fondo único). Default False = comportamiento histórico.
     enable_scenes: bool = Form(False),
+    # Optional operator-authored per-scene prompt contract. A JSON list is
+    # matched to unique scenes in order; an object may include shared text and
+    # recurrence-keyed prompts. Legacy numbered blocks in background_hint are
+    # parsed by the pipeline too.
+    scene_prompts_json: str = Form("", max_length=60000),
     # Capa C 2026-05-24: si el operador hizo pre-gen via /generate-preview
     # mientras editaba lyrics, este field contiene el hash que mapea al
     # background pre-cacheado en R2. La pipeline lo reusa antes de llamar
@@ -10054,6 +10108,7 @@ async def generate_with_segments(
         line_transition = _profile_fields["line_transition"]
         if _render_profile.get("background_id") is not None:
             background_id = _render_profile["background_id"]
+    scene_prompts = _parse_scene_prompts_json(scene_prompts_json)
     reuse = bool(job_id)
     try:
         segments = json.loads(segments_json)
@@ -10809,6 +10864,7 @@ async def generate_with_segments(
         # Si el flag llega pero el usuario no tiene acceso, se ignora (fondo
         # único) — el gate de feature vive en el backend, no en el form.
         enable_scenes=_effective_scenes,
+        scene_prompts=scene_prompts,
         title_template=title_template if title_template in ("auto", "centered", "lower_third", "badge") else "auto",
         title_size=_clamp_title_size(title_size),
         title_artist_font=(title_artist_font.strip() or ""),
@@ -16669,7 +16725,7 @@ async def retry_job(
     for k in ("font", "font_scale", "text_case", "frame_format", "text_contrast",
               "movement_style", "animate_image", "genre", "match_lyrics",
               "background_hint", "concept", "bg_verbatim",
-              "effect", "custom_colors",
+              "effect", "custom_colors", "scene_prompts",
               # Lyric animation + line transition (libass templates from the
               # wizard). Added 2026-05-22 along with /variant: if a job with
               # karaoke/reveal fell to validation_failed and the operator hit

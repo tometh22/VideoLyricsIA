@@ -537,6 +537,7 @@ def build_scene_plan(
     song_title: str = "",
     style: str = "",
     operator_movement: str = "",
+    prompt_overrides: list[str] | dict[str, str] | None = None,
 ) -> dict:
     """Construye el storyboard: una escena por recurrence_key única.
 
@@ -570,17 +571,30 @@ def build_scene_plan(
             continue
         movement = _forced_movement or energy_to_movement(sec.energy)
         hint = _scene_hint(bible_text, sec)
-        try:
-            result = prompt_fn(
-                background_hint=hint,
-                movement_style=movement,
-                section_type=sec.type,
-                energy=sec.energy,
+        override = None
+        if isinstance(prompt_overrides, dict):
+            override = prompt_overrides.get(key)
+        elif isinstance(prompt_overrides, list):
+            # Match the list to UNIQUE scene order, not raw section order:
+            # repeated choruses share one Veo clip and one prompt slot.
+            override = (
+                prompt_overrides[len(scenes)]
+                if len(scenes) < len(prompt_overrides) else None
             )
-            prompt = (result or {}).get("prompt", "") or hint
-        except Exception as e:  # noqa: BLE001 — un prompt que falla no debe tumbar el plan
-            logger.warning("[SCENES] prompt_fn falló para %s (%s); uso hint", key, e)
-            prompt = hint
+        if override:
+            prompt = str(override).strip()
+        else:
+            try:
+                result = prompt_fn(
+                    background_hint=hint,
+                    movement_style=movement,
+                    section_type=sec.type,
+                    energy=sec.energy,
+                )
+                prompt = (result or {}).get("prompt", "") or hint
+            except Exception as e:  # noqa: BLE001 — un prompt que falla no debe tumbar el plan
+                logger.warning("[SCENES] prompt_fn falló para %s (%s); uso hint", key, e)
+                prompt = hint
         scene = {
             "id": key,
             "recurrence_key": key,

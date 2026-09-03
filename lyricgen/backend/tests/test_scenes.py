@@ -288,3 +288,23 @@ def test_scene_hint_carries_coherence_not_texture_or_camera():
     # Textura/cámara de la biblia AUSENTES del hint (no se imponen).
     for leaked in ["16mm", "film grain", "sprocket", "camcorder"]:
         assert leaked not in blob, f"la biblia filtró {leaked!r} al hint por-escena"
+
+
+def test_build_scene_plan_uses_literal_overrides_in_unique_order():
+    """Explicit operator prompts bypass the generic prompt function and map
+    to unique scenes, so repeated chorus sections do not consume extra slots."""
+    secs = scenes.detect_sections(_song_with_repeated_chorus(), audio_duration=100.0)
+    prompts = [f"operator scene {i}" for i in range(len({s.recurrence_key for s in secs}))]
+    calls = []
+
+    def unexpected_prompt_fn(**kwargs):
+        calls.append(kwargs)
+        return {"prompt": "generic fallback"}
+
+    plan = scenes.build_scene_plan(
+        secs, {"world": "shared"}, unexpected_prompt_fn,
+        operator_movement="estatico", prompt_overrides=prompts,
+    )
+    assert calls == []
+    assert [scene["prompt"] for scene in plan["scenes"]] == prompts
+    assert all(scene["movement_style"] == "estatico" for scene in plan["scenes"])

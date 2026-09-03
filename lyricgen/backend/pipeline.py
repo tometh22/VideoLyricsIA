@@ -1188,6 +1188,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # que acá se confía. Cualquier fallo cae al fondo único (cero
                  # regresión). Default False = comportamiento histórico.
                  enable_scenes: bool = False,
+                 # Operator-authored per-scene prompt contract.  This is
+                 # intentionally persisted with render_params so retries and
+                 # later edits cannot silently fall back to Gemini's generic
+                 # scene planner.
+                 scene_prompts: list | dict | str | None = None,
                  # Title-card customization (Full Rotor v1). Defaults reproduce
                  # the historical look. title_size clamps 0.5-2.0; the font ids
                  # resolve via _resolve_font ("" → ExtraBold artist / lyric song);
@@ -1283,6 +1288,15 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         return
     job_dir = os.path.join(OUTPUTS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
+    # Normalize once before any background branch so the exact operator
+    # direction can also be persisted when a custom/library asset is used.
+    _scene_prompt_spec = _normalize_scene_prompt_spec(
+        scene_prompts, background_hint,
+    )
+    if scene_prompts not in (None, "") and _scene_prompt_spec is None:
+        raise ValueError(
+            "Structured scene prompts must contain at least two non-empty scenes"
+        )
 
     # Drop any ProRes .mov left from a PRIOR render of this same job_id
     # (e.g. a /retry re-render: retry_job clears s3_keys but reuses job_dir,
@@ -1691,6 +1705,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         background_hint=background_hint, bg_verbatim=bg_verbatim,
                         match_lyrics=match_lyrics,
                         allow_people=_compute_allow_people(job_id, background_hint),
+                        scene_prompts=_scene_prompt_spec,
                         job_id=job_id,
                     )
                     bg_image_path = _scene_timeline
@@ -1733,6 +1748,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     _scenes_active = False
                 except Exception as e:  # noqa: BLE001
                     _raise_if_job_timeout(e)
+                    if _scene_prompt_spec:
+                        # An operator storyboard is a paid-generation
+                        # contract. Never hide a failure by silently issuing a
+                        # different, generic single-background request.
+                        raise
                     logger.error("[SCENES] multi-escena falló para job=%s (%s) — "
                                  "fallback a fondo único", job_id, e)
                     _scenes_active = False
@@ -1864,6 +1884,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # heredan vía la whitelist de render_params en main.py.
         if enable_scenes:
             _new_rp["enable_scenes"] = True
+        if _scene_prompt_spec:
+            _new_rp["scene_prompts"] = _scene_prompt_spec
         # U5 (audit 2026-05-25): merge atómico vía jobs.merge_render_params.
         # El read-then-write fuera de un row lock dejaba race: 2 callers
         # concurrentes (worker + /edit endpoint, o 2 /edit calls) podían
@@ -13582,6 +13604,86 @@ def _parse_json_object(text: str) -> dict | None:
         return None
 
 
+def _normalize_scene_prompt_spec(scene_prompts=None, background_hint=None):
+    """Normalize an operator-authored, per-scene prompt contract.
+
+    The legacy UI stores one free-form ``background_hint``.  When that text
+    contains numbered scene blocks (``1. ...`` through ``N. ...``), preserve
+    those blocks verbatim instead of sending the whole text through the
+    generic Gemini scene planner.  New callers may send ``scene_prompts`` as
+    ``{"shared": str, "scenes": list|dict}`` or a plain list/dict.
+
+    Returns a small JSON-safe object or ``None``.  A prompt is considered
+    structured only when it has at least two non-empty scene blocks; ordinary
+    one-line hints keep the historical planner behavior.
+    """
+    import json as _json
+
+    shared = ""
+    scenes = None
+    if isinstance(scene_prompts, dict):
+        shared = str(scene_prompts.get("shared") or "").strip()
+        scenes = scene_prompts.get("scenes")
+    elif isinstance(scene_prompts, list):
+        scenes = scene_prompts
+    elif isinstance(scene_prompts, str) and scene_prompts.strip():
+        try:
+            parsed = _json.loads(scene_prompts)
+        except (TypeError, ValueError, _json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            return _normalize_scene_prompt_spec(parsed, background_hint=background_hint)
+
+    if isinstance(scenes, dict):
+        normalized = {
+            str(key).strip(): str(value).strip()
+            for key, value in scenes.items()
+            if str(key).strip() and str(value).strip()
+        }
+        if len(normalized) < 2:
+            return None
+        return {"shared": shared, "scenes": normalized, "mode": "literal"}
+    if isinstance(scenes, list):
+        normalized = [str(value).strip() for value in scenes if str(value).strip()]
+        if len(normalized) < 2:
+            return None
+        return {"shared": shared, "scenes": normalized, "mode": "literal"}
+
+    raw = str(background_hint or "").strip()
+    if not raw:
+        return None
+    import re as _re
+    matches = list(_re.finditer(
+        r"(?ms)^\s*(\d+)[.)]\s+(.+?)(?=^\s*\d+[.)]\s+|\Z)", raw,
+    ))
+    if len(matches) < 2:
+        return None
+    shared = raw[:matches[0].start()].strip()
+    normalized = [match.group(2).strip() for match in matches if match.group(2).strip()]
+    if len(normalized) < 2:
+        return None
+    return {"shared": shared, "scenes": normalized, "mode": "literal"}
+
+
+def _scene_prompt_texts(spec):
+    """Return ``(shared, overrides)`` in the shape scenes.py consumes."""
+    if not isinstance(spec, dict):
+        return "", None
+    shared = str(spec.get("shared") or "").strip()
+    scenes = spec.get("scenes")
+    if isinstance(scenes, dict):
+        overrides = {
+            str(key).strip(): str(value).strip()
+            for key, value in scenes.items()
+            if str(key).strip() and str(value).strip()
+        }
+    elif isinstance(scenes, list):
+        overrides = [str(value).strip() for value in scenes if str(value).strip()]
+    else:
+        overrides = None
+    return shared, overrides
+
+
 def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
                           style, custom_colors, job_id, allow_people,
                           *, match_lyrics=True, operator_prompt=None,
@@ -14087,6 +14189,7 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                               custom_colors: str = "", background_hint: str | None = None,
                               bg_verbatim: bool = False, match_lyrics: bool = True,
                               allow_people: bool = False,
+                              scene_prompts: list | dict | str | None = None,
                               atmospherics_policy: dict | None = None,
                               job_id: str = None, target_w: int = 1920,
                               target_h: int = 1080) -> tuple[str, dict]:
@@ -14098,25 +14201,60 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
     camino de fondo único (cero regresión).
     """
     import scenes as _scenes
-    creative_mode = resolve_creative_mode(
+    scene_prompt_spec = _normalize_scene_prompt_spec(
+        scene_prompts, background_hint,
+    )
+    shared_scene_prompt, scene_prompt_overrides = _scene_prompt_texts(
+        scene_prompt_spec,
+    )
+    explicit_scene_prompts = bool(scene_prompt_overrides)
+    if explicit_scene_prompts and shared_scene_prompt:
+        if isinstance(scene_prompt_overrides, dict):
+            scene_prompt_overrides = {
+                key: f"{shared_scene_prompt}. {value}"
+                for key, value in scene_prompt_overrides.items()
+            }
+        else:
+            scene_prompt_overrides = [
+                f"{shared_scene_prompt}. {value}"
+                for value in scene_prompt_overrides
+            ]
+    if explicit_scene_prompts:
+        # A structured operator prompt is already the storyboard. Do not ask
+        # Gemini to rewrite it or infer a new world from the lyrics.
+        creative_mode = "prompt_literal"
+        background_hint_for_policy = shared_scene_prompt
+    else:
+        background_hint_for_policy = background_hint
+    creative_mode = creative_mode if explicit_scene_prompts else resolve_creative_mode(
         match_lyrics=match_lyrics,
-        operator_prompt=background_hint,
+        operator_prompt=background_hint_for_policy,
         verbatim=bg_verbatim,
     )
     atmospherics_policy = atmospherics_policy or resolve_atmospherics_policy(
-        background_hint
+        background_hint_for_policy
     )
     secs = _scenes.detect_sections(segments, audio_duration)
     n_unique = len({s.recurrence_key for s in secs})
     logger.info("[SCENES] %d secciones, %d escenas únicas (canción %.0fs)",
                 len(secs), n_unique, audio_duration or 0.0)
-    bible = _build_visual_bible(lyrics_text, artist, song_title, genre, concept,
-                                style_hint, custom_colors, job_id,
-                                background_hint=background_hint, bg_verbatim=bg_verbatim,
-                                match_lyrics=match_lyrics,
-                                creative_mode=creative_mode,
-                                atmospherics_policy=atmospherics_policy,
-                                allow_people=allow_people)
+    if explicit_scene_prompts:
+        bible = {
+            "world": shared_scene_prompt or "One coherent cinematic world",
+            "palette": "deep blue and warm amber",
+            "texture": "photorealistic cinematic realism, elegant sensuality, no smoke or airborne particles",
+            "camera": "locked tripod or locked macro camera, environmental motion only",
+            "motif": "water, rain, reflections, curtains and changing natural light",
+        }
+    else:
+        bible = _build_visual_bible(
+            lyrics_text, artist, song_title, genre, concept,
+            style_hint, custom_colors, job_id,
+            background_hint=background_hint, bg_verbatim=bg_verbatim,
+            match_lyrics=match_lyrics, creative_mode=creative_mode,
+            atmospherics_policy=atmospherics_policy,
+            allow_people=allow_people,
+        )
     prompt_fn = _make_scene_prompt_fn(lyrics_text, artist, song_title, genre,
                                       concept, style_hint, custom_colors, job_id,
                                       allow_people, match_lyrics=match_lyrics,
@@ -14124,9 +14262,13 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       bg_verbatim=bg_verbatim,
                                       creative_mode=creative_mode,
                                       atmospherics_policy=atmospherics_policy)
-    plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
-                                    song_title=song_title, style=style_hint,
-                                    operator_movement=_normalize_movement_style(movement_style))
+    plan = _scenes.build_scene_plan(
+        secs, bible, prompt_fn, artist=artist, song_title=song_title,
+        style=style_hint,
+        operator_movement=("estatico" if explicit_scene_prompts
+                           else _normalize_movement_style(movement_style)),
+        prompt_overrides=scene_prompt_overrides,
+    )
     plan["generation_policy"] = {
         "policy_version": BACKGROUND_POLICY_VERSION,
         "creative_mode": creative_mode,
@@ -14138,7 +14280,12 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
         scene["creative_mode"] = creative_mode
         scene["atmospherics_policy"] = atmospherics_policy
         scene["allow_people"] = bool(allow_people)
-        scene["operator_prompt"] = (background_hint or "").strip()
+        scene["operator_prompt"] = (
+            (shared_scene_prompt or background_hint or "").strip()
+        )
+        if explicit_scene_prompts:
+            scene["prompt_source"] = "operator_structured"
+            scene["shared_prompt"] = shared_scene_prompt
     clip_for_key = _generate_scene_clips(plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
                                          job_id=job_id, allow_people=allow_people,
