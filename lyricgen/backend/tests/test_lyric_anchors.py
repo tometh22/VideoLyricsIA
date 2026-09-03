@@ -270,3 +270,37 @@ def test_la_cobertura_no_castiga_por_obedecer_compliance():
     # Sólo cuentan lugar + silla; piel y estrellas ya no inflan el denominador.
     assert cov["total"] == 2 and cov["covered"] == 2
     assert la.coverage_is_sufficient(cov) is True
+
+
+# ── Métrica de lugar concreto (la que mira el sello) ───────────────────────
+def test_nombra_el_lugar_de_la_letra():
+    anchors = _payload()          # lugar = "Plaza de Mayo", con su línea
+    r = la.names_place_from_lyrics(
+        "Plaza de Mayo vacía al mediodía, papeles en la vereda", anchors)
+    assert r["names_place"] is True
+    assert r["citado"] is True
+    assert r["lugar"] == "Plaza de Mayo"
+
+
+def test_detecta_que_el_compositor_ignoro_el_lugar():
+    """El modo de falla que importa: se extrajo un lugar de la letra y la escena
+    terminó en otro lado."""
+    r = la.names_place_from_lyrics(
+        "un valle de montaña con niebla al amanecer", _payload())
+    assert r["names_place"] is False
+    assert "no lo usó" in r["reason"]
+
+
+def test_distingue_no_haber_lugar_de_haberlo_ignorado():
+    """Una canción abstracta sin lugar no es un incumplimiento; ignorar un lugar
+    que la letra sí daba, sí. La métrica los separa para poder diagnosticar."""
+    r = la.names_place_from_lyrics("cualquier escena", _payload(lugar=None))
+    assert r["names_place"] is False
+    assert "no ancla en un lugar" in r["reason"]
+
+
+def test_el_lugar_sin_cita_se_marca_como_no_rastreable():
+    r = la.names_place_from_lyrics("Plaza de Mayo vacía",
+                                   _payload(linea_lugar=None))
+    assert r["names_place"] is True
+    assert r["citado"] is False

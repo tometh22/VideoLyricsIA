@@ -9622,6 +9622,50 @@ títulos, sin viñetas, sin numeración — los títulos son para vos, no van en
     sin cambios bruscos, una sola escena continua sin cortes ni transiciones."""
 
 
+# Requisitos contractuales del sello. No son preferencias estéticas: son las
+# condiciones que un entregable tiene que cumplir para ser aceptado, así que van
+# como reglas duras del compositor y no como sugerencias del final del prompt.
+# Se repiten en positivo (lo que SÍ tiene que pasar) porque los generadores
+# responden mejor a una afirmación que a una prohibición; las prohibiciones
+# equivalentes ya viajan aparte en el riel de negativos del provider.
+_UMG_MOVEMENT_VIDEO = (
+    "- MOVIMIENTO: sólo movimiento ambiental sutil dentro de la escena (viento,\n"
+    "  agua, luz, telas, papeles). UNA sola escena continua de principio a fin:\n"
+    "  sin cortes, sin cambios de plano, sin transiciones, sin que la escena se\n"
+    "  transforme en otra."
+)
+# El 50% del lote va por Imagen: una foto fija que se anima localmente con un
+# paneo suave. Pedirle "movimiento ambiental" a un generador de imágenes produce
+# un fotograma congelado a mitad de acción, que después salta raro bajo el Ken
+# Burns — el mismo motivo por el que el addendum de Imagen saca las palabras de
+# cámara. Acá la regla se traduce a su equivalente en imagen fija.
+_UMG_MOVEMENT_IMAGE = (
+    "- MOMENTO ÚNICO: es una IMAGEN FIJA. Una sola escena, un solo instante\n"
+    "  coherente, sin sujetos congelados a mitad de una acción y sin sugerir un\n"
+    "  antes y un después dentro del mismo cuadro."
+)
+
+_UMG_DELIVERY_RULES = """
+REQUISITOS DE ENTREGA (obligatorios, el entregable se rechaza si no se cumplen):
+- ENCUADRE: 16:9 completo, imagen de borde a borde. Sin franjas negras arriba,
+  abajo ni a los costados, sin recorte cinematográfico 2.39:1, sin marco. La
+  zona central queda LIMPIA y de bajo contraste: ahí va la letra de la canción y
+  tiene que leerse sin esfuerzo. La riqueza visual va en los bordes y el fondo.
+{movimiento}
+- ILUMINACIÓN: estable durante toda la canción. La hora del día NO cambia — si
+  es atardecer, sigue siendo atardecer hasta el final. Sin pasar de día a noche,
+  sin que se prendan o apaguen luces, sin cambios de dirección o temperatura de
+  la luz.
+- SIN TEXTO NI MARCAS: nada legible en el cuadro. Ni letras, ni números, ni
+  palabras, ni logos, ni marcas, ni publicidad, ni símbolos partidarios. Los
+  carteles, pancartas, afiches y vidrieras pueden existir como objetos SIEMPRE
+  que estén en blanco, gastados o ilegibles.
+- SIN CARAS: sin rostros reconocibles ni personas como sujeto del plano.
+- ESTÉTICA DEL ARTISTA: la escena tiene que sentirse de ESTE artista y de ESTA
+  canción. Usá el linaje visual del artista, su época y su región para decidir
+  el look — no un estilo genérico intercambiable con cualquier otro tema."""
+
+
 # Las cláusulas de cámara y de personas del motor viejo traen sus propios
 # EJEMPLOS DE CONTENIDO ("dust motes", "falling petals", "rain on glass", "the
 # empty chair, the two coffee cups"). Sangran igual que el bloque de ejemplos de
@@ -9686,6 +9730,10 @@ def _anchored_scene_system_prompt(
         )
 
     _movement_line = ("\n- " + movement_rule) if movement_rule else ""
+    _delivery_rules = _UMG_DELIVERY_RULES.format(
+        movimiento=(_UMG_MOVEMENT_IMAGE if for_provider == "imagen"
+                    else _UMG_MOVEMENT_VIDEO)
+    )
     _provider_line = (
         "\n- Es una IMAGEN FIJA que después se anima localmente con un paneo suave. "
         "Nada de palabras de movimiento de cámara: describí COMPOSICIÓN, luz y textura."
@@ -9716,6 +9764,7 @@ lista de "negativos". Una escena ubicada y real con negativos precisos es mejor
 que una metáfora bonita que podría ser de cualquier canción.
 
 {_ANCHORED_SCENE_STRUCTURE}
+{_delivery_rules}
 {_styling}
 REGLAS DURAS
 - "style" siempre "{_style_value}".

@@ -418,3 +418,68 @@ def test_la_regla_de_personas_anclada_permite_carteles_en_blanco():
 def test_con_allow_people_no_se_inyecta_regla_de_personas():
     body = _body("_analyze_lyrics_for_background")
     assert 'people_rule=("" if allow_people else _ANCHORED_PEOPLE_RULE)' in body
+
+
+# ── Requisitos contractuales del sello en el compositor ────────────────────
+def _rules(provider="veo"):
+    import pipeline
+    return pipeline._UMG_DELIVERY_RULES.format(
+        movimiento=(pipeline._UMG_MOVEMENT_IMAGE if provider == "imagen"
+                    else pipeline._UMG_MOVEMENT_VIDEO))
+
+
+def test_el_compositor_lleva_los_cinco_requisitos_de_entrega():
+    """No son preferencias estéticas: son las condiciones que un entregable
+    tiene que cumplir para que el sello lo acepte."""
+    r = _rules()
+    assert "16:9 completo" in r and "Sin franjas negras" in r
+    assert "zona central queda LIMPIA" in r          # espacio para la letra
+    assert "La hora del día NO cambia" in r          # iluminación estable
+    assert "sigue siendo atardecer" in r
+    assert "nada legible en el cuadro" in r          # sin texto/logos/marcas
+    assert "sin rostros reconocibles" in r
+    assert "ESTÉTICA DEL ARTISTA" in r
+
+
+def test_las_pancartas_en_blanco_estan_permitidas_y_el_texto_no():
+    """La decisión de producto: el objeto pasa, lo legible falla."""
+    r = _rules()
+    assert "en blanco, gastados o ilegibles" in r
+    assert "Ni letras, ni números, ni" in r
+
+
+def test_video_pide_movimiento_ambiental_sin_cambios_de_escena():
+    r = _rules("veo")
+    assert "movimiento ambiental sutil" in r
+    assert "sin cortes" in r and "sin transiciones" in r
+
+
+def test_imagen_no_pide_movimiento_ambiental():
+    """El 50% del lote va por Imagen. Pedirle movimiento a un generador de
+    imágenes da un fotograma congelado a mitad de acción, que salta raro bajo el
+    Ken Burns — el mismo motivo por el que el addendum de Imagen saca las
+    palabras de cámara."""
+    r = _rules("imagen")
+    assert "IMAGEN FIJA" in r
+    assert "movimiento ambiental sutil" not in r
+    # La regla de una sola escena sobrevive en su forma de imagen.
+    assert "un solo instante" in r
+
+
+def test_el_modo_imagen_tambien_recibe_las_anclas():
+    """Contrato: la mitad del lote son imágenes fijas generadas. Tienen que
+    salir de la misma lectura de la letra que los videos."""
+    body = _body("_ensure_background")
+    imagen = body[body.find('if bg_mode == "imagen"'):]
+    assert "anchors=_lyric_anchors_data" in imagen[:1200]
+
+
+def test_el_compositor_de_imagen_pide_photo_y_las_reglas_de_entrega():
+    import pipeline
+    out = pipeline._anchored_scene_system_prompt(
+        clause2="fijo", people_rule=pipeline._ANCHORED_PEOPLE_RULE,
+        concept="", concept_guide="", genre="rock",
+        for_provider="imagen", movement_rule="")
+    assert '"style":"photo"' in out
+    assert "REQUISITOS DE ENTREGA" in out
+    assert "IMAGEN FIJA" in out

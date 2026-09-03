@@ -122,6 +122,9 @@ def _correr(cancion: dict, modo: str) -> dict:
     }
     if anclas:
         salida["cobertura"] = lyric_anchors.anchor_coverage(prompt, anclas)
+        # Métrica que mira el sello: ¿la escena transcurre en un lugar que sale
+        # de la letra, y esa afirmación es rastreable hasta una línea del texto?
+        salida["lugar"] = lyric_anchors.names_place_from_lyrics(prompt, anclas)
     return salida
 
 
@@ -189,6 +192,21 @@ def main() -> int:
         print(f"cobertura de anclas  {prom:.1f} promedio   "
               f"{suf}/{len(covs)} canciones con cobertura suficiente")
     print(f"negativos por canción  {_prom('on', 'negativos'):.1f}")
+
+    lugares = [(r.get("on") or {}).get("lugar") for r in resultados]
+    lugares = [x for x in lugares if x]
+    if lugares:
+        con_lugar = [x for x in lugares if x["names_place"]]
+        citados = [x for x in con_lugar if x.get("citado")]
+        print(f"\nnombra un lugar concreto de la letra   "
+              f"{100 * len(con_lugar) / len(lugares):.0f}% "
+              f"({len(con_lugar)}/{len(lugares)})")
+        print(f"  de esos, con la línea citada         "
+              f"{len(citados)}/{len(con_lugar)}")
+        sin = [x for x in lugares if not x["names_place"]]
+        for x in sin[:4]:
+            print(f"  · {x['reason']}"
+                  + (f" ({x['lugar']})" if x.get("lugar") else ""))
     print(f"\ndetalle -> {args.out}")
     return 0
 

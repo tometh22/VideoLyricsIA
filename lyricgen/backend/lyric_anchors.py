@@ -369,6 +369,39 @@ def anchor_coverage(prompt: str | None, anchors: dict[str, Any] | None) -> dict[
     }
 
 
+def names_place_from_lyrics(prompt: str | None,
+                            anchors: dict[str, Any] | None) -> dict[str, Any]:
+    """¿El prompt final nombra un lugar concreto que SALIÓ de la letra?
+
+    Es la métrica que mira el sello: el lineamiento "el fondo tiene que estar
+    relacionado con la letra" se cumple de forma verificable cuando la escena
+    transcurre en un lugar que la canción nombra o implica, y esa afirmación se
+    puede rastrear hasta una línea del texto.
+
+    Devuelve las tres piezas por separado para que un incumplimiento se pueda
+    diagnosticar: si no hubo lugar extraído, si lo hubo pero sin cita
+    verificable, o si lo hubo y el compositor igual lo ignoró.
+    """
+    lugar = (anchors or {}).get("lugar")
+    linea = (anchors or {}).get("linea_lugar")
+    if not lugar:
+        return {"names_place": False, "reason": "la letra no ancla en un lugar",
+                "lugar": None, "linea": None}
+    tokens = _content_tokens(lugar)
+    used = bool(tokens) and all(tok in normalize(prompt) for tok in tokens)
+    return {
+        "names_place": used,
+        "reason": ("lugar de la letra presente en el prompt" if used
+                   else "se extrajo un lugar y el prompt no lo usó"),
+        "lugar": lugar,
+        # La cita es lo que hace la afirmación auditable: `verify_anchors` ya
+        # descartó el lugar si su línea no estaba en la letra, así que si llegó
+        # hasta acá con línea, es rastreable.
+        "linea": linea,
+        "citado": bool((linea or "").strip()),
+    }
+
+
 def coverage_is_sufficient(coverage: dict[str, Any] | None,
                            minimum: int = MIN_ANCHOR_COVERAGE) -> bool:
     """True si el prompt usó suficientes anclas como para aceptarlo.
