@@ -38,10 +38,17 @@ from typing import Any
 BACKEND_ROOT = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, BACKEND_ROOT)
 
-RULE_VERSION = "semaforo-v1"
-ACTION = "semaforo.verdict.v1"
-DISAGREEMENT_GREEN_MAX = 0.035
-DISAGREEMENT_RED_MIN = 0.082
+RULE_VERSION = "semaforo-v2"
+ACTION = "semaforo.verdict.v2"
+# Señal de ruteo: segundos de voz cantada (VAD del stem, independiente del ASR)
+# que ningún cartel reclama. Reemplaza al desacuerdo LoRA↔base y a la etiqueta
+# "vivo": medido sobre el holdout el 2026-09-02, el desacuerdo ordenó al revés
+# (la canción con el desacuerdo más alto de las 30, "Eso Es Real", tenía WER
+# 0,08) y 2 de los 4 vivos estaban bien. voiced_gap_s fue la única señal
+# persistida que ordenó correctamente los cuatro. Los umbrales son los que el
+# producto ya usa en transcription_quality (crítico >= 10 s, aviso >= 3 s).
+VOICED_GAP_GREEN_MAX = 3.0
+VOICED_GAP_RED_MIN = 10.0
 COVERAGE_GREEN_MIN = 0.97
 COVERAGE_RED_MAX = 0.90
 UNSAFE_WINDOWS_RED_MIN = 11
@@ -68,12 +75,15 @@ def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, 
     quality = quality if isinstance(quality, dict) else {}
     metrics = quality.get("metrics") if isinstance(quality.get("metrics"), dict) else {}
     router = metrics.get("difficulty_router") if isinstance(metrics.get("difficulty_router"), dict) else {}
+    # El desacuerdo se conserva SÓLO como dato informativo: LoRA y el router
+    # están congelados y su escala nunca se validó fuera de la muestra.
     disagreement_source = "runtime_difficulty_router"
     disagreement = _num(router.get("score"))
     if isinstance(paired, dict) and _num(paired.get("disagreement")) is not None:
         disagreement = _num(paired.get("disagreement"))
         disagreement_source = str(paired.get("source") or "paired_offline")
     coverage = _num(metrics.get("audio_coverage"))
+    voiced_gap_s = _num(metrics.get("voiced_gap_s"))
     is_live = bool(metrics.get("is_live"))
     unsafe = [w for w in (quality.get("unsafe_windows") or []) if isinstance(w, dict)]
     decision = str(quality.get("decision") or "unknown")
@@ -82,8 +92,11 @@ def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, 
     windows_resolved = int(_num(retry.get("windows_resolved")) or 0)
 
     inputs = {
+        "voiced_gap_s": voiced_gap_s,
         "disagreement": disagreement, "disagreement_source": disagreement_source,
+        "disagreement_role": "informativo_no_decide",
         "audio_coverage": coverage,
+        "voiced_coverage": _num(metrics.get("voiced_coverage")),
         "is_live": is_live, "unsafe_windows": len(unsafe),
         "windows_resolved": windows_resolved, "decision": decision,
         "analysis_status": analysis_status,
@@ -92,10 +105,10 @@ def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, 
     reasons: list[str] = []
     if is_live:
         reasons.append("live_never_green")
-    if disagreement is None:
-        reasons.append("disagreement_missing")
-    elif disagreement >= DISAGREEMENT_RED_MIN:
-        reasons.append("disagreement_high")
+    if voiced_gap_s is None:
+        reasons.append("voiced_gap_missing")
+    elif voiced_gap_s >= VOICED_GAP_RED_MIN:
+        reasons.append("voiced_gap_high")
     if coverage is None:
         reasons.append("coverage_missing")
     elif coverage < COVERAGE_RED_MAX:
@@ -110,7 +123,7 @@ def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, 
     if reasons:
         color = "red"
     elif (
-        disagreement <= DISAGREEMENT_GREEN_MAX
+        voiced_gap_s <= VOICED_GAP_GREEN_MAX
         and coverage >= COVERAGE_GREEN_MIN
         and not unsafe
         and decision in {"pass", "approved", "safe"}
@@ -120,15 +133,15 @@ def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, 
         color = "yellow"
         if unsafe:
             reasons.append(f"unsafe_windows_{len(unsafe)}")
-        if disagreement > DISAGREEMENT_GREEN_MAX:
-            reasons.append("disagreement_ambiguous")
+        if voiced_gap_s > VOICED_GAP_GREEN_MAX:
+            reasons.append("voiced_gap_partial")
         if coverage < COVERAGE_GREEN_MIN:
             reasons.append("coverage_partial")
         if decision not in {"pass", "approved", "safe"}:
             reasons.append(f"decision_{decision}")
 
-    # Delivery order: easiest first. Missing disagreement sorts last.
-    rank_key = disagreement if disagreement is not None else 9.0
+    # Orden de entrega: los de menor hueco cantado primero. Sin señal, al final.
+    rank_key = voiced_gap_s if voiced_gap_s is not None else 9_999.0
     return {
         "rule_version": RULE_VERSION, "color": color, "reasons": reasons,
         "inputs": inputs, "rank_key": rank_key,
