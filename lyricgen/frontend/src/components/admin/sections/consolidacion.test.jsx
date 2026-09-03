@@ -36,9 +36,13 @@ describe("AdminSidebar consolidado", () => {
     expect(screen.getByText("Gestión")).toBeInTheDocument();
   });
 
-  it("Gestión arranca en usuarios; Ahora no tiene sub-tabs", () => {
+  it("cada sección arranca en su primera sub-tab", () => {
     expect(defaultSubTab("gestion")).toBe("usuarios");
-    expect(defaultSubTab("ahora")).toBe(null);
+    // "Ahora" ganó sub-tabs en sep-2026 (se le sumó "Estado público", la
+    // redacción de incidentes de la página /status). El default sigue
+    // siendo el triaje en vivo: abrir Admin durante una caída tiene que
+    // mostrar qué se rompió, no el formulario para contarlo.
+    expect(defaultSubTab("ahora")).toBe("pipeline");
   });
 });
 
