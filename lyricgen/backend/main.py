@@ -128,6 +128,8 @@ from batch_profiles import (
 )
 from billing import router as billing_router
 from admin import router as admin_router
+from status_page import router as status_page_router
+from status_page import admin_router as status_admin_router
 import emails
 
 # ---------------------------------------------------------------------------
@@ -632,6 +634,10 @@ async def enforce_submissions_switch(request: Request, call_next):
 # --- Include routers ---
 app.include_router(billing_router)
 app.include_router(admin_router)
+# Página de status pública (/service-status/*, sin auth) + redacción de
+# incidentes para admin (/admin/status/*). Ver status_page.py.
+app.include_router(status_page_router)
+app.include_router(status_admin_router)
 
 
 # --- Startup ---

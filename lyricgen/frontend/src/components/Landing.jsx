@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
+import ServiceStatusBanner from "./ServiceStatusBanner";
 import "./Landing.css";
 
 const API = import.meta.env.VITE_API_URL || "";
@@ -150,6 +151,7 @@ const COPY = {
     footerStyles: "Sistema de estilos",
     footerWorkflow: "Flujo de creación",
     footerCompany: "GenLy AI",
+    footerStatus: "Estado del servicio",
     footerDescription: "Dirección visual generativa para lyric videos.",
     footerRights: "GenLy AI · Producto creado para música",
   },
@@ -173,7 +175,7 @@ const COPY = {
     definitionEyebrow: "What is GenLy", definitionTitle: "A lyric video maker with generative visual direction.", definitionBody: "GenLy is a web application for creating lyric videos from a song. It combines lyrics transcription and synchronization, AI visual generation, style controls and a review editor. It does not work as a library of closed templates: the user directs concept, motion, color, effects, typography and animation before generating deliverables.", definitionFor: "Built for artists, producers, content teams and labels that need to turn songs into visual pieces without losing creative control.",
     faqEyebrow: "Frequently asked questions", faqTitle: "The essentials, without vague promises.", faqs: [{ q: "Does GenLy use lyric video templates?", a: "It does not rely on closed video templates. It uses a generative system directed through concept, motion, palette, effects, typography and animation. You can also use your own background or an available library option." }, { q: "Can I correct the lyrics and synchronization?", a: "Yes. Before rendering you can edit text, adjust timing on a timeline, split or merge lines and review the result in a synchronized preview." }, { q: "What can I control in the visual style?", a: "You can choose creative mode, genre, visual concept, motion, palette, custom colors, effects, typography, size, contrast and lyrics animation." }, { q: "What does each song generate?", a: "The standard flow generates a Full HD 16:9 lyric video, a 30-second vertical Short and a JPG thumbnail. Some accounts also have ProRes deliverables enabled." }, { q: "Can I create videos with multiple scenes?", a: "Yes. Multi-scene creates a shared visual identity, organizes scenes by song section and lets you review or regenerate individual scenes. It uses additional credits." }, { q: "Can I work on several songs together?", a: "Yes. The wizard currently supports batches of up to five MP3 or WAV files and lets you customize individual songs inside the batch." }],
     contactEyebrow: "For catalogs and teams", contactTitle: "Do you have a release volume to produce?", contactBody: "Tell us how many songs you manage and what your current workflow looks like. We'll show GenLy with cases aligned to your operation.", contactMagnet: "Product demo and volume assessment, grounded in the real product.", formName: "Name", formCompany: "Label, studio or company", formEmail: "Work email", formVolume: "Approximate volume", volumeOptions: ["1–5 songs per month", "6–25 songs per month", "More than 25 songs per month"], formMessage: "Tell us what you need to produce", formSubmit: "Request a demo", formSending: "Sending…", formSent: "We received your request. We'll contact you soon.", formError: "We couldn't send the form. We opened your email with the request prepared.",
-    finalEyebrow: "Start from the song", finalTitle: "Your next lyric video doesn't have to look like everyone else's.", finalBody: "Upload the audio, define a visual direction and review every detail before generating.", finalCta: "Create lyric video", footerProduct: "Product", footerEngine: "Visual engine", footerStyles: "Style system", footerWorkflow: "Creation workflow", footerCompany: "GenLy AI", footerDescription: "Generative visual direction for lyric videos.", footerRights: "GenLy AI · A product built for music",
+    finalEyebrow: "Start from the song", finalTitle: "Your next lyric video doesn't have to look like everyone else's.", finalBody: "Upload the audio, define a visual direction and review every detail before generating.", finalCta: "Create lyric video", footerProduct: "Product", footerEngine: "Visual engine", footerStyles: "Style system", footerWorkflow: "Creation workflow", footerCompany: "GenLy AI", footerStatus: "Service status", footerDescription: "Generative visual direction for lyric videos.", footerRights: "GenLy AI · A product built for music",
   },
   pt: {
     metaTitle: "GenLy AI — Lyric videos com direção visual generativa",
@@ -192,7 +194,7 @@ const COPY = {
     definitionEyebrow: "O que é GenLy", definitionTitle: "Um lyric video maker com direção visual generativa.", definitionBody: "GenLy é uma aplicação web para criar lyric videos a partir de uma música. Combina transcrição e sincronização de letras, geração visual com IA, controles de estilo e um editor de revisão. Não funciona como uma biblioteca de templates fechados: o usuário dirige conceito, movimento, cor, efeitos, tipografia e animação antes de gerar os entregáveis.", definitionFor: "Criado para artistas, produtores, equipes de conteúdo e gravadoras que precisam transformar músicas em peças visuais sem perder controle criativo.",
     faqEyebrow: "Perguntas frequentes", faqTitle: "O essencial, sem promessas vagas.", faqs: [{ q: "GenLy usa templates de lyric videos?", a: "Não trabalha com templates de vídeo fechados. Usa um sistema generativo dirigido por conceito, movimento, paleta, efeitos, tipografia e animações. Você também pode usar um fundo próprio ou uma opção disponível na biblioteca." }, { q: "Posso corrigir a letra e a sincronização?", a: "Sim. Antes do render você pode editar o texto, ajustar o timing em uma timeline, dividir ou unir linhas e revisar o resultado em um preview sincronizado." }, { q: "O que posso controlar no estilo visual?", a: "Você pode escolher modo criativo, gênero, conceito visual, movimento, paleta, cores personalizadas, efeitos, tipografia, tamanho, contraste e animação das lyrics." }, { q: "O que cada música gera?", a: "O fluxo padrão gera um lyric video Full HD 16:9, um Short vertical de 30 segundos e um thumbnail JPG. Algumas contas também têm entregas ProRes habilitadas." }, { q: "Posso criar vídeos com várias cenas?", a: "Sim. Multi-cena cria uma identidade visual compartilhada, organiza cenas por seção da música e permite revisar ou regenerar cenas individuais. Utiliza créditos adicionais." }, { q: "Posso trabalhar várias músicas juntas?", a: "Sim. Atualmente o wizard admite lotes de até cinco arquivos MP3 ou WAV e permite personalizar músicas individualmente dentro do lote." }],
     contactEyebrow: "Para catálogos e equipes", contactTitle: "Tem um volume de lançamentos para produzir?", contactBody: "Conte quantas músicas você administra e como é seu fluxo atual. Mostramos GenLy com casos alinhados à sua operação.", contactMagnet: "Demo de produto e avaliação de volume baseadas no produto real.", formName: "Nome", formCompany: "Gravadora, estúdio ou empresa", formEmail: "Email de trabalho", formVolume: "Volume aproximado", volumeOptions: ["1–5 músicas por mês", "6–25 músicas por mês", "Mais de 25 músicas por mês"], formMessage: "Conte o que você precisa produzir", formSubmit: "Solicitar uma demo", formSending: "Enviando…", formSent: "Recebemos sua consulta. Entraremos em contato em breve.", formError: "Não conseguimos enviar o formulário. Abrimos seu email com a consulta preparada.",
-    finalEyebrow: "Comece pela música", finalTitle: "Seu próximo lyric video não precisa parecer com todos os outros.", finalBody: "Envie o áudio, defina uma direção visual e revise cada detalhe antes de gerar.", finalCta: "Criar lyric video", footerProduct: "Produto", footerEngine: "Motor visual", footerStyles: "Sistema de estilos", footerWorkflow: "Fluxo de criação", footerCompany: "GenLy AI", footerDescription: "Direção visual generativa para lyric videos.", footerRights: "GenLy AI · Produto criado para música",
+    finalEyebrow: "Comece pela música", finalTitle: "Seu próximo lyric video não precisa parecer com todos os outros.", finalBody: "Envie o áudio, defina uma direção visual e revise cada detalhe antes de gerar.", finalCta: "Criar lyric video", footerProduct: "Produto", footerEngine: "Motor visual", footerStyles: "Sistema de estilos", footerWorkflow: "Fluxo de criação", footerCompany: "GenLy AI", footerStatus: "Status do serviço", footerDescription: "Direção visual generativa para lyric videos.", footerRights: "GenLy AI · Produto criado para música",
   },
 };
 
@@ -378,6 +380,12 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         )}
       </header>
 
+      {/* Incidente de plataforma en la home pública. Debajo de la nav
+          sticky, arriba del hero: quien entra durante un outage lo ve
+          antes de intentar registrarse. `variant="landing"` sólo cambia el
+          padding para respetar el ancho de la grilla de marketing. */}
+      <ServiceStatusBanner variant="landing" />
+
       <main id="main-content">
         <section id="top" className="mk-hero mk-container">
           <div className="mk-hero__copy">
@@ -537,7 +545,7 @@ export default function Landing({ onStart, onLogin, isLoggedIn = false }) {
         <section className="mk-final mk-container"><div><p className="mk-pill"><SparkIcon />{c.finalEyebrow}</p><h2>{c.finalTitle}</h2><p>{c.finalBody}</p><button type="button" onClick={isLoggedIn ? onStart : onLogin} className="mk-button">{c.finalCta}<ArrowIcon /></button></div></section>
       </main>
 
-      <footer className="mk-footer"><div className="mk-container mk-footer__inner"><div><BrandLockup size="md" /><p>{c.footerDescription}</p></div><div><strong>{c.footerProduct}</strong><a href="#engine">{c.footerEngine}</a><a href="#styles">{c.footerStyles}</a><a href="#workflow">{c.footerWorkflow}</a></div><div><strong>{c.footerCompany}</strong><a href="#faq">FAQ</a><a href="#contact">Demo</a><button type="button" onClick={onLogin}>{c.login}</button></div></div><div className="mk-container mk-footer__bottom"><span>{c.footerRights}</span><span>© {new Date().getFullYear()}</span></div></footer>
+      <footer className="mk-footer"><div className="mk-container mk-footer__inner"><div><BrandLockup size="md" /><p>{c.footerDescription}</p></div><div><strong>{c.footerProduct}</strong><a href="#engine">{c.footerEngine}</a><a href="#styles">{c.footerStyles}</a><a href="#workflow">{c.footerWorkflow}</a></div><div><strong>{c.footerCompany}</strong><a href="#faq">FAQ</a><a href="#contact">Demo</a><a href="/status">{c.footerStatus}</a><button type="button" onClick={onLogin}>{c.login}</button></div></div><div className="mk-container mk-footer__bottom"><span>{c.footerRights}</span><span>© {new Date().getFullYear()}</span></div></footer>
     </div>
   );
 }

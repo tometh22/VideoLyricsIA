@@ -1716,6 +1716,135 @@ class CostSnapshot(Base):
 
 
 # ---------------------------------------------------------------------------
+# Status page (status_page.py) — comunicación de incidentes + historial de
+# disponibilidad. Ver docs/STATUS_PAGE_SETUP.md.
+#
+# Tres tablas porque responden tres preguntas distintas y una sola las
+# confundiría:
+#   - status_incidents        → qué le contamos al cliente (redactado a mano)
+#   - status_incident_updates → cómo evolucionó ese relato (append-only)
+#   - status_component_events → qué vio la máquina (sondas de /health)
+#
+# El relato humano NUNCA se deriva de la máquina ni al revés: un incidente
+# de un proveedor externo (Replicate en cola, Veo sin cuota) puede tener
+# todas las sondas verdes, y un deploy parcial puede poner una sonda roja
+# sin que el cliente note nada. Mezclarlas en una tabla obliga a elegir
+# cuál manda y las dos veces que eso se decide se elige mal.
+# ---------------------------------------------------------------------------
+
+class StatusIncident(Base):
+    """Un incidente redactado por un operador, público en /status.
+
+    Es la fuente de verdad de la barra horizontal de la home: mientras
+    haya una fila abierta con `banner=True`, todos los usuarios la ven.
+
+    `components` es la lista de ids de componente afectados (los ids
+    estables de status_page.COMPONENTS, no labels traducibles). Se guarda
+    como JSONB y no como tabla puente porque son <=6 valores de un enum
+    cerrado y jamás se consulta "dame los incidentes del componente X"
+    sin traer igual el incidente entero.
+    """
+    __tablename__ = "status_incidents"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(200), nullable=False)
+    # investigating | identified | monitoring | resolved
+    status = Column(String(20), nullable=False, default="investigating")
+    # none | minor | major | critical  — 'none' es mantenimiento/aviso.
+    impact = Column(String(16), nullable=False, default="minor")
+    components = Column(JSONB, nullable=True)
+
+    # started_at es EDITABLE a mano: casi siempre el operador se entera
+    # después de que el incidente empezó, y el historial de uptime lo usa
+    # como ventana real. Si fuera created_at, cada incidente reportado
+    # tarde acortaría su propio downtime en el gráfico.
+    started_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Si el banner de la home se muestra. Se separa de `status` porque hay
+    # dos casos legítimos de incidente abierto SIN banner: un aviso de
+    # mantenimiento programado que todavía no empezó, y un incidente que
+    # solo afecta a un proveedor interno y no cambia nada para el usuario.
+    banner = Column(Boolean, nullable=False, default=True, server_default="true")
+
+    # Un incidente no público existe para el historial interno sin
+    # aparecer en /status (ej. el postmortem de algo que nadie vio).
+    public = Column(Boolean, nullable=False, default=True, server_default="true")
+
+    created_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_status_incidents_started", "started_at"),
+        Index("ix_status_incidents_open", "resolved_at", "public"),
+    )
+
+
+class StatusIncidentUpdate(Base):
+    """Una entrada del timeline de un incidente. APPEND-ONLY.
+
+    Append-only a propósito: el timeline es el registro de qué se le dijo
+    al cliente y cuándo. Editar una entrada pasada convierte la página en
+    un documento que se puede reescribir, que es exactamente lo contrario
+    de para qué sirve. Corregir = publicar otra entrada.
+    """
+    __tablename__ = "status_incident_updates"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    incident_id = Column(
+        Integer,
+        ForeignKey("status_incidents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # El status del incidente en el momento de esta entrada — se copia y
+    # no se joinea con el incidente porque el timeline tiene que poder
+    # mostrar "Investigating → Identified → Resolved" tal como se publicó.
+    status = Column(String(20), nullable=False)
+    body = Column(Text, nullable=False)
+    created_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_status_updates_incident", "incident_id", "created_at"),
+    )
+
+
+class StatusComponentEvent(Base):
+    """Un tramo de tiempo durante el cual la máquina vio un componente en
+    un estado dado. Es la materia prima de las barras de 90 días.
+
+    POR QUÉ TRAMOS Y NO MUESTRAS: una muestra por sonda son ~8.600 filas
+    por día por componente y aun así deja huecos sin decir dónde. Un tramo
+    (`started_at`, `last_seen_at`) escribe UNA fila por transición y bumpea
+    `last_seen_at` en cada observación igual, así que la tabla crece con
+    los cambios de estado (unos pocos por mes) y no con el tráfico.
+
+    POR QUÉ `last_seen_at` Y NO SOLO `started_at`: sin él, no hay forma de
+    distinguir "estuvo verde 30 días" de "lo vimos verde una vez hace 30
+    días y nunca más". El gráfico tiene que poder dibujar un día como
+    "sin datos" en vez de inventarle un verde: la única razón para tener
+    una página de status es que se le pueda creer, y un 100% de uptime
+    fabricado por falta de observaciones la vuelve peor que no tenerla.
+    """
+    __tablename__ = "status_component_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    component = Column(String(32), nullable=False)
+    # operational | degraded | partial_outage | major_outage
+    status = Column(String(20), nullable=False)
+    # La razón cruda de /health (degraded_reason, down_reason, r2_slow_1800ms).
+    # Interna: /status la expone solo a admins.
+    reason = Column(String(120), nullable=True)
+    started_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_status_events_component_seen", "component", "last_seen_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------
 
