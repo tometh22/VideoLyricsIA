@@ -748,7 +748,27 @@ function JobDetailRoute({ fetchHistory }) {
       >
         <JobDetail
           job={job}
-          onBack={() => navigate("/dashboard")}
+          onBack={async () => {
+            if (!job?.campaign_id) {
+              navigate("/dashboard");
+              return;
+            }
+            try {
+              await authFetch(`${API}/editor/${job.job_id}/lock`, {
+                method: "DELETE", headers: editorSessionHeaders(),
+              });
+              const response = await authFetch(
+                `${API}/batch/campaigns/${job.campaign_id}/review-queue/next?stage=final`,
+                { method: "POST", headers: editorSessionHeaders() },
+              );
+              const next = await response.json().catch(() => ({}));
+              navigate(response.ok && next.job_id
+                ? (next.open_path || `/videos/${next.job_id}`)
+                : `/campaigns/${job.campaign_id}`);
+            } catch {
+              navigate(`/campaigns/${job.campaign_id}`);
+            }
+          }}
           onJobUpdate={(updatedJob) => {
             // fetchHistory() is the expensive call (lists every job in the
             // tenant). It only needs to refresh on a status BOUNDARY —
@@ -795,7 +815,7 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
         if (typeof data.current_step === "string") setPolledStep(data.current_step);
         // Transition a un estado editable → recargá la página para que
         // EditLyricsRoute corra su bootstrap de nuevo y monte el editor.
-        const editable = ["done", "pending_review", "rejected"].includes(newStatus);
+        const editable = ["done", "pending_review", "rejected", "lyrics_approved"].includes(newStatus);
         if (editable) {
           // [editor-reload-loop] capture (P0 UMG Chile 2026-06-16). This reload
           // re-runs EditLyricsRoute's bootstrap. If the job keeps flipping back
@@ -989,6 +1009,7 @@ function EditLyricsRoute({
       // bail-out: no tiene sentido abrir el editor sobre un render en curso.
       const editable =
         job.status === "pending_review" ||
+        job.status === "lyrics_approved" ||
         job.status === "done" ||
         job.status === "rejected";
       if (!editable) {
@@ -4108,6 +4129,13 @@ export default function App() {
       navigate(reviewJobPath(job.transcribeJobId), { replace: true });
     };
 
+    if (campaignId && !window.confirm(
+      "Confirmo que escuché el audio completo y verifiqué, línea por línea, la letra y cada timing. La referencia fue tratada como hipótesis y no agregué texto que el audio no confirme."
+    )) {
+      restoreCampaignReview(jobList[0], jobList[0].segments);
+      return;
+    }
+
     let nextIdx = 0;
     const worker = async () => {
       while (nextIdx < jobList.length) {
@@ -4191,6 +4219,41 @@ export default function App() {
 
         let res = null;
         try {
+          if (campaignId) {
+            const confirmedLineIds = generationSegments.map((segment) =>
+              String(segment?.segment_id || segment?.id || "")
+            );
+            const approvalResponse = await authFetch(
+              `${API}/batch/campaigns/${campaignId}/jobs/${jobList[i].transcribeJobId}/approve-lyrics`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  editor_revision: generationBaseRevision,
+                  editor_version_id: generationVersionId,
+                  confirmed_line_ids: confirmedLineIds,
+                  lyrics_confirmed: true,
+                  timings_confirmed: true,
+                  heard_against_audio: true,
+                }),
+              },
+            );
+            const approvalData = await approvalResponse.json().catch(() => ({}));
+            if (!approvalResponse.ok || approvalData.status !== "lyrics_approved") {
+              const reason = translateBackendError(approvalData.detail, t)
+                || "No se pudo registrar la aprobación completa de letra y timing.";
+              setJobs((prev) => prev.map((j, idx) =>
+                idx === i ? { ...j, status: "error", error: reason } : j
+              ));
+              alert({
+                title: "La canción no quedó aprobada",
+                description: reason,
+                tone: "error",
+              });
+              restoreCampaignReview(jobList[i], generationSegments);
+              continue;
+            }
+          }
           res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
           let data;
           try {

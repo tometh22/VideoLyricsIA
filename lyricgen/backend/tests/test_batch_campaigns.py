@@ -6,10 +6,12 @@ from fastapi import HTTPException
 
 import batch_campaigns as batch
 from database import (
-    BatchCampaign, BatchCampaignItem, BatchUploadSession, EditorDocument, Job,
-    JobOutboxEvent, SessionLocal, User,
+    AuditLog, BatchCampaign, BatchCampaignItem, BatchUploadSession,
+    EditorDocument, Job, JobOutboxEvent, ProductEvent, SessionLocal, User,
 )
 from editor import acquire_lock, release_lock
+from reference_hypothesis import build as build_reference_hypothesis
+from transcription_quality import segments_hash
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +30,9 @@ def clean_batch_campaign_rows():
                 Job.workload_class == "batch",
             ).all()]
             if job_ids:
+                session.query(ProductEvent).filter(
+                    ProductEvent.job_id.in_(job_ids),
+                ).delete(synchronize_session=False)
                 session.query(EditorDocument).filter(
                     EditorDocument.job_id.in_(job_ids),
                 ).delete(synchronize_session=False)
@@ -38,6 +43,9 @@ def clean_batch_campaign_rows():
                 Job.workload_class == "batch",
             ).delete(synchronize_session=False)
             session.query(BatchUploadSession).delete(synchronize_session=False)
+            session.query(AuditLog).filter(
+                AuditLog.action == "batch.lyrics_and_timing_approved",
+            ).delete(synchronize_session=False)
             session.query(BatchCampaignItem).delete(synchronize_session=False)
             session.query(BatchCampaign).delete(synchronize_session=False)
             session.commit()
@@ -109,6 +117,7 @@ def test_campaign_transcription_uses_auto_language_for_initial_and_retry(db):
     assert first == retry
     assert first["language"] == ""
     assert first["live"] is True
+    assert first["reference_required"] is True
 
 
 def test_reconciler_reserves_ready_buffer_for_active_transcriptions(db):
@@ -146,10 +155,166 @@ def test_render_capacity_is_separate_and_bounded(db):
         Job.campaign_id == campaign.id,
         Job.status == "transcribed_pending",
     ).one()
+    candidate.status = "lyrics_approved"
+    candidate.segments_json = [{
+        "segment_id": "line-one", "start": 0, "end": 1, "text": "Hola",
+    }]
+    candidate.input_audio_sha256 = "a" * 64
+    candidate.audio_revision = 1
+    candidate.segments_revision = 0
+    candidate.transcription_quality = {
+        "reference_hypothesis": build_reference_hypothesis(
+            text="Hola", provider="gemini-2.5-flash-audio",
+            audio_sha256="a" * 64, audio_revision=1,
+            source_kind="gemini_complete_audio_derived",
+            complete_audio_verified=True,
+        ),
+        "pre_background_approval": {
+            "audio_sha256": "a" * 64, "audio_revision": 1,
+            "editor_revision": 0,
+            "segments_sha256": segments_hash(candidate.segments_json),
+            "lyrics_confirmed": True, "timings_confirmed": True,
+            "heard_against_audio": True,
+        },
+    }
+    db.commit()
     with pytest.raises(HTTPException) as exc:
         batch.enforce_render_capacity(db, candidate)
     assert exc.value.status_code == 429
     assert exc.value.detail["code"] == "batch_render_window_full"
+
+
+def test_render_capacity_fails_closed_before_human_approval(db):
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+    )
+    db.add(job)
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        batch.enforce_render_capacity(db, job)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "reference_hypothesis_missing"
+
+
+def test_human_approval_binds_every_line_audio_and_editor_revision(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    segments = [
+        {"segment_id": "line-1", "start": 0, "end": 1, "text": "Hello"},
+        {"segment_id": "line-2", "start": 1, "end": 2, "text": "mundo"},
+    ]
+    audio_sha = "b" * 64
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+        segments_json=segments, segments_revision=0,
+        input_audio_sha256=audio_sha, input_audio_etag=audio_sha,
+        audio_revision=1,
+        transcription_quality={
+            "reference_hypothesis": build_reference_hypothesis(
+                text="Hello\nmundo", provider="lrclib",
+                audio_sha256=audio_sha, audio_revision=1,
+                source_kind="catalogue_candidate_audio_verified",
+                complete_audio_verified=True,
+            ),
+        },
+    )
+    db.add(job)
+    db.add(EditorDocument(
+        job_id=job.job_id, tenant_id=campaign.tenant_id,
+        current_segments=segments, original_segments=segments, revision=0,
+    ))
+    db.commit()
+    response = batch.approve_campaign_lyrics(
+        campaign.id,
+        job.job_id,
+        batch.LyricsApprovalRequest(
+            editor_revision=0,
+            confirmed_line_ids=["line-1", "line-2"],
+            lyrics_confirmed=True,
+            timings_confirmed=True,
+            heard_against_audio=True,
+        ),
+        {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"},
+        db,
+    )
+    assert response["status"] == "lyrics_approved"
+    db.refresh(job)
+    approval = batch.require_prebackground_approval(job)
+    assert approval["confirmed_line_count"] == 2
+    assert job.transcription_quality["reference_hypothesis"]["review_status"] == "human_line_review_approved"
+
+
+def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
+    db, monkeypatch,
+):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 3)
+    items = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).order_by(BatchCampaignItem.ordinal).all()
+    items[1].title = "Canción 2 (Live)"
+    user = db.query(User).first()
+    jobs = []
+    for item in items:
+        job = Job(
+            job_id=uuid.uuid4().hex[:12], user_id=user.id,
+            tenant_id=campaign.tenant_id, artist=item.artist,
+            song_title=item.title, filename=item.filename,
+            status="transcribed_pending", workload_class="batch",
+            campaign_id=campaign.id, campaign_item_id=item.id,
+        )
+        db.add(job)
+        jobs.append(job)
+    db.flush()
+    colors = ("red", "green", "green")
+    disagreements = (0.2, 0.9, 0.1)
+    for job, color, disagreement in zip(jobs, colors, disagreements):
+        db.add(AuditLog(
+            action="semaforo.verdict.v2",
+            detail={
+                "job_id": job.job_id, "color": color,
+                "rank_key": 0 if color == "green" else 20,
+                "inputs": {"disagreement": disagreement},
+            },
+        ))
+    db.commit()
+    actor = {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}
+
+    queue_args = {
+        "stage": "lyrics", "state": None, "version": None,
+        "background_mode": None, "artist": None, "audit_preapproved": False,
+        "page": 1, "limit": 50, "current_user": actor, "db": db,
+    }
+    delivery = batch.review_queue(campaign.id, order="delivery", **queue_args)
+    assert [row["job_id"] for row in delivery["items"]] == [
+        jobs[2].job_id, jobs[0].job_id, jobs[1].job_id,
+    ]
+    assert [row["priority"] for row in delivery["items"]] == ["1", "2", "3"]
+    assert all(row["semaforo"] is None for row in delivery["items"])
+    assert delivery["confidence"]["colors_visible"] is False
+
+    learning = batch.review_queue(
+        campaign.id, order="learning", **queue_args,
+    )
+    assert [row["job_id"] for row in learning["items"]] == [jobs[1].job_id]
+    assert learning["counters"]["ready"] == 3
 
 
 def test_paused_campaign_cannot_start_a_new_render(db):
@@ -221,6 +386,13 @@ def test_pairing_code_registers_unicode_manifest_without_account_token(
         "code": pairing.json()["pairing_code"],
     })
     assert exchange.status_code == 200
+    probe = client.get(
+        "/batch/upload-sessions/me",
+        headers={"X-Batch-Upload-Token": exchange.json()["upload_token"]},
+    )
+    assert probe.status_code == 200
+    assert probe.json()["campaign_id"] == campaign_id
+    assert probe.json()["renewable"] is True
     token = exchange.json()["upload_token"]
     manifest = client.post(
         f"/batch/campaigns/{campaign_id}/manifest",

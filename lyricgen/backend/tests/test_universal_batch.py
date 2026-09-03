@@ -6,7 +6,8 @@ import pytest
 from batch_manifest import AudioManifestEntry, build_manifest, parse_audio_filename
 from batch_profiles import RenderProfileError, normalize_render_profile, pipeline_fields
 from universal_batch import (
-    Api, BatchError, _resolved_language, process_wave, select_backgrounds,
+    Api, AuthSession, BatchError, _assert_wave_approved, _resolved_language,
+    process_wave, select_backgrounds,
 )
 import universal_batch as ub
 
@@ -146,7 +147,7 @@ def test_wave_submits_every_song_before_reconcile_and_one_failure_does_not_stop_
 
         def wait_for_transcription(self, entry, job_id, poll_seconds):
             events.append(("wait", entry.title))
-            entry.status = "transcribed"
+            entry.status = "lyrics_review_pending"
             return [{"text": entry.title}]
 
         def generate(self, entry, job_id, segments, poll_seconds):
@@ -164,7 +165,11 @@ def test_wave_submits_every_song_before_reconcile_and_one_failure_does_not_stop_
 
     assert entries[1].status == "error"
     assert "bad audio" in entries[1].error
-    assert all(entry.status == "pending_review" for i, entry in enumerate(entries) if i != 1)
+    assert all(
+        entry.status == "lyrics_review_pending"
+        for i, entry in enumerate(entries) if i != 1
+    )
+    assert not any(event[0] == "generate" for event in events)
     start_positions = [i for i, event in enumerate(events) if event[0] == "start"]
     wait_positions = [i for i, event in enumerate(events) if event[0] == "wait"]
     assert max(start_positions) < min(wait_positions)
@@ -279,24 +284,7 @@ def test_waits_for_reviewers_before_starting_next_wave(monkeypatch):
     )
 
 
-def test_run_stops_after_canary_until_explicit_continue(monkeypatch, tmp_path):
-    entries = [_entry(1), _entry(2)]
-    monkeypatch.setattr(ub, "build_manifest", lambda _folder: entries)
-    monkeypatch.setattr(ub.Api, "validate_capacity", lambda *a, **k: None)
-    monkeypatch.setattr(ub.Api, "wait_for_backlog_capacity", lambda *a, **k: None)
-    monkeypatch.setattr(ub, "select_backgrounds", lambda _api, count: [{"id": 1}] * count)
-    monkeypatch.setattr(ub, "assign_profiles", lambda _entries, _assets: None)
-    waves = []
-
-    def fake_process(wave, **kwargs):
-        waves.append([entry.title for entry in wave])
-        for entry in wave:
-            entry.status = "pending_review"
-            entry.job_id = f"job-{entry.title}"
-        kwargs["save"]()
-        return wave
-
-    monkeypatch.setattr(ub, "process_wave", fake_process)
+def test_run_refuses_legacy_non_campaign_transcription(tmp_path):
     args = SimpleNamespace(
         folder=str(tmp_path),
         manifest=str(tmp_path / "manifest.json"),
@@ -313,10 +301,72 @@ def test_run_stops_after_canary_until_explicit_continue(monkeypatch, tmp_path):
         poll_seconds=0,
         capacity_poll_seconds=0,
         capacity_wait_seconds=1,
+        stage="transcription",
     )
-    assert ub.run(args) == 0
-    assert waves == [["Song 1"]]
-    assert entries[1].status == "pending"
+    with pytest.raises(BatchError, match="campaign_uploader"):
+        ub.run(args)
+
+
+def test_render_stage_refuses_whole_wave_before_background_work():
+    entries = [_entry(1), _entry(2)]
+    entries[0].job_id = "job-1"
+    entries[1].job_id = "job-2"
+
+    class FakeApi:
+        def request(self, method, path):
+            assert method == "GET"
+            return {
+                "status": "lyrics_approved" if path.endswith("job-1")
+                else "transcribed_pending"
+            }
+
+    with pytest.raises(BatchError, match="not approved"):
+        _assert_wave_approved(FakeApi(), entries)
+
+
+def test_render_stage_accepts_already_completed_jobs_when_resuming():
+    entries = [_entry(1), _entry(2)]
+    entries[0].job_id = "job-1"
+    entries[1].job_id = "job-2"
+
+    class FakeApi:
+        def request(self, method, path):
+            assert method == "GET"
+            return {"status": "done" if path.endswith("job-1") else "pending_review"}
+
+    _assert_wave_approved(FakeApi(), entries)
+    assert [entry.status for entry in entries] == ["done", "pending_review"]
+
+
+def test_forced_expiry_is_retried_once_with_shared_valid_token(monkeypatch):
+    auth = AuthSession(
+        "https://example.test", "still-valid-token",
+        force_expire_after_requests=1,
+    )
+    api = Api("https://example.test", auth=auth)
+    seen = []
+
+    class Response:
+        content = b"{}"
+
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+        def json(self):
+            return {"ok": True}
+
+    def fake_request(method, url, **kwargs):
+        bearer = kwargs["headers"]["Authorization"]
+        seen.append(bearer)
+        return Response(401 if "forced-expired" in bearer else 200)
+
+    monkeypatch.setattr(api.session, "request", fake_request)
+    assert api.request("GET", "/auth/me") == {"ok": True}
+    assert seen == [
+        "Bearer forced-expired-canary-token",
+        "Bearer still-valid-token",
+    ]
+    assert {"forced_expiry", "recovered_401"}.issubset(auth.events)
 
 
 def test_presigned_put_never_carries_api_authorization(tmp_path, monkeypatch):

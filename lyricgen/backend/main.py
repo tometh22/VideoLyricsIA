@@ -7198,6 +7198,8 @@ async def _run_transcription_for_job(
     request, current_user, job_id: str, audio_path: str,
     *, language: str = "", artist: str = "", title: str = "",
     filename: str = "", live: bool = False,
+    reference_required: bool = False,
+    workload_class: str = "interactive",
 ):
     """Shared transcription pipeline: lrclib synced/plain → Whisper →
     hallucination recovery → segments. Used by both /transcribe (legacy
@@ -7239,6 +7241,10 @@ async def _run_transcription_for_job(
     # the same reference-health observability without duplicating payload
     # plumbing across the cascade.
     _reference_attestation_state = {"report": None}
+    _reference_candidate_state = {
+        "text": "", "provider": "none", "source_kind": "none",
+        "complete_audio_verified": False, "source_version": {},
+    }
 
     try:
         # Language is a per-job property. Tenant, role and geography never
@@ -7472,6 +7478,14 @@ async def _run_transcription_for_job(
                 out["reference_attestation"] = dict(
                     _reference_attestation_state["report"]
                 )
+            if reference_required:
+                out["reference_hypothesis_candidate"] = {
+                    **_reference_candidate_state,
+                    "attestation": dict(
+                        _reference_attestation_state.get("report") or {}
+                    ),
+                    "workload_class": str(workload_class or "batch"),
+                }
 
             # Cobertura contra el AUDIO en el punto de salida de la cascada.
             # Toda métrica previa se mide contra la letra de REFERENCIA y por
@@ -7757,6 +7771,89 @@ async def _run_transcription_for_job(
                     _removed_credits,
                 )
 
+        # Campaign ingestion requires one reference hypothesis tied to this
+        # exact recording before alignment begins.  Catalogue/search text is
+        # only a candidate: Gemini must hear the full upload while checking
+        # it.  If no usable candidate exists (or verification declines), the
+        # fallback is an audio-only full-recording hypothesis.  Neither path
+        # authorizes render; every line and timing still requires the durable
+        # human approval gate below the editor.
+        if reference_required:
+            _candidate = ((lrc or {}).get("plain") or "").strip()
+            _verified_candidate = None
+            if _candidate:
+                try:
+                    from pipeline import _gemini_cleanup_lyrics as _verify_reference
+                    _verified_candidate = await asyncio.to_thread(
+                        _verify_reference,
+                        tmp_path,
+                        _candidate,
+                        artist=artist_hint,
+                        song=song_hint,
+                        force=True,
+                        strict_audio_only=True,
+                    )
+                except Exception as _verify_exc:
+                    logger.warning(
+                        "[BATCH-REFERENCE] catalogue verification failed: %s",
+                        _verify_exc,
+                    )
+            if _verified_candidate:
+                if lrc is None:
+                    lrc = {}
+                lrc["plain"] = _verified_candidate
+                _reference_candidate_state.update({
+                    "text": _verified_candidate,
+                    "provider": str(lyrics_source or "catalogue"),
+                    "source_kind": "catalogue_candidate_audio_verified",
+                    "complete_audio_verified": True,
+                    "source_version": {
+                        "record_id": (lrc or {}).get("source_record_id"),
+                        "artist": (
+                            (lrc or {}).get("source_artist_name") or artist_hint
+                        ),
+                        "title": (
+                            (lrc or {}).get("source_track_name") or song_hint
+                        ),
+                        "album": (lrc or {}).get("source_album_name"),
+                        "duration_seconds": (lrc or {}).get("duration"),
+                    },
+                })
+            else:
+                try:
+                    from pipeline import (
+                        _gemini_derive_lyrics_from_full_audio as _derive_reference,
+                    )
+                    _derived = await asyncio.to_thread(
+                        _derive_reference,
+                        tmp_path,
+                        artist=artist_hint,
+                        song=song_hint,
+                    )
+                except Exception as _derive_exc:
+                    logger.warning(
+                        "[BATCH-REFERENCE] audio derivation failed: %s",
+                        _derive_exc,
+                    )
+                    _derived = None
+                if not _derived:
+                    raise RuntimeError("batch_reference_hypothesis_unavailable")
+                if lrc is None:
+                    lrc = {}
+                lrc["plain"] = _derived
+                lrc["synced"] = None
+                lyrics_source = "gemini_audio"
+                _reference_candidate_state.update({
+                    "text": _derived,
+                    "provider": "gemini-2.5-flash-audio",
+                    "source_kind": "gemini_complete_audio_derived",
+                    "complete_audio_verified": True,
+                    "source_version": {
+                        "model": "gemini-2.5-flash",
+                        "audio_scope": "complete",
+                    },
+                })
+
         # The upload wizard defaults to Auto.  Resolve that choice from the
         # canonical lyrics before the primary ASR runs, so English references
         # are transcribed as English while Spanish references retain the
@@ -7982,9 +8079,11 @@ async def _run_transcription_for_job(
                 # vocabulary or whole-song structure.  Default mode is OFF;
                 # `observe` exports metrics only, while `enforce` fails closed
                 # to raw WhisperX when the candidate lacks ASR support.
-                _reference_gate_mode = os.environ.get(
-                    "REFERENCE_ATTESTATION_MODE", "off"
-                ).strip().lower()
+                _reference_gate_mode = (
+                    "enforce" if reference_required else os.environ.get(
+                        "REFERENCE_ATTESTATION_MODE", "off"
+                    ).strip().lower()
+                )
                 if _wx_segs and _canonical and _reference_gate_mode in {
                     "observe", "enforce",
                 }:
@@ -7999,7 +8098,10 @@ async def _run_transcription_for_job(
                     _reference_report = assess_reference_attestation(
                         _canonical,
                         _wx_segs,
-                        reference_source="catalog_unverified",
+                        reference_source=str(
+                            _reference_candidate_state.get("source_kind")
+                            or "catalog_unverified"
+                        ),
                         audio_duration_s=_audio_dur_for_lrc,
                         is_live=_reference_is_live,
                     )
@@ -10150,7 +10252,11 @@ async def generate_with_segments(
         # by the older worker variant that drifted from the convention,
         # and `awaiting_upload` covers the direct-generate path (no editor).
         # See transcription_worker.py:137 for the writer side.
-        if job_row.status not in ("transcribed_pending", "transcribed", "awaiting_upload"):
+        _generatable_statuses = (
+            ("lyrics_approved",) if _batch_generation
+            else ("transcribed_pending", "transcribed", "awaiting_upload")
+        )
+        if job_row.status not in _generatable_statuses:
             # Stable code (mirrors the `job_not_found` path above) so the client
             # can react without string/status matching.
             return JSONResponse(
@@ -10234,6 +10340,13 @@ async def generate_with_segments(
                     ),
                 },
             )
+        if _batch_generation:
+            # This check intentionally runs before quota checks, custom
+            # background uploads, preview/cache resolution and outbox
+            # publication.  A campaign song without the exact durable human
+            # approval cannot spend on or create a background by any path.
+            from batch_campaigns import require_prebackground_approval
+            require_prebackground_approval(job_row)
         if job_row.status == "awaiting_upload":
             # Direct-generate path. The R2 PUT must be finished (no
             # in-flight multipart) and the key must be recorded — without
@@ -10368,7 +10481,8 @@ async def generate_with_segments(
         if (job_row is None
                 or not _tenant_ok
                 or job_row.status not in (
-                    "transcribed_pending", "transcribed", "awaiting_upload",
+                    ("lyrics_approved",) if _batch_generation
+                    else ("transcribed_pending", "transcribed", "awaiting_upload")
                 )):
             return JSONResponse(
                 status_code=409,
@@ -10478,8 +10592,9 @@ async def generate_with_segments(
         job_row.umg_spec = umg_spec
         # The runnable transition is committed atomically with the outbox after
         # all request-side validation/background work has succeeded.
-        job_row.status = "transcribed_pending"
-        job_row.current_step = "editing"
+        if not _batch_generation:
+            job_row.status = "transcribed_pending"
+            job_row.current_step = "editing"
         # Audit 2026-05-26 (#388 wizard-duplicate-jobs): reset progress +
         # error + last_progress_at on reuse. Without this, a double-fire
         # of /generate on the same job_id can land here while a prior
@@ -10731,9 +10846,11 @@ async def generate_with_segments(
     publication_job = (
         db.query(Job).filter(Job.job_id == job_id).with_for_update().one()
     )
-    if reuse and publication_job.status not in (
-        "transcribed_pending", "transcribed", "awaiting_upload",
-    ):
+    _publication_statuses = (
+        ("lyrics_approved",) if _batch_generation
+        else ("transcribed_pending", "transcribed", "awaiting_upload")
+    )
+    if reuse and publication_job.status not in _publication_statuses:
         # Close the concurrent double-click race. Two requests can both pass
         # the early ownership check before either publishes; only the first
         # locked transition may create an outbox event/render.
@@ -12226,7 +12343,10 @@ async def approve_job(
         raise HTTPException(status_code=400, detail="Job is not pending review")
 
     from delivery_qc_runtime import approval_gate, effective_delivery_qc_mode
-    _delivery_gate = approval_gate(job.delivery_qc, effective_delivery_qc_mode())
+    _delivery_gate = approval_gate(
+        job.delivery_qc,
+        "enforce" if job.workload_class == "batch" else effective_delivery_qc_mode(),
+    )
     if _delivery_gate.get("blocked"):
         raise HTTPException(
             status_code=409,
@@ -12369,10 +12489,26 @@ async def decide_delivery_qc_issue(
         row = dict(raw)
         if str(row.get("issue_id")) == issue_id:
             found = row
+            if row.get("manual_verification_required") and body.decision != "resolved_manual":
+                raise HTTPException(
+                    status_code=422,
+                    detail="mandatory_reviewer_check_requires_signed_manual_resolution",
+                )
+            if row.get("severity") == "FAIL" and body.decision == "acknowledged":
+                raise HTTPException(
+                    status_code=422,
+                    detail="fail_finding_cannot_be_acknowledged",
+                )
             row["status"] = status_map[body.decision]
             row["operator_decision"] = {
                 "decision": body.decision, "reason": body.reason,
                 "user_id": current_user["id"],
+                "reviewer_name": str(
+                    current_user.get("full_name")
+                    or current_user.get("username")
+                    or current_user.get("email")
+                    or f"user-{current_user['id']}"
+                )[:160],
                 "decided_at": datetime.now(timezone.utc).isoformat(),
             }
         issues.append(row)
@@ -12387,7 +12523,10 @@ async def decide_delivery_qc_issue(
         "warn_count": sum(row.get("severity") == "WARN" for row in open_rows),
     }
     from delivery_qc_runtime import approval_gate, effective_delivery_qc_mode
-    report["approval"] = approval_gate(report, effective_delivery_qc_mode())
+    report["approval"] = approval_gate(
+        report,
+        "enforce" if job.workload_class == "batch" else effective_delivery_qc_mode(),
+    )
     job.delivery_qc = report
     db.add(ProductEvent(
         tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job_id,
@@ -14284,7 +14423,7 @@ async def save_segments(
     # jobs were persisted with status='transcribed' literal. Newer
     # jobs use 'transcribed_pending'. Editor must work on both.
     _SAVE_SEGMENTS_ALLOWED = (
-        "transcribed_pending", "transcribed", "pending_review", "rejected", "editing", "done",
+        "transcribed_pending", "transcribed", "lyrics_approved", "pending_review", "rejected", "editing", "done",
     )
     if job.status not in _SAVE_SEGMENTS_ALLOWED:
         # Outcome metric (issue #934, autosave poco confiable): el 409 por
@@ -14602,7 +14741,7 @@ async def acknowledge_transcription_quality(
 # (ver _SAVE_SEGMENTS_ALLOWED en save_segments): si el operador puede
 # corregir texto ahí, puede pedir el re-anclado ahí.
 _REANCHOR_ALLOWED = (
-    "transcribed_pending", "transcribed", "pending_review", "rejected", "editing", "done",
+    "transcribed_pending", "transcribed", "lyrics_approved", "pending_review", "rejected", "editing", "done",
 )
 
 

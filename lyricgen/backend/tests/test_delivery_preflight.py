@@ -40,11 +40,11 @@ def test_universal_example_groups_spelling_and_flags_metadata():
         fps=30,
     )
 
-    assert report["decision"] == "REVIEW"
+    assert report["decision"] == "BLOCK"
     assert report["summary"] == {
         "issue_count": 4,
-        "fail_count": 0,
-        "warn_count": 4,
+        "fail_count": 1,
+        "warn_count": 3,
         "open_count": 4,
         "segment_count": 4,
     }

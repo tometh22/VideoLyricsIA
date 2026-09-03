@@ -4695,6 +4695,12 @@ def _parse_lrclib_record(data: dict) -> dict | None:
         "plain": plain,
         "synced": synced,
         "duration": data.get("duration"),
+        # Non-lyric catalogue identity is retained so campaign references can
+        # prove which provider record/version was tested against the audio.
+        "source_record_id": data.get("id"),
+        "source_track_name": data.get("trackName"),
+        "source_artist_name": data.get("artistName"),
+        "source_album_name": data.get("albumName"),
     }
 
 
@@ -7465,7 +7471,12 @@ def _gemini_cleanup_lines_grounded(cleaned: str, plain: str) -> bool:
     return True
 
 
-def _gemini_cleanup_cache_key(audio_path: str, lrclib_plain: str):
+def _gemini_cleanup_cache_key(
+    audio_path: str,
+    lrclib_plain: str,
+    *,
+    policy: str = "cleanup-v2",
+):
     """Content-addressable cache key for Gemini lyrics cleanup. Same
     audio + same lrclib hint = same cleaned output (deterministic with
     temperature=0.1). Mirrors `whisperx_transcribe._compute_cache_key`."""
@@ -7480,7 +7491,7 @@ def _gemini_cleanup_cache_key(audio_path: str, lrclib_plain: str):
         return (None, None, None)
     hint = (lrclib_plain or "").strip()
     hint_hash = hashlib.sha1(hint.encode("utf-8")).hexdigest()[:16] if hint else ""
-    key = f"gem-clean:{audio_hash}:{hint_hash}"
+    key = f"gem-clean:{policy}:{audio_hash}:{hint_hash}"
     return (key, audio_hash, hint_hash)
 
 
@@ -7566,7 +7577,9 @@ def _record_gemini_audio_completion(
 
 def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
                             *, artist: str = "", song: str = "",
-                            timeout_s: int = 90) -> str | None:
+                            timeout_s: int = 90,
+                            force: bool = False,
+                            strict_audio_only: bool = False) -> str | None:
     """Send the audio + lrclib plain lyrics to Gemini 2.5 Flash and return
     the proofread text. Used when lrclib has the canonical text but it has
     the predictable defects of community transcriptions:
@@ -7595,7 +7608,7 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     Content-addressable cache: same audio + same lrclib hint → cache hit
     (no Gemini call). Multi-retry pipelines pay the cost once.
     """
-    if not _env_flag("GEMINI_LYRICS_CLEANUP_ENABLED"):
+    if not force and not _env_flag("GEMINI_LYRICS_CLEANUP_ENABLED"):
         return None
     if not audio_path or not os.path.exists(audio_path):
         return None
@@ -7603,7 +7616,11 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
     if not plain:
         return None
 
-    cache_key, audio_hash, hint_hash = _gemini_cleanup_cache_key(audio_path, plain)
+    cache_key, audio_hash, hint_hash = _gemini_cleanup_cache_key(
+        audio_path,
+        plain,
+        policy="strict-audio-v1" if strict_audio_only else "cleanup-v2",
+    )
     if cache_key:
         cached = _gemini_cleanup_cache_lookup(cache_key)
         if (
@@ -7667,6 +7684,14 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
         "Return ONLY the corrected lyrics, one line per row. "
         "No preamble, no markdown, no commentary."
     )
+    if strict_audio_only:
+        system_prompt += (
+            "\n\nBATCH REFERENCE RULE: the supplied transcription is only a "
+            "hypothesis. Verify every output line against the attached audio. "
+            "Delete any line or repetition the recording does not confirm. "
+            "Never fill from memory or knowledge of this song/version. If a "
+            "word is unclear, omit it instead of guessing."
+        )
 
     try:
         with open(audio_path, "rb") as f:
@@ -7805,6 +7830,85 @@ def _gemini_cleanup_lyrics(audio_path: str, lrclib_plain: str,
         )
 
     return cleaned
+
+
+def _gemini_derive_lyrics_from_full_audio(
+    audio_path: str,
+    *,
+    artist: str = "",
+    song: str = "",
+    timeout_s: int = 120,
+) -> str | None:
+    """Derive a review hypothesis from one complete audio recording.
+
+    This is the mandatory batch fallback when no catalogue candidate exists.
+    It is deliberately audio-only: artist/title are identification metadata,
+    not permission to recall a known lyric.  The result remains a hypothesis
+    and cannot authorize render without the separate human line/timing gate.
+    """
+    if not audio_path or not os.path.exists(audio_path):
+        return None
+    try:
+        from google import genai
+        client = _get_genai_client()
+        with open(audio_path, "rb") as handle:
+            audio_bytes = handle.read()
+    except Exception as exc:
+        logger.warning("[GEMINI-REFERENCE] unavailable: %s", exc)
+        return None
+
+    ext = os.path.splitext(audio_path)[1].lower().lstrip(".")
+    mime = {
+        "wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac",
+        "ogg": "audio/ogg", "m4a": "audio/mp4",
+    }.get(ext, "audio/wav")
+    instruction = (
+        "Listen to the COMPLETE attached recording from beginning to end and "
+        "produce a lyric reference hypothesis. Transcribe only words and "
+        "vocalizations that the audio itself confirms. Never complete from "
+        "memory, artist/title knowledge, genre conventions, or an expected "
+        "version. Preserve every language exactly; never translate or "
+        "paraphrase. Do not invent repeated choruses. If speech is not "
+        "intelligible, omit it instead of guessing. Return only the heard "
+        "lyrics, one performed line per row, in performance order, with no "
+        "timestamps, markdown, notes, or preamble."
+    )
+    contents = [
+        genai.types.Part.from_bytes(data=audio_bytes, mime_type=mime),
+        genai.types.Part.from_text(
+            text=f"Identification metadata only (do not recall lyrics):\nArtist: {artist}\nSong: {song}"
+        ),
+    ]
+    try:
+        response = _call_with_timeout(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=instruction,
+                    temperature=0.0,
+                    max_output_tokens=8000,
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+                ),
+            ),
+            timeout_s=float(timeout_s),
+            label="GEMINI-REFERENCE",
+        )
+        raw = _record_gemini_audio_completion(
+            response,
+            view="full_audio_without_reference",
+            transformation="gemini_reference_hypothesis_raw",
+        )
+    except Exception as exc:
+        logger.warning("[GEMINI-REFERENCE] full-audio call failed: %s", exc)
+        return None
+    candidate = _gemini_cleanup_strip_preamble((raw or "").strip())
+    if not candidate or _gemini_cleanup_is_refusal(candidate):
+        return None
+    lines = [line.strip() for line in candidate.splitlines() if line.strip()]
+    if not lines or len(lines) > 1000:
+        return None
+    return "\n".join(lines)
 
 
 def _target_language_instruction(language: str | None, segs: list[dict]) -> str:

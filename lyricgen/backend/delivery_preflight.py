@@ -357,7 +357,7 @@ def _metadata_occurrences(
         seconds = _finite_number(asset.get("title_time")) or 0.0
         found.append((0, _Occurrence(
             code="METADATA_TITLE_MISMATCH",
-            severity="WARN",
+            severity="FAIL",
             category="Metadata mismatch",
             summary="Rendered title does not match delivery metadata",
             description=(
