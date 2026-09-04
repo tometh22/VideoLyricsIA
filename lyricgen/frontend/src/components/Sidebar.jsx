@@ -94,12 +94,12 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
       id: "campaigns", label: "Campañas", path: "/campaigns",
       icon: <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10" strokeLinecap="round"/><circle cx="19" cy="18" r="2"/></svg>,
     });
+  }
+  if (user?.role === "admin") {
     items.splice(3, 0, {
       id: "review_queue", label: "Cola de revisión", path: "/admin/cola",
       icon: <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h9" strokeLinecap="round"/><path d="M18 16l2 2 3-4" strokeLinecap="round" strokeLinejoin="round"/></svg>,
     });
-  }
-  if (user?.role === "admin") {
     items.push({
       id: "admin", label: "Admin", path: "/admin",
       icon: <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" strokeLinecap="round" strokeLinejoin="round"/></svg>,

@@ -138,10 +138,10 @@ def _require_scope(user: dict) -> None:
 
 
 def _campaign_or_404(db: Session, campaign_id: str, user: dict) -> BatchCampaign:
-    campaign = db.query(BatchCampaign).filter(
-        BatchCampaign.id == campaign_id,
-        BatchCampaign.tenant_id == user["tenant_id"],
-    ).first()
+    query = db.query(BatchCampaign).filter(BatchCampaign.id == campaign_id)
+    if user.get("role") != "admin":
+        query = query.filter(BatchCampaign.tenant_id == user["tenant_id"])
+    campaign = query.first()
     if campaign is None:
         raise HTTPException(status_code=404, detail="Campaign not found.")
     return campaign
@@ -304,9 +304,10 @@ def list_campaigns(
     db: Session = Depends(get_db),
 ):
     _require_scope(current_user)
-    rows = db.query(BatchCampaign).filter(
-        BatchCampaign.tenant_id == current_user["tenant_id"],
-    ).order_by(BatchCampaign.created_at.desc()).limit(100).all()
+    query = db.query(BatchCampaign)
+    if current_user.get("role") != "admin":
+        query = query.filter(BatchCampaign.tenant_id == current_user["tenant_id"])
+    rows = query.order_by(BatchCampaign.created_at.desc()).limit(100).all()
     return {"items": [_summary(db, row) for row in rows]}
 
 
