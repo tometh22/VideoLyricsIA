@@ -204,6 +204,49 @@ def test_staged_campaign_prewarms_every_stem_before_releasing_asr(
     } == {"full"}
 
 
+def test_staged_campaign_canary_limit_is_resumable_in_delivery_order(
+    db, monkeypatch,
+):
+    campaign = _campaign(db, 3)
+    campaign.default_render_params = {
+        "stage1_pipeline": {
+            "prewarm_separation": True,
+            "promotion_limit": 2,
+        },
+    }
+    db.commit()
+    monkeypatch.setattr(batch, "SEPARATION_WINDOW", 3)
+    monkeypatch.setattr(batch, "TRANSCRIPTION_WINDOW", 3)
+
+    first = batch._promote_campaign(db, campaign)
+    assert len(first) == 2
+    linked_ordinals = [row[0] for row in db.query(
+        BatchCampaignItem.ordinal,
+    ).join(Job, Job.campaign_item_id == BatchCampaignItem.id).filter(
+        Job.campaign_id == campaign.id,
+    ).order_by(BatchCampaignItem.ordinal).all()]
+    assert linked_ordinals == [1, 2]
+    assert db.query(Job).filter(Job.campaign_id == campaign.id).count() == 2
+    for job in db.query(Job).filter(Job.campaign_id == campaign.id):
+        job.status = "separation_ready"
+    db.commit()
+
+    canary_full = batch._promote_campaign(db, campaign)
+    assert len(canary_full) == 2
+    assert db.query(Job).filter(Job.campaign_id == campaign.id).count() == 2
+
+    campaign.default_render_params = {
+        "stage1_pipeline": {
+            "prewarm_separation": True,
+            "promotion_limit": 3,
+        },
+    }
+    db.commit()
+    resumed = batch._promote_campaign(db, campaign)
+    assert len(resumed) == 1
+    assert db.query(Job).filter(Job.campaign_id == campaign.id).count() == 3
+
+
 def test_failed_separation_is_red_but_does_not_block_other_asr(db, monkeypatch):
     campaign = _campaign(db, 3)
     campaign.default_render_params = {
