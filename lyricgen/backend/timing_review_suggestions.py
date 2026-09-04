@@ -9,10 +9,18 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import math
+import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+
+
+def automatic_tail_enabled() -> bool:
+    """Keep automatic mutation off until operator-gold calibration passes."""
+    return os.environ.get(
+        "STABLE_PITCH_TAIL_ENABLED", "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
