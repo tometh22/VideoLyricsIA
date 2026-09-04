@@ -177,6 +177,20 @@ function formatTimestamp(seconds) {
   return `${m}:${s.toString().padStart(2, "0")}.${ms}`;
 }
 
+// Return only rows that are actually inside the browser viewport.  Keeping
+// this pure makes the campaign review gate testable without coupling it to a
+// particular scroll container.
+export function visibleReviewLineIds(segments, rowElements, viewportHeight) {
+  const height = Number(viewportHeight);
+  if (!Number.isFinite(height) || height <= 0) return [];
+  return (segments || []).flatMap((segment) => {
+    const element = rowElements?.[segment?._id];
+    if (!element?.getBoundingClientRect) return [];
+    const rect = element.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < height ? [segment._id] : [];
+  });
+}
+
 function fallbackIdempotencyDigest(value) {
   let h1 = 0x9e3779b1;
   let h2 = 0x85ebca77;
@@ -1925,7 +1939,10 @@ export default function LyricsEditor({
   const lineReviewKey = transcribeJobId ? `genly:line-review:${transcribeJobId}` : null;
   const [reviewedLineIds, setReviewedLineIds] = useState(() => {
     if (!lineReviewKey) return [];
-    try { return JSON.parse(localStorage.getItem(lineReviewKey) || "[]"); }
+    try {
+      const value = JSON.parse(localStorage.getItem(lineReviewKey) || "[]");
+      return Array.isArray(value) ? value : [];
+    }
     catch { return []; }
   });
   useEffect(() => {
@@ -1934,8 +1951,23 @@ export default function LyricsEditor({
     catch { /* autosave remains authoritative if browser storage is full */ }
   }, [lineReviewKey, reviewedLineIds]);
   const markLineReviewed = useCallback((id) => {
-    if (!id) return;
+    if (id == null) return;
     setReviewedLineIds((current) => current.includes(id) ? current : [...current, id]);
+  }, []);
+  // A deliberate text/timing edit is itself evidence that the operator
+  // reviewed that line.  Window confirmation is applied after React commits
+  // the new snapshot so it is bound to the new qualityReviewKey, never the
+  // stale pre-edit key.
+  const editedReviewLineIdsRef = useRef(new Set());
+  const markLinesReviewedByEdit = useCallback((ids) => {
+    const validIds = (Array.isArray(ids) ? ids : [ids]).filter((id) => id != null);
+    if (!validIds.length) return;
+    validIds.forEach((id) => editedReviewLineIdsRef.current.add(id));
+    setReviewedLineIds((current) => {
+      const next = new Set(current);
+      validIds.forEach((id) => next.add(id));
+      return next.size === current.length ? current : [...next];
+    });
   }, []);
 
   // Inline timestamp edit state. Only one row can be in edit mode at a
@@ -2041,6 +2073,7 @@ export default function LyricsEditor({
   // timeline only captures history after a drag actually commits, so pointer
   // cancellation cannot create a phantom Undo entry.
   const handleTimelineTimingChange = useCallback((id, newStart, newEnd, interaction = {}) => {
+    markLinesReviewedByEdit(id);
     setIsDirty(true);
     setEdited((prev) => prev.map((s) =>
       s._id === id ? { ...s, start: newStart, end: newEnd, locked: true } : s
@@ -2060,10 +2093,11 @@ export default function LyricsEditor({
     // flush effect below reads the just-updated `edited` and persists.
     setFlushCounter((c) => c + 1);
     trackEditorEvent("editor_timing_changed", { count: 1, operation: interaction.operation || "resize_or_move" });
-  }, [trackEditorEvent]);
+  }, [markLinesReviewedByEdit, trackEditorEvent]);
 
   const handleTimelineTimingChangeBatch = useCallback((changes, interaction = {}) => {
     if (!changes?.length) return;
+    markLinesReviewedByEdit(changes.map(({ id }) => id));
     const firstOriginal = editedRef.current.find((segment) => segment._id === changes[0].id);
     const deltaMs = firstOriginal ? Math.round((changes[0].start - firstOriginal.start) * 1000) : 0;
     setIsDirty(true);
@@ -2094,7 +2128,7 @@ export default function LyricsEditor({
       delta_ms: deltaMs,
       duration_ms: Math.round(interaction.durationMs || 0),
     });
-  }, [trackEditorEvent]);
+  }, [markLinesReviewedByEdit, trackEditorEvent]);
 
   const handleGuidedTimingChange = useCallback((id, newStart, newEnd, interaction = {}) => {
     pushEditHistory();
@@ -2117,6 +2151,7 @@ export default function LyricsEditor({
   // flags, so the render goes back to auto hold-until-next.
   const resetTimings = useCallback(() => {
     pushEditHistory();
+    markLinesReviewedByEdit(editedRef.current.map((segment) => segment._id));
     const byId = new Map(sanitizeSegments(originalSegmentsRef.current || []).map((s) => [s._id, s]));
     setEdited((prev) => prev.map((s) => {
       const o = byId.get(s._id);
@@ -2127,7 +2162,7 @@ export default function LyricsEditor({
     }));
     setFlushCounter((c) => c + 1);
     toast({ message: "Timings restaurados al original", tone: "info" });
-  }, [pushEditHistory, toast]);
+  }, [markLinesReviewedByEdit, pushEditHistory, toast]);
 
   // Versión B, parte 2 — "Re-sincronizar con IA". Flujo:
   //   1. Flush del estado local a /save-segments (el backend re-ancla lo
@@ -2225,6 +2260,7 @@ export default function LyricsEditor({
     // the undo stack — the user's Ctrl+Z would feel broken otherwise.
     if (Math.abs(newStart - seg.start) >= 1e-3) {
       pushEditHistory();
+      markLinesReviewedByEdit(seg._id);
     }
     setEdited((prev) => prev.map((s) => {
       if (s._id !== seg._id) return s;
@@ -2356,6 +2392,11 @@ export default function LyricsEditor({
       );
       if (!ok) applyCascade = false;
     }
+    markLinesReviewedByEdit(
+      applyCascade
+        ? edited.slice(syncCursor).map((segment) => segment._id)
+        : target._id,
+    );
     const appliedDelta = applyCascade
       ? clampBlockShiftDelta(edited.slice(syncCursor), delta, duration)
       : delta;
@@ -2485,7 +2526,7 @@ export default function LyricsEditor({
         });
       });
     }
-  }, [syncMode, syncCursor, edited, currentTime, duration, syncCascade]);
+  }, [syncMode, syncCursor, edited, currentTime, duration, syncCascade, markLinesReviewedByEdit]);
 
   // Keep syncCursor inside the bounds of `edited` after split/delete
   // operations performed mid-sync. Without this, deleting line 8 while
@@ -3164,6 +3205,7 @@ export default function LyricsEditor({
 
   const updateText = (id, text) => {
     pushEditHistory();
+    markLinesReviewedByEdit(id);
     setEdited((prev) => prev.map((seg) => (seg._id === id ? { ...seg, text } : seg)));
   };
 
@@ -3194,6 +3236,7 @@ export default function LyricsEditor({
     if (!propagationPrompt) return;
     const { newText, matchIds } = propagationPrompt;
     pushEditHistory();
+    markLinesReviewedByEdit(matchIds);
     const idset = new Set(matchIds);
     setEdited((prev) => prev.map((s) => (idset.has(s._id) ? { ...s, text: newText } : s)));
     setPropagationPrompt(null);
@@ -3216,6 +3259,9 @@ export default function LyricsEditor({
 
   const applyAllSuggestions = () => {
     pushEditHistory();
+    markLinesReviewedByEdit(edited
+      .filter((segment) => suggestionsById[segment._id])
+      .map((segment) => segment._id));
     setEdited((prev) =>
       prev.map((seg) => {
         const suggestion = suggestionsById[seg._id];
@@ -3231,8 +3277,9 @@ export default function LyricsEditor({
   const shiftAllSegments = useCallback((delta) => {
     if (Math.abs(delta) < 0.05) return;
     pushEditHistory();
+    markLinesReviewedByEdit(editedRef.current.map((segment) => segment._id));
     setEdited((prev) => shiftBlockWithinDuration(prev, delta, duration));
-  }, [pushEditHistory, duration]);
+  }, [markLinesReviewedByEdit, pushEditHistory, duration]);
 
   const deleteSegments = useCallback((ids) => {
     const requested = new Set(Array.isArray(ids) ? ids : [ids]);
@@ -3268,8 +3315,13 @@ export default function LyricsEditor({
   /** Bulk: trim every segment whose duration exceeds the cap. Each
    * segment is trimmed independently — only its own `end` is modified
    * based on its own text length and start. No cross-segment effect. */
-  const trimAllLongSegs = () => {
+  const trimAllLongSegs = ({ confirmReview = true } = {}) => {
     pushEditHistory();
+    if (confirmReview) {
+      markLinesReviewedByEdit(edited
+        .filter((segment) => segment.end - segment.start > estimateVoiceEndDuration(segment.text))
+        .map((segment) => segment._id));
+    }
     setEdited((prev) =>
       prev.map((seg) => {
         const dur = seg.end - seg.start;
@@ -3296,7 +3348,7 @@ export default function LyricsEditor({
     if (autoTrimAppliedRef.current) return;
     if (!edited || edited.length === 0) return;
     if (longSegCount > 0) {
-      trimAllLongSegs();
+      trimAllLongSegs({ confirmReview: false });
     }
     autoTrimAppliedRef.current = true;
   }, [edited, longSegCount]);
@@ -3588,6 +3640,11 @@ export default function LyricsEditor({
   const qualityGuidanceAvailable = isTranscriptionQualityV5(transcriptionQuality)
     && (transcriptionQuality?.decision === "review_required" || qualityAnalysisPending)
     && unsafeWindows.length > 0;
+  // Stage-1 campaign review is stricter than the generic editor: every
+  // machine-flagged window that is shown to the reviewer must be confirmed,
+  // including when the quality engine is still in observe mode.
+  const campaignQualityReview = requireLineReview && qualityGuidanceAvailable;
+  const qualityConfirmationActive = focusedQualityReview || campaignQualityReview;
   useEffect(() => {
     if (viewMode === "advanced" && !qualityGuidanceAvailable) {
       setTimingWorkspaceMode("timeline");
@@ -3615,30 +3672,63 @@ export default function LyricsEditor({
       text: segment.text,
     })),
   }), [approvalSegments, transcriptionQuality]);
-  const [qualityWindowReview, setQualityWindowReview] = useState({ key: null, ids: [] });
+  const qualityWindowReviewStorageKey = transcribeJobId
+    ? `genly:quality-window-review:${transcribeJobId}`
+    : null;
+  const [qualityWindowReview, setQualityWindowReview] = useState(() => {
+    if (!requireLineReview || !qualityWindowReviewStorageKey) return { key: null, ids: [] };
+    try {
+      const value = JSON.parse(localStorage.getItem(qualityWindowReviewStorageKey) || "null");
+      return value && Array.isArray(value.ids) ? value : { key: null, ids: [] };
+    } catch { return { key: null, ids: [] }; }
+  });
+  useEffect(() => {
+    if (!requireLineReview || !qualityWindowReviewStorageKey) return;
+    try { localStorage.setItem(qualityWindowReviewStorageKey, JSON.stringify(qualityWindowReview)); }
+    catch { /* the durable editor draft remains authoritative */ }
+  }, [qualityWindowReview, qualityWindowReviewStorageKey, requireLineReview]);
   const serverAcknowledgement = transcriptionQuality?.acknowledgement;
   const serverAcknowledgementCurrent = isServerQualityAcknowledgementCurrent({
     quality: transcriptionQuality,
     revision: segmentsRevision,
     dirty: isDirty,
-    focused: focusedQualityReview,
+    focused: qualityConfirmationActive,
   });
   const confirmedUnsafeWindowIds = useMemo(() => new Set(
     serverAcknowledgementCurrent
       ? (serverAcknowledgement?.confirmed_window_ids || [])
       : (qualityWindowReview.key === qualityReviewKey ? qualityWindowReview.ids : []),
   ), [qualityReviewKey, qualityWindowReview, serverAcknowledgement, serverAcknowledgementCurrent]);
-  const unconfirmedUnsafeWindows = focusedQualityReview
+  const unconfirmedUnsafeWindows = qualityConfirmationActive
     ? unsafeWindows.filter((window) => !confirmedUnsafeWindowIds.has(window.id))
     : [];
+  // Text/timing edits confirm both the affected line and every quality
+  // window that overlaps it.  Carry unrelated window confirmations forward;
+  // the edited window itself is re-confirmed against the new snapshot here.
+  useEffect(() => {
+    const editedIds = editedReviewLineIdsRef.current;
+    if (!requireLineReview || !editedIds.size || !unsafeWindows.length) return;
+    const changedSegments = sanitizedEdited.filter((segment) => editedIds.has(segment._id));
+    editedIds.clear();
+    const changedWindowIds = unsafeWindows
+      .filter((qualityWindow) => changedSegments.some((segment) => (
+        segmentOverlapsWindow(segment, qualityWindow)
+      )))
+      .map((qualityWindow) => qualityWindow.id);
+    if (!changedWindowIds.length) return;
+    setQualityWindowReview((current) => ({
+      key: qualityReviewKey,
+      ids: [...new Set([...(current.ids || []), ...changedWindowIds])],
+    }));
+  }, [qualityReviewKey, requireLineReview, sanitizedEdited, unsafeWindows]);
   const unsafeCandidateSegmentIds = useMemo(() => {
     if (!qualityGuidanceAvailable) return new Set();
-    const windowsForRows = focusedQualityReview ? unconfirmedUnsafeWindows : unsafeWindows;
+    const windowsForRows = qualityConfirmationActive ? unconfirmedUnsafeWindows : unsafeWindows;
     return new Set(sanitizedEdited.flatMap((segment) => {
       const coveringWindows = unsafeWindows.filter((qualityWindow) => (
         segmentOverlapsWindow(segment, qualityWindow)
       ));
-      const confirmedByWindow = focusedQualityReview
+      const confirmedByWindow = qualityConfirmationActive
         && coveringWindows.length > 0
         && coveringWindows.every((qualityWindow) => confirmedUnsafeWindowIds.has(qualityWindow.id));
       if (confirmedByWindow) return [];
@@ -3650,14 +3740,14 @@ export default function LyricsEditor({
         || segment?.review === true;
       return overlapsUnsafeWindow || explicitlyUnsafe ? [segment._id] : [];
     }));
-  }, [confirmedUnsafeWindowIds, focusedQualityReview, qualityGuidanceAvailable, sanitizedEdited, unsafeWindows, unconfirmedUnsafeWindows]);
+  }, [confirmedUnsafeWindowIds, qualityConfirmationActive, qualityGuidanceAvailable, sanitizedEdited, unsafeWindows, unconfirmedUnsafeWindows]);
   // One calm marker/navigation stop per unsafe *part*, not one warning per
   // lyric line. Long windows often cover several valid lines; painting and
   // navigating every one made a single diagnosis look like many failures.
   // In observe mode diagnostics remain available in the summary/timing view,
   // but do not permanently decorate the lyric rows.
   const unsafeWindowMarkerSegmentIds = useMemo(() => {
-    if (!qualityGuidanceAvailable || !focusedQualityReview) return new Set();
+    if (!qualityGuidanceAvailable || !qualityConfirmationActive) return new Set();
     const markerIds = new Set();
     unconfirmedUnsafeWindows.forEach((qualityWindow) => {
       const first = sanitizedEdited.find((segment) => (
@@ -3680,7 +3770,7 @@ export default function LyricsEditor({
       inExplicitRun = explicitlyUnsafe;
     });
     return markerIds;
-  }, [focusedQualityReview, qualityGuidanceAvailable, sanitizedEdited, unsafeWindows, unconfirmedUnsafeWindows]);
+  }, [qualityConfirmationActive, qualityGuidanceAvailable, sanitizedEdited, unsafeWindows, unconfirmedUnsafeWindows]);
   unsafeNavigationIdsRef.current = unsafeWindowMarkerSegmentIds;
   // ENMASCARAR ≠ INFORMAR. Reemplazar la letra por "Letra sin confirmar" en el
   // preview es una consecuencia del modo `enforce`, donde el operador PUEDE
@@ -3755,9 +3845,43 @@ export default function LyricsEditor({
     });
     trackEditorEvent("editor_guided_window_confirmed", {
       window_id: qualityWindow.id,
-      required: focusedQualityReview,
+      required: campaignQualityReview,
     });
-  }, [focusedQualityReview, isQualityWindowConfirmable, qualityReviewKey, t, toast, trackEditorEvent]);
+  }, [campaignQualityReview, isQualityWindowConfirmable, qualityReviewKey, t, toast, trackEditorEvent]);
+
+  const confirmVisibleReviewBlock = useCallback(() => {
+    const visibleIds = visibleReviewLineIds(
+      sanitizedEdited,
+      rowRefs.current,
+      window.innerHeight,
+    );
+    if (!visibleIds.length) {
+      toast({ message: "No hay líneas visibles para confirmar.", tone: "info" });
+      return;
+    }
+    const idSet = new Set(visibleIds);
+    setReviewedLineIds((current) => [...new Set([...current, ...visibleIds])]);
+    const visibleSegments = sanitizedEdited.filter((segment) => idSet.has(segment._id));
+    const visibleWindowIds = unsafeWindows
+      .filter((qualityWindow) => visibleSegments.some((segment) => (
+        segmentOverlapsWindow(segment, qualityWindow)
+      )))
+      .map((qualityWindow) => qualityWindow.id);
+    if (visibleWindowIds.length) {
+      setQualityWindowReview((current) => ({
+        key: qualityReviewKey,
+        ids: [...new Set([...(current.ids || []), ...visibleWindowIds])],
+      }));
+    }
+    trackEditorEvent("editor_visible_review_block_confirmed", {
+      line_count: visibleIds.length,
+      window_count: visibleWindowIds.length,
+    });
+  }, [qualityReviewKey, sanitizedEdited, toast, trackEditorEvent, unsafeWindows]);
+  const campaignReviewIncomplete = requireLineReview && (
+    edited.some((segment) => !reviewedLineIds.includes(segment._id))
+    || unconfirmedUnsafeWindows.length > 0
+  );
 
   // Single-flight del CTA completo, incluido el flush de autosave que ocurre
   // ANTES de onApprove. El lock de App sólo cubre el POST /edit; no alcanzaba
@@ -3784,6 +3908,11 @@ export default function LyricsEditor({
         seekTo(Math.max(0, missing.start), false);
         rowRefs.current[missing._id]?.scrollIntoView?.({ behavior: "smooth", block: "center" });
         toast({ message: "Falta confirmar al menos una línea contra el audio.", tone: "info" });
+        return;
+      }
+      if (unconfirmedUnsafeWindows.length > 0) {
+        jumpToUnsafeWindow(unconfirmedUnsafeWindows[0]);
+        toast({ message: "Falta confirmar al menos una ventana marcada contra el audio.", tone: "info" });
         return;
       }
     }
@@ -3817,14 +3946,18 @@ export default function LyricsEditor({
     }
     setWrapWarning(null);
     const cleaned = approvalSegments;
+    const confirmedLineIdsForApproval = cleaned
+      .filter((segment) => reviewedLineIds.includes(segment._id))
+      .map((segment) => String(segment.segment_id || segment.id || "").trim())
+      .filter(Boolean);
     const correctionSummary = summarizeOperatorCorrections(
       originalSegmentsRef.current || [], cleaned || [],
     );
-    // Quality remains a diagnostic: it highlights uncertain passages but
-    // never turns the editor into a mandatory review workflow. The final
-    // render uses the operator's saved lyrics, regardless of whether the
-    // asynchronous quality analysis has finished.
-    const qualityAcknowledged = false;
+    // Generic edits keep quality as a diagnostic.  The campaign's stage-1
+    // contract is stricter: all displayed windows are acknowledged against
+    // the exact persisted editor revision before lyrics approval.
+    const qualityAcknowledged = campaignQualityReview
+      && unconfirmedUnsafeWindows.length === 0;
     const approvalTelemetry = {
       ...correctionSummary,
       duration_ms: Math.max(0, Date.now() - editorSessionStartedAtRef.current),
@@ -3845,8 +3978,8 @@ export default function LyricsEditor({
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               base_revision: revision,
-              confirmed_window_ids: focusedQualityReview
-                ? unsafeWindows.map((qualityWindow) => qualityWindow.id)
+              confirmed_window_ids: qualityAcknowledged
+                ? [...confirmedUnsafeWindowIds]
                 : [],
             }),
           },
@@ -3884,6 +4017,7 @@ export default function LyricsEditor({
           editorRevision: currentSave.revision,
           editorVersionId: currentSave.versionId,
           operatorMetrics,
+          confirmedLineIds: confirmedLineIdsForApproval,
         }));
         if (approvalResult?.ok !== false || approvalResult.reason !== "conflict") break;
 
@@ -3925,6 +4059,7 @@ export default function LyricsEditor({
       await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
         baseRevision: revision,
         operatorMetrics,
+        confirmedLineIds: confirmedLineIdsForApproval,
       }));
       clearActiveClock();
       trackEditorEvent("editor_approved", {
@@ -3947,6 +4082,7 @@ export default function LyricsEditor({
     await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
       baseRevision: approvedRevision,
       operatorMetrics,
+      confirmedLineIds: confirmedLineIdsForApproval,
     }));
     clearActiveClock();
     trackEditorEvent("editor_approved", {
@@ -4284,9 +4420,28 @@ export default function LyricsEditor({
         </details>
       )}
       {requireLineReview && (
-        <div className="mb-3 flex items-center justify-between rounded-xl bg-brand/[0.08] px-4 py-3 text-xs ring-1 ring-brand/25">
-          <span className="text-brand-light">Líneas confirmadas contra el audio</span>
-          <span className="font-semibold tabular-nums text-white">{reviewedLineIds.filter((id) => edited.some((segment) => segment._id === id)).length}/{edited.length}</span>
+        <div className="mb-3 rounded-xl bg-brand/[0.08] px-4 py-3 text-xs ring-1 ring-brand/25" data-testid="line-review-gate">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span className="text-brand-light">Líneas confirmadas contra el audio</span>
+            <span className="font-semibold tabular-nums text-white" data-testid="line-review-progress">
+              {reviewedLineIds.filter((id) => edited.some((segment) => segment._id === id)).length}/{edited.length}
+            </span>
+            <button
+              type="button"
+              onClick={confirmVisibleReviewBlock}
+              className="rounded-lg bg-brand px-3 py-2 font-semibold text-white transition hover:bg-brand-light"
+            >
+              Confirmar bloque visible
+            </button>
+          </div>
+          <p className="mt-2 leading-relaxed text-ink-secondary">
+            Tus cambios se guardan automáticamente. Confirmar registra la revisión; no hace falta aprobar para guardarlos.
+          </p>
+          {campaignQualityReview && (
+            <p className="mt-1 text-amber-100" data-testid="campaign-window-review-progress">
+              Ventanas marcadas confirmadas: {unsafeWindows.length - unconfirmedUnsafeWindows.length}/{unsafeWindows.length}
+            </p>
+          )}
         </div>
       )}
 
@@ -4343,7 +4498,7 @@ export default function LyricsEditor({
           </div>
           <button
             onClick={handleApprove}
-            disabled={isApproving || languageConflict || languageUncertain || (editorV2Enabled && (!durableHydrated || durableEditor.loading)) || saveErrorReason === "draft-corrupt"}
+            disabled={isApproving || campaignReviewIncomplete || languageConflict || languageUncertain || (editorV2Enabled && (!durableHydrated || durableEditor.loading)) || saveErrorReason === "draft-corrupt"}
             aria-busy={isApproving}
             aria-label={isApproving
               ? (t("editor.applying_changes") || "Aplicando cambios…")
@@ -4352,7 +4507,8 @@ export default function LyricsEditor({
                 : (t("editor.approve_generate") || "Aprobar y generar")))}
             aria-describedby={qualityGuidanceAvailable ? "transcription-quality-review" : undefined}
             data-quality-status={qualityAnalysisPending ? "analysis_pending" : (transcriptionQuality?.decision || undefined)}
-            data-quality-review-required="false"
+            data-quality-review-required={campaignQualityReview ? "true" : "false"}
+            data-review-incomplete={campaignReviewIncomplete ? "true" : "false"}
             data-tour="editor-approve-floating"
             className="editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-brand-light px-5 text-sm font-semibold text-white shadow-xl shadow-brand/25 transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
           >
@@ -4457,7 +4613,7 @@ export default function LyricsEditor({
               <p id="transcription-quality-title" className="text-xs font-semibold text-amber-100">
                 {t("editor.quality_title") || "Revisión focalizada de transcripción"}
               </p>
-              {focusedQualityReview && (
+              {qualityConfirmationActive && (
                 <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
                   unconfirmedUnsafeWindows.length === 0
                     ? "bg-emerald-400/10 text-emerald-200 ring-emerald-300/25"
@@ -4518,7 +4674,7 @@ export default function LyricsEditor({
                         <span className="shrink-0 font-mono text-[11px] font-semibold tabular-nums text-white">{range}</span>
                         <span className="truncate text-[11px] text-ink-secondary">{unsafeWindowReasonLabel(qualityWindow, t)}</span>
                       </button>
-                      {focusedQualityReview && (
+                      {qualityConfirmationActive && (
                         <button
                           type="button"
                           onClick={() => confirmUnsafeWindow(qualityWindow)}
@@ -4546,9 +4702,11 @@ export default function LyricsEditor({
                 })}
               </ul>
             )}
-            {focusedQualityReview && (
+            {qualityConfirmationActive && (
               <p className="mt-2 text-[10px] leading-relaxed text-amber-100/60">
-                {t("editor.quality_reset_hint") || "Si cambiás la letra o los tiempos después de confirmar, deberás revisar estas zonas nuevamente."}
+                {campaignQualityReview
+                  ? "Editar el texto o timing de una línea confirma también las ventanas marcadas que toca."
+                  : (t("editor.quality_reset_hint") || "Si cambiás la letra o los tiempos después de confirmar, deberás revisar estas zonas nuevamente.")}
               </p>
             )}
           </div>
@@ -5705,6 +5863,7 @@ export default function LyricsEditor({
                 ref={(el) => { rowRefs.current[seg._id] = el; }}
                 {...(idx === 0 ? { "data-tour": "editor-list-row" } : {})}
                 data-testid={`lyric-row-${idx + 1}`}
+                data-line-confirmed={reviewedLineIds.includes(seg._id) ? "true" : "false"}
                 data-unsafe-candidate={isUnsafeCandidate ? "true" : "false"}
                 data-unsafe-marker={isUnsafeMarker ? "true" : "false"}
                 aria-describedby={isUnsafeMarker ? unsafeCandidateHintId : undefined}
@@ -5851,13 +6010,28 @@ export default function LyricsEditor({
                          word-jump abajo sea el único texto visible. Al
                          clickear el input para editar, focusedSegId cambia
                          y el texto vuelve. */
-                      className={`w-full px-3 py-2 rounded-xl bg-surface-1 border text-sm
+                      className={`w-full px-3 py-2 ${requireLineReview ? "pr-24" : ""} rounded-xl bg-surface-1 border text-sm
                         focus:border-brand/40 focus:outline-none hover:border-white/[0.08] transition-all
                         text-white
                         ${isUnsafeMarker
                           ? "border-amber-300/30"
                           : suggestion && !isApplied ? "border-amber-500/20" : "border-white/[0.04]"}`}
                     />
+                    {requireLineReview && (
+                      <button
+                        type="button"
+                        onClick={() => markLineReviewed(seg._id)}
+                        aria-pressed={reviewedLineIds.includes(seg._id)}
+                        aria-label={`${reviewedLineIds.includes(seg._id) ? "Línea confirmada" : "Confirmar línea"} ${idx + 1}`}
+                        className={`absolute right-1.5 top-1.5 rounded-lg px-2 py-1 text-[10px] font-semibold transition ${
+                          reviewedLineIds.includes(seg._id)
+                            ? "bg-emerald-400/10 text-emerald-200"
+                            : "bg-brand/15 text-brand-light hover:bg-brand/25"
+                        }`}
+                      >
+                        {reviewedLineIds.includes(seg._id) ? "Confirmada ✓" : "Confirmar"}
+                      </button>
+                    )}
                     {isUnsafeMarker && (
                       <div
                         id={unsafeCandidateHintId}
