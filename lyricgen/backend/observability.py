@@ -21,6 +21,78 @@ ENV = (os.environ.get("ENVIRONMENT")
        or "dev").lower().strip()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
+_TIMING_WORK_QUEUES = {
+    "transcription", "transcription_batch", "enterprise", "default", "canary",
+}
+
+
+def _float_env(name: str, default: float = 0.0) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, str(default)) or default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _int_env(name: str, default: int = 0) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default)) or default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    fallback = "1" if default else "0"
+    return os.environ.get(name, fallback).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def runtime_timing_config() -> dict[str, float | int | bool]:
+    """Canonical timing knobs that must agree across transcription services."""
+    return {
+        "lyric_hold_s": _float_env("LYRIC_HOLD_S"),
+        "lyric_lead_in_s": _float_env("LYRIC_LEAD_IN_S"),
+        "lyric_lead_in_ms": _int_env("LYRIC_LEAD_IN_MS"),
+        "stable_pitch_tail_enabled": _bool_env("STABLE_PITCH_TAIL_ENABLED"),
+    }
+
+
+def timing_config_parity(
+    release_rows: list[dict], api_config: dict | None = None,
+) -> dict:
+    """Fail-closed parity view for API and workers that can transcribe.
+
+    Render- and quality-only workers are intentionally excluded: these knobs
+    cannot affect their output. A transcription worker that does not publish
+    its timing config is unverifiable and therefore fails the operational gate.
+    """
+    configurations = {"api": dict(api_config or runtime_timing_config())}
+    missing: list[str] = []
+    for row in release_rows or []:
+        queues = set(row.get("queues") or [])
+        if not queues.intersection(_TIMING_WORK_QUEUES):
+            continue
+        service = str(row.get("service") or "worker")
+        worker = str(row.get("worker") or "unknown")
+        label = f"{service}:{worker}"
+        config = row.get("timing_config")
+        if not isinstance(config, dict):
+            missing.append(label)
+            continue
+        configurations[label] = dict(config)
+    identities = {
+        json.dumps(config, sort_keys=True, separators=(",", ":"))
+        for config in configurations.values()
+    }
+    match = not missing and len(identities) == 1
+    return {
+        "match": match,
+        "api": configurations["api"],
+        "participants": len(configurations),
+        "missing": sorted(missing),
+        "configurations": configurations,
+    }
+
 
 def _resolve_release() -> str:
     """Release tag attached to every Sentry event so a spike can be
@@ -770,6 +842,18 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
                             _down("worker_fleet_incoherent", allow_starting=False)
                         else:
                             _degrade("worker_fleet_incoherent")
+                    timing_parity = timing_config_parity(active_release_rows)
+                    snap["timing_config_parity"] = timing_parity
+                    if not timing_parity["match"]:
+                        reason = (
+                            "timing_config_unreported"
+                            if timing_parity["missing"]
+                            else "timing_config_mismatch"
+                        )
+                        if enforce_fleet_readiness:
+                            _down(reason, allow_starting=False)
+                        else:
+                            _degrade(reason)
                 except Exception:
                     snap["worker_releases"] = []
                     snap["fleet_coherent"] = False
