@@ -80,9 +80,28 @@ def test_no_window_replay_persists_text_only_suggestions(monkeypatch):
     assert result["status"] == "persisted"
     assert result["operator_proposal_count"] == 1
     assert captured["quality"]["retry"]["mutated_segments"] is False
+    assert captured["quality"]["segment_only_operator_replay_complete"] is True
     windows = captured["proposal"]["windows"]
     assert [window["suggestion_type"] for window in windows] == ["text"]
     assert windows[0]["proposed_segments"][0]["text"] == "JAMÁS"
+
+
+def test_text_only_replay_completion_does_not_relax_prior_quality_decision():
+    quality = {
+        "decision": "retry_failed",
+        "render_blocked": True,
+        "segment_only_operator_replay_complete": True,
+    }
+
+    assert quality_jobs._analysis_status_for_quality(quality) == "complete"
+    assert quality["decision"] == "retry_failed"
+    assert quality["render_blocked"] is True
+
+
+def test_failed_audio_replay_without_text_completion_stays_failed():
+    assert quality_jobs._analysis_status_for_quality({
+        "decision": "retry_failed",
+    }) == "failed"
 
 
 def test_structural_t4_shadow_is_observable_but_never_mutates(monkeypatch):
