@@ -7200,6 +7200,7 @@ async def _run_transcription_for_job(
     filename: str = "", live: bool = False,
     reference_required: bool = False,
     workload_class: str = "interactive",
+    parallel_audio_reference: bool = False,
 ):
     """Shared transcription pipeline: lrclib synced/plain → Whisper →
     hallucination recovery → segments. Used by both /transcribe (legacy
@@ -7250,6 +7251,8 @@ async def _run_transcription_for_job(
         reference_required=reference_required,
         workload_class=workload_class,
     )
+    _batch_reference_task = None
+    _batch_reference_resolved = False
 
     try:
         # Language is a per-job property. Tenant, role and geography never
@@ -7700,6 +7703,81 @@ async def _run_transcription_for_job(
         # "FA gap-driven re-fetch" block below `if fa_segs:`.
         lyrics_source: str | None = "lrclib" if (lrc and (lrc.get("plain") or "").strip()) else None
 
+        _reference_not_supplied = object()
+
+        async def _resolve_audio_reference(
+            precomputed=_reference_not_supplied,
+        ) -> str | None:
+            """Persist one complete-audio hypothesis outcome in local state.
+
+            Batch audio-only mode may start the provider call before ASR and
+            join it afterwards.  This helper is idempotent so the legacy
+            fallback can safely call it too when WhisperX is unavailable.
+            """
+            nonlocal lrc, lyrics_source, _batch_reference_resolved
+            if _batch_reference_resolved:
+                return str(_reference_candidate_state.get("text") or "") or None
+            _batch_reference_resolved = True
+            derived = None if precomputed is _reference_not_supplied else precomputed
+            if isinstance(derived, BaseException):
+                logger.warning(
+                    "[BATCH-REFERENCE] audio derivation failed: %s",
+                    type(derived).__name__,
+                )
+                derived = None
+            if precomputed is _reference_not_supplied:
+                try:
+                    from pipeline import (
+                        _gemini_derive_lyrics_from_full_audio as _derive_reference,
+                    )
+                    derived = await asyncio.to_thread(
+                        _derive_reference,
+                        tmp_path,
+                        artist=artist_hint,
+                        song=song_hint,
+                    )
+                except Exception as derive_exc:
+                    logger.warning(
+                        "[BATCH-REFERENCE] audio derivation failed: %s",
+                        type(derive_exc).__name__,
+                    )
+                    derived = None
+            if not derived:
+                _reference_candidate_state.update({
+                    "text": "",
+                    "provider": "gemini-2.5-flash-audio",
+                    "source_kind": "gemini_complete_audio_hypothesis_unavailable",
+                    "complete_audio_verified": True,
+                    "source_version": {
+                        "model": "gemini-2.5-flash",
+                        "audio_scope": "complete",
+                        "outcome": "unavailable",
+                    },
+                })
+                logger.warning(
+                    "[BATCH-REFERENCE] full-audio hypothesis unavailable; "
+                    "continuing audio-first transcription for mandatory "
+                    "manual review job=%s",
+                    job_id,
+                )
+                return None
+            if lrc is None:
+                lrc = {}
+            lrc["plain"] = str(derived)
+            lrc["synced"] = None
+            lyrics_source = "gemini_audio"
+            _reference_candidate_state.update({
+                "text": str(derived),
+                "provider": "gemini-2.5-flash-audio",
+                "source_kind": "gemini_complete_audio_derived",
+                "complete_audio_verified": True,
+                "source_version": {
+                    "model": "gemini-2.5-flash",
+                    "audio_scope": "complete",
+                },
+            })
+            return str(derived)
+
         # GENIUS FALLBACK (2026-05-25): when lrclib trae nothing OR trae
         # only `synced` without `plain` and the synced is suspiciously
         # short, try Genius as a second source. Genius's editorial
@@ -7852,62 +7930,25 @@ async def _run_transcription_for_job(
                     },
                 })
             else:
-                try:
+                if _batch_audio_only_reference and parallel_audio_reference:
                     from pipeline import (
                         _gemini_derive_lyrics_from_full_audio as _derive_reference,
                     )
-                    _derived = await asyncio.to_thread(
-                        _derive_reference,
-                        tmp_path,
-                        artist=artist_hint,
-                        song=song_hint,
+                    _batch_reference_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _derive_reference,
+                            tmp_path,
+                            artist=artist_hint,
+                            song=song_hint,
+                        )
                     )
-                except Exception as _derive_exc:
-                    logger.warning(
-                        "[BATCH-REFERENCE] audio derivation failed: %s",
-                        _derive_exc,
-                    )
-                    _derived = None
-                if not _derived:
-                    # A missing hypothesis is a review-priority signal, not a
-                    # transcription failure. WhisperX continues audio-first;
-                    # the worker persists an exact-audio-bound unavailable
-                    # marker and the queue ranks the song red/manual.
-                    _reference_candidate_state.update({
-                        "text": "",
-                        "provider": "gemini-2.5-flash-audio",
-                        "source_kind": (
-                            "gemini_complete_audio_hypothesis_unavailable"
-                        ),
-                        "complete_audio_verified": True,
-                        "source_version": {
-                            "model": "gemini-2.5-flash",
-                            "audio_scope": "complete",
-                            "outcome": "unavailable",
-                        },
-                    })
-                    logger.warning(
-                        "[BATCH-REFERENCE] full-audio hypothesis unavailable; "
-                        "continuing audio-first transcription for mandatory "
-                        "manual review job=%s",
+                    logger.info(
+                        "[BATCH-REFERENCE] complete-audio hypothesis started "
+                        "in parallel with blind ASR job=%s",
                         job_id,
                     )
                 else:
-                    if lrc is None:
-                        lrc = {}
-                    lrc["plain"] = _derived
-                    lrc["synced"] = None
-                    lyrics_source = "gemini_audio"
-                    _reference_candidate_state.update({
-                        "text": _derived,
-                        "provider": "gemini-2.5-flash-audio",
-                        "source_kind": "gemini_complete_audio_derived",
-                        "complete_audio_verified": True,
-                        "source_version": {
-                            "model": "gemini-2.5-flash",
-                            "audio_scope": "complete",
-                        },
-                    })
+                    await _resolve_audio_reference()
 
         # The upload wizard defaults to Auto.  Resolve that choice from the
         # canonical lyrics before the primary ASR runs, so English references
@@ -8110,14 +8151,42 @@ async def _run_transcription_for_job(
                         "[WC] live audio-as-truth — clean whisperX, "
                         "catalogue text remains available for reconciliation",
                     )
-                try:
-                    _wx_segs = await asyncio.to_thread(
-                        _wx_mod.transcribe_whisperx, _aa, lang,
-                        None if _drop_hint else (_canonical or None),
+                if _batch_reference_task is not None:
+                    from stage1_audio_parallel import run_asr_with_pending_reference
+                    _asr_outcome, _reference_outcome = (
+                        await run_asr_with_pending_reference(
+                            lambda: _wx_mod.transcribe_whisperx(
+                                _aa,
+                                lang,
+                                # The independently derived hypothesis never
+                                # becomes an ASR prompt.  It is joined below.
+                                None,
+                            ),
+                            _batch_reference_task,
+                        )
                     )
-                except Exception as e:
-                    logger.warning("[WC] whisperX raised: %s — falling through to legacy", e)
-                    _wx_segs = None
+                    _batch_reference_task = None
+                    await _resolve_audio_reference(_reference_outcome)
+                    if isinstance(_asr_outcome, BaseException):
+                        logger.warning(
+                            "[WC] whisperX raised: %s — falling through to legacy",
+                            type(_asr_outcome).__name__,
+                        )
+                        _wx_segs = None
+                    else:
+                        _wx_segs = _asr_outcome
+                    # Reference text becomes available only after blind ASR.
+                    # It may now participate in attestation/reconciliation.
+                    _canonical = ((lrc or {}).get("plain") or "").strip()
+                else:
+                    try:
+                        _wx_segs = await asyncio.to_thread(
+                            _wx_mod.transcribe_whisperx, _aa, lang,
+                            None if _drop_hint else (_canonical or None),
+                        )
+                    except Exception as e:
+                        logger.warning("[WC] whisperX raised: %s — falling through to legacy", e)
+                        _wx_segs = None
 
                 if _wx_segs:
                     # Generic hallucination filter (mega-segment, fuzzy
@@ -8826,6 +8895,18 @@ async def _run_transcription_for_job(
                 logger.info("[WC] whisperX returned no segments — falling through to legacy")
             else:
                 logger.info("[WC] WHISPERX_ENABLED off — using legacy FA path")
+
+        # WhisperX may be disabled by rollout or unavailable on this worker.
+        # Join the already-running complete-audio reference before entering
+        # the legacy ASR path, so every successful emit still carries the
+        # same exact-audio evidence contract.
+        if _batch_reference_task is not None:
+            (_reference_outcome,) = await asyncio.gather(
+                _batch_reference_task,
+                return_exceptions=True,
+            )
+            _batch_reference_task = None
+            await _resolve_audio_reference(_reference_outcome)
 
         # ─────────────────────────────────────────────────────────────────
         # LEGACY FA-primary pipeline (below). Kept as a safety net during
@@ -10085,6 +10166,16 @@ async def _run_transcription_for_job(
                          job_id)
         raise
     finally:
+        # An exception before the ASR/reference join must not leave an
+        # asyncio.to_thread task detached from this job's event loop.
+        if _batch_reference_task is not None:
+            try:
+                await asyncio.gather(
+                    _batch_reference_task,
+                    return_exceptions=True,
+                )
+            except Exception:
+                pass
         _end_recognition(_recognition_token)
         # tmp_dir holds intermediate slices (intro/body cuts) only — the
         # main audio (audio_path) is under job_dir and must survive until
@@ -12173,10 +12264,26 @@ class DeliveryQCIssueDecisionRequest(BaseModel):
     reason: str = Field(default="", max_length=300)
 
 
+class DeliveryQCExternalFindingRequest(BaseModel):
+    finding_id: str = Field(default="", max_length=160)
+    code: str = Field(default="", max_length=100)
+    category: str = Field(default="", max_length=160)
+    severity: str = Field(default="WARN", pattern="^(?i:PASS|WARN|FAIL)$")
+    frequency: str = Field(default="UNKNOWN", max_length=32)
+    description: str = Field(default="", max_length=2000)
+    actual: str = Field(default="", max_length=1000)
+    expected: str = Field(default="", max_length=1000)
+    timecode: str = Field(default="", max_length=32)
+    timecodes: list[str] = Field(default_factory=list, max_length=100)
+
+
 class DeliveryQCExternalResultRequest(BaseModel):
     finding_count: int = Field(ge=0, le=10000)
     report_id: str = Field(default="", max_length=160)
     source: str = Field(default="umg", pattern="^[a-zA-Z0-9_-]{1,32}$")
+    findings: list[DeliveryQCExternalFindingRequest] = Field(
+        default_factory=list, max_length=10000,
+    )
 
 
 def _merge_content_validation_choice(
@@ -12619,11 +12726,29 @@ async def record_delivery_qc_external_result(
     job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    raw_findings = [item.model_dump() for item in body.findings]
+    if raw_findings and len(raw_findings) != body.finding_count:
+        raise HTTPException(
+            status_code=422,
+            detail="external_qc_finding_count_mismatch",
+        )
+    from external_qc_regressions import (
+        evaluate_preflight_recall, normalize_external_report,
+    )
+    normalized = normalize_external_report(
+        source=body.source, report_id=body.report_id,
+        findings=raw_findings,
+    )
     report = dict(job.delivery_qc or {})
     history = list(report.get("external_results") or [])
     result = {
         "source": body.source, "report_id": body.report_id,
         "finding_count": body.finding_count,
+        "schema_version": normalized["schema_version"],
+        "findings": normalized["findings"],
+        "regression": evaluate_preflight_recall(
+            report.get("issues") or [], normalized["findings"],
+        ) if raw_findings else None,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "recorded_by": current_user["id"],
     }

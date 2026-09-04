@@ -155,3 +155,58 @@ def test_external_qc_result_is_admin_only_and_persists(
     db.expire_all()
     stored = db.query(Job).filter(Job.job_id == job.job_id).one()
     assert stored.delivery_qc["external_results"][-1]["report_id"] == "umg-2026-08-28"
+
+
+def test_external_qc_findings_are_normalized_and_become_a_regression_case(
+    client, admin_token, db,
+):
+    admin = _me(client, admin_token)
+    job = _job(db, admin)
+    report = dict(job.delivery_qc)
+    report["issues"] = [{
+        **report["issues"][0],
+        "code": "LYRIC_ORTHOGRAPHY_MISMATCH",
+        "actual": "JAMAS", "expected": "JAMÁS",
+    }]
+    job.delivery_qc = report
+    db.commit()
+
+    response = client.post(
+        f"/jobs/{job.job_id}/delivery-qc/external-result",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "source": "umg", "report_id": "umg-regression-1",
+            "finding_count": 1,
+            "findings": [{
+                "description": 'Misspelled in lyrics, "JAMAS" should be "JAMÁS"',
+                "timecode": "00:01:15:24",
+            }],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    result = response.json()["external_result"]
+    assert result["schema_version"] == "genly-external-qc-regression-v1"
+    assert result["findings"][0]["code"] == "LYRIC_ORTHOGRAPHY_MISMATCH"
+    assert result["regression"]["gate_passed"] is True
+    assert result["regression"]["recall"] == 1.0
+
+
+def test_external_qc_rejects_mismatched_finding_count(client, admin_token, db):
+    admin = _me(client, admin_token)
+    job = _job(db, admin)
+
+    response = client.post(
+        f"/jobs/{job.job_id}/delivery-qc/external-result",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "source": "umg", "report_id": "broken-count",
+            "finding_count": 2,
+            "findings": [{
+                "description": 'Misspelled in lyrics, "JAMAS" should be "JAMÁS"',
+            }],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "external_qc_finding_count_mismatch"
