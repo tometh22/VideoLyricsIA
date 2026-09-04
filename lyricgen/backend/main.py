@@ -7338,6 +7338,9 @@ async def _run_transcription_for_job(
         from timing_sources import VALID_TIMING_SOURCES, WHISPER_RAW
         from transcribe_postprocess import normalize_words as _normalize_words
         from transcribe_postprocess import dedup_collisions as _dedup_collisions
+        from transcribe_postprocess import (
+            strip_terminal_line_periods as _strip_terminal_line_periods,
+        )
 
         def _emit_segments(segments, source, *,
                             reference_lyrics: str = "",
@@ -7389,7 +7392,9 @@ async def _run_transcription_for_job(
             if deduped and segments and len(deduped) != len(segments):
                 logger.info("[EMIT] deduped collisions: %d → %d segments (job=%s)",
                             len(segments), len(deduped), job_id)
-            polished = _snap(_normalize_words(deduped))
+            polished = _strip_terminal_line_periods(
+                _snap(_normalize_words(deduped))
+            )
             anomalies = timing_anomalies(polished)
             if anomalies["regressions"] or anomalies["duplicate_starts"]:
                 logger.warning(

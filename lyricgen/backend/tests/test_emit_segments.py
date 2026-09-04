@@ -4,8 +4,9 @@ The chokepoint is the architectural invariant for Bugs B + D: every
 return path that ships segments MUST go through `_emit_segments`, which
 (a) calls `set_timing_source` so the job is never tagged with NULL,
 (b) runs `normalize_words` so FA word-stamps with score are preserved
-while Whisper-raw words are stripped, and (c) applies `_snap` (split +
-beat-snap + chorus repetitions).
+while Whisper-raw words are stripped, (c) applies `_snap` (split + beat-snap +
+chorus repetitions), and (d) removes lyric-video terminal periods from the
+final emitted lines.
 
 We test the invariant two ways:
 
@@ -87,6 +88,13 @@ def test_orchestrator_imports_timing_sources():
     src = _MAIN_PATH.read_text()
     assert "VALID_TIMING_SOURCES" in src, \
         "main.py must reference VALID_TIMING_SOURCES — registry is the source of truth"
+
+
+def test_orchestrator_applies_terminal_period_policy_at_emit_chokepoint():
+    src = _MAIN_PATH.read_text()
+    orchestrator = ast.get_source_segment(src, _find_orchestrator(ast.parse(src)))
+    assert "strip_terminal_line_periods as _strip_terminal_line_periods" in orchestrator
+    assert "_strip_terminal_line_periods(\n                _snap(_normalize_words(deduped))" in orchestrator
 
 
 def test_all_expected_source_constants_are_valid():

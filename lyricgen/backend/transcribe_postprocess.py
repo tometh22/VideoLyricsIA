@@ -11,6 +11,39 @@ strip when not (Whisper-1 raw — redundant with line-level timing and
 from __future__ import annotations
 
 
+def has_terminal_line_period(value: object) -> bool:
+    """Return whether a lyric line ends in one sentence period.
+
+    ASCII ellipses (two or more trailing periods) and the Unicode ellipsis
+    remain untouched.  Question/exclamation marks, commas and internal periods
+    are outside this policy.
+    """
+    text = str(value or "")
+    stripped = text.rstrip()
+    return stripped.endswith(".") and not stripped.endswith("..")
+
+
+def strip_terminal_line_periods(segments: list) -> list:
+    """Remove a single final period from unlocked lyric lines.
+
+    The transform is pure and changes only the literal period byte.  Human
+    timing/text gold is protected by either supported line-lock marker.
+    """
+    output = []
+    for raw in segments or []:
+        segment = dict(raw)
+        if segment.get("locked") is True or segment.get("operator_locked") is True:
+            output.append(segment)
+            continue
+        text = str(segment.get("text") or "")
+        stripped = text.rstrip()
+        if has_terminal_line_period(text):
+            period_index = len(stripped) - 1
+            segment["text"] = text[:period_index] + text[period_index + 1:]
+        output.append(segment)
+    return output
+
+
 def normalize_words(segments: list) -> list:
     """Apply the per-word stripping policy on a list of segment dicts.
 

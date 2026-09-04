@@ -504,6 +504,44 @@ def _timeline_occurrences(
     return found
 
 
+def _terminal_period_occurrences(
+    segments: Sequence[Mapping[str, Any]],
+) -> list[tuple[int, _Occurrence]]:
+    """Block delivery when an unlocked or locked lyric still ends in ``.``.
+
+    The post-process removes this style violation from unlocked lines.  The
+    preflight deliberately checks every delivered line, including locked human
+    rows, so a protected exception cannot pass unnoticed.
+    """
+    from transcribe_postprocess import has_terminal_line_period
+
+    found: list[tuple[int, _Occurrence]] = []
+    for index, row in enumerate(segments):
+        line = _segment_text(row)
+        if not has_terminal_line_period(line):
+            continue
+        found.append((index, _Occurrence(
+            code="LYRIC_TERMINAL_PERIOD",
+            severity="FAIL",
+            category="Typography",
+            summary="Lyric line ends with a period",
+            description=(
+                "Lyric-video lines must not end in a sentence period; remove "
+                "only the final period and preserve all other punctuation."
+            ),
+            seconds=_segment_start(row),
+            actual=".",
+            expected="",
+            detector="terminal_line_period_v1",
+            confidence=1.0,
+            auto_fixable=not (
+                row.get("locked") is True or row.get("operator_locked") is True
+            ),
+            evidence={"segment_index": index, "displayed_line": line},
+        )))
+    return found
+
+
 def _reference_health_occurrences(
     health: Mapping[str, Any] | None,
     segments: Sequence[Mapping[str, Any]],
@@ -622,6 +660,7 @@ def build_delivery_preflight(
         effective_fps = 30.0
     occurrences: list[tuple[int, _Occurrence]] = []
     occurrences.extend(_metadata_occurrences(meta, asset_row))
+    occurrences.extend(_terminal_period_occurrences(segment_rows))
     occurrences.extend(_timeline_occurrences(segment_rows, duration))
     occurrences.extend(_reference_health_occurrences(reference_health, segment_rows))
     occurrences.extend(_acoustic_finding_occurrences(acoustic_findings, segment_rows))

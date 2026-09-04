@@ -65,3 +65,11 @@ Antes de una campaña real, correr 5–10 canciones y luego 30. Verificar:
 Rollback: pausar campañas, poner `BATCH_CAMPAIGN_ENABLED=0` y dejar drenar las
 colas batch. No hace falta revertir la migración; las columnas nuevas son
 compatibles y todos los jobs históricos tienen `workload_class=interactive`.
+
+## Throughput — objetivo septiembre 2026
+
+La campaña UMG Agosto midió que el CTC ejecutado en CPU consume alrededor del
+35% del tiempo por canción. Con 8 réplicas y el proveedor estable no se escala
+más durante el lote actual. La mejora prioritaria de septiembre es mover CTC a
+GPU, conservando exactamente los mismos gates y comparando canciones/hora,
+latencia p50/p95 y paridad de alineación antes de cambiar el runtime.
