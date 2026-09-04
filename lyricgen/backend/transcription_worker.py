@@ -170,7 +170,8 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             # through an attached, energy-backed pitch run (±2 semitones).
             # This happens after word consistency, never trims, and skips
             # operator-locked boundaries.
-            if _stem:
+            from timing_review_suggestions import automatic_tail_enabled
+            if _stem and automatic_tail_enabled():
                 try:
                     from pathlib import Path
                     from timing_review_suggestions import (
