@@ -129,12 +129,77 @@ def test_rule_version_is_v2():
     assert m.ACTION == "semaforo.verdict.v2"
 
 
-def test_persists_risk_derived_score_during_blind_calibration():
+def test_hidden_score_is_not_the_constant_observe_mode_risk():
     m = _load()
     verdict = m.song_verdict(_quality(risk=0.1234567, score=None))
-    assert verdict["score"] == 87.654
-    assert verdict["score_source"] == "risk_derived"
+    assert verdict["score"] == 54.6
+    assert verdict["score_source"] == "stage1_signal_composite"
+    assert verdict["score_version"] == "stage1-confidence-v1"
     assert verdict["risk"] == 0.123457
+
+
+def test_hidden_score_reflects_consensus_coverage_reference_and_lid():
+    m = _load()
+    reference = {
+        "reference_text": "Audio-derived hypothesis",
+        "verification": {"complete_audio": True},
+    }
+    high = m.song_verdict(
+        _quality(
+            metrics={"audio_coverage": 0.99, "language": "es"},
+            reference_hypothesis=reference,
+        ),
+        segments=[
+            {"text": "line one", "consensus_sources": ["stem", "gemini"]},
+            {"text": "line two", "consensus_sources": ["mix", "gemini"]},
+        ],
+    )
+    low = m.song_verdict(
+        _quality(metrics={"audio_coverage": 0.72, "language": "unknown"}),
+        segments=[{"text": "line one"}, {"text": "line two"}],
+    )
+    assert high["score"] == 99.6
+    assert low["score"] == 28.8
+    assert high["score"] != low["score"]
+    assert set(high["score_components"]) == {
+        "line_consensus", "audio_coverage", "reference_available", "lid_known",
+    }
+    assert high["score_components"]["line_consensus"] == {
+        "value": 1.0,
+        "agreed_lines": 2,
+        "observed_lines": 2,
+        "source": "selected_line_consensus_sources",
+        "available": True,
+        "weight": 0.3,
+    }
+
+
+def test_hidden_score_uses_persisted_per_line_replay_consensus():
+    m = _load()
+    quality = _quality(retry={
+        "windows_resolved": 0,
+        "lora_shadow": {"comparisons": 4, "with_consensus": 3},
+    })
+    verdict = m.song_verdict(quality, segments=[{"text": "line"}])
+    component = verdict["score_components"]["line_consensus"]
+    assert component["value"] == 0.75
+    assert component["agreed_lines"] == 3
+    assert component["observed_lines"] == 4
+    assert component["source"] == "quality_replay_paired_line_consensus"
+
+
+def test_hidden_score_does_not_change_colour_gate():
+    m = _load()
+    red = _quality(metrics={"audio_coverage": 0.72, "language": "es"})
+    red["reference_hypothesis"] = {
+        "reference_text": "Audio-derived hypothesis",
+        "verification": {"complete_audio": True},
+    }
+    verdict = m.song_verdict(red, segments=[{
+        "text": "line", "consensus_sources": ["stem", "gemini"],
+    }])
+    assert verdict["score"] == 88.8
+    assert verdict["color"] == "red"
 
 
 def test_missing_audio_hypothesis_is_always_red_and_manual():

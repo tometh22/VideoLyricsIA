@@ -40,6 +40,13 @@ sys.path.insert(0, BACKEND_ROOT)
 
 RULE_VERSION = "semaforo-v2"
 ACTION = "semaforo.verdict.v2"
+SCORE_VERSION = "stage1-confidence-v1"
+SCORE_WEIGHTS = {
+    "line_consensus": 0.30,
+    "audio_coverage": 0.40,
+    "reference_available": 0.15,
+    "lid_known": 0.15,
+}
 # Señal de ruteo: segundos de voz cantada (VAD del stem, independiente del ASR)
 # que ningún cartel reclama. Reemplaza al desacuerdo LoRA↔base y a la etiqueta
 # "vivo": medido sobre el holdout el 2026-09-02, el desacuerdo ordenó al revés
@@ -64,7 +71,124 @@ def _num(value: Any) -> float | None:
     return value if value == value else None
 
 
-def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, Any]:
+def _bounded(value: Any) -> float | None:
+    number = _num(value)
+    return None if number is None else max(0.0, min(1.0, number))
+
+
+def _line_consensus_component(
+    quality: dict[str, Any], segments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return a bounded, auditable per-line independent-consensus signal.
+
+    Selected lines can carry the two agreeing source families directly.  The
+    quality replay also persists a paired per-window counter in ``lora_shadow``;
+    use that counter only when the selected rows contain no explicit consensus
+    annotations.  Missing observations score zero instead of being silently
+    replaced by the song-level calibration risk.
+    """
+    lyric_lines = [
+        row for row in segments
+        if isinstance(row, dict) and str(row.get("text") or "").strip()
+    ]
+    explicit = 0
+    for row in lyric_lines:
+        sources = {
+            str(value).strip().casefold()
+            for value in (row.get("consensus_sources") or [])
+            if str(value).strip()
+        }
+        if len(sources) >= 2:
+            explicit += 1
+    if explicit:
+        denominator = max(1, len(lyric_lines))
+        return {
+            "value": round(min(1.0, explicit / denominator), 6),
+            "agreed_lines": explicit,
+            "observed_lines": denominator,
+            "source": "selected_line_consensus_sources",
+            "available": True,
+        }
+
+    retry = quality.get("retry") if isinstance(quality.get("retry"), dict) else {}
+    shadow = retry.get("lora_shadow") if isinstance(retry.get("lora_shadow"), dict) else {}
+    comparisons = max(0, int(_num(shadow.get("comparisons")) or 0))
+    agreed = max(0, int(_num(shadow.get("with_consensus")) or 0))
+    if comparisons:
+        return {
+            "value": round(min(1.0, agreed / comparisons), 6),
+            "agreed_lines": min(agreed, comparisons),
+            "observed_lines": comparisons,
+            "source": "quality_replay_paired_line_consensus",
+            "available": True,
+        }
+    return {
+        "value": 0.0,
+        "agreed_lines": 0,
+        "observed_lines": 0,
+        "source": "unavailable",
+        "available": False,
+    }
+
+
+def _reference_available(quality: dict[str, Any]) -> bool:
+    hypothesis = quality.get("reference_hypothesis")
+    if bool(quality.get("reference_hypothesis_unavailable")) or not isinstance(
+        hypothesis, dict,
+    ):
+        return False
+    verification = hypothesis.get("verification")
+    return bool(
+        hypothesis.get("availability") != "unavailable"
+        and str(hypothesis.get("reference_text") or "").strip()
+        and isinstance(verification, dict)
+        and verification.get("complete_audio") is True
+    )
+
+
+def _confidence_score(
+    quality: dict[str, Any], metrics: dict[str, Any],
+    segments: list[dict[str, Any]],
+) -> tuple[float, dict[str, Any]]:
+    consensus = _line_consensus_component(quality, segments)
+    coverage = _bounded(metrics.get("audio_coverage"))
+    reference_available = _reference_available(quality)
+    language = str(metrics.get("language") or "unknown").strip().casefold()
+    lid_known = language not in {"", "unknown", "none", "auto"}
+    components: dict[str, Any] = {
+        "line_consensus": {
+            **consensus,
+            "weight": SCORE_WEIGHTS["line_consensus"],
+        },
+        "audio_coverage": {
+            "value": round(coverage or 0.0, 6),
+            "weight": SCORE_WEIGHTS["audio_coverage"],
+            "available": coverage is not None,
+        },
+        "reference_available": {
+            "value": 1.0 if reference_available else 0.0,
+            "weight": SCORE_WEIGHTS["reference_available"],
+            "available": True,
+        },
+        "lid_known": {
+            "value": 1.0 if lid_known else 0.0,
+            "weight": SCORE_WEIGHTS["lid_known"],
+            "available": True,
+            "language": language or "unknown",
+        },
+    }
+    score = 100.0 * sum(
+        float(component["value"]) * float(component["weight"])
+        for component in components.values()
+    )
+    return round(score, 3), components
+
+
+def song_verdict(
+    quality: dict | None,
+    paired: dict | None = None,
+    segments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Pure rule: quality payload -> persisted blind routing verdict.
 
     ``paired`` optionally supplies the pilot-scale disagreement (turbo base vs
@@ -73,10 +197,10 @@ def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, 
     WhisperX against LoRA and is not on the pilot's scale.
     """
     quality = quality if isinstance(quality, dict) else {}
-    from machine_evidence import quality_training_signal
-
-    training_signal = quality_training_signal(quality)
     metrics = quality.get("metrics") if isinstance(quality.get("metrics"), dict) else {}
+    confidence_score, score_components = _confidence_score(
+        quality, metrics, [row for row in (segments or []) if isinstance(row, dict)],
+    )
     router = metrics.get("difficulty_router") if isinstance(metrics.get("difficulty_router"), dict) else {}
     # El desacuerdo se conserva SÓLO como dato informativo: LoRA y el router
     # están congelados y su escala nunca se validó fuera de la muestra.
@@ -149,9 +273,15 @@ def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, 
     rank_key = voiced_gap_s if voiced_gap_s is not None else 9_999.0
     return {
         "rule_version": RULE_VERSION, "color": color, "reasons": reasons,
-        "score": training_signal["score"],
-        "score_source": training_signal["score_source"],
-        "risk": training_signal["risk"],
+        "score": confidence_score,
+        "score_source": "stage1_signal_composite",
+        "score_version": SCORE_VERSION,
+        "score_components": score_components,
+        "risk": (
+            round(bounded_risk, 6)
+            if (bounded_risk := _bounded(quality.get("risk"))) is not None
+            else None
+        ),
         "inputs": inputs, "rank_key": rank_key,
     }
 
@@ -211,7 +341,11 @@ def main() -> int:
         emitted_at = datetime.now(timezone.utc).isoformat()
         rows = []
         for job in jobs:
-            verdict = song_verdict(job.transcription_quality, paired_by_job.get(job.job_id))
+            verdict = song_verdict(
+                job.transcription_quality,
+                paired_by_job.get(job.job_id),
+                job.segments_json,
+            )
             prior = existing.get(job.job_id)
             reused = bool(prior) and not args.force
             record = {

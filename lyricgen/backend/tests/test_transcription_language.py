@@ -9,6 +9,7 @@ import pytest
 from transcription_language import (
     detect_text_language,
     detect_text_languages,
+    diagnose_language_state,
     normalize_language,
     resolve_transcription_language,
 )
@@ -83,6 +84,32 @@ def test_bilingual_reference_stays_multi_label():
     assert detect_text_languages(reference) == {"es", "en"}
     assert detect_text_language(reference) is None
     assert resolve_transcription_language("", reference_text=reference) is None
+
+
+def test_lid_diagnostic_separates_mixed_and_insufficient_abstentions():
+    mixed = (
+        "Yo tengo una razón para cambiar la noche y nunca volver atrás.\n"
+        "The night is falling and I can hear you because you will leave me alone."
+    )
+    assert diagnose_language_state(mixed) == {
+        "classification": "mixed_language_abstention",
+        "persisted_language": None,
+        "detected_languages": ["en", "es"],
+        "mixed_language": True,
+    }
+    assert diagnose_language_state("oh oh sister midnight") == {
+        "classification": "insufficient_evidence_abstention",
+        "persisted_language": None,
+        "detected_languages": [],
+        "mixed_language": False,
+    }
+
+
+def test_lid_diagnostic_finds_unknown_persistence_failure():
+    diagnostic = diagnose_language_state(SPANISH_REFERENCE, "unknown")
+    assert diagnostic["classification"] == "lid_persistence_failure"
+    assert diagnostic["detected_languages"] == ["es"]
+    assert diagnose_language_state(SPANISH_REFERENCE, "es")["classification"] == "known"
 
 
 def test_repeated_common_token_does_not_misclassify_los_pericos_as_portuguese():
