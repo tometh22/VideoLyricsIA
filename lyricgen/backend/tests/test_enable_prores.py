@@ -231,3 +231,69 @@ def test_enable_prores_idempotent_overwrites_umg_spec(monkeypatch, client, admin
     assert fresh.umg_spec["frame_size"] == "HD"
     assert fresh.umg_spec["fps"] == pytest.approx(29.97)
     assert fresh.umg_spec["prores_profile"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Qué variantes se PRE-generan
+# ---------------------------------------------------------------------------
+#
+# Medido sobre `audit_log` de producción (jun a sep-2026):
+#
+#   umg_master   284 descargas · 95 jobs distintos  → 92% de las entregas vivas
+#   umg_short      4 descargas ·  2 jobs distintos  → 2%, y CERO desde junio
+#
+# Pre-generar el short manda 0,58 GB por video a R2 (egress de Railway, $0,05/GB)
+# y los deja ahí para siempre — el bucket no tiene regla de expiración y crece
+# ~$15/mes de costo NUEVO cada mes. Por dos descargas en cuatro meses.
+
+def test_el_short_no_se_pregenera_por_defecto(monkeypatch):
+    """El master sí, el short no. Es la diferencia entre 92% y 2% de uso."""
+    import importlib
+    import queue_jobs
+    monkeypatch.delenv("PRORES_PREWARM_TYPES", raising=False)
+    importlib.reload(queue_jobs)
+    assert queue_jobs.PRORES_PREWARM_TYPES == ("umg_master",)
+
+
+def test_un_pedido_explicito_del_usuario_se_respeta_igual(monkeypatch):
+    """`force=True` es alguien apretando Descargar: no se le niega nunca.
+
+    Sin esta excepción, sacar el short de la pre-generación lo volvería
+    INDESCARGABLE en vez de perezoso, que es un bug de producto, no un
+    ahorro.
+    """
+    import importlib
+    import queue_jobs
+    monkeypatch.delenv("PRORES_PREWARM_TYPES", raising=False)
+    importlib.reload(queue_jobs)
+
+    llamadas = []
+
+    class _Q:
+        def enqueue(self, *a, **k):
+            llamadas.append(k.get("args") or a)
+            class _J:  # noqa: D401
+                id = "rq-1"
+            return _J()
+
+    # `q_enterprise` sale de `_init_redis()`, no es atributo del módulo.
+    monkeypatch.setattr(queue_jobs, "_init_redis", lambda: (None, None, _Q()))
+    monkeypatch.setattr(queue_jobs, "queue_depth", lambda *_a, **_k: 0)
+
+    # Sin force: el short se saltea.
+    assert queue_jobs.enqueue_prores_prewarm("j1", "umg_short") is None
+    # Con force: se encola igual.
+    assert queue_jobs.enqueue_prores_prewarm("j1", "umg_short", force=True) is not None
+
+
+def test_se_puede_volver_atras_sin_deploy(monkeypatch):
+    """La lista es una env var: reponer el short no exige tocar código."""
+    import importlib
+    import queue_jobs
+    monkeypatch.setenv("PRORES_PREWARM_TYPES", "umg_master,umg_short")
+    importlib.reload(queue_jobs)
+    try:
+        assert "umg_short" in queue_jobs.PRORES_PREWARM_TYPES
+    finally:
+        monkeypatch.delenv("PRORES_PREWARM_TYPES", raising=False)
+        importlib.reload(queue_jobs)

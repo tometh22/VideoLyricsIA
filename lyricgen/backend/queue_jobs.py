@@ -181,6 +181,30 @@ def transcription_quality_rollout_eligible(
 # tenant currently triggering the umg/both delivery_profile.
 PRORES_PREWARM_ENABLED = os.environ.get("PRORES_PREWARM", "1").lower() not in ("0", "false", "no")
 
+# QUÉ variantes se pre-generan. El prewarm ahorra la espera de ffmpeg (60-300 s)
+# la primera vez que alguien baja el ProRes; pre-generar una variante que nadie
+# baja es storage y egress puro.
+#
+# Medido sobre `audit_log` de producción (jun a sep-2026), descargas por tipo:
+#
+#   umg_master   284 descargas · 95 jobs distintos  → 92% de las entregas vivas
+#   umg_short      4 descargas ·  2 jobs distintos  → 2%, y CERO desde junio
+#
+# El master se usa y su prewarm está justificado. El short se genera para
+# todos y lo bajaron dos veces en cuatro meses: son 0,58 GB por video que
+# viajan a R2 (egress de Railway) y se quedan ahí para siempre.
+#
+# No se rompe nada al sacarlo: `ensure_prores_exists()` lo genera bajo demanda
+# en el `/download`, igual que hoy hace cuando el prewarm hizo skip por
+# backpressure de cola. Sólo cambia que la primera descarga espera el ffmpeg.
+#
+# Reversible sin deploy: `PRORES_PREWARM_TYPES=umg_master,umg_short`.
+PRORES_PREWARM_TYPES = tuple(
+    t.strip() for t in
+    os.environ.get("PRORES_PREWARM_TYPES", "umg_master").split(",")
+    if t.strip()
+)
+
 # Backpressure: when the enterprise queue already has more than this
 # many jobs waiting, skip new prewarm enqueues. The lazy /download path
 # (with its 202+Retry-After contract) handles the wait gracefully, so
@@ -1832,6 +1856,12 @@ def enqueue_prores_prewarm(
         return None
     if file_type not in ("umg_master", "umg_short"):
         logger.warning("[PRORES] prewarm: unsupported file_type %r", file_type)
+        return None
+    # `force=True` es un pedido explícito del usuario: se respeta siempre,
+    # aunque la variante no esté en la lista de pre-generación.
+    if file_type not in PRORES_PREWARM_TYPES and not force:
+        logger.info("[PRORES] prewarm: %s no está en PRORES_PREWARM_TYPES, "
+                    "se genera bajo demanda", file_type)
         return None
     _, _, q_enterprise = _init_redis()
     if q_enterprise is None:
