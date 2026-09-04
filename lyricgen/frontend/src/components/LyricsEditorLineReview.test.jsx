@@ -81,7 +81,7 @@ describe("LyricsEditor — gate de confirmación por línea", () => {
     expect(approve).toBeDisabled();
     expect(approve).toHaveAttribute("data-review-incomplete", "true");
     expect(screen.getByTestId("line-review-progress")).toHaveTextContent("0/2");
-    expect(screen.getByText(/no hace falta aprobar para guardarlos/i)).toBeInTheDocument();
+    expect(screen.getByText(/no hace falta aprobar para conservarlos/i)).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Letra de la línea 1"), {
       target: { value: "Primera línea corregida" },
@@ -133,14 +133,14 @@ describe("LyricsEditor — gate de confirmación por línea", () => {
     secondRow.getBoundingClientRect = () => ({ top: 900, bottom: 950 });
     Object.defineProperty(window, "innerHeight", { configurable: true, value: 800 });
 
-    await userEvent.click(screen.getByRole("button", { name: "Confirmar bloque visible" }));
+    await userEvent.click(screen.getByRole("button", { name: "Confirmar líneas visibles" }));
     expect(screen.getByTestId("line-review-progress")).toHaveTextContent("1/2");
     expect(screen.getByTestId("campaign-window-review-progress")).toHaveTextContent("1/2");
     expect(firstRow).toHaveAttribute("data-line-confirmed", "true");
     expect(secondRow).toHaveAttribute("data-line-confirmed", "false");
 
     secondRow.getBoundingClientRect = () => ({ top: 200, bottom: 250 });
-    await userEvent.click(screen.getByRole("button", { name: "Confirmar bloque visible" }));
+    await userEvent.click(screen.getByRole("button", { name: "Confirmar líneas visibles" }));
     expect(screen.getByTestId("line-review-progress")).toHaveTextContent("2/2");
     expect(screen.getByTestId("campaign-window-review-progress")).toHaveTextContent("2/2");
 
@@ -158,6 +158,20 @@ describe("LyricsEditor — gate de confirmación por línea", () => {
     const acknowledgement = JSON.parse(acknowledgementCall[1].body);
     expect(acknowledgement.confirmed_window_ids).toEqual(["visible-window", "hidden-window"]);
     expect(onApprove).toHaveBeenCalledTimes(1);
+  });
+
+  it("expone al encabezado la misma salida que guarda antes de volver", async () => {
+    const onBack = vi.fn();
+    const onRegisterSafeExit = vi.fn();
+    render(<LyricsEditor {...props({ onBack, onRegisterSafeExit })} />);
+
+    await waitFor(() => expect(onRegisterSafeExit).toHaveBeenCalledWith(expect.any(Function)));
+    const safeExit = onRegisterSafeExit.mock.calls.find(
+      ([handler]) => typeof handler === "function",
+    )[0];
+    await act(async () => { await safeExit(); });
+
+    expect(onBack).toHaveBeenCalledTimes(1);
   });
 });
 

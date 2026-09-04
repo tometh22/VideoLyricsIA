@@ -682,7 +682,8 @@ export default function LyricsEditor({
   referenceLinks = [], referenceUnavailable = false,
   coverageWarning = false, transcriptionQuality: transcriptionQualityProp = null, recoverySource = "",
   languageConflict = false, languageUncertain = false, mixedLanguage = false,
-  onApprove, onBack, isBatch = false, batchProgress = "",
+  onApprove, onBack, onRegisterSafeExit = null,
+  isBatch = false, batchProgress = "",
   user = null,
   font = "",
   textCase = "upper",
@@ -3867,6 +3868,9 @@ export default function LyricsEditor({
       toast({ message: "No hay líneas visibles para confirmar.", tone: "info" });
       return;
     }
+    const newlyConfirmed = visibleIds.filter(
+      (id) => !reviewedLineIds.includes(id),
+    ).length;
     const idSet = new Set(visibleIds);
     setReviewedLineIds((current) => [...new Set([...current, ...visibleIds])]);
     const visibleSegments = sanitizedEdited.filter((segment) => idSet.has(segment._id));
@@ -3885,7 +3889,13 @@ export default function LyricsEditor({
       line_count: visibleIds.length,
       window_count: visibleWindowIds.length,
     });
-  }, [qualityReviewKey, sanitizedEdited, toast, trackEditorEvent, unsafeWindows]);
+    toast({
+      message: newlyConfirmed > 0
+        ? `${newlyConfirmed} ${newlyConfirmed === 1 ? "línea visible confirmada" : "líneas visibles confirmadas"}.`
+        : "Las líneas visibles ya estaban confirmadas.",
+      tone: "success",
+    });
+  }, [qualityReviewKey, reviewedLineIds, sanitizedEdited, toast, trackEditorEvent, unsafeWindows]);
   const campaignReviewIncomplete = requireLineReview && (
     edited.some((segment) => !reviewedLineIds.includes(segment._id))
     || unconfirmedUnsafeWindows.length > 0
@@ -4116,6 +4126,16 @@ export default function LyricsEditor({
     if (result?.ok === false && result.reason === "stale-revision") return;
     onBack?.();
   }, [flushPendingSave, onBack]);
+
+  // The campaign header lives in App, outside this component. Register the
+  // same save-aware exit used by the editor's back arrow so its header action
+  // cannot bypass a pending autosave or leave this review mounted over the
+  // queue route.
+  useEffect(() => {
+    if (!onRegisterSafeExit) return undefined;
+    onRegisterSafeExit(handleBackSafely);
+    return () => onRegisterSafeExit(null);
+  }, [handleBackSafely, onRegisterSafeExit]);
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
 
@@ -4439,11 +4459,11 @@ export default function LyricsEditor({
               onClick={confirmVisibleReviewBlock}
               className="rounded-lg bg-brand px-3 py-2 font-semibold text-white transition hover:bg-brand-light"
             >
-              Confirmar bloque visible
+              Confirmar líneas visibles
             </button>
           </div>
           <p className="mt-2 leading-relaxed text-ink-secondary">
-            Tus cambios se guardan automáticamente. Confirmar registra la revisión; no hace falta aprobar para guardarlos.
+            Después de escuchar las líneas que ves, confirmalas acá. Tus cambios se guardan automáticamente; no hace falta aprobar para conservarlos.
           </p>
           {campaignQualityReview && (
             <p className="mt-1 text-amber-100" data-testid="campaign-window-review-progress">

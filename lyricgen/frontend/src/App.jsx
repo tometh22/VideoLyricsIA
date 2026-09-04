@@ -1769,6 +1769,10 @@ export default function App() {
   // transient API/DB failure never strands the timing editor without audio.
   const reviewAudioRequestSequenceRef = useRef(0);
   const reviewReactiveAudioRequestRef = useRef(false);
+  const campaignReviewSafeExitRef = useRef(null);
+  const registerCampaignReviewSafeExit = useCallback((handler) => {
+    campaignReviewSafeExitRef.current = typeof handler === "function" ? handler : null;
+  }, []);
   const retryTranscriptionReviewAudio = useCallback(async (jobId, { reason = "initial", preferOriginal = false } = {}) => {
     if (!jobId) return;
     const preventive = reason === "signed_url_expiring";
@@ -3964,6 +3968,7 @@ export default function App() {
               editor_revision: Number.isInteger(saveMeta.editorRevision)
                 ? saveMeta.editorRevision
                 : (Number.isInteger(saveMeta.baseRevision) ? saveMeta.baseRevision : 0),
+              editor_version_id: saveMeta.editorVersionId || null,
               confirmed_line_ids: confirmedLineIds,
               lyrics_confirmed: true,
               timings_confirmed: true,
@@ -5566,6 +5571,14 @@ export default function App() {
     }
   }, [alert, currentReview?.transcribeJobId]);
 
+  const handleCampaignReviewExit = useCallback(() => {
+    const review = currentReview;
+    setCurrentReview(null);
+    wizardPersistence.clear();
+    if (review) segmentsStore.evict(reviewStoreKey(review));
+    navigate("/admin/cola");
+  }, [currentReview, navigate]);
+
   // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
   // before launching generation. Empty state → redirect home.
@@ -5689,10 +5702,14 @@ export default function App() {
                 {currentReview.campaignId && (
                   <button
                     type="button"
-                    onClick={() => navigate("/admin/cola")}
+                    onClick={() => {
+                      const safeExit = campaignReviewSafeExitRef.current;
+                      if (safeExit) void safeExit();
+                      else handleCampaignReviewExit();
+                    }}
                     className="btn-primary shrink-0 px-4 py-2 text-xs"
                   >
-                    Siguiente
+                    Guardar y volver a la cola
                   </button>
                 )}
                 <button
@@ -5778,8 +5795,11 @@ export default function App() {
             mixedLanguage={!!currentReview.mixedLanguage}
             onApprove={handleApproveLyrics}
             submitLabel={currentReview.campaignId ? "Aprobar letra y timing" : null}
+            onRegisterSafeExit={currentReview.campaignId
+              ? registerCampaignReviewSafeExit
+              : null}
             onBack={currentReview.campaignId
-              ? () => navigate("/admin/cola")
+              ? handleCampaignReviewExit
               : handleBackInReview}
             // Post-render edit: cuando editingJobId está set, el autosave
             // de /save-segments va al job real (no al transcribeJob, que

@@ -899,7 +899,12 @@ def approve_campaign_lyrics(
     job = db.query(Job).filter(
         Job.job_id == job_id,
         Job.campaign_id == campaign.id,
-        Job.tenant_id == current_user["tenant_id"],
+        # `_campaign_or_404` already enforces tenant isolation for ordinary
+        # reviewers and deliberately lets platform admins open a campaign
+        # across tenants. Re-applying the actor's tenant here made that admin
+        # access read-only by accident: editor/autosave worked, but approval
+        # returned a misleading 404. Bind the job to the campaign tenant.
+        Job.tenant_id == campaign.tenant_id,
     ).with_for_update().first()
     if job is None:
         raise HTTPException(status_code=404, detail="Campaign job not found.")

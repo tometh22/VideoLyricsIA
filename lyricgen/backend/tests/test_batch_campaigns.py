@@ -381,8 +381,9 @@ def test_render_capacity_fails_closed_before_human_approval(db):
 
 
 @pytest.mark.parametrize("reference_available", [True, False])
+@pytest.mark.parametrize("admin_tenant", ["campaign", "platform-admin"])
 def test_human_approval_binds_every_line_audio_and_editor_revision(
-    db, monkeypatch, reference_available,
+    db, monkeypatch, reference_available, admin_tenant,
 ):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
     campaign = _campaign(db, 1)
@@ -437,7 +438,12 @@ def test_human_approval_binds_every_line_audio_and_editor_revision(
             timings_confirmed=True,
             heard_against_audio=True,
         ),
-        {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"},
+        {
+            "id": user.id,
+            "tenant_id": campaign.tenant_id
+            if admin_tenant == "campaign" else admin_tenant,
+            "role": "admin",
+        },
         db,
     )
     assert response["status"] == "lyrics_approved"
