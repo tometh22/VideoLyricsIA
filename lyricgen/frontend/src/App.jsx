@@ -3947,9 +3947,13 @@ export default function App() {
     // the generic wizard's approve→generate transition: backgrounds and
     // renders are a separate, later stage triggered outside this screen.
     if (r.campaignId && r.transcribeJobId) {
-      const confirmedLineIds = (editedSegments || []).map((segment) => (
-        segment.segment_id || segment.id || segment._id
-      )).filter(Boolean);
+      // Never infer review from mere presence in the submitted document.
+      // LyricsEditor supplies only the identities explicitly confirmed (or
+      // deliberately edited) by the operator; the backend then compares this
+      // ordered set with the exact durable editor revision and fails closed.
+      const confirmedLineIds = Array.isArray(saveMeta.confirmedLineIds)
+        ? saveMeta.confirmedLineIds
+        : [];
       try {
         const response = await authFetch(
           `${API}/batch/campaigns/${r.campaignId}/jobs/${r.transcribeJobId}/approve-lyrics`,
@@ -3978,6 +3982,7 @@ export default function App() {
         wizardPersistence.clear();
         segmentsStore.evict(reviewStoreKey(r));
         localStorage.removeItem(`genly:line-review:${r.transcribeJobId}`);
+        localStorage.removeItem(`genly:quality-window-review:${r.transcribeJobId}`);
         setCurrentReview(null);
         navigate(`/admin/cola?approved=${encodeURIComponent(r.transcribeJobId)}`, {
           replace: true,
