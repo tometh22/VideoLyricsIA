@@ -147,6 +147,25 @@ def test_clean_delivery_passes():
     assert report["issues"] == []
 
 
+def test_terminal_line_period_preflight_blocks_only_single_final_periods():
+    report = build_delivery_preflight(
+        metadata={"artist": "Artist", "title": "Song"},
+        asset={"rendered_artist": "Artist", "rendered_title": "Song"},
+        segments=[
+            {"start": 1, "end": 2, "text": "Termina."},
+            {"start": 3, "end": 4, "text": "Sigue..."},
+            {"start": 5, "end": 6, "text": "¿Pregunta?"},
+            {"start": 7, "end": 8, "text": "Humana.", "locked": True},
+        ],
+    )
+
+    issue = next(row for row in report["issues"] if row["code"] == "LYRIC_TERMINAL_PERIOD")
+    assert report["decision"] == "BLOCK"
+    assert issue["occurrence_count"] == 2
+    assert issue["timecodes"] == ["00:00:01:00", "00:00:07:00"]
+    assert issue["auto_fixable"] is False
+
+
 def test_reference_health_blocks_wrong_or_incomplete_catalogue_text():
     report = build_delivery_preflight(
         metadata={"title": "Wrong catalogue"},
