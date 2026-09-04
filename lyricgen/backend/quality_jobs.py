@@ -128,6 +128,10 @@ def _segment_only_operator_replay(
     retry["mutated_segments"] = False
     quality["retry"] = retry
     quality["operator_suggestions_persisted"] = False
+    # This replay completed its full, intentionally text-only scope. Preserve
+    # the prior quality decision/render gate, but do not let a historical
+    # ``retry_failed`` decision mislabel this successful attempt as failed.
+    quality["segment_only_operator_replay_complete"] = True
     persisted = _persist_if_current(
         job_id, expected_revision, expected_segments_hash, quality,
         expected_audio_revision=expected_audio_revision,
@@ -141,6 +145,13 @@ def _segment_only_operator_replay(
         "decision": quality.get("decision"),
         "operator_proposal_count": int(telemetry.get("proposal_count") or 0),
     }
+
+
+def _analysis_status_for_quality(quality: dict) -> str:
+    """Separate attempt completion from the conservative quality decision."""
+    if quality.get("segment_only_operator_replay_complete") is True:
+        return "complete"
+    return "failed" if quality.get("decision") == "retry_failed" else "complete"
 
 
 def _attach_structural_t4_shadow(quality: dict, segments: list[dict]) -> dict:
@@ -629,9 +640,7 @@ def _persist_if_current(job_id: str, expected_revision: int,
         ):
             if durable_key in previous:
                 quality[durable_key] = previous[durable_key]
-        quality["analysis_status"] = (
-            "failed" if quality.get("decision") == "retry_failed" else "complete"
-        )
+        quality["analysis_status"] = _analysis_status_for_quality(quality)
         quality["analysis_pending"] = False
         if previous.get("analysis_job_id"):
             quality["analysis_job_id"] = str(previous["analysis_job_id"])
