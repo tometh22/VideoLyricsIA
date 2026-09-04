@@ -151,6 +151,33 @@ def test_individual_failure_does_not_stop_the_campaign_wave(db):
     assert batch._queue_state("lyrics", failed, None) == "failed"
 
 
+def test_admin_lists_and_opens_campaigns_across_tenants(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    user = db.query(User).first()
+    admin = {"id": user.id, "tenant_id": "platform-admin", "role": "admin"}
+
+    listed = batch.list_campaigns(current_user=admin, db=db)
+
+    assert campaign.id in {row["id"] for row in listed["items"]}
+    assert batch.get_campaign(
+        campaign.id, current_user=admin, db=db,
+    )["id"] == campaign.id
+
+
+def test_non_admin_cannot_open_another_tenants_campaign(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    monkeypatch.setenv("BATCH_CAMPAIGN_SCOPES", "another-tenant")
+    campaign = _campaign(db, 1)
+    user = db.query(User).first()
+    other_tenant = {"id": user.id, "tenant_id": "another-tenant", "role": "user"}
+
+    with pytest.raises(HTTPException) as exc:
+        batch.get_campaign(campaign.id, current_user=other_tenant, db=db)
+
+    assert exc.value.status_code == 404
+
+
 def test_render_capacity_is_separate_and_bounded(db):
     campaign = _campaign(db, 11)
     items = db.query(BatchCampaignItem).filter(

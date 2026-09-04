@@ -1,5 +1,5 @@
 import { useRef, useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useI18n } from "../../i18n";
 import { useChangelog } from "./useChangelog";
 import ReleaseVisual from "./ReleaseVisual";
@@ -8,19 +8,25 @@ import useDialogA11y from "../../hooks/useDialogA11y";
 export default function WhatsNewModal({ user }) {
   const { t } = useI18n();
   const navigate = useNavigate();
+  const { pathname } = useLocation();
   const { modalEntry, dismissModal } = useChangelog();
   const [open, setOpen] = useState(false);
   const closeButtonRef = useRef(null);
+  const isReviewDelivery = pathname === "/admin/cola" || pathname.startsWith("/review/");
 
   useEffect(() => {
-    if (user && modalEntry) setOpen(true);
-  }, [user, modalEntry]);
+    if (isReviewDelivery) {
+      setOpen(false);
+    } else if (user && modalEntry) {
+      setOpen(true);
+    }
+  }, [user, modalEntry, isReviewDelivery]);
 
   const close = () => { setOpen(false); dismissModal(); };
 
   const dialogRef = useDialogA11y({ open, onClose: close, initialFocusRef: closeButtonRef });
 
-  if (!open || !modalEntry) return null;
+  if (isReviewDelivery || !open || !modalEntry) return null;
   const e = modalEntry;
   const modalFeatures = Array.isArray(e.modalFeatures) ? e.modalFeatures : [];
 
