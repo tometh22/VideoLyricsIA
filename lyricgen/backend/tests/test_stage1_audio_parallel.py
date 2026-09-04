@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from pathlib import Path
 
 from stage1_audio_parallel import run_asr_with_pending_reference
 
@@ -38,3 +39,12 @@ def test_reference_failure_does_not_discard_valid_asr():
     asr_result, reference_result = asyncio.run(run())
     assert asr_result == [{"text": "heard", "start": 0, "end": 1}]
     assert isinstance(reference_result, RuntimeError)
+
+
+def test_late_audio_reference_initializes_cleanup_fallback_state():
+    source = (Path(__file__).parents[1] / "main.py").read_text()
+    join = source.index("await run_asr_with_pending_reference")
+    fallback = source.index("_cleaned\n", join)
+    initialization = source.rfind("_cleaned = None", 0, fallback)
+
+    assert 0 <= initialization < join < fallback
