@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import LyricsEditor, { visibleReviewLineIds } from "./LyricsEditor";
@@ -45,6 +45,34 @@ afterEach(() => {
 });
 
 describe("LyricsEditor — gate de confirmación por línea", () => {
+  it("no recorta ni persiste timings al abrir una campaña de 41 líneas", async () => {
+    const longSegments = Array.from({ length: 41 }, (_, index) => ({
+      segment_id: `long-line-${index + 1}`,
+      start: index * 10,
+      end: index * 10 + 9,
+      text: `Línea ${index + 1}`,
+    }));
+    const originalEnds = longSegments.map((segment) => segment.end);
+    const onPersistSegments = vi.fn().mockResolvedValue({ ok: true, revision: 8 });
+
+    vi.useFakeTimers();
+    try {
+      render(<LyricsEditor {...props({
+        segments: longSegments,
+        transcribeJobId: "campaign-41-long-lines",
+        disableAutosave: false,
+        onPersistSegments,
+      })} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(4_000); });
+      expect(segmentsStore.get("campaign-41-long-lines").map((segment) => segment.end))
+        .toEqual(originalEnds);
+      expect(screen.getByTestId("line-review-progress")).toHaveTextContent("0/41");
+      expect(onPersistSegments).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("considera las ediciones de texto y timing como confirmaciones durables", async () => {
     const onApprove = vi.fn();
     const first = render(<LyricsEditor {...props({ onApprove })} />);

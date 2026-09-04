@@ -3347,11 +3347,19 @@ export default function LyricsEditor({
   useEffect(() => {
     if (autoTrimAppliedRef.current) return;
     if (!edited || edited.length === 0) return;
+    // Campaign stage 1 must open the exact machine-produced timeline.  A
+    // mount-time heuristic used to shorten long lines before the reviewer
+    // touched anything, then autosave those silent changes without locks.
+    // Keep trimming as an explicit operator action only in this workflow.
+    if (requireLineReview) {
+      autoTrimAppliedRef.current = true;
+      return;
+    }
     if (longSegCount > 0) {
       trimAllLongSegs({ confirmReview: false });
     }
     autoTrimAppliedRef.current = true;
-  }, [edited, longSegCount]);
+  }, [edited, longSegCount, requireLineReview]);
 
   // Compute how many visual lines a segment will occupy in the video.
   const linesForSeg = useCallback((text) => {
