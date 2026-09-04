@@ -127,3 +127,12 @@ def test_rule_version_is_v2():
     m = _load()
     assert m.song_verdict(_quality())["rule_version"] == "semaforo-v2"
     assert m.ACTION == "semaforo.verdict.v2"
+
+
+def test_missing_audio_hypothesis_is_always_red_and_manual():
+    m = _load()
+    quality = _quality()
+    quality["reference_hypothesis_unavailable"] = True
+    verdict = m.song_verdict(quality)
+    assert verdict["color"] == "red"
+    assert "reference_hypothesis_unavailable" in verdict["reasons"]

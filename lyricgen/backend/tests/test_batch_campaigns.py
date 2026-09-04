@@ -1,5 +1,6 @@
 import hashlib
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -11,6 +12,7 @@ from database import (
 )
 from editor import acquire_lock, release_lock
 from reference_hypothesis import build as build_reference_hypothesis
+from reference_hypothesis import build_unavailable as build_unavailable_reference
 from transcription_quality import segments_hash
 
 
@@ -135,6 +137,20 @@ def test_reconciler_reserves_ready_buffer_for_active_transcriptions(db):
     assert db.query(Job).filter(Job.campaign_id == campaign.id).count() == 50
 
 
+def test_individual_failure_does_not_stop_the_campaign_wave(db):
+    campaign = _campaign(db, 31)
+    batch._promote_campaign(db, campaign)
+    failed = db.query(Job).filter(Job.campaign_id == campaign.id).first()
+    failed.status = "transcription_failed"
+    db.commit()
+
+    promoted = batch._promote_campaign(db, campaign)
+
+    assert len(promoted) == 1
+    assert db.query(Job).filter(Job.campaign_id == campaign.id).count() == 31
+    assert batch._queue_state("lyrics", failed, None) == "failed"
+
+
 def test_render_capacity_is_separate_and_bounded(db):
     campaign = _campaign(db, 11)
     items = db.query(BatchCampaignItem).filter(
@@ -205,7 +221,10 @@ def test_render_capacity_fails_closed_before_human_approval(db):
     assert exc.value.detail["code"] == "reference_hypothesis_missing"
 
 
-def test_human_approval_binds_every_line_audio_and_editor_revision(db, monkeypatch):
+@pytest.mark.parametrize("reference_available", [True, False])
+def test_human_approval_binds_every_line_audio_and_editor_revision(
+    db, monkeypatch, reference_available,
+):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
     campaign = _campaign(db, 1)
     item = db.query(BatchCampaignItem).filter(
@@ -227,12 +246,20 @@ def test_human_approval_binds_every_line_audio_and_editor_revision(db, monkeypat
         input_audio_sha256=audio_sha, input_audio_etag=audio_sha,
         audio_revision=1,
         transcription_quality={
-            "reference_hypothesis": build_reference_hypothesis(
+            "reference_hypothesis": (
+                build_reference_hypothesis(
                 text="Hello\nmundo", provider="lrclib",
                 audio_sha256=audio_sha, audio_revision=1,
                 source_kind="catalogue_candidate_audio_verified",
                 complete_audio_verified=True,
+                ) if reference_available else build_unavailable_reference(
+                    audio_sha256=audio_sha, audio_revision=1,
+                )
             ),
+            **({} if reference_available else {
+                "reference_hypothesis_unavailable": True,
+                "manual_full_review_required": True,
+            }),
         },
     )
     db.add(job)
@@ -270,6 +297,13 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
         BatchCampaignItem.campaign_id == campaign.id,
     ).order_by(BatchCampaignItem.ordinal).all()
     items[1].title = "Canción 2 (Live)"
+    items[0].render_overrides = {
+        "review_reference_links": [
+            {"kind": "official_channel", "url": "https://youtube.com/watch?v=ok"},
+            {"kind": "licensed_musixmatch", "url": "https://lyricstranslate.com/bad"},
+            {"kind": "fan_site", "url": "javascript:alert(1)"},
+        ],
+    }
     user = db.query(User).first()
     jobs = []
     for item in items:
@@ -294,6 +328,13 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
                 "inputs": {"disagreement": disagreement},
             },
         ))
+    heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+    for offset in (0, 15):
+        db.add(ProductEvent(
+            tenant_id=campaign.tenant_id, user_id=user.id,
+            job_id=jobs[0].job_id, name="editor_activity_heartbeat",
+            occurred_at=heartbeat_at + timedelta(seconds=offset), properties={},
+        ))
     db.commit()
     actor = {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}
 
@@ -309,6 +350,11 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
     assert [row["priority"] for row in delivery["items"]] == ["1", "2", "3"]
     assert all(row["semaforo"] is None for row in delivery["items"])
     assert delivery["confidence"]["colors_visible"] is False
+    first_job = next(row for row in delivery["items"] if row["job_id"] == jobs[0].job_id)
+    assert first_job["active_minutes"] == 0.25
+    assert first_job["reference"]["external_links"] == [{
+        "kind": "official_channel", "url": "https://youtube.com/watch?v=ok",
+    }]
 
     learning = batch.review_queue(
         campaign.id, order="learning", **queue_args,

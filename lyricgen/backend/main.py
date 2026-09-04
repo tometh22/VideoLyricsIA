@@ -7245,6 +7245,11 @@ async def _run_transcription_for_job(
         "text": "", "provider": "none", "source_kind": "none",
         "complete_audio_verified": False, "source_version": {},
     }
+    from reference_hypothesis import audio_only_batch_mode
+    _batch_audio_only_reference = audio_only_batch_mode(
+        reference_required=reference_required,
+        workload_class=workload_class,
+    )
 
     try:
         # Language is a per-job property. Tenant, role and geography never
@@ -7632,21 +7637,39 @@ async def _run_transcription_for_job(
             _audio_dur_for_lrc = await asyncio.to_thread(_audio_duration, tmp_path)
         except Exception:
             _audio_dur_for_lrc = None
-        try:
-            with scoped_db() as _lrc_db:
-                lrc, _lrc_meta = await asyncio.to_thread(
-                    _fetch_lrclib_with_swap_retry, artist_hint, song_hint, _lrc_db,
-                    _audio_dur_for_lrc,
-                )
-        except Exception as _lrc_db_err:
-            # Transient Postgres SSL drop (Neon cold-start after idle period).
-            # Same fallback as the genius/gemini blocks: treat as a cache miss
-            # so the pipeline continues with whisperX + fallbacks.
-            logger.warning(
-                "[LYRICS] lrclib DB lookup raised (%s) — treating as miss",
-                _lrc_db_err,
+        if _batch_audio_only_reference:
+            # Batch policy: URLs and catalogue rows are reviewer-only pointers.
+            # Do not fetch, cache, align or pass their text to any engine.
+            lrc, _lrc_meta = None, {
+                "swapped": False,
+                "artist_used": artist_hint,
+                "song_used": song_hint,
+            }
+            logger.info(
+                "[BATCH-REFERENCE] external lyric lookup disabled; "
+                "complete-audio hypothesis only job=%s",
+                job_id,
             )
-            lrc, _lrc_meta = None, {"swapped": False, "artist_used": artist_hint, "song_used": song_hint}
+        else:
+            try:
+                with scoped_db() as _lrc_db:
+                    lrc, _lrc_meta = await asyncio.to_thread(
+                        _fetch_lrclib_with_swap_retry, artist_hint, song_hint,
+                        _lrc_db, _audio_dur_for_lrc,
+                    )
+            except Exception as _lrc_db_err:
+                # Transient Postgres SSL drop (Neon cold-start after idle period).
+                # Same fallback as the genius/gemini blocks: treat as a cache miss
+                # so the pipeline continues with whisperX + fallbacks.
+                logger.warning(
+                    "[LYRICS] lrclib DB lookup raised (%s) — treating as miss",
+                    _lrc_db_err,
+                )
+                lrc, _lrc_meta = None, {
+                    "swapped": False,
+                    "artist_used": artist_hint,
+                    "song_used": song_hint,
+                }
         # Auto-correct inverted metadata: when the swap-retry hit, the upload
         # had artist/title swapped (incident 2026-05-24 Viejas Locas /
         # Legalícenla in staging — frontend parser assumes Title_Artist for
@@ -7693,7 +7716,10 @@ async def _run_transcription_for_job(
         # know which source we used. The `recovery_source` in the final
         # _emit_segments will record `forced_align` either way; we log
         # the source so post-mortems can trace back.
-        if not lrc or not (lrc.get("plain") or "").strip():
+        if (
+            not _batch_audio_only_reference
+            and (not lrc or not (lrc.get("plain") or "").strip())
+        ):
             try:
                 import genius_fetch
                 if genius_fetch.is_enabled():
@@ -7733,7 +7759,10 @@ async def _run_transcription_for_job(
         # to LyricsCache (same table Genius and lrclib use, separate
         # keyspace) so subsequent fetches of the same song skip the
         # API call.
-        if not lrc or not (lrc.get("plain") or "").strip():
+        if (
+            not _batch_audio_only_reference
+            and (not lrc or not (lrc.get("plain") or "").strip())
+        ):
             try:
                 from pipeline import _fetch_lyrics_via_gemini_search
                 with scoped_db() as _gemini_db:
@@ -7779,7 +7808,10 @@ async def _run_transcription_for_job(
         # authorizes render; every line and timing still requires the durable
         # human approval gate below the editor.
         if reference_required:
-            _candidate = ((lrc or {}).get("plain") or "").strip()
+            _candidate = (
+                "" if _batch_audio_only_reference
+                else ((lrc or {}).get("plain") or "").strip()
+            )
             _verified_candidate = None
             if _candidate:
                 try:
@@ -7837,22 +7869,45 @@ async def _run_transcription_for_job(
                     )
                     _derived = None
                 if not _derived:
-                    raise RuntimeError("batch_reference_hypothesis_unavailable")
-                if lrc is None:
-                    lrc = {}
-                lrc["plain"] = _derived
-                lrc["synced"] = None
-                lyrics_source = "gemini_audio"
-                _reference_candidate_state.update({
-                    "text": _derived,
-                    "provider": "gemini-2.5-flash-audio",
-                    "source_kind": "gemini_complete_audio_derived",
-                    "complete_audio_verified": True,
-                    "source_version": {
-                        "model": "gemini-2.5-flash",
-                        "audio_scope": "complete",
-                    },
-                })
+                    # A missing hypothesis is a review-priority signal, not a
+                    # transcription failure. WhisperX continues audio-first;
+                    # the worker persists an exact-audio-bound unavailable
+                    # marker and the queue ranks the song red/manual.
+                    _reference_candidate_state.update({
+                        "text": "",
+                        "provider": "gemini-2.5-flash-audio",
+                        "source_kind": (
+                            "gemini_complete_audio_hypothesis_unavailable"
+                        ),
+                        "complete_audio_verified": True,
+                        "source_version": {
+                            "model": "gemini-2.5-flash",
+                            "audio_scope": "complete",
+                            "outcome": "unavailable",
+                        },
+                    })
+                    logger.warning(
+                        "[BATCH-REFERENCE] full-audio hypothesis unavailable; "
+                        "continuing audio-first transcription for mandatory "
+                        "manual review job=%s",
+                        job_id,
+                    )
+                else:
+                    if lrc is None:
+                        lrc = {}
+                    lrc["plain"] = _derived
+                    lrc["synced"] = None
+                    lyrics_source = "gemini_audio"
+                    _reference_candidate_state.update({
+                        "text": _derived,
+                        "provider": "gemini-2.5-flash-audio",
+                        "source_kind": "gemini_complete_audio_derived",
+                        "complete_audio_verified": True,
+                        "source_version": {
+                            "model": "gemini-2.5-flash",
+                            "audio_scope": "complete",
+                        },
+                    })
 
         # The upload wizard defaults to Auto.  Resolve that choice from the
         # canonical lyrics before the primary ASR runs, so English references
@@ -11057,6 +11112,11 @@ def status(
         # (JobDetail.jsx fetches `/status/${job_id}`, never `/jobs/{id}`).
         "segments_json": job.get("segments_json"),
         "segments_revision": int(job.get("segments_revision") or 0),
+        "transcription_quality": job.get("transcription_quality"),
+        "reference_lyrics": str(
+            ((job.get("transcription_quality") or {}).get("reference_hypothesis") or {})
+            .get("reference_text") or ""
+        ),
         # Final-render preflight is consumed by JobDetail from this polling
         # endpoint.  Returning it here is essential: /jobs is only the list
         # bootstrap, while a refresh and every render/edit completion hydrate

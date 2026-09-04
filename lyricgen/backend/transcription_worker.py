@@ -907,21 +907,16 @@ def run_transcription_job(
                 quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
                 if reference_required:
                     candidate = result.get("reference_hypothesis_candidate") or {}
-                    from reference_hypothesis import build as build_reference_hypothesis
-                    hypothesis = build_reference_hypothesis(
-                        text=str(candidate.get("text") or reference_lyrics or ""),
-                        provider=str(candidate.get("provider") or "unknown"),
+                    from reference_hypothesis import build_from_candidate
+                    hypothesis, manual_review = build_from_candidate(
+                        candidate,
+                        fallback_text=reference_lyrics,
                         audio_sha256=source_audio_sha256,
                         audio_revision=int(row.audio_revision or 0),
-                        source_kind=str(candidate.get("source_kind") or "unknown"),
-                        complete_audio_verified=bool(
-                            candidate.get("complete_audio_verified")
-                        ),
-                        attestation=candidate.get("attestation") or {},
-                        source_version=candidate.get("source_version") or {},
                     )
-                    if not hypothesis["reference_text"]:
-                        raise RuntimeError("batch_reference_hypothesis_missing")
+                    if manual_review:
+                        quality["reference_hypothesis_unavailable"] = True
+                        quality["manual_full_review_required"] = True
                     quality["reference_hypothesis"] = hypothesis
                 row.transcription_quality = quality
                 from machine_evidence import finalize_machine_evidence

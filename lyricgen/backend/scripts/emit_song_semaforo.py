@@ -103,6 +103,8 @@ def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, 
         "language": metrics.get("language"),
     }
     reasons: list[str] = []
+    if bool(quality.get("reference_hypothesis_unavailable")):
+        reasons.append("reference_hypothesis_unavailable")
     if is_live:
         reasons.append("live_never_green")
     if voiced_gap_s is None:

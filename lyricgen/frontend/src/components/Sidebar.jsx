@@ -94,6 +94,10 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
       id: "campaigns", label: "Campañas", path: "/campaigns",
       icon: <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10" strokeLinecap="round"/><circle cx="19" cy="18" r="2"/></svg>,
     });
+    items.splice(3, 0, {
+      id: "review_queue", label: "Cola de revisión", path: "/admin/cola",
+      icon: <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h9" strokeLinecap="round"/><path d="M18 16l2 2 3-4" strokeLinecap="round" strokeLinejoin="round"/></svg>,
+    });
   }
   if (user?.role === "admin") {
     items.push({
@@ -102,7 +106,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
     });
   }
   const groups = [
-    { label: t("sidebar.production"), items: items.filter((item) => ["dashboard", "new", "campaigns", "history"].includes(item.id)) },
+    { label: t("sidebar.production"), items: items.filter((item) => ["dashboard", "new", "campaigns", "review_queue", "history"].includes(item.id)) },
     { label: t("sidebar.workspace"), items: items.filter((item) => ["settings", "admin"].includes(item.id)) },
   ];
 

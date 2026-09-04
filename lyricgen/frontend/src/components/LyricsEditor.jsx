@@ -39,29 +39,28 @@ import QualityProposalPanel from "./QualityProposalPanel";
 // Decir siempre "red" es deshonesto y manda a la operadora por el camino
 // equivocado. `server` es el fallback = el copy original (comportamiento sin
 // cambios cuando el motivo es desconocido). El núcleo tranquilizador
-// («Aprobar y generar» usa lo de pantalla) se mantiene en TODAS las causas —
-// eso sigue siendo verdad porque el approve manda los segments en el body.
+// (la aprobación usa lo de pantalla) se mantiene en TODAS las causas.
 const _SAVE_ERROR_COPY = {
   network: {
     short: "No pudimos respaldar tu última edición (problema de red)",
     detail:
-      "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado».",
+      "Tus cambios siguen acá y la aprobación usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado».",
     confirm:
-      "Tu última edición no se pudo respaldar en el servidor (problema de red). Podés aprobar igual: el video se genera con lo que ves en pantalla. Solo el respaldo para reanudar la sesión queda desactualizado. ¿Continuar?",
+      "Tu última edición no se pudo respaldar en el servidor (problema de red). Esperá a ver «Guardado» antes de aprobar.",
   },
   session: {
     short: "No pudimos respaldar tu última edición (tu sesión venció)",
     detail:
-      "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. El reintento automático no alcanza si la sesión expiró: reingresá en otra pestaña para que el respaldo vuelva a guardarse.",
+      "Tus cambios siguen acá. El reintento automático no alcanza si la sesión expiró: reingresá en otra pestaña para que el respaldo vuelva a guardarse.",
     confirm:
-      "Tu última edición no se pudo respaldar (tu sesión venció). Podés aprobar igual: el video se genera con lo que ves en pantalla. Pero si vas a cerrar y reanudar después, reingresá primero para no perder el respaldo. ¿Continuar?",
+      "Tu última edición no se pudo respaldar (tu sesión venció). Reingresá antes de aprobar para no perder el respaldo.",
   },
   "job-gone": {
     short: "No pudimos respaldar: este trabajo ya no está en el servidor",
     detail:
-      "Puede haber expirado por inactividad. Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla, pero al generar el servidor podría rechazarlo. Si falla, volvé a subir la canción.",
+      "Puede haber expirado por inactividad. Tus cambios siguen acá, pero no se pueden aprobar hasta reconectar el trabajo del servidor.",
     confirm:
-      "Este trabajo ya no está en el servidor (pudo expirar por inactividad). Tus cambios siguen en pantalla, pero al generar podría fallar. ¿Intentar aprobar igual?",
+      "Este trabajo ya no está en el servidor. Reconectalo antes de aprobar.",
   },
   "draft-corrupt": {
     short: "Encontramos un borrador local que necesita revisión",
@@ -77,9 +76,9 @@ const _SAVE_ERROR_COPY = {
   server: {
     short: "No pudimos respaldar tu última edición en el servidor",
     detail:
-      "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado».",
+      "Tus cambios siguen acá y la aprobación usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado».",
     confirm:
-      "Tu última edición no se pudo respaldar en el servidor. Podés aprobar igual: el video se genera con lo que ves en pantalla. Solo el respaldo para reanudar la sesión queda desactualizado. ¿Continuar?",
+      "Tu última edición no se pudo respaldar en el servidor. Esperá a ver «Guardado» antes de aprobar.",
   },
 };
 
@@ -666,6 +665,7 @@ export default function LyricsEditor({
   // que preserva la identidad de filas (reseedPreservingIds) — hoy sin caller
   // de producción (reservado / lo ejercitan sólo los tests).
   segments, filename, audioFile, referenceLyrics,
+  referenceLinks = [], referenceUnavailable = false,
   coverageWarning = false, transcriptionQuality: transcriptionQualityProp = null, recoverySource = "",
   languageConflict = false, languageUncertain = false, mixedLanguage = false,
   onApprove, onBack, isBatch = false, batchProgress = "",
@@ -732,6 +732,7 @@ export default function LyricsEditor({
   disableBeforeUnload = false,
   disableAutosave = false,
   submitLabel = null,
+  requireLineReview = false,
   // Optional audio peak envelope for the timeline waveform, fetched by the
   // parent (the post-render /edit modal has a job in R2; the wizard doesn't).
   // null → timeline renders without a waveform (graceful).
@@ -981,6 +982,7 @@ export default function LyricsEditor({
   // changes. Ahora ambos autosaves actualizan saveStatus, y "error"
   // se muestra como chip rojo con botón Reintentar.
   const [saveStatus, setSaveStatus] = useState("idle"); // idle|local|saving|saved|offline|conflict|error
+  const [savedAt, setSavedAt] = useState(null);
   // Motivo del último fallo de respaldo, para que el banner + el confirm de
   // "Aprobar" digan la CAUSA REAL en vez de "problema de red" siempre (el
   // copy honesto de PR A quedó hardcodeado a "red"; la causa real puede ser
@@ -1294,6 +1296,7 @@ export default function LyricsEditor({
     setSaveStatus(status);
     setSaveErrorReason(reason);
     if (status === "saved") {
+      setSavedAt(new Date());
       // Cuántos fallos hicieron falta antes de que este guardado saliera. Es
       // el dato que faltaba para distinguir "hipo transitorio que se recuperó
       // solo" de "el operador estuvo peleando con el editor".
@@ -1515,6 +1518,7 @@ export default function LyricsEditor({
     const unsubscribe = queue.subscribe(transcribeJobId, ({ status, reason }) => {
       setSaveStatus(status);
       setSaveErrorReason(reason);
+      if (status === "saved") setSavedAt(new Date());
       if (status === "saved" && draftKey) {
         try { localStorage.removeItem(draftKey); } catch { /* storage blocked */ }
       }
@@ -1918,6 +1922,21 @@ export default function LyricsEditor({
   }, [isPlaying, sanitizedEdited, onPlaybackTick]);
   const [wrapWarning, setWrapWarning] = useState(null); // {ids: [...]} for 3+ line segs
   const [focusedSegId, setFocusedSegId] = useState(null); // for preview panel
+  const lineReviewKey = transcribeJobId ? `genly:line-review:${transcribeJobId}` : null;
+  const [reviewedLineIds, setReviewedLineIds] = useState(() => {
+    if (!lineReviewKey) return [];
+    try { return JSON.parse(localStorage.getItem(lineReviewKey) || "[]"); }
+    catch { return []; }
+  });
+  useEffect(() => {
+    if (!lineReviewKey) return;
+    try { localStorage.setItem(lineReviewKey, JSON.stringify(reviewedLineIds)); }
+    catch { /* autosave remains authoritative if browser storage is full */ }
+  }, [lineReviewKey, reviewedLineIds]);
+  const markLineReviewed = useCallback((id) => {
+    if (!id) return;
+    setReviewedLineIds((current) => current.includes(id) ? current : [...current, id]);
+  }, []);
 
   // Inline timestamp edit state. Only one row can be in edit mode at a
   // time; clicking a different row's timestamp swaps the active editor.
@@ -2994,6 +3013,24 @@ export default function LyricsEditor({
         e.preventDefault();
         if (syncMode) tapAnchor();
         else togglePlay();
+      } else if (requireLineReview && e.key === "ArrowLeft") {
+        e.preventDefault();
+        seekTo(Math.max(0, currentTime - 2), false);
+      } else if (requireLineReview && e.key === "ArrowRight") {
+        e.preventDefault();
+        seekTo(Math.min(duration || currentTime + 2, currentTime + 2), false);
+      } else if (requireLineReview && e.key === "Enter") {
+        e.preventDefault();
+        markLineReviewed(focusedSegId || activeId || edited[0]?._id);
+      } else if (requireLineReview && e.key === "Tab") {
+        e.preventDefault();
+        const currentIndex = Math.max(0, edited.findIndex((segment) => segment._id === focusedSegId));
+        const next = edited[(currentIndex + (e.shiftKey ? -1 : 1) + edited.length) % edited.length];
+        if (next) {
+          setFocusedSegId(next._id);
+          seekTo(Math.max(0, next.start), false);
+          rowRefs.current[next._id]?.querySelector('input[type="text"]')?.focus();
+        }
       } else if ((e.metaKey || e.ctrlKey) && (e.key === "z" || e.key === "Z")) {
         // Cmd/Ctrl+Z: undo. Sync Mode rolls back the last anchor (with
         // its propagated future); outside Sync Mode it pops the manual
@@ -3034,7 +3071,7 @@ export default function LyricsEditor({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit, audioUrl, enterSyncMode, exitSyncMode, toggleFocusMode, jumpToNextReview]);
+  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit, audioUrl, enterSyncMode, exitSyncMode, toggleFocusMode, jumpToNextReview, requireLineReview, currentTime, duration, focusedSegId, activeId, edited, markLineReviewed, seekTo]);
 
   // ─── Reference lyrics suggestions (unchanged) ───────────────────────
   const refLines = useMemo(() => {
@@ -3740,6 +3777,16 @@ export default function LyricsEditor({
       toast({ message: "Descartá o recuperá manualmente el borrador local antes de aprobar.", tone: "error" });
       return;
     }
+    if (requireLineReview) {
+      const missing = edited.find((segment) => !reviewedLineIds.includes(segment._id));
+      if (missing) {
+        setFocusedSegId(missing._id);
+        seekTo(Math.max(0, missing.start), false);
+        rowRefs.current[missing._id]?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+        toast({ message: "Falta confirmar al menos una línea contra el audio.", tone: "info" });
+        return;
+      }
+    }
     // Aviso (no bloqueo) si el último autosave falló. IMPORTANTE — contrato
     // real verificado (incidente UMG 21-jul-2026): aprobar manda los
       // segments EN PANTALLA en el cuerpo del POST (onApprove(cleaned) acá;
@@ -4017,7 +4064,7 @@ export default function LyricsEditor({
     idle: isDirty ? "Cambios locales" : "Guardado",
     local: "Cambios locales",
     saving: "Guardando…",
-    saved: "Guardado",
+    saved: `Guardado ✓${savedAt ? ` ${savedAt.toLocaleTimeString([], { hour12: false })}` : ""}`,
     offline: "Sin conexión",
     conflict: "Cambio en conflicto",
     error: "No se pudo guardar",
@@ -4209,6 +4256,38 @@ export default function LyricsEditor({
             }
           }}
         />
+      )}
+      {(referenceLyrics || referenceUnavailable || referenceLinks.length > 0) && (
+        <details className="mb-3 rounded-xl bg-surface-2/45 p-4 ring-1 ring-white/[0.06]">
+          <summary className="cursor-pointer text-sm font-semibold text-white">
+            Referencia derivada del audio
+          </summary>
+          <p className="mt-2 text-xs font-medium text-amber-200">
+            Sugerencia: verificar cada línea contra el audio. Nunca se aplica sola.
+          </p>
+          {referenceUnavailable ? (
+            <p className="mt-3 rounded-lg bg-red-500/10 p-3 text-xs text-red-200 ring-1 ring-red-500/25">
+              No hubo hipótesis automática. Esta canción requiere revisión manual completa.
+            </p>
+          ) : referenceLyrics ? (
+            <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-lg bg-black/20 p-3 text-xs leading-5 text-ink-secondary">{referenceLyrics}</pre>
+          ) : null}
+          {referenceLinks.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {referenceLinks.map((link) => (
+                <a key={`${link.kind}:${link.url}`} href={link.url} target="_blank" rel="noreferrer noopener" className="rounded-lg bg-white/[0.06] px-3 py-2 text-xs text-brand-light hover:bg-white/[0.1]">
+                  {link.kind}
+                </a>
+              ))}
+            </div>
+          )}
+        </details>
+      )}
+      {requireLineReview && (
+        <div className="mb-3 flex items-center justify-between rounded-xl bg-brand/[0.08] px-4 py-3 text-xs ring-1 ring-brand/25">
+          <span className="text-brand-light">Líneas confirmadas contra el audio</span>
+          <span className="font-semibold tabular-nums text-white">{reviewedLineIds.filter((id) => edited.some((segment) => segment._id === id)).length}/{edited.length}</span>
+        </div>
       )}
 
       {/* Header: back + title (non-sticky). The primary CTA is a FIXED
@@ -5726,6 +5805,12 @@ export default function LyricsEditor({
                       onKeyDown={(e) => {
                         const el = e.currentTarget;
                         if (e.key === "Enter") {
+                          if (requireLineReview) {
+                            e.preventDefault();
+                            markLineReviewed(seg._id);
+                            el.blur();
+                            return;
+                          }
                           // Split THIS line at the cursor, word-aware (keeps timing).
                           e.preventDefault();
                           const caret = el.selectionStart ?? el.value.length;

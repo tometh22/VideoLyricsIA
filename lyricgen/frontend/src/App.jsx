@@ -43,6 +43,7 @@ const Dashboard = lazy(() => import("./components/Dashboard"));
 const UploadZone = lazy(() => import("./components/UploadZone"));
 const SearchPalette = lazy(() => import("./components/SearchPalette"));
 const CampaignsPage = lazy(() => import("./components/CampaignsPage"));
+const ReviewQueuePage = lazy(() => import("./components/ReviewQueuePage"));
 // Paso final del wizard de variante: la letra en modo LECTURA (el POST
 // /variant no lleva segments y el autosave del editor le escribiría al
 // job padre). Ver components/VariantLyricsSummary.jsx.
@@ -573,6 +574,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
   const activeView =
     (pathname === "/new" || pathname === "/review" || pathname === "/generating") ? "new" :
     (pathname === "/videos" || pathname.startsWith("/videos/")) ? "history" :
+    pathname === "/admin/cola" ? "review_queue" :
     pathname.startsWith("/campaigns") ? "campaigns" :
     pathname === "/account" ? "settings" :
     pathname === "/admin" ? "admin" :
@@ -632,6 +634,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
     else if (id === "new") navigate("/new");
     else if (id === "history") navigate("/videos");
     else if (id === "campaigns") navigate("/campaigns");
+    else if (id === "review_queue") navigate("/admin/cola");
     else if (id === "settings") navigate("/account");
     else if (id === "admin") navigate("/admin");
   };
@@ -2259,6 +2262,11 @@ export default function App() {
           segments,
           segmentsRevision: Number.isInteger(job.segments_revision) ? job.segments_revision : 0,
           referenceLyrics: job.reference_lyrics || "",
+          referenceLinks: job.campaign?.review_reference_links || [],
+          referenceUnavailable: Boolean(
+            job.transcription_quality?.manual_full_review_required
+            || job.transcription_quality?.reference_hypothesis?.availability === "unavailable"
+          ),
           coverageWarning: !!job.coverage_warning,
           transcriptionQuality: job.transcription_quality || null,
           recoverySource: job.recovery_source || "",
@@ -3932,6 +3940,52 @@ export default function App() {
         return { ok: true, approvedEditorVersionId: data?.approved_editor_version_id || null };
       } finally {
         editSubmitLockRef.current = false;
+      }
+    }
+
+    // Campaign stage 1 ends at durable human approval. It must never share
+    // the generic wizard's approve→generate transition: backgrounds and
+    // renders are a separate, later stage triggered outside this screen.
+    if (r.campaignId && r.transcribeJobId) {
+      const confirmedLineIds = (editedSegments || []).map((segment) => (
+        segment.segment_id || segment.id || segment._id
+      )).filter(Boolean);
+      try {
+        const response = await authFetch(
+          `${API}/batch/campaigns/${r.campaignId}/jobs/${r.transcribeJobId}/approve-lyrics`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              editor_revision: Number.isInteger(saveMeta.editorRevision)
+                ? saveMeta.editorRevision
+                : (Number.isInteger(saveMeta.baseRevision) ? saveMeta.baseRevision : 0),
+              confirmed_line_ids: confirmedLineIds,
+              lyrics_confirmed: true,
+              timings_confirmed: true,
+              heard_against_audio: true,
+            }),
+          },
+        );
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          return {
+            ok: false,
+            reason: response.status === 409 ? "conflict" : `http-${response.status}`,
+            conflict: body?.detail || null,
+          };
+        }
+        wizardPersistence.clear();
+        segmentsStore.evict(reviewStoreKey(r));
+        localStorage.removeItem(`genly:line-review:${r.transcribeJobId}`);
+        setCurrentReview(null);
+        navigate(`/admin/cola?approved=${encodeURIComponent(r.transcribeJobId)}`, {
+          replace: true,
+        });
+        return { ok: true, approvedEditorVersionId: body?.approved_version_id || null };
+      } catch (error) {
+        console.warn("[campaign-review] approval failed", error);
+        return { ok: false, reason: "network" };
       }
     }
 
@@ -5626,13 +5680,24 @@ export default function App() {
                   {reviewJobPath(currentReview.transcribeJobId)}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={handleCopyReviewLink}
-                className="btn-secondary shrink-0 px-3 py-2 text-xs"
-              >
-                Copiar enlace
-              </button>
+              <div className="flex gap-2">
+                {currentReview.campaignId && (
+                  <button
+                    type="button"
+                    onClick={() => navigate("/admin/cola")}
+                    className="btn-primary shrink-0 px-4 py-2 text-xs"
+                  >
+                    Siguiente
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handleCopyReviewLink}
+                  className="btn-secondary shrink-0 px-3 py-2 text-xs"
+                >
+                  Copiar enlace
+                </button>
+              </div>
             </div>
           )}
           <Suspense fallback={<EditorSuspenseFallback />}>
@@ -5697,6 +5762,9 @@ export default function App() {
             waveform={currentReview.waveform || null}
             waveformLoading={currentReview.waveformLoading ?? (!!currentReview.transcribeJobId && !currentReview.waveform)}
             referenceLyrics={currentReview.referenceLyrics || ""}
+            referenceLinks={currentReview.referenceLinks || []}
+            referenceUnavailable={!!currentReview.referenceUnavailable}
+            requireLineReview={!!currentReview.campaignId}
             coverageWarning={currentReview.coverageWarning}
             transcriptionQuality={currentReview.transcriptionQuality}
             recoverySource={currentReview.recoverySource}
@@ -5704,8 +5772,10 @@ export default function App() {
             languageUncertain={!!currentReview.languageUncertain}
             mixedLanguage={!!currentReview.mixedLanguage}
             onApprove={handleApproveLyrics}
-            submitLabel={currentReview.campaignId ? "Generar y seguir" : null}
-            onBack={handleBackInReview}
+            submitLabel={currentReview.campaignId ? "Aprobar letra y timing" : null}
+            onBack={currentReview.campaignId
+              ? () => navigate("/admin/cola")
+              : handleBackInReview}
             // Post-render edit: cuando editingJobId está set, el autosave
             // de /save-segments va al job real (no al transcribeJob, que
             // en este flow es null). Orden importante: editingJobId gana.
@@ -5965,6 +6035,7 @@ export default function App() {
           <Route path="/review/:jobId" element={wizardScreen} />
           <Route path="/campaigns" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
           <Route path="/campaigns/:campaignId" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
+          <Route path="/admin/cola" element={<Suspense fallback={<RouteSuspenseFallback />}><ReviewQueuePage /></Suspense>} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
             <Suspense fallback={<RouteSuspenseFallback />}>
