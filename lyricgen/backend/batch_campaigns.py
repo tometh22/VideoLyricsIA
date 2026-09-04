@@ -1402,10 +1402,19 @@ def _stage1_pipeline_settings(campaign: BatchCampaign) -> dict[str, Any]:
         requested_ready_limit = int(raw.get("lyrics_ready_limit", LYRICS_READY_LIMIT))
     except (TypeError, ValueError):
         requested_ready_limit = LYRICS_READY_LIMIT
+    try:
+        requested_promotion_limit = int(raw.get("promotion_limit", ITEM_LIMIT))
+    except (TypeError, ValueError):
+        requested_promotion_limit = ITEM_LIMIT
     return {
         "prewarm_separation": bool(raw.get("prewarm_separation", False)),
         "lyrics_ready_limit": max(
             1, min(ITEM_LIMIT, requested_ready_limit),
+        ),
+        # A campaign can prove a real canary against its first N delivery-order
+        # rows, then raise this limit without duplicating uploads or jobs.
+        "promotion_limit": max(
+            1, min(ITEM_LIMIT, requested_promotion_limit),
         ),
     }
 
@@ -1549,7 +1558,9 @@ def _promote_campaign(db: Session, campaign: BatchCampaign) -> list[str]:
         max(0, stage1_settings["lyrics_ready_limit"] - ready - active_trans),
     )
     linked = db.query(Job.campaign_item_id).filter(Job.campaign_id == campaign.id)
-    processable = _processable_items_query(db, campaign)
+    processable = _processable_items_query(db, campaign).filter(
+        BatchCampaignItem.ordinal <= stage1_settings["promotion_limit"],
+    )
 
     if stage1_settings["prewarm_separation"]:
         # Phase A is a durable barrier: enqueue/cache every stem before Phase B
