@@ -6,10 +6,15 @@
  * de costos se eliminó la sub-vista `gestion/infra`, y cualquiera que la
  * tuviera guardada habría abierto el panel en una pantalla vacía.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { leerDestino } from "./AdminPanel";
-import { SECCIONES, defaultSubTab, subTabValida } from "./layout/AdminSidebar";
+import {
+  SECCIONES,
+  defaultSubTab,
+  seccionesVisibles,
+  subTabValida,
+} from "./layout/AdminSidebar";
 
 const guardado = (o) => JSON.stringify(o);
 
@@ -77,6 +82,63 @@ describe("el NAV es la única fuente de verdad", () => {
     for (const s of SECCIONES) {
       const d = defaultSubTab(s);
       if (d !== null) expect(subTabValida(s, d)).toBe(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Permisos: el filtro tiene que valer también para las sub-vistas
+// ---------------------------------------------------------------------------
+//
+// Regresión real de este trabajo: al mover las sub-vistas fuera del `map` del
+// sidebar perdieron el filtro de `showInsights`. Un admin no-super que abría
+// `#/insights/margen` veía la barra de tabs de una sección que ni figura en su
+// columna, con el contenido en blanco — y como clickear persiste el destino,
+// el panel quedaba roto en cada apertura siguiente.
+
+describe("secciones que el usuario no puede ver", () => {
+  it("un no-super-admin no aterriza en Insights por un link compartido", () => {
+    const d = leerDestino("#/insights/margen", null, false);
+    expect(d.section).toBe("ahora");
+  });
+
+  it("un super-admin sí llega", () => {
+    const d = leerDestino("#/insights/margen", null, true);
+    expect(d).toEqual({ section: "insights", subTab: "margen" });
+  });
+
+  it("tampoco lo restaura desde lo guardado", () => {
+    const g = JSON.stringify({ section: "insights", subTab: "features" });
+    expect(leerDestino("", g, false).section).toBe("ahora");
+    expect(leerDestino("", g, true).section).toBe("insights");
+  });
+
+  it("seccionesVisibles es la única lista, y respeta el permiso", () => {
+    expect(seccionesVisibles(false).map((s) => s.id)).not.toContain("insights");
+    expect(seccionesVisibles(true).map((s) => s.id)).toContain("insights");
+  });
+});
+
+describe("localStorage de verdad, sin inyectar", () => {
+  // El parámetro `guardado` de los tests de arriba es un bypass: con él, la
+  // rama que toca `localStorage` nunca se ejecuta. Estos sí la ejercitan.
+  afterEach(() => window.localStorage.clear());
+
+  it("lee el destino guardado del storage real", () => {
+    window.localStorage.setItem("genly_admin_destino",
+      JSON.stringify({ section: "gestion", subTab: "facturacion" }));
+    expect(leerDestino("", null, false)).toEqual({
+      section: "gestion", subTab: "facturacion",
+    });
+  });
+
+  it("un storage que tira excepción no impide abrir el panel", () => {
+    const orig = window.localStorage.getItem;
+    window.localStorage.getItem = () => { throw new Error("bloqueado"); };
+    try {
+      expect(leerDestino("", null, false).section).toBe("ahora");
+    } finally {
+      window.localStorage.getItem = orig;
     }
   });
 });

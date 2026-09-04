@@ -56,10 +56,13 @@ function InvoicesTab() {
 export default function GestionSection({ subTab }) {
   if (subTab === "fondos") return <FondosTab />;
   if (subTab === "compliance") return <ComplianceTab />;
-  // `infra` era una sub-tab aparte antes de la consolidación. Se conserva
-  // como alias: el sub-tab activo se persiste, así que sin esto quien la
-  // tuviera abierta caía en la pantalla de usuarios sin entender por qué.
-  if (subTab === "costos" || subTab === "infra") return <CostosPage />;
+  // El alias `infra` se ELIMINÓ. `leerDestino` valida el sub-tab contra el
+  // NAV antes de restaurarlo, así que un `infra` guardado ya se coerciona al
+  // default de Gestión y nunca llega hasta acá: la rama era muerta y su
+  // comentario prometía lo contrario de lo que pasaba. Si alguna vez hace
+  // falta redirigir sub-vistas retiradas, va como mapa de alias EN el NAV,
+  // que es la única fuente de verdad, no como un `if` acá abajo.
+  if (subTab === "costos") return <CostosPage />;
   if (subTab === "facturacion") return <InvoicesTab />;
   if (subTab === "creditos") return <CreditsView />;
   return <GestionView />;

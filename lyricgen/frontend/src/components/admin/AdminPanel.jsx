@@ -6,13 +6,13 @@
 //
 // El estado transversal (banner de error, stats globales) vive en
 // AdminContext; todo lo demás es local de cada sección.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { AdminProvider, useAdmin } from "./AdminContext";
 import AdminSidebar, {
-  SECCIONES,
   SubTabs,
   defaultSubTab,
+  seccionVisible,
   subTabValida,
 } from "./layout/AdminSidebar";
 import OperacionSection from "./sections/operacion/OperacionSection";
@@ -33,9 +33,13 @@ const DESTINO_KEY = "genly_admin_destino";
  * Eso ya pasó cuando se eliminó la sub-tab `infra` de Costos.
  */
 export function leerDestino(hash = typeof window !== "undefined" ? window.location.hash : "",
-                            guardado = null) {
+                            guardado = null, showInsights = false) {
   const valido = (sec, sub) => {
-    if (!sec || !SECCIONES.has(sec)) return null;
+    // Permiso, no sólo existencia: `insights` está en el NAV para todos pero
+    // sólo se RENDERIZA para super-admin. Sin este filtro, un link
+    // compartido dejaba al resto en un panel en blanco — y como clickear
+    // persiste el destino, roto en cada apertura siguiente.
+    if (!sec || !seccionVisible(sec, showInsights)) return null;
     const sinDefault = defaultSubTab(sec);
     // Una sub-vista inválida no invalida la sección: se cae al default de
     // ella, que es lo que el usuario esperaría.
@@ -47,7 +51,8 @@ export function leerDestino(hash = typeof window !== "undefined" ? window.locati
   if (porHash) return porHash;
 
   try {
-    const raw = guardado ?? window.localStorage.getItem(DESTINO_KEY);
+    const raw = guardado ?? (typeof window !== "undefined"
+      ? window.localStorage.getItem(DESTINO_KEY) : null);
     if (raw) {
       const g = JSON.parse(raw);
       const porGuardado = valido(g.section, g.subTab);
@@ -60,14 +65,24 @@ export function leerDestino(hash = typeof window !== "undefined" ? window.locati
 }
 
 function guardarDestino(section, subTab) {
+  // DOS try separados a propósito. Estaban juntos y el que puede fallar iba
+  // primero: en Safari privado `setItem` tira QuotaExceededError y se comía
+  // el hash, así que el panel navegaba bien pero la URL nunca reflejaba
+  // dónde estabas. Persistir es opcional; el link copiable no.
   try {
     window.localStorage.setItem(DESTINO_KEY, JSON.stringify({ section, subTab }));
-    // El hash mantiene el link copiable sin agregar una entrada al historial
-    // por cada click: `replaceState` no ensucia el botón Atrás del browser.
-    const ruta = subTab ? `#/${section}/${subTab}` : `#/${section}`;
-    window.history.replaceState(null, "", ruta);
   } catch {
-    // Idem: persistir es una comodidad, no un requisito para navegar.
+    // Storage bloqueado o lleno: no es motivo para no navegar.
+  }
+  try {
+    const ruta = subTab ? `#/${section}/${subTab}` : `#/${section}`;
+    // Se PRESERVA `history.state`. Pasar `null` destruía el `{usr,key,idx}`
+    // de React Router: `getIndex()` volvía null y todo push posterior
+    // recalculaba mal el índice del historial. Hoy nada lo lee, pero el día
+    // que entre un scroll-restoration o un blocker rompería sólo acá.
+    window.history.replaceState(window.history.state, "", ruta);
+  } catch {
+    // Idem.
   }
 }
 
@@ -84,9 +99,37 @@ function AdminShell({ onBack, isSuperAdmin }) {
   //
   // El hash gana sobre lo guardado: un link compartido tiene que llevarte
   // adonde dice, no adonde estabas vos.
-  const inicial = leerDestino();
+  const inicial = leerDestino(undefined, null, isSuperAdmin);
   const [section, setSection] = useState(inicial.section);
   const [subTab, setSubTab] = useState(inicial.subTab);
+
+  // El hash tiene que funcionar con el panel YA ABIERTO.
+  //
+  // `leerDestino` sólo corría en el inicializador del useState, o sea una vez
+  // al montar. Cambiar el hash no recarga el documento —el browser dispara
+  // `hashchange`— así que pegar un link compartido en una pestaña abierta no
+  // hacía nada Y la URL quedaba mintiendo sobre lo que se veía. Si esa
+  // persona copiaba la URL, propagaba el destino equivocado.
+  //
+  // Se sincroniza en el mismo efecto que escribe el hash inicial: quien
+  // restauró desde localStorage abre sin hash, y sin esto su URL no era
+  // copiable hasta el primer click — justo el caso de uso que motivó todo.
+  useEffect(() => {
+    const aplicar = () => {
+      const d = leerDestino(window.location.hash, null, isSuperAdmin);
+      setSection(d.section);
+      setSubTab(d.subTab);
+    };
+    window.addEventListener("hashchange", aplicar);
+    return () => window.removeEventListener("hashchange", aplicar);
+  }, [isSuperAdmin]);
+
+  // Refleja en la URL el destino restaurado, para que sea copiable de entrada.
+  useEffect(() => {
+    if (!window.location.hash) guardarDestino(section, subTab);
+    // Sólo al montar: después lo mantiene `navigate`.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const navigate = (nextSection, nextSubTab) => {
     setSection(nextSection);

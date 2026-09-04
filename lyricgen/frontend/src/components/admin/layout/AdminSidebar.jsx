@@ -97,6 +97,24 @@ const NAV = [
  * segunda lista que se olvide de actualizar. */
 export const SECCIONES = new Set(NAV.map((n) => n.id));
 
+/** Las secciones que este usuario puede ver.
+ *
+ * UNA sola función para los tres consumidores —columna, `SubTabs` y el
+ * router de contenido— porque tenerlo en dos lados ya rompió: al mover las
+ * sub-vistas fuera del `map` del sidebar perdieron el filtro de
+ * `showInsights`, y un admin no-super que abría `#/insights/margen` veía la
+ * fila de tabs de una sección que ni figura en su columna, con el contenido
+ * en blanco. Y como clickear una tab persiste el destino, el panel quedaba
+ * roto en cada apertura siguiente.
+ */
+export function seccionesVisibles(showInsights = false) {
+  return NAV.filter((item) => item.id !== "insights" || showInsights);
+}
+
+export function seccionVisible(sectionId, showInsights = false) {
+  return seccionesVisibles(showInsights).some((n) => n.id === sectionId);
+}
+
 /** ¿`subTab` existe dentro de `sectionId`?
  *
  * Lo usa la restauración de navegación: un destino guardado puede apuntar a
@@ -123,12 +141,18 @@ export function defaultSubTab(sectionId) {
  * Devuelve `null` cuando la sección no tiene sub-vistas, así el contenido
  * sube y no queda una barra vacía ocupando lugar.
  */
-export function SubTabs({ section, subTab, onNavigate }) {
-  const item = NAV.find((n) => n.id === section);
+export function SubTabs({ section, subTab, onNavigate, showInsights = false }) {
+  // Filtra por permiso, no sólo por existencia: una sección que el usuario
+  // no puede ver no debe dibujar su barra de sub-vistas.
+  const item = seccionesVisibles(showInsights).find((n) => n.id === section);
   if (!item?.subTabs?.length) return null;
   return (
-    <div
-      role="tablist"
+    // Sin `role="tablist"`/`role="tab"` a propósito. Ese patrón es un
+    // contrato con el lector de pantalla: promete `aria-controls` a un
+    // `tabpanel` y roving tabindex (flechas para moverse). No cumplíamos
+    // ninguna de las dos, así que anunciaba "pestaña 4 de 6" y las flechas
+    // no hacían nada — peor que botones normales, que al menos tabulan.
+    <nav
       aria-label={`Vistas de ${item.label}`}
       className="flex items-center gap-1 flex-wrap border-b border-white/[0.06] mb-5 -mt-1"
     >
@@ -138,8 +162,7 @@ export function SubTabs({ section, subTab, onNavigate }) {
           <button
             key={st.id}
             type="button"
-            role="tab"
-            aria-selected={activo}
+            aria-current={activo ? "page" : undefined}
             onClick={() => onNavigate(section, st.id)}
             // El subrayado marca el activo en vez de un fondo: es más
             // liviano que una píldora y no compite con los KPIs de abajo.
@@ -153,13 +176,13 @@ export function SubTabs({ section, subTab, onNavigate }) {
           </button>
         );
       })}
-    </div>
+    </nav>
   );
 }
 
 
 export default function AdminSidebar({ section, subTab, onNavigate, badges = {}, showInsights = false }) {
-  const items = NAV.filter((item) => item.id !== "insights" || showInsights);
+  const items = seccionesVisibles(showInsights);
   return (
     <nav className="admin-subnav" aria-label="Secciones de administración">
       {items.map((item) => {
