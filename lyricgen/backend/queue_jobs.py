@@ -924,6 +924,8 @@ def enqueue_transcription(
     publication_id: str | None = None,
     publication_dedupe_key: str | None = None,
     workload_class: str = "interactive",
+    pipeline_stage: str = "full",
+    parallel_audio_reference: bool = False,
 ) -> str:
     """Enqueue una transcripción en la queue `transcription` (alta prioridad,
     drenada por el mismo worker container que enterprise/default).
@@ -954,6 +956,8 @@ def enqueue_transcription(
             "anchor_lyrics": anchor_lyrics,
             "reference_required": reference_required,
             "workload_class": workload_class,
+            "pipeline_stage": pipeline_stage,
+            "parallel_audio_reference": parallel_audio_reference,
         }
         if publication_id:
             from transactional_outbox import run_outbox_transcription as target
@@ -1028,6 +1032,8 @@ def enqueue_transcription(
         "anchor_lyrics": anchor_lyrics,
         "reference_required": reference_required,
         "workload_class": workload_class,
+        "pipeline_stage": pipeline_stage,
+        "parallel_audio_reference": parallel_audio_reference,
     }
     if publication_id:
         from transactional_outbox import run_outbox_transcription as target

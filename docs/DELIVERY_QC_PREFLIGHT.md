@@ -14,7 +14,9 @@ delivered.
 
 - metadata title/version and artist versus the render manifest/title card;
 - final displayed spelling and diacritics versus a trusted approved lyric;
-- conservative detection of local token typos such as `AVENTRUA`/`AVENTURA`;
+- a reference-free deterministic Spanish pass for fixed accents, uppercase
+  accents, future endings (`-ás`/`-á`/`-án`) and audited near-exact dictionary
+  typos such as `AVENTRUA`/`AVENTURA`;
 - invalid ranges, overlaps and lyrics outside the media duration;
 - propagation of the upstream Quality v6 verdict;
 - blocking of unattested catalogue text and materially incomplete timelines
@@ -23,7 +25,10 @@ delivered.
 
 A catalogue result is not accepted as truth.  If the lyric was not supplied by
 the client, verified by an operator or supported by the evidence policy, the
-spelling comparator abstains.  This is especially important for live songs.
+song-reference comparator abstains.  The narrower deterministic Spanish pass
+still runs without a reference and emits human suggestions only.  It excludes
+ambiguous homographs (`si`/`sí`, `tu`/`tú`, `aun`/`aún`) and never changes a
+line automatically.  This is especially important for live songs.
 
 ## Product integration implemented
 
@@ -51,6 +56,12 @@ spelling comparator abstains.  This is especially important for live songs.
 - text suggestions derived from a reference are exposed only when that reference
   is independently attested and bound to the current segment hash;
 - automatic correction remains behind per-category acceptance evidence.
+
+The Spanish pass is `observe` by construction: its candidates carry
+`automatic_apply_allowed=false` and are persisted in the existing one-click
+operator proposal.  A category may gain automatic authority only after at
+least 50 reviewed songs and measured precision of at least 99%; authorization
+is per category, never global.
 
 ## CLI
 

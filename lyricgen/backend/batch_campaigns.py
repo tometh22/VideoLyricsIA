@@ -46,7 +46,11 @@ router = APIRouter(prefix="/batch", tags=["batch-campaigns"])
 CAMPAIGN_STATUSES = frozenset({"active", "paused", "completed", "cancelled"})
 ITEM_LIMIT = int(os.environ.get("BATCH_CAMPAIGN_ITEM_LIMIT", "1000"))
 TRANSCRIPTION_WINDOW = int(os.environ.get("BATCH_TRANSCRIPTION_WINDOW", "30"))
+# The conservative platform default remains 50.  Large campaigns must opt in
+# explicitly through stage1_pipeline.lyrics_ready_limit; this avoids silently
+# widening every tenant while still allowing the 300-song August queue.
 LYRICS_READY_LIMIT = int(os.environ.get("BATCH_LYRICS_READY_LIMIT", "50"))
+SEPARATION_WINDOW = int(os.environ.get("BATCH_SEPARATION_WINDOW", "300"))
 RENDER_WINDOW = int(os.environ.get("BATCH_RENDER_WINDOW", "10"))
 FINAL_REVIEW_LIMIT = int(os.environ.get("BATCH_FINAL_REVIEW_LIMIT", "50"))
 PART_SIZE = int(os.environ.get("MULTIPART_PART_SIZE_BYTES", str(8 * 1024 * 1024)))
@@ -58,6 +62,7 @@ MAX_AUDIO_BYTES = int(os.environ.get("BATCH_MAX_AUDIO_BYTES", str(500 * 1024 * 1
 MAX_AUDIO_DURATION = float(os.environ.get("BATCH_MAX_AUDIO_DURATION", "3600"))
 
 _ACTIVE_TRANSCRIPTION = frozenset({"awaiting_upload", "transcribing_queued", "transcribing"})
+_ACTIVE_SEPARATION = frozenset({"separation_queued", "separating"})
 _ACTIVE_RENDER = frozenset({"queued", "processing", "editing", "background_generating", "rendering"})
 _FAILURE = frozenset({"error", "transcription_failed", "validation_failed", "rejected"})
 _SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -157,6 +162,10 @@ def _hash_secret(value: str) -> str:
 
 
 def _phase(upload_state: str, job_status: str | None, metadata_error: str | None = None) -> str:
+    if job_status in _ACTIVE_SEPARATION:
+        return "separating"
+    if job_status == "separation_ready":
+        return "separation_ready"
     if job_status in _ACTIVE_TRANSCRIPTION:
         return "transcribing"
     if job_status in {"transcribed_pending", "transcribed"}:
@@ -169,7 +178,9 @@ def _phase(upload_state: str, job_status: str | None, metadata_error: str | None
         return "final_review"
     if job_status == "done":
         return "done"
-    if job_status in _FAILURE or upload_state == "error" or metadata_error in {"invalid_size", "invalid_duration"}:
+    if job_status in _FAILURE or upload_state == "error" or metadata_error in {
+        "invalid_size", "invalid_duration", "promotion_failed",
+    }:
         return "failed"
     if upload_state == "uploaded":
         return "waiting_processing"
@@ -190,6 +201,7 @@ def _summary(db: Session, campaign: BatchCampaign) -> dict[str, Any]:
     counters = {
         key: 0 for key in (
             "waiting_upload", "uploading", "waiting_processing", "transcribing",
+            "separating", "separation_ready",
             "lyrics_ready", "lyrics_approved", "rendering", "final_review",
             "done", "failed",
         )
@@ -1172,6 +1184,18 @@ def review_queue(
         color_rank = {"green": 0, "yellow": 1, "red": 2}.get(color, 2)
         quality = dict(job.transcription_quality or {}) if job else {}
         reference = dict(quality.get("reference_hypothesis") or {})
+        reference_available = False
+        if job and reference:
+            from reference_hypothesis import validate_binding
+            reference_available, _reference_reason = validate_binding(
+                reference,
+                audio_sha256=str(job.input_audio_sha256 or ""),
+                audio_revision=int(job.audio_revision or 0),
+            )
+        manual_full_review = bool(
+            quality.get("manual_full_review_required")
+            or not reference_available
+        )
         rows.append({
             "item_id": item.id,
             "job_id": job.job_id if job else None,
@@ -1198,15 +1222,12 @@ def review_queue(
                 else verdict.get("disagreement") or verdict.get("score"),
             ),
             "reference": {
-                "available": reference.get("availability") != "unavailable",
+                "available": reference_available,
                 "provider": (reference.get("source") or {}).get("provider"),
                 "source_kind": (reference.get("source") or {}).get("kind"),
                 "status": reference.get("review_status"),
                 "line_count": reference.get("line_count"),
-                "manual_full_review_required": bool(
-                    quality.get("manual_full_review_required")
-                    or reference.get("availability") == "unavailable"
-                ),
+                "manual_full_review_required": manual_full_review,
                 "external_links": _review_reference_links(overrides),
             },
             "open_path": (
@@ -1227,6 +1248,7 @@ def review_queue(
         rows = rows[:max(1, math.ceil(len(rows) * 0.20))]
     else:
         rows.sort(key=lambda row: (
+            1 if row["reference"]["manual_full_review_required"] else 0,
             1 if row["version"] == "live" else 0,
             row["_semaforo_rank"],
             row["_delivery_rank"],
@@ -1266,10 +1288,10 @@ def review_queue(
         )
     total = len(rows)
     start = (page - 1) * limit
-    background_split = {
+    background_split = ({
         "fixed": sum(row["background_mode"] in {"fixed", "as_is", "library"} for row in counter_rows),
         "generated": sum(row["background_mode"] not in {"fixed", "as_is", "library"} for row in counter_rows),
-    }
+    } if stage == "final" else None)
     return {
         "campaign_id": campaign.id,
         "stage": stage,
@@ -1342,6 +1364,8 @@ def claim_next_stage_review(
 def _batch_transcription_kwargs(
     campaign: BatchCampaign,
     item: BatchCampaignItem,
+    *,
+    pipeline_stage: str = "full",
 ) -> dict[str, Any]:
     """Build one audio-first transcription request for every campaign path."""
     title = item.title or ""
@@ -1358,10 +1382,149 @@ def _batch_transcription_kwargs(
         "anchor_lyrics": "",
         "reference_required": True,
         "workload_class": "batch",
+        "pipeline_stage": pipeline_stage,
+        # The full-audio Gemini hypothesis is independent evidence.  In the
+        # full stage it runs alongside blind ASR and is joined before
+        # attestation/reconciliation.  No catalogue/web lyric text is used.
+        "parallel_audio_reference": True,
     }
 
 
+def _stage1_pipeline_settings(campaign: BatchCampaign) -> dict[str, Any]:
+    raw = dict((campaign.default_render_params or {}).get("stage1_pipeline") or {})
+    try:
+        requested_ready_limit = int(raw.get("lyrics_ready_limit", LYRICS_READY_LIMIT))
+    except (TypeError, ValueError):
+        requested_ready_limit = LYRICS_READY_LIMIT
+    return {
+        "prewarm_separation": bool(raw.get("prewarm_separation", False)),
+        "lyrics_ready_limit": max(
+            1, min(ITEM_LIMIT, requested_ready_limit),
+        ),
+    }
+
+
+def _processable_items_query(db: Session, campaign: BatchCampaign):
+    """Uploaded audio eligible for stage 1, including manual metadata rows.
+
+    Missing/conflicting metadata must make the row red for human review, not
+    suppress transcription of an otherwise valid official audio asset.
+    """
+    return db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+        BatchCampaignItem.upload_state == "uploaded",
+        or_(
+            BatchCampaignItem.metadata_error.is_(None),
+            ~BatchCampaignItem.metadata_error.in_((
+                "invalid_size", "invalid_duration", "promotion_failed",
+            )),
+        ),
+    )
+
+
+def _create_stage_event(
+    db: Session,
+    campaign: BatchCampaign,
+    item: BatchCampaignItem,
+    *,
+    pipeline_stage: str,
+) -> str:
+    from transactional_outbox import create_transcription_outbox_event
+
+    job_id = create_job(
+        db,
+        artist=item.artist or "Unknown",
+        song_title=item.title or "",
+        style="auto",
+        filename=item.filename,
+        user_id=campaign.created_by,
+        tenant_id=campaign.tenant_id,
+        delivery_profile="youtube",
+        initial_status="awaiting_upload",
+        input_r2_key=item.upload_key,
+        workload_class="batch",
+        campaign_id=campaign.id,
+        campaign_item_id=item.id,
+        commit=False,
+    )
+    job = db.query(Job).filter(Job.job_id == job_id).one()
+    job.status = (
+        "separation_queued" if pipeline_stage == "separation"
+        else "transcribing_queued"
+    )
+    job.current_step = (
+        "transcribe.separation_queued" if pipeline_stage == "separation"
+        else "transcribe.prepare"
+    )
+    job.progress = 1
+    job.last_progress_at = _now()
+    audio_path = os.path.join(
+        os.path.dirname(__file__), "..", "outputs", job_id, item.filename,
+    )
+    event = create_transcription_outbox_event(
+        db,
+        job=job,
+        audio_path=audio_path,
+        transcription_kwargs=_batch_transcription_kwargs(
+            campaign, item, pipeline_stage=pipeline_stage,
+        ),
+    )
+    return event.id
+
+
+def _queue_full_stage_for_separated(
+    db: Session,
+    campaign: BatchCampaign,
+    *,
+    room: int,
+) -> list[str]:
+    from transactional_outbox import create_transcription_outbox_event
+
+    pairs = db.query(Job, BatchCampaignItem).join(
+        BatchCampaignItem, BatchCampaignItem.id == Job.campaign_item_id,
+    ).filter(
+        Job.campaign_id == campaign.id,
+        Job.status == "separation_ready",
+    ).order_by(BatchCampaignItem.ordinal.asc()).with_for_update(
+        skip_locked=True,
+    ).limit(room).all()
+    event_ids: list[str] = []
+    for job, item in pairs:
+        try:
+            event_id = None
+            with db.begin_nested():
+                audio_path = os.path.join(
+                    os.path.dirname(__file__), "..", "outputs", job.job_id,
+                    item.filename,
+                )
+                event = create_transcription_outbox_event(
+                    db,
+                    job=job,
+                    audio_path=audio_path,
+                    transcription_kwargs=_batch_transcription_kwargs(
+                        campaign, item, pipeline_stage="full",
+                    ),
+                )
+                job.status = "transcribing_queued"
+                job.current_step = "transcribe.prepare"
+                job.progress = max(21, int(job.progress or 0))
+                job.last_progress_at = _now()
+                event_id = event.id
+            if event_id:
+                event_ids.append(event_id)
+        except Exception as exc:
+            job.status = "transcription_failed"
+            job.current_step = "error"
+            job.error = "stage1_full_promotion_failed"
+            job.error_category = type(exc).__name__[:100]
+    if pairs:
+        campaign.updated_at = _now()
+        db.commit()
+    return event_ids
+
+
 def _promote_campaign(db: Session, campaign: BatchCampaign) -> list[str]:
+    stage1_settings = _stage1_pipeline_settings(campaign)
     active_trans = db.query(func.count(Job.id)).filter(
         Job.tenant_id == campaign.tenant_id,
         Job.workload_class == "batch",
@@ -1372,56 +1535,79 @@ def _promote_campaign(db: Session, campaign: BatchCampaign) -> list[str]:
         Job.workload_class == "batch",
         Job.status.in_(("transcribed_pending", "transcribed", "lyrics_approved")),
     ).scalar() or 0
-    room = min(
+    transcription_room = min(
         max(0, TRANSCRIPTION_WINDOW - active_trans),
         # Reserve room for every active transcription to finish. Without
         # this, 30 active jobs could complete on top of 40 ready lyrics and
-        # overshoot the promised 50-song review buffer.
-        max(0, LYRICS_READY_LIMIT - ready - active_trans),
+        # overshoot the configured review buffer.
+        max(0, stage1_settings["lyrics_ready_limit"] - ready - active_trans),
     )
-    if room <= 0:
-        return []
     linked = db.query(Job.campaign_item_id).filter(Job.campaign_id == campaign.id)
-    items = db.query(BatchCampaignItem).filter(
-        BatchCampaignItem.campaign_id == campaign.id,
-        BatchCampaignItem.upload_state == "uploaded",
-        BatchCampaignItem.metadata_error.is_(None),
+    processable = _processable_items_query(db, campaign)
+
+    if stage1_settings["prewarm_separation"]:
+        # Phase A is a durable barrier: enqueue/cache every stem before Phase B
+        # releases any full transcription. Failed separations are terminal red
+        # rows but do not prevent the remaining songs from crossing the barrier.
+        active_separation = db.query(func.count(Job.id)).filter(
+            Job.campaign_id == campaign.id,
+            Job.status.in_(_ACTIVE_SEPARATION),
+        ).scalar() or 0
+        separation_room = max(0, SEPARATION_WINDOW - active_separation)
+        unlinked_count = processable.filter(~BatchCampaignItem.id.in_(linked)).count()
+        if unlinked_count and separation_room:
+            items = processable.filter(
+                ~BatchCampaignItem.id.in_(linked),
+            ).order_by(BatchCampaignItem.ordinal.asc()).with_for_update(
+                skip_locked=True,
+            ).limit(separation_room).all()
+            event_ids: list[str] = []
+            for item in items:
+                try:
+                    event_id = None
+                    with db.begin_nested():
+                        event_id = _create_stage_event(
+                            db, campaign, item, pipeline_stage="separation",
+                        )
+                    if event_id:
+                        event_ids.append(event_id)
+                except Exception as exc:
+                    item.metadata_error = "promotion_failed"
+                    item.upload_error = type(exc).__name__[:100]
+            if items:
+                campaign.updated_at = _now()
+                db.commit()
+            return event_ids
+        if unlinked_count or active_separation:
+            return []
+        if transcription_room <= 0:
+            return []
+        return _queue_full_stage_for_separated(
+            db, campaign, room=transcription_room,
+        )
+
+    if transcription_room <= 0:
+        return []
+    items = processable.filter(
         ~BatchCampaignItem.id.in_(linked),
-    ).order_by(BatchCampaignItem.ordinal.asc()).with_for_update(skip_locked=True).limit(room).all()
+    ).order_by(BatchCampaignItem.ordinal.asc()).with_for_update(
+        skip_locked=True,
+    ).limit(transcription_room).all()
     event_ids: list[str] = []
-    from transactional_outbox import create_transcription_outbox_event
     for item in items:
-        job_id = create_job(
-            db,
-            artist=item.artist or "Unknown",
-            song_title=item.title or "",
-            style="auto",
-            filename=item.filename,
-            user_id=campaign.created_by,
-            tenant_id=campaign.tenant_id,
-            delivery_profile="youtube",
-            initial_status="awaiting_upload",
-            input_r2_key=item.upload_key,
-            workload_class="batch",
-            campaign_id=campaign.id,
-            campaign_item_id=item.id,
-            commit=False,
-        )
-        job = db.query(Job).filter(Job.job_id == job_id).one()
-        job.status = "transcribing_queued"
-        job.current_step = "transcribe.prepare"
-        job.progress = 1
-        job.last_progress_at = _now()
-        audio_path = os.path.join(
-            os.path.dirname(__file__), "..", "outputs", job_id, item.filename,
-        )
-        event = create_transcription_outbox_event(
-            db,
-            job=job,
-            audio_path=audio_path,
-            transcription_kwargs=_batch_transcription_kwargs(campaign, item),
-        )
-        event_ids.append(event.id)
+        try:
+            event_id = None
+            with db.begin_nested():
+                event_id = _create_stage_event(
+                    db, campaign, item, pipeline_stage="full",
+                )
+            if event_id:
+                event_ids.append(event_id)
+        except Exception as exc:
+            # One corrupt/conflicting row is visible as red and cannot abort
+            # creation or dispatch for the rest of the wave.
+            item.metadata_error = "promotion_failed"
+            item.upload_error = type(exc).__name__[:100]
     if items:
         campaign.updated_at = _now()
         db.commit()

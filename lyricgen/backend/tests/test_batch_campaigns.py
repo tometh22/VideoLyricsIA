@@ -137,6 +137,95 @@ def test_reconciler_reserves_ready_buffer_for_active_transcriptions(db):
     assert db.query(Job).filter(Job.campaign_id == campaign.id).count() == 50
 
 
+def test_campaign_can_explicitly_raise_ready_limit_for_300_stage1_rows(
+    db, monkeypatch,
+):
+    campaign = _campaign(db, 60)
+    campaign.default_render_params = {
+        "stage1_pipeline": {"lyrics_ready_limit": 60},
+    }
+    db.commit()
+    monkeypatch.setattr(batch, "TRANSCRIPTION_WINDOW", 60)
+
+    promoted = batch._promote_campaign(db, campaign)
+
+    assert len(promoted) == 60
+    assert batch.LYRICS_READY_LIMIT == 50
+
+
+def test_staged_campaign_prewarms_every_stem_before_releasing_asr(
+    db, monkeypatch,
+):
+    campaign = _campaign(db, 3)
+    campaign.default_render_params = {
+        "stage1_pipeline": {
+            "prewarm_separation": True,
+            "lyrics_ready_limit": 310,
+        },
+    }
+    db.commit()
+    monkeypatch.setattr(batch, "SEPARATION_WINDOW", 2)
+    monkeypatch.setattr(batch, "TRANSCRIPTION_WINDOW", 2)
+
+    first = batch._promote_campaign(db, campaign)
+    assert len(first) == 2
+    first_events = db.query(JobOutboxEvent).filter(
+        JobOutboxEvent.id.in_(first),
+    ).all()
+    assert {
+        event.payload["transcription_kwargs"]["pipeline_stage"]
+        for event in first_events
+    } == {"separation"}
+    assert db.query(Job).filter(
+        Job.campaign_id == campaign.id,
+        Job.status == "transcribing_queued",
+    ).count() == 0
+
+    for job in db.query(Job).filter(Job.campaign_id == campaign.id):
+        job.status = "separation_ready"
+    db.commit()
+    second = batch._promote_campaign(db, campaign)
+    assert len(second) == 1
+    last = db.query(Job).filter(
+        Job.campaign_id == campaign.id,
+        Job.status == "separation_queued",
+    ).one()
+    last.status = "separation_ready"
+    db.commit()
+
+    full = batch._promote_campaign(db, campaign)
+    assert len(full) == 2
+    full_events = db.query(JobOutboxEvent).filter(
+        JobOutboxEvent.id.in_(full),
+    ).all()
+    assert {
+        event.payload["transcription_kwargs"]["pipeline_stage"]
+        for event in full_events
+    } == {"full"}
+
+
+def test_failed_separation_is_red_but_does_not_block_other_asr(db, monkeypatch):
+    campaign = _campaign(db, 3)
+    campaign.default_render_params = {
+        "stage1_pipeline": {"prewarm_separation": True},
+    }
+    db.commit()
+    monkeypatch.setattr(batch, "SEPARATION_WINDOW", 3)
+
+    batch._promote_campaign(db, campaign)
+    jobs = db.query(Job).filter(Job.campaign_id == campaign.id).order_by(Job.id).all()
+    jobs[0].status = "transcription_failed"
+    jobs[1].status = "separation_ready"
+    jobs[2].status = "separation_ready"
+    db.commit()
+
+    released = batch._promote_campaign(db, campaign)
+
+    assert len(released) == 2
+    assert jobs[0].status == "transcription_failed"
+    assert batch._phase("uploaded", jobs[0].status) == "failed"
+
+
 def test_individual_failure_does_not_stop_the_campaign_wave(db):
     campaign = _campaign(db, 31)
     batch._promote_campaign(db, campaign)
@@ -382,6 +471,9 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
     assert first_job["reference"]["external_links"] == [{
         "kind": "official_channel", "url": "https://youtube.com/watch?v=ok",
     }]
+    assert first_job["reference"]["available"] is False
+    assert first_job["reference"]["manual_full_review_required"] is True
+    assert delivery["background_split"] is None
 
     learning = batch.review_queue(
         campaign.id, order="learning", **queue_args,

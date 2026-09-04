@@ -1322,6 +1322,11 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 "enabled": False, "proposal_count": 0,
                 "automatic_apply_allowed": False,
             }
+            spanish_orthography_candidates = []
+            spanish_orthography_report = {
+                "enabled": False, "finding_count": 0, "candidate_count": 0,
+                "automatic_apply_allowed": False,
+            }
             # The provider/content retry remains separately kill-switchable.
             # Raw rows stay in memory until the typed, signed review-proposal
             # gate accepts them; global quality analytics receive only counts.
@@ -1357,6 +1362,32 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
             ).strip().lower() in {"1", "true", "yes", "on"}:
                 try:
+                    from spanish_orthography import analyze_spanish_orthography
+
+                    raw_spanish_report = analyze_spanish_orthography(
+                        snapshot["segments"],
+                    )
+                    spanish_orthography_candidates = list(
+                        raw_spanish_report.pop("candidates", []) or []
+                    )
+                    # Persist raw lyric text only in the revision-bound editor
+                    # proposal. Global quality telemetry keeps counts/policy.
+                    raw_spanish_report.pop("findings", None)
+                    spanish_orthography_report = {
+                        **raw_spanish_report, "enabled": True,
+                    }
+                except Exception as exc:
+                    logger.warning(
+                        "[SPANISH-ORTHOGRAPHY] fail-closed job=%s error=%s",
+                        job_id, type(exc).__name__,
+                    )
+                    spanish_orthography_candidates = []
+                    spanish_orthography_report = {
+                        "enabled": True, "finding_count": 0,
+                        "candidate_count": 0, "failure": type(exc).__name__,
+                        "automatic_apply_allowed": False,
+                    }
+                try:
                     from pathlib import Path
                     from timing_review_suggestions import (
                         build_timing_review_candidates, load_acoustic_track,
@@ -1386,6 +1417,9 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                     }
             retry_stats["timing_review_suggestions"] = (
                 _sanitize_analytical_evidence(timing_review_report)
+            )
+            retry_stats["spanish_orthography"] = (
+                _sanitize_analytical_evidence(spanish_orthography_report)
             )
 
             evidence_windows = [
@@ -1441,7 +1475,10 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                     build_operator_review_proposal(
                         snapshot["segments"],
                         timing_candidates=timing_review_candidates,
-                        text_candidates=raw_proposal_windows,
+                        text_candidates=[
+                            *raw_proposal_windows,
+                            *spanish_orthography_candidates,
+                        ],
                         complete_parent_ids=complete_parent_ids,
                     )
                 )

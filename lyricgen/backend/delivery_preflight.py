@@ -341,6 +341,53 @@ def _lyric_occurrences(
     return found
 
 
+def _deterministic_spanish_occurrences(
+    segments: Sequence[Mapping[str, Any]],
+) -> list[tuple[int, _Occurrence]]:
+    """Surface high-precision Spanish suggestions without a song reference."""
+    from spanish_orthography import analyze_spanish_orthography
+
+    report = analyze_spanish_orthography(segments)
+    found: list[tuple[int, _Occurrence]] = []
+    for finding in report.get("findings") or []:
+        if not isinstance(finding, Mapping):
+            continue
+        try:
+            index = int(finding.get("segment_index"))
+            seconds = float(finding.get("start") or 0)
+        except (TypeError, ValueError):
+            continue
+        detector = _text(finding.get("detector"))
+        actual = _text(finding.get("actual"))
+        expected = _text(finding.get("expected"))
+        if not actual or not expected:
+            continue
+        typo = detector == "spanish_dictionary_near_match"
+        found.append((index, _Occurrence(
+            code=("LYRIC_TOKEN_TYPO" if typo else "LYRIC_ORTHOGRAPHY_MISMATCH"),
+            severity="WARN",
+            category=("Sung lyric mismatch" if typo else "Misspelled lyrics"),
+            summary=(
+                f'Possible typo: "{actual}"' if typo
+                else f'Check spelling/diacritics: "{actual}"'
+            ),
+            description=(
+                f'Deterministic Spanish check suggests "{expected}" for '
+                f'final displayed token "{actual}". Verify against the audio.'
+            ),
+            seconds=seconds,
+            actual=actual,
+            expected=expected,
+            detector=detector,
+            confidence=0.99 if finding.get("confidence") == "high" else 0.9,
+            # The rollout is observe-only. The same candidate is exposed as a
+            # one-click human suggestion, never granted mutation authority.
+            auto_fixable=False,
+            evidence=dict(finding),
+        )))
+    return found
+
+
 def _metadata_occurrences(
     metadata: Mapping[str, Any], asset: Mapping[str, Any]
 ) -> list[tuple[int, _Occurrence]]:
@@ -582,6 +629,8 @@ def build_delivery_preflight(
         occurrences.extend(_lyric_occurrences(
             segment_rows, approved_lyrics, reference_trusted=reference_trusted
         ))
+    if not reference_trusted:
+        occurrences.extend(_deterministic_spanish_occurrences(segment_rows))
 
     issues = _aggregate(
         occurrences, total_segments=len(segment_rows), fps=effective_fps,

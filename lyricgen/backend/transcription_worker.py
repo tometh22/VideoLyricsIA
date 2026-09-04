@@ -507,6 +507,8 @@ def run_transcription_job(
     anchor_lyrics: str = "",
     reference_required: bool = False,
     workload_class: str = "interactive",
+    pipeline_stage: str = "full",
+    parallel_audio_reference: bool = False,
 ) -> dict:
     """RQ entry point — sync wrapper around `_run_transcription_for_job`.
 
@@ -537,12 +539,19 @@ def run_transcription_job(
     if not filename:
         filename = os.path.basename(audio_path)
 
-    # 1. Status flip a "transcribing" para que el polling lo vea ya en marcha.
+    if pipeline_stage not in {"full", "separation"}:
+        return _fail(job_id, "Etapa de transcripción inválida.")
+
+    # 1. Expose the durable stage before materialising the official audio.
     try:
         update_job(
             job_id,
-            status="transcribing",
-            current_step="transcribe.prepare",
+            status="separating" if pipeline_stage == "separation" else "transcribing",
+            current_step=(
+                "transcribe.isolate_vocals"
+                if pipeline_stage == "separation"
+                else "transcribe.prepare"
+            ),
             progress=2,
         )
     except Exception as exc:
@@ -645,6 +654,47 @@ def run_transcription_job(
     finally:
         _identity_db.close()
 
+    if pipeline_stage == "separation":
+        # Phase A only computes and validates the content-addressed stem.  The
+        # campaign reconciler releases Phase B after every song is either
+        # separation_ready or terminal red.  No ASR/Gemini/background/render
+        # work is reachable from this branch.
+        import vocal_sep
+        if not vocal_sep.is_enabled():
+            return _fail(job_id, "Separación vocal requerida pero deshabilitada.")
+        stem_path = None
+        try:
+            stem_path = vocal_sep.separate_vocals(audio_path)
+            if not stem_path:
+                return _fail(job_id, "No se pudo preparar la separación vocal.")
+            update_job(
+                job_id,
+                status="separation_ready",
+                current_step="transcribe.separation_ready",
+                progress=20,
+            )
+            try:
+                from batch_campaigns import ensure_campaign_reconciler_scheduled
+                ensure_campaign_reconciler_scheduled()
+            except Exception as exc:
+                logger.warning(
+                    "[TRANSCRIBE-WORKER] separation ready but campaign wake-up "
+                    "failed job=%s error_type=%s",
+                    job_id, _safe_exception_code(exc),
+                )
+            return {
+                "job_id": job_id,
+                "status": "separation_ready",
+                "audio_sha256": source_audio_sha256,
+                "audio_revision": source_audio_revision,
+            }
+        finally:
+            if stem_path:
+                try:
+                    os.unlink(stem_path)
+                except OSError:
+                    pass
+
     # 3. Llamar al pipeline async existente. `request` y `current_user` son
     #    ignorados dentro del cuerpo (verified) — passing None es seguro.
     try:
@@ -654,6 +704,7 @@ def run_transcription_job(
                 language=language, artist=artist, title=title, filename=filename,
                 live=live, reference_required=reference_required,
                 workload_class=workload_class,
+                parallel_audio_reference=parallel_audio_reference,
             )
             from recognition_provenance import resume_from_result
             resume_from_result(r)

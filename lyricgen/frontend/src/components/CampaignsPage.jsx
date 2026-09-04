@@ -118,7 +118,7 @@ function CampaignDetail({ id }) {
       const [head, rows, review] = await Promise.all([
         api(`/batch/campaigns/${id}`),
         api(`/batch/campaigns/${id}/items?page=${page}&limit=50${phase ? `&phase=${phase}` : ""}`),
-        api(`/batch/campaigns/${id}/review-queue?stage=${queueStage}&order=${queueOrder}${queueVersion ? `&version=${queueVersion}` : ""}${queueState ? `&state=${encodeURIComponent(queueState)}` : ""}${queueBackground ? `&background_mode=${encodeURIComponent(queueBackground)}` : ""}${queueArtist ? `&artist=${encodeURIComponent(queueArtist)}` : ""}${queueAudit ? "&audit_preapproved=true" : ""}`),
+        api(`/batch/campaigns/${id}/review-queue?stage=${queueStage}&order=${queueOrder}${queueVersion ? `&version=${queueVersion}` : ""}${queueState ? `&state=${encodeURIComponent(queueState)}` : ""}${queueStage === "final" && queueBackground ? `&background_mode=${encodeURIComponent(queueBackground)}` : ""}${queueArtist ? `&artist=${encodeURIComponent(queueArtist)}` : ""}${queueAudit ? "&audit_preapproved=true" : ""}`),
       ]);
       setCampaign(head); setItems(rows.items || []); setPages(rows.pages || 1);
       setReviewQueue(review);
@@ -198,7 +198,7 @@ function CampaignDetail({ id }) {
             <select value={queueState} onChange={(e) => setQueueState(e.target.value)} className="rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10">
               <option value="">Todos los estados</option><option value="pending">Pendiente</option><option value="processing">Procesando</option><option value="ready">Lista</option><option value="reviewing">En revisión</option><option value="approved">Aprobada</option><option value="exported">Exportada</option>
             </select>
-            <input value={queueBackground} onChange={(e) => setQueueBackground(e.target.value)} placeholder="Modo de fondo" className="w-32 rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10" />
+            {queueStage === "final" && <input value={queueBackground} onChange={(e) => setQueueBackground(e.target.value)} placeholder="Modo de fondo" className="w-32 rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10" />}
             <input value={queueArtist} onChange={(e) => setQueueArtist(e.target.value)} placeholder="Artista" className="w-32 rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10" />
             {reviewQueue?.confidence?.preapproved_audit_available && <button onClick={() => setQueueAudit((value) => !value)} className={`rounded-lg px-3 py-2 text-xs ring-1 ${queueAudit ? "bg-emerald-500/15 text-emerald-200 ring-emerald-500/30" : "bg-black/25 text-white ring-white/10"}`}>Auditar verdes preaprobados</button>}
           </div>
@@ -208,14 +208,14 @@ function CampaignDetail({ id }) {
         </div>
         <div className="flex flex-wrap gap-4 text-xs text-ink-secondary">
           <span>Promedio hoy: {reviewQueue?.review_minutes_today?.average ?? "—"} min</span>
-          <span>Fondos fijos: {reviewQueue?.background_split?.fixed || 0}</span>
-          <span>Fondos generados: {reviewQueue?.background_split?.generated || 0}</span>
+          {queueStage === "final" && <span>Fondos fijos: {reviewQueue?.background_split?.fixed || 0}</span>}
+          {queueStage === "final" && <span>Fondos generados: {reviewQueue?.background_split?.generated || 0}</span>}
           <span>{reviewQueue?.confidence?.colors_visible ? "Semáforo visible" : `Semáforo oculto hasta ${reviewQueue?.confidence?.calibration_target || 50} revisiones`}</span>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[850px] text-left text-xs">
-            <thead className="text-ink-tertiary"><tr><th className="p-2">Prioridad</th><th className="p-2">Artista / canción</th><th className="p-2">Versión</th><th className="p-2">Fondo</th><th className="p-2">Duración</th><th className="p-2">Estado</th><th className="p-2">Referencia</th><th className="p-2"></th></tr></thead>
-            <tbody>{(reviewQueue?.items || []).map((row) => <tr key={row.item_id} className="border-t border-white/[0.05] text-ink-secondary"><td className="p-2">{row.priority}</td><td className="p-2"><div className="font-medium text-white">{row.title}</div><div>{row.artist}</div></td><td className="p-2">{row.version}</td><td className="p-2">{row.background_mode}</td><td className="p-2">{row.duration_seconds ? `${Math.round(row.duration_seconds)}s` : "—"}</td><td className="p-2">{row.state}{row.reviewer_name ? ` · ${row.reviewer_name}` : ""}</td><td className="p-2">{row.reference?.provider || "pendiente"} · {row.reference?.status || "sin asociar"}</td><td className="p-2">{row.open_path && <button onClick={() => navigate(row.open_path)} className="rounded-lg bg-brand/15 px-3 py-1.5 text-brand-light">Abrir</button>}</td></tr>)}</tbody>
+            <thead className="text-ink-tertiary"><tr><th className="p-2">Prioridad</th><th className="p-2">Artista / canción</th><th className="p-2">Versión</th>{queueStage === "final" && <th className="p-2">Fondo</th>}<th className="p-2">Duración</th><th className="p-2">Estado</th><th className="p-2">Referencia</th><th className="p-2"></th></tr></thead>
+            <tbody>{(reviewQueue?.items || []).map((row) => <tr key={row.item_id} className="border-t border-white/[0.05] text-ink-secondary"><td className="p-2">{row.priority}</td><td className="p-2"><div className="font-medium text-white">{row.title}</div><div>{row.artist}</div></td><td className="p-2">{row.version}</td>{queueStage === "final" && <td className="p-2">{row.background_mode}</td>}<td className="p-2">{row.duration_seconds ? `${Math.round(row.duration_seconds)}s` : "—"}</td><td className="p-2">{row.state}{row.reviewer_name ? ` · ${row.reviewer_name}` : ""}</td><td className="p-2">{row.reference?.provider || "pendiente"} · {row.reference?.status || "sin asociar"}</td><td className="p-2">{row.open_path && <button onClick={() => navigate(row.open_path)} className="rounded-lg bg-brand/15 px-3 py-1.5 text-brand-light">Abrir</button>}</td></tr>)}</tbody>
           </table>
         </div>
       </section>
