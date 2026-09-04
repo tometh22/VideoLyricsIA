@@ -55,6 +55,7 @@ MIN_CALLS_FOR_CALIBRATION = 25
 # Sufijo con el que `load_applied_rates` guarda, junto a la tarifa derivada de
 # la factura, la estimada de lista ponderada por uso. `rate_for_tool` divide
 # una por otra para conservar los precios relativos DENTRO del grupo.
+BASE_KEY_PREFIX = "__lista_al_calibrar__:"
 EST_KEY_SUFFIX = "::estimada"
 
 # Cinturón de seguridad: si la tarifa derivada se va más de esto respecto de
@@ -140,6 +141,15 @@ def derive_rates(sessions: dict, invoiced_by_tool: dict[str, float],
         acc[1] += n
     estimated = {t: round(s / c, 6) for t, (s, c) in weighted.items() if c}
 
+    # Base de precios de lista con la que se derivó, POR MODELO.
+    #
+    # `estimated_rate` es el promedio ponderado de la FAMILIA, así que por
+    # diseño no coincide con la lista de ningún modelo suelto — compararlos
+    # sería comparar cosas distintas. Para saber si un snapshot quedó rancio
+    # hay que comparar la lista de HOY del mismo modelo contra la que había
+    # al calibrar, y para eso hay que guardarla.
+    base_lista = {m: cost_for_record(m, "google_vertex") for m in by_model}
+
     results = []
     applied: dict[str, float] = {}
     for tool in sorted(set(calls) | set(invoiced_by_tool)):
@@ -151,6 +161,8 @@ def derive_rates(sessions: dict, invoiced_by_tool: dict[str, float],
         # per-call price: persisting it would make attributed cost and margin
         # negative for every later job.
         derived = round(billed / n, 6) if (n and billed > 0) else None
+        modelos_del_grupo = {m: r for m, r in base_lista.items()
+                             if _tool_of(m) == tool}
 
         status, reason = "ok", None
         if billed < 0:
@@ -177,6 +189,9 @@ def derive_rates(sessions: dict, invoiced_by_tool: dict[str, float],
             "derived_rate": derived, "estimated_rate": est,
             "drift": (round(derived / est, 3) if est and derived else None),
             "status": status, "reason": reason,
+            # Con qué precios de lista se derivó. Sirve para detectar un
+            # snapshot rancio al leerlo — ver `rate_for_tool`.
+            "list_basis": modelos_del_grupo,
         })
 
     return {
@@ -253,11 +268,31 @@ def load_applied_rates(db, period: str) -> dict[str, float]:
             # aplastar sus precios relativos — ver allá.
             if r.get("estimated_rate"):
                 out[f"{r['tool']}{EST_KEY_SUFFIX}"] = float(r["estimated_rate"])
+            for modelo, precio in (r.get("list_basis") or {}).items():
+                out[f"{BASE_KEY_PREFIX}{modelo}"] = float(precio)
         return out
     except Exception as exc:
         logger.warning("[RATES] no pude leer la calibración de %s: %r",
                        period, exc)
         return {}
+
+
+# Cuánto puede moverse el precio de lista de UN MISMO modelo entre la
+# calibración y la lectura antes de invalidar el multiplicador. 5% es
+# tolerancia de redondeo: la lista de un modelo dado no cambia sola, y un
+# cambio de `VEO_CLIP_SECONDS` la mueve al doble o la mitad.
+#
+# Se compara modelo contra el MISMO modelo, no contra `estimated_rate`: esa
+# es el promedio ponderado de la familia y por diseño difiere de la lista de
+# cada modelo suelto (un Veo Standard vale 4x un Fast). Compararlos rompía
+# la razón 4x que el multiplicador existe para conservar.
+MAX_DERIVA_LISTA = 0.05
+
+
+def _escalas_compatibles(base: float, lista: float) -> bool:
+    if not base or not lista:
+        return False
+    return abs(lista - base) / base <= MAX_DERIVA_LISTA
 
 
 def rate_for_tool(tool_name: str, calibrated: dict[str, float]) -> float | None:
@@ -287,6 +322,33 @@ def rate_for_tool(tool_name: str, calibrated: dict[str, float]) -> float | None:
         from provenance import COST_PER_CALL
         lista = COST_PER_CALL.get((tool_name, "google_vertex"))
         if est and lista:
+            # GUARDA CONTRA SNAPSHOT RANCIO.
+            #
+            # El multiplicador sólo tiene sentido si `est` —el promedio de
+            # lista ponderado, congelado al calibrar— sigue siendo del mismo
+            # orden que la lista VIVA. Si no, el resultado es basura con
+            # cara de dato de factura.
+            #
+            # Pasó de verdad: la calibración de jul-2026 se derivó en un
+            # proceso sin `VEO_CLIP_SECONDS` (est=$0,80) mientras la app
+            # corre con 4 (lista $0,40). El panel valuó Veo a $0,146058
+            # contra una factura de $0,292116 — la MITAD, y en la dirección
+            # que infla la utilidad repartible. Nada avisó.
+            #
+            # Cuando divergen se cae a la tarifa derivada PLANA: pierde el
+            # precio relativo dentro de la familia (un Fast y un Standard
+            # valen igual) pero el total sigue cuadrando contra la factura,
+            # que es la propiedad que no se puede perder.
+            base = calibrated.get(f"{BASE_KEY_PREFIX}{tool_name}")
+            if base and not _escalas_compatibles(base, lista):
+                logger.warning(
+                    "[RATES] %s: la lista de hoy ($%.4f) no coincide con la "
+                    "de cuando se calibró ($%.4f) — el snapshot se derivó "
+                    "con otra configuración de precios. Se usa la derivada "
+                    "plana ($%.6f) en vez del multiplicador. Re-calibrá el "
+                    "período desde el proceso de la app.",
+                    tool_name, lista, base, derived)
+                return derived
             return round(lista * (derived / est), 6)
         return derived
     return None

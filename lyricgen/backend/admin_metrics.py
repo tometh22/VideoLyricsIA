@@ -125,10 +125,18 @@ def metrics_timeseries(db: Session, days: int = 28) -> dict:
         .join(Job, Job.job_id == AIProvenance.job_id)
         .filter(AIProvenance.created_at >= since)
         # MISMO costo que /admin/margin. Sin estos dos, "Costo IA" valía una
-        # cosa en Rendimiento e Insights y otra en Gestión → Costos, sin que
-        # nada en pantalla lo dijera. Medido en jul-2026: la tarifa de lista
-        # de Veo ($0,10) contra la derivada de la factura ($0,292116) —
-        # 2,9x abajo; gemini al revés, 7x arriba.
+        # cosa acá y otra en Gestión → Costos, sin que nada en pantalla lo
+        # dijera.
+        #
+        # Medido en jul-2026 con la config REAL (`VEO_CLIP_SECONDS=4` en
+        # staging y en prod, o sea lista $0,40/llamada):
+        #
+        #   veo-3.1-fast   lista $0,40   factura $0,292116   lista 1,37x ARRIBA
+        #
+        # (Una versión anterior de este comentario decía "$0,10 → 2,9x
+        # abajo". Estaba mal por dos lados: $0,10 es la tarifa por SEGUNDO,
+        # no por llamada, y el signo iba al revés. Quien lo leyera para
+        # diagnosticar corregía en la dirección equivocada.)
         .filter(billable_filter())
         .all()
     )

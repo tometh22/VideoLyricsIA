@@ -307,12 +307,32 @@ def test_el_costo_ia_usa_la_tarifa_calibrada_no_la_de_lista(db):
                         tool_provider="google_vertex", prompt_sent="x",
                         response_summary="ok", created_at=ahora))
     db.commit()
-    # Forma REAL de lo que produce `derive_rates`: `load_applied_rates` lee
-    # de `breakdown`, no de `applied`, y exige status ok + derived_rate.
+    # Forma REAL de `derive_rates`, con `estimated_rate` INCLUIDO.
+    #
+    # La primera versión de este test lo omitía, y por eso no atrapó un bug
+    # que costó dinero: `rate_for_tool` no reemplaza la tarifa, la aplica
+    # como MULTIPLICADOR sobre el precio de lista vigente
+    # (`lista × derived/estimated`). Sin `estimated_rate` toma la rama plana
+    # `return derived`, que NO es la que corre en producción.
+    #
+    # El bug real: la calibración de jul-2026 se guardó con
+    # `estimated_rate=0.8` —derivada en un proceso sin `VEO_CLIP_SECONDS`—
+    # mientras api corre con `VEO_CLIP_SECONDS=4`, o sea lista $0,40. El
+    # panel valuaba a $0,146058 contra una factura de $0,292116: la MITAD,
+    # y en la dirección que infla la utilidad repartible.
+    # `estimated_rate` se toma de la lista VIVA, que es exactamente lo que
+    # hace `derive_rates` en el proceso real. Así el multiplicador queda en
+    # 1 y la derivada se aplica tal cual — y el test no depende de cuánto
+    # valga `VEO_CLIP_SECONDS` en el entorno donde corra.
+    from provenance import COST_PER_CALL
+    LISTA = COST_PER_CALL[("veo-3.1-fast-generate-001", "google_vertex")]
+
     rc.store_rates(db, period, {
         "applied": {"veo": TARIFA},
         "rates": [{"tool": "veo", "status": "ok", "derived_rate": TARIFA,
-                   "calls": 527, "invoiced_usd": 140.80}],
+                   "estimated_rate": LISTA, "calls": 482,
+                   "invoiced_usd": 140.80,
+                   "list_basis": {"veo-3.1-fast-generate-001": LISTA}}],
     })
     db.commit()
     try:
@@ -323,7 +343,30 @@ def test_el_costo_ia_usa_la_tarifa_calibrada_no_la_de_lista(db):
         # ($0,80): esa diferencia es 2,7x y no se pierde en el redondeo.
         assert fila["ai_cost_usd"] == pytest.approx(round(TARIFA, 2), abs=0.005), (
             f"usó la tarifa de lista en vez de la calibrada: {fila['ai_cost_usd']}")
-        assert fila["ai_cost_usd"] < 0.5, "sigue valuando a precio de lista"
+        # Y no es ni la lista ($0,40) ni la mitad ($0,15) que salía con el
+        # `estimated_rate` desalineado. El `< 0.5` que había acá antes era
+        # vacuo: la lista con clip=4 vale $0,40 y lo pasaba igual.
+        assert fila["ai_cost_usd"] != pytest.approx(round(LISTA, 2), abs=0.005)
+        # Y el bug real, ahora con guarda: un `estimated_rate` que no
+        # coincide con la lista viva YA NO parte la tarifa. `rate_for_tool`
+        # detecta la escala rancia y cae a la derivada plana, que sigue
+        # cuadrando contra la factura.
+        rc.store_rates(db, period, {
+            "applied": {"veo": TARIFA},
+            # Base de lista RANCIA: se calibró cuando ese modelo valía el
+            # doble. Es exactamente lo que pasa al mover VEO_CLIP_SECONDS.
+            "rates": [{"tool": "veo", "status": "ok", "derived_rate": TARIFA,
+                       "estimated_rate": LISTA, "calls": 482,
+                       "invoiced_usd": 140.80,
+                       "list_basis": {"veo-3.1-fast-generate-001": LISTA * 2}}],
+        })
+        desalineada = admin_metrics.metrics_economics(db, days=7)
+        con_guarda = next(t for t in desalineada["tenants"]
+                          if t["tenant_id"] == tenant)
+        assert con_guarda["ai_cost_usd"] == pytest.approx(round(TARIFA, 2), abs=0.005), (
+            f"un snapshot con la escala rancia devolvió "
+            f"{con_guarda['ai_cost_usd']} en vez de la derivada {TARIFA}. "
+            "Sin la guarda esto da la MITAD, que es el bug que costó dinero.")
     finally:
         db.query(AIProvenance).filter(AIProvenance.job_id == "mc1").delete(
             synchronize_session=False)
@@ -331,4 +374,49 @@ def test_el_costo_ia_usa_la_tarifa_calibrada_no_la_de_lista(db):
         db.query(CostSnapshot).filter(CostSnapshot.period == period,
                                       CostSnapshot.source == "rate_calibration"
                                       ).delete(synchronize_session=False)
+        db.commit()
+
+
+def test_la_serie_diaria_usa_las_mismas_reglas_que_economics(db):
+    """`metrics_timeseries` también, no sólo `metrics_economics`.
+
+    Los dos primeros tests de este bloque llamaban únicamente a
+    `metrics_economics`: se podía revertir el `billable_filter` y el
+    `_rates_for_month` de `metrics_timeseries` enteros y la suite quedaba
+    verde. Es la mitad del cambio sin cubrir, y es la que alimenta el
+    gráfico de tendencia de Rendimiento.
+    """
+    from datetime import datetime, timedelta, timezone
+    from database import AIProvenance, Job
+    import admin_metrics
+    from provenance import CACHE_HIT_PREFIX, COST_PER_CALL
+
+    tenant = "metrics-serie-test"
+    ahora = datetime.now(timezone.utc) - timedelta(days=1)
+    db.query(Job).filter(Job.tenant_id == tenant).delete(synchronize_session=False)
+    db.add(Job(job_id="ms1", user_id=1, tenant_id=tenant, artist="A",
+               filename="a.mp3", status="done", created_at=ahora))
+    db.flush()
+    for resumen in ("ok", f"{CACHE_HIT_PREFIX} reuse"):
+        db.add(AIProvenance(job_id="ms1", step="video_bg",
+                            tool_name="veo-3.1-fast-generate-001",
+                            tool_provider="google_vertex", prompt_sent="x",
+                            response_summary=resumen, created_at=ahora))
+    db.commit()
+    try:
+        serie = admin_metrics.metrics_timeseries(db, days=7)
+        dias = serie["series"] if isinstance(serie, dict) else serie
+        total = 0.0
+        for punto in (dias.values() if isinstance(dias, dict) else dias):
+            fila = punto.get(tenant) if isinstance(punto, dict) else None
+            if isinstance(fila, dict):
+                total += fila.get("ai_cost_usd", 0.0)
+        una = COST_PER_CALL[("veo-3.1-fast-generate-001", "google_vertex")]
+        # Una llamada, no dos: el cache hit no gastó plata.
+        assert total == pytest.approx(una, abs=0.01), (
+            f"la serie contó el cache hit: {total} (una llamada = {una})")
+    finally:
+        db.query(AIProvenance).filter(AIProvenance.job_id == "ms1").delete(
+            synchronize_session=False)
+        db.query(Job).filter(Job.tenant_id == tenant).delete(synchronize_session=False)
         db.commit()

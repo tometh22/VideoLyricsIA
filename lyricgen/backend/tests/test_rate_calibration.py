@@ -185,3 +185,61 @@ def test_load_applied_rates_ignora_las_no_ok():
         def query(self, *a, **k): return _Q()
 
     assert rc.load_applied_rates(_S(), "2026-07") == {"veo": 0.62}
+
+
+# ---------------------------------------------------------------------------
+# Guarda contra snapshot rancio
+# ---------------------------------------------------------------------------
+#
+# `rate_for_tool` aplica la calibración como MULTIPLICADOR sobre la lista
+# viva: `lista × derivada/estimada`. Eso conserva el precio relativo dentro
+# de una familia (un Veo Fast y un Standard no valen igual), pero sólo
+# funciona si `estimada` —congelada al calibrar— sigue siendo del mismo
+# orden que la lista de hoy.
+#
+# Pasó de verdad: la calibración de jul-2026 se derivó en un proceso sin
+# `VEO_CLIP_SECONDS` (estimada $0,80) mientras la app corre con 4 (lista
+# $0,40). El panel valuó Veo a $0,146058 contra una factura de $0,292116 —
+# la MITAD, y en la dirección que infla la utilidad repartible. Nada avisó,
+# y la única defensa era acordarse de calibrar desde el proceso correcto.
+
+def test_un_snapshot_derivado_con_otra_lista_no_parte_la_tarifa():
+    import rate_calibration as rc
+    from provenance import COST_PER_CALL
+
+    MODELO = "veo-3.1-fast-generate-001"
+    lista = COST_PER_CALL[(MODELO, "google_vertex")]
+    derivada = 0.292116
+    est = lista * 1.25          # promedio de familia: difiere de la lista, y está bien
+
+    base = f"{rc.BASE_KEY_PREFIX}{MODELO}"
+
+    # Snapshot COHERENTE: se calibró con la misma lista que hay hoy.
+    ok = rc.rate_for_tool(MODELO, {
+        "veo": derivada, "veo::estimada": est, base: lista})
+    assert ok == pytest.approx(round(lista * (derivada / est), 6), abs=1e-6)
+
+    # Snapshot RANCIO: se calibró cuando la lista de ESE modelo valía el
+    # doble (es lo que pasa al cambiar VEO_CLIP_SECONDS). No puede aplicar
+    # el multiplicador: cae a la derivada plana, que sigue cuadrando contra
+    # la factura.
+    rancio = rc.rate_for_tool(MODELO, {
+        "veo": derivada, "veo::estimada": est, base: lista * 2})
+    assert rancio == pytest.approx(derivada, abs=1e-6), (
+        f"aplicó un multiplicador rancio: {rancio}")
+
+
+def test_sin_base_guardada_se_comporta_como_antes():
+    """Compatibilidad: los snapshots viejos no tienen `list_basis`.
+
+    Sin esa clave no hay con qué comparar, así que se aplica el
+    multiplicador como siempre — degradar a plano ahí sería romper meses ya
+    calibrados por una protección que no puede evaluar.
+    """
+    import rate_calibration as rc
+    from provenance import COST_PER_CALL
+
+    MODELO = "veo-3.1-fast-generate-001"
+    lista = COST_PER_CALL[(MODELO, "google_vertex")]
+    r = rc.rate_for_tool(MODELO, {"veo": 0.8, "veo::estimada": 1.0})
+    assert r == pytest.approx(round(lista * 0.8, 6), abs=1e-6)
