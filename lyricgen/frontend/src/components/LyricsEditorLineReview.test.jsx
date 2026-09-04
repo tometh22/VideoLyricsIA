@@ -78,10 +78,13 @@ describe("LyricsEditor — gate de confirmación por línea", () => {
     const first = render(<LyricsEditor {...props({ onApprove })} />);
     const approve = screen.getByRole("button", { name: "Aprobar letra y timing" });
 
-    expect(approve).toBeDisabled();
+    expect(approve).not.toBeDisabled();
     expect(approve).toHaveAttribute("data-review-incomplete", "true");
     expect(screen.getByTestId("line-review-progress")).toHaveTextContent("0/2");
     expect(screen.getByText(/no hace falta aprobar para conservarlos/i)).toBeInTheDocument();
+
+    await userEvent.click(approve);
+    expect(onApprove).not.toHaveBeenCalled();
 
     fireEvent.change(screen.getByLabelText("Letra de la línea 1"), {
       target: { value: "Primera línea corregida" },

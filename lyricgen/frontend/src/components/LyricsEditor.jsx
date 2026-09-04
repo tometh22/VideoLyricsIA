@@ -3896,9 +3896,11 @@ export default function LyricsEditor({
       tone: "success",
     });
   }, [qualityReviewKey, reviewedLineIds, sanitizedEdited, toast, trackEditorEvent, unsafeWindows]);
+  const unconfirmedReviewLineCount = requireLineReview
+    ? edited.filter((segment) => !reviewedLineIds.includes(segment._id)).length
+    : 0;
   const campaignReviewIncomplete = requireLineReview && (
-    edited.some((segment) => !reviewedLineIds.includes(segment._id))
-    || unconfirmedUnsafeWindows.length > 0
+    unconfirmedReviewLineCount > 0 || unconfirmedUnsafeWindows.length > 0
   );
 
   // Single-flight del CTA completo, incluido el flush de autosave que ocurre
@@ -4522,11 +4524,15 @@ export default function LyricsEditor({
         <div className="mx-auto flex w-full max-w-[1800px] items-center justify-between gap-4">
           <div className="hidden min-w-0 sm:block">
             <p className={`text-[11px] font-medium ${saveStatus === "error" || saveStatus === "offline" ? "text-red-300" : "text-white"}`}>{saveStatusLabel}</p>
-            <p className="mt-0.5 truncate text-[10px] text-ink-tertiary">{edited.length} líneas · {viewMode === "advanced" ? "timings revisados" : "texto revisado"}</p>
+            <p className="mt-0.5 truncate text-[10px] text-ink-tertiary">
+              {campaignReviewIncomplete
+                ? `Pendiente: ${unconfirmedReviewLineCount} líneas y ${unconfirmedUnsafeWindows.length} partes marcadas`
+                : `${edited.length} líneas · ${viewMode === "advanced" ? "timings revisados" : "texto revisado"}`}
+            </p>
           </div>
           <button
             onClick={handleApprove}
-            disabled={isApproving || campaignReviewIncomplete || languageConflict || languageUncertain || (editorV2Enabled && (!durableHydrated || durableEditor.loading)) || saveErrorReason === "draft-corrupt"}
+            disabled={isApproving || languageConflict || languageUncertain || (editorV2Enabled && (!durableHydrated || durableEditor.loading)) || saveErrorReason === "draft-corrupt"}
             aria-busy={isApproving}
             aria-label={isApproving
               ? (t("editor.applying_changes") || "Aplicando cambios…")
