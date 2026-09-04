@@ -559,6 +559,42 @@ def test_manual_metadata_stays_red_reviewable_without_visual_fields(db, monkeypa
     assert row["reference"]["manual_full_review_required"] is True
     assert row["background_mode"] is None
 
+
+def test_bound_unavailable_reference_is_manual_in_review_queue(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter_by(campaign_id=campaign.id).one()
+    user = db.query(User).first()
+    audio_sha256 = "a" * 64
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+        input_audio_sha256=audio_sha256, audio_revision=1,
+        transcription_quality={
+            "reference_hypothesis": build_unavailable_reference(
+                audio_sha256=audio_sha256, audio_revision=1,
+            ),
+        },
+    )
+    db.add(job)
+    db.commit()
+
+    result = batch.review_queue(
+        campaign.id, stage="lyrics", order="delivery", state=None,
+        version=None, background_mode=None, artist=None,
+        audit_preapproved=False, page=1, limit=50, current_user={
+            "id": campaign.created_by, "tenant_id": campaign.tenant_id,
+            "role": "admin",
+        }, db=db,
+    )
+
+    reference = result["items"][0]["reference"]
+    assert reference["available"] is False
+    assert reference["manual_full_review_required"] is True
+
 def test_paused_campaign_cannot_start_a_new_render(db):
     campaign = _campaign(db, 1)
     campaign.status = "paused"

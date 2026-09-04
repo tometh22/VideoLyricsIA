@@ -220,6 +220,26 @@ def test_lora_shadow_counters_survive_quality_sanitizer():
     assert sanitized == payload
 
 
+def test_operator_suggestion_counts_survive_quality_sanitizer():
+    payload = {
+        "spanish_orthography": {
+            "enabled": True, "finding_count": 2, "candidate_count": 2,
+            "automatic_apply_allowed": False,
+        },
+        "timing_review_suggestions": {
+            "enabled": False, "proposal_count": 0,
+            "automatic_apply_allowed": False,
+        },
+        "operator_suggestions": {
+            "candidate_count": 2, "proposal_count": 2,
+            "declined_overlap_count": 0,
+            "by_type": {"text": 2, "timing": 0, "vocalization": 0},
+            "automatic_apply_allowed": False,
+        },
+    }
+    assert quality_jobs._sanitize_analytical_evidence(payload) == payload
+
+
 def test_failure_callback_persists_only_error_type_not_provider_message(
         monkeypatch, caplog):
     secret = "PRIVATE_LYRIC_IN_PROVIDER_EXCEPTION"

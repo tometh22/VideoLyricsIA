@@ -803,6 +803,7 @@ _ANALYTICAL_KEYS = frozenset({
     "phonetic_evidence", "phonetic_candidates", "model_identity",
     "evidence_lineage", "parent_coverage", "resolved_window_ids",
     "review_proposal", "blockers", "reasons", "reason", "declined",
+    "timing_review_suggestions", "spanish_orthography", "operator_suggestions",
     "structural_hybrid_diagnostics", "current_segments", "proposed_segments",
     # Booleans, counters and bounded measurements.
     "accepted", "complete", "attempted", "failed", "blocked", "suggested",
@@ -822,6 +823,9 @@ _ANALYTICAL_KEYS = frozenset({
     "structural_hybrid_attempts", "structural_hybrid_accepts",
     "strong_unassigned_events", "unassigned_events", "viable_hypotheses",
     "authorized_windows", "candidates", "invalid_candidates",
+    "finding_count", "candidate_count", "proposal_count",
+    "declined_overlap_count", "by_type", "text", "timing", "vocalization",
+    "automatic_apply_allowed",
     # Paired LoRA-v1 shadow attribution (with/without the additional family).
     # Keep these counters in the analytical allow-list so the quality row can
     # be aggregated over the first 30–50 real songs.
@@ -908,6 +912,9 @@ def _sanitize_analytical_evidence(value, *, _key: str = ""):
     if isinstance(value, dict):
         sanitized = {}
         for key, item in value.items():
+            if key == "text" and _key == "by_type" and isinstance(item, (int, float)):
+                sanitized["text"] = item
+                continue
             if key == "text":
                 sanitized["text_present"] = bool(str(item or "").strip())
                 sanitized["text_length"] = len(str(item or ""))
