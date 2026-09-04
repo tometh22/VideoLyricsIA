@@ -2,8 +2,16 @@ import numpy as np
 
 from timing_review_suggestions import (
     AcousticTrack, TimingReviewPolicy, build_timing_review_candidates,
-    extend_line_ends_to_stable_pitch,
+    automatic_tail_enabled, extend_line_ends_to_stable_pitch,
 )
+
+
+def test_stable_pitch_tail_automatic_mutation_is_default_off(monkeypatch):
+    monkeypatch.delenv("STABLE_PITCH_TAIL_ENABLED", raising=False)
+    assert automatic_tail_enabled() is False
+
+    monkeypatch.setenv("STABLE_PITCH_TAIL_ENABLED", "1")
+    assert automatic_tail_enabled() is True
 
 
 def _track(pitched):
