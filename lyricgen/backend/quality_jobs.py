@@ -22,6 +22,126 @@ import unicodedata
 
 logger = logging.getLogger("genly.quality_jobs")
 
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def operator_text_suggestions_enabled() -> bool:
+    """Return whether human-click text proposals may be generated."""
+    return os.environ.get(
+        "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
+    ).strip().lower() in _TRUE_ENV_VALUES
+
+
+def operator_timing_suggestions_enabled() -> bool:
+    """Timing proposals have a separate, fail-closed rollout switch."""
+    return os.environ.get(
+        "QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", "0",
+    ).strip().lower() in _TRUE_ENV_VALUES
+
+
+def _spanish_operator_suggestions(
+    segments: list[dict],
+) -> tuple[list[dict], dict]:
+    """Build deterministic text candidates without requiring audio windows."""
+    report = {
+        "enabled": False, "finding_count": 0, "candidate_count": 0,
+        "automatic_apply_allowed": False,
+    }
+    if not operator_text_suggestions_enabled():
+        return [], report
+    try:
+        from spanish_orthography import analyze_spanish_orthography
+
+        raw_report = analyze_spanish_orthography(segments)
+        candidates = list(raw_report.pop("candidates", []) or [])
+        # Persist raw lyric text only in the revision-bound editor proposal.
+        # Global quality telemetry keeps counts and policy metadata.
+        raw_report.pop("findings", None)
+        return candidates, {**raw_report, "enabled": True}
+    except Exception as exc:
+        logger.warning(
+            "[SPANISH-ORTHOGRAPHY] fail-closed error=%s",
+            type(exc).__name__,
+        )
+        return [], {
+            "enabled": True, "finding_count": 0, "candidate_count": 0,
+            "failure": type(exc).__name__,
+            "automatic_apply_allowed": False,
+        }
+
+
+def _timing_operator_suggestions(
+    segments: list[dict], stem_path: str,
+) -> tuple[list[dict], dict]:
+    """Build timing candidates only behind their explicit rollout switch."""
+    report = {
+        "enabled": False, "proposal_count": 0,
+        "automatic_apply_allowed": False,
+    }
+    if not operator_timing_suggestions_enabled():
+        return [], report
+    try:
+        from pathlib import Path
+        from timing_review_suggestions import (
+            build_timing_review_candidates, load_acoustic_track,
+        )
+
+        acoustic_track = load_acoustic_track(Path(stem_path))
+        candidates, raw_report = build_timing_review_candidates(
+            segments, acoustic_track,
+        )
+        return candidates, {**raw_report, "enabled": True}
+    except Exception as exc:
+        # Suggestions are optional and human-operated. A pitch failure must
+        # not fail transcription quality.
+        logger.warning(
+            "[T4-SUGGESTION] fail-closed error=%s",
+            type(exc).__name__,
+        )
+        return [], {
+            "enabled": True, "proposal_count": 0,
+            "failure": type(exc).__name__,
+            "automatic_apply_allowed": False,
+        }
+
+
+def _segment_only_operator_replay(
+    job_id: str, snapshot: dict, *, expected_revision: int,
+    expected_segments_hash: str, expected_audio_revision: int | None,
+    expected_audio_sha256: str, analysis_attempt_id: str,
+) -> dict:
+    """Reissue deterministic text proposals when no audio window is unsafe."""
+    from operator_review_proposals import build_operator_review_proposal
+
+    candidates, spanish_report = _spanish_operator_suggestions(
+        snapshot["segments"],
+    )
+    proposal, telemetry = build_operator_review_proposal(
+        snapshot["segments"], text_candidates=candidates,
+    )
+    quality = dict(snapshot["quality"])
+    retry = dict(quality.get("retry") or {})
+    retry["spanish_orthography"] = _sanitize_analytical_evidence(
+        spanish_report,
+    )
+    retry["operator_suggestions"] = _sanitize_analytical_evidence(telemetry)
+    retry["mutated_segments"] = False
+    quality["retry"] = retry
+    quality["operator_suggestions_persisted"] = False
+    persisted = _persist_if_current(
+        job_id, expected_revision, expected_segments_hash, quality,
+        expected_audio_revision=expected_audio_revision,
+        expected_audio_sha256=expected_audio_sha256,
+        analysis_attempt_id=analysis_attempt_id,
+        operator_proposal=proposal,
+    )
+    return {
+        "status": "persisted" if persisted else "discarded",
+        "reason": None if persisted else "stale_after_analysis",
+        "decision": quality.get("decision"),
+        "operator_proposal_count": int(telemetry.get("proposal_count") or 0),
+    }
+
 
 def _attach_structural_t4_shadow(quality: dict, segments: list[dict]) -> dict:
     """Persist T4 evidence only when the staging observation flag is on."""
@@ -1172,6 +1292,14 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
     quality_before = snapshot["quality"]
     windows = list(quality_before.get("unsafe_windows") or [])
     if not windows:
+        if operator_text_suggestions_enabled():
+            return _segment_only_operator_replay(
+                job_id, snapshot, expected_revision=expected_revision,
+                expected_segments_hash=expected_segments_hash,
+                expected_audio_revision=expected_audio_revision,
+                expected_audio_sha256=expected_audio_sha256,
+                analysis_attempt_id=analysis_attempt_id,
+            )
         return {"status": "discarded", "reason": "no_unsafe_windows"}
     if not snapshot.get("input_r2_key"):
         failed = evaluate(
@@ -1317,16 +1445,12 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 len(selected_tiles) - len(lexical_retry_tiles)
             )
             raw_proposal_windows = []
-            timing_review_candidates = []
-            timing_review_report = {
-                "enabled": False, "proposal_count": 0,
-                "automatic_apply_allowed": False,
-            }
-            spanish_orthography_candidates = []
-            spanish_orthography_report = {
-                "enabled": False, "finding_count": 0, "candidate_count": 0,
-                "automatic_apply_allowed": False,
-            }
+            timing_review_candidates, timing_review_report = (
+                _timing_operator_suggestions(snapshot["segments"], stem_path)
+            )
+            spanish_orthography_candidates, spanish_orthography_report = (
+                _spanish_operator_suggestions(snapshot["segments"])
+            )
             # The provider/content retry remains separately kill-switchable.
             # Raw rows stay in memory until the typed, signed review-proposal
             # gate accepts them; global quality analytics receive only counts.
@@ -1358,63 +1482,6 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 )
                 retry_stats["mutated_segments"] = False
 
-            if os.environ.get(
-                "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
-            ).strip().lower() in {"1", "true", "yes", "on"}:
-                try:
-                    from spanish_orthography import analyze_spanish_orthography
-
-                    raw_spanish_report = analyze_spanish_orthography(
-                        snapshot["segments"],
-                    )
-                    spanish_orthography_candidates = list(
-                        raw_spanish_report.pop("candidates", []) or []
-                    )
-                    # Persist raw lyric text only in the revision-bound editor
-                    # proposal. Global quality telemetry keeps counts/policy.
-                    raw_spanish_report.pop("findings", None)
-                    spanish_orthography_report = {
-                        **raw_spanish_report, "enabled": True,
-                    }
-                except Exception as exc:
-                    logger.warning(
-                        "[SPANISH-ORTHOGRAPHY] fail-closed job=%s error=%s",
-                        job_id, type(exc).__name__,
-                    )
-                    spanish_orthography_candidates = []
-                    spanish_orthography_report = {
-                        "enabled": True, "finding_count": 0,
-                        "candidate_count": 0, "failure": type(exc).__name__,
-                        "automatic_apply_allowed": False,
-                    }
-                try:
-                    from pathlib import Path
-                    from timing_review_suggestions import (
-                        build_timing_review_candidates, load_acoustic_track,
-                    )
-
-                    acoustic_track = load_acoustic_track(Path(stem_path))
-                    timing_review_candidates, timing_review_report = (
-                        build_timing_review_candidates(
-                            snapshot["segments"], acoustic_track,
-                        )
-                    )
-                    timing_review_report = {
-                        **timing_review_report, "enabled": True,
-                    }
-                except Exception as exc:
-                    # Suggestions are an optional, human-operated layer. A
-                    # pitch failure must not fail transcription quality.
-                    logger.warning(
-                        "[T4-SUGGESTION] fail-closed job=%s error=%s",
-                        job_id, type(exc).__name__,
-                    )
-                    timing_review_candidates = []
-                    timing_review_report = {
-                        "enabled": True, "proposal_count": 0,
-                        "failure": type(exc).__name__,
-                        "automatic_apply_allowed": False,
-                    }
             retry_stats["timing_review_suggestions"] = (
                 _sanitize_analytical_evidence(timing_review_report)
             )
@@ -1466,19 +1533,26 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 parent_id for parent_id, item in coverage.items() if item.get("complete")
             }
             operator_proposal = None
-            if os.environ.get(
-                "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
-            ).strip().lower() in {"1", "true", "yes", "on"}:
+            if (
+                operator_text_suggestions_enabled()
+                or operator_timing_suggestions_enabled()
+            ):
                 from operator_review_proposals import build_operator_review_proposal
 
                 operator_proposal, operator_telemetry = (
                     build_operator_review_proposal(
                         snapshot["segments"],
-                        timing_candidates=timing_review_candidates,
-                        text_candidates=[
-                            *raw_proposal_windows,
-                            *spanish_orthography_candidates,
-                        ],
+                        timing_candidates=(
+                            timing_review_candidates
+                            if operator_timing_suggestions_enabled() else []
+                        ),
+                        text_candidates=(
+                            [
+                                *raw_proposal_windows,
+                                *spanish_orthography_candidates,
+                            ]
+                            if operator_text_suggestions_enabled() else []
+                        ),
                         complete_parent_ids=complete_parent_ids,
                     )
                 )

@@ -45,10 +45,31 @@ def quality_consensus_observations_enabled() -> bool:
 
 
 def operator_suggestions_enabled() -> bool:
-    """Human-click suggestions are independent from automatic correction."""
+    """Return whether any human-click suggestion family is enabled."""
+    return text_operator_suggestions_enabled() or timing_operator_suggestions_enabled()
+
+
+def text_operator_suggestions_enabled() -> bool:
+    """Text proposals are independent from automatic correction."""
     return os.environ.get(
         "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
     ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def timing_operator_suggestions_enabled() -> bool:
+    """Timing proposals require their own explicit rollout switch."""
+    return os.environ.get(
+        "QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def operator_suggestion_type_enabled(suggestion_type: str) -> bool:
+    """Route persisted proposal families through independent switches."""
+    if suggestion_type == "timing":
+        return timing_operator_suggestions_enabled()
+    if suggestion_type in {"text", "vocalization"}:
+        return text_operator_suggestions_enabled()
+    return False
 
 
 def revoke_quality_proposal_if_disabled(document: EditorDocument) -> bool:
@@ -978,6 +999,8 @@ def persist_operator_review_proposal_if_current(
             if isinstance(item, dict)
         ]
         suggestion_type = str(window.get("suggestion_type") or "")
+        if not operator_suggestion_type_enabled(suggestion_type):
+            continue
         if (not current and suggestion_type == "timing") or any(
             item.get("locked") is True or item.get("operator_locked") is True
             or _segment_key(item) not in original_keys

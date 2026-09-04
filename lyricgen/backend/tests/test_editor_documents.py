@@ -22,12 +22,24 @@ from editor import (
     persist_quality_proposal_if_current,
     persist_quality_observation_if_current,
     persist_operator_review_proposal_if_current,
+    operator_suggestion_type_enabled,
     rebase_operator_suggestions_after_manual_edit,
     save_document,
 )
 from transcription_quality import segments_hash
 from quality_v6_contracts import PROPOSAL_WINDOW_SCHEMA, REVIEW_PROPOSAL_SCHEMA
 from tests.conftest import auth
+
+
+def test_operator_suggestion_types_have_independent_rollout_switches(monkeypatch):
+    monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    monkeypatch.delenv(
+        "QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", raising=False,
+    )
+
+    assert operator_suggestion_type_enabled("text") is True
+    assert operator_suggestion_type_enabled("vocalization") is True
+    assert operator_suggestion_type_enabled("timing") is False
 
 
 def _users_and_job(tenant="editor_team"):
@@ -426,6 +438,7 @@ def test_quality_proposal_is_audio_revision_scoped_and_applies_idempotently(
 
 def test_operator_suggestions_accept_and_reject_one_at_a_time(client, monkeypatch):
     monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    monkeypatch.setenv("QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", "1")
     first, _second, job_id = _users_and_job("editor_operator_suggestions")
     token = _token_for(first)
     proposal_id = f"operator-{uuid.uuid4().hex}"
@@ -522,6 +535,7 @@ def test_manual_timing_edit_keeps_other_suggestions_and_records_delta(
     client, monkeypatch,
 ):
     monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    monkeypatch.setenv("QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", "1")
     first, _second, job_id = _users_and_job("editor_operator_manual")
     token = _token_for(first)
     proposal_id = f"operator-{uuid.uuid4().hex}"
