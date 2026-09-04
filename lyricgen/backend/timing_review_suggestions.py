@@ -1,8 +1,9 @@
-"""Human-only timing suggestions derived from stable vocal pitch.
+"""Line-end timing derived from stable vocal pitch.
 
-This selector deliberately has a lower release bar than automatic mutation:
-an operator hears the bounded preview and accepts or rejects one proposal.
-It never uses catalogue, UMG or competitor timing at inference time.
+The review selector never mutates lyrics.  The automatic tail helper is more
+conservative: it may only extend a machine-timed line through a contiguous,
+energy-backed pitch sustain and never touches an operator-locked line.
+Neither path uses catalogue, UMG or competitor timing at inference time.
 """
 from __future__ import annotations
 
@@ -158,6 +159,126 @@ def _last_word_end(segment: Mapping[str, Any]) -> float | None:
         if (value := _number(word.get("end"))) is not None
     ]
     return max(ends) if ends else None
+
+
+def _stable_tail_endpoint(
+    track: AcousticTrack,
+    *,
+    word_end: float,
+    limit: float,
+    maximum_pitch_distance_cents: float = 200.0,
+    maximum_gap_s: float = 0.15,
+) -> float | None:
+    """Find the contiguous stable-pitch run attached to ``word_end``."""
+    if not len(track.times) or limit <= word_end:
+        return None
+    anchor = _track_slice(track, max(0.0, word_end - 0.20), word_end + 0.25)
+    anchor_indices = np.flatnonzero(track.pitched[anchor])
+    if not len(anchor_indices):
+        return None
+    anchor_left = anchor.start or 0
+    absolute_anchor_indices = anchor_left + anchor_indices
+    anchor_f0 = track.f0[absolute_anchor_indices]
+    anchor_pitch = float(np.median(anchor_f0[np.isfinite(anchor_f0)]))
+    if not math.isfinite(anchor_pitch) or anchor_pitch <= 0:
+        return None
+
+    start_index = max(0, int(math.floor(word_end / track.frame_seconds)))
+    stop_index = min(
+        len(track.times), int(math.ceil(limit / track.frame_seconds)) + 1,
+    )
+    allowed_gap_frames = max(1, int(math.ceil(
+        maximum_gap_s / track.frame_seconds,
+    )))
+    last_stable = None
+    gap_frames = 0
+    stable_frames = 0
+    for index in range(start_index, stop_index):
+        f0 = float(track.f0[index])
+        within_pitch = bool(
+            track.pitched[index]
+            and math.isfinite(f0)
+            and f0 > 0
+            and abs(1200.0 * math.log2(f0 / anchor_pitch))
+            <= maximum_pitch_distance_cents
+        )
+        if within_pitch:
+            last_stable = index
+            stable_frames += 1
+            gap_frames = 0
+            continue
+        gap_frames += 1
+        if gap_frames > allowed_gap_frames:
+            break
+    if last_stable is None or stable_frames < 2:
+        return None
+    endpoint = min(
+        limit, float(track.times[last_stable] + track.frame_seconds),
+    )
+    return endpoint if endpoint > word_end else None
+
+
+def extend_line_ends_to_stable_pitch(
+    segments: Sequence[dict[str, Any]],
+    track: AcousticTrack,
+    *,
+    next_line_guard_s: float = 0.02,
+    maximum_tail_s: float = 6.0,
+    minimum_extension_s: float = 0.10,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Extend only machine-timed lines through an attached vocal sustain."""
+    frozen = [dict(item) for item in segments if isinstance(item, dict)]
+    output: list[dict[str, Any]] = []
+    extended = 0
+    abstentions: dict[str, int] = {}
+
+    def abstain(reason: str) -> None:
+        abstentions[reason] = abstentions.get(reason, 0) + 1
+
+    for index, segment in enumerate(frozen):
+        if segment.get("locked") is True or segment.get("operator_locked") is True:
+            output.append(segment)
+            abstain("operator_locked")
+            continue
+        current_end = _number(segment.get("end"))
+        word_end = _last_word_end(segment)
+        if current_end is None or word_end is None:
+            output.append(segment)
+            abstain("word_endpoint_unavailable")
+            continue
+        next_start = (
+            _number(frozen[index + 1].get("start"))
+            if index + 1 < len(frozen) else None
+        )
+        track_limit = float(track.times[-1] + track.frame_seconds)
+        limit = min(track_limit, word_end + maximum_tail_s)
+        if next_start is not None:
+            limit = min(limit, next_start - next_line_guard_s)
+        endpoint = _stable_tail_endpoint(
+            track, word_end=word_end, limit=limit,
+        )
+        if endpoint is None or endpoint < current_end + minimum_extension_s:
+            output.append(segment)
+            abstain("no_stable_pitch_extension")
+            continue
+        updated = dict(segment)
+        updated["end"] = round(endpoint, 4)
+        updated["stable_pitch_tail_extended"] = True
+        updated["stable_pitch_tail_source"] = "pitch_energy_contiguous_v1"
+        output.append(updated)
+        extended += 1
+
+    report = {
+        "schema_version": "stable-pitch-tail-v1",
+        "segment_count": len(frozen),
+        "extended_count": extended,
+        "maximum_pitch_distance_cents": 200.0,
+        "maximum_tail_s": maximum_tail_s,
+        "next_line_guard_s": next_line_guard_s,
+        "abstention_reasons": abstentions,
+        "mutated_text": False,
+    }
+    return (output if extended else list(segments)), report
 
 
 def _diagnosis(
