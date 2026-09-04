@@ -15,7 +15,7 @@ import secrets
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -277,6 +277,7 @@ class LyricsApprovalRequest(BaseModel):
     editor_revision: int = Field(..., ge=0)
     editor_version_id: str | None = Field(default=None, max_length=36)
     confirmed_line_ids: list[str] = Field(..., min_length=1, max_length=2000)
+    review_scope: Literal["song"] = "song"
     lyrics_confirmed: bool
     timings_confirmed: bool
     heard_against_audio: bool
@@ -765,6 +766,7 @@ def campaign_upload_complete(
 @router.post("/campaigns/{campaign_id}/next")
 def claim_next_review(
     campaign_id: str,
+    skip_job_id: str | None = Query(default=None, min_length=12, max_length=12),
     x_editor_session: str | None = Header(default=None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -781,11 +783,12 @@ def claim_next_review(
         EditorDocument, EditorDocument.job_id == Job.job_id,
     ).filter(
         Job.campaign_id == campaign.id,
-        Job.tenant_id == current_user["tenant_id"],
+        Job.tenant_id == campaign.tenant_id,
         Job.status.in_(("transcribed_pending", "transcribed")),
         EditorDocument.lock_user_id == current_user["id"],
         EditorDocument.lock_session_id == session_id,
         EditorDocument.lock_expires_at > now,
+        *([Job.job_id != skip_job_id] if skip_job_id else []),
     ).first()
     if existing:
         job, _ = existing
@@ -795,8 +798,9 @@ def claim_next_review(
         BatchCampaignItem, BatchCampaignItem.id == Job.campaign_item_id,
     ).outerjoin(EditorDocument, EditorDocument.job_id == Job.job_id).filter(
         Job.campaign_id == campaign.id,
-        Job.tenant_id == current_user["tenant_id"],
+        Job.tenant_id == campaign.tenant_id,
         Job.status.in_(("transcribed_pending", "transcribed")),
+        *([Job.job_id != skip_job_id] if skip_job_id else []),
         or_(
             EditorDocument.job_id.is_(None),
             EditorDocument.lock_expires_at.is_(None),
@@ -891,7 +895,7 @@ def approve_campaign_lyrics(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Approve every lyric line and timing before any background can start."""
+    """Bind one explicit song-level approval to the exact editor snapshot."""
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
     if campaign.status != "active":
@@ -899,7 +903,12 @@ def approve_campaign_lyrics(
     job = db.query(Job).filter(
         Job.job_id == job_id,
         Job.campaign_id == campaign.id,
-        Job.tenant_id == current_user["tenant_id"],
+        # `_campaign_or_404` already enforces tenant isolation for ordinary
+        # reviewers and deliberately lets platform admins open a campaign
+        # across tenants. Re-applying the actor's tenant here made that admin
+        # access read-only by accident: editor/autosave worked, but approval
+        # returned a misleading 404. Bind the job to the campaign tenant.
+        Job.tenant_id == campaign.tenant_id,
     ).with_for_update().first()
     if job is None:
         raise HTTPException(status_code=404, detail="Campaign job not found.")
@@ -970,6 +979,7 @@ def approve_campaign_lyrics(
     from transcription_quality import segments_hash
     approval = {
         "schema": "batch-pre-background-approval-v1",
+        "review_scope": body.review_scope,
         "audio_sha256": str(job.input_audio_sha256 or ""),
         "audio_revision": int(job.audio_revision or 0),
         "editor_revision": int(document.revision or 0),
@@ -1331,12 +1341,19 @@ def review_queue(
 def claim_next_stage_review(
     campaign_id: str,
     stage: str = Query(default="lyrics", pattern="^(lyrics|final)$"),
+    skip_job_id: str | None = Query(default=None, min_length=12, max_length=12),
     x_editor_session: str | None = Header(default=None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     if stage == "lyrics":
-        return claim_next_review(campaign_id, x_editor_session, current_user, db)
+        return claim_next_review(
+            campaign_id,
+            skip_job_id,
+            x_editor_session,
+            current_user,
+            db,
+        )
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
     if campaign.status != "active":

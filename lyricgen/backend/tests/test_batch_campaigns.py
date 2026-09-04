@@ -381,8 +381,9 @@ def test_render_capacity_fails_closed_before_human_approval(db):
 
 
 @pytest.mark.parametrize("reference_available", [True, False])
+@pytest.mark.parametrize("admin_tenant", ["campaign", "platform-admin"])
 def test_human_approval_binds_every_line_audio_and_editor_revision(
-    db, monkeypatch, reference_available,
+    db, monkeypatch, reference_available, admin_tenant,
 ):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
     campaign = _campaign(db, 1)
@@ -437,14 +438,64 @@ def test_human_approval_binds_every_line_audio_and_editor_revision(
             timings_confirmed=True,
             heard_against_audio=True,
         ),
-        {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"},
+        {
+            "id": user.id,
+            "tenant_id": campaign.tenant_id
+            if admin_tenant == "campaign" else admin_tenant,
+            "role": "admin",
+        },
         db,
     )
     assert response["status"] == "lyrics_approved"
     db.refresh(job)
     approval = batch.require_prebackground_approval(job)
     assert approval["confirmed_line_count"] == 2
+    assert approval["review_scope"] == "song"
     assert job.transcription_quality["reference_hypothesis"]["review_status"] == "human_line_review_approved"
+
+
+def test_platform_admin_can_skip_to_next_job_in_foreign_tenant(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 2)
+    items = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).order_by(BatchCampaignItem.ordinal).all()
+    for item in items:
+        db.add(Job(
+            job_id=uuid.uuid4().hex[:12],
+            user_id=campaign.created_by,
+            tenant_id=campaign.tenant_id,
+            artist=item.artist,
+            song_title=item.title,
+            filename=item.filename,
+            status="transcribed_pending",
+            current_step="editing",
+            progress=100,
+            workload_class="batch",
+            campaign_id=campaign.id,
+            campaign_item_id=item.id,
+            segments_json=[{
+                "segment_id": f"line-{item.ordinal}",
+                "start": 0,
+                "end": 1,
+                "text": f"línea {item.ordinal}",
+            }],
+        ))
+    db.commit()
+    actor = {
+        "id": campaign.created_by,
+        "tenant_id": "platform-admin",
+        "role": "admin",
+    }
+    first = batch.claim_next_review(
+        campaign.id, None, "platform_admin_session", actor, db,
+    )
+    second = batch.claim_next_review(
+        campaign.id, first["job_id"], "platform_admin_session", actor, db,
+    )
+    assert first["job_id"]
+    assert second["job_id"]
+    assert second["job_id"] != first["job_id"]
 
 
 def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
@@ -757,16 +808,16 @@ def test_manifest_registers_600_items_in_chunks(client, admin_token, monkeypatch
     assert summary["counters"]["waiting_upload"] == 600
 
 
-def test_two_tabs_claim_different_ready_jobs(client, admin_token, monkeypatch):
+def test_two_tabs_and_skip_claim_different_ready_jobs(client, admin_token, monkeypatch):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
     auth = {"Authorization": f"Bearer {admin_token}"}
     campaign_id = client.post("/batch/campaigns", headers=auth, json={
-        "name": "Dos pestañas", "expected_count": 2,
+        "name": "Dos pestañas", "expected_count": 3,
     }).json()["id"]
     session = SessionLocal()
     try:
         campaign = session.query(BatchCampaign).filter(BatchCampaign.id == campaign_id).one()
-        for ordinal in (1, 2):
+        for ordinal in (1, 2, 3):
             item = BatchCampaignItem(
                 id=str(uuid.uuid4()), campaign_id=campaign.id,
                 tenant_id=campaign.tenant_id, ordinal=ordinal,
@@ -799,12 +850,21 @@ def test_two_tabs_claim_different_ready_jobs(client, admin_token, monkeypatch):
         f"/batch/campaigns/{campaign_id}/next",
         headers={**auth, "X-Editor-Session": "tab_session_alpha"},
     )
+    skipped = client.post(
+        f"/batch/campaigns/{campaign_id}/review-queue/next"
+        f"?stage=lyrics&skip_job_id={first.json()['job_id']}",
+        headers={**auth, "X-Editor-Session": "tab_session_alpha"},
+    )
     second = client.post(
         f"/batch/campaigns/{campaign_id}/next",
         headers={**auth, "X-Editor-Session": "tab_session_bravo"},
     )
     assert first.status_code == 200, first.text
+    assert skipped.status_code == 200, skipped.text
     assert second.status_code == 200, second.text
     assert first.json()["job_id"]
+    assert skipped.json()["job_id"]
     assert second.json()["job_id"]
-    assert first.json()["job_id"] != second.json()["job_id"]
+    assert len({
+        first.json()["job_id"], skipped.json()["job_id"], second.json()["job_id"],
+    }) == 3
