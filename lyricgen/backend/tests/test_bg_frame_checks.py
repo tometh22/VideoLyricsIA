@@ -229,3 +229,36 @@ def test_pillarbox_simetrico_si_cuenta():
 def test_sombra_lateral_en_un_solo_borde_no_cuenta():
     r = fc.letterbox_report((1440, 1080, 480, 0), 1920, 1080)
     assert r["has_bars"] is False
+
+
+# ── Exposición a texto (decide si enforce_text es barato o caro) ───────────
+def test_detecta_superficies_con_riesgo_de_texto():
+    p = "Plaza de Mayo vacía, pancartas de cartón en blanco y un letrero oxidado"
+    assert fc.signage_terms(p) == ["letrero", "pancartas"]
+
+
+def test_una_escena_natural_no_expone_a_texto():
+    assert fc.signage_terms("un valle con niebla y pinos al amanecer") == []
+
+
+def test_es_insensible_a_tildes():
+    assert "senal" in fc.signage_terms("una señal de tránsito oxidada")
+
+
+def test_mide_la_exposicion_del_lote():
+    prompts = [
+        "Plaza de Mayo con pancartas en blanco",
+        "un valle con niebla",
+        "una calle con vidrieras apagadas",
+        "el mar al amanecer",
+    ]
+    exp = fc.signage_exposure(prompts)
+    assert exp["total"] == 4
+    assert exp["with_signage"] == 2
+    assert exp["ratio"] == 0.5
+    assert "pancartas" in exp["terms"] and "vidrieras" in exp["terms"]
+
+
+def test_lote_vacio_no_rompe():
+    exp = fc.signage_exposure([])
+    assert exp["total"] == 0 and exp["ratio"] == 0.0

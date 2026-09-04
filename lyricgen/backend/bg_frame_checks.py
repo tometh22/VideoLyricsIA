@@ -33,6 +33,13 @@ import os
 import re
 from typing import Any, Iterable, Sequence
 
+# Se reusa la normalización de lyric_anchors a propósito y no se duplica: el
+# conteo de cartelería tiene que tokenizar EXACTAMENTE igual que la cobertura de
+# anclas, o las dos métricas del mismo informe dirían cosas distintas sobre el
+# mismo prompt. Ambos módulos son puros y lyric_anchors no importa a éste, así
+# que no hay ciclo.
+from lyric_anchors import normalize
+
 # ── Geometría ──────────────────────────────────────────────────────────────
 # Fracción del alto (o ancho) que se puede perder antes de llamarlo franja. Veo
 # a veces deja 1-2 px de borde por redondeo de escalado; eso no es letterbox.
@@ -193,6 +200,59 @@ def lighting_consistency(
         "worst_pair": worst_pair,
         "offenders": offenders,
         "scenes": len(usable),
+    }
+
+
+# ── Exposición a texto ─────────────────────────────────────────────────────
+# El validador Vision ganó una categoría `text` que hoy sólo OBSERVA. Antes de
+# proponer ponerla en bloqueo hace falta saber a cuántas escenas legítimas les
+# pegaría: una plaza, una estación o una calle honesta traen cartelería de fondo
+# sin que eso sea un incumplimiento — lo que incumple es que el cartel tenga algo
+# LEGIBLE. Este contador estima esa exposición leyendo el prompt, que es barato
+# y no necesita renderizar nada.
+#
+# Es un PROXY declarado: mide qué escenas PIDEN una superficie que podría llevar
+# texto, no cuántas terminan con texto legible en el frame. Sirve para decidir si
+# vale la pena medir en serio sobre frames, no para reemplazar esa medición.
+_SIGNAGE_TERMS = (
+    "cartel", "carteles", "cartelera", "pancarta", "pancartas", "afiche",
+    "afiches", "letrero", "letreros", "marquesina", "vidriera", "vidrieras",
+    "escaparate", "grafiti", "graffiti", "pintada", "pintadas", "senal",
+    "senales", "placa", "matricula", "patente", "diario", "diarios",
+    "periodico", "revista", "libro", "libros", "pantalla", "pantallas",
+    "sign", "signs", "signage", "billboard", "billboards", "poster", "posters",
+    "banner", "banners", "marquee", "storefront", "shopfront", "neon",
+    "newspaper", "magazine", "screen", "screens", "plate", "label",
+)
+
+
+def signage_terms(prompt: str | None) -> list[str]:
+    """Superficies del prompt que podrían llevar texto legible en el render."""
+    tokens = set(normalize(prompt).split())
+    return sorted(t for t in _SIGNAGE_TERMS if t in tokens)
+
+
+def signage_exposure(prompts: Iterable[str | None]) -> dict[str, Any]:
+    """Qué fracción de las escenas pide una superficie con riesgo de texto.
+
+    Es el número que decide si `enforce_text` es barato o caro: si casi ninguna
+    escena trae cartelería, bloquear cuesta poco; si la mitad la trae, un
+    sobre-bloqueo pararía la mitad del lote y hay que medir sobre frames antes
+    de tocar nada.
+    """
+    prompts = list(prompts)
+    hits = [(p, signage_terms(p)) for p in prompts]
+    with_signage = [(p, t) for p, t in hits if t]
+    counts: dict[str, int] = {}
+    for _, terms in with_signage:
+        for term in terms:
+            counts[term] = counts.get(term, 0) + 1
+    total = len(prompts)
+    return {
+        "total": total,
+        "with_signage": len(with_signage),
+        "ratio": (len(with_signage) / total) if total else 0.0,
+        "terms": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
     }
 
 

@@ -207,6 +207,20 @@ def main() -> int:
         for x in sin[:4]:
             print(f"  · {x['reason']}"
                   + (f" ({x['lugar']})" if x.get("lugar") else ""))
+
+    # Exposición a `enforce_text`: cuántas escenas legítimas piden una
+    # superficie que podría llevar texto. Es el número que decide si poner el
+    # validador de texto en bloqueo es barato o caro.
+    import bg_frame_checks
+    for modo, etiqueta in (("off", "motor viejo"), ("on", "anclado")):
+        prompts = [(r.get(modo) or {}).get("prompt") for r in resultados]
+        exp = bg_frame_checks.signage_exposure([p for p in prompts if p])
+        if exp["total"]:
+            print(f"\nescenas con cartelería ({etiqueta})   "
+                  f"{100 * exp['ratio']:.0f}% ({exp['with_signage']}/{exp['total']})")
+            if exp["terms"]:
+                top = ", ".join(f"{k}×{v}" for k, v in list(exp["terms"].items())[:6])
+                print(f"  términos: {top}")
     print(f"\ndetalle -> {args.out}")
     return 0
 
