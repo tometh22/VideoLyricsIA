@@ -1212,11 +1212,29 @@ def review_queue(
             item.metadata_error
             and item.metadata_error not in {"invalid_size", "invalid_duration"}
         )
+        segments = list(job.segments_json or []) if job else []
+        lyric_line_count = sum(
+            1 for segment in segments
+            if isinstance(segment, dict) and str(segment.get("text") or "").strip()
+        )
+        empty_transcription = bool(job and lyric_line_count == 0)
+        manual_reasons = []
+        if not reference_available:
+            manual_reasons.append("missing_reference")
+        if empty_transcription:
+            manual_reasons.append("empty_transcription")
+        if metadata_review_required:
+            manual_reasons.append("metadata_review")
+        if quality.get("manual_full_review_required") and not manual_reasons:
+            manual_reasons.append("quality_manual_review")
         manual_full_review = bool(
             quality.get("manual_full_review_required")
-            or not reference_available
-            or metadata_review_required
+            or manual_reasons
         )
+        doubt_count = len([
+            window for window in (quality.get("unsafe_windows") or [])
+            if isinstance(window, dict)
+        ])
         rows.append({
             "item_id": item.id,
             "job_id": job.job_id if job else None,
@@ -1226,6 +1244,10 @@ def review_queue(
             "version": title_version,
             "background_mode": bg_mode if stage == "final" else None,
             "metadata_review_required": metadata_review_required,
+            "lyric_line_count": lyric_line_count,
+            "doubt_count": doubt_count,
+            "review_group": "manual" if manual_full_review else "standard",
+            "manual_reasons": manual_reasons,
             "duration_seconds": item.duration_seconds,
             "active_minutes": active_minutes.get(job.job_id, 0.0) if job else 0.0,
             "state": queue_state,
@@ -1272,8 +1294,8 @@ def review_queue(
         rows.sort(key=lambda row: (
             1 if row["reference"]["manual_full_review_required"] else 0,
             1 if row["version"] == "live" else 0,
-            row["_semaforo_rank"],
-            row["_delivery_rank"],
+            row["_semaforo_rank"] if confidence_gate_passed else 0,
+            row["_delivery_rank"] if confidence_gate_passed else row["doubt_count"],
             row["ordinal"],
         ))
     # One priority column only. During blind calibration it exposes merely

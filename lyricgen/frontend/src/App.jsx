@@ -5748,7 +5748,7 @@ export default function App() {
                       }}
                       className="btn-secondary shrink-0 px-4 py-2 text-xs"
                     >
-                      Guardar y salir
+                      Guardar borrador y salir
                     </button>
                     <button
                       type="button"

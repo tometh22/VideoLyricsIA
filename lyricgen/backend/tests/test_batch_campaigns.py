@@ -517,12 +517,26 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
     user = db.query(User).first()
     jobs = []
     for item in items:
+        audio_sha256 = hashlib.sha256(item.id.encode()).hexdigest()
         job = Job(
             job_id=uuid.uuid4().hex[:12], user_id=user.id,
             tenant_id=campaign.tenant_id, artist=item.artist,
             song_title=item.title, filename=item.filename,
             status="transcribed_pending", workload_class="batch",
             campaign_id=campaign.id, campaign_item_id=item.id,
+            input_audio_sha256=audio_sha256, audio_revision=1,
+            segments_json=[{
+                "segment_id": f"line-{item.ordinal}", "start": 0,
+                "end": 1, "text": f"línea {item.ordinal}",
+            }],
+            transcription_quality={
+                "reference_hypothesis": build_reference_hypothesis(
+                    text=f"línea {item.ordinal}", provider="gemini",
+                    audio_sha256=audio_sha256, audio_revision=1,
+                    source_kind="gemini_complete_audio_derived",
+                    complete_audio_verified=True,
+                ),
+            },
         )
         db.add(job)
         jobs.append(job)
@@ -555,7 +569,7 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
     }
     delivery = batch.review_queue(campaign.id, order="delivery", **queue_args)
     assert [row["job_id"] for row in delivery["items"]] == [
-        jobs[2].job_id, jobs[0].job_id, jobs[1].job_id,
+        jobs[0].job_id, jobs[2].job_id, jobs[1].job_id,
     ]
     assert [row["priority"] for row in delivery["items"]] == ["1", "2", "3"]
     assert all(row["semaforo"] is None for row in delivery["items"])
@@ -565,8 +579,9 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
     assert first_job["reference"]["external_links"] == [{
         "kind": "official_channel", "url": "https://youtube.com/watch?v=ok",
     }]
-    assert first_job["reference"]["available"] is False
-    assert first_job["reference"]["manual_full_review_required"] is True
+    assert first_job["reference"]["available"] is True
+    assert first_job["reference"]["manual_full_review_required"] is False
+    assert first_job["review_group"] == "standard"
     assert first_job["background_mode"] is None
     assert delivery["background_split"] is None
 
@@ -645,6 +660,10 @@ def test_bound_unavailable_reference_is_manual_in_review_queue(db, monkeypatch):
     reference = result["items"][0]["reference"]
     assert reference["available"] is False
     assert reference["manual_full_review_required"] is True
+    assert result["items"][0]["review_group"] == "manual"
+    assert result["items"][0]["manual_reasons"] == [
+        "missing_reference", "empty_transcription",
+    ]
 
 def test_paused_campaign_cannot_start_a_new_render(db):
     campaign = _campaign(db, 1)
