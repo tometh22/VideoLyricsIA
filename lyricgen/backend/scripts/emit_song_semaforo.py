@@ -65,7 +65,7 @@ def _num(value: Any) -> float | None:
 
 
 def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, Any]:
-    """Pure rule: quality payload -> {color, reasons, inputs, rank_key}.
+    """Pure rule: quality payload -> persisted blind routing verdict.
 
     ``paired`` optionally supplies the pilot-scale disagreement (turbo base vs
     turbo+LoRA on identical chunks, see paired_disagreement_offline.py). When
@@ -73,6 +73,9 @@ def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, 
     WhisperX against LoRA and is not on the pilot's scale.
     """
     quality = quality if isinstance(quality, dict) else {}
+    from machine_evidence import quality_training_signal
+
+    training_signal = quality_training_signal(quality)
     metrics = quality.get("metrics") if isinstance(quality.get("metrics"), dict) else {}
     router = metrics.get("difficulty_router") if isinstance(metrics.get("difficulty_router"), dict) else {}
     # El desacuerdo se conserva SÓLO como dato informativo: LoRA y el router
@@ -146,6 +149,9 @@ def song_verdict(quality: dict | None, paired: dict | None = None) -> dict[str, 
     rank_key = voiced_gap_s if voiced_gap_s is not None else 9_999.0
     return {
         "rule_version": RULE_VERSION, "color": color, "reasons": reasons,
+        "score": training_signal["score"],
+        "score_source": training_signal["score_source"],
+        "risk": training_signal["risk"],
         "inputs": inputs, "rank_key": rank_key,
     }
 

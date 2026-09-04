@@ -129,6 +129,14 @@ def test_rule_version_is_v2():
     assert m.ACTION == "semaforo.verdict.v2"
 
 
+def test_persists_risk_derived_score_during_blind_calibration():
+    m = _load()
+    verdict = m.song_verdict(_quality(risk=0.1234567, score=None))
+    assert verdict["score"] == 87.654
+    assert verdict["score_source"] == "risk_derived"
+    assert verdict["risk"] == 0.123457
+
+
 def test_missing_audio_hypothesis_is_always_red_and_manual():
     m = _load()
     quality = _quality()
