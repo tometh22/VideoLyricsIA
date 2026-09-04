@@ -3970,6 +3970,7 @@ export default function App() {
                 : (Number.isInteger(saveMeta.baseRevision) ? saveMeta.baseRevision : 0),
               editor_version_id: saveMeta.editorVersionId || null,
               confirmed_line_ids: confirmedLineIds,
+              review_scope: "song",
               lyrics_confirmed: true,
               timings_confirmed: true,
               heard_against_audio: true,
@@ -5571,13 +5572,50 @@ export default function App() {
     }
   }, [alert, currentReview?.transcribeJobId]);
 
-  const handleCampaignReviewExit = useCallback(() => {
+  const handleCampaignReviewExit = useCallback(async () => {
     const review = currentReview;
+    if (review?.transcribeJobId) {
+      try {
+        await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
+          method: "DELETE",
+          headers: editorSessionHeaders(),
+        });
+      } catch { /* the lock expires safely even if release is unavailable */ }
+    }
     setCurrentReview(null);
     wizardPersistence.clear();
     if (review) segmentsStore.evict(reviewStoreKey(review));
     navigate("/admin/cola");
   }, [currentReview, navigate]);
+
+  const handleCampaignReviewNext = useCallback(async () => {
+    const review = currentReview;
+    if (!review?.campaignId || !review?.transcribeJobId) {
+      await handleCampaignReviewExit();
+      return;
+    }
+    let nextPath = "/admin/cola";
+    try {
+      const response = await authFetch(
+        `${API}/batch/campaigns/${review.campaignId}/review-queue/next?stage=lyrics&skip_job_id=${encodeURIComponent(review.transcribeJobId)}`,
+        { method: "POST", headers: editorSessionHeaders() },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok && payload.job_id) {
+        nextPath = payload.open_path || reviewJobPath(payload.job_id);
+      }
+    } catch { /* leave through the queue; the current draft is already saved */ }
+    try {
+      await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
+        method: "DELETE",
+        headers: editorSessionHeaders(),
+      });
+    } catch { /* the lock expires safely even if release is unavailable */ }
+    setCurrentReview(null);
+    wizardPersistence.clear();
+    segmentsStore.evict(reviewStoreKey(review));
+    navigate(nextPath);
+  }, [currentReview, handleCampaignReviewExit, navigate]);
 
   // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
@@ -5700,17 +5738,30 @@ export default function App() {
               </div>
               <div className="flex gap-2">
                 {currentReview.campaignId && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const safeExit = campaignReviewSafeExitRef.current;
-                      if (safeExit) void safeExit();
-                      else handleCampaignReviewExit();
-                    }}
-                    className="btn-primary shrink-0 px-4 py-2 text-xs"
-                  >
-                    Guardar y volver a la cola
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const safeExit = campaignReviewSafeExitRef.current;
+                        if (safeExit) void safeExit();
+                        else void handleCampaignReviewExit();
+                      }}
+                      className="btn-secondary shrink-0 px-4 py-2 text-xs"
+                    >
+                      Guardar y salir
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const safeExit = campaignReviewSafeExitRef.current;
+                        if (safeExit) void safeExit(handleCampaignReviewNext);
+                        else void handleCampaignReviewNext();
+                      }}
+                      className="btn-primary shrink-0 px-4 py-2 text-xs"
+                    >
+                      Siguiente
+                    </button>
+                  </>
                 )}
                 <button
                   type="button"
