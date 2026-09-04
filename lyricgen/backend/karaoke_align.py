@@ -335,6 +335,11 @@ def enforce_line_word_consistency(segments):
             if not isinstance(seg, dict) or not _has_valid_words(seg):
                 out.append(seg)
                 continue
+            if seg.get("locked") is True or seg.get("operator_locked") is True:
+                # The operator's dragged boundary is authoritative.  Timing
+                # post-passes may inspect it but must never rewrite it.
+                out.append(seg)
+                continue
             try:
                 ls, le = float(seg.get("start")), float(seg.get("end"))
             except (TypeError, ValueError):

@@ -165,6 +165,33 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                         "[COVERAGE] sin stem para voiced_gaps error_type=%s",
                         _safe_exception_code(exc),
                     )
+            # CTC/Whisper word clocks end at the last phoneme and omit a held
+            # vowel. Reuse the already-cached vocal stem to extend a line only
+            # through an attached, energy-backed pitch run (±2 semitones).
+            # This happens after word consistency, never trims, and skips
+            # operator-locked boundaries.
+            if _stem:
+                try:
+                    from pathlib import Path
+                    from timing_review_suggestions import (
+                        extend_line_ends_to_stable_pitch,
+                        load_acoustic_track,
+                    )
+
+                    _track = load_acoustic_track(Path(_stem))
+                    _extended, _tail_report = extend_line_ends_to_stable_pitch(
+                        r.get("segments") or [], _track,
+                    )
+                    if _tail_report["extended_count"]:
+                        r["segments"] = _extended
+                    r.setdefault("postpass_stats", {})[
+                        "stable_pitch_tail"
+                    ] = _tail_report
+                except Exception as exc:
+                    logger.info(
+                        "[TIMING-TAIL] abstained error_type=%s job=%s",
+                        _safe_exception_code(exc), job_id,
+                    )
             # Veredictos del sondeo con ASR: gap_rescue mide PALABRAS, la
             # única evidencia real de letra faltante. El breaker no puede
             # acusar un hueco que aquél ya descartó (batch 30-07: 8 de 8
