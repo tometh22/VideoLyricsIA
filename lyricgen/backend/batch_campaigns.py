@@ -1192,6 +1192,12 @@ def review_queue(
                 audio_sha256=str(job.input_audio_sha256 or ""),
                 audio_revision=int(job.audio_revision or 0),
             )
+            reference_available = bool(
+                reference_available
+                and reference.get("availability") != "unavailable"
+                and reference.get("review_status") != "manual_full_review_required"
+                and int(reference.get("line_count") or 0) > 0
+            )
         metadata_review_required = bool(
             item.metadata_error
             and item.metadata_error not in {"invalid_size", "invalid_duration"}
