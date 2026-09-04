@@ -428,7 +428,23 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     if live_hint:
         from lyric_content_policy import EDITORIAL_POLICY_ID
         final_metrics["editorial_policy_id"] = EDITORIAL_POLICY_ID
-    final_metrics["language"] = str(language or "unknown")[:16]
+    # Preserve why auto-LID abstained.  The old single ``unknown`` value
+    # collapsed valid bilingual/low-evidence abstentions together with a
+    # persistence failure, making the 10/30 campaign result impossible to
+    # autopsy.  A final-row singleton is safe to persist as the detected
+    # language; mixed and insufficient evidence remain explicit abstentions.
+    from transcription_language import diagnose_language_state
+    lid_diagnostic = diagnose_language_state(r, language)
+    detected_languages = list(lid_diagnostic["detected_languages"])
+    resolved_language = str(language or "").strip().lower()
+    if not resolved_language and len(detected_languages) == 1:
+        resolved_language = detected_languages[0]
+    final_metrics["language"] = str(resolved_language or "unknown")[:16]
+    final_metrics["detected_languages"] = detected_languages
+    final_metrics["mixed_language"] = bool(lid_diagnostic["mixed_language"])
+    final_metrics["lid_status"] = (
+        "known" if resolved_language else lid_diagnostic["classification"]
+    )
     # Persist the paired LoRA↔base disagreement as a song-level routing
     # feature. It is computed before internal witness streams are stripped,
     # uses no reference lyrics, and remains advisory until calibration signs
@@ -996,7 +1012,7 @@ def run_transcription_job(
                         if str((log.detail or {}).get("job_id") or "") == job_id
                     ), None)
                     if existing_verdict is None:
-                        verdict = song_verdict(quality)
+                        verdict = song_verdict(quality, segments=segments)
                         _persist_db.add(AuditLog(
                             user_id=None,
                             action=ACTION,

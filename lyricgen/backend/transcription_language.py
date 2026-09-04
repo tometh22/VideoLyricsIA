@@ -220,8 +220,35 @@ def resolve_transcription_language(
     return None
 
 
+def diagnose_language_state(value, persisted_language: str | None = None) -> dict:
+    """Classify an unknown LID without guessing a language.
+
+    This deliberately exposes no lyric text.  It distinguishes an intentional
+    mixed/insufficient-evidence abstention from the operational bug where a
+    single supported language is detectable in the persisted lines but the
+    stored song metric still says ``unknown``.
+    """
+    languages = sorted(detect_text_languages(value))
+    persisted = normalize_language(persisted_language)
+    if persisted:
+        classification = "known"
+    elif len(languages) > 1:
+        classification = "mixed_language_abstention"
+    elif len(languages) == 1:
+        classification = "lid_persistence_failure"
+    else:
+        classification = "insufficient_evidence_abstention"
+    return {
+        "classification": classification,
+        "persisted_language": persisted,
+        "detected_languages": languages,
+        "mixed_language": len(languages) > 1,
+    }
+
+
 __all__ = [
     "SUPPORTED_LANGUAGES",
+    "diagnose_language_state",
     "detect_text_language",
     "detect_text_languages",
     "normalize_language",
