@@ -8046,6 +8046,7 @@ async def _run_transcription_for_job(
                 # GEMINI_LYRICS_CLEANUP_ENABLED, off by default. Cost:
                 # ~$0.01/song. Cache content-addressable; second call
                 # on the same audio is free.
+                _cleaned = None
                 if _canonical:
                     try:
                         from pipeline import _gemini_cleanup_lyrics as _gcl
