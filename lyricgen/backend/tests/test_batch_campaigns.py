@@ -473,6 +473,7 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
     }]
     assert first_job["reference"]["available"] is False
     assert first_job["reference"]["manual_full_review_required"] is True
+    assert first_job["background_mode"] is None
     assert delivery["background_split"] is None
 
     learning = batch.review_queue(
@@ -481,6 +482,39 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
     assert [row["job_id"] for row in learning["items"]] == [jobs[1].job_id]
     assert learning["counters"]["ready"] == 3
 
+
+def test_manual_metadata_stays_red_reviewable_without_visual_fields(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter_by(campaign_id=campaign.id).one()
+    item.metadata_error = "manual_metadata_review"
+    user = db.query(User).first()
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+    )
+    db.add(job)
+    db.commit()
+    monkeypatch.setattr(batch, "_latest_semaforo_verdicts", lambda *_: {
+        job.job_id: {"color": "green", "rank_key": 0.1},
+    })
+
+    result = batch.review_queue(
+        campaign.id, stage="lyrics", order="delivery", state=None,
+        version=None, background_mode=None, artist=None,
+        audit_preapproved=False, page=1, limit=50, current_user={
+            "id": campaign.created_by, "tenant_id": campaign.tenant_id,
+            "role": "admin",
+        }, db=db,
+    )
+
+    row = result["items"][0]
+    assert row["metadata_review_required"] is True
+    assert row["reference"]["manual_full_review_required"] is True
+    assert row["background_mode"] is None
 
 def test_paused_campaign_cannot_start_a_new_render(db):
     campaign = _campaign(db, 1)

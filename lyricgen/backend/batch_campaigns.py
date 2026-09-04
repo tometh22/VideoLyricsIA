@@ -1192,9 +1192,14 @@ def review_queue(
                 audio_sha256=str(job.input_audio_sha256 or ""),
                 audio_revision=int(job.audio_revision or 0),
             )
+        metadata_review_required = bool(
+            item.metadata_error
+            and item.metadata_error not in {"invalid_size", "invalid_duration"}
+        )
         manual_full_review = bool(
             quality.get("manual_full_review_required")
             or not reference_available
+            or metadata_review_required
         )
         rows.append({
             "item_id": item.id,
@@ -1203,7 +1208,8 @@ def review_queue(
             "artist": item.artist or "",
             "title": item.title or item.filename,
             "version": title_version,
-            "background_mode": bg_mode,
+            "background_mode": bg_mode if stage == "final" else None,
+            "metadata_review_required": metadata_review_required,
             "duration_seconds": item.duration_seconds,
             "active_minutes": active_minutes.get(job.job_id, 0.0) if job else 0.0,
             "state": queue_state,
