@@ -835,9 +835,15 @@ def claim_next_review(
 
 def _review_line_ids(segments: list[dict[str, Any]]) -> list[str]:
     line_ids: list[str] = []
-    for segment in segments:
+    for index, segment in enumerate(segments):
         value = str(segment.get("segment_id") or segment.get("id") or "").strip()
-        if not value or value in line_ids:
+        # Campaigns created before stable line identities were introduced
+        # contain only ordered lyric rows. Approval is already bound to the
+        # exact EditorDocument revision/version; this deterministic fallback
+        # lets the one song-level attestation cover those legacy rows without
+        # weakening the stale/partial-list check below.
+        value = value or f"index:{index}"
+        if value in line_ids:
             raise HTTPException(
                 status_code=409,
                 detail={"code": "review_line_identity_missing"},

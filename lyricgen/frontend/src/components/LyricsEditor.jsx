@@ -3907,7 +3907,14 @@ export default function LyricsEditor({
     // reject stale/partial documents without requiring per-line clicks.
     const confirmedLineIdsForApproval = cleaned
       .filter((segment) => requireLineReview || reviewedLineIds.includes(segment._id))
-      .map((segment) => String(segment.segment_id || segment.id || "").trim())
+      .map((segment, index) => {
+        const persistedIdentity = String(segment.segment_id || segment.id || "").trim();
+        // The August campaign was materialized before stable `segment_id`s
+        // existed. Its durable revision still binds the exact snapshot, so
+        // use the same ordered fallback as the API instead of submitting an
+        // empty list and making every legacy song impossible to approve.
+        return persistedIdentity || `index:${index}`;
+      })
       .filter(Boolean);
     const correctionSummary = summarizeOperatorCorrections(
       originalSegmentsRef.current || [], cleaned || [],

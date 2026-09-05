@@ -454,6 +454,60 @@ def test_human_approval_binds_every_line_audio_and_editor_revision(
     assert job.transcription_quality["reference_hypothesis"]["review_status"] == "human_line_review_approved"
 
 
+def test_human_approval_accepts_ordered_ids_for_legacy_document(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    segments = [
+        {"start": 0, "end": 1, "text": "Hello"},
+        {"start": 1, "end": 2, "text": "mundo"},
+    ]
+    audio_sha = "c" * 64
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+        segments_json=segments, segments_revision=0,
+        input_audio_sha256=audio_sha, input_audio_etag=audio_sha,
+        audio_revision=1,
+        transcription_quality={
+            "reference_hypothesis": build_unavailable_reference(
+                audio_sha256=audio_sha, audio_revision=1,
+            ),
+            "reference_hypothesis_unavailable": True,
+            "manual_full_review_required": True,
+        },
+    )
+    db.add(job)
+    db.add(EditorDocument(
+        job_id=job.job_id, tenant_id=campaign.tenant_id,
+        current_segments=segments, original_segments=segments, revision=0,
+    ))
+    db.commit()
+
+    response = batch.approve_campaign_lyrics(
+        campaign.id,
+        job.job_id,
+        batch.LyricsApprovalRequest(
+            editor_revision=0,
+            confirmed_line_ids=["index:0", "index:1"],
+            lyrics_confirmed=True,
+            timings_confirmed=True,
+            heard_against_audio=True,
+        ),
+        {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"},
+        db,
+    )
+
+    assert response["status"] == "lyrics_approved"
+    assert batch.require_prebackground_approval(job)["confirmed_line_count"] == 2
+
+
 def test_platform_admin_can_skip_to_next_job_in_foreign_tenant(db, monkeypatch):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
     campaign = _campaign(db, 2)
