@@ -264,6 +264,12 @@ def review_window(song, window, *, evidence, external_reference=None, commit, po
         candidates += external_reference.splitlines()
     content = select_content(current.get("text", ""), candidates, witnesses,
                              minimum_families=policy.min_independent_audio_families)
+    if content["decision"] != "propose" and any(e.get("kind") == "minimal_text_patch_request" for e in evidence):
+        from reviewer_text_patch import propose_patches
+        patches = propose_patches(current.get("text", ""),
+            [e for e in evidence if e.get("kind") == "minimal_text_patch_request"])
+        if patches:
+            content = patches[0]
     timing = select_endpoint(current, [e for e in evidence if e.get("kind") == "endpoint"],
                              next_start=float(song["segments"][index + 1]["start"]) if index + 1 < len(song["segments"]) else None,
                              duration=float(song["duration_seconds"]), policy=policy)

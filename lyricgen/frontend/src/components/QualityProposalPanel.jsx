@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 const CLOSED_STATUSES = new Set(["applied", "dismissed", "rejected", "cancelled", "observed"]);
 
 const REASON_LABELS = {
+  reviewer_audio_evidence: "Cambio puntual respaldado por escucha independiente; verificar con el audio",
   acoustic_cardinality_disagreement: "La cantidad de frases no coincide con el audio",
   event_count: "Cantidad de frases dudosa",
   low_asr_content_confidence: "Contenido con baja confianza",
@@ -324,7 +325,9 @@ export default function QualityProposalPanel({
                     {suggestionType === "timing" ? "Timing" : suggestionType === "vocalization" ? "Vocalización" : "Texto"}
                   </span>
                   <span className="rounded-full bg-white/5 px-2 py-1 text-gray-300">
-                    Confianza {confidence === "high" ? "alta" : confidence === "low" ? "baja" : "media"}
+                    {proposal?.reviewer_assist
+                      ? "Sugerencia sin calibrar · no certifica la línea"
+                      : `Confianza ${confidence === "high" ? "alta" : confidence === "low" ? "baja" : "media"}`}
                   </span>
                   {proposalWindow?.impact_ms != null && (
                     <span className="rounded-full bg-white/5 px-2 py-1 text-gray-400">

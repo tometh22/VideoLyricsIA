@@ -18,6 +18,14 @@ approval changes or production publication occurred in this experiment.
 - Source revision/audio invalidation, selector revalidation, locked protection.
 - Operational receipt reducer distinguishes generated, shown, examined,
   accepted, edited, rejected and unexamined; does not estimate precision/savings.
+- Fixed scalar telemetry validation: existing operator exposure events carried
+  proposal IDs/counts that the validator rejected. Added bounded, privacy-safe
+  identifiers/counts and a regression test. This does not yet prove exposure
+  was actually in the viewport (the old client counts a loaded batch).
+- Minimal text-patch selector: two independent, reference-free audio families
+  must support the changed span plus a unique two-word adjacent anchor. Does
+  not certify unchanged text, use alignment as recognition, or apply edits.
+  The supervised panel labels these suggestions uncalibrated, not confidence %.
 - Preview malformed option tags fixed, with regression and browser check.
 
 ## Executed on real audio
@@ -41,6 +49,13 @@ Private artifacts under `.context/reviewer-shadow-artifacts`:
 - `prehuman-replay-v1.json`: three frozen Bersuit controls aligned from revision
   zero before reading later human endpoints. Comparisons are development-only;
   historical auto-trim contamination excludes them from clean gold.
+- `text-edit-replay-v1/report.json`: two additional development windows within
+  Bersuit; four real paid listening calls using the unchanged models/prompts.
+  Later corrected text hidden during listening. One minimal patch reproduces
+  the later split of a fused word; the other case abstains. Both retained.
+- `text-edit-proposals-v1.json`: that one offline patch passes through the
+  existing operator-proposal schema. Its live counterpart is locked and was
+  NOT published or changed. This is an operational match, not clean accuracy.
 
 Initial runs used Python 3.11.15 and the modified draft worktree based on
 42c2ca5e6ff8080339df0d64c1a7a12e58a038e9; that base SHA alone does not identify
@@ -72,5 +87,7 @@ Run with the dedicated Python 3.11 environment, from this worktree:
 PYTHONPATH=lyricgen/backend /Users/tomi/conductor/workspaces/VideoLyricsIA-main/riyadh/.context/venvs/shadow-py311/bin/python -m pytest lyricgen/backend/tests/test_reviewer_assist.py lyricgen/backend/tests/test_reviewer_shadow.py lyricgen/backend/tests/test_shadow_reference_import.py -q
 ```
 
-Result before the additional occurrence-drift regression: 34 tests passed.
-This is targeted verification, not full release CI.
+Latest targeted verification: 50 backend tests passed (including text-patch and
+product-telemetry suites); 8 existing QualityProposalPanel tests passed.
+This is targeted verification, not full release CI. The isolated frontend used
+the existing workspace dependency installation, without installing packages.

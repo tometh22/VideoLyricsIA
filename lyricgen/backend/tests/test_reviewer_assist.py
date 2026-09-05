@@ -104,3 +104,12 @@ def test_preview_has_six_real_options_not_malformed_closing_tags():
     parser.feed((Path(__file__).parents[1] / "scripts/reviewer_shadow_preview.html").read_text())
     assert parser.values == ["unreviewed", "current_acceptable", "current_early",
                              "current_late", "ambiguous", "tool_failure"]
+
+
+def test_operator_exposure_payload_is_not_silently_rejected():
+    from product_telemetry import valid_property
+    payload = {"proposal_id": "a" * 64, "total": 2, "timing_count": 0,
+               "text_count": 2, "vocalization_count": 0}
+    assert all(valid_property(k, v) for k, v in payload.items())
+    assert not valid_property("proposal_id", "private lyric with spaces")
+    assert not valid_property("total", float("nan"))
