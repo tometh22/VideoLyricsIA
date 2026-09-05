@@ -29,6 +29,10 @@ def test_same_family_is_not_two_votes():
     assert not propose_patches("¿Cómo estripartito sobra el apetito?", rows)
 
 
+def test_stricter_family_gate_is_not_bypassed():
+    assert not propose_patches("¿Cómo estripartito sobra el apetito?", evidence(), minimum_families=3)
+
+
 def test_conditioned_text_cannot_support_a_patch():
     rows = evidence()
     rows[1]["conditioning_texts"] = ["external lyric"]

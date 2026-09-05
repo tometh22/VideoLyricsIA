@@ -10,7 +10,7 @@ import re
 from reviewer_shadow import _family, tokens
 
 
-def propose_patches(current, requests):
+def propose_patches(current, requests, *, minimum_families=2):
     words = tokens(current)
     spans = list(re.finditer(r"[^\W_]+(?:['’][^\W_]+)?", current))
     if len(spans) != len(words):
@@ -46,7 +46,7 @@ def propose_patches(current, requests):
             if any(sum(heard[i:i+len(anchor)] == anchor
                        for i in range(len(heard)-len(anchor)+1)) == 1 for anchor in anchors):
                 families.add(family)
-        if len(families) < 2:
+        if len(families) < max(2, minimum_families):
             continue
         updated = current[:spans[a].start()] + " ".join(replacement) + current[spans[b-1].end():]
         result.append({"decision": "propose", "text": updated,
