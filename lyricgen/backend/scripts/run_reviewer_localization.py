@@ -6,7 +6,7 @@ from pathlib import Path
 import platform
 import subprocess
 
-from reviewer_phrase_alignment import align_phrase, extend_context, phrase_occurrences
+from reviewer_phrase_alignment import align_phrase, compare_occurrence_anchors, extend_context, phrase_occurrences
 from reviewer_shadow import source_binding, validate_snapshot
 from reviewer_shadow_audio import file_sha, private_write
 
@@ -50,15 +50,19 @@ def main(root, output, known_truncated=()):
                     if expanded["expanded"]:
                         row["arms"].append(align_phrase(mix, segment["text"], expanded))
                 latest = row["arms"][-1]
+                anchor_check = compare_occurrence_anchors(first, latest)
+                row["context_anchor_check"] = anchor_check
                 row["candidate_generated"] = bool(latest["words"])
                 # Lexical repeats need ordered anchors; CTC forcing is not occurrence proof.
                 row["occurrence_localized"] = bool(latest["words"] and
-                    all(len(m["occurrences"]) <= 1 for m in matches))
+                    all(len(m["occurrences"]) <= 1 for m in matches) and
+                    anchor_check["same_occurrence_supported"])
                 row["occurrence_status"] = "provisional_alignment_not_independent_recognition"
                 if latest["words"]:
                     row["candidate_end"] = latest["words"][-1]["global_end"]
                 row["selector_reason"] = ("human_protection" if row["human_protected"] else
                     "alignment_tool_error" if latest["status"] == "tool_error" else
+                    "context_occurrence_drift" if anchor_check["status"] == "occurrence_drift" else
                     "repeated_occurrence_requires_anchors" if not row["occurrence_localized"] else
                     "phonetic_endpoint_not_certified_by_forced_alignment")
             else:

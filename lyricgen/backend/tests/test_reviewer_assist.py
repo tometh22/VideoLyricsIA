@@ -5,7 +5,7 @@ from html.parser import HTMLParser
 import pytest
 
 from reviewer_assist import enabled, operational_counts, prepare, publish
-from reviewer_phrase_alignment import extend_context, phrase_occurrences
+from reviewer_phrase_alignment import compare_occurrence_anchors, extend_context, phrase_occurrences
 from reviewer_shadow import plan_windows, review_window
 from shadow_reference_import import digest
 
@@ -73,6 +73,16 @@ def test_extension_requires_evidence_and_has_total_budget():
 def test_repeats_are_not_silently_assigned_to_first_occurrence():
     assert len(phrase_occurrences("otra vez", "otra vez y otra vez")) == 2
     assert phrase_occurrences("él", "el") == []
+
+
+def test_wider_context_cannot_silently_jump_to_another_chorus():
+    before = {"words": [{"word": "otra", "global_start": 10.},
+                        {"word": "vez", "global_start": 11.}]}
+    after = {"words": [{"word": "otra", "global_start": 20.},
+                       {"word": "vez", "global_start": 21.}]}
+    assert compare_occurrence_anchors(before, after)["status"] == "occurrence_drift"
+    assert compare_occurrence_anchors(before, before)["same_occurrence_supported"] is True
+    assert compare_occurrence_anchors({"words": []}, after)["status"] == "unverifiable"
 
 
 def test_preview_has_six_real_options_not_malformed_closing_tags():

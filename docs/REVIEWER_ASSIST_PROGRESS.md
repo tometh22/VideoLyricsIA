@@ -28,6 +28,13 @@ Private artifacts under `.context/reviewer-shadow-artifacts`:
   endpoints. Four repeated-occurrence blockers; four phonetic-evidence blockers;
   three protected human lines. Zero selected/published changes. Unique lexical
   occurrence plus CTC is only provisional localization, not independent proof.
+- `localization-v2.json`: committed replay at c80d64f1708bb8dd93436f504daf024ecea1072e,
+  12 alignments / 19.812 seconds summed tool latency / zero paid calls. On the
+  user-reported truncated Luciano window, extending 181.32 to 189.32 seconds
+  moves the forced endpoint from 178.82 to 188.10. This is NOT evidence of a
+  successful extension: repeated-occurrence drift must be checked. Added a
+  prefix-anchor stability guard and regression test, without changing selector
+  gates. The broader fragment can contain a different occurrence of the phrase.
 - `clock-audit-v1.json`: all three mixes are PCM WAV; all three stems contain MP3
   despite a `.wav` suffix. Metadata and decoded sample counts recorded. Provider
   encoder delay/padding has not been proven; no stem-to-mix transfer authorized.
@@ -65,4 +72,5 @@ Run with the dedicated Python 3.11 environment, from this worktree:
 PYTHONPATH=lyricgen/backend /Users/tomi/conductor/workspaces/VideoLyricsIA-main/riyadh/.context/venvs/shadow-py311/bin/python -m pytest lyricgen/backend/tests/test_reviewer_assist.py lyricgen/backend/tests/test_reviewer_shadow.py lyricgen/backend/tests/test_shadow_reference_import.py -q
 ```
 
-Result: 34 tests passed. This is targeted verification, not full release CI.
+Result before the additional occurrence-drift regression: 34 tests passed.
+This is targeted verification, not full release CI.

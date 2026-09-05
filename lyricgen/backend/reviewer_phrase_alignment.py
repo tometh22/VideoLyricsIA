@@ -22,6 +22,25 @@ def phrase_occurrences(text, hypothesis):
             if haystack[i:i + len(needle)] == needle]
 
 
+def compare_occurrence_anchors(before, after, *, tolerance=.15):
+    """Wider audio must not silently select a later repeated phrase.
+
+    Compare all word starts except the final word, whose boundary is being
+    investigated. A single-word phrase has no independent prefix anchor.
+    This consistency check does not certify that either alignment is correct.
+    """
+    left, right = before.get("words", []), after.get("words", [])
+    if len(left) < 2 or len(left) != len(right) or any(
+        tokens(a["word"]) != tokens(b["word"]) for a, b in zip(left, right)
+    ):
+        return {"status": "unverifiable", "same_occurrence_supported": False}
+    shifts = [b["global_start"] - a["global_start"] for a, b in zip(left[:-1], right[:-1])]
+    stable = all(abs(shift) <= tolerance for shift in shifts)
+    return {"status": "prefix_stable" if stable else "occurrence_drift",
+            "prefix_shifts_seconds": shifts, "tolerance_seconds": tolerance,
+            "same_occurrence_supported": stable, "correctness_certified": False}
+
+
 def extend_context(window, *, duration, continuity=False, truncated=False,
                    extension_used=0, maximum_extension=8.0, maximum_duration=24.0):
     """One bounded arm; never mutates a document or silently extends a line."""
