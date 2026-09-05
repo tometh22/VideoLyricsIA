@@ -11096,6 +11096,9 @@ async def generate_with_segments(
         art_track=art_track,
         label_line=(label_line or "").strip() if art_track else "",
         render_profile=_render_profile,
+        preserve_approved_timing=bool(
+            _batch_generation or selected_editor_version is not None
+        ),
     )
 
     return {
@@ -16911,6 +16914,43 @@ async def retry_job(
     # bg-preservation logic downstream can introspect the failure cause.
     _previous_error = job.error or ""
 
+    # Freeze whether the persisted segments are an exact approved snapshot
+    # BEFORE retry clears delivery approval fields/status. Campaign approval
+    # and EditorVersion approval are independent durable paths; either one is
+    # sufficient only when it still binds the current revision and bytes.
+    from transcription_quality import segments_hash as _segments_hash
+    _retry_segments = list(job.segments_json or [])
+    _prebackground = (job.transcription_quality or {}).get(
+        "pre_background_approval",
+    )
+    _campaign_timing_approved = bool(
+        isinstance(_prebackground, dict)
+        and str(_prebackground.get("editor_revision"))
+        == str(int(job.segments_revision or 0))
+        and str(_prebackground.get("segments_sha256") or "")
+        == _segments_hash(_retry_segments)
+        and _prebackground.get("timings_confirmed") is True
+        and _prebackground.get("heard_against_audio") is True
+    )
+    _approved_editor_snapshot = (
+        db.query(EditorVersion)
+        .filter(
+            EditorVersion.job_id == job.job_id,
+            EditorVersion.tenant_id == job.tenant_id,
+            EditorVersion.revision == int(job.segments_revision or 0),
+            EditorVersion.is_approved.is_(True),
+        )
+        .order_by(EditorVersion.id.desc())
+        .first()
+    )
+    _retry_preserve_approved_timing = bool(
+        _campaign_timing_approved
+        or (
+            _approved_editor_snapshot is not None
+            and _approved_editor_snapshot.segments == _retry_segments
+        )
+    )
+
     # Reset job to initial processing state before re-enqueueing.
     job.status = "processing"
     job.current_step = "whisper"
@@ -17074,6 +17114,7 @@ async def retry_job(
         umg_spec=umg_spec,
         segments_override=segments_override,
         bg_r2_key=preserved_bg_r2_key,
+        preserve_approved_timing=_retry_preserve_approved_timing,
         **retry_pipeline_kwargs,
     )
 
@@ -17834,6 +17875,9 @@ async def create_variant(
         "song_title": parent.song_title or "",
         "umg_spec": parent.umg_spec or {},
         "segments_override": parent.segments_json,
+        # A variant inherits the already-approved parent lyric snapshot. The
+        # new render may change its background, never its line boundaries.
+        "preserve_approved_timing": True,
     }
     # render_params (padre + overrides) → kwargs individuales de
     # run_pipeline. Cada nombre acá EXISTE en la firma de run_pipeline

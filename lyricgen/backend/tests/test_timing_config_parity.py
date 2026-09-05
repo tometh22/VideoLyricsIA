@@ -31,7 +31,12 @@ def test_runtime_timing_config_normalizes_equivalent_values(monkeypatch):
     }
 
 
-def test_parity_matches_api_and_both_transcription_worker_families():
+def test_runtime_timing_config_uses_same_safe_hold_default_as_pipeline(monkeypatch):
+    monkeypatch.delenv("LYRIC_HOLD_S", raising=False)
+    assert runtime_timing_config()["lyric_hold_s"] == 0.5
+
+
+def test_parity_requires_render_and_quality_workers_to_match_too():
     config = {"lyric_hold_s": 0.5}
     result = timing_config_parity([
         _row("ShortWorker", config),
@@ -42,8 +47,8 @@ def test_parity_matches_api_and_both_transcription_worker_families():
         ),
     ], api_config=config)
 
-    assert result["match"] is True
-    assert result["participants"] == 3
+    assert result["match"] is False
+    assert result["participants"] == 4
     assert result["missing"] == []
 
 

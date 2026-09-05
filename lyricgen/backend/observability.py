@@ -21,11 +21,6 @@ ENV = (os.environ.get("ENVIRONMENT")
        or "dev").lower().strip()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
-_TIMING_WORK_QUEUES = {
-    "transcription", "transcription_batch", "enterprise", "default", "canary",
-}
-
-
 def _float_env(name: str, default: float = 0.0) -> float:
     try:
         return max(0.0, float(os.environ.get(name, str(default)) or default))
@@ -50,7 +45,7 @@ def _bool_env(name: str, default: bool = False) -> bool:
 def runtime_timing_config() -> dict[str, float | int | bool]:
     """Canonical timing knobs that must agree across transcription services."""
     return {
-        "lyric_hold_s": _float_env("LYRIC_HOLD_S"),
+        "lyric_hold_s": _float_env("LYRIC_HOLD_S", 0.5),
         "lyric_lead_in_s": _float_env("LYRIC_LEAD_IN_S"),
         "lyric_lead_in_ms": _int_env("LYRIC_LEAD_IN_MS"),
         "stable_pitch_tail_enabled": _bool_env("STABLE_PITCH_TAIL_ENABLED"),
@@ -60,18 +55,16 @@ def runtime_timing_config() -> dict[str, float | int | bool]:
 def timing_config_parity(
     release_rows: list[dict], api_config: dict | None = None,
 ) -> dict:
-    """Fail-closed parity view for API and workers that can transcribe.
+    """Fail-closed parity view for API and every application worker.
 
-    Render- and quality-only workers are intentionally excluded: these knobs
-    cannot affect their output. A transcription worker that does not publish
+    Timing settings must not depend on which service happens to consume a
+    retry, edit or render payload. All worker heartbeat rows participate,
+    including render- and quality-only queues. A worker that does not publish
     its timing config is unverifiable and therefore fails the operational gate.
     """
     configurations = {"api": dict(api_config or runtime_timing_config())}
     missing: list[str] = []
     for row in release_rows or []:
-        queues = set(row.get("queues") or [])
-        if not queues.intersection(_TIMING_WORK_QUEUES):
-            continue
         service = str(row.get("service") or "worker")
         worker = str(row.get("worker") or "unknown")
         label = f"{service}:{worker}"

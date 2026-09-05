@@ -28,7 +28,7 @@ def _track(pitched):
     )
 
 
-def test_builds_review_only_pitch_candidate_with_perceptual_lead():
+def test_builds_review_only_pitch_candidate_without_unvalidated_end_discount():
     pitched = np.zeros(120, dtype=bool)
     pitched[20:55] = True  # 1.00 through 2.75 seconds.
     segments = [
@@ -41,8 +41,10 @@ def test_builds_review_only_pitch_candidate_with_perceptual_lead():
 
     assert segments[0]["end"] == 2.0
     assert candidates[0]["suggestion_type"] == "timing"
-    assert candidates[0]["proposed_end"] == 2.65
-    assert candidates[0]["proposed_segments"][0]["end"] == 2.65
+    assert candidates[0]["proposed_end"] == 2.75
+    assert candidates[0]["proposed_segments"][0]["end"] == 2.75
+    assert candidates[0]["raw_acoustic_end"] == 2.75
+    assert candidates[0]["perceptual_end_offset_s"] == 0.0
     assert candidates[0]["automatic_apply_allowed"] is False
     assert report["mutated_segments"] is False
 

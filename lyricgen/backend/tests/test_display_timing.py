@@ -42,6 +42,36 @@ def test_no_two_subtitles_overlap():
         assert a["end"] <= b["start"], f"{a} overlaps {b}"
 
 
+def test_no_overlap_wins_over_minimum_readable_duration():
+    """Regression: applying the 300ms floor after the neighbour ceiling used
+    to create an overlap that was absent from the source timeline."""
+    segs = [_seg(1.0, 1.1), _seg(1.2, 2.0)]
+    out = pipeline._apply_display_timing(segs, duration=3.0)
+    assert out[0]["end"] == 1.2 - GAP
+    assert out[0]["end"] < 1.0 + 0.3
+    assert out[0]["end"] < out[1]["start"]
+
+
+def test_approved_timeline_is_rendered_exactly_without_display_transform():
+    approved = [
+        _seg(1.0, 1.1, "short approved line"),
+        _seg(1.2, 2.0, "next approved line"),
+    ]
+    out = pipeline._effective_render_segments(
+        approved, duration=3.0, preserve_approved_timing=True,
+    )
+    assert out == approved
+    assert out is not approved
+
+
+def test_unapproved_timeline_keeps_display_normalization():
+    source = [_seg(1.0, 1.1), _seg(1.2, 2.0)]
+    out = pipeline._effective_render_segments(
+        source, duration=3.0, preserve_approved_timing=False,
+    )
+    assert out == pipeline._apply_display_timing(source, duration=3.0)
+
+
 def test_last_line_holds_past_end_capped_at_duration():
     segs = [_seg(50.0, 52.0)]
     out = pipeline._apply_display_timing(segs, duration=53.0)
