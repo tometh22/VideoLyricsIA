@@ -137,7 +137,11 @@ def _symmetric_phrase_endpoint(
 
 @dataclass(frozen=True)
 class TimingReviewPolicy:
-    perceptual_lead_s: float = 0.10
+    # Endpoint benchmark 2026-09-05, operator gold e926 rev51 (38 locked):
+    # raw acoustic endpoint 3/17 within ±150ms, MAE .6444s; subtracting 100ms
+    # 2/17, MAE .7199s. Keep the proposal at the measured endpoint. This is
+    # observation/reviewer guidance only; automatic timing remains disabled.
+    perceptual_lead_s: float = 0.0
     minimum_visible_delta_s: float = 0.15
     maximum_visible_delta_s: float = 6.0
     next_line_guard_s: float = 0.02
@@ -405,6 +409,10 @@ def build_timing_review_candidates(
             "impact_ms": round(abs(delta) * 1000),
             "current_end": round(current_end, 4),
             "proposed_end": round(candidate_end, 4),
+            "raw_acoustic_end": (
+                round(acoustic_end, 4) if acoustic_end is not None else None
+            ),
+            "perceptual_end_offset_s": selected_policy.perceptual_lead_s,
             "preview_start": round(max(0.0, min(current_end, candidate_end) - 1.0), 4),
             "preview_end": round(max(current_end, candidate_end) + 1.0, 4),
             "source_families": (

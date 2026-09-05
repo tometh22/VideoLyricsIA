@@ -1217,7 +1217,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  # Canonical allowlisted batch contract. Individual fields
                  # above remain for backwards compatibility; this object is
                  # persisted verbatim (after API validation) for audit/retry.
-                 render_profile: dict | None = None):
+                 render_profile: dict | None = None,
+                 # Set only by an approval-bound API publication. Prevents
+                 # render-time display normalization from changing the exact
+                 # editor snapshot the human approved.
+                 preserve_approved_timing: bool = False):
     """Run the full pipeline for a job. Called synchronously.
 
     delivery_profile:
@@ -2306,6 +2310,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 still_background=(
                     _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
                 ),
+                preserve_approved_timing=preserve_approved_timing,
             )
             # Cinemascope opt-in: letterbox the finished YouTube master. Skipped
             # for UMG (that path returns a ProRes .mov — re-encoding it as h264
@@ -17607,8 +17612,9 @@ def _apply_display_timing(
        (next.start - gap_s) enforces the upper bound.
 
     Both reduce to: end = min(base_end + max_hold_s, next.start - gap_s),
-    floored to a >=0.3s readable window. The min() makes overlap (ceiling
-    wins) and gap (hold wins) one expression. The last line holds past its
+    with a preferred >=0.3s readable window. NO-OVERLAP is the hard
+    invariant: when the next line starts too soon to fit 300 ms, the ceiling
+    wins and the current line may be shorter. The last line holds past its
     final word, capped at `duration`. Returns a new list; input untouched.
 
     LOCKED lines (`seg["locked"] is True`) — the operator set this line's end
@@ -17630,17 +17636,39 @@ def _apply_display_timing(
         ceiling = (sorted_segs[i + 1]["start"] - gap_s) if i + 1 < n else duration
         if locked:
             # Respect the operator's manual end; only enforce no-overlap.
-            new_end = min(base_end, ceiling)
-            new_end = max(new_end, seg["start"] + 0.3)
+            candidate_end = min(base_end, ceiling)
         elif i + 1 < n:
-            new_end = min(base_end + max_hold_s, ceiling)
-            new_end = max(new_end, seg["start"] + 0.3)
+            candidate_end = min(base_end + max_hold_s, ceiling)
         else:
-            new_end = min(base_end + max_hold_s, duration)
-        if new_end > duration:
-            new_end = duration
+            candidate_end = min(base_end + max_hold_s, duration)
+        # Readability is preferred, but can never undo the hard ceiling. The
+        # previous max(..., start + .3) after min(..., ceiling) recreated an
+        # overlap for packed lines (1.00-1.10 followed by 1.20 became 1.30).
+        new_end = min(max(candidate_end, seg["start"] + 0.3), ceiling, duration)
         cleaned.append({**seg, "end": new_end})
     return cleaned
+
+
+def _effective_render_segments(
+    segments: list[dict],
+    duration: float,
+    *,
+    preserve_approved_timing: bool,
+) -> list[dict]:
+    """Return the exact timeline handed to both render engines.
+
+    Human approval is a snapshot boundary. Once a caller attests that the
+    supplied segments are approved, rendering must not add hold, clamp a
+    neighbour, or impose a minimum duration. Pre-approval/legacy generation
+    keeps the display normalization above.
+    """
+    visible = [
+        dict(segment) for segment in segments
+        if (segment.get("text") or "").strip()
+    ]
+    if preserve_approved_timing:
+        return visible
+    return _apply_display_timing(visible, duration)
 
 
 def _ffmpeg_filter_escape(path: str) -> str:
@@ -18047,6 +18075,10 @@ def generate_lyric_video(
     # Con este flag el caller —que es quien sabe si el operador pidió "quieta"—
     # elige, y el render sólo ejecuta. Default False = comportamiento histórico.
     still_background: bool = False,
+    # Exact human approval snapshot. When true, the renderer must consume the
+    # supplied line start/end values byte-for-byte (apart from dropping blank
+    # text rows, which cannot produce a subtitle).
+    preserve_approved_timing: bool = False,
 ) -> tuple[str, str, str | None]:
     """Generate a lyric video. Returns (video_path, font, bg_source).
 
@@ -18094,15 +18126,13 @@ def generate_lyric_video(
     # expected" error and aborts the whole render.
     if segments:
         before = len(segments)
-        segments = [s for s in segments if (s.get("text") or "").strip()]
+        segments = _effective_render_segments(
+            segments, duration,
+            preserve_approved_timing=preserve_approved_timing,
+        )
         dropped = before - len(segments)
         if dropped:
             logger.info("[RENDER] dropped %s blank segment(s) before render", dropped)
-
-    # Display-timing normalization (hold-until-next + no-overlap). See
-    # _apply_display_timing for the full rationale + the UMG incident.
-    if segments:
-        segments = _apply_display_timing(segments, duration)
 
     # Title shown on the card — resolved once and shared by both render
     # paths (libass below, moviepy further down).
@@ -20778,6 +20808,9 @@ def run_edit_pipeline(
             still_background=(
                 _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
             ),
+            # Every edit render consumes a persisted operator snapshot. Never
+            # reinterpret its approved/manual line boundaries at display time.
+            preserve_approved_timing=True,
         )
         # Cinemascope opt-in — mirror run_pipeline. YouTube master only.
         if _video_out and not wants_umg:
