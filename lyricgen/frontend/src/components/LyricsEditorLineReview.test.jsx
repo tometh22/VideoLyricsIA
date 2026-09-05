@@ -91,6 +91,22 @@ describe("LyricsEditor — aprobación por canción", () => {
     }));
   });
 
+  it("aprueba documentos legacy sin segment_id usando identidades ordenadas", async () => {
+    const onApprove = vi.fn();
+    const legacySegments = [
+      { start: 1, end: 2, text: "Primera línea" },
+      { start: 5, end: 6, text: "Segunda línea" },
+    ];
+    render(<LyricsEditor {...props({ segments: legacySegments, onApprove })} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Aprobar letra y timing" }));
+
+    await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
+    expect(onApprove.mock.calls[0][1]).toEqual(expect.objectContaining({
+      confirmedLineIds: ["index:0", "index:1"],
+    }));
+  });
+
   it("muestra las ventanas como guía sin exigir clicks ni acknowledgement", async () => {
     const onApprove = vi.fn();
     const editorRequest = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), {
