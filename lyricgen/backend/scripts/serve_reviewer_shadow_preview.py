@@ -8,6 +8,13 @@ import re
 
 
 class Handler(SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # The terminal that launched this local viewer may close while the
+        # user keeps reviewing. Default stderr logging can then raise a
+        # BrokenPipeError before response headers, producing empty replies.
+        # This read-only private viewer needs no per-request/access logging.
+        pass
+
     def send_head(self):
         self.byte_range = None
         path = self.translate_path(self.path)
