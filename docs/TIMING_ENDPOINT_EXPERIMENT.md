@@ -51,3 +51,35 @@ Review minutes per song and task type are joined from the editor timer in the
 analysis report; they are not inferred from model latency. Rendered-video
 timestamps, rather than database timestamps, are the final endpoint source for
 all delivery measurements.
+
+### Evaluator v2: evidence units and conditional risk
+
+Line proportions are descriptive, not independent-binomial confidence bounds.
+The evaluator builds connected components across song, artist, recording,
+job, audio hash and supplied evaluation-unit IDs. A caller's ID can merge
+components, never split related lines into independent evidence. Abstained
+and ambiguous labels also participate in grouping. No such group may cross
+train/calibration/test. Correct grouping still requires an external audit of
+sampling independence; identifiers alone cannot prove it.
+
+Both exploratory and 99% gates use groups with actual changes. A group is a
+success only if every judged applied change is safe. The exact lower bound
+therefore estimates group-wide safety, not line precision. No-op applications
+do not count as evidence. Applying an ambiguous endpoint or ambiguous vocal
+attribution blocks the gate; those cases remain separately reported.
+
+Control harm is conditioned on actually changing a correct control. The
+descriptive denominator is changed controls; the conservative bound uses
+groups with changed controls, counting any harm in a group as a failure.
+Untouched controls cannot dilute risk. Exploratory harm must have a one-sided
+95% upper bound at most 5%; the 99% gate requires at most 1%. Zero observed
+damage is never reported as zero upper-bound risk. Test itself must contain
+all label classes and random/control samples; training rows cannot satisfy
+test coverage requirements.
+
+These are separate marginal 95% bounds, not a joint simultaneous guarantee.
+Threshold freezing is an input attestation, not cryptographic proof: the
+release reviewer must verify a single preregistered calibration choice, a
+previously untouched test, rendered candidate endpoints after clipping, and
+sampling/group independence before interpreting a passed offline gate. No
+model has been trained or certified by adding this evaluator.

@@ -22,6 +22,10 @@ DECISIONS = {"apply", "abstain"}
 VOCAL_ATTRIBUTIONS = {"target_singer", "relevant_ensemble", "ambiguous"}
 TASK_TYPES = {"text", "timing", "reference", "other"}
 _TEXT_FIELDS = {"text", "lyric_text", "lyrics", "reference_text"}
+_DEPENDENCY_FIELDS = (
+    "song_group_id", "artist_group_id", "recording_group_id", "job_id",
+    "audio_sha256", "evaluation_unit_id",
+)
 
 
 class GoldValidationError(ValueError):
@@ -122,7 +126,7 @@ def validate_gold(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
             "vocal_attribution": vocal_attribution,
         })
 
-        for group_field in ("song_group_id", "artist_group_id", "recording_group_id"):
+        for group_field in _DEPENDENCY_FIELDS:
             key = (group_field, row[group_field])
             previous = group_splits.setdefault(key, split)
             if previous != split:
@@ -227,11 +231,44 @@ def zero_error_sample_size(target_precision: float, confidence: float = 0.95) ->
     return math.ceil(math.log(1 - confidence) / math.log(target_precision))
 
 
+def _dependency_units(gold: list[dict[str, Any]]) -> dict[str, str]:
+    """Connected components: a supplied unit ID may merge, never split evidence.
+
+    Include abstentions and ambiguous labels when finding dependencies, because
+    excluding them could break a bridge between related songs/recordings.
+    """
+    parent = {row["label_id"]: row["label_id"] for row in gold}
+
+    def root(label_id: str) -> str:
+        while parent[label_id] != label_id:
+            parent[label_id] = parent[parent[label_id]]
+            label_id = parent[label_id]
+        return label_id
+
+    seen: dict[tuple[str, str], str] = {}
+    for row in gold:
+        label_id = row["label_id"]
+        for field in _DEPENDENCY_FIELDS:
+            key = (field, row[field])
+            if key in seen:
+                left, right = sorted((root(label_id), root(seen[key])))
+                parent[right] = left
+            else:
+                seen[key] = label_id
+    return {label_id: root(label_id) for label_id in parent}
+
+
 def _evaluate_subset(
     gold: list[dict[str, Any]], predictions: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
-    judged = [row for row in gold if row["label_class"] != "ambiguous"]
-    applied = [row for row in judged if predictions[row["label_id"]]["decision"] == "apply"]
+    judged = [row for row in gold if row["label_class"] != "ambiguous"
+              and row["vocal_attribution"] != "ambiguous"]
+    requested = [row for row in gold if predictions[row["label_id"]]["decision"] == "apply"]
+    changed = [row for row in requested if not math.isclose(
+        predictions[row["label_id"]]["proposed_end_s"], row["current_end_s"],
+        rel_tol=0, abs_tol=1e-6,
+    )]
+    applied = [row for row in changed if row in judged]
     correct_applied = [
         row for row in applied
         if row["acceptable_end_min_s"]
@@ -241,39 +278,50 @@ def _evaluate_subset(
     short = [row for row in judged if row["label_class"] == "short"]
     recovered_short = [row for row in correct_applied if row["label_class"] == "short"]
     controls = [row for row in judged if row["label_class"] == "correct"]
+    applied_controls = [row for row in applied if row["label_class"] == "correct"]
     harmed_controls = [row for row in applied if row["label_class"] == "correct" and row not in correct_applied]
 
     units: dict[str, list[bool]] = defaultdict(list)
+    control_units: dict[str, list[bool]] = defaultdict(list)
+    dependency_units = _dependency_units(gold)
     for row in applied:
-        units[row["evaluation_unit_id"]].append(row in correct_applied)
+        unit = dependency_units[row["label_id"]]
+        units[unit].append(row in correct_applied)
+        if row["label_class"] == "correct":
+            control_units[unit].append(row in harmed_controls)
     successful_units = sum(all(results) for results in units.values())
+    harmed_control_units = sum(any(results) for results in control_units.values())
     return {
         "labels": len(gold),
         "judged_labels": len(judged),
         "ambiguous_labels": len(gold) - len(judged),
         "applied_changes": len(applied),
-        "abstentions": len(judged) - len(applied),
+        "requested_applications": len(requested),
+        "no_op_applications": len(requested) - len(changed),
+        "unjudgable_applications": sum(row not in judged for row in changed),
+        "abstentions": sum(predictions[row["label_id"]]["decision"] == "abstain" for row in gold),
         "coverage": round(len(applied) / len(judged), 6) if judged else None,
         "successful_changes": len(correct_applied),
         "applied_change_precision": round(len(correct_applied) / len(applied), 6) if applied else None,
-        "applied_change_precision_lower_95": (
-            round(clopper_pearson_lower(len(correct_applied), len(applied)) or 0.0, 6)
-            if applied else None
-        ),
+        # Line-level proportions are descriptive only, never binomial evidence.
+        "applied_change_precision_lower_95": None,
         "short_labels": len(short),
         "short_recovered": len(recovered_short),
         "short_recall": round(len(recovered_short) / len(short), 6) if short else None,
         "correct_controls": len(controls),
+        "applied_controls": len(applied_controls),
         "harmed_controls": len(harmed_controls),
-        "control_harm_rate": round(len(harmed_controls) / len(controls), 6) if controls else None,
+        "control_harm_rate": round(len(harmed_controls) / len(applied_controls), 6) if applied_controls else None,
+        "control_units_with_changes": len(control_units),
+        "harmed_control_units": harmed_control_units,
         "control_harm_upper_95": (
-            round(clopper_pearson_upper(len(harmed_controls), len(controls)) or 0.0, 6)
-            if controls else None
+            clopper_pearson_upper(harmed_control_units, len(control_units))
+            if control_units else None
         ),
         "evaluation_units_with_changes": len(units),
         "successful_evaluation_units": successful_units,
         "unit_precision_lower_95": (
-            round(clopper_pearson_lower(successful_units, len(units)) or 0.0, 6)
+            clopper_pearson_lower(successful_units, len(units))
             if units else None
         ),
     }
@@ -300,22 +348,26 @@ def evaluate_experiment(
         exploratory_blockers.append("threshold_not_frozen_before_test")
     if not any(row["split"] == "test" and row["annotation_mode"] == "blind" for row in gold):
         exploratory_blockers.append("no_blind_test_labels")
-    if (test["applied_change_precision_lower_95"] or 0.0) < 0.95:
-        exploratory_blockers.append("applied_precision_lower_95_below_0.95")
+    if (test["unit_precision_lower_95"] or 0.0) < 0.95:
+        exploratory_blockers.append("unit_precision_lower_95_below_0.95")
+    if test["unjudgable_applications"]:
+        exploratory_blockers.append("changes_applied_to_ambiguous_labels")
     if (test["control_harm_upper_95"] or 1.0) > 0.05:
         exploratory_blockers.append("control_harm_upper_95_above_0.05")
     for required_class in sorted(LABEL_CLASSES):
-        if not any(row["label_class"] == required_class for row in gold):
-            exploratory_blockers.append(f"missing_{required_class}_labels")
+        if not any(row["split"] == "test" and row["label_class"] == required_class for row in gold):
+            exploratory_blockers.append(f"missing_test_{required_class}_labels")
     for required_role in ("random", "control"):
-        if not any(row["sample_role"] == required_role for row in gold):
-            exploratory_blockers.append(f"missing_{required_role}_sample")
+        if not any(row["split"] == "test" and row["sample_role"] == required_role for row in gold):
+            exploratory_blockers.append(f"missing_test_{required_role}_sample")
 
     certification_blockers = list(exploratory_blockers)
     if test["evaluation_units_with_changes"] < zero_error_sample_size(0.99):
         certification_blockers.append("fewer_than_299_independent_evaluation_units")
     if (test["unit_precision_lower_95"] or 0.0) < 0.99:
         certification_blockers.append("unit_precision_lower_95_below_0.99")
+    if (test["control_harm_upper_95"] or 1.0) > 0.01:
+        certification_blockers.append("conditional_control_harm_upper_95_above_0.01")
 
     family_pairs = Counter(
         (row["proposer_family"], row["selector_family"])
@@ -338,7 +390,11 @@ def evaluate_experiment(
         minutes_by_job[job_id] += active_minutes
 
     return {
-        "schema": "timing-endpoint-experiment-report-v1",
+        "schema": "timing-endpoint-experiment-report-v2",
+        "uncertainty_unit": "connected_song_artist_recording_job_audio_unit_groups",
+        "uncertainty_estimand": "probability_all_applied_changes_in_group_are_safe",
+        "harm_estimand": "probability_of_any_harm_in_group_given_control_change_applied",
+        "independence_requires_external_sampling_audit": True,
         "gold_schema": SCHEMA,
         "prediction_schema": PREDICTION_SCHEMA,
         "label_distribution": dict(sorted(Counter(row["label_class"] for row in gold).items())),
@@ -347,7 +403,8 @@ def evaluate_experiment(
         "by_split": by_split,
         "model_components": [
             {"proposer_family": pair[0], "selector_family": pair[1], "labels": count,
-             "independent_families": pair[0] != pair[1]}
+             "distinct_family_labels": pair[0] != pair[1],
+             "independent_families": False, "independence_status": "not_attested"}
             for pair, count in sorted(family_pairs.items())
         ],
         "human_review": {

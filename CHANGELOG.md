@@ -3,6 +3,18 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.1] - 2026-09-05
+
+### Fixed
+
+- Offline endpoint evaluation now derives dependency groups from songs,
+  artists, related recordings, jobs and audio hashes instead of trusting
+  per-line unit IDs. Exploratory confidence uses grouped evidence.
+- Control damage is conditioned on actual changes, with conservative grouped
+  rare-risk bounds. No-op changes and ambiguous applications cannot inflate
+  evidence; different component names do not attest independent model families.
+- No runtime timing mutation, training, or automatic promotion is enabled.
+
 ## [1.0.0] - 2026-05-22
 
 **Public launch.** First customer: Universal Music Argentina (200 videos/month).
