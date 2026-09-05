@@ -137,7 +137,7 @@ class BlindAudioTools:
                 payload = self._whisper(clip)
             else:
                 payload = self._gemini(clip)
-            base.update(payload, tool_status="ok", received_audio=True)
+            base.update(payload, tool_status=payload.get("tool_status", "ok"), received_audio=True)
         except Exception as exc:
             base.update(tool_status="tool_error", error_type=type(exc).__name__,
                         http_status=getattr(getattr(exc, "response", None), "status_code", None))
@@ -176,12 +176,16 @@ class BlindAudioTools:
                 config=genai.types.GenerateContentConfig(system_instruction=BLIND_PROMPT,
                     temperature=0, response_mime_type="application/json", max_output_tokens=4096,
                     thinking_config=genai.types.ThinkingConfig(thinking_budget=0)))
-        payload = json.loads(response.text)
-        if not isinstance(payload, dict) or not isinstance(payload.get("events"), list) or len(payload["events"]) > 16:
-            raise ValueError("invalid_blind_events_schema")
-        return {"response": payload,
+        trace = {"raw_response_text": response.text, "response": {},
                 "usage": response.usage_metadata.model_dump(mode="json") if response.usage_metadata else None,
                 "model_version": response.model_version, "request_id": response.response_id}
+        try:
+            payload = json.loads(response.text)
+        except (json.JSONDecodeError, TypeError):
+            return {**trace, "tool_status": "invalid_response", "error_type": "invalid_json_response"}
+        if not isinstance(payload, dict) or not isinstance(payload.get("events"), list) or len(payload["events"]) > 16:
+            return {**trace, "tool_status": "invalid_response", "error_type": "invalid_blind_events_schema"}
+        return {**trace, "response": payload}
 
 
 def localized_witnesses(results, segment, window, duration):

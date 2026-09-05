@@ -120,6 +120,19 @@ def test_external_text_alone_never_creates_a_proposal():
     assert result["timing"]["decision"] == "abstain"
 
 
+def test_invalid_provider_response_preserves_audio_receipt_usage_and_raw(tmp_path, monkeypatch):
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"fixture")
+    tools = BlindAudioTools(tmp_path / "cache")
+    monkeypatch.setattr(tools, "_gemini", lambda _: {"tool_status": "invalid_response",
+                        "raw_response_text": "{broken", "usage": {"prompt_token_count": 123}})
+    result = tools.listen(clip, provider="google", view="stem", source={}, window={})
+    assert result["tool_status"] == "invalid_response"
+    assert result["received_audio"] is True
+    assert result["usage"]["prompt_token_count"] == 123
+    assert result["raw_response_text"] == "{broken"
+
+
 def test_repeated_phrase_cannot_claim_unique_occurrence():
     results = [{"provider": "openai", "tool_status": "ok", "response": {"words": [
         {"word": "hola", "start": 1., "end": 2.}, {"word": "hola", "start": 3., "end": 4.}]}},
