@@ -7,6 +7,9 @@ import os
 def timing_capture(previous, current, *, job, user_id, checkpoint, from_revision, to_revision):
     if os.getenv('REVIEWER_TIMING_CAPTURE_ENABLED', '0') != '1' or checkpoint not in {'draft', 'autosave', 'manual', 'approve'}:
         return None
+    from reviewer_assist_scope import campaign_in_scope
+    if not campaign_in_scope(getattr(job, 'campaign_id', None)):
+        return None
     if user_id is None or len(previous) != len(current):
         return None  # structural edits need explicit correspondence
     changed = []

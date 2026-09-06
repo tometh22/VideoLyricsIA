@@ -15,6 +15,9 @@ def run_snapshot(job_id, snapshot, mix_path, stem_path):
         return None, {"enabled": False}
     if snapshot.get("approved_at") or snapshot.get("status") in {"lyrics_approved", "done"}:
         return None, {"enabled": True, "reason": "human_approval_preserved", "provider_calls": 0}
+    from reviewer_assist_scope import inference_enabled
+    if not inference_enabled(snapshot.get("campaign_id")):
+        return None, {"enabled": True, "reason": "inference_disabled_or_campaign_out_of_scope", "provider_calls": 0}
     if os.environ.get("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}:
         return None, {"enabled": True, "reason": "text_suggestion_rollout_disabled", "provider_calls": 0}
     cache_base = os.environ.get("REVIEWER_ASSIST_CACHE_DIR")
@@ -24,7 +27,7 @@ def run_snapshot(job_id, snapshot, mix_path, stem_path):
         return None, {"enabled": True, "reason": "stem_unavailable", "provider_calls": 0}
     if file_sha(mix_path) != snapshot["audio_sha256"]:
         return None, {"enabled": True, "reason": "source_audio_hash_mismatch", "provider_calls": 0}
-    song = {"job_id": job_id, "segments": snapshot["segments"],
+    song = {"job_id": job_id, "campaign_id": snapshot.get("campaign_id"), "segments": snapshot["segments"],
         "segments_revision": snapshot["revision"], "segments_sha256": digest(snapshot["segments"]),
         "audio_revision": snapshot["audio_revision"], "audio_sha256": snapshot["audio_sha256"],
         "duration_seconds": probe(mix_path)}

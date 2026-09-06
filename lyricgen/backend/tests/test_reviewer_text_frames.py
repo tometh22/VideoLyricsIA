@@ -45,11 +45,12 @@ def test_frame_profile_accounts_for_alternative_ctc_paths():
 
 def test_prospective_capture_default_off_and_machine_apply_excluded(monkeypatch):
     old=[{'start':1.,'end':2.,'text':'hola'}]; new=[{'start':1.,'end':2.7,'text':'hola'}]
-    args=dict(job=SimpleNamespace(job_id='j',tenant_id='t',input_audio_sha256='a'*64,audio_revision=1),
+    args=dict(job=SimpleNamespace(job_id='j',tenant_id='t',campaign_id='fixture00001',input_audio_sha256='a'*64,audio_revision=1),
         user_id=2,checkpoint='draft',from_revision=4,to_revision=5)
     monkeypatch.delenv('REVIEWER_TIMING_CAPTURE_ENABLED',raising=False)
     assert timing_capture(old,new,**args) is None
     monkeypatch.setenv('REVIEWER_TIMING_CAPTURE_ENABLED','1')
+    monkeypatch.setenv('REVIEWER_ASSIST_CAMPAIGN_ID','fixture00001')
     evidence=timing_capture(old,new,**args)
     assert evidence['changed'][0]['end_delta']==.7 or abs(evidence['changed'][0]['end_delta']-.7)<1e-9
     assert evidence['audio_sha256']=='a'*64 and not evidence['clean_gold']
@@ -59,12 +60,18 @@ def test_prospective_capture_default_off_and_machine_apply_excluded(monkeypatch)
 
 def test_normal_editor_save_captures_once_without_approval(monkeypatch):
     from tests.test_editor_documents import _users_and_job
-    from database import SessionLocal, Job, EditorDocument, AuditLog
+    from database import SessionLocal, Job, EditorDocument, AuditLog, BatchCampaign
+    import uuid
     from editor import save_document
     first,_,job_id=_users_and_job('prospective_timing_test')
     monkeypatch.setenv('REVIEWER_TIMING_CAPTURE_ENABLED','1')
+    campaign_id=uuid.uuid4().hex[:12]
+    monkeypatch.setenv('REVIEWER_ASSIST_CAMPAIGN_ID',campaign_id)
     with SessionLocal() as db:
         job=db.query(Job).filter_by(job_id=job_id).one()
+        db.add(BatchCampaign(id=campaign_id,tenant_id=job.tenant_id,created_by=first.id,name='Timing fixture'))
+        db.flush()
+        job.campaign_id=campaign_id
         job.input_audio_sha256='a'*64
         db.flush()
         doc=db.query(EditorDocument).filter_by(job_id=job_id).one()

@@ -27,6 +27,19 @@ it("permite escuchar dudas localizadas con el audio existente", async () => {
   expect(onSeek).toHaveBeenCalledWith(1);
 });
 
+it("muestra decisiones retenidas como dudas sin acciones de incorporación", async () => {
+  const onSeek = vi.fn();
+  render(<CompleteReviewerCandidate candidate={{ ...candidate,
+    review_details: { held_decisions: [{ line_index: 0, reason: "phrase_association_unresolved" }] } }}
+    currentRevision={3} currentSegments={baseline} onSeek={onSeek} />);
+  await userEvent.click(screen.getByText(/Dudas y límites/));
+  expect(screen.getByText(/No se pudo localizar esta frase/)).toBeInTheDocument();
+  expect(screen.getByText(/no se incorporan como cambios/)).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Escuchar duda 1" }));
+  expect(onSeek).toHaveBeenCalledWith(1);
+  expect(screen.queryByRole("button", { name: /incorporar|aprobar|aplicar/i })).toBeNull();
+});
+
 it.each([[4, baseline], [3, [{ ...baseline[0], text: "Edición humana" }]]])(
   "oculta candidata desactualizada tras revisión o edición local", (revision, segments) => {
     const { container } = render(<CompleteReviewerCandidate candidate={candidate} currentRevision={revision} currentSegments={segments} />);

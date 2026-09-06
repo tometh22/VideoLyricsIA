@@ -113,6 +113,8 @@ def test_interval_does_not_invent_word_end_at_pitch_change():
 def test_worker_builds_complete_candidate_via_existing_proposal_schema(monkeypatch, tmp_path):
     import reviewer_assist_runtime as runtime
     monkeypatch.setenv("REVIEWER_ASSIST_ENABLED", "1")
+    monkeypatch.setenv("REVIEWER_ASSIST_INFERENCE_ENABLED", "1")
+    monkeypatch.setenv("REVIEWER_ASSIST_CAMPAIGN_ID", "fixture00001")
     monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
     monkeypatch.setenv("REVIEWER_ASSIST_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(runtime, "file_sha", lambda _: "a" * 64)
@@ -135,6 +137,7 @@ def test_worker_builds_complete_candidate_via_existing_proposal_schema(monkeypat
             {"text": "Otra línea", "start": 6., "end": 8., "locked": True}]
     before = deepcopy(rows)
     proposal, report = runtime.run_snapshot("test", {"segments": rows,
+        "campaign_id": "fixture00001",
         "revision": 1, "audio_revision": 1, "audio_sha256": "a" * 64,
         "quality": {"unsafe_windows": [{"start": 1., "end": 5.}]}}, "mix", "stem")
     assert report["provider_calls"] == 2
@@ -154,14 +157,19 @@ def test_candidate_counts_survive_existing_analytics_sanitizer():
 
 def test_human_candidate_adoption_is_versioned_but_not_approved_or_locked(db, monkeypatch):
     import uuid
-    from database import Job
+    from database import Job, BatchCampaign
     from editor import ensure_document, persist_operator_review_proposal_if_current, apply_quality_proposal, approve_document
     from operator_review_proposals import build_operator_review_proposal
     from transcription_quality import segments_hash
     monkeypatch.setenv("REVIEWER_ASSIST_ENABLED", "1")
+    campaign_id = uuid.uuid4().hex[:12]
+    monkeypatch.setenv("REVIEWER_ASSIST_CAMPAIGN_ID", campaign_id)
+    monkeypatch.setenv("REVIEWER_ASSIST_PUBLISH_ENABLED", "1")
+    db.add(BatchCampaign(id=campaign_id, tenant_id="reviewer-test", created_by=1, name="Reviewer fixture"))
+    db.flush()
     monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
     rows = [{"text": "Canto así", "start": 2., "end": 4.}]
-    job = Job(job_id=uuid.uuid4().hex[:12], user_id=1, tenant_id="reviewer-test",
+    job = Job(job_id=uuid.uuid4().hex[:12], user_id=1, tenant_id="reviewer-test", campaign_id=campaign_id,
         filename="test.wav", artist="Test", style="oscuro", status="transcribed_pending",
         segments_json=rows, audio_revision=1, input_audio_sha256="a" * 64)
     db.add(job)
@@ -171,7 +179,7 @@ def test_human_candidate_adoption_is_versioned_but_not_approved_or_locked(db, mo
         "kind": "operator_review_candidate", "id": "test-window", "suggestion_type": "text",
         "start": 2., "end": 4., "current_segments": rows,
         "proposed_segments": [{"text": "Canto aquí", "start": 2., "end": 4.}]}])
-    proposal["reviewer_assist"] = {"version": "v1"}
+    proposal["reviewer_assist"] = {"version": "v1", "campaign_id": campaign_id}
     assert persist_operator_review_proposal_if_current(db, job_id=job.job_id,
         expected_revision=doc.revision, expected_segments_hash=segments_hash(rows),
         expected_audio_revision=1, expected_audio_sha256="a" * 64, proposal=proposal)

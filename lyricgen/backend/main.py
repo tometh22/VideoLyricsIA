@@ -13529,6 +13529,8 @@ async def get_editor_document(
     # Serialization can erase an expired proposal. Build the response before
     # commit so that tenant-scoped raw text is durably removed by this GET.
     payload = serialize_document(db, document)
+    from reviewer_campaign_product import status_for_job
+    payload["reviewer_campaign_status"] = status_for_job(job, document)
     editor_quality = getattr(job, "transcription_quality", None)
     from reviewer_assist import enabled as reviewer_assist_enabled
     candidate_inputs = None

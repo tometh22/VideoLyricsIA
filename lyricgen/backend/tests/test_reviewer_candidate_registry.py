@@ -14,12 +14,15 @@ from tests.test_reviewer_batch_bridge import fixture as review_fixture
 
 def setup_registry(monkeypatch, tmp_path, *, no_changes=False):
     monkeypatch.setenv("REVIEWER_ASSIST_ENABLED", "1")
+    monkeypatch.setenv("REVIEWER_ASSIST_PUBLISH_ENABLED", "1")
+    monkeypatch.setenv("REVIEWER_ASSIST_CAMPAIGN_ID", "fixture00001")
     monkeypatch.setenv("REVIEWER_ASSIST_CACHE_DIR", str(tmp_path))
     monkeypatch.setenv("REVIEWER_CANDIDATE_STORAGE", "local")
     song, candidate, review = review_fixture()
+    song["campaign_id"] = "fixture00001"
     if no_changes:
         candidate = build_candidate(song)
-    job = SimpleNamespace(job_id=song["job_id"], tenant_id="tenant",
+    job = SimpleNamespace(job_id=song["job_id"], tenant_id="tenant", campaign_id="fixture00001",
         audio_revision=song["audio_revision"], input_audio_sha256=song["audio_sha256"], status="ready")
     document = SimpleNamespace(job_id=song["job_id"], tenant_id="tenant",
         revision=song["segments_revision"], current_segments=deepcopy(song["segments"]))
@@ -228,16 +231,20 @@ def r2_fixture(monkeypatch, tmp_path):
     return values, client, stub
 
 
-def test_r2_conditional_put_is_shared_readable_without_local_volume(monkeypatch, tmp_path):
+@pytest.mark.parametrize("environment", ["test", "staging"])
+def test_r2_conditional_put_is_shared_readable_without_local_volume(monkeypatch, tmp_path, environment):
     from botocore.stub import ANY
     from io import BytesIO
     import reviewer_candidate_registry as registry
     values, client, stub = r2_fixture(monkeypatch, tmp_path)
+    monkeypatch.setenv("ENVIRONMENT", environment)
+    monkeypatch.delenv("REVIEWER_CANDIDATE_STORAGE_PREFIX", raising=False)
     song, candidate, review, job, document = values
     record = prepare_registry_record("tenant", song, candidate, review)
     created = datetime(2026, 9, 6, tzinfo=timezone.utc)
     envelope = {**record, "created_at": created.isoformat(), "expires_at": (created + timedelta(days=7)).isoformat()}
     key = registry._object_key("tenant", record["identity"])
+    assert key.startswith("staging/") == (environment == "staging")
     conditional = ({"IfNoneMatch": "*"} if "IfNoneMatch" in
         client.meta.service_model.operation_model("PutObject").input_shape.members else {})
     stub.add_response("put_object", {}, {"Bucket": "test-bucket", "Key": key,
@@ -250,6 +257,15 @@ def test_r2_conditional_put_is_shared_readable_without_local_volume(monkeypatch,
         assert payload["segments"] == candidate["segments"]
     stub.assert_no_pending_responses()
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("prefix", ["reviewer-candidates/v1", "staging/../prod", "/staging/a", "staging//a"])
+def test_staging_storage_prefix_rejects_shared_or_unsafe_keys(monkeypatch, prefix):
+    import reviewer_candidate_registry as registry
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setenv("REVIEWER_CANDIDATE_STORAGE_PREFIX", prefix)
+    with pytest.raises(ValueError, match="invalid_reviewer_storage_prefix"):
+        registry._object_key("tenant", "identity")
 
 
 def test_r2_precondition_failure_reads_existing_never_overwrites(monkeypatch, tmp_path):

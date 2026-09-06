@@ -244,6 +244,17 @@ jobs:
       CORS_ORIGINS: http://127.0.0.1:4173
       RATE_LIMIT_ENABLED: "false"
       BACKGROUND_THREADS_ENABLED: "false"
+      REAL_REVIEWER_E2E: "1"
+      BATCH_CAMPAIGN_ENABLED: "1"
+      BATCH_CAMPAIGN_SCOPES: editor_e2e_team
+      REVIEWER_ASSIST_ENABLED: "1"
+      REVIEWER_ASSIST_PUBLISH_ENABLED: "1"
+      REVIEWER_ASSIST_INFERENCE_ENABLED: "0"
+      REVIEWER_ASSIST_CAMPAIGN_ID: e2erevcamp01
+      REVIEWER_CANDIDATE_STORAGE: local
+      REVIEWER_ASSIST_CACHE_DIR: /tmp/reviewer-e2e-cache
+      QUALITY_OPERATOR_SUGGESTIONS_ENABLED: "1"
+      QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED: "0"
     services:
       postgres:
         image: postgres:18
@@ -284,13 +295,13 @@ jobs:
           uvicorn main:app --host 127.0.0.1 --port 8000 > /tmp/editor-api.log 2>&1 &
           for i in {1..30}; do curl -fsS http://127.0.0.1:8000/health/live && break; sleep 1; done
           curl -fsS http://127.0.0.1:8000/health/live
-      - name: Run two-user Chromium collaboration flow
+      - name: Run collaboration and supervised candidate flows in isolated PostgreSQL
         working-directory: lyricgen/frontend
         env:
           REAL_EDITOR_E2E: "1"
           REAL_EDITOR_API: http://127.0.0.1:8000
           VITE_API_URL: http://127.0.0.1:8000
-        run: npx playwright test e2e/editor-collaboration-real.spec.js
+        run: npx playwright test e2e/editor-collaboration-real.spec.js e2e/reviewer-real.spec.js
       - name: Upload editor diagnostics
         if: failure()
         uses: actions/upload-artifact@v4

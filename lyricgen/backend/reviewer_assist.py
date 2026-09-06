@@ -57,6 +57,7 @@ def prepare(song, decisions):
         for window in proposal["windows"]:
             window["telemetry_id"] = hashlib.sha256(window["id"].encode()).hexdigest()[:16]
         proposal["reviewer_assist"] = {"version": "supervised-v1",
+            "campaign_id": song.get("campaign_id"),
             "source": deepcopy(decisions[0]["source"]),
             "decision_ids": [d["proposal_id"] for d in decisions],
             "evidence_sha256": digest(decisions), "correctness_certified": False}
@@ -67,6 +68,9 @@ def prepare(song, decisions):
 def publish(db, song, decisions):
     if not enabled():
         return {"published": False, "reason": "reviewer_assist_disabled"}
+    from reviewer_assist_scope import publication_enabled
+    if not publication_enabled(song.get("campaign_id")):
+        return {"published": False, "reason": "candidate_publication_disabled_or_out_of_scope"}
     prepared = prepare(song, decisions)
     if prepared["proposal"] is None:
         return {"published": False, "reason": "no_qualified_proposals", **prepared}

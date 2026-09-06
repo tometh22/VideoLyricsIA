@@ -50,8 +50,10 @@ def operator_suggestions_enabled() -> bool:
 
 
 def reviewer_candidate_enabled(proposal: dict) -> bool:
-    return not isinstance(proposal, dict) or not proposal.get("reviewer_assist") or os.environ.get(
-        "REVIEWER_ASSIST_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if not isinstance(proposal, dict) or not proposal.get("reviewer_assist"):
+        return True
+    from reviewer_assist_scope import display_enabled
+    return display_enabled(proposal["reviewer_assist"].get("campaign_id"))
 
 
 def text_operator_suggestions_enabled() -> bool:
@@ -984,6 +986,10 @@ def persist_operator_review_proposal_if_current(
     ).with_for_update().first()
     if job is None or document is None:
         return False
+    if proposal.get("reviewer_assist"):
+        from reviewer_assist_scope import publication_enabled
+        if not publication_enabled(getattr(job, "campaign_id", None)):
+            return False
     if proposal.get("reviewer_assist") and document.quality_proposal:
         previous_proposal = document.quality_proposal
         if not (previous_proposal.get("reviewer_assist") and previous_proposal.get("status") == "stale"):
@@ -1209,6 +1215,15 @@ def apply_quality_proposal(
         EditorDocument.job_id == document.job_id,
     ).populate_existing().with_for_update().one()
     proposal = dict(document.quality_proposal or {})
+    if proposal.get("reviewer_assist") and (
+        getattr(document, "approved_at", None) or getattr(job, "approved_at", None)
+        or getattr(job, "status", None) in {"lyrics_approved", "done"}
+    ):
+        raise RuntimeError("approved_song_preserved")
+    if proposal.get("reviewer_assist"):
+        from reviewer_assist_scope import display_enabled
+        if not display_enabled(getattr(job, "campaign_id", None)):
+            raise QualityProposalsDisabled("reviewer_campaign_out_of_scope")
     operator_only = proposal.get("operator_suggestion_only") is True
     if operator_only:
         if not operator_suggestions_enabled() or not reviewer_candidate_enabled(proposal):

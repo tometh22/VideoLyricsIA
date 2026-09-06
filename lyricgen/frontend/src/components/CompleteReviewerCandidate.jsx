@@ -25,7 +25,7 @@ export default function CompleteReviewerCandidate({ candidate, currentRevision, 
       || !sameRows(candidate.baseline, currentSegments)) return null;
   const rows = candidate.segments || [];
   const details = candidate.review_details || {};
-  const doubts = [...(details.localized_doubts || []), ...(details.line_diagnostics || []).filter(row =>
+  const doubts = [...(details.localized_doubts || []), ...(details.held_decisions || []), ...(details.line_diagnostics || []).filter(row =>
     row.discrepancy_class !== "normalized_text_match_not_certification")];
   const seek = row => {
     const start = Number(row.start ?? row.global_start ?? rows[row.line_index]?.start);
@@ -54,6 +54,7 @@ export default function CompleteReviewerCandidate({ candidate, currentRevision, 
       </li>)}</ol>
     </details>
     <details className="mt-3"><summary>Dudas y límites de la revisión ({doubts.length})</summary>
+      <p className="mt-2 text-xs text-gray-400">Estas dudas no son reparaciones respaldadas y no se incorporan como cambios de la candidata.</p>
       <ul>{doubts.map((row, i) => <li key={i} className="mt-2 text-sm">
         <button type="button" className="mr-2 text-cyan-300" onClick={() => seek(row)}>Escuchar duda {i + 1}</button>
         {row.line_index != null ? `Línea ${row.line_index + 1}: ` : ""}

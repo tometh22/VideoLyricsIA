@@ -207,10 +207,13 @@ def _summary(db: Session, campaign: BatchCampaign) -> dict[str, Any]:
         )
     }
     rows = _campaign_rows(db, campaign.id)
+    from reviewer_campaign_product import campaign_payload
+    reviewer_summary, _ = campaign_payload(db, campaign.id, rows)
     for item, job in rows:
         counters[_phase(item.upload_state, job.status if job else None, item.metadata_error)] += 1
     return {
         "id": campaign.id,
+        "reviewer_campaign_status": reviewer_summary,
         "name": campaign.name,
         "status": campaign.status,
         "created_by": campaign.created_by,
@@ -375,6 +378,8 @@ def list_campaign_items(
     _require_scope(current_user)
     _campaign_or_404(db, campaign_id, current_user)
     rows = _campaign_rows(db, campaign_id)
+    from reviewer_campaign_product import campaign_payload
+    reviewer_summary, reviewer_rows = campaign_payload(db, campaign_id, rows)
     serialized = []
     for item, job in rows:
         item_phase = _phase(item.upload_state, job.status if job else None, item.metadata_error)
@@ -396,12 +401,14 @@ def list_campaign_items(
             "phase": item_phase,
             "job_id": job.job_id if job else None,
             "job_status": job.status if job else None,
+            "reviewer_campaign_status": reviewer_rows.get(job.job_id) if job else None,
             "render_overrides": item.render_overrides or {},
         })
     total = len(serialized)
     start = (page - 1) * limit
     return {
         "items": serialized[start:start + limit],
+        "reviewer_campaign_status": reviewer_summary,
         "page": page,
         "limit": limit,
         "total": total,
@@ -1152,11 +1159,17 @@ def review_queue(
     campaign = _campaign_or_404(db, campaign_id, current_user)
     pairs = _campaign_rows(db, campaign.id)
     job_ids = [job.job_id for _, job in pairs if job is not None]
+    from sqlalchemy.orm import load_only
     documents = {
-        row.job_id: row for row in db.query(EditorDocument).filter(
+        row.job_id: row for row in db.query(EditorDocument).options(load_only(
+            EditorDocument.job_id, EditorDocument.revision, EditorDocument.current_segments,
+            EditorDocument.lock_user_id, EditorDocument.lock_expires_at,
+        )).filter(
             EditorDocument.job_id.in_(job_ids)
         ).all()
     } if job_ids else {}
+    from reviewer_campaign_product import campaign_payload
+    reviewer_summary, reviewer_rows = campaign_payload(db, campaign.id, pairs, documents)
     reviewer_ids = {
         int(row.lock_user_id) for row in documents.values()
         if row.lock_user_id is not None
@@ -1243,6 +1256,7 @@ def review_queue(
         ])
         rows.append({
             "item_id": item.id,
+            "reviewer_campaign_status": reviewer_rows.get(job.job_id) if job else None,
             "job_id": job.job_id if job else None,
             "ordinal": item.ordinal,
             "artist": item.artist or "",
@@ -1345,6 +1359,7 @@ def review_queue(
     return {
         "campaign_id": campaign.id,
         "stage": stage,
+        "reviewer_campaign_status": reviewer_summary,
         "order": order,
         "items": [
             {key: value for key, value in row.items() if not key.startswith("_")}

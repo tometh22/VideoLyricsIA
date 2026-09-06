@@ -92,6 +92,7 @@ def prepare_batch_candidate(song, candidate, review, *, original_segments=None,
     prepared = prepare(song, decisions)
     if prepared["proposal"]:
         prepared["proposal"]["reviewer_assist"].update({
+            "campaign_id": song.get("campaign_id"),
             "candidate": {"segments": safe["segments"],
                 "baseline_sha256": safe["baseline_sha256"],
                 "candidate_sha256": safe["candidate_sha256"],
@@ -112,6 +113,9 @@ def publish_batch_candidate(db, song, candidate, review):
     """
     if not enabled():
         return {"published": False, "reason": "reviewer_assist_disabled"}
+    from reviewer_assist_scope import publication_enabled
+    if not publication_enabled(song.get("campaign_id")):
+        return {"published": False, "reason": "candidate_publication_disabled_or_out_of_scope"}
     from database import EditorDocument, Job
     from editor import (operator_suggestions_enabled, operator_suggestion_type_enabled,
                         persist_operator_review_proposal_if_current)
@@ -122,6 +126,14 @@ def publish_batch_candidate(db, song, candidate, review):
     document = db.query(EditorDocument).filter(EditorDocument.job_id == song["job_id"]).populate_existing().with_for_update().first()
     if job is None or document is None:
         return {"published": False, "reason": "document_or_job_missing"}
+    if not publication_enabled(getattr(job, "campaign_id", None)):
+        return {"published": False, "reason": "campaign_out_of_scope"}
+    from datetime import datetime, timezone
+    expiry = getattr(document, "lock_expires_at", None)
+    if expiry and expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if getattr(document, "lock_user_id", None) and expiry and expiry > datetime.now(timezone.utc):
+        return {"published": False, "reason": "active_human_review_preserved"}
     if getattr(document, "approved_at", None) or getattr(job, "approved_at", None) or getattr(job, "status", None) in {"lyrics_approved", "done"}:
         return {"published": False, "reason": "human_approval_preserved"}
     if document.quality_proposal:

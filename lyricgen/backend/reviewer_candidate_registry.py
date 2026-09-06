@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from botocore.exceptions import BotoCoreError, ClientError
 
 from reviewer_assist import enabled
+from reviewer_assist_scope import display_enabled, publication_enabled
 from reviewer_batch_bridge import prepare_batch_candidate
 from reviewer_shadow import source_binding, validate_snapshot
 from shadow_reference_import import digest
@@ -62,7 +63,15 @@ def _r2_client():
 
 
 def _object_key(tenant_id, identity):
-    return f"reviewer-candidates/v1/{digest(str(tenant_id))}/{identity}.json"
+    environment = os.getenv("ENVIRONMENT", "").strip().lower()
+    prefix = os.getenv("REVIEWER_CANDIDATE_STORAGE_PREFIX", "").strip()
+    if not prefix:
+        prefix = "staging/reviewer-candidates/v1" if environment == "staging" else "reviewer-candidates/v1"
+    if (any(part in {"", ".", ".."} for part in prefix.split("/"))
+            or any(not (c.isalnum() or c in "-_/" ) for c in prefix)
+            or (environment == "staging" and not prefix.startswith("staging/"))):
+        raise ValueError("invalid_reviewer_storage_prefix")
+    return f"{prefix}/{digest(str(tenant_id))}/{identity}.json"
 
 
 def _read_r2(tenant_id, identity):
@@ -170,6 +179,8 @@ def register_candidate(tenant_id, song, candidate, review, *, original_segments=
     """
     if not enabled():
         return {"registered": False, "reason": "reviewer_assist_disabled"}
+    if not publication_enabled(song.get("campaign_id")):
+        return {"registered": False, "reason": "candidate_publication_disabled_or_out_of_scope"}
     mode, root = _mode(), _root()
     if mode not in {"local", "r2"}:
         return {"registered": False, "reason": "unsupported_candidate_storage"}
@@ -216,6 +227,8 @@ def candidate_for_editor(job, document, *, now=None):
     No unsigned audio URLs or private filesystem paths enter the response.
     """
     if not enabled() or _mode() not in {"local", "r2"} or (_mode() == "local" and _root() is None):
+        return None
+    if not display_enabled(getattr(job, "campaign_id", None)):
         return None
     if str(job.job_id) != str(document.job_id) or str(job.tenant_id) != str(document.tenant_id):
         return None
@@ -301,7 +314,7 @@ def editor_candidate_snapshot(job, document):
     objects afterwards risks expired/lazy attributes and cross-thread sessions.
     """
     job_view = SimpleNamespace(**{name: deepcopy(getattr(job, name, None)) for name in (
-        "job_id", "tenant_id", "audio_revision", "input_audio_sha256", "status", "approved_at")})
+        "job_id", "tenant_id", "campaign_id", "audio_revision", "input_audio_sha256", "status", "approved_at")})
     document_view = SimpleNamespace(**{name: deepcopy(getattr(document, name, None)) for name in (
         "job_id", "tenant_id", "revision", "current_segments", "approved_at", "quality_proposal")})
     return job_view, document_view
