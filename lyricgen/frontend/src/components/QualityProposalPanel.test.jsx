@@ -32,8 +32,39 @@ const PROPOSAL = {
 };
 
 afterEach(cleanup);
+afterEach(() => vi.unstubAllGlobals());
 
 describe("QualityProposalPanel", () => {
+  it("mide exposición real separada de examen, sin contar carga como rechazo", async () => {
+    let notify;
+    vi.stubGlobal("IntersectionObserver", class {
+      constructor(callback) { notify = callback; }
+      observe() {} disconnect() {}
+    });
+    const user = userEvent.setup(), telemetry = vi.fn();
+    const proposal = { ...PROPOSAL, operator_suggestion_only: true, reviewer_assist: { version: "v1" },
+      windows: PROPOSAL.windows.map((w, i) => ({ ...w, telemetry_id: `receipt-${i}` })) };
+    render(<QualityProposalPanel proposal={proposal} currentRevision={12} onReviewTelemetry={telemetry} onSeek={vi.fn()} />);
+    expect(telemetry).not.toHaveBeenCalled();
+    const target = screen.getByTestId("quality-proposal-window-outro-a");
+    notify([{ target, isIntersecting: true, intersectionRatio: 0.8 }]);
+    notify([{ target, isIntersecting: true, intersectionRatio: 0.8 }]);
+    expect(telemetry.mock.calls.filter(([e]) => e.kind === "shown")).toHaveLength(1);
+    await user.click(within(target).getByRole("button", { name: /Escuchar zona 1/ }));
+    expect(telemetry.mock.calls.some(([e]) => e.kind === "examined")).toBe(true);
+    expect(telemetry.mock.calls.some(([e]) => e.kind === "rejected")).toBe(false);
+  });
+  it("permite usar una candidata completa sin aceptar cada ventana", async () => {
+    const user = userEvent.setup();
+    const apply = vi.fn();
+    const proposal = { ...PROPOSAL, operator_suggestion_only: true,
+      reviewer_assist: { candidate: { segments: [{ text: "Canción completa", start: 0, end: 3 }] } } };
+    render(<QualityProposalPanel proposal={proposal} currentRevision={12} onApplySelected={apply} />);
+    expect(apply).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Usar candidata completa para revisar" }));
+    expect(apply).toHaveBeenCalledWith(["outro-a", "outro-b"], proposal);
+    expect(screen.getByText(/Lo conservado no está certificado/)).toBeInTheDocument();
+  });
   it("compara antes/después y nunca selecciona ni aplica automáticamente", () => {
     const onApplySelected = vi.fn();
     const onDismiss = vi.fn();

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { editorSessionHeaders } from "../lib/editorSession";
+import { CampaignReviewerRow, CampaignReviewerSummary } from "./CampaignReviewerStatus";
 
 const API = import.meta.env.VITE_API_URL || "";
 const PHASES = [
@@ -176,6 +177,7 @@ function CampaignDetail({ id }) {
         </div>
       </div>
       {error && <div className="rounded-xl bg-amber-500/10 p-4 text-sm text-amber-100 ring-1 ring-amber-500/25">{error}</div>}
+      <CampaignReviewerSummary status={campaign.reviewer_campaign_status} />
       <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         {PHASES.slice(1).map(([key, label]) => <Counter key={key} label={label} value={campaign.counters?.[key]} active={phase === key} onClick={() => { setPhase(phase === key ? "" : key); setPage(1); }} />)}
       </div>
@@ -215,7 +217,17 @@ function CampaignDetail({ id }) {
         <div className="overflow-x-auto">
           <table className="w-full min-w-[850px] text-left text-xs">
             <thead className="text-ink-tertiary"><tr><th className="p-2">Prioridad</th><th className="p-2">Artista / canción</th><th className="p-2">Versión</th>{queueStage === "final" && <th className="p-2">Fondo</th>}<th className="p-2">Duración</th><th className="p-2">Estado</th><th className="p-2">Referencia</th><th className="p-2"></th></tr></thead>
-            <tbody>{(reviewQueue?.items || []).map((row) => <tr key={row.item_id} className="border-t border-white/[0.05] text-ink-secondary"><td className="p-2">{row.priority}</td><td className="p-2"><div className="font-medium text-white">{row.title}</div><div>{row.artist}</div></td><td className="p-2">{row.version}</td>{queueStage === "final" && <td className="p-2">{row.background_mode}</td>}<td className="p-2">{row.duration_seconds ? `${Math.round(row.duration_seconds)}s` : "—"}</td><td className="p-2">{row.state}{row.reviewer_name ? ` · ${row.reviewer_name}` : ""}</td><td className="p-2">{row.reference?.provider || "pendiente"} · {row.reference?.status || "sin asociar"}</td><td className="p-2">{row.open_path && <button onClick={() => navigate(row.open_path)} className="rounded-lg bg-brand/15 px-3 py-1.5 text-brand-light">Abrir</button>}</td></tr>)}</tbody>
+            <tbody>{(reviewQueue?.items || []).map((row) => <tr key={row.item_id} className="border-t border-white/[0.05] text-ink-secondary">
+              <td className="p-2">{row.priority}</td>
+              <td className="p-2"><div className="font-medium text-white">{row.title}</div><div>{row.artist}</div>
+                {queueStage === "lyrics" && campaign.reviewer_campaign_status?.enabled === true && <CampaignReviewerRow status={row.reviewer_campaign_status} jobId={row.job_id} onOpen={navigate} />}
+              </td>
+              <td className="p-2">{row.version}</td>{queueStage === "final" && <td className="p-2">{row.background_mode}</td>}
+              <td className="p-2">{row.duration_seconds ? `${Math.round(row.duration_seconds)}s` : "—"}</td>
+              <td className="p-2">{row.state}{row.reviewer_name ? ` · ${row.reviewer_name}` : ""}</td>
+              <td className="p-2">{row.reference?.provider || "pendiente"} · {row.reference?.status || "sin asociar"}</td>
+              <td className="p-2">{row.open_path && <button onClick={() => navigate(row.open_path)} className="rounded-lg bg-brand/15 px-3 py-1.5 text-brand-light">Abrir</button>}</td>
+            </tr>)}</tbody>
           </table>
         </div>
       </section>
@@ -236,7 +248,15 @@ function CampaignDetail({ id }) {
       <section className="overflow-hidden rounded-2xl bg-surface-2/40 ring-1 ring-white/[0.06]">
         <div className="flex items-center justify-between border-b border-white/[0.06] p-4"><h2 className="font-semibold text-white">Canciones {phase ? `· ${labels[phase]}` : ""}</h2><span className="text-xs text-ink-tertiary">Página {page}/{pages}</span></div>
         <div className="divide-y divide-white/[0.05]">
-          {items.map((item) => <div key={item.id} className="grid gap-3 p-4 md:grid-cols-[55px_1fr_180px_auto] md:items-center"><span className="text-xs text-ink-tertiary">#{item.ordinal}</span><div className="min-w-0"><div className="truncate text-sm font-medium text-white">{item.title || item.filename}</div><div className="truncate text-xs text-ink-tertiary">{item.artist || "Falta artista"} · {item.technical_code || "Falta código"}</div></div><span className="text-xs text-ink-secondary">{labels[item.phase] || item.phase}</span><div className="flex gap-2">{item.metadata_error && <button onClick={() => editMetadata(item)} className="rounded-lg bg-amber-500/10 px-3 py-1.5 text-xs text-amber-100">Completar metadata</button>}{item.job_id && item.phase === "lyrics_ready" && <button onClick={() => navigate(`/review/${item.job_id}`)} className="rounded-lg bg-brand/15 px-3 py-1.5 text-xs text-brand-light">Corregir</button>}{item.phase === "failed" && <button onClick={() => retry(item)} className="rounded-lg bg-red-500/10 px-3 py-1.5 text-xs text-red-200">Reintentar</button>}</div></div>)}
+          {items.map((item) => <div key={item.id} className="grid gap-3 p-4 md:grid-cols-[55px_1fr_180px_auto] md:items-center">
+            <span className="text-xs text-ink-tertiary">#{item.ordinal}</span>
+            <div className="min-w-0"><div className="truncate text-sm font-medium text-white">{item.title || item.filename}</div>
+              <div className="truncate text-xs text-ink-tertiary">{item.artist || "Falta artista"} · {item.technical_code || "Falta código"}</div>
+              {campaign.reviewer_campaign_status?.enabled === true && <CampaignReviewerRow status={item.reviewer_campaign_status} jobId={item.job_id} onOpen={navigate} />}
+            </div>
+            <span className="text-xs text-ink-secondary">{labels[item.phase] || item.phase}</span>
+            <div className="flex gap-2">{item.metadata_error && <button onClick={() => editMetadata(item)} className="rounded-lg bg-amber-500/10 px-3 py-1.5 text-xs text-amber-100">Completar metadata</button>}{item.job_id && item.phase === "lyrics_ready" && <button onClick={() => navigate(`/review/${item.job_id}`)} className="rounded-lg bg-brand/15 px-3 py-1.5 text-xs text-brand-light">Corregir</button>}{item.phase === "failed" && <button onClick={() => retry(item)} className="rounded-lg bg-red-500/10 px-3 py-1.5 text-xs text-red-200">Reintentar</button>}</div>
+          </div>)}
           {!items.length && <div className="p-10 text-center text-sm text-ink-tertiary">No hay items en este filtro.</div>}
         </div>
         <div className="flex justify-end gap-2 border-t border-white/[0.06] p-4"><button disabled={page <= 1} onClick={() => setPage((p) => p - 1)} className="rounded-lg bg-white/[0.06] px-3 py-2 text-xs text-white disabled:opacity-30">Anterior</button><button disabled={page >= pages} onClick={() => setPage((p) => p + 1)} className="rounded-lg bg-white/[0.06] px-3 py-2 text-xs text-white disabled:opacity-30">Siguiente</button></div>

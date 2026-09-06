@@ -3,6 +3,32 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.0] - 2026-09-06
+
+### Added
+
+- Campaign-scoped, supervised full-song reviewer candidates in the existing
+  campaign and editor workflow, with source-bound coverage, highlighted text
+  changes, localized doubts and full audio playback. Publication never approves
+  a song or replaces the current editor document.
+- Resumable two-family acoustic review, conservative in-flight API accounting,
+  bounded recovery and immutable candidate artifacts. Listening and display are
+  independently gated; opening a campaign cannot buy another review.
+- Opt-in capture of ordinary human timing corrections, preserving their source,
+  author and revision. Historical development comparisons are not clean gold.
+
+### Fixed
+
+- Editor autosave now retains local text/timing changes made while an earlier
+  save or conflict reconciliation is in flight.
+- Local-only reconciliation reuses its exclusively owned evidence inventory.
+
+### Release scope
+
+- Staging only, explicitly allowlisted campaign; no production promotion.
+- Automatic timing repair, automatic approval and paid runtime inference remain
+  off. Acoustic coverage is not correctness certification or measured time saved.
+
 ## [1.0.1] - 2026-09-05
 
 ### Fixed

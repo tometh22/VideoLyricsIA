@@ -97,7 +97,7 @@ import {
   PROACTIVE_URL_RETRY_MS,
 } from "./lib/editorAudioRecovery";
 import { isReusableEditSnapshot } from "./lib/reviewRecovery";
-import { reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
+import { beginReviewResume, reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
 import { creativeFieldsForReviewResume } from "./lib/reviewResume";
 import { editorSessionHeaders } from "./lib/editorSession";
 
@@ -2218,16 +2218,14 @@ export default function App() {
   useEffect(() => {
     const resumeJobId = reviewJobIdFromLocation(location.pathname, location.search);
     if (!resumeJobId) return;
-    if (resumeJobAttemptedRef.current === resumeJobId) return;
-    resumeJobAttemptedRef.current = resumeJobId;
-
-    let cancelled = false;
+    const attempt = beginReviewResume(resumeJobAttemptedRef, resumeJobId);
+    if (!attempt) return;
     (async () => {
       try {
         const statusRes = await authFetchCriticalRead(`${API}/status/${resumeJobId}`);
         if (!statusRes.ok) throw new Error(`status ${statusRes.status}`);
         const job = await statusRes.json();
-        if (cancelled) return;
+        if (attempt.cancelled) return;
         const segments = job.segments || job.segments_json || [];
         const resumedCreativeFields = creativeFieldsForReviewResume(job);
         const campaignPreset = {
@@ -2316,15 +2314,16 @@ export default function App() {
         // entry. Direct /review/:jobId links already point at this target.
         navigate(reviewJobPath(resumeJobId), { replace: true });
       } catch (err) {
+        if (attempt.cancelled) return;
         console.warn("[RESUME] no pude cargar el job:", err);
-        resumeJobAttemptedRef.current = null;   // permitir reintento si el operador cambia URL
+        attempt.cancel(); // liberar sólo este intento, nunca el de otra canción
         // Fallback honesto: si el resume falla (auth no lista, red, 4xx),
         // mandar al JobDetail en vez de dejar al usuario varado en /new
         // con el wizard vacío — que parece "crear video nuevo".
         navigate(`/videos/${resumeJobId}`, { replace: true });
       }
     })();
-    return () => { cancelled = true; };
+    return () => attempt.cancel();
   }, [location.pathname, location.search, navigate, retryTranscriptionReviewAudio]);
 
   // Imperative resume — called by the banner's "Continuar" button.

@@ -146,6 +146,21 @@ def _reap_seeded_orphan(db, job_id: str) -> None:
     db.commit()
 
 
+def _reap_seeded_edit(db, job_id: str) -> None:
+    """Test discovery + locked edit rollback, not ownership of a global sweep.
+
+    Earlier lifespan tests leave daemon reapers running. PostgreSQL correctly
+    returns zero from reap_all_stuck when that daemon owns the advisory lock;
+    a zero sweep result does not establish that this row was ever inspected.
+    Advisory-lock orchestration is covered in test_prod_readiness separately.
+    """
+    abandoned = find_abandoned_edits(db, threshold_min=30)
+    job = next((row for row in abandoned if row.job_id == job_id), None)
+    assert job is not None, f"expected seeded edit {job_id!r} to be abandoned"
+    _reaper.revert_abandoned_edit(db, job)
+    db.commit()
+
+
 def test_recent_processing_job_is_left_alone():
     """A job that's only been in processing for 30 min is not a zombie."""
     db = SessionLocal()
@@ -404,10 +419,12 @@ def test_fresh_editing_job_is_not_reverted():
         db.close()
 
 
-def test_old_editing_job_is_reverted_to_pending_review():
+def test_old_editing_job_is_reverted_to_pending_review(monkeypatch):
     """Edit started 45 min ago and still in editing/40% → worker is
     dead. Reaper reverts to pending_review and restores edit_count so
     the user gets the failed attempt back."""
+    cancellations = []
+    monkeypatch.setattr("queue_jobs.cancel_rq_job", cancellations.append)
     db = SessionLocal()
     try:
         _cleanup(db)
@@ -416,11 +433,7 @@ def test_old_editing_job_is_reverted_to_pending_review():
             editing_started_minutes_ago=45, edit_count=2,
             progress=40, current_step="video",
         )
-        n = reap_all_stuck(threshold_min=100)
-        # The age-based sweep (find_stuck_jobs) might also catch this
-        # because the row is 120 min old. What we assert is the final
-        # state, not the headline count.
-        assert n >= 0  # may be 0 if a different status path won the race
+        _reap_seeded_edit(db, jid)
 
         row = db.query(Job).filter(Job.job_id == jid).first()
         db.refresh(row)
@@ -442,6 +455,7 @@ def test_old_editing_job_is_reverted_to_pending_review():
         assert row.error is None, (
             f"error should be None on revert (the original render is fine), got {row.error!r}"
         )
+        assert f"edit:{jid}" in cancellations
     finally:
         _cleanup(db)
         db.close()
@@ -477,9 +491,10 @@ def test_edit_count_floor_at_zero():
             db, status="editing", age_minutes=120,
             editing_started_minutes_ago=60, edit_count=0,
         )
-        reap_all_stuck(threshold_min=100)
+        _reap_seeded_edit(db, jid)
         row = db.query(Job).filter(Job.job_id == jid).first()
         db.refresh(row)
+        assert row.status == "pending_review"
         assert row.edit_count == 0, (
             f"edit_count must not go negative, got {row.edit_count}"
         )

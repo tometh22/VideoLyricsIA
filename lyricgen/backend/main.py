@@ -13529,7 +13529,14 @@ async def get_editor_document(
     # Serialization can erase an expired proposal. Build the response before
     # commit so that tenant-scoped raw text is durably removed by this GET.
     payload = serialize_document(db, document)
+    from reviewer_campaign_product import status_for_job
+    payload["reviewer_campaign_status"] = status_for_job(job, document)
     editor_quality = getattr(job, "transcription_quality", None)
+    from reviewer_assist import enabled as reviewer_assist_enabled
+    candidate_inputs = None
+    if reviewer_assist_enabled():
+        from reviewer_candidate_registry import editor_candidate_snapshot
+        candidate_inputs = editor_candidate_snapshot(job, document)
     if not isinstance(editor_quality, dict) and job.segments_json:
         # Expand compatibility for legacy jobs without mutating on GET. The
         # editor receives an explicit fail-closed verdict and its approval
@@ -13552,6 +13559,13 @@ async def get_editor_document(
         "transcription_quality": editor_quality,
     })
     db.commit()  # lazy migration/reconciliation/expiry is an intentional side effect
+    payload["reviewer_candidate"] = None
+    if candidate_inputs is not None:
+        # Never yield while retaining editor row locks: a second synchronous
+        # SELECT FOR UPDATE on this event loop would block the first commit.
+        from reviewer_candidate_registry import candidate_for_editor
+        from starlette.concurrency import run_in_threadpool
+        payload["reviewer_candidate"] = await run_in_threadpool(candidate_for_editor, *candidate_inputs)
     return payload
 
 
@@ -14125,6 +14139,7 @@ _PRODUCT_EVENT_NAMES = {
     "editor_conflict", "editor_version_restored", "editor_approved",
     "editor_help_opened", "editor_operator_suggestions_shown",
     "editor_operator_suggestion_decision", "editor_audio_playback_failed",
+    "editor_reviewer_candidate",
 }
 
 # Ventana de /admin/product-metrics. Sin esto la única acotación era
@@ -14135,6 +14150,7 @@ PRODUCT_METRICS_WINDOW_DAYS = int(
 )
 
 _PRODUCT_EVENT_PROPERTIES = {
+    "editor_reviewer_candidate": {"kind", "proposal_id", "candidate_id", "event_id", "seconds"},
     "editor_opened": {"line_count", "view", "source"},
     "editor_view_changed": {"from", "to"},
     "editor_seek": {"position_ms", "source"},

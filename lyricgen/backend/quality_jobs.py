@@ -420,7 +420,10 @@ def _snapshot(job_id: str):
                     break
         return {
             "revision": int(row.segments_revision or 0),
+            "status": row.status,
+            "approved_at": row.approved_at.isoformat() if row.approved_at else None,
             "segments": [dict(item) for item in (row.segments_json or [])],
+            "original_segments": list(document.original_segments or []) if document is not None else [],
             # The immutable machine snapshot carries the LoRA word stream
             # after the worker removes transport-only keys.  Quality replay
             # must be able to compare the attested family with/without it.
@@ -812,7 +815,7 @@ _ANALYTICAL_KEYS = frozenset({
     "phonetic_evidence", "phonetic_candidates", "model_identity",
     "evidence_lineage", "parent_coverage", "resolved_window_ids",
     "review_proposal", "blockers", "reasons", "reason", "declined",
-    "timing_review_suggestions", "spanish_orthography", "operator_suggestions",
+    "timing_review_suggestions", "spanish_orthography", "operator_suggestions", "reviewer_assist",
     "structural_hybrid_diagnostics", "current_segments", "proposed_segments",
     # Booleans, counters and bounded measurements.
     "accepted", "complete", "attempted", "failed", "blocked", "suggested",
@@ -833,6 +836,7 @@ _ANALYTICAL_KEYS = frozenset({
     "strong_unassigned_events", "unassigned_events", "viable_hypotheses",
     "authorized_windows", "candidates", "invalid_candidates",
     "finding_count", "candidate_count", "proposal_count",
+    "provider_calls", "processed_windows", "generated", "tool_errors",
     "declined_overlap_count", "by_type", "text", "timing", "vocalization",
     "automatic_apply_allowed",
     # Paired LoRA-v1 shadow attribution (with/without the additional family).
@@ -860,6 +864,9 @@ _ANALYTICAL_RAW_HASH_KEYS = frozenset({
 })
 
 _ANALYTICAL_STRING_VALUES = frozenset({
+    "reviewer_assist_tool_error", "persistent_cache_directory_required",
+    "human_approval_preserved", "text_suggestion_rollout_disabled",
+    "stem_unavailable", "source_audio_hash_mismatch",
     "lyrics-quality-v6", "lyrics-quality-v6-diagnostic-v1",
     "lyrics-quality-v6-review-proposal-v1", "review_proposal",
     "review_proposal_window", "diagnostic_finding", "unknown", "accepted",
@@ -1575,6 +1582,28 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 retry_stats["operator_suggestions"] = (
                     _sanitize_analytical_evidence(operator_telemetry)
                 )
+            # Default-off reviewer uses the same human-operated proposal path.
+            # Never replace a native suggestion batch to attach agent output.
+            if operator_proposal is None:
+                from reviewer_assist import enabled as reviewer_assist_enabled
+                if reviewer_assist_enabled():
+                    try:
+                        from reviewer_assist_runtime import run_snapshot
+                        operator_proposal, assist_stats = run_snapshot(
+                            job_id, snapshot, audio_path, stem_path,
+                        )
+                        retry_stats["reviewer_assist"] = assist_stats
+                        retry_stats["provider_attempts"] += int(assist_stats.get("provider_calls", 0))
+                        if assist_stats.get("provider_calls"):
+                            retry_stats["cost_complete"] = False
+                    except Exception as exc:
+                        logger.warning("[REVIEWER-ASSIST] %s job=%s", type(exc).__name__, job_id)
+                        retry_stats["cost_complete"] = False
+                        retry_stats["reviewer_assist"] = {
+                            "enabled": True, "failed": True, "tool_errors": 1,
+                            "failure_reason": "reviewer_assist_tool_error",
+                            "automatic_apply_allowed": False,
+                        }
             complete_windows = [
                 item for item in windows
                 if str(item.get("id")) in complete_parent_ids

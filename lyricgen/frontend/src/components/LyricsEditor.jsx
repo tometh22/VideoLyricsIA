@@ -30,6 +30,7 @@ import { createSaveQueue } from "../lib/saveQueue";
 import VersionHistory from "./VersionHistory";
 import WrapWarningDialog from "./WrapWarningDialog";
 import QualityProposalPanel from "./QualityProposalPanel";
+import CompleteReviewerCandidate from "./CompleteReviewerCandidate";
 
 // Copy honesto del fallo de respaldo (autosave), por CAUSA real. El banner
 // + el confirm de "Aprobar" antes decían "problema de red" para cualquier
@@ -4554,6 +4555,10 @@ export default function LyricsEditor({
         </section>
       )}
 
+      <CompleteReviewerCandidate candidate={durableEditor.document?.reviewer_candidate}
+        currentRevision={durableEditor.document?.revision} currentSegments={edited}
+        onSeek={(start) => seekTo(start, true)} />
+
       {durableEditor.document?.quality_proposal && (
         <div className="mb-4">
           <QualityProposalPanel
@@ -4564,6 +4569,7 @@ export default function LyricsEditor({
             onDismiss={dismissQualityProposal}
             onObserve={observeQualityProposal}
             onRejectWindow={rejectQualityProposalWindow}
+            onReviewTelemetry={(properties) => trackEditorEvent("editor_reviewer_candidate", properties)}
             applying={qualityProposalBusy.applying}
             dismissing={qualityProposalBusy.dismissing}
             observing={qualityProposalBusy.observing}
