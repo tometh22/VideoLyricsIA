@@ -90,6 +90,7 @@ from background_policy import (
     runtime_rollout_fingerprint,
     sanitize_generated_text,
 )
+import lyric_anchors
 from render_spec import FPS_RATIONAL, RenderSpec
 from subprocess_utils import run_checked, SubprocessExecutionError  # noqa: F401 — exported for upstream catches
 from transcription_language import resolve_transcription_language
@@ -9675,6 +9676,297 @@ def _planner_match_lyrics(
     return creative_mode == "lyrics"
 
 
+# ── Compositor de escena anclado en la letra (flag BG_LYRIC_ANCHORS) ───────
+# Reemplaza al compositor histórico SOLO en modo "Inspirado en la letra" y sólo
+# cuando hay anclas verificadas. Tres diferencias con el de siempre:
+#
+#   1. NO lleva ejemplos de escena. Los `_EXAMPLES_BLOCK` de más abajo se
+#      copiaban: medido sobre 269 prompts entregados en staging, 59% terminaba
+#      en golden hour/atardecer, 29% con niebla, 6,7% con "dust motes" — todas
+#      palabras que están literalmente en esos ejemplos. El 59% era IDÉNTICO en
+#      modo Auto, que ni mira la letra. Acá va una plantilla ESTRUCTURAL
+#      (secciones, no contenido), que es lo que se puede imitar sin sangrar
+#      motivos.
+#   2. El presupuesto sube de 80-120 palabras a 260-360. El formato objetivo
+#      (definido por el operador) necesita un inventario denso de objetos, y con
+#      120 palabras no entra: quedaba un mood-piece.
+#   3. El anti-cliché se INVIERTE. La regla vieja mandaba sustituir por metáfora
+#      ante temas sensibles (drogas, política, alcohol, violencia) — o sea buena
+#      parte del catálogo de rock argentino — y sus ejemplos trabajados eran
+#      ellos mismos el sangrado: el ejemplo "empty bar at dawn, single bottle on
+#      counter" salió tal cual en Coti "Nada Fue Un Error". Acá se va a lo
+#      específico y ubicado, y lo sensible se resuelve con NEGATIVOS explícitos,
+#      que es como lo resuelve el resto del pipeline.
+_ANCHORED_SCENE_STRUCTURE = """Escribí el prompt en SEIS bloques, en este orden, en prosa corrida (sin
+títulos, sin viñetas, sin numeración — los títulos son para vos, no van en la salida):
+
+(1) LUGAR. Abrí nombrando el lugar concreto de las anclas y el momento. Si es un
+    lugar real, nombralo con su nombre propio y sumá un detalle arquitectónico o
+    geográfico que lo haga inconfundible. Nada de "un lugar", "una ciudad", "un
+    espacio": si el lugar no es reconocible, el bloque falló.
+
+(2) INVENTARIO. De 8 a 15 objetos concretos, visibles y ubicados en el plano,
+    construidos a partir de los objetos de las anclas y de lo que esos objetos
+    arrastran con ellos. Cada uno con su material, su estado y su posición.
+    Este bloque es el corazón del prompt y el más largo.
+
+(3) LA AUSENCIA. Qué acaba de pasar ahí. La escena no tiene personas, así que la
+    presencia humana se cuenta por lo que dejaron y por cómo quedó: objetos
+    corridos, cosas a medio terminar, huellas, desorden reciente. Decí
+    explícitamente hace cuánto y quiénes estuvieron. Este bloque es lo que
+    convierte "no hay gente" en una decisión narrativa y no en un vacío.
+
+(4) LUZ Y ATMÓSFERA. Tipo y dirección de la luz, paleta con colores nombrados,
+    clima, y el registro emocional usando el vocabulario de la canción.
+
+(5) REFERENCIA. La estética fotográfica o cinematográfica concreta, la época del
+    look, y la textura. Si el artista tiene un linaje visual reconocible,
+    nombralo. Sin nombrar formatos de película (nada de 16mm, 35mm, Super 8,
+    VHS, celuloide): nombrarlos hace que el generador dibuje el fotograma físico
+    con perforaciones y borde negro encima de la escena.
+
+(6) ENCUADRE. Cómo se compone para que ENCIMA vaya la letra de la canción:
+    16:9 completo de borde a borde, composición rica en los bordes y el centro
+    despejado y de bajo contraste para que el texto se lea, iluminación estable
+    sin cambios bruscos, una sola escena continua sin cortes ni transiciones."""
+
+
+# Requisitos contractuales del sello. No son preferencias estéticas: son las
+# condiciones que un entregable tiene que cumplir para ser aceptado, así que van
+# como reglas duras del compositor y no como sugerencias del final del prompt.
+# Se repiten en positivo (lo que SÍ tiene que pasar) porque los generadores
+# responden mejor a una afirmación que a una prohibición; las prohibiciones
+# equivalentes ya viajan aparte en el riel de negativos del provider.
+_UMG_MOVEMENT_VIDEO = (
+    "- MOVIMIENTO: sólo movimiento ambiental sutil dentro de la escena (viento,\n"
+    "  agua, luz, telas, papeles). UNA sola escena continua de principio a fin:\n"
+    "  sin cortes, sin cambios de plano, sin transiciones, sin que la escena se\n"
+    "  transforme en otra."
+)
+# El 50% del lote va por Imagen: una foto fija que se anima localmente con un
+# paneo suave. Pedirle "movimiento ambiental" a un generador de imágenes produce
+# un fotograma congelado a mitad de acción, que después salta raro bajo el Ken
+# Burns — el mismo motivo por el que el addendum de Imagen saca las palabras de
+# cámara. Acá la regla se traduce a su equivalente en imagen fija.
+_UMG_MOVEMENT_IMAGE = (
+    "- MOMENTO ÚNICO: es una IMAGEN FIJA. Una sola escena, un solo instante\n"
+    "  coherente, sin sujetos congelados a mitad de una acción y sin sugerir un\n"
+    "  antes y un después dentro del mismo cuadro."
+)
+
+_UMG_DELIVERY_RULES = """
+REQUISITOS DE ENTREGA (obligatorios, el entregable se rechaza si no se cumplen):
+- ENCUADRE: 16:9 completo, imagen de borde a borde. Sin franjas negras arriba,
+  abajo ni a los costados, sin recorte cinematográfico 2.39:1, sin marco. La
+  zona central queda LIMPIA y de bajo contraste: ahí va la letra de la canción y
+  tiene que leerse sin esfuerzo. La riqueza visual va en los bordes y el fondo.
+{movimiento}
+- ILUMINACIÓN: estable durante toda la canción. La hora del día NO cambia — si
+  es atardecer, sigue siendo atardecer hasta el final. Sin pasar de día a noche,
+  sin que se prendan o apaguen luces, sin cambios de dirección o temperatura de
+  la luz.
+- SIN TEXTO NI MARCAS: nada legible en el cuadro. Ni letras, ni números, ni
+  palabras, ni logos, ni marcas, ni publicidad, ni símbolos partidarios. Los
+  carteles, pancartas, afiches y vidrieras pueden existir como objetos SIEMPRE
+  que estén en blanco, gastados o ilegibles.
+- SIN CARAS: sin rostros reconocibles ni personas como sujeto del plano.
+- ESTÉTICA DEL ARTISTA: la escena tiene que sentirse de ESTE artista y de ESTA
+  canción. Usá el linaje visual del artista, su época y su región para decidir
+  el look — no un estilo genérico intercambiable con cualquier otro tema."""
+
+
+# Las cláusulas de cámara y de personas del motor viejo traen sus propios
+# EJEMPLOS DE CONTENIDO ("dust motes", "falling petals", "rain on glass", "the
+# empty chair, the two coffee cups"). Sangran igual que el bloque de ejemplos de
+# escena — "dust motes" aparece en el 6,7% de los prompts entregados — así que en
+# el camino anclado se conserva la REGLA y se tiran los ejemplos, atando el
+# detalle a las anclas de la canción en vez de a una lista de stock.
+_EXAMPLE_RUN_RE = re.compile(
+    r",?\s*e\.g\.:.*?(?=\.\s+[A-Z]|$)", re.DOTALL | re.IGNORECASE,
+)
+
+
+def _strip_content_examples(clause: str) -> str:
+    """Saca la enumeración de ejemplos de una cláusula, dejando la regla."""
+    cleaned = _EXAMPLE_RUN_RE.sub("", clause or "")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return re.sub(r"\s+([,.;:])", r"\1", cleaned).strip()
+
+
+# El "traducí la persona a su ENTORNO" del motor viejo viene con cuatro ejemplos
+# concretos que el modelo copia. Acá el entorno ya está dado por las anclas.
+_ANCHORED_PEOPLE_RULE = (
+    "- Sin personas, caras, manos ni siluetas humanas en la escena. La presencia\n"
+    "  humana se cuenta con los objetos de las anclas y con cómo quedó el lugar,\n"
+    "  no con un cuerpo.\n"
+    "- Sin texto legible, letras, números, logos ni marcas. Los carteles,\n"
+    "  pancartas, afiches y vidrieras pueden existir como objetos SIEMPRE que\n"
+    "  estén en blanco, gastados o ilegibles.\n"
+)
+
+
+def _anchored_scene_system_prompt(
+    *,
+    clause2: str,
+    people_rule: str,
+    concept: str = "",
+    concept_guide: str = "",
+    genre: str = "",
+    for_provider: str = "veo",
+    movement_rule: str = "",
+) -> str:
+    """System prompt del compositor anclado. Estructura, nunca contenido.
+
+    `clause2` (cámara), `people_rule` y la guía de concepto se reusan tal cual
+    del motor de siempre: son las reglas que ya están calibradas contra
+    incidentes reales y no hay motivo para reescribirlas acá.
+    """
+    _is_imagen = for_provider == "imagen"
+    _style_value = "photo" if _is_imagen else "video"
+
+    _styling = ""
+    if concept and concept_guide:
+        _styling = (
+            f"\nEl operador eligió el registro estético {concept.upper()}. Ese registro "
+            f"manda sobre la PALETA, la TEXTURA y la ATMÓSFERA — nunca sobre el lugar ni "
+            f"sobre los objetos, que salen de las anclas:\n{concept_guide}\n"
+        )
+    elif genre:
+        _styling = (
+            f"\nEl género declarado es {genre.upper()}. Usalo SOLO para la paleta, la luz "
+            f"y la energía. No puede elegir el lugar ni los objetos: eso ya está decidido "
+            f"por las anclas.\n"
+        )
+
+    _movement_line = ("\n- " + movement_rule) if movement_rule else ""
+    _delivery_rules = _UMG_DELIVERY_RULES.format(
+        movimiento=(_UMG_MOVEMENT_IMAGE if for_provider == "imagen"
+                    else _UMG_MOVEMENT_VIDEO)
+    )
+    _provider_line = (
+        "\n- Es una IMAGEN FIJA que después se anima localmente con un paneo suave. "
+        "Nada de palabras de movimiento de cámara: describí COMPOSICIÓN, luz y textura."
+        if _is_imagen else
+        "\n- Es un VIDEO. El movimiento vive DENTRO de la escena (viento, agua, luz, "
+        "papeles, telas), no en cortes ni en cambios de plano."
+    )
+
+    return f"""Sos director de arte. Escribís el prompt de producción del fondo de un video de
+letras, a partir de anclas ya extraídas de la canción.
+
+Respondé SOLO con un objeto JSON, sin texto alrededor, con esta forma exacta:
+{{"style":"{_style_value}","prompt":"<el prompt>","negativos":["...","..."]}}
+
+IDIOMA: escribí "prompt" y "negativos" en el MISMO idioma que la letra de la canción.
+
+LO QUE TIENE QUE PASAR CON LAS ANCLAS
+El lugar de las anclas ES el lugar de la escena. Los objetos de las anclas
+aparecen literalmente en la escena. No los traduzcas a un equivalente genérico
+ni los cambies por una escena que te resulte más familiar o más linda: la razón
+de ser de este modo es que el fondo salga de ESTA canción y no de otra.
+
+ESPECÍFICO ANTES QUE SIMBÓLICO
+Si la letra habla de algo sensible — política, drogas, alcohol, violencia, sexo,
+religión — NO lo abstraigas ni lo cambies por una metáfora atmosférica. Andá al
+lugar concreto y al momento concreto, y sacá lo que no puede aparecer con la
+lista de "negativos". Una escena ubicada y real con negativos precisos es mejor
+que una metáfora bonita que podría ser de cualquier canción.
+
+{_ANCHORED_SCENE_STRUCTURE}
+{_delivery_rules}
+{_styling}
+REGLAS DURAS
+- "style" siempre "{_style_value}".
+- "prompt" de 240 a 320 palabras. Denso y concreto. Sin adjetivos vagos
+  ("hermoso", "increíble", "impresionante") y sin frases de relleno.
+- Cámara: {clause2}. Cuando la cámara está fija, las fuentes de movimiento
+  salen de los OBJETOS y del LUGAR de las anclas (lo que el viento mueve ahí, lo
+  que gotea, lo que titila), nunca de relleno atmosférico genérico.{_provider_line}
+{people_rule}- "negativos": de 10 a 25 frases cortas con lo que NO puede aparecer en ESTA
+  escena en particular. Pensalas así: dado este lugar y esta canción, ¿qué es lo
+  que un generador de video dibujaría mal, de más, o de forma inapropiada? Poné
+  eso. No repitas prohibiciones genéricas de texto, logos o personas: ésas ya se
+  agregan por separado y gastarlas acá es desperdiciar la lista.
+- No inventes una época ni una hora del día si las anclas no la dan, y no caigas
+  en atardecer/golden hour por descarte: es el default gastado de este sistema.{_movement_line}"""
+
+
+def _extract_lyric_anchors(lyrics_text: str, artist: str = "", song_title: str = "",
+                           job_id: str | None = None) -> dict | None:
+    """Paso 1 del modo anclado: LEER la letra antes de componer la escena.
+
+    Una llamada chica y barata a Gemini (temperatura 0,2, sin thinking, JSON
+    estricto, ~USD 0,0005 por canción) cuya única tarea es devolver sustantivos
+    concretos que están en el texto, cada uno citando su línea. La cita se
+    verifica localmente contra la letra (`verify_anchors`), así que una
+    alucinación se descarta sin necesidad de un segundo modelo.
+
+    Best-effort en serio: devuelve None ante cualquier fallo y el caller sigue
+    con el compositor de siempre. Este paso NUNCA puede tumbar un render.
+    """
+    from google import genai
+    from provenance import record_ai_call
+
+    if not (lyrics_text or "").strip():
+        return None
+
+    recorder = None
+    try:
+        client = _get_genai_client()
+        user_content = lyric_anchors.build_extraction_request(
+            artist=artist, song_title=song_title, lyrics_text=lyrics_text,
+        )
+        recorder = record_ai_call(
+            job_id=job_id or "unknown",
+            step="lyric_anchors",
+            tool_name="gemini-2.5-flash",
+            tool_provider="google_vertex",
+            prompt=f"system:{lyric_anchors.EXTRACTION_SYSTEM_PROMPT}\nuser:{user_content}",
+            input_data_types=["artist_name", "lyrics_text_4000chars"],
+        ) if job_id else None
+        response = _generate_content_with_quota_retry(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=user_content,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=lyric_anchors.EXTRACTION_SYSTEM_PROMPT,
+                    # Baja a propósito: extraer no es una tarea creativa. El
+                    # compositor de abajo es el que necesita temperatura.
+                    temperature=0.2,
+                    max_output_tokens=1200,
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+                    response_mime_type="application/json",
+                ),
+            ),
+            timeout_s=30.0,
+            label="BG-ANCHORS",
+        )
+        parsed = lyric_anchors.parse_anchors(response.text)
+        verified = lyric_anchors.verify_anchors(parsed, lyrics_text)
+        if verified is None:
+            logger.info("[BG][ANCHORS] sin anclas verificables job=%s — uso el motor de siempre",
+                        job_id)
+            if recorder:
+                recorder.finish(response_summary=f"no_anchors: {(response.text or '')[:300]}")
+            return None
+        _dropped = len((parsed or {}).get("objetos", [])) - len(verified.get("objetos", []))
+        logger.info(
+            "[BG][ANCHORS] job=%s lugar=%r objetos=%d descartados_por_cita=%d epoca=%r",
+            job_id, verified.get("lugar"), len(verified.get("objetos", [])),
+            max(0, _dropped), verified.get("epoca"),
+        )
+        if recorder:
+            recorder.finish(response_summary=(response.text or "")[:480])
+        return verified
+    except Exception as e:  # noqa: BLE001 — leer la letra nunca tumba un render
+        _raise_if_job_timeout(e)
+        logger.warning("[BG][ANCHORS] extracción falló job=%s (%s) — uso el motor de siempre",
+                       job_id, e)
+        if recorder:
+            recorder.finish(response_summary=f"error: {str(e)[:200]}")
+        return None
+
+
 def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = None,
                                     song_title: str = "", genre: str = "",
                                     concept: str = "",
@@ -9687,7 +9979,8 @@ def _analyze_lyrics_for_background(lyrics_text: str, artist: str, job_id: str = 
                                     custom_colors: str = "",
                                     allow_people: bool = False,
                                     creative_mode: str | None = None,
-                                    atmospherics_policy: dict | None = None) -> dict:
+                                    atmospherics_policy: dict | None = None,
+                                    anchors: dict | None = None) -> dict:
     """Use Gemini to analyze lyrics and choose visual style + prompt.
 
     match_lyrics=True  ("Inspirado en la letra"): lyrics anchor or infuse the scene.
@@ -10023,7 +10316,27 @@ explicitly. When in doubt, prefer warm/natural over urban/industrial."""
     # absorb the change without further edits.
     _EXAMPLE = _BASE_INSTRUCTIONS
 
-    if normalized_concept:
+    # Camino anclado (BG_LYRIC_ANCHORS=on): sólo en modo letra y sólo cuando la
+    # extracción devolvió anclas que se verificaron contra el texto. Sin anclas
+    # se cae al motor de siempre, así que una canción abstracta o un fallo del
+    # extractor nunca dejan al operador sin fondo.
+    _use_anchors = bool(
+        anchors and creative_mode == "lyrics" and lyric_anchors.anchors_enabled()
+    )
+    if _use_anchors:
+        system_prompt = _anchored_scene_system_prompt(
+            # `_clause2` viene redactada como el ítem (2) de una enumeración;
+            # acá va suelta detrás de "Cámara:", así que se le saca el número.
+            clause2=_strip_content_examples(re.sub(r"^\(2\)\s*", "", _clause2)),
+            people_rule=("" if allow_people else _ANCHORED_PEOPLE_RULE),
+            concept=normalized_concept,
+            concept_guide=(_CONCEPT_SCENE_GUIDE.get(normalized_concept, "")
+                           if normalized_concept else ""),
+            genre=normalized_genre,
+            for_provider=for_provider,
+            movement_rule=movement_rule,
+        )
+    elif normalized_concept:
         concept_guide = _CONCEPT_SCENE_GUIDE[normalized_concept]
         genre_hint = (f"\n\nFor stylistic colour-grading flavour only "
                       f"(NOT for scene choice), the song genre is: "
@@ -10236,7 +10549,15 @@ Hard rules:
     else:
         _lyrics_label = "Lyrics (may be incomplete or noisy):"
         _lyrics_fallback = "[transcription failed; rely on artist + title + declared metadata]"
+    # Las anclas van PRIMERAS. En el motor de siempre la letra iba última,
+    # etiquetada "may be incomplete or noisy", y perdía contra el system prompt
+    # entero; ése es el origen medido del 59% de fondos al atardecer. Acá lo
+    # primero que el modelo lee es qué dice esta canción.
+    anchors_block = (
+        lyric_anchors.anchors_constraint_block(anchors) if _use_anchors else ""
+    )
     user_content = (
+        f"{anchors_block}"
         f"{hint_block}"
         f"{scene_context_block}"
         f"Artist: {artist_label}{title_part}{genre_part}{concept_part}\n\n"
@@ -10299,7 +10620,18 @@ Hard rules:
         # Re-roll is gated to the case where it's actually unwanted: the
         # operator gave no background_hint AND didn't explicitly ask for
         # the "urbano" concept. An explicit alley request must be honored.
-        _reroll_eligible = (not _has_operator_hint and normalized_concept != "urbano")
+        # Tercer opt-out: si las anclas verificadas ubican la canción en la
+        # calle, el callejón no es el prior del modelo — es la letra. Re-rollear
+        # ahí sería pelearle a la canción, que es justo lo que este modo intenta
+        # dejar de hacer. (Y el menú del addendum lista "desert"/"golden hour",
+        # o sea que cambia un cliché por otro: 10,5% de los prompts medidos
+        # terminan en desierto.)
+        _anchored_urban = _use_anchors and lyric_anchors.has_urban_anchor(anchors)
+        _reroll_eligible = (
+            not _has_operator_hint
+            and normalized_concept != "urbano"
+            and not _anchored_urban
+        )
         _max_attempts = 2 if _reroll_eligible else 1
         text = ""
         response = None
@@ -10323,13 +10655,19 @@ Hard rules:
                 temperature=_temp,
                 # max_output_tokens=1500 (was 500): the expanded prompt and
                 # lyrics-anchor instructions need headroom for valid JSON.
-                max_output_tokens=1500,
+                # El camino anclado pide 260-360 palabras MÁS una lista de
+                # negativos; con 1500 el JSON se cortaba a mitad de frase y caía
+                # al recuperador de truncados.
+                max_output_tokens=2600 if _use_anchors else 1500,
                 thinking_config=genai.types.ThinkingConfig(
                     thinking_budget=512
                 ),
                 **(
                     {"response_mime_type": "application/json"}
-                    if policy_enforces(atmospherics_policy) else {}
+                    # El modo anclado lo pide siempre: 16 de 723 llamadas
+                    # históricas murieron en parse y cayeron a una escena de
+                    # stock aleatoria sin que nada lo marcara.
+                    if (policy_enforces(atmospherics_policy) or _use_anchors) else {}
                 ),
             )
             # One provenance row per provider attempt. The corrective alley
@@ -10401,7 +10739,31 @@ Hard rules:
                     logger.info("[BG] Gemini chose: style=%s, prompt=%s...", style, prompt[:80])
                     if recorder:
                         recorder.finish(response_summary=f"attempt={_attempt} " + text[:480])
-                    return {"style": style, "prompt": prompt}
+                    result = {"style": style, "prompt": prompt}
+                    # Negativos derivados de ESTA canción. Se SUMAN a los fijos
+                    # del provider boundary, nunca los reemplazan: los fijos son
+                    # IP y compliance, éstos son "qué dibujaría mal el generador
+                    # para esta escena en particular".
+                    _song_negatives = parsed.get("negativos")
+                    if _use_anchors and isinstance(_song_negatives, list):
+                        result["negatives"] = [
+                            str(n).strip() for n in _song_negatives[:25]
+                            if str(n).strip()
+                        ]
+                    # Cobertura: gratis, sin LLM, y verificable. Se loguea
+                    # también en shadow para poder comparar contra el motor
+                    # viejo antes de prender nada.
+                    if anchors and lyric_anchors.anchors_observed():
+                        _cov = lyric_anchors.anchor_coverage(prompt, anchors)
+                        result["anchor_coverage"] = _cov
+                        logger.info(
+                            "[BG][ANCHORS] cobertura job=%s modo=%s %d/%d (%.0f%%) "
+                            "faltan=%s",
+                            job_id, lyric_anchors.anchors_mode(),
+                            _cov["covered"], _cov["total"], 100 * _cov["ratio"],
+                            _cov["misses"][:5],
+                        )
+                    return result
             # Parse failed this attempt. If attempts remain, the loop retries
             # (a re-roll often parses cleanly); otherwise fall through.
             if recorder:
@@ -10439,7 +10801,8 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
                        palette_style: str = "", custom_colors: str = "",
                        allow_people: bool = False,
                        creative_mode: str | None = None,
-                       atmospherics_policy: dict | None = None) -> dict:
+                       atmospherics_policy: dict | None = None,
+                       anchors: dict | None = None) -> dict:
     """Get a unique style+prompt combination. Returns {style, prompt}.
 
     `for_provider` ("veo" default | "imagen") nudges the prompt towards
@@ -10515,6 +10878,7 @@ def _get_unique_prompt(lyrics_text: str = None, artist: str = "", job_id: str = 
             style=palette_style, custom_colors=custom_colors,
             allow_people=allow_people, creative_mode=creative_mode,
             atmospherics_policy=atmospherics_policy,
+            anchors=anchors,
         )
         if result["prompt"] and result["prompt"] not in used:
             used.append(result["prompt"])
@@ -11495,8 +11859,14 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
                         cache_key_override: str | None = None,
                         cache_override_policy_fingerprint: str | None = None,
                         out_meta: dict | None = None,
-                        require_persistent_tracking: bool = False) -> str:
+                        require_persistent_tracking: bool = False,
+                        song_negatives: list[str] | None = None) -> str:
     """Generate a video clip with Google Veo 3 via direct Vertex AI REST API.
+
+    `song_negatives`: prohibiciones derivadas de ESTA canción por el compositor
+    anclado (modo "Inspirado en la letra" con BG_LYRIC_ANCHORS=on). Se SUMAN a
+    los negativos fijos de abajo, nunca los reemplazan: los fijos son IP y
+    compliance, éstos son "qué dibujaría mal el generador para esta escena".
 
     We bypass google-genai SDK for Veo specifically because its internal auth
     chain hits "invalid_scope: Invalid OAuth scope or ID token audience" on
@@ -11562,7 +11932,13 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # decisión UMG 2026-05-21). Sus palabras de ESCENA y CÁMARA se respetan
     # tal cual — no le pegamos los de-bias (callejón/avance). Solo quedan los
     # rieles legales (sin personas/caras/texto/logos) más abajo.
-    no_alley = "" if (normalized_concept == "urbano" or verbatim) else (
+    # True sólo en el camino anclado (modo letra con BG_LYRIC_ANCHORS=on).
+    # Gatea los dos aflojes de abajo — el riel anti-callejón y los negativos de
+    # objeto — para que con el flag apagado el prompt salga bit-idéntico.
+    _anchored_negatives = song_negatives is not None
+
+    no_alley = "" if (normalized_concept == "urbano" or verbatim
+                      or _anchored_negatives) else (
         "Avoid generic narrow alleyway, dark alley, callejón, and neon-lit "
         "back-street as the primary subject unless the lyrics demand it. "
     )
@@ -11585,10 +11961,36 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     )
     # Shared IP / content negatives (text, logos, optionally people) — present
     # in every register.
+    #
+    # 2026-09-03 — el camino anclado (BG_LYRIC_ANCHORS) prohíbe el CONTENIDO
+    # LEGIBLE en vez del OBJETO. La preocupación real siempre fue texto leíble,
+    # logos y marcas; prohibir el sustantivo entero ("no banners, no posters,
+    # no graffiti, no shop windows") volvía imposible cualquier escena urbana
+    # honesta — una plaza después de una marcha necesita pancartas EN BLANCO, y
+    # con la lista vieja el generador tenía prohibido dibujarlas.
+    #
+    # Es el mismo argumento, y el mismo remedio, que el cambio del 2026-07-24
+    # sobre las personas: "no people" se aflojó a "no recognizable faces / no
+    # person as the subject" porque el absoluto peleaba contra la escena en vez
+    # de acompañarla. `no logos`/`no trademarks`/`no brand symbols` y toda la
+    # cláusula de personas quedan intactas: eso es IP y compliance, no estética.
+    if _anchored_negatives:
+        _ip_negatives = (
+            "No readable text, no words, no letters, no numbers, no legible "
+            "writing or lettering anywhere in the frame, no logos, no "
+            "trademarks, no brand symbols, no advertising. Signs, billboards, "
+            "posters, banners, shop windows and painted walls may appear as "
+            "physical objects ONLY when completely blank, unmarked, weathered "
+            f"or illegible — never carrying readable content,{_people_clause}"
+        )
+    else:
+        _ip_negatives = (
+            "No text, no words, no letters, no signs, no billboards, no posters, "
+            "no banners, no graffiti, no shop windows, no street signs, no neon "
+            f"signs, no logos, no trademarks, no brand symbols,{_people_clause}"
+        )
     _base_negatives = (
-        "No text, no words, no letters, no signs, no billboards, no posters, "
-        "no banners, no graffiti, no shop windows, no street signs, no neon "
-        f"signs, no logos, no trademarks, no brand symbols,{_people_clause}"
+        f"{_ip_negatives}"
         # Anti-UI-de-cámara (incidente 2026-06-19, multi-escena "No Hay Santos"):
         # la biblia "found footage / film viejo" hacía que Veo dibujara una
         # interfaz de camcorder falsa — visor, indicador REC, timecode, texto de
@@ -11614,6 +12016,17 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         "widescreen bars, no anamorphic bars, no top or bottom black bars, no "
         "2.39:1 or 2.35:1 crop, fill the entire 16:9 frame edge to edge,"
     )
+    # Negativos derivados de la canción. Van DESPUÉS de los fijos y sin
+    # reemplazarlos: son lo que el generador dibujaría mal para ESTA escena en
+    # particular (para una plaza después de una marcha: sin disturbios activos,
+    # sin fuego, sin bombos, sin clima de recital). Se limitan a 25 para que no
+    # se coman el prompt si el modelo se entusiasma con la lista.
+    if song_negatives:
+        _cleaned = [str(n).strip().rstrip(".,") for n in song_negatives[:25]]
+        _cleaned = [n for n in _cleaned if n]
+        if _cleaned:
+            _base_negatives = _base_negatives + " " + ", ".join(_cleaned) + ","
+
     # Camera-motion negatives — the LAST line of defense for static intent.
     # Veo's payload exposes no structured camera-lock field, so these words
     # are the only lever; they fight Veo's strong drift prior. Appended only
@@ -12757,6 +13170,96 @@ def _frame_pair_discontinuity(frame_a, frame_b) -> float:
     return 0.5 * mae + 0.5 * (hist_d / 3.0)
 
 
+def _measure_letterbox(video_path: str) -> dict:
+    """¿El clip tiene barras negras horneadas? Determinístico, sin LLM.
+
+    El bloque anti-letterbox del prompt de Veo existe desde el incidente de
+    2026-07-07 ("Seguir Viviendo Sin Tu Amor"/Spinetta) y su propio comentario
+    dice que el fallo era ESTOCÁSTICO — "un video sí y otro no". Un negativo que
+    falla a veces necesita que alguien mida la salida.
+
+    Usa `cropdetect` de ffmpeg sobre una pasada corta y compara el rectángulo
+    detectado contra el frame completo. Fail-open: ante cualquier error devuelve
+    `has_bars=False` — un bug acá no puede tirar un fondo bueno (mismo contrato
+    que _bg_scene_discontinuity y el relevance score).
+
+    OJO: mide el CLIP DE FONDO, no el master. El letterbox 2.39:1 de
+    `frame_format="cine"` es una opción consciente del operador que se aplica
+    después, sobre el video terminado, y no debe confundirse con esto.
+    """
+    try:
+        import bg_frame_checks
+
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
+             video_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        dims = (probe.stdout or "").strip().split("x")
+        if len(dims) < 2:
+            return {"has_bars": False, "reason": "sin dimensiones"}
+        width, height = int(dims[0]), int(dims[1])
+
+        # cropdetect escribe su estimación en stderr, un `crop=` por frame.
+        # `reset=0` acumula sobre toda la pasada en vez de reiniciar.
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", video_path,
+             "-vf", "cropdetect=limit=24:round=2:reset=0",
+             "-frames:v", "48", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=90,
+        )
+        crop = bg_frame_checks.parse_cropdetect(proc.stderr)
+        return bg_frame_checks.letterbox_report(crop, width, height)
+    except Exception as e:  # noqa: BLE001 — medir nunca tumba un render
+        _raise_if_job_timeout(e)
+        logger.debug("[BG][LETTERBOX] medición falló: %s", e)
+        return {"has_bars": False, "reason": f"error: {e}"}
+
+
+def _scene_light_signature(video_path: str, key: str = "") -> dict | None:
+    """Firma de luz (luminancia + calidez) de un frame medio del clip.
+
+    Se toma el frame del MEDIO y no el primero: el primero suele venir de un
+    fundido de entrada y no representa la luz de la escena.
+    """
+    if not video_path or not os.path.exists(video_path):
+        return None
+    tmp_png = None
+    try:
+        import tempfile as _tf
+
+        import bg_frame_checks
+        from PIL import Image as _Img
+
+        with _tf.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            tmp_png = f.name
+        try:
+            _dur = _audio_duration(video_path) or 0.0
+        except Exception:
+            _dur = 0.0
+        _seek = ["-ss", f"{max(0.0, _dur / 2.0):.2f}"] if _dur else []
+        run_checked(
+            ["ffmpeg", "-y", "-loglevel", "error", *_seek, "-i", video_path,
+             "-frames:v", "1", "-vf", "scale=64:36", tmp_png],
+            label="ffmpeg-scene-light", timeout=60, output_path=tmp_png,
+        )
+        with _Img.open(tmp_png) as im:
+            sig = bg_frame_checks.light_signature(list(im.convert("RGB").getdata()))
+        sig["key"] = key
+        return sig
+    except Exception as e:  # noqa: BLE001 — fail-open
+        _raise_if_job_timeout(e)
+        logger.debug("[SCENES][LIGHT] firma falló para %s: %s", key, e)
+        return None
+    finally:
+        if tmp_png and os.path.exists(tmp_png):
+            try:
+                os.unlink(tmp_png)
+            except OSError:
+                pass
+
+
 def _bg_scene_discontinuity(video_path: str) -> float:
     """Mide si el clip de fondo contiene un cambio de escena (0.0-1.0).
 
@@ -13505,6 +14008,9 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
         "texture": "clean modern digital grade, fine subtle grain, soft cinematic depth of field",
         "camera": "slow, deliberate camera language",
         "motif": "a single recurring light source tying the scenes together",
+        # Sin esto, el fallback dejaba la hora del día librada a cada escena y
+        # multi-escena podía ir de día a noche dentro de la misma canción.
+        "light": "one single consistent time of day for the whole video, even soft light",
     }
     if _v4_semantics and creative_mode == "prompt_literal":
         # Literal means no Gemini rewrite. The same raw direction is used for
@@ -13527,10 +14033,21 @@ def _build_visual_bible(lyrics_text: str, artist: str, song_title: str = "",
             "the scene engine from the song itself, so DON'T impose a fixed "
             "aesthetic. Respond ONLY with a JSON object with exactly these string "
             "keys: world (the setting/environment family), palette (colors + "
-            "lighting), texture (a light grade/mood note, kept neutral), camera "
-            "(a light note on the camera language), motif (one recurring visual "
-            "element). Keep each value under 25 words. No text/letters/logos "
-            "in the described world. "
+            "lighting), light (the TIME OF DAY and light state shared by every "
+            "scene — e.g. 'late afternoon, low warm sun from the west' or "
+            "'overcast midday, flat grey light'; be concrete about the moment, "
+            "never a range), texture (a light grade/mood note, kept neutral), "
+            "camera (a light note on the camera language), motif (one recurring "
+            "visual element). Keep each value under 25 words. No text/letters/"
+            "logos in the described world. "
+            # `light` es obligatoria y explícita porque la regla del producto es
+            # que la iluminación no cambie durante la canción: si es atardecer,
+            # se mantiene el atardecer. `palette` no alcanzaba — describe colores,
+            # no un momento del día — y multi-escena genera cada escena por
+            # separado, así que sin esto el verso podía salir a mediodía y el
+            # coro de noche.
+            "The `light` value is a HARD CONSTRAINT: every scene of this video "
+            "happens at that same moment, with the same light. "
             # Prohibición factual (no es un patrón — evita un bug): nombrar un
             # formato/calibre de film hace que Veo dibuje el fotograma físico
             # (incidente 2026-06-19, "16mm film grain" → sprockets + marco negro).
@@ -13695,7 +14212,8 @@ def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
                           style, custom_colors, job_id, allow_people,
                           *, match_lyrics=True, operator_prompt=None,
                           bg_verbatim=False, creative_mode=None,
-                          atmospherics_policy=None):
+                          atmospherics_policy=None, anchors=None,
+                          shared_light=None):
     """Fabrica la callable que scenes.build_scene_plan usa por escena.
 
     ``operator_prompt`` is the only user-authored value. The callable argument
@@ -13717,17 +14235,29 @@ def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
         scene_planner=True,
     )
 
+    import bg_frame_checks as _bgfc
+    _light_line = _bgfc.shared_light_directive(shared_light)
+
     def prompt_fn(background_hint="", movement_style="", section_type="", energy=0.0):
+        # La luz compartida se antepone al contexto de escena para que TODAS las
+        # escenas hereden el mismo momento del día. La biblia ya comparte
+        # `palette`, pero una paleta no fija una hora: dos escenas pueden
+        # compartir colores y estar una al mediodía y otra de noche.
+        _ctx = f"{_light_line} {background_hint}".strip() if _light_line else background_hint
         return _get_unique_prompt(
             lyrics_text=lyrics_text, artist=artist, job_id=job_id,
             song_title=song_title, genre=genre, concept=concept,
             movement_style=movement_style, match_lyrics=_scene_match_lyrics,
             background_hint=operator_prompt,
-            scene_context=background_hint,
+            scene_context=_ctx,
             bg_verbatim=bg_verbatim,
             palette_style=style, custom_colors=custom_colors,
             allow_people=allow_people, creative_mode=creative_mode,
             atmospherics_policy=atmospherics_policy,
+            # Las mismas anclas para TODAS las escenas: es lo que mantiene el
+            # "mismo film" del lado de la letra, igual que la biblia lo mantiene
+            # del lado visual. Se extraen una vez en _generate_scene_background.
+            anchors=anchors,
         )
     return prompt_fn
 
@@ -13741,9 +14271,15 @@ def _scene_cache_ns(artist: str, song_title: str, key: str, token: str = "",
     demás escenas siguen pegando su caché original (re-stitch sin costo). Al
     persistirse el token en scene_plan, un edit posterior re-baja la versión
     regenerada, no la vieja."""
+    # El sufijo de anclas se agrega SÓLO cuando el modo no es `off`: los clips
+    # del motor viejo y los del anclado no pueden compartir namespace, pero con
+    # el flag apagado la key tiene que quedar byte-idéntica o el deploy tira a la
+    # basura todo el caché de escenas de R2 y se re-paga Veo sin motivo.
+    _anchors_ns = lyric_anchors.anchors_mode()
     base = (
         f"{artist}|{song_title}|{key}|{creative_mode}|"
         f"{cache_policy_fingerprint(atmospherics_policy)}"
+        + (f"|anchors:{_anchors_ns}" if _anchors_ns != "off" else "")
     )
     return f"{base}|{token}" if token else base
 
@@ -14219,6 +14755,14 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
     n_unique = len({s.recurrence_key for s in secs})
     logger.info("[SCENES] %d secciones, %d escenas únicas (canción %.0fs)",
                 len(secs), n_unique, audio_duration or 0.0)
+    # Una sola extracción para todo el storyboard: las escenas comparten anclas
+    # igual que comparten la biblia. Extraer por escena costaría N llamadas y,
+    # peor, cada escena podría anclar en un objeto distinto de la canción.
+    _scene_anchors = None
+    if creative_mode == "lyrics" and lyric_anchors.anchors_observed():
+        _scene_anchors = _extract_lyric_anchors(
+            lyrics_text or "", artist, song_title, job_id=job_id,
+        )
     bible = _build_visual_bible(lyrics_text, artist, song_title, genre, concept,
                                 style_hint, custom_colors, job_id,
                                 background_hint=background_hint, bg_verbatim=bg_verbatim,
@@ -14232,7 +14776,9 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       operator_prompt=background_hint,
                                       bg_verbatim=bg_verbatim,
                                       creative_mode=creative_mode,
-                                      atmospherics_policy=atmospherics_policy)
+                                      atmospherics_policy=atmospherics_policy,
+                                      anchors=_scene_anchors,
+                                      shared_light=(bible or {}).get("light"))
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
                                     song_title=song_title, style=style_hint,
                                     operator_movement=_normalize_movement_style(movement_style))
@@ -14259,6 +14805,54 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
     # badge a nivel job sin abrir el filmstrip.
     _failed = sum(1 for s in plan.get("scenes", []) if s.get("status") == "failed")
     plan["degraded"] = {"failed": _failed, "total": len(plan.get("scenes", []))}
+    # Coherencia de luz entre escenas. La regla del producto es que la
+    # iluminación no cambie durante la canción: si es atardecer, se mantiene el
+    # atardecer. El fondo único está a salvo por construcción (un clip de 4-8s
+    # loopeado en palíndromo vuelve siempre a su punto de partida), pero acá cada
+    # escena es una generación Veo separada y sólo compartían una `palette`
+    # blanda. Se compara la luz entre escenas CONTIGUAS en el orden en que se
+    # ven, que es donde el ojo registra el salto.
+    #
+    # Fail-open y sólo observación: bloquear el render por esto sería peor que
+    # un salto de luz que la review humana atrapa. Queda en el plan (lo lee el
+    # filmstrip) y en Sentry agrupado.
+    try:
+        import bg_frame_checks as _bgfc
+        _sigs = []
+        for _sec in _scenes.sections_from_plan(plan):
+            _clip = clip_for_key.get(_sec.recurrence_key)
+            if not _clip:
+                continue
+            if _sigs and _sigs[-1].get("key") == _sec.recurrence_key:
+                continue  # el coro repetido es EL MISMO clip: no es un corte
+            _sig = _scene_light_signature(_clip, key=_sec.recurrence_key)
+            if _sig:
+                _sigs.append(_sig)
+        _light = _bgfc.lighting_consistency(_sigs)
+        plan["light_consistency"] = _light
+        if not _light["consistent"]:
+            logger.warning(
+                "[SCENES][LIGHT] salto de iluminación entre escenas job=%s "
+                "peor=%.1f entre %s — revisar antes de aprobar: %s",
+                job_id, _light["worst_delta"], _light["worst_pair"],
+                _light["offenders"][:3],
+            )
+            try:
+                import sentry_sdk
+                with sentry_sdk.push_scope() as _scope:
+                    _scope.fingerprint = ["scenes-light-jump"]
+                    _scope.set_extra("job_id", job_id)
+                    _scope.set_extra("light_consistency", _light)
+                    sentry_sdk.capture_message(
+                        "Multi-escena con salto de iluminación", level="warning")
+            except Exception:
+                pass
+        else:
+            logger.info("[SCENES][LIGHT] luz coherente en %d escenas (peor salto %.1f)",
+                        _light["scenes"], _light["worst_delta"])
+    except Exception as e:  # noqa: BLE001 — medir nunca tumba un render
+        _raise_if_job_timeout(e)
+        logger.debug("[SCENES][LIGHT] medición falló: %s", e)
     # Audit LOW: persistir la duración usada como fuente única, así el re-stitch
     # de un edit/regen no difiere por un frame entre _audio_duration y ffprobe.
     plan["audio_duration"] = float(audio_duration or 0.0)
@@ -14552,6 +15146,17 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         atmospherics_policy.get("authorization_source"),
     )
 
+    # Paso 1 del modo anclado: leer la letra ANTES de componer la escena. Una
+    # sola vez por fondo — el re-roll de calidad de más abajo reusa estas mismas
+    # anclas, así no se paga dos veces ni se cambia el ancla a mitad de camino.
+    # Sólo en modo letra: en Auto la letra no debe influir, y con "Mi prompt"
+    # manda el operador.
+    _lyric_anchors_data = None
+    if creative_mode == "lyrics" and lyric_anchors.anchors_observed():
+        _lyric_anchors_data = _extract_lyric_anchors(
+            lyrics_text or "", artist, song_title, job_id=job_id,
+        )
+
     _norm_move_bg = _normalize_movement_style(movement_style)
 
     # La elección REAL de efecto del operador. Se usa para gatear el darkening
@@ -14681,6 +15286,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             palette_style=style_hint, custom_colors=custom_colors,
             allow_people=allow_people, creative_mode=creative_mode,
             atmospherics_policy=atmospherics_policy,
+            anchors=_lyric_anchors_data,
         )
         # Foto fija + efectos (2026-06-03; review-fixed same day): if the
         # operator picked a luminous particle effect, bias the still toward a
@@ -14799,6 +15405,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         image_to_video_path and not _live_photo
         and os.path.exists(image_to_video_path)
     )
+    _song_negatives: list[str] | None = None
+    _anchor_cov: dict | None = None
     if _i2v_animate:
         prompt = (
             (background_hint or "").strip() if _is_verbatim
@@ -14814,8 +15422,11 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             palette_style=style_hint, custom_colors=custom_colors,
             allow_people=allow_people, creative_mode=creative_mode,
             atmospherics_policy=atmospherics_policy,
+            anchors=_lyric_anchors_data,
         )
         prompt = result["prompt"]
+        _song_negatives = result.get("negatives")
+        _anchor_cov = result.get("anchor_coverage")
 
     bg_path = os.path.join(job_dir, "bg_generated.mp4")
     import time as _time_bg
@@ -14859,6 +15470,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                 atmospherics_policy=atmospherics_policy,
                 verbatim=_is_verbatim,
                 live_photo=_live_photo,
+                song_negatives=_song_negatives,
             )
             # Semantic relevance check — always score, but cap retries at one
             # to bound cost (+$0.80 worst case). quality_retry_used gates the
@@ -14871,6 +15483,17 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # produce un fondo que alterna escenas todo el video al
             # loopearse. El relevance score no lo ve (mira UN frame).
             discont = _bg_scene_discontinuity(bg_path)
+            # Franjas negras horneadas por Veo. El negativo del prompt existe
+            # desde el incidente Spinetta (2026-07-07) y falla de forma
+            # estocástica, así que acá se MIDE la salida. Comparte el único slot
+            # de re-roll con el corte de escena: si el clip vino con barras, el
+            # mismo do-over lo vuelve a pedir.
+            _bars = _measure_letterbox(bg_path)
+            if _bars.get("has_bars"):
+                logger.warning(
+                    "[BG][LETTERBOX] el clip trae %s (job=%s) — 16:9 incompleto",
+                    _bars.get("reason"), job_id,
+                )
             if discont >= _BG_SCENE_CUT_THRESHOLD:
                 logger.warning(
                     "[BG][SCENE-CUT] discontinuidad %.3f >= %.2f en %s (job=%s) — "
@@ -14925,7 +15548,21 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             # safe_prompt → Veo cache HIT → same clip, wasting a scoring pass
             # and never improving. The operator asked for their exact prompt;
             # we accept the first result and just log the score.
-            _needs_retry = (score < 7) or (discont >= _BG_SCENE_CUT_THRESHOLD)
+            _anchors_thin = (
+                lyric_anchors.anchors_enabled()
+                and _anchor_cov is not None
+                and not lyric_anchors.coverage_is_sufficient(_anchor_cov)
+            )
+            if _anchors_thin:
+                logger.warning(
+                    "[BG][ANCHORS] cobertura insuficiente %d/%d (job=%s) — "
+                    "re-roll: el prompt ignoró la letra",
+                    _anchor_cov["covered"], _anchor_cov["total"], job_id,
+                )
+            _needs_retry = (
+                (score < 7) or (discont >= _BG_SCENE_CUT_THRESHOLD)
+                or _anchors_thin or bool(_bars.get("has_bars"))
+            )
             if _needs_retry and not quality_retry_used and not bg_verbatim:
                 quality_retry_used = True
                 logger.info("[BG] Score %s / discontinuidad %.3f — generating new prompt and retrying VEO",
@@ -14945,11 +15582,30 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                     palette_style=style_hint, custom_colors=custom_colors,
                     allow_people=allow_people, creative_mode=creative_mode,
                     atmospherics_policy=atmospherics_policy,
+                    anchors=_lyric_anchors_data,
                 )
                 prompt = result["prompt"]
+                _song_negatives = result.get("negatives")
+                _anchor_cov = result.get("anchor_coverage")
                 continue
             if score < 7:
                 logger.warning("[BG] Score %s < 7 after retry — accepting best available result", score)
+            if _bars.get("has_bars"):
+                logger.warning(
+                    "[BG][LETTERBOX] aceptando clip con %s tras el re-roll "
+                    "(job=%s) — revisar el 16:9 antes de aprobar",
+                    _bars.get("reason"), job_id,
+                )
+                try:
+                    import sentry_sdk
+                    with sentry_sdk.push_scope() as _scope:
+                        _scope.fingerprint = ["bg-letterbox"]
+                        _scope.set_extra("job_id", job_id)
+                        _scope.set_extra("letterbox", _bars)
+                        sentry_sdk.capture_message(
+                            "Fondo con franjas negras horneadas", level="warning")
+                except Exception:
+                    pass
             if discont >= _BG_SCENE_CUT_THRESHOLD:
                 # Aceptamos igual (fail-open: bloquear el render es peor que
                 # un fondo feo que la review humana atrapa), pero el operador
