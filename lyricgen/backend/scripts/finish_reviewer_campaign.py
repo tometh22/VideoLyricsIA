@@ -56,13 +56,15 @@ def recovery_plan(root, snapshot, manifest, index):
     return plan
 
 
-def finish(root, snapshot_path, authorization_path):
+def finish(root, snapshot_path, authorization_path, *, recovery_only=False):
     folder = root / 'campaign-300'
     snapshot = json.loads(snapshot_path.read_text())
     if tick(root, authorization_path)['exceeds_budget']:
+        run(root, snapshot_path, authorization_path=authorization_path, local_only=True)
         return
     # This pass has one durable known-response retry, never an unbounded loop.
-    run(root, snapshot_path, authorization_path=authorization_path)
+    if not recovery_only:
+        run(root, snapshot_path, authorization_path=authorization_path)
     manifest = json.loads((folder / 'manifest.json').read_text())
     plan = recovery_plan(root, snapshot, manifest, request_index(root))
     atomic_json(folder / 'bounded-completion-plan.json', {
@@ -82,5 +84,7 @@ if __name__ == '__main__':
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--snapshot', type=Path, required=True)
     parser.add_argument('--authorization', type=Path, required=True)
+    parser.add_argument('--recovery-only', action='store_true',
+                        help='Skip the normal runner; repair only existing known failed windows')
     args = parser.parse_args()
-    finish(args.root, args.snapshot, args.authorization)
+    finish(args.root, args.snapshot, args.authorization, recovery_only=args.recovery_only)

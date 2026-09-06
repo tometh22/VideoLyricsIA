@@ -1,6 +1,6 @@
 """Exact300, resumable isolated review. Zero paid calls without budget authority.
 
-Default cache-only. One owner/concurrency1, zero automatic retries, durable
+Default cache-only. One song owner, 2/4/8 bounded provider requests, durable
 reservation before any provider request. Unknown completions are not repurchased.
 No database writes, suggestions publication, approvals, merges or deployments.
 """
@@ -8,6 +8,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 import json
+from itertools import islice
 import math
 from pathlib import Path
 import subprocess
@@ -152,7 +153,57 @@ def usage_estimate(records):
     return sum(costs)
 
 
-def run(root, snapshot_path, *, authorization_path=None, max_songs=300, local_only=False):
+def execute_request_batches(specifications, ledger, source, errors, *, concurrency=2,
+                            listener_factory=None):
+    """Only listen runs on workers; reservation and settlement stay on owner.
+
+    Batches are bounded even when the input is lazy. Existing request identity,
+    cache directory and policy are unchanged. A retry is only the existing one
+    for a known malformed response, not for an unknown completion.
+    """
+    if type(concurrency) is not int or concurrency not in (2,4,8):
+        raise ValueError('unsupported_provider_concurrency')
+    listener_factory=listener_factory or BlindAudioTools
+    iterator=iter(specifications)
+    while batch:=list(islice(iterator,concurrency)):
+        pending=[]
+        for spec in batch:
+            identity=spec['identity'];provider=spec['provider'];window=spec['window']
+            reserved,reason=ledger.reserve(identity,provider,window['end']-window['start'])
+            retrying=False
+            if not reserved and reason=='invalid_response':
+                identity=digest({'retry_of':identity,'retry_number':1})
+                reserved,reason=ledger.reserve(identity,provider,window['end']-window['start'])
+                retrying=reserved
+            if not reserved:
+                errors.append(reason);continue
+            directory=spec['folder']/('retry-1/requests' if retrying else 'requests')
+            policy=replace(ShadowPolicy(),max_calls_per_song=1) if retrying else spec['policy']
+            # Separate mutable adapter counters; immutable request policy and
+            # identity remain byte-for-byte compatible with prior cached calls.
+            listener=listener_factory(directory,policy=policy)
+            pending.append((identity,listener,spec,directory))
+        # Every reservation above is committed before a provider starts.
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures={pool.submit(listener.listen,spec['clip'],provider=spec['provider'],
+                view='mix',source=source,window=spec['window']):(identity,directory)
+                for identity,listener,spec,directory in pending}
+            for future in as_completed(futures):
+                identity,directory=futures[future]
+                try:
+                    request=future.result()
+                except Exception:
+                    # No response receipt: keep the durable unknown reservation.
+                    # Do not repurchase or pretend that provider execution failed.
+                    errors.append('audio_worker_unknown_completion');continue
+                ledger.finish(identity,request['tool_status'],directory,request=request)
+                if request['tool_status']!='ok':errors.append('audio_tool_'+request['tool_status'])
+
+
+def run(root, snapshot_path, *, authorization_path=None, max_songs=300, local_only=False,
+        provider_concurrency=2):
+    if type(provider_concurrency) is not int or provider_concurrency not in (2,4,8):
+        raise ValueError('unsupported_provider_concurrency')
     out=root/'campaign-300';started=time.monotonic()
     with owner_lock(out):
         snapshot=json.loads(snapshot_path.read_text())
@@ -161,6 +212,7 @@ def run(root, snapshot_path, *, authorization_path=None, max_songs=300, local_on
         fresh=create_manifest(snapshot,sample,root/'audio')
         manifest=refresh_manifest(json.loads(target.read_text()) if target.exists() else None,fresh)
         auth=authorization(authorization_path,manifest);manifest['authorization']=auth
+        manifest['provider_concurrency']=provider_concurrency
         ledger=SpendLedger(out/'spend.sqlite',approved_usd=auth['approved_usd'],max_attempts=auth['max_attempts'])
         index=request_index(root);jobs={j['job_id']:j for j in snapshot['jobs']}
         rows={r['job_id']:r for r in manifest['songs']}
@@ -189,7 +241,8 @@ def run(root, snapshot_path, *, authorization_path=None, max_songs=300, local_on
             try:
                 process_song(root,out,manifest,row,song,refs,index,ledger,commit,
                     paid_allowed=not local_only and auth['approved_usd']>0 and
-                    (row['first_ten'] or expansion_allowed(first_check,manifest)))
+                    (row['first_ten'] or expansion_allowed(first_check,manifest)),
+                    provider_concurrency=provider_concurrency)
             except Exception as exc:
                 # Failure details stay per song; credentials / raw provider messages do not leak.
                 row.update(status='blocked',blocker='song_execution_failed:'+type(exc).__name__,
@@ -213,7 +266,8 @@ def run(root, snapshot_path, *, authorization_path=None, max_songs=300, local_on
             'latency_seconds':manifest['run_latency_seconds'],'manifest':str(target)}))
 
 
-def process_song(root,out,manifest,row,song,refs,index,ledger,commit,*,paid_allowed):
+def process_song(root,out,manifest,row,song,refs,index,ledger,commit,*,paid_allowed,
+                 provider_concurrency=2):
     job_id=song['job_id']
     if not song['segments'] or not any(s.get('text','').strip() for s in song['segments']):
         # This repair/adoption method requires existing caption occurrences.
@@ -226,43 +280,21 @@ def process_song(root,out,manifest,row,song,refs,index,ledger,commit,*,paid_allo
         audio=Path(row['audio_path'])
         if row['windows']:
             row['decoded_duration_seconds']=verify_audio(audio,song)
-            tool=BlindAudioTools(folder/'requests',policy=replace(ShadowPolicy(),
-                max_calls_per_song=len(row['windows'])*2))
-            for w in row['windows']:
-                pending=[]
-                for provider,family in [('openai','openai/whisper-1'),('google','google/gemini-2.5-flash-audio')]:
-                    if covered(cached['receipts'],family,w):
-                        continue
-                    if previous_unknown(index,song,provider,w):
-                        errors.append('unknown_completion_not_repeated');continue
-                    identity=digest({'audio':{k:song[k] for k in ('job_id','audio_sha256','audio_revision')},
-                        'window':w,'provider':provider,'method':manifest['method_sha256']})
-                    clip=folder/(digest(w)+'.wav')
-                    if not clip.exists():
-                        extract_clip(audio,w,clip)
-                    reserved,reason=ledger.reserve(identity,provider,w['end']-w['start'])
-                    retrying=False
-                    if not reserved and reason=='invalid_response':
-                        # Exactly one new request after a KNOWN malformed result.
-                        # Unknown completion and transport errors never enter here.
-                        identity=digest({'retry_of':identity,'retry_number':1})
-                        reserved,reason=ledger.reserve(identity,provider,w['end']-w['start'])
-                        retrying=reserved
-                    if not reserved:
-                        errors.append(reason);continue
-                    listener=(BlindAudioTools(folder/'retry-1'/'requests',policy=replace(ShadowPolicy(),
-                        max_calls_per_song=1)) if retrying else tool)
-                    pending.append((identity,listener,clip,provider))
-                # One song / two independent provider calls maximum. ALL
-                # reservations commit on the owner thread before any call starts.
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    futures={pool.submit(listener.listen,clip,provider=provider,view='mix',
-                        source=source_binding(song),window=w):identity
-                        for identity,listener,clip,provider in pending}
-                    for future in as_completed(futures):
-                        request=future.result();identity=futures[future]
-                        ledger.finish(identity,request['tool_status'],folder/'requests',request=request)
-                        if request['tool_status']!='ok':errors.append('audio_tool_'+request['tool_status'])
+            policy=replace(ShadowPolicy(),max_calls_per_song=len(row['windows'])*2)
+            def specifications():
+                for w in row['windows']:
+                    for provider,family in [('openai','openai/whisper-1'),('google','google/gemini-2.5-flash-audio')]:
+                        if covered(cached['receipts'],family,w):continue
+                        if previous_unknown(index,song,provider,w):
+                            errors.append('unknown_completion_not_repeated');continue
+                        identity=digest({'audio':{k:song[k] for k in ('job_id','audio_sha256','audio_revision')},
+                            'window':w,'provider':provider,'method':manifest['method_sha256']})
+                        clip=folder/(digest(w)+'.wav')
+                        if not clip.exists():extract_clip(audio,w,clip)
+                        yield {'identity':identity,'provider':provider,'window':w,'clip':clip,
+                            'folder':folder,'policy':policy}
+            execute_request_batches(specifications(),ledger,source_binding(song),errors,
+                concurrency=provider_concurrency)
             index=request_index(root);cached=cached_receipts(song,index=index)
     reference=next((r for r in refs if r.get('matched_job_id')==job_id
         and r.get('association')=='unique_metadata_candidate' and r.get('availability')=='present'),None)
@@ -318,5 +350,7 @@ if __name__=='__main__':
     p.add_argument('--snapshot',type=Path,required=True);p.add_argument('--authorization',type=Path)
     p.add_argument('--max-songs',type=int,choices=[10,300],default=300)
     p.add_argument('--local-only',action='store_true')
+    p.add_argument('--provider-concurrency',type=int,choices=[2,4,8],default=2)
     args=p.parse_args();run(args.root,args.snapshot,authorization_path=args.authorization,
-        max_songs=args.max_songs,local_only=args.local_only)
+        max_songs=args.max_songs,local_only=args.local_only,
+        provider_concurrency=args.provider_concurrency)
