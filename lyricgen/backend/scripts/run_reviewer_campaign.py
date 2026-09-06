@@ -59,9 +59,15 @@ def refresh_manifest(previous, fresh):
 
 
 def covered(receipts, family, window):
-    # Cached provider clips may differ by sub-millisecond metadata rounding.
-    return any(r['family']==family and r['start']<=window['start']+1e-6
-               and r['end']+1e-6>=window['end'] for r in receipts)
+    # Recovery may split a failed24s response into overlapping shorter clips.
+    # The UNION must cover the required interval without any acoustic gap.
+    cursor=window['start']
+    for r in sorted((r for r in receipts if r['family']==family),key=lambda r:r['start']):
+        if r['end']<cursor:continue
+        if r['start']>cursor+1e-6:break
+        cursor=max(cursor,r['end'])
+        if cursor+1e-6>=window['end']:return True
+    return False
 
 
 def expansion_binding(manifest):
@@ -281,6 +287,10 @@ def process_song(root,out,manifest,row,song,refs,index,ledger,commit,*,paid_allo
         for f in ('openai/whisper-1','google/gemini-2.5-flash-audio')
         if not covered(cached['receipts'],f,w)]
     row['operationally_published']=False
+    if candidate is not None:
+        candidate['residual_qc']['complete_audio_coverage_verified']=row['status']=='complete'
+        candidate['residual_qc']['coverage_is_not_correctness_certification']=True
+        atomic_json(folder/'candidate.json',candidate)
     if row['status']=='complete':
         prepared=prepare_batch_candidate(song,candidate,review,original_segments=song.get('original_segments'))
         atomic_json(folder/'prepared-product-bridge.json',prepared)

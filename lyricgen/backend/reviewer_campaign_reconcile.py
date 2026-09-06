@@ -11,7 +11,7 @@ from reviewer_integral import locate_words
 from reviewer_shadow import review_window, source_binding, tokens
 from shadow_reference_import import digest
 
-SELECTOR_REVISION='caption-neighbor-ownership-v2'
+SELECTOR_REVISION='caption-neighbor-ownership-v2-recovered-witnesses'
 
 
 def human_protected(song, index):
@@ -75,7 +75,18 @@ def reconcile(song, cached, *, commit, external_reference=None):
         else:
             trace['discrepancy_class']='phrase_association_unresolved'
         evidence=[]
-        for record in o['group'].values():
+        witness_records=list(o['group'].values())
+        if 'google' not in o['group']:
+            alternatives=[r for r in cached['records'] if r['request']['provider']=='google'
+                and r['request']['window']['start']<=line['start']
+                and r['request']['window']['end']>=line['end']]
+            if alternatives:
+                witness_records.append(min(alternatives,key=lambda r:
+                    r['request']['window']['end']-r['request']['window']['start']))
+        trace['witness_windows']=[{'family':r['request']['family'],
+            'window':r['request']['window'],'evidence_sha256':r['evidence_sha256']}
+            for r in witness_records]
+        for record in witness_records:
             evidence.append({**record['request'],'kind':'minimal_text_patch_request',
                 'source':source_binding(song),'original_source':record['original_source'],
                 'cached_evidence_sha256':record['evidence_sha256']})

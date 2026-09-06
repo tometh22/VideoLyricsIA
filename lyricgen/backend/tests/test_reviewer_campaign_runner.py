@@ -7,6 +7,20 @@ import pytest
 from scripts import run_reviewer_campaign as runner
 
 
+def test_recovery_union_covers_window_but_gaps_do_not():
+    w={'start':0.,'end':24.}
+    assert runner.covered([{'family':'g','start':0.,'end':13.},
+                           {'family':'g','start':11.,'end':24.}],'g',w)
+    assert not runner.covered([{'family':'g','start':0.,'end':11.},
+                               {'family':'g','start':13.,'end':24.}],'g',w)
+
+
+def test_empty_baseline_cannot_be_a_completed_candidate():
+    with pytest.raises(ValueError,match='empty_transcription_baseline'):
+        runner.process_song(None,None,None,None,{'job_id':'empty','segments':[]},
+                            None,None,None,None,paid_allowed=False)
+
+
 def manifest():
     return {'campaign_id':'campaign','roster_sha256':'roster','method_sha256':'method',
         'snapshot_sha256':'snapshot','first_ten':['one'],'execution_order':['one','two'],
