@@ -1,5 +1,8 @@
 # Complete isolated candidate milestone — 2026-09-05 ART
 
+Subsequent acoustic coverage and endpoint development results:
+[integral acoustic milestone](REVIEWER_INTEGRAL_ACOUSTIC_MILESTONE.md).
+
 ## Delivered artifacts and actual outcome
 
 The first repaired complete candidate uses the immutable **prehuman Bersuit

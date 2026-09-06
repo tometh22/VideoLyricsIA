@@ -2,6 +2,8 @@
 
 Historical checkpoint. Current complete-candidate implementation and remaining
 limits are documented in `REVIEWER_FULL_CANDIDATE_MILESTONE.md`.
+The subsequent full acoustic coverage experiment and negative endpoint result
+are in `REVIEWER_INTEGRAL_ACOUSTIC_MILESTONE.md`.
 
 Scope: lyrics and timing only. No media generation, auto-application, training,
 approval changes or production publication occurred in this experiment.

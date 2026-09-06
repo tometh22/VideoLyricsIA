@@ -160,6 +160,8 @@ def evaluate(root, output):
     frozen = json.loads((output / "freeze.json").read_text())
     if file_sha(output / "predictions-frozen.json") != frozen["prediction_sha256"]:
         raise ValueError("predictions_changed_after_freeze")
+    if file_sha(output / "input.json") != frozen["input_sha256"]:
+        raise ValueError("input_changed_after_freeze")
     predictions = json.loads((output / "predictions-frozen.json").read_text())
     # This is the ONLY inference-stage command allowed to open current timings.
     current = next(j for j in json.loads((root / "snapshot.json").read_text())["jobs"]

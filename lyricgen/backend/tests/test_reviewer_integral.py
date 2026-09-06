@@ -1,4 +1,5 @@
 import math
+import json
 import numpy as np
 import pytest
 
@@ -56,3 +57,27 @@ def test_spectral_proxy_detects_shape_change_without_pitch_detector():
     result = spectral_continuity(wave, rate, .2, .6, 1.6)
     assert .9 < result['candidate_end'] < 1.1
     assert not result['automatic_apply_allowed']
+
+
+def test_prepare_exports_only_prehuman_revision(tmp_path):
+    from scripts.review_integral_audio import prepare
+    from shadow_reference_import import digest
+    old = [{'text': 'antes', 'start': 1., 'end': 2.}]
+    job = {'job_id': 'e926daf14d7a', 'audio_sha256': 'a' * 64,
+           'audio_revision': 'source', 'duration_seconds': 3., 'original_revision': 0,
+           'original_segments': old, 'original_sha256': digest(old),
+           'segments': [{'text': 'HUMAN_SECRET', 'start': 1., 'end': 2.8, 'locked': True}]}
+    (tmp_path / 'snapshot.json').write_text(json.dumps({'jobs': [job]}))
+    prepare(tmp_path, tmp_path / 'experiment')
+    exported = (tmp_path / 'experiment/input.json').read_text()
+    assert 'HUMAN_SECRET' not in exported
+    assert json.loads(exported)['segments'] == old
+    assert json.loads(exported)['segments_revision'] == 0
+
+
+def test_evaluation_refuses_changed_frozen_results_before_reading_humans(tmp_path):
+    from scripts.review_integral_audio import evaluate
+    (tmp_path / 'freeze.json').write_text(json.dumps({'prediction_sha256': 'wrong'}))
+    (tmp_path / 'predictions-frozen.json').write_text('{}')
+    with pytest.raises(ValueError, match='predictions_changed_after_freeze'):
+        evaluate(tmp_path / 'no_human_data_access', tmp_path)
