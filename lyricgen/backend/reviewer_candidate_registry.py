@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -243,6 +244,64 @@ def candidate_for_editor(job, document, *, now=None):
         result["current_song_approved"] = bool(getattr(document, "approved_at", None)
             or getattr(job, "approved_at", None) or getattr(job, "status", None) in {"lyrics_approved", "done"})
         result["read_only"] = True
+        result["adoption_status"] = _adoption_status(result, job, document, now=current)
         return result
     except (OSError, ValueError, KeyError, TypeError, BotoCoreError, ClientError, RuntimeError):
         return None
+
+
+def _adoption_status(candidate, job, document, *, now):
+    """Never imply a native/old proposal will adopt this separate candidate."""
+    if candidate["current_song_approved"]:
+        return "approved_song_preserved"
+    if not candidate.get("changes"):
+        return "no_changes_to_adopt"
+    proposal = getattr(document, "quality_proposal", None) or {}
+    if not proposal:
+        return "candidate_not_published_for_adoption"
+    assist = proposal.get("reviewer_assist") or {}
+    source = candidate["source"]
+    try:
+        expires = datetime.fromisoformat(proposal["expires_at"])
+        if (proposal.get("status") != "pending" or expires <= now
+                or assist.get("source") != source
+                or proposal.get("base_revision") != source["segments_revision"]
+                or proposal.get("audio_revision") != source["audio_revision"]
+                or proposal.get("audio_sha256") != source["audio_sha256"]
+                or assist.get("candidate", {}).get("candidate_sha256") != candidate["candidate_sha256"]):
+            return "existing_different_proposal_preserved"
+        from editor import operator_suggestions_enabled, operator_suggestion_type_enabled
+        windows = proposal.get("windows") or []
+        if not operator_suggestions_enabled() or not windows or any(
+                not operator_suggestion_type_enabled(w.get("suggestion_type", "")) for w in windows):
+            return "candidate_adoption_not_enabled"
+        # Match the actual windows, not merely an embedded candidate's label.
+        effective = deepcopy(candidate["baseline"])
+        for window in windows:
+            remove = {digest(row) for row in window.get("current_segments", [])}
+            if not remove or not remove.issubset({digest(row) for row in effective}):
+                return "existing_different_proposal_preserved"
+            effective = [row for row in effective if digest(row) not in remove]
+            effective.extend(deepcopy(window.get("proposed_segments", [])))
+        def normalized(rows):
+            keys = ("text", "start", "end", "locked", "operator_locked")
+            return sorted([{k: row.get(k) for k in keys} for row in rows],
+                          key=lambda row: (row["start"], row["end"], row["text"]))
+        if normalized(effective) != normalized(candidate["segments"]):
+            return "existing_different_proposal_preserved"
+        return "matching_existing_proposal"
+    except (ValueError, TypeError, KeyError):
+        return "existing_different_proposal_preserved"
+
+
+def editor_candidate_snapshot(job, document):
+    """Detach registry input BEFORE committing the editor transaction.
+
+    The async route must commit before awaiting registry I/O. Passing ORM
+    objects afterwards risks expired/lazy attributes and cross-thread sessions.
+    """
+    job_view = SimpleNamespace(**{name: deepcopy(getattr(job, name, None)) for name in (
+        "job_id", "tenant_id", "audio_revision", "input_audio_sha256", "status", "approved_at")})
+    document_view = SimpleNamespace(**{name: deepcopy(getattr(document, name, None)) for name in (
+        "job_id", "tenant_id", "revision", "current_segments", "approved_at", "quality_proposal")})
+    return job_view, document_view

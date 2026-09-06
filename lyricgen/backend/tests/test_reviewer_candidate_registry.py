@@ -145,32 +145,72 @@ def test_editor_get_fetches_only_after_existing_authorization(monkeypatch):
     # Do not depend on another test having imported main under development.
     monkeypatch.setenv("ENVIRONMENT", "development")
     monkeypatch.setenv("CORS_ORIGINS", "http://localhost:5173")
+    monkeypatch.setenv("REVIEWER_ASSIST_ENABLED", "1")
     import main
     calls = []
     job = SimpleNamespace(transcription_quality=None, segments_json=[], artist="Artist",
-        song_title="Song", filename="audio.wav", status="ready")
-    document = object()
+        song_title="Song", filename="audio.wav", status="ready", job_id="song",
+        tenant_id="tenant", audio_revision=1, input_audio_sha256="a" * 64)
+    document = SimpleNamespace(job_id="song", tenant_id="tenant", revision=1,
+        current_segments=[{"text": "Canto", "start": 0., "end": 2.}])
     def authorize(db, job_id, user):
         calls.append("authorized")
         return job, document
     def fetch(actual_job, actual_document):
-        assert actual_job is job and actual_document is document
+        assert calls == ["authorized", "committed"]
+        assert actual_job is not job and actual_document is not document
+        assert actual_job.audio_revision == 1
+        assert actual_document.current_segments[0]["text"] == "Canto"
         calls.append("registry")
         return {"id": "candidate", "read_only": True}
+    def commit():
+        calls.append("committed")
+        job.audio_revision = 2
+        document.current_segments[0]["text"] = "Later revision"
     monkeypatch.setattr(main, "_editor_document_or_404", authorize)
     monkeypatch.setattr(main, "_audit_cross_tenant_access", lambda *a, **k: None)
     monkeypatch.setattr(main, "revoke_quality_proposal_if_disabled", lambda *a: None)
     monkeypatch.setattr(main, "serialize_document", lambda *a: {})
     monkeypatch.setattr("reviewer_candidate_registry.candidate_for_editor", fetch)
-    result = asyncio.run(main.get_editor_document("song", {"id": 1}, SimpleNamespace(commit=lambda: None)))
-    assert calls == ["authorized", "registry"]
+    result = asyncio.run(main.get_editor_document("song", {"id": 1}, SimpleNamespace(commit=commit)))
+    assert calls == ["authorized", "committed", "registry"]
     assert result["reviewer_candidate"]["read_only"] is True
+    # With the rollout off there is no registry/threadpool await while locked.
+    monkeypatch.setenv("REVIEWER_ASSIST_ENABLED", "0")
+    result = asyncio.run(main.get_editor_document("song", {"id": 1}, SimpleNamespace(commit=commit)))
+    assert result["reviewer_candidate"] is None
+    assert calls == ["authorized", "committed", "registry", "authorized", "committed"]
     def deny(*args):
         raise main.HTTPException(status_code=404)
     monkeypatch.setattr(main, "_editor_document_or_404", deny)
     with pytest.raises(main.HTTPException):
         asyncio.run(main.get_editor_document("song", {"id": 1}, None))
-    assert calls == ["authorized", "registry"]
+    assert calls == ["authorized", "committed", "registry", "authorized", "committed"]
+
+
+def test_registry_native_proposal_not_claimed_as_candidate_adoption(monkeypatch, tmp_path):
+    song, candidate, review, job, document = setup_registry(monkeypatch, tmp_path)
+    register_candidate("tenant", song, candidate, review)
+    native = {"status": "pending", "windows": [{"proposed_segments": [{"text": "Different edit"}]}]}
+    document.quality_proposal = deepcopy(native)
+    result = candidate_for_editor(job, document)
+    assert result["adoption_status"] == "existing_different_proposal_preserved"
+    assert document.quality_proposal == native
+
+
+def test_adoption_requires_matching_source_and_actual_window_edits(monkeypatch, tmp_path):
+    from reviewer_batch_bridge import prepare_batch_candidate
+    song, candidate, review, job, document = setup_registry(monkeypatch, tmp_path)
+    register_candidate("tenant", song, candidate, review)
+    proposal = prepare_batch_candidate(song, candidate, review)["proposal"]
+    proposal.update(status="pending", expires_at="2099-01-01T00:00:00+00:00",
+        base_revision=song["segments_revision"], audio_revision=song["audio_revision"],
+        audio_sha256=song["audio_sha256"])
+    document.quality_proposal = proposal
+    monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    assert candidate_for_editor(job, document)["adoption_status"] == "matching_existing_proposal"
+    proposal["windows"][0]["proposed_segments"][0]["text"] = "Different edit"
+    assert candidate_for_editor(job, document)["adoption_status"] == "existing_different_proposal_preserved"
 
 
 def r2_fixture(monkeypatch, tmp_path):

@@ -34,7 +34,11 @@ export default function CompleteReviewerCandidate({ candidate, currentRevision, 
   return <section aria-label="Revisión acústica completa" className="mb-4 rounded-xl border border-cyan-400/20 p-4">
     <h3 className="font-semibold text-cyan-200">Candidata de revisión completa</h3>
     <p className="mt-1 text-sm text-gray-300">{candidate.changes?.length
-      ? `${candidate.changes.length} cambios respaldados propuestos. Usá la acción de propuestas existente para incorporarlos.`
+      ? `${candidate.changes.length} cambios respaldados propuestos. ${candidate.adoption_status === "matching_existing_proposal"
+        ? "La propuesta asociada corresponde a esta candidata; podés usar su acción de incorporación."
+        : candidate.adoption_status === "existing_different_proposal_preserved"
+          ? "Las propuestas actuales son distintas y se conservan. Esta candidata aún no está disponible para incorporar."
+          : "Candidata disponible para escuchar y comparar; su incorporación aún no está habilitada."}`
       : "Sin cambios respaldados; no certifica exactitud."} Esta vista no modifica ni aprueba la canción.</p>
     <p className="text-xs text-gray-400">Escuchá con contexto: la reproducción continúa después de la frase.</p>
     <p className="text-xs text-gray-400">Las líneas conservadas y los finales sin reparación no están certificados.</p>

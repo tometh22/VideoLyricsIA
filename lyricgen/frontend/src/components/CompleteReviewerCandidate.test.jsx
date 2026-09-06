@@ -37,3 +37,18 @@ it("permanece ausente cuando el servidor no habilitó la candidata", () => {
   const { container } = render(<CompleteReviewerCandidate currentRevision={3} currentSegments={baseline} />);
   expect(container.innerHTML).toBe("");
 });
+
+it("no dirige al revisor a adoptar otras propuestas nativas", () => {
+  render(<CompleteReviewerCandidate candidate={{ ...candidate, changes: [{}],
+    adoption_status: "existing_different_proposal_preserved" }}
+    currentRevision={3} currentSegments={baseline} />);
+  expect(screen.getByText(/Las propuestas actuales son distintas y se conservan/)).toBeTruthy();
+  expect(screen.queryByText(/podés usar su acción de incorporación/)).toBeNull();
+});
+
+it("solo identifica la acción existente si corresponde a la candidata", () => {
+  render(<CompleteReviewerCandidate candidate={{ ...candidate, changes: [{}],
+    adoption_status: "matching_existing_proposal" }} currentRevision={3} currentSegments={baseline} />);
+  expect(screen.getByText(/La propuesta asociada corresponde a esta candidata/)).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /incorporar|aprobar/i })).toBeNull();
+});
