@@ -108,13 +108,13 @@ def publish_song(db, campaign, song, row, artifact=None, *, execute=False):
     registered = False; publication_reason = None
     if row["status"] == "complete":
         if not candidate or not artifact.get("review"): raise ValueError("complete_candidate_artifact_missing")
-        record = prepare_registry_record(campaign.tenant_id, scoped, candidate, artifact["review"], original_segments=song.get("original_segments"))
+        record = prepare_registry_record(campaign.tenant_id, scoped, candidate, artifact["review"], original_segments=song.get("original_segments"), versioned=True)
         candidate = {**candidate, "changes": record["payload"]["changes"]}
         import json
         from reviewer_candidate_registry import MAX_RECORD_BYTES
         if len(json.dumps(record).encode()) > MAX_RECORD_BYTES - 1024: raise ValueError("candidate_record_too_large")
         if execute:
-            registration = register_candidate(campaign.tenant_id, scoped, candidate, artifact["review"], original_segments=song.get("original_segments"))
+            registration = register_candidate(campaign.tenant_id, scoped, candidate, artifact["review"], original_segments=song.get("original_segments"), versioned=True)
             registered = registration.get("registered") is True
             if registered:
                 publication = publish_batch_candidate(db, scoped, candidate, artifact["review"])
@@ -128,6 +128,10 @@ def publish_song(db, campaign, song, row, artifact=None, *, execute=False):
                         publication_reason = None
         else: registered = True
     state = prepare_status(row, candidate=candidate, registered=registered, publication_reason=publication_reason)
+    if registered:
+        # Only publish a new pointer after the immutable object was written.
+        # Job metadata and native proposal commit together; documents stay intact.
+        state['candidate_registry_identity'] = record['identity']
     if execute:
         quality = deepcopy(job.transcription_quality or {})
         old = quality.get(KEY)

@@ -48,6 +48,9 @@ def availability(value):
         return "not_found"
     if not isinstance(value, str) or value.startswith("#REF!"):
         return "invalid"
+    # A source label plus URL is a pointer, not a lyric. Never fetch it here.
+    if re.fullmatch(r"\s*(?:\[[^\]\n]+\]\s*)?https?://\S+\s*", value):
+        return "pointer_only"
     return "present"
 
 
@@ -136,6 +139,8 @@ def import_workbook(path: str | Path, month="Agosto"):
                 original = fields.pop("lyrics", None)
                 state = availability(original)
                 pointer = fields.get("url") or links.get(f"{mapping['lyrics']}{row_number}")
+                if state == 'pointer_only' and not pointer:
+                    pointer = re.search(r'https?://\S+', original).group(0)
                 row = {**fields, "workbook": path.name, "workbook_sha256": workbook_hash,
                        "sheet": name, "row": row_number, "lyrics_cell": f"{mapping['lyrics']}{row_number}",
                        "availability": state, "original_cell_text": original,

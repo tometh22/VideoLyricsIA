@@ -3,6 +3,18 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.2] - 2026-09-06
+
+### Fixed
+
+- Classify inline source URLs in lyric spreadsheets as pointers, never lyric
+  text. Preserve raw cells and URLs without fetching linked content.
+- Add cache-only Excel-guided phrase reconciliation with dual blind audio
+  occurrence evidence, explicit abstentions and protected human revisions.
+- Permit immutable candidate generations for the same source through a
+  source-checked campaign pointer, retaining legacy reads and prior evidence.
+  Publishing a generation never changes an editor document or approval.
+
 ## [1.1.1] - 2026-09-06
 
 ### Fixed
