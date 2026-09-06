@@ -13530,6 +13530,8 @@ async def get_editor_document(
     # commit so that tenant-scoped raw text is durably removed by this GET.
     payload = serialize_document(db, document)
     editor_quality = getattr(job, "transcription_quality", None)
+    from reviewer_candidate_registry import candidate_for_editor
+    payload["reviewer_candidate"] = candidate_for_editor(job, document)
     if not isinstance(editor_quality, dict) and job.segments_json:
         # Expand compatibility for legacy jobs without mutating on GET. The
         # editor receives an explicit fail-closed verdict and its approval
