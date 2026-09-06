@@ -235,7 +235,11 @@ def select_endpoint(segment, candidates, *, next_start, duration, policy=ShadowP
             return {"decision": "abstain", "reason": "editorial_policy_pending", "candidates": candidates}
     qualified = [c for c in candidates if c.get("clock_source") == "acoustic_tool"
                  and c.get("target_voice_verified") is True and c.get("phonetic_end_supported") is True
-                 and c.get("mix_stem_sync_verified") is True and c.get("tool_status") == "ok"]
+                 and (c.get("mix_stem_sync_verified") is True or
+                      (c.get("clock") == "original_mix_decoded" and
+                       c.get("source_clock_verified") is True and
+                       c.get("cross_signal_timestamp_transfer") is False))
+                 and c.get("tool_status") == "ok"]
     if len(qualified) != 1:
         return {"decision": "abstain", "reason": "insufficient_or_conflicting_endpoint_evidence", "candidates": candidates}
     candidate = qualified[0]
@@ -243,6 +247,11 @@ def select_endpoint(segment, candidates, *, next_start, duration, policy=ShadowP
     if not isinstance(endpoint, (float, int)) or not math.isfinite(endpoint) or not float(segment["start"]) < endpoint <= duration:
         return {"decision": "abstain", "reason": "invalid_endpoint", "candidates": candidates}
     rendered = min(endpoint, next_start) if next_start is not None and policy.no_overlap else endpoint
+    intent = candidate.get("repair_intent")
+    if intent == "extend" and rendered < float(segment["end"]):
+        return {"decision": "abstain", "reason": "extension_would_shorten_baseline"}
+    if rendered < float(segment["end"]) and candidate.get("reduction_evidence_verified") is not True:
+        return {"decision": "abstain", "reason": "reduction_requires_own_evidence"}
     if rendered < candidate.get("acceptable_earliest_end_seconds", endpoint):
         return {"decision": "abstain", "reason": "render_overlap_policy_conflict", "candidates": candidates}
     if abs(rendered - float(segment["end"])) < policy.min_timing_change_seconds:

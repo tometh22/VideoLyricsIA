@@ -1709,6 +1709,16 @@ def save_document(
         return document, version, False
     previous_segments = [dict(item) for item in (document.current_segments or [])]
     previous_revision = int(document.revision or 0)
+    from reviewer_timing_capture import timing_capture
+    capture = timing_capture(previous_segments, segments, job=job, user_id=user_id,
+        checkpoint=reason, from_revision=previous_revision, to_revision=previous_revision + 1)
+    if capture:
+        # Same transaction as save; capture submitted timings before any
+        # normalization, without adding forms or asserting line-level intent.
+        capture['normalization_changed_timing'] = any(
+            a.get('start') != b.get('start') or a.get('end') != b.get('end')
+            for a, b in zip(segments, normalized))
+        db.add(AuditLog(user_id=user_id, action='lyrics.prospective_timing', detail=capture))
     document.current_segments = normalized
     document.revision += 1
     document.updated_by = user_id

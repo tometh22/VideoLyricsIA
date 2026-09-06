@@ -7,6 +7,8 @@ identity of the voice or turn a mixture change-point into a phoneme boundary.
 import math
 from reviewer_shadow import tokens
 
+SPECTRAL_EXPERIMENT_STATUS = 'archived_negative_result_not_for_operational_use'
+
 
 def windows(duration, length=24., overlap=6.):
     if not math.isfinite(duration) or duration <= 0 or not 0 < overlap < length <= 24:
