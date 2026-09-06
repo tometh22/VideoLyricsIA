@@ -81,3 +81,16 @@ def test_normal_editor_save_captures_once_without_approval(monkeypatch):
         save_document(db,job=job,document=doc,user_id=first.id,
             base_revision=doc.revision,segments=revised,reason='draft')
         assert db.query(AuditLog).filter_by(action='lyrics.prospective_timing',user_id=first.id).count()==1
+
+
+def test_offline_replay_rejects_changed_audio_before_inference(tmp_path,monkeypatch):
+    import json
+    import pytest
+    from scripts import reviewer_text_and_frames as replay
+    folder=tmp_path/'integral-v2';folder.mkdir()
+    (folder/'input.json').write_text(json.dumps({'audio_sha256':'expected'}))
+    (folder/'predictions-frozen.json').write_text(json.dumps({'source':{'audio_sha256':'expected'}}))
+    monkeypatch.setattr(replay,'file_sha',lambda _: 'changed')
+    for phase in [replay.text_run,replay.model_run]:
+        with pytest.raises(ValueError,match='stale_source_audio'):
+            phase(tmp_path,tmp_path/'output')

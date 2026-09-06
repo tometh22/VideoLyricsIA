@@ -177,6 +177,7 @@ Privados en `.context/reviewer-shadow-artifacts/`:
 - `text-frames-v1`: primer intento, incluida realineación que invade frase vecina.
 - `text-frames-v2`: candidata acotada, correspondencias y tres trazasCTC+actividad;
   controlLuciano. Modelo ejecutado desde commit`82a5a210`.
+- `text-frames-v3`: candidata y clasificación ortográfica final, commit`b4f389c5`.
 - `veracity-vendor`: checkout upstream fijado, pesos y licencia, sin modificaciones.
 - La reclasificación ortográfica posterior no vuelve a llamar a proveedores.
 
@@ -191,6 +192,10 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=lyricgen/backend "$REVIEWER_P
 En la ejecución fijada, tres diagnósticosCTC sumaron8,80s y las cuatro
 inferencias de actividad1,63s. Cero llamadas pagas nuevas. No hay factura de
 CPU local: no se inventa costo monetario cero. Todavía no se midió ahorro humano.
+
+Verificación local:151 pruebas backend aprobadas,2 PostgreSQL-only omitidas;
+incluye guardas de reloj/dirección y captura transaccional de una edición normal,
+con baseline/audio/actor y sin aprobación ni duplicación por reintento.
 
 El siguiente paso útil es vincular esta actividad y las trayectorias a
 fonemas/voz objetivo con evidencia, no convertir activity>umbral en otro padding.

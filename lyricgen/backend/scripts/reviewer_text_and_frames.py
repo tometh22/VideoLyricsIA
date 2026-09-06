@@ -8,13 +8,15 @@ from reviewer_shadow import review_window, tokens
 from reviewer_correspondence import correspond
 from reviewer_candidate import build_candidate
 from reviewer_phrase_alignment import align_phrase
-from reviewer_shadow_audio import private_write
+from reviewer_shadow_audio import private_write, file_sha
 from reviewer_singing_activity import run_activity
 from reviewer_ctc_frames import inspect
 
 
 def text_run(root, output):
     source=json.loads((root/'integral-v2/input.json').read_text())
+    if file_sha(root/'audio/e926daf14d7a-mix.wav') != source['audio_sha256']:
+        raise ValueError('stale_source_audio')
     previous=json.loads((root/'integral-v2/predictions-frozen.json').read_text())
     listening=json.loads((root/'integral-v2/listening.json').read_text())
     commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
@@ -87,6 +89,8 @@ def text_run(root, output):
 def model_run(root,output):
     output.mkdir(mode=0o700,parents=True,exist_ok=True)
     prior=json.loads((root/'integral-v2/predictions-frozen.json').read_text())
+    if file_sha(root/'audio/e926daf14d7a-mix.wav') != prior['source']['audio_sha256']:
+        raise ValueError('stale_source_audio')
     for i in [6,33,40]:
         row=prior['lines'][i]
         window=row['ctc']['window']
