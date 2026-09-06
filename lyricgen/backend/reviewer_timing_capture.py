@@ -23,8 +23,8 @@ def timing_capture(previous, current, *, job, user_id, checkpoint, from_revision
             'baseline': {k: old[k] for k in ['start', 'end']},
             'human_submitted': {k: new[k] for k in ['start', 'end']},
             'start_delta': new['start']-old['start'], 'end_delta': new['end']-old['end'],
-            'baseline_text_sha256': hashlib.sha256(old.get('text','').encode()).hexdigest(),
-            'submitted_text_sha256': hashlib.sha256(new.get('text','').encode()).hexdigest()})
+            'baseline_text_sha256': hashlib.sha256(str(old.get('text','')).encode()).hexdigest(),
+            'submitted_text_sha256': hashlib.sha256(str(new.get('text','')).encode()).hexdigest()})
     if not changed:
         return None
     return {'schema': 'prospective-editor-timing-v1', 'job_id': job.job_id,

@@ -3,6 +3,7 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import unicodedata
 from reviewer_shadow import review_window, tokens
 from reviewer_correspondence import correspond
 from reviewer_candidate import build_candidate
@@ -73,6 +74,10 @@ def text_run(root, output):
         # Competing distinct locations remain visible; never certify by score.
         conflicts=bool(best and any(abs(c['start']-best['start'])>1 and c['similarity']==best['similarity'] for c in options))
         if conflicts: classification='occurrence_conflict'
+        if best and not conflicts:
+            fold=lambda seq: [''.join(c for c in unicodedata.normalize('NFD',t) if not unicodedata.combining(c)) for t in seq]
+            if tokens(row['text']) != best['heard_tokens'] and fold(tokens(row['text'])) == fold(best['heard_tokens']):
+                classification='orthographic_diacritic_difference_not_lexical_error'
         audit.append({'line_index':r['line_index'],'baseline_text':row['text'],'classification':classification,
             'correspondences':options[:3],'human_error_confirmed':False,'similarity_is_certification':False})
     private_write(output/'correspondences.json',{'lines':audit,'provider_calls':0,'implementation_commit':commit})

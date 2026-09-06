@@ -55,3 +55,29 @@ def test_prospective_capture_default_off_and_machine_apply_excluded(monkeypatch)
     assert evidence['audio_sha256']=='a'*64 and not evidence['clean_gold']
     assert evidence['changed'][0]['association']=='position_only_unverified'
     assert timing_capture(old,new,**{**args,'checkpoint':'reviewer_candidate'}) is None
+
+
+def test_normal_editor_save_captures_once_without_approval(monkeypatch):
+    from tests.test_editor_documents import _users_and_job
+    from database import SessionLocal, Job, EditorDocument, AuditLog
+    from editor import save_document
+    first,_,job_id=_users_and_job('prospective_timing_test')
+    monkeypatch.setenv('REVIEWER_TIMING_CAPTURE_ENABLED','1')
+    with SessionLocal() as db:
+        job=db.query(Job).filter_by(job_id=job_id).one()
+        job.input_audio_sha256='a'*64
+        db.flush()
+        doc=db.query(EditorDocument).filter_by(job_id=job_id).one()
+        revised=[{**r} for r in doc.current_segments]
+        revised[0]['end']=.8
+        doc,_,changed=save_document(db,job=job,document=doc,user_id=first.id,
+            base_revision=doc.revision,segments=revised,reason='draft')
+        db.flush()
+        assert changed and job.approved_at is None
+        evidence=db.query(AuditLog).filter_by(action='lyrics.prospective_timing',user_id=first.id).one()
+        assert evidence.detail['changed'][0]['baseline']['end']==1
+        assert evidence.detail['changed'][0]['human_submitted']['end']==.8
+        assert evidence.detail['audio_sha256']=='a'*64
+        save_document(db,job=job,document=doc,user_id=first.id,
+            base_revision=doc.revision,segments=revised,reason='draft')
+        assert db.query(AuditLog).filter_by(action='lyrics.prospective_timing',user_id=first.id).count()==1
