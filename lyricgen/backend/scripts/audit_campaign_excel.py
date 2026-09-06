@@ -117,7 +117,9 @@ def run(root, snapshot_path, output, commit, align_new=False):
         preflights = {}
         for phase, segments in [('before', song['segments']), ('after', candidate['segments'] if candidate else song['segments'])]:
             preflights[phase] = build_delivery_preflight(metadata={'artist': song['artist'], 'title': song['title']},
-                segments=segments, reference_trusted=False, asset={'duration': song['duration_seconds']})
+                segments=segments, reference_trusted=False, asset={'duration': song['duration_seconds']},
+                quality={'decision': 'unsafe', 'reason': 'empty_transcription_baseline'}
+                    if not segments or not any(s.get('text', '').strip() for s in segments) else None)
         preflights.update(stage='lyrics_and_timing_only', media_checks_deferred_to_stage_2=True,
             reference_not_trusted_as_spelling_authority=True)
         atomic_json(folder/'preflight.json', preflights)
