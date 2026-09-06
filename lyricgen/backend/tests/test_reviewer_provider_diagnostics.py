@@ -32,3 +32,18 @@ def test_malformed_error_body_does_not_hide_original_http_status(monkeypatch, tm
         source={'job_id':'test'},window={'start':0.,'end':1.,'offset_seconds':0.})
     assert result['http_status'] == 429 and result['tool_status'] == 'tool_error'
     assert 'provider_error_code' not in result
+
+
+def test_vertex_sdk_code_without_response_reaches_circuit_breaker(monkeypatch, tmp_path):
+    clip = tmp_path/'audio.wav'; clip.write_bytes(b'synthetic')
+    class Failure(Exception):
+        code = 429
+        status = 'RESOURCE_EXHAUSTED'
+        response = None
+    def fail(*args): raise Failure('PRIVATE_PROVIDER_MESSAGE')
+    monkeypatch.setattr(BlindAudioTools, '_gemini', fail)
+    result = BlindAudioTools(tmp_path/'requests').listen(clip,provider='google',view='mix',
+        source={'job_id':'test'},window={'start':0.,'end':1.,'offset_seconds':0.})
+    assert result['http_status'] == 429
+    assert result['provider_error_type'] == 'RESOURCE_EXHAUSTED'
+    assert 'PRIVATE' not in str(result)

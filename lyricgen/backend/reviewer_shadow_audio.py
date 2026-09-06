@@ -199,6 +199,14 @@ class BlindAudioTools:
         except Exception as exc:
             base.update(tool_status="tool_error", error_type=type(exc).__name__,
                         http_status=getattr(getattr(exc, "response", None), "status_code", None))
+            # Vertex SDK may expose the HTTP code without a response object.
+            sdk_code = getattr(exc, "code", None)
+            if base["http_status"] is None and type(sdk_code) is int and 400 <= sdk_code <= 599:
+                base["http_status"] = sdk_code
+            sdk_status = getattr(exc, "status", None)
+            if sdk_status in {"RESOURCE_EXHAUSTED", "UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL",
+                              "UNAUTHENTICATED", "PERMISSION_DENIED", "INVALID_ARGUMENT"}:
+                base["provider_error_type"] = sdk_status
             response = getattr(exc, "response", None)
             if response is not None:
                 # Diagnostic codes only: never persist provider messages,
