@@ -3,7 +3,7 @@
 PR #1294, continuation of `8ec2df5e`. No live database writes, deployment,
 approvals, backgrounds or videos. Experiments are development, not independent
 accuracy measurements. Preview is loopback-only on the operator's Mac:
-`http://127.0.0.1:8768/bounded-delivery-v1/index.html`.
+`http://127.0.0.1:8768/final-delivery-v1/index.html`.
 
 ## Text delivered
 
@@ -35,9 +35,9 @@ Invoiced USD unavailable. Existing Bersuit/control evidence was reused.
 ## Endpoint decision: exactly two approaches
 
 Same decoded mix SHA and frame lattice verified. Enlarging singing-detector
-context by two seconds preserves all tested interior probabilities exactly
-(median absolute difference 0) but changes boundary probabilities by up to
-0.982. Its 1.643 s receptive field blurs transitions; this is **not** a measured
+context by two seconds gives interior median absolute difference 0, with
+maximum differences 0.000650 / 0.004715 / 0.005320 across the three windows;
+boundary differences reach 0.982. Its 1.643 s receptive field blurs transitions; this is **not** a measured
 perceptual latency. Stem/mix transfer remains blocked and was not used.
 
 A: three strongest later local CTC exit-path peaks. B: largest learned-activity
@@ -85,3 +85,6 @@ Artifacts (private workspace): `bounded-delivery-v1/` holds full candidates,
 requests, usage, clips and browser evidence; `endpoint-decision-v1/` holds
 expanded activity frames, immutable predictions, comparator evaluation and
 Luciano control. Source snapshots and original evidence were not overwritten.
+`final-delivery-v1/` provides the latest complete preview with evidence links.
+Local endpoint inference added 1.572 s for the three enlarged activity windows,
+and 9.921 s CTC + 0.582 s activity for Luciano; no paid endpoint calls.

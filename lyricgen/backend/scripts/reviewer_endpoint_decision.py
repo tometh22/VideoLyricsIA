@@ -40,6 +40,7 @@ def run(root,out):
             'clock_check':{'same_decoded_audio_sha256':new['audio_sha256']==ctc['audio_sha256'],
                 'cross_signal_transfer':False,'frame_lattice_shift':140,
                 'interior_probability_delta_median':statistics.median(deltas),
+                'interior_probability_delta_max':max(deltas),
                 'boundary_probability_delta_max':max(boundary_deltas),
                 'perceptual_latency_verified':False},
             'options':options(ctc,new,seg['end'],limit)})
