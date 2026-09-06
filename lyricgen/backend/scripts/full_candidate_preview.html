@@ -22,7 +22,7 @@ d.segments.forEach((s,i)=>{const tr=document.createElement('tr');tr.dataset.line
 const time=document.createElement('td'),button=document.createElement('button');button.textContent=`${i+1} · ${s.start.toFixed(2)} s`;button.onclick=()=>seek(i);time.append(button);tr.append(time);
 for(const row of [d.baseline[i],s]){const td=document.createElement('td');td.textContent=row.text;const detail=document.createElement('small');detail.textContent=` (${row.start.toFixed(2)} → ${row.end.toFixed(2)} s)`;td.append(document.createElement('br'),detail);tr.append(td);}
 const status=document.createElement('td');status.textContent=s.locked||s.operator_locked?'Protegida':changes.has(i)?'Cambio del candidato · revisar':'Conservado sin certificar';tr.append(status);$('lines').append(tr);});
-$('summary').textContent=`${d.segments.length} líneas · ${d.changes.length} cambios · aprobación pendiente · cobertura completa del canto NO certificada`;
+$('summary').textContent=`${d.segments.length} líneas · ${d.changes.length} cambios · ${d.qc.complete_audio_coverage_verified?'Cobertura de escucha completa':'Cobertura parcial o no comprobada'} · exactitud NO certificada · aprobación pendiente`;
 $('evidence').href=d.evidence_url;
 $('trace').textContent=JSON.stringify({baseline_sha256:d.baseline_sha256,candidate_sha256:d.candidate_sha256,cambios:d.changes,realineaciones:d.realignments,comprobaciones:d.qc},null,2);}
 $('song').onchange=()=>{current=Number($('song').value);load();};

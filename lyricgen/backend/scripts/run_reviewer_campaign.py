@@ -152,7 +152,7 @@ def usage_estimate(records):
     return sum(costs)
 
 
-def run(root, snapshot_path, *, authorization_path=None, max_songs=300):
+def run(root, snapshot_path, *, authorization_path=None, max_songs=300, local_only=False):
     out=root/'campaign-300';started=time.monotonic()
     with owner_lock(out):
         snapshot=json.loads(snapshot_path.read_text())
@@ -169,9 +169,26 @@ def run(root, snapshot_path, *, authorization_path=None, max_songs=300):
         first_check=out/'first-ten-check.json'
         for job_id in manifest['execution_order'][:max_songs]:
             song=jobs[job_id];row=rows[job_id]
+            if auth['approved_usd']>0 and not local_only:
+                # Lifetime guard: applies on every resume, independently of the
+                # finite external watch. Operational cost only; no quality tuning.
+                from scripts.watch_reviewer_campaign_budget import project
+                projection=project(manifest,index,ledger.totals(),approved_usd=auth['approved_usd'])
+                manifest['budget_projection']=projection
+                if projection['exceeds_budget']:
+                    ledger.hold_after_attempts(projection['attempts'])
+                    projection.update(new_reservations_held=True,
+                        hold_reason='projected_remaining_exceeds_authorized_balance',
+                        created_at_epoch=time.time())
+                    atomic_json(out/'budget-projection-hold.json',projection)
+                    manifest['counts']=counters(manifest);manifest['spend']=ledger.totals()
+                    manifest['run_latency_seconds']=round(time.monotonic()-started,3)
+                    atomic_json(target,manifest)
+                    print(json.dumps({'event':'budget_hold',**projection}),flush=True)
+                    break
             try:
                 process_song(root,out,manifest,row,song,refs,index,ledger,commit,
-                    paid_allowed=auth['approved_usd']>0 and
+                    paid_allowed=not local_only and auth['approved_usd']>0 and
                     (row['first_ten'] or expansion_allowed(first_check,manifest)))
             except Exception as exc:
                 # Failure details stay per song; credentials / raw provider messages do not leak.
@@ -300,4 +317,6 @@ if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True)
     p.add_argument('--snapshot',type=Path,required=True);p.add_argument('--authorization',type=Path)
     p.add_argument('--max-songs',type=int,choices=[10,300],default=300)
-    args=p.parse_args();run(args.root,args.snapshot,authorization_path=args.authorization,max_songs=args.max_songs)
+    p.add_argument('--local-only',action='store_true')
+    args=p.parse_args();run(args.root,args.snapshot,authorization_path=args.authorization,
+        max_songs=args.max_songs,local_only=args.local_only)
