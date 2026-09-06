@@ -11,7 +11,7 @@ test.describe("Complete reviewer candidate with real PostgreSQL persistence", ()
 
   test("listens, compares, adopts, then approves once without generating media", async ({ browser, request }) => {
     const login = await request.post(`${API}/auth/login`, {
-      data: { username: "editor_e2e_a", password: "EditorE2E-test-123" },
+      data: { username: "reviewer_e2e_admin", password: "EditorE2E-test-123" },
     });
     expect(login.ok()).toBeTruthy();
     const token = (await login.json()).token;
@@ -48,10 +48,12 @@ test.describe("Complete reviewer candidate with real PostgreSQL persistence", ()
     await page.route(`**/jobs/${JOB}/background-url`, route => route.fulfill({ json: { url: null } }));
     try {
       await page.goto(`/review/${JOB}`);
-      await expect(page.getByRole("button", { name: /4 Lyrics/ })).toBeVisible();
+      // A campaign opens directly at lyrics (six-step wizard), unlike the
+      // four-step post-render editor. Wait for the actual editor, not a tab's
+      // incidental step number; keep every candidate/adoption assertion below.
+      await expect(page.getByTestId("lyrics-editor")).toBeVisible();
       const announcement = page.getByRole("dialog");
       if (await announcement.isVisible()) await announcement.getByRole("button", { name: "Cancelar", exact: true }).click();
-      await page.getByRole("button", { name: /4 Lyrics/ }).click();
       await expect(page.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
       const companion = page.getByRole("region", { name: "Revisión acústica completa" });
       await expect(companion).toBeVisible();

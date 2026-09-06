@@ -34,8 +34,8 @@ def seed_reviewer_candidate(db, user):
     from shadow_reference_import import digest
 
     campaign_id, job_id = "e2erevcamp01", "e2ereview001"
-    rows = [{"text": "Canto así", "start": 2., "end": 4.},
-            {"text": "No cambiar", "start": 6., "end": 8., "locked": True}]
+    rows = [{"_id": 0, "text": "Canto así", "start": 2., "end": 4.},
+            {"_id": 1, "text": "No cambiar", "start": 6., "end": 8., "locked": True}]
     db.add(BatchCampaign(id=campaign_id, tenant_id=TENANT_ID, created_by=user.id,
         name="Synthetic reviewer integration", expected_count=1))
     db.flush()
@@ -116,7 +116,10 @@ def main() -> None:
         ))
         db.commit()
         if os.getenv("REAL_REVIEWER_E2E") == "1":
-            seed_reviewer_candidate(db, users[0])
+            reviewer = create_user(db, "reviewer_e2e_admin", PASSWORD, None, tenant_id=TENANT_ID)
+            reviewer.role = "admin"  # /admin/cola intentionally stays admin-only.
+            db.flush()
+            seed_reviewer_candidate(db, reviewer)
             db.commit()
     finally:
         db.close()

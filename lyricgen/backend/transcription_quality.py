@@ -10,6 +10,7 @@ import os
 import math
 import hashlib
 import json
+from copy import deepcopy
 from typing import Iterable
 
 from evidence_attestation import verify_artifact
@@ -350,9 +351,10 @@ def supersede_pending_analysis(
     """Invalidate every quality artifact when a human changes the snapshot.
 
     Even a terminal verdict is stale after a text/timing edit.  Preserve only
-    immutable runtime identity and the *bounds* that still need re-analysis;
-    acoustic evidence, scores, acknowledgements and fingerprints must never
-    cross a segment hash boundary.
+    immutable runtime identity and the *bounds* that still need re-analysis.
+    Segment-bound acoustic evidence, scores, acknowledgements and fingerprints
+    never cross a segment hash boundary. Recording-bound reference hypotheses
+    and old campaign provenance survive, without their human approval.
     """
     if not isinstance(quality, dict):
         return quality
@@ -379,6 +381,24 @@ def supersede_pending_analysis(
         "audio_sha256", "mode",
     }
     updated = {key: quality[key] for key in identity_keys if key in quality}
+    # Keep the old source binding as provenance. status_for_job compares it to
+    # the new revision and exposes "stale", never a current completed review.
+    if isinstance(quality.get("reviewer_campaign_status"), dict):
+        updated["reviewer_campaign_status"] = deepcopy(quality["reviewer_campaign_status"])
+    # This hypothesis is bound to the recording, not the edited segment hash.
+    # Dropping it here makes every subsequent campaign approval fail its audio
+    # binding gate. Preserve the hypothesis without carrying a human approval:
+    # validate_binding still checks its exact audio SHA/revision at approval.
+    reference = quality.get("reference_hypothesis")
+    if isinstance(reference, dict):
+        reference = deepcopy(reference)
+        reference.pop("reviewed_editor_revision", None)
+        reference["review_status"] = ("manual_full_review_required"
+            if reference.get("availability") == "unavailable" else "pending_human_line_review")
+        updated["reference_hypothesis"] = reference
+        for key in ("reference_hypothesis_unavailable", "manual_full_review_required"):
+            if key in quality:
+                updated[key] = deepcopy(quality[key])
     updated.update({
         "decision": "review_required", "render_blocked": True,
         "analysis_pending": False,
