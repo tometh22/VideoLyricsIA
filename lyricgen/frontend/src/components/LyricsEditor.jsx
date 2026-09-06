@@ -4564,6 +4564,7 @@ export default function LyricsEditor({
             onDismiss={dismissQualityProposal}
             onObserve={observeQualityProposal}
             onRejectWindow={rejectQualityProposalWindow}
+            onReviewTelemetry={(properties) => trackEditorEvent("editor_reviewer_candidate", properties)}
             applying={qualityProposalBusy.applying}
             dismissing={qualityProposalBusy.dismissing}
             observing={qualityProposalBusy.observing}

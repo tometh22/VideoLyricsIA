@@ -5,6 +5,7 @@ Publication additionally obeys existing text/timing rollout gates and revision
 checks. Neither path applies edits, approves songs, or schedules media.
 """
 from copy import deepcopy
+import hashlib
 import os
 
 from operator_review_proposals import build_operator_review_proposal
@@ -53,6 +54,8 @@ def prepare(song, decisions):
         text_candidates=[c for c in candidates if c["suggestion_type"] == "text"],
         timing_candidates=[c for c in candidates if c["suggestion_type"] == "timing"])
     if proposal:
+        for window in proposal["windows"]:
+            window["telemetry_id"] = hashlib.sha256(window["id"].encode()).hexdigest()[:16]
         proposal["reviewer_assist"] = {"version": "supervised-v1",
             "source": deepcopy(decisions[0]["source"]),
             "decision_ids": [d["proposal_id"] for d in decisions],
@@ -74,7 +77,8 @@ def publish(db, song, decisions):
         EditorDocument.job_id == song["job_id"]).with_for_update().first()
     if document is None:
         return {"published": False, "reason": "document_missing"}
-    if document.quality_proposal:
+    if document.quality_proposal and not (document.quality_proposal.get("reviewer_assist")
+                                        and document.quality_proposal.get("status") == "stale"):
         return {"published": False, "reason": "existing_proposal_preserved"}
     published = persist_operator_review_proposal_if_current(db, job_id=song["job_id"],
         expected_revision=song["segments_revision"],
@@ -88,15 +92,22 @@ def operational_counts(generated_ids, events):
     """Ignored != rejected; receipts describe operation, not objective precision."""
     generated = set(generated_ids)
     seen, examined, decisions, event_ids = set(), set(), {}, set()
+    post_accept_edits = set()
     active = 0.0
     for event in events:
-        if not event.get("event_id") or event["event_id"] in event_ids:
+        props = event.get("properties") or event
+        event_id = props.get("event_id") or event.get("id")
+        if not event_id or event_id in event_ids:
             continue
-        event_ids.add(event["event_id"])
-        identity = event.get("proposal_id")
+        event_ids.add(event_id)
+        identity = props.get("proposal_id") or props.get("window_id")
         if identity not in generated:
             continue
-        kind = event.get("kind")
+        kind = props.get("kind") or props.get("decision")
+        if kind == "manual_override":
+            kind = "edited"
+        if kind == "edited_after_accept":
+            post_accept_edits.add(identity)
         if kind == "shown":
             seen.add(identity)
         if kind == "examined":
@@ -105,10 +116,11 @@ def operational_counts(generated_ids, events):
             decisions[identity] = kind
             examined.add(identity)
         if kind == "active_seconds":
-            seconds = event.get("seconds", 0)
+            seconds = props.get("seconds", 0)
             if isinstance(seconds, (int, float)) and 0 <= seconds <= 60:
                 active += seconds
     return {"generated": len(generated), "shown": len(seen),
             "unexamined": len(generated - examined),
+            "edited_after_accept": len(post_accept_edits),
             **{k: sum(v == k for v in decisions.values()) for k in ("accepted", "edited", "rejected")},
             "active_seconds": active, "objective_precision": None, "causal_time_saved": None}

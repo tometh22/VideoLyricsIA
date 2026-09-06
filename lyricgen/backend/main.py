@@ -14125,6 +14125,7 @@ _PRODUCT_EVENT_NAMES = {
     "editor_conflict", "editor_version_restored", "editor_approved",
     "editor_help_opened", "editor_operator_suggestions_shown",
     "editor_operator_suggestion_decision", "editor_audio_playback_failed",
+    "editor_reviewer_candidate",
 }
 
 # Ventana de /admin/product-metrics. Sin esto la única acotación era
@@ -14135,6 +14136,7 @@ PRODUCT_METRICS_WINDOW_DAYS = int(
 )
 
 _PRODUCT_EVENT_PROPERTIES = {
+    "editor_reviewer_candidate": {"kind", "proposal_id", "candidate_id", "event_id", "seconds"},
     "editor_opened": {"line_count", "view", "source"},
     "editor_view_changed": {"from", "to"},
     "editor_seek": {"position_ms", "source"},

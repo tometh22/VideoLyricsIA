@@ -18,7 +18,7 @@ from segment_timing import canonicalize_editor_segments
 
 EDITOR_REASONS = {
     "autosave", "manual", "restore", "approve", "conflict", "migration",
-    "transcription", "quality_proposal",
+    "transcription", "quality_proposal", "reviewer_candidate",
 }
 EDITOR_CHECKPOINTS = EDITOR_REASONS | {"draft"}
 MAX_SEGMENTS = 5000
@@ -47,6 +47,11 @@ def quality_consensus_observations_enabled() -> bool:
 def operator_suggestions_enabled() -> bool:
     """Return whether any human-click suggestion family is enabled."""
     return text_operator_suggestions_enabled() or timing_operator_suggestions_enabled()
+
+
+def reviewer_candidate_enabled(proposal: dict) -> bool:
+    return not isinstance(proposal, dict) or not proposal.get("reviewer_assist") or os.environ.get(
+        "REVIEWER_ASSIST_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def text_operator_suggestions_enabled() -> bool:
@@ -87,7 +92,7 @@ def revoke_quality_proposal_if_disabled(document: EditorDocument) -> bool:
     ) or (
         operator_only
         and status == "pending"
-        and not operator_suggestions_enabled()
+        and (not operator_suggestions_enabled() or not reviewer_candidate_enabled(proposal))
     ) or (
         not observation and not operator_only
         and status == "pending"
@@ -391,6 +396,9 @@ def _record_training_delta(
     )
     if detail is None:
         return False
+    if checkpoint == "reviewer_candidate":
+        detail["author_kind"] = "machine_candidate"
+        detail["human_certified"] = False
     db.add(AuditLog(
         user_id=user_id,
         action="lyrics.segments_diff",
@@ -959,7 +967,7 @@ def persist_operator_review_proposal_if_current(
     """Persist auditable one-click suggestions without authorizing automation."""
     from transcription_quality import segments_hash
 
-    if not operator_suggestions_enabled():
+    if not operator_suggestions_enabled() or not reviewer_candidate_enabled(proposal):
         return False
     if not (
         isinstance(proposal, dict)
@@ -976,6 +984,11 @@ def persist_operator_review_proposal_if_current(
     ).with_for_update().first()
     if job is None or document is None:
         return False
+    if proposal.get("reviewer_assist") and document.quality_proposal:
+        previous_proposal = document.quality_proposal
+        if not (previous_proposal.get("reviewer_assist") and previous_proposal.get("status") == "stale"):
+            # Never replace another pending batch or a human acceptance ledger.
+            return False
     if (
         int(document.revision or 0) != int(expected_revision)
         or segments_hash(document.current_segments or []) != expected_segments_hash
@@ -1039,6 +1052,13 @@ def persist_operator_review_proposal_if_current(
         "created_at": created.isoformat(),
         "expires_at": (created + timedelta(days=7)).isoformat(),
     }
+    if proposal.get("reviewer_assist"):
+        from database import ProductEvent
+        for window in eligible_windows:
+            db.add(ProductEvent(tenant_id=str(job.tenant_id), user_id=None, job_id=job_id,
+                name="editor_reviewer_candidate", properties={"kind": "generated",
+                    "proposal_id": hashlib.sha256(window["id"].encode()).hexdigest()[:16],
+                    "candidate_id": document.quality_proposal["id"], "event_id": str(uuid.uuid4())}))
     db.flush()
     return True
 
@@ -1191,7 +1211,7 @@ def apply_quality_proposal(
     proposal = dict(document.quality_proposal or {})
     operator_only = proposal.get("operator_suggestion_only") is True
     if operator_only:
-        if not operator_suggestions_enabled():
+        if not operator_suggestions_enabled() or not reviewer_candidate_enabled(proposal):
             revoke_quality_proposal_if_disabled(document)
             db.flush()
             raise QualityProposalsDisabled("operator_suggestions_disabled")
@@ -1267,7 +1287,8 @@ def apply_quality_proposal(
     ))
     segments = _strict_timeline(segments, label="quality proposal result")
     document, version, applied = save_document(
-        db, job, document, user_id, base_revision, segments, "quality_proposal",
+        db, job, document, user_id, base_revision, segments,
+        "reviewer_candidate" if proposal.get("reviewer_assist") else "quality_proposal",
     )
     history = [
         dict(item) for item in (proposal.get("decision_history") or [])
@@ -1283,6 +1304,12 @@ def apply_quality_proposal(
         dict(item) for item in validated_proposal["windows"]
         if str(item.get("id")) not in selected
     ]
+    assist_receipt = None
+    if proposal.get("reviewer_assist"):
+        assist_receipt = {**proposal["reviewer_assist"], "accepted_windows": [
+            *proposal["reviewer_assist"].get("accepted_windows", []),
+            *[{"id": w["id"], "proposed_segments": w["proposed_segments"]} for w in windows],
+        ]}
     if operator_only and remaining:
         current = list(document.current_segments or [])
         document.quality_proposal = {
@@ -1295,6 +1322,9 @@ def apply_quality_proposal(
             "decision_history": history,
             "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
         }
+        if assist_receipt:
+            assist_receipt.pop("candidate", None)
+            document.quality_proposal = {**document.quality_proposal, "reviewer_assist": assist_receipt}
     else:
         document.quality_proposal = {
             "id": proposal_id, "status": "applied", "windows": [],
@@ -1304,6 +1334,9 @@ def apply_quality_proposal(
             "decision_history": history,
             "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
         }
+        if assist_receipt:
+            document.quality_proposal = {**document.quality_proposal,
+                "reviewer_assist": assist_receipt}
     db.flush()
     return document, version, applied
 
@@ -1335,7 +1368,7 @@ def reject_operator_suggestion(
         or proposal.get("operator_suggestion_only") is not True
     ):
         raise LookupError("operator_suggestion_not_found")
-    if not operator_suggestions_enabled():
+    if not operator_suggestions_enabled() or not reviewer_candidate_enabled(proposal):
         revoke_quality_proposal_if_disabled(document)
         db.flush()
         raise QualityProposalsDisabled("operator_suggestions_disabled")
@@ -1431,6 +1464,21 @@ def rebase_operator_suggestions_after_manual_edit(
     """
     proposal = dict(proposal or {})
     from transcription_quality import segments_hash
+    if proposal.get("reviewer_assist") and proposal.get("status") == "applied":
+        def row_identity(row):
+            return (str(row.get("text", "")), round(float(row.get("start", 0)), 4),
+                    round(float(row.get("end", 0)), 4))
+        before_keys = {row_identity(row) for row in previous_segments}
+        after_keys = {row_identity(row) for row in document.current_segments}
+        events = []
+        for window in proposal["reviewer_assist"].get("accepted_windows", []):
+            keys = {row_identity(row) for row in window["proposed_segments"]}
+            if keys <= before_keys and not keys <= after_keys:
+                events.append({"decision": "edited_after_accept",
+                    "window_id": hashlib.sha256(window["id"].encode()).hexdigest()[:16],
+                    "decided_at": now_utc().isoformat()})
+        document.quality_proposal = proposal
+        return events
     if (
         proposal.get("operator_suggestion_only") is not True
         or proposal.get("status") != "pending"
@@ -1567,7 +1615,14 @@ def rebase_operator_suggestions_after_manual_edit(
         decisions.append(evidence)
         history.append(evidence)
 
-    if remaining:
+    if proposal.get("reviewer_assist"):
+        # A complete version is not rebased piecemeal after a human revision.
+        assist = dict(proposal["reviewer_assist"])
+        assist.pop("candidate", None)
+        document.quality_proposal = {"id": proposal.get("id"), "status": "stale",
+            "windows": [], "base_revision": proposal.get("base_revision"),
+            "decision_history": history[-100:], "reviewer_assist": assist}
+    elif remaining:
         document.quality_proposal = {
             **proposal,
             "status": "pending",

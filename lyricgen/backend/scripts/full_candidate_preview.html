@@ -1,0 +1,30 @@
+<!doctype html><html lang="es"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Canciones candidatas · Sin modificar Genly</title>
+<style>
+body{font:16px system-ui;max-width:1200px;margin:30px auto;padding:0 20px;background:#121722;color:#f0f3fa}button,select{font:inherit;padding:10px;color:inherit;background:#25334c;border:1px solid #61718e;border-radius:6px}header{position:sticky;top:0;background:#121722;padding:10px 0}audio{width:100%;margin:12px 0}table{width:100%;border-collapse:collapse}td,th{padding:12px;border-bottom:1px solid #394761;text-align:left;vertical-align:top}.changed{background:#18394a}.active{outline:2px solid #7dd3fc}small{color:#b0bdd2}.warning{color:#ffcd80}td:nth-child(2),td:nth-child(3){width:35%}
+</style>
+<h1>Canciones candidatas completas</h1>
+<p class="warning">Versiones aisladas: no modifican Genly ni aprueban canciones. El caso histórico es de desarrollo, no una evaluación independiente.</p>
+<header><select id="song" aria-label="Canción"></select><button id="doubt">Siguiente duda</button>
+<audio id="audio" controls preload="metadata"></audio><p id="summary"></p></header>
+<p>Audio completo: podés seguir escuchando después de cualquier línea. Hacé clic en un tiempo para ir a esa frase.</p>
+<table><thead><tr><th>Línea / tiempo</th><th>Baseline</th><th>Candidata</th><th>Estado</th></tr></thead><tbody id="lines"></tbody></table>
+<details><summary>Hashes y alcance de las comprobaciones</summary><pre id="trace"></pre></details>
+<script>
+const data=__CANDIDATES__, $=id=>document.getElementById(id),audio=$('audio');
+const names={e926daf14d7a:'Bersuit · Hecho en Buenos Aires',b9f7e218a071:'Enanitos Verdes · Polizonte', '497451e63958':'Luciano Pereyra · Hoy le pido a Dios'};
+let current=0, doubtIndex=-1;
+data.forEach((d,i)=>$('song').add(new Option(`${names[d.job_id]} · ${d.mode==='historical_development'?'HISTÓRICO, desarrollo':'snapshot actual'}`,i)));
+function seek(i){audio.currentTime=Math.max(0,data[current].segments[i].start-1);audio.play().catch(()=>{});document.querySelector(`[data-line="${i}"]`)?.scrollIntoView({block:'center'});}
+function load(){const d=data[current];audio.src=`../audio/${d.job_id}-mix.wav`;$('lines').replaceChildren();doubtIndex=-1;
+const changes=new Set(d.changes.map(c=>c.line_index));
+d.segments.forEach((s,i)=>{const tr=document.createElement('tr');tr.dataset.line=i;if(changes.has(i))tr.className='changed';
+const time=document.createElement('td'),button=document.createElement('button');button.textContent=`${i+1} · ${s.start.toFixed(2)} s`;button.onclick=()=>seek(i);time.append(button);tr.append(time);
+for(const row of [d.baseline[i],s]){const td=document.createElement('td');td.textContent=row.text;const detail=document.createElement('small');detail.textContent=` (${row.start.toFixed(2)} → ${row.end.toFixed(2)} s)`;td.append(document.createElement('br'),detail);tr.append(td);}
+const status=document.createElement('td');status.textContent=s.locked||s.operator_locked?'Protegida':changes.has(i)?'Cambio del candidato · revisar':'Conservado sin certificar';tr.append(status);$('lines').append(tr);});
+$('summary').textContent=`${d.segments.length} líneas · ${d.changes.length} cambios · aprobación pendiente · cobertura completa del canto NO certificada`;
+$('trace').textContent=JSON.stringify({baseline_sha256:d.baseline_sha256,candidate_sha256:d.candidate_sha256,comprobaciones:d.qc},null,2);}
+$('song').onchange=()=>{current=Number($('song').value);load();};
+$('doubt').onclick=()=>{const d=data[current],ids=[...new Set([...d.changes.map(c=>c.line_index),...d.qc.unresolved_decisions.map(c=>c.line_index),...d.qc.hypothesis_discrepancies.flatMap(c=>c.line_indices)])].sort((a,b)=>a-b);if(ids.length){doubtIndex=(doubtIndex+1)%ids.length;seek(ids[doubtIndex]);}else $('summary').textContent+=' · Sin dudas localizadas no significa canción verificada';};
+audio.ontimeupdate=()=>document.querySelectorAll('[data-line]').forEach(tr=>{const s=data[current].segments[Number(tr.dataset.line)];tr.classList.toggle('active',audio.currentTime>=s.start&&audio.currentTime<s.end);});load();
+</script></html>
