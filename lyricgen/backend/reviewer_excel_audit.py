@@ -19,6 +19,21 @@ METHOD = "excel-guided-blind-occurrence-v3-local-reference-anchors"
 TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)?")
 
 
+def deterministic_spelling(text):
+    """Existing preflight rules, not recognition witnesses or Excel authority."""
+    from spanish_orthography import analyze_spanish_orthography
+    report = analyze_spanish_orthography([{'text': text, 'start': 0., 'end': 1.}])
+    selected = [f for f in report['findings'] if f['confidence'] == 'high']
+    spans = list(re.finditer(r'[^\W_]+', text))
+    updated = text
+    for finding in sorted(selected, key=lambda f: f['token_index'], reverse=True):
+        span = spans[finding['token_index']]
+        if span.group(0) != finding['actual']:
+            raise ValueError('orthography_token_source_mismatch')
+        updated = updated[:span.start()] + finding['expected'] + updated[span.end():]
+    return updated, selected, report
+
+
 def _hypothesis(song, difference):
     indices = difference['line_indices']
     if len(indices) != 1:

@@ -3,6 +3,7 @@ import pytest
 
 from reviewer_excel_audit import audit
 from reviewer_excel_audit import _local_reference_hypotheses
+from reviewer_excel_audit import deterministic_spelling
 from reviewer_candidate import build_candidate
 from reviewer_shadow import source_binding
 from shadow_reference_import import digest
@@ -107,3 +108,35 @@ def test_local_reference_anchors_locate_hypothesis_not_certification():
     assert len(hypotheses) == 1
     assert hypotheses[0]['reference_tokens'] == ['en']
     assert audit(s, r, {'records': []}, commit='test')['decisions'] == []
+
+
+def test_preflight_spelling_without_reference_or_audio_witness():
+    from reviewer_shadow import review_window
+    s, _, _ = fixture()
+    s['segments'][0]['text'] = 'JAMAS olvidaré esta AVENTRUA'
+    s['original_segments'] = deepcopy(s['segments']); s['segments_sha256'] = digest(s['segments'])
+    evidence = [{'kind': 'deterministic_orthography_request', 'source': source_binding(s),
+                 'tool_status': 'ok', 'received_audio': False}]
+    decision = review_window(s, {'line_index': 0, 'start': 0., 'end': 6., 'offset_seconds': 0.}, evidence=evidence, commit='test')
+    assert decision['content']['text'] == 'JAMÁS olvidaré esta AVENTURA'
+    assert decision['content']['families'] == ['deterministic_spanish_orthography']
+    assert not decision['content']['orthography_is_audio_witness']
+    c = build_candidate(s, [decision])
+    assert c['segments'][0]['end'] == 5.
+    assert not c['approved']
+
+
+def test_ambiguous_tildes_and_voseo_not_stripped_to_match_excel():
+    current = 'Si te mandás, el camino y tu voz'
+    assert deterministic_spelling(current)[0] == current
+    assert deterministic_spelling('cantaras')[0] == 'cantaras'
+
+
+def test_spelling_request_must_match_current_source():
+    from reviewer_shadow import review_window
+    s, _, _ = fixture()
+    s['segments'][0]['text'] = 'JAMAS mi corazon'
+    s['segments_sha256'] = digest(s['segments'])
+    d = review_window(s, {'line_index': 0, 'start': 0., 'end': 6., 'offset_seconds': 0.},
+        evidence=[{'kind': 'deterministic_orthography_request', 'source': {}}], commit='test')
+    assert d['content']['decision'] != 'propose'

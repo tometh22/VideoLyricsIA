@@ -24,6 +24,13 @@ human pointers; the importer never downloads them. Workbook bytes are unchanged.
   not acoustic agreement with an unaccented Excel cell.
 - Human-modified, locked and approved content is never changed. Existing
   machine candidates are preserved separately from newly generated repairs.
+- Run Delivery QC Preflight on all 300 baselines and candidates, including
+  songs without Excel text. High-confidence existing orthographic rules may
+  propose isolated corrections without acoustic witnesses; ambiguous written
+  accents remain review findings. No media/render check is claimed executed.
+- Preflight's one-edit lexicon incorrectly treated valid "aventuras" as a
+  typo for "aventura". That offline false repair was discarded before any
+  publication; valid plural/verb neighbors now have a preservation regression.
 - Same-source candidate generations use immutable content-addressed artifacts
   and a campaign metadata pointer. Old objects remain intact; removing the
   pointer restores legacy lookup. No artificial editor revision bump is used.

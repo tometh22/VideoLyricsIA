@@ -11,6 +11,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   text. Preserve raw cells and URLs without fetching linked content.
 - Add cache-only Excel-guided phrase reconciliation with dual blind audio
   occurrence evidence, explicit abstentions and protected human revisions.
+- Run the existing delivery preflight before and after isolated repair; add
+  its high-confidence spelling suggestions through a distinct deterministic
+  path, without inventing audio witnesses. Exclude valid "aventuras" and verb
+  neighbors from the near-match typo rule.
 - Permit immutable candidate generations for the same source through a
   source-checked campaign pointer, retaining legacy reads and prior evidence.
   Publishing a generation never changes an editor document or approval.

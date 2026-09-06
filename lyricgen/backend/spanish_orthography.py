@@ -39,6 +39,9 @@ _FIXED_ACCENTS = {
 # every new label QC report adds a tested target rather than granting a fuzzy
 # dictionary blanket authority over artist names or slang.
 _TYPO_DICTIONARY = {"aventura"}
+# Valid neighbors of the audited target are not typos merely because their
+# edit distance is one. In particular, never singularize "aventuras".
+_VALID_TYPO_NEIGHBORS = {"aventuras", "aventuro", "aventure"}
 
 _COMMON_INFINITIVES = {
     "amar", "bailar", "buscar", "cambiar", "cantar", "caminar", "dejar",
@@ -117,7 +120,7 @@ def _token_suggestion(token: str) -> tuple[str, str, str] | None:
         candidate = _copy_case(token, replacement)
         if token != candidate:
             return candidate, "future_accent_rule", confidence
-    if len(folded) >= 6:
+    if len(folded) >= 6 and folded not in _VALID_TYPO_NEIGHBORS:
         for expected in _TYPO_DICTIONARY:
             if folded[:1] == expected[:1] and _damerau_one(folded, expected):
                 return _copy_case(token, expected), "spanish_dictionary_near_match", "high"

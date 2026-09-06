@@ -67,3 +67,10 @@ def test_deterministic_candidate_is_a_one_click_operator_proposal():
     assert proposal["operator_suggestion_only"] is True
     assert proposal["automatic_apply_allowed"] is False
     assert proposal["windows"][0]["proposed_segments"][0]["text"] == "JAMÁS"
+
+
+def test_valid_plural_and_verb_neighbors_are_not_near_match_typos():
+    report = analyze_spanish_orthography([
+        {'start': 1, 'end': 3, 'text': 'Increíbles aventuras, yo aventuro, que aventure'},
+    ])
+    assert report['findings'] == []
