@@ -118,7 +118,11 @@ def test_worker_builds_complete_candidate_via_existing_proposal_schema(monkeypat
     monkeypatch.setattr(runtime, "file_sha", lambda _: "a" * 64)
     monkeypatch.setattr(runtime, "probe", lambda _: 10.)
     monkeypatch.setattr(runtime, "extract_clip", lambda *args: None)
-    monkeypatch.setattr(runtime, "align_phrase", lambda *args: {"status": "aligned_hypothesis", "words": []})
+    aligned_windows = []
+    def align(audio, text, window):
+        aligned_windows.append(window)
+        return {"status": "aligned_hypothesis", "words": []}
+    monkeypatch.setattr(runtime, "align_phrase", align)
     class Listener:
         def __init__(self, *args, **kwargs): self.calls = 0
         def listen(self, clip, *, provider, source, **kwargs):
@@ -138,6 +142,7 @@ def test_worker_builds_complete_candidate_via_existing_proposal_schema(monkeypat
     assert len(proposal["reviewer_assist"]["candidate"]["segments"]) == 2
     assert proposal["reviewer_assist"]["candidate"]["segments"][1] == before[1]
     assert rows == before
+    assert aligned_windows == [{"start": 1., "end": 6., "offset_seconds": 1.}]
 
 
 def test_candidate_counts_survive_existing_analytics_sanitizer():
@@ -150,7 +155,7 @@ def test_candidate_counts_survive_existing_analytics_sanitizer():
 def test_human_candidate_adoption_is_versioned_but_not_approved_or_locked(db, monkeypatch):
     import uuid
     from database import Job
-    from editor import ensure_document, persist_operator_review_proposal_if_current, apply_quality_proposal
+    from editor import ensure_document, persist_operator_review_proposal_if_current, apply_quality_proposal, approve_document
     from operator_review_proposals import build_operator_review_proposal
     from transcription_quality import segments_hash
     monkeypatch.setenv("REVIEWER_ASSIST_ENABLED", "1")
@@ -178,6 +183,10 @@ def test_human_candidate_adoption_is_versioned_but_not_approved_or_locked(db, mo
     assert not doc.current_segments[0].get("locked")
     assert not doc.current_segments[0].get("operator_locked")
     assert doc.quality_proposal["reviewer_assist"]["accepted_windows"][0]["id"] == "test-window"
+    approved_doc, approved_version = approve_document(db, job, 1,
+        editor_revision=doc.revision, editor_version_id=version.id)
+    assert approved_version.is_approved
+    assert approved_doc.current_segments[0]["text"] == "Canto aquí"
 
 
 def test_existing_backend_receipts_join_exposure_and_later_edits():

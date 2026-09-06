@@ -9,12 +9,12 @@ body{font:16px system-ui;max-width:1200px;margin:30px auto;padding:0 20px;backgr
 <audio id="audio" controls preload="metadata"></audio><p id="summary"></p></header>
 <p>Audio completo: podés seguir escuchando después de cualquier línea. Hacé clic en un tiempo para ir a esa frase.</p>
 <table><thead><tr><th>Línea / tiempo</th><th>Baseline</th><th>Candidata</th><th>Estado</th></tr></thead><tbody id="lines"></tbody></table>
-<details><summary>Hashes y alcance de las comprobaciones</summary><pre id="trace"></pre></details>
+<details><summary>Evidencia, realineación y alcance de las comprobaciones</summary><a id="evidence">Abrir evidencia completa (JSON)</a><pre id="trace"></pre></details>
 <script>
 const data=__CANDIDATES__, $=id=>document.getElementById(id),audio=$('audio');
 const names={e926daf14d7a:'Bersuit · Hecho en Buenos Aires',b9f7e218a071:'Enanitos Verdes · Polizonte', '497451e63958':'Luciano Pereyra · Hoy le pido a Dios'};
 let current=0, doubtIndex=-1;
-data.forEach((d,i)=>$('song').add(new Option(`${names[d.job_id]} · ${d.mode==='historical_development'?'HISTÓRICO, desarrollo':'snapshot actual'}`,i)));
+data.forEach((d,i)=>$('song').add(new Option(`${names[d.job_id]||d.label} · ${d.mode==='historical_development'?'HISTÓRICO, desarrollo':'snapshot actual'}`,i)));
 function seek(i){audio.currentTime=Math.max(0,data[current].segments[i].start-1);audio.play().catch(()=>{});document.querySelector(`[data-line="${i}"]`)?.scrollIntoView({block:'center'});}
 function load(){const d=data[current];audio.src=`../audio/${d.job_id}-mix.wav`;$('lines').replaceChildren();doubtIndex=-1;
 const changes=new Set(d.changes.map(c=>c.line_index));
@@ -23,7 +23,8 @@ const time=document.createElement('td'),button=document.createElement('button');
 for(const row of [d.baseline[i],s]){const td=document.createElement('td');td.textContent=row.text;const detail=document.createElement('small');detail.textContent=` (${row.start.toFixed(2)} → ${row.end.toFixed(2)} s)`;td.append(document.createElement('br'),detail);tr.append(td);}
 const status=document.createElement('td');status.textContent=s.locked||s.operator_locked?'Protegida':changes.has(i)?'Cambio del candidato · revisar':'Conservado sin certificar';tr.append(status);$('lines').append(tr);});
 $('summary').textContent=`${d.segments.length} líneas · ${d.changes.length} cambios · aprobación pendiente · cobertura completa del canto NO certificada`;
-$('trace').textContent=JSON.stringify({baseline_sha256:d.baseline_sha256,candidate_sha256:d.candidate_sha256,comprobaciones:d.qc},null,2);}
+$('evidence').href=d.evidence_url;
+$('trace').textContent=JSON.stringify({baseline_sha256:d.baseline_sha256,candidate_sha256:d.candidate_sha256,cambios:d.changes,realineaciones:d.realignments,comprobaciones:d.qc},null,2);}
 $('song').onchange=()=>{current=Number($('song').value);load();};
 $('doubt').onclick=()=>{const d=data[current],ids=[...new Set([...d.changes.map(c=>c.line_index),...d.qc.unresolved_decisions.map(c=>c.line_index),...d.qc.hypothesis_discrepancies.flatMap(c=>c.line_indices)])].sort((a,b)=>a-b);if(ids.length){doubtIndex=(doubtIndex+1)%ids.length;seek(ids[doubtIndex]);}else $('summary').textContent+=' · Sin dudas localizadas no significa canción verificada';};
 audio.ontimeupdate=()=>document.querySelectorAll('[data-line]').forEach(tr=>{const s=data[current].segments[Number(tr.dataset.line)];tr.classList.toggle('active',audio.currentTime>=s.start&&audio.currentTime<s.end);});load();

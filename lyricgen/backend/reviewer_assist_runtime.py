@@ -75,8 +75,13 @@ def run_snapshot(job_id, snapshot, mix_path, stem_path):
     for change in candidate["changes"]:
         if change["field"] == "text":
             i = change["line_index"]
-            window = next(d["window"] for d in decisions if d["window"]["line_index"] == i)
+            recognition_window = next(d["window"] for d in decisions if d["window"]["line_index"] == i)
+            start = max(0., song["segments"][i]["start"] - 1.)
+            end = (song["segments"][i+1]["start"] if i+1 < len(song["segments"])
+                   else song["duration_seconds"])
+            window = {"start": start, "end": min(end, start+24.), "offset_seconds": start}
             candidate["realignments"].append({"line_index": i,
+                "recognition_window": recognition_window, "display_timing_changed": False,
                 **align_phrase(mix_path, candidate["segments"][i]["text"], window)})
     artifact = root / f"candidate-{candidate['id']}.json"
     if not artifact.exists():

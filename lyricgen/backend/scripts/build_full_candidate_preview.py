@@ -14,6 +14,9 @@ if __name__ == "__main__":
     for entry in manifest["candidates"]:
         candidate = json.loads(Path(entry["path"]).read_text())
         rows.append({"job_id": entry["job_id"], "mode": entry["mode"],
+            "label": entry.get("label", entry["job_id"]),
+            "evidence_url": os.path.relpath(entry["path"], a.directory),
+            "realignments": candidate.get("realignments", []),
             "baseline": candidate["baseline"], "segments": candidate["segments"],
             "changes": candidate["changes"], "qc": candidate["residual_qc"],
             "baseline_sha256": candidate["baseline_sha256"], "candidate_sha256": candidate["candidate_sha256"]})
