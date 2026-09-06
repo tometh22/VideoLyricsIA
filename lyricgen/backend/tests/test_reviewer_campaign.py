@@ -80,3 +80,15 @@ def test_inflight_reserved_then_priced_usage_releases_only_known_difference(tmp_
     ledger.finish('second','tool_error','result',request={'provider':'google','received_audio':False})
     assert ledger.totals()['unsettled_reservations_usd']>0
     assert not ledger.reserve('third','google',24)[0]
+
+
+def test_phase_hold_stops_new_calls_without_cancelling_inflight(tmp_path):
+    import sqlite3
+    ledger=SpendLedger(tmp_path/'ledger.sqlite',approved_usd=20,max_attempts=10)
+    ledger.hold_after_attempts(1)
+    assert ledger.reserve('one','google',24)[0]
+    with pytest.raises(sqlite3.IntegrityError,match='first_ten_inspection_hold'):
+        ledger.reserve('two','google',24)
+    assert ledger.totals()['attempts']==1
+    ledger.release_phase_hold()
+    assert ledger.reserve('two','google',24)[0]

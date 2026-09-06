@@ -111,15 +111,34 @@ class SpendLedger:
         self.db.execute('CREATE TABLE IF NOT EXISTS usage_accounting (id TEXT PRIMARY KEY, priced_usage REAL, usage_json TEXT)')
         self.limit=approved_usd; self.cap=max_attempts
 
+    def hold_after_attempts(self, count):
+        """Durable stage boundary, also enforced against an already-running owner.
+
+        SQLite serializes this with reserve transactions; no in-flight attempt
+        is cancelled. Only subsequent insertions beyond the phase limit stop.
+        """
+        self.db.execute('CREATE TABLE IF NOT EXISTS phase_limit (maximum INTEGER NOT NULL)')
+        self.db.execute('DELETE FROM phase_limit')
+        self.db.execute('INSERT INTO phase_limit VALUES (?)',(int(count),))
+        self.db.execute("""CREATE TRIGGER IF NOT EXISTS campaign_phase_guard BEFORE INSERT ON attempts
+            WHEN (SELECT count(*) FROM attempts)>=(SELECT maximum FROM phase_limit LIMIT 1)
+            BEGIN SELECT RAISE(ABORT,'first_ten_inspection_hold'); END""")
+        self.db.commit()
+
+    def release_phase_hold(self):
+        self.db.execute('DELETE FROM phase_limit');self.db.commit()
+
     def reserve(self,identity,provider,duration):
         if provider not in {'openai','google'} or not 0 < duration <= 24:
             raise ValueError('unsupported_billing_request')
         # Conservative configured published rates incl maximum Gemini output.
-        from reviewer_shadow_audio import BLIND_PROMPT
-        # Byte count bounds text tokenization conservatively; 32 audio tokens/s
-        # reserves above observed25, rather than treating one sample as a cap.
+        from reviewer_shadow_audio import BLIND_PROMPT, BLIND_RESPONSE_SCHEMA
+        # Bound fixed text+schema by UTF8bytes, allow32audio tokens/s (>25
+        # observed), and reserve all inputs at the HIGHER audio token rate.
+        # Returned usage can release this conservative reservation, not invoices.
+        input_bound=len(BLIND_PROMPT.encode('utf-8'))+len(json.dumps(BLIND_RESPONSE_SCHEMA).encode('utf-8'))+24*32
         bound=math.ceil(duration)*.006/60 if provider=='openai' else (
-            24*32/1e6+len(BLIND_PROMPT.encode('utf-8'))*.30/1e6+4096*2.5/1e6)
+            input_bound/1e6+4096*2.5/1e6)
         self.db.execute('BEGIN IMMEDIATE')
         try:
             old=self.db.execute('SELECT status,result_path FROM attempts WHERE id=?',(identity,)).fetchone()

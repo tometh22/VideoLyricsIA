@@ -5,6 +5,7 @@ reservation before any provider request. Unknown completions are not repurchased
 No database writes, suggestions publication, approvals, merges or deployments.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 import json
 import math
@@ -16,7 +17,7 @@ from reviewer_acoustic_cache import cached_receipts, request_index
 from reviewer_batch_bridge import prepare_batch_candidate
 from reviewer_campaign import (SpendLedger, atomic_json, counters, create_manifest,
     owner_lock, update_status)
-from reviewer_campaign_reconcile import reconcile
+from reviewer_campaign_reconcile import reconcile, SELECTOR_REVISION
 from reviewer_phrase_alignment import align_phrase
 from reviewer_shadow import ShadowPolicy, source_binding
 from reviewer_shadow_audio import BlindAudioTools, extract_clip, file_sha
@@ -66,7 +67,7 @@ def covered(receipts, family, window):
 def expansion_binding(manifest):
     first=set(manifest['first_ten'])
     return digest({'campaign':manifest['campaign_id'],'roster':manifest['roster_sha256'],
-        'method':manifest['method_sha256'],'first_ten':[
+        'method':manifest['method_sha256'],'selector_revision':SELECTOR_REVISION,'first_ten':[
             {k:r.get(k) for k in ('job_id','source','duration_seconds','protected_lines','snapshot_status')}
             for r in manifest['songs'] if r['job_id'] in first]})
 
@@ -145,7 +146,7 @@ def usage_estimate(records):
     return sum(costs)
 
 
-def run(root, snapshot_path, *, authorization_path=None):
+def run(root, snapshot_path, *, authorization_path=None, max_songs=300):
     out=root/'campaign-300';started=time.monotonic()
     with owner_lock(out):
         snapshot=json.loads(snapshot_path.read_text())
@@ -160,7 +161,7 @@ def run(root, snapshot_path, *, authorization_path=None):
         refs=json.loads((root/'import-reconciled.json').read_text())['rows']
         commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
         first_check=out/'first-ten-check.json'
-        for job_id in manifest['execution_order']:
+        for job_id in manifest['execution_order'][:max_songs]:
             song=jobs[job_id];row=rows[job_id]
             try:
                 process_song(root,out,manifest,row,song,refs,index,ledger,commit,
@@ -173,7 +174,7 @@ def run(root, snapshot_path, *, authorization_path=None):
                     operationally_published=False)
                 row['failure_code']=str(exc) if isinstance(exc,ValueError) and str(exc) in {
                     'source_audio_not_downloaded','source_audio_sha256_mismatch',
-                    'decoded_audio_duration_mismatch'} else type(exc).__name__
+                    'decoded_audio_duration_mismatch','empty_transcription_baseline'} else type(exc).__name__
             index=request_index(root)
             manifest['counts']=counters(manifest);manifest['spend']=ledger.totals()
             manifest['run_latency_seconds']=round(time.monotonic()-started,3)
@@ -191,6 +192,10 @@ def run(root, snapshot_path, *, authorization_path=None):
 
 def process_song(root,out,manifest,row,song,refs,index,ledger,commit,*,paid_allowed):
     job_id=song['job_id']
+    if not song['segments'] or not any(s.get('text','').strip() for s in song['segments']):
+        # This repair/adoption method requires existing caption occurrences.
+        # An empty full-length JSON document must never count as a candidate.
+        raise ValueError('empty_transcription_baseline')
     cached=cached_receipts(song,index=index)
     folder=out/job_id;folder.mkdir(mode=0o700,exist_ok=True)
     errors=[]
@@ -201,6 +206,7 @@ def process_song(root,out,manifest,row,song,refs,index,ledger,commit,*,paid_allo
             tool=BlindAudioTools(folder/'requests',policy=replace(ShadowPolicy(),
                 max_calls_per_song=len(row['windows'])*2))
             for w in row['windows']:
+                pending=[]
                 for provider,family in [('openai','openai/whisper-1'),('google','google/gemini-2.5-flash-audio')]:
                     if covered(cached['receipts'],family,w):
                         continue
@@ -212,11 +218,28 @@ def process_song(root,out,manifest,row,song,refs,index,ledger,commit,*,paid_allo
                     if not clip.exists():
                         extract_clip(audio,w,clip)
                     reserved,reason=ledger.reserve(identity,provider,w['end']-w['start'])
+                    retrying=False
+                    if not reserved and reason=='invalid_response':
+                        # Exactly one new request after a KNOWN malformed result.
+                        # Unknown completion and transport errors never enter here.
+                        identity=digest({'retry_of':identity,'retry_number':1})
+                        reserved,reason=ledger.reserve(identity,provider,w['end']-w['start'])
+                        retrying=reserved
                     if not reserved:
                         errors.append(reason);continue
-                    request=tool.listen(clip,provider=provider,view='mix',source=source_binding(song),window=w)
-                    ledger.finish(identity,request['tool_status'],folder/'requests',request=request)
-                    if request['tool_status']!='ok':errors.append('audio_tool_'+request['tool_status'])
+                    listener=(BlindAudioTools(folder/'retry-1'/'requests',policy=replace(ShadowPolicy(),
+                        max_calls_per_song=1)) if retrying else tool)
+                    pending.append((identity,listener,clip,provider))
+                # One song / two independent provider calls maximum. ALL
+                # reservations commit on the owner thread before any call starts.
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures={pool.submit(listener.listen,clip,provider=provider,view='mix',
+                        source=source_binding(song),window=w):identity
+                        for identity,listener,clip,provider in pending}
+                    for future in as_completed(futures):
+                        request=future.result();identity=futures[future]
+                        ledger.finish(identity,request['tool_status'],folder/'requests',request=request)
+                        if request['tool_status']!='ok':errors.append('audio_tool_'+request['tool_status'])
             index=request_index(root);cached=cached_receipts(song,index=index)
     reference=next((r for r in refs if r.get('matched_job_id')==job_id
         and r.get('association')=='unique_metadata_candidate' and r.get('availability')=='present'),None)
@@ -224,6 +247,7 @@ def process_song(root,out,manifest,row,song,refs,index,ledger,commit,*,paid_allo
     row.update(observed_usage_requests=len(cached['records']),usage_estimate_complete=usage is not None,
         observed_usage_cost_usd=usage or 0,usage_is_invoice=False)
     reconciliation_key=digest({'source':source_binding(song),'method':manifest['method_sha256'],
+        'selector_revision':SELECTOR_REVISION,
         'reference':reference,'receipts':[r['evidence_sha256'] for r in cached['receipts']]})
     if (not errors and row.get('reconciliation_key')==reconciliation_key
         and (folder/'candidate.json').exists() and (folder/'review.json').exists()
@@ -252,6 +276,7 @@ def process_song(root,out,manifest,row,song,refs,index,ledger,commit,*,paid_allo
         blocker=';'.join(sorted(set(errors))) if errors else None)
     row['cached_requests']=len(cached['records'])
     row['reconciliation_key']=reconciliation_key
+    row['selector_revision']=SELECTOR_REVISION
     row['missing_audio_windows']=[{'window':w,'family':f} for w in row['windows']
         for f in ('openai/whisper-1','google/gemini-2.5-flash-audio')
         if not covered(cached['receipts'],f,w)]
@@ -264,4 +289,5 @@ def process_song(root,out,manifest,row,song,refs,index,ledger,commit,*,paid_allo
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True)
     p.add_argument('--snapshot',type=Path,required=True);p.add_argument('--authorization',type=Path)
-    args=p.parse_args();run(args.root,args.snapshot,authorization_path=args.authorization)
+    p.add_argument('--max-songs',type=int,choices=[10,300],default=300)
+    args=p.parse_args();run(args.root,args.snapshot,authorization_path=args.authorization,max_songs=args.max_songs)

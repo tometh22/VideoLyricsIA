@@ -15,6 +15,7 @@ from tests.test_reviewer_batch_bridge import fixture as review_fixture
 def setup_registry(monkeypatch, tmp_path, *, no_changes=False):
     monkeypatch.setenv("REVIEWER_ASSIST_ENABLED", "1")
     monkeypatch.setenv("REVIEWER_ASSIST_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("REVIEWER_CANDIDATE_STORAGE", "local")
     song, candidate, review = review_fixture()
     if no_changes:
         candidate = build_candidate(song)
@@ -170,3 +171,99 @@ def test_editor_get_fetches_only_after_existing_authorization(monkeypatch):
     with pytest.raises(main.HTTPException):
         asyncio.run(main.get_editor_document("song", {"id": 1}, None))
     assert calls == ["authorized", "registry"]
+
+
+def r2_fixture(monkeypatch, tmp_path):
+    import boto3
+    from botocore.stub import Stubber
+    import reviewer_candidate_registry as registry
+    values = setup_registry(monkeypatch, tmp_path)
+    monkeypatch.setenv("REVIEWER_CANDIDATE_STORAGE", "r2")
+    monkeypatch.delenv("REVIEWER_ASSIST_CACHE_DIR", raising=False)
+    client = boto3.client("s3", region_name="auto", endpoint_url="https://example.invalid",
+        aws_access_key_id="test", aws_secret_access_key="test")
+    client.meta.events.register("before-sign.s3.PutObject", registry._create_only_header)
+    monkeypatch.setattr(registry, "_r2_client", lambda: (client, "test-bucket"))
+    stub = Stubber(client)
+    return values, client, stub
+
+
+def test_r2_conditional_put_is_shared_readable_without_local_volume(monkeypatch, tmp_path):
+    from botocore.stub import ANY
+    from io import BytesIO
+    import reviewer_candidate_registry as registry
+    values, client, stub = r2_fixture(monkeypatch, tmp_path)
+    song, candidate, review, job, document = values
+    record = prepare_registry_record("tenant", song, candidate, review)
+    created = datetime(2026, 9, 6, tzinfo=timezone.utc)
+    envelope = {**record, "created_at": created.isoformat(), "expires_at": (created + timedelta(days=7)).isoformat()}
+    key = registry._object_key("tenant", record["identity"])
+    conditional = ({"IfNoneMatch": "*"} if "IfNoneMatch" in
+        client.meta.service_model.operation_model("PutObject").input_shape.members else {})
+    stub.add_response("put_object", {}, {"Bucket": "test-bucket", "Key": key,
+        "Body": ANY, "ContentType": "application/json", "CacheControl": "private, no-store", **conditional})
+    stub.add_response("get_object", {"Body": BytesIO(json.dumps(envelope).encode())},
+        {"Bucket": "test-bucket", "Key": key})
+    with stub:
+        assert register_candidate("tenant", song, candidate, review, now=created)["storage"] == "r2"
+        payload = candidate_for_editor(job, document, now=created)
+        assert payload["segments"] == candidate["segments"]
+    stub.assert_no_pending_responses()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_r2_precondition_failure_reads_existing_never_overwrites(monkeypatch, tmp_path):
+    from io import BytesIO
+    values, _, stub = r2_fixture(monkeypatch, tmp_path)
+    song, candidate, review, _, _ = values
+    record = prepare_registry_record("tenant", song, candidate, review)
+    stub.add_client_error("put_object", service_error_code="PreconditionFailed", http_status_code=412)
+    stub.add_response("get_object", {"Body": BytesIO(json.dumps(record).encode())})
+    with stub:
+        assert register_candidate("tenant", song, candidate, review)["created"] is False
+    stub.assert_no_pending_responses()
+
+
+def test_r2_conflict_never_overwrites(monkeypatch, tmp_path):
+    from io import BytesIO
+    values, _, stub = r2_fixture(monkeypatch, tmp_path)
+    song, candidate, review, _, _ = values
+    stub.add_client_error("put_object", service_error_code="PreconditionFailed", http_status_code=412)
+    stub.add_response("get_object", {"Body": BytesIO(b'{"payload": {}}')})
+    with stub, pytest.raises(ValueError, match="immutable_candidate_conflict"):
+        register_candidate("tenant", song, candidate, review)
+    stub.assert_no_pending_responses()
+
+
+def test_r2_unavailable_does_not_fallback_to_local_or_block_editor(monkeypatch, tmp_path):
+    values, _, stub = r2_fixture(monkeypatch, tmp_path)
+    song, candidate, review, job, document = values
+    stub.add_client_error("put_object", service_error_code="AccessDenied", http_status_code=403)
+    stub.add_client_error("get_object", service_error_code="AccessDenied", http_status_code=403)
+    with stub:
+        assert register_candidate("tenant", song, candidate, review)["registered"] is False
+        assert candidate_for_editor(job, document) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_pinned_old_sdk_signs_conditional_header_before_any_network(monkeypatch):
+    import boto3
+    import storage
+    import reviewer_candidate_registry as registry
+    client = boto3.client("s3", region_name="auto", endpoint_url="https://example.invalid",
+        aws_access_key_id="test", aws_secret_access_key="test")
+    # Simulate the exact missing member in repository-pinned botocore 1.35.0.
+    client.meta.service_model.operation_model("PutObject").input_shape.members.pop("IfNoneMatch", None)
+    monkeypatch.setattr(registry, "_object_client", None)
+    monkeypatch.setattr(storage, "is_enabled", lambda: True)
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: client)
+    registry._r2_client()
+    captured = []
+    def intercept(request, **kwargs):
+        captured.append(request.headers)
+        raise RuntimeError("offline_intercept_before_network")
+    client.meta.events.register("before-send.s3.PutObject", intercept)
+    with pytest.raises(RuntimeError, match="offline_intercept_before_network"):
+        client.put_object(Bucket="test-bucket", Key="candidate.json", Body=b"{}")
+    assert captured[0]["If-None-Match"] == b"*"
+    assert b"if-none-match" in captured[0]["Authorization"]

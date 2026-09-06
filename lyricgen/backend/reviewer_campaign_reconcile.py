@@ -11,6 +11,8 @@ from reviewer_integral import locate_words
 from reviewer_shadow import review_window, source_binding, tokens
 from shadow_reference_import import digest
 
+SELECTOR_REVISION='caption-neighbor-ownership-v2'
+
 
 def human_protected(song, index):
     row=song['segments'][index]
@@ -85,7 +87,19 @@ def reconcile(song, cached, *, commit, external_reference=None):
             trace['proposed_text']=proposed;trace['proposed_occurrence']=location
             before,after=tokens(line['text']),tokens(proposed)
             tokenization_only=''.join(before)==''.join(after) and before!=after
+            # A wider listening window may include neighboring displayed words.
+            # Agreement that they were sung does not authorize duplicating them
+            # into this caption. Keep the full evidence as an editorial doubt.
+            replacement=verdict.get('replacement_tokens',[])
+            span=verdict.get('changed_token_range',[-1,-1])
+            previous=tokens(song['segments'][i-1]['text']) if i else []
+            following=tokens(song['segments'][i+1]['text']) if i+1<len(song['segments']) else []
+            duplicates_neighbor=(span[0]==0 and any(replacement[:n]==previous[-n:]
+                for n in range(1,min(len(previous),len(replacement))+1)) or (
+                span[1]==len(before) and any(replacement[-n:]==following[:n]
+                for n in range(1,min(len(following),len(replacement))+1))))
             reason=('human_protection' if trace['protected'] else
+                'adjacent_caption_word_ownership_unresolved' if duplicates_neighbor else
                 'tokenization_requires_editorial_review' if tokenization_only else
                 'proposed_occurrence_not_unique' if not location['selected'] else None)
             if reason:
@@ -112,6 +126,7 @@ def reconcile(song, cached, *, commit, external_reference=None):
                 seen.add(key);outside.append({**a,'evidence_sha256':record['evidence_sha256'],
                     'classification':'possible_uncovered_singing_not_certified_omission'})
     review={'schema':'full-song-review-v1','source':source_binding(song),
+        'selector_revision':SELECTOR_REVISION,'implementation_commit':commit,
         'reconciliation_complete':True,'required_families':['openai/whisper-1','google/gemini-2.5-flash-audio'],
         'audio_evidence':cached['receipts'],'line_diagnostics':diagnostics,
         'uncovered_singing_hypotheses':outside,'held_decisions':held,
@@ -122,6 +137,8 @@ def reconcile(song, cached, *, commit, external_reference=None):
             'tool_status':r.get('request',{}).get('tool_status')} for r in cached['excluded']],
         'original_documents_modified':False,'human_checked':False}
     candidate['campaign_reconciliation_sha256']=digest(review)
+    candidate['selector_revision']=SELECTOR_REVISION
+    candidate['implementation_commit']=commit
     candidate['residual_qc']['campaign_line_diagnostics']=diagnostics
     candidate['residual_qc']['uncovered_singing_hypotheses']=outside
     candidate['residual_qc']['unresolved_decisions'].extend(

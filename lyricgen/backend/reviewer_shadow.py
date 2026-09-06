@@ -279,7 +279,9 @@ def review_window(song, window, *, evidence, external_reference=None, commit, po
             [e for e in evidence if e.get("kind") == "minimal_text_patch_request"
              and (e.get("source") or {}).get("audio_sha256") == song["audio_sha256"]
              and (e.get("source") or {}).get("audio_revision") == song["audio_revision"]],
-            minimum_families=policy.min_independent_audio_families)
+            minimum_families=policy.min_independent_audio_families,
+            previous_text=song['segments'][index-1].get('text','') if index else '',
+            next_text=song['segments'][index+1].get('text','') if index+1<len(song['segments']) else '')
         if patches:
             content = patches[0]
     timing = select_endpoint(current, [e for e in evidence if e.get("kind") == "endpoint"],

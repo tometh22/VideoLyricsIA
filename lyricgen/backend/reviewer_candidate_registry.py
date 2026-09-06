@@ -11,11 +11,95 @@ import os
 from pathlib import Path
 import tempfile
 
+from botocore.exceptions import BotoCoreError, ClientError
+
 from reviewer_assist import enabled
 from reviewer_batch_bridge import prepare_batch_candidate
 from reviewer_shadow import source_binding, validate_snapshot
 from shadow_reference_import import digest
 
+MAX_RECORD_BYTES = 8 * 1024 * 1024
+_object_client = None
+
+
+def _mode():
+    return os.environ.get("REVIEWER_CANDIDATE_STORAGE", "local").strip().lower()
+
+
+def _create_only_header(request, **kwargs):
+    # Compatibility with boto3 1.35.0: the service model lacks IfNoneMatch,
+    # but signing an explicit HTTP header is supported. This hook exists only
+    # on the registry client, never storage's shared media client.
+    request.headers["If-None-Match"] = "*"
+
+
+def _r2_client():
+    """Existing R2 configuration, separate bounded SDK pool for editor reads.
+
+    storage's bulk-media client has 120 s read timeouts: do not put that client
+    on the editor read path or modify its settings for unrelated media jobs.
+    """
+    import storage
+    if not storage.is_enabled():
+        raise RuntimeError("candidate_r2_not_configured")
+    global _object_client
+    if _object_client is None:
+        import boto3
+        from botocore.config import Config
+        options = dict(signature_version="s3v4", connect_timeout=2, read_timeout=3,
+            retries={"total_max_attempts": 1}, max_pool_connections=4)
+        # Checksum switches are absent from the repository's older pinned SDK.
+        for name in ("request_checksum_calculation", "response_checksum_validation"):
+            if name in Config.OPTION_DEFAULTS:
+                options[name] = "when_required"
+        _object_client = boto3.client("s3", endpoint_url=storage.R2_ENDPOINT_URL,
+            aws_access_key_id=storage.R2_ACCESS_KEY_ID,
+            aws_secret_access_key=storage.R2_SECRET_ACCESS_KEY,
+            config=Config(**options))
+        _object_client.meta.events.register("before-sign.s3.PutObject", _create_only_header)
+    return _object_client, storage.R2_BUCKET
+
+
+def _object_key(tenant_id, identity):
+    return f"reviewer-candidates/v1/{digest(str(tenant_id))}/{identity}.json"
+
+
+def _read_r2(tenant_id, identity):
+    client, bucket = _r2_client()
+    response = client.get_object(Bucket=bucket, Key=_object_key(tenant_id, identity))
+    body = response["Body"]
+    try:
+        data = body.read(MAX_RECORD_BYTES + 1)
+    finally:
+        body.close()
+    if len(data) > MAX_RECORD_BYTES:
+        raise ValueError("candidate_record_too_large")
+    return json.loads(data)
+
+
+def _register_r2(envelope):
+    client, bucket = _r2_client()
+    encoded = json.dumps(envelope, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    if len(encoded) > MAX_RECORD_BYTES:
+        raise ValueError("candidate_record_too_large")
+    identity = envelope["identity"]
+    try:
+        # Verified SDK support + R2 conditional operations. Never retry with an
+        # unconditional overwrite if the server rejects the precondition.
+        modeled = client.meta.service_model.operation_model("PutObject").input_shape.members
+        conditional = {"IfNoneMatch": "*"} if "IfNoneMatch" in modeled else {}
+        client.put_object(Bucket=bucket, Key=_object_key(envelope["tenant_id"], identity),
+            Body=encoded, ContentType="application/json", CacheControl="private, no-store",
+            **conditional)
+    except ClientError as exc:
+        if exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") != 412:
+            raise
+        existing = _read_r2(envelope["tenant_id"], identity)
+        if (existing.get("payload_sha256") != envelope["payload_sha256"]
+                or existing.get("payload") != envelope["payload"]):
+            raise ValueError("immutable_candidate_conflict")
+        return {"registered": True, "created": False, "identity": identity, "storage": "r2"}
+    return {"registered": True, "created": True, "identity": identity, "storage": "r2"}
 
 def _root():
     configured = os.environ.get("REVIEWER_ASSIST_CACHE_DIR")
@@ -85,16 +169,23 @@ def register_candidate(tenant_id, song, candidate, review, *, original_segments=
     """
     if not enabled():
         return {"registered": False, "reason": "reviewer_assist_disabled"}
-    root = _root()
-    if root is None:
+    mode, root = _mode(), _root()
+    if mode not in {"local", "r2"}:
+        return {"registered": False, "reason": "unsupported_candidate_storage"}
+    if mode == "local" and root is None:
         return {"registered": False, "reason": "persistent_cache_directory_required"}
     record = prepare_registry_record(tenant_id, song, candidate, review,
         original_segments=original_segments)
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    target = root / f"{record['identity']}.json"
     created = now or datetime.now(timezone.utc)
     envelope = {**record, "created_at": created.isoformat(),
         "expires_at": (created + timedelta(days=7)).isoformat()}
+    if mode == "r2":
+        try:
+            return _register_r2(envelope)
+        except (BotoCoreError, ClientError, RuntimeError):
+            return {"registered": False, "reason": "candidate_r2_unavailable"}
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = root / f"{record['identity']}.json"
     # Link a fully fsynced temporary file atomically, without replacing a prior
     # immutable record. A crash during serialization cannot poison its key.
     temporary = None
@@ -123,7 +214,7 @@ def candidate_for_editor(job, document, *, now=None):
     Missing, stale, expired, corrupt or cross-tenant records return no candidate.
     No unsigned audio URLs or private filesystem paths enter the response.
     """
-    if not enabled() or _root() is None:
+    if not enabled() or _mode() not in {"local", "r2"} or (_mode() == "local" and _root() is None):
         return None
     if str(job.job_id) != str(document.job_id) or str(job.tenant_id) != str(document.tenant_id):
         return None
@@ -133,8 +224,11 @@ def candidate_for_editor(job, document, *, now=None):
         "segments_sha256": digest(document.current_segments or [])}
     try:
         identity = _identity(job.tenant_id, song)
-        path = _root() / f"{identity}.json"
-        record = json.loads(path.read_text())
+        if _mode() == "r2":
+            record = _read_r2(job.tenant_id, identity)
+        else:
+            path = _root() / f"{identity}.json"
+            record = json.loads(path.read_text())
         expires = datetime.fromisoformat(record["expires_at"])
         current = now or datetime.now(timezone.utc)
         payload = record["payload"]
@@ -150,5 +244,5 @@ def candidate_for_editor(job, document, *, now=None):
             or getattr(job, "approved_at", None) or getattr(job, "status", None) in {"lyrics_approved", "done"})
         result["read_only"] = True
         return result
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, BotoCoreError, ClientError, RuntimeError):
         return None

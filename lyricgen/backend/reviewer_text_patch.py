@@ -10,7 +10,7 @@ import re
 from reviewer_shadow import _family, tokens
 
 
-def propose_patches(current, requests, *, minimum_families=2):
+def propose_patches(current, requests, *, minimum_families=2, previous_text='', next_text=''):
     words = tokens(current)
     spans = list(re.finditer(r"[^\W_]+(?:['’][^\W_]+)?", current))
     if len(spans) != len(words):
@@ -33,6 +33,21 @@ def propose_patches(current, requests, *, minimum_families=2):
             if tag != "replace" or not 1 <= b - a <= 2 or not 1 <= d - c <= 3:
                 continue
             replacement = heard[c:d]
+            # Full listening windows include adjacent captions. Remove context
+            # already displayed by those neighbors from a boundary replacement,
+            # then demand the SAME independent two-word audio anchors below.
+            # This neither inserts external text nor transfers neighboring times.
+            previous, following = tokens(previous_text), tokens(next_text)
+            if a == 0:
+                for n in range(min(len(previous),len(replacement)-1),0,-1):
+                    if replacement[:n] == previous[-n:]:
+                        replacement=replacement[n:];break
+            if b == len(words):
+                for n in range(min(len(following),len(replacement)-1),0,-1):
+                    if replacement[-n:] == following[:n]:
+                        replacement=replacement[:-n];break
+            if replacement == words[a:b]:
+                continue
             candidates[(a, b, tuple(replacement))] = replacement
     result = []
     for (a, b, _), replacement in candidates.items():

@@ -51,3 +51,21 @@ def test_unique_context_anchor_is_required():
     for r in rows:
         r["response"] = {"text": "es tripartito"}
     assert not propose_patches("estripartito", rows)
+
+
+def test_neighbor_context_is_not_duplicated_into_boundary_repair():
+    rows=evidence()
+    for r in rows:r['response']={'text':'creciendo vivo fuertes madrugadas que al otro día siento'}
+    current='Vivos fuertes madrugadas que al otro día siento'
+    result=propose_patches(current,rows,previous_text='Creciendo')
+    assert result[0]['text']=='vivo fuertes madrugadas que al otro día siento'
+    assert result[0]['replacement_tokens']==['vivo']
+    assert result[0]['families']==['google_gemini','openai_asr']
+    rows[1]['received_audio']=False
+    assert not propose_patches(current,rows,previous_text='Creciendo')
+
+
+def test_neighbor_removal_that_leaves_no_real_change_is_not_a_repair():
+    rows=evidence()
+    for r in rows:r['response']={'text':'creciendo vivo fuertes madrugadas'}
+    assert not propose_patches('vivo fuertes madrugadas',rows,previous_text='Creciendo')

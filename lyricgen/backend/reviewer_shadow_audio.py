@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import asdict
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -16,17 +17,59 @@ import time
 from reviewer_shadow import ShadowPolicy, local_to_global, tokens
 from shadow_reference_import import digest
 
+LEGACY_PROMPT_VERSION = "blind-vocal-events-shadow-v1"
 BLIND_PROMPT = (
     "Escuchá únicamente este audio. Transcribí lo efectivamente cantado, sin completar "
     "desde memoria ni inferir una letra conocida. Conservá idioma y repeticiones. "
-    "No recibiste artista, título ni letra candidata. Devolvé JSON: events, una lista "
-    "de frases {text, start, end, kind}; start/end en segundos locales son hipótesis. "
-    "kind es sung, speech o vocalization. Máximo 16 eventos. Incluí además "
-    "editorial_ambiguity (true si hay voces o frases superpuestas, coro sostenido "
-    "tras voz principal, adlibs superpuestos o corte incierto), ambiguity_reason, "
-    "reverb (audible/uncertain/absent). No confundas ausencia de pitch con silencio."
+    "No recibiste artista, título ni letra candidata. Seguí el esquema de respuesta. "
+    "Los tiempos son hipótesis locales del fragmento. No confundas ausencia de pitch "
+    "con silencio. Cada frase tiene como máximo 240 caracteres; dividí frases largas "
+    "en eventos contiguos sin perder palabras. Una vocal sostenida no son repeticiones "
+    "nuevas: no expandas la duración de una nota escribiendo sílabas infinitas. "
+    "Conservá las repeticiones que realmente oís, sin inventar más allá del fragmento."
 )
-PROMPT_VERSION = "blind-vocal-events-shadow-v1"
+PROMPT_VERSION = "blind-vocal-events-shadow-v2-bounded-schema"
+MAX_EVENT_CHARACTERS = 240
+AMBIGUITY_REASONS = ["none", "overlapping_voices", "sustained_chorus",
+                     "overlapping_adlibs", "uncertain_boundary", "multiple_conditions", "uncertain"]
+# Vertex documents maxItems, enums and numeric ranges, but NOT maxLength.
+# Character limits below are descriptions + local validation, not a claimed
+# provider-enforced maxLength guarantee. Never recover truncated JSON as valid.
+BLIND_RESPONSE_SCHEMA = {
+    "type": "OBJECT", "required": ["events", "editorial_ambiguity", "ambiguity_reason", "reverb"],
+    "propertyOrdering": ["events", "editorial_ambiguity", "ambiguity_reason", "reverb"],
+    "properties": {
+        "events": {"type": "ARRAY", "maxItems": 16, "items": {
+            "type": "OBJECT", "required": ["text", "start", "end", "kind"],
+            "propertyOrdering": ["text", "start", "end", "kind"],
+            "properties": {
+                "text": {"type": "STRING", "description": "Frase realmente oída, máximo 240 caracteres; no expandir vocales sostenidas como repeticiones."},
+                "start": {"type": "NUMBER", "minimum": 0, "maximum": 24},
+                "end": {"type": "NUMBER", "minimum": 0, "maximum": 24},
+                "kind": {"type": "STRING", "enum": ["sung", "speech", "vocalization"]}}}},
+        "editorial_ambiguity": {"type": "BOOLEAN", "description": "Hay superposición de voces, coro sostenido, adlibs superpuestos o corte incierto."},
+        "ambiguity_reason": {"type": "STRING", "enum": AMBIGUITY_REASONS},
+        "reverb": {"type": "STRING", "enum": ["audible", "uncertain", "absent"]}}}
+
+
+def valid_blind_response(payload, *, legacy=False):
+    if not isinstance(payload, dict) or not isinstance(payload.get("events"), list) or len(payload["events"]) > 16:
+        return False
+    for event in payload["events"]:
+        if not isinstance(event, dict) or not isinstance(event.get("text"), str) or not event["text"].strip():
+            return False
+        if not legacy and len(event["text"]) > MAX_EVENT_CHARACTERS:
+            return False
+        start, end = event.get("start"), event.get("end")
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (start, end)):
+            return False
+        if not 0 <= start < end or (not legacy and end > 24):
+            return False
+        if event.get("kind") not in {"sung", "speech", "vocalization"}:
+            return False
+    return legacy or (isinstance(payload.get("editorial_ambiguity"), bool)
+        and payload.get("ambiguity_reason") in AMBIGUITY_REASONS
+        and payload.get("reverb") in {"audible", "uncertain", "absent"})
 
 
 def private_write(path, value):
@@ -120,6 +163,21 @@ class BlindAudioTools:
         if target.exists():
             result = json.loads(target.read_text())
             return {**result, "cache_hit": True, "calls_this_run": 0}
+        if provider == "google":
+            old_identity = {**identity, "prompt_version": LEGACY_PROMPT_VERSION}
+            old_id = digest(old_identity)
+            old_target = self.cache / (old_id + ".json")
+            if old_target.exists():
+                old = json.loads(old_target.read_text())
+                if (all(old.get(k) == v for k, v in old_identity.items())
+                        and old.get("tool_status") == "ok" and old.get("received_audio") is True
+                        and old.get("conditioning_texts") == []
+                        and valid_blind_response(old.get("response"), legacy=True)):
+                    return {**old, "cache_hit": True, "calls_this_run": 0,
+                        "cache_compatibility": "valid_legacy_blind_v1", "requested_prompt_version": PROMPT_VERSION}
+            elif (self.cache / (old_id + ".attempt.json")).exists():
+                return {**old_identity, "tool_status": "unknown_completion", "calls_this_run": 0,
+                    "reason": "prior_attempt_has_no_result_do_not_repurchase", "received_audio": False}
         base = {**identity, "tool_status": "not_run", "received_audio": False,
                 "conditioning_texts": [], "family": "openai/whisper-1" if provider == "openai" else "google/gemini-2.5-flash-audio",
                 "calls": 0, "calls_this_run": 0, "usage": None, "observed_cost_usd": None,
@@ -175,15 +233,22 @@ class BlindAudioTools:
                 contents=[genai.types.Part.from_bytes(data=Path(clip).read_bytes(), mime_type="audio/wav")],
                 config=genai.types.GenerateContentConfig(system_instruction=BLIND_PROMPT,
                     temperature=0, response_mime_type="application/json", max_output_tokens=4096,
+                    response_schema=BLIND_RESPONSE_SCHEMA,
                     thinking_config=genai.types.ThinkingConfig(thinking_budget=0)))
-        trace = {"raw_response_text": response.text, "response": {},
+        finish = getattr(response.candidates[0], "finish_reason", None) if response.candidates else None
+        finish = getattr(finish, "value", finish)
+        trace = {"raw_response_text": response.text, "response": {}, "finish_reason": finish,
+                "response_schema_sha256": digest(BLIND_RESPONSE_SCHEMA),
+                "character_limit_provider_enforced": False,
                 "usage": response.usage_metadata.model_dump(mode="json") if response.usage_metadata else None,
                 "model_version": response.model_version, "request_id": response.response_id}
+        if finish != "STOP":
+            return {**trace, "tool_status": "invalid_response", "error_type": "incomplete_or_blocked_generation"}
         try:
             payload = json.loads(response.text)
         except (json.JSONDecodeError, TypeError):
             return {**trace, "tool_status": "invalid_response", "error_type": "invalid_json_response"}
-        if not isinstance(payload, dict) or not isinstance(payload.get("events"), list) or len(payload["events"]) > 16:
+        if not valid_blind_response(payload):
             return {**trace, "tool_status": "invalid_response", "error_type": "invalid_blind_events_schema"}
         return {**trace, "response": payload}
 

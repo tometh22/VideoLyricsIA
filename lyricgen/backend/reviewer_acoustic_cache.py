@@ -22,7 +22,7 @@ def _hash(value):
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
-def request_index(artifact_root, *, max_files=10000):
+def request_index(artifact_root, *, max_files=20000):
     """Small immutable request records only; never recursively parse snapshots/candidates."""
     root = Path(artifact_root).resolve()
     paths = sorted(root.glob("**/requests/*.json"))
@@ -33,6 +33,8 @@ def request_index(artifact_root, *, max_files=10000):
         if path.is_symlink() or root not in path.resolve().parents:
             continue
         if path.stat().st_size > 4 * 1024 * 1024:
+            continue
+        if path.name.endswith('.attempt.json') and path.with_name(path.name.replace('.attempt.json','.json')).exists():
             continue
         raw = path.read_bytes()
         try:
@@ -64,7 +66,9 @@ def _reason(request, song):
     if request.get("view") != "mix":
         return "stem_clock_not_transferred"
     specification = PROVIDERS.get(request.get("provider"))
-    if not specification or (request.get("model"), request.get("family"), request.get("prompt_version")) != specification:
+    valid_prompts={'no-prompt-v1'} if request.get('provider')=='openai' else {
+        'blind-vocal-events-shadow-v1','blind-vocal-events-shadow-v2-bounded-schema'}
+    if not specification or (request.get("model"), request.get("family")) != specification[:2] or request.get('prompt_version') not in valid_prompts:
         return "unsupported_model_or_blind_prompt"
     if request.get("conditioning_texts") != []:
         return "text_conditioning_unverified"
@@ -83,6 +87,10 @@ def _reason(request, song):
     if request["provider"] == "google":
         if not isinstance(response.get("events"), list):
             return "unusable_audio_response"
+        if request.get('prompt_version')=='blind-vocal-events-shadow-v2-bounded-schema':
+            from reviewer_shadow_audio import valid_blind_response
+            if not valid_blind_response(response):
+                return 'unusable_bounded_audio_response'
     elif not isinstance(response.get("words"), list) and not isinstance(response.get("text"), str):
         return "unusable_audio_response"
     return None
