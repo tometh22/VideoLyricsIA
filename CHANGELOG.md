@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.1] - 2026-09-06
+
+### Fixed
+
+- Immutable reviewer-candidate R2 writes now sign exactly one create-only
+  header on both old and new SDKs. Duplicate signed values previously caused
+  `SignatureDoesNotMatch` and blocked campaign publication in staging.
+- Preserve conditional creation and source protections; no inference, timing
+  automation, document replacement or approval is enabled by this hotfix.
+
 ## [1.1.0] - 2026-09-06
 
 ### Added

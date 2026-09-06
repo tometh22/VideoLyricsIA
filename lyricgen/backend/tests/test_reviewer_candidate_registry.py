@@ -12,6 +12,26 @@ from reviewer_candidate_registry import (
 from tests.test_reviewer_batch_bridge import fixture as review_fixture
 
 
+@pytest.mark.parametrize("existing", [[], ["*"], ["*", "*"], ['"other-etag"']])
+def test_create_only_header_has_identical_signed_and_sent_value(existing):
+    from botocore.awsrequest import AWSRequest
+    from botocore.auth import SigV4Auth
+    from botocore.credentials import Credentials
+    from reviewer_candidate_registry import _create_only_header
+    request = AWSRequest(method="PUT", url="https://example.invalid/bucket/candidate", data=b"{}")
+    for value in existing:
+        request.headers["if-none-match"] = value
+    # A modeled IfNoneMatch or a re-sign must not duplicate the conditional.
+    _create_only_header(request)
+    _create_only_header(request)
+    assert request.headers.get_all("If-None-Match") == ["*"]
+    signer = SigV4Auth(Credentials("test", "test"), "s3", "auto")
+    canonical = signer.canonical_request(request)
+    assert "\nif-none-match:*\n" in canonical
+    assert "if-none-match:*,*" not in canonical
+    prepared = request.prepare()
+    assert prepared.headers["If-None-Match"] == "*"
+
 def setup_registry(monkeypatch, tmp_path, *, no_changes=False):
     monkeypatch.setenv("REVIEWER_ASSIST_ENABLED", "1")
     monkeypatch.setenv("REVIEWER_ASSIST_PUBLISH_ENABLED", "1")

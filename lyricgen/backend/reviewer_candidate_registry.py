@@ -32,6 +32,12 @@ def _create_only_header(request, **kwargs):
     # Compatibility with boto3 1.35.0: the service model lacks IfNoneMatch,
     # but signing an explicit HTTP header is supported. This hook exists only
     # on the registry client, never storage's shared media client.
+    # AWSRequest uses HTTPHeaders: assignment appends, it does not replace.
+    # Newer service models already serialize IfNoneMatch. Signing two values
+    # yields "*,*", while preparation sends one "*": R2 rejects that signature.
+    # Delete all existing case-insensitive values before setting exactly one.
+    if "If-None-Match" in request.headers:
+        del request.headers["If-None-Match"]
     request.headers["If-None-Match"] = "*"
 
 
