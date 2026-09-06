@@ -199,3 +199,70 @@ def test_another_final_song_unknown_is_not_misattributed():
     ledger = SimpleNamespace(db=SimpleNamespace(execute=lambda *a: [("other-final", "unknown_completion")]))
     assert final.reservation_windows(ledger, {"songs": [], "method_sha256": "x"}, index, s,
                                     other_final_plans=[other]) == []
+
+
+@pytest.mark.parametrize("status", ["tool_error", "unknown_completion", "reserved_unknown_completion"])
+def test_openai_uncertainty_does_not_veto_google_or_settle_old_reservation(tmp_path, monkeypatch, status):
+    s, folder, calls = setup_execution(tmp_path, monkeypatch)
+    window = {"start": 0., "end": 24., "offset_seconds": 0.}
+    path = folder / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["songs"][0]["windows"] = [window]
+    path.write_text(json.dumps(manifest))
+    request = record(s, 0., 24., status)["request"]
+    request.update(provider="openai", model="whisper-1", family="openai/whisper-1",
+                   prompt_version="no-prompt-v1", http_status=429 if status == "tool_error" else None,
+                   received_audio=False)
+    final.request_index(tmp_path).append({"request": request, "evidence_sha256": digest(request),
+                                         "cache_path": "/synthetic/openai.json"})
+    identity = digest({"audio": final.audio_identity(s), "window": window,
+                       "provider": "openai", "method": "method"})
+    ledger = final.SpendLedger(folder / "spend.sqlite", approved_usd=20, max_attempts=100)
+    ledger.reserve(identity, "openai", 24.)
+    ledger.finish(identity, status, "/synthetic/original", request=request)
+    old = ledger.db.execute("SELECT * FROM attempts WHERE id=?", (identity,)).fetchone()
+    ledger.db.close()
+    result = final.recover(tmp_path, {"jobs": [s]}, "song", execute=True)
+    assert result["clips"][0]["status"] == "ok"
+    assert len(calls) == 1 and calls[0]["provider"] == "google"
+    receipts = final.cached_receipts(s, index=final.request_index(tmp_path))["receipts"]
+    assert {r["family"] for r in receipts} == {final.FAMILY}
+    assert not (folder / "song" / "candidate.json").exists()
+    db = sqlite3.connect(folder / "spend.sqlite")
+    assert db.execute("SELECT * FROM attempts WHERE id=?", (identity,)).fetchone() == old
+    assert db.execute("SELECT count(*) FROM attempts").fetchone() == (2,)
+    assert db.execute("SELECT count(*) FROM usage_accounting WHERE id=?", (identity,)).fetchone() == (0,)
+    db.close()
+
+
+@pytest.mark.parametrize("kind", ["canonical", "invalid_retry", "quota_retry"])
+def test_openai_reservation_identity_attribution_is_provider_specific(kind):
+    s, index = fixture(); window = {"start": 0., "end": 24., "offset_seconds": 0.}
+    manifest = {"songs": [{"source": source_binding(s), "windows": [window]}], "method_sha256": "frozen"}
+    identity = digest({"audio": final.audio_identity(s), "window": window, "provider": "openai", "method": "frozen"})
+    if kind == "invalid_retry": identity = digest({"retry_of": identity, "retry_number": 1})
+    if kind == "quota_retry": identity = digest({"quota_retry_of": identity, "quota_retry_number": 1})
+    ledger = SimpleNamespace(db=SimpleNamespace(execute=lambda *a: [(identity, "reserved_unknown_completion")]))
+    assert final.reservation_windows(ledger, manifest, index, s) == []
+    assert len(final.plan_final_gaps(s, index, unknown_windows=[])["clips"]) == 1
+
+
+@pytest.mark.parametrize("provider", ["google", "openai"])
+def test_subdivision_reservation_retains_provider(provider):
+    s, index = fixture()
+    failed = record(s, 0., 24., "invalid_response")["request"]
+    failed["provider"] = provider
+    index.append({"request": failed})
+    window = {"start": 0., "end": 13., "offset_seconds": 0.}
+    identity = digest({"recovery_of": digest(failed), "window": window, "attempt": 1})
+    ledger = SimpleNamespace(db=SimpleNamespace(execute=lambda *a: [(identity, "unknown_completion")]))
+    result = final.reservation_windows(ledger, {"songs": [], "method_sha256": "m"}, index, s)
+    assert result == ([window] if provider == "google" else [])
+
+
+def test_unknown_provider_remains_conservative():
+    s, index = fixture()
+    unknown = record(s, 9., 11., "unknown_completion")
+    unknown["request"].pop("provider")
+    index.append(unknown)
+    assert final.plan_final_gaps(s, index)["clips"] == []

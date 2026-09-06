@@ -2,7 +2,8 @@
 
 No timing rule/model/prompt/selector changes. At most four <=6 s uncovered gaps
 per song, each with <=0.5 s context per side. Known invalid responses only;
-unknown or tool-error overlap is never repurchased through a shorter window.
+Google unknown/tool-error overlap is never repurchased through a shorter window.
+OpenAI uncertainty remains reserved but does not veto a different provider.
 Default is plan-only. Root campaign owner is the sole authorized executor.
 """
 import argparse
@@ -30,6 +31,13 @@ def audio_identity(song):
 
 def overlaps(a, b):
     return max(a["start"], b["start"]) < min(a["end"], b["end"]) - 1e-6
+
+
+def uncertain_google_or_unattributed(request):
+    # Missing/unsupported attribution stays conservative. Only an explicitly
+    # attributable OpenAI call is outside this Google-only no-repurchase gate.
+    return (request.get("provider") != "openai"
+        and request.get("tool_status") in {"unknown_completion", "tool_error", "reserved_unknown_completion"})
 
 
 def uncovered(duration, receipts):
@@ -68,7 +76,7 @@ def plan_final_gaps(song, index, *, subdivided=(), unknown_windows=()):
         window = {"start": max(0., gap["start"] - .5), "end": min(duration, gap["end"] + .5)}
         window["offset_seconds"] = window["start"]
         unsafe = [entry for entry in records if entry["request"].get("view") == "mix"
-            and entry["request"].get("tool_status") in {"unknown_completion", "tool_error", "reserved_unknown_completion"}
+            and uncertain_google_or_unattributed(entry["request"])
             and overlaps(entry["request"].get("window", {"start": 0., "end": duration}), window)]
         if unsafe or any(overlaps(w, window) for w in unknown_windows):
             result["blockers"].append("unknown_or_tool_error_overlaps_final_clip")
@@ -112,7 +120,9 @@ def reservation_windows(ledger, manifest, index, song, existing_plan=None, other
             for provider in ("google", "openai"):
                 identity = digest({"audio": audio, "window": window, "provider": provider,
                     "method": manifest["method_sha256"]})
-                known[identity] = known[digest({"retry_of": identity, "retry_number": 1})] = (audio, window)
+                known[identity] = known[digest({"retry_of": identity, "retry_number": 1})] = (audio, window, provider)
+                if provider == "openai":
+                    known[digest({"quota_retry_of": identity, "quota_retry_number": 1})] = (audio, window, provider)
     for entry in index:
         failed = entry.get("request", {}); parent = failed.get("window", {})
         if failed.get("tool_status") != "invalid_response" or not 18 < parent.get("end", 0) - parent.get("start", 0) <= 24:
@@ -121,17 +131,19 @@ def reservation_windows(ledger, manifest, index, song, existing_plan=None, other
         for start, end in [(parent["start"], mid + 1), (mid - 1, parent["end"])]:
             window = {"start": start, "end": end, "offset_seconds": start}
             identity = digest({"recovery_of": digest(failed), "window": window, "attempt": 1})
-            known[identity] = (failed.get("source", {}), window)
+            known[identity] = (failed.get("source", {}), window, failed.get("provider"))
     for final_plan in [existing_plan or {}, *other_final_plans]:
         for clip in final_plan.get("clips", []):
-            known[clip["identity"]] = (final_plan["audio"], clip["window"])
+            known[clip["identity"]] = (final_plan["audio"], clip["window"], "google")
     unknown = []
     for identity, status in ledger.db.execute("SELECT id,status FROM attempts WHERE status IN ('reserved_unknown_completion','unknown_completion','tool_error')"):
         match = known.get(identity)
         if match is None:
             raise ValueError("unattributed_unknown_reservation_blocks_final_round")
-        source, window = match
-        if all(source.get(k) == v for k, v in audio_identity(song).items()):
+        source, window, provider = match
+        if provider not in {"google", "openai"}:
+            raise ValueError("unattributed_unknown_reservation_blocks_final_round")
+        if provider == "google" and all(source.get(k) == v for k, v in audio_identity(song).items()):
             unknown.append(window)
     return unknown
 
@@ -196,7 +208,7 @@ def recover(root, snapshot, job_id, *, execute=False, authorization_path=None):
                 plan = plan_final_gaps(song, index, subdivided=subdivided, unknown_windows=unknown)
                 previous["current_blockers"] = plan["blockers"]
                 blocked_overlap = any(overlaps(w, clip["window"]) for w in unknown) or any(
-                    entry.get("request", {}).get("tool_status") in {"unknown_completion", "tool_error", "reserved_unknown_completion"}
+                    uncertain_google_or_unattributed(entry.get("request", {}))
                     and all(entry.get("request", {}).get("source", {}).get(k) == v for k, v in audio_identity(song).items())
                     and overlaps(entry["request"].get("window", {"start": 0., "end": song["duration_seconds"]}), clip["window"])
                     for entry in index)
