@@ -99,13 +99,18 @@ def test_local_only_preserves_authority_and_hold_without_projection_or_calls(tmp
     auth={'approved_usd':20,'max_attempts':9004}
     monkeypatch.setattr(runner,'create_manifest',lambda *a:m)
     monkeypatch.setattr(runner,'authorization',lambda *a:auth)
-    monkeypatch.setattr(runner,'request_index',lambda *a:[])
+    inventories=[]
+    def inventory(*args):
+        inventories.append(args)
+        return []
+    monkeypatch.setattr(runner,'request_index',inventory)
     monkeypatch.setattr(runner.subprocess,'check_output',lambda *a,**k:'commit')
     visited=[]
     monkeypatch.setattr(runner,'process_song',lambda *a,**k:visited.append(k['paid_allowed']))
     monkeypatch.setattr(monitor,'project',lambda *a,**k:pytest.fail('local work does not require budget projection'))
     runner.run(tmp_path,tmp_path/'snapshot.json',authorization_path=tmp_path/'authority',local_only=True)
     assert visited==[False]
+    assert len(inventories)==1  # No new listening under the exclusive local owner.
     assert json.loads((folder/'manifest.json').read_text())['authorization']==auth
     ledger=SpendLedger(folder/'spend.sqlite',approved_usd=20,max_attempts=9004)
     with pytest.raises(sqlite3.IntegrityError):ledger.reserve('new','openai',24)

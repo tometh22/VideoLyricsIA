@@ -293,7 +293,11 @@ def run(root, snapshot_path, *, authorization_path=None, max_songs=300, local_on
                 row['failure_code']=str(exc) if isinstance(exc,ValueError) and str(exc) in {
                     'source_audio_not_downloaded','source_audio_sha256_mismatch',
                     'decoded_audio_duration_mismatch','empty_transcription_baseline'} else type(exc).__name__
-            index=request_index(root)
+            # Exclusive owner + local-only means no new provider receipts can
+            # appear during this pass. Reuse the immutable evidence inventory;
+            # rescanning thousands of files after every song adds no evidence.
+            if not local_only:
+                index=request_index(root)
             manifest['counts']=counters(manifest);manifest['spend']=ledger.totals()
             manifest['run_latency_seconds']=round(time.monotonic()-started,3)
             atomic_json(target,manifest)
