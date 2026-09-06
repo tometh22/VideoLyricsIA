@@ -56,6 +56,12 @@ class NoRetryLedger:
     def finish(self, *args, **kwargs):
         return self.ledger.finish(*args, **kwargs)
 
+    def totals(self):
+        return self.ledger.totals()
+
+    def hold_after_attempts(self, count):
+        return self.ledger.hold_after_attempts(count)
+
 
 def diagnose(song, cached):
     """Sequence/occurrence evidence, not text certification or endpoint proof."""

@@ -199,6 +199,21 @@ class BlindAudioTools:
         except Exception as exc:
             base.update(tool_status="tool_error", error_type=type(exc).__name__,
                         http_status=getattr(getattr(exc, "response", None), "status_code", None))
+            response = getattr(exc, "response", None)
+            if response is not None:
+                # Diagnostic codes only: never persist provider messages,
+                # request headers, credentials or echoed audio/text payloads.
+                try:
+                    error = response.json().get("error", {})
+                    for key in ("code", "type"):
+                        value = error.get(key)
+                        if isinstance(value, str) and len(value) <= 80 and value.replace("_", "").isalnum():
+                            base["provider_error_" + key] = value
+                except (ValueError, AttributeError, TypeError):
+                    pass
+                retry_after = getattr(response, "headers", {}).get("retry-after")
+                if isinstance(retry_after, str) and retry_after.isdecimal():
+                    base["retry_after_seconds"] = min(int(retry_after), 86400)
         base["latency_seconds"] = round(time.monotonic() - begin, 4)
         private_write(target, base)
         return base

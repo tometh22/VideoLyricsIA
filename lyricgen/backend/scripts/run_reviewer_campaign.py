@@ -153,6 +153,15 @@ def usage_estimate(records):
     return sum(costs)
 
 
+class ProviderCircuitOpen(RuntimeError):
+    def __init__(self, failures, attempts):
+        super().__init__('provider_http_429_circuit_open')
+        self.receipt={'schema':'reviewer-provider-circuit-v1','status':'open',
+            'reason':'known_provider_http_429','failures':failures,'attempts':attempts,
+            'in_flight_batch_drained':True,'new_reservations_held':True,
+            'created_at_epoch':time.time()}
+
+
 def execute_request_batches(specifications, ledger, source, errors, *, concurrency=2,
                             listener_factory=None):
     """Only listen runs on workers; reservation and settlement stay on owner.
@@ -184,6 +193,7 @@ def execute_request_batches(specifications, ledger, source, errors, *, concurren
             listener=listener_factory(directory,policy=policy)
             pending.append((identity,listener,spec,directory))
         # Every reservation above is committed before a provider starts.
+        rate_limits=[]
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures={pool.submit(listener.listen,spec['clip'],provider=spec['provider'],
                 view='mix',source=source,window=spec['window']):(identity,directory)
@@ -198,6 +208,16 @@ def execute_request_batches(specifications, ledger, source, errors, *, concurren
                     errors.append('audio_worker_unknown_completion');continue
                 ledger.finish(identity,request['tool_status'],directory,request=request)
                 if request['tool_status']!='ok':errors.append('audio_tool_'+request['tool_status'])
+                if request.get('http_status')==429:
+                    rate_limits.append({'identity':identity,'provider':request.get('provider'),
+                        'model':request.get('model'),'http_status':429,
+                        'tool_status':request['tool_status']})
+        if rate_limits:
+            # Every in-flight result above is settled (or remains explicitly
+            # unknown). Do not even consume the next lazy batch of specifications.
+            attempts=ledger.totals()['attempts']
+            ledger.hold_after_attempts(attempts)
+            raise ProviderCircuitOpen(rate_limits,attempts)
 
 
 def run(root, snapshot_path, *, authorization_path=None, max_songs=300, local_only=False,
@@ -219,6 +239,13 @@ def run(root, snapshot_path, *, authorization_path=None, max_songs=300, local_on
         refs=json.loads((root/'import-reconciled.json').read_text())['rows']
         commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
         first_check=out/'first-ten-check.json'
+        circuit_path=out/'provider-circuit-hold.json'
+        if auth['approved_usd']>0 and not local_only and circuit_path.exists():
+            circuit=json.loads(circuit_path.read_text())
+            if circuit.get('status')=='open':
+                print(json.dumps({'event':'provider_circuit_open','hold':str(circuit_path),
+                    'counts':counters(manifest),'new_calls':0}),flush=True)
+                return
         for job_id in manifest['execution_order'][:max_songs]:
             song=jobs[job_id];row=rows[job_id]
             if auth['approved_usd']>0 and not local_only:
@@ -243,6 +270,21 @@ def run(root, snapshot_path, *, authorization_path=None, max_songs=300, local_on
                     paid_allowed=not local_only and auth['approved_usd']>0 and
                     (row['first_ten'] or expansion_allowed(first_check,manifest)),
                     provider_concurrency=provider_concurrency)
+            except ProviderCircuitOpen as exc:
+                # A provider incident is not evidence that the remaining songs
+                # failed. Preserve every unvisited row and exit this run cleanly.
+                current=cached_receipts(song,index=request_index(root))
+                update_status(row,current['receipts'],blocker='provider_http_429_circuit_open')
+                row['failure_code']='provider_http_429_circuit_open'
+                row['operationally_published']=False
+                manifest['provider_circuit']=exc.receipt
+                manifest['counts']=counters(manifest);manifest['spend']=ledger.totals()
+                manifest['run_latency_seconds']=round(time.monotonic()-started,3)
+                atomic_json(circuit_path,exc.receipt)
+                atomic_json(target,manifest)
+                print(json.dumps({'event':'provider_circuit_open','job_id':job_id,
+                    'counts':manifest['counts'],'spend':manifest['spend']}),flush=True)
+                break
             except Exception as exc:
                 # Failure details stay per song; credentials / raw provider messages do not leak.
                 row.update(status='blocked',blocker='song_execution_failed:'+type(exc).__name__,
