@@ -273,6 +273,7 @@ def process_song(root,out,manifest,row,song,refs,index,ledger,commit,*,paid_allo
         # This repair/adoption method requires existing caption occurrences.
         # An empty full-length JSON document must never count as a candidate.
         raise ValueError('empty_transcription_baseline')
+    row.pop('failure_code', None)
     cached=cached_receipts(song,index=index)
     folder=out/job_id;folder.mkdir(mode=0o700,exist_ok=True)
     errors=[]
@@ -306,7 +307,7 @@ def process_song(root,out,manifest,row,song,refs,index,ledger,commit,*,paid_allo
         'reference':reference,'receipts':[r['evidence_sha256'] for r in cached['receipts']]})
     if (not errors and row.get('reconciliation_key')==reconciliation_key
         and (folder/'candidate.json').exists() and (folder/'review.json').exists()
-        and row.get('reconciliation_complete')):
+        and row.get('reconciliation_complete') and row.get('status')=='complete'):
         old_candidate=json.loads((folder/'candidate.json').read_text())
         if old_candidate.get('source')==source_binding(song):return
     candidate=None;review=None

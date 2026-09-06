@@ -21,6 +21,36 @@ def test_empty_baseline_cannot_be_a_completed_candidate():
                             None,None,None,None,paid_allowed=False)
 
 
+def test_cached_reconciliation_does_not_preserve_transient_blocker(tmp_path, monkeypatch):
+    from reviewer_shadow import source_binding
+    from shadow_reference_import import digest
+    song={'job_id':'cached','audio_sha256':'a'*64,'audio_revision':1,
+          'segments_revision':0,'segments_sha256':'b'*64,'duration_seconds':6.,
+          'segments':[{'text':'Una frase','start':1.,'end':4.}]}
+    source=source_binding(song)
+    receipts=[{'source':source,'clock':'original_mix_decoded','start':0.,'end':6.,
+               'evidence_sha256':str(i)*64,'family':family,'tool_status':'ok','received_audio':True}
+              for i,family in enumerate(('openai/whisper-1','google/gemini-2.5-flash-audio'))]
+    cached={'records':[{}],'receipts':receipts}
+    key=digest({'source':source,'method':'method','selector_revision':runner.SELECTOR_REVISION,
+                'reference':None,'receipts':[r['evidence_sha256'] for r in receipts]})
+    row={'job_id':'cached','source':source,'duration_seconds':6.,'windows':[],
+         'reconciliation_key':key,'reconciliation_complete':True,'status':'blocked',
+         'blocker':'audio_tool_invalid_response','failure_code':'IntegrityError'}
+    folder=tmp_path/'cached';folder.mkdir()
+    candidate={'source':source,'changes':[],'residual_qc':{}}
+    (folder/'candidate.json').write_text(json.dumps(candidate))
+    (folder/'review.json').write_text('{}')
+    monkeypatch.setattr(runner,'cached_receipts',lambda *a,**k:cached)
+    monkeypatch.setattr(runner,'usage_estimate',lambda *a:0.)
+    monkeypatch.setattr(runner,'reconcile',lambda *a,**k:(deepcopy(candidate),{}))
+    monkeypatch.setattr(runner,'prepare_batch_candidate',lambda *a,**k:{})
+    runner.process_song(tmp_path,tmp_path,{'method_sha256':'method'},row,song,[],[],None,
+                        'commit',paid_allowed=False)
+    assert row['status']=='complete' and row['blocker'] is None
+    assert 'failure_code' not in row
+
+
 def manifest():
     return {'campaign_id':'campaign','roster_sha256':'roster','method_sha256':'method',
         'snapshot_sha256':'snapshot','first_ten':['one'],'execution_order':['one','two'],
