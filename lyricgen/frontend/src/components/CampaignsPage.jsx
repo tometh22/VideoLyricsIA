@@ -21,6 +21,10 @@ function authHeaders(headers = {}) {
 async function api(path, options = {}) {
   const response = await fetch(`${API}${path}`, {
     ...options,
+    // Campaign state changes while the operator is in the editor. A cached
+    // GET can therefore show the song removed from the active filter while
+    // leaving the campaign counters at their previous value.
+    cache: options.cache || "no-store",
     headers: authHeaders(options.headers || {}),
   });
   const body = await response.json().catch(() => ({}));
@@ -128,6 +132,17 @@ function CampaignDetail({ id }) {
     } catch (e) { setError(e.message); }
   }, [id, page, phase, queueStage, queueOrder, queueVersion, queueState, queueBackground, queueArtist, queueAudit]);
   useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState === "visible") void load();
+    };
+    window.addEventListener("pageshow", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("pageshow", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [load]);
   useEffect(() => {
     if (!campaign || ["completed", "cancelled"].includes(campaign.status)) return undefined;
     const timer = window.setInterval(load, 10_000);
