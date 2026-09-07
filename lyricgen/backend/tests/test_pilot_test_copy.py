@@ -235,8 +235,31 @@ def test_copy_edits_stay_out_of_the_training_corpus():
         db.close()
 
 
+@pytest.fixture
+def pilot_client():
+    """A client that never runs the app lifespan.
+
+    Entering TestClient as a context manager starts the FastAPI startup hooks,
+    and with them the reaper daemon. Under random test ordering that daemon
+    then wins the advisory lock that tests/test_reaper.py needs, so booting the
+    app from here would make unrelated tests fail. These endpoint tests only
+    need routing and the database, both available without startup.
+    """
+    from fastapi.testclient import TestClient
+    from main import app
+    return TestClient(app)
+
+
+@pytest.fixture
+def pilot_admin_token(pilot_client):
+    response = pilot_client.post(
+        "/auth/login", json={"username": "admin", "password": "testadmin123"},
+    )
+    return response.json()["token"]
+
+
 def test_endpoint_creates_an_isolated_copy_and_refuses_a_copy_of_a_copy(
-    client, admin_token, monkeypatch,
+    pilot_client, pilot_admin_token, monkeypatch,
 ):
     monkeypatch.setenv("ENVIRONMENT", "staging")
     db = SessionLocal()
@@ -246,10 +269,10 @@ def test_endpoint_creates_an_isolated_copy_and_refuses_a_copy_of_a_copy(
         db.close()
     pilot_id = f"p{uuid.uuid4().hex[:8]}"
 
-    created = client.post(
+    created = pilot_client.post(
         "/pilot/test-copies",
         json={"source_job_id": source_job_id, "pilot_id": pilot_id},
-        headers=auth(admin_token),
+        headers=auth(pilot_admin_token),
     )
     assert created.status_code == 200, created.text
     payload = created.json()
@@ -277,16 +300,16 @@ def test_endpoint_creates_an_isolated_copy_and_refuses_a_copy_of_a_copy(
     finally:
         db.close()
 
-    again = client.post(
+    again = pilot_client.post(
         "/pilot/test-copies",
         json={"source_job_id": payload["job_id"], "pilot_id": pilot_id},
-        headers=auth(admin_token),
+        headers=auth(pilot_admin_token),
     )
     assert again.status_code == 400
 
 
 def test_endpoint_is_admin_only_and_refused_outside_test_environments(
-    client, admin_token, user_token, monkeypatch,
+    pilot_client, pilot_admin_token, monkeypatch,
 ):
     db = SessionLocal()
     try:
@@ -295,9 +318,22 @@ def test_endpoint_is_admin_only_and_refused_outside_test_environments(
         db.close()
     body = {"source_job_id": source_job_id, "pilot_id": "guardrail"}
 
+    db = SessionLocal()
+    try:
+        plain = create_user(
+            db, f"pilot_outsider_{uuid.uuid4().hex[:6]}", "testpass12345", None,
+            tenant_id="pilot_guard_tenant",
+        )
+        plain_name = plain.username
+    finally:
+        db.close()
+    plain_token = pilot_client.post(
+        "/auth/login", json={"username": plain_name, "password": "testpass12345"},
+    ).json()["token"]
+
     monkeypatch.setenv("ENVIRONMENT", "staging")
-    assert client.post("/pilot/test-copies", json=body, headers=auth(user_token)).status_code == 403
+    assert pilot_client.post("/pilot/test-copies", json=body, headers=auth(plain_token)).status_code == 403
 
     monkeypatch.setenv("ENVIRONMENT", "production")
     monkeypatch.delenv("RAILWAY_ENVIRONMENT_NAME", raising=False)
-    assert client.post("/pilot/test-copies", json=body, headers=auth(admin_token)).status_code == 403
+    assert pilot_client.post("/pilot/test-copies", json=body, headers=auth(pilot_admin_token)).status_code == 403
