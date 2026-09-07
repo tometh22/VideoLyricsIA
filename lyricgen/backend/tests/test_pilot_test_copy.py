@@ -9,7 +9,7 @@ import uuid
 import pytest
 
 from auth import create_user
-from database import AuditLog, EditorDocument, Job, SessionLocal
+from database import AuditLog, EditorDocument, EditorVersion, Job, SessionLocal
 from editor import (
     PILOT_AGENT_ROLE,
     actor_for,
@@ -337,3 +337,100 @@ def test_endpoint_is_admin_only_and_refused_outside_test_environments(
     monkeypatch.setenv("ENVIRONMENT", "production")
     monkeypatch.delenv("RAILWAY_ENVIRONMENT_NAME", raising=False)
     assert pilot_client.post("/pilot/test-copies", json=body, headers=auth(pilot_admin_token)).status_code == 403
+
+
+def _api_copy(pilot_client, pilot_admin_token, monkeypatch, tenant):
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    db = SessionLocal()
+    try:
+        _, source_job_id = _source_job(db, tenant=tenant)
+    finally:
+        db.close()
+    created = pilot_client.post(
+        "/pilot/test-copies",
+        json={"source_job_id": source_job_id, "pilot_id": f"p{uuid.uuid4().hex[:8]}"},
+        headers=auth(pilot_admin_token),
+    )
+    assert created.status_code == 200, created.text
+    return source_job_id, created.json()
+
+
+def test_a_pilot_copy_never_starts_paid_work(pilot_client, pilot_admin_token, monkeypatch):
+    """role="agent" alone proves nothing: the copy must be unable to spend."""
+    _, copy = _api_copy(pilot_client, pilot_admin_token, monkeypatch, "pilot_spend_tenant")
+    job_id = copy["job_id"]
+
+    generated = pilot_client.post(
+        "/generate",
+        data={"job_id": job_id, "segments_json": "[]"},
+        headers=auth(pilot_admin_token),
+    )
+    assert generated.status_code == 403, generated.text
+
+    retried = pilot_client.post(f"/retry/{job_id}", headers=auth(pilot_admin_token))
+    assert retried.status_code == 403, retried.text
+
+    varied = pilot_client.post(
+        f"/jobs/{job_id}/variant", json={"concept": "x"}, headers=auth(pilot_admin_token),
+    )
+    assert varied.status_code == 403, varied.text
+
+    db = SessionLocal()
+    try:
+        row = db.query(Job).filter(Job.job_id == job_id).one()
+        assert row.status == "transcribed_pending"
+        assert row.video_url is None and row.s3_keys is None
+    finally:
+        db.close()
+
+
+def test_lock_keeps_agents_and_humans_on_their_own_side(
+    pilot_client, pilot_admin_token, monkeypatch,
+):
+    """An agent holding a lock on a real song would block the human reviewer."""
+    source_job_id, copy = _api_copy(
+        pilot_client, pilot_admin_token, monkeypatch, "pilot_lock_tenant",
+    )
+    # The admin is a human: it may lock the real song, never the pilot copy.
+    assert pilot_client.post(
+        f"/editor/{source_job_id}/lock", headers=auth(pilot_admin_token),
+    ).status_code == 200
+    blocked = pilot_client.post(
+        f"/editor/{copy['job_id']}/lock", headers=auth(pilot_admin_token),
+    )
+    assert blocked.status_code == 403
+    assert "agent" in blocked.json()["detail"]
+
+    db = SessionLocal()
+    try:
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == copy["job_id"],
+        ).one()
+        assert document.lock_user_id is None
+    finally:
+        db.close()
+
+
+def test_learning_exclusion_does_not_rest_on_the_role_alone(
+    pilot_client, pilot_admin_token, monkeypatch,
+):
+    """Three independent barriers, each checked against the stored row."""
+    _, copy = _api_copy(pilot_client, pilot_admin_token, monkeypatch, "pilot_learn_tenant")
+    db = SessionLocal()
+    try:
+        row = db.query(Job).filter(Job.job_id == copy["job_id"]).one()
+        # 1. learning_triggers filters machine_snapshot_required.is_(True), and
+        #    _record_training_delta / persist_training_draft read the same flag.
+        assert row.machine_snapshot_required is False
+        # 2. record_correction_observation requires an approved EditorVersion,
+        #    and approval is refused on every path for a pilot copy.
+        assert row.approved_at is None and row.approved_by is None
+        assert not db.query(EditorVersion).filter(
+            EditorVersion.job_id == row.job_id,
+            EditorVersion.is_approved.is_(True),
+        ).count()
+        # 3. no campaign item, so no reviewer queue or candidate registry flow.
+        assert row.campaign_id is None and row.campaign_item_id is None
+    finally:
+        db.close()
+

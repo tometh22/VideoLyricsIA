@@ -123,6 +123,7 @@ from editor import (
     record_quality_observation,
     revoke_quality_proposal_if_disabled,
     PILOT_AGENT_ROLE,
+    assert_pilot_actor,
 )
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import (run_pipeline, transcribe, _normalize_movement_style,
@@ -10383,6 +10384,13 @@ async def generate_with_segments(
         # (bug real, staging 2026-08-19: found=True tenant_match=False).
         _is_admin_cross_tenant = bool(job_row and not _tenant_match
                                        and current_user.get("role") == "admin")
+        if job_row is not None and job_row.pilot_id:
+            # A pilot copy exists to be edited and read back, never rendered.
+            # Blocking here covers the money and the deliverables at once.
+            raise HTTPException(
+                status_code=403,
+                detail="Una copia de piloto no genera fondos ni videos.",
+            )
         if not job_row or (not _tenant_match and not _is_admin_cross_tenant):
             # Do not expose whether a foreign job exists, but leave enough
             # forensic signal to distinguish a reaped temporary job from a
@@ -14068,7 +14076,14 @@ async def editor_lock(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _, document = _editor_document_or_404(db, job_id, current_user)
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    # Taking a lock is not a write, but an agent holding one on a real song
+    # would block the human reviewer, and a human holding one on a pilot copy
+    # would make its authorship ambiguous.
+    try:
+        assert_pilot_actor(db, job, current_user["id"])
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from None
     result = acquire_lock(
         db, document, current_user["id"], session_id=x_editor_session,
     )
@@ -17010,6 +17025,10 @@ async def retry_job(
     if current_user.get("role") != "admin":
         _retry_q = _retry_q.filter(JobModel.tenant_id == current_user["tenant_id"])
     job = _retry_q.first()
+    if job is not None and job.pilot_id:
+        raise HTTPException(
+            status_code=403, detail="Una copia de piloto no se re-renderiza.",
+        )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _audit_cross_tenant_access(db, current_user, job, "retry")
@@ -17677,6 +17696,10 @@ async def create_variant(
     parent = _parent_q.first()
     if not parent:
         raise HTTPException(status_code=404, detail="Parent job not found")
+    if parent.pilot_id:
+        raise HTTPException(
+            status_code=403, detail="Una copia de piloto no es base de variantes.",
+        )
 
     _is_cross_tenant_admin = (
         current_user.get("role") == "admin"
