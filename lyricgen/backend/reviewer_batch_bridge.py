@@ -146,6 +146,12 @@ def publish_batch_candidate(db, song, candidate, review):
         "segments_revision": document.revision, "audio_revision": job.audio_revision,
         "audio_sha256": job.input_audio_sha256,
         "segments_sha256": digest(document.current_segments or [])}
+    # Candidate payloads may come from an untrusted cache and must not carry
+    # the ownership receipt used to distinguish verified migrations from human
+    # edits. Recompute it from the locked editor history before validation so
+    # the preparation path sees the same source of truth as persistence.
+    from reviewer_edit_provenance import from_database
+    live["edit_provenance"] = from_database(db, live)
     prepared = prepare_batch_candidate(live, candidate, review,
         original_segments=document.original_segments or [],
         allowed_suggestion_types=tuple(k for k in ("text", "timing")
