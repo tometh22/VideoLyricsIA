@@ -1773,6 +1773,20 @@ export default function App() {
   const registerCampaignReviewSafeExit = useCallback((handler) => {
     campaignReviewSafeExitRef.current = typeof handler === "function" ? handler : null;
   }, []);
+  // Campaign review links carry a durable return target so the editor's own
+  // back action and the browser back action land on the exact queue context
+  // (tab, search, filters, order, page and focus), rather than the legacy
+  // admin queue. Only campaign paths are accepted; arbitrary URLs never
+  // become an open redirect.
+  const campaignReturnPath = useMemo(() => {
+    const candidate = new URLSearchParams(location.search).get("return_to");
+    return candidate && candidate.startsWith("/campaigns/") ? candidate : null;
+  }, [location.search]);
+  const withCampaignReturn = useCallback((path) => {
+    if (!campaignReturnPath || !String(path || "").startsWith("/review/")) return path;
+    const separator = String(path).includes("?") ? "&" : "?";
+    return `${path}${separator}return_to=${encodeURIComponent(campaignReturnPath)}`;
+  }, [campaignReturnPath]);
   const retryTranscriptionReviewAudio = useCallback(async (jobId, { reason = "initial", preferOriginal = false } = {}) => {
     if (!jobId) return;
     const preventive = reason === "signed_url_expiring";
@@ -1983,9 +1997,10 @@ export default function App() {
     const jobId = currentReview?.transcribeJobId;
     if (!jobId || wizardStage !== "review") return;
     if (location.pathname !== "/new" && !location.pathname.startsWith("/review")) return;
-    const target = reviewJobPath(jobId);
-    if (location.pathname !== target) navigate(target, { replace: true });
-  }, [currentReview?.transcribeJobId, location.pathname, navigate, wizardStage]);
+    const targetPath = reviewJobPath(jobId);
+    const target = `${targetPath}${location.pathname.startsWith("/review") ? location.search : ""}`;
+    if (location.pathname !== targetPath) navigate(target, { replace: true });
+  }, [currentReview?.transcribeJobId, location.pathname, location.search, navigate, wizardStage]);
 
   const [jobs, setJobs] = useState([]);
   // Pre-fetched transcription results for batch review songs 1..N-1.
@@ -5584,8 +5599,8 @@ export default function App() {
     setCurrentReview(null);
     wizardPersistence.clear();
     if (review) segmentsStore.evict(reviewStoreKey(review));
-    navigate("/admin/cola");
-  }, [currentReview, navigate]);
+    navigate(campaignReturnPath || "/admin/cola");
+  }, [campaignReturnPath, currentReview, navigate]);
 
   const handleCampaignReviewNext = useCallback(async () => {
     const review = currentReview;
@@ -5593,15 +5608,24 @@ export default function App() {
       await handleCampaignReviewExit();
       return;
     }
-    let nextPath = "/admin/cola";
+    let nextPath = campaignReturnPath || "/admin/cola";
+    const returnParams = campaignReturnPath
+      ? new URL(campaignReturnPath, window.location.origin).searchParams
+      : null;
     try {
+      const nextQuery = new URLSearchParams({ stage: "lyrics" });
+      if (review.transcribeJobId) nextQuery.set("skip_job_id", review.transcribeJobId);
+      if (returnParams?.get("q")) nextQuery.set("search", returnParams.get("q"));
+      if (returnParams?.get("version")) nextQuery.set("version", returnParams.get("version"));
+      if (returnParams?.get("artist")) nextQuery.set("artist", returnParams.get("artist"));
+      if (returnParams?.get("mine") === "1") nextQuery.set("reviewed_by", "me");
       const response = await authFetch(
-        `${API}/batch/campaigns/${review.campaignId}/review-queue/next?stage=lyrics&skip_job_id=${encodeURIComponent(review.transcribeJobId)}`,
+        `${API}/batch/campaigns/${review.campaignId}/review-queue/next?${nextQuery.toString()}`,
         { method: "POST", headers: editorSessionHeaders() },
       );
       const payload = await response.json().catch(() => ({}));
       if (response.ok && payload.job_id) {
-        nextPath = payload.open_path || reviewJobPath(payload.job_id);
+        nextPath = withCampaignReturn(payload.open_path || reviewJobPath(payload.job_id));
       }
     } catch { /* leave through the queue; the current draft is already saved */ }
     try {
@@ -5614,7 +5638,7 @@ export default function App() {
     wizardPersistence.clear();
     segmentsStore.evict(reviewStoreKey(review));
     navigate(nextPath);
-  }, [currentReview, handleCampaignReviewExit, navigate]);
+  }, [campaignReturnPath, currentReview, handleCampaignReviewExit, navigate, withCampaignReturn]);
 
   // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary

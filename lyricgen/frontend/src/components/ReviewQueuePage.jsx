@@ -6,7 +6,7 @@ const API = import.meta.env.VITE_API_URL || "";
 const STATE_LABELS = {
   pending: "Pendiente",
   processing: "Procesando",
-  ready: "Lista",
+  ready: "Sin revisar",
   reviewing: "En revisión",
   approved: "Aprobada",
   failed: "Fallida",
@@ -78,11 +78,11 @@ export default function ReviewQueuePage() {
         || (campaigns.items || [])[0];
       if (!current) throw new Error("No hay una campaña activa.");
       const firstPage = await api(
-        `/batch/campaigns/${current.id}/review-queue?stage=lyrics&order=delivery&scope=${scope}&limit=100`,
+        `/batch/campaigns/${current.id}/review-queue?stage=lyrics&order=effort&scope=${scope}&limit=100`,
       );
       const remainingPages = await Promise.all(
         Array.from({ length: Math.max(0, Number(firstPage.pages || 1) - 1) }, (_, index) => (
-          api(`/batch/campaigns/${current.id}/review-queue?stage=lyrics&order=delivery&scope=${scope}&limit=100&page=${index + 2}`)
+          api(`/batch/campaigns/${current.id}/review-queue?stage=lyrics&order=effort&scope=${scope}&limit=100&page=${index + 2}`)
         )),
       );
       const data = {

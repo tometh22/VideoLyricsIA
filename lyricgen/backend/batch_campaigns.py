@@ -780,6 +780,10 @@ def claim_next_review(
     x_editor_session: str | None = Header(default=None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    search: str | None = None,
+    version: str | None = None,
+    artist: str | None = None,
+    reviewed_by: str | None = None,
 ):
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
@@ -817,6 +821,38 @@ def claim_next_review(
             EditorDocument.lock_expires_at <= now,
         ),
     ).all()
+    normalized_search = str(search or "").strip().lower()
+    normalized_artist = str(artist or "").strip().lower()
+    if normalized_search:
+        candidate_pairs = [
+            pair for pair in candidate_pairs
+            if normalized_search in " ".join(
+                str(value or "").lower()
+                for value in (pair[0].song_title, pair[0].artist, pair[1].title, pair[1].artist)
+            )
+        ]
+    if normalized_artist:
+        candidate_pairs = [
+            pair for pair in candidate_pairs
+            if normalized_artist in str(pair[1].artist or pair[0].artist or "").lower()
+        ]
+    if version in {"studio", "live"}:
+        candidate_pairs = [
+            pair for pair in candidate_pairs
+            if ("live" in f"{pair[1].title or ''} {pair[1].filename or ''}".lower()
+                or "en vivo" in f"{pair[1].title or ''} {pair[1].filename or ''}".lower()) == (version == "live")
+        ]
+    if reviewed_by == "me":
+        mine_ids = {
+            row.job_id for row in db.query(EditorDocument).filter(
+                EditorDocument.job_id.in_([job.job_id for job, _item in candidate_pairs]),
+                or_(
+                    EditorDocument.updated_by == current_user["id"],
+                    EditorDocument.lock_user_id == current_user["id"],
+                ),
+            ).all()
+        }
+        candidate_pairs = [pair for pair in candidate_pairs if pair[0].job_id in mine_ids]
     verdicts = _latest_semaforo_verdicts(
         db, [job.job_id for job, _item in candidate_pairs],
     )
@@ -1434,12 +1470,14 @@ def _review_reference_links(overrides: dict[str, Any]) -> list[dict[str, str]]:
 def review_queue(
     campaign_id: str,
     stage: str = Query(default="lyrics", pattern="^(lyrics|final)$"),
-    order: str = Query(default="delivery", pattern="^(delivery|learning)$"),
+    order: str = Query(default="effort", pattern="^(delivery|effort|learning)$"),
     scope: str = Query(default="pending", pattern="^(pending|approved|all)$"),
     state: str | None = None,
     version: str | None = Query(default=None, pattern="^(studio|live)$"),
     background_mode: str | None = None,
     artist: str | None = None,
+    search: str | None = None,
+    reviewed_by: str | None = Query(default=None, pattern="^(me|all)$"),
     audit_preapproved: bool = False,
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=50, ge=1, le=100),
@@ -1456,6 +1494,7 @@ def review_queue(
         row.job_id: row for row in db.query(EditorDocument).options(load_only(
             EditorDocument.job_id, EditorDocument.revision, EditorDocument.current_segments,
             EditorDocument.lock_user_id, EditorDocument.lock_expires_at,
+            EditorDocument.updated_by, EditorDocument.updated_at,
         )).filter(
             EditorDocument.job_id.in_(job_ids)
         ).all()
@@ -1466,6 +1505,14 @@ def review_queue(
         int(row.lock_user_id) for row in documents.values()
         if row.lock_user_id is not None
     }
+    reviewer_ids.update(
+        int(row.updated_by) for row in documents.values()
+        if row.updated_by is not None
+    )
+    reviewer_ids.update(
+        int(job.approved_by) for _item, job in pairs
+        if job is not None and job.approved_by is not None
+    )
     reviewers = {
         row.id: (row.full_name or row.username or row.email or f"user-{row.id}")
         for row in db.query(User).filter(User.id.in_(reviewer_ids)).all()
@@ -1506,6 +1553,20 @@ def review_queue(
             continue
         if artist and artist.lower() not in str(item.artist or "").lower():
             continue
+        normalized_search = str(search or "").strip().lower()
+        if normalized_search and normalized_search not in " ".join(
+            str(value or "").lower()
+            for value in (item.title, item.artist, item.filename, job.song_title if job else "", job.artist if job else "")
+        ):
+            continue
+        if reviewed_by == "me":
+            if effective_scope == "approved":
+                if not job or job.approved_by != current_user.get("id"):
+                    continue
+            elif not document or current_user.get("id") not in {
+                document.updated_by, document.lock_user_id,
+            }:
+                continue
         verdict = verdicts.get(job.job_id, {}) if job else {}
         color = str(verdict.get("color") or "red").lower()
         color_rank = {"green": 0, "yellow": 1, "red": 2}.get(color, 2)
@@ -1568,6 +1629,25 @@ def review_queue(
             "reviewer_name": (
                 reviewers.get(document.lock_user_id) if document else None
             ),
+            "reviewer_is_current_user": bool(
+                document and document.lock_user_id == current_user.get("id")
+            ),
+            "reviewer_lock_active": bool(
+                document and document.lock_user_id is not None
+                and _aware(document.lock_expires_at) and _aware(document.lock_expires_at) > _now()
+            ),
+            "last_reviewed_by": document.updated_by if document else None,
+            "last_reviewed_name": reviewers.get(document.updated_by) if document else None,
+            "last_reviewed_at": document.updated_at.isoformat() if document and document.updated_at else None,
+            "resume_available": bool(
+                queue_state in _PENDING_REVIEW_STATES and document
+                and document.updated_by == current_user.get("id")
+            ),
+            "approval": {
+                "user_id": job.approved_by if job else None,
+                "name": reviewers.get(job.approved_by) if job and job.approved_by else None,
+                "at": job.approved_at.isoformat() if job and job.approved_at else None,
+            },
             "priority": "",
             "semaforo": verdict.get("color") if confidence_gate_passed else None,
             "semaforo_hidden": not confidence_gate_passed,
@@ -1679,7 +1759,7 @@ def review_queue(
         "campaign_id": campaign.id,
         "stage": stage,
         "reviewer_campaign_status": reviewer_summary,
-        "order": order,
+        "order": "effort" if order == "delivery" else order,
         "scope": {
             "key": effective_scope if state not in _ALL_REVIEW_STATES else "state",
             "label": {
@@ -1725,6 +1805,10 @@ def claim_next_stage_review(
     campaign_id: str,
     stage: str = Query(default="lyrics", pattern="^(lyrics|final)$"),
     skip_job_id: str | None = Query(default=None, min_length=12, max_length=12),
+    search: str | None = None,
+    version: str | None = Query(default=None, pattern="^(studio|live)$"),
+    artist: str | None = None,
+    reviewed_by: str | None = Query(default=None, pattern="^(me|all)$"),
     x_editor_session: str | None = Header(default=None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1736,6 +1820,10 @@ def claim_next_stage_review(
             x_editor_session,
             current_user,
             db,
+            search=search,
+            version=version,
+            artist=artist,
+            reviewed_by=reviewed_by,
         )
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
