@@ -342,6 +342,27 @@ def test_acoustic_context_reads_structural_events_without_text():
     assert "text" not in json.dumps(features)
 
 
+def test_operational_campaign_observation_is_idempotent_and_never_automatic_gold(db, monkeypatch):
+    monkeypatch.setenv('QUALITY_LEARNING_HMAC_KEY', STRONG_TEST_HMAC_KEY)
+    user, job = _job(db)
+    original = [{'_id':0, 'start':0., 'end':1., 'text':'Canto'}]
+    document = ensure_document(db, job.job_id, job.tenant_id, original,
+        initial_reason='transcription', initial_provenance=machine_snapshot_provenance(job, job.transcription_quality))
+    document, _, _ = save_document(db, job, document, user.id, 0,
+        [{**original[0], 'end':1.0001}], 'manual')
+    _, approved = approve_document(db, job, user.id, editor_revision=document.revision)
+    row = create_observation(db, job.job_id, approved.id, source_confidence='operational_review')
+    again = create_observation(db, job.job_id, approved.id, source_confidence='operational_review')
+    assert row.id == again.id
+    assert row.label_tier == 'observed'
+    history = row.metrics['operational_history']
+    assert history['events'][0]['delta_seconds']['end'] == .0001
+    assert not history['clean_gold'] and not history['automatic_training_allowed']
+    row.matures_at = now_utc()-timedelta(seconds=1)
+    db.flush(); mature_observations(db)
+    assert row.label_tier == 'observed'
+
+
 def test_observation_uses_exact_machine_snapshot_and_invalidates_after_edit(db, monkeypatch):
     monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY", STRONG_TEST_HMAC_KEY)
     user, job = _job(db)

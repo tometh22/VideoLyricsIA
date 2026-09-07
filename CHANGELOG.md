@@ -3,6 +3,23 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.3] - 2026-09-06
+
+### Fixed
+
+- Approval validates real overlaps without silently imposing a 50 ms gap or
+  modifying saved endpoints, including protected lines. Remove the remaining
+  mount-time text-length trim outside campaign mode; trimming is explicit only.
+- Reconstruct line ownership from contiguous editor history and exact replay
+  of audited hold/punctuation migrations. Unknown provenance, human edits,
+  locks and approved songs remain protected; publication verifies live history.
+- Persist campaign correction-capture intent atomically with approval through
+  the existing outbox and idempotent learning queue. Operational observations
+  retain version/audio/exposure evidence and distinguish structural changes,
+  automatic migrations and endpoint candidates, without training or gold promotion.
+- Ignore only four-decimal persistence-equivalent timing noise. Show auxiliary
+  reference discrepancies in candidate doubts; preflight PASS is not certification.
+
 ## [1.1.2] - 2026-09-06
 
 ### Fixed

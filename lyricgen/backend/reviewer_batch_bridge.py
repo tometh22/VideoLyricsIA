@@ -82,8 +82,12 @@ def prepare_batch_candidate(song, candidate, review, *, original_segments=None,
     for change in rebuilt["changes"]:
         row = song["segments"][change["line_index"]]
         kind = "text" if change["field"] == "text" else "timing"
+        from reviewer_edit_provenance import protected
+        verified = protected(song, change['line_index'])
+        human_changed = (verified if verified is not None else
+            original_keys is not None and content_key(row) not in original_keys)
         if (kind not in allowed_suggestion_types
-                or original_keys is not None and content_key(row) not in original_keys):
+                or human_changed):
             held.add(change["evidence_id"])
     backed_ids = {change["evidence_id"] for change in rebuilt["changes"]}
     decisions = [d for d in candidate.get("decision_evidence", [])

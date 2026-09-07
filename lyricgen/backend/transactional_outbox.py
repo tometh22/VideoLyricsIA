@@ -229,6 +229,13 @@ def _publish(
     transcription_publisher: Callable[..., str | None] | None = None,
 ) -> str | None:
     payload = dict(event.payload or {})
+    if event.event_type == "correction.enqueue":
+        from queue_jobs import enqueue_correction_learning
+        rq_id = enqueue_correction_learning(event.job_id, str(payload['approved_version_id']),
+                                            source_confidence='operational_review')
+        if str(rq_id).startswith('disabled:'):
+            raise OutboxDeliveryError('correction_capture_disabled', retryable=False)
+        return rq_id
     if event.event_type == "edit.enqueue":
         if edit_publisher is None:
             from queue_jobs import enqueue_edit as edit_publisher

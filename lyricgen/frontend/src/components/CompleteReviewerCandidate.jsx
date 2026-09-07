@@ -42,6 +42,7 @@ export default function CompleteReviewerCandidate({ candidate, currentRevision, 
       : "Sin cambios respaldados; no certifica exactitud."} Esta vista no modifica ni aprueba la canción.</p>
     <p className="text-xs text-gray-400">Escuchá con contexto: la reproducción continúa después de la frase.</p>
     <p className="text-xs text-gray-400">Las líneas conservadas y los finales sin reparación no están certificados.</p>
+    <p className="text-xs text-gray-400">Preflight comprueba reglas concretas; un PASS no certifica toda la ortografía ni la letra.</p>
     <details className="mt-3"><summary>Ver letra y timing de toda la candidata ({rows.length} líneas)</summary>
       <ol className="mt-2 space-y-2">{rows.map((row, i) => <li key={i} className="rounded bg-white/5 p-2">
         <button type="button" onClick={() => seek(row)} aria-label={`Escuchar línea ${i + 1}`}
@@ -59,6 +60,9 @@ export default function CompleteReviewerCandidate({ candidate, currentRevision, 
         <button type="button" className="mr-2 text-cyan-300" onClick={() => seek(row)}>Escuchar duda {i + 1}</button>
         {row.line_index != null ? `Línea ${row.line_index + 1}: ` : ""}
         {doubtLabel(row)}
+        {(row.proposed_text || row.text) && <p className="ml-2 text-amber-200">
+          Referencia auxiliar: {row.proposed_text || row.text} · Sugerencia pendiente, verificar contra el audio; no se aplica sola.
+        </p>}
       </li>)}</ul>
       {(details.uncovered_singing_hypotheses || []).map((row, i) => <p key={`outside-${i}`} className="mt-2 text-sm">
         <button type="button" className="mr-2 text-cyan-300" onClick={() => seek(row)}>Escuchar posible voz sin cartel {i + 1}</button>

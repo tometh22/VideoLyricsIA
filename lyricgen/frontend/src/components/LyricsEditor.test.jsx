@@ -501,19 +501,12 @@ describe("LyricsEditor — advanced shell and timing safety", () => {
 
     const kept = screen.getByDisplayValue("kept");
     expect(kept).toBeInTheDocument();
+    await userEvent.type(kept, " edited");
     await userEvent.click(screen.getByRole("button", { name: /Aprobar/i }));
 
-    expect(onApprove).toHaveBeenCalledOnce();
-    const approved = onApprove.mock.calls[0][0];
-    expect(approved).toHaveLength(2);
-    approved.forEach((segment) => {
-      expect(Number.isFinite(segment.start)).toBe(true);
-      expect(Number.isFinite(segment.end)).toBe(true);
-    });
-    expect(approved[0].start).toBe(0);
-    expect(approved[0].end).toBeGreaterThanOrEqual(0.3);
-    expect(approved[1].start).toBe(0);
-    expect(approved[1].end).toBeGreaterThan(approved[1].start);
+    // Invalid timestamps were sanitized into overlapping drafts. Keep saving
+    // them for recovery, but do not silently repair them during approval.
+    expect(onApprove).not.toHaveBeenCalled();
 
     window.dispatchEvent(new Event("pagehide"));
     expect(onPersistSegments).toHaveBeenCalled();
@@ -526,6 +519,20 @@ describe("LyricsEditor — advanced shell and timing safety", () => {
 });
 
 describe("LyricsEditor — aprobación con advertencia de tipografía", () => {
+  it("aprueba los dos bordes históricos sin quitar 40 ms ni cambiar locked", async () => {
+    const onApprove = vi.fn();
+    const rows = [{ start:90.2229, end:95.23, text:"Primera", locked:true },
+      { start:95.24, end:97.42, text:"Siguiente" },
+      { start:159.86, end:162.83, text:"Otra" },
+      { start:162.84, end:164.8958, text:"Final" }];
+    render(<LyricsEditor {...baseProps({ segments:rows, onApprove, disableAutoSplit:true })} />);
+    await userEvent.click(screen.getByRole("button", { name:/Aprobar y generar/i }));
+    expect(onApprove).toHaveBeenCalledOnce();
+    const sent=onApprove.mock.calls[0][0];
+    expect(sent[0].end).toBe(95.23);
+    expect(sent[2].end).toBe(162.83);
+    expect(sent[0].locked).toBe(true);
+  });
   const oversizedLine = Array.from({ length: 80 }, () => "palabra").join(" ");
 
   it("muestra la decisión en un diálogo visible y permite aprobar igualmente", async () => {

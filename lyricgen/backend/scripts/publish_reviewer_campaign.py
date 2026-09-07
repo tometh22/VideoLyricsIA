@@ -20,7 +20,7 @@ def build_bundle(root, snapshot_path, output):
     manifest = json.loads((root / "campaign-300" / "manifest.json").read_text())
     snapshot = json.loads(snapshot_path.read_text())
     keys = {"job_id", "audio_sha256", "audio_revision", "segments_revision", "segments_sha256",
-            "segments", "original_segments", "duration_seconds"}
+            "segments", "original_segments", "duration_seconds", "edit_provenance", "status", "approved_at"}
     songs = [{k: s[k] for k in keys if k in s} for s in snapshot["jobs"]]
     artifacts = {}
     for row in manifest["songs"]:

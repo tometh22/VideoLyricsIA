@@ -7,6 +7,7 @@ import json
 import uuid
 import hashlib
 import os
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -1009,6 +1010,17 @@ def persist_operator_review_proposal_if_current(
         _segment_key(dict(item))
         for item in (document.original_segments or []) if isinstance(item, dict)
     }
+    if proposal.get('reviewer_assist'):
+        from reviewer_edit_provenance import from_database
+        from shadow_reference_import import digest
+        current_rows = list(document.current_segments or [])
+        receipt = from_database(db, {'job_id':job_id, 'segments':current_rows,
+            'segments_revision':document.revision, 'segments_sha256':digest(current_rows),
+            'audio_sha256':job.input_audio_sha256, 'audio_revision':job.audio_revision,
+            'status':job.status, 'approved_at':job.approved_at})
+        denied = {_segment_key(current_rows[r['line_index']]) for r in receipt['lines'] if r['protected']}
+        original_keys = {_segment_key(current_rows[r['line_index']]) for r in receipt['lines']
+                         if not r['protected']} - denied
     eligible_windows = []
     for window in proposal.get("windows") or []:
         if not isinstance(window, dict):
@@ -1731,7 +1743,7 @@ def save_document(
         # Same transaction as save; capture submitted timings before any
         # normalization, without adding forms or asserting line-level intent.
         capture['normalization_changed_timing'] = any(
-            a.get('start') != b.get('start') or a.get('end') != b.get('end')
+            any(round(float(a.get(k, 0)), 4) != round(float(b.get(k, 0)), 4) for k in ('start', 'end'))
             for a, b in zip(segments, normalized))
         db.add(AuditLog(user_id=user_id, action='lyrics.prospective_timing', detail=capture))
     document.current_segments = normalized
@@ -1932,6 +1944,23 @@ def resolve_conflict(
     )
 
 
+def validate_approval_snapshot(segments):
+    """No normalisation/repair here: the saved revision is the contract."""
+    if not segments:
+        raise ValueError("approval_requires_nonempty_lyrics")
+    ordered = []
+    for index, row in enumerate(segments):
+        start, end = row.get('start'), row.get('end')
+        if (not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (start, end))
+                or start < 0 or end <= start or not str(row.get('text') or '').strip()):
+            raise ValueError(f"approval_invalid_line:{index + 1}")
+        ordered.append((round(start, 4), round(end, 4), index))
+    ordered.sort()
+    for left, right in zip(ordered, ordered[1:]):
+        if left[1] > right[0]:
+            raise ValueError(f"approval_overlap_requires_explicit_edit:{left[2] + 1}:{right[2] + 1}")
+
+
 def approve_document(
     db: Session,
     job: Job,
@@ -1953,10 +1982,15 @@ def approve_document(
         .with_for_update()
         .one()
     )
-    document = get_or_create_document(
-        db, job.job_id, job.tenant_id, job.segments_json or [],
-    )
+    # Existing persisted documents must not pass through migration/healing on
+    # approval. Conflicts are explicit; opening/normalizing is not approval.
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == job.job_id, EditorDocument.tenant_id == job.tenant_id,
+    ).populate_existing().with_for_update().first()
+    if document is None:
+        document = get_or_create_document(db, job.job_id, job.tenant_id, job.segments_json or [])
     require_machine_snapshot(job, document)
+    validate_approval_snapshot(document.current_segments)
     selected = None
     selected_is_equivalent_current = False
     if editor_version_id:
@@ -1984,7 +2018,7 @@ def approve_document(
     if version.reason != "transcription":
         version.reason = "approve"
     freeze_approval_training_evidence(job, version)
-    job.segments_json = normalize_segments(document.current_segments)
+    job.segments_json = deepcopy(document.current_segments)
     job.segments_revision = document.revision
     db.flush()
     return document, version

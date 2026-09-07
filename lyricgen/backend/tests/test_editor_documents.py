@@ -1471,6 +1471,39 @@ def test_transaction_rollback_never_leaves_partial_editor_state():
         verify.close()
 
 
+def test_approval_preserves_historical_forty_ms_edges_including_locked():
+    from copy import deepcopy
+    first, _, job_id = _users_and_job('approval_no_implicit_trim')
+    rows = [
+        {'_id': 18, 'start': 90.2229, 'end': 95.23, 'text': 'Primera', 'locked': True},
+        {'_id': 19, 'start': 95.24, 'end': 97.42, 'text': 'Siguiente'},
+        {'_id': 26, 'start': 159.86, 'end': 162.83, 'text': 'Otra'},
+        {'_id': 27, 'start': 162.84, 'end': 164.8958, 'text': 'Final'},
+    ]
+    with SessionLocal() as db:
+        job = db.query(Job).filter_by(job_id=job_id).one()
+        document = db.query(EditorDocument).filter_by(job_id=job_id).one()
+        document, version, _ = save_document(db, job, document, first.id, 0, rows, 'manual')
+        db.commit()
+        before = deepcopy(document.current_segments)
+        approved, frozen = approve_document(db, job, first.id, editor_revision=version.revision, editor_version_id=version.id)
+        db.commit()
+        assert before == approved.current_segments == frozen.segments == job.segments_json
+        assert [r['end'] for r in frozen.segments][::2] == [95.23, 162.83]
+        assert frozen.segments[0]['locked'] is True
+
+
+def test_approval_overlap_validation_does_not_mutate_input():
+    from copy import deepcopy
+    from editor import validate_approval_snapshot
+    rows = [{'start': 1., 'end': 3., 'text': 'one', 'locked': True},
+            {'start': 2., 'end': 4., 'text': 'two'}]
+    before = deepcopy(rows)
+    with pytest.raises(ValueError, match='approval_overlap_requires_explicit_edit'):
+        validate_approval_snapshot(rows)
+    assert rows == before
+
+
 def test_approval_requires_the_current_exact_snapshot():
     first, _, job_id = _users_and_job("editor_approval")
     db = SessionLocal()

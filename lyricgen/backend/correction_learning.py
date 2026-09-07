@@ -633,6 +633,7 @@ def create_observation(db: Any, job_id: str, approved_version_id: str,
     )
     from evidence_attestation import lyric_snapshot_hash
 
+    operational_capture = source_confidence == 'operational_review'
     secret = os.environ.get("QUALITY_LEARNING_HMAC_KEY", "").strip()
     if strong_hmac_secret_bytes(secret) is None:
         raise RuntimeError("quality_learning_hmac_key_missing_or_weak")
@@ -730,6 +731,32 @@ def create_observation(db: Any, job_id: str, approved_version_id: str,
         db.flush()
         return existing
     delta = classify_corrections(original, approved, secret=secret)
+    operational = None
+    if operational_capture:
+        from reviewer_correction_history import summarize
+        from database import AuditLog, ProductEvent
+        operational = summarize([{'revision':v.revision, 'reason':v.reason,
+            'segments':v.segments, 'provenance':v.provenance, 'created_by':v.created_by}
+            for v in original_versions if v.revision <= version.revision])
+        # Preserve the exact version/audio and exposure receipts. Viewing is
+        # not acceptance; absence of an event does not establish blindness.
+        operational['audio_content_hmac'] = hmac_identifier('audio', job.input_audio_sha256)
+        operational['audio_revision'] = job.audio_revision
+        operational['approved_version_id'] = version.id
+        operational['ai_exposure_status'] = 'not_assumed_blind'
+        from shadow_reference_import import digest
+        operational['approval_provenance_sha256'] = digest(version.provenance or {})
+        for event in operational['events']:
+            event['actor_hmac'] = hmac_identifier('operator', event.pop('actor_user_id', None))
+        operational['ai_event_ids'] = [a.id for a in db.query(AuditLog).filter(
+            AuditLog.action.like('%reviewer%'),
+            AuditLog.detail['job_id'].as_string() == job_id).all()]
+        operational['ai_product_events'] = [
+            {'id': e.id, 'name': e.name, 'occurred_at': e.occurred_at.isoformat() if e.occurred_at else None,
+             'properties': e.properties}
+            for e in db.query(ProductEvent).filter(ProductEvent.job_id == job_id,
+                ProductEvent.name.in_(['editor_operator_suggestions_shown',
+                    'editor_operator_suggestion_decision', 'editor_reviewer_candidate'])).all()]
     moment = now_utc()
     # A later approval supersedes every previous active label for this job.
     for stale in db.query(CorrectionObservation).filter(
@@ -794,6 +821,7 @@ def create_observation(db: Any, job_id: str, approved_version_id: str,
         features=privacy_safe_features(job),
         metrics={
             **delta["metrics"], "alignment_counts": delta["alignment_counts"],
+            **({'operational_history': operational} if operational is not None else {}),
             "operator_time_source": (
                 "server_product_events_v1"
                 if active_edit_source == "server_product_events_v1"

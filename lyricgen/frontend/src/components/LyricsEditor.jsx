@@ -9,6 +9,7 @@ import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { tierForLength } from "../lib/lyricTiers";
+import { approvalConflict } from "../lib/approvalSnapshot";
 import { resolveLegacyDraft } from "../lib/reviewRecovery";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
@@ -1264,13 +1265,6 @@ export default function LyricsEditor({
   // original real; fallback a `edited` para el path jobId-less/local (donde
   // el primer mount `original` === `edited` de todos modos).
   const originalSegmentsRef = useRef(segmentsStore.getOriginal(_storeKey) ?? edited);
-  // Operator feedback 2026-05-25 (UMG): "Debería hacerlo solo, no
-  // preguntarme" — the auto-trim banner ("Recortar N líneas con texto
-  // colgado · Aplicar") was friction. Detection is reliable enough to
-  // apply silently on initial load. The ref tracks per-segments-prop
-  // application so re-seeding a new job re-triggers; routine edits
-  // (typing in a line) do NOT, because they don't change the ref.
-  const autoTrimAppliedRef = useRef(false);
   // PR E (2026-07): acá vivía el effect de prop-sync/reseed (Bug B7 + los
   // guards de eco #724/live-edit + el detector [reseed-storm]). Se ELIMINÓ
   // entero: el estado vive en segmentsStore (sobrevive unmounts, el prop
@@ -3318,29 +3312,8 @@ export default function LyricsEditor({
     return dur > estimateVoiceEndDuration(seg.text);
   }).length;
 
-  // Auto-trim on initial load: if the just-loaded segments have hanging
-  // text (lrclib/genius lines that ran into instrumental outros, or
-  // duplicated chorus blocks at the end), apply the same fix the
-  // operator would have applied manually via the autofix banner. The
-  // `autoTrimAppliedRef` (declared up by the segments re-seed effect)
-  // guards against re-running on every text-edit keystroke. Cmd-Z still
-  // works because trimAllLongSegs calls pushEditHistory.
-  useEffect(() => {
-    if (autoTrimAppliedRef.current) return;
-    if (!edited || edited.length === 0) return;
-    // Campaign stage 1 must open the exact machine-produced timeline.  A
-    // mount-time heuristic used to shorten long lines before the reviewer
-    // touched anything, then autosave those silent changes without locks.
-    // Keep trimming as an explicit operator action only in this workflow.
-    if (requireLineReview) {
-      autoTrimAppliedRef.current = true;
-      return;
-    }
-    if (longSegCount > 0) {
-      trimAllLongSegs({ confirmReview: false });
-    }
-    autoTrimAppliedRef.current = true;
-  }, [edited, longSegCount, requireLineReview]);
+  // Opening or approving a song never invokes text-length-based trimming.
+  // The explicit trim action above remains available to the operator.
 
   // Compute how many visual lines a segment will occupy in the video.
   const linesForSeg = useCallback((text) => {
@@ -3595,21 +3568,7 @@ export default function LyricsEditor({
   const hasSuggestions = pendingSuggestions > 0;
   const blankCount = edited.filter((seg) => !(seg.text || "").trim()).length;
 
-  const approvalSegments = useMemo(() => {
-    const sorted = sanitizeSegments(edited)
-      .filter((seg) => (seg.text || "").trim())
-      .sort((a, b) => a.start - b.start);
-    return sorted.map((seg, i) => {
-      let end = seg.end;
-      if (i + 1 < sorted.length) {
-        const nextStart = sorted[i + 1].start;
-        if (end > nextStart - 0.05) {
-          end = Math.max(seg.start + 0.3, nextStart - 0.05);
-        }
-      }
-      return { ...seg, end };
-    });
-  }, [edited]);
+  const approvalSegments = useMemo(() => edited.map((seg) => ({ ...seg })), [edited]);
 
   const unsafeWindows = useMemo(
     () => normalizeUnsafeWindows(transcriptionQuality),
@@ -3857,6 +3816,11 @@ export default function LyricsEditor({
   const [isApproving, setIsApproving] = useState(false);
 
   const runApprove = async ({ skipWrapWarning = false } = {}) => {
+    const conflict = approvalConflict(approvalSegments);
+    if (conflict) {
+      toast({ message: conflict, tone: "error" });
+      return;
+    }
     if (languageConflict) {
       toast({ message: "No se puede aprobar: el idioma detectado contradice la transcripción. Corregí el idioma y reprocesá esta canción.", tone: "info" });
       return;
@@ -3960,9 +3924,8 @@ export default function LyricsEditor({
       return false;
     };
     if (editorV2Enabled) {
-      // `_buildCleanedSegments` may tighten an overlap by 50 ms. Persist
-      // that exact final snapshot before sending its revision/version id;
-      // Editor 2.0 intentionally ignores browser JSON during approval.
+      // Flush the same editor snapshot, never tighten gaps during approval.
+      // The backend approves only the exact persisted revision.
       const cleanedForPersistence = sanitizeSegmentsForPersistence(cleaned);
       const saveResult = await flushDurableSave("manual", cleanedForPersistence);
       if (saveResult?.ok === false) {

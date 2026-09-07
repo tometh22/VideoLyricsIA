@@ -71,7 +71,8 @@ def run_correction_observation_job(job_id: str, approved_version_id: str,
         # turn a successful approval into a failed learning capture.
         try:
             from learning_triggers import trigger_after_capture
-            trigger_after_capture()
+            if source_confidence != 'operational_review':
+                trigger_after_capture()
         except Exception as exc:
             import logging
             logging.getLogger("genly.quality_learning").warning(

@@ -19,13 +19,18 @@ def timing_capture(previous, current, *, job, user_id, checkpoint, from_revision
         values = [old.get('start'), old.get('end'), new.get('start'), new.get('end')]
         if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in values):
             continue
-        if old['start'] == new['start'] and old['end'] == new['end']:
+        if all(round(old[k], 4) == round(new[k], 4) for k in ('start', 'end')):
             continue
         changed.append({'line_index': i, 'line_id': new.get('_id'),
             'association': 'stable_id' if new.get('_id') is not None else 'position_only_unverified',
             'baseline': {k: old[k] for k in ['start', 'end']},
             'human_submitted': {k: new[k] for k in ['start', 'end']},
-            'start_delta': new['start']-old['start'], 'end_delta': new['end']-old['end'],
+            'start_delta': round(round(new['start'], 4)-round(old['start'], 4), 4),
+            'end_delta': round(round(new['end'], 4)-round(old['end'], 4), 4),
+            'persisted_precision_seconds': .0001,
+            'same_phrase': old.get('text') == new.get('text'),
+            'category': ('same_phrase_timing_candidate' if old.get('text') == new.get('text')
+                         else 'text_and_timing_requires_occurrence_review'),
             'baseline_text_sha256': hashlib.sha256(str(old.get('text','')).encode()).hexdigest(),
             'submitted_text_sha256': hashlib.sha256(str(new.get('text','')).encode()).hexdigest()})
     if not changed:

@@ -18,6 +18,11 @@ def human_protected(song, index):
     row=song['segments'][index]
     if row.get('locked') or row.get('operator_locked'):
         return True
+    if song.get('approved_at') or song.get('status') in {'lyrics_approved','done'}:
+        return True
+    from reviewer_edit_provenance import protected
+    verified = protected(song, index)
+    if verified is not None: return verified
     original=song.get('original_segments')
     if original is None:
         return song.get('segments_revision',0)>0

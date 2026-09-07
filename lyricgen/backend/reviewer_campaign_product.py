@@ -104,6 +104,11 @@ def publish_song(db, campaign, song, row, artifact=None, *, execute=False):
             quality = deepcopy(job.transcription_quality or {}); quality[KEY] = stale; job.transcription_quality = quality
         return {"job_id": song["job_id"], "status": "stale", "reason": "source_changed"}
     scoped = {**song, "campaign_id": campaign.id}
+    if song.get('edit_provenance'):
+        from reviewer_edit_provenance import from_database
+        live = {**song, 'status':job.status, 'approved_at':job.approved_at}
+        if from_database(db, live) != song['edit_provenance']:
+            raise ValueError('editor_provenance_not_current_or_forged')
     candidate = (artifact or {}).get("candidate")
     registered = False; publication_reason = None
     if row["status"] == "complete":
