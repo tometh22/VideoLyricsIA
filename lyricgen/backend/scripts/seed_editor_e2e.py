@@ -25,7 +25,8 @@ def seed_reviewer_candidate(db, user):
     if make_url(os.environ["DATABASE_URL"]).database != "genly_editor_e2e":
         raise RuntimeError("reviewer_fixture_requires_disposable_ci_database")
     from database import BatchCampaign, BatchCampaignItem
-    from editor import get_or_create_document
+    from editor import ensure_document, save_document
+    from correction_learning import machine_snapshot_provenance
     from reviewer_batch_bridge import REQUIRED_AUDIO_FAMILIES, publish_batch_candidate
     from reviewer_candidate import build_candidate
     from reviewer_candidate_registry import register_candidate
@@ -56,7 +57,14 @@ def seed_reviewer_candidate(db, user):
             "reference_hypothesis_unavailable": True},
         input_r2_key=f"inputs/{TENANT_ID}/{job_id}/reviewer.wav"))
     db.flush()
-    document = get_or_create_document(db, job_id, TENANT_ID, rows)
+    job = db.query(Job).filter_by(job_id=job_id).one()
+    document = ensure_document(db, job_id, TENANT_ID, rows, initial_reason='transcription',
+        initial_provenance={**machine_snapshot_provenance(job, {}), 'synthetic_ci_fixture':True})
+    migrated = [{**row} for row in document.current_segments]
+    migrated[0]['end'] += .25
+    document, migration, _ = save_document(db, job, document, None, document.revision, migrated, 'migration')
+    migration.provenance = {'kind':'fixed_hold_backfill','from_hold_s':.25,'to_hold_s':.5,'changed_lines':1}
+    db.flush()
     song = {"job_id": job_id, "campaign_id": campaign_id, "audio_sha256": "a" * 64,
         "audio_revision": 1, "segments_revision": document.revision,
         "segments": document.current_segments, "segments_sha256": digest(document.current_segments),
