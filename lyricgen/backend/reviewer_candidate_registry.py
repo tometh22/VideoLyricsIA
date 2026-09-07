@@ -8,6 +8,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -152,7 +153,7 @@ def _review_details(review):
     return details
 
 
-def prepare_registry_record(tenant_id, song, candidate, review, *, original_segments=None):
+def prepare_registry_record(tenant_id, song, candidate, review, *, original_segments=None, versioned=False):
     """Pure, possible with rollout off; excludes held/previously-human edits."""
     identity = _identity(tenant_id, song)
     prepared = prepare_batch_candidate(song, candidate, review,
@@ -172,11 +173,13 @@ def prepare_registry_record(tenant_id, song, candidate, review, *, original_segm
         "approved": False, "automatic_apply_allowed": False,
         "adoption_via_existing_operator_proposal_only": True,
         "audio_playback": "existing_authorized_editor_audio"}
+    if versioned:
+        identity = digest({'source_identity': identity, 'payload_sha256': digest(payload)})
     return {"schema": "reviewer-candidate-registry-v1", "identity": identity,
         "tenant_id": str(tenant_id), "payload": payload, "payload_sha256": digest(payload)}
 
 
-def register_candidate(tenant_id, song, candidate, review, *, original_segments=None, now=None):
+def register_candidate(tenant_id, song, candidate, review, *, original_segments=None, now=None, versioned=False):
     """Future authorized artifact publication; no document or approval writes.
 
     Same source/content is idempotent; a different candidate for the same source
@@ -193,7 +196,7 @@ def register_candidate(tenant_id, song, candidate, review, *, original_segments=
     if mode == "local" and root is None:
         return {"registered": False, "reason": "persistent_cache_directory_required"}
     record = prepare_registry_record(tenant_id, song, candidate, review,
-        original_segments=original_segments)
+        original_segments=original_segments, versioned=versioned)
     created = now or datetime.now(timezone.utc)
     envelope = {**record, "created_at": created.isoformat(),
         "expires_at": (created + timedelta(days=7)).isoformat()}
@@ -244,6 +247,15 @@ def candidate_for_editor(job, document, *, now=None):
         "segments_sha256": digest(document.current_segments or [])}
     try:
         identity = _identity(job.tenant_id, song)
+        source_identity = identity
+        status = (getattr(job, 'transcription_quality', None) or {}).get('reviewer_campaign_status') or {}
+        pointer = status.get('candidate_registry_identity')
+        if pointer is not None:
+            if (not isinstance(pointer, str) or not re.fullmatch(r'[a-f0-9]{64}', pointer)
+                    or status.get('source') != source_binding(song)
+                    or status.get('campaign_id') != job.campaign_id):
+                return None
+            identity = pointer
         if _mode() == "r2":
             record = _read_r2(job.tenant_id, identity)
         else:
@@ -252,6 +264,9 @@ def candidate_for_editor(job, document, *, now=None):
         expires = datetime.fromisoformat(record["expires_at"])
         current = now or datetime.now(timezone.utc)
         payload = record["payload"]
+        if pointer is not None and identity != digest({'source_identity': source_identity,
+                                                       'payload_sha256': digest(payload)}):
+            return None
         if (expires <= current or record.get("schema") != "reviewer-candidate-registry-v1"
                 or record.get("identity") != identity or record.get("tenant_id") != str(job.tenant_id)
                 or payload.get("source") != source_binding(song)
@@ -320,7 +335,7 @@ def editor_candidate_snapshot(job, document):
     objects afterwards risks expired/lazy attributes and cross-thread sessions.
     """
     job_view = SimpleNamespace(**{name: deepcopy(getattr(job, name, None)) for name in (
-        "job_id", "tenant_id", "campaign_id", "audio_revision", "input_audio_sha256", "status", "approved_at")})
+        "job_id", "tenant_id", "campaign_id", "audio_revision", "input_audio_sha256", "status", "approved_at", "transcription_quality")})
     document_view = SimpleNamespace(**{name: deepcopy(getattr(document, name, None)) for name in (
         "job_id", "tenant_id", "revision", "current_segments", "approved_at", "quality_proposal")})
     return job_view, document_view

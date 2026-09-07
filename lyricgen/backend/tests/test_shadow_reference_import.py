@@ -68,3 +68,13 @@ def test_availability_does_not_confuse_empty_invalid_missing():
     assert availability(123) == "invalid"
     assert availability("") == "empty"
     assert availability("¿Qué ves?") == "present"
+
+
+def test_inline_source_pointer_kept_without_becoming_lyrics(tmp_path):
+    result = import_workbook(workbook(tmp_path,
+        headers={'G': 'Artista', 'D': 'Track', 'Z': 'Lyrics'},
+        values={'G': 'A', 'D': 'T', 'Z': '[Musixmatch] https://example.test/song'}))
+    row = result['rows'][0]
+    assert row['availability'] == 'pointer_only'
+    assert row['lyrics'] is None
+    assert row['url'] == 'https://example.test/song'

@@ -284,6 +284,19 @@ def review_window(song, window, *, evidence, external_reference=None, commit, po
             next_text=song['segments'][index+1].get('text','') if index+1<len(song['segments']) else '')
         if patches:
             content = patches[0]
+    if any(e.get('kind') == 'deterministic_orthography_request'
+           and e.get('source') == source_binding(song) for e in evidence):
+        # Separate normative spelling from independent recognition. Recompute
+        # the existing preflight rules; never trust supplied replacement text.
+        from reviewer_excel_audit import deterministic_spelling
+        spelling_base = content['text'] if content['decision'] == 'propose' else current.get('text', '')
+        corrected, findings, _ = deterministic_spelling(spelling_base)
+        if corrected != spelling_base:
+            content = {'decision': 'propose', 'text': corrected,
+                'classification': 'deterministic_orthography_candidate',
+                'families': content.get('families', []) + ['deterministic_spanish_orthography'],
+                'orthography_findings': findings, 'orthography_is_audio_witness': False,
+                'correctness_certified': False, 'automatic_apply_allowed': False}
     timing = select_endpoint(current, [e for e in evidence if e.get("kind") == "endpoint"],
                              next_start=float(song["segments"][index + 1]["start"]) if index + 1 < len(song["segments"]) else None,
                              duration=float(song["duration_seconds"]), policy=policy)

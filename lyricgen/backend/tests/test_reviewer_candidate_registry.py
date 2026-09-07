@@ -104,6 +104,36 @@ def test_conflicting_candidate_cannot_overwrite_same_source(monkeypatch, tmp_pat
     assert candidate_for_editor(job, document)["segments"] == candidate["segments"]
 
 
+def test_versioned_candidate_replaces_pointer_not_source_or_evidence(monkeypatch, tmp_path):
+    from reviewer_shadow import source_binding
+    song, candidate, review, job, document = setup_registry(monkeypatch, tmp_path)
+    before = deepcopy(document.current_segments)
+    legacy = register_candidate('tenant', song, build_candidate(song), review)
+    new = register_candidate('tenant', song, candidate, review, versioned=True)
+    assert new['identity'] != legacy['identity']
+    assert len(list((tmp_path/'complete_candidates').glob('*.json'))) == 2
+    assert candidate_for_editor(job, document)['changes'] == []
+    job.transcription_quality = {'reviewer_campaign_status': {
+        'campaign_id': song['campaign_id'], 'source': source_binding(song),
+        'candidate_registry_identity': new['identity']}}
+    assert candidate_for_editor(job, document)['segments'] == candidate['segments']
+    assert document.current_segments == before
+    assert register_candidate('tenant', song, candidate, review, versioned=True)['created'] is False
+    del job.transcription_quality['reviewer_campaign_status']['candidate_registry_identity']
+    assert candidate_for_editor(job, document)['changes'] == []
+
+
+@pytest.mark.parametrize('pointer', ['../../escape', 'b'*64, 42])
+def test_invalid_version_pointer_never_falls_back(monkeypatch, tmp_path, pointer):
+    from reviewer_shadow import source_binding
+    song, candidate, review, job, document = setup_registry(monkeypatch, tmp_path)
+    register_candidate('tenant', song, candidate, review)
+    job.transcription_quality = {'reviewer_campaign_status': {
+        'campaign_id': song['campaign_id'], 'source': source_binding(song),
+        'candidate_registry_identity': pointer}}
+    assert candidate_for_editor(job, document) is None
+
+
 def test_tampering_fails_closed(monkeypatch, tmp_path):
     song, candidate, review, job, document = setup_registry(monkeypatch, tmp_path)
     register_candidate("tenant", song, candidate, review)
