@@ -1665,6 +1665,8 @@ def enqueue_correction_learning(job_id: str, approved_version_id: str, *,
         expected_revision = int(document.revision or 0)
         expected_approved_hash = lyric_snapshot_hash(version.segments or [])
         expected_learning_epoch = int(document.job.quality_learning_epoch or 0)
+        expected_audio_sha256 = document.job.input_audio_sha256
+        expected_audio_revision = document.job.audio_revision
         # The browser-provided active_edit_ms remains telemetry only. Learning
         # gates consume exclusively contiguous server-side heartbeat evidence.
         server_active_edit_ms = derive_server_active_edit_ms(
@@ -1692,6 +1694,8 @@ def enqueue_correction_learning(job_id: str, approved_version_id: str, *,
             "expected_revision": expected_revision,
             "expected_approved_hash": expected_approved_hash,
             "expected_learning_epoch": expected_learning_epoch,
+            "expected_audio_sha256": expected_audio_sha256,
+            "expected_audio_revision": expected_audio_revision,
         },
         job_timeout=int(os.environ.get("QUALITY_LEARNING_JOB_TIMEOUT", "600")),
         result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL, job_id=rq_id,

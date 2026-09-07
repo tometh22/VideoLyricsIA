@@ -355,6 +355,9 @@ def test_operational_campaign_observation_is_idempotent_and_never_automatic_gold
     again = create_observation(db, job.job_id, approved.id, source_confidence='operational_review')
     assert row.id == again.id
     assert row.label_tier == 'observed'
+    with pytest.raises(StaleCorrectionSnapshot, match='correction_audio_snapshot_changed'):
+        create_observation(db, job.job_id, approved.id, source_confidence='operational_review',
+                           expected_audio_sha256='b'*64, expected_audio_revision=2)
     history = row.metrics['operational_history']
     assert history['events'][0]['delta_seconds']['end'] == .0001
     assert not history['clean_gold'] and not history['automatic_training_allowed']

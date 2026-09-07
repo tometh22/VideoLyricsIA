@@ -137,6 +137,14 @@ def publish_song(db, campaign, song, row, artifact=None, *, execute=False):
         # Only publish a new pointer after the immutable object was written.
         # Job metadata and native proposal commit together; documents stay intact.
         state['candidate_registry_identity'] = record['identity']
+        previous = (job.transcription_quality or {}).get(KEY) or {}
+        old_identity = previous.get('candidate_registry_identity')
+        if old_identity and old_identity != record['identity']:
+            state['previous_candidate_registry_identity'] = old_identity
+        elif previous.get('previous_candidate_registry_identity'):
+            state['previous_candidate_registry_identity'] = previous['previous_candidate_registry_identity']
+        if song.get('edit_provenance'):
+            state['edit_provenance_history_sha256'] = song['edit_provenance']['history_sha256']
     if execute:
         quality = deepcopy(job.transcription_quality or {})
         old = quality.get(KEY)

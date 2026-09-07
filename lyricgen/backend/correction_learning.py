@@ -627,7 +627,9 @@ def create_observation(db: Any, job_id: str, approved_version_id: str,
                        session_hmac: str | None = None,
                        expected_revision: int | None = None,
                        expected_approved_hash: str | None = None,
-                       expected_learning_epoch: int | None = None) -> Any:
+                       expected_learning_epoch: int | None = None,
+                       expected_audio_sha256: str | None = None,
+                       expected_audio_revision: int | None = None) -> Any:
     from database import (
         CorrectionObservation, EditorDocument, EditorVersion, Job,
     )
@@ -639,6 +641,9 @@ def create_observation(db: Any, job_id: str, approved_version_id: str,
         raise RuntimeError("quality_learning_hmac_key_missing_or_weak")
     hmac_key_id = current_hmac_key_id()
     job = db.query(Job).filter(Job.job_id == job_id).with_for_update().one()
+    if ((expected_audio_sha256 is not None and job.input_audio_sha256 != expected_audio_sha256)
+            or (expected_audio_revision is not None and job.audio_revision != expected_audio_revision)):
+        raise StaleCorrectionSnapshot('correction_audio_snapshot_changed')
     if (
         expected_learning_epoch is not None
         and int(job.quality_learning_epoch or 0) != int(expected_learning_epoch)

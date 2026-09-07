@@ -17,7 +17,9 @@ def run_correction_observation_job(job_id: str, approved_version_id: str,
                                    session_hmac: str | None = None,
                                    expected_revision: int | None = None,
                                    expected_approved_hash: str | None = None,
-                                   expected_learning_epoch: int | None = None) -> dict:
+                                   expected_learning_epoch: int | None = None,
+                                   expected_audio_sha256: str | None = None,
+                                   expected_audio_revision: int | None = None) -> dict:
     from correction_learning import create_observation, StaleCorrectionSnapshot
     from database import SessionLocal
     started = time.monotonic()
@@ -33,6 +35,8 @@ def run_correction_observation_job(job_id: str, approved_version_id: str,
             expected_revision=expected_revision,
             expected_approved_hash=expected_approved_hash,
             expected_learning_epoch=expected_learning_epoch,
+            expected_audio_sha256=expected_audio_sha256,
+            expected_audio_revision=expected_audio_revision,
         )
         metrics = dict(row.metrics or {})
         if "operational" not in metrics:

@@ -231,6 +231,12 @@ def _publish(
     payload = dict(event.payload or {})
     if event.event_type == "correction.enqueue":
         from queue_jobs import enqueue_correction_learning
+        from database import SessionLocal, Job
+        with SessionLocal() as snapshot_db:
+            job = snapshot_db.query(Job).filter_by(job_id=event.job_id).one()
+            if (job.input_audio_sha256 != payload.get('audio_sha256')
+                    or job.audio_revision != payload.get('audio_revision')):
+                raise OutboxDeliveryError('correction_audio_snapshot_stale', retryable=False)
         rq_id = enqueue_correction_learning(event.job_id, str(payload['approved_version_id']),
                                             source_confidence='operational_review')
         if str(rq_id).startswith('disabled:'):
