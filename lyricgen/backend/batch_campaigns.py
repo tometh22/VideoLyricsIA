@@ -66,6 +66,9 @@ _ACTIVE_SEPARATION = frozenset({"separation_queued", "separating"})
 _ACTIVE_RENDER = frozenset({"queued", "processing", "editing", "background_generating", "rendering"})
 _FAILURE = frozenset({"error", "transcription_failed", "validation_failed", "rejected"})
 _SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+_PENDING_REVIEW_STATES = frozenset({"pending", "processing", "ready", "reviewing", "failed"})
+_APPROVED_REVIEW_STATES = frozenset({"approved", "exported"})
+_ALL_REVIEW_STATES = _PENDING_REVIEW_STATES | _APPROVED_REVIEW_STATES
 
 
 def _now() -> datetime:
@@ -817,8 +820,11 @@ def claim_next_review(
     verdicts = _latest_semaforo_verdicts(
         db, [job.job_id for job, _item in candidate_pairs],
     )
+    active_minutes = _review_minutes_by_job(
+        db, [job.job_id for job, _item in candidate_pairs],
+    )
     candidate_pairs.sort(
-        key=lambda pair: _delivery_rank(pair[1], verdicts.get(pair[0].job_id)),
+        key=lambda pair: _pair_review_effort_key(pair, active_minutes),
     )
     if not candidate_pairs:
         return {"job_id": None, "empty": True}
@@ -1084,6 +1090,81 @@ def _queue_state(stage: str, job: Job | None, document: EditorDocument | None) -
     return "failed" if job.status in _FAILURE else "pending"
 
 
+def _review_reference_available(job: Job | None) -> tuple[bool, dict[str, Any]]:
+    """Validate the bound reference without treating a missing one as bad text."""
+    quality = dict(job.transcription_quality or {}) if job else {}
+    reference = dict(quality.get("reference_hypothesis") or {})
+    if not job or not reference:
+        return False, reference
+    from reference_hypothesis import validate_binding
+    available, _reason = validate_binding(
+        reference,
+        audio_sha256=str(job.input_audio_sha256 or ""),
+        audio_revision=int(job.audio_revision or 0),
+    )
+    return bool(
+        available
+        and reference.get("availability") != "unavailable"
+        and reference.get("review_status") != "manual_full_review_required"
+        and int(reference.get("line_count") or 0) > 0
+    ), reference
+
+
+def _timing_evidence(quality: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose only safe, concrete windows; never turn a score into confidence."""
+    result: list[dict[str, Any]] = []
+    for index, window in enumerate(quality.get("unsafe_windows") or []):
+        if not isinstance(window, dict):
+            continue
+        start = _number(window.get("start"), math.nan)
+        end = _number(window.get("end"), math.nan)
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            continue
+        reasons = [
+            str(reason).strip() for reason in (window.get("reasons") or [])
+            if str(reason).strip()
+        ]
+        row: dict[str, Any] = {
+            "id": str(window.get("id") or f"window-{index + 1}"),
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "reasons": list(dict.fromkeys(reasons)),
+        }
+        segment_indices = [
+            int(value) for value in (window.get("segment_indices") or [])
+            if isinstance(value, int) and value >= 0
+        ]
+        if segment_indices:
+            row["segment_indices"] = segment_indices
+        result.append(row)
+    return result
+
+
+def _review_inputs(item: BatchCampaignItem, job: Job | None) -> dict[str, Any]:
+    quality = dict(job.transcription_quality or {}) if job else {}
+    reference_available, reference = _review_reference_available(job)
+    segments = list(job.segments_json or []) if job else []
+    lyric_line_count = sum(
+        1 for segment in segments
+        if isinstance(segment, dict) and str(segment.get("text") or "").strip()
+    )
+    timing_windows = _timing_evidence(quality)
+    raw_windows = [window for window in (quality.get("unsafe_windows") or []) if isinstance(window, dict)]
+    return {
+        "quality": quality,
+        "reference": reference,
+        "reference_available": reference_available,
+        "metadata_review_required": bool(
+            item.metadata_error
+            and item.metadata_error not in {"invalid_size", "invalid_duration"}
+        ),
+        "lyric_line_count": lyric_line_count,
+        "empty_transcription": bool(job and lyric_line_count == 0),
+        "doubt_count": len(raw_windows),
+        "timing_windows": timing_windows,
+    }
+
+
 def _review_minutes_by_job(
     db: Session,
     job_ids: list[str],
@@ -1122,14 +1203,35 @@ def _review_minutes_by_job(
 
 
 def _review_minutes_today(db: Session, job_ids: list[str]) -> dict[str, Any]:
-    today = _now().replace(hour=0, minute=0, second=0, microsecond=0)
+    now = _now()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     minutes_by_job = _review_minutes_by_job(db, job_ids, since=today)
     minutes = list(minutes_by_job.values())
+    telemetry_events = db.query(ProductEvent).filter(
+        ProductEvent.name == "editor_activity_heartbeat",
+        ProductEvent.job_id.in_(job_ids),
+        ProductEvent.created_at >= today,
+    ).all() if job_ids else []
+    session_keys = set()
+    for event in telemetry_events:
+        props = event.properties if isinstance(event.properties, dict) else {}
+        session_id = str(props.get("session_id") or "").strip()
+        session_keys.add((str(event.job_id), session_id or f"user:{event.user_id or 'unknown'}"))
+    observed_jobs = {str(event.job_id) for event in telemetry_events}
     return {
         "average": round(sum(minutes) / len(minutes), 2) if minutes else None,
         "total": round(sum(minutes), 2),
         "songs": len(minutes),
         "source": "editor_activity_heartbeat_v1",
+        "window_start": today.isoformat(),
+        "window_end": now.isoformat(),
+        "pause_gap_seconds": 25,
+        "single_heartbeat_seconds": 15,
+        "songs_with_telemetry": len(observed_jobs),
+        "songs_without_telemetry": max(0, len(set(job_ids)) - len(observed_jobs)),
+        "sessions_with_telemetry": len(session_keys),
+        "sessions_without_telemetry": max(0, len(set(job_ids)) - len(session_keys)),
+        "pause_treatment": "sólo intervalos entre latidos de 0<gap<=25s; pausas mayores quedan fuera; un único latido suma 15s; sin latidos no entra al promedio",
     }
 
 
@@ -1139,11 +1241,13 @@ _REFERENCE_LINK_KINDS = frozenset({
 
 
 _REVIEW_REASON_LABELS = {
-    "missing_reference": "Texto: falta una referencia verificable",
+    "missing_reference": "Texto: referencia no disponible (no indica error de letra)",
     "empty_transcription": "Texto: no hay líneas transcritas",
     "metadata_review": "Operativo: metadata pendiente de revisión",
-    "quality_manual_review": "Texto y timing: revisión completa requerida",
-    "timing_windows_pending": "Timing: hay ventanas de duda para revisar",
+    "quality_manual_review": "Texto: revisión completa requerida",
+    "quality_timing_review": "Timing: revisión completa requerida",
+    "timing_windows_pending": "Timing: revisar intervalos localizados",
+    "timing_general_review": "Timing: requiere revisión acústica general (sin intervalo localizado)",
     "timing_analysis_pending": "Timing: análisis acústico pendiente",
     "job_not_ready": "Operativo: el audio todavía no está listo",
 }
@@ -1169,6 +1273,7 @@ def _review_classification(
     metadata_review_required: bool,
     empty_transcription: bool,
     doubt_count: int,
+    timing_windows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return deterministic review work scopes, never a calibrated score.
 
@@ -1184,6 +1289,8 @@ def _review_classification(
             "review_priority_label": "Bloqueada: audio no listo",
             "review_priority_rank": 0,
             "review_reasons": [reason],
+            "timing_evidence": [],
+            "timing_localization": "none",
             "review_domains": {
                 "text": {"status": "not_ready", "reasons": []},
                 "timing": {"status": "not_ready", "reasons": []},
@@ -1201,31 +1308,38 @@ def _review_classification(
     if metadata_review_required:
         operational_reasons.append(_review_reason("metadata_review", "operational"))
     if quality.get("manual_full_review_required"):
-        full_reason = _review_reason("quality_manual_review", "text")
-        text_reasons.append(full_reason)
-        timing_reasons.append({**full_reason, "domain": "timing"})
+        text_reasons.append(_review_reason("quality_manual_review", "text"))
+        timing_reasons.append(_review_reason("quality_timing_review", "timing"))
     if doubt_count:
-        timing_reasons.append(_review_reason(
-            "timing_windows_pending", "timing", count=doubt_count,
-        ))
-    if str(quality.get("analysis_status") or "").lower() in {
-        "pending", "queued", "running",
-    }:
+        if timing_windows:
+            timing_reasons.append(_review_reason(
+                "timing_windows_pending", "timing", count=len(timing_windows),
+            ))
+        else:
+            timing_reasons.append(_review_reason(
+                "timing_general_review", "timing", count=doubt_count,
+            ))
+    analysis_status = str(quality.get("analysis_status") or "").lower()
+    if analysis_status not in {"complete", "completed", "succeeded", "pass"}:
         timing_reasons.append(_review_reason("timing_analysis_pending", "timing"))
 
     manual_full = bool(text_reasons or operational_reasons)
     timing_targeted = bool(timing_reasons)
     if manual_full:
-        priority, priority_label, rank = "manual_full", "Manual completa", 1
+        priority, priority_label, rank = "manual_full", "Revisión extensa", 2
     elif timing_targeted:
-        priority, priority_label, rank = "timing_targeted", "Timing dirigido", 2
+        priority, priority_label, rank = "timing_targeted", "Revisión focalizada", 1
     else:
-        priority, priority_label, rank = "standard", "Revisión estándar", 3
+        priority, priority_label, rank = "standard", "Revisión breve sugerida", 0
     return {
         "review_priority": priority,
         "review_priority_label": priority_label,
         "review_priority_rank": rank,
         "review_reasons": text_reasons + timing_reasons + operational_reasons,
+        "timing_evidence": list(timing_windows or []),
+        "timing_localization": "localized" if timing_windows else (
+            "general" if timing_reasons else "none"
+        ),
         "review_domains": {
             "text": {
                 "status": "manual_full" if text_reasons else "standard",
@@ -1241,6 +1355,64 @@ def _review_classification(
             },
         },
     }
+
+
+def _review_effort_key(
+    classification: dict[str, Any],
+    *,
+    doubt_count: int,
+    active_minutes: float | None,
+    active_minutes_observed: bool,
+    duration_seconds: float | None,
+    ordinal: int,
+) -> tuple[int, int, int, int, float, float, int]:
+    """Stable lowest-work-first ordering, not a confidence score."""
+    priority_rank = {"standard": 0, "timing_targeted": 1, "manual_full": 2, "blocked": 3}.get(
+        classification.get("review_priority"), 3,
+    )
+    reason_count = len(classification.get("review_reasons") or [])
+    localized_rank = 0 if classification.get("timing_localization") == "localized" else 1
+    telemetry_rank = 0 if active_minutes_observed else 1
+    observed_minutes = float(active_minutes or 0.0) if active_minutes_observed else float("inf")
+    duration = _number(duration_seconds, float("inf"))
+    return (
+        priority_rank, reason_count, localized_rank, telemetry_rank,
+        observed_minutes, duration, int(ordinal or 0),
+    )
+
+
+def _review_effort_band(priority: str) -> str:
+    return {
+        "standard": "breve_sugerida",
+        "timing_targeted": "focalizada",
+        "manual_full": "extensa",
+        "blocked": "bloqueada",
+    }.get(priority, "bloqueada")
+
+
+def _pair_review_effort_key(
+    pair: tuple[Job, BatchCampaignItem],
+    active_minutes: dict[str, float],
+) -> tuple[int, int, int, int, float, float, int]:
+    job, item = pair
+    evidence = _review_inputs(item, job)
+    classification = _review_classification(
+        job=job,
+        quality=evidence["quality"],
+        reference_available=evidence["reference_available"],
+        metadata_review_required=evidence["metadata_review_required"],
+        empty_transcription=evidence["empty_transcription"],
+        doubt_count=evidence["doubt_count"],
+        timing_windows=evidence["timing_windows"],
+    )
+    return _review_effort_key(
+        classification,
+        doubt_count=evidence["doubt_count"],
+        active_minutes=active_minutes.get(job.job_id),
+        active_minutes_observed=job.job_id in active_minutes,
+        duration_seconds=item.duration_seconds,
+        ordinal=item.ordinal,
+    )
 
 
 def _review_reference_links(overrides: dict[str, Any]) -> list[dict[str, str]]:
@@ -1263,6 +1435,7 @@ def review_queue(
     campaign_id: str,
     stage: str = Query(default="lyrics", pattern="^(lyrics|final)$"),
     order: str = Query(default="delivery", pattern="^(delivery|learning)$"),
+    scope: str = Query(default="pending", pattern="^(pending|approved|all)$"),
     state: str | None = None,
     version: str | None = Query(default=None, pattern="^(studio|live)$"),
     background_mode: str | None = None,
@@ -1304,6 +1477,12 @@ def review_queue(
     )
     confidence_gate_passed = bool(queue_config.get("confidence_gate_passed"))
     active_minutes = _review_minutes_by_job(db, job_ids)
+    effective_scope = state if state in _ALL_REVIEW_STATES else scope
+    allowed_states = {state} if state in _ALL_REVIEW_STATES else (
+        _PENDING_REVIEW_STATES if effective_scope == "pending" else
+        _APPROVED_REVIEW_STATES if effective_scope == "approved" else
+        _ALL_REVIEW_STATES
+    )
     rows: list[dict[str, Any]] = []
     for item, job in pairs:
         document = documents.get(job.job_id) if job else None
@@ -1319,7 +1498,7 @@ def review_queue(
             or (campaign.default_render_params or {}).get("background_mode")
             or "generated"
         )
-        if state and queue_state != state:
+        if queue_state not in allowed_states:
             continue
         if version and title_version != version:
             continue
@@ -1330,36 +1509,14 @@ def review_queue(
         verdict = verdicts.get(job.job_id, {}) if job else {}
         color = str(verdict.get("color") or "red").lower()
         color_rank = {"green": 0, "yellow": 1, "red": 2}.get(color, 2)
-        quality = dict(job.transcription_quality or {}) if job else {}
-        reference = dict(quality.get("reference_hypothesis") or {})
-        reference_available = False
-        if job and reference:
-            from reference_hypothesis import validate_binding
-            reference_available, _reference_reason = validate_binding(
-                reference,
-                audio_sha256=str(job.input_audio_sha256 or ""),
-                audio_revision=int(job.audio_revision or 0),
-            )
-            reference_available = bool(
-                reference_available
-                and reference.get("availability") != "unavailable"
-                and reference.get("review_status") != "manual_full_review_required"
-                and int(reference.get("line_count") or 0) > 0
-            )
-        metadata_review_required = bool(
-            item.metadata_error
-            and item.metadata_error not in {"invalid_size", "invalid_duration"}
-        )
-        segments = list(job.segments_json or []) if job else []
-        lyric_line_count = sum(
-            1 for segment in segments
-            if isinstance(segment, dict) and str(segment.get("text") or "").strip()
-        )
-        empty_transcription = bool(job and lyric_line_count == 0)
-        doubt_count = len([
-            window for window in (quality.get("unsafe_windows") or [])
-            if isinstance(window, dict)
-        ])
+        evidence = _review_inputs(item, job)
+        quality = evidence["quality"]
+        reference = evidence["reference"]
+        reference_available = evidence["reference_available"]
+        metadata_review_required = evidence["metadata_review_required"]
+        lyric_line_count = evidence["lyric_line_count"]
+        empty_transcription = evidence["empty_transcription"]
+        doubt_count = evidence["doubt_count"]
         classification = _review_classification(
             job=job,
             quality=quality,
@@ -1367,6 +1524,7 @@ def review_queue(
             metadata_review_required=metadata_review_required,
             empty_transcription=empty_transcription,
             doubt_count=doubt_count,
+            timing_windows=evidence["timing_windows"],
         )
         review_reasons = classification["review_reasons"]
         manual_reasons = [
@@ -1395,8 +1553,16 @@ def review_queue(
             "review_priority_label": classification["review_priority_label"],
             "review_reasons": review_reasons,
             "review_domains": classification["review_domains"],
+            "timing_evidence": classification["timing_evidence"],
+            "timing_localization": classification["timing_localization"],
+            "review_effort": {
+                "band": _review_effort_band(classification["review_priority"]),
+                "basis": [reason["code"] for reason in review_reasons],
+                "calibrated": False,
+            },
             "duration_seconds": item.duration_seconds,
             "active_minutes": active_minutes.get(job.job_id, 0.0) if job else 0.0,
+            "active_minutes_observed": bool(job and job.job_id in active_minutes),
             "state": queue_state,
             "reviewer_user_id": document.lock_user_id if document else None,
             "reviewer_name": (
@@ -1440,11 +1606,15 @@ def review_queue(
         rows = rows[:max(1, math.ceil(len(rows) * 0.20))]
     else:
         rows.sort(key=lambda row: (
-            row["_review_priority_rank"],
-            1 if row["version"] == "live" else 0,
-            row["_semaforo_rank"] if confidence_gate_passed else 0,
-            row["_delivery_rank"] if confidence_gate_passed else row["doubt_count"],
-            row["ordinal"],
+            _review_effort_key(
+                {"review_priority": row["review_priority"], "review_reasons": row["review_reasons"],
+                 "timing_localization": row["timing_localization"]},
+                doubt_count=row["doubt_count"],
+                active_minutes=row["active_minutes"],
+                active_minutes_observed=row["active_minutes_observed"],
+                duration_seconds=row["duration_seconds"],
+                ordinal=row["ordinal"],
+            ),
         ))
     # One priority column only. During blind calibration it exposes merely
     # the queue position (the ordering itself is required) and never a color
@@ -1481,12 +1651,24 @@ def review_queue(
                 AuditLog.created_at >= today,
             ).all()
         }
-        counters["approved_today"] = len(approved_today_ids.intersection(job_ids))
+        counters["approved_today"] = len(approved_today_ids.intersection(
+            {row["job_id"] for row in counter_rows if row.get("job_id")}
+        ))
     else:
         counters["approved_today"] = sum(
-            bool(job and _aware(job.approved_at) and _aware(job.approved_at) >= today)
-            for _, job in pairs
+            bool(row.get("job_id") and row["job_id"] in {
+                job.job_id for _, job in pairs
+                if job and _aware(job.approved_at) and _aware(job.approved_at) >= today
+            })
+            for row in counter_rows
         )
+    campaign_state_counts = {key: 0 for key in _ALL_REVIEW_STATES}
+    for item, job in pairs:
+        campaign_state_counts[_queue_state(stage, job, documents.get(job.job_id) if job else None)] += 1
+    campaign_approved_today = len(approved_today_ids.intersection(set(job_ids))) if stage == "lyrics" else sum(
+        bool(job and _aware(job.approved_at) and _aware(job.approved_at) >= today)
+        for _, job in pairs
+    )
     total = len(rows)
     start = (page - 1) * limit
     background_split = ({
@@ -1498,6 +1680,21 @@ def review_queue(
         "stage": stage,
         "reviewer_campaign_status": reviewer_summary,
         "order": order,
+        "scope": {
+            "key": effective_scope if state not in _ALL_REVIEW_STATES else "state",
+            "label": {
+                "pending": "Pendientes",
+                "approved": "Aprobadas",
+                "all": "Toda la campaña",
+            }.get(effective_scope, f"Estado: {effective_scope}"),
+            "total": total,
+            "states": sorted(allowed_states),
+        },
+        "campaign_totals": {
+            "songs": len(pairs),
+            "approved": campaign_state_counts.get("approved", 0) + campaign_state_counts.get("exported", 0),
+            "approved_today": campaign_approved_today,
+        },
         "items": [
             {key: value for key, value in row.items() if not key.startswith("_")}
             for row in rows[start:start + limit]
