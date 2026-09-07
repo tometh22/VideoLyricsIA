@@ -1138,6 +1138,111 @@ _REFERENCE_LINK_KINDS = frozenset({
 })
 
 
+_REVIEW_REASON_LABELS = {
+    "missing_reference": "Texto: falta una referencia verificable",
+    "empty_transcription": "Texto: no hay líneas transcritas",
+    "metadata_review": "Operativo: metadata pendiente de revisión",
+    "quality_manual_review": "Texto y timing: revisión completa requerida",
+    "timing_windows_pending": "Timing: hay ventanas de duda para revisar",
+    "timing_analysis_pending": "Timing: análisis acústico pendiente",
+    "job_not_ready": "Operativo: el audio todavía no está listo",
+}
+
+
+def _review_reason(code: str, domain: str, *, count: int | None = None) -> dict[str, Any]:
+    """Build a reviewer-facing reason without implying calibrated confidence."""
+    reason = {
+        "code": str(code),
+        "domain": str(domain),
+        "label": _REVIEW_REASON_LABELS.get(str(code), str(code)),
+    }
+    if count is not None:
+        reason["count"] = int(count)
+    return reason
+
+
+def _review_classification(
+    *,
+    job: Job | None,
+    quality: dict[str, Any],
+    reference_available: bool,
+    metadata_review_required: bool,
+    empty_transcription: bool,
+    doubt_count: int,
+) -> dict[str, Any]:
+    """Return deterministic review work scopes, never a calibrated score.
+
+    Text and timing are intentionally separate: a missing text reference does
+    not certify a timing defect, and an acoustic doubt window does not imply a
+    lyric error.  The labels describe the work a human should do, not model
+    confidence or approval quality.
+    """
+    if job is None:
+        reason = _review_reason("job_not_ready", "operational")
+        return {
+            "review_priority": "blocked",
+            "review_priority_label": "Bloqueada: audio no listo",
+            "review_priority_rank": 0,
+            "review_reasons": [reason],
+            "review_domains": {
+                "text": {"status": "not_ready", "reasons": []},
+                "timing": {"status": "not_ready", "reasons": []},
+                "operational": {"status": "blocked", "reasons": [reason]},
+            },
+        }
+
+    text_reasons: list[dict[str, Any]] = []
+    timing_reasons: list[dict[str, Any]] = []
+    operational_reasons: list[dict[str, Any]] = []
+    if not reference_available:
+        text_reasons.append(_review_reason("missing_reference", "text"))
+    if empty_transcription:
+        text_reasons.append(_review_reason("empty_transcription", "text"))
+    if metadata_review_required:
+        operational_reasons.append(_review_reason("metadata_review", "operational"))
+    if quality.get("manual_full_review_required"):
+        full_reason = _review_reason("quality_manual_review", "text")
+        text_reasons.append(full_reason)
+        timing_reasons.append({**full_reason, "domain": "timing"})
+    if doubt_count:
+        timing_reasons.append(_review_reason(
+            "timing_windows_pending", "timing", count=doubt_count,
+        ))
+    if str(quality.get("analysis_status") or "").lower() in {
+        "pending", "queued", "running",
+    }:
+        timing_reasons.append(_review_reason("timing_analysis_pending", "timing"))
+
+    manual_full = bool(text_reasons or operational_reasons)
+    timing_targeted = bool(timing_reasons)
+    if manual_full:
+        priority, priority_label, rank = "manual_full", "Manual completa", 1
+    elif timing_targeted:
+        priority, priority_label, rank = "timing_targeted", "Timing dirigido", 2
+    else:
+        priority, priority_label, rank = "standard", "Revisión estándar", 3
+    return {
+        "review_priority": priority,
+        "review_priority_label": priority_label,
+        "review_priority_rank": rank,
+        "review_reasons": text_reasons + timing_reasons + operational_reasons,
+        "review_domains": {
+            "text": {
+                "status": "manual_full" if text_reasons else "standard",
+                "reasons": text_reasons,
+            },
+            "timing": {
+                "status": "targeted" if timing_targeted else "standard",
+                "reasons": timing_reasons,
+            },
+            "operational": {
+                "status": "manual" if operational_reasons else "clear",
+                "reasons": operational_reasons,
+            },
+        },
+    }
+
+
 def _review_reference_links(overrides: dict[str, Any]) -> list[dict[str, str]]:
     """Expose inert reviewer pointers; never retrieve or process their text."""
     rows = overrides.get("review_reference_links") or []
@@ -1251,23 +1356,27 @@ def review_queue(
             if isinstance(segment, dict) and str(segment.get("text") or "").strip()
         )
         empty_transcription = bool(job and lyric_line_count == 0)
-        manual_reasons = []
-        if not reference_available:
-            manual_reasons.append("missing_reference")
-        if empty_transcription:
-            manual_reasons.append("empty_transcription")
-        if metadata_review_required:
-            manual_reasons.append("metadata_review")
-        if quality.get("manual_full_review_required") and not manual_reasons:
-            manual_reasons.append("quality_manual_review")
-        manual_full_review = bool(
-            quality.get("manual_full_review_required")
-            or manual_reasons
-        )
         doubt_count = len([
             window for window in (quality.get("unsafe_windows") or [])
             if isinstance(window, dict)
         ])
+        classification = _review_classification(
+            job=job,
+            quality=quality,
+            reference_available=reference_available,
+            metadata_review_required=metadata_review_required,
+            empty_transcription=empty_transcription,
+            doubt_count=doubt_count,
+        )
+        review_reasons = classification["review_reasons"]
+        manual_reasons = [
+            reason["code"] for reason in review_reasons
+            if reason["code"] in {
+                "missing_reference", "empty_transcription", "metadata_review",
+                "quality_manual_review",
+            }
+        ]
+        manual_full_review = classification["review_priority"] == "manual_full"
         rows.append({
             "item_id": item.id,
             "reviewer_campaign_status": reviewer_rows.get(job.job_id) if job else None,
@@ -1282,6 +1391,10 @@ def review_queue(
             "doubt_count": doubt_count,
             "review_group": "manual" if manual_full_review else "standard",
             "manual_reasons": manual_reasons,
+            "review_priority": classification["review_priority"],
+            "review_priority_label": classification["review_priority_label"],
+            "review_reasons": review_reasons,
+            "review_domains": classification["review_domains"],
             "duration_seconds": item.duration_seconds,
             "active_minutes": active_minutes.get(job.job_id, 0.0) if job else 0.0,
             "state": queue_state,
@@ -1294,6 +1407,7 @@ def review_queue(
             "semaforo_hidden": not confidence_gate_passed,
             "_semaforo_rank": color_rank,
             "_delivery_rank": _number(verdict.get("rank_key"), 9_999.0),
+            "_review_priority_rank": classification["review_priority_rank"],
             "disagreement": _number(
                 (verdict.get("inputs") or {}).get("disagreement")
                 if isinstance(verdict.get("inputs"), dict)
@@ -1326,7 +1440,7 @@ def review_queue(
         rows = rows[:max(1, math.ceil(len(rows) * 0.20))]
     else:
         rows.sort(key=lambda row: (
-            1 if row["reference"]["manual_full_review_required"] else 0,
+            row["_review_priority_rank"],
             1 if row["version"] == "live" else 0,
             row["_semaforo_rank"] if confidence_gate_passed else 0,
             row["_delivery_rank"] if confidence_gate_passed else row["doubt_count"],
@@ -1345,8 +1459,17 @@ def review_queue(
         "pending", "processing", "ready", "reviewing", "approved",
         "approved_today", "exported", "failed",
     )}
+    classification_counts = {
+        "manual_full": 0,
+        "timing_targeted": 0,
+        "standard": 0,
+        "blocked": 0,
+    }
     for row in counter_rows:
         counters[row["state"]] = counters.get(row["state"], 0) + 1
+        classification_counts[row["review_priority"]] = (
+            classification_counts.get(row["review_priority"], 0) + 1
+        )
     today = _now().replace(hour=0, minute=0, second=0, microsecond=0)
     if stage == "lyrics":
         # Count only campaign jobs from the already materialized rows to
@@ -1383,6 +1506,12 @@ def review_queue(
         "page": page,
         "pages": max(1, math.ceil(total / limit)),
         "counters": counters,
+        "classification_counts": classification_counts,
+        "classification": {
+            "schema": "operational_review_priority_v1",
+            "calibrated": False,
+            "basis": "human_work_scope_rules",
+        },
         "background_split": background_split,
         "review_minutes_today": _review_minutes_today(db, job_ids),
         "confidence": {
