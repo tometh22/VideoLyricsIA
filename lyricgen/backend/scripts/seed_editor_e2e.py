@@ -30,6 +30,7 @@ def seed_reviewer_candidate(db, user):
     from reviewer_batch_bridge import REQUIRED_AUDIO_FAMILIES, publish_batch_candidate
     from reviewer_candidate import build_candidate
     from reviewer_candidate_registry import register_candidate
+    from reviewer_edit_provenance import from_database
     from reviewer_shadow import review_window, source_binding
     from reference_hypothesis import build_unavailable
     from shadow_reference_import import digest
@@ -69,6 +70,11 @@ def seed_reviewer_candidate(db, user):
         "audio_revision": 1, "segments_revision": document.revision,
         "segments": document.current_segments, "segments_sha256": digest(document.current_segments),
         "duration_seconds": 10.}
+    # The registry is immutable and is built before the DB publication call.
+    # Give it the same DB-derived ownership receipt that publication will
+    # recompute; a missing receipt would conservatively erase this verified
+    # migration from the candidate's backed changes.
+    song["edit_provenance"] = from_database(db, song)
     evidence = [{"kind": "content", "family": family, "text": "Canto aquí",
         "tool_status": "ok", "received_audio": True, "conditioning_texts": [],
         "occurrence_verified": True, "synthetic_ci_fixture": True}
