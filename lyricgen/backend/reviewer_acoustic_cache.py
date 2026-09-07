@@ -108,12 +108,20 @@ def _annotations(request):
             continue
         start, end = item.get("start"), item.get("end")
         text = item.get("word", item.get("text"))
-        if not isinstance(text, str) or not text.strip() or not all(_number(v) for v in (start, end)) or not 0 <= start < end <= duration + .001:
+        if not isinstance(text, str) or not text.strip() or not all(_number(v) for v in (start, end)) or not 0 <= start <= end <= duration + .001:
             invalid.append({"index": index, "reason": "invalid_provider_timestamp_or_text", "raw": item})
             continue
+        # A provider sometimes emits start == end for a word it did hear.
+        # Dropping the annotation removed the WORD from the witness stream, so a
+        # line that genuinely contains it could read as never sung. Keep the
+        # lexical evidence and mark the span unusable: a zero-length span is not
+        # a word end and must never reach endpoint or duration logic.
+        degenerate = start == end
         valid.append({**item, "text": text, "local_start": start, "local_end": end,
                       "global_start": start + offset, "global_end": end + offset,
-                      "timestamp_status": "provider_hypothesis_not_alignment"})
+                      "timestamp_status": ("provider_degenerate_span_lexical_only" if degenerate
+                                           else "provider_hypothesis_not_alignment"),
+                      "usable_span": not degenerate})
     return valid, invalid
 
 
