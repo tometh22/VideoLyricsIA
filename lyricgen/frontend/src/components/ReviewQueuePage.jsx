@@ -16,6 +16,9 @@ async function api(path, options = {}) {
   const token = localStorage.getItem("genly_token");
   const response = await fetch(`${API}${path}`, {
     ...options,
+    // Approval mutates the queue while this page is often restored from the
+    // browser back-forward cache. Never reuse a stale campaign snapshot.
+    cache: options.cache || "no-store",
     headers: {
       ...(options.headers || {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -90,6 +93,17 @@ export default function ReviewQueuePage() {
   }, []);
 
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState === "visible") void load();
+    };
+    window.addEventListener("pageshow", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("pageshow", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [load]);
   useEffect(() => {
     const timer = window.setInterval(load, 10_000);
     return () => window.clearInterval(timer);

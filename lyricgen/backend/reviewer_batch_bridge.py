@@ -82,8 +82,12 @@ def prepare_batch_candidate(song, candidate, review, *, original_segments=None,
     for change in rebuilt["changes"]:
         row = song["segments"][change["line_index"]]
         kind = "text" if change["field"] == "text" else "timing"
+        from reviewer_edit_provenance import protected
+        verified = protected(song, change['line_index'])
+        human_changed = (verified if verified is not None else
+            original_keys is not None and content_key(row) not in original_keys)
         if (kind not in allowed_suggestion_types
-                or original_keys is not None and content_key(row) not in original_keys):
+                or human_changed):
             held.add(change["evidence_id"])
     backed_ids = {change["evidence_id"] for change in rebuilt["changes"]}
     decisions = [d for d in candidate.get("decision_evidence", [])
@@ -142,6 +146,12 @@ def publish_batch_candidate(db, song, candidate, review):
         "segments_revision": document.revision, "audio_revision": job.audio_revision,
         "audio_sha256": job.input_audio_sha256,
         "segments_sha256": digest(document.current_segments or [])}
+    # Candidate payloads may come from an untrusted cache and must not carry
+    # the ownership receipt used to distinguish verified migrations from human
+    # edits. Recompute it from the locked editor history before validation so
+    # the preparation path sees the same source of truth as persistence.
+    from reviewer_edit_provenance import from_database
+    live["edit_provenance"] = from_database(db, live)
     prepared = prepare_batch_candidate(live, candidate, review,
         original_segments=document.original_segments or [],
         allowed_suggestion_types=tuple(k for k in ("text", "timing")

@@ -1037,10 +1037,24 @@ def approve_campaign_lyrics(
             "confirmed_line_count": approval["confirmed_line_count"],
         },
     ))
+    # Commit the capture intent with approval. A Redis outage must not lose
+    # the correction nor roll back a completed human review.
+    from transactional_outbox import create_outbox_event, dispatch_outbox_event
+    event = create_outbox_event(db, job_id=job_id, event_type='correction.enqueue',
+        dedupe_key=f'campaign-correction:{job_id}:{version.id}',
+        payload={'approved_version_id': version.id, 'approved_revision': document.revision,
+                 'audio_sha256': approval['audio_sha256'], 'audio_revision': approval['audio_revision']})
+    event_id, version_id = event.id, version.id
     db.commit()
+    try:
+        dispatch_outbox_event(event_id)
+    except Exception as exc:
+        # Approval is already committed; the durable outbox owns retries.
+        import logging
+        logging.getLogger(__name__).warning('Correction outbox delivery pending: %s', type(exc).__name__)
     return {
         "job_id": job_id, "status": "lyrics_approved",
-        "approved_version_id": version.id, "deduplicated": False,
+        "approved_version_id": version_id, "deduplicated": False,
     }
 
 

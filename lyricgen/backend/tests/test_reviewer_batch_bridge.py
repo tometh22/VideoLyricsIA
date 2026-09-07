@@ -1,4 +1,5 @@
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
@@ -104,3 +105,63 @@ def test_default_off_publication_never_accesses_database(monkeypatch):
     monkeypatch.delenv("REVIEWER_ASSIST_ENABLED", raising=False)
     assert publish_batch_candidate(None, {}, {}, {}) == {
         "published": False, "reason": "reviewer_assist_disabled"}
+
+
+def test_publication_rederives_edit_provenance_from_locked_history(monkeypatch):
+    """A cached/forged receipt must never decide migration ownership."""
+    song, candidate, review = fixture()
+    song.update(campaign_id="fixture-campaign", edit_provenance={"forged": True})
+    job = SimpleNamespace(
+        campaign_id="fixture-campaign", audio_revision=song["audio_revision"],
+        input_audio_sha256=song["audio_sha256"], status="ready",
+        approved_at=None,
+    )
+    document = SimpleNamespace(
+        current_segments=deepcopy(song["segments"]),
+        original_segments=deepcopy(song["segments"]),
+        revision=song["segments_revision"], quality_proposal=None,
+        lock_user_id=None, lock_expires_at=None, approved_at=None,
+    )
+
+    class Query:
+        def __init__(self, value):
+            self.value = value
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def populate_existing(self):
+            return self
+
+        def with_for_update(self):
+            return self
+
+        def first(self):
+            return self.value
+
+    class DB:
+        def query(self, model):
+            from database import EditorDocument, Job
+            return Query(job if model is Job else document if model is EditorDocument else None)
+
+    receipt = {"schema": "reviewer-edit-provenance-v1", "lines": []}
+    captured = {}
+
+    def fake_prepare(live, *_args, **_kwargs):
+        captured["song"] = live
+        return {"proposal": {"kind": "operator_review_proposal"}}
+
+    monkeypatch.setenv("REVIEWER_ASSIST_ENABLED", "1")
+    monkeypatch.setenv("REVIEWER_ASSIST_PUBLISH_ENABLED", "1")
+    monkeypatch.setenv("REVIEWER_ASSIST_CAMPAIGN_ID", "fixture-campaign")
+    monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    monkeypatch.setenv("QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", "0")
+    monkeypatch.setattr("reviewer_batch_bridge.prepare_batch_candidate", fake_prepare)
+    monkeypatch.setattr("reviewer_edit_provenance.from_database", lambda *_args: receipt)
+    monkeypatch.setattr("editor.persist_operator_review_proposal_if_current", lambda *_args, **_kwargs: True)
+
+    result = publish_batch_candidate(DB(), song, candidate, review)
+
+    assert result["published"] is True
+    assert captured["song"]["edit_provenance"] is receipt
+    assert captured["song"]["edit_provenance"] != song["edit_provenance"]

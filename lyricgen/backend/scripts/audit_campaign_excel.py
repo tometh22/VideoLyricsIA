@@ -17,11 +17,11 @@ from delivery_preflight import build_delivery_preflight
 from shadow_reference_import import digest, import_workbook, associate
 
 
-def run(root, snapshot_path, output, commit, align_new=False):
+def run(root, snapshot_path, output, commit, align_new=False, reference_import=None):
     started = time.monotonic()
     snapshot = json.loads(snapshot_path.read_text())
     workbook = root.parent/'attachments/0r7Dxt/Copia de Lista Genly Lyrics _ Art Tracks-4.xlsx'
-    imported = associate(import_workbook(workbook), snapshot['jobs'])
+    imported = associate(json.loads(reference_import.read_text()) if reference_import else import_workbook(workbook), snapshot['jobs'])
     manifest = json.loads((root/'campaign-300/manifest.json').read_text())
     roster = {s['job_id']: s for s in manifest['songs']}
     assert len(snapshot['jobs']) == len(roster) == 300
@@ -47,7 +47,7 @@ def run(root, snapshot_path, output, commit, align_new=False):
         orthographic_lines = []
         if song['segments']:
             old = json.loads((old_folder/'candidate.json').read_text()) if (old_folder/'candidate.json').exists() else None
-            if old and old['source'] == source_binding(song):
+            if (old and old['source'] == source_binding(song) and not song.get('edit_provenance')):
                 base = old
                 review = json.loads((old_folder/'review.json').read_text())
             else:
@@ -165,5 +165,6 @@ if __name__ == '__main__':
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--commit', required=True)
     p.add_argument('--align-new', action='store_true')
+    p.add_argument('--reference-import', type=Path, help='Reuse stored workbook extraction; reassociate against current metadata')
     a = p.parse_args()
-    run(a.root, a.snapshot, a.output, a.commit, a.align_new)
+    run(a.root, a.snapshot, a.output, a.commit, a.align_new, a.reference_import)

@@ -452,6 +452,21 @@ def test_human_approval_binds_every_line_audio_and_editor_revision(
     assert approval["confirmed_line_count"] == 2
     assert approval["review_scope"] == "song"
     assert job.transcription_quality["reference_hypothesis"]["review_status"] == "human_line_review_approved"
+    capture = db.query(JobOutboxEvent).filter_by(job_id=job.job_id, event_type='correction.enqueue').one()
+    assert capture.payload['approved_version_id'] == response['approved_version_id']
+    assert capture.payload['audio_sha256'] == audio_sha
+    from transactional_outbox import _publish
+    calls = []
+    monkeypatch.setattr('queue_jobs.enqueue_correction_learning',
+        lambda *args, **kwargs: calls.append((args, kwargs)) or 'fixture-capture')
+    assert _publish(capture) == 'fixture-capture'
+    assert calls[0][1]['source_confidence'] == 'operational_review'
+    from correction_learning import create_observation
+    observation = create_observation(db, job.job_id, response['approved_version_id'], source_confidence='operational_review')
+    repeated = create_observation(db, job.job_id, response['approved_version_id'], source_confidence='operational_review')
+    assert observation.id == repeated.id
+    assert observation.label_tier == 'observed'
+    assert observation.metrics['operational_history']['approved_version_id'] == response['approved_version_id']
 
 
 def test_human_approval_accepts_ordered_ids_for_legacy_document(db, monkeypatch):

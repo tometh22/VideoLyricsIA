@@ -55,6 +55,8 @@ def main():
                 "quality_status": quality.get("analysis_status"),
                 "language_evidence": {k: v for k, v in quality.items() if "language" in k or "lid" in k},
             })
+            from reviewer_edit_provenance import from_database
+            output[-1]['edit_provenance'] = from_database(db, output[-1])
         result = {"schema": "reviewer-shadow-snapshot-v1", "campaign_id": args.campaign,
                   "captured_at": datetime.now(timezone.utc).isoformat(), "jobs": output,
                   "read_only_transaction": True, "automatic_apply_allowed": False}

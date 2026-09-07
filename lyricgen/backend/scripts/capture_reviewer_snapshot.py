@@ -11,6 +11,12 @@ if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True)
     p.add_argument('--identity',required=True);a=p.parse_args()
     source=Path(__file__).with_name('export_reviewer_shadow_snapshot.py').read_bytes()
+    # Read-only exporter can audit a new provenance policy before its deploy.
+    helper=Path(__file__).parents[1].joinpath('reviewer_edit_provenance.py').read_bytes()
+    bootstrap=("import sys,types,base64\nmodule=types.ModuleType('reviewer_edit_provenance')\n"
+        "sys.modules[module.__name__]=module\nexec(compile(base64.b64decode(%r),'readonly_provenance','exec'),module.__dict__)\n"
+        % base64.b64encode(helper).decode()).encode()
+    source=bootstrap+source
     code="import base64;exec(compile(base64.b64decode(%r),'readonly_snapshot','exec'))" % base64.b64encode(source).decode()
     result=subprocess.run(['railway','ssh','-e','staging','-s','api','-i',a.identity,
         '--',shlex.join(['python','-c',code,'--campaign','ba3318bdfffe'])],capture_output=True,timeout=90)

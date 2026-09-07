@@ -4,6 +4,16 @@ import { afterEach, expect, it, vi } from "vitest";
 import CompleteReviewerCandidate from "./CompleteReviewerCandidate";
 
 afterEach(cleanup);
+it('expone discrepancia ortográfica auxiliar sin certificar PASS ni aplicarla', async () => {
+  const rows=[{text:'Que me cegan de su tristeza',start:64.24,end:67.87}];
+  render(<CompleteReviewerCandidate candidate={{source:{segments_revision:2}, baseline:rows, segments:rows,
+    changes:[],review_details:{localized_doubts:[{line_index:0,proposed_text:'Que me ciegan de su tristeza'}]}}}
+    currentRevision={2} currentSegments={rows} />);
+  await userEvent.click(screen.getByText(/Dudas y límites/));
+  expect(screen.getByText(/Referencia auxiliar: Que me ciegan/)).toBeInTheDocument();
+  expect(screen.getByText(/un PASS no certifica toda/)).toBeInTheDocument();
+  expect(screen.queryByRole('button',{name:/aplicar|aprobar/i})).toBeNull();
+});
 const baseline = [{ text: "Canto", start: 2, end: 4 }];
 const candidate = { source: { segments_revision: 3 }, baseline, segments: baseline,
   changes: [], review_details: { localized_doubts: [{ line_index: 0, reason: "Final incierto" }] } };

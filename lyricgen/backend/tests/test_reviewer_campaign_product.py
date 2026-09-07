@@ -115,6 +115,17 @@ def test_complete_publication_requires_full_evidence_before_r2(monkeypatch):
             {'candidate':candidate,'review':review},execute=True)
 
 
+def test_publication_recomputes_protection_receipt_from_live_database(monkeypatch):
+    enabled(monkeypatch)
+    song,candidate,review,job,doc,row=objects()
+    song['edit_provenance']={'forged':'unprotect'}
+    monkeypatch.setattr('reviewer_edit_provenance.from_database',lambda *a:{'verified':'protected'})
+    monkeypatch.setattr('reviewer_candidate_registry.register_candidate',lambda *a,**k:pytest.fail('no write'))
+    with pytest.raises(ValueError,match='editor_provenance_not_current_or_forged'):
+        publish_song(fake_db(job,doc),SimpleNamespace(id=CAMPAIGN,tenant_id='tenant'),song,row,
+            {'candidate':candidate,'review':review},execute=True)
+
+
 def test_publish_keeps_candidate_viewable_when_native_proposal_conflicts(monkeypatch):
     enabled(monkeypatch)
     song,candidate,review,job,doc,row=objects();doc.quality_proposal={'native':'unchanged'}

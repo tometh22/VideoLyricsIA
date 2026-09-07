@@ -174,7 +174,9 @@ def test_human_candidate_adoption_is_versioned_but_not_approved_or_locked(db, mo
         segments_json=rows, audio_revision=1, input_audio_sha256="a" * 64)
     db.add(job)
     db.flush()
-    doc = ensure_document(db, job.job_id, job.tenant_id, rows)
+    from correction_learning import machine_snapshot_provenance
+    doc = ensure_document(db, job.job_id, job.tenant_id, rows,
+        initial_reason='transcription', initial_provenance=machine_snapshot_provenance(job, {}))
     proposal, _ = build_operator_review_proposal(rows, text_candidates=[{
         "kind": "operator_review_candidate", "id": "test-window", "suggestion_type": "text",
         "start": 2., "end": 4., "current_segments": rows,

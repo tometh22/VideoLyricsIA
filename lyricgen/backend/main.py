@@ -592,6 +592,12 @@ async def add_response_time_header(request: Request, call_next):
     # cheap to keep stable).
     response.headers["X-Response-Time"] = f"{elapsed_ms:.1f}ms"
     response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.1f}"
+    # Campaign/job state changes from the editor while the operator remains
+    # in the SPA. Do not let an intermediary cache a pre-approval summary or
+    # queue page: otherwise the approved row leaves the active filter while
+    # the visible counters still describe the previous snapshot.
+    if request.method == "GET" and request.url.path.startswith("/batch/campaigns"):
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
