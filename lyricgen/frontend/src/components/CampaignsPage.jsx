@@ -227,13 +227,21 @@ function CampaignDetail({ id }) {
           <span>Promedio hoy: {reviewQueue?.review_minutes_today?.average ?? "—"} min</span>
           {queueStage === "final" && <span>Fondos fijos: {reviewQueue?.background_split?.fixed || 0}</span>}
           {queueStage === "final" && <span>Fondos generados: {reviewQueue?.background_split?.generated || 0}</span>}
-          <span>{reviewQueue?.confidence?.colors_visible ? "Semáforo visible" : `Semáforo oculto hasta ${reviewQueue?.confidence?.calibration_target || 50} revisiones`}</span>
+          <span>Prioridad operativa: reglas explícitas · no es confianza calibrada</span>
         </div>
+        {queueStage === "lyrics" && <div className="flex flex-wrap gap-2 text-xs">
+          <span className="rounded-full bg-red-500/10 px-2.5 py-1 text-red-200">Manual completa: {reviewQueue?.classification_counts?.manual_full || 0}</span>
+          <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-amber-200">Timing dirigido: {reviewQueue?.classification_counts?.timing_targeted || 0}</span>
+          <span className="rounded-full bg-white/[0.06] px-2.5 py-1 text-ink-secondary">Estándar: {reviewQueue?.classification_counts?.standard || 0}</span>
+        </div>}
         <div className="overflow-x-auto">
           <table className="w-full min-w-[850px] text-left text-xs">
             <thead className="text-ink-tertiary"><tr><th className="p-2">Prioridad</th><th className="p-2">Artista / canción</th><th className="p-2">Versión</th>{queueStage === "final" && <th className="p-2">Fondo</th>}<th className="p-2">Duración</th><th className="p-2">Estado</th><th className="p-2">Referencia</th><th className="p-2"></th></tr></thead>
             <tbody>{(reviewQueue?.items || []).map((row) => <tr key={row.item_id} className="border-t border-white/[0.05] text-ink-secondary">
-              <td className="p-2">{row.priority}</td>
+              <td className="p-2"><div className="font-semibold text-white">{row.priority} · {row.review_priority_label || "Revisión estándar"}</div>
+                <div className="mt-1 text-[11px]">Texto: {row.review_domains?.text?.status === "manual_full" ? "manual" : row.review_domains?.text?.status || "—"} · Timing: {row.review_domains?.timing?.status === "targeted" ? "dirigido" : row.review_domains?.timing?.status || "—"}</div>
+                {!!row.review_reasons?.length && <div className="mt-1 text-[11px] text-amber-200">{row.review_reasons.map((reason) => reason.label).join(" · ")}</div>}
+              </td>
               <td className="p-2"><div className="font-medium text-white">{row.title}</div><div>{row.artist}</div>
                 {queueStage === "lyrics" && campaign.reviewer_campaign_status?.enabled === true && <CampaignReviewerRow status={row.reviewer_campaign_status} jobId={row.job_id} onOpen={navigate} />}
               </td>

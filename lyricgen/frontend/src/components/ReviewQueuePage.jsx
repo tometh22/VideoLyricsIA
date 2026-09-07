@@ -145,9 +145,14 @@ export default function ReviewQueuePage() {
         <div className="rounded-2xl bg-surface-2/50 p-4 ring-1 ring-white/[0.06]"><div className="text-2xl font-bold text-white">{queue?.review_minutes_today?.average ?? "—"}</div><div className="text-xs text-ink-tertiary">Minutos promedio hoy</div></div>
       </div>
 
+      <div className="mb-2 flex flex-wrap gap-2 text-xs">
+        <span className="rounded-full bg-red-500/10 px-2.5 py-1 text-red-200">Manual completa: {queue?.classification_counts?.manual_full || 0}</span>
+        <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-amber-200">Timing dirigido: {queue?.classification_counts?.timing_targeted || 0}</span>
+        <span className="rounded-full bg-white/[0.06] px-2.5 py-1 text-ink-secondary">Estándar: {queue?.classification_counts?.standard || 0}</span>
+      </div>
       <div className="overflow-x-auto rounded-2xl bg-surface-2/40 ring-1 ring-white/[0.06]">
         <table className="w-full min-w-[850px] text-left text-sm">
-          <thead className="border-b border-white/[0.06] text-xs text-ink-tertiary"><tr><th className="p-4">#</th><th className="p-4">Artista</th><th className="p-4">Título</th><th className="p-4">Estudio / vivo</th><th className="p-4">Duración</th><th className="p-4">Estado</th><th className="p-4">Tiempo acumulado</th><th className="p-4" /></tr></thead>
+          <thead className="border-b border-white/[0.06] text-xs text-ink-tertiary"><tr><th className="p-4">Prioridad operativa</th><th className="p-4">Artista</th><th className="p-4">Título</th><th className="p-4">Estudio / vivo</th><th className="p-4">Duración</th><th className="p-4">Estado</th><th className="p-4">Tiempo acumulado</th><th className="p-4" /></tr></thead>
           <tbody>{rows.map((row, index) => {
             const highlighted = row.job_id === highlightedJobId;
             const manual = row.reference?.manual_full_review_required;
@@ -167,7 +172,7 @@ export default function ReviewQueuePage() {
                 </td>
               </tr>}
               <tr className={`border-b border-white/[0.045] ${highlighted ? "bg-brand/10 ring-1 ring-inset ring-brand/30" : ""}`}>
-              <td className="p-4 font-semibold text-white">{row.priority}</td><td className="p-4 text-ink-secondary">{row.artist || "—"}</td><td className="p-4 font-medium text-white">{row.title}</td><td className="p-4 text-ink-secondary">{row.version === "live" ? "Vivo" : "Estudio"}</td><td className="p-4 text-ink-secondary">{duration(row.duration_seconds)}</td><td className="p-4 text-ink-secondary">{STATE_LABELS[row.state] || row.state}{row.reviewer_name ? ` por ${row.reviewer_name}` : ""}{manual && <span className="ml-2 rounded-full bg-red-500/15 px-2 py-1 text-[11px] font-semibold text-red-200">Revisión manual completa</span>}</td><td className="p-4 tabular-nums text-ink-secondary">{Number(row.active_minutes || 0).toFixed(2)} min</td><td className="p-4"><button onClick={() => open(row)} disabled={!row.job_id || !["ready", "reviewing"].includes(row.state)} className="min-w-28 rounded-xl bg-brand px-5 py-3 text-sm font-semibold text-white disabled:bg-white/[0.06] disabled:text-ink-tertiary">Revisar</button></td>
+              <td className="p-4"><div className="font-semibold text-white">{row.priority} · {row.review_priority_label || "Revisión estándar"}</div><div className="mt-1 text-[11px] text-ink-tertiary">Texto: {row.review_domains?.text?.status === "manual_full" ? "manual" : row.review_domains?.text?.status || "—"} · Timing: {row.review_domains?.timing?.status === "targeted" ? "dirigido" : row.review_domains?.timing?.status || "—"}</div>{!!row.review_reasons?.length && <div className="mt-1 text-[11px] text-amber-200">{row.review_reasons.map((reason) => reason.label).join(" · ")}</div>}</td><td className="p-4 text-ink-secondary">{row.artist || "—"}</td><td className="p-4 font-medium text-white">{row.title}</td><td className="p-4 text-ink-secondary">{row.version === "live" ? "Vivo" : "Estudio"}</td><td className="p-4 text-ink-secondary">{duration(row.duration_seconds)}</td><td className="p-4 text-ink-secondary">{STATE_LABELS[row.state] || row.state}{row.reviewer_name ? ` por ${row.reviewer_name}` : ""}{manual && <span className="ml-2 rounded-full bg-red-500/15 px-2 py-1 text-[11px] font-semibold text-red-200">Revisión manual completa</span>}</td><td className="p-4 tabular-nums text-ink-secondary">{Number(row.active_minutes || 0).toFixed(2)} min</td><td className="p-4"><button onClick={() => open(row)} disabled={!row.job_id || !["ready", "reviewing"].includes(row.state)} className="min-w-28 rounded-xl bg-brand px-5 py-3 text-sm font-semibold text-white disabled:bg-white/[0.06] disabled:text-ink-tertiary">Revisar</button></td>
               </tr>
               {manual && <tr className="border-b border-white/[0.045] bg-red-500/[0.025]">
                 <td />
@@ -182,7 +187,7 @@ export default function ReviewQueuePage() {
         </table>
         {!rows.length && !error && <div className="p-10 text-center text-sm text-ink-tertiary">No hay canciones en la campaña actual.</div>}
       </div>
-      <p className="text-xs text-ink-tertiary">Semáforo: umbrales sin calibrar. Está oculto y no se usa para ordenar ni automatizar hasta contar con revisiones humanas. Esta pantalla no genera fondos ni renders.</p>
+      <p className="text-xs text-ink-tertiary">La prioridad operativa usa reglas explícitas de alcance de trabajo; no es confianza calibrada ni automatiza aprobaciones. Esta pantalla no genera fondos ni renders.</p>
     </div>
   );
 }

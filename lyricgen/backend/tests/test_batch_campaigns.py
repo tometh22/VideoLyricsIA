@@ -651,6 +651,12 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
     assert first_job["reference"]["available"] is True
     assert first_job["reference"]["manual_full_review_required"] is False
     assert first_job["review_group"] == "standard"
+    assert first_job["review_priority"] == "standard"
+    assert first_job["review_domains"]["text"]["status"] == "standard"
+    assert first_job["review_domains"]["timing"]["status"] == "standard"
+    assert delivery["classification_counts"] == {
+        "manual_full": 0, "timing_targeted": 0, "standard": 3, "blocked": 0,
+    }
     assert first_job["background_mode"] is None
     assert delivery["background_split"] is None
 
@@ -659,6 +665,86 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
     )
     assert [row["job_id"] for row in learning["items"]] == [jobs[1].job_id]
     assert learning["counters"]["ready"] == 3
+
+
+def test_review_queue_separates_text_and_timing_priority_with_visible_reasons(
+    db, monkeypatch,
+):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 3)
+    items = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).order_by(BatchCampaignItem.ordinal).all()
+    user = db.query(User).first()
+    jobs = []
+    for index, item in enumerate(items):
+        audio_sha256 = hashlib.sha256(f"classification-{item.id}".encode()).hexdigest()
+        quality = {}
+        if index == 1:
+            quality = {
+                "reference_hypothesis": build_reference_hypothesis(
+                    text="línea válida", provider="gemini",
+                    audio_sha256=audio_sha256, audio_revision=1,
+                    source_kind="gemini_complete_audio_derived",
+                    complete_audio_verified=True,
+                ),
+                "unsafe_windows": [{"start": 1.0, "end": 2.0}],
+            }
+        elif index == 2:
+            quality = {
+                "reference_hypothesis": build_reference_hypothesis(
+                    text="línea válida", provider="gemini",
+                    audio_sha256=audio_sha256, audio_revision=1,
+                    source_kind="gemini_complete_audio_derived",
+                    complete_audio_verified=True,
+                ),
+            }
+        job = Job(
+            job_id=uuid.uuid4().hex[:12], user_id=user.id,
+            tenant_id=campaign.tenant_id, artist=item.artist,
+            song_title=item.title, filename=item.filename,
+            status="transcribed_pending", workload_class="batch",
+            campaign_id=campaign.id, campaign_item_id=item.id,
+            input_audio_sha256=audio_sha256, audio_revision=1,
+            segments_json=[{
+                "segment_id": f"line-{item.ordinal}", "start": 0,
+                "end": 1, "text": "línea válida" if index else "",
+            }],
+            transcription_quality=quality,
+        )
+        db.add(job)
+        jobs.append(job)
+    db.commit()
+
+    result = batch.review_queue(
+        campaign.id, stage="lyrics", order="delivery", state=None,
+        version=None, background_mode=None, artist=None,
+        audit_preapproved=False, page=1, limit=50, current_user={
+            "id": user.id, "tenant_id": campaign.tenant_id, "role": "admin",
+        }, db=db,
+    )
+
+    assert [row["job_id"] for row in result["items"]] == [
+        jobs[0].job_id, jobs[1].job_id, jobs[2].job_id,
+    ]
+    assert [row["review_priority"] for row in result["items"]] == [
+        "manual_full", "timing_targeted", "standard",
+    ]
+    assert result["classification_counts"] == {
+        "manual_full": 1, "timing_targeted": 1, "standard": 1, "blocked": 0,
+    }
+    text_row, timing_row, standard_row = result["items"]
+    assert text_row["review_domains"]["text"]["status"] == "manual_full"
+    assert {reason["code"] for reason in text_row["review_domains"]["text"]["reasons"]} == {
+        "missing_reference", "empty_transcription",
+    }
+    assert timing_row["review_domains"]["text"]["status"] == "standard"
+    assert timing_row["review_domains"]["timing"]["status"] == "targeted"
+    assert timing_row["review_domains"]["timing"]["reasons"][0]["domain"] == "timing"
+    assert timing_row["review_domains"]["timing"]["reasons"][0]["count"] == 1
+    assert standard_row["review_domains"]["text"]["status"] == "standard"
+    assert standard_row["review_domains"]["timing"]["status"] == "standard"
+    assert result["classification"]["calibrated"] is False
 
 
 def test_manual_metadata_stays_red_reviewable_without_visual_fields(db, monkeypatch):
