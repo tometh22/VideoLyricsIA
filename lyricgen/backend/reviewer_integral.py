@@ -33,6 +33,29 @@ def union_seconds(intervals):
     return round(total, 4)
 
 
+def usable_span(word):
+    """Whether this provider word may define an interval bound.
+
+    A provider sometimes emits start == end for a word it did hear. The word is
+    lexical evidence, but a zero-length span is not a measured boundary, so it
+    must never become the start or end of a located occurrence. Words that do
+    not carry the flag are judged by their own span, so raw provider responses
+    behave the same as annotations read back from the acoustic cache.
+    """
+    flag = word.get("usable_span")
+    if flag is not None:
+        return bool(flag)
+    # Annotations read back from the acoustic cache carry local_/global_ spans;
+    # rebuilt provider words carry start/end. An entry that exposes no span at
+    # all keeps its previous treatment, so this never silently drops evidence.
+    for low, high in (("start", "end"), ("local_start", "local_end"),
+                      ("global_start", "global_end")):
+        a, b = word.get(low), word.get(high)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return b > a
+    return True
+
+
 def locate_words(text, request, window, baseline):
     """Exact lexical occurrences, disambiguated by temporal overlap; not truth."""
     if request.get("tool_status") != "ok":
@@ -48,7 +71,15 @@ def locate_words(text, request, window, baseline):
     for i in range(len(flat) - len(needle) + 1) if needle else []:
         if flat[i:i + len(needle)] != needle:
             continue
-        a, b = words[owners[i]], words[owners[i + len(needle) - 1]]
+        # The match may legitimately include a word whose span is unusable; the
+        # occurrence still exists lexically, but its bounds come only from words
+        # that carry a measured span.
+        matched = [words[owner] for owner in
+                   sorted(set(owners[i:i + len(needle)]), key=owners[i:i + len(needle)].index)]
+        bounded = [word for word in matched if usable_span(word)]
+        if not bounded:
+            continue
+        a, b = bounded[0], bounded[-1]
         start, end = window["start"] + a["start"], window["start"] + b["end"]
         if not window["start"] <= start < end <= window["end"] + .05:
             continue

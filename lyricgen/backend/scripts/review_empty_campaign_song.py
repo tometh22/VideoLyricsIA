@@ -10,6 +10,7 @@ from pathlib import Path
 import time
 
 from reviewer_acoustic_cache import cached_receipts, request_index
+from reviewer_integral import usable_span
 from reviewer_campaign import SpendLedger, atomic_json, counters, owner_lock, update_status
 from reviewer_integral import union_seconds, windows
 from reviewer_shadow import ShadowPolicy, source_binding, tokens
@@ -80,7 +81,11 @@ def diagnose(song, cached):
                 for i in range(len(haystack) - len(phrase) + 1) if phrase else []:
                     if haystack[i:i + len(phrase)] != phrase:
                         continue
-                    first, last = flattened[i][1], flattened[i + len(phrase) - 1][1]
+                    spanned = [word for _, word in flattened[i:i + len(phrase)]
+                               if usable_span(word)]
+                    if not spanned:
+                        continue
+                    first, last = spanned[0], spanned[-1]
                     start, end = first["global_start"], last["global_end"]
                     if max(start, annotation["global_start"]) >= min(end, annotation["global_end"]):
                         continue

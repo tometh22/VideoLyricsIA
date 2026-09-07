@@ -11,6 +11,7 @@ import re
 import unicodedata
 
 from reviewer_campaign_reconcile import human_protected
+from reviewer_integral import usable_span
 from reviewer_shadow import (review_window, sequence_discrepancies, source_binding,
                              tokens, validate_snapshot)
 from shadow_reference_import import digest
@@ -93,8 +94,14 @@ def _witness(song, i, proposed, record):
     if len(matches) != 1:
         return None
     j = matches[0]
-    first, last = annotations[owners[j]], annotations[owners[j+len(target)-1]]
-    start, end = first['global_start'], last['global_end']
+    matched = annotations[owners[j]:owners[j+len(target)-1]+1]
+    # A zero-length provider span is lexical evidence, never a boundary. The
+    # occurrence keeps its full token range, but its extent — and therefore the
+    # single-caption overlap test below — rests only on measured spans.
+    bounded = [a for a in matched if usable_span(a)]
+    if not bounded:
+        return None
+    start, end = bounded[0]['global_start'], bounded[-1]['global_end']
     line = song['segments'][i]
     # Provider event times are only occurrence hypotheses, not precise timing.
     # Reject any span overlapping another displayed occurrence, not just an

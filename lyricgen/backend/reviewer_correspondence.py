@@ -1,5 +1,6 @@
 """Sequence anchors propose correspondences, never certify recognition."""
 from difflib import SequenceMatcher
+from reviewer_integral import usable_span
 from reviewer_shadow import tokens
 
 
@@ -19,7 +20,14 @@ def correspond(segment, request, window):
             b = a + length
             if b > len(flat):
                 continue
-            first, last = words[owners[a]], words[owners[b-1]]
+            # A zero-length provider span is lexical evidence, never a bound:
+            # keep the candidate but take its extent from measured words only.
+            spanned = [words[owner] for owner in
+                       sorted(set(owners[a:b]), key=owners[a:b].index)
+                       if usable_span(words[owner])]
+            if not spanned:
+                continue
+            first, last = spanned[0], spanned[-1]
             start, end = window['start'] + first['start'], window['start'] + last['end']
             if not max(start, segment['start']) < min(end, segment['end']):
                 continue
