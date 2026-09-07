@@ -18,6 +18,12 @@ function authHeaders(headers = {}) {
   return token ? { ...headers, Authorization: `Bearer ${token}` } : headers;
 }
 
+function timestamp(seconds) {
+  if (!Number.isFinite(Number(seconds))) return "—";
+  const value = Math.max(0, Number(seconds));
+  return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, "0")}`;
+}
+
 async function api(path, options = {}) {
   const response = await fetch(`${API}${path}`, {
     ...options,
@@ -113,6 +119,7 @@ function CampaignDetail({ id }) {
   const [queueOrder, setQueueOrder] = useState("delivery");
   const [queueVersion, setQueueVersion] = useState("");
   const [queueState, setQueueState] = useState("");
+  const [queueScope, setQueueScope] = useState("pending");
   const [queueBackground, setQueueBackground] = useState("");
   const [queueArtist, setQueueArtist] = useState("");
   const [queueAudit, setQueueAudit] = useState(false);
@@ -120,17 +127,27 @@ function CampaignDetail({ id }) {
 
   const load = useCallback(async () => {
     try {
-      const [head, rows, review] = await Promise.all([
+      const queueQuery = `stage=${queueStage}&order=${queueOrder}&scope=${queueScope}&limit=100${queueVersion ? `&version=${queueVersion}` : ""}${queueState ? `&state=${encodeURIComponent(queueState)}` : ""}${queueStage === "final" && queueBackground ? `&background_mode=${encodeURIComponent(queueBackground)}` : ""}${queueArtist ? `&artist=${encodeURIComponent(queueArtist)}` : ""}${queueAudit ? "&audit_preapproved=true" : ""}`;
+      const [head, rows, firstReview] = await Promise.all([
         api(`/batch/campaigns/${id}`),
         api(`/batch/campaigns/${id}/items?page=${page}&limit=50${phase ? `&phase=${phase}` : ""}`),
-        api(`/batch/campaigns/${id}/review-queue?stage=${queueStage}&order=${queueOrder}${queueVersion ? `&version=${queueVersion}` : ""}${queueState ? `&state=${encodeURIComponent(queueState)}` : ""}${queueStage === "final" && queueBackground ? `&background_mode=${encodeURIComponent(queueBackground)}` : ""}${queueArtist ? `&artist=${encodeURIComponent(queueArtist)}` : ""}${queueAudit ? "&audit_preapproved=true" : ""}`),
+        api(`/batch/campaigns/${id}/review-queue?${queueQuery}`),
       ]);
+      const remainingReviews = await Promise.all(
+        Array.from({ length: Math.max(0, Number(firstReview.pages || 1) - 1) }, (_, index) => (
+          api(`/batch/campaigns/${id}/review-queue?${queueQuery}&page=${index + 2}`)
+        )),
+      );
+      const review = {
+        ...firstReview,
+        items: [firstReview.items || [], ...remainingReviews.map((pageData) => pageData.items || [])].flat(),
+      };
       setCampaign(head); setItems(rows.items || []); setPages(rows.pages || 1);
       setReviewQueue(review);
       setPresetText((current) => current || JSON.stringify(head.default_render_params || {}, null, 2));
       setError("");
     } catch (e) { setError(e.message); }
-  }, [id, page, phase, queueStage, queueOrder, queueVersion, queueState, queueBackground, queueArtist, queueAudit]);
+  }, [id, page, phase, queueStage, queueOrder, queueScope, queueVersion, queueState, queueBackground, queueArtist, queueAudit]);
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
     const refresh = () => {
@@ -185,8 +202,8 @@ function CampaignDetail({ id }) {
       <button onClick={() => navigate("/campaigns")} className="text-sm text-ink-secondary hover:text-white">← Campañas</button>
       <div className="flex flex-col gap-4 md:flex-row md:items-start">
         <div className="min-w-0 flex-1"><h1 className="truncate text-3xl font-bold text-white">{campaign.name}</h1><p className="mt-2 text-sm text-ink-secondary">{campaign.registered_count}/{campaign.expected_count || "—"} audios registrados · estado {campaign.status}</p></div>
-        <div className="flex flex-wrap gap-2">
-          <button onClick={() => takeNext(queueStage)} disabled={queueStage === "lyrics" ? !reviewQueue?.counters?.ready : !reviewQueue?.counters?.ready} className="rounded-xl bg-brand px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-40">Tomar siguiente · {queueStage === "lyrics" ? "letra" : "QC final"}</button>
+      <div className="flex flex-wrap gap-2">
+          <button onClick={() => takeNext(queueStage)} disabled={queueScope !== "pending" || !reviewQueue?.counters?.ready} className="rounded-xl bg-brand px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-40">Tomar siguiente · {queueStage === "lyrics" ? "letra" : "QC final"}</button>
           {campaign.status === "active" ? <button onClick={() => patch({ status: "paused" })} className="rounded-xl bg-white/[0.06] px-4 py-2.5 text-sm text-white">Pausar</button> : campaign.status === "paused" ? <button onClick={() => patch({ status: "active" })} className="rounded-xl bg-white/[0.06] px-4 py-2.5 text-sm text-white">Reanudar</button> : null}
           {!['completed', 'cancelled'].includes(campaign.status) && <button onClick={() => window.confirm("¿Cancelar esta campaña?") && patch({ status: "cancelled" })} className="rounded-xl bg-red-500/10 px-4 py-2.5 text-sm text-red-200">Cancelar</button>}
         </div>
@@ -209,6 +226,9 @@ function CampaignDetail({ id }) {
             <select value={queueOrder} onChange={(e) => setQueueOrder(e.target.value)} className="rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10">
               <option value="delivery">Orden entrega</option><option value="learning">Aprendizaje (20%)</option>
             </select>
+            <select value={queueScope} onChange={(e) => setQueueScope(e.target.value)} aria-label="Alcance de la cola" className="rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10">
+              <option value="pending">Pendientes</option><option value="approved">Aprobadas</option><option value="all">Toda la campaña</option>
+            </select>
             <select value={queueVersion} onChange={(e) => setQueueVersion(e.target.value)} className="rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10">
               <option value="">Studio + live</option><option value="studio">Studio</option><option value="live">Live</option>
             </select>
@@ -224,23 +244,25 @@ function CampaignDetail({ id }) {
           {["pending", "processing", "ready", "reviewing", "approved", "approved_today", "exported"].map((key) => <div key={key} className="rounded-xl bg-black/20 p-3"><div className="text-lg font-bold text-white">{reviewQueue?.counters?.[key] || 0}</div><div className="text-[11px] uppercase tracking-wide text-ink-tertiary">{key}</div></div>)}
         </div>
         <div className="flex flex-wrap gap-4 text-xs text-ink-secondary">
-          <span>Promedio hoy: {reviewQueue?.review_minutes_today?.average ?? "—"} min</span>
+          <span>Promedio hoy: {reviewQueue?.review_minutes_today?.average ?? "—"} min ({reviewQueue?.review_minutes_today?.songs || 0} canciones con telemetría)</span>
+          <span>Alcance: {reviewQueue?.scope?.label || "Pendientes"} · {reviewQueue?.scope?.total || 0} canciones · aprobadas campaña: {reviewQueue?.campaign_totals?.approved || 0} · hoy: {reviewQueue?.campaign_totals?.approved_today || 0}</span>
           {queueStage === "final" && <span>Fondos fijos: {reviewQueue?.background_split?.fixed || 0}</span>}
           {queueStage === "final" && <span>Fondos generados: {reviewQueue?.background_split?.generated || 0}</span>}
           <span>Prioridad operativa: reglas explícitas · no es confianza calibrada</span>
         </div>
         {queueStage === "lyrics" && <div className="flex flex-wrap gap-2 text-xs">
-          <span className="rounded-full bg-red-500/10 px-2.5 py-1 text-red-200">Manual completa: {reviewQueue?.classification_counts?.manual_full || 0}</span>
-          <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-amber-200">Timing dirigido: {reviewQueue?.classification_counts?.timing_targeted || 0}</span>
-          <span className="rounded-full bg-white/[0.06] px-2.5 py-1 text-ink-secondary">Estándar: {reviewQueue?.classification_counts?.standard || 0}</span>
+          <span className="rounded-full bg-red-500/10 px-2.5 py-1 text-red-200">Extensa: {reviewQueue?.classification_counts?.manual_full || 0}</span>
+          <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-amber-200">Focalizada: {reviewQueue?.classification_counts?.timing_targeted || 0}</span>
+          <span className="rounded-full bg-white/[0.06] px-2.5 py-1 text-ink-secondary">Breve sugerida: {reviewQueue?.classification_counts?.standard || 0}</span>
         </div>}
         <div className="overflow-x-auto">
           <table className="w-full min-w-[850px] text-left text-xs">
             <thead className="text-ink-tertiary"><tr><th className="p-2">Prioridad</th><th className="p-2">Artista / canción</th><th className="p-2">Versión</th>{queueStage === "final" && <th className="p-2">Fondo</th>}<th className="p-2">Duración</th><th className="p-2">Estado</th><th className="p-2">Referencia</th><th className="p-2"></th></tr></thead>
             <tbody>{(reviewQueue?.items || []).map((row) => <tr key={row.item_id} className="border-t border-white/[0.05] text-ink-secondary">
-              <td className="p-2"><div className="font-semibold text-white">{row.priority} · {row.review_priority_label || "Revisión estándar"}</div>
+              <td className="p-2"><div className="font-semibold text-white">{row.priority} · {row.review_priority_label || "Revisión breve sugerida"}</div>
                 <div className="mt-1 text-[11px]">Texto: {row.review_domains?.text?.status === "manual_full" ? "manual" : row.review_domains?.text?.status || "—"} · Timing: {row.review_domains?.timing?.status === "targeted" ? "dirigido" : row.review_domains?.timing?.status || "—"}</div>
-                {!!row.review_reasons?.length && <div className="mt-1 text-[11px] text-amber-200">{row.review_reasons.map((reason) => reason.label).join(" · ")}</div>}
+                {!!row.review_reasons?.length && <div className="mt-1 text-[11px] text-amber-200">{[...new Map(row.review_reasons.map((reason) => [reason.code, reason])).values()].map((reason) => reason.label).join(" · ")}</div>}
+                {!!row.timing_evidence?.length && <div className="mt-1 flex flex-wrap gap-1 text-[11px] text-cyan-200">{row.timing_evidence.slice(0, 4).map((window) => <span key={window.id} className="rounded bg-cyan-400/10 px-1.5 py-0.5">{timestamp(window.start)}–{timestamp(window.end)}{window.reasons?.length ? ` · ${window.reasons.join(", ")}` : ""}</span>)}</div>}
               </td>
               <td className="p-2"><div className="font-medium text-white">{row.title}</div><div>{row.artist}</div>
                 {queueStage === "lyrics" && campaign.reviewer_campaign_status?.enabled === true && <CampaignReviewerRow status={row.reviewer_campaign_status} jobId={row.job_id} onOpen={navigate} />}

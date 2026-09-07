@@ -35,7 +35,7 @@ afterEach(() => {
 });
 
 describe("ReviewQueuePage", () => {
-  it("carga todas las páginas y conserva el grupo manual al final", async () => {
+  it("carga todas las páginas del mismo alcance y deja la acción útil primero", async () => {
     const fetchMock = vi.fn(async (input) => {
       const url = String(input);
       if (url === "/batch/campaigns") {
@@ -46,7 +46,7 @@ describe("ReviewQueuePage", () => {
       }
       if (url.includes("page=3")) {
         return response({
-          items: [row(254, {
+        items: [row(254, {
             title: "¿Qué Ves?",
             review_group: "manual",
             manual_reasons: ["missing_reference"],
@@ -60,7 +60,9 @@ describe("ReviewQueuePage", () => {
         items: [row(1)],
         page: 1,
         pages: 3,
-        counters: { ready: 300, approved_today: 0 },
+        counters: { ready: 2, approved_today: 0 },
+        scope: { key: "pending", label: "Pendientes", total: 3 },
+        campaign_totals: { songs: 3, approved: 0, approved_today: 0 },
         review_minutes_today: { average: null },
       });
     });
@@ -70,8 +72,9 @@ describe("ReviewQueuePage", () => {
 
     await waitFor(() => expect(screen.getByText("¿Qué Ves?")).toBeInTheDocument());
     expect(screen.getByText("Canción 101")).toBeInTheDocument();
-    expect(screen.getByText("Revisión manual · 1 canciones")).toBeInTheDocument();
-    expect(screen.getByText("Sin referencia")).toBeInTheDocument();
+    expect(screen.getAllByText("Pendientes").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Revisión manual · 1 canciones")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Siguiente" })).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining("page=2"), expect.any(Object),
     );

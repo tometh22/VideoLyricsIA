@@ -598,7 +598,8 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
                 "segment_id": f"line-{item.ordinal}", "start": 0,
                 "end": 1, "text": f"línea {item.ordinal}",
             }],
-            transcription_quality={
+                transcription_quality={
+                "analysis_status": "complete",
                 "reference_hypothesis": build_reference_hypothesis(
                     text=f"línea {item.ordinal}", provider="gemini",
                     audio_sha256=audio_sha256, audio_revision=1,
@@ -638,7 +639,7 @@ def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
     }
     delivery = batch.review_queue(campaign.id, order="delivery", **queue_args)
     assert [row["job_id"] for row in delivery["items"]] == [
-        jobs[0].job_id, jobs[2].job_id, jobs[1].job_id,
+        jobs[0].job_id, jobs[1].job_id, jobs[2].job_id,
     ]
     assert [row["priority"] for row in delivery["items"]] == ["1", "2", "3"]
     assert all(row["semaforo"] is None for row in delivery["items"])
@@ -725,25 +726,28 @@ def test_review_queue_separates_text_and_timing_priority_with_visible_reasons(
     )
 
     assert [row["job_id"] for row in result["items"]] == [
-        jobs[0].job_id, jobs[1].job_id, jobs[2].job_id,
+        jobs[2].job_id, jobs[1].job_id, jobs[0].job_id,
     ]
     assert [row["review_priority"] for row in result["items"]] == [
-        "manual_full", "timing_targeted", "standard",
+        "timing_targeted", "timing_targeted", "manual_full",
     ]
     assert result["classification_counts"] == {
-        "manual_full": 1, "timing_targeted": 1, "standard": 1, "blocked": 0,
+        "manual_full": 1, "timing_targeted": 2, "standard": 0, "blocked": 0,
     }
-    text_row, timing_row, standard_row = result["items"]
+    timing_row, localized_timing_row, text_row = result["items"]
     assert text_row["review_domains"]["text"]["status"] == "manual_full"
     assert {reason["code"] for reason in text_row["review_domains"]["text"]["reasons"]} == {
         "missing_reference", "empty_transcription",
     }
+    assert localized_timing_row["review_domains"]["text"]["status"] == "standard"
+    assert localized_timing_row["review_domains"]["timing"]["status"] == "targeted"
+    assert localized_timing_row["review_domains"]["timing"]["reasons"][0]["domain"] == "timing"
+    assert localized_timing_row["review_domains"]["timing"]["reasons"][0]["count"] == 1
+    assert localized_timing_row["timing_evidence"] == [{
+        "id": "window-1", "start": 1.0, "end": 2.0, "reasons": [],
+    }]
     assert timing_row["review_domains"]["text"]["status"] == "standard"
     assert timing_row["review_domains"]["timing"]["status"] == "targeted"
-    assert timing_row["review_domains"]["timing"]["reasons"][0]["domain"] == "timing"
-    assert timing_row["review_domains"]["timing"]["reasons"][0]["count"] == 1
-    assert standard_row["review_domains"]["text"]["status"] == "standard"
-    assert standard_row["review_domains"]["timing"]["status"] == "standard"
     assert result["classification"]["calibrated"] is False
 
 
@@ -819,6 +823,49 @@ def test_bound_unavailable_reference_is_manual_in_review_queue(db, monkeypatch):
     assert result["items"][0]["manual_reasons"] == [
         "missing_reference", "empty_transcription",
     ]
+
+
+def test_review_queue_scope_keeps_pending_categories_and_approved_filter_aligned(
+    db, monkeypatch,
+):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 3)
+    items = db.query(BatchCampaignItem).filter_by(campaign_id=campaign.id).order_by(
+        BatchCampaignItem.ordinal,
+    ).all()
+    user = db.query(User).first()
+    jobs = []
+    for item in items:
+        job = Job(
+            job_id=uuid.uuid4().hex[:12], user_id=user.id,
+            tenant_id=campaign.tenant_id, artist=item.artist,
+            song_title=item.title, filename=item.filename,
+            status="transcribed_pending", workload_class="batch",
+            campaign_id=campaign.id, campaign_item_id=item.id,
+            segments_json=[{"start": 0, "end": 1, "text": "línea"}],
+            transcription_quality={"analysis_status": "complete"},
+        )
+        db.add(job); jobs.append(job)
+    db.flush()
+    jobs[0].status = "lyrics_approved"
+    jobs[0].approved_at = datetime.now(timezone.utc)
+    db.commit()
+    actor = {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}
+    args = dict(stage="lyrics", order="delivery", state=None, version=None,
+                background_mode=None, artist=None, audit_preapproved=False,
+                page=1, limit=50, current_user=actor, db=db)
+
+    pending = batch.review_queue(campaign.id, scope="pending", **args)
+    approved = batch.review_queue(campaign.id, scope="approved", **args)
+    assert pending["scope"]["key"] == "pending"
+    assert pending["total"] == 2
+    assert sum(pending["classification_counts"].values()) == 2
+    assert {row["job_id"] for row in pending["items"]} == {jobs[1].job_id, jobs[2].job_id}
+    assert pending["campaign_totals"] == {"songs": 3, "approved": 1, "approved_today": 0}
+    assert approved["scope"]["key"] == "approved"
+    assert approved["total"] == 1
+    assert sum(approved["classification_counts"].values()) == 1
+    assert approved["items"][0]["job_id"] == jobs[0].job_id
 
 def test_paused_campaign_cannot_start_a_new_render(db):
     campaign = _campaign(db, 1)
