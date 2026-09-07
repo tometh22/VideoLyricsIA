@@ -41,6 +41,15 @@ def summarize(versions):
                 category = 'translated_or_reassociated_interval'
             else:
                 category = 'same_phrase_endpoint_candidate'
+            if (after.get('reason') == 'approve' and not text_changed and not delta['start']
+                    and delta['end'] < 0 and i+1 < len(new)
+                    and round(float(b['end']),4) == round(float(new[i+1]['start'])-.05,4)):
+                category = 'approval_clamp_signature_excluded'
+            cap = max(3.5, len(str(a.get('text') or ''))*.1+1.)
+            if (after.get('reason') in {'autosave','draft'} and not text_changed and not delta['start']
+                    and delta['end'] < 0 and not b.get('locked') and not b.get('operator_locked')
+                    and round(float(b['end']),4) == round(float(a['start'])+cap,4)):
+                category = 'legacy_text_length_trim_signature_excluded'
             events.append({**base, 'line_index': i, 'line_identity': list(old_ids[i]),
                 'category': category, 'baseline': {k:a[k] for k in ('start','end')},
                 'submitted': {k:b[k] for k in ('start','end')}, 'delta_seconds': delta,
