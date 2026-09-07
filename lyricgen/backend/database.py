@@ -689,6 +689,14 @@ class Job(Base):
     # se borra, la variante sobrevive como job independiente. Indexado
     # para listar hijos en /jobs eficientemente.
     parent_job_id = Column(String(32), nullable=True, index=True)
+    # Piloto de revisor: identifica una COPIA DE PRUEBA y a qué corrida
+    # pertenece. NULL = job normal (todos los existentes). No nulo implica,
+    # por sí solo y verificado en el servidor: copia de prueba, fuera de
+    # campaña, escribible únicamente por su usuario de agente
+    # (editor.save_document) y no aprobable. Deliberadamente NO se agregó
+    # una columna de "learning_eligible": machine_snapshot_required=False
+    # ya excluye el job de training_corpus y de learning_triggers.
+    pilot_id = Column(String(64), nullable=True)
     # Set by /edit when the operator triggers an edit (typography/lyrics/
     # background). The reaper uses this to detect edits that died mid-render
     # (worker killed by deploy/OOM): if a job is status="editing" and
@@ -2344,6 +2352,9 @@ def _migrate_user_columns():
         # delete del padre no rompa la variante. Indexado para que el
         # /jobs liste con `variant_count` eficientemente.
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS parent_job_id VARCHAR(32)",
+        # Reviewer pilot test copies. Nullable and unindexed: every existing
+        # row stays NULL and no read path filters on it.
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pilot_id VARCHAR(64)",
         "CREATE INDEX IF NOT EXISTS ix_jobs_parent_job_id ON jobs(parent_job_id)",
         # Archive of previous deliverable s3_keys overwritten by a partial
         # re-render (lyrics/typography/background edit). Populated by

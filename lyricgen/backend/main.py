@@ -122,6 +122,7 @@ from editor import (
     reject_operator_suggestion,
     record_quality_observation,
     revoke_quality_proposal_if_disabled,
+    PILOT_AGENT_ROLE,
 )
 from observability import init_sentry, init_logging, health_snapshot
 from pipeline import (run_pipeline, transcribe, _normalize_movement_style,
@@ -12523,6 +12524,11 @@ async def approve_job(
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "pending_review":
         raise HTTPException(status_code=400, detail="Job is not pending review")
+    if job.pilot_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Una copia de piloto no se aprueba ni se entrega.",
+        )
 
     from delivery_qc_runtime import approval_gate, effective_delivery_qc_mode
     _delivery_gate = approval_gate(
@@ -13523,6 +13529,155 @@ def _editor_conflict_payload(db: Session, document: EditorDocument) -> dict:
     }
 
 
+class PilotTestCopyRequest(BaseModel):
+    source_job_id: str = Field(..., max_length=12)
+    pilot_id: str = Field(..., min_length=1, max_length=64,
+                          pattern=r"^[A-Za-z0-9_-]+$")
+
+
+def _pilot_agent_user(db: Session, tenant_id: str, pilot_id: str):
+    """The dedicated non-human account that owns and edits one pilot copy.
+
+    Authorship is a users row, not a request flag: `admin.py` only ever writes
+    role "user"/"admin", so nothing in the product can promote an account to
+    this role or demote the agent to look human.
+    """
+    import secrets
+    from database import User as UserModel
+    from auth import pwd_context
+
+    username = f"pilot-agent:{pilot_id}"
+    agent = db.query(UserModel).filter(UserModel.username == username).first()
+    if agent is not None:
+        if agent.role != PILOT_AGENT_ROLE or agent.tenant_id != tenant_id:
+            raise HTTPException(
+                status_code=409,
+                detail="El usuario de agente de este piloto ya existe con otro rol o tenant.",
+            )
+        return agent
+    agent = UserModel(
+        username=username,
+        email=None,
+        # No login path uses this account; it is written to only by this
+        # endpoint and read by the editor save guard.
+        hashed_password=pwd_context.hash(secrets.token_urlsafe(48)),
+        role=PILOT_AGENT_ROLE,
+        tenant_id=tenant_id,
+        is_active=True,
+    )
+    db.add(agent)
+    db.flush()
+    return agent
+
+
+@app.post("/pilot/test-copies")
+async def create_pilot_test_copy(
+    body: PilotTestCopyRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create an editable test copy of a job for the reviewer pilot.
+
+    The copy is a normal Job row that reuses the isolation the product already
+    has: `campaign_id`/`campaign_item_id` stay NULL so it never enters the
+    campaign review queue or its counters, `machine_snapshot_required` stays
+    False so `_record_training_delta`, `persist_training_draft` and
+    `learning_triggers` all skip it, and `pilot_id` marks it as agent-owned.
+
+    Nothing is enqueued, charged, generated or rendered: the row is created in
+    `transcribed_pending` and only the editor ever touches it. The source job
+    is read, never written.
+    """
+    from copy import deepcopy
+    from database import Job as JobModel, EditorDocument as EditorDocumentModel, AuditLog
+    from jobs import create_job
+
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Solo un admin puede crear copias de piloto.")
+    environment = (
+        os.environ.get("ENVIRONMENT")
+        or os.environ.get("RAILWAY_ENVIRONMENT_NAME")
+        or "production"
+    ).strip().lower()
+    if environment not in {"staging", "dev", "development", "test", "testing", "local"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Las copias de piloto son exclusivas de entornos de prueba.",
+        )
+    source = db.query(JobModel).filter(JobModel.job_id == body.source_job_id).first()
+    if source is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if source.pilot_id:
+        raise HTTPException(status_code=400, detail="No se copia una copia de piloto.")
+    _audit_cross_tenant_access(db, current_user, source, "pilot_test_copy", commit=False)
+
+    # Read-only on the source: use its durable document when it already exists
+    # and fall back to the Job snapshot, never creating a document for it here.
+    source_document = (
+        db.query(EditorDocumentModel)
+        .filter(EditorDocumentModel.job_id == source.job_id)
+        .first()
+    )
+    baseline = deepcopy(
+        list((source_document.current_segments if source_document else source.segments_json) or [])
+    )
+    if not baseline:
+        raise HTTPException(status_code=422, detail="El job de origen no tiene lyrics persistidas.")
+
+    agent = _pilot_agent_user(db, str(source.tenant_id), body.pilot_id)
+    job_id = create_job(
+        db,
+        artist=source.artist,
+        style=source.style or "oscuro",
+        filename=source.filename,
+        user_id=agent.id,
+        tenant_id=str(source.tenant_id),
+        delivery_profile=source.delivery_profile or "youtube",
+        initial_status="transcribed_pending",
+        song_title=source.song_title or "",
+        input_r2_key=source.input_r2_key,
+        workload_class="interactive",
+        campaign_id=None,
+        campaign_item_id=None,
+        commit=False,
+    )
+    test_copy = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    test_copy.pilot_id = body.pilot_id
+    test_copy.parent_job_id = source.job_id
+    test_copy.input_audio_sha256 = source.input_audio_sha256
+    test_copy.input_audio_etag = source.input_audio_etag
+    test_copy.audio_revision = source.audio_revision
+    test_copy.segments_json = baseline
+    test_copy.segments_revision = 0
+    test_copy.machine_snapshot_required = False
+    db.flush()
+    ensure_document(db, job_id, str(source.tenant_id), baseline, initial_reason="migration")
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="pilot.test_copy_created",
+        detail={
+            "pilot_id": body.pilot_id,
+            "source_job_id": source.job_id,
+            "copy_job_id": job_id,
+            "agent_user_id": agent.id,
+            "lines": len(baseline),
+        },
+    ))
+    db.commit()
+    return {
+        "job_id": job_id,
+        "pilot_id": body.pilot_id,
+        "source_job_id": source.job_id,
+        "agent_id": agent.username,
+        "campaign_id": None,
+        "approved": False,
+        "learning_eligible": False,
+        "audio_sha256": test_copy.input_audio_sha256,
+        "revision": 0,
+        "lines": len(baseline),
+    }
+
+
 @app.get("/editor/{job_id}")
 async def get_editor_document(
     job_id: str,
@@ -13534,7 +13689,7 @@ async def get_editor_document(
     revoke_quality_proposal_if_disabled(document)
     # Serialization can erase an expired proposal. Build the response before
     # commit so that tenant-scoped raw text is durably removed by this GET.
-    payload = serialize_document(db, document)
+    payload = serialize_document(db, document, job)
     from reviewer_campaign_product import status_for_job
     payload["reviewer_campaign_status"] = status_for_job(job, document)
     editor_quality = getattr(job, "transcription_quality", None)
