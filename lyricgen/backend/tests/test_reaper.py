@@ -146,6 +146,30 @@ def _reap_seeded_orphan(db, job_id: str) -> None:
     db.commit()
 
 
+def _reap_seeded_stalled(db, job_id: str) -> None:
+    """Exercise the stalled-render contract without racing the daemon lock.
+
+    Same reason as the helpers above: an earlier lifespan test leaves the app's
+    reaper daemon running, PostgreSQL hands it the advisory lock, and
+    reap_all_stuck then correctly returns zero here. That says nothing about
+    this row, so assert discovery plus the locked mutation instead.
+    """
+    stalled = find_stalled_renders(db, threshold_min=20)
+    job = next((row for row in stalled if row.job_id == job_id), None)
+    assert job is not None, f"expected seeded stalled render {job_id!r}"
+    assert _reaper.reap_stuck_job(db, job, _reaper._reason_for_stalled(job)) is True
+    db.commit()
+
+
+def _reap_seeded_stuck(db, job_id: str) -> None:
+    """Exercise the age-based stuck contract without racing the daemon lock."""
+    stuck = find_stuck_jobs(db, threshold_min=100)
+    job = next((row for row in stuck if row.job_id == job_id), None)
+    assert job is not None, f"expected seeded stuck job {job_id!r}"
+    assert _reaper.reap_stuck_job(db, job, _reaper._reason_for(job)) is True
+    db.commit()
+
+
 def _reap_seeded_edit(db, job_id: str) -> None:
     """Test discovery + locked edit rollback, not ownership of a global sweep.
 
@@ -376,16 +400,17 @@ def test_no_double_reap_when_job_is_both_old_and_orphan():
         jid = _seed(db, status="processing", age_minutes=110)
         _seed_provenance(db, job_id=jid, age_minutes=100, duration_ms=None)
 
-        n = reap_all_stuck(threshold_min=100)
-        # The exact count depends on other test data; what matters is
-        # that the same row didn't get hit twice in one pass. We assert
-        # the post-state is consistent and the message comes from the
-        # age path ("se interrumpió"), not the orphan path ("se reinició"),
-        # since stuck is processed first and orphans are filtered.
+        # The row is both past the age threshold and has a stale in-flight
+        # row. What matters is that it is reaped once, by the age path
+        # ("se interrumpió"), not the orphan path ("se reinició"): stuck is
+        # processed first and orphans are filtered afterwards. Asserting the
+        # per-row contract keeps that check out of a global sweep whose
+        # advisory lock the app daemon may legitimately own.
         # Copy fix 2026-05-25: was "abandonó"; reaper.py:395 message
         # was rewritten to "El video se interrumpió por un problema
         # temporal del servidor".
-        assert n >= 1
+        _reap_seeded_stuck(db, jid)
+        assert jid not in [j.job_id for j in find_orphan_polling_jobs(db, threshold_min=10)]
         row = db.query(Job).filter(Job.job_id == jid).first()
         db.refresh(row)
         assert row.status == "error"
@@ -538,8 +563,7 @@ def test_stalled_processing_job_is_reaped():
             last_progress_minutes_ago=25, progress=40,
             current_step="video",
         )
-        n = reap_all_stuck(threshold_min=100)
-        assert n >= 1, "stalled-render sweep should reap this job"
+        _reap_seeded_stalled(db, jid)
 
         row = db.query(Job).filter(Job.job_id == jid).first()
         db.refresh(row)
@@ -968,7 +992,7 @@ def test_reap_stuck_job_cancels_rq_entry(monkeypatch):
     try:
         _cleanup(db)
         jid = _seed(db, status="processing", age_minutes=110)
-        reap_all_stuck(threshold_min=100)
+        _reap_seeded_stuck(db, jid)
         assert jid in calls, (
             f"cancel_rq_job should have been called with {jid!r}, "
             f"got calls={calls!r}"
