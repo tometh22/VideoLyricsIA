@@ -7,7 +7,7 @@ from copy import deepcopy
 
 from reviewer_candidate import build_candidate
 from reviewer_correspondence import correspond
-from reviewer_integral import locate_words
+from reviewer_integral import locate_words, usable_span
 from reviewer_shadow import review_window, source_binding, tokens
 from shadow_reference_import import digest
 
@@ -48,7 +48,8 @@ def reconcile(song, cached, *, commit, external_reference=None):
                 continue
             request=deepcopy(whisper['request'])
             request['response']['words']=[{'word':a['text'],'start':a['local_start'],
-                'end':a['local_end']} for a in whisper['annotations']]
+                'end':a['local_end'],'usable_span':a.get('usable_span',a['local_end']>a['local_start'])}
+                for a in whisper['annotations']]
             window={'start':start,'end':end,'offset_seconds':start,'line_index':i}
             exact=locate_words(line['text'],request,window,line)
             association=correspond(line,request,window)
@@ -135,6 +136,10 @@ def reconcile(song, cached, *, commit, external_reference=None):
             continue
         for a in record['annotations']:
             if a.get('kind')!='sung':
+                continue
+            # A zero-length span cannot overlap any displayed line, so without
+            # this it would always look like singing outside the lyrics.
+            if not usable_span(a):
                 continue
             overlap=any(max(a['global_start'],s['start'])<min(a['global_end'],s['end']) for s in song['segments'])
             key=(tuple(tokens(a['text'])),round(a['global_start'],1),round(a['global_end'],1))

@@ -95,3 +95,101 @@ def test_whisper_words_and_empty_google_events_valid():
     entry["request"].update(provider="openai", model="whisper-1", family="openai/whisper-1",
                             prompt_version="no-prompt-v1", response={"words": [{"word": "hola", "start": 0, "end": 1}]})
     assert cached_receipts(song, index=[entry])["records"][0]["annotations"][0]["text"] == "hola"
+
+
+def test_degenerate_span_keeps_the_word_but_never_a_word_end():
+    """A provider zero-length span is lexical evidence, not an endpoint.
+
+    Dropping the annotation removed the word from the witness stream, which read
+    downstream as a line that was never sung. Measured on the existing campaign
+    cache, that moved 76 of 805 machine line decisions across 30 songs.
+    """
+    song, entry = fixture()
+    entry["request"].update(
+        provider="openai", model="whisper-1", family="openai/whisper-1",
+        prompt_version="no-prompt-v1",
+        response={"words": [{"word": "hola", "start": 0, "end": 1},
+                            {"word": "cielo", "start": 2, "end": 2}]},
+    )
+    record = cached_receipts(song, index=[entry])["records"][0]
+    assert [a["text"] for a in record["annotations"]] == ["hola", "cielo"]
+    assert record["invalid_annotations"] == []
+
+    sound, degenerate = record["annotations"]
+    assert sound["usable_span"] is True
+    assert sound["timestamp_status"] == "provider_hypothesis_not_alignment"
+    assert degenerate["usable_span"] is False
+    assert degenerate["timestamp_status"] == "provider_degenerate_span_lexical_only"
+    assert degenerate["global_start"] == degenerate["global_end"] == 14
+
+
+def test_reversed_and_out_of_range_spans_are_still_rejected():
+    song, entry = fixture()
+    entry["request"].update(
+        provider="openai", model="whisper-1", family="openai/whisper-1",
+        prompt_version="no-prompt-v1",
+        response={"words": [{"word": "atras", "start": 3, "end": 2},
+                            {"word": "afuera", "start": 0, "end": 99},
+                            {"word": "   ", "start": 1, "end": 2}]},
+    )
+    record = cached_receipts(song, index=[entry])["records"][0]
+    assert record["annotations"] == []
+    assert len(record["invalid_annotations"]) == 3
+
+
+def test_degenerate_word_is_matched_but_never_becomes_a_bound():
+    """The word counts lexically; its zero-length span must not bound anything.
+
+    locate_words and correspond derive the occurrence extent from the matched
+    words, so a degenerate token at either edge of a phrase would otherwise set
+    a boundary that was never measured.
+    """
+    from reviewer_correspondence import correspond
+    from reviewer_integral import locate_words, usable_span
+
+    window = {"start": 10.0, "end": 34.0, "offset_seconds": 10.0, "line_index": 0}
+    request = {"tool_status": "ok", "response": {"words": [
+        {"word": "cielo", "start": 2.0, "end": 2.0, "usable_span": False},
+        {"word": "azul", "start": 2.0, "end": 3.0, "usable_span": True},
+        {"word": "hoy", "start": 3.0, "end": 4.0, "usable_span": True},
+    ]}}
+    line = {"text": "cielo azul hoy", "start": 11.5, "end": 14.5}
+
+    located = locate_words(line["text"], request, window, line)
+    assert located["status"] == "unique_overlapping_occurrence"
+    # Bound taken from "azul", not from the degenerate "cielo".
+    assert located["selected"]["start"] == 12.0
+    assert located["selected"]["end"] == 14.0
+
+    associated = correspond(line, request, window)
+    assert associated["candidates"], "the phrase still associates lexically"
+    assert associated["candidates"][0]["start"] == 12.0
+
+    # A match made only of degenerate words yields no occurrence at all.
+    only = {"tool_status": "ok", "response": {"words": [
+        {"word": "cielo", "start": 2.0, "end": 2.0, "usable_span": False}]}}
+    assert locate_words("cielo", only, window, line)["status"] == "phrase_not_recognized_here"
+
+    # Words without the flag are judged by their own span, so raw provider
+    # responses behave the same as annotations read back from the cache.
+    assert usable_span({"start": 1.0, "end": 2.0}) is True
+    assert usable_span({"start": 2.0, "end": 2.0}) is False
+
+
+def test_degenerate_event_cannot_become_uncovered_singing():
+    """A zero-length span overlaps no displayed line, so without an explicit
+    guard it would always look like singing outside the lyrics."""
+    from reviewer_campaign_reconcile import reconcile
+
+    song, entry = fixture()
+    song["segments"] = [{"text": "hola", "start": 13.0, "end": 15.0, "_id": "a"}]
+    song["segments_sha256"] = __import__("shadow_reference_import").digest(song["segments"])
+    entry["request"]["response"] = {"events": [
+        {"text": "fantasma", "start": 5.0, "end": 5.0, "kind": "sung"},
+        {"text": "hola", "start": 3.0, "end": 5.0, "kind": "sung"},
+    ]}
+    cached = cached_receipts(song, index=[entry])
+    _, review = reconcile(song, cached, commit="test")
+    heard_outside = [h["text"] for h in review["uncovered_singing_hypotheses"]]
+    assert "fantasma" not in heard_outside
+
