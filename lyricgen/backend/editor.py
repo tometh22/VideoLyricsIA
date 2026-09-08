@@ -222,6 +222,39 @@ def _user_summary(db: Session, user_id: int | None) -> dict | None:
     return {"id": user.id, "username": user.username}
 
 
+# Reviewer-pilot actor. A pilot copy is owned by a dedicated users row whose
+# role is "agent"; admin.py only ever writes "user"/"admin", so this value can
+# not be set through the product. Everything else in the codebase compares role
+# against "admin", so an agent behaves exactly like a regular non-admin user.
+PILOT_AGENT_ROLE = "agent"
+
+
+def actor_for(db: Session, user_id: int | None) -> dict:
+    """Server-derived authorship. Never trust a client-supplied actor flag."""
+    user = (
+        db.query(User).filter(User.id == user_id).first()
+        if user_id is not None else None
+    )
+    if user is not None and user.role == PILOT_AGENT_ROLE:
+        return {"actor_kind": "agent", "agent_id": user.username}
+    return {"actor_kind": "human" if user_id is not None else None, "agent_id": None}
+
+
+def assert_pilot_actor(db: Session, job: Job, user_id: int) -> None:
+    """Keep agents and humans on opposite sides of the pilot boundary.
+
+    Raised as ValueError so every existing editor write path (PATCH, proposal
+    apply, restore, conflict resolve) fails closed with 422 instead of writing.
+    """
+    actor = db.query(User).filter(User.id == user_id).first()
+    is_agent = actor is not None and actor.role == PILOT_AGENT_ROLE
+    if getattr(job, "pilot_id", None):
+        if not is_agent or user_id != job.user_id:
+            raise ValueError("pilot_copy_is_writable_only_by_its_agent")
+    elif is_agent:
+        raise ValueError("agent_may_only_edit_its_pilot_copy")
+
+
 def _version_summary(db: Session, version: EditorVersion) -> dict:
     return {
         "id": version.id,
@@ -600,16 +633,33 @@ def require_machine_snapshot(job: Job, document: EditorDocument) -> None:
     validate_machine_evidence(document.machine_evidence, document.original_segments)
 
 
-def serialize_document(db: Session, document: EditorDocument) -> dict:
+def serialize_document(
+    db: Session, document: EditorDocument, job: Job | None = None,
+) -> dict:
     lock_expires = _aware(document.lock_expires_at)
     lock_active = bool(lock_expires and lock_expires > now_utc())
     proposal = _proposal_for_response(document)
+    # Authorship and isolation are read back from the stored rows, so a caller
+    # verifying a saved copy never has to take the client's word for them.
+    pilot = {
+        "pilot_id": getattr(job, "pilot_id", None) if job is not None else None,
+        "source_job_id": getattr(job, "parent_job_id", None) if job is not None else None,
+        "campaign_id": getattr(job, "campaign_id", None) if job is not None else None,
+        "approved": bool(getattr(job, "approved_at", None)) if job is not None else None,
+        "audio_sha256": getattr(job, "input_audio_sha256", None) if job is not None else None,
+        "learning_eligible": (
+            bool(getattr(job, "machine_snapshot_required", False))
+            if job is not None else None
+        ),
+    }
     return {
         "job_id": document.job_id,
         "revision": document.revision,
         "segments": document.current_segments,
         "original_segments": document.original_segments,
         "quality_proposal": proposal,
+        **pilot,
+        **actor_for(db, document.updated_by),
         "updated_at": _aware(document.updated_at).isoformat() if document.updated_at else None,
         "updated_by": _user_summary(db, document.updated_by),
         "lock": {
@@ -1701,6 +1751,11 @@ def save_document(
         .with_for_update()
         .one()
     )
+    # Guard every editor write path at once (PATCH, proposal apply, restore,
+    # conflict resolve) instead of one endpoint at a time.
+    assert_pilot_actor(db, job, user_id)
+    if getattr(job, "pilot_id", None) and reason == "approve":
+        raise ValueError("pilot_copy_cannot_be_approved")
     normalized = normalize_segments(segments)
     if document.revision != base_revision:
         # A background/typography render can advance the durable revision
@@ -1975,6 +2030,8 @@ def approve_document(
     else saved. Both selectors must still identify the document's current
     revision, otherwise approval fails closed with the standard conflict.
     """
+    if getattr(job, "pilot_id", None):
+        raise ValueError("pilot_copy_cannot_be_approved")
     job = (
         db.query(Job)
         .filter(Job.job_id == job.job_id)
