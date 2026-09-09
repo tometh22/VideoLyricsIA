@@ -106,6 +106,15 @@ _MULTIPART_SWEEP_INTERVAL_S = int(os.environ.get(
 ))
 _last_multipart_sweep_ts = 0.0
 
+# Delivery files are large (especially ProRes) but portal cleanup does not
+# need to run every five minutes. The sweep is still driven from this
+# single-runner reaper so multiple API replicas do not race on the same
+# external deliveries database or spam R2 with duplicate deletes.
+_DELIVERY_RETENTION_SWEEP_INTERVAL_S = int(os.environ.get(
+    "REAPER_DELIVERY_RETENTION_INTERVAL_S", str(24 * 3600),
+))
+_last_delivery_retention_sweep_ts = 0.0
+
 # Edit-request abandon threshold. The worst case is a background edit
 # which re-runs Veo (~3 min p99) plus the full video composite (~5-8 min
 # for a 4-min song). 30 min gives 2-3× headroom over the slowest healthy
@@ -1261,6 +1270,22 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
                     logger.info("[REAPER] stale multipart sweep: %s", _rep)
             except Exception as e:
                 logger.warning("[REAPER] stale multipart sweep failed: %s", e)
+
+        # Retain UMG portal deliverables for 60 days by default. This marks
+        # expired rows hidden and removes only the five published output
+        # names; source audio under inputs/ remains available to edit and
+        # re-render. The helper uses DeliveriesSessionLocal, which points at
+        # the production portal DB when DELIVERIES_DATABASE_URL is set.
+        global _last_delivery_retention_sweep_ts
+        if time.time() - _last_delivery_retention_sweep_ts >= _DELIVERY_RETENTION_SWEEP_INTERVAL_S:
+            _last_delivery_retention_sweep_ts = time.time()
+            try:
+                from delivery_retention import cleanup_expired_deliveries
+                _rep = cleanup_expired_deliveries()
+                if _rep.get("expired") or _rep.get("deleted") or _rep.get("failed"):
+                    logger.info("[REAPER] delivery retention sweep: %s", _rep)
+            except Exception as e:
+                logger.warning("[REAPER] delivery retention sweep failed: %s", e)
 
         _n_tr = _n_up = _n_ed = 0
         for job in abandoned:

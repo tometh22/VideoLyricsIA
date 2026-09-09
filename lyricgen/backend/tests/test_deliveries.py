@@ -292,6 +292,28 @@ def test_portal_items_lists_active_deliveries(client, admin_token, approved_job,
     assert len(v["files"]) == 5
 
 
+def test_chile_portal_does_not_expose_non_chile_delivery(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The new Chile surface is scoped to universal_chile by default.
+
+    The fixture uses the legacy/default tenant, which Argentina can still
+    see for backwards compatibility but Chile must not inherit.
+    """
+    client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    res = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    )
+    assert res.status_code == 200
+    assert not any(
+        song["artist"] == "Test Artist" for song in res.json()["songs"]
+    )
+
+
 def test_portal_can_delete(client, admin_token, approved_job, all_r2_files_present):
     # Publish first
     res = client.post(
