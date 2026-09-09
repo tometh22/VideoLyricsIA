@@ -124,6 +124,7 @@ describe("JobDetail UMG delivery recovery", () => {
     );
 
     fireEvent.click(screen.getByText("detail.send_umg"));
+    fireEvent.click(screen.getByText("umg.portal_argentina"));
     expect(screen.getByText("prores.enable_title")).toBeTruthy();
 
     fireEvent.click(screen.getByText("prores.submit"));
@@ -141,12 +142,51 @@ describe("JobDetail UMG delivery recovery", () => {
         ([url]) => url.includes("/admin/deliveries/from-job/83f95d0e2679"),
       );
       expect(publishCalls).toHaveLength(2);
+      expect(JSON.parse(publishCalls.at(-1)[1].body)).toEqual({ portal_id: "argentina" });
     });
 
     expect(await screen.findByText("Video publicado en umg.genly.pro")).toBeTruthy();
-    expect(screen.getByText("detail.in_umg_portal")).toBeTruthy();
+    expect(screen.getByText(/detail\.in_umg_portal/)).toBeTruthy();
     expect(onJobUpdate).toHaveBeenCalledWith(expect.objectContaining({
       prores_ready: true,
     }));
+  });
+
+  it("publishes an already prepared job to Chile", async () => {
+    const preparedJob = {
+      ...job,
+      umg_spec: { frame_size: "HD", fps: 29.97, prores_profile: 3 },
+      s3_keys: {
+        ...job.s3_keys,
+        umg_master: "tenant/job/umg_master.mov",
+        umg_short: "tenant/job/umg_short.mov",
+      },
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, options) => {
+      if (url.includes("/admin/deliveries/from-job/")) {
+        return response(200, { ok: true, label: "Renderizado", replaced: false, portal_id: "chile" });
+      }
+      throw new Error(`Unexpected fetch: ${url} ${options?.body || ""}`);
+    });
+
+    render(
+      <MemoryRouter>
+        <AlertProvider>
+          <JobDetail job={preparedJob} onBack={vi.fn()} onJobUpdate={vi.fn()} />
+        </AlertProvider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByText("detail.send_umg"));
+    fireEvent.click(screen.getByText("umg.portal_chile"));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/admin/deliveries/from-job/83f95d0e2679"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ portal_id: "chile" }),
+      }),
+    ));
+    expect(await screen.findByText("Video publicado en umgchile.genly.pro")).toBeTruthy();
   });
 });

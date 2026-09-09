@@ -7,13 +7,36 @@ envía `X-Portal-Id` (`argentina` o `chile`) junto con `X-Portal-Token`.
 ## Alcance
 
 - `umg.genly.pro`: mantiene compatibilidad con el listado histórico de
-  entregas de Argentina.
-- `umgchile.genly.pro`: por defecto solo lista entregas con
-  `tenant_snapshot=universal_chile`.
+  entregas de Argentina. Las filas históricas sin destino explícito se
+  interpretan como Argentina.
+- `umgchile.genly.pro`: lista las entregas cuyo destino explícito es Chile.
+  El tenant de origen (staging o producción) no limita una entrega que un
+  administrador haya enviado a Chile.
 - Ambos portales permiten descargar, previsualizar, aprobar, deshacer la
   aprobación, rechazar, pedir cambios y abrir `app.genly.pro/videos/{job_id}/edit-lyrics`.
 - La edición requiere sesión en la aplicación principal. Al guardar una
   corrección, el operador debe volver a publicar la versión desde GenLy.
+
+## Envío desde cuentas admin
+
+En el detalle de un video aprobado, `Enviar a UMG` permite elegir Argentina o
+Chile. El backend conserva una fila independiente por destino, de modo que el
+mismo `job_id` puede estar publicado en ambos portales. Reenviar al mismo
+destino actualiza esa fila sin duplicarla.
+
+La API acepta el destino explícito (si se omite, queda Argentina por
+compatibilidad):
+
+```http
+POST /admin/deliveries/from-job/{job_id}
+Content-Type: application/json
+
+{"portal_id":"argentina"}
+```
+
+Los valores válidos son `argentina` y `chile`. El estado del job conserva
+`is_in_umg_portal` para clientes antiguos y agrega `umg_portals` con todos los
+destinos activos.
 
 ## Configuración del backend
 
@@ -27,11 +50,10 @@ Opcionalmente se puede configurar un token distinto para Chile:
 
 ```text
 DELIVERY_PORTAL_TOKEN_CHILE=<password chile>
-DELIVERY_PORTAL_TENANTS_CHILE=universal_chile
 ```
 
 Si no se define el token específico de Chile, el primer rollout acepta el
-token compartido existente, pero mantiene el filtro de tenant. Para aislamiento
+token compartido existente. Para aislamiento
 criptográfico completo, definir `DELIVERY_PORTAL_TOKEN_CHILE` antes de entregar
 el acceso.
 
@@ -63,4 +85,3 @@ Luego verificar:
 dig +short umgchile.genly.pro
 vercel domains inspect umgchile.genly.pro
 ```
-
