@@ -3,6 +3,21 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.6] - 2026-09-09
+
+### Fixed
+
+- Preserve forced-alignment provenance through repeated evidence annotation and
+  retain native provider probability with its original meaning, not as CTC score.
+- Diagnose internal word gaps with unusable timing support. Display timing as
+  unvalidated in the editor without replacing text, retiming or changing approval.
+  This release demonstrates preservation and detection, not timing repair.
+- Includes the already-served #1306 language/reference discrepancy warning,
+  persisted review resolution and server approval gates, and Sentry 2.69.1 pin.
+  Version 1.1.5 was reserved for that fix but was not separately released.
+- Isolate Playwright's Ubuntu dependency setup from the unrelated Google Chrome
+  APT feed, whose inconsistent package index blocked CI; retain all browser gates.
+
 ## [1.1.4] - 2026-09-09
 
 ### Fixed

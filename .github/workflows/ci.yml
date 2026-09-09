@@ -219,7 +219,9 @@ jobs:
         run: npm audit --audit-level=moderate
 
       - name: Install Chromium for browser E2E
-        run: npx playwright install --with-deps chromium
+        run: |
+          bash ../../scripts/prepare_playwright_apt.sh
+          npx playwright install --with-deps chromium
 
       - name: Run browser E2E
         run: npm run test:e2e
@@ -286,6 +288,7 @@ jobs:
         run: |
           pip install -r lyricgen/backend/requirements.txt
           npm ci --prefix lyricgen/frontend
+          bash scripts/prepare_playwright_apt.sh
           cd lyricgen/frontend
           npx playwright install --with-deps chromium
       - name: Seed and start real editor API

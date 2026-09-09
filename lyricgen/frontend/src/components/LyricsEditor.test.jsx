@@ -101,6 +101,19 @@ function _setAudioCurrentTime(container, t) {
 }
 
 describe("LyricsEditor — banner de confianza + señal review calma (2026-07)", () => {
+  it("shows persisted unvalidated timing without claiming synchronization or mutating lines", () => {
+    const segments = [{ start: 10.439, end: 41.9, text: "una frase", review: true,
+      timing_validation: { status: "unvalidated", reasons: ["internal_word_gap_with_degenerate_support"] } }];
+    const props = baseProps({ segments });
+    const before = JSON.stringify(segments);
+    render(<LyricsEditor {...props} />);
+    expect(screen.getByTestId("editor-confidence")).toHaveTextContent("Timing no validado");
+    expect(screen.getByTestId("editor-confidence")).not.toHaveTextContent("Sincronizado con tu letra");
+    expect(screen.getByTestId("editor-confidence")).not.toHaveTextContent("Todo listo");
+    expect(screen.getByTestId("timing-unvalidated-1")).toHaveTextContent("No se cambiaron sus tiempos");
+    expect(JSON.stringify(segments)).toBe(before);
+    expect(props.onApprove).not.toHaveBeenCalled();
+  });
   // Rediseño: el borde/anillo ámbar completo + banner de alarma hacían
   // parecer todo roto con 11/26 líneas review, cuando el sync salió
   // excelente. Ahora: banner ÚNICO positivo con navegador secuencial, y
