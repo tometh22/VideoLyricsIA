@@ -3,6 +3,18 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.4] - 2026-09-09
+
+### Fixed
+
+- Make reviewer cards and pending/approved/all tabs actionable, keep campaign
+  counts stable, and restore filters with browser history and editor return.
+- Prevent late requests and conflicting status filters from hiding approved
+  songs. Show the first queue page promptly and avoid overlapping refreshes.
+- Clarify processing, approval, export and reviewer-lock states. Show actionable
+  durable-editor load errors with readable retry, job ID and HTTP status while
+  keeping editing and approval blocked until the saved revision is loaded.
+
 ## [1.1.3] - 2026-09-06
 
 ### Fixed
