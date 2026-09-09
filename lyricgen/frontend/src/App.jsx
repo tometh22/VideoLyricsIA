@@ -2267,7 +2267,21 @@ export default function App() {
           audioUnavailableReason: null,
           artist: job.artist || "",
           songTitle: job.song_title || "",
-          language: job.language || "es",
+          // Do NOT coerce an unknown language to "es" on reload: that silently
+          // relabels a mis-transcribed song as Spanish. Leave it empty (auto)
+          // and let the recomputed flags below drive the warning.
+          language: job.language || "",
+          // Recomputed by the server from persisted segments + reference, so the
+          // language / discrepancy warning and the approval block survive a
+          // reload / deep-link and recalculate after an edit (see /status).
+          languageConflict: !!job.language_conflict,
+          languageUncertain: !!job.language_uncertain,
+          mixedLanguage: !!job.mixed_language,
+          outputReferenceDivergence: !!job.output_reference_divergence,
+          needsLanguageReview: !!job.needs_language_review,
+          languageReviewResolved: !!job.language_review_resolved,
+          outputReferenceUnexplainedIndices:
+            job.output_reference_unexplained_indices || [],
           ...resumedCreativeFields,
           genre: preset("genre", "genre", resumedCreativeFields.genre),
           concept: preset("concept", "concept", resumedCreativeFields.concept),
@@ -3605,6 +3619,44 @@ export default function App() {
       return { ok: false, reason: "network", error: String(err) };
     }
   }, []);
+
+  // Explicit, persisted human resolution of a language/reference discrepancy.
+  // Reads the CURRENT server revision first (so an unsaved edit can't resolve a
+  // stale snapshot), then binds the resolution to it. On success it clears the
+  // block locally; the server gate remains the source of truth on approval.
+  const handleResolveLanguageReview = async () => {
+    const r = currentReview;
+    const jobId = r?.transcribeJobId || r?.editingJobId;
+    if (!jobId) return;
+    try {
+      const statusRes = await authFetch(`${API}/status/${jobId}`);
+      const job = await statusRes.json().catch(() => ({}));
+      const baseRevision = Number.isFinite(job.segments_revision)
+        ? job.segments_revision : 0;
+      const res = await authFetch(`${API}/jobs/${jobId}/language-resolution`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ base_revision: baseRevision }),
+      });
+      if (res.ok) {
+        setCurrentReview((cur) => (cur ? {
+          ...cur,
+          languageReviewResolved: true,
+          languageUncertain: false,
+          needsLanguageReview: false,
+        } : cur));
+        return;
+      }
+      const body = await res.json().catch(() => ({}));
+      if (res.status === 409 && body?.code === "stale_revision") {
+        // A pending edit bumped the revision; the editor autosaves, so ask the
+        // operator to retry once it settles rather than resolving a stale snapshot.
+        console.warn("[language-review] stale revision; save then retry", body);
+      }
+    } catch (err) {
+      console.warn("[language-review] resolution failed", err);
+    }
+  };
 
   const handleApproveLyrics = async (editedSegments, saveMeta = {}) => {
     const r = currentReview;
@@ -5876,6 +5928,11 @@ export default function App() {
             languageConflict={!!currentReview.languageConflict}
             languageUncertain={!!currentReview.languageUncertain}
             mixedLanguage={!!currentReview.mixedLanguage}
+            outputReferenceDivergence={!!currentReview.outputReferenceDivergence}
+            outputReferenceUnexplainedIndices={currentReview.outputReferenceUnexplainedIndices || []}
+            needsLanguageReview={!!currentReview.needsLanguageReview}
+            languageReviewResolved={!!currentReview.languageReviewResolved}
+            onResolveLanguageReview={handleResolveLanguageReview}
             onApprove={handleApproveLyrics}
             submitLabel={currentReview.campaignId ? "Aprobar letra y timing" : null}
             onRegisterSafeExit={currentReview.campaignId

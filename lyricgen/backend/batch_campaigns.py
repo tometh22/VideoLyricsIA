@@ -991,6 +991,45 @@ def approve_campaign_lyrics(
             status_code=409,
             detail={"code": "job_not_awaiting_lyrics_review", "status": job.status},
         )
+    # Server-side language/discrepancy gate (same contract as /approve and the
+    # reload serializers). Recomputed from persisted segments + reference so an
+    # old client cannot approve output that diverges from its own audio-derived
+    # reference — e.g. a chorus decoded in the wrong language. Released only by
+    # an explicit, revision-scoped human resolution (POST
+    # /jobs/{job_id}/language-resolution). Never rewrites the lyrics; the human
+    # review checkboxes above are necessary but not sufficient when the text
+    # does not match the reference.
+    from language_review import review_payload as _language_review_payload
+    _language_review = _language_review_payload(
+        job.segments_json, job.transcription_quality, job.segments_revision,
+    )
+    if (
+        _language_review["needs_language_review"]
+        and not _language_review["language_review_resolved"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "language_review_unresolved",
+                "message": (
+                    "La letra no coincide con el idioma/contenido de la "
+                    "referencia. Revisá los versos marcados y confirmá el "
+                    "idioma antes de aprobar."
+                ),
+                "language_review": {
+                    "output_reference_divergence":
+                        _language_review["output_reference_divergence"],
+                    "output_reference_divergence_ratio":
+                        _language_review["output_reference_divergence_ratio"],
+                    "output_reference_unexplained_indices":
+                        _language_review["output_reference_unexplained_indices"],
+                    "language_conflict": _language_review["language_conflict"],
+                    "detected_languages": _language_review["detected_languages"],
+                    "reference_languages": _language_review["reference_languages"],
+                    "segments_revision": int(job.segments_revision or 0),
+                },
+            },
+        )
     require_prebackground_reference = quality.get("reference_hypothesis")
     from reference_hypothesis import validate_binding
     reference_ok, reference_reason = validate_binding(

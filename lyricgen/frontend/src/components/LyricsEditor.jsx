@@ -670,6 +670,9 @@ export default function LyricsEditor({
   referenceLinks = [], referenceUnavailable = false,
   coverageWarning = false, transcriptionQuality: transcriptionQualityProp = null, recoverySource = "",
   languageConflict = false, languageUncertain = false, mixedLanguage = false,
+  outputReferenceDivergence = false, outputReferenceUnexplainedIndices = [],
+  needsLanguageReview = false, languageReviewResolved = false,
+  onResolveLanguageReview = null,
   onApprove, onBack, onRegisterSafeExit = null,
   isBatch = false, batchProgress = "",
   user = null,
@@ -3825,8 +3828,13 @@ export default function LyricsEditor({
       toast({ message: "No se puede aprobar: el idioma detectado contradice la transcripción. Corregí el idioma y reprocesá esta canción.", tone: "info" });
       return;
     }
-    if (languageUncertain) {
-      toast({ message: "No se puede aprobar: falta resolver el idioma de esta canción.", tone: "info" });
+    if (languageUncertain && !languageReviewResolved) {
+      toast({
+        message: outputReferenceDivergence
+          ? "No se puede aprobar: hay versos que no coinciden con la referencia. Corregilos, o confirmá que la letra es correcta."
+          : "No se puede aprobar: falta resolver el idioma de esta canción.",
+        tone: "info",
+      });
       return;
     }
     if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
@@ -4442,7 +4450,7 @@ export default function LyricsEditor({
           <button
             onClick={handleApprove}
             disabled={isApproving || (!requireLineReview && (
-              languageConflict || languageUncertain
+              languageConflict || (languageUncertain && !languageReviewResolved)
               || (editorV2Enabled && (!durableHydrated || durableEditor.loading))
               || saveErrorReason === "draft-corrupt"
             ))}
@@ -4488,7 +4496,37 @@ export default function LyricsEditor({
           </p>
         </div>
       )}
-      {languageUncertain && !languageConflict && (
+      {outputReferenceDivergence && !languageConflict && (
+        <div className="mb-4 rounded-2xl bg-amber-400/[0.08] px-4 py-3 ring-1 ring-amber-400/30">
+          <p className="text-xs leading-relaxed text-amber-100">
+            {t("editor.language_reference_divergence")
+              || "Algunos versos no coinciden con la referencia del audio (posible idioma equivocado en la transcripción)."}
+            {Array.isArray(outputReferenceUnexplainedIndices)
+              && outputReferenceUnexplainedIndices.length > 0 && (
+              <span className="block mt-1 text-amber-200/80">
+                {"Revisá las líneas: "}
+                {outputReferenceUnexplainedIndices.map((i) => i + 1).join(", ")}
+                {". Corregilas o, si la letra es correcta, confirmalo para poder aprobar."}
+              </span>
+            )}
+          </p>
+          {languageReviewResolved ? (
+            <p className="mt-2 text-xs text-emerald-200">
+              {t("editor.language_review_resolved") || "Discrepancia revisada por un humano. Ya podés aprobar."}
+            </p>
+          ) : (onResolveLanguageReview && (
+            <button
+              type="button"
+              data-testid="resolve-language-review"
+              onClick={() => onResolveLanguageReview()}
+              className="mt-2 rounded-lg bg-amber-400/20 px-3 py-1 text-xs text-amber-100 ring-1 ring-amber-400/40 hover:bg-amber-400/30"
+            >
+              {t("editor.confirm_lyrics_correct") || "Ya lo revisé, la letra es correcta"}
+            </button>
+          ))}
+        </div>
+      )}
+      {languageUncertain && !languageConflict && !outputReferenceDivergence && (
         <div className="mb-4 rounded-2xl bg-amber-400/[0.08] px-4 py-3 ring-1 ring-amber-400/30">
           <p className="text-xs leading-relaxed text-amber-100">
             {t("editor.language_uncertain") || "No pudimos corroborar el idioma. Elegí el idioma de esta canción y reprocesá antes de aprobar."}
