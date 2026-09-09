@@ -48,6 +48,11 @@ def review_payload(segments, transcription_quality, revision) -> dict:
     """
     payload = build_language_contract(
         segments or [], reference_text_of(transcription_quality),
+        # The requested language is not persisted, so its absence must NOT be
+        # read as uncertainty here: that would flag every reference-less job and
+        # block approvals across the catalogue. Only reconstructable evidence
+        # (reference discrepancy / conflict) may gate.
+        infer_uncertain_from_request=False,
     )
     payload["language_review_resolved"] = resolution_matches(
         transcription_quality, revision, segments,

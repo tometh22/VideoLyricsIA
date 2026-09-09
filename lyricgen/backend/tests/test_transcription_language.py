@@ -447,3 +447,42 @@ def test_campaign_approve_lyrics_enforces_language_review():
     body = _ast.get_source_segment(src, fn)
     assert "review_payload" in body
     assert "language_review_unresolved" in body
+
+
+def test_read_path_never_invents_uncertainty_for_referenceless_jobs():
+    """Recomputing from persisted data must not block the whole catalogue.
+
+    The requested language is not stored on the job, so its absence cannot be
+    read as "uncertain": doing so flagged every reference-less job (1286 of 1571
+    in staging) and blocked approval. Only reconstructable evidence may gate.
+    """
+    import language_review
+
+    payload = language_review.review_payload(
+        _segs(_ES_LINE, _ES_LINE_2, "Empieza por ti la cancion que somos hoy"),
+        {},          # no transcription_quality -> no reference persisted
+        1,
+    )
+    assert payload["language_uncertain"] is False
+    assert payload["needs_language_review"] is False
+    assert payload["output_reference_divergence"] is False
+    assert payload["language_review_resolved"] is False
+
+
+def test_read_path_still_flags_a_real_discrepancy():
+    import language_review
+
+    payload = language_review.review_payload(
+        _segs(_ES_LINE, _ES_LINE_2, _FOREIGN_LINE, _FOREIGN_LINE_2),
+        {"reference_hypothesis": {"reference_text": _ES_REFERENCE}},
+        1,
+    )
+    assert payload["output_reference_divergence"] is True
+    assert payload["needs_language_review"] is True
+
+
+def test_chokepoint_keeps_request_time_uncertainty():
+    """The transcription response DOES know the requested language, so the
+    original auto/no-reference uncertainty signal must survive there."""
+    c = build_language_contract(_segs("la la la na na"), "", requested_language="")
+    assert c["language_uncertain"] is True

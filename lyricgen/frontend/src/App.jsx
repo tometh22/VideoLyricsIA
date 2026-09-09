@@ -2275,8 +2275,6 @@ export default function App() {
           languageReviewResolved: !!job.language_review_resolved,
           outputReferenceUnexplainedIndices:
             job.output_reference_unexplained_indices || [],
-          segmentsRevision: Number.isFinite(job.segments_revision)
-            ? job.segments_revision : 0,
           ...resumedCreativeFields,
           genre: preset("genre", "genre", resumedCreativeFields.genre),
           concept: preset("concept", "concept", resumedCreativeFields.concept),

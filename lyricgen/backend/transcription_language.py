@@ -312,6 +312,7 @@ def build_language_contract(
     requested_language: str | None = None,
     *,
     expected_hint: str | None = None,
+    infer_uncertain_from_request: bool = True,
 ) -> dict:
     """Single source of truth for the language / discrepancy contract.
 
@@ -350,14 +351,19 @@ def build_language_contract(
         and divergence["substantial"] >= _DIVERGENCE_MIN_LINES
         and divergence["ratio"] >= _DIVERGENCE_FLAG_RATIO
     )
-    language_uncertain = bool(
-        (
-            not requested
-            and not reference_languages
-            and len(detected_languages) <= 1
-        )
-        or output_reference_divergence
+    # "Nobody asked for a language and nothing corroborates one" is a
+    # REQUEST-TIME signal: it depends on what the caller requested, which is not
+    # persisted on the job. Recomputing it from stored data would read every
+    # reference-less job as uncertain (most of the catalogue) and block its
+    # approval, so the read/gate path passes ``infer_uncertain_from_request=False``
+    # and relies on the evidence that IS reconstructable: the reference discrepancy.
+    request_heuristic = bool(
+        infer_uncertain_from_request
+        and not requested
+        and not reference_languages
+        and len(detected_languages) <= 1
     )
+    language_uncertain = bool(request_heuristic or output_reference_divergence)
     return {
         "requested_language": requested,
         "detected_language": detected_language,
