@@ -18746,6 +18746,10 @@ async def portal_get_items(
     return {
         "songs": list(songs.values()),
         "file_type_labels": file_type_labels,
+        # The static Chile portal uses this marker as a fail-closed guard
+        # while the backend rollout is in progress. Without it, an older
+        # backend would return the global legacy listing to Chile.
+        "portal_id": portal_id,
         "expires_at_ts": now + _DELIVERY_URL_EXPIRY_S,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
