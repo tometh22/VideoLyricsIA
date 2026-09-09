@@ -51,7 +51,7 @@ rq==1.16.2
 # retry/failure-callback wiring without a real Redis instance.
 fakeredis==2.26.2
 boto3==1.35.0
-sentry-sdk[fastapi]==2.14.0
+sentry-sdk[fastapi]==2.69.1
 slowapi==0.1.9
 psutil>=5.9.0,<7.0.0
 # --- Genly CTC timing engine (ctc_align.py, gated CTC_ALIGN_ENABLED) ---
