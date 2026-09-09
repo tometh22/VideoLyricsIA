@@ -51,7 +51,8 @@ use isolated fixtures, not real campaign songs.
 
 ## Release and rollback
 
-Release owner: singapore-v1; stage after its #1306/#1305 integration. Release
+Release owner: riyadh, explicit user-authorized handoff after inactive
+singapore-v1 completed #1306/#1305. Release 1.1.6 preserves that staging tip. Release
 VERSION/package/CHANGELOG updates and full clean-checkout CI must precede merge.
 No production deployment. Runtime verification should use a disposable test
 fixture or read-only code/bundle checks, never modify reviewed campaign songs.
