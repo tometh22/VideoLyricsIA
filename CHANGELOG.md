@@ -15,6 +15,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Includes the already-served #1306 language/reference discrepancy warning,
   persisted review resolution and server approval gates, and Sentry 2.69.1 pin.
   Version 1.1.5 was reserved for that fix but was not separately released.
+- Isolate Playwright's Ubuntu dependency setup from the unrelated Google Chrome
+  APT feed, whose inconsistent package index blocked CI; retain all browser gates.
 
 ## [1.1.4] - 2026-09-09
 
