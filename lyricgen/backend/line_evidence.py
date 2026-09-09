@@ -171,7 +171,14 @@ def annotate_provider_evidence(
             item.pop("content_asr_min_score", None)
         item["content_source"] = resolved_source
         output.append(item)
-    from timing_validation import diagnose
+    from timing_validation import SCHEMA as TIMING_VALIDATION_SCHEMA, diagnose
+    for item in output:
+        # Recompute only our derived diagnostic when the pipeline supplies new
+        # word evidence. Do not preserve a stale warning after a real alignment
+        # replacement, or erase unrelated/human metadata.
+        previous_validation = item.get("timing_validation")
+        if isinstance(previous_validation, dict) and previous_validation.get("schema") == TIMING_VALIDATION_SCHEMA:
+            item.pop("timing_validation")
     for finding in diagnose(output):
         output[finding["segment_index"]]["timing_validation"] = finding
     return output

@@ -76,6 +76,14 @@ def test_new_explicit_timing_source_supersedes_old_identity():
     assert updated[0]["timing_validation"]["status"] == "unvalidated"
 
 
+def test_replaced_word_evidence_recomputes_derived_diagnostic():
+    rows = annotate_provider_evidence(broken_rows(), timing_source="forced_align")
+    for row in rows:
+        row["words"] = [word("nuevo", 0, 1), word("timing", 1, 2)]
+    fresh = annotate_provider_evidence(rows, timing_source="ctc_alignment")
+    assert all("timing_validation" not in row for row in fresh)
+
+
 def test_quality_diagnostic_and_editor_serialization_preserve_payload():
     from editor import normalize_segments
     from transcription_quality import evaluate
