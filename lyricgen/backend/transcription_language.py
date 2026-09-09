@@ -302,8 +302,83 @@ def reference_divergence(output, reference_text: str) -> dict:
     }
 
 
+_DIVERGENCE_MIN_LINES = 3        # need enough lines before a ratio is trustworthy
+_DIVERGENCE_FLAG_RATIO = 0.34    # this share of lines unexplained -> flag review
+
+
+def build_language_contract(
+    output,
+    reference_text: str = "",
+    requested_language: str | None = None,
+    *,
+    expected_hint: str | None = None,
+) -> dict:
+    """Single source of truth for the language / discrepancy contract.
+
+    Computed over the FINAL lines the operator approves so the transcription
+    response, the reload serializers and the server-side approval gate all agree
+    (coherence is the whole point: an alert that is not persisted, or a gate
+    that recomputes differently, can be bypassed).
+
+    ``output_reference_divergence`` is a DISCREPANCY alert — the output does not
+    match its own audio-derived reference — NOT a verdict that the text is in a
+    specific wrong language.  It never forces a language and never translates.
+    ``needs_language_review`` is the single actionable boolean callers gate on.
+    """
+    reference_languages = detect_text_languages(reference_text)
+    detected_languages = detect_text_languages(output)
+    requested = normalize_language(requested_language)
+    reference_language = (
+        next(iter(reference_languages)) if len(reference_languages) == 1 else None
+    )
+    detected_language = (
+        next(iter(detected_languages)) if len(detected_languages) == 1 else None
+    )
+    mixed_language = len(reference_languages) > 1 or len(detected_languages) > 1
+    expected_language = (
+        normalize_language(expected_hint) or requested or reference_language
+    )
+    language_conflict = bool(
+        expected_language
+        and detected_languages
+        and expected_language not in detected_languages
+        and not mixed_language
+    )
+    divergence = reference_divergence(output, reference_text)
+    output_reference_divergence = bool(
+        divergence["has_reference"]
+        and divergence["substantial"] >= _DIVERGENCE_MIN_LINES
+        and divergence["ratio"] >= _DIVERGENCE_FLAG_RATIO
+    )
+    language_uncertain = bool(
+        (
+            not requested
+            and not reference_languages
+            and len(detected_languages) <= 1
+        )
+        or output_reference_divergence
+    )
+    return {
+        "requested_language": requested,
+        "detected_language": detected_language,
+        "detected_languages": sorted(detected_languages),
+        "reference_language": reference_language,
+        "reference_languages": sorted(reference_languages),
+        "mixed_language": mixed_language,
+        "language_conflict": language_conflict,
+        "language_uncertain": language_uncertain,
+        "output_reference_divergence": output_reference_divergence,
+        "output_reference_divergence_ratio": round(divergence["ratio"], 3),
+        "output_reference_unexplained_indices": divergence["unexplained_indices"],
+        "needs_language_review": bool(
+            language_conflict or output_reference_divergence
+        ),
+    }
+
+
 __all__ = [
     "SUPPORTED_LANGUAGES",
+    "build_language_contract",
     "diagnose_language_state",
     "detect_text_language",
     "detect_text_languages",

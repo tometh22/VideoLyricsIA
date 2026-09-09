@@ -325,3 +325,125 @@ def test_reference_divergence_is_bilingual_safe():
     assert out["has_reference"] is True
     assert out["unexplained"] == 0
     assert out["ratio"] == 0.0
+
+
+# --- build_language_contract: coherent alert/persistence/approval contract -----
+from transcription_language import build_language_contract  # noqa: E402
+
+
+def test_contract_flags_reference_discrepancy_as_review_not_language_verdict():
+    # Agus shape: Spanish reference, half the output shares no words with it.
+    c = build_language_contract(
+        _segs(_ES_LINE, _ES_LINE_2, _FOREIGN_LINE, _FOREIGN_LINE_2),
+        _ES_REFERENCE,
+    )
+    assert c["output_reference_divergence"] is True
+    assert c["needs_language_review"] is True
+    # It is a DISCREPANCY alert, not a claim that the text is a given language:
+    # the six-language detector abstains, so no positive language verdict.
+    assert c["language_conflict"] is False
+    assert c["output_reference_divergence_ratio"] == pytest.approx(0.5)
+
+
+def test_contract_clean_song_needs_no_review():
+    c = build_language_contract(
+        _segs(_ES_LINE, _ES_LINE_2, "Empieza por ti la cancion que somos hoy"),
+        _ES_REFERENCE,
+    )
+    assert c["output_reference_divergence"] is False
+    assert c["needs_language_review"] is False
+
+
+def test_contract_reference_omission_is_reported_as_discrepancy():
+    # The user's caveat: a reference can OMIT verses sung in another language.
+    # When it does, those verses read as unexplained -> we flag a discrepancy
+    # for human review. This is intentional and honest: divergence means
+    # "output disagrees with its reference", never "the text is wrong-language".
+    c = build_language_contract(
+        _segs(_ES_LINE, _ES_LINE_2,
+              "I can change the world tonight if you believe now",
+              "and every broken road will lead somewhere better soon"),
+        _ES_REFERENCE,  # Spanish-only reference that omitted the English bridge
+    )
+    assert c["output_reference_divergence"] is True
+    assert c["needs_language_review"] is True
+
+
+def test_contract_bilingual_with_complete_reference_is_not_flagged():
+    # When the audio-derived reference DID capture both languages, the bilingual
+    # output is explained and no review is required.
+    bilingual_reference = (
+        _ES_REFERENCE + "\nI can change the world tonight if you believe now\n"
+    )
+    c = build_language_contract(
+        _segs(_ES_LINE, "I can change the world tonight if you believe now"),
+        bilingual_reference,
+    )
+    assert c["output_reference_divergence"] is False
+    assert c["needs_language_review"] is False
+
+
+# --- Wiring: the alert must be recomputed on read and enforced on the server ---
+import ast as _ast  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+_MAIN_SRC = (_Path(__file__).parents[1] / "main.py").read_text()
+_MAIN_TREE = _ast.parse(_MAIN_SRC)
+
+
+def _func(name):
+    return next(
+        n for n in _ast.walk(_MAIN_TREE)
+        if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+        and n.name == name
+    )
+
+
+def test_approval_endpoint_enforces_language_review_server_side():
+    src = _ast.get_source_segment(_MAIN_SRC, _func("approve_job"))
+    assert "_language_review_payload(" in src
+    assert "language_review_unresolved" in src
+    # Gate must sit before the status flips to done.
+    assert src.index("language_review_unresolved") < src.index('job.status = "done"')
+
+
+def test_language_resolution_endpoint_exists_and_is_revision_scoped():
+    src = _ast.get_source_segment(_MAIN_SRC, _func("resolve_language_review"))
+    assert "language_resolution" in src
+    assert "stale_revision" in src          # rejects an edit made under it
+    assert "segments_hash" in src           # bound to content, not just revision
+
+
+def test_reload_serializers_recompute_language_flags():
+    for endpoint in ("status", "transcription_status"):
+        src = _ast.get_source_segment(_MAIN_SRC, _func(endpoint))
+        assert "_language_review_payload(" in src, endpoint
+
+
+def test_resolution_matches_only_current_revision_and_hash():
+    # Structural guard: the shared matcher checks BOTH revision and
+    # segments_hash so a stale resolution cannot silently clear a new
+    # discrepancy after an edit.
+    src = (_Path(__file__).parents[1] / "language_review.py").read_text()
+    tree = _ast.parse(src)
+    fn = next(
+        n for n in _ast.walk(tree)
+        if isinstance(n, _ast.FunctionDef) and n.name == "resolution_matches"
+    )
+    body = _ast.get_source_segment(src, fn)
+    assert "revision" in body and "segments_hash" in body
+
+
+def test_campaign_approve_lyrics_enforces_language_review():
+    # The path Agus uses (campaign approve-lyrics) must carry the same gate as
+    # /approve, or the enforcement is trivially bypassed for UMG jobs.
+    src = (_Path(__file__).parents[1] / "batch_campaigns.py").read_text()
+    tree = _ast.parse(src)
+    fn = next(
+        n for n in _ast.walk(tree)
+        if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+        and n.name == "approve_campaign_lyrics"
+    )
+    body = _ast.get_source_segment(src, fn)
+    assert "review_payload" in body
+    assert "language_review_unresolved" in body

@@ -132,10 +132,14 @@ from segment_timing import normalize_segments_timing, normalize_editor_segments,
 from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
 from render_spec import umg_catalog, validate_umg_config
 from transcription_language import (
+    build_language_contract,
     detect_text_languages,
     normalize_language,
-    reference_divergence,
     resolve_transcription_language,
+)
+from language_review import (
+    reference_text_of as _job_reference_text,
+    review_payload as _language_review_payload,
 )
 from provenance import job_was_delivered
 from batch_profiles import (
@@ -4949,10 +4953,19 @@ def transcription_status(
         if status == "transcribed":
             payload["segments"] = job_row.segments_json or []
             # reference_lyrics no es columna del modelo Job (la transcripción
-            # vieja la devolvía inline; ahora no la persistimos). Defer a
-            # otro PR si el editor la necesita post-render. Default "" para
-            # no romper el frontend que la lee.
-            payload["reference_lyrics"] = getattr(job_row, "reference_lyrics", "") or ""
+            # vieja la devolvía inline; ahora no la persistimos). Recuperamos la
+            # referencia audio-derived del transcription_quality para poder
+            # recomputar la contraseña de idioma/discrepancia en la recarga.
+            payload["reference_lyrics"] = (
+                getattr(job_row, "reference_lyrics", "")
+                or _job_reference_text(job_row.transcription_quality)
+            )
+            # Same recompute as /status so a reload right after transcription
+            # keeps the warning + approval block coherent with the server gate.
+            payload.update(_language_review_payload(
+                job_row.segments_json, job_row.transcription_quality,
+                job_row.segments_revision,
+            ))
         elif status == "transcription_failed":
             payload["error"] = (getattr(job_row, "error", None) or
                                 "Error desconocido durante la transcripción.")
@@ -7427,84 +7440,34 @@ async def _run_transcription_for_job(
                 "completed_attempt_count"
             ]
 
-            # Language is evaluated at the same single output chokepoint as
-            # timing. A bilingual song is valid: preserve multi-label
-            # evidence instead of forcing one global language.
-            reference_languages = detect_text_languages(reference_lyrics)
-            try:
-                language_evidence = _wx_segs if _wx_segs else polished
-            except NameError:
-                language_evidence = polished
-            detected_languages = detect_text_languages(language_evidence)
-            requested_language = normalize_language(language)
-            reference_language = (
-                next(iter(reference_languages))
-                if len(reference_languages) == 1 else None
+            # Language + discrepancy are evaluated at the same single output
+            # chokepoint as timing, over the FINAL lines the operator approves,
+            # through the shared contract so the reload serializers and the
+            # server approval gate recompute an IDENTICAL result (an alert that
+            # only lives in this response can be lost on reload or bypassed by an
+            # old client — see /status, /transcription-status and approve_job).
+            # A bilingual song stays valid: the contract preserves multi-label
+            # evidence and never forces one global language. The output-vs-
+            # reference divergence is a DISCREPANCY alert (the transcription does
+            # not match its own audio-derived reference), NOT a verdict that the
+            # text is a specific wrong language, and it never translates.
+            _lang = build_language_contract(
+                polished, reference_lyrics,
+                requested_language=language, expected_hint=lang,
             )
-            detected_language = (
-                next(iter(detected_languages))
-                if len(detected_languages) == 1 else None
-            )
-            mixed_language = (
-                len(reference_languages) > 1 or len(detected_languages) > 1
-            )
-            expected_language = lang or requested_language or reference_language
-            language_conflict = bool(
-                expected_language
-                and detected_languages
-                and expected_language not in detected_languages
-                and not mixed_language
-            )
-            # A supported reference "corroborates" the output's language today,
-            # but nothing checks the output actually AGREES with that reference.
-            # A half-Welsh decode of a Spanish song keeps a clean Spanish
-            # reference; the six-language detector abstains on lyric text
-            # (returning {} even for correct Spanish), so neither
-            # language_conflict nor language_uncertain fires and the operator can
-            # one-click approve foreign text.  Measure output-vs-reference drift
-            # over the FINAL lines the operator approves and surface it as
-            # uncertainty — never force a language, never translate.
-            _ref_divergence = reference_divergence(polished, reference_lyrics)
-            output_reference_divergence = bool(
-                _ref_divergence["has_reference"]
-                and _ref_divergence["substantial"] >= 3
-                and _ref_divergence["ratio"] >= 0.34
-            )
-            language_uncertain = bool(
-                (
-                    not requested_language
-                    and not reference_languages
-                    and len(detected_languages) <= 1
-                )
-                or output_reference_divergence
-            )
-            if language_conflict:
+            if _lang["language_conflict"]:
                 logger.error(
-                    "[LANGUAGE] conflict job=%s expected=%s detected=%s; "
-                    "blocking approval",
-                    job_id, expected_language, detected_language,
+                    "[LANGUAGE] conflict job=%s expected detected=%s; needs review",
+                    job_id, _lang["detected_language"],
                 )
-            if output_reference_divergence:
+            if _lang["output_reference_divergence"]:
                 logger.warning(
-                    "[LANGUAGE] output diverges from reference job=%s "
-                    "unexplained=%d/%d ratio=%.2f; flagging for review",
-                    job_id, _ref_divergence["unexplained"],
-                    _ref_divergence["substantial"], _ref_divergence["ratio"],
+                    "[LANGUAGE] output diverges from reference job=%s ratio=%.2f "
+                    "unexplained=%s; flagging for review",
+                    job_id, _lang["output_reference_divergence_ratio"],
+                    _lang["output_reference_unexplained_indices"],
                 )
-            out.update({
-                "requested_language": requested_language,
-                "detected_language": detected_language,
-                "detected_languages": sorted(detected_languages),
-                "reference_language": reference_language,
-                "reference_languages": sorted(reference_languages),
-                "mixed_language": mixed_language,
-                "language_conflict": language_conflict,
-                "language_uncertain": language_uncertain,
-                "output_reference_divergence": output_reference_divergence,
-                "output_reference_divergence_ratio": round(
-                    _ref_divergence["ratio"], 3
-                ),
-            })
+            out.update(_lang)
 
             # Segmentos crudos de whisperX (la performance REAL): viajan en
             # result para que el modo vivo pueda reemplazar el sufijo
@@ -11262,6 +11225,14 @@ def status(
             ((job.get("transcription_quality") or {}).get("reference_hypothesis") or {})
             .get("reference_text") or ""
         ),
+        # Recompute the language/discrepancy contract from persisted data so the
+        # editor's warning + approval block survive a reload/deep-link and
+        # recalculate after a lyric or reference edit (the flags are never
+        # written to the row; JobDetail/LyricsEditor hydrate from here).
+        **_language_review_payload(
+            job.get("segments_json"), job.get("transcription_quality"),
+            job.get("segments_revision"),
+        ),
         # Final-render preflight is consumed by JobDetail from this polling
         # endpoint.  Returning it here is essential: /jobs is only the list
         # bootstrap, while a refresh and every render/edit completion hydrate
@@ -12580,6 +12551,44 @@ async def approve_job(
                 "code": "delivery_qc_blocked",
                 "message": "El preflight de entrega tiene hallazgos pendientes.",
                 "delivery_qc": _delivery_gate,
+            },
+        )
+
+    # Server-side language/discrepancy gate. Recomputed from persisted segments
+    # + reference so an old or hand-rolled client cannot approve output that
+    # diverges from its own audio-derived reference (e.g. a chorus decoded in
+    # the wrong language). It only blocks APPROVAL — saving edits uses a
+    # separate endpoint — and is released by an explicit, revision-scoped human
+    # resolution (POST /jobs/{job_id}/language-resolution). It is a review gate,
+    # not a language verdict, and never rewrites the lyrics.
+    _language_review = _language_review_payload(
+        job.segments_json, job.transcription_quality, job.segments_revision,
+    )
+    if (
+        _language_review["needs_language_review"]
+        and not _language_review["language_review_resolved"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "language_review_unresolved",
+                "message": (
+                    "La letra no coincide con el idioma/contenido de la "
+                    "referencia. Revisá los versos marcados y confirmá el "
+                    "idioma antes de aprobar."
+                ),
+                "language_review": {
+                    "output_reference_divergence":
+                        _language_review["output_reference_divergence"],
+                    "output_reference_divergence_ratio":
+                        _language_review["output_reference_divergence_ratio"],
+                    "output_reference_unexplained_indices":
+                        _language_review["output_reference_unexplained_indices"],
+                    "language_conflict": _language_review["language_conflict"],
+                    "detected_languages": _language_review["detected_languages"],
+                    "reference_languages": _language_review["reference_languages"],
+                    "segments_revision": int(job.segments_revision or 0),
+                },
             },
         )
 
@@ -15020,6 +15029,77 @@ async def save_segments(
 class TranscriptionQualityAckRequest(BaseModel):
     base_revision: int = Field(..., ge=0)
     confirmed_window_ids: list[str] = Field(default_factory=list, max_length=64)
+
+
+class LanguageResolutionRequest(BaseModel):
+    base_revision: int = Field(..., ge=0)
+    note: str | None = Field(default=None, max_length=500)
+
+
+@app.post("/jobs/{job_id}/language-resolution")
+@limiter.limit("12/minute")
+async def resolve_language_review(
+    request: Request,
+    job_id: str,
+    body: LanguageResolutionRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Persist an explicit, revision-scoped human resolution of a language /
+    reference discrepancy so approval can proceed.
+
+    This is the ONLY way to clear the server approval gate (an old client cannot
+    forge it): the record is bound to the current revision + content hash, so a
+    later edit invalidates it and a fresh discrepancy must be reviewed again. It
+    does not touch the lyrics, approval status, or the saving path.
+    """
+    job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+    is_platform_admin = bool(current_user.get("is_super_admin"))
+    if (not job or (not is_platform_admin
+                    and job.tenant_id != current_user["tenant_id"])):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    current_revision = int(job.segments_revision or 0)
+    if body.base_revision != current_revision:
+        return JSONResponse(
+            status_code=409,
+            content={"code": "stale_revision", "current_revision": current_revision},
+        )
+    from transcription_quality import segments_hash
+    review = _language_review_payload(
+        job.segments_json, job.transcription_quality, current_revision,
+    )
+    if not review["needs_language_review"]:
+        # Nothing to resolve for this revision — report it so the client can
+        # simply proceed instead of persisting a spurious override.
+        return {"ok": True, "revision": current_revision, "nothing_to_resolve": True}
+    quality = (
+        dict(job.transcription_quality)
+        if isinstance(job.transcription_quality, dict) else {}
+    )
+    current_hash = segments_hash(job.segments_json or [])
+    quality["language_resolution"] = {
+        "revision": current_revision,
+        "segments_hash": current_hash,
+        "output_reference_divergence_ratio":
+            review["output_reference_divergence_ratio"],
+        "user_id": current_user["id"],
+        "note": (body.note or None),
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    job.transcription_quality = quality
+    db.add(AuditLog(
+        user_id=current_user["id"], action="lyrics.language_review_resolved",
+        detail={
+            "job_id": job_id, "revision": current_revision,
+            "segments_hash": current_hash,
+            "output_reference_divergence_ratio":
+                review["output_reference_divergence_ratio"],
+            "detected_languages": review["detected_languages"],
+            "reference_languages": review["reference_languages"],
+        },
+    ))
+    db.commit()
+    return {"ok": True, "revision": current_revision, "segments_hash": current_hash}
 
 
 @app.post("/jobs/{job_id}/transcription-quality/acknowledge")
