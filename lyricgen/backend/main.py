@@ -18011,17 +18011,70 @@ def _delivery_safe_filename(artist: str, song: str) -> str:
     return out.replace(" ", "_") or "video"
 
 
-def _verify_portal_token(authorization: str | None) -> None:
+_PORTAL_IDS = {"argentina", "chile"}
+
+
+def _portal_tenant_scope(portal_id: str) -> set[str] | None:
+    """Return the tenant allow-list for one portal, or None for legacy all.
+
+    Argentina historically listed legacy deliveries from several tenant
+    snapshots, so it remains unfiltered unless explicitly configured. Chile
+    defaults to the dedicated ``universal_chile`` tenant so a newly-created
+    Chile portal cannot expose Argentina's rows by accident.
+    """
+    env_name = f"DELIVERY_PORTAL_TENANTS_{portal_id.upper()}"
+    raw = os.environ.get(env_name)
+    if raw is not None:
+        tenants = {part.strip() for part in raw.split(",") if part.strip()}
+        return tenants or set()
+    if portal_id == "chile":
+        return {"universal_chile"}
+    return None
+
+
+def _portal_id(raw: str | None) -> str:
+    portal_id = (raw or "argentina").strip().lower()
+    if portal_id not in _PORTAL_IDS:
+        raise HTTPException(status_code=400, detail="Portal inválido")
+    return portal_id
+
+
+def _portal_delivery_query(query, portal_id: str):
+    tenants = _portal_tenant_scope(portal_id)
+    if tenants is not None:
+        query = query.filter(Delivery.tenant_snapshot.in_(tenants))
+    return query
+
+
+def _verify_portal_token(
+    authorization: str | None,
+    portal_id: str | None = None,
+) -> str:
     """Raise 401 unless the X-Portal-Token header matches the configured
     portal password. The portal is a static page so we can't use JWT —
-    this is the same shared password Universal enters in the portal UI."""
-    expected = os.environ.get("DELIVERY_PORTAL_TOKEN") or os.environ.get("DELIVERY_PASSWORD")
+    this is the same shared password Universal enters in the portal UI.
+
+    The Chile portal has its own token env var. This keeps the two portal
+    surfaces isolated even though they share the delivery database and R2
+    bucket. The Argentina path remains backward-compatible with the original
+    single-token deployment.
+    """
+    portal_id = _portal_id(portal_id)
+    token_env = f"DELIVERY_PORTAL_TOKEN_{portal_id.upper()}"
+    expected = os.environ.get(token_env)
+    if expected is None:
+        # Keep one shared password working for the existing Argentina portal
+        # and the first Chile rollout. Production can set
+        # DELIVERY_PORTAL_TOKEN_CHILE later for cryptographic separation;
+        # tenant filtering remains active either way.
+        expected = os.environ.get("DELIVERY_PORTAL_TOKEN") or os.environ.get("DELIVERY_PASSWORD")
     if not expected:
         # If the env var isn't set the portal endpoints are effectively
         # disabled — better than silently allowing unauth access.
         raise HTTPException(status_code=503, detail="Portal not configured")
     if not authorization or authorization != expected:
         raise HTTPException(status_code=401, detail="Invalid portal token")
+    return portal_id
 
 
 class SendToUMGRequest(BaseModel):
@@ -18253,11 +18306,20 @@ async def admin_delete_delivery(
     return _soft_delete_delivery(ddb, db, delivery_id, current_user["id"])
 
 
-def _soft_delete_delivery(ddb: Session, db: Session, delivery_id: int, actor_user_id: int | None):
+def _soft_delete_delivery(
+    ddb: Session,
+    db: Session,
+    delivery_id: int,
+    actor_user_id: int | None,
+    portal_id: str | None = None,
+):
     """Soft-delete: la fila Delivery vive en `ddb` (posible DB externa del
     portal); el AuditLog en la `db` local. removed_by_user_id es FK a los
     users de la DB de deliveries → mapear el id local a uno válido de esa DB."""
-    delivery = ddb.query(Delivery).filter(Delivery.id == delivery_id).first()
+    query = ddb.query(Delivery).filter(Delivery.id == delivery_id)
+    if portal_id is not None:
+        query = _portal_delivery_query(query, portal_id)
+    delivery = query.first()
     if delivery is None or delivery.removed_at is not None:
         raise HTTPException(status_code=404, detail="Delivery not found")
     delivery.removed_at = datetime.now(timezone.utc)
@@ -18283,16 +18345,19 @@ def _soft_delete_delivery(ddb: Session, db: Session, delivery_id: int, actor_use
 async def portal_delete_delivery(
     delivery_id: int,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
     """Soft-delete from the portal itself. Auth: shared portal token."""
-    _verify_portal_token(x_portal_token)
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
     # actor_user_id=None because the portal has no per-user identity.
     # The audit log entry records the action and which delivery; if we
     # later add per-recipient logins to the portal this will carry their
     # user id instead.
-    return _soft_delete_delivery(ddb, db, delivery_id, actor_user_id=None)
+    return _soft_delete_delivery(
+        ddb, db, delivery_id, actor_user_id=None, portal_id=portal_id,
+    )
 
 
 @app.post("/api/deliveries/{delivery_id}/change-request")
@@ -18300,6 +18365,7 @@ async def portal_submit_change_request(
     delivery_id: int,
     body: dict,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
@@ -18310,7 +18376,7 @@ async def portal_submit_change_request(
 
     Auth via X-Portal-Token (same shared password as the rest of /api).
     """
-    _verify_portal_token(x_portal_token)
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
     comment = (body.get("comment") or "").strip() if isinstance(body, dict) else ""
     if not comment:
         raise HTTPException(status_code=400, detail="El comentario no puede estar vacío.")
@@ -18321,12 +18387,13 @@ async def portal_submit_change_request(
             status_code=400,
             detail="El comentario es demasiado largo (máximo 5000 caracteres).",
         )
-    delivery = (
-        ddb.query(Delivery)
-        .filter(Delivery.id == delivery_id)
-        .filter(Delivery.removed_at.is_(None))
-        .first()
-    )
+    delivery = _portal_delivery_query(
+        ddb.query(Delivery), portal_id,
+    ).filter(
+        Delivery.id == delivery_id,
+    ).filter(
+        Delivery.removed_at.is_(None),
+    ).first()
     if not delivery:
         raise HTTPException(status_code=404, detail="Delivery no encontrada.")
     cr = DeliveryChangeRequest(
@@ -18386,6 +18453,7 @@ async def portal_submit_change_request(
 async def portal_approve_delivery(
     delivery_id: int,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
@@ -18399,13 +18467,14 @@ async def portal_approve_delivery(
 
     Auth: shared portal token (same envelope as the rest of /api).
     """
-    _verify_portal_token(x_portal_token)
-    delivery = (
-        ddb.query(Delivery)
-        .filter(Delivery.id == delivery_id)
-        .filter(Delivery.removed_at.is_(None))
-        .first()
-    )
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    delivery = _portal_delivery_query(
+        ddb.query(Delivery), portal_id,
+    ).filter(
+        Delivery.id == delivery_id,
+    ).filter(
+        Delivery.removed_at.is_(None),
+    ).first()
     if not delivery:
         raise HTTPException(status_code=404, detail="Delivery no encontrada.")
     if delivery.approved_at is not None:
@@ -18441,6 +18510,7 @@ async def portal_approve_delivery(
 async def portal_unapprove_delivery(
     delivery_id: int,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
@@ -18448,13 +18518,14 @@ async def portal_unapprove_delivery(
     approved_by_label so the row goes back to pending state on the
     portal listing. Idempotent — calling on an unapproved row is a no-op.
     """
-    _verify_portal_token(x_portal_token)
-    delivery = (
-        ddb.query(Delivery)
-        .filter(Delivery.id == delivery_id)
-        .filter(Delivery.removed_at.is_(None))
-        .first()
-    )
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    delivery = _portal_delivery_query(
+        ddb.query(Delivery), portal_id,
+    ).filter(
+        Delivery.id == delivery_id,
+    ).filter(
+        Delivery.removed_at.is_(None),
+    ).first()
     if not delivery:
         raise HTTPException(status_code=404, detail="Delivery no encontrada.")
     if delivery.approved_at is None:
@@ -18479,9 +18550,10 @@ async def portal_unapprove_delivery(
 @app.get("/api/deliveries/meta")
 async def portal_get_meta(
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
 ):
     """Title/description/expiry for the portal header. Public (portal token)."""
-    _verify_portal_token(x_portal_token)
+    _verify_portal_token(x_portal_token, x_portal_id)
     import time
     return {
         "title": "Entregables — GenLy AI",
@@ -18500,6 +18572,7 @@ async def portal_get_meta(
 @app.get("/api/deliveries/items")
 async def portal_get_items(
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_deliveries_db),
 ):
     """Return the portal listing in the shape the frontend expects.
@@ -18507,17 +18580,18 @@ async def portal_get_items(
     Queries the DB fresh on every call. Previous in-process cache broke
     under Railway's multi-worker setup — see the module-level note next
     to _DELIVERY_URL_EXPIRY_S."""
-    _verify_portal_token(x_portal_token)
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
     import time
     from concurrent.futures import ThreadPoolExecutor
 
     now = time.time()
-    deliveries = (
-        db.query(Delivery)
-        .filter(Delivery.removed_at.is_(None))
-        .order_by(Delivery.artist_snapshot, Delivery.song_title_snapshot, Delivery.added_at)
-        .all()
-    )
+    deliveries = _portal_delivery_query(
+        db.query(Delivery), portal_id,
+    ).filter(
+        Delivery.removed_at.is_(None),
+    ).order_by(
+        Delivery.artist_snapshot, Delivery.song_title_snapshot, Delivery.added_at,
+    ).all()
 
     # Resolve every (delivery, file) pair's R2 size in parallel BEFORE
     # building the response. Sequential head_object calls were the root
