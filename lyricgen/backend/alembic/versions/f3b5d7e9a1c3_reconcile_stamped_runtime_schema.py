@@ -40,13 +40,26 @@ def _create_index_if_missing(name: str, table: str, columns: list[str], *, uniqu
 
 
 def upgrade() -> None:
-    # The model metadata is the authoritative shape for tables whose earlier
-    # migrations were stamped without executing.  checkfirst keeps this safe
-    # for databases that already have the complete table set.
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        # Railway may start more than one release/pre-deploy process while a
+        # rolling deployment is draining. Serialize this one-time repair so
+        # two ALTER TABLE statements cannot deadlock each other.
+        op.execute("SELECT pg_advisory_xact_lock(hashtextextended('genly-schema-repair', 0))")
+
+    # The model metadata is authoritative for tables whose earlier migrations
+    # were stamped without executing. Restrict create_all to absent tables;
+    # scanning every existing table first held AccessShare locks while the
+    # column ALTERs below requested AccessExclusive locks under live traffic.
     from database import Base
 
-    bind = op.get_bind()
-    Base.metadata.create_all(bind=bind, checkfirst=True)
+    inspector = sa.inspect(bind)
+    missing_tables = set(Base.metadata.tables) - set(inspector.get_table_names())
+    if missing_tables:
+        missing_metadata = sa.MetaData()
+        for table_name in sorted(missing_tables):
+            Base.metadata.tables[table_name].to_metadata(missing_metadata)
+        missing_metadata.create_all(bind=bind, checkfirst=True)
 
     _add_column_if_missing(
         "jobs",
