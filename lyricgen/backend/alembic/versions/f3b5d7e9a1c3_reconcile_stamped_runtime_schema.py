@@ -57,6 +57,18 @@ def upgrade() -> None:
     missing_tables = set(Base.metadata.tables) - set(inspector.get_table_names())
     if missing_tables:
         missing_metadata = sa.MetaData()
+        # Foreign keys on the missing tables point at baseline tables that
+        # are already present in production. Reflect those targets into the
+        # temporary metadata so SQLAlchemy can resolve the references without
+        # attempting to create duplicate copies of them.
+        for referenced_table in ("users", "jobs", "editor_documents"):
+            if referenced_table in inspector.get_table_names():
+                sa.Table(
+                    referenced_table,
+                    missing_metadata,
+                    autoload_with=bind,
+                    resolve_fks=False,
+                )
         for table_name in sorted(missing_tables):
             Base.metadata.tables[table_name].to_metadata(missing_metadata)
         missing_metadata.create_all(bind=bind, checkfirst=True)
