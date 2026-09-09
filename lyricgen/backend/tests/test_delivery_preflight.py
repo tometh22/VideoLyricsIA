@@ -40,11 +40,11 @@ def test_universal_example_groups_spelling_and_flags_metadata():
         fps=30,
     )
 
-    assert report["decision"] == "REVIEW"
+    assert report["decision"] == "BLOCK"
     assert report["summary"] == {
         "issue_count": 4,
-        "fail_count": 0,
-        "warn_count": 4,
+        "fail_count": 1,
+        "warn_count": 3,
         "open_count": 4,
         "segment_count": 4,
     }
@@ -58,6 +58,47 @@ def test_universal_example_groups_spelling_and_flags_metadata():
     assert by_actual["AVENTRUA"]["expected"] == "AVENTURA"
     assert by_actual["AVENTRUA"]["timecode"] == "00:03:06:21"
     assert by_actual["AVENTRUA"]["auto_fixable"] is False
+
+
+def test_umg_tu_carcel_four_findings_without_reference():
+    """The UMG acceptance shape must work without a lyric oracle."""
+    report = build_delivery_preflight(
+        metadata={
+            "artist": "Enanitos Verdes", "title": "Tu Cárcel",
+            "version": "En Vivo", "isrc": "MXUV72602826",
+        },
+        asset={
+            "filename": "Enanitos_Verdes_-_Tu_Carcel_En_Vivo.mov",
+            "rendered_title": "Tu Carcel_En Vivo", "title_time": 1.133,
+        },
+        segments=[
+            {"start": 74.367, "end": 75.2, "text": "TENDRAS"},
+            {"start": 75.8, "end": 76.6, "text": "JAMAS"},
+            {"start": 77.967, "end": 78.8, "text": "JAMAS"},
+            {"start": 186.7, "end": 188.0, "text": "AVENTRUA"},
+        ],
+        approved_lyrics=None,
+        reference_trusted=False,
+        fps=30,
+    )
+
+    assert report["summary"] == {
+        "issue_count": 4,
+        "fail_count": 1,
+        "warn_count": 3,
+        "open_count": 4,
+        "segment_count": 4,
+    }
+    assert [
+        (row["code"], row["actual"], row["expected"], row["occurrence_count"])
+        for row in report["issues"]
+    ] == [
+        ("METADATA_TITLE_MISMATCH", "Tu Carcel_En Vivo", "Tu Cárcel", 1),
+        ("LYRIC_ORTHOGRAPHY_MISMATCH", "TENDRAS", "TENDRÁS", 1),
+        ("LYRIC_ORTHOGRAPHY_MISMATCH", "JAMAS", "JAMÁS", 2),
+        ("LYRIC_TOKEN_TYPO", "AVENTRUA", "AVENTURA", 1),
+    ]
+    assert all(row["auto_fixable"] is False for row in report["issues"][1:])
 
 
 def test_untrusted_catalogue_cannot_raise_lyric_corrections():
@@ -104,6 +145,25 @@ def test_clean_delivery_passes():
     )
     assert report["decision"] == "PASS"
     assert report["issues"] == []
+
+
+def test_terminal_line_period_preflight_blocks_only_single_final_periods():
+    report = build_delivery_preflight(
+        metadata={"artist": "Artist", "title": "Song"},
+        asset={"rendered_artist": "Artist", "rendered_title": "Song"},
+        segments=[
+            {"start": 1, "end": 2, "text": "Termina."},
+            {"start": 3, "end": 4, "text": "Sigue..."},
+            {"start": 5, "end": 6, "text": "¿Pregunta?"},
+            {"start": 7, "end": 8, "text": "Humana.", "locked": True},
+        ],
+    )
+
+    issue = next(row for row in report["issues"] if row["code"] == "LYRIC_TERMINAL_PERIOD")
+    assert report["decision"] == "BLOCK"
+    assert issue["occurrence_count"] == 2
+    assert issue["timecodes"] == ["00:00:01:00", "00:00:07:00"]
+    assert issue["auto_fixable"] is False
 
 
 def test_reference_health_blocks_wrong_or_incomplete_catalogue_text():

@@ -20,6 +20,33 @@ from delivery_preflight import build_delivery_preflight, frame_timecode
 
 SCHEMA_VERSION = "genly-delivery-qc-runtime-v1"
 
+MANDATORY_REVIEW_CHECKS = (
+    ("UMG_BLACK_BARS", "Sin franjas negras", "Confirmar 16:9 full screen sin bandas negras."),
+    ("UMG_BACKGROUND_TEXT", "Fondo sin texto ni logos", "Revisar el fondo antes/debajo de la letra y confirmar que no contiene texto, logos, marcas o palabras generadas."),
+    ("UMG_SCENE_CHANGE", "Sin cambios de escena", "Confirmar movimiento ambiental sutil, continuo y sin cortes o transiciones bruscas."),
+    ("UMG_LUMINANCE_STABLE", "Iluminación estable", "Comparar inicio, medio y fin; confirmar que no hay salto de luminancia, temperatura ni día/noche."),
+    ("UMG_MOBILE_CONTRAST", "Contraste legible en mobile", "Revisar el video en proporción mobile y confirmar legibilidad y contraste de toda la letra."),
+    ("UMG_LYRIC_NOT_LATE", "Ninguna línea entra tarde", "Escuchar el audio específico completo y confirmar que cada línea entra al inicio del canto o apenas antes."),
+    ("UMG_TITLE_METADATA", "Título coincide con metadata", "Confirmar coincidencia entre planilla, metadata y title card."),
+    ("UMG_IMAGE_NOT_STRETCHED", "Imagen sin estirar", "Confirmar proporción nativa/reencuadre sin deformación ni estiramiento."),
+)
+
+
+def mandatory_reviewer_issues() -> list[dict[str, Any]]:
+    """Unsigned contractual checks are failures, never abstentions."""
+    return [{
+        "code": code,
+        "severity": "FAIL",
+        "category": "umg_manual_checklist",
+        "summary": summary,
+        "description": description,
+        "seconds": [0.0],
+        "detector": "mandatory_signed_reviewer_checklist",
+        "confidence": 1.0,
+        "auto_fixable": False,
+        "manual_verification_required": True,
+    } for code, summary, description in MANDATORY_REVIEW_CHECKS]
+
 
 def effective_delivery_qc_mode() -> str:
     mode = os.environ.get("DELIVERY_QC_MODE", "off").strip().lower()
@@ -67,6 +94,11 @@ def _merge_prior_decisions(issues: list[dict[str, Any]], previous: Mapping[str, 
         for row in ((previous or {}).get("issues") or []) if isinstance(row, Mapping)
     }
     for issue in issues:
+        # A human visual/timing attestation is for one concrete render. Never
+        # inherit it into a rebuilt report, even when the stable check id is
+        # unchanged after a re-render.
+        if issue.get("manual_verification_required"):
+            continue
         old = prior.get(str(issue.get("issue_id")))
         if old and old.get("status") in {"ACKNOWLEDGED", "REJECTED", "RESOLVED_MANUAL"}:
             issue["status"] = old["status"]
@@ -109,7 +141,10 @@ def build_runtime_report(
     previous: Mapping[str, Any] | None = None,
     ocr_callback=None,
 ) -> dict[str, Any]:
-    mode = effective_delivery_qc_mode()
+    mode = (
+        "enforce" if getattr(job, "workload_class", "interactive") == "batch"
+        else effective_delivery_qc_mode()
+    )
     quality = job.transcription_quality if isinstance(job.transcription_quality, Mapping) else {}
     duration = None
     try:
@@ -153,7 +188,13 @@ def build_runtime_report(
         repair_actions = list(repair_shadow.get("actions") or [])
         candidate_segments = list(repair_shadow.get("candidate_segments") or [])
 
-    all_rows = list(base.get("issues") or []) + list(media.get("issues") or []) + list(ocr.get("issues") or []) + list(shadow_issues)
+    all_rows = (
+        list(base.get("issues") or [])
+        + list(media.get("issues") or [])
+        + list(ocr.get("issues") or [])
+        + list(shadow_issues)
+        + mandatory_reviewer_issues()
+    )
     _quality_verdict = str(quality.get("decision") or quality.get("verdict") or "").strip().lower()
     if _quality_verdict in {"unsafe", "fail", "blocked", "review_required"} and not any(
         str(row.get("code") or "").startswith("UPSTREAM_QUALITY") for row in all_rows
@@ -188,7 +229,15 @@ def build_runtime_report(
         "render_identity": {"path_basename": os.path.basename(video_path), "edit_count": int(job.edit_count or 0)},
         "decision": "BLOCK" if summary["fail_count"] else "REVIEW" if summary["warn_count"] else "PASS",
         "summary": summary, "issues": issues,
-        "abstentions": list(base.get("abstentions") or []) + list(media.get("abstentions") or []) + list(ocr.get("abstentions") or []),
+        # Missing automation is represented by a blocking, signed reviewer
+        # check above.  The final report therefore has no ambiguous abstention
+        # state: each requirement is either open FAIL or signed/resolved.
+        "abstentions": [],
+        "detector_diagnostics": (
+            list(base.get("abstentions") or [])
+            + list(media.get("abstentions") or [])
+            + list(ocr.get("abstentions") or [])
+        ),
         "technical": media.get("probe") or {},
         "ocr": {"sample_count": len(ocr.get("observations") or [])},
         "repairs": {
@@ -203,13 +252,18 @@ def build_runtime_report(
 
 def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None) -> dict[str, Any] | None:
     """Run and persist QC from a render worker. Never raises in observe mode."""
-    if effective_delivery_qc_mode() == "off":
-        return None
     from database import Job, SessionLocal
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
         if job is None:
+            return None
+        # Contractual batch QC cannot be disabled by the global interactive
+        # rollout flag. Interactive jobs retain the existing off switch.
+        if (
+            str(job.workload_class or "interactive") != "batch"
+            and effective_delivery_qc_mode() == "off"
+        ):
             return None
         rows = list(segments if segments is not None else (job.segments_json or []))
         previous = job.delivery_qc if isinstance(job.delivery_qc, Mapping) else None

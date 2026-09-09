@@ -15,7 +15,8 @@ import secrets
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -24,15 +25,19 @@ from sqlalchemy.orm import Session
 
 from auth import get_current_user, has_art_track_access
 from database import (
+    AuditLog,
     BatchCampaign,
     BatchCampaignItem,
     BatchUploadSession,
     EditorDocument,
     Job,
+    ProductEvent,
     SessionLocal,
+    User,
     get_db,
 )
 from jobs import create_job
+from machine_evidence import MachineSnapshotMissing
 import storage
 
 
@@ -42,7 +47,11 @@ CAMPAIGN_STATUSES = frozenset({"active", "paused", "completed", "cancelled"})
 ITEM_LIMIT = int(os.environ.get("BATCH_CAMPAIGN_ITEM_LIMIT", "1000"))
 ART_TRACK_ITEM_LIMIT = min(int(os.environ.get("BATCH_ART_TRACK_ITEM_LIMIT", "500")), 500)
 TRANSCRIPTION_WINDOW = int(os.environ.get("BATCH_TRANSCRIPTION_WINDOW", "30"))
+# The conservative platform default remains 50.  Large campaigns must opt in
+# explicitly through stage1_pipeline.lyrics_ready_limit; this avoids silently
+# widening every tenant while still allowing the 300-song August queue.
 LYRICS_READY_LIMIT = int(os.environ.get("BATCH_LYRICS_READY_LIMIT", "50"))
+SEPARATION_WINDOW = int(os.environ.get("BATCH_SEPARATION_WINDOW", "300"))
 RENDER_WINDOW = int(os.environ.get("BATCH_RENDER_WINDOW", "10"))
 FINAL_REVIEW_LIMIT = int(os.environ.get("BATCH_FINAL_REVIEW_LIMIT", "50"))
 PART_SIZE = int(os.environ.get("MULTIPART_PART_SIZE_BYTES", str(8 * 1024 * 1024)))
@@ -54,13 +63,24 @@ MAX_AUDIO_BYTES = int(os.environ.get("BATCH_MAX_AUDIO_BYTES", str(500 * 1024 * 1
 MAX_AUDIO_DURATION = float(os.environ.get("BATCH_MAX_AUDIO_DURATION", "3600"))
 
 _ACTIVE_TRANSCRIPTION = frozenset({"awaiting_upload", "transcribing_queued", "transcribing"})
+_ACTIVE_SEPARATION = frozenset({"separation_queued", "separating"})
 _ACTIVE_RENDER = frozenset({"queued", "processing", "editing", "background_generating", "rendering"})
 _FAILURE = frozenset({"error", "transcription_failed", "validation_failed", "rejected"})
 _SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+_PENDING_REVIEW_STATES = frozenset({"pending", "processing", "ready", "reviewing", "failed"})
+_APPROVED_REVIEW_STATES = frozenset({"approved", "exported"})
+_ALL_REVIEW_STATES = _PENDING_REVIEW_STATES | _APPROVED_REVIEW_STATES
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def art_track_feature_enabled() -> bool:
+    raw = os.environ.get("BATCH_ART_TRACK_ENABLED")
+    if raw is None:
+        return feature_enabled()
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -69,17 +89,48 @@ def _aware(value: datetime | None) -> datetime | None:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _latest_semaforo_verdicts(
+    db: Session,
+    job_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    wanted = set(job_ids)
+    if not wanted:
+        return {}
+    verdicts: dict[str, dict[str, Any]] = {}
+    for log in db.query(AuditLog).filter(
+        AuditLog.action.in_(("semaforo.verdict.v2", "semaforo.verdict.v1")),
+    ).order_by(AuditLog.id.desc()).all():
+        detail = dict(log.detail or {})
+        verdict_job = str(detail.get("job_id") or "")
+        if verdict_job in wanted and verdict_job not in verdicts:
+            verdicts[verdict_job] = detail
+    return verdicts
+
+
+def _delivery_rank(
+    item: BatchCampaignItem,
+    verdict: dict[str, Any] | None,
+) -> tuple[int, int, float, int]:
+    title = f"{item.title or ''} {item.filename or ''}".lower()
+    is_live = "live" in title or "en vivo" in title
+    color = str((verdict or {}).get("color") or "red").lower()
+    color_rank = {"green": 0, "yellow": 1, "red": 2}.get(color, 2)
+    signal_rank = _number((verdict or {}).get("rank_key"), 9_999.0)
+    return (1 if is_live else 0, color_rank, signal_rank, int(item.ordinal or 0))
+
+
 def feature_enabled() -> bool:
     return os.environ.get("BATCH_CAMPAIGN_ENABLED", "0").strip().lower() in {
         "1", "true", "yes", "on",
     }
-
-
-def art_track_feature_enabled() -> bool:
-    raw = os.environ.get("BATCH_ART_TRACK_ENABLED")
-    if raw is None:
-        return feature_enabled()
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _scope_enabled(user: dict) -> bool:
@@ -103,10 +154,10 @@ def _require_scope(user: dict) -> None:
 
 
 def _campaign_or_404(db: Session, campaign_id: str, user: dict) -> BatchCampaign:
-    campaign = db.query(BatchCampaign).filter(
-        BatchCampaign.id == campaign_id,
-        BatchCampaign.tenant_id == user["tenant_id"],
-    ).first()
+    query = db.query(BatchCampaign).filter(BatchCampaign.id == campaign_id)
+    if user.get("role") != "admin":
+        query = query.filter(BatchCampaign.tenant_id == user["tenant_id"])
+    campaign = query.first()
     if campaign is None:
         raise HTTPException(status_code=404, detail="Campaign not found.")
     return campaign
@@ -122,17 +173,25 @@ def _hash_secret(value: str) -> str:
 
 
 def _phase(upload_state: str, job_status: str | None, metadata_error: str | None = None) -> str:
+    if job_status in _ACTIVE_SEPARATION:
+        return "separating"
+    if job_status == "separation_ready":
+        return "separation_ready"
     if job_status in _ACTIVE_TRANSCRIPTION:
         return "transcribing"
     if job_status in {"transcribed_pending", "transcribed"}:
         return "lyrics_ready"
+    if job_status == "lyrics_approved":
+        return "lyrics_approved"
     if job_status in _ACTIVE_RENDER:
         return "rendering"
     if job_status == "pending_review":
         return "final_review"
     if job_status == "done":
         return "done"
-    if job_status in _FAILURE or upload_state == "error" or metadata_error in {"invalid_size", "invalid_duration"}:
+    if job_status in _FAILURE or upload_state == "error" or metadata_error in {
+        "invalid_size", "invalid_duration", "promotion_failed",
+    }:
         return "failed"
     if upload_state == "uploaded":
         return "waiting_processing"
@@ -153,14 +212,19 @@ def _summary(db: Session, campaign: BatchCampaign) -> dict[str, Any]:
     counters = {
         key: 0 for key in (
             "waiting_upload", "uploading", "waiting_processing", "transcribing",
-            "lyrics_ready", "rendering", "final_review", "done", "failed",
+            "separating", "separation_ready",
+            "lyrics_ready", "lyrics_approved", "rendering", "final_review",
+            "done", "failed",
         )
     }
     rows = _campaign_rows(db, campaign.id)
+    from reviewer_campaign_product import campaign_payload
+    reviewer_summary, _ = campaign_payload(db, campaign.id, rows)
     for item, job in rows:
         counters[_phase(item.upload_state, job.status if job else None, item.metadata_error)] += 1
     return {
         "id": campaign.id,
+        "reviewer_campaign_status": reviewer_summary,
         "name": campaign.name,
         "status": campaign.status,
         "created_by": campaign.created_by,
@@ -229,6 +293,16 @@ class RetryItemResponse(BaseModel):
     status: str
 
 
+class LyricsApprovalRequest(BaseModel):
+    editor_revision: int = Field(..., ge=0)
+    editor_version_id: str | None = Field(default=None, max_length=36)
+    confirmed_line_ids: list[str] = Field(..., min_length=1, max_length=2000)
+    review_scope: Literal["song"] = "song"
+    lyrics_confirmed: bool
+    timings_confirmed: bool
+    heard_against_audio: bool
+
+
 @router.get("/campaigns/access")
 def campaign_access(current_user: dict = Depends(get_current_user)):
     return {"enabled": _scope_enabled(current_user), "item_limit": ITEM_LIMIT}
@@ -272,9 +346,10 @@ def list_campaigns(
     db: Session = Depends(get_db),
 ):
     _require_scope(current_user)
-    rows = db.query(BatchCampaign).filter(
-        BatchCampaign.tenant_id == current_user["tenant_id"],
-    ).order_by(BatchCampaign.created_at.desc()).limit(100).all()
+    query = db.query(BatchCampaign)
+    if current_user.get("role") != "admin":
+        query = query.filter(BatchCampaign.tenant_id == current_user["tenant_id"])
+    rows = query.order_by(BatchCampaign.created_at.desc()).limit(100).all()
     return {"items": [_summary(db, row) for row in rows]}
 
 
@@ -333,6 +408,8 @@ def list_campaign_items(
     _require_scope(current_user)
     _campaign_or_404(db, campaign_id, current_user)
     rows = _campaign_rows(db, campaign_id)
+    from reviewer_campaign_product import campaign_payload
+    reviewer_summary, reviewer_rows = campaign_payload(db, campaign_id, rows)
     serialized = []
     for item, job in rows:
         item_phase = _phase(item.upload_state, job.status if job else None, item.metadata_error)
@@ -354,12 +431,14 @@ def list_campaign_items(
             "phase": item_phase,
             "job_id": job.job_id if job else None,
             "job_status": job.status if job else None,
+            "reviewer_campaign_status": reviewer_rows.get(job.job_id) if job else None,
             "render_overrides": item.render_overrides or {},
         })
     total = len(serialized)
     start = (page - 1) * limit
     return {
         "items": serialized[start:start + limit],
+        "reviewer_campaign_status": reviewer_summary,
         "page": page,
         "limit": limit,
         "total": total,
@@ -476,6 +555,21 @@ def _upload_session_or_401(
     ):
         raise HTTPException(status_code=401, detail="Batch upload token is invalid or expired.")
     return session
+
+
+@router.get("/upload-sessions/me")
+def inspect_upload_session(
+    x_batch_upload_token: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    """Read-only runner preflight and forced-expiry recovery target."""
+    session = _upload_session_or_401(db, x_batch_upload_token)
+    return {
+        "campaign_id": session.campaign_id,
+        "tenant_id": session.tenant_id,
+        "expires_at": _aware(session.token_expires_at).isoformat(),
+        "renewable": True,
+    }
 
 
 @router.post("/campaigns/{campaign_id}/manifest")
@@ -709,9 +803,14 @@ def campaign_upload_complete(
 @router.post("/campaigns/{campaign_id}/next")
 def claim_next_review(
     campaign_id: str,
+    skip_job_id: str | None = Query(default=None, min_length=12, max_length=12),
     x_editor_session: str | None = Header(default=None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    search: str | None = None,
+    version: str | None = None,
+    artist: str | None = None,
+    reviewed_by: str | None = None,
 ):
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
@@ -725,49 +824,84 @@ def claim_next_review(
         EditorDocument, EditorDocument.job_id == Job.job_id,
     ).filter(
         Job.campaign_id == campaign.id,
-        Job.tenant_id == current_user["tenant_id"],
+        Job.tenant_id == campaign.tenant_id,
         Job.status.in_(("transcribed_pending", "transcribed")),
         EditorDocument.lock_user_id == current_user["id"],
         EditorDocument.lock_session_id == session_id,
         EditorDocument.lock_expires_at > now,
+        *([Job.job_id != skip_job_id] if skip_job_id else []),
     ).first()
     if existing:
         job, _ = existing
         return {"job_id": job.job_id, "deduplicated": True}
 
-    candidates = db.query(Job).join(
+    candidate_pairs = db.query(Job, BatchCampaignItem).join(
         BatchCampaignItem, BatchCampaignItem.id == Job.campaign_item_id,
     ).outerjoin(EditorDocument, EditorDocument.job_id == Job.job_id).filter(
         Job.campaign_id == campaign.id,
-        Job.tenant_id == current_user["tenant_id"],
+        Job.tenant_id == campaign.tenant_id,
         Job.status.in_(("transcribed_pending", "transcribed")),
+        *([Job.job_id != skip_job_id] if skip_job_id else []),
         or_(
             EditorDocument.job_id.is_(None),
             EditorDocument.lock_expires_at.is_(None),
             EditorDocument.lock_expires_at <= now,
         ),
-    # PostgreSQL rejects a blanket FOR UPDATE when an OUTER JOIN is present
-    # because the nullable editor_documents side cannot be locked. Lock only
-    # the jobs that are being claimed; the editor lock is acquired separately
-    # below under its own row lock.
-    ).order_by(BatchCampaignItem.ordinal.asc()).with_for_update(
-        of=Job, skip_locked=True,
-    ).limit(10).all()
-    if not candidates:
+    ).all()
+    normalized_search = str(search or "").strip().lower()
+    normalized_artist = str(artist or "").strip().lower()
+    if normalized_search:
+        candidate_pairs = [
+            pair for pair in candidate_pairs
+            if normalized_search in " ".join(
+                str(value or "").lower()
+                for value in (pair[0].song_title, pair[0].artist, pair[1].title, pair[1].artist)
+            )
+        ]
+    if normalized_artist:
+        candidate_pairs = [
+            pair for pair in candidate_pairs
+            if normalized_artist in str(pair[1].artist or pair[0].artist or "").lower()
+        ]
+    if version in {"studio", "live"}:
+        candidate_pairs = [
+            pair for pair in candidate_pairs
+            if ("live" in f"{pair[1].title or ''} {pair[1].filename or ''}".lower()
+                or "en vivo" in f"{pair[1].title or ''} {pair[1].filename or ''}".lower()) == (version == "live")
+        ]
+    if reviewed_by == "me":
+        mine_ids = {
+            row.job_id for row in db.query(EditorDocument).filter(
+                EditorDocument.job_id.in_([job.job_id for job, _item in candidate_pairs]),
+                or_(
+                    EditorDocument.updated_by == current_user["id"],
+                    EditorDocument.lock_user_id == current_user["id"],
+                ),
+            ).all()
+        }
+        candidate_pairs = [pair for pair in candidate_pairs if pair[0].job_id in mine_ids]
+    verdicts = _latest_semaforo_verdicts(
+        db, [job.job_id for job, _item in candidate_pairs],
+    )
+    active_minutes = _review_minutes_by_job(
+        db, [job.job_id for job, _item in candidate_pairs],
+    )
+    candidate_pairs.sort(
+        key=lambda pair: _pair_review_effort_key(pair, active_minutes),
+    )
+    if not candidate_pairs:
         return {"job_id": None, "empty": True}
     from editor import acquire_lock, get_or_create_document
-    for job in candidates:
+    for job, item in candidate_pairs:
         document = get_or_create_document(
             db, job.job_id, job.tenant_id, job.segments_json or [],
         )
         lock = acquire_lock(db, document, current_user["id"], session_id=session_id)
         if lock.get("acquired"):
             db.commit()
-            item = db.query(BatchCampaignItem).filter(
-                BatchCampaignItem.id == job.campaign_item_id,
-            ).first()
             return {
                 "job_id": job.job_id,
+                "open_path": f"/review/{job.job_id}",
                 "default_render_params": campaign.default_render_params or {},
                 "render_overrides": item.render_overrides if item else {},
             }
@@ -775,12 +909,1202 @@ def claim_next_review(
     return {"job_id": None, "empty": True}
 
 
+def _review_line_ids(segments: list[dict[str, Any]]) -> list[str]:
+    line_ids: list[str] = []
+    for index, segment in enumerate(segments):
+        value = str(segment.get("segment_id") or segment.get("id") or "").strip()
+        # Campaigns created before stable line identities were introduced
+        # contain only ordered lyric rows. Approval is already bound to the
+        # exact EditorDocument revision/version; this deterministic fallback
+        # lets the one song-level attestation cover those legacy rows without
+        # weakening the stale/partial-list check below.
+        value = value or f"index:{index}"
+        if value in line_ids:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "review_line_identity_missing"},
+            )
+        line_ids.append(value)
+    if not line_ids:
+        raise HTTPException(status_code=409, detail={"code": "review_has_no_lines"})
+    return line_ids
+
+
+def require_prebackground_approval(job: Job) -> dict[str, Any]:
+    """Fail closed unless the exact audio/editor revision was human-approved."""
+    quality = dict(job.transcription_quality or {})
+    hypothesis = quality.get("reference_hypothesis")
+    from reference_hypothesis import validate_binding
+    reference_ok, reference_reason = validate_binding(
+        hypothesis,
+        audio_sha256=str(job.input_audio_sha256 or ""),
+        audio_revision=int(job.audio_revision or 0),
+    )
+    if not reference_ok:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": reference_reason, "stage": "lyrics_and_timing"},
+        )
+    approval = quality.get("pre_background_approval")
+    if not isinstance(approval, dict):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "lyrics_and_timing_approval_missing"},
+        )
+    from transcription_quality import segments_hash
+    expected_hash = segments_hash(job.segments_json or [])
+    if (
+        int(approval.get("audio_revision") if approval.get("audio_revision") is not None else -1) != int(job.audio_revision or 0)
+        or str(approval.get("audio_sha256") or "") != str(job.input_audio_sha256 or "")
+        or int(approval.get("editor_revision") if approval.get("editor_revision") is not None else -1) != int(job.segments_revision or 0)
+        or str(approval.get("segments_sha256") or "") != expected_hash
+        or approval.get("lyrics_confirmed") is not True
+        or approval.get("timings_confirmed") is not True
+        or approval.get("heard_against_audio") is not True
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "lyrics_and_timing_approval_stale"},
+        )
+    return approval
+
+
+@router.post("/campaigns/{campaign_id}/jobs/{job_id}/approve-lyrics")
+def approve_campaign_lyrics(
+    campaign_id: str,
+    job_id: str,
+    body: LyricsApprovalRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Bind one explicit song-level approval to the exact editor snapshot."""
+    _require_scope(current_user)
+    campaign = _campaign_or_404(db, campaign_id, current_user)
+    if campaign.status != "active":
+        raise HTTPException(status_code=409, detail="Campaign is not reviewable.")
+    job = db.query(Job).filter(
+        Job.job_id == job_id,
+        Job.campaign_id == campaign.id,
+        # `_campaign_or_404` already enforces tenant isolation for ordinary
+        # reviewers and deliberately lets platform admins open a campaign
+        # across tenants. Re-applying the actor's tenant here made that admin
+        # access read-only by accident: editor/autosave worked, but approval
+        # returned a misleading 404. Bind the job to the campaign tenant.
+        Job.tenant_id == campaign.tenant_id,
+    ).with_for_update().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Campaign job not found.")
+    if not (
+        body.lyrics_confirmed
+        and body.timings_confirmed
+        and body.heard_against_audio
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "complete_human_review_required"},
+        )
+    quality = dict(job.transcription_quality or {})
+    existing = quality.get("pre_background_approval") or {}
+    if job.status == "lyrics_approved":
+        require_prebackground_approval(job)
+        if int(existing.get("editor_revision") if existing.get("editor_revision") is not None else -1) == body.editor_revision:
+            return {
+                "job_id": job_id, "status": job.status,
+                "approved_version_id": existing.get("editor_version_id"),
+                "deduplicated": True,
+            }
+    if job.status not in {"transcribed_pending", "transcribed"}:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "job_not_awaiting_lyrics_review", "status": job.status},
+        )
+    # Server-side language/discrepancy gate (same contract as /approve and the
+    # reload serializers). Recomputed from persisted segments + reference so an
+    # old client cannot approve output that diverges from its own audio-derived
+    # reference — e.g. a chorus decoded in the wrong language. Released only by
+    # an explicit, revision-scoped human resolution (POST
+    # /jobs/{job_id}/language-resolution). Never rewrites the lyrics; the human
+    # review checkboxes above are necessary but not sufficient when the text
+    # does not match the reference.
+    from language_review import review_payload as _language_review_payload
+    _language_review = _language_review_payload(
+        job.segments_json, job.transcription_quality, job.segments_revision,
+    )
+    if (
+        _language_review["needs_language_review"]
+        and not _language_review["language_review_resolved"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "language_review_unresolved",
+                "message": (
+                    "La letra no coincide con el idioma/contenido de la "
+                    "referencia. Revisá los versos marcados y confirmá el "
+                    "idioma antes de aprobar."
+                ),
+                "language_review": {
+                    "output_reference_divergence":
+                        _language_review["output_reference_divergence"],
+                    "output_reference_divergence_ratio":
+                        _language_review["output_reference_divergence_ratio"],
+                    "output_reference_unexplained_indices":
+                        _language_review["output_reference_unexplained_indices"],
+                    "language_conflict": _language_review["language_conflict"],
+                    "detected_languages": _language_review["detected_languages"],
+                    "reference_languages": _language_review["reference_languages"],
+                    "segments_revision": int(job.segments_revision or 0),
+                },
+            },
+        )
+    require_prebackground_reference = quality.get("reference_hypothesis")
+    from reference_hypothesis import validate_binding
+    reference_ok, reference_reason = validate_binding(
+        require_prebackground_reference,
+        audio_sha256=str(job.input_audio_sha256 or ""),
+        audio_revision=int(job.audio_revision or 0),
+    )
+    if not reference_ok:
+        raise HTTPException(status_code=409, detail={"code": reference_reason})
+    from editor import approve_document
+    try:
+        document, version = approve_document(
+            db,
+            job,
+            current_user["id"],
+            editor_revision=body.editor_revision,
+            editor_version_id=body.editor_version_id,
+        )
+    except LookupError:
+        raise HTTPException(status_code=409, detail="editor_version_not_found") from None
+    except MachineSnapshotMissing:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "machine_snapshot_missing"},
+        ) from None
+    except RuntimeError:
+        raise HTTPException(status_code=409, detail="editor_revision_conflict") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    expected_ids = _review_line_ids(list(document.current_segments or []))
+    submitted_ids = [str(value) for value in body.confirmed_line_ids]
+    if submitted_ids != expected_ids:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "review_lines_incomplete_or_stale",
+                "expected_count": len(expected_ids),
+                "confirmed_count": len(submitted_ids),
+            },
+        )
+    from transcription_quality import segments_hash
+    approval = {
+        "schema": "batch-pre-background-approval-v1",
+        "review_scope": body.review_scope,
+        "audio_sha256": str(job.input_audio_sha256 or ""),
+        "audio_revision": int(job.audio_revision or 0),
+        "editor_revision": int(document.revision or 0),
+        "editor_version_id": version.id,
+        "segments_sha256": segments_hash(list(document.current_segments or [])),
+        "confirmed_line_count": len(expected_ids),
+        "lyrics_confirmed": True,
+        "timings_confirmed": True,
+        "heard_against_audio": True,
+        "reviewer_user_id": current_user["id"],
+        "approved_at": _now().isoformat(),
+    }
+    reference = dict(quality["reference_hypothesis"])
+    reference["review_status"] = "human_line_review_approved"
+    reference["reviewed_editor_revision"] = int(document.revision or 0)
+    quality["reference_hypothesis"] = reference
+    quality["pre_background_approval"] = approval
+    job.transcription_quality = quality
+    job.status = "lyrics_approved"
+    job.current_step = "lyrics_and_timing_approved"
+    job.progress = 100
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="batch.lyrics_and_timing_approved",
+        detail={
+            "campaign_id": campaign.id,
+            "job_id": job_id,
+            "audio_sha256": approval["audio_sha256"],
+            "audio_revision": approval["audio_revision"],
+            "editor_revision": approval["editor_revision"],
+            "editor_version_id": approval["editor_version_id"],
+            "segments_sha256": approval["segments_sha256"],
+            "confirmed_line_count": approval["confirmed_line_count"],
+        },
+    ))
+    db.add(ProductEvent(
+        tenant_id=str(job.tenant_id), user_id=current_user["id"],
+        job_id=job_id, name="batch_lyrics_and_timing_approved",
+        occurred_at=_now(), properties={
+            "campaign_id": campaign.id,
+            "editor_revision": approval["editor_revision"],
+            "confirmed_line_count": approval["confirmed_line_count"],
+        },
+    ))
+    # Commit the capture intent with approval. A Redis outage must not lose
+    # the correction nor roll back a completed human review.
+    from transactional_outbox import create_outbox_event, dispatch_outbox_event
+    event = create_outbox_event(db, job_id=job_id, event_type='correction.enqueue',
+        dedupe_key=f'campaign-correction:{job_id}:{version.id}',
+        payload={'approved_version_id': version.id, 'approved_revision': document.revision,
+                 'audio_sha256': approval['audio_sha256'], 'audio_revision': approval['audio_revision']})
+    event_id, version_id = event.id, version.id
+    db.commit()
+    try:
+        dispatch_outbox_event(event_id)
+    except Exception as exc:
+        # Approval is already committed; the durable outbox owns retries.
+        import logging
+        logging.getLogger(__name__).warning('Correction outbox delivery pending: %s', type(exc).__name__)
+    return {
+        "job_id": job_id, "status": "lyrics_approved",
+        "approved_version_id": version_id, "deduplicated": False,
+    }
+
+
+def _queue_state(stage: str, job: Job | None, document: EditorDocument | None) -> str:
+    if job is None:
+        return "pending"
+    now = _now()
+    locked = bool(
+        document and document.lock_user_id
+        and _aware(document.lock_expires_at)
+        and _aware(document.lock_expires_at) > now
+    )
+    if stage == "lyrics":
+        if job.status in _ACTIVE_TRANSCRIPTION or job.status in {"awaiting_upload"}:
+            return "processing"
+        if job.status in {"transcribed_pending", "transcribed"}:
+            return "reviewing" if locked else "ready"
+        if job.status in {"lyrics_approved", "queued", "processing", "rendering", "pending_review", "done"}:
+            return "approved"
+    else:
+        if job.status in _ACTIVE_RENDER or job.status == "lyrics_approved":
+            return "processing"
+        if job.status == "pending_review":
+            return "reviewing" if locked else "ready"
+        if job.status == "done":
+            return "exported" if job.video_url or job.s3_keys else "approved"
+    return "failed" if job.status in _FAILURE else "pending"
+
+
+def _review_reference_available(job: Job | None) -> tuple[bool, dict[str, Any]]:
+    """Validate the bound reference without treating a missing one as bad text."""
+    quality = dict(job.transcription_quality or {}) if job else {}
+    reference = dict(quality.get("reference_hypothesis") or {})
+    if not job or not reference:
+        return False, reference
+    from reference_hypothesis import validate_binding
+    available, _reason = validate_binding(
+        reference,
+        audio_sha256=str(job.input_audio_sha256 or ""),
+        audio_revision=int(job.audio_revision or 0),
+    )
+    return bool(
+        available
+        and reference.get("availability") != "unavailable"
+        and reference.get("review_status") != "manual_full_review_required"
+        and int(reference.get("line_count") or 0) > 0
+    ), reference
+
+
+def _timing_evidence(quality: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose only safe, concrete windows; never turn a score into confidence."""
+    result: list[dict[str, Any]] = []
+    for index, window in enumerate(quality.get("unsafe_windows") or []):
+        if not isinstance(window, dict):
+            continue
+        start = _number(window.get("start"), math.nan)
+        end = _number(window.get("end"), math.nan)
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            continue
+        reasons = [
+            str(reason).strip() for reason in (window.get("reasons") or [])
+            if str(reason).strip()
+        ]
+        row: dict[str, Any] = {
+            "id": str(window.get("id") or f"window-{index + 1}"),
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "reasons": list(dict.fromkeys(reasons)),
+        }
+        segment_indices = [
+            int(value) for value in (window.get("segment_indices") or [])
+            if isinstance(value, int) and value >= 0
+        ]
+        if segment_indices:
+            row["segment_indices"] = segment_indices
+        result.append(row)
+    return result
+
+
+def _review_inputs(item: BatchCampaignItem, job: Job | None) -> dict[str, Any]:
+    quality = dict(job.transcription_quality or {}) if job else {}
+    reference_available, reference = _review_reference_available(job)
+    segments = list(job.segments_json or []) if job else []
+    lyric_line_count = sum(
+        1 for segment in segments
+        if isinstance(segment, dict) and str(segment.get("text") or "").strip()
+    )
+    timing_windows = _timing_evidence(quality)
+    raw_windows = [window for window in (quality.get("unsafe_windows") or []) if isinstance(window, dict)]
+    return {
+        "quality": quality,
+        "reference": reference,
+        "reference_available": reference_available,
+        "metadata_review_required": bool(
+            item.metadata_error
+            and item.metadata_error not in {"invalid_size", "invalid_duration"}
+        ),
+        "lyric_line_count": lyric_line_count,
+        "empty_transcription": bool(job and lyric_line_count == 0),
+        "doubt_count": len(raw_windows),
+        "timing_windows": timing_windows,
+    }
+
+
+def _review_minutes_by_job(
+    db: Session,
+    job_ids: list[str],
+    *,
+    since: datetime | None = None,
+) -> dict[str, float]:
+    if not job_ids:
+        return {}
+    query = db.query(ProductEvent).filter(
+        ProductEvent.name == "editor_activity_heartbeat",
+        ProductEvent.job_id.in_(job_ids),
+    )
+    if since is not None:
+        query = query.filter(ProductEvent.created_at >= since)
+    events = query.order_by(ProductEvent.created_at.asc()).all()
+    stamps: dict[tuple[str, int | None], list[datetime]] = {}
+    for event in events:
+        when = _aware(event.occurred_at or event.created_at)
+        if when is not None:
+            stamps.setdefault((str(event.job_id), event.user_id), []).append(when)
+    seconds_by_job: dict[str, float] = {}
+    for (job_id, _user_id), values in stamps.items():
+        seconds = sum(
+            gap for gap in (
+                (right - left).total_seconds()
+                for left, right in zip(values, values[1:])
+            ) if 0 < gap <= 25.0
+        )
+        seconds_by_job[job_id] = seconds_by_job.get(job_id, 0.0) + (
+            seconds if seconds > 0 else 15.0
+        )
+    return {
+        job_id: round(seconds / 60.0, 2)
+        for job_id, seconds in seconds_by_job.items()
+    }
+
+
+def _review_minutes_today(db: Session, job_ids: list[str]) -> dict[str, Any]:
+    now = _now()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    minutes_by_job = _review_minutes_by_job(db, job_ids, since=today)
+    minutes = list(minutes_by_job.values())
+    telemetry_events = db.query(ProductEvent).filter(
+        ProductEvent.name == "editor_activity_heartbeat",
+        ProductEvent.job_id.in_(job_ids),
+        ProductEvent.created_at >= today,
+    ).all() if job_ids else []
+    session_keys = set()
+    for event in telemetry_events:
+        props = event.properties if isinstance(event.properties, dict) else {}
+        session_id = str(props.get("session_id") or "").strip()
+        session_keys.add((str(event.job_id), session_id or f"user:{event.user_id or 'unknown'}"))
+    observed_jobs = {str(event.job_id) for event in telemetry_events}
+    return {
+        "average": round(sum(minutes) / len(minutes), 2) if minutes else None,
+        "total": round(sum(minutes), 2),
+        "songs": len(minutes),
+        "source": "editor_activity_heartbeat_v1",
+        "window_start": today.isoformat(),
+        "window_end": now.isoformat(),
+        "pause_gap_seconds": 25,
+        "single_heartbeat_seconds": 15,
+        "songs_with_telemetry": len(observed_jobs),
+        "songs_without_telemetry": max(0, len(set(job_ids)) - len(observed_jobs)),
+        "sessions_with_telemetry": len(session_keys),
+        "sessions_without_telemetry": max(0, len(set(job_ids)) - len(session_keys)),
+        "pause_treatment": "sólo intervalos entre latidos de 0<gap<=25s; pausas mayores quedan fuera; un único latido suma 15s; sin latidos no entra al promedio",
+    }
+
+
+_REFERENCE_LINK_KINDS = frozenset({
+    "fan_site", "aggregator", "official_artist_site", "official_channel",
+})
+
+
+_REVIEW_REASON_LABELS = {
+    "missing_reference": "Texto: referencia no disponible (no indica error de letra)",
+    "empty_transcription": "Texto: no hay líneas transcritas",
+    "metadata_review": "Operativo: metadata pendiente de revisión",
+    "quality_manual_review": "Texto: revisión completa requerida",
+    "quality_timing_review": "Timing: revisión completa requerida",
+    "timing_windows_pending": "Timing: revisar intervalos localizados",
+    "timing_general_review": "Timing: requiere revisión acústica general (sin intervalo localizado)",
+    "timing_analysis_pending": "Timing: análisis acústico pendiente",
+    "job_not_ready": "Operativo: el audio todavía no está listo",
+}
+
+
+def _review_reason(code: str, domain: str, *, count: int | None = None) -> dict[str, Any]:
+    """Build a reviewer-facing reason without implying calibrated confidence."""
+    reason = {
+        "code": str(code),
+        "domain": str(domain),
+        "label": _REVIEW_REASON_LABELS.get(str(code), str(code)),
+    }
+    if count is not None:
+        reason["count"] = int(count)
+    return reason
+
+
+def _review_classification(
+    *,
+    job: Job | None,
+    quality: dict[str, Any],
+    reference_available: bool,
+    metadata_review_required: bool,
+    empty_transcription: bool,
+    doubt_count: int,
+    timing_windows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Return deterministic review work scopes, never a calibrated score.
+
+    Text and timing are intentionally separate: a missing text reference does
+    not certify a timing defect, and an acoustic doubt window does not imply a
+    lyric error.  The labels describe the work a human should do, not model
+    confidence or approval quality.
+    """
+    if job is None:
+        reason = _review_reason("job_not_ready", "operational")
+        return {
+            "review_priority": "blocked",
+            "review_priority_label": "Bloqueada: audio no listo",
+            "review_priority_rank": 0,
+            "review_reasons": [reason],
+            "timing_evidence": [],
+            "timing_localization": "none",
+            "review_domains": {
+                "text": {"status": "not_ready", "reasons": []},
+                "timing": {"status": "not_ready", "reasons": []},
+                "operational": {"status": "blocked", "reasons": [reason]},
+            },
+        }
+
+    text_reasons: list[dict[str, Any]] = []
+    timing_reasons: list[dict[str, Any]] = []
+    operational_reasons: list[dict[str, Any]] = []
+    if not reference_available:
+        text_reasons.append(_review_reason("missing_reference", "text"))
+    if empty_transcription:
+        text_reasons.append(_review_reason("empty_transcription", "text"))
+    if metadata_review_required:
+        operational_reasons.append(_review_reason("metadata_review", "operational"))
+    if quality.get("manual_full_review_required"):
+        text_reasons.append(_review_reason("quality_manual_review", "text"))
+        timing_reasons.append(_review_reason("quality_timing_review", "timing"))
+    if doubt_count:
+        if timing_windows:
+            timing_reasons.append(_review_reason(
+                "timing_windows_pending", "timing", count=len(timing_windows),
+            ))
+        else:
+            timing_reasons.append(_review_reason(
+                "timing_general_review", "timing", count=doubt_count,
+            ))
+    analysis_status = str(quality.get("analysis_status") or "").lower()
+    if analysis_status not in {"complete", "completed", "succeeded", "pass"}:
+        timing_reasons.append(_review_reason("timing_analysis_pending", "timing"))
+
+    manual_full = bool(text_reasons or operational_reasons)
+    timing_targeted = bool(timing_reasons)
+    if manual_full:
+        priority, priority_label, rank = "manual_full", "Revisión extensa", 2
+    elif timing_targeted:
+        priority, priority_label, rank = "timing_targeted", "Revisión focalizada", 1
+    else:
+        priority, priority_label, rank = "standard", "Revisión breve sugerida", 0
+    return {
+        "review_priority": priority,
+        "review_priority_label": priority_label,
+        "review_priority_rank": rank,
+        "review_reasons": text_reasons + timing_reasons + operational_reasons,
+        "timing_evidence": list(timing_windows or []),
+        "timing_localization": "localized" if timing_windows else (
+            "general" if timing_reasons else "none"
+        ),
+        "review_domains": {
+            "text": {
+                "status": "manual_full" if text_reasons else "standard",
+                "reasons": text_reasons,
+            },
+            "timing": {
+                "status": "targeted" if timing_targeted else "standard",
+                "reasons": timing_reasons,
+            },
+            "operational": {
+                "status": "manual" if operational_reasons else "clear",
+                "reasons": operational_reasons,
+            },
+        },
+    }
+
+
+def _review_effort_key(
+    classification: dict[str, Any],
+    *,
+    doubt_count: int,
+    active_minutes: float | None,
+    active_minutes_observed: bool,
+    duration_seconds: float | None,
+    ordinal: int,
+) -> tuple[int, int, int, int, float, float, int]:
+    """Stable lowest-work-first ordering, not a confidence score."""
+    priority_rank = {"standard": 0, "timing_targeted": 1, "manual_full": 2, "blocked": 3}.get(
+        classification.get("review_priority"), 3,
+    )
+    reason_count = len(classification.get("review_reasons") or [])
+    localized_rank = 0 if classification.get("timing_localization") == "localized" else 1
+    telemetry_rank = 0 if active_minutes_observed else 1
+    observed_minutes = float(active_minutes or 0.0) if active_minutes_observed else float("inf")
+    duration = _number(duration_seconds, float("inf"))
+    return (
+        priority_rank, reason_count, localized_rank, telemetry_rank,
+        observed_minutes, duration, int(ordinal or 0),
+    )
+
+
+def _review_effort_band(priority: str) -> str:
+    return {
+        "standard": "breve_sugerida",
+        "timing_targeted": "focalizada",
+        "manual_full": "extensa",
+        "blocked": "bloqueada",
+    }.get(priority, "bloqueada")
+
+
+def _pair_review_effort_key(
+    pair: tuple[Job, BatchCampaignItem],
+    active_minutes: dict[str, float],
+) -> tuple[int, int, int, int, float, float, int]:
+    job, item = pair
+    evidence = _review_inputs(item, job)
+    classification = _review_classification(
+        job=job,
+        quality=evidence["quality"],
+        reference_available=evidence["reference_available"],
+        metadata_review_required=evidence["metadata_review_required"],
+        empty_transcription=evidence["empty_transcription"],
+        doubt_count=evidence["doubt_count"],
+        timing_windows=evidence["timing_windows"],
+    )
+    return _review_effort_key(
+        classification,
+        doubt_count=evidence["doubt_count"],
+        active_minutes=active_minutes.get(job.job_id),
+        active_minutes_observed=job.job_id in active_minutes,
+        duration_seconds=item.duration_seconds,
+        ordinal=item.ordinal,
+    )
+
+
+def _review_reference_links(overrides: dict[str, Any]) -> list[dict[str, str]]:
+    """Expose inert reviewer pointers; never retrieve or process their text."""
+    rows = overrides.get("review_reference_links") or []
+    result: list[dict[str, str]] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        kind = str(row.get("kind") or "").strip().lower()
+        url = str(row.get("url") or "").strip()
+        parsed = urlparse(url)
+        if kind in _REFERENCE_LINK_KINDS and parsed.scheme == "https" and parsed.netloc:
+            result.append({"kind": kind, "url": url})
+    return result[:10]
+
+
+@router.get("/campaigns/{campaign_id}/review-queue")
+def review_queue(
+    campaign_id: str,
+    stage: str = Query(default="lyrics", pattern="^(lyrics|final)$"),
+    order: str = Query(default="effort", pattern="^(delivery|effort|learning)$"),
+    scope: str = Query(default="pending", pattern="^(pending|approved|all)$"),
+    state: str | None = None,
+    version: str | None = Query(default=None, pattern="^(studio|live)$"),
+    background_mode: str | None = None,
+    artist: str | None = None,
+    search: str | None = None,
+    reviewed_by: str | None = Query(default=None, pattern="^(me|all)$"),
+    audit_preapproved: bool = False,
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=50, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Operational queue for pre-background and post-render review."""
+    _require_scope(current_user)
+    campaign = _campaign_or_404(db, campaign_id, current_user)
+    pairs = _campaign_rows(db, campaign.id)
+    job_ids = [job.job_id for _, job in pairs if job is not None]
+    from sqlalchemy.orm import load_only
+    documents = {
+        row.job_id: row for row in db.query(EditorDocument).options(load_only(
+            EditorDocument.job_id, EditorDocument.revision, EditorDocument.current_segments,
+            EditorDocument.lock_user_id, EditorDocument.lock_expires_at,
+            EditorDocument.updated_by, EditorDocument.updated_at,
+        )).filter(
+            EditorDocument.job_id.in_(job_ids)
+        ).all()
+    } if job_ids else {}
+    from reviewer_campaign_product import campaign_payload
+    reviewer_summary, reviewer_rows = campaign_payload(db, campaign.id, pairs, documents)
+    reviewer_ids = {
+        int(row.lock_user_id) for row in documents.values()
+        if row.lock_user_id is not None
+    }
+    reviewer_ids.update(
+        int(row.updated_by) for row in documents.values()
+        if row.updated_by is not None
+    )
+    reviewer_ids.update(
+        int(job.approved_by) for _item, job in pairs
+        if job is not None and job.approved_by is not None
+    )
+    reviewers = {
+        row.id: (row.full_name or row.username or row.email or f"user-{row.id}")
+        for row in db.query(User).filter(User.id.in_(reviewer_ids)).all()
+    } if reviewer_ids else {}
+    verdicts = _latest_semaforo_verdicts(db, job_ids)
+    queue_config = dict((campaign.default_render_params or {}).get("review_queue") or {})
+    calibration_target = max(
+        50, min(80, int(_number(queue_config.get("calibration_target"), 50))),
+    )
+    confidence_gate_passed = bool(queue_config.get("confidence_gate_passed"))
+    active_minutes = _review_minutes_by_job(db, job_ids)
+    effective_scope = state if state in _ALL_REVIEW_STATES else scope
+    allowed_states = {state} if state in _ALL_REVIEW_STATES else (
+        _PENDING_REVIEW_STATES if effective_scope == "pending" else
+        _APPROVED_REVIEW_STATES if effective_scope == "approved" else
+        _ALL_REVIEW_STATES
+    )
+    rows: list[dict[str, Any]] = []
+    for item, job in pairs:
+        document = documents.get(job.job_id) if job else None
+        queue_state = _queue_state(stage, job, document)
+        title_version = "live" if (
+            "live" in str(item.title or "").lower()
+            or "en vivo" in str(item.title or "").lower()
+            or "live" in str(item.filename or "").lower()
+        ) else "studio"
+        overrides = dict(item.render_overrides or {})
+        bg_mode = str(
+            overrides.get("background_mode")
+            or (campaign.default_render_params or {}).get("background_mode")
+            or "generated"
+        )
+        if queue_state not in allowed_states:
+            continue
+        if version and title_version != version:
+            continue
+        if background_mode and bg_mode != background_mode:
+            continue
+        if artist and artist.lower() not in str(item.artist or "").lower():
+            continue
+        normalized_search = str(search or "").strip().lower()
+        if normalized_search and normalized_search not in " ".join(
+            str(value or "").lower()
+            for value in (item.title, item.artist, item.filename, job.song_title if job else "", job.artist if job else "")
+        ):
+            continue
+        if reviewed_by == "me":
+            if effective_scope == "approved":
+                if not job or job.approved_by != current_user.get("id"):
+                    continue
+            elif not document or current_user.get("id") not in {
+                document.updated_by, document.lock_user_id,
+            }:
+                continue
+        verdict = verdicts.get(job.job_id, {}) if job else {}
+        color = str(verdict.get("color") or "red").lower()
+        color_rank = {"green": 0, "yellow": 1, "red": 2}.get(color, 2)
+        evidence = _review_inputs(item, job)
+        quality = evidence["quality"]
+        reference = evidence["reference"]
+        reference_available = evidence["reference_available"]
+        metadata_review_required = evidence["metadata_review_required"]
+        lyric_line_count = evidence["lyric_line_count"]
+        empty_transcription = evidence["empty_transcription"]
+        doubt_count = evidence["doubt_count"]
+        classification = _review_classification(
+            job=job,
+            quality=quality,
+            reference_available=reference_available,
+            metadata_review_required=metadata_review_required,
+            empty_transcription=empty_transcription,
+            doubt_count=doubt_count,
+            timing_windows=evidence["timing_windows"],
+        )
+        review_reasons = classification["review_reasons"]
+        manual_reasons = [
+            reason["code"] for reason in review_reasons
+            if reason["code"] in {
+                "missing_reference", "empty_transcription", "metadata_review",
+                "quality_manual_review",
+            }
+        ]
+        manual_full_review = classification["review_priority"] == "manual_full"
+        rows.append({
+            "item_id": item.id,
+            "reviewer_campaign_status": reviewer_rows.get(job.job_id) if job else None,
+            "job_id": job.job_id if job else None,
+            "ordinal": item.ordinal,
+            "artist": item.artist or "",
+            "title": item.title or item.filename,
+            "version": title_version,
+            "background_mode": bg_mode if stage == "final" else None,
+            "metadata_review_required": metadata_review_required,
+            "lyric_line_count": lyric_line_count,
+            "doubt_count": doubt_count,
+            "review_group": "manual" if manual_full_review else "standard",
+            "manual_reasons": manual_reasons,
+            "review_priority": classification["review_priority"],
+            "review_priority_label": classification["review_priority_label"],
+            "review_reasons": review_reasons,
+            "review_domains": classification["review_domains"],
+            "timing_evidence": classification["timing_evidence"],
+            "timing_localization": classification["timing_localization"],
+            "review_effort": {
+                "band": _review_effort_band(classification["review_priority"]),
+                "basis": [reason["code"] for reason in review_reasons],
+                "calibrated": False,
+            },
+            "duration_seconds": item.duration_seconds,
+            "active_minutes": active_minutes.get(job.job_id, 0.0) if job else 0.0,
+            "active_minutes_observed": bool(job and job.job_id in active_minutes),
+            "state": queue_state,
+            "reviewer_user_id": document.lock_user_id if document else None,
+            "reviewer_name": (
+                reviewers.get(document.lock_user_id) if document else None
+            ),
+            "reviewer_is_current_user": bool(
+                document and document.lock_user_id == current_user.get("id")
+            ),
+            "reviewer_lock_active": bool(
+                document and document.lock_user_id is not None
+                and _aware(document.lock_expires_at) and _aware(document.lock_expires_at) > _now()
+            ),
+            "last_reviewed_by": document.updated_by if document else None,
+            "last_reviewed_name": reviewers.get(document.updated_by) if document else None,
+            "last_reviewed_at": document.updated_at.isoformat() if document and document.updated_at else None,
+            "resume_available": bool(
+                queue_state in _PENDING_REVIEW_STATES and document
+                and document.updated_by == current_user.get("id")
+            ),
+            "approval": {
+                "user_id": job.approved_by if job else None,
+                "name": reviewers.get(job.approved_by) if job and job.approved_by else None,
+                "at": job.approved_at.isoformat() if job and job.approved_at else None,
+            },
+            "priority": "",
+            "semaforo": verdict.get("color") if confidence_gate_passed else None,
+            "semaforo_hidden": not confidence_gate_passed,
+            "_semaforo_rank": color_rank,
+            "_delivery_rank": _number(verdict.get("rank_key"), 9_999.0),
+            "_review_priority_rank": classification["review_priority_rank"],
+            "disagreement": _number(
+                (verdict.get("inputs") or {}).get("disagreement")
+                if isinstance(verdict.get("inputs"), dict)
+                else verdict.get("disagreement") or verdict.get("score"),
+            ),
+            "reference": {
+                "available": reference_available,
+                "provider": (reference.get("source") or {}).get("provider"),
+                "source_kind": (reference.get("source") or {}).get("kind"),
+                "status": reference.get("review_status"),
+                "line_count": reference.get("line_count"),
+                "manual_full_review_required": manual_full_review,
+                "external_links": _review_reference_links(overrides),
+            },
+            "open_path": (
+                f"/review/{job.job_id}" if stage == "lyrics" and job
+                else f"/videos/{job.job_id}" if job else None
+            ),
+        })
+    if audit_preapproved:
+        rows = [
+            row for row in rows
+            if confidence_gate_passed
+            and str(row.get("semaforo") or "").lower() == "green"
+            and row["state"] in {"approved", "exported"}
+        ]
+    counter_rows = list(rows)
+    if order == "learning":
+        rows.sort(key=lambda row: (-row["disagreement"], row["ordinal"]))
+        rows = rows[:max(1, math.ceil(len(rows) * 0.20))]
+    else:
+        rows.sort(key=lambda row: (
+            _review_effort_key(
+                {"review_priority": row["review_priority"], "review_reasons": row["review_reasons"],
+                 "timing_localization": row["timing_localization"]},
+                doubt_count=row["doubt_count"],
+                active_minutes=row["active_minutes"],
+                active_minutes_observed=row["active_minutes_observed"],
+                duration_seconds=row["duration_seconds"],
+                ordinal=row["ordinal"],
+            ),
+        ))
+    # One priority column only. During blind calibration it exposes merely
+    # the queue position (the ordering itself is required) and never a color
+    # or three-bucket proxy. After the confidence gate the same column shows
+    # the actual semaforo label.
+    for position, row in enumerate(rows, start=1):
+        row["priority"] = (
+            str(row.get("semaforo") or "red")
+            if confidence_gate_passed else str(position)
+        )
+    counters = {key: 0 for key in (
+        "pending", "processing", "ready", "reviewing", "approved",
+        "approved_today", "exported", "failed",
+    )}
+    classification_counts = {
+        "manual_full": 0,
+        "timing_targeted": 0,
+        "standard": 0,
+        "blocked": 0,
+    }
+    for row in counter_rows:
+        counters[row["state"]] = counters.get(row["state"], 0) + 1
+        classification_counts[row["review_priority"]] = (
+            classification_counts.get(row["review_priority"], 0) + 1
+        )
+    today = _now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if stage == "lyrics":
+        # Count only campaign jobs from the already materialized rows to
+        # avoid JSON-path dialect drift between SQLite and PostgreSQL.
+        approved_today_ids = {
+            str((log.detail or {}).get("job_id") or "")
+            for log in db.query(AuditLog).filter(
+                AuditLog.action == "batch.lyrics_and_timing_approved",
+                AuditLog.created_at >= today,
+            ).all()
+        }
+        counters["approved_today"] = len(approved_today_ids.intersection(
+            {row["job_id"] for row in counter_rows if row.get("job_id")}
+        ))
+    else:
+        counters["approved_today"] = sum(
+            bool(row.get("job_id") and row["job_id"] in {
+                job.job_id for _, job in pairs
+                if job and _aware(job.approved_at) and _aware(job.approved_at) >= today
+            })
+            for row in counter_rows
+        )
+    campaign_state_counts = {key: 0 for key in _ALL_REVIEW_STATES}
+    for item, job in pairs:
+        campaign_state_counts[_queue_state(stage, job, documents.get(job.job_id) if job else None)] += 1
+    campaign_approved_today = len(approved_today_ids.intersection(set(job_ids))) if stage == "lyrics" else sum(
+        bool(job and _aware(job.approved_at) and _aware(job.approved_at) >= today)
+        for _, job in pairs
+    )
+    total = len(rows)
+    start = (page - 1) * limit
+    background_split = ({
+        "fixed": sum(row["background_mode"] in {"fixed", "as_is", "library"} for row in counter_rows),
+        "generated": sum(row["background_mode"] not in {"fixed", "as_is", "library"} for row in counter_rows),
+    } if stage == "final" else None)
+    return {
+        "campaign_id": campaign.id,
+        "stage": stage,
+        "reviewer_campaign_status": reviewer_summary,
+        "order": "effort" if order == "delivery" else order,
+        "scope": {
+            "key": effective_scope if state not in _ALL_REVIEW_STATES else "state",
+            "label": {
+                "pending": "Pendientes",
+                "approved": "Aprobadas",
+                "all": "Toda la campaña",
+            }.get(effective_scope, f"Estado: {effective_scope}"),
+            "total": total,
+            "states": sorted(allowed_states),
+        },
+        "campaign_totals": {
+            "songs": len(pairs),
+            "approved": campaign_state_counts.get("approved", 0) + campaign_state_counts.get("exported", 0),
+            "approved_today": campaign_approved_today,
+        },
+        "items": [
+            {key: value for key, value in row.items() if not key.startswith("_")}
+            for row in rows[start:start + limit]
+        ],
+        "total": total,
+        "page": page,
+        "pages": max(1, math.ceil(total / limit)),
+        "counters": counters,
+        "classification_counts": classification_counts,
+        "classification": {
+            "schema": "operational_review_priority_v1",
+            "calibrated": False,
+            "basis": "human_work_scope_rules",
+        },
+        "background_split": background_split,
+        "review_minutes_today": _review_minutes_today(db, job_ids),
+        "confidence": {
+            "gate_passed": confidence_gate_passed,
+            "calibration_target": calibration_target,
+            "colors_visible": confidence_gate_passed,
+            "preapproved_audit_available": confidence_gate_passed,
+        },
+    }
+
+
+@router.post("/campaigns/{campaign_id}/review-queue/next")
+def claim_next_stage_review(
+    campaign_id: str,
+    stage: str = Query(default="lyrics", pattern="^(lyrics|final)$"),
+    skip_job_id: str | None = Query(default=None, min_length=12, max_length=12),
+    search: str | None = None,
+    version: str | None = Query(default=None, pattern="^(studio|live)$"),
+    artist: str | None = None,
+    reviewed_by: str | None = Query(default=None, pattern="^(me|all)$"),
+    x_editor_session: str | None = Header(default=None),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if stage == "lyrics":
+        return claim_next_review(
+            campaign_id,
+            skip_job_id,
+            x_editor_session,
+            current_user,
+            db,
+            search=search,
+            version=version,
+            artist=artist,
+            reviewed_by=reviewed_by,
+        )
+    _require_scope(current_user)
+    campaign = _campaign_or_404(db, campaign_id, current_user)
+    if campaign.status != "active":
+        raise HTTPException(status_code=409, detail="Campaign is not reviewable.")
+    session_id = (x_editor_session or "").strip()
+    if not _SAFE_SESSION_RE.fullmatch(session_id):
+        raise HTTPException(status_code=400, detail="A valid editor session is required.")
+    now = _now()
+    candidate_pairs = db.query(Job, BatchCampaignItem).join(
+        BatchCampaignItem, BatchCampaignItem.id == Job.campaign_item_id,
+    ).outerjoin(EditorDocument, EditorDocument.job_id == Job.job_id).filter(
+        Job.campaign_id == campaign.id,
+        Job.tenant_id == current_user["tenant_id"],
+        Job.status == "pending_review",
+        or_(
+            EditorDocument.job_id.is_(None),
+            EditorDocument.lock_expires_at.is_(None),
+            EditorDocument.lock_expires_at <= now,
+        ),
+    ).all()
+    verdicts = _latest_semaforo_verdicts(
+        db, [job.job_id for job, _item in candidate_pairs],
+    )
+    candidate_pairs.sort(
+        key=lambda pair: _delivery_rank(pair[1], verdicts.get(pair[0].job_id)),
+    )
+    from editor import acquire_lock, get_or_create_document
+    for job, _item in candidate_pairs:
+        document = get_or_create_document(db, job.job_id, job.tenant_id, job.segments_json or [])
+        if acquire_lock(db, document, current_user["id"], session_id=session_id).get("acquired"):
+            db.commit()
+            return {"job_id": job.job_id, "open_path": f"/videos/{job.job_id}"}
+    db.rollback()
+    return {"job_id": None, "empty": True}
+
+
+def _batch_transcription_kwargs(
+    campaign: BatchCampaign,
+    item: BatchCampaignItem,
+    *,
+    pipeline_stage: str = "full",
+) -> dict[str, Any]:
+    """Build one audio-first transcription request for every campaign path."""
+    title = item.title or ""
+    lowered_title = title.lower()
+    return {
+        # Empty means provider auto-LID.  The worker confirms the language on
+        # the vocal stem and deliberately keeps mixed-language input unforced.
+        "language": "",
+        "artist": item.artist or "",
+        "title": title,
+        "filename": item.filename,
+        "tenant_id": campaign.tenant_id,
+        "live": "live" in lowered_title or "en vivo" in lowered_title,
+        "anchor_lyrics": "",
+        "reference_required": True,
+        "workload_class": "batch",
+        "pipeline_stage": pipeline_stage,
+        # The full-audio Gemini hypothesis is independent evidence.  In the
+        # full stage it runs alongside blind ASR and is joined before
+        # attestation/reconciliation.  No catalogue/web lyric text is used.
+        "parallel_audio_reference": True,
+    }
+
+
+def _stage1_pipeline_settings(campaign: BatchCampaign) -> dict[str, Any]:
+    raw = dict((campaign.default_render_params or {}).get("stage1_pipeline") or {})
+    try:
+        requested_ready_limit = int(raw.get("lyrics_ready_limit", LYRICS_READY_LIMIT))
+    except (TypeError, ValueError):
+        requested_ready_limit = LYRICS_READY_LIMIT
+    try:
+        requested_promotion_limit = int(raw.get("promotion_limit", ITEM_LIMIT))
+    except (TypeError, ValueError):
+        requested_promotion_limit = ITEM_LIMIT
+    return {
+        "prewarm_separation": bool(raw.get("prewarm_separation", False)),
+        "lyrics_ready_limit": max(
+            1, min(ITEM_LIMIT, requested_ready_limit),
+        ),
+        # A campaign can prove a real canary against its first N delivery-order
+        # rows, then raise this limit without duplicating uploads or jobs.
+        "promotion_limit": max(
+            1, min(ITEM_LIMIT, requested_promotion_limit),
+        ),
+    }
+
+
+def _processable_items_query(db: Session, campaign: BatchCampaign):
+    """Uploaded audio eligible for stage 1, including manual metadata rows.
+
+    Missing/conflicting metadata must make the row red for human review, not
+    suppress transcription of an otherwise valid official audio asset.
+    """
+    return db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+        BatchCampaignItem.upload_state == "uploaded",
+        or_(
+            BatchCampaignItem.metadata_error.is_(None),
+            ~BatchCampaignItem.metadata_error.in_((
+                "invalid_size", "invalid_duration", "promotion_failed",
+            )),
+        ),
+    )
+
+
+def _create_stage_event(
+    db: Session,
+    campaign: BatchCampaign,
+    item: BatchCampaignItem,
+    *,
+    pipeline_stage: str,
+) -> str:
+    from transactional_outbox import create_transcription_outbox_event
+
+    job_id = create_job(
+        db,
+        artist=item.artist or "Unknown",
+        song_title=item.title or "",
+        style="auto",
+        filename=item.filename,
+        user_id=campaign.created_by,
+        tenant_id=campaign.tenant_id,
+        delivery_profile="youtube",
+        initial_status="awaiting_upload",
+        input_r2_key=item.upload_key,
+        workload_class="batch",
+        campaign_id=campaign.id,
+        campaign_item_id=item.id,
+        commit=False,
+    )
+    job = db.query(Job).filter(Job.job_id == job_id).one()
+    job.status = (
+        "separation_queued" if pipeline_stage == "separation"
+        else "transcribing_queued"
+    )
+    job.current_step = (
+        "transcribe.separation_queued" if pipeline_stage == "separation"
+        else "transcribe.prepare"
+    )
+    job.progress = 1
+    job.last_progress_at = _now()
+    audio_path = os.path.join(
+        os.path.dirname(__file__), "..", "outputs", job_id, item.filename,
+    )
+    event = create_transcription_outbox_event(
+        db,
+        job=job,
+        audio_path=audio_path,
+        transcription_kwargs=_batch_transcription_kwargs(
+            campaign, item, pipeline_stage=pipeline_stage,
+        ),
+    )
+    return event.id
+
+
+def _queue_full_stage_for_separated(
+    db: Session,
+    campaign: BatchCampaign,
+    *,
+    room: int,
+) -> list[str]:
+    from transactional_outbox import create_transcription_outbox_event
+
+    pairs = db.query(Job, BatchCampaignItem).join(
+        BatchCampaignItem, BatchCampaignItem.id == Job.campaign_item_id,
+    ).filter(
+        Job.campaign_id == campaign.id,
+        Job.status == "separation_ready",
+    ).order_by(BatchCampaignItem.ordinal.asc()).with_for_update(
+        skip_locked=True,
+    ).limit(room).all()
+    event_ids: list[str] = []
+    for job, item in pairs:
+        try:
+            event_id = None
+            with db.begin_nested():
+                audio_path = os.path.join(
+                    os.path.dirname(__file__), "..", "outputs", job.job_id,
+                    item.filename,
+                )
+                event = create_transcription_outbox_event(
+                    db,
+                    job=job,
+                    audio_path=audio_path,
+                    transcription_kwargs=_batch_transcription_kwargs(
+                        campaign, item, pipeline_stage="full",
+                    ),
+                )
+                job.status = "transcribing_queued"
+                job.current_step = "transcribe.prepare"
+                job.progress = max(21, int(job.progress or 0))
+                job.last_progress_at = _now()
+                event_id = event.id
+            if event_id:
+                event_ids.append(event_id)
+        except Exception as exc:
+            job.status = "transcription_failed"
+            job.current_step = "error"
+            job.error = "stage1_full_promotion_failed"
+            job.error_category = type(exc).__name__[:100]
+    if pairs:
+        campaign.updated_at = _now()
+        db.commit()
+    return event_ids
+
+
 def _promote_campaign(db: Session, campaign: BatchCampaign) -> list[str]:
-    # Art tracks use the cover/audio asset path and must never enter the
-    # transcription feeder.  Their renderer is promoted by the dedicated
+    # Art tracks use the audio+cover path and must never enter the lyric
+    # transcription feeder. Their renderer is promoted by the dedicated
     # reconciler in art_track_campaigns.py.
     if (campaign.kind or "lyric_video") == "art_track":
         return []
+    stage1_settings = _stage1_pipeline_settings(campaign)
     active_trans = db.query(func.count(Job.id)).filter(
         Job.tenant_id == campaign.tenant_id,
         Job.workload_class == "batch",
@@ -789,67 +2113,83 @@ def _promote_campaign(db: Session, campaign: BatchCampaign) -> list[str]:
     ready = db.query(func.count(Job.id)).filter(
         Job.tenant_id == campaign.tenant_id,
         Job.workload_class == "batch",
-        Job.status.in_(("transcribed_pending", "transcribed")),
+        Job.status.in_(("transcribed_pending", "transcribed", "lyrics_approved")),
     ).scalar() or 0
-    room = min(
+    transcription_room = min(
         max(0, TRANSCRIPTION_WINDOW - active_trans),
         # Reserve room for every active transcription to finish. Without
         # this, 30 active jobs could complete on top of 40 ready lyrics and
-        # overshoot the promised 50-song review buffer.
-        max(0, LYRICS_READY_LIMIT - ready - active_trans),
+        # overshoot the configured review buffer.
+        max(0, stage1_settings["lyrics_ready_limit"] - ready - active_trans),
     )
-    if room <= 0:
-        return []
     linked = db.query(Job.campaign_item_id).filter(Job.campaign_id == campaign.id)
-    items = db.query(BatchCampaignItem).filter(
-        BatchCampaignItem.campaign_id == campaign.id,
-        BatchCampaignItem.upload_state == "uploaded",
-        BatchCampaignItem.metadata_error.is_(None),
+    processable = _processable_items_query(db, campaign).filter(
+        BatchCampaignItem.ordinal <= stage1_settings["promotion_limit"],
+    )
+
+    if stage1_settings["prewarm_separation"]:
+        # Phase A is a durable barrier: enqueue/cache every stem before Phase B
+        # releases any full transcription. Failed separations are terminal red
+        # rows but do not prevent the remaining songs from crossing the barrier.
+        active_separation = db.query(func.count(Job.id)).filter(
+            Job.campaign_id == campaign.id,
+            Job.status.in_(_ACTIVE_SEPARATION),
+        ).scalar() or 0
+        separation_room = max(0, SEPARATION_WINDOW - active_separation)
+        unlinked_count = processable.filter(~BatchCampaignItem.id.in_(linked)).count()
+        if unlinked_count and separation_room:
+            items = processable.filter(
+                ~BatchCampaignItem.id.in_(linked),
+            ).order_by(BatchCampaignItem.ordinal.asc()).with_for_update(
+                skip_locked=True,
+            ).limit(separation_room).all()
+            event_ids: list[str] = []
+            for item in items:
+                try:
+                    event_id = None
+                    with db.begin_nested():
+                        event_id = _create_stage_event(
+                            db, campaign, item, pipeline_stage="separation",
+                        )
+                    if event_id:
+                        event_ids.append(event_id)
+                except Exception as exc:
+                    item.metadata_error = "promotion_failed"
+                    item.upload_error = type(exc).__name__[:100]
+            if items:
+                campaign.updated_at = _now()
+                db.commit()
+            return event_ids
+        if unlinked_count or active_separation:
+            return []
+        if transcription_room <= 0:
+            return []
+        return _queue_full_stage_for_separated(
+            db, campaign, room=transcription_room,
+        )
+
+    if transcription_room <= 0:
+        return []
+    items = processable.filter(
         ~BatchCampaignItem.id.in_(linked),
-    ).order_by(BatchCampaignItem.ordinal.asc()).with_for_update(skip_locked=True).limit(room).all()
+    ).order_by(BatchCampaignItem.ordinal.asc()).with_for_update(
+        skip_locked=True,
+    ).limit(transcription_room).all()
     event_ids: list[str] = []
-    from transactional_outbox import create_transcription_outbox_event
     for item in items:
-        job_id = create_job(
-            db,
-            artist=item.artist or "Unknown",
-            song_title=item.title or "",
-            style="auto",
-            filename=item.filename,
-            user_id=campaign.created_by,
-            tenant_id=campaign.tenant_id,
-            delivery_profile="youtube",
-            initial_status="awaiting_upload",
-            input_r2_key=item.upload_key,
-            workload_class="batch",
-            campaign_id=campaign.id,
-            campaign_item_id=item.id,
-            commit=False,
-        )
-        job = db.query(Job).filter(Job.job_id == job_id).one()
-        job.status = "transcribing_queued"
-        job.current_step = "transcribe.prepare"
-        job.progress = 1
-        job.last_progress_at = _now()
-        audio_path = os.path.join(
-            os.path.dirname(__file__), "..", "outputs", job_id, item.filename,
-        )
-        event = create_transcription_outbox_event(
-            db,
-            job=job,
-            audio_path=audio_path,
-            transcription_kwargs={
-                "language": "es",
-                "artist": item.artist or "",
-                "title": item.title or "",
-                "filename": item.filename,
-                "tenant_id": campaign.tenant_id,
-                "live": "live" in (item.title or "").lower() or "en vivo" in (item.title or "").lower(),
-                "anchor_lyrics": "",
-                "workload_class": "batch",
-            },
-        )
-        event_ids.append(event.id)
+        try:
+            event_id = None
+            with db.begin_nested():
+                event_id = _create_stage_event(
+                    db, campaign, item, pipeline_stage="full",
+                )
+            if event_id:
+                event_ids.append(event_id)
+        except Exception as exc:
+            # One corrupt/conflicting row is visible as red and cannot abort
+            # creation or dispatch for the rest of the wave.
+            item.metadata_error = "promotion_failed"
+            item.upload_error = type(exc).__name__[:100]
     if items:
         campaign.updated_at = _now()
         db.commit()
@@ -876,8 +2216,7 @@ def reconcile_batch_campaigns() -> dict[str, int]:
                     event_ids.extend(reconcile_art_track_campaign(db, campaign))
                 except Exception:
                     # Art-track rollout is isolated from the mature lyric
-                    # campaign feeder; a temporary import/schema issue must
-                    # not stop lyric campaigns from reconciling.
+                    # feeder; a schema/import issue must not stop lyrics.
                     pass
             rows = _campaign_rows(db, campaign.id)
             manifest_complete = bool(rows) and (
@@ -904,6 +2243,7 @@ def enforce_render_capacity(db: Session, job: Job) -> None:
     """Keep campaign rendering bounded without consuming interactive quota."""
     if job.workload_class != "batch" or not job.campaign_id:
         return
+    require_prebackground_approval(job)
     campaign = db.query(BatchCampaign).filter(
         BatchCampaign.id == job.campaign_id,
     ).with_for_update().first()
@@ -947,6 +2287,9 @@ def context_for_job(db: Session, job: Job) -> dict[str, Any] | None:
         "campaign_status": campaign.status if campaign else None,
         "default_render_params": campaign.default_render_params if campaign else {},
         "render_overrides": item.render_overrides if item else {},
+        "review_reference_links": _review_reference_links(
+            dict(item.render_overrides or {}) if item else {},
+        ),
     }
 
 
@@ -995,12 +2338,7 @@ def retry_campaign_item(
             db,
             job=job,
             audio_path=audio_path,
-            transcription_kwargs={
-                "language": "es", "artist": item.artist or "",
-                "title": item.title or "", "filename": item.filename,
-                "tenant_id": campaign.tenant_id, "live": False,
-                "anchor_lyrics": "", "workload_class": "batch",
-            },
+            transcription_kwargs=_batch_transcription_kwargs(campaign, item),
         )
         db.commit()
         from transactional_outbox import dispatch_outbox_event
@@ -1010,13 +2348,18 @@ def retry_campaign_item(
         # Rendering retries return to the approved-lyrics gate. This keeps
         # all campaign retries on the batch queue and prevents an automatic
         # background charge after a failure.
-        job.status = "transcribed_pending"
-        job.current_step = "editing"
+        try:
+            require_prebackground_approval(job)
+            job.status = "lyrics_approved"
+            job.current_step = "lyrics_and_timing_approved"
+        except HTTPException:
+            job.status = "transcribed_pending"
+            job.current_step = "editing"
         job.progress = 100
         job.error = None
         job.last_progress_at = _now()
         db.commit()
-        return RetryItemResponse(job_id=job.job_id, status="transcribed_pending")
+        return RetryItemResponse(job_id=job.job_id, status=job.status)
     raise HTTPException(status_code=409, detail=f"Job in {job.status!r} is not retryable.")
 
 

@@ -22,12 +22,24 @@ from editor import (
     persist_quality_proposal_if_current,
     persist_quality_observation_if_current,
     persist_operator_review_proposal_if_current,
+    operator_suggestion_type_enabled,
     rebase_operator_suggestions_after_manual_edit,
     save_document,
 )
 from transcription_quality import segments_hash
 from quality_v6_contracts import PROPOSAL_WINDOW_SCHEMA, REVIEW_PROPOSAL_SCHEMA
 from tests.conftest import auth
+
+
+def test_operator_suggestion_types_have_independent_rollout_switches(monkeypatch):
+    monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    monkeypatch.delenv(
+        "QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", raising=False,
+    )
+
+    assert operator_suggestion_type_enabled("text") is True
+    assert operator_suggestion_type_enabled("vocalization") is True
+    assert operator_suggestion_type_enabled("timing") is False
 
 
 def _users_and_job(tenant="editor_team"):
@@ -114,6 +126,27 @@ def test_editor_document_is_shared_by_tenant_and_conflicts_are_explicit(client):
     assert detail["detail"] == "editor_revision_conflict"
     assert detail["server_revision"] == 1
     assert detail["server_segments"][0]["text"] == "ONE"
+
+
+def test_timing_validation_survives_persistence_and_reload_without_approval(client):
+    from line_evidence import annotate_provider_evidence
+    from tests.test_timing_validation import broken_rows
+    first, _, job_id = _users_and_job()
+    token = _token_for(first)
+    rows = annotate_provider_evidence(broken_rows(), timing_source="forced_align")
+    loaded = client.get(f"/editor/{job_id}", headers=auth(token))
+    saved = client.patch(f"/editor/{job_id}", headers=auth(token), json={
+        "base_revision": loaded.json()["revision"], "segments": rows, "checkpoint": "manual",
+    })
+    assert saved.status_code == 200, saved.text
+    reloaded = client.get(f"/editor/{job_id}", headers=auth(token))
+    assert reloaded.status_code == 200
+    for actual, expected in zip(reloaded.json()["segments"], rows):
+        assert actual["start"] == expected["start"]
+        assert actual["end"] == expected["end"]
+        assert actual["text"] == expected["text"]
+        assert actual["timing_validation"] == expected["timing_validation"]
+        assert actual["timing_provenance"]["source"] == "forced_align"
 
 
 def test_opening_explicit_editor_revives_soft_superseded_job(client):
@@ -426,6 +459,7 @@ def test_quality_proposal_is_audio_revision_scoped_and_applies_idempotently(
 
 def test_operator_suggestions_accept_and_reject_one_at_a_time(client, monkeypatch):
     monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    monkeypatch.setenv("QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", "1")
     first, _second, job_id = _users_and_job("editor_operator_suggestions")
     token = _token_for(first)
     proposal_id = f"operator-{uuid.uuid4().hex}"
@@ -522,6 +556,7 @@ def test_manual_timing_edit_keeps_other_suggestions_and_records_delta(
     client, monkeypatch,
 ):
     monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    monkeypatch.setenv("QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", "1")
     first, _second, job_id = _users_and_job("editor_operator_manual")
     token = _token_for(first)
     proposal_id = f"operator-{uuid.uuid4().hex}"
@@ -1455,6 +1490,39 @@ def test_transaction_rollback_never_leaves_partial_editor_state():
         assert verify.query(EditorVersion).filter(EditorVersion.job_id == job_id).count() == 1
     finally:
         verify.close()
+
+
+def test_approval_preserves_historical_forty_ms_edges_including_locked():
+    from copy import deepcopy
+    first, _, job_id = _users_and_job('approval_no_implicit_trim')
+    rows = [
+        {'_id': 18, 'start': 90.2229, 'end': 95.23, 'text': 'Primera', 'locked': True},
+        {'_id': 19, 'start': 95.24, 'end': 97.42, 'text': 'Siguiente'},
+        {'_id': 26, 'start': 159.86, 'end': 162.83, 'text': 'Otra'},
+        {'_id': 27, 'start': 162.84, 'end': 164.8958, 'text': 'Final'},
+    ]
+    with SessionLocal() as db:
+        job = db.query(Job).filter_by(job_id=job_id).one()
+        document = db.query(EditorDocument).filter_by(job_id=job_id).one()
+        document, version, _ = save_document(db, job, document, first.id, 0, rows, 'manual')
+        db.commit()
+        before = deepcopy(document.current_segments)
+        approved, frozen = approve_document(db, job, first.id, editor_revision=version.revision, editor_version_id=version.id)
+        db.commit()
+        assert before == approved.current_segments == frozen.segments == job.segments_json
+        assert [r['end'] for r in frozen.segments][::2] == [95.23, 162.83]
+        assert frozen.segments[0]['locked'] is True
+
+
+def test_approval_overlap_validation_does_not_mutate_input():
+    from copy import deepcopy
+    from editor import validate_approval_snapshot
+    rows = [{'start': 1., 'end': 3., 'text': 'one', 'locked': True},
+            {'start': 2., 'end': 4., 'text': 'two'}]
+    before = deepcopy(rows)
+    with pytest.raises(ValueError, match='approval_overlap_requires_explicit_edit'):
+        validate_approval_snapshot(rows)
+    assert rows == before
 
 
 def test_approval_requires_the_current_exact_snapshot():

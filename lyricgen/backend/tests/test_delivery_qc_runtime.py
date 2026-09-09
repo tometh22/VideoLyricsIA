@@ -60,7 +60,7 @@ def test_editor_mutation_marks_report_stale():
     assert stale["segments_revision"] == 4
 
 
-def test_runtime_report_is_bound_to_render_and_has_explicit_ocr_abstention(tmp_path, monkeypatch):
+def test_runtime_report_turns_missing_detectors_into_signed_manual_failures(tmp_path, monkeypatch):
     asset = tmp_path / "video.mp4"
     asset.write_bytes(b"encoded")
     monkeypatch.setenv("DELIVERY_QC_MODE", "observe")
@@ -86,4 +86,36 @@ def test_runtime_report_is_bound_to_render_and_has_explicit_ocr_abstention(tmp_p
     assert report["status"] == "COMPLETE"
     assert report["mode"] == "observe"
     assert report["render_identity"]["edit_count"] == 1
-    assert any(row["detector"] == "final_frame_ocr" for row in report["abstentions"])
+    assert report["abstentions"] == []
+    manual = [
+        row for row in report["issues"]
+        if row["detector"] == "mandatory_signed_reviewer_checklist"
+    ]
+    assert len(manual) == 8
+    assert all(row["severity"] == "FAIL" and row["status"] == "OPEN" for row in manual)
+    assert any(
+        row["detector"] == "final_frame_ocr"
+        for row in report["detector_diagnostics"]
+    )
+
+    signed_previous = {
+        **report,
+        "issues": [
+            {
+                **row,
+                "status": "RESOLVED_MANUAL",
+                "operator_decision": {"reviewer_name": "Reviewer"},
+            }
+            for row in report["issues"]
+        ],
+    }
+    rebuilt = build_runtime_report(
+        job=job, video_path=str(asset),
+        segments=[{"start": 0, "end": 2, "text": "Hola"}],
+        previous=signed_previous,
+    )
+    rebuilt_manual = [
+        row for row in rebuilt["issues"]
+        if row["detector"] == "mandatory_signed_reviewer_checklist"
+    ]
+    assert all(row["status"] == "OPEN" for row in rebuilt_manual)

@@ -115,6 +115,17 @@ def test_existing_review_flag_is_not_duplicated_or_lost():
     assert out is segs, "already flagged + unfixable → nothing to change"
 
 
+def test_final_word_consistency_never_overrides_manual_timing():
+    words = [_w("manual", 10.0, 13.5)]
+    segs = [_seg(10.0, 14.0, words, locked=True)]
+
+    out = ka.enforce_line_word_consistency(segs)
+
+    assert out is segs
+    assert out[0]["start"] == 10.0
+    assert out[0]["end"] == 14.0
+
+
 def test_segment_without_words_is_untouched():
     segs = [{"start": 1.0, "end": 99.0, "text": "sin palabras"}]
     assert ka.enforce_line_word_consistency(segs) is segs

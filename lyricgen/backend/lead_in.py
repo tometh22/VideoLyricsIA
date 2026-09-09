@@ -74,13 +74,22 @@ def lead_seconds() -> float:
 
 
 def hold_seconds() -> float:
-    """Hold configurado (LYRIC_HOLD_S), saneado. 0 (default) = apagado."""
-    raw = os.environ.get("LYRIC_HOLD_S", "0")
+    """Hold configurado (LYRIC_HOLD_S), saneado. Default seguro = 0.5 s.
+
+    El default vive también en ``observability.runtime_timing_config`` para
+    que el readiness compare el valor *efectivo*, no sólo la presencia de la
+    variable. Así, quitar accidentalmente LYRIC_HOLD_S de un servicio no
+    vuelve a apagar el hold en silencio.
+    """
+    raw = os.environ.get("LYRIC_HOLD_S", "0.5")
     try:
         return max(0.0, float(raw))
     except (TypeError, ValueError):
-        logger.warning("[LEAD_IN] LYRIC_HOLD_S=%r inválido — apagado", raw)
-        return 0.0
+        logger.warning(
+            "[LEAD_IN] LYRIC_HOLD_S=%r inválido — usando default seguro 0.5 s",
+            raw,
+        )
+        return 0.5
 
 
 def apply_hold(segs: list[dict], hold_s: float | None = None) -> list[dict]:
@@ -90,11 +99,11 @@ def apply_hold(segs: list[dict], hold_s: float | None = None) -> list[dict]:
     Medido contra el gold (03/07, sweep de holds sobre 40 canciones): los
     operadores NO empalman estilo ROTOR (78% de las transiciones aprobadas
     dejan aire; hold sin tope da 23.8% ≤0.3s vs 37.5% de hoy) pero un hold
-    chico ayuda: +0.25s sube los finales ≤0.3s del gold de 37.5% → 42.7%.
-    Todo hold ≥0.5s EMPEORA — de ahí el valor conservador cuando se
-    prende. Nunca acorta; la última línea queda intacta (sin señal de gold
-    para el outro, y el hold infinito de ROTOR es justo lo que los
-    operadores no hacen).
+    chico ayuda. El lote de agosto recalibró el fallback a 0.5s después de
+    eliminar el auto-trim del editor; ese valor queda como fallback temporal,
+    no como sustituto del endpoint derivado del canto. Nunca acorta; la última
+    línea queda intacta (sin señal de gold para el outro, y el hold infinito
+    de ROTOR es justo lo que los operadores no hacen).
     """
     hold = hold_seconds() if hold_s is None else max(0.0, float(hold_s))
     if not segs or hold <= 0.0:

@@ -920,9 +920,12 @@ def enqueue_transcription(
     live: bool = False,
     tenant_id: str = "",
     anchor_lyrics: str = "",
+    reference_required: bool = False,
     publication_id: str | None = None,
     publication_dedupe_key: str | None = None,
     workload_class: str = "interactive",
+    pipeline_stage: str = "full",
+    parallel_audio_reference: bool = False,
 ) -> str:
     """Enqueue una transcripción en la queue `transcription` (alta prioridad,
     drenada por el mismo worker container que enterprise/default).
@@ -951,6 +954,10 @@ def enqueue_transcription(
             "language": language, "artist": artist, "title": title,
             "filename": filename, "live": live,
             "anchor_lyrics": anchor_lyrics,
+            "reference_required": reference_required,
+            "workload_class": workload_class,
+            "pipeline_stage": pipeline_stage,
+            "parallel_audio_reference": parallel_audio_reference,
         }
         if publication_id:
             from transactional_outbox import run_outbox_transcription as target
@@ -1023,6 +1030,10 @@ def enqueue_transcription(
         "language": language, "artist": artist, "title": title,
         "filename": filename, "live": live,
         "anchor_lyrics": anchor_lyrics,
+        "reference_required": reference_required,
+        "workload_class": workload_class,
+        "pipeline_stage": pipeline_stage,
+        "parallel_audio_reference": parallel_audio_reference,
     }
     if publication_id:
         from transactional_outbox import run_outbox_transcription as target
@@ -1654,6 +1665,8 @@ def enqueue_correction_learning(job_id: str, approved_version_id: str, *,
         expected_revision = int(document.revision or 0)
         expected_approved_hash = lyric_snapshot_hash(version.segments or [])
         expected_learning_epoch = int(document.job.quality_learning_epoch or 0)
+        expected_audio_sha256 = document.job.input_audio_sha256
+        expected_audio_revision = document.job.audio_revision
         # The browser-provided active_edit_ms remains telemetry only. Learning
         # gates consume exclusively contiguous server-side heartbeat evidence.
         server_active_edit_ms = derive_server_active_edit_ms(
@@ -1681,6 +1694,8 @@ def enqueue_correction_learning(job_id: str, approved_version_id: str, *,
             "expected_revision": expected_revision,
             "expected_approved_hash": expected_approved_hash,
             "expected_learning_epoch": expected_learning_epoch,
+            "expected_audio_sha256": expected_audio_sha256,
+            "expected_audio_revision": expected_audio_revision,
         },
         job_timeout=int(os.environ.get("QUALITY_LEARNING_JOB_TIMEOUT", "600")),
         result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL, job_id=rq_id,

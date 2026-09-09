@@ -90,6 +90,31 @@ def test_empty_segments_yields_single_scene():
     assert secs[0].start == 0.0 and secs[0].end == 120.0
 
 
+def test_long_non_repeating_lyrics_are_split_into_multiple_scenes(monkeypatch):
+    """Multi-scene must not depend on exact chorus text matches.
+
+    A continuous lyric block used to become one ``verso`` and therefore one
+    Veo clip for the entire song.  Long blocks now get balanced cuts at lyric
+    starts while short tracks keep the historical single-scene behavior.
+    """
+    monkeypatch.setattr(scenes, "MAX_SCENE_DURATION", 30.0)
+    segs = [
+        _line(float(i * 5), float(i * 5 + 4), f"linea unica numero {i}")
+        for i in range(16)
+    ]
+
+    sections = scenes.detect_sections(segs, audio_duration=80.0)
+
+    assert len(sections) == 3
+    assert len({section.recurrence_key for section in sections}) == 3
+    assert sections[0].start == 0.0
+    assert sections[-1].end == 80.0
+    assert all(section.duration <= 30.0 for section in sections)
+    # The first two cuts land on starts from the original lyric rows.
+    assert sections[1].start in {25.0, 30.0, 35.0, 40.0}
+    assert sections[2].start in {50.0, 55.0, 60.0}
+
+
 def test_cap_unique_scenes_collapses_verses(monkeypatch):
     monkeypatch.setattr(scenes, "MAX_UNIQUE_SCENES", 3)
     monkeypatch.setattr(scenes, "MIN_SCENE_DURATION", 4.0)

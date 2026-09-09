@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
+import { mergeThreeWay, segmentsEquivalent } from "../editorMerge";
 
 export function useEditorAutosave({ enabled, segments, dirty, save, reconcile, onStatus, onMerged }) {
   const MAX_REBASE_ATTEMPTS = 3;
@@ -33,7 +34,20 @@ export function useEditorAutosave({ enabled, segments, dirty, save, reconcile, o
       return { ok: false, reason: "disabled" };
     }
     let snapshot = overrideSegments || segmentsRef.current;
+    // A server merge describes the snapshot sent, not necessarily the text
+    // currently being typed. Rebase edits made during each await before making
+    // that merge visible or retrying it. Capture the rendered local baseline,
+    // not an explicit approval override, so the override is not undone.
+    const publishMerge = (mergedSegments, localBeforeRequest, state) => {
+      const merged = segmentsEquivalent(localBeforeRequest, segmentsRef.current)
+        ? mergedSegments
+        : mergeThreeWay(localBeforeRequest, segmentsRef.current, mergedSegments).merged;
+      segmentsRef.current = merged;
+      runtimeRef.current.onMerged?.(merged, state);
+      return merged;
+    };
     if (isRetry && runtime.reconcile) {
+      const localBeforeReconcile = segmentsRef.current;
       const state = await runtime.reconcile(snapshot);
       if (!mountedRef.current) return { ok: false, reason: "unmounted" };
       if (!state?.ok) {
@@ -57,12 +71,12 @@ export function useEditorAutosave({ enabled, segments, dirty, save, reconcile, o
         return { ...state, reason };
       }
       if (Array.isArray(state?.mergedSegments)) {
-        snapshot = state.mergedSegments;
-        runtimeRef.current.onMerged?.(state.mergedSegments, state);
+        snapshot = publishMerge(state.mergedSegments, localBeforeReconcile, state);
       }
     }
     runtimeRef.current.onStatus?.("saving", null);
     const started = performance.now();
+    const localBeforeSave = segmentsRef.current;
     const result = await runtimeRef.current.save(snapshot, checkpoint);
     // A request already on the wire may settle after route navigation. Never
     // let that abandoned editor publish status or arm another retry timer.
@@ -80,8 +94,8 @@ export function useEditorAutosave({ enabled, segments, dirty, save, reconcile, o
       // local value for a same-line collision but still writes through the
       // backend CAS check, so no request can overwrite a newer revision raw.
       if (rebaseAttempts < MAX_REBASE_ATTEMPTS) {
-        runtimeRef.current.onMerged?.(result.mergedSegments, result);
-        return runSave(checkpoint, false, result.mergedSegments, rebaseAttempts + 1);
+        const merged = publishMerge(result.mergedSegments, localBeforeSave, result);
+        return runSave(checkpoint, false, merged, rebaseAttempts + 1);
       }
       const delay = Math.min(30_000, 1_000 * (2 ** retryCountRef.current));
       retryCountRef.current += 1;

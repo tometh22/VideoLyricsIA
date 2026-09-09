@@ -195,10 +195,17 @@ class WarmOnlyWorker(_RQWorker):
         # este worker está vivo. Si la huella no se puede calcular, se manda
         # vacía y el gate cae a comparar el SHA — nunca se cae el heartbeat.
         try:
-            from observability import backend_code_fingerprint
+            from observability import backend_code_fingerprint, runtime_timing_config
             _fingerprint = backend_code_fingerprint()
+            _timing_config = runtime_timing_config()
         except Exception:
-            _fingerprint = ""
+            _fingerprint = "unknown"
+            _timing_config = None
+        try:
+            from queue_jobs import _transcription_quality_runtime_token
+            _runtime_token = _transcription_quality_runtime_token()
+        except Exception:
+            _runtime_token = None
 
         ttl = _release_heartbeat_ttl_seconds()
         queues = [getattr(q, "name", str(q)) for q in getattr(self, "queues", [])]
@@ -218,6 +225,16 @@ class WarmOnlyWorker(_RQWorker):
             # commits de sólo-frontend, lo que dejaba /health en `down` con todo
             # funcionando.
             "code_fingerprint": _fingerprint,
+            # Token de identidad de runtime (política + release + las 72 flags
+            # de configuración + calibración). Si difiere entre el servicio que
+            # encola y el quality-worker, cada replay se descarta con
+            # runtime_identity_mismatch sin dejar rastro; publicarlo acá es lo
+            # que permite verlo en /health en vez de descubrirlo 21 días tarde.
+            "runtime_token": _runtime_token,
+            # API and every worker capable of transcription must agree on the
+            # same timing constants. /health/ready compares this canonical
+            # payload and fails closed on mismatch or missing publication.
+            "timing_config": _timing_config,
             "rq_payload_version": RQ_PAYLOAD_VERSION,
             "rq_supported_payload_versions": sorted(RQ_SUPPORTED_PAYLOAD_VERSIONS),
             "environment": (

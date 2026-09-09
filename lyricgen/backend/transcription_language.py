@@ -220,10 +220,175 @@ def resolve_transcription_language(
     return None
 
 
+def diagnose_language_state(value, persisted_language: str | None = None) -> dict:
+    """Classify an unknown LID without guessing a language.
+
+    This deliberately exposes no lyric text.  It distinguishes an intentional
+    mixed/insufficient-evidence abstention from the operational bug where a
+    single supported language is detectable in the persisted lines but the
+    stored song metric still says ``unknown``.
+    """
+    languages = sorted(detect_text_languages(value))
+    persisted = normalize_language(persisted_language)
+    if persisted:
+        classification = "known"
+    elif len(languages) > 1:
+        classification = "mixed_language_abstention"
+    elif len(languages) == 1:
+        classification = "lid_persistence_failure"
+    else:
+        classification = "insufficient_evidence_abstention"
+    return {
+        "classification": classification,
+        "persisted_language": persisted,
+        "detected_languages": languages,
+        "mixed_language": len(languages) > 1,
+    }
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Distinct alphabetic tokens of length >= 2 (NFC, apostrophes split)."""
+    normalized = unicodedata.normalize("NFC", text or "").casefold()
+    normalized = normalized.replace("’", "'").replace("'", " ")
+    return set(re.findall(r"[^\W\d_]{2,}", normalized, re.UNICODE))
+
+
+# A transcription must agree with its own audio-derived reference.  A lexical
+# language detector only knows six languages, abstains on ordinary lyric text
+# (it returns ``{}`` even for a clean Spanish verse) and is blind to anything
+# else — so a half-Welsh decode of a Spanish song keeps a clean Spanish
+# reference, produces no detected language, and trips neither ``language_conflict``
+# nor ``language_uncertain``.  Measuring how much of the OUTPUT is unexplained by
+# the reference catches that drift without guessing a language and without
+# translating: a correct transcription overlaps its reference heavily, a
+# wrong-language or hallucinated decode shares almost no words with it, and a
+# genuinely bilingual song stays low because the reference — drawn from the same
+# audio — contains both languages.
+_MIN_SEGMENT_TOKENS = 4          # skip short vocalisations / proper-noun lines
+_REFERENCE_OVERLAP_FLOOR = 0.34  # below this a line shares almost no words
+_MIN_REFERENCE_TOKENS = 8        # need a real reference to compare against
+
+
+def reference_divergence(output, reference_text: str) -> dict:
+    """Fraction of substantial output lines unexplained by the reference.
+
+    Returns ``{"substantial", "unexplained", "ratio", "unexplained_indices",
+    "has_reference"}``.  ``ratio`` is ``0.0`` when there is no usable reference
+    or no substantial line, so a missing reference can never fabricate
+    divergence.  This never coerces or translates: it only reports drift so the
+    caller can surface it for human review.
+    """
+    reference_tokens = _content_tokens(reference_text)
+    if len(reference_tokens) < _MIN_REFERENCE_TOKENS:
+        return {"substantial": 0, "unexplained": 0, "ratio": 0.0,
+                "unexplained_indices": [], "has_reference": False}
+    substantial = 0
+    unexplained_indices: list[int] = []
+    for index, text in enumerate(_texts(output)):
+        tokens = _content_tokens(text)
+        if len(tokens) < _MIN_SEGMENT_TOKENS:
+            continue
+        substantial += 1
+        overlap = len(tokens & reference_tokens) / len(tokens)
+        if overlap < _REFERENCE_OVERLAP_FLOOR:
+            unexplained_indices.append(index)
+    ratio = (len(unexplained_indices) / substantial) if substantial else 0.0
+    return {
+        "substantial": substantial,
+        "unexplained": len(unexplained_indices),
+        "ratio": ratio,
+        "unexplained_indices": unexplained_indices,
+        "has_reference": True,
+    }
+
+
+_DIVERGENCE_MIN_LINES = 3        # need enough lines before a ratio is trustworthy
+_DIVERGENCE_FLAG_RATIO = 0.34    # this share of lines unexplained -> flag review
+
+
+def build_language_contract(
+    output,
+    reference_text: str = "",
+    requested_language: str | None = None,
+    *,
+    expected_hint: str | None = None,
+    infer_uncertain_from_request: bool = True,
+) -> dict:
+    """Single source of truth for the language / discrepancy contract.
+
+    Computed over the FINAL lines the operator approves so the transcription
+    response, the reload serializers and the server-side approval gate all agree
+    (coherence is the whole point: an alert that is not persisted, or a gate
+    that recomputes differently, can be bypassed).
+
+    ``output_reference_divergence`` is a DISCREPANCY alert — the output does not
+    match its own audio-derived reference — NOT a verdict that the text is in a
+    specific wrong language.  It never forces a language and never translates.
+    ``needs_language_review`` is the single actionable boolean callers gate on.
+    """
+    reference_languages = detect_text_languages(reference_text)
+    detected_languages = detect_text_languages(output)
+    requested = normalize_language(requested_language)
+    reference_language = (
+        next(iter(reference_languages)) if len(reference_languages) == 1 else None
+    )
+    detected_language = (
+        next(iter(detected_languages)) if len(detected_languages) == 1 else None
+    )
+    mixed_language = len(reference_languages) > 1 or len(detected_languages) > 1
+    expected_language = (
+        normalize_language(expected_hint) or requested or reference_language
+    )
+    language_conflict = bool(
+        expected_language
+        and detected_languages
+        and expected_language not in detected_languages
+        and not mixed_language
+    )
+    divergence = reference_divergence(output, reference_text)
+    output_reference_divergence = bool(
+        divergence["has_reference"]
+        and divergence["substantial"] >= _DIVERGENCE_MIN_LINES
+        and divergence["ratio"] >= _DIVERGENCE_FLAG_RATIO
+    )
+    # "Nobody asked for a language and nothing corroborates one" is a
+    # REQUEST-TIME signal: it depends on what the caller requested, which is not
+    # persisted on the job. Recomputing it from stored data would read every
+    # reference-less job as uncertain (most of the catalogue) and block its
+    # approval, so the read/gate path passes ``infer_uncertain_from_request=False``
+    # and relies on the evidence that IS reconstructable: the reference discrepancy.
+    request_heuristic = bool(
+        infer_uncertain_from_request
+        and not requested
+        and not reference_languages
+        and len(detected_languages) <= 1
+    )
+    language_uncertain = bool(request_heuristic or output_reference_divergence)
+    return {
+        "requested_language": requested,
+        "detected_language": detected_language,
+        "detected_languages": sorted(detected_languages),
+        "reference_language": reference_language,
+        "reference_languages": sorted(reference_languages),
+        "mixed_language": mixed_language,
+        "language_conflict": language_conflict,
+        "language_uncertain": language_uncertain,
+        "output_reference_divergence": output_reference_divergence,
+        "output_reference_divergence_ratio": round(divergence["ratio"], 3),
+        "output_reference_unexplained_indices": divergence["unexplained_indices"],
+        "needs_language_review": bool(
+            language_conflict or output_reference_divergence
+        ),
+    }
+
+
 __all__ = [
     "SUPPORTED_LANGUAGES",
+    "build_language_contract",
+    "diagnose_language_state",
     "detect_text_language",
     "detect_text_languages",
     "normalize_language",
+    "reference_divergence",
     "resolve_transcription_language",
 ]

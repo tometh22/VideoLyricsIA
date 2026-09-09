@@ -324,3 +324,96 @@ def test_free_tier_is_not_prorated_over_a_partial_range(db, monkeypatch):
     assert aj["total_usd"] == 0.0
     assert "mes completo" in aj["motivo"]
 
+
+
+# ---------------------------------------------------------------------------
+# `stale_sources` — el ok que miente
+# ---------------------------------------------------------------------------
+#
+# Medido en staging el 1-sep-2026: agosto tenía las 31 celdas de GCP en `ok`
+# y `complete: true`, con 30 de esos 31 días en $0,00 exacto porque el export
+# de facturación a BigQuery cortaba el 1-ago. El panel mostraba GCP en $3,97
+# contra $138,90 de julio, en verde. Leído como ahorro, es un 97% de gasto
+# desaparecido justo antes de repartir utilidades.
+
+def _sembrar(db, source, dia_a_monto, grain="day"):
+    # Limpia primero: otros tests de este archivo ya sembraron celdas y la
+    # PK de cost_collection_runs es (day, source).
+    from database import CostDaily, CostCollectionRun
+    _limpiar(db, source, min(dia_a_monto), max(dia_a_monto))
+    for d, monto in dia_a_monto.items():
+        db.add(CostDaily(day=d, source=source, grain=grain, dim_type="total",
+                         dim_value="total", amount_usd=monto))
+        db.add(CostCollectionRun(day=d, source=source, status="ok"))
+    db.commit()
+
+
+def test_marca_la_fuente_que_contesta_ok_pero_devuelve_cero(db):
+    from datetime import date, timedelta
+    import cost_series
+
+    ini = date(2022, 3, 1)
+    # Gasto hasta el día 5, cero desde el 6 al 20: el export se cortó.
+    montos = {ini + timedelta(days=i): (4.0 if i <= 4 else 0.0) for i in range(20)}
+    _sembrar(db, "gcp", montos)
+    try:
+        avisos = cost_series.stale_sources(db, ini, ini + timedelta(days=19))
+        gcp = next(a for a in avisos if a["source"] == "gcp")
+        assert gcp["last_nonzero_day"] == (ini + timedelta(days=4)).isoformat()
+        assert gcp["zero_days"] == 15
+        # El total reportado NO es el total: es un piso.
+        assert gcp["reported_usd"] == 20.0
+    finally:
+        _limpiar(db, "gcp", ini, ini + timedelta(days=19))
+
+
+def test_un_dia_tranquilo_suelto_no_dispara_el_aviso(db):
+    from datetime import date, timedelta
+    import cost_series
+
+    ini = date(2022, 4, 1)
+    # Dos días en cero al final: por debajo del umbral. Un proveedor puede
+    # no cobrar un fin de semana sin renders.
+    montos = {ini + timedelta(days=i): (4.0 if i < 8 else 0.0) for i in range(10)}
+    _sembrar(db, "replicate", montos)
+    try:
+        avisos = cost_series.stale_sources(db, ini, ini + timedelta(days=9))
+        assert not [a for a in avisos if a["source"] == "replicate"]
+    finally:
+        _limpiar(db, "replicate", ini, ini + timedelta(days=9))
+
+
+def test_una_fuente_sin_ningun_gasto_no_se_marca(db):
+    # Sin un solo día con gasto no hay contra qué comparar: puede ser una
+    # fuente que de verdad no se usó. Ese caso lo cubre `coverage`.
+    from datetime import date, timedelta
+    import cost_series
+
+    ini = date(2022, 5, 1)
+    _sembrar(db, "replicate", {ini + timedelta(days=i): 0.0 for i in range(10)})
+    try:
+        assert not cost_series.stale_sources(db, ini, ini + timedelta(days=9))
+    finally:
+        _limpiar(db, "replicate", ini, ini + timedelta(days=9))
+
+
+def test_las_suscripciones_mensuales_no_se_marcan(db):
+    # Grano mensual: una fila por mes y el resto de los días en cero por
+    # diseño. Marcarlas sería ruido permanente.
+    from datetime import date, timedelta
+    import cost_series
+
+    ini = date(2022, 6, 1)
+    _sembrar(db, "fixed", {ini: 24.0}, grain="month")
+    try:
+        assert not cost_series.stale_sources(db, ini, ini + timedelta(days=19))
+    finally:
+        _limpiar(db, "fixed", ini, ini + timedelta(days=19))
+
+
+def _limpiar(db, source, desde, hasta):
+    from database import CostDaily, CostCollectionRun
+    for modelo in (CostDaily, CostCollectionRun):
+        db.query(modelo).filter(modelo.source == source, modelo.day >= desde,
+                                modelo.day <= hasta).delete(synchronize_session=False)
+    db.commit()

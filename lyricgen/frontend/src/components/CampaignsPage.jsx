@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { editorSessionHeaders } from "../lib/editorSession";
+import { CampaignReviewerRow, CampaignReviewerSummary } from "./CampaignReviewerStatus";
+import ReviewScopes from "./ReviewScopes";
+import useLatestReviewRequest from "../hooks/useLatestReviewRequest";
+import { reviewCounts, reviewStateLabel, reviewActionLabel, validReviewScope, reviewStateFilter } from "../lib/reviewerNavigation";
 
 const API = import.meta.env.VITE_API_URL || "";
 const PHASES = [
   ["", "Todos"], ["waiting_upload", "Esperando carga"],
   ["uploading", "Subiendo"], ["waiting_processing", "En espera"],
   ["transcribing", "Transcribiendo"], ["lyrics_ready", "Listo para corregir"],
+  ["lyrics_approved", "Letra y timing aprobados"],
   ["rendering", "Renderizando"], ["final_review", "Revisión final"],
   ["done", "Terminado"], ["failed", "Fallido"],
 ];
@@ -16,9 +21,45 @@ function authHeaders(headers = {}) {
   return token ? { ...headers, Authorization: `Bearer ${token}` } : headers;
 }
 
+function timestamp(seconds) {
+  if (!Number.isFinite(Number(seconds))) return "—";
+  const value = Math.max(0, Number(seconds));
+  return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, "0")}`;
+}
+
+function contextPath(id, values = {}) {
+  const params = new URLSearchParams();
+  const entries = {
+    tab: values.tab || "pending",
+    q: values.q || "",
+    mine: values.mine ? "1" : "",
+    order: values.order || "effort",
+    page: values.page > 1 ? String(values.page) : "",
+    stage: values.stage && values.stage !== "lyrics" ? values.stage : "",
+    version: values.version || "",
+    state: values.state || "",
+    artist: values.artist || "",
+    phase: values.phase || "",
+    focus: values.focus || "",
+    scroll: values.scroll ? String(Math.round(values.scroll)) : "",
+  };
+  Object.entries(entries).forEach(([key, value]) => { if (value) params.set(key, value); });
+  const query = params.toString();
+  return `/campaigns/${encodeURIComponent(id)}${query ? `?${query}` : ""}`;
+}
+
+function returnReviewPath(id, jobId, values = {}) {
+  const returnTo = contextPath(id, values);
+  return `/review/${encodeURIComponent(jobId)}?return_to=${encodeURIComponent(returnTo)}`;
+}
+
 async function api(path, options = {}) {
   const response = await fetch(`${API}${path}`, {
     ...options,
+    // Campaign state changes while the operator is in the editor. A cached
+    // GET can therefore show the song removed from the active filter while
+    // leaving the campaign counters at their previous value.
+    cache: options.cache || "no-store",
     headers: authHeaders(options.headers || {}),
   });
   const body = await response.json().catch(() => ({}));
@@ -26,15 +67,6 @@ async function api(path, options = {}) {
     typeof body.detail === "string" ? body.detail : body.detail?.code || `Error ${response.status}`,
   );
   return body;
-}
-
-function Counter({ label, value, active, onClick }) {
-  return (
-    <button onClick={onClick} className={`rounded-xl p-4 text-left ring-1 transition ${active ? "bg-brand/15 ring-brand/40" : "bg-surface-2/50 ring-white/[0.06] hover:ring-white/15"}`}>
-      <div className="text-2xl font-bold text-white">{value || 0}</div>
-      <div className="mt-1 text-xs text-ink-tertiary">{label}</div>
-    </button>
-  );
 }
 
 function CampaignList() {
@@ -46,8 +78,18 @@ function CampaignList() {
   const [destination, setDestination] = useState("argentina");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const load = useCallback(() => api("/batch/campaigns").then((d) => setItems(d.items || [])).catch((e) => setError(e.message)), []);
-  useEffect(() => { load(); }, [load]);
+  const [loading, setLoading] = useState(true);
+  const { start, cancel } = useLatestReviewRequest();
+  const load = useCallback(async () => {
+    const request = start();
+    setLoading(true);
+    try {
+      const data = await api("/batch/campaigns", { signal: request.signal });
+      if (request.current()) { setItems(data.items || []); setError(""); }
+    } catch (e) { if (request.current()) setError(e.message); }
+    finally { if (request.current()) setLoading(false); request.finish(); }
+  }, [start]);
+  useEffect(() => { load(); return cancel; }, [load, cancel]);
 
   const create = async (event) => {
     event.preventDefault();
@@ -84,6 +126,7 @@ function CampaignList() {
         <button disabled={busy || !name.trim()} className="rounded-xl bg-brand px-5 py-3 text-sm font-semibold text-white disabled:opacity-50">{busy ? "Creando…" : "Nueva campaña"}</button>
       </form>
       {error && <div className="rounded-xl bg-red-500/10 p-4 text-sm text-red-200 ring-1 ring-red-500/25">{error}</div>}
+      {loading && <p role="status" className="text-sm text-ink-secondary">Cargando campañas…</p>}
       <div className="grid gap-3">
         {items.map((campaign) => (
           <button key={campaign.id} onClick={() => navigate(`/campaigns/${campaign.id}`)} className="flex items-center gap-4 rounded-2xl bg-surface-2/40 p-5 text-left ring-1 ring-white/[0.06] hover:ring-brand/30">
@@ -91,10 +134,10 @@ function CampaignList() {
               <div className="truncate font-semibold text-white">{campaign.name}</div>
               <div className="mt-1 text-xs text-ink-tertiary">{campaign.registered_count}/{campaign.expected_count || "—"} registradas · {campaign.counters?.done || 0} terminadas</div>
             </div>
-            <span className="rounded-full bg-white/[0.06] px-3 py-1 text-xs text-ink-secondary">{campaign.status}</span>
+            <span className="rounded-full bg-white/[0.06] px-3 py-1 text-xs text-ink-secondary">{{ active: "Activa", paused: "Pausada", completed: "Completada", cancelled: "Cancelada" }[campaign.status] || "Estado no disponible"}</span>
           </button>
         ))}
-        {!items.length && !error && <div className="rounded-2xl border border-dashed border-white/10 p-10 text-center text-sm text-ink-tertiary">Todavía no hay campañas.</div>}
+        {!items.length && !error && !loading && <div className="rounded-2xl border border-dashed border-white/10 p-10 text-center text-sm text-ink-tertiary">Todavía no hay campañas.</div>}
       </div>
     </div>
   );
@@ -102,10 +145,13 @@ function CampaignList() {
 
 function CampaignDetail({ id }) {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialScope = validReviewScope(searchParams.get("tab"));
+  const initialOrder = searchParams.get("order") === "learning" ? "learning" : "effort";
   const [campaign, setCampaign] = useState(null);
   const [items, setItems] = useState([]);
-  const [phase, setPhase] = useState("");
-  const [page, setPage] = useState(1);
+  const [phase, setPhase] = useState(() => searchParams.get("phase") || "");
+  const [page, setPage] = useState(() => Number(searchParams.get("page") || 1) || 1);
   const [pages, setPages] = useState(1);
   const [pair, setPair] = useState(null);
   const [error, setError] = useState("");
@@ -113,24 +159,150 @@ function CampaignDetail({ id }) {
   const [assetBusy, setAssetBusy] = useState(false);
   const [deliveryMessage, setDeliveryMessage] = useState("");
   const fileInput = useRef(null);
+  const [queueStage, setQueueStage] = useState(() => searchParams.get("stage") || "lyrics");
+  const [queueOrder, setQueueOrder] = useState(initialOrder);
+  const [queueVersion, setQueueVersion] = useState(() => searchParams.get("version") || "");
+  const [queueState, setQueueState] = useState(() => reviewStateFilter(searchParams.get("state"), initialScope));
+  const [queueScope, setQueueScope] = useState(initialScope);
+  const [queueBackground, setQueueBackground] = useState("");
+  const [queueArtist, setQueueArtist] = useState(() => searchParams.get("artist") || "");
+  const [queueSearch, setQueueSearch] = useState(() => searchParams.get("q") || "");
+  const [queueMine, setQueueMine] = useState(() => searchParams.get("mine") === "1");
+  const [queueAudit, setQueueAudit] = useState(false);
+  const [reviewQueue, setReviewQueue] = useState(null);
+  const [highlightedJobId, setHighlightedJobId] = useState(() => searchParams.get("focus") || null);
+  const restoredScrollRef = useRef(null);
+  const [queueLoading, setQueueLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [totals, setTotals] = useState(null);
+  const { start, cancel, active } = useLatestReviewRequest();
+
+  // URL is authoritative for browser Back/Forward and copied links. Saved
+  // context must not resurrect a stale status filter after changing tabs.
+  useEffect(() => {
+    setQueueScope(validReviewScope(searchParams.get("tab")));
+    setQueueOrder(searchParams.get("order") === "learning" ? "learning" : "effort");
+    setQueueSearch(searchParams.get("q") || "");
+    setQueueMine(searchParams.get("mine") === "1");
+    setQueueStage(searchParams.get("stage") === "final" ? "final" : "lyrics");
+    setQueueVersion(searchParams.get("version") || "");
+    setQueueState(reviewStateFilter(searchParams.get("state"), validReviewScope(searchParams.get("tab"))));
+    setQueueArtist(searchParams.get("artist") || "");
+    setPhase(searchParams.get("phase") || "");
+    setPage(Math.max(1, Number(searchParams.get("page")) || 1));
+    setHighlightedJobId(searchParams.get("focus") || null);
+  }, [searchParams]);
+
+  const saveContext = useCallback((overrides = {}, push = false) => {
+    const values = {
+      tab: queueScope, q: queueSearch, mine: queueMine, order: queueOrder,
+      page, stage: queueStage, version: queueVersion, state: queueState,
+      artist: queueArtist, phase, ...overrides,
+    };
+    const next = new URLSearchParams(searchParams);
+    ["tab", "q", "mine", "order", "page", "stage", "version", "state", "artist", "phase", "focus", "scroll"].forEach((key) => next.delete(key));
+    const path = contextPath(id, values);
+    const query = path.split("?")[1];
+    if (query) new URLSearchParams(query).forEach((value, key) => next.set(key, value));
+    setSearchParams(next, { replace: !push });
+    try { sessionStorage.setItem(`campaign-review-context:${id}`, JSON.stringify(values)); } catch { /* best effort */ }
+  }, [id, page, phase, queueStage, queueVersion, queueState, queueArtist, queueMine, queueOrder, queueScope, queueSearch, searchParams, setSearchParams]);
+
+  const selectScope = (scope) => {
+    if (scope === queueScope && !queueState) return;
+    cancel(); setReviewQueue(null); setQueueLoading(true); setError("");
+    setQueueScope(scope); setQueueState(""); setHighlightedJobId(null);
+    saveContext({ tab: scope, state: "", focus: null, scroll: null, page: 1 }, true);
+  };
+
+  const openReview = useCallback((row) => {
+    if (!row?.job_id) return;
+    const context = {
+      tab: queueScope, q: queueSearch, mine: queueMine, order: queueOrder,
+      page, stage: queueStage, version: queueVersion, state: queueState,
+      artist: queueArtist, phase, focus: row.job_id, scroll: window.scrollY,
+    };
+    try { sessionStorage.setItem(`campaign-review-context:${id}`, JSON.stringify(context)); } catch { /* best effort */ }
+    if (row.state === "approved" || row.state === "exported") {
+      navigate(`/videos/${encodeURIComponent(row.job_id)}?return_to=${encodeURIComponent(contextPath(id, context))}`);
+    } else {
+      navigate(returnReviewPath(id, row.job_id, context));
+    }
+  }, [id, navigate, page, phase, queueStage, queueVersion, queueState, queueArtist, queueMine, queueOrder, queueScope, queueSearch]);
 
   const load = useCallback(async () => {
+    const request = start();
+    const options = { signal: request.signal };
     try {
-      const [head, rows] = await Promise.all([
-        api(`/batch/campaigns/${id}`),
-        api(`/batch/campaigns/${id}/items?page=${page}&limit=50${phase ? `&phase=${phase}` : ""}`),
+      const queueQuery = `stage=${queueStage}&order=${queueOrder}&scope=${queueScope}&limit=100${queueVersion ? `&version=${queueVersion}` : ""}${queueState ? `&state=${encodeURIComponent(queueState)}` : ""}${queueStage === "final" && queueBackground ? `&background_mode=${encodeURIComponent(queueBackground)}` : ""}${queueArtist ? `&artist=${encodeURIComponent(queueArtist)}` : ""}${queueSearch ? `&search=${encodeURIComponent(queueSearch)}` : ""}${queueMine ? "&reviewed_by=me" : ""}${queueAudit ? "&audit_preapproved=true" : ""}`;
+      const [head, rows, firstReview] = await Promise.all([
+        api(`/batch/campaigns/${id}`, options),
+        api(`/batch/campaigns/${id}/items?page=${page}&limit=50${phase ? `&phase=${phase}` : ""}`, options),
+        api(`/batch/campaigns/${id}/review-queue?${queueQuery}`, options),
       ]);
+      if (!request.current()) return;
       setCampaign(head); setItems(rows.items || []); setPages(rows.pages || 1);
+      setReviewQueue(firstReview); setTotals(firstReview.campaign_totals);
+      setQueueLoading(false); setLoadingMore(Number(firstReview.pages || 1) > 1); setError("");
+      const remainingReviews = await Promise.all(
+        Array.from({ length: Math.max(0, Number(firstReview.pages || 1) - 1) }, (_, index) => (
+          api(`/batch/campaigns/${id}/review-queue?${queueQuery}&page=${index + 2}`, options)
+        )),
+      );
+      const review = {
+        ...firstReview,
+        items: [firstReview.items || [], ...remainingReviews.map((pageData) => pageData.items || [])].flat(),
+      };
+      if (!request.current()) return;
+      setReviewQueue(review);
       setPresetText((current) => current || JSON.stringify(head.default_render_params || {}, null, 2));
       setError("");
-    } catch (e) { setError(e.message); }
-  }, [id, page, phase]);
-  useEffect(() => { load(); }, [load]);
+    } catch (e) { if (request.current()) setError(e.message); }
+    finally {
+      if (request.current()) { setQueueLoading(false); setLoadingMore(false); }
+      request.finish();
+    }
+  }, [id, page, phase, queueStage, queueOrder, queueScope, queueVersion, queueState, queueBackground, queueArtist, queueSearch, queueMine, queueAudit, start]);
+  useEffect(() => { setQueueLoading(true); setReviewQueue(null); load(); return cancel; }, [load, cancel]);
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState === "visible" && !active.current) void load();
+    };
+    window.addEventListener("pageshow", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("pageshow", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [load]);
   useEffect(() => {
     if (!campaign || ["completed", "cancelled"].includes(campaign.status)) return undefined;
-    const timer = window.setInterval(load, 10_000);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible" && !active.current) void load();
+    }, 30_000);
     return () => window.clearInterval(timer);
   }, [campaign?.status, load]);
+
+  useEffect(() => {
+    if (!reviewQueue || restoredScrollRef.current === highlightedJobId) return;
+    restoredScrollRef.current = highlightedJobId;
+    let saved = Number(searchParams.get("scroll") || 0);
+    if (!saved) {
+      try { saved = Number(JSON.parse(sessionStorage.getItem(`campaign-review-context:${id}`) || "{}").scroll || 0); } catch { saved = 0; }
+    }
+    requestAnimationFrame(() => {
+      if (saved > 0) window.scrollTo(0, saved);
+      if (highlightedJobId) document.querySelector(`[data-review-job="${highlightedJobId}"]`)?.scrollIntoView({ block: "center" });
+    });
+    const timer = window.setTimeout(() => {
+      if (searchParams.get("focus")) {
+        const next = new URLSearchParams(searchParams);
+        next.delete("focus"); next.delete("scroll");
+        setSearchParams(next, { replace: true });
+      }
+    }, 5000);
+    return () => window.clearTimeout(timer);
+  }, [id, highlightedJobId, reviewQueue, searchParams, setSearchParams]);
 
   const patch = async (value) => {
     try {
@@ -138,11 +310,16 @@ function CampaignDetail({ id }) {
       await load();
     } catch (e) { setError(e.message); }
   };
-  const takeNext = async () => {
+  const takeNext = async (stage = queueStage) => {
     try {
-      const data = await api(`/batch/campaigns/${id}/next`, { method: "POST", headers: editorSessionHeaders() });
-      if (data.job_id) navigate(`/review/${data.job_id}`);
-      else setError("Todavía no hay letras listas para corregir.");
+      const params = new URLSearchParams({ stage });
+      if (queueSearch) params.set("search", queueSearch);
+      if (queueVersion) params.set("version", queueVersion);
+      if (queueArtist) params.set("artist", queueArtist);
+      if (queueMine) params.set("reviewed_by", "me");
+      const data = await api(`/batch/campaigns/${id}/review-queue/next?${params.toString()}`, { method: "POST", headers: editorSessionHeaders() });
+      if (data.job_id) openReview({ job_id: data.job_id });
+      else setError(stage === "lyrics" ? "Todavía no hay letras listas para corregir." : "Todavía no hay renders listos para QC final.");
     } catch (e) { setError(e.message); }
   };
   const editMetadata = async (item) => {
@@ -239,50 +416,83 @@ function CampaignDetail({ id }) {
 
   const labels = useMemo(() => Object.fromEntries(PHASES), []);
   if (!campaign) return <div className="p-8 text-sm text-ink-secondary">{error || "Cargando campaña…"}</div>;
+  const selectedRow = (reviewQueue?.items || []).find((row) => row.job_id === highlightedJobId);
+  const counts = reviewCounts({ campaign_totals: totals }, campaign);
+  const approvedCount = counts.approved ?? "—";
+  const songCount = counts.all ?? "—";
+  const clearFilters = () => {
+    setQueueSearch(""); setQueueArtist(""); setQueueVersion(""); setQueueState(""); setQueueMine(false);
+    setHighlightedJobId(null); saveContext({ q: "", mine: false, version: "", artist: "", state: "", focus: null, scroll: null });
+    try { sessionStorage.setItem(`campaign-review-context:${id}`, JSON.stringify({ tab: queueScope, order: queueOrder, page })); } catch { /* best effort */ }
+  };
+  const queueRows = reviewQueue?.items || [];
   return (
     <div className="mx-auto max-w-7xl space-y-6">
       <button onClick={() => navigate("/campaigns")} className="text-sm text-ink-secondary hover:text-white">← Campañas</button>
-      <div className="flex flex-col gap-4 md:flex-row md:items-start">
-      <div className="min-w-0 flex-1"><h1 className="truncate text-3xl font-bold text-white">{campaign.name}</h1><p className="mt-2 text-sm text-ink-secondary">{campaign.registered_count}/{campaign.expected_count || "—"} {campaign.kind === "art_track" ? "art tracks" : "audios"} registrados · estado {campaign.status}</p></div>
-        <div className="flex flex-wrap gap-2">
-          {campaign.kind !== "art_track" && <button onClick={takeNext} disabled={!campaign.counters?.lyrics_ready} className="rounded-xl bg-brand px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-40">Tomar siguiente</button>}
-          {campaign.status === "active" ? <button onClick={() => patch({ status: "paused" })} className="rounded-xl bg-white/[0.06] px-4 py-2.5 text-sm text-white">Pausar</button> : campaign.status === "paused" ? <button onClick={() => patch({ status: "active" })} className="rounded-xl bg-white/[0.06] px-4 py-2.5 text-sm text-white">Reanudar</button> : null}
-          {!['completed', 'cancelled'].includes(campaign.status) && <button onClick={() => window.confirm("¿Cancelar esta campaña?") && patch({ status: "cancelled" })} className="rounded-xl bg-red-500/10 px-4 py-2.5 text-sm text-red-200">Cancelar</button>}
-        </div>
+      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+        <div className="min-w-0"><h1 className="truncate text-3xl font-bold text-white">{campaign.name}</h1><p className="mt-2 text-sm text-ink-secondary">{campaign.kind === "art_track" ? `${campaign.registered_count}/${campaign.expected_count || "—"} art tracks registrados` : `${approvedCount} de ${songCount} letras aprobadas`} · {campaign.status === "active" ? "campaña activa" : campaign.status}</p></div>
+        {campaign.kind !== "art_track" && <button onClick={() => takeNext(queueStage)} disabled={queueLoading || !!error || queueScope !== "pending" || !reviewQueue?.counters?.ready} className="rounded-xl bg-brand px-5 py-3 text-sm font-semibold text-white disabled:opacity-40">Revisar siguiente canción</button>}
       </div>
-      {error && <div className="rounded-xl bg-amber-500/10 p-4 text-sm text-amber-100 ring-1 ring-amber-500/25">{error}</div>}
-      {deliveryMessage && <div className="rounded-xl bg-brand/10 p-4 text-sm text-brand-light ring-1 ring-brand/25">{deliveryMessage}</div>}
-      {campaign.kind === "art_track" && <section className="rounded-2xl bg-surface-2/40 p-5 ring-1 ring-white/[0.06]"><div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="font-semibold text-white">Art tracks · audio + cover</h2><p className="mt-1 text-sm text-ink-secondary">Seleccioná hasta 500 audios y portadas. Se asocian por ruta, código, nombre o cover de carpeta; los ambiguos quedan bloqueados.</p></div><input ref={fileInput} type="file" multiple webkitdirectory="" directory="" accept=".wav,.mp3,.jpg,.jpeg,.png" onChange={importArtFiles} className="max-w-[260px] text-xs text-ink-secondary" /></div><div className="mt-4 flex flex-wrap gap-2"><button disabled={assetBusy} onClick={confirmAndRender} className="rounded-xl bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{assetBusy ? "Subiendo…" : "Confirmar asociados y generar"}</button><button onClick={previewDeliveries} className="rounded-xl bg-white/[0.07] px-4 py-2 text-sm text-white">Previsualizar envíos</button><button onClick={createDeliveries} className="rounded-xl bg-white/[0.07] px-4 py-2 text-sm text-white">Enviar aprobados</button></div></section>}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-        {PHASES.slice(1).map(([key, label]) => <Counter key={key} label={label} value={campaign.counters?.[key]} active={phase === key} onClick={() => { setPhase(phase === key ? "" : key); setPage(1); }} />)}
-      </div>
-      <div className="grid gap-4 lg:grid-cols-2">
-        <section className="rounded-2xl bg-surface-2/40 p-5 ring-1 ring-white/[0.06]">
-          <h2 className="font-semibold text-white">Cargador local</h2>
-          <p className="mt-2 text-sm text-ink-secondary">Generá un código temporal. El cargador nunca recibe el token principal de tu cuenta.</p>
-          <button onClick={async () => { try { setPair(await api(`/batch/campaigns/${id}/upload-session`, { method: "POST" })); } catch (e) { setError(e.message); } }} className="mt-4 rounded-xl bg-white/[0.07] px-4 py-2 text-sm text-white">Generar código</button>
-          {pair && <div className="mt-4 rounded-xl bg-black/25 p-4"><div className="font-mono text-2xl font-bold tracking-[.2em] text-brand-light">{pair.pairing_code}</div><code className="mt-3 block whitespace-pre-wrap break-all text-xs text-ink-secondary">python3 scripts/campaign_uploader.py --api "{API || "https://TU-API"}" --campaign {id} --code {pair.pairing_code} --folder "/ruta/a/audios"</code></div>}
-        </section>
-        <section className="rounded-2xl bg-surface-2/40 p-5 ring-1 ring-white/[0.06]">
-          <h2 className="font-semibold text-white">Preset compartido</h2>
-          <p className="mt-2 text-sm text-ink-secondary">JSON con fondo, tipografía, movimiento, formato y entrega. Cada canción puede tener overrides.</p>
-          <textarea value={presetText} onChange={(e) => setPresetText(e.target.value)} rows={6} className="mt-3 w-full rounded-xl bg-black/25 p-3 font-mono text-xs text-white ring-1 ring-white/10 outline-none focus:ring-brand/40" />
-          <button onClick={() => { try { patch({ default_render_params: JSON.parse(presetText) }); } catch { setError("El preset no es JSON válido."); } }} className="mt-3 rounded-xl bg-white/[0.07] px-4 py-2 text-sm text-white">Guardar preset</button>
-        </section>
-      </div>
-      <section className="overflow-hidden rounded-2xl bg-surface-2/40 ring-1 ring-white/[0.06]">
-        <div className="flex items-center justify-between border-b border-white/[0.06] p-4"><h2 className="font-semibold text-white">Canciones {phase ? `· ${labels[phase]}` : ""}</h2><span className="text-xs text-ink-tertiary">Página {page}/{pages}</span></div>
-        <div className="divide-y divide-white/[0.05]">
-          {items.map((item) => <div key={item.id} className="grid gap-3 p-4 md:grid-cols-[55px_1fr_180px_auto] md:items-center"><span className="text-xs text-ink-tertiary">#{item.ordinal}</span><div className="min-w-0"><div className="truncate text-sm font-medium text-white">{item.title || item.filename}</div><div className="truncate text-xs text-ink-tertiary">{item.artist || "Falta artista"} · {item.technical_code || "Falta código"}</div></div><span className="text-xs text-ink-secondary">{labels[item.phase] || item.phase}</span><div className="flex gap-2">{item.metadata_error && <button onClick={() => editMetadata(item)} className="rounded-lg bg-amber-500/10 px-3 py-1.5 text-xs text-amber-100">Completar metadata</button>}{item.job_id && campaign.kind === "art_track" && ["final_review", "done"].includes(item.phase) && <button onClick={() => navigate(`/videos/${item.job_id}`)} className="rounded-lg bg-brand/15 px-3 py-1.5 text-xs text-brand-light">Revisar</button>}{item.job_id && campaign.kind !== "art_track" && item.phase === "lyrics_ready" && <button onClick={() => navigate(`/review/${item.job_id}`)} className="rounded-lg bg-brand/15 px-3 py-1.5 text-xs text-brand-light">Corregir</button>}{item.phase === "failed" && <button onClick={() => retry(item)} className="rounded-lg bg-red-500/10 px-3 py-1.5 text-xs text-red-200">Reintentar</button>}</div></div>)}
-          {!items.length && <div className="p-10 text-center text-sm text-ink-tertiary">No hay items en este filtro.</div>}
-        </div>
-        <div className="flex justify-end gap-2 border-t border-white/[0.06] p-4"><button disabled={page <= 1} onClick={() => setPage((p) => p - 1)} className="rounded-lg bg-white/[0.06] px-3 py-2 text-xs text-white disabled:opacity-30">Anterior</button><button disabled={page >= pages} onClick={() => setPage((p) => p + 1)} className="rounded-lg bg-white/[0.06] px-3 py-2 text-xs text-white disabled:opacity-30">Siguiente</button></div>
+      {campaign.kind === "art_track" && <section className="rounded-2xl bg-surface-2/40 p-5 ring-1 ring-white/[0.06]"><div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="font-semibold text-white">Art tracks · audio + cover</h2><p className="mt-1 text-sm text-ink-secondary">Seleccioná una carpeta con hasta 500 audios y portadas. Los conflictos quedan bloqueados para corrección manual.</p></div><input ref={fileInput} type="file" multiple webkitdirectory="" directory="" accept=".wav,.mp3,.jpg,.jpeg,.png" onChange={importArtFiles} className="max-w-[260px] text-xs text-ink-secondary" /></div><div className="mt-4 flex flex-wrap gap-2"><button disabled={assetBusy} onClick={confirmAndRender} className="rounded-xl bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{assetBusy ? "Subiendo…" : "Confirmar asociados y generar"}</button><button onClick={previewDeliveries} className="rounded-xl bg-white/[0.07] px-4 py-2 text-sm text-white">Previsualizar envíos</button><button onClick={createDeliveries} className="rounded-xl bg-white/[0.07] px-4 py-2 text-sm text-white">Enviar aprobados</button></div></section>}
+      {selectedRow?.resume_available && <div className="flex items-center justify-between gap-3 rounded-xl bg-brand/10 p-4 text-sm text-brand-light ring-1 ring-brand/25"><span>Tenés una revisión guardada: <strong>{selectedRow.title}</strong>.</span><button onClick={() => openReview(selectedRow)} className="rounded-lg bg-brand px-3 py-2 text-xs font-semibold text-white">Continuar {selectedRow.title}</button></div>}
+      {!queueLoading && !loadingMore && highlightedJobId && !selectedRow && <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-amber-500/10 p-4 text-sm text-amber-100 ring-1 ring-amber-500/25"><span>La canción recién abierta ya no coincide con este filtro. Puede haber cambiado de estado o estar aprobada en otra pestaña.</span><button onClick={() => selectScope("approved")} className="rounded-lg bg-amber-500/20 px-3 py-2 text-xs font-semibold">Buscar en Aprobadas</button></div>}
+      {error && <div role="alert" className="rounded-xl bg-amber-500/10 p-4 text-sm text-amber-100 ring-1 ring-amber-500/25">{error} <button onClick={load} className="underline">Reintentar</button></div>}
+      <ReviewScopes cards value={queueScope} counts={counts} onChange={selectScope} />
+      <ReviewScopes value={queueScope} counts={counts} onChange={selectScope} />
+      {queueLoading && <p role="status" className="text-sm text-ink-secondary">Cargando canciones…</p>}
+      {loadingMore && <p role="status" className="text-sm text-ink-secondary">Mostrando {reviewQueue?.items?.length || 0} de {reviewQueue?.scope?.total || 0} canciones. Cargando el resto…</p>}
+      <section className="space-y-4 rounded-2xl bg-surface-2/40 p-5 ring-1 ring-white/[0.06]">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between"><div><h2 className="font-semibold text-white">Encontrá una canción y empezá a trabajar</h2><p className="mt-1 text-xs text-ink-tertiary">El orden predeterminado prioriza el menor esfuerzo estimado según la evidencia disponible.</p></div><div className="flex flex-wrap gap-2"><input value={queueSearch} onChange={(e) => { setQueueSearch(e.target.value); saveContext({ q: e.target.value, focus: null }); }} placeholder="Buscar canción o artista" aria-label="Buscar canción o artista" className="w-56 rounded-lg bg-black/25 px-3 py-2 text-sm text-white ring-1 ring-white/10" /><select value={queueOrder} onChange={(e) => { setQueueOrder(e.target.value); saveContext({ order: e.target.value }); }} aria-label="Orden" className="rounded-lg bg-black/25 px-3 py-2 text-sm text-white ring-1 ring-white/10"><option value="effort">Menor esfuerzo estimado primero</option><option value="learning">Aprendizaje (20%)</option></select><button onClick={() => { const next = !queueMine; setQueueMine(next); saveContext({ mine: next }); }} className={`rounded-lg px-3 py-2 text-sm ring-1 ${queueMine ? "bg-brand/15 text-brand-light ring-brand/30" : "bg-black/25 text-ink-secondary ring-white/10"}`}>Revisadas por mí</button></div></div>
+        {(queueSearch || queueMine || queueVersion || queueArtist || queueState) && <div className="flex flex-wrap items-center gap-2 text-xs text-ink-secondary"><span>Filtros activos:</span>{queueSearch && <span className="rounded-full bg-white/[0.07] px-2 py-1">“{queueSearch}”</span>}{queueMine && <span className="rounded-full bg-white/[0.07] px-2 py-1">Revisadas por mí</span>}<button onClick={clearFilters} className="underline hover:text-white">Limpiar</button></div>}
+        <div className="flex flex-wrap items-center gap-2 text-xs"><span className="rounded-full bg-white/[0.06] px-2.5 py-1 text-ink-secondary">Revisión breve sugerida: {reviewQueue?.classification_counts?.standard || 0}</span><span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-amber-200">Revisar algunos fragmentos: {reviewQueue?.classification_counts?.timing_targeted || 0}</span><span className="rounded-full bg-red-500/10 px-2.5 py-1 text-red-200">Revisar completa: {reviewQueue?.classification_counts?.manual_full || 0}</span><span className="text-ink-tertiary">{reviewQueue?.scope?.total || 0} canciones en este alcance</span></div>
+        <div className="overflow-x-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="border-b border-white/[0.06] text-xs text-ink-tertiary"><tr><th className="p-3">Canción</th><th className="p-3">Duración</th><th className="p-3">Estado</th><th className="p-3">Trabajo sugerido</th><th className="p-3" /></tr></thead><tbody>{queueRows.map((row) => { const action = reviewActionLabel(row); const reasons = [...new Map((row.review_reasons || []).map((reason) => [reason.code, reason])).values()]; return <tr key={row.item_id} data-review-job={row.job_id || undefined} className={`border-b border-white/[0.045] ${row.job_id === highlightedJobId ? "bg-brand/10 ring-1 ring-inset ring-brand/30" : ""}`}><td className="p-3"><div className="font-medium text-white">{row.title}</div><div className="text-xs text-ink-tertiary">{row.artist || "Artista no informado"}</div>{row.approval?.user_id && <div className="mt-1 text-xs text-emerald-200">Aprobó {row.approval.name || "otro operador"}{row.approval.at ? ` · ${new Date(row.approval.at).toLocaleString()}` : ""}</div>}</td><td className="p-3 text-ink-secondary">{row.duration_seconds ? timestamp(row.duration_seconds) : "—"}</td><td className="p-3 text-ink-secondary">{reviewStateLabel(row)}</td><td className="p-3"><div className="text-xs font-medium text-white">{row.review_priority_label || "Revisión breve sugerida"}</div>{reasons.length > 0 && <div className="mt-1 text-xs text-ink-secondary">{reasons.map((reason) => reason.label).join(" · ")}</div>}{row.timing_evidence?.length > 0 && <div className="mt-1 flex flex-wrap gap-1">{row.timing_evidence.slice(0, 4).map((window) => <span key={window.id} className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[11px] text-cyan-200">{timestamp(window.start)}–{timestamp(window.end)}{window.reasons?.length ? ` · ${window.reasons.join(", ")}` : ""}</span>)}</div>}{row.timing_localization === "general" && <div className="mt-1 text-xs text-amber-200">Revisar timing; la duda no está localizada en un intervalo.</div>}</td><td className="p-3 text-right">{action ? <button onClick={() => openReview(row)} disabled={queueLoading || (!["approved", "exported"].includes(row.state) && row.reviewer_lock_active && !row.reviewer_is_current_user)} className="rounded-lg bg-brand/15 px-3 py-2 text-xs font-semibold text-brand-light disabled:cursor-not-allowed disabled:bg-white/[0.05] disabled:text-ink-tertiary">{action}</button> : <span className="text-xs text-ink-tertiary">{row.reviewer_lock_active ? "Otra persona está revisando" : "No disponible para revisión"}</span>}</td></tr>; })}</tbody></table>{!queueRows.length && !error && !queueLoading && <div className="p-10 text-center text-sm text-ink-tertiary">{queueSearch || queueMine ? "No hay coincidencias con los filtros actuales." : queueScope === "approved" ? "Todavía no hay canciones aprobadas en este alcance." : "No hay canciones pendientes para revisar."}</div>}</div>
       </section>
+      <details className="rounded-2xl bg-surface-2/30 p-4 ring-1 ring-white/[0.06]"><summary className="cursor-pointer text-sm font-semibold text-white">Opciones avanzadas y trazabilidad</summary><div className="mt-4 space-y-4"><div className="flex flex-wrap gap-2"><select value={queueStage} onChange={(e) => { setQueueStage(e.target.value); saveContext({ stage: e.target.value }); }} className="rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10"><option value="lyrics">Letra y timing</option><option value="final">QC final</option></select><select value={queueVersion} onChange={(e) => { setQueueVersion(e.target.value); saveContext({ version: e.target.value }); }} className="rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10"><option value="">Studio + live</option><option value="studio">Studio</option><option value="live">Live</option></select><select value={queueState} aria-label="Estado de revisión" onChange={(e) => {
+      const state = e.target.value;
+      const scope = ["approved", "exported"].includes(state) ? "approved" : state ? "pending" : queueScope;
+      setQueueState(state); setQueueScope(scope);
+      saveContext({ state, tab: scope, page: 1 }, true);
+    }} className="rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10"><option value="">Todos los estados</option><option value="pending">Pendiente</option><option value="processing">Procesando</option><option value="ready">Sin revisar</option><option value="reviewing">En revisión</option><option value="approved">Aprobada</option><option value="exported">Exportada</option></select><input value={queueArtist} onChange={(e) => { setQueueArtist(e.target.value); saveContext({ artist: e.target.value }); }} placeholder="Filtrar artista" className="w-36 rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10" /></div><CampaignReviewerSummary status={campaign.reviewer_campaign_status} /><p className="text-xs text-ink-tertiary">La recomendación describe alcance de trabajo; no es confianza calibrada. La ausencia de referencia externa no determina por sí sola que la letra sea incorrecta. Los detalles de evidencia quedan disponibles aquí sin interrumpir la cola.</p>{reviewQueue?.review_minutes_today && <p className="text-xs text-ink-tertiary">Actividad secundaria: {reviewQueue.review_minutes_today.average ?? "—"} min promedio hoy en {reviewQueue.review_minutes_today.songs || 0} canciones con telemetría; pausas mayores a 25 s quedan fuera y un único latido suma 15 s. Sin telemetría no entra al promedio.</p>}</div></details>
+      <details className="rounded-2xl bg-surface-2/30 p-4 ring-1 ring-white/[0.06]">
+        <summary className="cursor-pointer text-sm font-semibold text-white">Administración de campaña (fuera de la revisión)</summary>
+        <div className="mt-4 space-y-4">
+          <div className="grid gap-4 lg:grid-cols-2">
+            <section className="rounded-2xl bg-surface-2/40 p-5 ring-1 ring-white/[0.06]">
+              <h2 className="font-semibold text-white">Cargador local</h2>
+              <p className="mt-2 text-sm text-ink-secondary">Generá un código temporal. El cargador nunca recibe el token principal de tu cuenta.</p>
+              <button onClick={async () => { try { setPair(await api(`/batch/campaigns/${id}/upload-session`, { method: "POST" })); } catch (e) { setError(e.message); } }} className="mt-4 rounded-xl bg-white/[0.07] px-4 py-2 text-sm text-white">Generar código</button>
+              {pair && <div className="mt-4 rounded-xl bg-black/25 p-4"><div className="font-mono text-2xl font-bold tracking-[.2em] text-brand-light">{pair.pairing_code}</div><code className="mt-3 block whitespace-pre-wrap break-all text-xs text-ink-secondary">python3 scripts/campaign_uploader.py --api "{API || "https://TU-API"}" --campaign {id} --code {pair.pairing_code} --folder "/ruta/a/audios"</code></div>}
+            </section>
+            <section className="rounded-2xl bg-surface-2/40 p-5 ring-1 ring-white/[0.06]">
+              <h2 className="font-semibold text-white">Preset compartido</h2>
+              <p className="mt-2 text-sm text-ink-secondary">JSON con fondo, tipografía, movimiento, formato y entrega. Cada canción puede tener overrides.</p>
+              <textarea value={presetText} onChange={(e) => setPresetText(e.target.value)} rows={6} className="mt-3 w-full rounded-xl bg-black/25 p-3 font-mono text-xs text-white ring-1 ring-white/10 outline-none focus:ring-brand/40" />
+              <button onClick={() => { try { patch({ default_render_params: JSON.parse(presetText) }); } catch { setError("El preset no es JSON válido."); } }} className="mt-3 rounded-xl bg-white/[0.07] px-4 py-2 text-sm text-white">Guardar preset</button>
+            </section>
+          </div>
+          <section className="overflow-hidden rounded-2xl bg-surface-2/40 ring-1 ring-white/[0.06]">
+            <div className="flex items-center justify-between border-b border-white/[0.06] p-4"><h2 className="font-semibold text-white">Canciones {phase ? `· ${labels[phase]}` : ""}</h2><span className="text-xs text-ink-tertiary">Página {page}/{pages}</span></div>
+            <div className="divide-y divide-white/[0.05]">
+              {items.map((item) => <div key={item.id} className="grid gap-3 p-4 md:grid-cols-[55px_1fr_180px_auto] md:items-center">
+                <span className="text-xs text-ink-tertiary">#{item.ordinal}</span>
+                <div className="min-w-0"><div className="truncate text-sm font-medium text-white">{item.title || item.filename}</div>
+                  <div className="truncate text-xs text-ink-tertiary">{item.artist || "Falta artista"} · {item.technical_code || "Falta código"}</div>
+                  {campaign.reviewer_campaign_status?.enabled === true && <CampaignReviewerRow status={item.reviewer_campaign_status} jobId={item.job_id} onOpen={navigate} />}
+                </div>
+                <span className="text-xs text-ink-secondary">{labels[item.phase] || item.phase}</span>
+                <div className="flex gap-2">{item.metadata_error && <button onClick={() => editMetadata(item)} className="rounded-lg bg-amber-500/10 px-3 py-1.5 text-xs text-amber-100">Completar metadata</button>}{item.job_id && campaign.kind === "art_track" && ["final_review", "done"].includes(item.phase) && <button onClick={() => navigate(`/videos/${item.job_id}`)} className="rounded-lg bg-brand/15 px-3 py-1.5 text-xs text-brand-light">Revisar</button>}{item.job_id && campaign.kind !== "art_track" && item.phase === "lyrics_ready" && <button onClick={() => navigate(`/review/${item.job_id}`)} className="rounded-lg bg-brand/15 px-3 py-1.5 text-xs text-brand-light">Corregir</button>}{item.phase === "failed" && <button onClick={() => retry(item)} className="rounded-lg bg-red-500/10 px-3 py-1.5 text-xs text-red-200">Reintentar</button>}</div>
+              </div>)}
+              {!items.length && <div className="p-10 text-center text-sm text-ink-tertiary">No hay items en este filtro.</div>}
+            </div>
+            <div className="flex justify-end gap-2 border-t border-white/[0.06] p-4"><button disabled={page <= 1} onClick={() => setPage((p) => p - 1)} className="rounded-lg bg-white/[0.06] px-3 py-2 text-xs text-white disabled:opacity-30">Anterior</button><button disabled={page >= pages} onClick={() => setPage((p) => p + 1)} className="rounded-lg bg-white/[0.06] px-3 py-2 text-xs text-white disabled:opacity-30">Siguiente</button></div>
+          </section>
+        </div>
+      </details>
     </div>
   );
 }
 
 export default function CampaignsPage() {
   const { campaignId } = useParams();
-  return campaignId ? <CampaignDetail id={campaignId} /> : <CampaignList />;
+  return campaignId ? <CampaignDetail key={campaignId} id={campaignId} /> : <CampaignList />;
 }

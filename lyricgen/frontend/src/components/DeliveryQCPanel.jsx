@@ -118,7 +118,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
                 </div>
               </div>
               {issue.status === "OPEN" ? (
-                <button disabled={busy === issue.issue_id} onClick={() => updateDecision(issue, "acknowledged")} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50">Revisado</button>
+                <button disabled={busy === issue.issue_id} onClick={() => updateDecision(issue, issue.manual_verification_required ? "resolved_manual" : "acknowledged")} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50">{issue.manual_verification_required ? "Firmar check" : "Revisado"}</button>
               ) : <span className="text-[10px] text-emerald-300">{issue.status}</span>}
             </div>
           </div>

@@ -245,6 +245,49 @@ hay una base confiable para imputarle al proyecto el top-up compartido. Ese
 mínimo queda deliberadamente sin asignar; no se debe sumar como suscripción
 fija porque podría duplicar gasto ya absorbido por otros proyectos.
 
+#### La línea que NO se suma: `Agent Usage`
+
+El Bill Breakdown de Railway tiene **seis** líneas: Memory, CPU, Egress,
+Volume, Backup y **Agent**. El conector modela las cinco primeras y
+reconcilia contra la factura al **0,3%**. La sexta fueron **US$5,07 sobre
+US$204,09** en el ciclo 20-jul→20-ago-2026 (2,5%) y **queda fuera del
+total a propósito**.
+
+Se investigó la query `agentUsage` (introspección + llamada real,
+1-sep-2026):
+
+```graphql
+agentUsage(workspaceId: String!): AgentUsageSummary!   # "unified AI usage"
+AgentUsageSummary { totalUsedCents: Int!  hardLimitCents: Int
+                    softLimitCents: Int  billingPeriodEnd: DateTime!
+                    usageRemaining: Float }
+```
+
+No sirve para valorizar un mes ni un día, por cuatro razones independientes:
+
+1. **No acepta rango.** `startDate` devuelve `Unknown argument "startDate"
+   on field "Query.agentUsage"`. Es un contador acumulado del ciclo
+   **abierto**, un gauge, no una serie.
+2. **El ciclo no es el mes.** Va del 20 al 20 y pisa dos meses calendario:
+   preguntar por agosto y por septiembre devuelve *el mismo* contador, así
+   que sumarlo contaría el dinero dos veces.
+3. **No tiene dimensiones.** Es workspace-wide, sin proyecto, sin servicio y
+   sin día. `MetricMeasurement` tampoco trae ninguna medición de agente, de
+   modo que `usage`, `estimatedUsage` y `workspaceUsageTotals` no la ven.
+4. **Los ciclos cerrados no vuelven.** Sólo se lee el vigente: los $5,07 de
+   julio-agosto son irrecuperables por API.
+
+Qué hace el conector entonces: cuando el período pedido es el mes en curso,
+lee el contador y lo publica en el `breakdown` del snapshot de Railway como
+`AGENT_USAGE` con `cost: 0.0`, `excluded_from_total: true` y el valor real en
+`observed_cycle_amount_usd`, más una nota en el `detail`. El número queda
+visible en `/admin/cost/real` sin ensuciar la reconciliación.
+
+El techo está acotado y lo confirma la propia API: `hardLimitCents = 2000`,
+o sea el límite de **US$20/mes** configurado en la cuenta. Medido el
+1-sep-2026, el ciclo abierto (cierra el 20-sep) iba en **US$0,00**. Si esta
+línea deja de ser marginal, se ve primero acá.
+
 > **La trampa de las unidades:** los recursos vuelven en *unidad-minutos*
 > acumulados sobre la ventana, pero `NETWORK_TX_GB` es un flujo ya
 > expresado en GB. Confundirlos es un error de ~700x. Hay un test que lo

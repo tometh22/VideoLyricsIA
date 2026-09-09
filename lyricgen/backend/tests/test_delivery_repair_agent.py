@@ -36,7 +36,8 @@ def test_repair_agent_fixes_umg_example_and_keeps_audit():
     assert original == frozen
     assert result["status"] == "REPAIRED"
     assert result["summary"]["applied_count"] == 5  # title + four occurrences
-    assert result["summary"]["risk_before"] == (0, 4, 5)
+    # A visible title/metadata mismatch is delivery-blocking, not advisory.
+    assert result["summary"]["risk_before"] == (1, 3, 5)
     assert result["summary"]["risk_after"] == (0, 0, 0)
     assert result["manifest"]["asset"]["rendered_title"] == "Tu Cárcel"
     assert [row["text"] for row in result["manifest"]["segments"]] == [

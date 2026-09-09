@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { reseedPreservingIds } from "./segmentIds";
+import { reseedPreservingIds, mintSegmentId } from "./segmentIds";
 
 const seg = (id, start, end, text) => ({ _id: id, start, end, text });
 
@@ -64,5 +64,24 @@ describe("reseedPreservingIds", () => {
   it("empty current seeds everything fresh from 0", () => {
     const out = reseedPreservingIds([], [{ start: 0, end: 1, text: "x" }]);
     expect(out[0]._id).toBe(0);
+  });
+});
+
+// `segment_id` es la clave del merge a tres puntas: dos filas que la comparten
+// hacían que el merge devolviera N veces la misma línea y que el deduplicador
+// de colisiones borrara el resto (job f866cbcf0e49, 1-sep-2026 — 44 líneas
+// → 38). Una fila nueva NUNCA puede heredar la identidad de la que la originó.
+describe("mintSegmentId", () => {
+  it("nunca repite un id", () => {
+    const ids = Array.from({ length: 500 }, () => mintSegmentId());
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("no puede chocar con los ids derivados de índice/_id del backend", () => {
+    // decorateSegments le pone String(index) o String(_id) a las filas que
+    // llegan sin `segment_id`: todos numéricos. El acuñado nunca lo es.
+    for (let i = 0; i < 50; i += 1) {
+      expect(Number.isNaN(Number(mintSegmentId()))).toBe(true);
+    }
   });
 });

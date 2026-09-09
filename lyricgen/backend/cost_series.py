@@ -114,6 +114,83 @@ def coverage(db: Session, since: date, until: date) -> dict:
     }
 
 
+# Días seguidos en CERO al final del rango que ya no se pueden explicar por
+# un día tranquilo. Tres es deliberadamente bajo: el costo de un falso aviso
+# es que alguien mire un panel que está bien; el de no avisar es cerrar un
+# mes con la mitad del gasto sin enterarse.
+DIAS_EN_CERO_SOSPECHOSOS = 3
+
+
+def stale_sources(db: Session, since: date, until: date) -> list[dict]:
+    """Fuentes que contestaron `ok` pero cuyo valor no es creíble.
+
+    EL AGUJERO QUE ESTO TAPA
+    ------------------------
+    `coverage()` responde "¿el proveedor contestó?". No responde "¿lo que
+    contestó tiene sentido?". Son preguntas distintas y la segunda es la que
+    duele: un `status='ok'` con importe $0,00 se dibuja **idéntico** a un día
+    genuinamente gratis, y el banner de cobertura se queda en verde.
+
+    Medido en staging el 1-sep-2026: agosto tenía las 31 celdas de GCP en
+    `ok` y `complete: true`, con 30 de esos 31 días en $0,00 exacto — el
+    export de facturación a BigQuery cortaba el 1-ago. El panel mostraba
+    GCP en $3,97 contra los $138,90 de julio y lo presentaba como un mes
+    completo. Leído como ahorro, es un 97% de gasto desaparecido.
+
+    POR QUÉ "CERO" Y NO "BAJO"
+    Un umbral porcentual exigiría saber cuánto *debería* costar un mes, que
+    es justamente lo que no sabemos. El cero exacto no: ningún proveedor
+    cobra exactamente $0,000000 varios días seguidos si la plataforma estuvo
+    corriendo. Es una señal binaria y no necesita calibración.
+
+    Se ignoran las fuentes de grano mensual (suscripciones fijas): tienen
+    una fila por mes y el resto de los días son cero por diseño.
+    """
+    hoy = datetime.now(timezone.utc).date()
+    last = min(until, hoy - timedelta(days=1))
+    if last < since:
+        return []
+
+    filas = (db.query(CostDaily.source, CostDaily.day, CostDaily.amount_usd)
+             .filter(CostDaily.day >= since, CostDaily.day <= last,
+                     CostDaily.dim_type == "total",
+                     CostDaily.grain == "day")
+             .all())
+    por_fuente: dict[str, dict[date, float]] = {}
+    for f in filas:
+        por_fuente.setdefault(f.source, {})[f.day] = float(f.amount_usd or 0.0)
+
+    avisos = []
+    for source, dias in por_fuente.items():
+        con_gasto = [d for d, v in dias.items() if v > 0]
+        # Sin ningún día con gasto no hay contra qué comparar: puede ser una
+        # fuente que de verdad no se usó. Eso lo cubre `coverage`, no esto.
+        if not con_gasto:
+            continue
+        ultimo_con_gasto = max(con_gasto)
+
+        # Días seguidos en cero desde el final del rango hacia atrás.
+        en_cero, d = 0, last
+        while d > ultimo_con_gasto and d >= since:
+            if dias.get(d, 0.0) > 0:
+                break
+            en_cero += 1
+            d -= timedelta(days=1)
+
+        if en_cero >= DIAS_EN_CERO_SOSPECHOSOS:
+            avisos.append({
+                "source": source,
+                "last_nonzero_day": ultimo_con_gasto.isoformat(),
+                "zero_days": en_cero,
+                "reported_usd": round(sum(dias.values()), 2),
+                "detail": (f"{en_cero} días seguidos en $0,00 después del "
+                           f"{ultimo_con_gasto.isoformat()}. La fuente "
+                           "contestó ok, así que la cobertura no lo marca: "
+                           "el total de esta fuente es un PISO."),
+            })
+    return sorted(avisos, key=lambda a: -a["zero_days"])
+
+
 def monthly_adjustments(db: Session, since: date, until: date) -> dict:
     """Franquicias del MES, aplicadas una sola vez sobre el agregado.
 
@@ -291,6 +368,10 @@ def series(db: Session, since: date, until: date, *,
         "estimated_usd": round(estimado, 4),
         "estimated_share": round(estimado / total, 4) if total else None,
         "coverage": cov,
+        # Distinto de `coverage`: eso dice si el proveedor contestó, esto si
+        # lo que contestó es creíble. Un mes puede estar 100% recolectado y
+        # aun así faltarle el 97% del gasto.
+        "stale_sources": stale_sources(db, since, until),
         "monthly_adjustments": ajustes,
         "openai_line_item_filter": of,
     }

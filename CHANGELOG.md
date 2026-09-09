@@ -3,6 +3,121 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.6] - 2026-09-09
+
+### Fixed
+
+- Preserve forced-alignment provenance through repeated evidence annotation and
+  retain native provider probability with its original meaning, not as CTC score.
+- Diagnose internal word gaps with unusable timing support. Display timing as
+  unvalidated in the editor without replacing text, retiming or changing approval.
+  This release demonstrates preservation and detection, not timing repair.
+- Includes the already-served #1306 language/reference discrepancy warning,
+  persisted review resolution and server approval gates, and Sentry 2.69.1 pin.
+  Version 1.1.5 was reserved for that fix but was not separately released.
+- Isolate Playwright's Ubuntu dependency setup from the unrelated Google Chrome
+  APT feed, whose inconsistent package index blocked CI; retain all browser gates.
+
+## [1.1.7] - 2026-09-09
+
+### Added
+
+- Add parallel Art Track campaigns for up to 500 audio+cover pairs, with resumable uploads, deterministic/manual association, mandatory human review and durable bulk delivery operations.
+- Persist delivery destination with `Delivery.portal_id` and isolate Argentina/Chile portal listings, tokens and publish operations.
+
+## [1.1.4] - 2026-09-09
+
+### Fixed
+
+- Make reviewer cards and pending/approved/all tabs actionable, keep campaign
+  counts stable, and restore filters with browser history and editor return.
+- Prevent late requests and conflicting status filters from hiding approved
+  songs. Show the first queue page promptly and avoid overlapping refreshes.
+- Clarify processing, approval, export and reviewer-lock states. Show actionable
+  durable-editor load errors with readable retry, job ID and HTTP status while
+  keeping editing and approval blocked until the saved revision is loaded.
+
+## [1.1.3] - 2026-09-06
+
+### Fixed
+
+- Approval validates real overlaps without silently imposing a 50 ms gap or
+  modifying saved endpoints, including protected lines. Remove the remaining
+  mount-time text-length trim outside campaign mode; trimming is explicit only.
+- Reconstruct line ownership from contiguous editor history and exact replay
+  of audited hold/punctuation migrations. Unknown provenance, human edits,
+  locks and approved songs remain protected; publication verifies live history.
+- Persist campaign correction-capture intent atomically with approval through
+  the existing outbox and idempotent learning queue. Operational observations
+  retain version/audio/exposure evidence and distinguish structural changes,
+  automatic migrations and endpoint candidates, without training or gold promotion.
+- Ignore only four-decimal persistence-equivalent timing noise. Show auxiliary
+  reference discrepancies in candidate doubts; preflight PASS is not certification.
+
+## [1.1.2] - 2026-09-06
+
+### Fixed
+
+- Classify inline source URLs in lyric spreadsheets as pointers, never lyric
+  text. Preserve raw cells and URLs without fetching linked content.
+- Add cache-only Excel-guided phrase reconciliation with dual blind audio
+  occurrence evidence, explicit abstentions and protected human revisions.
+- Run the existing delivery preflight before and after isolated repair; add
+  its high-confidence spelling suggestions through a distinct deterministic
+  path, without inventing audio witnesses. Exclude valid "aventuras" and verb
+  neighbors from the near-match typo rule.
+- Permit immutable candidate generations for the same source through a
+  source-checked campaign pointer, retaining legacy reads and prior evidence.
+  Publishing a generation never changes an editor document or approval.
+
+## [1.1.1] - 2026-09-06
+
+### Fixed
+
+- Immutable reviewer-candidate R2 writes now sign exactly one create-only
+  header on both old and new SDKs. Duplicate signed values previously caused
+  `SignatureDoesNotMatch` and blocked campaign publication in staging.
+- Preserve conditional creation and source protections; no inference, timing
+  automation, document replacement or approval is enabled by this hotfix.
+
+## [1.1.0] - 2026-09-06
+
+### Added
+
+- Campaign-scoped, supervised full-song reviewer candidates in the existing
+  campaign and editor workflow, with source-bound coverage, highlighted text
+  changes, localized doubts and full audio playback. Publication never approves
+  a song or replaces the current editor document.
+- Resumable two-family acoustic review, conservative in-flight API accounting,
+  bounded recovery and immutable candidate artifacts. Listening and display are
+  independently gated; opening a campaign cannot buy another review.
+- Opt-in capture of ordinary human timing corrections, preserving their source,
+  author and revision. Historical development comparisons are not clean gold.
+
+### Fixed
+
+- Editor autosave now retains local text/timing changes made while an earlier
+  save or conflict reconciliation is in flight.
+- Local-only reconciliation reuses its exclusively owned evidence inventory.
+
+### Release scope
+
+- Staging only, explicitly allowlisted campaign; no production promotion.
+- Automatic timing repair, automatic approval and paid runtime inference remain
+  off. Acoustic coverage is not correctness certification or measured time saved.
+
+## [1.0.1] - 2026-09-05
+
+### Fixed
+
+- Offline endpoint evaluation now derives dependency groups from songs,
+  artists, related recordings, jobs and audio hashes instead of trusting
+  per-line unit IDs. Exploratory confidence uses grouped evidence.
+- Control damage is conditioned on actual changes, with conservative grouped
+  rare-risk bounds. No-op changes and ambiguous applications cannot inflate
+  evidence; different component names do not attest independent model families.
+- No runtime timing mutation, training, or automatic promotion is enabled.
+
 ## [1.0.0] - 2026-05-22
 
 **Public launch.** First customer: Universal Music Argentina (200 videos/month).

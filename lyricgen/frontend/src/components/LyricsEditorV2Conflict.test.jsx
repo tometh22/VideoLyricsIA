@@ -241,6 +241,9 @@ describe("Editor 2.0 stale draft recovery", () => {
       name: "No pudimos abrir la versión editable",
     });
     expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeDisabled();
+    expect(loadError).toHaveTextContent("HTTP 404");
+    expect(loadError).toHaveTextContent(JOB);
+    expect(loadError).toHaveTextContent("Comprobá el enlace y los permisos");
     expect(request.mock.calls.some(([path]) => path.endsWith("/lock/heartbeat"))).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: "Reintentar" }));

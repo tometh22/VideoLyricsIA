@@ -4,6 +4,7 @@ from learning_triggers import (
     TRIGGER_SPECS,
     catalog_training_authorization,
     env_enabled,
+    lora_retraining_eligibility,
     run_realign_selector_trigger,
 )
 
@@ -23,6 +24,21 @@ def test_trigger_thresholds_are_explicit(monkeypatch):
     assert TRIGGER_SPECS["realignment_selector"]["threshold_default"] == 200
     assert TRIGGER_SPECS["realignment_selector"]["companion_triggers"] == ("t4_95",)
     assert env_enabled("LORA_V1_AUTORETRAIN_ENABLED") is False
+
+
+def test_lora_trigger_requires_100_corrected_songs_and_artist_diversity():
+    assert lora_retraining_eligibility(
+        corrected_songs=99, distinct_artists=30,
+    )["reasons"] == ["insufficient_human_corrected_songs"]
+    assert lora_retraining_eligibility(
+        corrected_songs=100, distinct_artists=19,
+    )["reasons"] == ["insufficient_artist_diversity"]
+    eligible = lora_retraining_eligibility(
+        corrected_songs=100, distinct_artists=20,
+    )
+    assert eligible["eligible"] is True
+    assert eligible["due_bucket"] == 1
+    assert eligible["split_policy"] == "song_and_artist_disjoint"
 
 
 def test_t4_uses_the_selector_executor_once(monkeypatch):

@@ -76,9 +76,36 @@ function keyOf(segment, index) {
   return String(segment?.segment_id ?? segment?.id ?? segment?._id ?? `index:${index}`);
 }
 
-function indexed(segments) {
+// Rows sharing one `segment_id` are NOT hypothetical: hasta este fix,
+// duplicar/dividir una línea clonaba el `segment_id` del padre, y los jobs
+// editados antes siguen cargando esos duplicados. Con la clave pelada, cada
+// grupo de duplicados colapsaba en el `Map` (last-write-wins) y el merge
+// devolvía UNA fila por clave distinta: 44 líneas entraban y salían 38, sin
+// conflicto y sin aviso (job f866cbcf0e49, UMG Chile, 1-sep-2026 — el
+// operador había duplicado el estribillo a mano y perdió las 5 repeticiones
+// al reabrir el editor). Calificar la clave con el ordinal de aparición
+// mantiene distintas a las filas duplicadas y aparea la n-ésima copia de un
+// lado con la n-ésima del otro.
+function occurrenceKeys(segments) {
+  const seen = new Map();
+  return segments.map((segment, index) => {
+    const stable = keyOf(segment, index);
+    const occurrence = seen.get(stable) || 0;
+    seen.set(stable, occurrence + 1);
+    return occurrence === 0 ? stable : `${stable}#${occurrence}`;
+  });
+}
+
+// El ordinal es un detalle interno del merge: lo que sale en `conflicts[].key`
+// (contrato con el editor) sigue siendo el id estable pelado.
+function stableIdOf(key) {
+  const hash = key.lastIndexOf("#");
+  return hash === -1 ? key : key.slice(0, hash);
+}
+
+function indexed(segments, keys) {
   const map = new Map();
-  segments.forEach((segment, index) => map.set(keyOf(segment, index), segment));
+  segments.forEach((segment, index) => map.set(keys[index], segment));
   return map;
 }
 
@@ -87,15 +114,24 @@ function indexed(segments) {
  * conflicting when both sides changed the same stable segment differently.
  */
 export function mergeThreeWay(base = [], local = [], remote = []) {
-  const baseMap = indexed(base);
-  const localMap = indexed(local);
-  const remoteMap = indexed(remote);
+  const baseKeys = occurrenceKeys(base);
+  const localKeys = occurrenceKeys(local);
+  const remoteKeys = occurrenceKeys(remote);
+  const baseMap = indexed(base, baseKeys);
+  const localMap = indexed(local, localKeys);
+  const remoteMap = indexed(remote, remoteKeys);
   const order = [];
-  local.forEach((segment, index) => order.push(keyOf(segment, index)));
-  remote.forEach((segment, index) => {
-    const key = keyOf(segment, index);
-    if (!order.includes(key)) order.push(key);
-  });
+  const ordered = new Set();
+  for (const key of localKeys) {
+    if (ordered.has(key)) continue;
+    ordered.add(key);
+    order.push(key);
+  }
+  for (const key of remoteKeys) {
+    if (ordered.has(key)) continue;
+    ordered.add(key);
+    order.push(key);
+  }
 
   const conflicts = [];
   const merged = [];
@@ -115,8 +151,42 @@ export function mergeThreeWay(base = [], local = [], remote = []) {
       if (l != null) merged.push(l);
       continue;
     }
-    conflicts.push({ key, base: b || null, local: l || null, remote: r || null });
+    conflicts.push({
+      key: stableIdOf(key), base: b || null, local: l || null, remote: r || null,
+    });
     if (l != null) merged.push(l);
   }
-  return { merged: decorateSegments(merged), conflicts };
+
+  // Invariante: cada fila de salida tiene que venir de una fila de entrada
+  // DISTINTA. Ese es exactamente el contrato que rompía el bug: con la clave
+  // pelada, `order` visitaba la clave duplicada N veces y `localMap.get(key)`
+  // devolvía siempre la MISMA fila (la última del grupo), así que el merge
+  // salía con 44 filas pero sólo 38 contenidos distintos — y el deduplicador
+  // de colisiones de `canonicalizeEditorSegments` remataba borrando las 6
+  // copias sobrantes. Nada "se perdía" acá adentro: se clonaba, y el borrado
+  // ocurría dos pasos después. Un guardrail de cantidad no lo habría visto;
+  // éste sí. `[merge-dup]` lo reenvía observability.js a Sentry (mismo
+  // mecanismo que `[reseed-storm]`).
+  const seenSources = new Set();
+  const deduped = [];
+  const repeated = [];
+  for (const segment of merged) {
+    if (seenSources.has(segment)) {
+      repeated.push(segment);
+      continue;
+    }
+    seenSources.add(segment);
+    deduped.push(segment);
+  }
+  if (repeated.length > 0) {
+    // eslint-disable-next-line no-console
+    console.warn("[merge-dup] three-way merge emitted the same row more than once", {
+      repeated: repeated.length,
+      texts: repeated.slice(0, 5).map((segment) => String(segment?.text || "")),
+      local: local.length,
+      remote: remote.length,
+      merged: merged.length,
+    });
+  }
+  return { merged: decorateSegments(deduped), conflicts };
 }

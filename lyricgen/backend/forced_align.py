@@ -471,6 +471,17 @@ def wordstamps_to_segments(
                 }
                 if w.get("score") is not None:
                     w_obj["score"] = float(w.get("score"))
+                if "probability" in w:
+                    # Native provider field, NOT a calibrated CTC/ASR score.
+                    w_obj["probability"] = _safe_provider_value(w["probability"])
+                    w_obj["probability_provenance"] = {
+                        "provider": "replicate/cureau/force-align-wordstamps",
+                        "model": _MODEL,
+                        "field": "probability",
+                        "meaning": "provider_native_word_probability",
+                        "calibration": "unspecified_by_adapter",
+                        "score_equivalence": False,
+                    }
                 if w_obj["word"]:
                     words_out.append(w_obj)
             except (TypeError, ValueError):

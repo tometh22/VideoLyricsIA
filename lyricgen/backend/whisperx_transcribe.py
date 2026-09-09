@@ -684,9 +684,25 @@ def _compute_cache_key(audio_path: str, language: str | None, lyrics_hint: str |
     # this env var (e.g. "2") without touching the DB. Default "1" preserves
     # all pre-existing rows so changing it is a deliberate opt-in bust.
     ver = os.environ.get("WHISPERX_CACHE_VERSION", "1").strip() or "1"
+    # El modelo y la identidad del pipeline TIENEN que entrar en la clave. En el
+    # canary del 2026-09-02, 15 de 30 canciones sirvieron resultados de agosto
+    # porque la clave sólo miraba el audio: el lote "probó" un pipeline que
+    # nunca corrió. Cambiar el modelo, el release o cualquiera de las 72 flags
+    # de configuración ahora invalida la entrada sola.
+    try:
+        from transcription_quality import runtime_identity
+        identity = runtime_identity()
+        release = str(identity.get("pipeline_release") or "unknown")[:16]
+        config = str(identity.get("pipeline_config_fingerprint") or "unknown")[:16]
+    except Exception:
+        release, config = "unknown", "unknown"
+    model_id = hashlib.sha1(str(_MODEL).encode("utf-8")).hexdigest()[:12]
     # vad_onset/vad_offset change the output, so they MUST be part of the key —
     # otherwise a VAD tweak silently serves stale pre-tweak cached results.
-    key = f"wx:{audio_hash}:{lang}:{hint_hash}:{ver}:vo{vad_onset}:vf{vad_offset}"
+    key = (
+        f"wx:{audio_hash}:{lang}:{hint_hash}:{ver}:vo{vad_onset}:vf{vad_offset}"
+        f":m{model_id}:r{release}:c{config}"
+    )
     return (key, audio_hash, hint_hash)
 
 

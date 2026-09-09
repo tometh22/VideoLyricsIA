@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
+import { safeReviewReturnPath } from "./lib/reviewerNavigation";
 import {
   Routes, Route, Navigate, Outlet,
   useNavigate, useLocation, useParams,
@@ -43,6 +44,7 @@ const Dashboard = lazy(() => import("./components/Dashboard"));
 const UploadZone = lazy(() => import("./components/UploadZone"));
 const SearchPalette = lazy(() => import("./components/SearchPalette"));
 const CampaignsPage = lazy(() => import("./components/CampaignsPage"));
+const ReviewQueuePage = lazy(() => import("./components/ReviewQueuePage"));
 // Paso final del wizard de variante: la letra en modo LECTURA (el POST
 // /variant no lleva segments y el autosave del editor le escribiría al
 // job padre). Ver components/VariantLyricsSummary.jsx.
@@ -51,10 +53,15 @@ const VariantLyricsSummary = lazy(() => import("./components/VariantLyricsSummar
 // pública standalone, sin relación con LyricsEditor/AppShell — ver
 // components/CorpusAnnotator.jsx y backend/corpus.py.
 const CorpusAnnotator = lazy(() => import("./components/CorpusAnnotator"));
+// Página pública de estado del servicio. Lazy y fuera de AppShell: la abre
+// gente sin login (y sin token válido, si el outage es de auth) y no tiene
+// que arrastrar el bundle del workspace. Ver components/StatusPage.jsx.
+const StatusPage = lazy(() => import("./components/StatusPage"));
 import BatchProgress from "./components/BatchProgress";
 import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
 import GiftCreditsBanner from "./components/GiftCreditsBanner";
+import ServiceStatusBanner from "./components/ServiceStatusBanner";
 import { useAlert } from "./components/AlertProvider";
 import { ACTIVE_STATUSES, isTerminalStatus } from "./lib/jobStatus";
 import {
@@ -91,7 +98,7 @@ import {
   PROACTIVE_URL_RETRY_MS,
 } from "./lib/editorAudioRecovery";
 import { isReusableEditSnapshot } from "./lib/reviewRecovery";
-import { reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
+import { beginReviewResume, reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
 import { creativeFieldsForReviewResume } from "./lib/reviewResume";
 import { editorSessionHeaders } from "./lib/editorSession";
 
@@ -568,6 +575,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
   const activeView =
     (pathname === "/new" || pathname === "/review" || pathname === "/generating") ? "new" :
     (pathname === "/videos" || pathname.startsWith("/videos/")) ? "history" :
+    pathname === "/admin/cola" ? "review_queue" :
     pathname.startsWith("/campaigns") ? "campaigns" :
     pathname === "/account" ? "settings" :
     pathname === "/admin" ? "admin" :
@@ -627,6 +635,7 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
     else if (id === "new") navigate("/new");
     else if (id === "history") navigate("/videos");
     else if (id === "campaigns") navigate("/campaigns");
+    else if (id === "review_queue") navigate("/admin/cola");
     else if (id === "settings") navigate("/account");
     else if (id === "admin") navigate("/admin");
   };
@@ -662,6 +671,11 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
           navigationOpen={sidebarOpen}
         />
 
+        {/* Incidente de plataforma. Va PRIMERO: si el servicio está caído,
+            eso explica el error que el usuario está viendo mejor que
+            cualquier otro aviso de la pantalla. */}
+        <ServiceStatusBanner />
+
         {/* Dunning banner — sits above content, below the top bar */}
         <PastDueBanner user={user} />
         <UpgradeNudge user={user} />
@@ -689,6 +703,8 @@ function LegacyVideoRedirect() {
 function JobDetailRoute({ fetchHistory }) {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const returnTo = safeReviewReturnPath(new URLSearchParams(location.search).get("return_to"));
   const [job, setJob] = useState(null);
   const [error, setError] = useState(false);
 
@@ -713,7 +729,7 @@ function JobDetailRoute({ fetchHistory }) {
     return (
       <div className="text-center mt-16">
         <p className="text-gray-500 mb-4">No se encontró el video.</p>
-        <button onClick={() => navigate("/dashboard")} className="btn-secondary">Volver</button>
+        <button onClick={() => navigate(returnTo || "/dashboard")} className="btn-secondary">Volver</button>
       </div>
     );
   }
@@ -738,7 +754,31 @@ function JobDetailRoute({ fetchHistory }) {
       >
         <JobDetail
           job={job}
-          onBack={() => navigate("/dashboard")}
+          onBack={async () => {
+            if (returnTo) {
+              navigate(returnTo);
+              return;
+            }
+            if (!job?.campaign_id) {
+              navigate("/dashboard");
+              return;
+            }
+            try {
+              await authFetch(`${API}/editor/${job.job_id}/lock`, {
+                method: "DELETE", headers: editorSessionHeaders(),
+              });
+              const response = await authFetch(
+                `${API}/batch/campaigns/${job.campaign_id}/review-queue/next?stage=final`,
+                { method: "POST", headers: editorSessionHeaders() },
+              );
+              const next = await response.json().catch(() => ({}));
+              navigate(response.ok && next.job_id
+                ? (next.open_path || `/videos/${next.job_id}`)
+                : `/campaigns/${job.campaign_id}`);
+            } catch {
+              navigate(`/campaigns/${job.campaign_id}`);
+            }
+          }}
           onJobUpdate={(updatedJob) => {
             // fetchHistory() is the expensive call (lists every job in the
             // tenant). It only needs to refresh on a status BOUNDARY —
@@ -785,7 +825,7 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
         if (typeof data.current_step === "string") setPolledStep(data.current_step);
         // Transition a un estado editable → recargá la página para que
         // EditLyricsRoute corra su bootstrap de nuevo y monte el editor.
-        const editable = ["done", "pending_review", "rejected"].includes(newStatus);
+        const editable = ["done", "pending_review", "rejected", "lyrics_approved"].includes(newStatus);
         if (editable) {
           // [editor-reload-loop] capture (P0 UMG Chile 2026-06-16). This reload
           // re-runs EditLyricsRoute's bootstrap. If the job keeps flipping back
@@ -979,6 +1019,7 @@ function EditLyricsRoute({
       // bail-out: no tiene sentido abrir el editor sobre un render en curso.
       const editable =
         job.status === "pending_review" ||
+        job.status === "lyrics_approved" ||
         job.status === "done" ||
         job.status === "rejected";
       if (!editable) {
@@ -1735,6 +1776,24 @@ export default function App() {
   // transient API/DB failure never strands the timing editor without audio.
   const reviewAudioRequestSequenceRef = useRef(0);
   const reviewReactiveAudioRequestRef = useRef(false);
+  const campaignReviewSafeExitRef = useRef(null);
+  const registerCampaignReviewSafeExit = useCallback((handler) => {
+    campaignReviewSafeExitRef.current = typeof handler === "function" ? handler : null;
+  }, []);
+  // Campaign review links carry a durable return target so the editor's own
+  // back action and the browser back action land on the exact queue context
+  // (tab, search, filters, order, page and focus), rather than the legacy
+  // admin queue. Only campaign and queue paths are accepted; arbitrary URLs never
+  // become an open redirect.
+  const campaignReturnPath = useMemo(() => {
+    const candidate = new URLSearchParams(location.search).get("return_to");
+    return safeReviewReturnPath(candidate);
+  }, [location.search]);
+  const withCampaignReturn = useCallback((path) => {
+    if (!campaignReturnPath || !String(path || "").startsWith("/review/")) return path;
+    const separator = String(path).includes("?") ? "&" : "?";
+    return `${path}${separator}return_to=${encodeURIComponent(campaignReturnPath)}`;
+  }, [campaignReturnPath]);
   const retryTranscriptionReviewAudio = useCallback(async (jobId, { reason = "initial", preferOriginal = false } = {}) => {
     if (!jobId) return;
     const preventive = reason === "signed_url_expiring";
@@ -1945,9 +2004,10 @@ export default function App() {
     const jobId = currentReview?.transcribeJobId;
     if (!jobId || wizardStage !== "review") return;
     if (location.pathname !== "/new" && !location.pathname.startsWith("/review")) return;
-    const target = reviewJobPath(jobId);
-    if (location.pathname !== target) navigate(target, { replace: true });
-  }, [currentReview?.transcribeJobId, location.pathname, navigate, wizardStage]);
+    const targetPath = reviewJobPath(jobId);
+    const target = `${targetPath}${location.pathname.startsWith("/review") ? location.search : ""}`;
+    if (location.pathname !== targetPath) navigate(target, { replace: true });
+  }, [currentReview?.transcribeJobId, location.pathname, location.search, navigate, wizardStage]);
 
   const [jobs, setJobs] = useState([]);
   // Pre-fetched transcription results for batch review songs 1..N-1.
@@ -2180,16 +2240,14 @@ export default function App() {
   useEffect(() => {
     const resumeJobId = reviewJobIdFromLocation(location.pathname, location.search);
     if (!resumeJobId) return;
-    if (resumeJobAttemptedRef.current === resumeJobId) return;
-    resumeJobAttemptedRef.current = resumeJobId;
-
-    let cancelled = false;
+    const attempt = beginReviewResume(resumeJobAttemptedRef, resumeJobId);
+    if (!attempt) return;
     (async () => {
       try {
         const statusRes = await authFetchCriticalRead(`${API}/status/${resumeJobId}`);
         if (!statusRes.ok) throw new Error(`status ${statusRes.status}`);
         const job = await statusRes.json();
-        if (cancelled) return;
+        if (attempt.cancelled) return;
         const segments = job.segments || job.segments_json || [];
         const resumedCreativeFields = creativeFieldsForReviewResume(job);
         const campaignPreset = {
@@ -2209,7 +2267,21 @@ export default function App() {
           audioUnavailableReason: null,
           artist: job.artist || "",
           songTitle: job.song_title || "",
-          language: job.language || "es",
+          // Do NOT coerce an unknown language to "es" on reload: that silently
+          // relabels a mis-transcribed song as Spanish. Leave it empty (auto)
+          // and let the recomputed flags below drive the warning.
+          language: job.language || "",
+          // Recomputed by the server from persisted segments + reference, so the
+          // language / discrepancy warning and the approval block survive a
+          // reload / deep-link and recalculate after an edit (see /status).
+          languageConflict: !!job.language_conflict,
+          languageUncertain: !!job.language_uncertain,
+          mixedLanguage: !!job.mixed_language,
+          outputReferenceDivergence: !!job.output_reference_divergence,
+          needsLanguageReview: !!job.needs_language_review,
+          languageReviewResolved: !!job.language_review_resolved,
+          outputReferenceUnexplainedIndices:
+            job.output_reference_unexplained_indices || [],
           ...resumedCreativeFields,
           genre: preset("genre", "genre", resumedCreativeFields.genre),
           concept: preset("concept", "concept", resumedCreativeFields.concept),
@@ -2228,6 +2300,11 @@ export default function App() {
           segments,
           segmentsRevision: Number.isInteger(job.segments_revision) ? job.segments_revision : 0,
           referenceLyrics: job.reference_lyrics || "",
+          referenceLinks: job.campaign?.review_reference_links || [],
+          referenceUnavailable: Boolean(
+            job.transcription_quality?.manual_full_review_required
+            || job.transcription_quality?.reference_hypothesis?.availability === "unavailable"
+          ),
           coverageWarning: !!job.coverage_warning,
           transcriptionQuality: job.transcription_quality || null,
           recoverySource: job.recovery_source || "",
@@ -2273,15 +2350,16 @@ export default function App() {
         // entry. Direct /review/:jobId links already point at this target.
         navigate(reviewJobPath(resumeJobId), { replace: true });
       } catch (err) {
+        if (attempt.cancelled) return;
         console.warn("[RESUME] no pude cargar el job:", err);
-        resumeJobAttemptedRef.current = null;   // permitir reintento si el operador cambia URL
+        attempt.cancel(); // liberar sólo este intento, nunca el de otra canción
         // Fallback honesto: si el resume falla (auth no lista, red, 4xx),
         // mandar al JobDetail en vez de dejar al usuario varado en /new
         // con el wizard vacío — que parece "crear video nuevo".
         navigate(`/videos/${resumeJobId}`, { replace: true });
       }
     })();
-    return () => { cancelled = true; };
+    return () => attempt.cancel();
   }, [location.pathname, location.search, navigate, retryTranscriptionReviewAudio]);
 
   // Imperative resume — called by the banner's "Continuar" button.
@@ -3542,6 +3620,44 @@ export default function App() {
     }
   }, []);
 
+  // Explicit, persisted human resolution of a language/reference discrepancy.
+  // Reads the CURRENT server revision first (so an unsaved edit can't resolve a
+  // stale snapshot), then binds the resolution to it. On success it clears the
+  // block locally; the server gate remains the source of truth on approval.
+  const handleResolveLanguageReview = async () => {
+    const r = currentReview;
+    const jobId = r?.transcribeJobId || r?.editingJobId;
+    if (!jobId) return;
+    try {
+      const statusRes = await authFetch(`${API}/status/${jobId}`);
+      const job = await statusRes.json().catch(() => ({}));
+      const baseRevision = Number.isFinite(job.segments_revision)
+        ? job.segments_revision : 0;
+      const res = await authFetch(`${API}/jobs/${jobId}/language-resolution`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ base_revision: baseRevision }),
+      });
+      if (res.ok) {
+        setCurrentReview((cur) => (cur ? {
+          ...cur,
+          languageReviewResolved: true,
+          languageUncertain: false,
+          needsLanguageReview: false,
+        } : cur));
+        return;
+      }
+      const body = await res.json().catch(() => ({}));
+      if (res.status === 409 && body?.code === "stale_revision") {
+        // A pending edit bumped the revision; the editor autosaves, so ask the
+        // operator to retry once it settles rather than resolving a stale snapshot.
+        console.warn("[language-review] stale revision; save then retry", body);
+      }
+    } catch (err) {
+      console.warn("[language-review] resolution failed", err);
+    }
+  };
+
   const handleApproveLyrics = async (editedSegments, saveMeta = {}) => {
     const r = currentReview;
     if (!r) return;
@@ -3904,6 +4020,61 @@ export default function App() {
       }
     }
 
+    // Campaign stage 1 ends at durable human approval. It must never share
+    // the generic wizard's approve→generate transition: backgrounds and
+    // renders are a separate, later stage triggered outside this screen.
+    if (r.campaignId && r.transcribeJobId) {
+      // Never infer review from mere presence in the submitted document.
+      // LyricsEditor supplies only the identities explicitly confirmed (or
+      // deliberately edited) by the operator; the backend then compares this
+      // ordered set with the exact durable editor revision and fails closed.
+      const confirmedLineIds = Array.isArray(saveMeta.confirmedLineIds)
+        ? saveMeta.confirmedLineIds
+        : [];
+      try {
+        const response = await authFetch(
+          `${API}/batch/campaigns/${r.campaignId}/jobs/${r.transcribeJobId}/approve-lyrics`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              editor_revision: Number.isInteger(saveMeta.editorRevision)
+                ? saveMeta.editorRevision
+                : (Number.isInteger(saveMeta.baseRevision) ? saveMeta.baseRevision : 0),
+              editor_version_id: saveMeta.editorVersionId || null,
+              confirmed_line_ids: confirmedLineIds,
+              review_scope: "song",
+              lyrics_confirmed: true,
+              timings_confirmed: true,
+              heard_against_audio: true,
+            }),
+          },
+        );
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          return {
+            ok: false,
+            reason: response.status === 409 ? "conflict" : `http-${response.status}`,
+            conflict: body?.detail || null,
+          };
+        }
+        wizardPersistence.clear();
+        segmentsStore.evict(reviewStoreKey(r));
+        localStorage.removeItem(`genly:line-review:${r.transcribeJobId}`);
+        localStorage.removeItem(`genly:quality-window-review:${r.transcribeJobId}`);
+        setCurrentReview(null);
+        const returnUrl = new URL(campaignReturnPath || "/admin/cola", window.location.origin);
+        returnUrl.searchParams.set("approved", r.transcribeJobId);
+        navigate(`${returnUrl.pathname}${returnUrl.search}`, {
+          replace: true,
+        });
+        return { ok: true, approvedEditorVersionId: body?.approved_version_id || null };
+      } catch (error) {
+        console.warn("[campaign-review] approval failed", error);
+        return { ok: false, reason: "network" };
+      }
+    }
+
     // 2026-06-04 — settings-loss fix: currentReview puede no tener los picks
     // del operador (movement/effect/bg/typo) si el sync file→review no corrió
     // para esta canción (p.ej. los eligió después del transcribe, o subió la
@@ -4098,6 +4269,13 @@ export default function App() {
       navigate(reviewJobPath(job.transcribeJobId), { replace: true });
     };
 
+    if (campaignId && !window.confirm(
+      "Confirmo que escuché el audio completo y verifiqué, línea por línea, la letra y cada timing. La referencia fue tratada como hipótesis y no agregué texto que el audio no confirme."
+    )) {
+      restoreCampaignReview(jobList[0], jobList[0].segments);
+      return;
+    }
+
     let nextIdx = 0;
     const worker = async () => {
       while (nextIdx < jobList.length) {
@@ -4181,6 +4359,41 @@ export default function App() {
 
         let res = null;
         try {
+          if (campaignId) {
+            const confirmedLineIds = generationSegments.map((segment) =>
+              String(segment?.segment_id || segment?.id || "")
+            );
+            const approvalResponse = await authFetch(
+              `${API}/batch/campaigns/${campaignId}/jobs/${jobList[i].transcribeJobId}/approve-lyrics`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  editor_revision: generationBaseRevision,
+                  editor_version_id: generationVersionId,
+                  confirmed_line_ids: confirmedLineIds,
+                  lyrics_confirmed: true,
+                  timings_confirmed: true,
+                  heard_against_audio: true,
+                }),
+              },
+            );
+            const approvalData = await approvalResponse.json().catch(() => ({}));
+            if (!approvalResponse.ok || approvalData.status !== "lyrics_approved") {
+              const reason = translateBackendError(approvalData.detail, t)
+                || "No se pudo registrar la aprobación completa de letra y timing.";
+              setJobs((prev) => prev.map((j, idx) =>
+                idx === i ? { ...j, status: "error", error: reason } : j
+              ));
+              alert({
+                title: "La canción no quedó aprobada",
+                description: reason,
+                tone: "error",
+              });
+              restoreCampaignReview(jobList[i], generationSegments);
+              continue;
+            }
+          }
           res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
           let data;
           try {
@@ -5434,6 +5647,60 @@ export default function App() {
     }
   }, [alert, currentReview?.transcribeJobId]);
 
+  const handleCampaignReviewExit = useCallback(async () => {
+    const review = currentReview;
+    if (review?.transcribeJobId) {
+      try {
+        await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
+          method: "DELETE",
+          headers: editorSessionHeaders(),
+        });
+      } catch { /* the lock expires safely even if release is unavailable */ }
+    }
+    setCurrentReview(null);
+    wizardPersistence.clear();
+    if (review) segmentsStore.evict(reviewStoreKey(review));
+    navigate(campaignReturnPath || "/admin/cola");
+  }, [campaignReturnPath, currentReview, navigate]);
+
+  const handleCampaignReviewNext = useCallback(async () => {
+    const review = currentReview;
+    if (!review?.campaignId || !review?.transcribeJobId) {
+      await handleCampaignReviewExit();
+      return;
+    }
+    let nextPath = campaignReturnPath || "/admin/cola";
+    const returnParams = campaignReturnPath
+      ? new URL(campaignReturnPath, window.location.origin).searchParams
+      : null;
+    try {
+      const nextQuery = new URLSearchParams({ stage: "lyrics" });
+      if (review.transcribeJobId) nextQuery.set("skip_job_id", review.transcribeJobId);
+      if (returnParams?.get("q")) nextQuery.set("search", returnParams.get("q"));
+      if (returnParams?.get("version")) nextQuery.set("version", returnParams.get("version"));
+      if (returnParams?.get("artist")) nextQuery.set("artist", returnParams.get("artist"));
+      if (returnParams?.get("mine") === "1") nextQuery.set("reviewed_by", "me");
+      const response = await authFetch(
+        `${API}/batch/campaigns/${review.campaignId}/review-queue/next?${nextQuery.toString()}`,
+        { method: "POST", headers: editorSessionHeaders() },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok && payload.job_id) {
+        nextPath = withCampaignReturn(payload.open_path || reviewJobPath(payload.job_id));
+      }
+    } catch { /* leave through the queue; the current draft is already saved */ }
+    try {
+      await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
+        method: "DELETE",
+        headers: editorSessionHeaders(),
+      });
+    } catch { /* the lock expires safely even if release is unavailable */ }
+    setCurrentReview(null);
+    wizardPersistence.clear();
+    segmentsStore.evict(reviewStoreKey(review));
+    navigate(nextPath);
+  }, [campaignReturnPath, currentReview, handleCampaignReviewExit, navigate, withCampaignReturn]);
+
   // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
   // before launching generation. Empty state → redirect home.
@@ -5553,13 +5820,41 @@ export default function App() {
                   {reviewJobPath(currentReview.transcribeJobId)}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={handleCopyReviewLink}
-                className="btn-secondary shrink-0 px-3 py-2 text-xs"
-              >
-                Copiar enlace
-              </button>
+              <div className="flex gap-2">
+                {currentReview.campaignId && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const safeExit = campaignReviewSafeExitRef.current;
+                        if (safeExit) void safeExit();
+                        else void handleCampaignReviewExit();
+                      }}
+                      className="btn-secondary shrink-0 px-4 py-2 text-xs"
+                    >
+                      Guardar borrador y salir
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const safeExit = campaignReviewSafeExitRef.current;
+                        if (safeExit) void safeExit(handleCampaignReviewNext);
+                        else void handleCampaignReviewNext();
+                      }}
+                      className="btn-primary shrink-0 px-4 py-2 text-xs"
+                    >
+                      Siguiente
+                    </button>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={handleCopyReviewLink}
+                  className="btn-secondary shrink-0 px-3 py-2 text-xs"
+                >
+                  Copiar enlace
+                </button>
+              </div>
             </div>
           )}
           <Suspense fallback={<EditorSuspenseFallback />}>
@@ -5624,15 +5919,28 @@ export default function App() {
             waveform={currentReview.waveform || null}
             waveformLoading={currentReview.waveformLoading ?? (!!currentReview.transcribeJobId && !currentReview.waveform)}
             referenceLyrics={currentReview.referenceLyrics || ""}
+            referenceLinks={currentReview.referenceLinks || []}
+            referenceUnavailable={!!currentReview.referenceUnavailable}
+            requireLineReview={!!currentReview.campaignId}
             coverageWarning={currentReview.coverageWarning}
             transcriptionQuality={currentReview.transcriptionQuality}
             recoverySource={currentReview.recoverySource}
             languageConflict={!!currentReview.languageConflict}
             languageUncertain={!!currentReview.languageUncertain}
             mixedLanguage={!!currentReview.mixedLanguage}
+            outputReferenceDivergence={!!currentReview.outputReferenceDivergence}
+            outputReferenceUnexplainedIndices={currentReview.outputReferenceUnexplainedIndices || []}
+            needsLanguageReview={!!currentReview.needsLanguageReview}
+            languageReviewResolved={!!currentReview.languageReviewResolved}
+            onResolveLanguageReview={handleResolveLanguageReview}
             onApprove={handleApproveLyrics}
-            submitLabel={currentReview.campaignId ? "Generar y seguir" : null}
-            onBack={handleBackInReview}
+            submitLabel={currentReview.campaignId ? "Aprobar letra y timing" : null}
+            onRegisterSafeExit={currentReview.campaignId
+              ? registerCampaignReviewSafeExit
+              : null}
+            onBack={currentReview.campaignId
+              ? handleCampaignReviewExit
+              : handleBackInReview}
             // Post-render edit: cuando editingJobId está set, el autosave
             // de /save-segments va al job real (no al transcribeJob, que
             // en este flow es null). Orden importante: editingJobId gana.
@@ -5842,6 +6150,18 @@ export default function App() {
             </Suspense>
           }
         />
+        {/* Estado del servicio: público, sin JWT y FUERA de <RequireAuth>
+            a propósito. Si el outage es de login, el cliente igual tiene
+            que poder abrir esta página — es el único momento en que de
+            verdad la necesita. */}
+        <Route
+          path="/status"
+          element={
+            <Suspense fallback={<RouteSuspenseFallback />}>
+              <StatusPage />
+            </Suspense>
+          }
+        />
         <Route
           element={
             <RequireAuth token={token}>
@@ -5880,6 +6200,11 @@ export default function App() {
           <Route path="/review/:jobId" element={wizardScreen} />
           <Route path="/campaigns" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
           <Route path="/campaigns/:campaignId" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
+          <Route path="/admin/cola" element={
+            user?.role === "admin"
+              ? <Suspense fallback={<RouteSuspenseFallback />}><ReviewQueuePage /></Suspense>
+              : <Navigate to="/dashboard" replace />
+          } />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
             <Suspense fallback={<RouteSuspenseFallback />}>

@@ -54,10 +54,17 @@ antes de 200 canciones capturadas.
 ## Triggers sin duplicados
 
 Después de cada captura de corrección y en un reconciliador periódico, el
-worker cuenta jobs distintos con snapshot pre-humano y aprobación. Con:
+worker cuenta jobs distintos con snapshot pre-humano y aprobación. Para LoRA,
+además exige al menos un delta humano real de texto, timing o reordenamiento;
+aprobar sin corregir no infla la población supervisada. Con:
 
 * `LORA_V1_AUTORETRAIN_ENABLED=1` y `CORPUS_RETRAIN_EVERY_SONGS=100` solicita
-  un run en cada bucket de 100.
+  un run en cada bucket de **100 canciones corregidas y aprobadas**, siempre que
+  haya al menos 20 artistas distintos (`LORA_RETRAIN_MIN_DISTINCT_ARTISTS=20`).
+  El executor recibe obligatoriamente `song_and_artist_disjoint`, reserva como
+  mínimo 20 canciones de evaluación de 5 artistas completamente ausentes de
+  train/validation, y conserva además separación por canción. Si cualquiera de
+  esos mínimos falta, el trigger queda bloqueado y no entrena.
 * `REALIGN_SELECTOR_AUTORUN_ENABLED=1` y
   `REALIGN_SELECTOR_TRIGGER_SONGS=200` solicita un único job que incluye el
   selector y el companion `t4_95`; T4 no tiene un trigger independiente.
@@ -119,7 +126,7 @@ completo de evaluación y verifica el SHA-256 del adaptador; nunca permite
 reemplazar Whisper base. El reemplazo requeriría dos evaluaciones consecutivas
 con CI por canción.
 
-## V2: política fijada para el trigger de 100 canciones
+## V2: política fijada para el trigger de 100 canciones corregidas
 
 El diagnóstico direccional sobre las 18 canciones `reconstructed` (WER
 31,10% → 10,68%, −65,67% relativo; 15 mejoran, una igual y dos empeoran;

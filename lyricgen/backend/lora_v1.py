@@ -167,6 +167,31 @@ def prepare_manifest(
                 "song_split": "validation" if song["song_id"] in validation_ids else "train",
                 "artist_split": "leave_artist_out" if song["artist"] in held_artists else "train",
             })
+    # Registro de roles: ninguna canción marcada como holdout de evaluación
+    # puede entrar al dataset. Antes esto dependía sólo de ``eval_only``, que
+    # se calcula acá mismo; el registro es externo y audita el caso en que la
+    # cohorte canónica cambie o una canción se reserve por otro motivo.
+    try:
+        from song_roles import SongRoleViolation, assert_trainable, role_split
+    except ImportError:  # pragma: no cover - el registro es parte del backend
+        assert_trainable = None  # type: ignore[assignment]
+        role_split = None  # type: ignore[assignment]
+        SongRoleViolation = RuntimeError  # type: ignore[misc,assignment]
+    role_summary: dict[str, int] = {}
+    if assert_trainable is not None:
+        offenders: list[str] = []
+        for row in rows:
+            try:
+                assert_trainable(str(row["song_id"]))
+            except SongRoleViolation:
+                offenders.append(str(row["song_id"]))
+        if offenders:
+            raise ValueError(
+                "el dataset incluye canciones de holdout de evaluación: "
+                + ", ".join(sorted(set(offenders)))
+            )
+        role_summary = role_split({str(row["song_id"]) for row in rows})
+
     historical: list[dict[str, Any]] = []
     historical_rejected = 0
     for path in historical_paths:
@@ -198,6 +223,7 @@ def prepare_manifest(
         "base_model": BASE_MODEL,
         "samples": len(rows), "historical_pairs": len(historical),
         "historical_pairs_rejected": historical_rejected, "songs": len(songs),
+        "role_split": role_summary,
         "canonical_eval_cohort": {
             "size": len(canonical_ids), "song_ids": sorted(canonical_ids),
             "raw_quality": "exact", "training_excluded": True,

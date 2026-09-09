@@ -33,6 +33,7 @@ elige entre este path async y el legacy sync. Default a env de staging primero.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 import os
 import re
@@ -163,6 +164,34 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                     logger.info(
                         "[COVERAGE] sin stem para voiced_gaps error_type=%s",
                         _safe_exception_code(exc),
+                    )
+            # CTC/Whisper word clocks end at the last phoneme and omit a held
+            # vowel. Reuse the already-cached vocal stem to extend a line only
+            # through an attached, energy-backed pitch run (±2 semitones).
+            # This happens after word consistency, never trims, and skips
+            # operator-locked boundaries.
+            from timing_review_suggestions import automatic_tail_enabled
+            if _stem and automatic_tail_enabled():
+                try:
+                    from pathlib import Path
+                    from timing_review_suggestions import (
+                        extend_line_ends_to_stable_pitch,
+                        load_acoustic_track,
+                    )
+
+                    _track = load_acoustic_track(Path(_stem))
+                    _extended, _tail_report = extend_line_ends_to_stable_pitch(
+                        r.get("segments") or [], _track,
+                    )
+                    if _tail_report["extended_count"]:
+                        r["segments"] = _extended
+                    r.setdefault("postpass_stats", {})[
+                        "stable_pitch_tail"
+                    ] = _tail_report
+                except Exception as exc:
+                    logger.info(
+                        "[TIMING-TAIL] abstained error_type=%s job=%s",
+                        _safe_exception_code(exc), job_id,
                     )
             # Veredictos del sondeo con ASR: gap_rescue mide PALABRAS, la
             # única evidencia real de letra faltante. El breaker no puede
@@ -335,7 +364,9 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     from line_evidence import annotate_provider_evidence
 
     r = dict(r)
-    r["segments"] = annotate_provider_evidence(r.get("segments") or [])
+    r["segments"] = annotate_provider_evidence(
+        r.get("segments") or [], timing_source=r.get("timing_source"),
+    )
 
     calibrated = calibration_identity()["calibrated"]
     require_independent = bool(
@@ -427,11 +458,45 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     if live_hint:
         from lyric_content_policy import EDITORIAL_POLICY_ID
         final_metrics["editorial_policy_id"] = EDITORIAL_POLICY_ID
-    final_metrics["language"] = str(language or "unknown")[:16]
+    # Preserve why auto-LID abstained.  The old single ``unknown`` value
+    # collapsed valid bilingual/low-evidence abstentions together with a
+    # persistence failure, making the 10/30 campaign result impossible to
+    # autopsy.  A final-row singleton is safe to persist as the detected
+    # language; mixed and insufficient evidence remain explicit abstentions.
+    from transcription_language import diagnose_language_state
+    lid_diagnostic = diagnose_language_state(r, language)
+    detected_languages = list(lid_diagnostic["detected_languages"])
+    resolved_language = str(language or "").strip().lower()
+    if not resolved_language and len(detected_languages) == 1:
+        resolved_language = detected_languages[0]
+    final_metrics["language"] = str(resolved_language or "unknown")[:16]
+    final_metrics["detected_languages"] = detected_languages
+    final_metrics["mixed_language"] = bool(lid_diagnostic["mixed_language"])
+    final_metrics["lid_status"] = (
+        "known" if resolved_language else lid_diagnostic["classification"]
+    )
     # Persist the paired LoRA↔base disagreement as a song-level routing
     # feature. It is computed before internal witness streams are stripped,
     # uses no reference lyrics, and remains advisory until calibration signs
     # the router gate.
+    # Contador de llamadas reales al ASR vs cache hits. La procedencia ya
+    # distingue "replicate_raw" de "cache_hit_raw"; acá se agrega para que
+    # cualquier reporte pueda declarar si el ASR corrió, sin auditar a mano.
+    try:
+        asr_calls = {"whisperx_real_calls": 0, "whisperx_cache_hits": 0}
+        for hypothesis in (r.get("_recognition_hypotheses") or []):
+            if not isinstance(hypothesis, dict):
+                continue
+            transformation = str(hypothesis.get("transformation") or "")
+            if transformation == "cache_hit_raw":
+                asr_calls["whisperx_cache_hits"] += 1
+            elif transformation == "replicate_raw":
+                asr_calls["whisperx_real_calls"] += 1
+        asr_calls["asr_actually_ran"] = asr_calls["whisperx_real_calls"] > 0
+        final_metrics["asr_calls"] = asr_calls
+    except Exception:
+        pass
+
     try:
         from lora_family import song_disagreement_score
         router_signal = song_disagreement_score(
@@ -486,6 +551,10 @@ def run_transcription_job(
     filename: str = "",
     live: bool = False,
     anchor_lyrics: str = "",
+    reference_required: bool = False,
+    workload_class: str = "interactive",
+    pipeline_stage: str = "full",
+    parallel_audio_reference: bool = False,
 ) -> dict:
     """RQ entry point — sync wrapper around `_run_transcription_for_job`.
 
@@ -516,12 +585,19 @@ def run_transcription_job(
     if not filename:
         filename = os.path.basename(audio_path)
 
-    # 1. Status flip a "transcribing" para que el polling lo vea ya en marcha.
+    if pipeline_stage not in {"full", "separation"}:
+        return _fail(job_id, "Etapa de transcripción inválida.")
+
+    # 1. Expose the durable stage before materialising the official audio.
     try:
         update_job(
             job_id,
-            status="transcribing",
-            current_step="transcribe.prepare",
+            status="separating" if pipeline_stage == "separation" else "transcribing",
+            current_step=(
+                "transcribe.isolate_vocals"
+                if pipeline_stage == "separation"
+                else "transcribe.prepare"
+            ),
             progress=2,
         )
     except Exception as exc:
@@ -624,6 +700,47 @@ def run_transcription_job(
     finally:
         _identity_db.close()
 
+    if pipeline_stage == "separation":
+        # Phase A only computes and validates the content-addressed stem.  The
+        # campaign reconciler releases Phase B after every song is either
+        # separation_ready or terminal red.  No ASR/Gemini/background/render
+        # work is reachable from this branch.
+        import vocal_sep
+        if not vocal_sep.is_enabled():
+            return _fail(job_id, "Separación vocal requerida pero deshabilitada.")
+        stem_path = None
+        try:
+            stem_path = vocal_sep.separate_vocals(audio_path)
+            if not stem_path:
+                return _fail(job_id, "No se pudo preparar la separación vocal.")
+            update_job(
+                job_id,
+                status="separation_ready",
+                current_step="transcribe.separation_ready",
+                progress=20,
+            )
+            try:
+                from batch_campaigns import ensure_campaign_reconciler_scheduled
+                ensure_campaign_reconciler_scheduled()
+            except Exception as exc:
+                logger.warning(
+                    "[TRANSCRIBE-WORKER] separation ready but campaign wake-up "
+                    "failed job=%s error_type=%s",
+                    job_id, _safe_exception_code(exc),
+                )
+            return {
+                "job_id": job_id,
+                "status": "separation_ready",
+                "audio_sha256": source_audio_sha256,
+                "audio_revision": source_audio_revision,
+            }
+        finally:
+            if stem_path:
+                try:
+                    os.unlink(stem_path)
+                except OSError:
+                    pass
+
     # 3. Llamar al pipeline async existente. `request` y `current_user` son
     #    ignorados dentro del cuerpo (verified) — passing None es seguro.
     try:
@@ -631,7 +748,9 @@ def run_transcription_job(
             r = await _run_transcription_for_job(
                 None, None, job_id, audio_path,
                 language=language, artist=artist, title=title, filename=filename,
-                live=live,
+                live=live, reference_required=reference_required,
+                workload_class=workload_class,
+                parallel_audio_reference=parallel_audio_reference,
             )
             from recognition_provenance import resume_from_result
             resume_from_result(r)
@@ -773,7 +892,7 @@ def run_transcription_job(
         # frontend (main.py:2778), so the editor sees `transcribed` and
         # `/generate` sees `transcribed_pending`. Same observable
         # behaviour as the legacy path, no frontend change needed.
-        from database import Job, SessionLocal
+        from database import AuditLog, Job, SessionLocal
         _persist_db = SessionLocal()
         try:
             row = (
@@ -883,6 +1002,19 @@ def run_transcription_job(
                 )
                 quality["machine_evidence_required"] = True
                 quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
+                if reference_required:
+                    candidate = result.get("reference_hypothesis_candidate") or {}
+                    from reference_hypothesis import build_from_candidate
+                    hypothesis, manual_review = build_from_candidate(
+                        candidate,
+                        fallback_text=reference_lyrics,
+                        audio_sha256=source_audio_sha256,
+                        audio_revision=int(row.audio_revision or 0),
+                    )
+                    if manual_review:
+                        quality["reference_hypothesis_unavailable"] = True
+                        quality["manual_full_review_required"] = True
+                    quality["reference_hypothesis"] = hypothesis
                 row.transcription_quality = quality
                 from machine_evidence import finalize_machine_evidence
                 durable_evidence = finalize_machine_evidence(
@@ -898,6 +1030,32 @@ def run_transcription_job(
                 require_machine_snapshot(row, document)
                 row.status = "transcribed_pending"
                 row.current_step = "editing"
+                if str(row.workload_class or workload_class) == "batch":
+                    # The review queue must be ordered before a human opens
+                    # it. Persist the blind v2 verdict atomically with the
+                    # transcription instead of relying on an operator script.
+                    from scripts.emit_song_semaforo import ACTION, song_verdict
+                    existing_verdict = next((
+                        log for log in _persist_db.query(AuditLog).filter(
+                            AuditLog.action == ACTION,
+                        ).order_by(AuditLog.id.desc()).limit(1000).all()
+                        if str((log.detail or {}).get("job_id") or "") == job_id
+                    ), None)
+                    if existing_verdict is None:
+                        verdict = song_verdict(quality, segments=segments)
+                        _persist_db.add(AuditLog(
+                            user_id=None,
+                            action=ACTION,
+                            detail={
+                                "job_id": job_id,
+                                "filename": row.filename,
+                                "tenant_id": row.tenant_id,
+                                "job_status": row.status,
+                                **verdict,
+                                "emitted_at": datetime.now(timezone.utc).isoformat(),
+                                "blind_review": True,
+                            },
+                        ))
             _persist_db.commit()
             persisted_revision = current_revision
             persisted_tenant_id = str(row.tenant_id or "")
@@ -932,9 +1090,9 @@ def run_transcription_job(
                     "[QUALITY-QUEUE] enqueue declined job=%s error_type=%s",
                     job_id, _safe_exception_code(enqueue_exc),
                 )
-        # reference_lyrics no tiene columna en el modelo Job (defer a otro PR
-        # si el editor lo necesita post-transcribe). Lo dejo en el log para
-        # diagnóstico mientras tanto.
+        # The batch reference is persisted inside transcription_quality and
+        # bound to audio SHA/revision above.  The legacy top-level text remains
+        # response-only for backwards compatibility.
         if reference_lyrics:
             logger.info("[TRANSCRIBE-WORKER] job=%s ref_lyrics=%d chars (no persistido aún)",
                         job_id, len(reference_lyrics))

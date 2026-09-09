@@ -52,6 +52,17 @@ def main() -> int:
         raise ValueError(f"canonical cohort must contain exactly {CANONICAL_COHORT_SIZE} songs")
     additional_exact = _canonical_ids(args.additional_exact_cohort) or set()
     evaluation_song_ids = canonical | additional_exact
+    # Nunca puntuar con audio que el adaptador vio entrenando: es la lección del
+    # sprint del 2026-09-03 (13 de las 18 canciones "reconstructed" del piloto
+    # del router eran del train set y nadie lo detectó).
+    from song_roles import filter_evaluable, role_split
+    _evaluable, _train_songs = filter_evaluable(sorted(evaluation_song_ids))
+    if _train_songs:
+        raise SystemExit(
+            "abortado: la cohorte de evaluación incluye canciones de entrenamiento: "
+            + ", ".join(_train_songs)
+        )
+    cohort_role_split = role_split(sorted(evaluation_song_ids))
     baseline = read_jsonl(args.baseline.resolve())
     candidate = read_jsonl(args.candidate.resolve())
     evaluation = evaluate_predictions(
@@ -92,6 +103,7 @@ def main() -> int:
             if training_report.get(key) is not None:
                 evaluation[key] = training_report[key]
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    evaluation["cohort_role_split"] = cohort_role_split
     args.output.write_text(json.dumps(evaluation, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(evaluation, ensure_ascii=False, indent=2))
     return 0

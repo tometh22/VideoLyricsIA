@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -33,19 +34,130 @@ MAX_BYTES = int(os.environ.get("BATCH_UPLOADER_MAX_BYTES", str(500 * 1024 * 1024
 MAX_DURATION = float(os.environ.get("BATCH_UPLOADER_MAX_DURATION", "3600"))
 
 
-def json_request(url: str, *, method="GET", body=None, token=None, attempts=5):
+class CampaignAuth:
+    """Shared, renewable upload credential; secrets remain memory-only."""
+
+    def __init__(
+        self,
+        base: str,
+        campaign_id: str,
+        *,
+        pairing_code: str = "",
+        username: str = "",
+        password: str = "",
+        force_expire_after_requests: int = 0,
+    ):
+        self.base = base.rstrip("/")
+        self.campaign_id = campaign_id
+        self.pairing_code = pairing_code
+        self.username = username
+        self.password = password
+        self.force_after = max(0, int(force_expire_after_requests))
+        self.token = ""
+        self.expires_at = 0.0
+        self.request_count = 0
+        self.forced_once = False
+        self.events: list[str] = []
+        self.lock = threading.RLock()
+
+    def _account_token(self) -> str:
+        if not self.username or not self.password:
+            raise RuntimeError(
+                "upload token recovery requires STAGING_BATCH_USER and "
+                "STAGING_BATCH_PASSWORD"
+            )
+        result = json_request(
+            f"{self.base}/auth/login", method="POST",
+            body={"username": self.username, "password": self.password},
+        )
+        token = str(result.get("token") or "")
+        if not token:
+            raise RuntimeError("campaign login returned no token")
+        return token
+
+    def _exchange_locked(self, *, renewal: bool) -> None:
+        code = self.pairing_code if not renewal else ""
+        if not code:
+            account_token = self._account_token()
+            created = json_request(
+                f"{self.base}/batch/campaigns/{self.campaign_id}/upload-session",
+                method="POST",
+                headers={"Authorization": f"Bearer {account_token}"},
+            )
+            code = str(created.get("pairing_code") or "")
+        result = json_request(
+            f"{self.base}/batch/upload-sessions/exchange", method="POST",
+            body={"campaign_id": self.campaign_id, "code": code},
+        )
+        token = str(result.get("upload_token") or "")
+        if not token:
+            raise RuntimeError("campaign token exchange returned no token")
+        self.token = token
+        self.expires_at = time.time() + int(result.get("expires_in") or 0)
+        self.pairing_code = ""
+        self.events.append("renewal" if renewal else "exchange")
+
+    def authorization(self) -> tuple[str, bool]:
+        with self.lock:
+            if not self.token:
+                self._exchange_locked(renewal=False)
+            elif self.expires_at and self.expires_at - time.time() <= 900:
+                self._exchange_locked(renewal=True)
+                self.events.append("proactive_refresh")
+            self.request_count += 1
+            if (
+                self.force_after
+                and not self.forced_once
+                and self.request_count >= self.force_after
+            ):
+                self.forced_once = True
+                self.events.append("forced_expiry")
+                self.token = "forced-expired-canary-token"
+                return self.token, True
+            return self.token, False
+
+    def recover_401(self, failed_token: str) -> None:
+        with self.lock:
+            if failed_token != self.token:
+                # Forced-expiry injection or another thread already renewed.
+                self.events.append("recovered_401")
+                return
+            self._exchange_locked(renewal=True)
+            self.events.append("recovered_401")
+
+
+def json_request(
+    url: str,
+    *,
+    method="GET",
+    body=None,
+    token=None,
+    auth: CampaignAuth | None = None,
+    headers=None,
+    attempts=5,
+):
     payload = json.dumps(body).encode() if body is not None else None
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["X-Batch-Upload-Token"] = token
+    request_headers = {"Content-Type": "application/json", **(headers or {})}
     last = None
     for attempt in range(attempts):
+        active_token = token
+        if auth is not None:
+            active_token, _forced = auth.authorization()
+        call_headers = dict(request_headers)
+        if active_token:
+            call_headers["X-Batch-Upload-Token"] = active_token
         try:
-            request = urllib.request.Request(url, data=payload, method=method, headers=headers)
+            request = urllib.request.Request(
+                url, data=payload, method=method, headers=call_headers,
+            )
             with urllib.request.urlopen(request, timeout=60) as response:
                 return json.loads(response.read() or b"{}")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
+            if exc.code == 401 and auth is not None and attempt + 1 < attempts:
+                auth.recover_401(active_token or "")
+                last = exc
+                continue
             if exc.code < 500 and exc.code != 429:
                 raise RuntimeError(f"{method} {url}: HTTP {exc.code} {detail}") from exc
             last = exc
@@ -124,9 +236,14 @@ def put(url: str, data: bytes, content_type: str, attempts=6) -> str | None:
     raise RuntimeError(f"R2 PUT failed: {last}")
 
 
-def upload_one(base: str, token: str, entry: dict, item_id: str) -> tuple[str, str]:
+def upload_one(
+    base: str,
+    auth: CampaignAuth,
+    entry: dict,
+    item_id: str,
+) -> tuple[str, str]:
     ticket = json_request(
-        f"{base}/batch/uploads/{item_id}/ticket", method="POST", body={}, token=token,
+        f"{base}/batch/uploads/{item_id}/ticket", method="POST", body={}, auth=auth,
     )
     if ticket.get("complete"):
         return entry["filename"], "already uploaded"
@@ -160,15 +277,21 @@ def upload_one(base: str, token: str, entry: dict, item_id: str) -> tuple[str, s
         put(ticket["upload_url"], path.read_bytes(), content_type)
     json_request(
         f"{base}/batch/uploads/{item_id}/complete",
-        method="POST", body={"parts": parts}, token=token,
+        method="POST", body={"parts": parts}, auth=auth,
     )
     return entry["filename"], "uploaded"
 
 
-def upload_art_asset(base: str, token: str, entry: dict, asset_id: str) -> tuple[str, str]:
-    """Upload one audio/cover asset through the art-track token contract."""
+def upload_art_asset(
+    base: str,
+    auth: CampaignAuth,
+    entry: dict,
+    asset_id: str,
+) -> tuple[str, str]:
+    """Upload one Art Track audio/cover asset with resumable multipart support."""
     ticket = json_request(
-        f"{base}/batch/art-track-assets/{asset_id}/ticket", method="POST", body={}, token=token,
+        f"{base}/batch/art-track-assets/{asset_id}/ticket",
+        method="POST", body={}, auth=auth,
     )
     if ticket.get("complete"):
         return entry["filename"], "already uploaded"
@@ -191,16 +314,15 @@ def upload_art_asset(base: str, token: str, entry: dict, asset_id: str) -> tuple
                     continue
                 size = min(part_size, entry["size_bytes"] - (number - 1) * part_size)
                 stream.seek((number - 1) * part_size)
-                data = stream.read(size)
-                etag = put(part["url"], data, content_type)
+                etag = put(part["url"], stream.read(size), content_type)
                 if not etag:
                     raise RuntimeError(f"Part {number} did not expose ETag")
                 parts.append({"part_number": number, "etag": etag})
     else:
         put(ticket["upload_url"], path.read_bytes(), content_type)
     json_request(
-        f"{base}/batch/art-track-assets/{asset_id}/complete", method="POST",
-        body={"parts": parts}, token=token,
+        f"{base}/batch/art-track-assets/{asset_id}/complete",
+        method="POST", body={"parts": parts}, auth=auth,
     )
     return entry["filename"], "uploaded"
 
@@ -209,12 +331,38 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Upload a WAV/MP3 folder to a Genly campaign")
     parser.add_argument("--api", required=True, help="API base URL")
     parser.add_argument("--campaign", required=True, help="Campaign id")
-    parser.add_argument("--code", required=True, help="Temporary pairing code from the panel")
+    parser.add_argument("--code", default="", help="Temporary pairing code from the panel")
     parser.add_argument("--folder", required=True, type=Path)
-    parser.add_argument("--covers", type=Path, help="Folder containing JPG/PNG covers for an art-track campaign")
+    parser.add_argument("--covers", type=Path, help="Folder containing JPG/PNG covers for an Art Track campaign")
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument(
+        "--username", default=(
+            os.environ.get("STAGING_BATCH_USERNAME", "")
+            or os.environ.get("STAGING_BATCH_USER", "")
+        ), help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--password", default=os.environ.get("STAGING_BATCH_PASSWORD", ""),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--force-token-expiry-after-requests", type=int, default=0,
+        help="canary auth-resilience proof; requires campaign credentials",
+    )
     args = parser.parse_args()
     base = args.api.rstrip("/")
+    if not args.code and not (args.username and args.password):
+        parser.error("--code or campaign credentials in the environment are required")
+    if args.force_token_expiry_after_requests and not (args.username and args.password):
+        parser.error("forced expiry proof requires campaign credentials")
+    auth = CampaignAuth(
+        base, args.campaign, pairing_code=args.code,
+        username=args.username, password=args.password,
+        force_expire_after_requests=args.force_token_expiry_after_requests,
+    )
+    auth_probe = json_request(f"{base}/batch/upload-sessions/me", auth=auth)
+    if str(auth_probe.get("campaign_id") or "") != args.campaign:
+        raise RuntimeError("campaign upload token is scoped to another campaign")
     folder = args.folder.expanduser().resolve()
     paths = sorted(path for path in folder.rglob("*") if path.is_file() and path.suffix.lower() in ALLOWED)
     if not paths:
@@ -234,47 +382,56 @@ def main() -> int:
             except Exception as exc:
                 print(f"ERROR inspecting {futures[future].name}: {exc}", file=sys.stderr)
     entries.sort(key=lambda item: item["filename"].casefold())
-    exchange = json_request(
-        f"{base}/batch/upload-sessions/exchange", method="POST",
-        body={"campaign_id": args.campaign, "code": args.code},
-    )
-    token = exchange["upload_token"]
-
     if args.covers:
-        # Art-track import is intentionally explicit. The server performs
-        # the same deterministic matching rules used by the browser and
-        # refuses ambiguous pairs; this CLI only supplies the manifest and
-        # transfers the bytes.
-        cover_paths = sorted(path for path in args.covers.expanduser().resolve().rglob("*") if path.is_file() and path.suffix.lower() in COVER_ALLOWED)
+        cover_root = args.covers.expanduser().resolve()
+        cover_paths = sorted(
+            path for path in cover_root.rglob("*")
+            if path.is_file() and path.suffix.lower() in COVER_ALLOWED
+        )
         covers = []
         for path in cover_paths:
             digest = sha256(path)
             covers.append({
-                "filename": path.name, "relative_path": str(path.relative_to(args.covers.expanduser().resolve())),
-                "sha256": digest, "size_bytes": path.stat().st_size,
-                "mime_type": {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}[path.suffix.lower()],
+                "client_id": digest,
+                "filename": path.name,
+                "relative_path": str(path.relative_to(cover_root)),
+                "sha256": digest,
+                "size_bytes": path.stat().st_size,
+                "mime_type": {
+                    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                }[path.suffix.lower()],
                 "path": path,
             })
-        manifest_audios = [{key: value for key, value in entry.items() if key != "path"} for entry in entries]
         registered = json_request(
-            f"{base}/batch/art-track-campaigns/{args.campaign}/manifest", method="POST",
-            body={"audios": manifest_audios, "covers": [{key: value for key, value in entry.items() if key != "path"} for entry in covers]}, token=token,
+            f"{base}/batch/art-track-campaigns/{args.campaign}/manifest",
+            method="POST",
+            body={
+                "audios": [{key: value for key, value in entry.items() if key != "path"} for entry in entries],
+                "covers": [{key: value for key, value in entry.items() if key != "path"} for entry in covers],
+            },
+            auth=auth,
         )
-        assets = json_request(f"{base}/batch/art-track-campaigns/{args.campaign}/assets", token=token)
-        by_path = {str(path.relative_to(args.covers.expanduser().resolve())): entry for path, entry in ((e["path"], e) for e in covers)}
-        by_name = {e["filename"]: e for e in covers}
-        by_audio = {e["filename"]: e for e in entries}
+        assets = json_request(
+            f"{base}/batch/art-track-campaigns/{args.campaign}/assets", auth=auth,
+        )
+        by_path = {entry["relative_path"]: entry for entry in covers}
+        by_name = {entry["filename"]: entry for entry in covers}
+        by_audio = {entry["filename"]: entry for entry in entries}
         failures = []
         for asset in assets.get("items", []):
-            source = by_path.get(asset.get("relative_path")) or by_name.get(asset.get("filename")) or by_audio.get(asset.get("filename"))
+            source = (
+                by_path.get(asset.get("relative_path"))
+                or by_name.get(asset.get("filename"))
+                or by_audio.get(asset.get("filename"))
+            )
             if not source or asset.get("upload_state") == "uploaded":
                 continue
             try:
-                upload_art_asset(base, token, source, asset["id"])
-                print(f"OK {asset['filename']}: uploaded")
+                filename, state = upload_art_asset(base, auth, source, asset["id"])
+                print(f"OK {filename}: {state}")
             except Exception as exc:
-                failures.append(asset["filename"])
-                print(f"ERROR {asset['filename']}: {exc}", file=sys.stderr)
+                failures.append(asset.get("filename") or source["filename"])
+                print(f"ERROR {asset.get('filename')}: {exc}", file=sys.stderr)
         if failures:
             print("Re-run with the same folders and a new pairing code to resume missing assets.", file=sys.stderr)
             return 1
@@ -287,7 +444,7 @@ def main() -> int:
         body = {"items": [{key: value for key, value in entry.items() if key != "path"} for entry in chunk]}
         registered = json_request(
             f"{base}/batch/campaigns/{args.campaign}/manifest",
-            method="POST", body=body, token=token,
+            method="POST", body=body, auth=auth,
         )
         for result in registered.get("items", []):
             item_ids[result["client_id"]] = result
@@ -309,7 +466,7 @@ def main() -> int:
     failures = []
     with ThreadPoolExecutor(max_workers=max(1, min(args.concurrency, 8))) as pool:
         futures = {
-            pool.submit(upload_one, base, token, entry, item_id): (item_id, entry)
+            pool.submit(upload_one, base, auth, entry, item_id): (item_id, entry)
             for item_id, entry in unique.items()
         }
         for future in as_completed(futures):
@@ -321,6 +478,12 @@ def main() -> int:
                 failures.append(entry["filename"])
                 print(f"ERROR {entry['filename']}: {exc}", file=sys.stderr)
     print(f"Finished: {len(unique) - len(failures)} ok, {len(failures)} failed.")
+    if args.force_token_expiry_after_requests:
+        required = {"forced_expiry", "recovered_401"}
+        if not required.issubset(auth.events):
+            print("Auth resilience proof did not observe 401 recovery.", file=sys.stderr)
+            return 3
+        print("Auth resilience: forced expiry -> 401 -> automatic recovery: confirmed")
     if failures:
         print("Run the same command with a new pairing code to resume only missing bytes.")
     return 1 if failures else 0

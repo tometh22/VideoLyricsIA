@@ -5,6 +5,48 @@ import { useEditorAutosave } from "./useEditorAutosave";
 afterEach(() => vi.useRealTimers());
 
 describe("useEditorAutosave", () => {
+  it.each(["save", "reconcile"])("preserves text and timing edited during an in-flight %s merge", async (stage) => {
+    const initial = [
+      { id: "a", start: 0, end: 1, text: "Edición de A" },
+      { id: "b", start: 2, end: 3, text: "Segunda línea" },
+    ];
+    const latest = [{ ...initial[0], text: "A queda local", end: 1.8, operator_locked: true }, initial[1]];
+    const remoteMerge = [initial[0], { ...initial[1], text: "Edición de B" }];
+    let resolve;
+    const deferred = new Promise((done) => { resolve = done; });
+    const save = vi.fn().mockResolvedValue({ ok: true });
+    const reconcile = vi.fn().mockReturnValue(deferred);
+    if (stage === "save") save.mockReturnValueOnce(deferred);
+    const onMerged = vi.fn();
+    const { result, rerender } = renderHook(({ segments }) => useEditorAutosave({
+      enabled: true, dirty: false, segments, save, reconcile, onMerged,
+    }), { initialProps: { segments: initial } });
+    let pending;
+    act(() => { pending = stage === "save" ? result.current.flush("autosave") : result.current.forceRecover(); });
+    rerender({ segments: latest });
+    await act(async () => {
+      resolve({ ok: stage === "reconcile", reason: "merged", mergedSegments: remoteMerge });
+      await pending;
+    });
+    const persisted = save.mock.calls.at(-1)[0];
+    expect(persisted[0]).toMatchObject({ text: "A queda local", end: 1.8, operator_locked: true });
+    expect(persisted[1].text).toBe("Edición de B");
+    expect(onMerged.mock.calls.at(-1)[0]).toEqual(persisted);
+  });
+
+  it("does not undo an explicit approval override when its save conflicts", async () => {
+    const current = [{ id: "a", start: 0, end: 2, text: "current" }];
+    const approved = [{ ...current[0], end: 1.95 }];
+    const save = vi.fn()
+      .mockResolvedValueOnce({ ok: false, reason: "merged", mergedSegments: approved })
+      .mockResolvedValueOnce({ ok: true });
+    const { result } = renderHook(() => useEditorAutosave({
+      enabled: true, dirty: false, segments: current, save, onMerged: vi.fn(),
+    }));
+    await act(async () => { await result.current.flush("manual", approved); });
+    expect(save.mock.calls[1][0]).toEqual(approved);
+  });
+
   it("writes a draft at 800ms and a checkpoint after 5s", async () => {
     vi.useFakeTimers();
     const save = vi.fn().mockResolvedValue({ ok: true, revision: 2 });

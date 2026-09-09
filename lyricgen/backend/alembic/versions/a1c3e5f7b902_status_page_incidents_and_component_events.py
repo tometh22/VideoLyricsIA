@@ -122,4 +122,3 @@ def downgrade() -> None:
     op.drop_index("ix_status_incidents_open", table_name="status_incidents")
     op.drop_index("ix_status_incidents_started", table_name="status_incidents")
     op.drop_table("status_incidents")
-

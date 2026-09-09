@@ -19,6 +19,9 @@ TRIGGER_SPECS: dict[str, dict[str, Any]] = {
     "lora_retraining": {
         "threshold_env": "CORPUS_RETRAIN_EVERY_SONGS",
         "threshold_default": 100,
+        "min_distinct_artists_env": "LORA_RETRAIN_MIN_DISTINCT_ARTISTS",
+        "min_distinct_artists_default": 20,
+        "split_policy": "song_and_artist_disjoint",
         "enabled_env": "LORA_V1_AUTORETRAIN_ENABLED",
         "job_function": "run_lora_retraining_trigger",
     },
@@ -86,6 +89,72 @@ def corpus_song_count(db) -> int:
     return int(value or 0)
 
 
+def corpus_training_stats(db) -> dict[str, int]:
+    """Count approved songs that contain an actual human correction.
+
+    An approval without a text/timing/reorder delta is useful review evidence,
+    but it is not new supervised material for adapting ASR. Automatic LoRA
+    retraining therefore uses the stricter population while the other learning
+    milestones retain the approved-corpus count.
+    """
+    from database import AuditLog, EditorVersion, Job
+
+    corrected_ids: set[str] = set()
+    for row in db.query(AuditLog).filter(
+        AuditLog.action == "lyrics.segments_diff",
+    ).all():
+        detail = row.detail if isinstance(row.detail, dict) else {}
+        job_id = str(detail.get("job_id") or "").strip()
+        summary = detail.get("correction_summary")
+        if isinstance(summary, dict):
+            changed = sum(int(summary.get(key) or 0) for key in (
+                "changed_lines", "text_changes", "timing_changes", "reorders",
+            ))
+        else:
+            changed = len(detail.get("changed") or []) + len(detail.get("reorder") or [])
+        if job_id and changed:
+            corrected_ids.add(job_id)
+
+    approved = db.query(Job.job_id, Job.artist).join(
+        EditorVersion, EditorVersion.job_id == Job.job_id,
+    ).filter(
+        Job.machine_snapshot_required.is_(True),
+        EditorVersion.is_approved.is_(True),
+        Job.job_id.in_(corrected_ids or {"__none__"}),
+    ).distinct().all()
+    artists = {
+        str(artist or "").strip().casefold()
+        for _, artist in approved if str(artist or "").strip()
+    }
+    return {
+        "corrected_songs": len({str(job_id) for job_id, _ in approved}),
+        "distinct_artists": len(artists),
+    }
+
+
+def lora_retraining_eligibility(
+    *, corrected_songs: int, distinct_artists: int,
+    threshold: int = 100, min_distinct_artists: int = 20,
+) -> dict[str, Any]:
+    """Pure gate for the automatic, leakage-resistant LoRA milestone."""
+    due_bucket = max(0, int(corrected_songs)) // max(1, int(threshold))
+    reasons = []
+    if due_bucket < 1:
+        reasons.append("insufficient_human_corrected_songs")
+    if int(distinct_artists) < max(1, int(min_distinct_artists)):
+        reasons.append("insufficient_artist_diversity")
+    return {
+        "eligible": not reasons,
+        "due_bucket": due_bucket,
+        "corrected_songs": int(corrected_songs),
+        "distinct_artists": int(distinct_artists),
+        "threshold": max(1, int(threshold)),
+        "min_distinct_artists": max(1, int(min_distinct_artists)),
+        "split_policy": "song_and_artist_disjoint",
+        "reasons": reasons,
+    }
+
+
 def _scheduled_buckets(db, trigger_type: str) -> set[int]:
     from database import AuditLog
 
@@ -149,6 +218,8 @@ def schedule_due_triggers(*, reason: str = "approval") -> dict[str, Any]:
     try:
         count = corpus_song_count(db)
         result["corpus_songs"] = count
+        lora_stats = corpus_training_stats(db)
+        result["lora_training_population"] = lora_stats
         authorization = catalog_training_authorization()
         for trigger_type, spec in TRIGGER_SPECS.items():
             enabled = env_enabled(spec["enabled_env"])
@@ -161,7 +232,33 @@ def schedule_due_triggers(*, reason: str = "approval") -> dict[str, Any]:
             if not enabled:
                 continue
             threshold = _threshold(spec)
-            due_bucket = count // threshold
+            trigger_count = count
+            if trigger_type == "lora_retraining":
+                trigger_count = lora_stats["corrected_songs"]
+                try:
+                    min_artists = int(os.environ.get(
+                        spec["min_distinct_artists_env"],
+                        spec["min_distinct_artists_default"],
+                    ))
+                except (TypeError, ValueError):
+                    min_artists = int(spec["min_distinct_artists_default"])
+                eligibility = lora_retraining_eligibility(
+                    corrected_songs=trigger_count,
+                    distinct_artists=lora_stats["distinct_artists"],
+                    threshold=threshold,
+                    min_distinct_artists=min_artists,
+                )
+                result["lora_retraining_eligibility"] = eligibility
+                if not eligibility["eligible"]:
+                    result["blocked"].append({
+                        "trigger_type": trigger_type,
+                        "reason": ",".join(eligibility["reasons"]),
+                        "eligibility": eligibility,
+                    })
+                    continue
+                due_bucket = eligibility["due_bucket"]
+            else:
+                due_bucket = trigger_count // threshold
             if due_bucket < 1:
                 continue
             scheduled = _scheduled_buckets(db, trigger_type)
@@ -169,7 +266,7 @@ def schedule_due_triggers(*, reason: str = "approval") -> dict[str, Any]:
                 if bucket in scheduled:
                     continue
                 try:
-                    rq_id = _enqueue_research_job(trigger_type, bucket, count)
+                    rq_id = _enqueue_research_job(trigger_type, bucket, trigger_count)
                 except Exception as exc:
                     result["blocked"].append({
                         "trigger_type": trigger_type, "bucket": bucket,
@@ -178,9 +275,14 @@ def schedule_due_triggers(*, reason: str = "approval") -> dict[str, Any]:
                     continue
                 detail = {
                     "trigger_type": trigger_type, "bucket": bucket,
-                    "threshold": threshold, "corpus_songs": count,
+                    "threshold": threshold, "corpus_songs": trigger_count,
                     "rq_job_id": rq_id, "reason": reason,
                     "companion_triggers": list(spec.get("companion_triggers", ())),
+                    "split_policy": spec.get("split_policy"),
+                    "distinct_artists": (
+                        lora_stats["distinct_artists"]
+                        if trigger_type == "lora_retraining" else None
+                    ),
                     "authorization": authorization if trigger_type == "lora_retraining" else None,
                 }
                 db.add(AuditLog(
@@ -227,6 +329,15 @@ def _run_configured_command(
         }
     args = [command, "--trigger", kind, "--bucket", str(bucket),
             "--corpus-songs", str(count)]
+    if kind == "lora_v1":
+        args.extend((
+            "--split-policy", "song_and_artist_disjoint",
+            "--min-distinct-artists", str(TRIGGER_SPECS[
+                "lora_retraining"
+            ]["min_distinct_artists_default"]),
+            "--min-eval-songs", "20",
+            "--min-eval-artists", "5",
+        ))
     for companion in companion_triggers:
         args.extend(("--companion-trigger", companion))
     try:

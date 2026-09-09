@@ -11,6 +11,7 @@ import { useState } from "react";
 import { AdminProvider, useAdmin } from "./AdminContext";
 import AdminSidebar, { defaultSubTab } from "./layout/AdminSidebar";
 import OperacionSection from "./sections/operacion/OperacionSection";
+import StatusIncidentsPanel from "./sections/operacion/StatusIncidentsPanel";
 import RendimientoSection from "./sections/rendimiento/RendimientoSection";
 import InsightsSection from "./sections/insights/InsightsSection";
 import GestionSection from "./sections/gestion/GestionSection";
@@ -78,7 +79,9 @@ function AdminShell({ onBack, isSuperAdmin }) {
           showInsights={isSuperAdmin}
         />
         <div className="flex-1 min-w-0">
-          {section === "ahora" && <OperacionSection />}
+          {section === "ahora" && subTab === "estado-publico"
+            ? <StatusIncidentsPanel />
+            : section === "ahora" && <OperacionSection />}
           {section === "rendimiento" && <RendimientoSection />}
           {/* Doble guard: el sidebar ya oculta la entrada, pero si el flag
               quedó stale en localStorage el render también la niega. La

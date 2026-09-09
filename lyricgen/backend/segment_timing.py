@@ -9,10 +9,13 @@ different lyric order.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import unicodedata
 from typing import Any
+
+logger = logging.getLogger("genly")
 
 
 MIN_SEGMENT_GAP = 0.05
@@ -62,6 +65,7 @@ def _deduplicate_editor_collisions(segments: list[dict]) -> list[dict]:
     Different text is intentionally preserved because harmonies can overlap.
     """
     out: list[dict] = []
+    dropped: list[str] = []
     for segment in segments:
         text = _collision_text(segment)
         try:
@@ -79,8 +83,18 @@ def _deduplicate_editor_collisions(segments: list[dict]) -> list[dict]:
                 float(duplicate.get("end") or 0),
                 float(segment.get("end") or 0),
             )
+            dropped.append(text)
             continue
         out.append(dict(segment))
+    # Este deduplicador borra filas del documento del operador y hasta ahora lo
+    # hacía en silencio: fue el que ejecutó la pérdida de las 6 líneas del job
+    # f866cbcf0e49 (1-sep-2026) cuando el merge del editor le pasó N copias
+    # idénticas de la misma línea. Que borre está bien; que no deje rastro, no.
+    if dropped:
+        logger.info(
+            "[SEGMENTS] collision dedupe dropped %d row(s) of %d: %s",
+            len(dropped), len(segments), dropped[:5],
+        )
     return out
 
 

@@ -12,6 +12,7 @@ vi.mock("../../i18n", () => ({
 const mockNavigate = vi.fn();
 vi.mock("react-router-dom", () => ({
   useNavigate: () => mockNavigate,
+  useLocation: () => ({ pathname: window.location.pathname }),
 }));
 
 vi.mock("./useChangelog", () => ({
@@ -38,6 +39,17 @@ function setup(entryOverrides = {}, { user = { id: 1 } } = {}) {
 }
 
 describe("WhatsNewModal", () => {
+  it.each(["/admin/cola", "/review/job-123"])(
+    "no interrumpe la entrega de revisión en %s",
+    (pathname) => {
+      window.history.pushState({}, "", pathname);
+      const { container, dismissModal } = setup();
+      expect(container).toBeEmptyDOMElement();
+      expect(dismissModal).not.toHaveBeenCalled();
+      window.history.pushState({}, "", "/");
+    },
+  );
+
   it("no renderiza nada sin modalEntry", () => {
     const { container } = setup(null);
     expect(container).toBeEmptyDOMElement();

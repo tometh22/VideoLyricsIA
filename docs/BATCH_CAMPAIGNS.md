@@ -6,7 +6,6 @@ La funcionalidad queda apagada por defecto. En API y workers configurar:
 
 ```text
 BATCH_CAMPAIGN_ENABLED=1
-BATCH_ART_TRACK_ENABLED=1  # kill-switch independiente; unset sigue al anterior
 BATCH_CAMPAIGN_SCOPES=<tenant_id o billing_group autorizado>
 ```
 
@@ -82,10 +81,16 @@ ASR, Demucs, letras ni fondos IA. La cola está limitada por
 `BATCH_RENDER_WINDOW` y `BATCH_FINAL_REVIEW_LIMIT`; cada resultado queda en
 revisión humana aunque `REQUIRE_REVIEW` esté apagado. Sólo las aprobaciones
 vigentes entran en la previsualización y operación durable de envío. El estado
-de la operación se consulta en `/batch/art-track-delivery-operations/{id}` y
-se reanuda desde el worker tras una caída.
+de la operación se consulta en `/batch/delivery-operations/{id}` y se reanuda
+desde el worker tras una caída.
 
-El destino AR/CL se guarda en la operación. Cuando el contrato `Delivery`
-incluye `portal_id`, el publisher lo usa para mantener entregas independientes
-en `umg.genly.pro` y `umgchile.genly.pro`; hasta integrar esa migración no se
-debe probar con material real de clientes.
+El destino AR/CL se guarda por fila `Delivery.portal_id`, con filtros y tokens
+independientes para `umg.genly.pro` y `umgchile.genly.pro`.
+
+## Throughput — objetivo septiembre 2026
+
+La campaña UMG Agosto midió que el CTC ejecutado en CPU consume alrededor del
+35% del tiempo por canción. Con 8 réplicas y el proveedor estable no se escala
+más durante el lote actual. La mejora prioritaria de septiembre es mover CTC a
+GPU, conservando exactamente los mismos gates y comparando canciones/hora,
+latencia p50/p95 y paridad de alineación antes de cambiar el runtime.

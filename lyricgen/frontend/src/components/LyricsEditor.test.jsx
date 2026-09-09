@@ -101,6 +101,19 @@ function _setAudioCurrentTime(container, t) {
 }
 
 describe("LyricsEditor — banner de confianza + señal review calma (2026-07)", () => {
+  it("shows persisted unvalidated timing without claiming synchronization or mutating lines", () => {
+    const segments = [{ start: 10.439, end: 41.9, text: "una frase", review: true,
+      timing_validation: { status: "unvalidated", reasons: ["internal_word_gap_with_degenerate_support"] } }];
+    const props = baseProps({ segments });
+    const before = JSON.stringify(segments);
+    render(<LyricsEditor {...props} />);
+    expect(screen.getByTestId("editor-confidence")).toHaveTextContent("Timing no validado");
+    expect(screen.getByTestId("editor-confidence")).not.toHaveTextContent("Sincronizado con tu letra");
+    expect(screen.getByTestId("editor-confidence")).not.toHaveTextContent("Todo listo");
+    expect(screen.getByTestId("timing-unvalidated-1")).toHaveTextContent("No se cambiaron sus tiempos");
+    expect(JSON.stringify(segments)).toBe(before);
+    expect(props.onApprove).not.toHaveBeenCalled();
+  });
   // Rediseño: el borde/anillo ámbar completo + banner de alarma hacían
   // parecer todo roto con 11/26 líneas review, cuando el sync salió
   // excelente. Ahora: banner ÚNICO positivo con navegador secuencial, y
@@ -501,19 +514,12 @@ describe("LyricsEditor — advanced shell and timing safety", () => {
 
     const kept = screen.getByDisplayValue("kept");
     expect(kept).toBeInTheDocument();
+    await userEvent.type(kept, " edited");
     await userEvent.click(screen.getByRole("button", { name: /Aprobar/i }));
 
-    expect(onApprove).toHaveBeenCalledOnce();
-    const approved = onApprove.mock.calls[0][0];
-    expect(approved).toHaveLength(2);
-    approved.forEach((segment) => {
-      expect(Number.isFinite(segment.start)).toBe(true);
-      expect(Number.isFinite(segment.end)).toBe(true);
-    });
-    expect(approved[0].start).toBe(0);
-    expect(approved[0].end).toBeGreaterThanOrEqual(0.3);
-    expect(approved[1].start).toBe(0);
-    expect(approved[1].end).toBeGreaterThan(approved[1].start);
+    // Invalid timestamps were sanitized into overlapping drafts. Keep saving
+    // them for recovery, but do not silently repair them during approval.
+    expect(onApprove).not.toHaveBeenCalled();
 
     window.dispatchEvent(new Event("pagehide"));
     expect(onPersistSegments).toHaveBeenCalled();
@@ -526,6 +532,20 @@ describe("LyricsEditor — advanced shell and timing safety", () => {
 });
 
 describe("LyricsEditor — aprobación con advertencia de tipografía", () => {
+  it("aprueba los dos bordes históricos sin quitar 40 ms ni cambiar locked", async () => {
+    const onApprove = vi.fn();
+    const rows = [{ start:90.2229, end:95.23, text:"Primera", locked:true },
+      { start:95.24, end:97.42, text:"Siguiente" },
+      { start:159.86, end:162.83, text:"Otra" },
+      { start:162.84, end:164.8958, text:"Final" }];
+    render(<LyricsEditor {...baseProps({ segments:rows, onApprove, disableAutoSplit:true })} />);
+    await userEvent.click(screen.getByRole("button", { name:/Aprobar y generar/i }));
+    expect(onApprove).toHaveBeenCalledOnce();
+    const sent=onApprove.mock.calls[0][0];
+    expect(sent[0].end).toBe(95.23);
+    expect(sent[2].end).toBe(162.83);
+    expect(sent[0].locked).toBe(true);
+  });
   const oversizedLine = Array.from({ length: 80 }, () => "palabra").join(" ");
 
   it("muestra la decisión en un diálogo visible y permite aprobar igualmente", async () => {
