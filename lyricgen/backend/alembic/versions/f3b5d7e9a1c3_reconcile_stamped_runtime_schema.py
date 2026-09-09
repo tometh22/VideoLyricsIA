@@ -54,7 +54,17 @@ def upgrade() -> None:
     from database import Base
 
     inspector = sa.inspect(bind)
-    missing_tables = set(Base.metadata.tables) - set(inspector.get_table_names())
+    # These tables have their own Alembic revision on the parallel
+    # art-track branch. Do not let this stamped-schema repair create them
+    # early from Base.metadata, otherwise the later art-track revision would
+    # race into "already exists" when both heads are upgraded together.
+    art_track_tables = {
+        "batch_campaign_assets", "delivery_batches", "delivery_batch_items",
+    }
+    missing_tables = (
+        set(Base.metadata.tables) - set(inspector.get_table_names())
+        - art_track_tables
+    )
     if missing_tables:
         missing_metadata = sa.MetaData()
         # Foreign keys on the missing tables point at baseline tables that

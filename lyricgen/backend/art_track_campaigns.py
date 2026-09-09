@@ -38,6 +38,7 @@ ART_TRACK_LIMIT = min(int(os.environ.get("BATCH_ART_TRACK_ITEM_LIMIT", "500")), 
 ALLOWED_AUDIO = {".wav": "audio/wav", ".mp3": "audio/mpeg"}
 ALLOWED_COVERS = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
 DESTINATIONS = {"argentina": "umg.genly.pro", "chile": "umgchile.genly.pro"}
+DELIVERY_FILE_TYPES = ["umg_master", "video", "umg_short", "short", "thumbnail"]
 _SEP_RE = re.compile(r"[^a-z0-9]+")
 _CODE_RE = re.compile(r"(?i)(?:^|[^a-z0-9])([a-z]{2,8}[-_ ]?\d{3,})(?:$|[^a-z0-9])")
 _COVER_WORDS = {"cover", "front", "album", "artwork", "folder", "caratula", "portada"}
@@ -601,6 +602,11 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                 if not job or job.status != "done" or not job.approved_at or _fingerprint(job) != row.approved_render_fingerprint:
                     row.status = "failed"; row.error_code = "stale_approval"; row.error_detail = "Approval or render version changed."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
                 if storage.is_enabled():
+                    # The MP4/short/thumbnail are produced by the render.
+                    # UMG ProRes is lazy in the existing individual flow and
+                    # is materialized on first portal download, so it is
+                    # intentionally included in file_types without blocking
+                    # the durable publication snapshot here.
                     missing = [ft for ft in ("video", "short", "thumbnail") if not (job.s3_keys or {}).get(ft) or not storage.object_exists((job.s3_keys or {}).get(ft))]
                     if missing:
                         row.status = "failed"; row.error_code = "deliverables_not_ready"; row.error_detail = ", ".join(missing); row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
@@ -620,11 +626,20 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     delivery_query = delivery_query.filter(Delivery.portal_id == op.destination_portal)
                 active = delivery_query.first()
                 if active is None:
-                    delivery_kwargs = dict(job_id=job.job_id, label="Art Track", file_types=["video", "short", "thumbnail"], artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now())
+                    delivery_kwargs = dict(job_id=job.job_id, label="Art Track", file_types=DELIVERY_FILE_TYPES, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"))
                     if hasattr(Delivery, "portal_id"):
                         delivery_kwargs["portal_id"] = op.destination_portal
                     active = Delivery(**delivery_kwargs)
                     ddb.add(active); ddb.flush()
+                else:
+                    active.label = "Art Track"
+                    active.file_types = DELIVERY_FILE_TYPES
+                    active.artist_snapshot = job.artist
+                    active.song_title_snapshot = job.song_title or ""
+                    active.tenant_snapshot = job.tenant_id
+                    active.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
+                    active.added_by_user_id = deliveries_added_by(op.created_by)
+                    active.added_at = _now()
                 row.delivery_id = active.id; row.status = "sent"; row.receipt = {"delivery_id": active.id, "portal": op.destination_portal}; row.attempts = int(row.attempts or 0) + 1; sent += 1
             ddb.commit()
         finally: ddb.close()
