@@ -364,7 +364,9 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     from line_evidence import annotate_provider_evidence
 
     r = dict(r)
-    r["segments"] = annotate_provider_evidence(r.get("segments") or [])
+    r["segments"] = annotate_provider_evidence(
+        r.get("segments") or [], timing_source=r.get("timing_source"),
+    )
 
     calibrated = calibration_identity()["calibrated"]
     require_independent = bool(

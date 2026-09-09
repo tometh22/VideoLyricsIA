@@ -723,6 +723,12 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
         )
     from line_evidence import evidence_issues
     line_issue_counts: dict[str, int] = {}
+    # Diagnostic-only signal: deliberately not added to build_unsafe_windows,
+    # so this check does not trigger new paid recovery calls.
+    from timing_validation import diagnose
+    timing_findings = diagnose(segments)
+    if timing_findings:
+        add("word_timing_not_validated", "critical", len(timing_findings), 30)
     for issue in evidence_issues(segments):
         for code in issue.get("reasons") or []:
             line_issue_counts[str(code)] = line_issue_counts.get(str(code), 0) + 1

@@ -4070,6 +4070,7 @@ export default function LyricsEditor({
   // y suprimimos los badges per-línea (el banner ya transmite la info).
   // Si <3 son review, el badge per-línea queda — es info útil sin saturar.
   const reviewSegCount = edited.reduce((n, s) => n + (s.review ? 1 : 0), 0);
+  const unvalidatedTimingCount = edited.filter((s) => s.timing_validation?.status === "unvalidated").length;
   // El chip anuncia cuántas líneas recorre el navegador, y el navegador
   // cicla `review` ∪ zonas dudosas. Contar sólo `review` dejaba el chip
   // desincronizado (o directamente oculto con 9 líneas navegables).
@@ -4123,7 +4124,9 @@ export default function LyricsEditor({
   // letra" (si hay líneas review del anclado) + estado del fondo. Si no
   // hay nada que avisar → "Todo listo".
   const confidenceParts = [];
-  if (reviewSegCount > 0) confidenceParts.push(t("editor.confidence_synced") || "Sincronizado con tu letra");
+  if (unvalidatedTimingCount > 0) {
+    confidenceParts.push(`Timing no validado · ${unvalidatedTimingCount} líneas a revisar`);
+  } else if (reviewSegCount > 0) confidenceParts.push(t("editor.confidence_synced") || "Sincronizado con tu letra");
   // Orientación al abrir (56 s medidos hasta la primera edición): cuántas zonas
   // marcó el análisis de calidad. Se AGREGA a la señal calma existente
   // ("señal review calma", 2026-07) en vez de reemplazarla — es un dato para
@@ -5941,6 +5944,11 @@ export default function LyricsEditor({
                     </div>
                   )}
                   <div className="flex-1 min-w-0 relative">
+                    {seg.timing_validation?.status === "unvalidated" && (
+                      <p data-testid={`timing-unvalidated-${idx + 1}`} className="px-3 pt-1 text-xs text-amber-300">
+                        Timing no validado · revisá este tramo contra el audio. No se cambiaron sus tiempos.
+                      </p>
+                    )}
                     <input
                       type="text"
                       aria-label={`Letra de la línea ${idx + 1}`}

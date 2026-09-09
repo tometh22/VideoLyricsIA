@@ -128,6 +128,27 @@ def test_editor_document_is_shared_by_tenant_and_conflicts_are_explicit(client):
     assert detail["server_segments"][0]["text"] == "ONE"
 
 
+def test_timing_validation_survives_persistence_and_reload_without_approval(client):
+    from line_evidence import annotate_provider_evidence
+    from tests.test_timing_validation import broken_rows
+    first, _, job_id = _users_and_job()
+    token = _token_for(first)
+    rows = annotate_provider_evidence(broken_rows(), timing_source="forced_align")
+    loaded = client.get(f"/editor/{job_id}", headers=auth(token))
+    saved = client.patch(f"/editor/{job_id}", headers=auth(token), json={
+        "base_revision": loaded.json()["revision"], "segments": rows, "checkpoint": "manual",
+    })
+    assert saved.status_code == 200, saved.text
+    reloaded = client.get(f"/editor/{job_id}", headers=auth(token))
+    assert reloaded.status_code == 200
+    for actual, expected in zip(reloaded.json()["segments"], rows):
+        assert actual["start"] == expected["start"]
+        assert actual["end"] == expected["end"]
+        assert actual["text"] == expected["text"]
+        assert actual["timing_validation"] == expected["timing_validation"]
+        assert actual["timing_provenance"]["source"] == "forced_align"
+
+
 def test_opening_explicit_editor_revives_soft_superseded_job(client):
     """A duplicate wizard response must not hide the draft being edited."""
     first, _second, job_id = _users_and_job("editor_soft_supersede")

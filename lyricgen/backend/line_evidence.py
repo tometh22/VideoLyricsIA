@@ -49,6 +49,9 @@ def _scores(words: list[dict]) -> list[float]:
     for word in words or []:
         if not isinstance(word, dict):
             continue
+        probability_origin = word.get("probability_provenance")
+        if isinstance(probability_origin, dict) and probability_origin.get("score_equivalence") is False:
+            continue
         raw = word.get("score", word.get("probability"))
         value = _f(raw, float("nan"))
         if math.isfinite(value) and 0.0 <= value <= 1.0:
@@ -168,6 +171,9 @@ def annotate_provider_evidence(
             item.pop("content_asr_min_score", None)
         item["content_source"] = resolved_source
         output.append(item)
+    from timing_validation import diagnose
+    for finding in diagnose(output):
+        output[finding["segment_index"]]["timing_validation"] = finding
     return output
 
 
