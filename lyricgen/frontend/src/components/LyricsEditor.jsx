@@ -4205,12 +4205,17 @@ export default function LyricsEditor({
                 </div>
                 <h3 className="mt-4 text-base font-semibold text-white">No pudimos abrir la versión editable</h3>
                 <p className="mt-2 text-sm leading-6 text-ink-secondary">
-                  Tus líneas siguen a salvo. Reconectá el editor antes de modificar o aprobar.
+                  {durableEditor.errorStatus === 401 ? "La sesión venció. Volvé a iniciar sesión para abrir esta canción."
+                    : [403, 404].includes(durableEditor.errorStatus) ? "No se pudo acceder a esta canción. Comprobá el enlace y los permisos de tu cuenta."
+                      : durableEditor.errorStatus === 429 || durableEditor.errorStatus >= 500 ? "El servidor no está disponible temporalmente. Esperá unos segundos y reintentá."
+                        : "No se pudo completar la conexión con el editor. Comprobá tu conexión y reintentá."}
                 </p>
+                <p className="mt-2 text-xs text-ink-secondary">La edición y la aprobación siguen bloqueadas hasta cargar la versión guardada.</p>
+                <p className="mt-3 break-all font-mono text-xs text-ink-secondary">Canción: {transcribeJobId}{durableEditor.errorStatus ? ` · HTTP ${durableEditor.errorStatus}` : " · Sin respuesta HTTP"}</p>
                 <button
                   type="button"
                   onClick={() => durableEditor.load()}
-                  className="mt-5 inline-flex h-11 items-center justify-center rounded-xl bg-white px-5 text-sm font-semibold text-surface-0 transition-colors hover:bg-gray-100"
+                  className="mt-5 inline-flex h-11 items-center justify-center rounded-xl bg-white px-5 text-sm font-semibold text-gray-950 transition-colors hover:bg-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand"
                 >
                   Reintentar
                 </button>
