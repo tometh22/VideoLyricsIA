@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
+import { safeReviewReturnPath } from "./lib/reviewerNavigation";
 import {
   Routes, Route, Navigate, Outlet,
   useNavigate, useLocation, useParams,
@@ -702,6 +703,8 @@ function LegacyVideoRedirect() {
 function JobDetailRoute({ fetchHistory }) {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const returnTo = safeReviewReturnPath(new URLSearchParams(location.search).get("return_to"));
   const [job, setJob] = useState(null);
   const [error, setError] = useState(false);
 
@@ -726,7 +729,7 @@ function JobDetailRoute({ fetchHistory }) {
     return (
       <div className="text-center mt-16">
         <p className="text-gray-500 mb-4">No se encontró el video.</p>
-        <button onClick={() => navigate("/dashboard")} className="btn-secondary">Volver</button>
+        <button onClick={() => navigate(returnTo || "/dashboard")} className="btn-secondary">Volver</button>
       </div>
     );
   }
@@ -752,6 +755,10 @@ function JobDetailRoute({ fetchHistory }) {
         <JobDetail
           job={job}
           onBack={async () => {
+            if (returnTo) {
+              navigate(returnTo);
+              return;
+            }
             if (!job?.campaign_id) {
               navigate("/dashboard");
               return;
@@ -1776,11 +1783,11 @@ export default function App() {
   // Campaign review links carry a durable return target so the editor's own
   // back action and the browser back action land on the exact queue context
   // (tab, search, filters, order, page and focus), rather than the legacy
-  // admin queue. Only campaign paths are accepted; arbitrary URLs never
+  // admin queue. Only campaign and queue paths are accepted; arbitrary URLs never
   // become an open redirect.
   const campaignReturnPath = useMemo(() => {
     const candidate = new URLSearchParams(location.search).get("return_to");
-    return candidate && candidate.startsWith("/campaigns/") ? candidate : null;
+    return safeReviewReturnPath(candidate);
   }, [location.search]);
   const withCampaignReturn = useCallback((path) => {
     if (!campaignReturnPath || !String(path || "").startsWith("/review/")) return path;
@@ -4056,7 +4063,9 @@ export default function App() {
         localStorage.removeItem(`genly:line-review:${r.transcribeJobId}`);
         localStorage.removeItem(`genly:quality-window-review:${r.transcribeJobId}`);
         setCurrentReview(null);
-        navigate(`/admin/cola?approved=${encodeURIComponent(r.transcribeJobId)}`, {
+        const returnUrl = new URL(campaignReturnPath || "/admin/cola", window.location.origin);
+        returnUrl.searchParams.set("approved", r.transcribeJobId);
+        navigate(`${returnUrl.pathname}${returnUrl.search}`, {
           replace: true,
         });
         return { ok: true, approvedEditorVersionId: body?.approved_version_id || null };
