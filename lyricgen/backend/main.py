@@ -10934,15 +10934,25 @@ def status(
         # the frontend reads job.approved_by directly from /status.
         "approved_by": job.get("approved_by"),
         "approved_at": job.get("approved_at"),
-        # Whether this job is currently published on the UMG deliverables
-        # portal. Drives the "Enviar a UMG" button state in JobDetail.jsx
-        # (hidden / available / "✓ Ya en UMG"). Single boolean is enough —
-        # JobDetail doesn't need the delivery id, just the on/off state.
+        # Whether this job is currently published on any UMG deliverables
+        # portal. Keep the boolean for older clients; `umg_portals` below is
+        # the destination-aware source for the admin publish selector.
         # El flag vive en la DB de deliveries (`ddb`, posible externa de prod).
         # Gateado por approved_at: el botón "Enviar a UMG" solo aparece en jobs
         # aprobados, así que para el caso común (job no aprobado, polleado sin
         # parar por JobDetail) devolvemos False sin pegarle a la DB externa —
         # evita latencia/egress/checkout de conexión de prod en cada poll.
+        # Keep the historical boolean for old clients, and expose the
+        # destinations separately so an admin can publish the same job to
+        # Argentina and Chile without the UI treating the first publish as a
+        # global one-shot action.
+        "umg_portals": sorted({
+            (portal_id or "argentina")
+            for portal_id, in ddb.query(Delivery.portal_id)
+            .filter(Delivery.job_id == job_id)
+            .filter(Delivery.removed_at.is_(None))
+            .all()
+        }) if job.get("approved_at") else [],
         "is_in_umg_portal": bool(
             job.get("approved_at")
             and ddb.query(Delivery.id)
@@ -18015,20 +18025,20 @@ _PORTAL_IDS = {"argentina", "chile"}
 
 
 def _portal_tenant_scope(portal_id: str) -> set[str] | None:
-    """Return the tenant allow-list for one portal, or None for legacy all.
+    """Return the legacy tenant allow-list, or None for an unfiltered list.
 
     Argentina historically listed legacy deliveries from several tenant
-    snapshots, so it remains unfiltered unless explicitly configured. Chile
-    defaults to the dedicated ``universal_chile`` tenant so a newly-created
-    Chile portal cannot expose Argentina's rows by accident.
+    snapshots, so it remains unfiltered unless explicitly configured. New
+    deliveries are scoped by their row-level ``portal_id``; tenant filtering
+    is therefore only applied to Argentina for backwards compatibility.
     """
+    if portal_id == "chile":
+        return None
     env_name = f"DELIVERY_PORTAL_TENANTS_{portal_id.upper()}"
     raw = os.environ.get(env_name)
     if raw is not None:
         tenants = {part.strip() for part in raw.split(",") if part.strip()}
         return tenants or set()
-    if portal_id == "chile":
-        return {"universal_chile"}
     return None
 
 
@@ -18040,7 +18050,22 @@ def _portal_id(raw: str | None) -> str:
 
 
 def _portal_delivery_query(query, portal_id: str):
-    tenants = _portal_tenant_scope(portal_id)
+    # A delivery's explicit destination is authoritative. Tenant filtering is
+    # retained for Argentina's legacy allow-list, but Chile must be able to
+    # receive an admin-selected delivery from either staging or production
+    # source tenant; otherwise the new destination selector would silently
+    # hide valid Chile deliveries.
+    tenants = _portal_tenant_scope(portal_id) if portal_id == "argentina" else None
+    # New rows carry an explicit destination. The migration backfills
+    # historical rows as Argentina; the NULL fallback keeps this safe during
+    # a rolling deploy against a database that has not run it yet.
+    if portal_id == "argentina":
+        from sqlalchemy import or_
+        query = query.filter(
+            or_(Delivery.portal_id == portal_id, Delivery.portal_id.is_(None))
+        )
+    else:
+        query = query.filter(Delivery.portal_id == portal_id)
     if tenants is not None:
         query = query.filter(Delivery.tenant_snapshot.in_(tenants))
     return query
@@ -18080,6 +18105,7 @@ def _verify_portal_token(
 class SendToUMGRequest(BaseModel):
     """Optional overrides when publishing a job to the portal."""
     label: str | None = None  # default: "Renderizado" or "Opción N"
+    portal_id: str = "argentina"  # destino visible: argentina | chile
 
 
 @app.post("/admin/deliveries/from-job/{job_id}")
@@ -18104,6 +18130,8 @@ async def admin_create_delivery_from_job(
     """
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
+
+    portal_id = _portal_id(body.portal_id if body else None)
 
     job = db.query(Job).filter(Job.job_id == job_id).first()
     if job is None:
@@ -18203,7 +18231,7 @@ async def admin_create_delivery_from_job(
     # delivery for this song gets "Renderizado"; subsequent ones get
     # "Opción N". Matches the manual items.json conventions.
     label = (body.label if body else None) or _compute_default_delivery_label(
-        ddb, job.artist, job.song_title
+        ddb, job.artist, job.song_title, portal_id
     )
 
     # added_by_user_id es FK NOT NULL a users.id de la DB de deliveries. Con
@@ -18218,6 +18246,7 @@ async def admin_create_delivery_from_job(
     existing = (
         ddb.query(Delivery)
         .filter(Delivery.job_id == job_id)
+        .filter(Delivery.portal_id == portal_id)
         .filter(Delivery.removed_at.is_(None))
         .first()
     )
@@ -18231,6 +18260,7 @@ async def admin_create_delivery_from_job(
         existing.artist_snapshot = job.artist
         existing.song_title_snapshot = job.song_title or ""
         existing.tenant_snapshot = job.tenant_id
+        existing.portal_id = portal_id
         existing.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
         delivery = existing
         action = "delivery.update"
@@ -18242,6 +18272,7 @@ async def admin_create_delivery_from_job(
             artist_snapshot=job.artist,
             song_title_snapshot=job.song_title or "",
             tenant_snapshot=job.tenant_id,
+            portal_id=portal_id,
             frame_size_snapshot=(job.umg_spec or {}).get("frame_size"),
             added_by_user_id=added_by,
             added_at=datetime.now(timezone.utc),
@@ -18258,7 +18289,13 @@ async def admin_create_delivery_from_job(
     db.add(AuditLog(
         user_id=current_user["id"],
         action=action,
-        detail={"job_id": job_id, "label": label, "artist": job.artist, "song": job.song_title},
+        detail={
+            "job_id": job_id,
+            "label": label,
+            "portal_id": portal_id,
+            "artist": job.artist,
+            "song": job.song_title,
+        },
     ))
     db.commit()
 
@@ -18269,11 +18306,17 @@ async def admin_create_delivery_from_job(
         "label": delivery.label,
         "artist": delivery.artist_snapshot,
         "song": delivery.song_title_snapshot,
+        "portal_id": delivery.portal_id or "argentina",
         "replaced": action == "delivery.update",
     }
 
 
-def _compute_default_delivery_label(db: Session, artist: str, song_title: str | None) -> str:
+def _compute_default_delivery_label(
+    db: Session,
+    artist: str,
+    song_title: str | None,
+    portal_id: str = "argentina",
+) -> str:
     """Default label for a new delivery.
 
     Rule: first active delivery for an (artist, song) gets "Renderizado".
@@ -18285,6 +18328,7 @@ def _compute_default_delivery_label(db: Session, artist: str, song_title: str | 
         db.query(Delivery)
         .filter(Delivery.artist_snapshot == artist)
         .filter(Delivery.song_title_snapshot == (song_title or ""))
+        .filter(Delivery.portal_id == portal_id)
         .filter(Delivery.removed_at.is_(None))
         .count()
     )

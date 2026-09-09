@@ -1267,7 +1267,7 @@ class QualityExperimentRun(Base):
 
 
 class Delivery(Base):
-    # Versions exposed on the UMG deliverables portal (umg.genly.pro).
+    # Versions exposed on the UMG deliverables portals (Argentina and Chile).
     # Replaces the previous static items.json workflow — admins click
     # "Enviar a UMG" on an approved job and a row lands here; the portal
     # fetches the list dynamically and signs R2 URLs on demand.
@@ -1303,6 +1303,13 @@ class Delivery(Base):
     artist_snapshot = Column(String(255), nullable=False)
     song_title_snapshot = Column(String(500), nullable=False)
     tenant_snapshot = Column(String(100), nullable=False)
+    # Destination surface for this published version. Legacy rows are
+    # Argentina by default; the row-level destination lets one job be
+    # published independently to both portals.
+    portal_id = Column(
+        String(20), nullable=False, default="argentina",
+        server_default="argentina", index=True,
+    )
     frame_size_snapshot = Column(String(20), nullable=True)  # HD | UHD-4K | DCI-4K
     added_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     added_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -1327,6 +1334,7 @@ class Delivery(Base):
             "artist": self.artist_snapshot,
             "song_title": self.song_title_snapshot,
             "tenant": self.tenant_snapshot,
+            "portal_id": self.portal_id or "argentina",
             "frame_size": self.frame_size_snapshot,
             "added_at": self.added_at.isoformat() if self.added_at else None,
             "removed_at": self.removed_at.isoformat() if self.removed_at else None,
@@ -2332,6 +2340,12 @@ def _migrate_user_columns():
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ",
         "CREATE INDEX IF NOT EXISTS ix_deliveries_approved_at ON deliveries(approved_at)",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_by_label VARCHAR(120)",
+        # Destination surface for published versions. Alembic is the
+        # canonical production migration; this startup mirror keeps older
+        # staging/dev databases self-healing when they boot without the
+        # release runner.
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS portal_id VARCHAR(20) DEFAULT 'argentina' NOT NULL",
+        "CREATE INDEX IF NOT EXISTS ix_deliveries_portal_id ON deliveries(portal_id)",
         # Categoría del error para el dashboard de actividad (PR telemetría).
         # Se setea en los sinks de error del pipeline/reaper vía
         # error_taxonomy.classify_error(). Espejo de la migración Alembic
