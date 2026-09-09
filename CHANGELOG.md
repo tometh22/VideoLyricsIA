@@ -18,6 +18,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Isolate Playwright's Ubuntu dependency setup from the unrelated Google Chrome
   APT feed, whose inconsistent package index blocked CI; retain all browser gates.
 
+## [1.1.7] - 2026-09-09
+
+### Added
+
+- Add parallel Art Track campaigns for up to 500 audio+cover pairs, with resumable uploads, deterministic/manual association, mandatory human review and durable bulk delivery operations.
+- Persist delivery destination with `Delivery.portal_id` and isolate Argentina/Chile portal listings, tokens and publish operations.
+
 ## [1.1.4] - 2026-09-09
 
 ### Fixed

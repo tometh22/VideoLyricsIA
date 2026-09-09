@@ -100,7 +100,6 @@ def test_agent_owns_its_copy_and_nobody_else_can_write_it():
     finally:
         db.close()
 
-
 def test_saving_as_the_agent_persists_agent_authorship():
     db = SessionLocal()
     try:
@@ -433,4 +432,3 @@ def test_learning_exclusion_does_not_rest_on_the_role_alone(
         assert row.campaign_id is None and row.campaign_item_id is None
     finally:
         db.close()
-

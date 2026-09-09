@@ -192,4 +192,3 @@ def test_degenerate_event_cannot_become_uncovered_singing():
     _, review = reconcile(song, cached, commit="test")
     heard_outside = [h["text"] for h in review["uncovered_singing_hypotheses"]]
     assert "fantasma" not in heard_outside
-

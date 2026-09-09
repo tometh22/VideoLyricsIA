@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from auth import get_current_user
+from auth import get_current_user, has_art_track_access
 from database import (
     AuditLog,
     BatchCampaign,
@@ -45,6 +45,7 @@ router = APIRouter(prefix="/batch", tags=["batch-campaigns"])
 
 CAMPAIGN_STATUSES = frozenset({"active", "paused", "completed", "cancelled"})
 ITEM_LIMIT = int(os.environ.get("BATCH_CAMPAIGN_ITEM_LIMIT", "1000"))
+ART_TRACK_ITEM_LIMIT = min(int(os.environ.get("BATCH_ART_TRACK_ITEM_LIMIT", "500")), 500)
 TRANSCRIPTION_WINDOW = int(os.environ.get("BATCH_TRANSCRIPTION_WINDOW", "30"))
 # The conservative platform default remains 50.  Large campaigns must opt in
 # explicitly through stage1_pipeline.lyrics_ready_limit; this avoids silently
@@ -73,6 +74,13 @@ _ALL_REVIEW_STATES = _PENDING_REVIEW_STATES | _APPROVED_REVIEW_STATES
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def art_track_feature_enabled() -> bool:
+    raw = os.environ.get("BATCH_ART_TRACK_ENABLED")
+    if raw is None:
+        return feature_enabled()
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -221,6 +229,9 @@ def _summary(db: Session, campaign: BatchCampaign) -> dict[str, Any]:
         "status": campaign.status,
         "created_by": campaign.created_by,
         "expected_count": campaign.expected_count,
+        "kind": campaign.kind or "lyric_video",
+        "destination_portal": campaign.destination_portal,
+        "preset_version": campaign.preset_version,
         "registered_count": len(rows),
         "default_render_params": campaign.default_render_params or {},
         "counters": counters,
@@ -234,12 +245,15 @@ class CampaignCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=160)
     expected_count: int = Field(default=0, ge=0, le=ITEM_LIMIT)
     default_render_params: dict[str, Any] = Field(default_factory=dict)
+    kind: str = Field(default="lyric_video", pattern="^(lyric_video|art_track)$")
+    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile)$")
 
 
 class CampaignPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
     status: str | None = None
     default_render_params: dict[str, Any] | None = None
+    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile)$")
 
 
 class ManifestItem(BaseModel):
@@ -301,6 +315,13 @@ def create_campaign(
     db: Session = Depends(get_db),
 ):
     _require_scope(current_user)
+    if body.kind == "art_track":
+        if not art_track_feature_enabled():
+            raise HTTPException(status_code=404, detail="Art-track campaigns are not enabled.")
+        if not has_art_track_access(current_user):
+            raise HTTPException(status_code=403, detail="Art Track is not enabled for this account.")
+        if body.expected_count > ART_TRACK_ITEM_LIMIT:
+            raise HTTPException(status_code=422, detail=f"Art-track campaigns accept at most {ART_TRACK_ITEM_LIMIT} audios.")
     campaign = BatchCampaign(
         id=uuid.uuid4().hex[:12],
         tenant_id=current_user["tenant_id"],
@@ -309,6 +330,8 @@ def create_campaign(
         expected_count=body.expected_count,
         status="active",
         default_render_params=body.default_render_params or {},
+        kind=body.kind,
+        destination_portal=body.destination_portal,
         created_at=_now(),
         updated_at=_now(),
     )
@@ -354,6 +377,10 @@ def patch_campaign(
         campaign.name = body.name.strip()
     if body.default_render_params is not None:
         campaign.default_render_params = body.default_render_params
+    if body.destination_portal is not None:
+        if campaign.destination_portal and campaign.destination_portal != body.destination_portal:
+            raise HTTPException(status_code=409, detail="Campaign destination cannot change after it is set.")
+        campaign.destination_portal = body.destination_portal
     if body.status is not None:
         if body.status not in CAMPAIGN_STATUSES:
             raise HTTPException(status_code=400, detail="Invalid campaign status.")
@@ -2072,6 +2099,11 @@ def _queue_full_stage_for_separated(
 
 
 def _promote_campaign(db: Session, campaign: BatchCampaign) -> list[str]:
+    # Art tracks use the audio+cover path and must never enter the lyric
+    # transcription feeder. Their renderer is promoted by the dedicated
+    # reconciler in art_track_campaigns.py.
+    if (campaign.kind or "lyric_video") == "art_track":
+        return []
     stage1_settings = _stage1_pipeline_settings(campaign)
     active_trans = db.query(func.count(Job.id)).filter(
         Job.tenant_id == campaign.tenant_id,
@@ -2178,6 +2210,14 @@ def reconcile_batch_campaigns() -> dict[str, int]:
         ).order_by(BatchCampaign.created_at.asc()).all()
         for campaign in campaigns:
             event_ids.extend(_promote_campaign(db, campaign))
+            if (campaign.kind or "lyric_video") == "art_track":
+                try:
+                    from art_track_campaigns import reconcile_art_track_campaign
+                    event_ids.extend(reconcile_art_track_campaign(db, campaign))
+                except Exception:
+                    # Art-track rollout is isolated from the mature lyric
+                    # feeder; a schema/import issue must not stop lyrics.
+                    pass
             rows = _campaign_rows(db, campaign.id)
             manifest_complete = bool(rows) and (
                 not campaign.expected_count or len(rows) >= campaign.expected_count

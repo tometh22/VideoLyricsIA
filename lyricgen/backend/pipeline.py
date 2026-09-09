@@ -2521,7 +2521,22 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         else:
             _normalized = _require_review_raw.strip().strip('"').strip("'").lower()
             _require_review = _normalized in ("true", "1", "yes", "y", "on")
-        final_status = "pending_review" if _require_review else "done"
+        # Campaign art tracks are always human-reviewed before publication.
+        # Keep the already-established individual Art Track flow unchanged;
+        # only the campaign workload gets this stricter worker-side gate.
+        _batch_art_track = False
+        if art_track:
+            try:
+                from database import SessionLocal as _ArtSession, Job as _ArtJob
+                with _ArtSession() as _art_db:
+                    _art_row = _art_db.query(_ArtJob).filter(_ArtJob.job_id == job_id).first()
+                    _batch_art_track = bool(_art_row and _art_row.workload_class == "batch")
+            except Exception:
+                # A missing row is fail-closed only through REQUIRE_REVIEW;
+                # the existing individual flow must not become dependent on
+                # an observability lookup at the end of a successful render.
+                _batch_art_track = False
+        final_status = "pending_review" if (_require_review or _batch_art_track) else "done"
         logger.info("[PIPELINE] job=%s REQUIRE_REVIEW=%r -> require_review=%s final_status=%s",
                     job_id, _require_review_raw, _require_review, final_status)
 

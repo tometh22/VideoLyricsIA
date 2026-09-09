@@ -47,6 +47,20 @@ const MEDIA_TABS = [
   { key: "thumbnail", label: "Thumbnail", desc: "1280x720" },
 ];
 
+const UMG_PORTALS = [
+  { id: "argentina", labelKey: "umg.portal_argentina", label: "Argentina", host: "umg.genly.pro" },
+  { id: "chile", labelKey: "umg.portal_chile", label: "Chile", host: "umgchile.genly.pro" },
+];
+
+function getUmgPortals(job) {
+  if (Array.isArray(job.umg_portals)) {
+    return UMG_PORTALS.map(({ id }) => id).filter((id) => job.umg_portals.includes(id));
+  }
+  // Old /status responses only exposed a boolean, which represented the
+  // original Argentina portal.
+  return job.is_in_umg_portal ? ["argentina"] : [];
+}
+
 // Canvas de Spotify: SOLO admin. Tres variantes del mismo fondo (encuadre
 // izquierda / centro / derecha) para poder rotar el Canvas durante la
 // campaña sin volver a producir. Van aparte de MEDIA_TABS porque se montan
@@ -412,10 +426,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     let stopped = false;
     const heartbeat = async () => {
       try {
-        await fetch(`${API}/editor/${job.job_id}/lock/heartbeat`, {
+        const res = await fetch(`${API}/editor/${job.job_id}/lock/heartbeat`, {
           method: "POST",
           headers: { ...authHeaders(), ...editorSessionHeaders() },
         });
+        if (!res.ok) throw new Error(`Heartbeat failed: ${res.status}`);
       } catch {
         // The visible queue remains authoritative; the next heartbeat retries.
       }
@@ -447,6 +462,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [sendingUmg, setSendingUmg] = useState(false);
   const [umgSendStage, setUmgSendStage] = useState(null);
   const [sendUmgAfterProres, setSendUmgAfterProres] = useState(false);
+  const [umgPortals, setUmgPortals] = useState(() => getUmgPortals(job));
+  const [showUmgPortalPicker, setShowUmgPortalPicker] = useState(false);
+  const [selectedUmgPortal, setSelectedUmgPortal] = useState("argentina");
+  const [sendUmgPortal, setSendUmgPortal] = useState("argentina");
   const [isInUmgPortal, setIsInUmgPortal] = useState(
     Boolean(job.is_in_umg_portal),
   );
@@ -456,7 +475,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // state wouldn't know).
   useEffect(() => {
     setIsInUmgPortal(Boolean(job.is_in_umg_portal));
-  }, [job.is_in_umg_portal]);
+    setUmgPortals(getUmgPortals(job));
+  }, [job.is_in_umg_portal, job.umg_portals]);
 
   const waitForUmgMasters = async (retryAfterSeconds = 10) => {
     const deadline = Date.now() + (10 * 60 * 1000);
@@ -487,8 +507,12 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     throw timeout;
   };
 
-  const publishToUMG = async () => {
+  const publishToUMG = async (requestedPortal = sendUmgPortal) => {
     if (sendingUmg) return;
+    const targetPortal = UMG_PORTALS.some(({ id }) => id === requestedPortal)
+      ? requestedPortal
+      : "argentina";
+    const target = UMG_PORTALS.find(({ id }) => id === targetPortal) || UMG_PORTALS[0];
     setSendingUmg(true);
     setUmgSendStage("publishing");
     try {
@@ -499,7 +523,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         resp = await fetch(`${API}/admin/deliveries/from-job/${job.job_id}`, {
           method: "POST",
           headers: { ...authHeaders(), "Content-Type": "application/json" },
-          body: JSON.stringify({}),
+          body: JSON.stringify({ portal_id: targetPortal }),
         });
         result = await resp.json().catch(() => ({}));
         if (resp.status !== 202 || result.status !== "preparing_prores") break;
@@ -532,10 +556,13 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         return;
       }
       setIsInUmgPortal(true);
+      setUmgPortals((previous) => [
+        ...new Set([...previous, targetPortal]),
+      ]);
       const label = result.label || "";
       const verbed = result.replaced ? "actualizado" : "publicado";
       alert({
-        title: `Video ${verbed} en umg.genly.pro`,
+        title: `Video ${verbed} en ${target.host}`,
         description: label ? `Aparece como "${label}".` : undefined,
         tone: "success",
       });
@@ -554,13 +581,22 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     }
   };
 
-  const handleSendToUMG = () => {
+  const beginUmgPublish = (portalId) => {
+    setSelectedUmgPortal(portalId);
+    setSendUmgPortal(portalId);
+    setShowUmgPortalPicker(false);
     if (!job.umg_spec) {
       setSendUmgAfterProres(true);
       setShowProResModal(true);
       return;
     }
-    publishToUMG();
+    publishToUMG(portalId);
+  };
+
+  const handleSendToUMG = () => {
+    const nextPortal = UMG_PORTALS.find(({ id }) => !umgPortals.includes(id));
+    setSelectedUmgPortal(nextPortal?.id || "argentina");
+    setShowUmgPortalPicker(true);
   };
   // Dropdown for HD/2K/4K selection on retry. Only shown when the job
   // has a meaningful umg_spec to override (i.e. went through the UMG
@@ -1860,27 +1896,71 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                     {t("detail.download_short_prores") || "Short ProRes"}
                   </button>
                 )}
-                {/* "Enviar a UMG" — admin only, only for approved jobs. Publishes
-                    the 5-file set (ProRes master + ProRes short + MP4 + MP4 short
-                    + thumbnail) to umg.genly.pro. Re-sending the same job_id
-                    replaces the existing entry rather than duplicating. */}
+                {/* "Enviar a UMG" — admin only, only for approved jobs. The
+                    destination picker lets one job be published independently
+                    to Argentina and Chile. Re-sending within a destination
+                    replaces that portal's entry rather than duplicating. */}
                 {isUmgAdmin && isDone && job.approved_by && (
-                  <button
-                    onClick={handleSendToUMG}
-                    disabled={sendingUmg || isInUmgPortal}
-                    className="btn-secondary text-xs h-10 px-4 disabled:opacity-60"
-                    title={isInUmgPortal
-                      ? "Este video ya está publicado en umg.genly.pro"
-                      : "Publicar este video en umg.genly.pro (visible para Universal Music)"}
-                  >
-                    {isInUmgPortal
-                      ? (t("detail.in_umg_portal") || "✓ En UMG")
-                      : umgSendStage === "preparing"
+                  <div className="relative">
+                    <button
+                      onClick={handleSendToUMG}
+                      disabled={sendingUmg}
+                      className="btn-secondary text-xs h-10 px-4 disabled:opacity-60"
+                      title={isInUmgPortal
+                        ? "Actualizar este video en un portal UMG"
+                        : "Publicar este video en un portal UMG"}
+                    >
+                      {umgSendStage === "preparing"
                         ? "Preparando masters…"
                         : sendingUmg
                           ? (t("detail.sending_umg") || "Enviando…")
-                        : (t("detail.send_umg") || "Enviar a UMG")}
-                  </button>
+                          : umgPortals.length
+                            ? `${t("detail.in_umg_portal") || "✓ En UMG"} (${umgPortals.map((id) => UMG_PORTALS.find((portal) => portal.id === id)?.label).join(" + ")})`
+                            : (t("detail.send_umg") || "Enviar a UMG")}
+                    </button>
+                    {showUmgPortalPicker && (
+                      <div className="absolute right-0 top-full z-30 mt-2 w-72 rounded-xl bg-surface-1 p-3 shadow-2xl ring-1 ring-white/10">
+                        <p className="mb-1 text-sm font-semibold text-ink-primary">
+                          {t("umg.choose_destination") || "Elegir portal de destino"}
+                        </p>
+                        <p className="mb-3 text-xs text-ink-secondary">
+                          {t("umg.destination_hint") || "Elegí dónde querés publicar este video."}
+                        </p>
+                        <div className="space-y-2">
+                          {UMG_PORTALS.map((portal) => {
+                            const published = umgPortals.includes(portal.id);
+                            const selected = selectedUmgPortal === portal.id;
+                            return (
+                              <button
+                                key={portal.id}
+                                type="button"
+                                onClick={() => beginUmgPublish(portal.id)}
+                                disabled={sendingUmg}
+                                className={`flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-xs ring-1 transition-colors ${selected ? "bg-brand/15 ring-brand/40" : "bg-surface-2/60 ring-white/[0.06] hover:bg-surface-2"}`}
+                              >
+                                <span>
+                                  <span className="block font-semibold text-ink-primary">
+                                    {t(portal.labelKey) || portal.label}
+                                  </span>
+                                  <span className="block text-[11px] text-ink-secondary">{portal.host}</span>
+                                </span>
+                                <span className="text-[11px] text-ink-secondary">
+                                  {published ? (t("umg.update") || "Actualizar") : (t("umg.publish") || "Publicar")}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setShowUmgPortalPicker(false)}
+                          className="mt-3 w-full text-xs text-ink-secondary hover:text-ink-primary"
+                        >
+                          {t("umg.cancel") || "Cancelar"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 )}
               </>
             );
@@ -2298,7 +2378,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             // persistido) y aparezca el tab de Máster ProRes.
             onJobUpdate?.({ ...job, umg_spec: data.umg_spec });
             if (shouldContinueToUmg) {
-              publishToUMG();
+              publishToUMG(sendUmgPortal);
             }
           }}
         />

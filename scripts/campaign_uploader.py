@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT / "lyricgen" / "backend"))
 from batch_manifest import parse_audio_filename  # noqa: E402
 
 ALLOWED = {".wav", ".mp3"}
+COVER_ALLOWED = {".jpg", ".jpeg", ".png"}
 MAX_BYTES = int(os.environ.get("BATCH_UPLOADER_MAX_BYTES", str(500 * 1024 * 1024)))
 MAX_DURATION = float(os.environ.get("BATCH_UPLOADER_MAX_DURATION", "3600"))
 
@@ -281,12 +282,58 @@ def upload_one(
     return entry["filename"], "uploaded"
 
 
+def upload_art_asset(
+    base: str,
+    auth: CampaignAuth,
+    entry: dict,
+    asset_id: str,
+) -> tuple[str, str]:
+    """Upload one Art Track audio/cover asset with resumable multipart support."""
+    ticket = json_request(
+        f"{base}/batch/art-track-assets/{asset_id}/ticket",
+        method="POST", body={}, auth=auth,
+    )
+    if ticket.get("complete"):
+        return entry["filename"], "already uploaded"
+    content_type = ticket.get("content_type") or entry.get("mime_type") or "application/octet-stream"
+    path = entry["path"]
+    parts = []
+    if ticket.get("use_multipart"):
+        part_size = int(ticket["part_size"])
+        uploaded = {
+            int(part.get("part_number") or part.get("PartNumber")): str(
+                part.get("etag") or part.get("ETag") or ""
+            ).strip('"')
+            for part in ticket.get("uploaded_parts", [])
+        }
+        with path.open("rb") as stream:
+            for part in ticket["parts"]:
+                number = int(part["part_number"])
+                if uploaded.get(number):
+                    parts.append({"part_number": number, "etag": uploaded[number]})
+                    continue
+                size = min(part_size, entry["size_bytes"] - (number - 1) * part_size)
+                stream.seek((number - 1) * part_size)
+                etag = put(part["url"], stream.read(size), content_type)
+                if not etag:
+                    raise RuntimeError(f"Part {number} did not expose ETag")
+                parts.append({"part_number": number, "etag": etag})
+    else:
+        put(ticket["upload_url"], path.read_bytes(), content_type)
+    json_request(
+        f"{base}/batch/art-track-assets/{asset_id}/complete",
+        method="POST", body={"parts": parts}, auth=auth,
+    )
+    return entry["filename"], "uploaded"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Upload a WAV/MP3 folder to a Genly campaign")
     parser.add_argument("--api", required=True, help="API base URL")
     parser.add_argument("--campaign", required=True, help="Campaign id")
     parser.add_argument("--code", default="", help="Temporary pairing code from the panel")
     parser.add_argument("--folder", required=True, type=Path)
+    parser.add_argument("--covers", type=Path, help="Folder containing JPG/PNG covers for an Art Track campaign")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument(
         "--username", default=(
@@ -317,7 +364,7 @@ def main() -> int:
     if str(auth_probe.get("campaign_id") or "") != args.campaign:
         raise RuntimeError("campaign upload token is scoped to another campaign")
     folder = args.folder.expanduser().resolve()
-    paths = sorted(path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in ALLOWED)
+    paths = sorted(path for path in folder.rglob("*") if path.is_file() and path.suffix.lower() in ALLOWED)
     if not paths:
         print("No WAV/MP3 files found.", file=sys.stderr)
         return 2
@@ -335,6 +382,62 @@ def main() -> int:
             except Exception as exc:
                 print(f"ERROR inspecting {futures[future].name}: {exc}", file=sys.stderr)
     entries.sort(key=lambda item: item["filename"].casefold())
+    if args.covers:
+        cover_root = args.covers.expanduser().resolve()
+        cover_paths = sorted(
+            path for path in cover_root.rglob("*")
+            if path.is_file() and path.suffix.lower() in COVER_ALLOWED
+        )
+        covers = []
+        for path in cover_paths:
+            digest = sha256(path)
+            covers.append({
+                "client_id": digest,
+                "filename": path.name,
+                "relative_path": str(path.relative_to(cover_root)),
+                "sha256": digest,
+                "size_bytes": path.stat().st_size,
+                "mime_type": {
+                    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                }[path.suffix.lower()],
+                "path": path,
+            })
+        registered = json_request(
+            f"{base}/batch/art-track-campaigns/{args.campaign}/manifest",
+            method="POST",
+            body={
+                "audios": [{key: value for key, value in entry.items() if key != "path"} for entry in entries],
+                "covers": [{key: value for key, value in entry.items() if key != "path"} for entry in covers],
+            },
+            auth=auth,
+        )
+        assets = json_request(
+            f"{base}/batch/art-track-campaigns/{args.campaign}/assets", auth=auth,
+        )
+        by_path = {entry["relative_path"]: entry for entry in covers}
+        by_name = {entry["filename"]: entry for entry in covers}
+        by_audio = {entry["filename"]: entry for entry in entries}
+        failures = []
+        for asset in assets.get("items", []):
+            source = (
+                by_path.get(asset.get("relative_path"))
+                or by_name.get(asset.get("filename"))
+                or by_audio.get(asset.get("filename"))
+            )
+            if not source or asset.get("upload_state") == "uploaded":
+                continue
+            try:
+                filename, state = upload_art_asset(base, auth, source, asset["id"])
+                print(f"OK {filename}: {state}")
+            except Exception as exc:
+                failures.append(asset.get("filename") or source["filename"])
+                print(f"ERROR {asset.get('filename')}: {exc}", file=sys.stderr)
+        if failures:
+            print("Re-run with the same folders and a new pairing code to resume missing assets.", file=sys.stderr)
+            return 1
+        print(f"Art-track manifest: {registered.get('registered_count', len(entries))} audios, {len(covers)} covers.")
+        return 0
+
     item_ids = {}
     for start in range(0, len(entries), 100):
         chunk = entries[start:start + 100]

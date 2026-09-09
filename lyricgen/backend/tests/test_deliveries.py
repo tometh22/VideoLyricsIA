@@ -292,6 +292,83 @@ def test_portal_items_lists_active_deliveries(client, admin_token, approved_job,
     assert len(v["files"]) == 5
 
 
+def test_chile_portal_does_not_expose_non_chile_delivery(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The Chile surface only exposes rows explicitly sent to Chile.
+
+    The fixture is published with the default Argentina destination, which
+    Chile must not inherit even when both portals use the same token.
+    """
+    client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    res = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    )
+    assert res.status_code == 200
+    assert not any(
+        song["artist"] == "Test Artist" for song in res.json()["songs"]
+    )
+
+
+def test_same_job_can_be_published_to_both_portals(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The destination is part of the delivery identity, not the job.
+
+    This is the regression test for the admin workflow: a video sent first to
+    Argentina must remain independently publishable to Chile.
+    """
+    argentina = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    chile = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert argentina.status_code == 200, argentina.text
+    assert chile.status_code == 200, chile.text
+    assert argentina.json()["portal_id"] == "argentina"
+    assert chile.json()["portal_id"] == "chile"
+    assert argentina.json()["delivery_id"] != chile.json()["delivery_id"]
+
+    argentina_items = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "argentina"},
+    ).json()
+    chile_items = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    ).json()
+    assert any(song["artist"] == "Test Artist" for song in argentina_items["songs"])
+    assert any(song["artist"] == "Test Artist" for song in chile_items["songs"])
+
+    status = client.get(
+        f"/status/{approved_job.job_id}", headers=auth(admin_token),
+    ).json()
+    assert set(status["umg_portals"]) == {"argentina", "chile"}
+
+
+def test_chile_publish_accepts_source_from_any_tenant(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The selected Chile destination, not the source tenant, controls visibility."""
+    res = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert res.status_code == 200, res.text
+    items = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    ).json()
+    assert any(song["artist"] == "Test Artist" for song in items["songs"])
+
+
 def test_portal_can_delete(client, admin_token, approved_job, all_r2_files_present):
     # Publish first
     res = client.post(
