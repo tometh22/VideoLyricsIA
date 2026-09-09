@@ -1,7 +1,7 @@
 """Store the destination portal on each delivery row.
 
 Revision ID: f2a4b6c8d0e2
-Revises: e8b4c2d6f0a3
+Revises: a1c3e5f7b902
 """
 
 from typing import Sequence, Union
@@ -11,7 +11,7 @@ from alembic import op
 
 
 revision: str = "f2a4b6c8d0e2"
-down_revision: Union[str, Sequence[str], None] = "e8b4c2d6f0a3"
+down_revision: Union[str, Sequence[str], None] = "a1c3e5f7b902"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
