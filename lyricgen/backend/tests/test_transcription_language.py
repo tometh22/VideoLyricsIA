@@ -240,3 +240,88 @@ def test_auto_language_is_resolved_before_primary_whisperx():
     ]
     assert resolution_lines and whisperx_lines
     assert min(resolution_lines) < min(whisperx_lines)
+
+
+# --- reference_divergence: the safety net for wrong-language ASR output -------
+# Regression for the "Cambiar el mundo" (Lerner) staging report: WhisperX
+# auto-LID decoded a Spanish song's repeated chorus as an unsupported language
+# (Welsh). The clean Spanish reference made expected_language=es and suppressed
+# language_uncertain, while the six-language detector abstained on the output
+# (detected_languages={}), so language_conflict could not fire either -> zero
+# alert on half-foreign text. Synthetic text below reproduces that SHAPE only.
+
+from transcription_language import reference_divergence  # noqa: E402
+
+_ES_REFERENCE = """
+Puedes cambiar el mundo en un instante
+Puedes mirar adentro tu sentimiento
+Si se renueva la esperanza cuando quieres
+Empieza por ti la cancion que somos hoy
+"""
+
+_ES_LINE = "Puedes cambiar el mundo en un instante quieres"
+_ES_LINE_2 = "Si se renueva la esperanza cuando quieres cambiar"
+# Foreign (unsupported-language) lines share no words with the Spanish reference.
+_FOREIGN_LINE = "byddwch chi gweld blynyddoedd llawer hyfryd ymlaen"
+_FOREIGN_LINE_2 = "gallwch gweld rhwystrau hefyd llwyd dechrau amdanyn"
+
+
+def _segs(*texts):
+    return [{"text": t} for t in texts]
+
+
+def test_reference_divergence_flags_half_foreign_output():
+    out = reference_divergence(
+        _segs(_ES_LINE, _ES_LINE_2, _FOREIGN_LINE, _FOREIGN_LINE_2),
+        _ES_REFERENCE,
+    )
+    assert out["has_reference"] is True
+    assert out["substantial"] == 4
+    assert out["unexplained"] == 2
+    assert out["ratio"] == pytest.approx(0.5)
+    assert out["unexplained_indices"] == [2, 3]
+
+
+def test_reference_divergence_clean_spanish_song_is_not_flagged():
+    out = reference_divergence(
+        _segs(_ES_LINE, _ES_LINE_2, "Empieza por ti la cancion que somos hoy"),
+        _ES_REFERENCE,
+    )
+    assert out["has_reference"] is True
+    assert out["substantial"] == 3
+    assert out["unexplained"] == 0
+    assert out["ratio"] == 0.0
+
+
+def test_reference_divergence_needs_a_real_reference():
+    # A missing/short reference can never fabricate divergence.
+    out = reference_divergence(_segs(_FOREIGN_LINE, _FOREIGN_LINE_2), "")
+    assert out == {
+        "substantial": 0, "unexplained": 0, "ratio": 0.0,
+        "unexplained_indices": [], "has_reference": False,
+    }
+    out_short = reference_divergence(_segs(_FOREIGN_LINE), "una dos")
+    assert out_short["has_reference"] is False
+
+
+def test_reference_divergence_ignores_short_fragments():
+    # Short vocalisations / proper-noun lines / hallucinated stubs never count.
+    out = reference_divergence(
+        _segs("Empiaisio por mi", "MPS 4.0", "i newid", _ES_LINE),
+        _ES_REFERENCE,
+    )
+    assert out["substantial"] == 1  # only the real Spanish line qualifies
+    assert out["unexplained"] == 0
+
+
+def test_reference_divergence_is_bilingual_safe():
+    # A genuinely bilingual song keeps a bilingual audio-derived reference, so
+    # both languages are explained and nothing is flagged.
+    bilingual_reference = _ES_REFERENCE + "\nI can change the world tonight if you believe\n"
+    out = reference_divergence(
+        _segs(_ES_LINE, "I can change the world tonight if you believe now"),
+        bilingual_reference,
+    )
+    assert out["has_reference"] is True
+    assert out["unexplained"] == 0
+    assert out["ratio"] == 0.0

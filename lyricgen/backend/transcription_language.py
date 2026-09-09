@@ -246,11 +246,68 @@ def diagnose_language_state(value, persisted_language: str | None = None) -> dic
     }
 
 
+def _content_tokens(text: str) -> set[str]:
+    """Distinct alphabetic tokens of length >= 2 (NFC, apostrophes split)."""
+    normalized = unicodedata.normalize("NFC", text or "").casefold()
+    normalized = normalized.replace("’", "'").replace("'", " ")
+    return set(re.findall(r"[^\W\d_]{2,}", normalized, re.UNICODE))
+
+
+# A transcription must agree with its own audio-derived reference.  A lexical
+# language detector only knows six languages, abstains on ordinary lyric text
+# (it returns ``{}`` even for a clean Spanish verse) and is blind to anything
+# else — so a half-Welsh decode of a Spanish song keeps a clean Spanish
+# reference, produces no detected language, and trips neither ``language_conflict``
+# nor ``language_uncertain``.  Measuring how much of the OUTPUT is unexplained by
+# the reference catches that drift without guessing a language and without
+# translating: a correct transcription overlaps its reference heavily, a
+# wrong-language or hallucinated decode shares almost no words with it, and a
+# genuinely bilingual song stays low because the reference — drawn from the same
+# audio — contains both languages.
+_MIN_SEGMENT_TOKENS = 4          # skip short vocalisations / proper-noun lines
+_REFERENCE_OVERLAP_FLOOR = 0.34  # below this a line shares almost no words
+_MIN_REFERENCE_TOKENS = 8        # need a real reference to compare against
+
+
+def reference_divergence(output, reference_text: str) -> dict:
+    """Fraction of substantial output lines unexplained by the reference.
+
+    Returns ``{"substantial", "unexplained", "ratio", "unexplained_indices",
+    "has_reference"}``.  ``ratio`` is ``0.0`` when there is no usable reference
+    or no substantial line, so a missing reference can never fabricate
+    divergence.  This never coerces or translates: it only reports drift so the
+    caller can surface it for human review.
+    """
+    reference_tokens = _content_tokens(reference_text)
+    if len(reference_tokens) < _MIN_REFERENCE_TOKENS:
+        return {"substantial": 0, "unexplained": 0, "ratio": 0.0,
+                "unexplained_indices": [], "has_reference": False}
+    substantial = 0
+    unexplained_indices: list[int] = []
+    for index, text in enumerate(_texts(output)):
+        tokens = _content_tokens(text)
+        if len(tokens) < _MIN_SEGMENT_TOKENS:
+            continue
+        substantial += 1
+        overlap = len(tokens & reference_tokens) / len(tokens)
+        if overlap < _REFERENCE_OVERLAP_FLOOR:
+            unexplained_indices.append(index)
+    ratio = (len(unexplained_indices) / substantial) if substantial else 0.0
+    return {
+        "substantial": substantial,
+        "unexplained": len(unexplained_indices),
+        "ratio": ratio,
+        "unexplained_indices": unexplained_indices,
+        "has_reference": True,
+    }
+
+
 __all__ = [
     "SUPPORTED_LANGUAGES",
     "diagnose_language_state",
     "detect_text_language",
     "detect_text_languages",
     "normalize_language",
+    "reference_divergence",
     "resolve_transcription_language",
 ]

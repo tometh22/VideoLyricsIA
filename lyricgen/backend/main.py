@@ -134,6 +134,7 @@ from render_spec import umg_catalog, validate_umg_config
 from transcription_language import (
     detect_text_languages,
     normalize_language,
+    reference_divergence,
     resolve_transcription_language,
 )
 from provenance import job_was_delivered
@@ -7454,16 +7455,41 @@ async def _run_transcription_for_job(
                 and expected_language not in detected_languages
                 and not mixed_language
             )
+            # A supported reference "corroborates" the output's language today,
+            # but nothing checks the output actually AGREES with that reference.
+            # A half-Welsh decode of a Spanish song keeps a clean Spanish
+            # reference; the six-language detector abstains on lyric text
+            # (returning {} even for correct Spanish), so neither
+            # language_conflict nor language_uncertain fires and the operator can
+            # one-click approve foreign text.  Measure output-vs-reference drift
+            # over the FINAL lines the operator approves and surface it as
+            # uncertainty — never force a language, never translate.
+            _ref_divergence = reference_divergence(polished, reference_lyrics)
+            output_reference_divergence = bool(
+                _ref_divergence["has_reference"]
+                and _ref_divergence["substantial"] >= 3
+                and _ref_divergence["ratio"] >= 0.34
+            )
             language_uncertain = bool(
-                not requested_language
-                and not reference_languages
-                and len(detected_languages) <= 1
+                (
+                    not requested_language
+                    and not reference_languages
+                    and len(detected_languages) <= 1
+                )
+                or output_reference_divergence
             )
             if language_conflict:
                 logger.error(
                     "[LANGUAGE] conflict job=%s expected=%s detected=%s; "
                     "blocking approval",
                     job_id, expected_language, detected_language,
+                )
+            if output_reference_divergence:
+                logger.warning(
+                    "[LANGUAGE] output diverges from reference job=%s "
+                    "unexplained=%d/%d ratio=%.2f; flagging for review",
+                    job_id, _ref_divergence["unexplained"],
+                    _ref_divergence["substantial"], _ref_divergence["ratio"],
                 )
             out.update({
                 "requested_language": requested_language,
@@ -7474,6 +7500,10 @@ async def _run_transcription_for_job(
                 "mixed_language": mixed_language,
                 "language_conflict": language_conflict,
                 "language_uncertain": language_uncertain,
+                "output_reference_divergence": output_reference_divergence,
+                "output_reference_divergence_ratio": round(
+                    _ref_divergence["ratio"], 3
+                ),
             })
 
             # Segmentos crudos de whisperX (la performance REAL): viajan en
