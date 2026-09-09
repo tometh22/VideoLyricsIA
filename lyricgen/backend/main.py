@@ -142,6 +142,7 @@ from billing import router as billing_router
 from admin import router as admin_router
 from corpus import router as corpus_router
 from batch_campaigns import router as batch_campaign_router
+from art_track_campaigns import router as art_track_campaign_router
 import emails
 
 # ---------------------------------------------------------------------------
@@ -625,6 +626,7 @@ app.include_router(billing_router)
 app.include_router(admin_router)
 app.include_router(corpus_router)
 app.include_router(batch_campaign_router)
+app.include_router(art_track_campaign_router)
 
 
 # --- Startup ---

@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT / "lyricgen" / "backend"))
 from batch_manifest import parse_audio_filename  # noqa: E402
 
 ALLOWED = {".wav", ".mp3"}
+COVER_ALLOWED = {".jpg", ".jpeg", ".png"}
 MAX_BYTES = int(os.environ.get("BATCH_UPLOADER_MAX_BYTES", str(500 * 1024 * 1024)))
 MAX_DURATION = float(os.environ.get("BATCH_UPLOADER_MAX_DURATION", "3600"))
 
@@ -164,17 +165,58 @@ def upload_one(base: str, token: str, entry: dict, item_id: str) -> tuple[str, s
     return entry["filename"], "uploaded"
 
 
+def upload_art_asset(base: str, token: str, entry: dict, asset_id: str) -> tuple[str, str]:
+    """Upload one audio/cover asset through the art-track token contract."""
+    ticket = json_request(
+        f"{base}/batch/art-track-assets/{asset_id}/ticket", method="POST", body={}, token=token,
+    )
+    if ticket.get("complete"):
+        return entry["filename"], "already uploaded"
+    content_type = ticket.get("content_type") or entry.get("mime_type") or "application/octet-stream"
+    path = entry["path"]
+    parts = []
+    if ticket.get("use_multipart"):
+        part_size = int(ticket["part_size"])
+        uploaded = {
+            int(part.get("part_number") or part.get("PartNumber")): str(
+                part.get("etag") or part.get("ETag") or ""
+            ).strip('"')
+            for part in ticket.get("uploaded_parts", [])
+        }
+        with path.open("rb") as stream:
+            for part in ticket["parts"]:
+                number = int(part["part_number"])
+                if uploaded.get(number):
+                    parts.append({"part_number": number, "etag": uploaded[number]})
+                    continue
+                size = min(part_size, entry["size_bytes"] - (number - 1) * part_size)
+                stream.seek((number - 1) * part_size)
+                data = stream.read(size)
+                etag = put(part["url"], data, content_type)
+                if not etag:
+                    raise RuntimeError(f"Part {number} did not expose ETag")
+                parts.append({"part_number": number, "etag": etag})
+    else:
+        put(ticket["upload_url"], path.read_bytes(), content_type)
+    json_request(
+        f"{base}/batch/art-track-assets/{asset_id}/complete", method="POST",
+        body={"parts": parts}, token=token,
+    )
+    return entry["filename"], "uploaded"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Upload a WAV/MP3 folder to a Genly campaign")
     parser.add_argument("--api", required=True, help="API base URL")
     parser.add_argument("--campaign", required=True, help="Campaign id")
     parser.add_argument("--code", required=True, help="Temporary pairing code from the panel")
     parser.add_argument("--folder", required=True, type=Path)
+    parser.add_argument("--covers", type=Path, help="Folder containing JPG/PNG covers for an art-track campaign")
     parser.add_argument("--concurrency", type=int, default=4)
     args = parser.parse_args()
     base = args.api.rstrip("/")
     folder = args.folder.expanduser().resolve()
-    paths = sorted(path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in ALLOWED)
+    paths = sorted(path for path in folder.rglob("*") if path.is_file() and path.suffix.lower() in ALLOWED)
     if not paths:
         print("No WAV/MP3 files found.", file=sys.stderr)
         return 2
@@ -197,6 +239,47 @@ def main() -> int:
         body={"campaign_id": args.campaign, "code": args.code},
     )
     token = exchange["upload_token"]
+
+    if args.covers:
+        # Art-track import is intentionally explicit. The server performs
+        # the same deterministic matching rules used by the browser and
+        # refuses ambiguous pairs; this CLI only supplies the manifest and
+        # transfers the bytes.
+        cover_paths = sorted(path for path in args.covers.expanduser().resolve().rglob("*") if path.is_file() and path.suffix.lower() in COVER_ALLOWED)
+        covers = []
+        for path in cover_paths:
+            digest = sha256(path)
+            covers.append({
+                "filename": path.name, "relative_path": str(path.relative_to(args.covers.expanduser().resolve())),
+                "sha256": digest, "size_bytes": path.stat().st_size,
+                "mime_type": {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}[path.suffix.lower()],
+                "path": path,
+            })
+        manifest_audios = [{key: value for key, value in entry.items() if key != "path"} for entry in entries]
+        registered = json_request(
+            f"{base}/batch/art-track-campaigns/{args.campaign}/manifest", method="POST",
+            body={"audios": manifest_audios, "covers": [{key: value for key, value in entry.items() if key != "path"} for entry in covers]}, token=token,
+        )
+        assets = json_request(f"{base}/batch/art-track-campaigns/{args.campaign}/assets", token=token)
+        by_path = {str(path.relative_to(args.covers.expanduser().resolve())): entry for path, entry in ((e["path"], e) for e in covers)}
+        by_name = {e["filename"]: e for e in covers}
+        by_audio = {e["filename"]: e for e in entries}
+        failures = []
+        for asset in assets.get("items", []):
+            source = by_path.get(asset.get("relative_path")) or by_name.get(asset.get("filename")) or by_audio.get(asset.get("filename"))
+            if not source or asset.get("upload_state") == "uploaded":
+                continue
+            try:
+                upload_art_asset(base, token, source, asset["id"])
+                print(f"OK {asset['filename']}: uploaded")
+            except Exception as exc:
+                failures.append(asset["filename"])
+                print(f"ERROR {asset['filename']}: {exc}", file=sys.stderr)
+        if failures:
+            print("Re-run with the same folders and a new pairing code to resume missing assets.", file=sys.stderr)
+            return 1
+        print(f"Art-track manifest: {registered.get('registered_count', len(entries))} audios, {len(covers)} covers.")
+        return 0
 
     item_ids = {}
     for start in range(0, len(entries), 100):

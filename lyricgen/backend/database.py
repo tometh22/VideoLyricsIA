@@ -871,6 +871,15 @@ class BatchCampaign(Base):
     tenant_id = Column(String(100), nullable=False, index=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     name = Column(String(160), nullable=False)
+    # ``lyric_video`` is the legacy default.  The value is immutable once an
+    # item has been imported so a lyric campaign can never be turned into an
+    # art-track campaign (or vice versa) by a later PATCH.
+    kind = Column(String(24), nullable=False, default="lyric_video", server_default="lyric_video")
+    # Destination is a business contract, not a tenant id.  It is kept on
+    # the campaign so an AR/CL choice cannot drift with a filename or a
+    # worker environment variable.
+    destination_portal = Column(String(32), nullable=True)
+    preset_version = Column(String(40), nullable=False, default="art-track-v1", server_default="art-track-v1")
     status = Column(String(20), nullable=False, default="active", server_default="active")
     expected_count = Column(Integer, nullable=False, default=0, server_default="0")
     default_render_params = Column(JSONB, nullable=False, default=dict, server_default="{}")
@@ -911,6 +920,14 @@ class BatchCampaignItem(Base):
     upload_attempts = Column(Integer, nullable=False, default=0, server_default="0")
     uploaded_at = Column(DateTime(timezone=True), nullable=True)
     render_overrides = Column(JSONB, nullable=False, default=dict, server_default="{}")
+    # Art-track association.  A cover asset is a separate row so one album
+    # cover can be referenced by many songs without duplicating bytes.
+    cover_asset_id = Column(String(36), ForeignKey("batch_campaign_assets.id"), nullable=True, index=True)
+    cover_match_state = Column(String(20), nullable=False, default="pending", server_default="pending")
+    cover_match_method = Column(String(32), nullable=True)
+    cover_match_error = Column(String(255), nullable=True)
+    association_confirmed = Column(Boolean, nullable=False, default=False, server_default="false")
+    approved_render_fingerprint = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
@@ -934,6 +951,90 @@ class BatchUploadSession(Base):
     claimed_at = Column(DateTime(timezone=True), nullable=True)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class BatchCampaignAsset(Base):
+    """Deduplicated audio/cover input owned by one campaign.
+
+    Audio rows created by the original uploader remain in
+    ``batch_campaign_items`` for backwards compatibility.  New art-track
+    manifests use this table for both roles and point items at the cover row.
+    """
+
+    __tablename__ = "batch_campaign_assets"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "role", "sha256", name="uq_batch_asset_campaign_role_sha"),
+        Index("ix_batch_assets_campaign_role_state", "campaign_id", "role", "upload_state"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    campaign_id = Column(String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    role = Column(String(12), nullable=False)  # audio | cover
+    filename = Column(String(500), nullable=False)
+    relative_path = Column(String(1000), nullable=True)
+    sha256 = Column(String(64), nullable=False)
+    size_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    mime_type = Column(String(120), nullable=False)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    upload_state = Column(String(20), nullable=False, default="registered", server_default="registered")
+    upload_key = Column(Text, nullable=True)
+    multipart_upload_id = Column(Text, nullable=True)
+    upload_error = Column(String(500), nullable=True)
+    upload_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    uploaded_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class DeliveryBatch(Base):
+    """Durable snapshot of one bulk publication operation."""
+
+    __tablename__ = "delivery_batches"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "idempotency_key", name="uq_delivery_batch_campaign_idempotency"),
+        Index("ix_delivery_batches_campaign_status", "campaign_id", "status"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    campaign_id = Column(String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    destination_portal = Column(String(32), nullable=False)
+    status = Column(String(24), nullable=False, default="queued", server_default="queued")
+    idempotency_key = Column(String(160), nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    total_count = Column(Integer, nullable=False, default=0, server_default="0")
+    sent_count = Column(Integer, nullable=False, default=0, server_default="0")
+    failed_count = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class DeliveryBatchItem(Base):
+    """Immutable item selection and per-song receipt for a delivery batch."""
+
+    __tablename__ = "delivery_batch_items"
+    __table_args__ = (
+        UniqueConstraint("delivery_batch_id", "job_id", name="uq_delivery_batch_item_job"),
+        Index("ix_delivery_batch_items_status", "delivery_batch_id", "status"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    delivery_batch_id = Column(String(36), ForeignKey("delivery_batches.id", ondelete="CASCADE"), nullable=False, index=True)
+    campaign_id = Column(String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    job_id = Column(String(12), nullable=False, index=True)
+    approved_render_fingerprint = Column(String(64), nullable=False)
+    status = Column(String(24), nullable=False, default="pending", server_default="pending")
+    delivery_id = Column(Integer, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    error_code = Column(String(120), nullable=True)
+    error_detail = Column(String(500), nullable=True)
+    receipt = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
 
 class EditorDocument(Base):
