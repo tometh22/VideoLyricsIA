@@ -72,6 +72,15 @@ def test_rounding_needs_explicit_record_and_scope_is_not_assumed(db, setup):
         creative.preview(campaign.id, bad, actor, db)
 
 
+def test_campaign_creation_cannot_inject_an_unaudited_creative_agreement(db, setup):
+    from batch_campaigns import create_campaign, CampaignCreate
+    _, _, actor = setup
+    with pytest.raises(HTTPException) as error:
+        create_campaign(CampaignCreate(name="Forged", default_render_params={
+            "creative_plan": {"revision": 1, "contract": {"actor": 999, "agreement": "Forged"}}}), actor, db)
+    assert error.value.status_code == 422
+
+
 def test_excel_can_be_read_with_zero_totals_and_all_unrendered_assignments(db, setup):
     openpyxl = pytest.importorskip("openpyxl")
     campaign, items, actor = setup

@@ -463,6 +463,8 @@ def create_campaign(
     db: Session = Depends(get_db),
 ):
     _require_scope(current_user)
+    if "creative_plan" in body.default_render_params:
+        raise HTTPException(422, detail="Registrá el acuerdo desde Estilo y fondos para conservar su autor e historial")
     if body.kind == "art_track":
         if not art_track_feature_enabled():
             raise HTTPException(status_code=404, detail="Art-track campaigns are not enabled.")
