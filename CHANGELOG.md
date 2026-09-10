@@ -3,6 +3,12 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.15] - 2026-09-10
+
+### Fixed
+
+- Print the complete campaign contract report on white pages without clipping it inside the application layout; preserve normal printing on other screens.
+
 ## [1.1.14] - 2026-09-10
 
 ### Added

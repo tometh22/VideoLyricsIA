@@ -136,3 +136,35 @@ test("individual campaign typography autosaves and reopens without approving or 
   await expect(page.getByRole("button", { name: /^Tipografía:?$/ }).first()).toContainText("Poppins");
   expect(paidCalls).toEqual([]);
 });
+
+test("printed campaign reports paginate outside the scrolling app and do not hide other screens", async ({ page }) => {
+  await harness(page);
+  const announcement = page.getByRole("dialog", { name: "Nuevo editor de letras" });
+  await page.addLocatorHandler(announcement, async () => announcement.getByRole("button", { name: "Cancelar" }).click());
+  await page.goto("/campaigns/chile1?view=contract");
+  await page.locator("#campaign-contract-report").waitFor();
+  await page.locator("#campaign-contract-report").evaluate(report => {
+    for (let i = 0; i < 60; i++) {
+      const line = document.createElement("p");
+      line.textContent = `Registro de auditoría ${i + 1}: canción, estilo y evidencia conservados.`;
+      report.append(line);
+    }
+    report.lastElementChild.dataset.printEnd = "true";
+  });
+  await page.emulateMedia({ media: "print" });
+  const layout = await page.locator("[data-print-end]").evaluate(end => {
+    const clipped = [];
+    const bottom = end.getBoundingClientRect().bottom;
+    for (let node = end.parentElement; node; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (["hidden", "auto", "scroll", "clip"].includes(style.overflowY) && node.getBoundingClientRect().bottom < bottom - 1) clipped.push(node.tagName);
+    }
+    return { clipped, background: getComputedStyle(document.body).backgroundColor, documentHeight: document.documentElement.scrollHeight };
+  });
+  expect(layout.clipped).toEqual([]);
+  expect(layout.background).toBe("rgb(255, 255, 255)");
+  expect(layout.documentHeight).toBeGreaterThan(1500);
+  await page.pdf({ path: "test-results/campaign-contract-print.pdf", format: "A4", printBackground: true });
+  await page.goto("/campaigns/chile1?view=history");
+  await expect(page.getByRole("heading", { name: "Videos de esta campaña (0)" })).toBeVisible();
+});
