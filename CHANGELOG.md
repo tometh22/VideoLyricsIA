@@ -13,6 +13,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Keep uploaded photos still when selecting Foto fija, both on the first render and on edits; effects remain independently composited.
 - Restore all campaign visual settings in the individual editor, autosave changes with revision checks and flush before approval or switching songs.
 - Preserve campaign membership in new variants and keep rendered evidence separate from requested settings.
 

@@ -25,15 +25,24 @@ def make_job(db, setup, tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg required")
-def test_real_photo_effect_encode_and_immutable_receipt(db, setup, tmp_path):
+def test_real_photo_effect_encode_and_immutable_receipt(db, setup, tmp_path, monkeypatch):
     import pipeline
     from tests.test_fx_e2e_render import _photo, _click_track, _spec
     job, folder = make_job(db, setup, tmp_path)
-    photo, audio, base = folder / "photo.jpg", folder / "audio.mp3", folder / "background.mp4"
+    photo, audio = folder / "photo.jpg", folder / "audio.mp3"
     _photo(photo); _click_track(audio)
-    pipeline._static_image_to_mp4(str(photo), str(base), duration=3., spec=_spec())
-    output = pipeline._render_lyrics_ass(str(base), str(audio), [], str(folder), 3.,
-        spec=_spec(), font_path="", effect="chromatic_pulse", render_text=False)
+    # Exercise the same uploaded-image conversion as the real renderer.
+    from types import SimpleNamespace
+    monkeypatch.setattr(pipeline, "AudioFileClip", lambda _: SimpleNamespace(duration=3., close=lambda: None))
+    def no_kenburns(*args, **kwargs):
+        pytest.fail("A fixed campaign photo must never enter the zoom renderer")
+    monkeypatch.setattr(pipeline, "_prerender_kenburns_bg", no_kenburns)
+    render = pipeline._render_lyrics_ass
+    def without_text(*args, **kwargs):
+        return render(*args, **kwargs, render_text=False)
+    monkeypatch.setattr(pipeline, "_render_lyrics_ass", without_text)
+    output, _, _ = pipeline.generate_lyric_video(str(audio), [], "auto", str(folder), "",
+        bg_image_path=str(photo), spec=_spec(), font="", effect="chromatic_pulse", still_background=True)
     encoded = json.loads((folder / "lyric_video.mp4.creative.json").read_text())
     assert encoded["background_kind"] == "image"
     assert encoded["effect_applied"] == "chromatic_pulse"

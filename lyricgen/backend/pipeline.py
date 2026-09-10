@@ -2309,12 +2309,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 art_track=art_track,
                 label_line=label_line,
                 # "Quieta de verdad": si el fondo entregado es una IMAGEN y el
-                # operador eligió Estático, no le metemos el zoom del 15%.
+                # operador eligió Estático o Foto fija, no le metemos el zoom
+                # del 15%. Foto fija conserva el código legacy foto-parallax.
                 # Es además la primera vez que `movement_style` hace algo en el
                 # camino de fondo humano: hasta ahora el eje entero era inerte
                 # acá (se enviaba, se persistía y nadie lo leía).
                 still_background=(
-                    _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
+                    _normalize_movement_style(movement_style) in {"estatico", "foto-estatica", "foto-parallax"}
                 ),
                 preserve_approved_timing=preserve_approved_timing,
             )
@@ -20849,7 +20850,7 @@ def run_edit_pipeline(
             bg_prelooped=bg_prelooped,
             # Espejo de run_pipeline: un edit no puede perder el "quieta".
             still_background=(
-                _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
+                _normalize_movement_style(movement_style) in {"estatico", "foto-estatica", "foto-parallax"}
             ),
             # Every edit render consumes a persisted operator snapshot. Never
             # reinterpret its approved/manual line boundaries at display time.
