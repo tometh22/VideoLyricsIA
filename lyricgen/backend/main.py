@@ -5664,7 +5664,8 @@ def _looks_live(*texts) -> bool:
 
 def _resolve_postprocess_language(requested_language, result, *, job_id: str):
     """Resolve auto once, then reuse the same language in every post-pass."""
-    reference = result.get("reference_lyrics", "") if isinstance(result, dict) else ""
+    from transcription_language import diagnostic_reference_text
+    reference = diagnostic_reference_text(result) if isinstance(result, dict) else ""
     resolved = resolve_transcription_language(
         requested_language,
         result=result if isinstance(result, dict) else None,
@@ -7453,8 +7454,13 @@ async def _run_transcription_for_job(
             # reference divergence is a DISCREPANCY alert (the transcription does
             # not match its own audio-derived reference), NOT a verdict that the
             # text is a specific wrong language, and it never translates.
+            from transcription_language import diagnostic_reference_text
+            _diagnostic_reference = diagnostic_reference_text({
+                "reference_lyrics": reference_lyrics,
+                "reference_hypothesis_candidate": _reference_candidate_state,
+            })
             _lang = build_language_contract(
-                polished, reference_lyrics,
+                polished, _diagnostic_reference,
                 requested_language=language, expected_hint=lang,
             )
             if _lang["language_conflict"]:

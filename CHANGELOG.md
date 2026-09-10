@@ -3,6 +3,18 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.8] - 2026-09-10
+
+### Fixed
+
+- Keep complete audio-derived hypotheses available for discrepancy diagnostics
+  and conservative post-pass language resolution when global alignment is rejected.
+  Rejection still prohibits copying reference lyrics into the transcript.
+- Detect adjacent unexplained repetitive phrases without counting only distinct
+  words or diluting a local failure across the whole song. Preserve vocal-only
+  adlibs, bilingual references, editorial documents and existing approval resolution.
+  These checks detect drift; they do not claim to repair the ASR's wrong words.
+
 ## [1.1.6] - 2026-09-09
 
 ### Fixed
