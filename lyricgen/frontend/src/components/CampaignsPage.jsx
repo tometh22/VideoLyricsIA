@@ -173,6 +173,8 @@ function CampaignDetail({ id }) {
   const [discardTarget, setDiscardTarget] = useState(null);
   const [discardReason, setDiscardReason] = useState("Instrumental · solicitud del cliente");
   const [discardBusy, setDiscardBusy] = useState(false);
+  const [discardError, setDiscardError] = useState("");
+  useEffect(() => { setDiscardError(""); }, [discardTarget]);
   const [queueAudit, setQueueAudit] = useState(false);
   const [reviewQueue, setReviewQueue] = useState(null);
   const [highlightedJobId, setHighlightedJobId] = useState(() => searchParams.get("focus") || null);
@@ -467,11 +469,12 @@ function CampaignDetail({ id }) {
       <p className="text-xs text-ink-secondary">Las alertas orientan la revisión; no son un porcentaje de acierto. La confianza todavía no está calibrada.</p>
       {queueLoading && <p role="status" className="text-sm text-ink-secondary">Cargando canciones…</p>}
       {loadingMore && <p role="status" className="text-sm text-ink-secondary">Mostrando {reviewQueue?.items?.length || 0} de {reviewQueue?.scope?.total || 0} canciones. Cargando el resto…</p>}
-      {discardTarget && <section role="dialog" aria-modal="true" aria-label={discardTarget.state === "discarded" ? "Recuperar canción" : "Descartar canción"} className="rounded-2xl bg-surface-2 p-5 ring-1 ring-amber-400/30">
+      {discardTarget && <section role="dialog" aria-modal="true" aria-label={discardTarget.state === "discarded" ? "Recuperar canción" : "Descartar canción"} onKeyDown={e => { if (e.key === "Escape" && !discardBusy) setDiscardTarget(null); }} className="fixed inset-0 z-[80] grid place-items-center overflow-y-auto bg-black/75 p-5 backdrop-blur-sm"><div className="w-full max-w-xl rounded-2xl bg-surface-2 p-6 shadow-xl ring-1 ring-amber-400/30">
         <h2 className="font-semibold text-white">{discardTarget.state === "discarded" ? "Recuperar" : "Descartar"} · {discardTarget.title}</h2>
         <p className="mt-2 text-sm text-ink-secondary">{discardTarget.artist} · El audio y el borrador se conservan. El cambio queda registrado.</p>
         {discardTarget.state !== "discarded" && <label className="mt-3 block text-sm text-ink-secondary">Motivo<input autoFocus value={discardReason} onChange={e => setDiscardReason(e.target.value)} maxLength={500} className="mt-1 block w-full rounded-lg bg-black/25 p-3 text-white ring-1 ring-white/10" /></label>}
-        <div className="mt-4 flex gap-3"><button disabled={discardBusy || (discardTarget.state !== "discarded" && discardReason.trim().length < 3)} onClick={async () => {
+        {discardError && <p role="alert" className="mt-3 text-sm text-red-200">{discardError}</p>}
+        <div className="mt-4 flex gap-3"><button autoFocus={discardTarget.state === "discarded"} disabled={discardBusy || (discardTarget.state !== "discarded" && discardReason.trim().length < 3)} onClick={async () => {
           setDiscardBusy(true);
           try {
             const restoring = discardTarget.state === "discarded";
@@ -480,10 +483,10 @@ function CampaignDetail({ id }) {
               ...(restoring ? {} : { body: JSON.stringify({ reason: discardReason.trim() }) }),
             });
             setDiscardTarget(null); await load();
-          } catch (e) { setError(e.message); }
+          } catch (e) { setDiscardError(e.message); }
           finally { setDiscardBusy(false); }
         }} className="rounded-lg bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-40">{discardBusy ? "Guardando…" : discardTarget.state === "discarded" ? "Confirmar recuperación" : "Confirmar descarte"}</button><button disabled={discardBusy} onClick={() => setDiscardTarget(null)} className="text-sm text-ink-secondary">Cancelar</button></div>
-      </section>}
+      </div></section>}
       <section className="space-y-4 rounded-2xl bg-surface-2/40 p-5 ring-1 ring-white/[0.06]">
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between"><div><h2 className="font-semibold text-white">Encontrá una canción y empezá a trabajar</h2><p className="mt-1 text-xs text-ink-tertiary">Primero aparecen las canciones con menos alertas. Todas requieren escuchar y confirmar letra y tiempos.</p></div><div className="flex flex-wrap gap-2"><input value={queueSearch} onChange={(e) => { setQueueSearch(e.target.value); saveContext({ q: e.target.value, focus: null }); }} placeholder="Buscar canción o artista" aria-label="Buscar canción o artista" className="w-56 rounded-lg bg-black/25 px-3 py-2 text-sm text-white ring-1 ring-white/10" /><select value={queueOrder} onChange={(e) => { setQueueOrder(e.target.value); saveContext({ order: e.target.value }); }} aria-label="Orden" className="rounded-lg bg-black/25 px-3 py-2 text-sm text-white ring-1 ring-white/10"><option value="effort">Menos alertas primero</option><option value="learning">Aprendizaje (20%)</option></select><button onClick={() => { const next = !queueMine; setQueueMine(next); saveContext({ mine: next }); }} className={`rounded-lg px-3 py-2 text-sm ring-1 ${queueMine ? "bg-brand/15 text-brand-light ring-brand/30" : "bg-black/25 text-ink-secondary ring-white/10"}`}>Revisadas por mí</button></div></div>
         {(queueSearch || queueMine || queueVersion || queueArtist || queueState) && <div className="flex flex-wrap items-center gap-2 text-xs text-ink-secondary"><span>Filtros activos:</span>{queueSearch && <span className="rounded-full bg-white/[0.07] px-2 py-1">“{queueSearch}”</span>}{queueMine && <span className="rounded-full bg-white/[0.07] px-2 py-1">Revisadas por mí</span>}<button onClick={clearFilters} className="underline hover:text-white">Limpiar</button></div>}
