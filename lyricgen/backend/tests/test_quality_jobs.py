@@ -546,6 +546,11 @@ def test_quality_persist_preserves_batch_reference_and_human_approval(db):
         "source_audio_sha256": "a" * 64, "source_audio_revision": 1,
         "reason": "attestation_audio_first",
     }
+    reviewer_receipt = {
+        "status": "complete", "candidate_available": True,
+        "source": {"audio_sha256": "a" * 64, "segments_revision": 2},
+        "candidate_registry_identity": "immutable-candidate-pointer",
+    }
     db.add(Job(
         job_id=job_id, user_id=user.id, tenant_id=tenant,
         artist="Artist", song_title="Song", filename="song.wav",
@@ -558,6 +563,7 @@ def test_quality_persist_preserves_batch_reference_and_human_approval(db):
             "analysis_status": "pending",
             "reference_hypothesis": reference,
             "catalog_reference": catalog,
+            "reviewer_campaign_status": reviewer_receipt,
             "pre_background_approval": approval,
         },
     ))
@@ -568,6 +574,7 @@ def test_quality_persist_preserves_batch_reference_and_human_approval(db):
     assert "pre_background_approval" not in candidate
     # Analytical replay cannot replace the transcription's source decision.
     candidate["catalog_reference"] = {"status": "audio_validated", "used": True}
+    candidate["reviewer_campaign_status"] = {"status": "pending", "candidate_available": False}
     persisted = quality_jobs._persist_if_current(
         job_id, 2, content_hash, candidate,
         expected_audio_revision=1,
@@ -580,6 +587,7 @@ def test_quality_persist_preserves_batch_reference_and_human_approval(db):
     row = db.query(Job).filter(Job.job_id == job_id).one()
     assert row.transcription_quality["reference_hypothesis"] == reference
     assert row.transcription_quality["catalog_reference"] == catalog
+    assert row.transcription_quality["reviewer_campaign_status"] == reviewer_receipt
     assert row.transcription_quality["pre_background_approval"] == approval
     assert row.transcription_quality["analysis_status"] == "complete"
     assert row.active_quality_attempt_id is None

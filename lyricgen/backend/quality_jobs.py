@@ -640,6 +640,7 @@ def _persist_if_current(job_id: str, expected_revision: int,
         for durable_key in (
             "reference_hypothesis",
             "catalog_reference",
+            "reviewer_campaign_status",
             "pre_background_approval",
         ):
             if durable_key in previous:

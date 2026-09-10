@@ -7,7 +7,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- Preserve the spreadsheet lyric decision when background quality analysis finishes, so reviewers retain whether the source was applied, declined, or absent.
+- Preserve spreadsheet lyric decisions and published reviewer candidate receipts when background quality analysis finishes. Reviewers retain source outcomes and candidate pointers; existing source checks still reject stale candidates.
 
 ## [1.1.12] - 2026-09-10
 
