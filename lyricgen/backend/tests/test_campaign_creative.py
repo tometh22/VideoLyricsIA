@@ -238,7 +238,7 @@ def test_lite_is_an_explicit_campaign_model_without_changing_ordinary_jobs(db, s
     preview = creative.preview(campaign.id, body, actor, db)
     creative.apply(campaign.id, creative.CommitRequest(preview_id=preview["preview_id"]), actor, db)
     job = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id, campaign_id=campaign.id,
-              campaign_item_id=items[0].id, artist="Test", filename="synthetic.wav", status="lyrics_approved")
+              campaign_item_id=items[0].id, workload_class="batch", artist="Test", filename="synthetic.wav", status="lyrics_approved")
     db.add(job); db.flush()
     settings = creative.effective_settings(campaign, items[0].render_overrides)
     creative.generation_receipt(db, job, "1", settings, actor); db.commit()

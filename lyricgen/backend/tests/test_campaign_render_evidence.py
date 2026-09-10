@@ -17,7 +17,7 @@ from tests.test_batch_campaigns import clean_batch_campaign_rows  # noqa: F401
 def make_job(db, setup, tmp_path):
     campaign, items, actor = setup
     job = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id,
-              campaign_id=campaign.id, campaign_item_id=items[0].id, artist="Test",
+              campaign_id=campaign.id, campaign_item_id=items[0].id, workload_class="batch", artist="Test",
               filename="synthetic.wav", status="processing", render_params={})
     db.add(job); db.commit()
     folder = tmp_path / job.job_id; folder.mkdir()
@@ -77,4 +77,3 @@ def test_provider_proof_is_bound_to_exact_background_and_job(db, setup, tmp_path
     evidence.persist_render_evidence(job.job_id, folder)
     db.refresh(job)
     assert "background_sha256" not in job.render_params["campaign_render_evidence"]
-

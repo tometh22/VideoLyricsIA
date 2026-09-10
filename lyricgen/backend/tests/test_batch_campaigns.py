@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 import batch_campaigns as batch
 from database import (
-    AuditLog, BatchCampaign, BatchCampaignItem, BatchUploadSession,
+    AIProvenance, AuditLog, BatchCampaign, BatchCampaignItem, BatchUploadSession,
     EditorDocument, Job, JobOutboxEvent, ProductEvent, SessionLocal, User,
 )
 from editor import acquire_lock, release_lock
@@ -32,6 +32,9 @@ def clean_batch_campaign_rows():
                 Job.workload_class == "batch",
             ).all()]
             if job_ids:
+                session.query(AIProvenance).filter(
+                    AIProvenance.job_id.in_(job_ids),
+                ).delete(synchronize_session=False)
                 session.query(ProductEvent).filter(
                     ProductEvent.job_id.in_(job_ids),
                 ).delete(synchronize_session=False)
