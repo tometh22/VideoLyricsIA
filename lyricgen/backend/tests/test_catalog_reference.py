@@ -145,7 +145,7 @@ def test_aligner_failure_preserves_original_even_after_mutation(monkeypatch, rai
 
 def test_repeated_chorus_cannot_hide_an_unheard_verse(monkeypatch):
     ref = reference()
-    ref["text"] = TEXT + "\n" + "invento cuatro palabras extranjeras" + "\n" + (TEXT + "\n") * 5
+    ref["text"] = (TEXT + "\n" + "invento cuatro palabras extranjeras" + "\n" + (TEXT + "\n") * 5).strip()
     ref["text_sha256"] = hashlib.sha256(ref["text"].encode()).hexdigest()
     monkeypatch.setattr("pipeline._audio_duration", lambda _: 7)
     baseline = result()
