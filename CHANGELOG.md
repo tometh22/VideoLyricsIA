@@ -3,6 +3,18 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.8] - 2026-09-09
+
+### Fixed
+
+- Keep campaign review URL, editor and audio bound to the selected song when navigating back or switching songs; preserve the campaign return link.
+- Load a campaign queue in one request, defer administrative item loading and debounce search.
+- Explain review actions and evidence in plain Spanish; expose uncalibrated confidence and remove duplicated navigation.
+
+### Added
+
+- Recoverable campaign discard with reason, actor, timestamp, original status and append-only audit events. Discarded songs stay out of pending review and retain audio and drafts.
+
 ## [1.1.6] - 2026-09-09
 
 ### Fixed

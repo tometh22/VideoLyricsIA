@@ -83,6 +83,47 @@ def _campaign(db, count=60):
     return campaign
 
 
+def test_discard_is_audited_recoverable_and_excluded_from_pending(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter_by(campaign_id=campaign.id).one()
+    user = db.query(User).first()
+    actor = {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}
+    segments = [{"start": 0, "end": 1, "text": "borrador conservado"}]
+    job = Job(job_id=uuid.uuid4().hex[:12], user_id=user.id, tenant_id=campaign.tenant_id,
+              artist=item.artist, song_title=item.title, filename=item.filename,
+              campaign_id=campaign.id, campaign_item_id=item.id, workload_class="batch",
+              status="transcribed_pending", segments_json=segments)
+    db.add(job); db.commit()
+    batch.discard_campaign_item(campaign.id, item.id, batch.DiscardRequest(reason="Instrumental · pedido de Universal"), actor, db)
+    assert job.status == "discarded"
+    assert job.segments_json == segments
+    assert batch._queue_state("lyrics", job, None) == "discarded"
+    assert batch._summary(db, campaign)["counters"]["discarded"] == 1
+    args = dict(stage="lyrics", order="effort", state=None, version=None,
+                background_mode=None, artist=None, search=None, reviewed_by=None,
+                audit_preapproved=False, page=1, limit=1000, current_user=actor, db=db)
+    assert batch.review_queue(campaign.id, scope="pending", **args)["items"] == []
+    queue = batch.review_queue(campaign.id, scope="discarded", **args)
+    assert queue["campaign_totals"]["discarded"] == 1
+    assert queue["items"][0]["discard"]["reason"] == "Instrumental · pedido de Universal"
+    batch.restore_campaign_item(campaign.id, item.id, actor, db)
+    assert job.status == "transcribed_pending"
+    assert job.segments_json == segments
+    assert item.discard_record["restored_by"] == user.id
+    assert len(batch.review_queue(campaign.id, scope="pending", **args)["items"]) == 1
+    actions = {log.action for log in db.query(AuditLog).filter(AuditLog.action.in_(["batch.song_discarded", "batch.song_restored"])).all() if log.detail.get("job_id") == job.job_id}
+    assert actions == {"batch.song_discarded", "batch.song_restored"}
+    job.status = "rendering"; db.commit()
+    with pytest.raises(HTTPException) as error:
+        batch.discard_campaign_item(campaign.id, item.id, batch.DiscardRequest(reason="No se usa"), actor, db)
+    assert error.value.status_code == 409
+    db.rollback()
+    foreign = {"id": user.id, "tenant_id": "another-tenant", "role": "user"}
+    with pytest.raises(HTTPException):
+        batch.restore_campaign_item(campaign.id, item.id, foreign, db)
+
+
 def test_reconciler_respects_30_active_and_50_ready_windows(db):
     campaign = _campaign(db, 60)
     first = batch._promote_campaign(db, campaign)
@@ -861,7 +902,7 @@ def test_review_queue_scope_keeps_pending_categories_and_approved_filter_aligned
     assert pending["total"] == 2
     assert sum(pending["classification_counts"].values()) == 2
     assert {row["job_id"] for row in pending["items"]} == {jobs[1].job_id, jobs[2].job_id}
-    assert pending["campaign_totals"] == {"songs": 3, "approved": 1, "approved_today": 0}
+    assert pending["campaign_totals"] == {"songs": 3, "approved": 1, "approved_today": 0, "discarded": 0}
     assert approved["scope"]["key"] == "approved"
     assert approved["total"] == 1
     assert sum(approved["classification_counts"].values()) == 1

@@ -42,15 +42,50 @@ function mount(path) {
 }
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); sessionStorage.clear(); localStorage.clear(); });
 
+it("loads the campaign once and discards/restores with a visible reason", async () => {
+  let discarded = false;
+  const mock = setupFetch((url, options) => {
+    if (url.pathname.endsWith("/discard")) {
+      expect(JSON.parse(options.body).reason).toBe("Instrumental · solicitud del cliente");
+      discarded = true; return response({ ok: true });
+    }
+    if (url.pathname.endsWith("/restore")) { discarded = false; return response({ ok: true }); }
+    if (url.pathname.endsWith("/review-queue")) {
+      const scope = url.searchParams.get("scope");
+      return response({ campaign, pages: 1, counters: {}, scope: { total: 1 },
+        campaign_totals: { songs: 1, approved: 0, discarded: discarded ? 1 : 0 },
+        items: discarded ? scope === "discarded" ? [{ ...ready, state: "discarded", discard: { reason: "Instrumental · solicitud del cliente" } }] : []
+          : scope === "discarded" ? [] : [{ ...ready, can_discard: true }],
+      });
+    }
+    return null;
+  });
+  mount("/campaigns/campaign-1");
+  await screen.findByText(ready.title);
+  expect(mock).toHaveBeenCalledTimes(1);
+  expect(mock.mock.calls[0][0]).toContain("limit=1000");
+  fireEvent.click(screen.getByRole("button", { name: "Descartar", exact: true }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirmar descarte" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  fireEvent.click(screen.getByRole("tab", { name: /Descartadas/ }));
+  await screen.findByText("Instrumental · solicitud del cliente");
+  fireEvent.click(screen.getByRole("button", { name: "Recuperar", exact: true }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirmar recuperación" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  fireEvent.click(screen.getByRole("tab", { name: /Por revisar/ }));
+  await screen.findByText(ready.title);
+  expect(screen.getByRole("button", { name: "Revisar", exact: true })).toBeEnabled();
+});
+
 describe.each(["/admin/cola", "/campaigns/campaign-1"])("review navigation %s", (path) => {
   it("makes cards/tabs work and restores scope with browser back/forward", async () => {
     setupFetch(); mount(path);
     await screen.findByText(ready.title);
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Resumen de la campaña" })).getByRole("button", { name: /Aprobadas/ }));
+    fireEvent.click(screen.getByRole("tab", { name: /Aprobadas/ }));
     await screen.findByText(approved.title);
     expect(screen.queryByText(ready.title)).not.toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /Aprobadas/ })).toHaveAttribute("aria-selected", "true");
-    expect(within(screen.getByRole("navigation", { name: "Resumen de la campaña" })).getByRole("button", { name: /Por revisar/ })).toHaveTextContent("2");
+    expect(screen.getByRole("tab", { name: /Por revisar/ })).toHaveTextContent("2");
     fireEvent.click(screen.getByRole("button", { name: "Volver navegador" }));
     await screen.findByText(ready.title);
     expect(screen.getByRole("tab", { name: /Por revisar/ })).toHaveAttribute("aria-selected", "true");
