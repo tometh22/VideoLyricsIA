@@ -3,7 +3,7 @@ import { REVIEW_SCOPES } from "../lib/reviewerNavigation";
 export default function ReviewScopes({ value, counts, onChange, cards = false }) {
   return <nav aria-label={cards ? "Resumen de la campaña" : "Filtrar canciones"}
     role={cards ? undefined : "tablist"}
-    className={cards ? "grid grid-cols-2 gap-3 sm:grid-cols-4" : "flex flex-wrap gap-2 border-b border-white/10"}>
+    className={cards ? "grid grid-cols-2 gap-3 sm:grid-cols-5" : "flex flex-wrap gap-2 border-b border-white/10"}>
     {REVIEW_SCOPES.map(([key, label], index) => <button key={key} type="button"
       role={cards ? undefined : "tab"} aria-selected={cards ? undefined : value === key}
       aria-pressed={cards ? value === key : undefined} tabIndex={cards || value === key ? 0 : -1}

@@ -2,9 +2,17 @@ import { describe, expect, it } from "vitest";
 import { reviewCounts, reviewStateLabel, reviewActionLabel, reviewDestination, safeReviewReturnPath, reviewStateFilter } from "./reviewerNavigation";
 
 describe("reviewer navigation contract", () => {
+  it("keeps drafts pending and resumes them without bypassing another editor's lock", () => {
+    expect(reviewCounts({ campaign_totals: { songs: 10, approved: 2, drafts: 3 } }).pending).toBe(8);
+    const draft = { job_id: "draft", state: "ready", is_draft: true };
+    expect(reviewStateLabel(draft)).toBe("Borrador guardado");
+    expect(reviewActionLabel(draft)).toBe("Continuar borrador");
+    expect(reviewActionLabel({ ...draft, reviewer_lock_active: true })).toBeNull();
+    expect(reviewActionLabel({ ...draft, state: "approved" })).toBe("Ver canción");
+  });
   it("keeps campaign counts independent of the active scope", () => {
     expect(reviewCounts({ scope: { total: 40 }, campaign_totals: { songs: 300, approved: 40 } }))
-      .toEqual({ all: 300, approved: 40, pending: 260, discarded: 0 });
+      .toEqual({ all: 300, approved: 40, pending: 260, discarded: 0, drafts: 0 });
     expect(reviewCounts(null).approved).toBeUndefined();
   });
   it.each([

@@ -902,11 +902,37 @@ def test_review_queue_scope_keeps_pending_categories_and_approved_filter_aligned
     assert pending["total"] == 2
     assert sum(pending["classification_counts"].values()) == 2
     assert {row["job_id"] for row in pending["items"]} == {jobs[1].job_id, jobs[2].job_id}
-    assert pending["campaign_totals"] == {"songs": 3, "approved": 1, "approved_today": 0, "discarded": 0}
+    assert pending["campaign_totals"] == {"songs": 3, "approved": 1, "approved_today": 0, "discarded": 0, "drafts": 0}
     assert approved["scope"]["key"] == "approved"
     assert approved["total"] == 1
     assert sum(approved["classification_counts"].values()) == 1
     assert approved["items"][0]["job_id"] == jobs[0].job_id
+
+    # Opening a document alone is not a saved draft. Edited, unapproved
+    # documents are discoverable, including older drafts saved before this tab.
+    for index, job in enumerate(jobs):
+        db.add(EditorDocument(
+            job_id=job.job_id, tenant_id=campaign.tenant_id,
+            current_segments=job.segments_json, original_segments=job.segments_json,
+            revision=index, updated_by=user.id if index != 2 else None,
+            updated_at=datetime(2026, 9, 9, index, tzinfo=timezone.utc),
+        ))
+    db.commit()
+    drafts = batch.review_queue(campaign.id, scope="drafts", **args)
+    assert [row["job_id"] for row in drafts["items"]] == [jobs[1].job_id]
+    assert drafts["items"][0]["is_draft"] is True
+    assert drafts["campaign_totals"]["drafts"] == 1
+    document = db.query(EditorDocument).filter_by(job_id=jobs[2].job_id).one()
+    document.updated_by = user.id
+    db.commit()
+    drafts = batch.review_queue(campaign.id, scope="drafts", **{**args, "order": "learning"})
+    assert drafts["order"] == "recent"
+    assert [row["job_id"] for row in drafts["items"]] == [jobs[2].job_id, jobs[1].job_id]
+    assert batch.review_queue(campaign.id, scope="approved", **args)["campaign_totals"]["drafts"] == 2
+    jobs[2].status = "discarded"
+    jobs[1].status = "lyrics_approved"
+    db.commit()
+    assert batch.review_queue(campaign.id, scope="drafts", **args)["items"] == []
 
 def test_paused_campaign_cannot_start_a_new_render(db):
     campaign = _campaign(db, 1)
