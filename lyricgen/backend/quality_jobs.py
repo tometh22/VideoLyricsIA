@@ -639,6 +639,7 @@ def _persist_if_current(job_id: str, expected_revision: int,
         # any same-named field in the analytical result.
         for durable_key in (
             "reference_hypothesis",
+            "catalog_reference",
             "pre_background_approval",
         ):
             if durable_key in previous:

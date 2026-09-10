@@ -540,6 +540,12 @@ def test_quality_persist_preserves_batch_reference_and_human_approval(db):
         "lyrics_confirmed": True,
         "timings_confirmed": True,
     }
+    catalog = {
+        "schema_version": "batch-catalog-reference-v1",
+        "status": "rejected", "used": False,
+        "source_audio_sha256": "a" * 64, "source_audio_revision": 1,
+        "reason": "attestation_audio_first",
+    }
     db.add(Job(
         job_id=job_id, user_id=user.id, tenant_id=tenant,
         artist="Artist", song_title="Song", filename="song.wav",
@@ -551,6 +557,7 @@ def test_quality_persist_preserves_batch_reference_and_human_approval(db):
         transcription_quality={
             "analysis_status": "pending",
             "reference_hypothesis": reference,
+            "catalog_reference": catalog,
             "pre_background_approval": approval,
         },
     ))
@@ -559,6 +566,8 @@ def test_quality_persist_preserves_batch_reference_and_human_approval(db):
     candidate = tq.evaluate(segments, None)
     assert "reference_hypothesis" not in candidate
     assert "pre_background_approval" not in candidate
+    # Analytical replay cannot replace the transcription's source decision.
+    candidate["catalog_reference"] = {"status": "audio_validated", "used": True}
     persisted = quality_jobs._persist_if_current(
         job_id, 2, content_hash, candidate,
         expected_audio_revision=1,
@@ -570,6 +579,7 @@ def test_quality_persist_preserves_batch_reference_and_human_approval(db):
     db.expire_all()
     row = db.query(Job).filter(Job.job_id == job_id).one()
     assert row.transcription_quality["reference_hypothesis"] == reference
+    assert row.transcription_quality["catalog_reference"] == catalog
     assert row.transcription_quality["pre_background_approval"] == approval
     assert row.transcription_quality["analysis_status"] == "complete"
     assert row.active_quality_attempt_id is None

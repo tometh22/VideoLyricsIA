@@ -3,6 +3,12 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.13] - 2026-09-10
+
+### Fixed
+
+- Preserve the spreadsheet lyric decision when background quality analysis finishes, so reviewers retain whether the source was applied, declined, or absent.
+
 ## [1.1.12] - 2026-09-10
 
 ### Fixed
