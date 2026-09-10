@@ -15,20 +15,20 @@ test("campaign back then another song keeps URL, lyrics and audio bound to the s
     if (url.pathname === "/batch/access") return json({ enabled: true });
     if (url.pathname.endsWith("/review-queue")) return json({
       campaign: { id: "c1", name: "Campaña UMG", status: "active", kind: "lyric_video" },
-      items: songs.map((s, i) => ({ ...s, item_id: `i${i}`, state: "ready" })),
+      items: songs.map((s, i) => ({ ...s, item_id: `i${i}`, state: "ready", can_discard: true })),
       campaign_totals: { songs: 2, approved: 0 }, pages: 1, counters: { ready: 2 }, scope: { total: 2 },
     });
     const song = songs.find(s => url.pathname === `/status/${s.job_id}`);
     if (song) {
       if (song.job_id.startsWith("latin")) await new Promise(resolve => setTimeout(resolve, 400));
       return json({ ...song, song_title: song.title, filename: `${song.title}.wav`,
-        status: "transcribed_pending", campaign_id: "c1", segments_revision: 0,
+        status: "transcribed_pending", campaign_id: "c1", campaign_item_id: `i${songs.indexOf(song)}`, segments_revision: 0,
         segments_json: [{ start: 0, end: 2, text: `Letra de ${song.title}` }],
       });
     }
     return route.fallback();
   });
-  const announcement = page.getByRole("dialog");
+  const announcement = page.getByRole("dialog", { name: "Nuevo editor de letras" });
   await page.addLocatorHandler(announcement, async () => {
     await announcement.getByRole("button", { name: "Cancelar" }).click();
   });
@@ -46,4 +46,7 @@ test("campaign back then another song keeps URL, lyrics and audio bound to the s
   await expect(page).toHaveURL(/review\/latin0000001\?return_to=/);
   await expect(page.locator('audio[src*="latin0000001"]').first()).toBeAttached();
   await expect(page.locator('audio[src*="charly000001"]')).toHaveCount(0);
+  await page.getByRole("button", { name: "Descartar canción", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Descartar canción" })).toBeVisible();
+  await expect(page.getByRole("dialog").getByRole("heading")).toContainText("Latin Geisha");
 });

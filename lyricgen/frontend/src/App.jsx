@@ -5658,7 +5658,7 @@ export default function App() {
     }
   }, [alert, currentReview?.transcribeJobId]);
 
-  const handleCampaignReviewExit = useCallback(async () => {
+  const handleCampaignReviewExit = useCallback(async (destination = null) => {
     const review = currentReview;
     if (review?.transcribeJobId) {
       try {
@@ -5671,7 +5671,7 @@ export default function App() {
     setCurrentReview(null);
     wizardPersistence.clear();
     if (review) segmentsStore.evict(reviewStoreKey(review));
-    navigate(campaignReturnPath || "/admin/cola");
+    navigate(typeof destination === "string" ? destination : campaignReturnPath || "/admin/cola");
   }, [campaignReturnPath, currentReview, navigate]);
 
   const handleCampaignReviewNext = useCallback(async () => {
@@ -5845,6 +5845,17 @@ export default function App() {
                     >
                       Guardar borrador y salir
                     </button>
+                    {currentReview.campaignItemId && <button
+                      type="button"
+                      onClick={() => {
+                        const path = `/campaigns/${encodeURIComponent(currentReview.campaignId)}?tab=all&discard=${encodeURIComponent(currentReview.campaignItemId)}`;
+                        const leave = () => handleCampaignReviewExit(path);
+                        const safeExit = campaignReviewSafeExitRef.current;
+                        if (safeExit) void safeExit(leave);
+                        else void leave();
+                      }}
+                      className="btn-secondary shrink-0 px-4 py-2 text-xs"
+                    >Descartar canción</button>}
                     <button
                       type="button"
                       onClick={() => {

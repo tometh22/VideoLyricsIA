@@ -182,6 +182,17 @@ function CampaignDetail({ id }) {
   const [totals, setTotals] = useState(null);
   const { start, cancel, active } = useLatestReviewRequest();
 
+  useEffect(() => {
+    const discardId = searchParams.get("discard");
+    if (!discardId || queueLoading || !reviewQueue) return;
+    const row = reviewQueue.items?.find(item => item.item_id === discardId);
+    if (row?.can_discard) setDiscardTarget(row);
+    else setError("La canción cambió de estado y no se puede descartar desde esta revisión.");
+    const next = new URLSearchParams(searchParams);
+    next.delete("discard");
+    setSearchParams(next, { replace: true });
+  }, [queueLoading, reviewQueue, searchParams, setSearchParams]);
+
   // URL is authoritative for browser Back/Forward and copied links. Saved
   // context must not resurrect a stale status filter after changing tabs.
   useEffect(() => {
