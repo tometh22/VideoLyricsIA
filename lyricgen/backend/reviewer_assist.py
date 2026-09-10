@@ -38,6 +38,8 @@ def prepare(song, decisions):
             proposed = deepcopy(current)
             if kind == "text":
                 proposed["text"] = verdict["text"]
+                proposed.pop("words", None)
+                proposed["word_alignment_status"] = "not_certified_after_text_change"
             else:
                 proposed["end"] = verdict["end_seconds"]
             candidates.append({"kind": "operator_review_candidate",

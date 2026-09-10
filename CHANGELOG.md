@@ -7,11 +7,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- Reject whole-song reference alignment when ordered comparison finds an
-  unsupported passage, even if a repeated chorus gives a high aggregate score.
-  Preserve the independent ASR's structure in the existing enforced path instead
-  of stretching or collapsing lines around missing reference lyrics. This does
-  not certify ASR words/timing or modify existing editor documents.
+- Allow operator text corrections that preserve every timestamp when another
+  existing line overlaps. Keep source, ownership, structural and approval checks;
+  do not silently repair timing or permit a proposal to introduce overlaps.
+- Discard stale word timestamps when reviewer suggestions replace text, matching
+  the isolated candidate and preserving the need to validate its new word timing.
 
 ## [1.1.10] - 2026-09-09
 

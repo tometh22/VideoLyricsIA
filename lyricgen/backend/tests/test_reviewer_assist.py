@@ -113,3 +113,18 @@ def test_operator_exposure_payload_is_not_silently_rejected():
     assert all(valid_property(k, v) for k, v in payload.items())
     assert not valid_property("proposal_id", "private lyric with spaces")
     assert not valid_property("total", float("nan"))
+
+
+def test_text_proposal_discards_word_times_for_replaced_words():
+    song, decision = fixture()
+    song['segments'][0]['words'] = [
+        {'word': 'Canto', 'start': 2., 'end': 3.},
+        {'word': 'así', 'start': 3., 'end': 4.},
+    ]
+    song['segments_sha256'] = digest(song['segments'])
+    decision = review_window(song, decision['window'], evidence=decision['evidence'], commit='a' * 40)
+    proposed = prepare(song, [decision])['proposal']['windows'][0]['proposed_segments'][0]
+    assert proposed['text'] == 'Canto aquí'
+    assert 'words' not in proposed
+    assert proposed['word_alignment_status'] == 'not_certified_after_text_change'
+    assert song['segments'][0]['words'][1]['word'] == 'así'
