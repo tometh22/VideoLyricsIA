@@ -936,6 +936,7 @@ class BatchCampaignItem(Base):
     cover_match_error = Column(String(255), nullable=True)
     association_confirmed = Column(Boolean, nullable=False, default=False, server_default="false")
     approved_render_fingerprint = Column(String(64), nullable=True)
+    discard_record = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 

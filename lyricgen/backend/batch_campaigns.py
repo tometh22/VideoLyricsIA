@@ -66,10 +66,11 @@ _ACTIVE_TRANSCRIPTION = frozenset({"awaiting_upload", "transcribing_queued", "tr
 _ACTIVE_SEPARATION = frozenset({"separation_queued", "separating"})
 _ACTIVE_RENDER = frozenset({"queued", "processing", "editing", "background_generating", "rendering"})
 _FAILURE = frozenset({"error", "transcription_failed", "validation_failed", "rejected"})
+_DISCARDABLE = _FAILURE | {"transcribed", "transcribed_pending"}
 _SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 _PENDING_REVIEW_STATES = frozenset({"pending", "processing", "ready", "reviewing", "failed"})
 _APPROVED_REVIEW_STATES = frozenset({"approved", "exported"})
-_ALL_REVIEW_STATES = _PENDING_REVIEW_STATES | _APPROVED_REVIEW_STATES
+_ALL_REVIEW_STATES = _PENDING_REVIEW_STATES | _APPROVED_REVIEW_STATES | {"discarded"}
 
 
 def _now() -> datetime:
@@ -177,6 +178,8 @@ def _phase(upload_state: str, job_status: str | None, metadata_error: str | None
         return "separating"
     if job_status == "separation_ready":
         return "separation_ready"
+    if job_status == "discarded":
+        return "discarded"
     if job_status in _ACTIVE_TRANSCRIPTION:
         return "transcribing"
     if job_status in {"transcribed_pending", "transcribed"}:
@@ -214,7 +217,7 @@ def _summary(db: Session, campaign: BatchCampaign) -> dict[str, Any]:
             "waiting_upload", "uploading", "waiting_processing", "transcribing",
             "separating", "separation_ready",
             "lyrics_ready", "lyrics_approved", "rendering", "final_review",
-            "done", "failed",
+            "done", "failed", "discarded",
         )
     }
     rows = _campaign_rows(db, campaign.id)
@@ -482,6 +485,77 @@ def patch_campaign_item(
     item.updated_at = _now()
     db.commit()
     return {"ok": True, "metadata_error": item.metadata_error}
+
+
+class DiscardRequest(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500)
+
+
+@router.post("/campaigns/{campaign_id}/items/{item_id}/discard")
+def discard_campaign_item(
+    campaign_id: str, item_id: str, body: DiscardRequest,
+    current_user: dict = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    return _set_item_discard(db, campaign_id, item_id, current_user, body.reason.strip())
+
+
+@router.post("/campaigns/{campaign_id}/items/{item_id}/restore")
+def restore_campaign_item(
+    campaign_id: str, item_id: str,
+    current_user: dict = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    return _set_item_discard(db, campaign_id, item_id, current_user, None)
+
+
+def _set_item_discard(db, campaign_id, item_id, user, reason):
+    _require_scope(user)
+    campaign = _campaign_or_404(db, campaign_id, user)
+    job = db.query(Job).filter(
+        Job.campaign_id == campaign.id, Job.campaign_item_id == item_id,
+        Job.tenant_id == campaign.tenant_id,
+    ).with_for_update().first()
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.id == item_id, BatchCampaignItem.campaign_id == campaign.id,
+    ).with_for_update().first()
+    if not item or not job:
+        raise HTTPException(404, "La canción todavía no está disponible para descartar.")
+    record = dict(item.discard_record or {})
+    if reason is not None:
+        if len(reason) < 3:
+            raise HTTPException(422, "Indicá el motivo del descarte.")
+        if job.status == "discarded":
+            return {"ok": True, "discard": record, "deduplicated": True}
+        if job.status not in _DISCARDABLE:
+            raise HTTPException(409, "Solo se pueden descartar canciones pendientes de revisión o fallidas.")
+        document = db.query(EditorDocument).filter(EditorDocument.job_id == job.job_id).with_for_update().first()
+        if document and document.lock_user_id not in {None, user["id"]} and _aware(document.lock_expires_at) and _aware(document.lock_expires_at) > _now():
+            raise HTTPException(409, "Otra persona está revisando esta canción. Esperá a que termine.")
+        actor = db.query(User).filter(User.id == user["id"]).first()
+        record = {"reason": reason, "at": _now().isoformat(), "by": user["id"],
+                  "by_name": (actor.full_name or actor.username or actor.email) if actor else str(user["id"]),
+                  "previous_status": job.status, "title": item.title or item.filename,
+                  "artist": item.artist, "job_id": job.job_id}
+        job.status = "discarded"
+        if document:
+            document.lock_user_id = None
+            document.lock_session_id = None
+            document.lock_expires_at = None
+        action = "batch.song_discarded"
+    else:
+        if job.status != "discarded":
+            raise HTTPException(409, "La canción no está descartada.")
+        previous = record.get("previous_status")
+        if previous not in _DISCARDABLE:
+            raise HTTPException(409, "No se pudo determinar el estado anterior de la canción.")
+        job.status = previous
+        record.update(restored_at=_now().isoformat(), restored_by=user["id"])
+        action = "batch.song_restored"
+    item.discard_record = record
+    db.add(AuditLog(user_id=user["id"], action=action, detail={
+        "campaign_id": campaign.id, "item_id": item.id, **record,
+    }))
+    db.commit()
+    return {"ok": True, "status": job.status, "discard": record}
 
 
 @router.post("/campaigns/{campaign_id}/upload-session")
@@ -1169,6 +1243,8 @@ def approve_campaign_lyrics(
 def _queue_state(stage: str, job: Job | None, document: EditorDocument | None) -> str:
     if job is None:
         return "pending"
+    if job.status == "discarded":
+        return "discarded"
     now = _now()
     locked = bool(
         document and document.lock_user_id
@@ -1275,7 +1351,7 @@ def _review_minutes_by_job(
 ) -> dict[str, float]:
     if not job_ids:
         return {}
-    query = db.query(ProductEvent).filter(
+    query = db.query(ProductEvent.job_id, ProductEvent.user_id, ProductEvent.occurred_at, ProductEvent.created_at).filter(
         ProductEvent.name == "editor_activity_heartbeat",
         ProductEvent.job_id.in_(job_ids),
     )
@@ -1537,7 +1613,7 @@ def review_queue(
     campaign_id: str,
     stage: str = Query(default="lyrics", pattern="^(lyrics|final)$"),
     order: str = Query(default="effort", pattern="^(delivery|effort|learning)$"),
-    scope: str = Query(default="pending", pattern="^(pending|approved|all)$"),
+    scope: str = Query(default="pending", pattern="^(pending|approved|all|discarded)$"),
     state: str | None = None,
     version: str | None = Query(default=None, pattern="^(studio|live)$"),
     background_mode: str | None = None,
@@ -1546,7 +1622,7 @@ def review_queue(
     reviewed_by: str | None = Query(default=None, pattern="^(me|all)$"),
     audit_preapproved: bool = False,
     page: int = Query(default=1, ge=1),
-    limit: int = Query(default=50, ge=1, le=100),
+    limit: int = Query(default=50, ge=1, le=1000),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1594,6 +1670,7 @@ def review_queue(
     allowed_states = {state} if state in _ALL_REVIEW_STATES else (
         _PENDING_REVIEW_STATES if effective_scope == "pending" else
         _APPROVED_REVIEW_STATES if effective_scope == "approved" else
+        {"discarded"} if effective_scope == "discarded" else
         _ALL_REVIEW_STATES
     )
     rows: list[dict[str, Any]] = []
@@ -1664,6 +1741,8 @@ def review_queue(
         manual_full_review = classification["review_priority"] == "manual_full"
         rows.append({
             "item_id": item.id,
+            "discard": item.discard_record,
+            "can_discard": bool(job and job.status in _DISCARDABLE),
             "reviewer_campaign_status": reviewer_rows.get(job.job_id) if job else None,
             "job_id": job.job_id if job else None,
             "ordinal": item.ordinal,
@@ -1824,6 +1903,13 @@ def review_queue(
     return {
         "campaign_id": campaign.id,
         "stage": stage,
+        "campaign": {
+            "id": campaign.id, "name": campaign.name, "status": campaign.status,
+            "kind": campaign.kind or "lyric_video", "registered_count": len(pairs),
+            "expected_count": campaign.expected_count,
+            "default_render_params": campaign.default_render_params or {},
+            "reviewer_campaign_status": reviewer_summary,
+        },
         "reviewer_campaign_status": reviewer_summary,
         "order": "effort" if order == "delivery" else order,
         "scope": {
@@ -1839,6 +1925,7 @@ def review_queue(
         "campaign_totals": {
             "songs": len(pairs),
             "approved": campaign_state_counts.get("approved", 0) + campaign_state_counts.get("exported", 0),
+            "discarded": campaign_state_counts.get("discarded", 0),
             "approved_today": campaign_approved_today,
         },
         "items": [
