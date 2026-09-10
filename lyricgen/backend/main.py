@@ -6799,7 +6799,9 @@ def _anchor_lyrics_enabled() -> bool:
 
 
 async def _maybe_anchor_align(result, audio_path: str, job_id: str,
-                              anchor_lyrics: str):
+                              anchor_lyrics: str, *,
+                              content_source: str = "operator_reference",
+                              enabled: bool | None = None):
     """Align operator-provided lyrics without ever silently discarding them.
 
     Local CTC remains the preferred timing engine. If it declines (including
@@ -6809,6 +6811,8 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
     fail closed instead of publishing free ASR as if the reference never
     existed (incident c6553b32b6c1, 2026-08-31).
     """
+    if content_source not in {"operator_reference", "catalog_reference"}:
+        raise ValueError("invalid alignment content source")
     _stem = None
     anchor_text = (anchor_lyrics or "").strip()
     psegs = [
@@ -6824,7 +6828,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                 "status": "declined",
                 "reason": str(reason or "unknown")[:80],
                 "error_type": str(error_type or "")[:80],
-                "content_source": "operator_reference",
+                "content_source": content_source,
                 "original_provider_segment_count": len(
                     (base or {}).get("segments") or []
                 ),
@@ -6844,9 +6848,9 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         anchored = []
         for segment in aligned:
             segment = dict(segment)
-            segment["content_source"] = "operator_reference"
+            segment["content_source"] = content_source
             segment["provider_evidence"] = {
-                "source": "operator_reference",
+                "source": content_source,
                 "text": str(segment.get("text") or ""),
                 "start": round(float(segment.get("start") or 0.0), 3),
                 "end": round(float(segment.get("end") or 0.0), 3),
@@ -6856,7 +6860,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                 "min_score": None,
             }
             segment["evidence_lineage"] = [
-                "operator_reference_content", timing_source,
+                f"{content_source}_content", timing_source,
             ]
             scores = [
                 word.get("score") for word in (segment.get("words") or [])
@@ -6883,7 +6887,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         out["timing_source"] = "anchor_ctc"
         out["anchor_alignment"] = {
             "status": "applied",
-            "content_source": "operator_reference",
+            "content_source": content_source,
             "timing_source": timing_source,
             "ctc_decline_reason": str(decline_reason or "")[:80],
             "original_provider_segment_count": len(
@@ -6917,7 +6921,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         return all(right > left for left, right in zip(starts, starts[1:]))
 
     try:
-        if not _anchor_lyrics_enabled():
+        if not (_anchor_lyrics_enabled() if enabled is None else enabled):
             # A stale browser may submit after an ops flag flip. Receiving an
             # official reference and silently treating it as absent would
             # recreate the incident even though the UI is now hidden.
@@ -6992,7 +6996,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
             # lyric is still authoritative and Whisper-DP can align it.
             retimed = None
             decline_reason = "too_few_lines_for_ctc"
-        if retimed is not None:
+        if retimed is not None and (content_source != "catalog_reference" or _safe_alignment(retimed)):
             result = _apply(
                 result, retimed, timing_source="ctc_timing_only",
             )

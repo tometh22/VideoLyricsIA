@@ -33,7 +33,9 @@ elige entre este path async y el legacy sync. Default a env de staging primero.
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import datetime, timezone
+import hashlib
 import logging
 import os
 import re
@@ -48,6 +50,133 @@ def _safe_exception_code(exc: BaseException) -> str:
     """Return a bounded class label; never serialize exception text/args."""
     name = getattr(type(exc), "__name__", "Exception")
     return name if isinstance(name, str) and _EXCEPTION_TYPE_RE.fullmatch(name) else "Exception"
+
+
+def _catalog_reference_summary(
+    reference: dict,
+    *,
+    status: str,
+    used: bool,
+    reason: str = "",
+    attestation: dict | None = None,
+    timing_source: str = "",
+) -> dict:
+    """Persist provenance and decisions without duplicating raw lyric text."""
+    summary = {
+        "schema_version": "batch-catalog-reference-v1",
+        "status": status,
+        "used": bool(used),
+        "reason": str(reason or "")[:120],
+        "source_kind": str(reference.get("source_kind") or "none")[:40],
+        "source_document_id": str(reference.get("source_document_id") or "")[:200],
+        "sheet_name": str(reference.get("sheet_name") or "")[:200],
+        "row_numbers": [int(row) for row in (reference.get("row_numbers") or [])[:10]],
+        "association_basis": str(reference.get("association_basis") or "none")[:80],
+        "source_asset_id": str(reference.get("source_asset_id") or "")[:100],
+        "source_audio_sha256": str(reference.get("source_audio_sha256") or "")[:64],
+        "text_sha256": str(reference.get("text_sha256") or "")[:64],
+        "timing_source": str(timing_source or "")[:80],
+    }
+    if isinstance(attestation, dict):
+        summary["attestation"] = attestation
+    return summary
+
+
+async def _maybe_apply_catalog_reference(
+    result: dict,
+    audio_path: str,
+    job_id: str,
+    reference: dict | None,
+    source_audio_sha256: str,
+    *,
+    live: bool,
+    aligner,
+) -> dict:
+    """Apply a sheet candidate only after audio-first attestation and alignment."""
+    if not isinstance(result, dict) or not isinstance(reference, dict):
+        return result
+    status = str(reference.get("status") or "")
+    if status == "absent":
+        result["catalog_reference"] = _catalog_reference_summary(
+            reference,
+            status="absent",
+            used=False,
+            reason=str(reference.get("absence_reason") or "external_reference_absent"),
+        )
+        return result
+    text = str(reference.get("text") or "").strip()
+    expected_text_hash = str(reference.get("text_sha256") or "").lower()
+    expected_audio_hash = str(reference.get("source_audio_sha256") or "").lower()
+    if (
+        status != "candidate"
+        or not text
+        or hashlib.sha256(text.encode("utf-8")).hexdigest() != expected_text_hash
+        or expected_audio_hash != str(source_audio_sha256 or "").lower()
+    ):
+        result["catalog_reference"] = _catalog_reference_summary(
+            reference,
+            status="invalidated",
+            used=False,
+            reason="source_binding_invalid",
+        )
+        return result
+
+    from pipeline import _audio_duration
+    from reference_attestation import assess_reference_attestation, reference_gate_action
+    try:
+        duration = await asyncio.to_thread(_audio_duration, audio_path)
+    except Exception:
+        duration = None
+    report = assess_reference_attestation(
+        text,
+        result.get("segments") or [],
+        reference_source="catalog_unverified",
+        audio_duration_s=duration,
+        is_live=live,
+    )
+    action = reference_gate_action(report, mode="enforce", is_live=live)
+    if action != "reference_allowed":
+        result["catalog_reference"] = _catalog_reference_summary(
+            reference,
+            status="rejected",
+            used=False,
+            reason=f"attestation_{action}",
+            attestation=report,
+        )
+        return result
+
+    original = copy.deepcopy(result)
+    try:
+        aligned = await aligner(
+            copy.deepcopy(result), audio_path, job_id, text,
+            content_source="catalog_reference", enabled=True,
+        )
+    except Exception as exc:
+        original["catalog_reference"] = _catalog_reference_summary(
+            reference, status="alignment_declined", used=False,
+            reason=f"alignment_{_safe_exception_code(exc)}", attestation=report,
+        )
+        return original
+    alignment = dict(aligned.get("anchor_alignment") or {}) if isinstance(aligned, dict) else {}
+    if alignment.get("status") != "applied":
+        original["catalog_reference"] = _catalog_reference_summary(
+            reference,
+            status="alignment_declined",
+            used=False,
+            reason=str(alignment.get("reason") or "alignment_declined"),
+            attestation=report,
+        )
+        return original
+    # Keep the independent acoustic reference separate from catalogue text.
+    aligned["reference_lyrics"] = original.get("reference_lyrics", "")
+    aligned["catalog_reference"] = _catalog_reference_summary(
+        reference,
+        status="audio_validated",
+        used=True,
+        attestation=report,
+        timing_source=str(alignment.get("timing_source") or ""),
+    )
+    return aligned
 
 
 def _drop_final_credit_hallucinations(result: dict, job_id: str) -> dict:
@@ -555,6 +684,7 @@ def run_transcription_job(
     workload_class: str = "interactive",
     pipeline_stage: str = "full",
     parallel_audio_reference: bool = False,
+    catalog_reference: dict | None = None,
 ) -> dict:
     """RQ entry point — sync wrapper around `_run_transcription_for_job`.
 
@@ -758,6 +888,15 @@ def run_transcription_job(
             # other timing/content post-pass can replace words and bounds.
             from line_evidence import freeze_result_provider_evidence
             r = freeze_result_provider_evidence(r)
+            r = await _maybe_apply_catalog_reference(
+                r,
+                audio_path,
+                job_id,
+                catalog_reference,
+                source_audio_sha256,
+                live=live or _looks_live(title, filename),
+                aligner=_maybe_anchor_align,
+            )
             # Post-pases gateados, en lockstep con los dos endpoints HTTP
             # (/transcribe y /transcribe-uploaded). ESTE es el camino que
             # usa el frontend real (enqueue → ShortWorker), así que si acá
@@ -816,6 +955,12 @@ def run_transcription_job(
                 _maybe_timing_consistency,
                 live_hint=live or _looks_live(title, filename),
             )
+            if isinstance(r.get("catalog_reference"), dict):
+                quality = dict(r.get("transcription_quality") or {})
+                quality["catalog_reference"] = {
+                    **r["catalog_reference"], "source_audio_revision": source_audio_revision,
+                }
+                r["transcription_quality"] = quality
             from delivery_repair_shadow import attach_delivery_repair_shadow
             return attach_delivery_repair_shadow(
                 r,

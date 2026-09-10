@@ -926,6 +926,7 @@ def enqueue_transcription(
     workload_class: str = "interactive",
     pipeline_stage: str = "full",
     parallel_audio_reference: bool = False,
+    catalog_reference: dict | None = None,
 ) -> str:
     """Enqueue una transcripción en la queue `transcription` (alta prioridad,
     drenada por el mismo worker container que enterprise/default).
@@ -958,6 +959,7 @@ def enqueue_transcription(
             "workload_class": workload_class,
             "pipeline_stage": pipeline_stage,
             "parallel_audio_reference": parallel_audio_reference,
+        **({"catalog_reference": catalog_reference} if catalog_reference is not None else {}),
         }
         if publication_id:
             from transactional_outbox import run_outbox_transcription as target
@@ -1034,6 +1036,7 @@ def enqueue_transcription(
         "workload_class": workload_class,
         "pipeline_stage": pipeline_stage,
         "parallel_audio_reference": parallel_audio_reference,
+        **({"catalog_reference": catalog_reference} if catalog_reference is not None else {}),
     }
     if publication_id:
         from transactional_outbox import run_outbox_transcription as target
