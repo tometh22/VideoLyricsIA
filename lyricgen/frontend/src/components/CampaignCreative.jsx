@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import "./CampaignCreative.print.css";
 import { useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS, AXIS_VALUE_LABELS, dynamicAxisLabel } from "../lib/optionLabels";
@@ -145,7 +146,6 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
     </>}
     {generation && <div role="dialog" aria-modal="true" aria-label="Confirmar generación" className="fixed inset-0 z-50 grid place-items-center bg-black/80 p-5"><div className="max-w-lg space-y-4 rounded-2xl bg-surface-2 p-6"><h2 className="text-xl font-semibold">Generar {generation.length} videos</h2><p>Esta acción genera fondos y videos y consume el cupo correspondiente. La configuración y el grupo de cada canción quedarán registrados.</p><ul className="max-h-40 overflow-auto">{generation.map(i => <li key={i.id}>{i.title} · {i.assignment?.group_name || "Configuración actual"}</li>)}</ul><button className={button} disabled={busy} onClick={() => run(async () => { let completed = 0; try { for (const item of generation) { const job = await request(`/status/${item.job_id}`); await request("/generate", { method: "POST", body: campaignGenerateForm(item, job) }); completed++; } } finally { setGeneration(null); await load(); setMessage(`${completed} trabajos enviados; consultá el historial de esta campaña.`); } })}>Confirmar generación</button><button className={button} disabled={busy} onClick={() => setGeneration(null)}>Cancelar</button></div></div>}
     {view === "contract" && report && <div id="campaign-contract-report" className="space-y-4">
-      <style>{"@media print { body * { visibility: hidden; } #campaign-contract-report, #campaign-contract-report * { visibility: visible; color: black !important; } #campaign-contract-report { position: absolute; inset: 0; background: white; } .campaign-no-print { display: none !important; } }"}</style>
       <h2 className="text-xl font-semibold">Contrato y cumplimiento · {report.name}</h2><p className="text-sm">Informe: {new Date(report.at).toLocaleString()} · Acuerdo versión {report.contract.revision || "Sin registrar"}</p>
       <p className="whitespace-pre-wrap">{report.contract.agreement || "Todavía no se registró un compromiso contractual."}</p><p>{report.contract.rounding_note}</p>
       <p>Universo: {report.contract.item_ids?.length || 0} entregas principales. Los reintentos y variantes no aumentan la cuota.</p>
