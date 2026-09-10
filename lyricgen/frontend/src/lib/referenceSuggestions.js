@@ -31,7 +31,7 @@ export function findReferenceSuggestion(text, referenceLines) {
       && !new Set(["tu", "el", "mi", "si", "te", "de", "se", "mas", "aun", "solo"]).has(a);
     // Lexical substitutions need context and a single near-typo. Never join
     // lines, translate a phrase, reorder words, or replace short chorus names.
-    const typo = source.length >= 4 && Math.min(a.length, b.length) >= 5 && oneEdit(a, b);
+    const typo = source.length >= 4 && Math.min(a.length, b.length) >= 5 && accents(a) !== accents(b) && oneEdit(a, b);
     if (diacritic || typo) matches.set(target.join(' '), line.trim());
   }
   return matches.size === 1 ? [...matches.values()][0] : null;

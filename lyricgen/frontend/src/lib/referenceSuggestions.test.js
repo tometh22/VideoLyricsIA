@@ -6,6 +6,9 @@ it('declines unrelated phrases and chorus alternatives even with shared words', 
  expect(findReferenceSuggestion('Y en la tumba de guardias de los desiertos', ['Y un quejido de fueye que tocás tan solo vos'])).toBeNull();
  expect(findReferenceSuggestion('I know my darling', ['Vos hablando y yo tratando de escucharte'])).toBeNull();
 });
+it('never removes an accent through the typo fallback', () => {
+ expect(findReferenceSuggestion('Yo canto esta canción contigo', ['Yo canto esta cancion contigo'])).toBeNull();
+});
 it('offers bounded orthography while declining ambiguity', () => {
  expect(findReferenceSuggestion('Vos sos Roman', ['Vos sos Román'])).toBe('Vos sos Román');
  expect(findReferenceSuggestion('Yo cantando bajo la lluvis', ['Yo cantando bajo la lluvia'])).toBe('Yo cantando bajo la lluvia');
