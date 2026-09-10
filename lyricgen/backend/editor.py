@@ -751,7 +751,7 @@ def segments_content_hash(value: list[dict]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _strict_timeline(value: Any, *, label: str) -> list[dict]:
+def _strict_timeline(value: Any, *, label: str, allow_overlaps: bool = False) -> list[dict]:
     """Validate without canonical repair so malformed proposals fail closed."""
     if not isinstance(value, list):
         raise ValueError(f"{label} must be an array")
@@ -785,7 +785,7 @@ def _strict_timeline(value: Any, *, label: str) -> list[dict]:
         if previous is not None:
             if abs(row["start"] - previous["start"]) <= _TIMELINE_EPSILON:
                 raise ValueError(f"{label} contains duplicate starts")
-            if row["start"] < previous["end"] - _TIMELINE_EPSILON:
+            if not allow_overlaps and row["start"] < previous["end"] - _TIMELINE_EPSILON:
                 raise ValueError(f"{label} contains overlapping segments")
         previous = row
     return rows
@@ -801,10 +801,42 @@ def _segments_overlapping_window(
     ]
 
 
+def _operator_text_preserves_timing(proposal: dict) -> bool:
+    """An existing overlap need not block a separate, time-preserving text edit.
+
+    This is inferred from server-stored rows, never a supplied exemption flag.
+    All source binding, ownership, window and approval checks still apply.
+    """
+    if (proposal.get("operator_suggestion_only") is not True
+            or proposal.get("automatic_apply_allowed") is not False):
+        return False
+    windows = proposal.get("windows")
+    if not isinstance(windows, list) or not windows:
+        return False
+    for window in windows:
+        if not isinstance(window, dict) or window.get("suggestion_type") != "text":
+            return False
+        before, after = window.get("current_segments"), window.get("proposed_segments")
+        if not isinstance(before, list) or not before or not isinstance(after, list) or len(before) != len(after):
+            return False
+        for left, right in zip(before, after):
+            if not isinstance(left, dict) or not isinstance(right, dict):
+                return False
+            try:
+                if any(not math.isfinite(float(left[key]))
+                       or float(left[key]) != float(right[key]) for key in ("start", "end")):
+                    return False
+            except (KeyError, TypeError, ValueError):
+                return False
+    return True
+
+
 def _validate_review_proposal_against_document(
     proposal: dict, current_segments: list[dict], *, require_hashes: bool = False,
 ) -> dict:
-    current = _strict_timeline(current_segments, label="current timeline")
+    preserves_timing = _operator_text_preserves_timing(proposal)
+    current = _strict_timeline(current_segments, label="current timeline",
+                               allow_overlaps=preserves_timing)
     windows = proposal.get("windows")
     if not isinstance(windows, list) or not windows:
         raise ValueError("quality proposal requires windows")
@@ -821,6 +853,7 @@ def _validate_review_proposal_against_document(
             raise ValueError("quality proposal window timing is invalid")
         supplied_current = _strict_timeline(
             window.get("current_segments"), label=f"window {index} current",
+            allow_overlaps=preserves_timing,
         )
         expected_current = _segments_overlapping_window(current, start, end)
         if supplied_current != expected_current:
@@ -833,6 +866,7 @@ def _validate_review_proposal_against_document(
             raise ValueError("quality proposal window cuts through a current segment")
         proposed = _strict_timeline(
             window.get("proposed_segments"), label=f"window {index} proposed",
+            allow_overlaps=preserves_timing,
         )
         if not proposed:
             raise ValueError("quality proposal window requires proposed segments")
@@ -1362,7 +1396,14 @@ def apply_quality_proposal(
         float(row.get("start") or 0), float(row.get("end") or 0),
         str(row.get("text") or ""),
     ))
-    segments = _strict_timeline(segments, label="quality proposal result")
+    preserves_timing = _operator_text_preserves_timing(validated_proposal)
+    segments = _strict_timeline(segments, label="quality proposal result",
+                               allow_overlaps=preserves_timing)
+    if preserves_timing and [
+        (float(row["start"]), float(row["end"])) for row in segments
+    ] != [(float(row["start"]), float(row["end"]))
+          for row in document.current_segments or []]:
+        raise ValueError("text proposal changed the existing timeline")
     document, version, applied = save_document(
         db, job, document, user_id, base_revision, segments,
         "reviewer_candidate" if proposal.get("reviewer_assist") else "quality_proposal",
