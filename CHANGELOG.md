@@ -3,6 +3,12 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.10] - 2026-09-09
+
+### Added
+
+- Add a Borradores campaign tab with saved edits, recent-first ordering, author and save time, searchable songs and a direct resume action. Existing drafts are discoverable; approved and discarded songs are excluded without deleting their edits.
+
 ## [1.1.9] - 2026-09-10
 
 ### Fixed

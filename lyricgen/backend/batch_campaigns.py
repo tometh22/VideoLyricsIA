@@ -1613,7 +1613,7 @@ def review_queue(
     campaign_id: str,
     stage: str = Query(default="lyrics", pattern="^(lyrics|final)$"),
     order: str = Query(default="effort", pattern="^(delivery|effort|learning)$"),
-    scope: str = Query(default="pending", pattern="^(pending|approved|all|discarded)$"),
+    scope: str = Query(default="pending", pattern="^(pending|approved|all|discarded|drafts)$"),
     state: str | None = None,
     version: str | None = Query(default=None, pattern="^(studio|live)$"),
     background_mode: str | None = None,
@@ -1667,6 +1667,12 @@ def review_queue(
     confidence_gate_passed = bool(queue_config.get("confidence_gate_passed"))
     active_minutes = _review_minutes_by_job(db, job_ids)
     effective_scope = state if state in _ALL_REVIEW_STATES else scope
+    draft_ids = {
+        job.job_id for _, job in pairs
+        if job and (document := documents.get(job.job_id))
+        and document.updated_by is not None
+        and _queue_state("lyrics", job, document) in {"ready", "reviewing"}
+    } if stage == "lyrics" else set()
     allowed_states = {state} if state in _ALL_REVIEW_STATES else (
         _PENDING_REVIEW_STATES if effective_scope == "pending" else
         _APPROVED_REVIEW_STATES if effective_scope == "approved" else
@@ -1677,6 +1683,8 @@ def review_queue(
     for item, job in pairs:
         document = documents.get(job.job_id) if job else None
         queue_state = _queue_state(stage, job, document)
+        if scope == "drafts" and (not job or job.job_id not in draft_ids):
+            continue
         title_version = "live" if (
             "live" in str(item.title or "").lower()
             or "en vivo" in str(item.title or "").lower()
@@ -1743,6 +1751,7 @@ def review_queue(
             "item_id": item.id,
             "discard": item.discard_record,
             "can_discard": bool(job and job.status in _DISCARDABLE),
+            "is_draft": bool(job and job.job_id in draft_ids),
             "reviewer_campaign_status": reviewer_rows.get(job.job_id) if job else None,
             "job_id": job.job_id if job else None,
             "ordinal": item.ordinal,
@@ -1826,7 +1835,9 @@ def review_queue(
             and row["state"] in {"approved", "exported"}
         ]
     counter_rows = list(rows)
-    if order == "learning":
+    if scope == "drafts":
+        rows.sort(key=lambda row: (row["last_reviewed_at"] or "", -row["ordinal"]), reverse=True)
+    elif order == "learning":
         rows.sort(key=lambda row: (-row["disagreement"], row["ordinal"]))
         rows = rows[:max(1, math.ceil(len(rows) * 0.20))]
     else:
@@ -1911,13 +1922,15 @@ def review_queue(
             "reviewer_campaign_status": reviewer_summary,
         },
         "reviewer_campaign_status": reviewer_summary,
-        "order": "effort" if order == "delivery" else order,
+        "order": "recent" if scope == "drafts" else "effort" if order == "delivery" else order,
         "scope": {
             "key": effective_scope if state not in _ALL_REVIEW_STATES else "state",
             "label": {
                 "pending": "Pendientes",
                 "approved": "Aprobadas",
                 "all": "Toda la campaña",
+                "drafts": "Borradores",
+                "discarded": "Descartadas",
             }.get(effective_scope, f"Estado: {effective_scope}"),
             "total": total,
             "states": sorted(allowed_states),
@@ -1926,6 +1939,7 @@ def review_queue(
             "songs": len(pairs),
             "approved": campaign_state_counts.get("approved", 0) + campaign_state_counts.get("exported", 0),
             "discarded": campaign_state_counts.get("discarded", 0),
+            "drafts": len(draft_ids),
             "approved_today": campaign_approved_today,
         },
         "items": [

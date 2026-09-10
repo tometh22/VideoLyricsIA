@@ -42,6 +42,29 @@ function mount(path) {
 }
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); sessionStorage.clear(); localStorage.clear(); });
 
+it("finds saved drafts and preserves the drafts tab when resuming", async () => {
+  setupFetch((url) => {
+    if (!url.pathname.endsWith("/review-queue")) return null;
+    const scope = url.searchParams.get("scope");
+    return response({ ...payload(scope), campaign,
+      campaign_totals: { songs: 3, approved: 1, drafts: 1 },
+      items: scope === "drafts" ? [{ ...ready, is_draft: true, last_reviewed_name: "Agus", last_reviewed_at: "2026-09-10T02:00:00Z" }] : [ready, failed] });
+  });
+  mount("/campaigns/campaign-1");
+  await screen.findByText(ready.title);
+  fireEvent.click(screen.getByRole("tab", { name: "Borradores 1" }));
+  await screen.findByText("Borrador guardado");
+  expect(screen.getByText(/Guardado por Agus/)).toBeInTheDocument();
+  expect(screen.getByRole("combobox", { name: "Orden" })).toBeDisabled();
+  expect(screen.queryByText(failed.title)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Continuar borrador" }));
+  await screen.findByText("Editor");
+  expect(decodeURIComponent(screen.getByTestId("location").textContent)).toContain("tab=drafts");
+  fireEvent.click(screen.getByRole("button", { name: "Volver navegador" }));
+  await screen.findByText("Borrador guardado");
+  expect(screen.getByRole("tab", { name: "Borradores 1" })).toHaveAttribute("aria-selected", "true");
+});
+
 it("loads the campaign once and discards/restores with a visible reason", async () => {
   let discarded = false;
   const mock = setupFetch((url, options) => {
