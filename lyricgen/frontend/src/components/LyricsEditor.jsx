@@ -8,6 +8,7 @@ import HelpTip from "./HelpCenter/HelpTip";
 import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
 import LyricVideoPreview from "./LyricVideoPreview";
+import { referenceSuggestionsById } from "../lib/referenceSuggestions";
 import { tierForLength } from "../lib/lyricTiers";
 import { approvalConflict } from "../lib/approvalSnapshot";
 import { resolveLegacyDraft } from "../lib/reviewRecovery";
@@ -446,43 +447,7 @@ function sanitizeSegmentsForPersistence(segments) {
   return sanitizeSegments(segments).map((segment) => ({ ...segment }));
 }
 
-function findSuggestion(whisperText, refLines, startIdx) {
-  if (!refLines.length) return null;
-  const wLower = whisperText.toLowerCase().trim();
-  let bestScore = 0;
-  let bestLine = null;
 
-  const searchStart = Math.max(0, startIdx - 3);
-  const searchEnd = Math.min(refLines.length, startIdx + 10);
-
-  for (let i = searchStart; i < searchEnd; i++) {
-    const rLower = refLines[i].toLowerCase().trim();
-    if (!rLower) continue;
-    const wWords = wLower.split(/\s+/);
-    const rWords = rLower.split(/\s+/);
-    let matches = 0;
-    for (const w of wWords) { if (rWords.includes(w)) matches++; }
-    const score = matches / Math.max(wWords.length, rWords.length);
-    if (score > bestScore) { bestScore = score; bestLine = refLines[i]; }
-
-    if (i < refLines.length - 1) {
-      const combined = rLower + " " + refLines[i + 1].toLowerCase().trim();
-      const cWords = combined.split(/\s+/);
-      let cMatches = 0;
-      for (const w of wWords) { if (cWords.includes(w)) cMatches++; }
-      const cScore = cMatches / Math.max(wWords.length, cWords.length);
-      if (cScore > bestScore) { bestScore = cScore; bestLine = refLines[i] + " " + refLines[i + 1]; }
-    }
-  }
-
-  if (bestScore > 0.3 && bestLine) {
-    const normalize = (s) => s.toLowerCase().replace(/[^a-záéíóúüñ\s]/g, "").replace(/\s+/g, " ").trim();
-    if (normalize(bestLine) !== normalize(whisperText)) {
-      return bestLine;
-    }
-  }
-  return null;
-}
 
 // Find two consecutive lines in `refLines` whose concatenation matches
 // `segText`. Used by the auto-split banner: when a Whisper segment
@@ -3098,21 +3063,10 @@ export default function LyricsEditor({
     return referenceLyrics.split("\n").filter((l) => l.trim());
   }, [referenceLyrics]);
 
-  const suggestionsById = useMemo(() => {
-    const map = {};
-    let refIdx = 0;
-    segments.forEach((seg, i) => {
-      const suggestion = findSuggestion(seg.text, refLines, refIdx);
-      map[i] = suggestion;
-      if (suggestion) {
-        const idx = refLines.findIndex(
-          (l, j) => j >= refIdx && l.toLowerCase().includes(seg.text.toLowerCase().split(" ")[0]?.toLowerCase())
-        );
-        if (idx >= 0) refIdx = idx + 1;
-      }
-    });
-    return map;
-  }, [segments, refLines]);
+  const suggestionsById = useMemo(
+    () => referenceSuggestionsById(edited, refLines),
+    [edited, refLines],
+  );
 
   // Detección de segments mergeados (2 lyric lines en 1 segment) usando
   // lrclib plain como oracle. Caso real motivador: Whisper agrupa
@@ -3818,23 +3772,48 @@ export default function LyricsEditor({
   const approveInFlightRef = useRef(false);
   const [isApproving, setIsApproving] = useState(false);
 
+  const [languageResolutionOpen, setLanguageResolutionOpen] = useState(false);
+  const [languageResolutionBusy, setLanguageResolutionBusy] = useState(false);
+  const [languageResolutionError, setLanguageResolutionError] = useState("");
+  const languageResolutionFlight = useRef(false);
+  const unresolvedLanguage = !languageReviewResolved
+    && (languageConflict || languageUncertain || needsLanguageReview);
+  const confirmLanguageReview = async () => {
+    if (languageResolutionFlight.current || !onResolveLanguageReview) return;
+    languageResolutionFlight.current = true;
+    setLanguageResolutionBusy(true);
+    setLanguageResolutionError("");
+    try {
+      const snapshot = JSON.stringify(sanitizeSegmentsForPersistence(editedRef.current));
+      const saved = await flushPendingSave(null, true);
+      if (!saved?.ok || !Number.isInteger(saved.revision)) {
+        throw new Error("No pudimos guardar esta versión. Tus cambios siguen en pantalla; reintentá el guardado.");
+      }
+      if (snapshot !== JSON.stringify(sanitizeSegmentsForPersistence(editedRef.current))) {
+        throw new Error("La letra cambió durante el guardado. Revisá la versión actual y volvé a confirmar.");
+      }
+      const result = await onResolveLanguageReview({ baseRevision: saved.revision });
+      if (!result?.ok) throw new Error(result?.reason === "stale_revision"
+        ? "La versión guardada cambió. Revisá la letra actual y volvé a confirmar."
+        : "No pudimos registrar tu confirmación. Tus cambios están guardados; reintentá.");
+      setLanguageResolutionOpen(false);
+      toast({ message: "Confirmación guardada. Ya podés aprobar letra y timing.", tone: "info" });
+    } catch (error) {
+      setLanguageResolutionError(error?.message || "No pudimos guardar la confirmación. Reintentá.");
+    } finally {
+      languageResolutionFlight.current = false;
+      setLanguageResolutionBusy(false);
+    }
+  };
+
   const runApprove = async ({ skipWrapWarning = false } = {}) => {
     const conflict = approvalConflict(approvalSegments);
     if (conflict) {
       toast({ message: conflict, tone: "error" });
       return;
     }
-    if (languageConflict) {
-      toast({ message: "No se puede aprobar: el idioma detectado contradice la transcripción. Corregí el idioma y reprocesá esta canción.", tone: "info" });
-      return;
-    }
-    if (languageUncertain && !languageReviewResolved) {
-      toast({
-        message: outputReferenceDivergence
-          ? "No se puede aprobar: hay versos que no coinciden con la referencia. Corregilos, o confirmá que la letra es correcta."
-          : "No se puede aprobar: falta resolver el idioma de esta canción.",
-        tone: "info",
-      });
+    if (unresolvedLanguage) {
+      setLanguageResolutionOpen(true);
       return;
     }
     if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
@@ -4450,11 +4429,16 @@ export default function LyricsEditor({
                 : `${edited.length} líneas · ${viewMode === "advanced" ? "timings revisados" : "texto revisado"}`}
             </p>
           </div>
+          {unresolvedLanguage && (
+            <button type="button" onClick={() => setLanguageResolutionOpen(true)}
+              className="ml-auto rounded-lg bg-amber-400/15 px-3 py-2 text-xs text-amber-100 ring-1 ring-amber-400/30">
+              Resolver discrepancia
+            </button>
+          )}
           <button
             onClick={handleApprove}
             disabled={isApproving || (!requireLineReview && (
-              languageConflict || (languageUncertain && !languageReviewResolved)
-              || (editorV2Enabled && (!durableHydrated || durableEditor.loading))
+              (editorV2Enabled && (!durableHydrated || durableEditor.loading))
               || saveErrorReason === "draft-corrupt"
             ))}
             aria-busy={isApproving}
@@ -4479,6 +4463,26 @@ export default function LyricsEditor({
           </button>
         </div>
       </div>
+
+      {languageResolutionOpen && createPortal(
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4">
+          <section role="dialog" aria-modal="true" aria-labelledby="language-resolution-title"
+            className="w-full max-w-lg rounded-2xl bg-surface-1 p-6 shadow-2xl ring-1 ring-white/15">
+            <h2 id="language-resolution-title" className="text-lg font-semibold text-white">Confirmar la letra revisada</h2>
+            <p className="mt-3 text-sm text-ink-secondary">La referencia automática puede equivocarse. Si escuchaste el audio y verificaste que la letra que dejaste es correcta, podés confirmar esta versión para aprobarla.</p>
+            {languageResolutionError && <p role="alert" className="mt-3 text-sm text-red-300">{languageResolutionError}</p>}
+            {!onResolveLanguageReview && <p role="alert" className="mt-3 text-sm text-red-300">No está disponible la confirmación. Guardá tus cambios y volvé a abrir la canción.</p>}
+            <div className="mt-5 flex justify-end gap-3">
+              <button type="button" disabled={languageResolutionBusy} onClick={() => setLanguageResolutionOpen(false)}
+                className="rounded-lg px-3 py-2 text-sm text-white">Seguir revisando</button>
+              <button type="button" disabled={languageResolutionBusy || !onResolveLanguageReview}
+                onClick={confirmLanguageReview} className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
+                {languageResolutionBusy ? "Guardando confirmación…" : "Escuché el audio y confirmo esta letra"}
+              </button>
+            </div>
+          </section>
+        </div>, document.body,
+      )}
 
       {coverageWarning && (
         <div className="mb-4 rounded-2xl ring-1 ring-accent/25 bg-accent/[0.06] px-4 py-3 flex items-start gap-3">
@@ -4521,7 +4525,7 @@ export default function LyricsEditor({
             <button
               type="button"
               data-testid="resolve-language-review"
-              onClick={() => onResolveLanguageReview()}
+              onClick={() => setLanguageResolutionOpen(true)}
               className="mt-2 rounded-lg bg-amber-400/20 px-3 py-1 text-xs text-amber-100 ring-1 ring-amber-400/40 hover:bg-amber-400/30"
             >
               {t("editor.confirm_lyrics_correct") || "Ya lo revisé, la letra es correcta"}
