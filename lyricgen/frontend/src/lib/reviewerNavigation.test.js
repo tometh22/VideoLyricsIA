@@ -4,7 +4,7 @@ import { reviewCounts, reviewStateLabel, reviewActionLabel, reviewDestination, s
 describe("reviewer navigation contract", () => {
   it("keeps campaign counts independent of the active scope", () => {
     expect(reviewCounts({ scope: { total: 40 }, campaign_totals: { songs: 300, approved: 40 } }))
-      .toEqual({ all: 300, approved: 40, pending: 260 });
+      .toEqual({ all: 300, approved: 40, pending: 260, discarded: 0 });
     expect(reviewCounts(null).approved).toBeUndefined();
   });
   it.each([

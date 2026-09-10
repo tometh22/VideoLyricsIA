@@ -2004,6 +2004,9 @@ export default function App() {
   useEffect(() => {
     const jobId = currentReview?.transcribeJobId;
     if (!jobId || wizardStage !== "review") return;
+    // A selected song in the URL owns identity. Never redirect a new deep
+    // link back to the previous editor while its status request is pending.
+    if (reviewJobIdFromLocation(location.pathname, location.search)) return;
     if (location.pathname !== "/new" && !location.pathname.startsWith("/review")) return;
     const targetPath = reviewJobPath(jobId);
     const target = `${targetPath}${location.pathname.startsWith("/review") ? location.search : ""}`;
@@ -2249,6 +2252,10 @@ export default function App() {
         if (!statusRes.ok) throw new Error(`status ${statusRes.status}`);
         const job = await statusRes.json();
         if (attempt.cancelled) return;
+        if (job.status === "discarded" && job.campaign_id) {
+          navigate(`/campaigns/${encodeURIComponent(job.campaign_id)}?tab=discarded`, { replace: true });
+          return;
+        }
         const segments = job.segments || job.segments_json || [];
         const resumedCreativeFields = creativeFieldsForReviewResume(job);
         const campaignPreset = {
@@ -2349,7 +2356,11 @@ export default function App() {
         setWizardStage("review");
         // Canonicalize legacy /new?resume= links without adding a history
         // entry. Direct /review/:jobId links already point at this target.
-        navigate(reviewJobPath(resumeJobId), { replace: true });
+        if (location.pathname === "/new") {
+          const params = new URLSearchParams(location.search);
+          params.delete("resume");
+          navigate(`${reviewJobPath(resumeJobId)}${params.size ? `?${params}` : ""}`, { replace: true });
+        }
       } catch (err) {
         if (attempt.cancelled) return;
         console.warn("[RESUME] no pude cargar el job:", err);
@@ -5627,7 +5638,7 @@ export default function App() {
     }
   }, [alert, currentReview?.transcribeJobId]);
 
-  const handleCampaignReviewExit = useCallback(async () => {
+  const handleCampaignReviewExit = useCallback(async (destination = null) => {
     const review = currentReview;
     if (review?.transcribeJobId) {
       try {
@@ -5640,7 +5651,7 @@ export default function App() {
     setCurrentReview(null);
     wizardPersistence.clear();
     if (review) segmentsStore.evict(reviewStoreKey(review));
-    navigate(campaignReturnPath || "/admin/cola");
+    navigate(typeof destination === "string" ? destination : campaignReturnPath || "/admin/cola");
   }, [campaignReturnPath, currentReview, navigate]);
 
   const handleCampaignReviewNext = useCallback(async () => {
@@ -5814,6 +5825,17 @@ export default function App() {
                     >
                       Guardar borrador y salir
                     </button>
+                    {currentReview.campaignItemId && <button
+                      type="button"
+                      onClick={() => {
+                        const path = `/campaigns/${encodeURIComponent(currentReview.campaignId)}?tab=all&discard=${encodeURIComponent(currentReview.campaignItemId)}`;
+                        const leave = () => handleCampaignReviewExit(path);
+                        const safeExit = campaignReviewSafeExitRef.current;
+                        if (safeExit) void safeExit(leave);
+                        else void leave();
+                      }}
+                      className="btn-secondary shrink-0 px-4 py-2 text-xs"
+                    >Descartar canción</button>}
                     <button
                       type="button"
                       onClick={() => {
@@ -6063,7 +6085,10 @@ export default function App() {
   // y el stepper persisten desde el drop del audio hasta "Crear videos".
   // wizardStage queda como flag de back-compat (sessionStorage, /review
   // como ruta legacy) pero NO controla qué pantalla se renderiza.
-  const wizardScreen = newBatchScreen;
+  const requestedReviewId = reviewJobIdFromLocation(location.pathname, location.search);
+  const wizardScreen = requestedReviewId && currentReview?.transcribeJobId !== requestedReviewId
+    ? <div role="status" className="mx-auto max-w-xl p-12 text-center text-ink-secondary">Cargando la canción seleccionada…</div>
+    : newBatchScreen;
 
   const generatingScreen = jobs.length > 0
     ? (

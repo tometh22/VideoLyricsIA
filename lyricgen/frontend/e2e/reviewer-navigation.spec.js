@@ -45,7 +45,7 @@ for (const path of ["/admin/cola", "/campaigns/campaign-1"]) {
     });
     await page.goto(path);
     await expect(page.getByText("Lista para revisar", { exact: true })).toBeVisible();
-    await page.getByRole("navigation", { name: "Resumen de la campaña" }).getByRole("button", { name: /Aprobadas/ }).click();
+    await page.getByRole("tab", { name: /Aprobadas/ }).click();
     await expect(page.getByText("Letra ya aprobada", { exact: true })).toBeVisible();
     await expect(page.getByText("Lista para revisar", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("tab", { name: /Aprobadas/ })).toHaveAttribute("aria-selected", "true");

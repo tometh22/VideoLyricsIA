@@ -3,7 +3,7 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [1.1.8] - 2026-09-10
+## [1.1.9] - 2026-09-10
 
 ### Fixed
 
@@ -14,6 +14,28 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   words or diluting a local failure across the whole song. Preserve vocal-only
   adlibs, bilingual references, editorial documents and existing approval resolution.
   These checks detect drift; they do not claim to repair the ASR's wrong words.
+- Resolve a pending complete-audio reference before Auto studio recognition so
+  the initial language hint is no longer skipped by the parallel batch path.
+  Veto the hint for a short foreign verse; never send derived lyrics as a prompt.
+  Explicit choices and live Auto keep their existing scheduling. No extra calls.
+- Make discrepancy resolution reachable from the approval action and fixed footer.
+  Save first, attest the exact saved revision, surface failures and keep the server
+  approval gate. Do not approve or alter songs on behalf of reviewers.
+- Restrict reference suggestions to unambiguous near-orthographic changes, bind
+  them to current stable line IDs and stop proposing unrelated or stale verses.
+
+## [1.1.8] - 2026-09-09
+
+### Fixed
+
+- Keep campaign review URL, editor and audio bound to the selected song when navigating back or switching songs; preserve the campaign return link.
+- Load a campaign queue in one request, defer administrative item loading and debounce search.
+- Explain review actions and evidence in plain Spanish; expose uncalibrated confidence and remove duplicated navigation.
+
+### Added
+
+- Recoverable campaign discard with reason, actor, timestamp, original status and append-only audit events. Discarded songs stay out of pending review and retain audio and drafts.
+
 
 ## [1.1.6] - 2026-09-09
 
