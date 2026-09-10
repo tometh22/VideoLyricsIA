@@ -3,6 +3,21 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.14] - 2026-09-10
+
+### Added
+
+- Campaign creative workspace: select songs across pages and assign complete styles or individual visual fields by percentage/count. Preview a stable allocation, preserve pinned exceptions, record rounding and undo the latest safe assignment.
+- Versioned contractual groups for fixed photo plus effect or an explicit Veo Fast/Lite model selected per group, with per-song settings, actor/date/reason, render fingerprints, applied-effect evidence, delivery records and CSV/Excel/print-to-PDF reports.
+- Campaign video history includes native generations and related variants. Generation uses the existing human lyric/timing approval and queue protections; saving styles never generates media.
+
+### Fixed
+
+- Keep uploaded photos still when selecting Foto fija, both on the first render and on edits; effects remain independently composited.
+- Restore all campaign visual settings in the individual editor, autosave changes with revision checks and flush before approval or switching songs.
+- Preserve campaign membership in new variants and keep rendered evidence separate from requested settings.
+- Recognize published aliases of already reviewed Python advisories without extending security exceptions or their expiry.
+
 ## [1.1.13] - 2026-09-10
 
 ### Fixed

@@ -208,6 +208,12 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
        Non-critical (umg_master, umg_short) keep the old "log and skip"
        behavior because they're lazy-regenerated on first /download.
     """
+    try:
+        from campaign_render_evidence import persist_render_evidence
+        persist_render_evidence(job_id, job_dir)
+    except Exception as exc:
+        _raise_if_job_timeout(exc)
+        logger.warning("[CAMPAIGN] render evidence unavailable job=%s: %s", job_id, exc)
     if not storage.is_enabled():
         if os.environ.get("ENVIRONMENT", "production").strip().lower() in {
             "production", "prod", "staging",
@@ -2303,12 +2309,13 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 art_track=art_track,
                 label_line=label_line,
                 # "Quieta de verdad": si el fondo entregado es una IMAGEN y el
-                # operador eligió Estático, no le metemos el zoom del 15%.
+                # operador eligió Estático o Foto fija, no le metemos el zoom
+                # del 15%. Foto fija conserva el código legacy foto-parallax.
                 # Es además la primera vez que `movement_style` hace algo en el
                 # camino de fondo humano: hasta ahora el eje entero era inerte
                 # acá (se enviaba, se persistía y nadie lo leía).
                 still_background=(
-                    _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
+                    _normalize_movement_style(movement_style) in {"estatico", "foto-estatica", "foto-parallax"}
                 ),
                 preserve_approved_timing=preserve_approved_timing,
             )
@@ -11822,6 +11829,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         model = _static_model
         logger.info("[BG] high-fidelity render → model=%s (movement=%s, verbatim=%s)",
                     model, _norm_move or "auto", high_fidelity)
+    # The campaign's frozen model choice wins over ordinary/default routing.
+    # It participates in the existing cache key, budget and provenance below.
+    from campaign_models import model_for_campaign_job
+    model = model_for_campaign_job(job_id, model)
     veo_params = {
         "aspectRatio": "16:9",
         "sampleCount": 1,
@@ -12428,6 +12439,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             response_summary=f"video_generated: {size_mb:.1f}MB key={cache_key_hash}",
             output_artifact=output_path,
         )
+    try:
+        from campaign_render_evidence import write_origin
+        write_origin(output_path, kind="video", model=model, provenance_id=getattr(recorder, "_row_id", None))
+    except Exception as exc:
+        _raise_if_job_timeout(exc)
+        logger.warning("[CAMPAIGN] provider source receipt unavailable: %s", exc)
     return output_path
 
 
@@ -16220,6 +16237,12 @@ def _static_image_to_mp4(image_path: str, output_path: str, duration: float,
         timeout=900,
         output_path=output_path,
     )
+    try:
+        from campaign_render_evidence import write_origin
+        write_origin(output_path, kind="image", original=image_path)
+    except Exception as exc:
+        _raise_if_job_timeout(exc)
+        logger.warning("[CAMPAIGN] static source receipt unavailable: %s", exc)
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     logger.info("[BG] static image render: %.0fs, %.1f MB", duration, size_mb)
     return output_path
@@ -18008,6 +18031,12 @@ def _render_lyrics_ass(
     # Validate the output is actually browser-playable; on failure the
     # caller (generate_lyric_video) catches and falls back to moviepy.
     _validate_rendered_mp4(out_path, duration)
+    try:
+        from campaign_render_evidence import write_encode_receipt
+        write_encode_receipt(out_path, bg_video_path, effect, bool(_extra_in), vfilter)
+    except Exception as exc:
+        _raise_if_job_timeout(exc)
+        logger.warning("[CAMPAIGN] encode receipt unavailable: %s", exc)
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
     logger.info("[ASS] lyric video rendered: %.0fs audio, %.1f MB (libass fast path, validated)",
                 duration, size_mb)
@@ -20821,7 +20850,7 @@ def run_edit_pipeline(
             bg_prelooped=bg_prelooped,
             # Espejo de run_pipeline: un edit no puede perder el "quieta".
             still_background=(
-                _normalize_movement_style(movement_style) in {"estatico", "foto-estatica"}
+                _normalize_movement_style(movement_style) in {"estatico", "foto-estatica", "foto-parallax"}
             ),
             # Every edit render consumes a persisted operator snapshot. Never
             # reinterpret its approved/manual line boundaries at display time.

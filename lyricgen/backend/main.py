@@ -642,6 +642,8 @@ app.include_router(billing_router)
 app.include_router(admin_router)
 app.include_router(corpus_router)
 app.include_router(batch_campaign_router)
+from campaign_creative import router as campaign_creative_router
+app.include_router(campaign_creative_router)
 app.include_router(art_track_campaign_router)
 # Página de status pública (/service-status/*, sin auth) + redacción de
 # incidentes para admin (/admin/status/*). Ver status_page.py.
@@ -10232,6 +10234,7 @@ async def generate_with_segments(
     request: Request,
     file: UploadFile = File(None),
     job_id: str = Form("", max_length=12),       # Job.job_id = VARCHAR(12)
+    campaign_creative_revision: str = Form("", max_length=20),
     artist: str = Form("", max_length=255),      # Job.artist = VARCHAR(255)
     song_title: str = Form("", max_length=500),  # Job.song_title = VARCHAR(500)
     style: str = Form("oscuro", max_length=50),  # Job.style = VARCHAR(50)
@@ -11055,6 +11058,12 @@ async def generate_with_segments(
     if publication_job.workload_class == "batch":
         from batch_campaigns import enforce_render_capacity
         enforce_render_capacity(db, publication_job)
+    from campaign_creative import generation_receipt, RENDER_KEYS
+    _creative_values = {k: v for k, v in locals().copy().items() if k in RENDER_KEYS}
+    _creative_values.update(font_scale=_font_scale_gen,
+                            animate_image=str(animate_image).strip().lower() in ("true", "1", "yes", "on"),
+                            enable_scenes=_effective_scenes)
+    generation_receipt(db, publication_job, campaign_creative_revision, _creative_values, current_user)
     publication_job.status = initial_status
     publication_job.current_step = "queued"
     publication_job.progress = 0
@@ -11065,7 +11074,7 @@ async def generate_with_segments(
         artist=artist,
         style=style,
         plan=current_user.get("plan", "100"),
-        tenant_id=current_user.get("tenant_id", ""),
+        tenant_id=publication_job.tenant_id,
         segments_override=segments,
         # Audit fix 2026-05-25: language se recibía como Form param
         # (línea 5041) pero NUNCA se forwardaba al pipeline. Whisper/
@@ -18069,6 +18078,7 @@ async def create_variant(
     )
 
     # Style: override o herencia.
+    new_render_params.pop("campaign_render_evidence", None)
     new_style = body.style if body.style is not None else (parent.style or "oscuro")
 
     # Crear el job nuevo. NO usamos jobs.create_job() porque queremos
@@ -18182,6 +18192,7 @@ async def create_variant(
         render_params=new_render_params,
         edit_count=0,
         parent_job_id=parent.job_id,
+        campaign_id=parent.campaign_id,
     )
     db.add(new_job)
     db.add(AuditLog(
