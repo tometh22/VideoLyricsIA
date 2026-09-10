@@ -114,3 +114,34 @@ def test_attestation_never_emits_plain_sha256_identities(monkeypatch):
         "reference_fingerprint": None,
         "asr_fingerprint": None,
     }
+
+
+def test_repeated_chorus_cannot_hide_a_missing_or_invented_verse():
+    chorus = "Otra estrella brillante ilumina nuestra noche\n" * 12
+    passage = "Caminamos lejos buscando nuevas historias compartidas\n"
+    for reference, asr in (
+        (chorus, passage + chorus),
+        (passage + chorus, chorus),
+        ("Inventamos mundos extraños llenos de fantasmas\n" + chorus,
+         passage + chorus),
+    ):
+        result = assess_reference_attestation(
+            reference, _segments(asr), audio_duration_s=100,
+        )
+        # High aggregate similarity still supports local vocabulary. It must
+        # not permit a missing passage to stretch or collapse neighboring lines.
+        assert result["allow_vocabulary_reconciliation"] is True
+        assert result["allow_global_forced_alignment"] is False
+        assert "reference_contains_unmatched_passage" in result["reasons"]
+        assert reference_gate_action(result, mode="enforce", is_live=False) == "audio_first"
+
+
+def test_structure_guard_keeps_exact_repeated_occurrences_and_small_mishears():
+    chorus = "Otra estrella brillante ilumina nuestra noche\n" * 12
+    result = assess_reference_attestation(
+        "Caminamos lejos buscando nuevas historias compartidas\n" + chorus,
+        _segments("Caminamos lento buscando nuevas historias compartidas\n" + chorus),
+        audio_duration_s=100,
+    )
+    assert result["allow_global_forced_alignment"] is True
+    assert result["metrics"]["longest_unmatched_content_run"] == 1
