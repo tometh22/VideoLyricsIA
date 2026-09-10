@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.11] - 2026-09-10
+
+### Added
+
+- Import audio-bound spreadsheet lyrics with batch campaigns. The worker compares each candidate against audio-first recognition before alignment, preserves independent acoustic evidence, and exposes applied, declined, and absent sources to human reviewers. Existing campaigns retain their audio-only behavior.
+
+### Fixed
+
+- Keep whole-song reference alignment disabled when an unsupported passage is hidden by otherwise matching choruses. Local vocabulary reconciliation remains available.
+
 ## [1.1.10] - 2026-09-09
 
 ### Added
