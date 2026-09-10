@@ -439,3 +439,27 @@ __all__ = [
     "reference_divergence",
     "resolve_transcription_language",
 ]
+
+
+def primary_reference_language(reference_text: str) -> str | None:
+    """Conservative global hint, vetoed by even a short foreign verse.
+
+    Full-song voting can dilute an English couplet. Distinct exclusive
+    function words on a line veto a monolingual hint; no reference text is
+    sent as a recognition prompt. Unknown remains provider-auto.
+    """
+    languages = detect_text_languages(reference_text)
+    if len(languages) != 1:
+        return None
+    language = next(iter(languages))
+    for other, markers in _MARKERS.items():
+        if other == language:
+            continue
+        exclusive = markers - set().union(*(
+            words for name, words in _MARKERS.items() if name != other))
+        for line in reference_text.splitlines():
+            normalized = unicodedata.normalize("NFC", line).casefold()
+            words = set(re.findall(r"[^\W\d_]+", normalized, re.UNICODE))
+            if len(words & exclusive) >= 2:
+                return None
+    return language

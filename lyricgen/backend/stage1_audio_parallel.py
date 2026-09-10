@@ -28,3 +28,14 @@ async def run_asr_with_pending_reference(
         return_exceptions=True,
     )
     return asr_result, reference_result
+
+
+async def join_reference_for_language(reference_task: asyncio.Task) -> Any:
+    """Consume the existing task once; failure never prevents blind ASR.
+
+    Cancellation is deliberately not swallowed. No retries or new model calls.
+    """
+    try:
+        return await reference_task
+    except Exception as exc:
+        return exc

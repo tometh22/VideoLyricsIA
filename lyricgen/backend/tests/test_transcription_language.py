@@ -231,7 +231,7 @@ def test_auto_language_is_resolved_before_primary_whisperx():
     calls = [node for node in ast.walk(runner) if isinstance(node, ast.Call)]
     resolution_lines = [
         node.lineno for node in calls
-        if getattr(node.func, "id", None) == "resolve_transcription_language"
+        if getattr(node.func, "id", None) == "primary_reference_language"
     ]
     whisperx_lines = [
         node.lineno for node in ast.walk(runner)
@@ -486,3 +486,12 @@ def test_chokepoint_keeps_request_time_uncertainty():
     original auto/no-reference uncertainty signal must survive there."""
     c = build_language_contract(_segs("la la la na na"), "", requested_language="")
     assert c["language_uncertain"] is True
+
+
+def test_primary_hint_vetoes_short_english_verse_hidden_by_spanish_majority():
+    from transcription_language import primary_reference_language
+    reference = SPANISH_REFERENCE * 5 + '\nI know my darling\nThis is no fun, remember'
+    assert primary_reference_language(reference) is None
+    assert primary_reference_language(SPANISH_REFERENCE) == 'es'
+    assert primary_reference_language(ENGLISH_REFERENCE) == 'en'
+    assert primary_reference_language('oh oh oh') is None

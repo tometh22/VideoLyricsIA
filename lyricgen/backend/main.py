@@ -134,6 +134,7 @@ from render_spec import umg_catalog, validate_umg_config
 from transcription_language import (
     build_language_contract,
     detect_text_languages,
+    primary_reference_language,
     normalize_language,
     resolve_transcription_language,
 )
@@ -7964,6 +7965,18 @@ async def _run_transcription_for_job(
                 else:
                     await _resolve_audio_reference()
 
+        # In Auto, the parallel batch path used to skip the language resolver:
+        # lrc was still empty when the primary ASR started. Join the existing
+        # audio-only task once before choosing the hint. This trades overlap
+        # for a stable decode without adding a model call or a lyric prompt.
+        if (_batch_reference_task is not None
+                and _can_infer_primary_language_from_reference(
+                    lang, live=live, title=title, filename=filename)):
+            from stage1_audio_parallel import join_reference_for_language
+            _language_reference = await join_reference_for_language(_batch_reference_task)
+            _batch_reference_task = None
+            await _resolve_audio_reference(_language_reference)
+
         # The upload wizard defaults to Auto.  Resolve that choice from the
         # canonical lyrics before the primary ASR runs, so English references
         # are transcribed as English while Spanish references retain the
@@ -7986,8 +7999,8 @@ async def _run_transcription_for_job(
                     )
                 lang = None
             _detected_lang = (
-                resolve_transcription_language(
-                    None, reference_text=_reference_for_language,
+                primary_reference_language(
+                    _reference_for_language,
                 )
                 if len(_reference_languages) == 1
                 and _can_infer_primary_language_from_reference(
@@ -8158,7 +8171,8 @@ async def _run_transcription_for_job(
                     and os.environ.get("LIVE_AUDIO_AS_TRUTH_ENABLED", "1")
                     .strip().lower() in ("1", "true", "yes", "on")
                 )
-                _drop_hint = _live_no_hint or _live_audio_truth or _no_hint_always
+                _drop_hint = (_live_no_hint or _live_audio_truth or _no_hint_always
+                              or _batch_audio_only_reference)
                 if _no_hint_always and not _live_no_hint:
                     logger.info("[WC] WHISPERX_NO_HINT_ALWAYS — clean whisperX, reconcile restores canonical text")
                 elif _live_audio_truth and not _live_no_hint:
