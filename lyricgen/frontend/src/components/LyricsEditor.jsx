@@ -33,6 +33,7 @@ import VersionHistory from "./VersionHistory";
 import WrapWarningDialog from "./WrapWarningDialog";
 import QualityProposalPanel from "./QualityProposalPanel";
 import CompleteReviewerCandidate from "./CompleteReviewerCandidate";
+import CatalogReference from "./CatalogReference";
 
 // Copy honesto del fallo de respaldo (autosave), por CAUSA real. El banner
 // + el confirm de "Aprobar" antes decían "problema de red" para cualquier
@@ -632,7 +633,7 @@ export default function LyricsEditor({
   // que preserva la identidad de filas (reseedPreservingIds) — hoy sin caller
   // de producción (reservado / lo ejercitan sólo los tests).
   segments, filename, audioFile, referenceLyrics,
-  referenceLinks = [], referenceUnavailable = false,
+  referenceLinks = [], referenceUnavailable = false, sourceReference = null,
   coverageWarning = false, transcriptionQuality: transcriptionQualityProp = null, recoverySource = "",
   languageConflict = false, languageUncertain = false, mixedLanguage = false,
   outputReferenceDivergence = false, outputReferenceUnexplainedIndices = [],
@@ -4332,6 +4333,7 @@ export default function LyricsEditor({
           }}
         />
       )}
+      <CatalogReference reference={sourceReference} />
       {(referenceLyrics || referenceUnavailable || referenceLinks.length > 0) && (
         <details className="mb-3 rounded-xl bg-surface-2/45 p-4 ring-1 ring-white/[0.06]">
           <summary className="cursor-pointer text-sm font-semibold text-white">

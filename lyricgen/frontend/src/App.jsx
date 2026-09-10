@@ -2309,6 +2309,7 @@ export default function App() {
           segmentsRevision: Number.isInteger(job.segments_revision) ? job.segments_revision : 0,
           referenceLyrics: job.reference_lyrics || "",
           referenceLinks: job.campaign?.review_reference_links || [],
+          sourceReference: job.campaign?.source_reference || null,
           referenceUnavailable: Boolean(
             job.transcription_quality?.manual_full_review_required
             || job.transcription_quality?.reference_hypothesis?.availability === "unavailable"
@@ -5922,6 +5923,7 @@ export default function App() {
             waveformLoading={currentReview.waveformLoading ?? (!!currentReview.transcribeJobId && !currentReview.waveform)}
             referenceLyrics={currentReview.referenceLyrics || ""}
             referenceLinks={currentReview.referenceLinks || []}
+            sourceReference={currentReview.sourceReference || null}
             referenceUnavailable={!!currentReview.referenceUnavailable}
             requireLineReview={!!currentReview.campaignId}
             coverageWarning={currentReview.coverageWarning}

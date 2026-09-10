@@ -68,6 +68,16 @@ def test_flag_off_with_submitted_reference_declines_and_never_calls_engine(monke
     assert out["anchor_alignment"]["reason"] == "feature_disabled"
 
 
+def test_catalog_alignment_has_distinct_provenance_without_global_flag(monkeypatch):
+    monkeypatch.delenv("ANCHOR_LYRICS_ENABLED", raising=False)
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *a, **k: _retimed())
+    out = _run(_result(), ANCHOR, content_source="catalog_reference", enabled=True)
+    assert out["anchor_alignment"]["content_source"] == "catalog_reference"
+    assert all(row["content_source"] == "catalog_reference" for row in out["segments"])
+    assert out["segments"][0]["provider_evidence"]["source"] == "catalog_reference"
+
+
 def test_empty_anchor_is_noop_but_short_anchor_uses_fallback(monkeypatch):
     monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
     _no_stem(monkeypatch)

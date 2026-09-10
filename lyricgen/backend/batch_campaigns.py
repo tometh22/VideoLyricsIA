@@ -173,6 +173,114 @@ def _hash_secret(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+_SOURCE_REFERENCE_KEY = "source_reference"
+
+
+def _validated_source_reference(
+    incoming: ManifestItem,
+) -> dict[str, Any] | None:
+    """Return the durable per-item source contract or reject it atomically."""
+    reference = incoming.source_reference
+    if reference is None:
+        return None
+    payload = reference.model_dump(mode="json")
+    payload["text"] = str(payload.get("text") or "").strip()
+    payload["text_sha256"] = str(payload.get("text_sha256") or "").lower()
+    payload["source_audio_sha256"] = str(
+        payload.get("source_audio_sha256") or ""
+    ).lower()
+    payload["source_asset_id"] = str(payload.get("source_asset_id") or "").strip()
+    payload["row_numbers"] = sorted(set(int(row) for row in payload.get("row_numbers") or []))
+
+    if payload["source_asset_id"] != str(incoming.client_id or ""):
+        raise HTTPException(status_code=422, detail={"code": "source_reference_asset_mismatch"})
+    if payload["source_audio_sha256"] != incoming.sha256.lower():
+        raise HTTPException(status_code=422, detail={"code": "source_reference_audio_mismatch"})
+
+    if payload["status"] == "absent":
+        if payload["source_kind"] != "none" or payload["text"] or payload["row_numbers"]:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_absent_source_reference"},
+            )
+        if payload["association_basis"] != "none" or not str(
+            payload.get("absence_reason") or ""
+        ).strip():
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "absent_source_reference_requires_reason"},
+            )
+        return payload
+
+    parsed = urlparse(str(payload.get("source_url") or ""))
+    digest = hashlib.sha256(payload["text"].encode("utf-8")).hexdigest()
+    if (
+        payload["source_kind"] != "google_sheet"
+        or parsed.scheme != "https"
+        or parsed.netloc.lower() != "docs.google.com"
+        or not payload["source_document_id"]
+        or not parsed.path.startswith(f"/spreadsheets/d/{payload['source_document_id']}/")
+        or not payload["sheet_name"]
+        or not payload["row_numbers"]
+        or any(row < 1 for row in payload["row_numbers"])
+        or not payload["artist"]
+        or not payload["track"]
+        or not payload["text"]
+        or not re.fullmatch(r"[0-9a-f]{64}", payload["text_sha256"])
+        or payload["text_sha256"] != digest
+        or payload["association_basis"] == "none"
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_candidate_source_reference"},
+        )
+    if payload["source_asset_id"] != str(incoming.client_id or ""):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "source_reference_asset_mismatch"},
+        )
+    if payload["source_audio_sha256"] != incoming.sha256.lower():
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "source_reference_audio_mismatch"},
+        )
+    return payload
+
+
+def _stored_source_reference(item: BatchCampaignItem | None) -> dict[str, Any] | None:
+    if item is None:
+        return None
+    value = dict(item.render_overrides or {}).get(_SOURCE_REFERENCE_KEY)
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _public_render_overrides(item: BatchCampaignItem | None) -> dict[str, Any]:
+    """Keep raw catalogue text out of generic cards and render parameters."""
+    overrides = dict(item.render_overrides or {}) if item else {}
+    overrides.pop(_SOURCE_REFERENCE_KEY, None)
+    return overrides
+
+
+def _source_reference_payload(
+    item: BatchCampaignItem | None,
+    job: Job | None = None,
+    *,
+    include_text: bool,
+) -> dict[str, Any] | None:
+    stored = _stored_source_reference(item)
+    if stored is None:
+        return None
+    quality = dict(job.transcription_quality or {}) if job else {}
+    outcome = quality.get("catalog_reference")
+    result = {
+        key: value for key, value in stored.items()
+        if key != "text" or include_text
+    }
+    if isinstance(outcome, dict):
+        result["audio_validation"] = dict(outcome)
+    return result
+
+
 def _phase(upload_state: str, job_status: str | None, metadata_error: str | None = None) -> str:
     if job_status in _ACTIVE_SEPARATION:
         return "separating"
@@ -259,6 +367,38 @@ class CampaignPatch(BaseModel):
     destination_portal: str | None = Field(default=None, pattern="^(argentina|chile)$")
 
 
+class SourceReferenceInput(BaseModel):
+    """Tenant-private lyric source bound to one exact uploaded recording.
+
+    ``candidate`` means metadata established a conservative association but
+    the worker must still attest and align the text against the audio before
+    it may affect the editable transcription. ``absent`` is persisted too so
+    the reviewer can distinguish an intentional audio-only row from a lost
+    spreadsheet field.
+    """
+
+    status: Literal["candidate", "absent"]
+    source_kind: Literal["google_sheet", "none"]
+    source_url: str = Field(default="", max_length=2048)
+    source_document_id: str = Field(default="", max_length=200)
+    sheet_name: str = Field(default="", max_length=200)
+    row_numbers: list[int] = Field(default_factory=list, max_length=10)
+    artist: str = Field(default="", max_length=255)
+    track: str = Field(default="", max_length=500)
+    text: str = Field(default="", max_length=50000)
+    text_sha256: str = Field(default="", max_length=64)
+    association_basis: Literal[
+        "exact_normalized",
+        "duplicate_identical_rows",
+        "artist_alias",
+        "title_typo",
+        "none",
+    ]
+    source_asset_id: str = Field(default="", max_length=100)
+    source_audio_sha256: str = Field(default="", max_length=64)
+    absence_reason: str = Field(default="", max_length=255)
+
+
 class ManifestItem(BaseModel):
     client_id: str | None = Field(default=None, max_length=100)
     filename: str = Field(..., min_length=1, max_length=500)
@@ -269,6 +409,7 @@ class ManifestItem(BaseModel):
     duration_seconds: float | None = Field(default=None, ge=0)
     sha256: str = Field(..., min_length=64, max_length=64)
     metadata_error: str | None = Field(default=None, max_length=255)
+    source_reference: SourceReferenceInput | None = None
 
 
 class ManifestRequest(BaseModel):
@@ -308,7 +449,11 @@ class LyricsApprovalRequest(BaseModel):
 
 @router.get("/campaigns/access")
 def campaign_access(current_user: dict = Depends(get_current_user)):
-    return {"enabled": _scope_enabled(current_user), "item_limit": ITEM_LIMIT}
+    return {
+        "enabled": _scope_enabled(current_user),
+        "item_limit": ITEM_LIMIT,
+        "source_reference_schema": 1,
+    }
 
 
 @router.post("/campaigns")
@@ -435,7 +580,10 @@ def list_campaign_items(
             "job_id": job.job_id if job else None,
             "job_status": job.status if job else None,
             "reviewer_campaign_status": reviewer_rows.get(job.job_id) if job else None,
-            "render_overrides": item.render_overrides or {},
+            "render_overrides": _public_render_overrides(item),
+            "source_reference": _source_reference_payload(
+                item, job, include_text=False,
+            ),
         })
     total = len(serialized)
     start = (page - 1) * limit
@@ -473,7 +621,16 @@ def patch_campaign_item(
                 normalized = normalized.upper()
             setattr(item, attr, normalized)
     if body.render_overrides is not None:
-        item.render_overrides = body.render_overrides
+        public_overrides = dict(body.render_overrides)
+        if _SOURCE_REFERENCE_KEY in public_overrides:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "source_reference_requires_manifest_contract"},
+            )
+        stored_reference = _stored_source_reference(item)
+        if stored_reference is not None:
+            public_overrides[_SOURCE_REFERENCE_KEY] = stored_reference
+        item.render_overrides = public_overrides
     if item.size_bytes <= 0 or item.size_bytes > MAX_AUDIO_BYTES:
         item.metadata_error = "invalid_size"
     elif item.duration_seconds is not None and (
@@ -657,6 +814,9 @@ def register_manifest(
     campaign = db.query(BatchCampaign).filter(BatchCampaign.id == campaign_id).first()
     if campaign is None or campaign.status == "cancelled":
         raise HTTPException(status_code=409, detail="Campaign is unavailable.")
+    validated_references = [
+        _validated_source_reference(item) for item in body.items
+    ]
     existing_count = db.query(func.count(BatchCampaignItem.id)).filter(
         BatchCampaignItem.campaign_id == campaign_id,
     ).scalar() or 0
@@ -691,7 +851,7 @@ def register_manifest(
         raise HTTPException(status_code=413, detail=f"Campaign limit is {ITEM_LIMIT} items.")
     results = []
     next_ordinal = int(existing_count)
-    for incoming in body.items:
+    for incoming, source_reference in zip(body.items, validated_references):
         digest = incoming.sha256.lower()
         if not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise HTTPException(status_code=400, detail=f"Invalid SHA-256 for {incoming.filename}.")
@@ -731,6 +891,10 @@ def register_manifest(
                 sha256=digest,
                 metadata_error=metadata_error,
                 upload_state="registered",
+                render_overrides=(
+                    {_SOURCE_REFERENCE_KEY: source_reference}
+                    if source_reference is not None else {}
+                ),
                 created_at=_now(),
                 updated_at=_now(),
             )
@@ -739,6 +903,28 @@ def register_manifest(
             existing_by_sha[digest] = row
             if code:
                 existing_by_code[code] = row
+        elif source_reference is not None:
+            if row.sha256 != digest:
+                raise HTTPException(status_code=409, detail={"code": "source_reference_existing_audio_mismatch"})
+            stored_reference = _stored_source_reference(row)
+            if stored_reference is None:
+                linked_job = db.query(Job.id).filter(
+                    Job.campaign_item_id == row.id,
+                ).first()
+                if linked_job is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "source_reference_already_processing"},
+                    )
+                overrides = dict(row.render_overrides or {})
+                overrides[_SOURCE_REFERENCE_KEY] = source_reference
+                row.render_overrides = overrides
+                row.updated_at = _now()
+            elif stored_reference != source_reference:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "source_reference_conflict"},
+                )
         results.append({
             "client_id": incoming.client_id,
             "item_id": row.id,
@@ -977,7 +1163,7 @@ def claim_next_review(
                 "job_id": job.job_id,
                 "open_path": f"/review/{job.job_id}",
                 "default_render_params": campaign.default_render_params or {},
-                "render_overrides": item.render_overrides if item else {},
+                "render_overrides": _public_render_overrides(item),
             }
     db.rollback()
     return {"job_id": None, "empty": True}
@@ -1821,6 +2007,9 @@ def review_queue(
                 "line_count": reference.get("line_count"),
                 "manual_full_review_required": manual_full_review,
                 "external_links": _review_reference_links(overrides),
+                "catalog": _source_reference_payload(
+                    item, job, include_text=False,
+                ),
             },
             "open_path": (
                 f"/review/{job.job_id}" if stage == "lyrics" and job
@@ -2037,6 +2226,7 @@ def _batch_transcription_kwargs(
     """Build one audio-first transcription request for every campaign path."""
     title = item.title or ""
     lowered_title = title.lower()
+    source_reference = _stored_source_reference(item)
     return {
         # Empty means provider auto-LID.  The worker confirms the language on
         # the vocal stem and deliberately keeps mixed-language input unforced.
@@ -2052,8 +2242,15 @@ def _batch_transcription_kwargs(
         "pipeline_stage": pipeline_stage,
         # The full-audio Gemini hypothesis is independent evidence.  In the
         # full stage it runs alongside blind ASR and is joined before
-        # attestation/reconciliation.  No catalogue/web lyric text is used.
+        # attestation/reconciliation. Catalogue text never primes these passes.
         "parallel_audio_reference": True,
+        # The worker receives this explicit, audio-bound contract. It is never
+        # an ASR prompt: blind ASR and the independent complete-audio
+        # hypothesis run first, then acoustic attestation may accept the
+        # catalogue text for alignment. ``absent`` is transported as evidence
+        # too, so a retry cannot silently turn a known missing source into an
+        # unspecified state.
+        **({"catalog_reference": source_reference} if source_reference is not None else {}),
     }
 
 
@@ -2387,9 +2584,12 @@ def context_for_job(db: Session, job: Job) -> dict[str, Any] | None:
         "campaign_item_id": job.campaign_item_id,
         "campaign_status": campaign.status if campaign else None,
         "default_render_params": campaign.default_render_params if campaign else {},
-        "render_overrides": item.render_overrides if item else {},
+        "render_overrides": _public_render_overrides(item),
         "review_reference_links": _review_reference_links(
             dict(item.render_overrides or {}) if item else {},
+        ),
+        "source_reference": _source_reference_payload(
+            item, job, include_text=True,
         ),
     }
 

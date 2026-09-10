@@ -12,6 +12,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   do not silently repair timing or permit a proposal to introduce overlaps.
 - Discard stale word timestamps when reviewer suggestions replace text, matching
   the isolated candidate and preserving the need to validate its new word timing.
+## [1.1.11] - 2026-09-10
+
+### Added
+
+- Import audio-bound spreadsheet lyrics with batch campaigns. The worker compares each candidate against audio-first recognition before alignment, preserves independent acoustic evidence, and exposes applied, declined, and absent sources to human reviewers. Existing campaigns retain their audio-only behavior.
+
+### Fixed
+
+- Keep whole-song reference alignment disabled when an unsupported passage is hidden by otherwise matching choruses. Local vocabulary reconciliation remains available.
 
 ## [1.1.10] - 2026-09-09
 

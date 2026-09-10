@@ -43,6 +43,7 @@ def test_batch_outbox_dispatch_preserves_reference_contract(monkeypatch):
         live=True,
         anchor_lyrics="",
         reference_required=True,
+        catalog_reference={"status": "absent", "source_asset_id": "fixture"},
         workload_class="batch",
         publication_id=event_id,
         publication_dedupe_key="dedupe-batch-reference",
@@ -60,3 +61,5 @@ def test_batch_outbox_dispatch_preserves_reference_contract(monkeypatch):
     )
     assert target_args[4]["reference_required"] is True
     assert target_args[4]["workload_class"] == "batch"
+
+    assert target_args[4]["catalog_reference"] == {"status": "absent", "source_asset_id": "fixture"}
