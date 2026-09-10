@@ -521,6 +521,13 @@ def patch_campaign(
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
     _require_manager(campaign, current_user)
+    campaign = db.query(BatchCampaign).filter_by(id=campaign_id).populate_existing().with_for_update().one()
+    if body.default_render_params is not None:
+        from campaign_creative import KEY, RENDER_KEYS
+        previous = campaign.default_render_params or {}
+        incoming = body.default_render_params
+        if incoming.get(KEY) != previous.get(KEY) or (previous.get(KEY) and any(incoming.get(k) != previous.get(k) for k in RENDER_KEYS)):
+            raise HTTPException(409, detail="Usá Estilo y fondos para cambiar la configuración creativa")
     if body.name is not None:
         campaign.name = body.name.strip()
     if body.default_render_params is not None:
@@ -607,6 +614,8 @@ def patch_campaign_item(
 ):
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
+    _require_manager(campaign, current_user)
+    db.query(BatchCampaign).filter_by(id=campaign_id).with_for_update().one()
     item = db.query(BatchCampaignItem).filter(
         BatchCampaignItem.id == item_id,
         BatchCampaignItem.campaign_id == campaign.id,
@@ -621,6 +630,8 @@ def patch_campaign_item(
                 normalized = normalized.upper()
             setattr(item, attr, normalized)
     if body.render_overrides is not None:
+        if "creative_assignment" in (item.render_overrides or {}) or "creative_assignment" in body.render_overrides:
+            raise HTTPException(409, detail="Usá Estilo y fondos para cambiar una asignación registrada")
         public_overrides = dict(body.render_overrides)
         if _SOURCE_REFERENCE_KEY in public_overrides:
             raise HTTPException(

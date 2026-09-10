@@ -1,3 +1,5 @@
+import { reviewCreativeSettings } from "./lib/campaignCreative";
+import useCampaignCreativeSave from "./hooks/useCampaignCreativeSave";
 import { resolveSavedLanguageReview } from "./lib/languageResolution";
 import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
 import { safeReviewReturnPath } from "./lib/reviewerNavigation";
@@ -2055,6 +2057,43 @@ export default function App() {
   // brand-new clip — UMG's path for getting a unique video off a
   // library asset they already used (or want to differentiate from).
   const [backgroundMode, setBackgroundMode] = useState("as_is");
+  const creativeReviewRef = useRef(currentReview);
+  creativeReviewRef.current = currentReview;
+  const campaignCreativeSave = useCampaignCreativeSave({
+    identity: currentReview?.campaignCreativeRevision != null && currentReview?.campaignId
+      ? `${currentReview.campaignId}/${currentReview.campaignItemId}` : null,
+    revision: currentReview?.campaignCreativeRevision,
+    settings: reviewCreativeSettings(currentReview || {}, {
+      style, custom_colors: customColors || "", background_id: bgSelectMode === "auto" ? null : backgroundId || null,
+      background_mode: backgroundMode, animate_image: animateImage, enable_scenes: enableScenes,
+      match_lyrics: inspiredByLyrics, delivery_profile: delivery.delivery_profile,
+      umg_frame_size: delivery.umg_frame_size || "HD", umg_fps: String(delivery.umg_fps || "25"),
+      umg_prores_profile: String(delivery.umg_prores_profile || "3"),
+    }),
+    file: bgSelectMode === "custom" ? backgroundFile : null,
+    onSave: async (settings, revision, file) => {
+      const review = currentReview;
+      const visual = { ...settings };
+      if (file) {
+        const media = new FormData(); media.set("file", file); media.set("name", file.name);
+        const uploaded = await authFetch(`${API}/batch/campaigns/${review.campaignId}/creative/assets`, { method: "POST", body: media });
+        const asset = await uploaded.json().catch(() => ({}));
+        if (!uploaded.ok) throw new Error(typeof asset.detail === "string" ? asset.detail : "No se pudo guardar el fondo propio");
+        visual.background_id = asset.id;
+        if (creativeReviewRef.current?.transcribeJobId === review.transcribeJobId) {
+          setBackgroundId(asset.id); setBgSelectMode("library"); setBackgroundFile(null);
+        }
+      }
+      const response = await authFetch(`${API}/batch/campaigns/${review.campaignId}/creative/items/${review.campaignItemId}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision, settings: visual }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "No se pudieron guardar los ajustes de la canción");
+      setCurrentReview(previous => previous?.transcribeJobId === review.transcribeJobId
+        ? { ...previous, campaignCreativeRevision: result.revision } : previous);
+      return result;
+    },
+  });
   const [sidebarOpen, setSidebarOpen] = useState(
     typeof window !== "undefined" && window.innerWidth >= 768
   );
@@ -2310,6 +2349,14 @@ export default function App() {
           referenceLyrics: job.reference_lyrics || "",
           referenceLinks: job.campaign?.review_reference_links || [],
           sourceReference: job.campaign?.source_reference || null,
+          campaignCreativeRevision: campaignPreset.creative_assignment?.revision ?? null,
+          bgVerbatim: preset("bg_verbatim", "bgVerbatim", resumedCreativeFields.bgVerbatim),
+          matchLyrics: preset("match_lyrics", "matchLyrics", true),
+          titleTemplate: preset("title_template", "titleTemplate", "auto"),
+          titleSize: String(preset("title_size", "titleSize", "1.0")),
+          titleArtistFont: preset("title_artist_font", "titleArtistFont", ""),
+          titleSongFont: preset("title_song_font", "titleSongFont", ""),
+          titleSongBreak: preset("title_song_break", "titleSongBreak", ""),
           referenceUnavailable: Boolean(
             job.transcription_quality?.manual_full_review_required
             || job.transcription_quality?.reference_hypothesis?.availability === "unavailable"
@@ -2341,10 +2388,11 @@ export default function App() {
         setAnimateImage(job.campaign_id
           ? preset("animate_image", "animateImage", false) === true
           : !!resumedCreativeFields.animateImage);
-        setEnableScenes(false);
+        setEnableScenes(job.campaign_id ? preset("enable_scenes", "enableScenes", false) === true : false);
         setArtTrack(false);
         if (job.campaign_id) {
           setStyle(preset("style", "style", "auto"));
+          setCustomColors(preset("custom_colors", "customColors", ""));
           setInspiredByLyrics(preset("match_lyrics", "matchLyrics", true) !== false);
           setDelivery((current) => ({
             ...current,
@@ -4024,6 +4072,7 @@ export default function App() {
         ? saveMeta.confirmedLineIds
         : [];
       try {
+        if (r.campaignCreativeRevision != null) await campaignCreativeSave.save();
         const response = await authFetch(
           `${API}/batch/campaigns/${r.campaignId}/jobs/${r.transcribeJobId}/approve-lyrics`,
           {
@@ -4109,6 +4158,7 @@ export default function App() {
       transcriptionQuality: r.transcriptionQuality || null,
       campaignId: r.campaignId || null,
       campaignItemId: r.campaignItemId || null,
+      campaignCreativeRevision: r.campaignCreativeRevision ?? null,
       // Capa C 2026-05-24: bgCacheKey viene del useBackgroundPreview hook
       // que corrió durante review. Si null = no se hizo pre-gen (free-tier
       // o params no estables); pipeline corre Veo/Imagen como siempre.
@@ -4282,6 +4332,7 @@ export default function App() {
         // backend didn't return a job_id (older deploy).
         if (jobList[i].transcribeJobId) {
           formData.append("job_id", jobList[i].transcribeJobId);
+          if (jobList[i].campaignCreativeRevision != null) formData.append("campaign_creative_revision", String(jobList[i].campaignCreativeRevision));
         } else {
           formData.append("file", jobList[i]._file);
         }
@@ -5542,8 +5593,8 @@ export default function App() {
         // render_params → la semántica del diff no cambia. Auditado contra los
         // 60 consumidores de batchDefaults: no hay camino a un POST sin click
         // explícito del operador.
-        editSeed={_wizardOnExistingJob ? {
-          jobId: currentReview.editingJobId || currentReview.parentJobId,
+        editSeed={(_wizardOnExistingJob || currentReview?.campaignId) ? {
+          jobId: currentReview.editingJobId || currentReview.parentJobId || currentReview.transcribeJobId,
           genre: currentReview.genre,
           concept: currentReview.concept,
           backgroundHint: currentReview.backgroundHint,
@@ -5641,6 +5692,8 @@ export default function App() {
 
   const handleCampaignReviewExit = useCallback(async (destination = null) => {
     const review = currentReview;
+    try { await campaignCreativeSave.save(); }
+    catch (error) { alert({ title: "No se guardaron los ajustes", description: error.message, tone: "error" }); return; }
     if (review?.transcribeJobId) {
       try {
         await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
@@ -5653,7 +5706,7 @@ export default function App() {
     wizardPersistence.clear();
     if (review) segmentsStore.evict(reviewStoreKey(review));
     navigate(typeof destination === "string" ? destination : campaignReturnPath || "/admin/cola");
-  }, [campaignReturnPath, currentReview, navigate]);
+  }, [campaignReturnPath, currentReview, navigate, campaignCreativeSave.save, alert]);
 
   const handleCampaignReviewNext = useCallback(async () => {
     const review = currentReview;
@@ -5661,6 +5714,8 @@ export default function App() {
       await handleCampaignReviewExit();
       return;
     }
+    try { await campaignCreativeSave.save(); }
+    catch (error) { alert({ title: "No se guardaron los ajustes", description: error.message, tone: "error" }); return; }
     let nextPath = campaignReturnPath || "/admin/cola";
     const returnParams = campaignReturnPath
       ? new URL(campaignReturnPath, window.location.origin).searchParams
@@ -5691,7 +5746,7 @@ export default function App() {
     wizardPersistence.clear();
     segmentsStore.evict(reviewStoreKey(review));
     navigate(nextPath);
-  }, [campaignReturnPath, currentReview, handleCampaignReviewExit, navigate, withCampaignReturn]);
+  }, [campaignReturnPath, currentReview, handleCampaignReviewExit, navigate, withCampaignReturn, campaignCreativeSave.save, alert]);
 
   // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
@@ -5860,6 +5915,10 @@ export default function App() {
               </div>
             </div>
           )}
+          {currentReview.campaignCreativeRevision != null && <div className="mb-3 text-sm" role={campaignCreativeSave.error ? "alert" : "status"}>
+            {campaignCreativeSave.error ? <span className="text-red-300">Ajustes sin guardar: {campaignCreativeSave.error} <button className="underline" onClick={() => campaignCreativeSave.save().catch(() => {})}>Reintentar guardado</button></span>
+              : campaignCreativeSave.status === "saved" ? "Ajustes de campaña guardados" : "Guardando ajustes de esta canción…"}
+          </div>}
           <Suspense fallback={<EditorSuspenseFallback />}>
           <LyricsEditor
             // 2026-07-16: cuando el wizard pasa un slot (bajo el video), el

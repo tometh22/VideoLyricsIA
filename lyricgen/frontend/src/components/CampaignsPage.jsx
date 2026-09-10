@@ -4,6 +4,7 @@ import { editorSessionHeaders } from "../lib/editorSession";
 import { CampaignReviewerRow, CampaignReviewerSummary } from "./CampaignReviewerStatus";
 import ReviewScopes from "./ReviewScopes";
 import CampaignReviewWork from "./CampaignReviewWork";
+import CampaignCreative from "./CampaignCreative";
 import useLatestReviewRequest from "../hooks/useLatestReviewRequest";
 import { reviewCounts, reviewStateLabel, reviewActionLabel, validReviewScope, reviewStateFilter } from "../lib/reviewerNavigation";
 
@@ -454,6 +455,9 @@ function CampaignDetail({ id }) {
     setHighlightedJobId(null); saveContext({ q: "", mine: false, version: "", artist: "", state: "", focus: null, scroll: null });
     try { sessionStorage.setItem(`campaign-review-context:${id}`, JSON.stringify({ tab: queueScope, order: queueOrder, page })); } catch { /* best effort */ }
   };
+  const workspaceView = ["creative", "contract", "history"].includes(searchParams.get("view")) ? searchParams.get("view") : "review";
+  const workspaceNav = campaign.kind !== "art_track" && <nav aria-label="Secciones de campaña" className="flex flex-wrap gap-2">{[["review", "Revisión de letras"], ["creative", "Estilo y fondos"], ["contract", "Contrato y cumplimiento"], ["history", "Historial de videos"]].map(([value, label]) => <button key={value} aria-current={workspaceView === value ? "page" : undefined} className={`rounded-xl px-4 py-2 text-sm ${workspaceView === value ? "bg-brand/20 text-brand-light" : "bg-white/5 text-ink-secondary"}`} onClick={() => { const params = new URLSearchParams(searchParams); params.set("view", value); setSearchParams(params); }}>{label}</button>)}</nav>;
+  if (campaign.kind !== "art_track" && workspaceView !== "review") return <div className="mx-auto max-w-7xl space-y-6"><button className="text-sm text-ink-secondary" onClick={() => navigate("/campaigns")}>← Campañas</button><h1 className="text-3xl font-bold">{campaign.name}</h1>{workspaceNav}<CampaignCreative key={id} campaignId={id} view={workspaceView} /></div>;
   const queueRows = reviewQueue?.items || [];
   return (
     <div className="mx-auto max-w-7xl space-y-6">
@@ -466,6 +470,7 @@ function CampaignDetail({ id }) {
       {selectedRow?.resume_available && <div className="flex items-center justify-between gap-3 rounded-xl bg-brand/10 p-4 text-sm text-brand-light ring-1 ring-brand/25"><span>Tenés una revisión guardada: <strong>{selectedRow.title}</strong>.</span><button onClick={() => openReview(selectedRow)} className="rounded-lg bg-brand px-3 py-2 text-xs font-semibold text-white">Continuar {selectedRow.title}</button></div>}
       {!queueLoading && !loadingMore && highlightedJobId && !selectedRow && <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-amber-500/10 p-4 text-sm text-amber-100 ring-1 ring-amber-500/25"><span>La canción recién abierta ya no coincide con este filtro. Puede haber cambiado de estado o estar aprobada en otra pestaña.</span><button onClick={() => selectScope("approved")} className="rounded-lg bg-amber-500/20 px-3 py-2 text-xs font-semibold">Buscar en Aprobadas</button></div>}
       {error && <div role="alert" className="rounded-xl bg-amber-500/10 p-4 text-sm text-amber-100 ring-1 ring-amber-500/25">{error} <button onClick={load} className="underline">Reintentar</button></div>}
+      {workspaceNav}
       <ReviewScopes value={queueScope} counts={counts} onChange={selectScope} />
       <p className="text-xs text-ink-secondary">Las alertas orientan la revisión; no son un porcentaje de acierto. La confianza todavía no está calibrada.</p>
       {queueLoading && <p role="status" className="text-sm text-ink-secondary">Cargando canciones…</p>}
