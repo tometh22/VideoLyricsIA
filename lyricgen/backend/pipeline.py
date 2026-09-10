@@ -11828,6 +11828,10 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         model = _static_model
         logger.info("[BG] high-fidelity render → model=%s (movement=%s, verbatim=%s)",
                     model, _norm_move or "auto", high_fidelity)
+    # The campaign's frozen model choice wins over ordinary/default routing.
+    # It participates in the existing cache key, budget and provenance below.
+    from campaign_models import model_for_campaign_job
+    model = model_for_campaign_job(job_id, model)
     veo_params = {
         "aspectRatio": "16:9",
         "sampleCount": 1,

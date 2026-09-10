@@ -8,7 +8,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - Campaign creative workspace: select songs across pages and assign complete styles or individual visual fields by percentage/count. Preview a stable allocation, preserve pinned exceptions, record rounding and undo the latest safe assignment.
-- Versioned contractual groups for fixed photo plus effect or a specific enabled Veo model, with per-song settings, actor/date/reason, render fingerprints, applied-effect evidence, delivery records and CSV/Excel/print-to-PDF reports.
+- Versioned contractual groups for fixed photo plus effect or an explicit Veo Fast/Lite model selected per group, with per-song settings, actor/date/reason, render fingerprints, applied-effect evidence, delivery records and CSV/Excel/print-to-PDF reports.
 - Campaign video history includes native generations and related variants. Generation uses the existing human lyric/timing approval and queue protections; saving styles never generates media.
 
 ### Fixed

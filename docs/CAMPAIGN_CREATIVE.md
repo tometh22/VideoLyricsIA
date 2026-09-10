@@ -16,7 +16,7 @@ Available for lyric-video campaigns under the existing batch feature/tenant acce
 ## Contractual evidence
 
 - Fixed photo + effect requires an image source, explicit photo movement, an actual overlay effect and no AI image animation/scenes/variation. `foto_viva` is not accepted as a fixed-photo effect.
-- Veo groups store the exact configured model identifier. “Veo Lite” has no verified mapping to the current default `veo-3.1-fast-generate-001`; do not certify that commercial name without resolving it.
+- Veo groups store the exact configured model identifier. Veo Lite is `veo-3.1-lite-generate-001` (Vertex public preview), distinct from the ordinary default `veo-3.1-fast-generate-001`. Choose the model per group; the frozen receipt controls the provider, cache key and provenance without changing other campaigns. Provider access/capacity errors remain visible and never certify another model as Lite.
 - Successful FFmpeg renders record final video/background SHA-256, source type, applied effect and renderer. Provider evidence is bound to exact background bytes and the owning job's provenance row. Requested settings alone never certify a render.
 - A same-job retry may reuse prior provenance only for identical background bytes. Missing cache provenance, stale sidecars, fallback renderers and degraded generation remain unverified or deviations. Native per-job provenance retains the original prompt referenced by its ID/hash.
 - One principal song delivery is the counting unit. Re-renders and variants remain visible but do not increase the contractual universe. Delivery is an explicit record of a current, approved file and destination; clicking it does not send a message or upload elsewhere.

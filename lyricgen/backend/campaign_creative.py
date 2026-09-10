@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from auth import get_current_user, has_scenes_access
 from database import AuditLog, BackgroundAsset, BatchCampaign, BatchCampaignItem, EditorDocument, Job, get_db
 from batch_campaigns import _campaign_or_404, _require_manager, _require_scope, _aware
+from campaign_models import veo_models
 
 router = APIRouter(prefix="/batch/campaigns", tags=["campaign-creative"])
 KEY = "creative_plan"
@@ -247,11 +248,8 @@ def validate_combination(db, campaign, settings, group, user):
         if settings.get("movement_style") != "foto-parallax":
             fail("Elegí Foto fija en movimiento para este grupo")
     if group.requirement == "veo":
-        model = os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip()
-        if settings.get("movement_style") == "estatico":
-            model = os.environ.get("VEO_MODEL_STATIC", "").strip() or model
-        if not group.model or group.model != model:
-            fail("El modelo comprometido debe coincidir con el modelo Veo habilitado")
+        if group.model not in {m["id"] for m in veo_models()}:
+            fail("Elegí uno de los modelos Veo disponibles para el contrato")
         if asset or settings.get("movement_style") in {"", "foto-parallax", None} or settings.get("effect") == "foto_viva":
             fail("Veo requiere fondo IA y movimiento de video explícito")
 
@@ -262,6 +260,7 @@ def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: S
     jobs = {j.campaign_item_id: j for j in db.query(Job).filter_by(campaign_id=campaign.id).all() if j.campaign_item_id}
     return {"campaign_id": campaign.id, "plan": _plan(campaign), "fields": FIELDS,
             "veo_model": os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip(),
+            "veo_models": veo_models(),
             "can_manage": current_user.get("role") == "admin" or campaign.created_by == current_user.get("id"),
             "items": [{"id": i.id, "ordinal": i.ordinal, "artist": i.artist, "title": i.title or i.filename,
                        "discarded": bool(i.discard_record and not i.discard_record.get("restored_at")),

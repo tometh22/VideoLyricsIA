@@ -4,7 +4,7 @@ import { installEditorHarness } from "./editor-harness";
 async function harness(page) {
   await installEditorHarness(page, { jobId: "chilejob0001", role: "admin", editorV2: true });
   const campaign = { id: "chile1", name: "Campaña Chile", kind: "lyric_video", status: "active", registered_count: 39 };
-  let head = { plan: { revision: 0 }, can_manage: true, veo_model: "veo-3.1-fast-generate-001", operations: [], fields: {
+  let head = { plan: { revision: 0 }, can_manage: true, veo_model: "veo-3.1-fast-generate-001", veo_models: [{ id: "veo-3.1-fast-generate-001", label: "Veo Fast" }, { id: "veo-3.1-lite-generate-001", label: "Veo Lite (vista previa)" }], operations: [], fields: {
     font: { label: "Tipografía", group: "Letra", kind: "select", options: ["", "anton", "poppins-bold"] },
     font_scale: { label: "Tamaño de letra", group: "Letra", kind: "number", min: .6, max: 1.5, step: .05 },
     effect: { label: "Efecto", group: "Movimiento y efectos", kind: "select", options: ["", "bokeh", "rain"] },
@@ -59,6 +59,7 @@ test("39-song contract assignment survives reload, generates only approved selec
   await page.getByLabel("Nombre del grupo 2").fill("Fondo Veo");
   await page.getByLabel("Cantidad del grupo 2").fill("50");
   await page.getByLabel("Requisito del grupo 2").selectOption("veo");
+  await page.getByLabel("Modelo del grupo 2").selectOption("veo-3.1-lite-generate-001");
   await page.getByLabel("Registrar este reparto como acuerdo contractual").check();
   await page.getByLabel("Acuerdo contractual", { exact: true }).fill("Contrato Chile: mitad foto con efecto, mitad Veo");
   await page.getByLabel("Aceptación del redondeo").fill("Aceptado 20 fotos y 19 Veo");
@@ -68,6 +69,7 @@ test("39-song contract assignment survives reload, generates only approved selec
   expect(calls.generations).toHaveLength(0);
   expect(calls.previews[0].item_ids).toHaveLength(39);
   expect(calls.previews[0].groups[0].settings.effect).toBe("bokeh");
+  expect(calls.previews[0].groups[1].model).toBe("veo-3.1-lite-generate-001");
   await page.getByRole("button", { name: "Guardar esta asignación" }).click();
   await expect(page.getByRole("status").filter({ hasText: "Asignación guardada" })).toBeVisible();
   await page.reload();

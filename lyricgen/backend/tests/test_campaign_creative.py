@@ -229,6 +229,31 @@ def test_generation_snapshot_is_revision_bound_and_native(db, setup):
     assert job.status == "lyrics_approved"  # only the native generate endpoint publishes work
 
 
+def test_lite_is_an_explicit_campaign_model_without_changing_ordinary_jobs(db, setup):
+    from campaign_models import VEO_LITE, model_for_campaign_job
+    campaign, items, actor = setup
+    body = creative.PlanRequest(revision=0, item_ids=[items[0].id], reason="Contrato Lite", groups=[
+        creative.Group(id="lite", name="Veo Lite", weight=100, requirement="veo", model=VEO_LITE,
+                       settings={"movement_style": "estandar"})])
+    preview = creative.preview(campaign.id, body, actor, db)
+    creative.apply(campaign.id, creative.CommitRequest(preview_id=preview["preview_id"]), actor, db)
+    job = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id, campaign_id=campaign.id,
+              campaign_item_id=items[0].id, artist="Test", filename="synthetic.wav", status="lyrics_approved")
+    db.add(job); db.flush()
+    settings = creative.effective_settings(campaign, items[0].render_overrides)
+    creative.generation_receipt(db, job, "1", settings, actor); db.commit()
+    assert model_for_campaign_job(job.job_id, "ordinary-static-model") == VEO_LITE
+    assert model_for_campaign_job(None, "ordinary-static-model") == "ordinary-static-model"
+    other = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id,
+                artist="Ordinary", filename="test.wav", status="done", render_params=job.render_params)
+    db.add(other); db.commit()
+    assert model_for_campaign_job(other.job_id, "ordinary-static-model") == "ordinary-static-model"
+    body.groups[0].model = "untrusted-model"
+    body.revision = 1
+    with pytest.raises(HTTPException):
+        creative.preview(campaign.id, body, actor, db)
+
+
 def test_http_assignment_approval_generate_outbox_history_chain(db, setup, client, admin_token, monkeypatch, tmp_path):
     import main
     import batch_campaigns as batch
