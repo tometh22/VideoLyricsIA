@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.12] - 2026-09-10
+
+### Fixed
+
+- Reject whole-song reference alignment when ordered comparison finds an
+  unsupported passage, even if a repeated chorus gives a high aggregate score.
+  Preserve the independent ASR's structure in the existing enforced path instead
+  of stretching or collapsing lines around missing reference lyrics. This does
+  not certify ASR words/timing or modify existing editor documents.
+
 ## [1.1.10] - 2026-09-09
 
 ### Added
