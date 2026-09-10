@@ -46,10 +46,11 @@ afterEach(() => {
 describe("LyricsEditor — revisión de idioma / discrepancia", () => {
   it("marca las líneas, bloquea aprobar y ofrece confirmación humana", async () => {
     const onApprove = vi.fn();
-    const onResolveLanguageReview = vi.fn();
+    const onResolveLanguageReview = vi.fn().mockResolvedValue({ok:true});
     render(<LyricsEditor {...baseProps({
       onApprove,
       onResolveLanguageReview,
+      onPersistSegments: vi.fn().mockResolvedValue({ok:true,revision:38}),
       requireLineReview: true,   // campaign review (Agus's UMG path)
       languageUncertain: true,
       needsLanguageReview: true,
@@ -62,14 +63,12 @@ describe("LyricsEditor — revisión de idioma / discrepancia", () => {
 
     // Approval is blocked while unresolved.
     fireEvent.click(screen.getByRole("button", { name: /Aprobar y generar/i }));
-    await waitFor(() =>
-      expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ tone: "info" })),
-    );
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
     expect(onApprove).not.toHaveBeenCalled();
 
     // The explicit human resolution action is offered and wired.
-    fireEvent.click(screen.getByTestId("resolve-language-review"));
-    expect(onResolveLanguageReview).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", {name: "Escuché el audio y confirmo esta letra"}));
+    await waitFor(() => expect(onResolveLanguageReview).toHaveBeenCalledWith({baseRevision:38}));
   });
 
   it("una resolución persistida libera el bloqueo y oculta el botón", () => {
@@ -85,4 +84,30 @@ describe("LyricsEditor — revisión de idioma / discrepancia", () => {
     expect(screen.getByText(/Ya podés aprobar/i)).toBeInTheDocument();
     expect(screen.queryByTestId("resolve-language-review")).not.toBeInTheDocument();
   });
+});
+
+it('keeps approval blocked and edits visible when saving the confirmation fails', async () => {
+  const resolve = vi.fn();
+  const approve = vi.fn();
+  render(<LyricsEditor {...baseProps({requireLineReview:true,languageUncertain:true,
+    needsLanguageReview:true,outputReferenceDivergence:true,onApprove:approve,
+    onResolveLanguageReview:resolve,onPersistSegments:vi.fn().mockResolvedValue({ok:false,reason:'network'})})} />);
+  fireEvent.click(screen.getByRole('button',{name:'Resolver discrepancia'}));
+  fireEvent.click(screen.getByRole('button',{name:'Escuché el audio y confirmo esta letra'}));
+  expect(await screen.findByText(/No pudimos guardar esta versión/)).toBeInTheDocument();
+  expect(resolve).not.toHaveBeenCalled();
+  expect(approve).not.toHaveBeenCalled();
+  expect(screen.getByRole('dialog')).toBeInTheDocument();
+});
+
+it('shows stale revision failures instead of silently discarding the confirmation', async () => {
+  const approve=vi.fn();
+  render(<LyricsEditor {...baseProps({requireLineReview:true,languageUncertain:true,
+    outputReferenceDivergence:true,onApprove:approve,
+    onResolveLanguageReview:vi.fn().mockResolvedValue({ok:false,reason:'stale_revision'}),
+    onPersistSegments:vi.fn().mockResolvedValue({ok:true,revision:39})})} />);
+  fireEvent.click(screen.getByRole('button',{name:/Aprobar y generar/i}));
+  fireEvent.click(screen.getByRole('button',{name:'Escuché el audio y confirmo esta letra'}));
+  expect(await screen.findByText(/La versión guardada cambió/)).toBeInTheDocument();
+  expect(approve).not.toHaveBeenCalled();
 });

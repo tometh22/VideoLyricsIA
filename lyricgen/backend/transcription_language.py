@@ -306,6 +306,51 @@ _DIVERGENCE_MIN_LINES = 3        # need enough lines before a ratio is trustwort
 _DIVERGENCE_FLAG_RATIO = 0.34    # this share of lines unexplained -> flag review
 
 
+def localized_reference_drift(output, reference_text: str) -> list[int]:
+    """Find adjacent unexplained phrases, even in a mostly matching song.
+
+    Occurrences establish phrase length; distinct words measure overlap. The
+    former must not use a set: repeated foreign decodes were silently excluded.
+    This is a discrepancy, not language identification or permission to replace
+    text. Two matching substantial phrases anchor the comparison; two adjacent
+    unexplained phrases establish a local run. Vocal-only adlibs are excluded.
+    """
+    reference = _content_tokens(reference_text)
+    if len(reference) < _MIN_REFERENCE_TOKENS:
+        return []
+    vocal_only = {"ah", "oh", "uh", "eh", "ouh", "uoh", "ooh", "aah",
+                  "yeah", "hey", "na", "la", "woah", "wow"}
+    unexplained, supported = set(), 0
+    for index, line in enumerate(_texts(output)):
+        normalized = unicodedata.normalize("NFC", line).casefold()
+        tokens = re.findall(r"[^\W\d_]{2,}", normalized.replace("’", " ").replace("'", " "), re.UNICODE)
+        unique = set(tokens)
+        if len(tokens) < _MIN_SEGMENT_TOKENS or unique <= vocal_only:
+            continue
+        overlap = len(unique & reference) / len(unique)
+        if overlap < _REFERENCE_OVERLAP_FLOOR:
+            unexplained.add(index)
+        elif len(unique) >= _MIN_SEGMENT_TOKENS and overlap >= 0.75:
+            supported += 1
+    if supported < 2:
+        return []
+    return sorted(i for i in unexplained if i-1 in unexplained or i+1 in unexplained)
+
+
+def diagnostic_reference_text(result: dict) -> str:
+    """Rejected alignment does not erase an audio hypothesis for diagnostics.
+
+    Does not authorize vocabulary reconciliation or certify the hypothesis.
+    Never recover catalogue-only text from the rejected candidate channel.
+    """
+    candidate = result.get("reference_hypothesis_candidate") or {}
+    if (isinstance(candidate, dict)
+            and candidate.get("complete_audio_verified") is True
+            and candidate.get("source_kind") == "gemini_complete_audio_derived"):
+        return str(candidate.get("text") or "")
+    return str(result.get("reference_lyrics") or "")
+
+
 def build_language_contract(
     output,
     reference_text: str = "",
@@ -346,10 +391,11 @@ def build_language_contract(
         and not mixed_language
     )
     divergence = reference_divergence(output, reference_text)
+    localized_drift = localized_reference_drift(output, reference_text)
     output_reference_divergence = bool(
-        divergence["has_reference"]
+        localized_drift or (divergence["has_reference"]
         and divergence["substantial"] >= _DIVERGENCE_MIN_LINES
-        and divergence["ratio"] >= _DIVERGENCE_FLAG_RATIO
+        and divergence["ratio"] >= _DIVERGENCE_FLAG_RATIO)
     )
     # "Nobody asked for a language and nothing corroborates one" is a
     # REQUEST-TIME signal: it depends on what the caller requested, which is not
@@ -375,7 +421,8 @@ def build_language_contract(
         "language_uncertain": language_uncertain,
         "output_reference_divergence": output_reference_divergence,
         "output_reference_divergence_ratio": round(divergence["ratio"], 3),
-        "output_reference_unexplained_indices": divergence["unexplained_indices"],
+        "output_reference_unexplained_indices": sorted(set(divergence["unexplained_indices"]) | set(localized_drift)),
+        "output_reference_localized_drift_indices": localized_drift,
         "needs_language_review": bool(
             language_conflict or output_reference_divergence
         ),
@@ -392,3 +439,27 @@ __all__ = [
     "reference_divergence",
     "resolve_transcription_language",
 ]
+
+
+def primary_reference_language(reference_text: str) -> str | None:
+    """Conservative global hint, vetoed by even a short foreign verse.
+
+    Full-song voting can dilute an English couplet. Distinct exclusive
+    function words on a line veto a monolingual hint; no reference text is
+    sent as a recognition prompt. Unknown remains provider-auto.
+    """
+    languages = detect_text_languages(reference_text)
+    if len(languages) != 1:
+        return None
+    language = next(iter(languages))
+    for other, markers in _MARKERS.items():
+        if other == language:
+            continue
+        exclusive = markers - set().union(*(
+            words for name, words in _MARKERS.items() if name != other))
+        for line in reference_text.splitlines():
+            normalized = unicodedata.normalize("NFC", line).casefold()
+            words = set(re.findall(r"[^\W\d_]+", normalized, re.UNICODE))
+            if len(words & exclusive) >= 2:
+                return None
+    return language

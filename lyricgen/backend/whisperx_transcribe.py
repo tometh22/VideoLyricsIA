@@ -1113,7 +1113,7 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
                 "forcing live recompute"
             )
 
-    payload: dict = {"align_output": True,
+    payload: dict = {"task": "transcribe", "align_output": True,
                      "vad_onset": vad_onset, "vad_offset": vad_offset}
     if language:
         payload["language"] = language

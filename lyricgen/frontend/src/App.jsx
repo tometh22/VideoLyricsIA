@@ -1,3 +1,4 @@
+import { resolveSavedLanguageReview } from "./lib/languageResolution";
 import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
 import { safeReviewReturnPath } from "./lib/reviewerNavigation";
 import {
@@ -3631,42 +3632,21 @@ export default function App() {
     }
   }, []);
 
-  // Explicit, persisted human resolution of a language/reference discrepancy.
-  // Reads the CURRENT server revision first (so an unsaved edit can't resolve a
-  // stale snapshot), then binds the resolution to it. On success it clears the
-  // block locally; the server gate remains the source of truth on approval.
-  const handleResolveLanguageReview = async () => {
-    const r = currentReview;
-    const jobId = r?.transcribeJobId || r?.editingJobId;
-    if (!jobId) return;
-    try {
-      const statusRes = await authFetch(`${API}/status/${jobId}`);
-      const job = await statusRes.json().catch(() => ({}));
-      const baseRevision = Number.isFinite(job.segments_revision)
-        ? job.segments_revision : 0;
-      const res = await authFetch(`${API}/jobs/${jobId}/language-resolution`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base_revision: baseRevision }),
-      });
-      if (res.ok) {
-        setCurrentReview((cur) => (cur ? {
-          ...cur,
-          languageReviewResolved: true,
-          languageUncertain: false,
-          needsLanguageReview: false,
-        } : cur));
-        return;
-      }
-      const body = await res.json().catch(() => ({}));
-      if (res.status === 409 && body?.code === "stale_revision") {
-        // A pending edit bumped the revision; the editor autosaves, so ask the
-        // operator to retry once it settles rather than resolving a stale snapshot.
-        console.warn("[language-review] stale revision; save then retry", body);
-      }
-    } catch (err) {
-      console.warn("[language-review] resolution failed", err);
+  // The editor flushes first and supplies its exact saved revision.
+  const handleResolveLanguageReview = async ({ baseRevision } = {}) => {
+    const jobId = currentReview?.transcribeJobId || currentReview?.editingJobId;
+    const result = await resolveSavedLanguageReview(
+      (path, options) => authFetch(`${API}${path}`, options), jobId, baseRevision,
+    );
+    if (result.ok) {
+      setCurrentReview((cur) => (
+        cur && (cur.transcribeJobId || cur.editingJobId) === jobId ? {
+          ...cur, languageReviewResolved: true, languageUncertain: false,
+          languageConflict: false, needsLanguageReview: false,
+        } : cur
+      ));
     }
+    return result;
   };
 
   const handleApproveLyrics = async (editedSegments, saveMeta = {}) => {
