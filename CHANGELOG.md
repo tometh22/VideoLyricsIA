@@ -10,6 +10,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Separate local draft recovery from server save errors. Compare browser copies
   before removing them, require an explicit recovery/discard choice for different
   content, and preserve unreadable copies without changing server approval.
+  Copies that would change during normalization are retained, including zero or
+  sub-minimum durations that would otherwise falsely match the server.
 
 ## [1.1.18] - 2026-09-11
 

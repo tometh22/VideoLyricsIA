@@ -478,6 +478,25 @@ describe("local recovery is separate from server save status", () => {
     expect(mutations(request)).toHaveLength(0);
   });
 
+  it.each([0, 0.005])("preserves a %s-second copy when normalization would make it equal to the server", async (end) => {
+    const raw = JSON.stringify({ segments: [{ ...SERVER[0], end }], base_revision: 4 });
+    localStorage.setItem(key, raw);
+    const fallback = makeRequest();
+    const request = vi.fn(async (path, options = {}) => {
+      if (path === `/editor/${JOB}` && !options.method) {
+        return reply({ job_id: JOB, revision: 5,
+          segments: [{ ...SERVER[0], end: 0.01 }], original_segments: SERVER,
+          lock: { active: false } });
+      }
+      return fallback(path, options);
+    });
+    renderEditor(request);
+    expect(await screen.findByText(/formato de letra y tiempos/)).toBeInTheDocument();
+    expect(localStorage.getItem(key)).toBe(raw);
+    expect(screen.queryByRole("button", { name: /Descartar copia/ })).not.toBeInTheDocument();
+    expect(mutations(request)).toHaveLength(0);
+  });
+
   it("does not clamp invalid timing and then delete a seemingly equivalent copy", async () => {
     const raw = JSON.stringify({ segments: [{ ...SERVER[0], start: null }] });
     localStorage.setItem(key, raw);

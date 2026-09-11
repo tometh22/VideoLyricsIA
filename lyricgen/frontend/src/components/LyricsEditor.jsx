@@ -1372,6 +1372,11 @@ export default function LyricsEditor({
                 && Number.isFinite(row.start) && Number.isFinite(row.end) && row.end >= row.start);
             if (!valid) throw new Error("invalid_segments");
             const local = sanitizeSegments(draft.segments);
+            // Even finite, nonnegative durations may be clamped by the editor.
+            // A normalized match must never authorize deleting different bytes.
+            if (!segmentsEquivalent(draft.segments, local)) {
+              throw new Error("draft_normalization_changes_content");
+            }
             const pending = draft.pending_changes || draft.pending_ops?.length;
             if (pending) throw new Error("uncomparable_pending_operations");
             const sameContent = segmentsEquivalent(local, remote);
