@@ -3,6 +3,15 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.16] - 2026-09-11
+
+### Fixed
+
+- Let campaign reviewers split a lyric line at the text caret with Enter. When
+  word-level timing is available, both new lines retain the original word
+  timestamps so reviewers can regroup poorly segmented phrases without
+  retiming the song.
+
 ## [1.1.15] - 2026-09-10
 
 ### Fixed
