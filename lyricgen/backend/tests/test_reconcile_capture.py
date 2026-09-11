@@ -219,3 +219,21 @@ def test_word_occurrence_duplicates_remain_ambiguous():
     link = word_ownership(attempt)[0]['words'][0]
     assert link['input_indices'] == [0, 1]
     assert link['association'] == 'ambiguous-or-absent'
+
+
+def test_first_job_window_and_ambiguous_configuration(monkeypatch, tmp_path):
+    enable(monkeypatch)
+    monkeypatch.delenv('RECONCILE_CAPTURE_UNTIL')
+    monkeypatch.setenv('RECONCILE_CAPTURE_WINDOW_SECONDS', '604800')
+    audio = tmp_path / 'identity'; audio.write_bytes(b'fixture')
+    start = int(NOW.timestamp())
+    trace = rc.begin('first', str(audio), route_context={}, now=NOW,
+                     reserve=lambda *args: [1, start, start + 604800])
+    assert trace.snapshot()['window']['seconds'] == 604800
+    assert trace.snapshot()['window']['started_at_epoch'] == start
+    assert rc.begin('repeat', str(audio), route_context={}, now=NOW,
+                    reserve=lambda *args: [0, start, start + 604800]).snapshot() is None
+    monkeypatch.setenv('RECONCILE_CAPTURE_UNTIL', (NOW + timedelta(days=1)).isoformat())
+    def forbidden(*args):
+        raise AssertionError('ambiguous settings must not reserve')
+    assert rc.begin('j', str(audio), route_context={}, now=NOW, reserve=forbidden).snapshot() is None

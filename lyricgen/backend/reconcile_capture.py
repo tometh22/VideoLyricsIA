@@ -46,6 +46,26 @@ redis.call('EXPIRE', KEYS[1], ARGV[3])
 return redis.call('SCARD', KEYS[1])
 """
 
+# A bounded cohort starts on its first ordinary admission. Keep the small
+# closed-cohort ledger: expiring it would silently permit another six jobs.
+_RESERVE_WINDOW = """
+local now = tonumber(redis.call('TIME')[1])
+local deadline = tonumber(redis.call('HGET', KEYS[1], 'deadline') or '0')
+if deadline == 0 then
+  deadline = now + tonumber(ARGV[3])
+  redis.call('HSET', KEYS[1], 'started_at', now, 'deadline', deadline, 'count', 0)
+end
+local started = tonumber(redis.call('HGET', KEYS[1], 'started_at'))
+if now >= deadline or redis.call('HEXISTS', KEYS[1], 'job:' .. ARGV[1]) == 1 then
+  return {0, started, deadline}
+end
+local count = tonumber(redis.call('HGET', KEYS[1], 'count'))
+if count >= tonumber(ARGV[2]) then return {0, started, deadline} end
+count = count + 1
+redis.call('HSET', KEYS[1], 'count', count, 'job:' .. ARGV[1], count)
+return {count, started, deadline}
+"""
+
 
 def _clone(value):
     # Reject lossy snapshots rather than inventing values for replay.
@@ -105,20 +125,36 @@ def begin(job_id, audio_path, *, route_context, now=None, reserve=None):
         if os.environ.get('ENVIRONMENT') != 'staging' or os.environ.get('RECONCILE_CAPTURE_ENABLED') != '1':
             return empty
         now = now or datetime.now(timezone.utc)
-        until = datetime.fromisoformat(os.environ.get('RECONCILE_CAPTURE_UNTIL', '').replace('Z', '+00:00'))
-        ttl = int((until - now).total_seconds())
         cohort = os.environ.get('RECONCILE_CAPTURE_COHORT', '')
-        if not cohort or not job_id or not 0 < ttl <= 7 * 86400:
+        window = int(os.environ.get('RECONCILE_CAPTURE_WINDOW_SECONDS', '0'))
+        until_value = os.environ.get('RECONCILE_CAPTURE_UNTIL', '')
+        if not cohort or not job_id or (window and until_value):
             return empty
+        if window:
+            ttl = window
+        else:
+            until = datetime.fromisoformat(until_value.replace('Z', '+00:00'))
+            ttl = int((until - now).total_seconds())
+        if not 0 < ttl <= 7 * 86400:
+            return empty
+        window_metadata = None
         if reserve is None:
             from redis import Redis
             client = Redis.from_url(os.environ['REDIS_URL'], socket_connect_timeout=1, socket_timeout=1)
             try:
-                ordinal = client.eval(_RESERVE, 1, 'reconcile-capture:' + hashlib.sha256(cohort.encode()).hexdigest(), job_id, MAX_JOBS, ttl)
+                key = 'reconcile-capture:' + hashlib.sha256(cohort.encode()).hexdigest()
+                admission = client.eval(_RESERVE_WINDOW if window else _RESERVE, 1,
+                                        key + ':window' if window else key, job_id, MAX_JOBS, ttl)
             finally:
                 client.close()
         else:
-            ordinal = reserve(cohort, job_id, MAX_JOBS, ttl)
+            admission = reserve(cohort, job_id, MAX_JOBS, ttl)
+        if window:
+            ordinal, started, deadline = map(int, admission)
+            window_metadata = {'mode': 'first-ordinary-admission', 'started_at_epoch': started,
+                               'deadline_epoch': deadline, 'seconds': deadline - started}
+        else:
+            ordinal = admission
         if not 1 <= int(ordinal) <= MAX_JOBS:
             return empty
         from transcription_quality import runtime_identity, _PIPELINE_CONFIG_KEYS
@@ -127,6 +163,7 @@ def begin(job_id, audio_path, *, route_context, now=None, reserve=None):
         payload = {
             'schema': SCHEMA, 'job_id': job_id, 'cohort': cohort,
             'ordinal': int(ordinal), 'selected_at': now.isoformat(),
+            'window': window_metadata,
             'selection': 'first-six-ordinary-jobs-before-recognition',
             'runtime': runtime_identity(),
             'code_sha256': {name: _digest(root / name) for name in CODE_FILES},

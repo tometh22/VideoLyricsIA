@@ -4,13 +4,14 @@ The behavior candidate stays frozen at `1cc550b5913f27a7c44cec33e0ad7401583a4c66
 
 ## Capture contract
 
-`reconcile_capture.begin` reserves a job **before recognition**. It requires all three settings below, `ENVIRONMENT=staging`, an existing Redis connection, and a deadline no more than seven days away. Otherwise it performs no capture; inference continues normally.
+`reconcile_capture.begin` reserves a job **before recognition**. It requires all three settings below, `ENVIRONMENT=staging`, an existing Redis connection, and a window of at most seven days starting at the first ordinary admission. Otherwise it performs no capture; inference continues normally.
 
 - `RECONCILE_CAPTURE_ENABLED=1`
 - `RECONCILE_CAPTURE_COHORT=reconcile-ownership-prospective-v1` (do not rotate to expand the cohort)
-- `RECONCILE_CAPTURE_UNTIL=<explicit UTC ISO deadline>`
+- `RECONCILE_CAPTURE_WINDOW_SECONDS=604800`
+- `RECONCILE_CAPTURE_UNTIL` must be absent/empty in this mode. The legacy absolute-deadline mode is retained for existing callers; setting both rejects capture.
 
-Redis atomically admits the first **six distinct ordinary jobs**, across workers, for this cohort. Retries consume no additional admissions and do not overwrite a capture. Failed jobs can leave fewer than six durable captures; do not buy replacements or automatically extend the cohort. Every payload is limited to 4 MiB/64 stages; overflow or serialization problems mark it incomplete rather than silently making truncated data replayable. No provider call, queue job or DB connection is created by capture. The only Redis write is its expiring reservation set on the existing service.
+Redis atomically admits the first **six distinct ordinary jobs**, across workers, for this cohort. Retries consume no additional admissions and do not overwrite a capture. Failed jobs can leave fewer than six durable captures; do not buy replacements or automatically extend the cohort. Every payload is limited to 4 MiB/64 stages; overflow or serialization problems mark it incomplete rather than silently making truncated data replayable. No provider call, queue job or DB connection is created by capture. The Redis reservation ledger on the existing service stores at most six job IDs plus its first-admission time and deadline. It stays after expiry to prevent reopening the cohort. Enabling capture without a job starts no clock. The first ordinary admission starts the seven days atomically using Redis time; later jobs/retries/configuration changes do not reset it.
 
 The four `reconcile` call sites in `_run_transcription_for_job` preserve:
 
