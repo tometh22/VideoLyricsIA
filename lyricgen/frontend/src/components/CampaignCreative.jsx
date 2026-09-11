@@ -97,6 +97,31 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
   useEffect(() => { let alive = true; load(true).catch(e => { if (alive) setError(e.message); }); return () => { alive = false; }; }, [load]);
   useEffect(() => { if (view === "history") { const timer = setInterval(() => load().catch(e => setError(e.message)), 15000); return () => clearInterval(timer); } }, [load, view]);
   const run = async fn => { setBusy(true); setError(""); setMessage(""); try { await fn(); } catch (e) { setError(e.message); } finally { setBusy(false); } };
+  const submitGeneration = () => run(async () => {
+    const batch = [...(generation || [])];
+    let sent = 0;
+    const failures = [];
+    setGenerationProgress({ attempted: 0, sent: 0, total: batch.length, current: batch[0]?.title || "" });
+    for (const [index, item] of batch.entries()) {
+      setGenerationProgress({ attempted: index, sent, total: batch.length, current: item.title });
+      try {
+        const job = await request(`/status/${item.job_id}`);
+        await request("/generate", { method: "POST", body: campaignGenerateForm(item, job) });
+        sent++;
+      } catch (submissionError) {
+        failures.push({ title: item.title, message: submissionError.message });
+      }
+      setGenerationProgress({ attempted: index + 1, sent, total: batch.length, current: batch[index + 1]?.title || "" });
+    }
+    setGenerationProgress(null);
+    setGeneration(null);
+    await load();
+    setMessage(`${sent} ${sent === 1 ? "trabajo enviado" : "trabajos enviados"}${failures.length ? ` · ${failures.length} no se enviaron` : ""}; consultá el historial de esta campaña.`);
+    if (failures.length) {
+      const titles = failures.map(failure => failure.title).join(", ");
+      throw new Error(`No se pudieron enviar ${failures.length} ${failures.length === 1 ? "video" : "videos"}: ${titles}. Los demás continuaron.`);
+    }
+  });
   const change = fn => { setPreview(null); fn(); };
   const updateGroup = (i, patch) => change(() => setGroups(old => old.map((g, n) => n === i ? { ...g, ...patch } : g)));
   const chooseRequirement = (i, value) => {
@@ -179,7 +204,7 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
         {data.operations[0]?.revision === data.plan.revision && <button className={button} disabled={reason.trim().length < 3} onClick={() => run(async () => { await post(`${base}/creative/undo`, { revision: data.plan.revision, operation_id: data.operations[0].id, reason }); setPreview(null); await load(); setMessage("Última asignación deshecha."); })}>Deshacer última asignación</button>}
       </fieldset>}</div>}
     </>}
-    {generation && <div role="dialog" aria-modal="true" aria-label="Confirmar generación" className="fixed inset-0 z-50 grid place-items-center bg-black/80 p-5"><div className="w-full max-w-lg space-y-4 rounded-2xl bg-surface-2 p-6"><h2 className="text-xl font-semibold">Generar {generation.length} videos</h2><p>Esta acción genera fondos y videos y consume el cupo correspondiente. La configuración y el grupo de cada canción quedarán registrados.</p><ul className="max-h-40 overflow-auto">{generation.map(i => <li key={i.id}>{i.title} · {i.assignment?.group_name || "Configuración actual"}</li>)}</ul>{generationProgress && <div role="status" aria-live="polite" className="space-y-2 rounded-xl bg-brand/10 p-4 ring-1 ring-brand/30"><div className="flex items-center gap-3"><span className="h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-brand-light/30 border-t-brand-light" aria-hidden="true" /><div><strong className="block">Enviando {Math.min(generationProgress.sent + 1, generationProgress.total)} de {generationProgress.total}</strong><span className="text-sm text-ink-secondary">{generationProgress.current || "Finalizando el envío…"}</span></div></div><div className="h-2 overflow-hidden rounded-full bg-black/30"><div className="h-full rounded-full bg-brand transition-all" style={{ width: `${Math.max(5, 100 * generationProgress.sent / generationProgress.total)}%` }} /></div><p className="text-xs text-ink-secondary">Podés esperar en esta pantalla. No vuelvas a confirmar: cada video se envía una sola vez.</p></div>}<button className={generationProgress ? primaryButton : button} disabled={busy} onClick={() => run(async () => { const batch = generation; let completed = 0; setGenerationProgress({ sent: 0, total: batch.length, current: batch[0]?.title || "" }); try { for (const [index, item] of batch.entries()) { setGenerationProgress({ sent: completed, total: batch.length, current: item.title }); const job = await request(`/status/${item.job_id}`); await request("/generate", { method: "POST", body: campaignGenerateForm(item, job) }); completed++; setGenerationProgress({ sent: completed, total: batch.length, current: batch[index + 1]?.title || "" }); } } finally { setGenerationProgress(null); setGeneration(null); await load(); setMessage(`${completed} trabajos enviados; consultá el historial de esta campaña.`); } })}>{generationProgress ? `Enviando ${generationProgress.sent} de ${generationProgress.total}…` : "Confirmar generación"}</button><button className={button} disabled={busy} onClick={() => { setGenerationProgress(null); setGeneration(null); }}>Cancelar</button></div></div>}
+    {generation && <div role="dialog" aria-modal="true" aria-label="Confirmar generación" className="fixed inset-0 z-50 grid place-items-center bg-black/80 p-5"><div className="w-full max-w-lg space-y-4 rounded-2xl bg-surface-2 p-6"><h2 className="text-xl font-semibold">Generar {generation.length} videos</h2><p>Esta acción genera fondos y videos y consume el cupo correspondiente. La configuración y el grupo de cada canción quedarán registrados.</p><ul className="max-h-40 overflow-auto">{generation.map(i => <li key={i.id}>{i.title} · {i.assignment?.group_name || "Configuración actual"}</li>)}</ul>{generationProgress && <div role="status" aria-live="polite" className="space-y-2 rounded-xl bg-brand/10 p-4 ring-1 ring-brand/30"><div className="flex items-center gap-3"><span className="h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-brand-light/30 border-t-brand-light" aria-hidden="true" /><div><strong className="block">{generationProgress.attempted < generationProgress.total ? `Enviando ${generationProgress.attempted + 1} de ${generationProgress.total}` : `Finalizando · ${generationProgress.sent} enviados`}</strong><span className="text-sm text-ink-secondary">{generationProgress.current || "Actualizando el estado de la campaña…"}</span></div></div><div className="h-2 overflow-hidden rounded-full bg-black/30"><div className="h-full rounded-full bg-brand transition-all" style={{ width: `${Math.max(5, 100 * generationProgress.attempted / generationProgress.total)}%` }} /></div><p className="text-xs text-ink-secondary">Podés esperar en esta pantalla. No vuelvas a confirmar: cada video se envía una sola vez.</p></div>}<button className={generationProgress ? primaryButton : button} disabled={busy} onClick={submitGeneration}>{generationProgress ? generationProgress.attempted < generationProgress.total ? `Enviando ${generationProgress.attempted + 1} de ${generationProgress.total}…` : "Actualizando estado…" : "Confirmar generación"}</button><button className={button} disabled={busy} onClick={() => { setGenerationProgress(null); setGeneration(null); }}>Cancelar</button></div></div>}
     {view === "contract" && report && <div id="campaign-contract-report" className="space-y-4">
       <h2 className="text-xl font-semibold">Contrato y cumplimiento · {report.name}</h2><p className="text-sm">Informe: {new Date(report.at).toLocaleString()} · Acuerdo versión {report.contract.revision || "Sin registrar"}</p>
       <p className="whitespace-pre-wrap">{report.contract.agreement || "Todavía no se registró un compromiso contractual."}</p><p>{report.contract.rounding_note}</p>

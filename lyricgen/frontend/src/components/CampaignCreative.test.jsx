@@ -5,15 +5,16 @@ import CampaignCreative from "./CampaignCreative";
 vi.mock("../i18n", () => ({ useI18n: () => ({ t: () => "" }) }));
 vi.mock("./WizardLivePreview", () => ({ default: () => <div>Vista previa visual</div> }));
 vi.mock("../mediaUrl", () => ({ useLazyMediaUrl: () => ({ ref: () => {}, url: "" }) }));
-let head, report, calls, generateGate;
+let head, report, calls, generateGate, generateFailures;
 const response = data => ({ ok: true, json: async () => data });
 beforeEach(() => {
   calls = [];
   generateGate = null;
+  generateFailures = new Set();
   head = { plan: { revision: 0 }, can_manage: true, veo_model: "veo-3.1-fast-generate-001", fields: {
     font: { label: "Tipografía", group: "Letra", kind: "select", options: ["", "anton"] },
     effect: { label: "Efecto", group: "Movimiento y efectos", kind: "select", options: ["", "bokeh", "rain"] },
-  }, operations: [], items: Array.from({ length: 39 }, (_, i) => ({ id: `i${i}`, title: `Tema ${i}`, artist: "Artista", status: i < 2 ? "lyrics_approved" : i === 2 ? "done" : "transcribed_pending", settings: {} })) };
+  }, operations: [], items: Array.from({ length: 39 }, (_, i) => ({ id: `i${i}`, job_id: `j${i}`, title: `Tema ${i}`, artist: "Artista", status: i < 2 ? "lyrics_approved" : i === 2 ? "done" : "transcribed_pending", settings: {} })) };
   report = { campaign_id: "c1", name: "Chile", at: new Date().toISOString(), contract: {}, groups: [], videos: [], history: [] };
   vi.stubGlobal("fetch", vi.fn(async (url, options = {}) => {
     calls.push([url, options]);
@@ -23,7 +24,7 @@ beforeEach(() => {
     if (url.endsWith("/preview")) return response({ preview_id: "p1", counts: [39], rounded: false, skipped: [], changes: head.items.map(i => ({ item_id: i.id, artist: i.artist, title: i.title, group: "Estilo 1", before: {}, after: { font: "anton" } })) });
     if (url.endsWith("/apply")) { head = { ...head, plan: { revision: 1 } }; return response({ revision: 1 }); }
     if (url.includes("/status/")) return response({ artist: "Artista", song_title: "Tema", segments_json: [], segments_revision: 2 });
-    if (url.endsWith("/generate")) { if (generateGate) await generateGate; return response({ ok: true }); }
+    if (url.endsWith("/generate")) { if (generateGate) await generateGate; const jobId = options.body.get("job_id"); return generateFailures.has(jobId) ? { ok: false, json: async () => ({ detail: "No disponible" }) } : response({ ok: true }); }
     throw new Error(`Unexpected request: ${url}`);
   }));
 });
@@ -94,9 +95,19 @@ describe("campaign bulk design", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirmar generación" }));
     expect(await screen.findByRole("status", { name: "" })).toHaveTextContent("Enviando 1 de 2");
     expect(screen.getByText(/No vuelvas a confirmar/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Enviando 0 de 2/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /Enviando 1 de 2/ })).toBeDisabled();
     releaseGenerate();
     await screen.findByText("2 trabajos enviados; consultá el historial de esta campaña.");
+    expect(calls.filter(([url]) => url.endsWith("/generate"))).toHaveLength(2);
+  });
+  it("continues submitting the remaining videos when one item fails", async () => {
+    generateFailures.add("j0");
+    mount("creative");
+    fireEvent.click(await screen.findByRole("button", { name: "Seleccionar listas para generar (2)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preparar generación de 2 aprobadas seleccionadas" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar generación" }));
+    await screen.findByText("1 trabajo enviado · 1 no se enviaron; consultá el historial de esta campaña.");
+    expect(screen.getByRole("alert")).toHaveTextContent("No se pudieron enviar 1 video: Tema 0");
     expect(calls.filter(([url]) => url.endsWith("/generate"))).toHaveLength(2);
   });
 });
