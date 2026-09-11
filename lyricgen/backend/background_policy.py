@@ -280,8 +280,8 @@ def sanitize_generated_text(
     # into the contradictory "do not introduce clear air". Normalize those
     # phrases before the immutable provider rail is appended.
     value = re.sub(
-        rf"\b(?:do\s+not|don't|no|not|without|avoid|exclude|never|sin|evitar|"
-        rf"excluir|nunca|sem|n[aã]o|evite)\b(?:\s+\w+){{0,4}}\s+clear\s+air\b",
+        r"\b(?:do\s+not|don't|no|not|without|avoid|exclude|never|sin|evitar|"
+        r"excluir|nunca|sem|n[aã]o|evite)\b(?:\s+\w+){0,4}\s+clear\s+air\b",
         "keep the air clear",
         value,
         flags=re.IGNORECASE,

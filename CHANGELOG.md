@@ -3,6 +3,22 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.20] - 2026-09-11
+
+### Added
+
+- Build lyric-inspired backgrounds from a lyric-only semantic pass whose visual
+  anchors must cite the supplied song, then compose a detailed 240–320 word
+  provider prompt around those verified anchors.
+- Check generated background frames for readable text, logos, black bars,
+  unstable lighting and scene changes before accepting them for lyric videos.
+
+### Fixed
+
+- Keep the API and rendering workers in one lyric-anchor rollout mode, reject
+  invented or partial-word anchor evidence, and retain a safe legacy fallback
+  when lyric analysis is unavailable.
+
 ## [1.1.19] - 2026-09-11
 
 ### Fixed
