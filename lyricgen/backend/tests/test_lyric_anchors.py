@@ -145,6 +145,10 @@ def test_verify_devuelve_none_si_no_queda_nada():
     assert la.verify_anchors(anchors, LETRA) is None
 
 
+def test_verify_no_acepta_anclas_si_no_hay_letra():
+    assert la.verify_anchors(_payload(), "") is None
+
+
 def test_verify_es_insensible_a_tildes_y_mayusculas():
     anchors = _payload(objetos=[
         {"objeto": "megáfono", "linea": "CON UNA BANDERA Y UN MEGÁFONO ROTO"},

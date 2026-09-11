@@ -262,7 +262,7 @@ def verify_anchors(anchors: dict[str, Any] | None, lyrics_text: str) -> dict[str
         return None
     haystack = normalize(lyrics_text)
     if not haystack:
-        return anchors
+        return None
     padded_haystack = f" {haystack} "
 
     def _contains_phrase(value: str | None) -> bool:
