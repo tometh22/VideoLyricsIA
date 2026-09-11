@@ -74,6 +74,7 @@ def _token_for(user):
         db.close()
 
 
+@pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("campaign_song,status,expected", [
     (True, "lyrics_approved", "transcribed_pending"),
     (False, "lyrics_approved", "lyrics_approved"),
@@ -81,7 +82,7 @@ def _token_for(user):
     (True, "done", "done"),
 ])
 def test_native_editor_reopens_only_changed_prerender_campaign_approval(
-    client, monkeypatch, campaign_song, status, expected,
+    client, monkeypatch, campaign_song, status, expected, legacy,
 ):
     import main
     from database import BatchCampaign
@@ -104,13 +105,17 @@ def test_native_editor_reopens_only_changed_prerender_campaign_approval(
     assert loaded.status_code == 200
     assert loaded.json()["job_status"] == status
     segments = loaded.json()["segments"]
-    unchanged = client.patch(f"/editor/{job_id}", headers=auth(token), json={
+    save = client.post if legacy else client.patch
+    save_path = f"/jobs/{job_id}/save-segments" if legacy else f"/editor/{job_id}"
+    unchanged = save(save_path, headers=auth(token), json={
         "base_revision": loaded.json()["revision"], "segments": segments, "checkpoint": "draft",
     })
-    assert unchanged.status_code == 200 and unchanged.json()["applied"] is False
+    assert unchanged.status_code == 200
+    if not legacy or campaign_song and status == "lyrics_approved":
+        assert unchanged.json()["applied"] is False
     assert client.get(f"/editor/{job_id}", headers=auth(token)).json()["job_status"] == status
     segments[0]["text"] = "Human correction after approval"
-    saved = client.patch(f"/editor/{job_id}", headers=auth(token), json={
+    saved = save(save_path, headers=auth(token), json={
         "base_revision": unchanged.json()["revision"], "segments": segments, "checkpoint": "draft",
     })
     assert saved.status_code == 200 and saved.json()["applied"] is True
