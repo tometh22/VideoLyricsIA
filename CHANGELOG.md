@@ -3,6 +3,21 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.21] - 2026-09-11
+
+### Changed
+
+- Simplify the campaign style/background workspace around the daily workflow:
+  show status totals, filter ready/pending/generating/approved songs, select only
+  approved lyrics in one action, and keep the generation action above the table.
+- Collapse contractual style distribution and advanced visual controls until an
+  operator explicitly opens them, while retaining the complete audited workflow.
+
+### Fixed
+
+- Exclude discarded songs from the ready-to-generate bulk selection and display
+  the number of selected songs that are actually eligible before confirmation.
+
 ## [1.1.20] - 2026-09-11
 
 ### Added
