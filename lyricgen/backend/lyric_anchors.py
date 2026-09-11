@@ -263,13 +263,16 @@ def verify_anchors(anchors: dict[str, Any] | None, lyrics_text: str) -> dict[str
     haystack = normalize(lyrics_text)
     if not haystack:
         return anchors
+    padded_haystack = f" {haystack} "
+
+    def _contains_phrase(value: str | None) -> bool:
+        needle = normalize(value)
+        return bool(needle and f" {needle} " in padded_haystack)
 
     def _supported(term: str | None, line: str | None) -> bool:
-        needle = normalize(line)
-        if needle:
-            return needle in haystack
-        literal = normalize(term)
-        return bool(literal and literal in haystack)
+        if normalize(line):
+            return _contains_phrase(line)
+        return _contains_phrase(term)
 
     kept = [
         a for a in anchors.get("objetos", [])

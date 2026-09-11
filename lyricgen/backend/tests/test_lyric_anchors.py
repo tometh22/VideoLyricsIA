@@ -120,6 +120,15 @@ def test_objeto_inventado_sin_cita_se_descarta():
     assert la.verify_anchors(anchors, LETRA) is None
 
 
+def test_objeto_sin_cita_no_matchea_dentro_de_otra_palabra():
+    anchors = _payload(
+        lugar=None,
+        linea_lugar=None,
+        objetos=[{"objeto": "sol", "linea": ""}],
+    )
+    assert la.verify_anchors(anchors, "Solo queda la noche") is None
+
+
 def test_lugar_literal_sin_cita_se_conserva():
     anchors = _payload(lugar="Plaza de Mayo", linea_lugar=None, objetos=[])
     assert la.verify_anchors(anchors, LETRA)["lugar"] == "Plaza de Mayo"
