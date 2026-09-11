@@ -253,16 +253,19 @@ describe("Editor 2.0 stale draft recovery", () => {
     expect(request.mock.calls.some(([path]) => path.endsWith("/lock/heartbeat"))).toBe(true);
   });
 
-  it("rebases a stale draft silently and keeps the local copy", async () => {
+  it("requires explicit recovery of a stale draft and keeps the local copy", async () => {
     const request = makeRequest();
     renderEditor(request);
 
+    await screen.findByRole("dialog", { name: "Revisar copia local" });
+    expect(request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Recuperar para editar" }));
     expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
   });
 
-  it("recovers a legacy draft base from version history without opening a false conflict", async () => {
+  it("shows an older revision for explicit recovery without silently merging history", async () => {
     localStorage.clear();
     localStorage.setItem(
       `genly_editor_draft:team-a:42:${JOB}`,
@@ -271,13 +274,16 @@ describe("Editor 2.0 stale draft recovery", () => {
     const request = makeRequest({ legacyBase: true });
     renderEditor(request);
 
+    await screen.findByRole("dialog", { name: "Revisar copia local" });
+    expect(request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Recuperar para editar" }));
     expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
-    expect(request.mock.calls.some(([path]) => path === `/editor/${JOB}/versions?limit=50`)).toBe(true);
+    expect(request.mock.calls.some(([path]) => path === `/editor/${JOB}/versions?limit=50`)).toBe(false);
     await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
   });
 
-  it("hydrates the oldest unversioned draft without a collaboration popup", async () => {
+  it("requires explicit recovery of the oldest unversioned draft", async () => {
     localStorage.clear();
     localStorage.setItem(
       `genly_editor_draft:team-a:42:${JOB}`,
@@ -286,6 +292,9 @@ describe("Editor 2.0 stale draft recovery", () => {
     const request = makeRequest();
     renderEditor(request);
 
+    await screen.findByRole("dialog", { name: "Revisar copia local" });
+    expect(request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Recuperar para editar" }));
     expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
@@ -294,6 +303,9 @@ describe("Editor 2.0 stale draft recovery", () => {
   it("does not expose a conflict resolver for an old local draft", async () => {
     const request = makeRequest();
     renderEditor(request);
+    await screen.findByRole("dialog", { name: "Revisar copia local" });
+    expect(request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Recuperar para editar" }));
     expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
     expect(request.mock.calls.some(([path]) => path.endsWith("/conflicts/resolve"))).toBe(false);
@@ -401,5 +413,77 @@ describe("Editor 2.0 quality proposal ambiguous timeout recovery", () => {
     expect(screen.getByTestId("quality-proposal-panel")).toHaveAttribute(
       "data-proposal-state", "dismissed",
     );
+  });
+});
+
+
+describe("local recovery is separate from server save status", () => {
+  const key = `genly_editor_draft:team-a:42:${JOB}`;
+  const mutations = (request) => request.mock.calls.filter(([, options]) => options?.method === "PATCH");
+
+  it("keeps an unreadable copy across reload/return without claiming a save failure", async () => {
+    const raw = '{"segments":';
+    localStorage.setItem(key, raw);
+    const request = makeRequest();
+    let view = renderEditor(request);
+    for (let visit = 0; visit < 3; visit++) {
+      const dialog = await screen.findByRole("dialog", { name: "Revisar copia local" });
+      expect(dialog).toHaveTextContent("revisión 5 está guardada");
+      expect(dialog).toHaveTextContent("No pudimos interpretar");
+      expect(screen.queryByText("No se pudo guardar")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Descartar copia/ })).not.toBeInTheDocument();
+      expect(localStorage.getItem(key)).toBe(raw);
+      expect(mutations(request)).toHaveLength(0);
+      view.unmount();
+      if (visit < 2) view = renderEditor(request);
+    }
+  });
+
+  it("removes an equivalent old-revision copy with zero server mutations across reload", async () => {
+    localStorage.setItem(key, JSON.stringify({ segments: SERVER, base_revision: 0 }));
+    const request = makeRequest();
+    const view = renderEditor(request);
+    await screen.findByDisplayValue("versión equipo");
+    await waitFor(() => expect(localStorage.getItem(key)).toBeNull());
+    expect(screen.queryByRole("dialog", { name: "Revisar copia local" })).not.toBeInTheDocument();
+    expect(mutations(request)).toHaveLength(0);
+    view.unmount(); renderEditor(request);
+    await screen.findByDisplayValue("versión equipo");
+    expect(mutations(request)).toHaveLength(0);
+  });
+
+  it("compares differences and discards only by explicit choice without reopening approval", async () => {
+    const request = makeRequest(); renderEditor(request);
+    const dialog = await screen.findByRole("dialog", { name: "Revisar copia local" });
+    expect(dialog).toHaveTextContent("versión local");
+    expect(dialog).toHaveTextContent("versión equipo");
+    expect(dialog).toHaveTextContent("revisión 4");
+    expect(localStorage.getItem(key)).not.toBeNull();
+    expect(mutations(request)).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Descartar copia local y usar guardada" }));
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    expect(localStorage.getItem(key)).toBeNull();
+    expect(mutations(request)).toHaveLength(0);
+    expect(await screen.findByDisplayValue("versión equipo")).toBeInTheDocument();
+  });
+
+  it("preserves a copy changed by another tab before a discard click", async () => {
+    const request = makeRequest(); renderEditor(request);
+    await screen.findByRole("dialog", { name: "Revisar copia local" });
+    const newer = JSON.stringify({ segments: PROPOSED, base_revision: 5 });
+    localStorage.setItem(key, newer);
+    fireEvent.click(screen.getByRole("button", { name: "Descartar copia local y usar guardada" }));
+    expect(await screen.findByText(/La copia cambió en otra pestaña/)).toBeInTheDocument();
+    expect(localStorage.getItem(key)).toBe(newer);
+    expect(mutations(request)).toHaveLength(0);
+  });
+
+  it("does not clamp invalid timing and then delete a seemingly equivalent copy", async () => {
+    const raw = JSON.stringify({ segments: [{ ...SERVER[0], start: null }] });
+    localStorage.setItem(key, raw);
+    const request = makeRequest(); renderEditor(request);
+    expect(await screen.findByText(/formato de letra y tiempos/)).toBeInTheDocument();
+    expect(localStorage.getItem(key)).toBe(raw);
+    expect(mutations(request)).toHaveLength(0);
   });
 });

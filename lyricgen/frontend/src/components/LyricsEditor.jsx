@@ -7,6 +7,7 @@ import { useToast } from "./ToastProvider";
 import HelpTip from "./HelpCenter/HelpTip";
 import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
+import LocalDraftRecovery from "./LocalDraftRecovery";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { referenceSuggestionsById } from "../lib/referenceSuggestions";
 import { tierForLength } from "../lib/lyricTiers";
@@ -961,6 +962,9 @@ export default function LyricsEditor({
   // sesión vencida, job expirado, etc. — ver _SAVE_ERROR_COPY). null cuando
   // no hay error. Se deriva de result.reason/status de persistSegments.
   const [saveErrorReason, setSaveErrorReason] = useState(null);
+  const [draftRecovery, setDraftRecovery] = useState(null);
+  const draftRecoveryRef = useRef(null);
+  draftRecoveryRef.current = draftRecovery;
   const [flushCounter, setFlushCounter] = useState(0);
   const [durableHydrated, setDurableHydrated] = useState(false);
   const saveConflictRef = useRef(false);
@@ -1289,7 +1293,7 @@ export default function LyricsEditor({
         });
       }
     }
-    if (status === "saved" && draftKey) {
+    if (status === "saved" && draftKey && !draftRecoveryRef.current) {
       // El snapshot confirmado se capturó hasta 800 ms (draft) o 5 s
       // (checkpoint) ANTES de este OK. Borrar el borrador a ciegas tiraba todo
       // lo tipeado en esa ventana: el efecto que reescribe el draft está
@@ -1323,7 +1327,7 @@ export default function LyricsEditor({
     setIsDirty(true);
   }, []);
   const { flush: flushDurableSave } = useEditorAutosave({
-    enabled: editorV2Enabled && durableHydrated && !durableEditor.loading,
+    enabled: editorV2Enabled && durableHydrated && !durableEditor.loading && !draftRecovery,
     segments: durableSegments,
     dirty: isDirty,
     save: durableEditor.save,
@@ -1353,81 +1357,40 @@ export default function LyricsEditor({
       let next = remote;
       let markDirty = false;
       if (draftKey) {
+        let raw = null;
+        let phase = "read";
         try {
-          const raw = localStorage.getItem(draftKey);
+          raw = localStorage.getItem(draftKey);
           if (raw) {
+            phase = "parse";
             const draft = JSON.parse(raw);
-            if (!Array.isArray(draft?.segments) || !draft.segments.length) {
-              setSaveStatus("error");
-              setSaveErrorReason("draft-corrupt");
+            phase = "compare";
+            // Validate before normalization: clamps/defaults must not make an
+            // unreadable copy look equivalent and eligible for deletion.
+            const valid = Array.isArray(draft?.segments) && draft.segments.length > 0
+              && draft.segments.every((row) => row && typeof row.text === "string"
+                && Number.isFinite(row.start) && Number.isFinite(row.end) && row.end >= row.start);
+            if (!valid) throw new Error("invalid_segments");
+            const local = sanitizeSegments(draft.segments);
+            const pending = draft.pending_changes || draft.pending_ops?.length;
+            if (pending) throw new Error("uncomparable_pending_operations");
+            const sameContent = segmentsEquivalent(local, remote);
+            if (sameContent) {
+              phase = "remove";
+              // Do not remove a different copy written by another tab meanwhile.
+              if (localStorage.getItem(draftKey) !== raw) throw new Error("draft_changed");
+              localStorage.removeItem(draftKey);
             } else {
-              const local = sanitizeSegments(draft.segments);
-              // A local draft can outlive a background/typography edit. Those
-              // operations may advance the document revision or refresh
-              // renderer metadata without changing any operator-owned lyric
-              // content. Comparing raw JSON here made that harmless case look
-              // like a stale draft as soon as the editor reopened.
-              const sameContent = segmentsEquivalent(local, remote);
-              if (sameContent) {
-                localStorage.removeItem(draftKey);
-              } else if (Number.isInteger(draft.base_revision)
-                && draft.base_revision === durableEditor.document.revision) {
-                next = local;
-                markDirty = true;
-                setSaveStatus("local");
-              } else {
-                let baseSegments = Array.isArray(draft.base_segments)
-                  ? sanitizeSegments(draft.base_segments)
-                  : null;
-
-                // Drafts created before base_segments was introduced still
-                // carry base_revision (and the oldest drafts carry neither).
-                // Prefer the immutable checkpoint, but fall back to the
-                // original transcription if history is unavailable. The
-                // original is a safe three-way base: edits made only by this
-                // browser merge cleanly, while same-line changes still use
-                // the local snapshot when it is rebased and saved below.
-                if (!baseSegments && Number.isInteger(draft.base_revision)
-                  && draft.base_revision === 0) {
-                  baseSegments = remoteOriginal;
-                }
-                if (!baseSegments && Number.isInteger(draft.base_revision) && editorRequest) {
-                  try {
-                    const summariesResponse = await editorRequest(
-                      `/editor/${transcribeJobId}/versions?limit=50`,
-                    );
-                    const summaries = summariesResponse.ok
-                      ? (await summariesResponse.clone().json())?.versions || []
-                      : [];
-                    const baseVersion = summaries.find(
-                      (version) => version.revision === draft.base_revision,
-                    );
-                    if (baseVersion?.id) {
-                      const versionResponse = await editorRequest(
-                        `/editor/${transcribeJobId}/versions/${encodeURIComponent(baseVersion.id)}`,
-                      );
-                      if (versionResponse.ok) {
-                        const version = await versionResponse.clone().json();
-                        if (Array.isArray(version?.segments)) {
-                          baseSegments = sanitizeSegments(version.segments);
-                        }
-                      }
-                    }
-                  } catch { /* use the original transcription fallback */ }
-                }
-                if (!baseSegments) baseSegments = remoteOriginal;
-                if (cancelled) return;
-                const merged = mergeThreeWay(baseSegments, local, remote);
-                next = merged.merged;
-                markDirty = !segmentsEquivalent(next, remote);
-                if (markDirty) setSaveStatus("local");
-                else localStorage.removeItem(draftKey);
-              }
+              setDraftRecovery({ kind: "different", raw, local,
+                baseRevision: draft.base_revision, updatedAt: draft.updated_at });
             }
           }
         } catch {
-          setSaveStatus("error");
-          setSaveErrorReason("draft-corrupt");
+          const message = phase === "read" ? "El navegador no permitió leer la copia local."
+            : phase === "parse" ? "No pudimos interpretar el archivo de la copia local."
+              : phase === "remove" ? "La copia coincide con la guardada, pero no pudimos retirar el aviso de forma segura. Puede haber cambiado en otra pestaña o el navegador impidió borrarla."
+                : "La copia local no tiene un formato de letra y tiempos que podamos comparar sin alterarlo.";
+          setDraftRecovery({ kind: "unreadable", raw, message });
         }
       }
       if (cancelled) return;
@@ -1484,7 +1447,7 @@ export default function LyricsEditor({
       setSaveStatus(status);
       setSaveErrorReason(reason);
       if (status === "saved") setSavedAt(new Date());
-      if (status === "saved" && draftKey) {
+      if (status === "saved" && draftKey && !draftRecoveryRef.current) {
         try { localStorage.removeItem(draftKey); } catch { /* storage blocked */ }
       }
     });
@@ -1520,7 +1483,7 @@ export default function LyricsEditor({
   }, [draftKey, editorV2Enabled, segmentsRevision, setEdited]);
 
   useEffect(() => {
-    if (!draftKey || !isDirty) return;
+    if (!draftKey || !isDirty || draftRecoveryRef.current) return;
     try {
       const cleaned = sanitizeSegmentsForPersistence(edited);
       localStorage.setItem(draftKey, JSON.stringify({
@@ -2989,6 +2952,7 @@ export default function LyricsEditor({
   // in sync mode so the operator can recover from a mistap.
   useEffect(() => {
     const onKey = (e) => {
+      if (draftRecoveryRef.current) return;
       const tag = (document.activeElement?.tagName || "").toUpperCase();
       const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
       if (editing) return;
@@ -3821,7 +3785,7 @@ export default function LyricsEditor({
       toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
       return;
     }
-    if (saveErrorReason === "draft-corrupt") {
+    if (draftRecovery) {
       toast({ message: "Descartá o recuperá manualmente el borrador local antes de aprobar.", tone: "error" });
       return;
     }
@@ -4022,7 +3986,7 @@ export default function LyricsEditor({
   };
 
   const handleBackSafely = useCallback(async (afterSave) => {
-    const result = await flushPendingSave();
+    const result = draftRecoveryRef.current ? { ok: true } : await flushPendingSave();
     if (result?.ok === false && result.reason === "stale-revision") return;
     if (typeof afterSave === "function") {
       await afterSave();
@@ -4162,12 +4126,39 @@ export default function LyricsEditor({
   // breathe: preview ~680 px wide (≈ 2× before), lines fit ≈ 60 chars per
   // row before scrolling. Timeline view stays at max-w-6xl (already wide
   // enough).
+  const resolveRecovery = (recover) => {
+    try {
+      if (localStorage.getItem(draftKey) !== draftRecovery.raw) {
+        setDraftRecovery({ ...draftRecovery, kind: "unreadable", message: "La copia cambió en otra pestaña. Recargá para compararla de nuevo; no borramos nada." });
+        return;
+      }
+      if (recover) {
+        // Only an explicit choice makes the local copy an editable draft.
+        // Keep its original bytes until the normal save path confirms them.
+        setEdited(reseedPreservingIds(editedRef.current, draftRecovery.local));
+        setIsDirty(true);
+        setSaveStatus("local");
+      } else {
+        localStorage.removeItem(draftKey);
+        setIsDirty(false);
+      }
+      draftRecoveryRef.current = null;
+      setDraftRecovery(null);
+    } catch {
+      setDraftRecovery({ ...draftRecovery, kind: "unreadable", message: "El navegador impidió resolver la copia local. La conservamos y no guardamos cambios en el servidor." });
+    }
+  };
+
   return (
     // UI F10 (2026-05-26): pb-28 (7 rem ≈ 112 px) garantiza safe-area
     // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
-    <div data-testid="lyrics-editor" aria-busy={editorInitializationBlocked} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+    <div data-testid="lyrics-editor" inert={draftRecovery ? "" : undefined} aria-busy={editorInitializationBlocked} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+      {draftRecovery && createPortal(<LocalDraftRecovery recovery={draftRecovery}
+        revision={durableEditor.document?.revision} remote={durableEditor.document?.segments || []}
+        onRecover={() => resolveRecovery(true)} onDiscard={() => resolveRecovery(false)}
+        onBack={() => onBack?.()} />, document.body)}
       {editorInitializationBlocked && createPortal(
         <div
           className="fixed inset-0 z-[80] flex items-center justify-center bg-surface-0/70 px-5 backdrop-blur-sm"
@@ -4441,7 +4432,7 @@ export default function LyricsEditor({
             onClick={handleApprove}
             disabled={isApproving || (!requireLineReview && (
               (editorV2Enabled && (!durableHydrated || durableEditor.loading))
-              || saveErrorReason === "draft-corrupt"
+              || !!draftRecovery
             ))}
             aria-busy={isApproving}
             aria-label={isApproving
