@@ -636,7 +636,8 @@ def test_build_ass_dissolve_blur_emits_blur_in_and_out():
     segs = [{"text": "hola", "start": 1.0, "end": 5.0}]
     d = _dialogue(_ass([_line(segs, transition="dissolve_blur")]))
     assert "\\blur8" in d and "\\blur0" in d
-    assert d.count("\\t(") == 2          # focus-in + blur-out
+    assert "\\4a&HFF&" in d                       # shadow fades with exit blur
+    assert d.count("\\t(") == 2          # focus-in + blur/shadow-out
 
 
 def test_line_transition_preserves_approved_lyric_window():
