@@ -22,12 +22,21 @@ CONFIG_KEYS = (
     'BEAT_SNAP_ENABLED', 'BEAT_SNAP_WINDOW_MS', 'LYRIC_LEAD_IN_S',
     'LYRIC_HOLD_S', 'WHISPERX_MAX_LINE_S', 'WHISPERX_MIN_SPLIT_GAP_S',
     'LINE_TEXT_CORRECT_ENABLED', 'LARGE_GAP_CLUSTER_FIX_ENABLED',
+    'ADLIB_CONSENSUS_ENABLED', 'CHORUS_SNAP_ENABLED', 'WORD_VOTE_ENABLED',
+    'REPETITION_RECONCILE_ENABLED', 'TIMING_CONSISTENCY_ENABLED',
+    'KARAOKE_FA_RETIME_ENABLED', 'LYRICS_FORMAT_ENABLED', 'CTC_ALIGN_COMPUTE_STEM',
+    'PHRASE_SEGMENTER_ENABLED', 'PHRASE_SEG_TARGET_LEN', 'PHRASE_SEG_MAX_LEN',
+    'PHRASE_SEG_MIN_LEN', 'PHRASE_SEG_MAX_DUR_S', 'PHRASE_SEG_GAP_CAP_S',
+    'GAP_RESCUE_ENABLED', 'GAP_RESCUE_MIN_GAP_S', 'GAP_RESCUE_CLIP_MAX_S',
+    'GAP_RESCUE_CONTEXT_S', 'GAP_RESCUE_MAX_GAPS',
 )
 CODE_FILES = (
     'main.py', 'whisperx_reconcile.py', 'forced_align.py', 'post_reconcile.py',
     'transcribe_postprocess.py', 'whisperx_transcribe.py', 'beat_snap.py',
     'chorus_trim.py', 'lead_in.py', 'line_evidence.py', 'segment_timing.py',
     'transcription_worker.py', 'reconcile_capture.py', 'reconcile_replay.py',
+    'ctc_align.py', 'lyrics_format.py', 'phrase_segmenter.py', 'chorus_snap.py',
+    'word_vote.py', 'gap_rescue.py', 'repetition_reconcile.py', 'karaoke_align.py',
 )
 _RESERVE = """
 if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then return 0 end
@@ -157,6 +166,8 @@ def record_result(result, stage):
             Capture(payload).record(stage, {
                 'segments': result.get('segments'),
                 'timing_source': result.get('timing_source'),
+                'postpass_stats': result.get('postpass_stats'),
+                'anchor_alignment': result.get('anchor_alignment'),
             })
     except Exception:
         pass
