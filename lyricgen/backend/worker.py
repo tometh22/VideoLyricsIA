@@ -464,14 +464,19 @@ def main():
         VALID_POLICY_MODES as _bg_policy_modes,
         policy_mode as _bg_policy_mode,
     )
+    from lyric_anchors import (
+        ANCHORS_ENV as _lyric_anchors_env,
+        VALID_ANCHOR_MODES as _lyric_anchor_modes,
+        anchors_mode as _lyric_anchors_mode,
+    )
     from observability import _resolve_release as _resolve_runtime_release
     logger.info(
         "[BG_POLICY][STARTUP] process=rq-worker release=%s environment=%s "
-        "policy_version=%s policy_mode=%s cache_namespace=%s queues=%s "
-        "rq_payload_version=%s",
+        "policy_version=%s policy_mode=%s lyric_anchor_mode=%s "
+        "cache_namespace=%s queues=%s rq_payload_version=%s",
         _resolve_runtime_release(),
         os.environ.get("ENVIRONMENT", "production").lower().strip(),
-        _bg_policy_version, _bg_policy_mode(),
+        _bg_policy_version, _bg_policy_mode(), _lyric_anchors_mode(),
         _bg_policy_version,
         ",".join(_resolve_queue_names()),
         os.environ.get("RQ_PAYLOAD_VERSION", "2"),
@@ -481,6 +486,12 @@ def main():
         logger.warning(
             "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
             _bg_policy_env, _raw_bg_policy_mode,
+        )
+    _raw_lyric_anchor_mode = os.environ.get(_lyric_anchors_env, "off").strip().lower()
+    if _raw_lyric_anchor_mode not in _lyric_anchor_modes:
+        logger.warning(
+            "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
+            _lyric_anchors_env, _raw_lyric_anchor_mode,
         )
 
     _warn_if_shutdown_grace_too_short()

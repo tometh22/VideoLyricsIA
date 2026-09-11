@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+from pathlib import Path
 
 import lyric_anchors as la
 
@@ -363,6 +364,15 @@ def test_shadow_tampoco_comparte_cache_con_on():
     with _anchors_env("on"):
         on = bg_preview.compute_bg_cache_key(params)
     assert shadow != on
+
+
+def test_startup_logs_expose_effective_anchor_mode_for_api_and_workers():
+    root = Path(__file__).resolve().parents[1]
+    for filename in ("main.py", "worker.py"):
+        source = (root / filename).read_text()
+        assert "lyric_anchor_mode=%s" in source
+        assert "anchors_mode as _lyric_anchors_mode" in source
+        assert "VALID_ANCHOR_MODES as _lyric_anchor_modes" in source
 
 
 # ── Ejemplos de contenido dentro de las cláusulas reusadas ─────────────────

@@ -690,18 +690,31 @@ def on_startup():
         VALID_POLICY_MODES as _bg_policy_modes,
         policy_mode as _bg_policy_mode,
     )
+    from lyric_anchors import (
+        ANCHORS_ENV as _lyric_anchors_env,
+        VALID_ANCHOR_MODES as _lyric_anchor_modes,
+        anchors_mode as _lyric_anchors_mode,
+    )
     from observability import _resolve_release as _resolve_runtime_release
     logger.info(
         "[BG_POLICY][STARTUP] process=api release=%s environment=%s "
-        "policy_version=%s policy_mode=%s cache_namespace=%s",
+        "policy_version=%s policy_mode=%s lyric_anchor_mode=%s "
+        "cache_namespace=%s",
         _resolve_runtime_release(), ENVIRONMENT,
-        _bg_policy_version, _bg_policy_mode(), _bg_policy_version,
+        _bg_policy_version, _bg_policy_mode(), _lyric_anchors_mode(),
+        _bg_policy_version,
     )
     _raw_bg_policy_mode = os.environ.get(_bg_policy_env, "off").strip().lower()
     if _raw_bg_policy_mode not in _bg_policy_modes:
         logger.warning(
             "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
             _bg_policy_env, _raw_bg_policy_mode,
+        )
+    _raw_lyric_anchor_mode = os.environ.get(_lyric_anchors_env, "off").strip().lower()
+    if _raw_lyric_anchor_mode not in _lyric_anchor_modes:
+        logger.warning(
+            "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
+            _lyric_anchors_env, _raw_lyric_anchor_mode,
         )
 
     # Background reaper. Daemon → dies with the container. Single
