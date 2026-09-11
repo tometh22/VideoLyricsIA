@@ -11,8 +11,18 @@ import { useLazyMediaUrl } from "../mediaUrl";
 const API = import.meta.env.VITE_API_URL || "";
 const input = "w-full rounded-lg bg-black/30 px-3 py-2 text-sm text-white ring-1 ring-white/15";
 const button = "rounded-lg bg-brand/20 px-4 py-2 text-sm text-brand-light disabled:opacity-40";
+const primaryButton = "rounded-lg bg-brand px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-brand/20 disabled:cursor-not-allowed disabled:opacity-40";
 const statusLabels = { waiting: "Esperando audio", transcribing: "Transcribiendo", transcribing_queued: "Transcripción en cola", transcribed: "Lista para revisar", transcribed_pending: "Lista para revisar", lyrics_approved: "Letra aprobada", queued: "En cola de generación", processing: "Generando", rendering: "Renderizando", editing: "Generando nueva versión", pending_review: "Pendiente de revisión final", done: "Aprobado", error: "Requiere atención", rejected: "Rechazado", discarded: "Descartada" };
 const sourceLabels = { lyrics: "Inspirado en la letra", auto: "Automático", prompt_literal: "Prompt exacto", prompt_improved: "Prompt mejorado con IA", as_is: "Usar tal cual", variation: "Crear variación" };
+const generationStatuses = new Set(["queued", "processing", "rendering", "editing", "pending_review"]);
+
+const songFilters = [
+  { id: "all", label: "Todas", matches: () => true },
+  { id: "ready", label: "Listas para generar", matches: item => item.status === "lyrics_approved" },
+  { id: "review", label: "Pendientes de aprobación", matches: item => ["transcribed", "transcribed_pending"].includes(item.status) },
+  { id: "generating", label: "En generación", matches: item => generationStatuses.has(item.status) },
+  { id: "approved", label: "Videos aprobados", matches: item => item.status === "done" },
+];
 
 async function request(path, options = {}) {
   const response = await fetch(`${API}${path}`, { cache: "no-store", ...options,
@@ -65,7 +75,7 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
   const navigate = useNavigate();
   const base = `/batch/campaigns/${campaignId}`;
   const [data, setData] = useState(null), [assets, setAssets] = useState([]), [report, setReport] = useState(null);
-  const [selected, setSelected] = useState(new Set()), [query, setQuery] = useState(""), [page, setPage] = useState(1);
+  const [selected, setSelected] = useState(new Set()), [query, setQuery] = useState(""), [songFilter, setSongFilter] = useState("all"), [page, setPage] = useState(1);
   const [groups, setGroups] = useState([]), [mode, setMode] = useState("percent"), [contract, setContract] = useState(false);
   const [agreement, setAgreement] = useState(""), [rounding, setRounding] = useState(""), [reason, setReason] = useState("");
   const [replace, setReplace] = useState(false), [pin, setPin] = useState(false), [preview, setPreview] = useState(null);
@@ -73,6 +83,7 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
   const [delivery, setDelivery] = useState(null), [destination, setDestination] = useState("");
   const [generation, setGeneration] = useState(null);
   const [previewStyle, setPreviewStyle] = useState(null);
+  const [configurationOpen, setConfigurationOpen] = useState(false);
   const load = useCallback(async (initialize = false) => {
     const [head, backgrounds, receipt] = await Promise.all([request(`${base}/creative`), request("/backgrounds"), request(`${base}/creative/report`)]);
     setData(head); setAssets(backgrounds); setReport(receipt);
@@ -98,21 +109,45 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
     const url = URL.createObjectURL(await response.blob()); const a = document.createElement("a"); a.href = url; a.download = `campana-${campaignId}.${ext}`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
   if (!data) return <div role={error ? "alert" : "status"}>{error || "Cargando configuración…"}</div>;
-  const filtered = data.items.filter(i => `${i.artist} ${i.title}`.toLowerCase().includes(query.toLowerCase()));
-  const visible = filtered.slice((page - 1) * 20, page * 20);
-  const eligible = data.items.filter(i => selected.has(i.id) && i.status === "lyrics_approved");
+  const activeFilter = songFilters.find(filter => filter.id === songFilter) || songFilters[0];
+  const searched = data.items.filter(i => `${i.artist} ${i.title}`.toLowerCase().includes(query.toLowerCase()));
+  const filtered = searched.filter(activeFilter.matches);
+  const eligible = data.items.filter(i => selected.has(i.id) && i.status === "lyrics_approved" && !i.discarded);
+  const ready = searched.filter(i => songFilters[1].matches(i) && !i.discarded);
+  const filterCounts = Object.fromEntries(songFilters.map(filter => [filter.id, searched.filter(filter.matches).length]));
+  const selectable = filtered.filter(i => !i.discarded);
+  const pages = Math.max(1, Math.ceil(filtered.length / 20));
+  const currentPage = Math.min(page, pages);
+  const visible = filtered.slice((currentPage - 1) * 20, currentPage * 20);
   return <section className="space-y-5" aria-label="Configuración de campaña">
     {error && <p role="alert" className="rounded-xl bg-red-500/15 p-3 text-red-200">{error}</p>}
     {message && <p role="status" className="rounded-xl bg-emerald-500/15 p-3 text-emerald-200">{message}</p>}
     <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-sm text-ink-secondary">Configuración guardada · versión {data.plan.revision}</p><button className={button} disabled={busy} onClick={() => run(() => load())}>Actualizar estado</button></div>
     {view === "creative" && <>
-      <div className="rounded-xl bg-surface-2/40 p-4"><h2 className="font-semibold">Seleccioná las canciones</h2><div className="my-3 flex flex-wrap gap-3">
-        <input className={input + " max-w-xs"} aria-label="Buscar para asignar" placeholder="Canción o artista" value={query} onChange={e => { setQuery(e.target.value); setPage(1); }} />
-        <button className={button} onClick={() => change(() => setSelected(new Set(filtered.filter(i => !i.discarded).map(i => i.id))))}>Seleccionar todas las coincidencias ({filtered.filter(i => !i.discarded).length})</button>
-        <button className={button} onClick={() => change(() => setSelected(new Set()))}>Limpiar selección</button><span>{selected.size} seleccionadas</span>
-      </div><div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr><th>Elegir</th><th>Canción</th><th>Grupo / excepción</th><th>Estado</th></tr></thead><tbody>{visible.map(i => <tr key={i.id} className="border-t border-white/10"><td className="p-2"><input type="checkbox" aria-label={`Seleccionar ${i.title}`} disabled={busy || i.discarded} checked={selected.has(i.id)} onChange={e => change(() => setSelected(old => { const next = new Set(old); if (e.target.checked) next.add(i.id); else next.delete(i.id); return next; }))} /></td><td>{i.title}<div className="text-xs text-ink-secondary">{i.artist}</div></td><td>{i.assignment?.group_name || "Sin asignar"}{i.assignment?.pinned ? " · Fijada" : ""}</td><td>{statusLabels[i.status] || "En preparación"}</td></tr>)}</tbody></table></div>
-      <div className="mt-3 flex gap-3"><button className={button} disabled={page <= 1} onClick={() => setPage(p => p - 1)}>Anterior</button><span>Página {page} de {Math.max(1, Math.ceil(filtered.length / 20))}</span><button className={button} disabled={page * 20 >= filtered.length} onClick={() => setPage(p => p + 1)}>Siguiente</button></div></div>
-      {data.can_manage && <fieldset disabled={busy} className="space-y-4">
+      <div className="overflow-hidden rounded-2xl bg-surface-2/40 ring-1 ring-white/10">
+        <div className="space-y-4 p-5">
+          <div><p className="text-xs font-semibold uppercase tracking-wider text-brand-light">Paso 1</p><h2 className="text-lg font-semibold">Elegí qué canciones trabajar</h2><p className="mt-1 text-sm text-ink-secondary">Filtrá las que ya tienen letra y tiempos aprobados para generar sólo esas.</p></div>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <button type="button" className="rounded-xl bg-emerald-500/10 p-3 text-left ring-1 ring-emerald-400/20" onClick={() => { setSongFilter("ready"); setPage(1); }}><strong className="block text-2xl text-emerald-200">{filterCounts.ready}</strong><span className="text-sm text-emerald-100">Listas para generar</span></button>
+            <button type="button" className="rounded-xl bg-white/5 p-3 text-left ring-1 ring-white/10" onClick={() => { setSongFilter("review"); setPage(1); }}><strong className="block text-2xl">{filterCounts.review}</strong><span className="text-sm text-ink-secondary">Pendientes de aprobación</span></button>
+            <button type="button" className="rounded-xl bg-white/5 p-3 text-left ring-1 ring-white/10" onClick={() => { setSongFilter("approved"); setPage(1); }}><strong className="block text-2xl">{filterCounts.approved}</strong><span className="text-sm text-ink-secondary">Videos aprobados</span></button>
+          </div>
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+            <input className={input + " lg:max-w-sm"} aria-label="Buscar para asignar" placeholder="Buscar canción o artista" value={query} onChange={e => { setQuery(e.target.value); setPage(1); }} />
+            <div className="flex flex-wrap gap-2" role="group" aria-label="Filtrar canciones por estado">{songFilters.map(filter => <button key={filter.id} type="button" aria-pressed={songFilter === filter.id} className={`rounded-full px-3 py-2 text-sm ring-1 ${songFilter === filter.id ? "bg-brand/25 text-brand-light ring-brand/50" : "bg-black/20 text-ink-secondary ring-white/10"}`} onClick={() => { setSongFilter(filter.id); setPage(1); }}>{filter.label} <span className="opacity-70">{filterCounts[filter.id]}</span></button>)}</div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 rounded-xl bg-black/20 p-3">
+            <button className={button} disabled={!selectable.length} onClick={() => change(() => setSelected(new Set(selectable.map(i => i.id))))}>Seleccionar resultados ({selectable.length})</button>
+            <button className={button} disabled={!ready.length} onClick={() => change(() => setSelected(new Set(ready.map(i => i.id))))}>Seleccionar listas para generar ({ready.length})</button>
+            <button className={button} disabled={!selected.size} onClick={() => change(() => setSelected(new Set()))}>Limpiar</button>
+            <span className="text-sm" aria-label={`${selected.size} seleccionadas; ${eligible.length} listas para generar`}><strong>{selected.size}</strong> seleccionadas · <strong className="text-emerald-200">{eligible.length}</strong> listas para generar</span>
+            <button aria-label={`Preparar generación de ${eligible.length} aprobadas seleccionadas`} className={primaryButton + " ml-auto"} disabled={busy || !eligible.length} onClick={() => setGeneration(eligible)}>{eligible.length ? `Generar ${eligible.length} ${eligible.length === 1 ? "video" : "videos"}` : "Generar videos"}</button>
+          </div>
+        </div>
+        <div className="overflow-x-auto border-t border-white/10"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-black/20 text-xs uppercase tracking-wide text-ink-secondary"><tr><th className="p-3">Elegir</th><th className="p-3">Canción</th><th className="p-3">Estilo asignado</th><th className="p-3">Estado</th></tr></thead><tbody>{visible.map(i => <tr key={i.id} className="border-t border-white/10 hover:bg-white/[0.025]"><td className="p-3"><input type="checkbox" aria-label={`Seleccionar ${i.title}`} disabled={busy || i.discarded} checked={selected.has(i.id)} onChange={e => change(() => setSelected(old => { const next = new Set(old); if (e.target.checked) next.add(i.id); else next.delete(i.id); return next; }))} /></td><td className="p-3 font-medium">{i.title}<div className="mt-0.5 text-xs font-normal text-ink-secondary">{i.artist}</div></td><td className="p-3 text-ink-secondary">{i.assignment?.group_name || "Configuración general"}{i.assignment?.pinned ? " · Fijada" : ""}</td><td className="p-3"><span className={`inline-flex rounded-full px-2.5 py-1 text-xs ${i.status === "lyrics_approved" ? "bg-emerald-500/15 text-emerald-200" : i.status === "done" ? "bg-brand/20 text-brand-light" : generationStatuses.has(i.status) ? "bg-amber-500/15 text-amber-200" : "bg-white/5 text-ink-secondary"}`}>{statusLabels[i.status] || "En preparación"}</span></td></tr>)}{!visible.length && <tr><td colSpan="4" className="p-8 text-center text-ink-secondary">No hay canciones que coincidan con este filtro.</td></tr>}</tbody></table></div>
+        <div className="flex items-center justify-between gap-3 border-t border-white/10 p-4"><span className="text-sm text-ink-secondary">{filtered.length} resultados · Página {currentPage} de {pages}</span><div className="flex gap-2"><button className={button} disabled={currentPage <= 1} onClick={() => setPage(p => p - 1)}>Anterior</button><button className={button} disabled={currentPage >= pages} onClick={() => setPage(p => p + 1)}>Siguiente</button></div></div>
+      </div>
+      {data.can_manage && <div className="rounded-2xl bg-surface-2/30 p-4 ring-1 ring-white/10"><button type="button" aria-expanded={configurationOpen} className="flex w-full items-center justify-between gap-4 text-left" onClick={() => setConfigurationOpen(open => !open)}><span><span className="text-xs font-semibold uppercase tracking-wider text-brand-light">Paso 2 · opcional</span><strong className="mt-1 block">Configurar estilos y reparto</strong><span className="mt-1 block text-sm font-normal text-ink-secondary">Abrilo sólo si querés cambiar el diseño guardado antes de generar.</span></span><span className="text-2xl text-brand-light" aria-hidden="true">{configurationOpen ? "−" : "+"}</span></button>{configurationOpen && <fieldset disabled={busy} className="mt-5 space-y-4 border-t border-white/10 pt-5">
         <div className="flex flex-wrap gap-4"><label>Repartir por <select aria-label="Modo de reparto" className={input} value={mode} onChange={e => change(() => setMode(e.target.value))}><option value="percent">Porcentaje</option><option value="count">Cantidad</option></select></label>
           <label className="flex items-center gap-2"><input type="checkbox" checked={replace} onChange={e => change(() => setReplace(e.target.checked))} />Reemplazar excepciones fijadas</label>
           <label className="flex items-center gap-2"><input type="checkbox" checked={pin} onChange={e => change(() => setPin(e.target.checked))} />Fijar estas asignaciones</label></div>
@@ -141,8 +176,7 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
           <button className={button} onClick={() => run(async () => { await post(`${base}/creative/apply`, { preview_id: preview.preview_id }); setPreview(null); await load(); setMessage("Asignación guardada. No se generaron videos."); })}>Guardar esta asignación</button>
         </div>}
         {data.operations[0]?.revision === data.plan.revision && <button className={button} disabled={reason.trim().length < 3} onClick={() => run(async () => { await post(`${base}/creative/undo`, { revision: data.plan.revision, operation_id: data.operations[0].id, reason }); setPreview(null); await load(); setMessage("Última asignación deshecha."); })}>Deshacer última asignación</button>}
-      </fieldset>}
-      <div className="rounded-xl bg-surface-2/40 p-4"><h3 className="font-semibold">Generación después de revisar letras</h3><p className="my-2 text-sm text-ink-secondary">Sólo se generan canciones con letra y tiempos aprobados. Se usan sus ajustes guardados; los videos aparecerán en el historial de esta campaña.</p><button className={button} disabled={busy || !eligible.length} onClick={() => setGeneration(eligible)}>Preparar generación de {eligible.length} aprobadas seleccionadas</button></div>
+      </fieldset>}</div>}
     </>}
     {generation && <div role="dialog" aria-modal="true" aria-label="Confirmar generación" className="fixed inset-0 z-50 grid place-items-center bg-black/80 p-5"><div className="max-w-lg space-y-4 rounded-2xl bg-surface-2 p-6"><h2 className="text-xl font-semibold">Generar {generation.length} videos</h2><p>Esta acción genera fondos y videos y consume el cupo correspondiente. La configuración y el grupo de cada canción quedarán registrados.</p><ul className="max-h-40 overflow-auto">{generation.map(i => <li key={i.id}>{i.title} · {i.assignment?.group_name || "Configuración actual"}</li>)}</ul><button className={button} disabled={busy} onClick={() => run(async () => { let completed = 0; try { for (const item of generation) { const job = await request(`/status/${item.job_id}`); await request("/generate", { method: "POST", body: campaignGenerateForm(item, job) }); completed++; } } finally { setGeneration(null); await load(); setMessage(`${completed} trabajos enviados; consultá el historial de esta campaña.`); } })}>Confirmar generación</button><button className={button} disabled={busy} onClick={() => setGeneration(null)}>Cancelar</button></div></div>}
     {view === "contract" && report && <div id="campaign-contract-report" className="space-y-4">
