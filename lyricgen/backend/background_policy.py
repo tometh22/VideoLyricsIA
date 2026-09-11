@@ -321,9 +321,28 @@ def cache_policy_fingerprint(policy: dict[str, Any] | None) -> str:
     return f"{policy.get('policy_version', POLICY_VERSION)}:{policy.get('policy_mode', 'off')}:{allowed}"
 
 
-def runtime_rollout_fingerprint(*, mode: str | None = None) -> str:
-    """Release-independent token used to keep API and workers in flag lockstep."""
+def runtime_rollout_fingerprint(
+    *,
+    mode: str | None = None,
+    anchors: str | None = None,
+) -> str:
+    """Release-independent token used to keep API and workers in flag lockstep.
+
+    Keep the historical token byte-identical while lyric anchors are off so a
+    code-only rolling deploy can drain already queued work.  Once anchors are
+    observed or enabled, include that mode: a partially restarted fleet must
+    reject work instead of silently composing with different lyric semantics.
+    """
     active = (mode or policy_mode()).strip().lower()
     if active not in VALID_POLICY_MODES:
         active = "off"
-    return f"{POLICY_VERSION}:{active}"
+    if anchors is None:
+        from lyric_anchors import anchors_mode
+
+        active_anchors = anchors_mode()
+    else:
+        active_anchors = str(anchors or "off").strip().lower()
+        if active_anchors not in {"off", "shadow", "on"}:
+            active_anchors = "off"
+    base = f"{POLICY_VERSION}:{active}"
+    return base if active_anchors == "off" else f"{base}:lyrics={active_anchors}"
