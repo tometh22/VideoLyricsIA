@@ -79,7 +79,7 @@ test("39-song contract assignment survives reload, generates only approved selec
   await page.getByRole("button", { name: /Seleccionar resultados/ }).click();
   await page.getByRole("button", { name: "Preparar generación de 1 aprobadas seleccionadas" }).click();
   await page.getByRole("button", { name: "Confirmar generación", exact: true }).click();
-  await expect(page.getByRole("status").filter({ hasText: "1 trabajos enviados" })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "1 trabajo enviado" })).toBeVisible();
   expect(calls.generations).toHaveLength(1);
   expect(calls.generations[0]).toContain('name="effect"\r\n\r\nbokeh');
   expect(calls.generations[0]).toContain('name="campaign_creative_revision"\r\n\r\n1');
