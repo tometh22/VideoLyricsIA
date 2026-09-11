@@ -254,9 +254,9 @@ def verify_anchors(anchors: dict[str, Any] | None, lyrics_text: str) -> dict[str
 
     Este es el chequeo que hace que el paso 1 sea verificable sin un segundo
     LLM: el extractor tiene que citar, y la cita se comprueba contra el texto.
-    Un ancla sin `linea` se conserva (el modelo a veces la omite y el objeto
-    igual es correcto), pero una con una `linea` INVENTADA se tira — ése es el
-    modo de falla que importa.
+    Un ancla sin `linea` sólo se conserva si el término aparece literalmente en
+    la letra. Así toleramos una cita omitida sin convertir la omisión en permiso
+    para inventar objetos genéricos. Una cita presente siempre debe verificarse.
     """
     if not anchors:
         return None
@@ -264,19 +264,23 @@ def verify_anchors(anchors: dict[str, Any] | None, lyrics_text: str) -> dict[str
     if not haystack:
         return anchors
 
-    def _cited(line: str | None) -> bool:
+    def _supported(term: str | None, line: str | None) -> bool:
         needle = normalize(line)
-        if not needle:
-            return True  # sin cita: se conserva, no se puede refutar
-        return needle in haystack
+        if needle:
+            return needle in haystack
+        literal = normalize(term)
+        return bool(literal and literal in haystack)
 
     kept = [
         a for a in anchors.get("objetos", [])
-        if _cited(a.get("linea")) and is_renderable(a.get("objeto", ""))
+        if _supported(a.get("objeto"), a.get("linea"))
+        and is_renderable(a.get("objeto", ""))
     ]
     result = dict(anchors)
     result["objetos"] = kept
-    if anchors.get("lugar") and not _cited(anchors.get("linea_lugar")):
+    if anchors.get("lugar") and not _supported(
+        anchors.get("lugar"), anchors.get("linea_lugar")
+    ):
         # El lugar es el ancla más fuerte del prompt; si la cita no se verifica,
         # se cae a null antes que arrastrar una alucinación a toda la escena.
         result["lugar"] = None

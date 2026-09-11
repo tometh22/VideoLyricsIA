@@ -106,11 +106,28 @@ def test_lugar_con_cita_inventada_cae_a_none():
     assert kept["lugar"] is None
 
 
-def test_objeto_sin_cita_se_conserva():
-    # Sin cita no se puede refutar; el modo de falla que importa es la cita
-    # INVENTADA, no la omitida.
+def test_objeto_literal_sin_cita_se_conserva():
     anchors = _payload(objetos=[{"objeto": "bandera", "linea": ""}])
     assert len(la.verify_anchors(anchors, LETRA)["objetos"]) == 1
+
+
+def test_objeto_inventado_sin_cita_se_descarta():
+    anchors = _payload(
+        lugar=None,
+        linea_lugar=None,
+        objetos=[{"objeto": "helicoptero", "linea": ""}],
+    )
+    assert la.verify_anchors(anchors, LETRA) is None
+
+
+def test_lugar_literal_sin_cita_se_conserva():
+    anchors = _payload(lugar="Plaza de Mayo", linea_lugar=None, objetos=[])
+    assert la.verify_anchors(anchors, LETRA)["lugar"] == "Plaza de Mayo"
+
+
+def test_lugar_inventado_sin_cita_se_descarta():
+    anchors = _payload(lugar="Machu Picchu", linea_lugar=None, objetos=[])
+    assert la.verify_anchors(anchors, LETRA) is None
 
 
 def test_verify_devuelve_none_si_no_queda_nada():
