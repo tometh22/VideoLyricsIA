@@ -3,6 +3,14 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.22] - 2026-09-11
+
+### Fixed
+
+- Show immediate, live progress while a campaign submits multiple video jobs,
+  including the current song, submitted count, and an explicit duplicate-click
+  warning instead of leaving a disabled confirmation modal that appears inert.
+
 ## [1.1.21] - 2026-09-11
 
 ### Changed

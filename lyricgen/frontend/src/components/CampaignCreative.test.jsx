@@ -5,10 +5,11 @@ import CampaignCreative from "./CampaignCreative";
 vi.mock("../i18n", () => ({ useI18n: () => ({ t: () => "" }) }));
 vi.mock("./WizardLivePreview", () => ({ default: () => <div>Vista previa visual</div> }));
 vi.mock("../mediaUrl", () => ({ useLazyMediaUrl: () => ({ ref: () => {}, url: "" }) }));
-let head, report, calls;
+let head, report, calls, generateGate;
 const response = data => ({ ok: true, json: async () => data });
 beforeEach(() => {
   calls = [];
+  generateGate = null;
   head = { plan: { revision: 0 }, can_manage: true, veo_model: "veo-3.1-fast-generate-001", fields: {
     font: { label: "Tipografía", group: "Letra", kind: "select", options: ["", "anton"] },
     effect: { label: "Efecto", group: "Movimiento y efectos", kind: "select", options: ["", "bokeh", "rain"] },
@@ -21,6 +22,8 @@ beforeEach(() => {
     if (url.endsWith("/backgrounds")) return response([]);
     if (url.endsWith("/preview")) return response({ preview_id: "p1", counts: [39], rounded: false, skipped: [], changes: head.items.map(i => ({ item_id: i.id, artist: i.artist, title: i.title, group: "Estilo 1", before: {}, after: { font: "anton" } })) });
     if (url.endsWith("/apply")) { head = { ...head, plan: { revision: 1 } }; return response({ revision: 1 }); }
+    if (url.includes("/status/")) return response({ artist: "Artista", song_title: "Tema", segments_json: [], segments_revision: 2 });
+    if (url.endsWith("/generate")) { if (generateGate) await generateGate; return response({ ok: true }); }
     throw new Error(`Unexpected request: ${url}`);
   }));
 });
@@ -81,5 +84,19 @@ describe("campaign bulk design", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Videos aprobados 1$/ }));
     expect(screen.getByText("Tema 2")).toBeInTheDocument();
     expect(screen.queryByText("Tema 0")).not.toBeInTheDocument();
+  });
+  it("shows immediate progress while the selected videos are being submitted", async () => {
+    let releaseGenerate;
+    generateGate = new Promise(resolve => { releaseGenerate = resolve; });
+    mount("creative");
+    fireEvent.click(await screen.findByRole("button", { name: "Seleccionar listas para generar (2)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preparar generación de 2 aprobadas seleccionadas" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar generación" }));
+    expect(await screen.findByRole("status", { name: "" })).toHaveTextContent("Enviando 1 de 2");
+    expect(screen.getByText(/No vuelvas a confirmar/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Enviando 0 de 2/ })).toBeDisabled();
+    releaseGenerate();
+    await screen.findByText("2 trabajos enviados; consultá el historial de esta campaña.");
+    expect(calls.filter(([url]) => url.endsWith("/generate"))).toHaveLength(2);
   });
 });
