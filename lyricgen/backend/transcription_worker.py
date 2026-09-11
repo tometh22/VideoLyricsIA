@@ -472,6 +472,7 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             r.pop("_pre_anchor_provider_segments", None)
             r.pop("_recognition_hypotheses", None)
             r.pop("_recognition_attempt_count", None)
+            r.pop("_reconcile_capture", None)
             r.pop("_primary_asr_family", None)
             r.pop("_independent_asr_family", None)
             r.pop("_lora_asr_words", None)
@@ -662,6 +663,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     r.pop("_pre_anchor_provider_segments", None)
     r.pop("_recognition_hypotheses", None)
     r.pop("_recognition_attempt_count", None)
+    r.pop("_reconcile_capture", None)
     r.pop("_primary_asr_family", None)
     r.pop("_independent_asr_family", None)
     r.pop("_lora_asr_words", None)
@@ -698,6 +700,7 @@ def run_transcription_job(
     # Observability 2026-06-10: toda línea de log de este job lleva job_id.
     from observability import set_job_log_context
     set_job_log_context(job_id)
+    from reconcile_capture import record_result as _record_reconcile_result
     # Lazy import — main.py es pesado y el worker no debería pagarlo si
     # corre otros queues. asyncio.run abre/cierra su propio event loop por job,
     # que es lo que queremos (jobs independientes, sin event-loop leak).
@@ -888,6 +891,7 @@ def run_transcription_job(
             # other timing/content post-pass can replace words and bounds.
             from line_evidence import freeze_result_provider_evidence
             r = freeze_result_provider_evidence(r)
+            _record_reconcile_result(r, "post:freeze_result_provider_evidence")
             r = await _maybe_apply_catalog_reference(
                 r,
                 audio_path,
@@ -897,6 +901,7 @@ def run_transcription_job(
                 live=live or _looks_live(title, filename),
                 aligner=_maybe_anchor_align,
             )
+            _record_reconcile_result(r, "post:_maybe_apply_catalog_reference")
             # Post-pases gateados, en lockstep con los dos endpoints HTTP
             # (/transcribe y /transcribe-uploaded). ESTE es el camino que
             # usa el frontend real (enqueue → ShortWorker), así que si acá
@@ -915,6 +920,7 @@ def run_transcription_job(
             if (anchor_lyrics or "").strip():
                 r = await _maybe_anchor_align(r, audio_path, job_id,
                                               anchor_lyrics)
+                _record_reconcile_result(r, "post:_maybe_anchor_align")
                 if (
                     isinstance(r, dict)
                     and (r.get("anchor_alignment") or {}).get("status")
@@ -924,6 +930,7 @@ def run_transcription_job(
             if not (isinstance(r, dict)
                     and r.get("timing_source") == "anchor_ctc"):
                 r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
+                _record_reconcile_result(r, "post:_maybe_ctc_retime")
             _post_lang = _resolve_postprocess_language(
                 language, r, job_id=job_id,
             )
@@ -932,24 +939,34 @@ def run_transcription_job(
                 live_hint=live or _looks_live(title, filename),
                 language=_post_lang,
             )
+            _record_reconcile_result(r, "post:_maybe_adlib_filter")
             r = _maybe_repetition_reconcile(r, job_id)
+            _record_reconcile_result(r, "post:_maybe_repetition_reconcile")
             r = await _maybe_gap_rescue(r, audio_path, job_id, _post_lang)
+            _record_reconcile_result(r, "post:_maybe_gap_rescue")
             r = await _maybe_lora_family(r, audio_path, job_id, _post_lang)
+            _record_reconcile_result(r, "post:_maybe_lora_family")
             r = await _maybe_word_vote(
                 r, audio_path, job_id, _post_lang,
                 live_hint=live or _looks_live(title, filename),
             )
+            _record_reconcile_result(r, "post:_maybe_word_vote")
             r = _maybe_chorus_snap(r, job_id)
+            _record_reconcile_result(r, "post:_maybe_chorus_snap")
             r = _maybe_phrase_segment(r, job_id)
+            _record_reconcile_result(r, "post:_maybe_phrase_segment")
             from lyrics_format import format_lyrics_pass as _fmt
             _antes = _coverage_de(r)
             r = await _fmt(r, language=_post_lang)
+            _record_reconcile_result(r, "post:_fmt")
             r = _drop_final_credit_hallucinations(r, job_id)
+            _record_reconcile_result(r, "post:_drop_final_credit_hallucinations")
             # Último post-pase: re-encuadra cada cartel a sus propias palabras
             # (audit 2026-08-13). Va al final porque todas las etapas de
             # arriba pueden haber movido start/end o words de forma
             # independiente. Lockstep con los dos caminos HTTP de main.py.
             r = _maybe_timing_consistency(r, job_id)
+            _record_reconcile_result(r, "post:_maybe_timing_consistency")
             r = await _quality_gate_and_retry(
                 r, audio_path, job_id, _post_lang, _antes,
                 _maybe_timing_consistency,

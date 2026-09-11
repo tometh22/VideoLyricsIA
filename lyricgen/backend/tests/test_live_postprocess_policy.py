@@ -116,11 +116,11 @@ def test_both_live_policies_postprocess_before_emit_and_reconcile():
     branch = src.index("if _live_no_hint or _live_audio_truth:")
     postprocess = src.index("await _postprocess_live_whisperx(", branch)
     emit = src.index("return _emit_segments(", postprocess)
-    reconcile = src.index("_reconciled = _wxr.reconcile", emit)
+    reconcile = src.index("_reconciled = _captured_reconcile", emit)
 
     assert branch < postprocess < emit < reconcile
     live_exit = src[branch:reconcile]
-    assert "_wxr.reconcile" not in live_exit
+    assert "_captured_reconcile(" not in live_exit
     assert "forced_align" not in live_exit
 
 
