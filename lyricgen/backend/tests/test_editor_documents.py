@@ -74,6 +74,71 @@ def _token_for(user):
         db.close()
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("campaign_song,status,expected", [
+    (True, "lyrics_approved", "transcribed_pending"),
+    (False, "lyrics_approved", "lyrics_approved"),
+    (True, "pending_review", "pending_review"),
+    (True, "done", "done"),
+])
+def test_native_editor_reopens_only_changed_prerender_campaign_approval(
+    client, monkeypatch, campaign_song, status, expected, legacy,
+):
+    import main
+    from database import BatchCampaign
+    monkeypatch.setattr(main, "_dispatch_editor_quality_outbox", lambda _event_id: None)
+    first, _, job_id = _users_and_job()
+    token = _token_for(first)
+    with SessionLocal() as db:
+        job = db.query(Job).filter_by(job_id=job_id).one()
+        if campaign_song:
+            campaign = BatchCampaign(id=uuid.uuid4().hex[:12], name="Editor reopen fixture",
+                tenant_id=job.tenant_id, created_by=first.id, status="active")
+            db.add(campaign); db.flush()
+            job.campaign_id = campaign.id
+        job.status = status
+        job.approved_by = first.id
+        job.approved_at = datetime.now(timezone.utc)
+        job.transcription_quality = {"pre_background_approval": {"editor_revision": 0}}
+        db.commit()
+    loaded = client.get(f"/editor/{job_id}", headers=auth(token))
+    assert loaded.status_code == 200
+    assert loaded.json()["job_status"] == status
+    segments = loaded.json()["segments"]
+    save = client.post if legacy else client.patch
+    save_path = f"/jobs/{job_id}/save-segments" if legacy else f"/editor/{job_id}"
+    unchanged = save(save_path, headers=auth(token), json={
+        "base_revision": loaded.json()["revision"], "segments": segments, "checkpoint": "draft",
+    })
+    assert unchanged.status_code == 200
+    if not legacy or campaign_song and status == "lyrics_approved":
+        assert unchanged.json()["applied"] is False
+    assert client.get(f"/editor/{job_id}", headers=auth(token)).json()["job_status"] == status
+    segments[0]["text"] = "Human correction after approval"
+    saved = save(save_path, headers=auth(token), json={
+        "base_revision": unchanged.json()["revision"], "segments": segments, "checkpoint": "draft",
+    })
+    assert saved.status_code == 200 and saved.json()["applied"] is True
+    reread = client.get(f"/editor/{job_id}", headers=auth(token)).json()
+    assert reread["job_status"] == expected
+    assert reread["segments"][0]["text"] == segments[0]["text"]
+    with SessionLocal() as db:
+        job = db.query(Job).filter_by(job_id=job_id).one()
+        if expected == "transcribed_pending":
+            assert job.approved_by is None and job.approved_at is None
+            assert "pre_background_approval" not in job.transcription_quality
+        else:
+            assert job.approved_by == first.id and job.approved_at is not None
+            assert not any(event.detail.get("job_id") == job_id for event in
+                db.query(AuditLog).filter_by(action="batch.lyrics_approval_reopened").all())
+        if campaign_song:
+            campaign_id = job.campaign_id
+            job.campaign_id = None
+            db.flush()
+            db.query(BatchCampaign).filter_by(id=campaign_id).delete(synchronize_session=False)
+            db.commit()
+
+
 def _proposal(proposal_id: str, windows: list[dict]) -> dict:
     return {
         "kind": "review_proposal", "schema": REVIEW_PROPOSAL_SCHEMA,

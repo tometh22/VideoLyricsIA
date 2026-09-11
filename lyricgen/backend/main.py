@@ -15063,6 +15063,25 @@ async def save_segments(
     previous_segments_for_quality = [
         dict(item) for item in (job.segments_json or []) if isinstance(item, dict)
     ]
+    if job.campaign_id and job.status == "lyrics_approved":
+        # Old clients must share the approved-transcript transition with
+        # PATCH /editor. In particular an unchanged autosave must not advance
+        # the revision and silently make the approval stale.
+        try:
+            editor_document, _, applied = save_document(
+                db, job, editor_document, current_user["id"],
+                current_revision, segs, "draft",
+            )
+        except RuntimeError:
+            db.rollback()
+            return JSONResponse(status_code=409, content={"code": "stale_revision"})
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        if not applied:
+            db.commit()
+            return {"ok": True, "job_id": job_id, "applied": False,
+                    "revision": current_revision, "count": len(segs)}
     job.segments_json = segs
     job.segments_revision = current_revision + 1
     job.transcription_quality = _invalidate_quality_after_editor_save(

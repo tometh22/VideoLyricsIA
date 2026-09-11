@@ -138,14 +138,23 @@ describe.each(["/admin/cola", "/campaigns/campaign-1"])("review navigation %s", 
     expect(screen.queryByText(ready.title)).not.toBeInTheDocument();
     expect(screen.getByText(approved.title)).toBeInTheDocument();
   });
-  it("opens approved details with the selected filter in return_to", async () => {
+  it("opens the approved transcript with the selected filter in return_to", async () => {
     setupFetch(); mount(path + (path.startsWith("/admin") ? "?scope=approved" : "?tab=approved"));
     await screen.findByText(approved.title);
-    fireEvent.click(screen.getByRole("button", { name: "Ver canción" }));
-    expect(await screen.findByText("Detalle aprobado")).toBeInTheDocument();
-    expect(screen.getByTestId("location")).toHaveTextContent("/videos/j2?return_to=");
+    fireEvent.click(screen.getByRole("button", { name: "Editar transcripción" }));
+    expect(await screen.findByText("Editor")).toBeInTheDocument();
+    expect(screen.getByTestId("location")).toHaveTextContent("/review/j2?return_to=");
     expect(decodeURIComponent(screen.getByTestId("location").textContent)).toContain("approved");
   });
+});
+
+it("keeps the final-review approved video accessible in its own stage", async () => {
+  setupFetch(); mount("/campaigns/campaign-1?tab=approved&stage=final");
+  await screen.findByText(approved.title);
+  fireEvent.click(screen.getByRole("button", { name: "Ver video" }));
+  expect(await screen.findByText("Detalle aprobado")).toBeInTheDocument();
+  expect(screen.getByTestId("location")).toHaveTextContent("/videos/j2?return_to=");
+  expect(decodeURIComponent(screen.getByTestId("location").textContent)).toContain("stage=final");
 });
 
 it("clears the advanced status when changing campaign tabs, and preserves other filters", async () => {

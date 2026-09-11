@@ -1848,6 +1848,22 @@ def save_document(
     document.updated_at = now_utc()
     job.segments_json = normalized
     job.segments_revision = document.revision
+    if getattr(job, "campaign_id", None) and job.status == "lyrics_approved":
+        # Opening or saving an identical snapshot keeps its approval. A real
+        # edit before rendering must return to human review, otherwise the
+        # old revision blocks both generation and a subsequent approval.
+        quality = dict(job.transcription_quality or {})
+        approval = quality.pop("pre_background_approval", None)
+        db.add(AuditLog(user_id=user_id, action="batch.lyrics_approval_reopened", detail={
+            "job_id": job.job_id, "campaign_id": job.campaign_id,
+            "previous_approval": approval,
+            "from_revision": previous_revision, "to_revision": document.revision,
+            "reason": "editor_segments_changed",
+        }))
+        job.transcription_quality = quality
+        job.status = "transcribed_pending"
+        job.approved_at = None
+        job.approved_by = None
     # Any ordinary edit makes a raw proposal stale. Quality-proposal apply
     # writes a text-free tombstone after save_document returns.
     document.quality_proposal = None

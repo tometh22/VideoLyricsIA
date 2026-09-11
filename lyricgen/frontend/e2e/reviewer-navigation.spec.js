@@ -10,7 +10,7 @@ const rows = [
 
 for (const path of ["/admin/cola", "/campaigns/campaign-1"]) {
   test(`${path}: cards, tabs, browser history and approved return`, async ({ page }) => {
-    await installEditorHarness(page, { role: "admin" });
+    await installEditorHarness(page, { jobId: "j2", role: "admin" });
     const mutations = [];
     await page.route("**/*", async (route) => {
       const request = route.request();
@@ -33,9 +33,12 @@ for (const path of ["/admin/cola", "/campaigns/campaign-1"]) {
         }
         return json(campaign);
       }
-      // Exercise the error-state return as well: a missing detail must not
-      // strand the reviewer or silently allocate another campaign job.
-      if (url.pathname === "/status/j2") return json({}, 404);
+      if (url.pathname === "/status/j2") return json({ job_id: "j2", status: "lyrics_approved",
+        campaign_id: campaign.id, campaign_item_id: "i2", filename: "approved.wav",
+        song_title: "Letra ya aprobada", segments_revision: 0,
+        segments_json: [{ start: 0, end: 2, text: "Texto aprobado sin video" }], video_url: null });
+      if (url.pathname.endsWith("/source-audio-url")) return json({ url: "/e2e/audio.wav" });
+      if (url.pathname.endsWith("/waveform")) return json({ peaks: [.1, .2, .1] });
       if (!["localhost", "127.0.0.1"].includes(url.hostname)) return route.abort();
       return route.fallback();
     });
@@ -54,8 +57,9 @@ for (const path of ["/admin/cola", "/campaigns/campaign-1"]) {
     await expect(page.getByText("Fallida", { exact: true })).toBeVisible();
     await page.goBack();
     await expect(page.getByRole("tab", { name: /Aprobadas/ })).toHaveAttribute("aria-selected", "true");
-    await page.getByRole("button", { name: "Ver canción", exact: true }).click();
-    await expect(page).toHaveURL(/\/videos\/j2\?return_to=/);
+    await page.getByRole("button", { name: "Editar transcripción", exact: true }).click();
+    await expect(page).toHaveURL(/\/review\/j2\?return_to=/);
+    await expect(page.getByLabel("Letra de la línea 1")).toHaveValue("Texto aprobado sin video");
     await page.getByRole("button", { name: "Volver", exact: true }).click();
     await expect(page.getByRole("tab", { name: /Aprobadas/ })).toHaveAttribute("aria-selected", "true");
     await expect(page.getByText("Letra ya aprobada", { exact: true })).toBeVisible();
