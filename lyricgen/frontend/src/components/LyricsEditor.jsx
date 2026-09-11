@@ -5968,12 +5968,10 @@ export default function LyricsEditor({
                       onKeyDown={(e) => {
                         const el = e.currentTarget;
                         if (e.key === "Enter") {
-                          if (requireLineReview) {
-                            e.preventDefault();
-                            el.blur();
-                            return;
-                          }
                           // Split THIS line at the cursor, word-aware (keeps timing).
+                          // Campaign review uses Enter for the same structural edit:
+                          // line confirmation is song-scoped, so it must not shadow
+                          // the editor's established split shortcut.
                           e.preventDefault();
                           const caret = el.selectionStart ?? el.value.length;
                           if (!el.value.slice(0, caret).trim() || !el.value.slice(caret).trim()) {
