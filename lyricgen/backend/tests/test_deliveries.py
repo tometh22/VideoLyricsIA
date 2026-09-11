@@ -275,6 +275,8 @@ def test_portal_items_lists_active_deliveries(client, admin_token, approved_job,
     # Then list
     res = client.get("/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN})
     assert res.status_code == 200
+    assert res.headers["cache-control"] == "private, no-store, max-age=0"
+    assert res.headers["pragma"] == "no-cache"
     payload = res.json()
     assert "songs" in payload
     assert "file_type_labels" in payload

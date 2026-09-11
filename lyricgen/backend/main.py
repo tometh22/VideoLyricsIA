@@ -20396,6 +20396,7 @@ async def portal_get_meta(
 
 @app.get("/api/deliveries/items")
 async def portal_get_items(
+    response: Response,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_deliveries_db),
@@ -20406,6 +20407,11 @@ async def portal_get_items(
     under Railway's multi-worker setup — see the module-level note next
     to _DELIVERY_URL_EXPIRY_S."""
     portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    # The listing contains private, short-lived R2 URLs and is served through
+    # both UMG hostnames. Never let a CDN/proxy reuse one portal's response
+    # for the other portal (or expose signed URLs from a shared cache).
+    response.headers["Cache-Control"] = "private, no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     import time
     from concurrent.futures import ThreadPoolExecutor
 
