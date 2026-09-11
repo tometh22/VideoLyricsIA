@@ -18074,6 +18074,25 @@ def _resolve_title_song(song_title: str, mp3_path: str, artist: str) -> str:
     return title_song
 
 
+def _visual_render_options_selected(
+    *,
+    effect: str = "",
+    lyrics_animation: str = "none",
+    line_transition: str = "none",
+) -> bool:
+    """Whether the render contains a visual option that must be honored.
+
+    ASS is the only renderer that implements the lyric animation and line
+    transition templates. Keeping this predicate in one place prevents a
+    fallback from turning a selected option into a successful-but-plain
+    deliverable. ``cut`` is the legacy spelling for no line motion.
+    """
+    return any(
+        str(value or "").strip().lower() not in {"", "none", "cut"}
+        for value in (effect, lyrics_animation, line_transition)
+    )
+
+
 def generate_lyric_video(
     mp3_path: str,
     segments: list[dict],
@@ -18222,12 +18241,29 @@ def generate_lyric_video(
     # pop/glow) ni line_transition (slide_up/slide_side/wipe/dissolve_blur).
     # Solo libass los implementa. El operador reportó que sus selecciones
     # "no salen en el video" — era esto: el default mandaba todo por
-    # moviepy, ignorando silenciosamente las animaciones. Si libass falla
-    # en runtime, el try/except (líneas ~7664+) cae a moviepy igual.
-    # Override vía env LYRIC_RENDER_ENGINE=moviepy para forzar path viejo.
+    # moviepy, ignorando silenciosamente las animaciones. Con una opción
+    # visual seleccionada, un fallo de libass ahora hace fallar el render;
+    # el fallback MoviePy queda reservado para el caso sin opciones visuales.
+    # LYRIC_RENDER_ENGINE=moviepy también queda bloqueado si hay una opción
+    # visual seleccionada, para evitar entregar un video plano por accidente.
     _engine = os.environ.get("LYRIC_RENDER_ENGINE", "ass").lower()
     _bg_is_video = not bg_source.lower().endswith((".jpg", ".jpeg", ".png"))
     _ass_ok_profile = spec.profile in ("youtube", "umg_intermediate")
+    _visual_options_selected = _visual_render_options_selected(
+        effect=effect,
+        lyrics_animation=lyrics_animation,
+        line_transition=line_transition,
+    )
+    if _visual_options_selected and _engine != "ass":
+        raise RuntimeError(
+            "selected visual effects/lyric animations require the ASS renderer; "
+            f"LYRIC_RENDER_ENGINE={_engine!r}"
+        )
+    if _visual_options_selected and not _ass_ok_profile:
+        raise RuntimeError(
+            "selected visual effects/lyric animations are unsupported for "
+            f"render profile {spec.profile!r}"
+        )
     if _engine == "ass" and _ass_ok_profile:
         try:
             ass_bg = bg_source
@@ -18270,6 +18306,17 @@ def generate_lyric_video(
             audio.close()
             return out, font, bg_source
         except Exception as e:
+            if _visual_options_selected:
+                # Never deliver a video that claims to contain an effect or
+                # animation while the fallback silently dropped it. Raising
+                # also lets the queue retry with the full diagnostic context.
+                audio.close()
+                raise RuntimeError(
+                    "ASS render failed while selected visual options were "
+                    f"requested (effect={effect!r}, "
+                    f"lyrics_animation={lyrics_animation!r}, "
+                    f"line_transition={line_transition!r}): {e}"
+                ) from e
             # Never fail the job on a fast-path error — fall through to the
             # proven moviepy composite below.
             logger.warning(
@@ -18528,7 +18575,15 @@ def generate_lyric_video(
                 _fx_source = _fx_source.fx(_vfx.speedx, factor=_fx_bpm / 120.0)
             _fx_clip = (_fx_source.fx(_vfx.loop, duration=duration)
                         .set_duration(duration))
+        if _visual_render_options_selected(effect=effect) and not _fx_path:
+            raise RuntimeError(
+                f"effect '{effect}' was requested but its overlay asset is unavailable"
+            )
     except Exception as _e:
+        if _visual_render_options_selected(effect=effect):
+            raise RuntimeError(
+                f"selected effect '{effect}' could not be composited in the MoviePy path: {_e}"
+            ) from _e
         logger.warning("[FX] moviepy effect skipped (%s); continuing", _e)
         _fx_clip = None
 
@@ -18804,8 +18859,9 @@ def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str,
     The short is moviepy-rendered and moviepy can't reproduce these blend
     modes efficiently, so the
     effect is applied as a C-level ffmpeg post-pass using the SAME pre-baked
-    fx assets the main video composites (fx_compositor). Falls back to the
-    un-effected short if ffmpeg fails."""
+    fx assets the main video composites (fx_compositor). A selected effect
+    fails the render if ffmpeg cannot apply it; returning a plain short would
+    silently violate the editor's visual selection."""
     tmp = os.path.join(job_dir, "short_fx.mp4")
     # Same per-effect pre-blend gain as the main libass path (fx_compositor),
     # so a dim effect (stars/bokeh/snow) reads the same in the short as in the
@@ -18838,13 +18894,18 @@ def _apply_short_effect(short_path: str, fx_path: str, fps: float, job_dir: str,
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if r.returncode != 0:
-            logger.warning("[SHORT] effect overlay failed (%s); keeping plain short",
-                           (r.stderr or "")[-200:])
-            return short_path
+            raise RuntimeError(
+                "short effect overlay failed: "
+                f"{(r.stderr or '').strip()[-500:]}"
+            )
         os.replace(tmp, short_path)
         logger.info("[SHORT] effect overlay applied")
     except Exception as e:
-        logger.warning("[SHORT] effect overlay errored (%s); keeping plain short", e)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise RuntimeError(f"short effect overlay errored: {e}") from e
     return short_path
 
 
@@ -19308,6 +19369,10 @@ def generate_short(
 
     import fx_compositor as _fx
     _selected_fx = _fx.effect_path(effect)
+    if _visual_render_options_selected(effect=effect) and not _selected_fx:
+        raise RuntimeError(
+            f"effect '{effect}' was requested but its overlay asset is unavailable"
+        )
 
     audio = AudioFileClip(mp3_path)
     start_time = _find_chorus_start(segments)
@@ -19488,6 +19553,22 @@ def generate_short(
     if burned:
         os.replace(burned, out_path)
     else:
+        if _visual_render_options_selected(
+            lyrics_animation=lyrics_animation,
+            line_transition=line_transition,
+        ):
+            _alert_sentry(
+                "short-libass-required",
+                "[SHORT] la pasada libass falló con una animación o transición "
+                "seleccionada; se rechaza el fallback MoviePy para no perderla",
+                job_dir=job_dir,
+                extra={"libass_error": libass_error} if libass_error else None,
+            )
+            raise RuntimeError(
+                "short ASS text burn failed while selected visual options were "
+                f"requested (lyrics_animation={lyrics_animation!r}, "
+                f"line_transition={line_transition!r}): {libass_error or 'unknown error'}"
+            )
         # Fallback histórico (moviepy/ImageMagick): texto menos idéntico al
         # video, pero un short SIN letra sería peor. Además de loggearse,
         # se ALERTA en Sentry: este es el único camino que puede volver a

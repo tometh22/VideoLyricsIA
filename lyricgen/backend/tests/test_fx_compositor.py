@@ -70,6 +70,15 @@ def test_no_effect_with_grade_prepends_eq():
     assert vf.startswith("eq=") and ",subtitles=lyrics.ass" in vf
 
 
+def test_requested_missing_effect_fails_instead_of_becoming_noop(monkeypatch):
+    monkeypatch.setattr(fx, "effect_path", lambda _effect: None)
+    with pytest.raises(RuntimeError, match="overlay asset is unavailable"):
+        fx.build_video_filter(
+            ass_basename="lyrics.ass", font_dir="/tmp/fonts",
+            width=1920, height=1080, effect="snow",
+        )
+
+
 def test_effect_builds_filter_complex_with_rgb_blend_fix():
     fc, use_complex, extra = fx.build_video_filter(
         ass_basename="lyrics.ass", font_dir="/tmp/fonts",
