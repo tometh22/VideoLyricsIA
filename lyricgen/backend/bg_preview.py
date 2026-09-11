@@ -53,6 +53,7 @@ import os
 import tempfile
 from typing import Optional
 
+import lyric_anchors
 from background_policy import (
     cache_policy_fingerprint,
     policy_enforces,
@@ -148,6 +149,16 @@ def compute_bg_cache_key(params: dict) -> str:
         # NOTA v7: la LETRA no entra al hash a propósito (ver CACHE_VERSION).
         # lyrics_text influye la generación del preview, no la etiqueta.
     }
+    # El motor anclado produce un prompt completamente distinto para los mismos
+    # parámetros de wizard: un fondo fabricado por el motor viejo no puede
+    # entrar como cache-hit del nuevo (ni al revés en un rollback), o el
+    # operador vería justo el fondo genérico que el flag existe para dejar
+    # atrás. La clave se agrega SÓLO cuando el modo no es `off`, así con el flag
+    # apagado el hash queda idéntico y el caché existente sigue sirviendo.
+    _anchors = lyric_anchors.anchors_mode()
+    if _anchors != "off":
+        canonical["_anchors_mode"] = _anchors
+
     payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return digest[:12]

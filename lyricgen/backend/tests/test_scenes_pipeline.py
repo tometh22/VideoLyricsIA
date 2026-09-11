@@ -15,9 +15,18 @@ def test_visual_bible_fallback_when_gemini_unavailable(monkeypatch):
     monkeypatch.setattr(pipeline, "_get_genai_client", boom)
     bible = pipeline._build_visual_bible(
         "una letra cualquiera", "Artista", style="neon", genre="rock")
-    # Siempre devuelve las 5 claves del look book, no-vacías.
-    assert set(bible) == {"world", "palette", "texture", "camera", "motif"}
+    # Siempre devuelve las 6 claves del look book, no-vacías.
+    #
+    # `light` se sumó el 2026-09-03: la regla del producto es que la iluminación
+    # no cambie durante la canción (si es atardecer, se mantiene el atardecer) y
+    # `palette` no alcanzaba — describe colores, no un momento del día. Como
+    # multi-escena genera cada escena por separado, sin una luz compartida
+    # explícita el verso podía salir a mediodía y el coro de noche.
+    assert set(bible) == {"world", "palette", "texture", "camera", "motif", "light"}
     assert all(isinstance(v, str) and v.strip() for v in bible.values())
+    # El fallback sin LLM también fija UNA hora del día, no la deja librada a
+    # cada escena.
+    assert "consistent time of day" in bible["light"]
     # La paleta del fallback refleja el style elegido.
     assert "neon" in bible["palette"].lower()
     # El fallback determinista NO debe traer sesgo de film/calibre (no pasa por

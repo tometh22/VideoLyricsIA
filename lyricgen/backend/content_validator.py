@@ -1,10 +1,20 @@
 """Content validation for generated background assets.
 
 Gemini Vision is used as a classifier, not as the policy authority.  It
-reports independent detections for people, atmospheric effects and commercial
-brands; the caller then decides which dimensions are allowed for this render.
-Keeping detection separate from enforcement prevents an opt-in for one visual
-element from accidentally disabling the other safety gates.
+reports independent detections for people, atmospheric effects, commercial
+brands and readable text; the caller then decides which dimensions are allowed
+for this render.  Keeping detection separate from enforcement prevents an opt-in
+for one visual element from accidentally disabling the other safety gates.
+
+`text` (2026-09-03) es la categoría más nueva y arranca en OBSERVACIÓN. El riel
+del prompt pedía "no text, no words, no letters" desde siempre, pero el gate no
+lo hacía cumplir: `brand` sólo mira marcas famosas y las palabras genéricas de
+cartelería y los "invented / gibberish text strings" estaban listados como
+aceptables — que son justo el artefacto típico de un generador de video. Ahora
+se detecta y se registra, pero sólo bloquea con `enforce_text=True`: antes de
+ponerlo en bloqueo hay que medir su tasa de falsos positivos sobre escenas
+urbanas legítimas, porque este repo ya tuvo un incidente de sobre-bloqueo del
+validador (jul-2026).
 """
 
 import logging
@@ -194,6 +204,31 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             "steam, vapor, a smoke machine, or a smoke-like atmospheric cloud "
             "is visibly present. Ordinary clouds in the sky, rain, dust, lens "
             "flare, bokeh and solid objects are not atmospherics.\n\n"
+            # Categoría nueva (2026-09-03). El riel del prompt pedía "no text,
+            # no words, no letters" desde siempre, pero el gate de salida NO lo
+            # hacía cumplir: `brand` sólo mira marcas comerciales famosas, y más
+            # abajo se listan como ACEPTABLES las palabras genéricas de
+            # cartelería y los "invented / gibberish / stylized text strings" —
+            # que son justo el artefacto típico de un generador de video. Un
+            # fondo con garabatos de IA pasaba el gate.
+            #
+            # Se reporta por separado de `brand` porque son riesgos distintos:
+            # `brand` es IP y bloquea siempre; `text` es un requisito de entrega
+            # del sello y arranca en observación para medir su tasa de falsos
+            # positivos antes de bloquear (este repo ya tuvo un incidente de
+            # sobre-bloqueo del validador, jul-2026).
+            "Set detections.text=true when ANY legible writing is visible in the "
+            "frame: letters, numbers, words, captions or subtitles, in any "
+            "language or alphabet — INCLUDING invented, garbled, misspelled or "
+            "AI-hallucinated glyphs that still read as writing. Report it "
+            "wherever it appears: signage, billboards, posters, banners, shop "
+            "windows, screens, painted walls, packaging, clothing or vehicles.\n"
+            "Set detections.text=false when the surface exists but carries no "
+            "readable content: blank, unmarked, weathered, peeling, smudged, "
+            "heavily blurred or too distant to resolve. A blank cardboard sign "
+            "or an empty billboard is ACCEPTABLE and must not be reported. "
+            "Abstract patterns, textures and shapes that merely resemble writing "
+            "without resolving into characters are also acceptable.\n\n"
             "Set detections.brand=true for these legal/IP risks:\n"
             "    - Text matching a globally famous COMMERCIAL brand "
             "(Nike, Coca-Cola, McDonald's, Apple, Pepsi, Adidas, "
@@ -224,7 +259,8 @@ def _check_frame_with_gemini(image_path: str) -> dict:
             "object could be operated by one. "
             "Respond ONLY with JSON using exactly this schema: "
             '{"detections":{"people":true/false,"atmospherics":true/false,'
-            '"brand":true/false},"issues":[{"category":"people|atmospherics|brand",'
+            '"brand":true/false,"text":true/false},'
+            '"issues":[{"category":"people|atmospherics|brand|text",'
             '"reason":"specific visible evidence"}]}'
         )
         response = None
@@ -309,6 +345,7 @@ def _evaluate_frame_result(
     allow_people: bool,
     allow_atmospherics: bool,
     enforce_atmospherics: bool,
+    enforce_text: bool = False,
 ) -> dict:
     """Apply render policy to a classifier result.
 
@@ -327,7 +364,8 @@ def _evaluate_frame_result(
             # human must never accidentally allow a brand (or vice versa).
             "passed": legacy_safe and not legacy_issues,
             "issues": legacy_issues,
-            "detections": {"people": False, "atmospherics": False, "brand": False},
+            "detections": {"people": False, "atmospherics": False,
+                           "brand": False, "text": False},
             "observations": [],
         }
 
@@ -335,9 +373,10 @@ def _evaluate_frame_result(
         "people": detections.get("people") is True,
         "atmospherics": detections.get("atmospherics") is True,
         "brand": detections.get("brand") is True,
+        "text": detections.get("text") is True,
     }
     reasons_by_category: dict[str, list[str]] = {
-        "people": [], "atmospherics": [], "brand": [],
+        "people": [], "atmospherics": [], "brand": [], "text": [],
     }
     for item in result.get("issues", []):
         if isinstance(item, dict) and item.get("category") in reasons_by_category:
@@ -365,6 +404,12 @@ def _evaluate_frame_result(
         and enforce_atmospherics
     ):
         blocked_categories.append("atmospherics")
+    # `text` sigue el mismo camino que atmospherics: se mide siempre, bloquea
+    # sólo cuando se lo pide explícitamente. Arranca en observación a propósito
+    # — pasarlo a bloqueo sin conocer su tasa de falsos positivos sobre escenas
+    # urbanas legítimas repetiría el sobre-bloqueo de jul-2026.
+    if normalized["text"] and enforce_text:
+        blocked_categories.append("text")
 
     blocked_issues = []
     for category in blocked_categories:
@@ -375,6 +420,9 @@ def _evaluate_frame_result(
     if normalized["atmospherics"] and not allow_atmospherics:
         reasons = reasons_by_category["atmospherics"] or ["Atmospheric effect detected"]
         observations.extend(f"atmospherics: {reason}" for reason in reasons)
+    if normalized["text"] and not enforce_text:
+        reasons = reasons_by_category["text"] or ["Readable text detected"]
+        observations.extend(f"text: {reason}" for reason in reasons)
 
     return {
         "passed": not blocked_categories,
@@ -419,7 +467,8 @@ def validate_video(
     all_issues = []
     check_errors = 0
     frames_checked = 0
-    detected = {"people": False, "atmospherics": False, "brand": False}
+    detected = {"people": False, "atmospherics": False, "brand": False,
+                "text": False}
     observations = []
 
     try:
