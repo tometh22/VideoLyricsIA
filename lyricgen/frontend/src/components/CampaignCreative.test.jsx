@@ -12,7 +12,7 @@ beforeEach(() => {
   head = { plan: { revision: 0 }, can_manage: true, veo_model: "veo-3.1-fast-generate-001", fields: {
     font: { label: "Tipografía", group: "Letra", kind: "select", options: ["", "anton"] },
     effect: { label: "Efecto", group: "Movimiento y efectos", kind: "select", options: ["", "bokeh", "rain"] },
-  }, operations: [], items: Array.from({ length: 39 }, (_, i) => ({ id: `i${i}`, title: `Tema ${i}`, artist: "Artista", status: "transcribed_pending", settings: {} })) };
+  }, operations: [], items: Array.from({ length: 39 }, (_, i) => ({ id: `i${i}`, title: `Tema ${i}`, artist: "Artista", status: i < 2 ? "lyrics_approved" : i === 2 ? "done" : "transcribed_pending", settings: {} })) };
   report = { campaign_id: "c1", name: "Chile", at: new Date().toISOString(), contract: {}, groups: [], videos: [], history: [] };
   vi.stubGlobal("fetch", vi.fn(async (url, options = {}) => {
     calls.push([url, options]);
@@ -30,8 +30,9 @@ const mount = view => render(<MemoryRouter><CampaignCreative campaignId="c1" vie
 describe("campaign bulk design", () => {
   it("selects all pages, previews a partial change and only saves on confirmation", async () => {
     mount("creative");
-    fireEvent.click(await screen.findByRole("button", { name: /Seleccionar todas las coincidencias/ }));
-    expect(screen.getByText("39 seleccionadas")).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: /Seleccionar resultados/ }));
+    expect(screen.getByLabelText(/39 seleccionadas/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Configurar estilos y reparto/ }));
     fireEvent.click(screen.getByText("Cambiar Tipografía"));
     fireEvent.change(screen.getByLabelText("Estilo 1: Tipografía"), { target: { value: "anton" } });
     fireEvent.change(screen.getByLabelText("Motivo del cambio"), { target: { value: "Tipografía acordada" } });
@@ -48,7 +49,8 @@ describe("campaign bulk design", () => {
   });
   it("invalidates the preview after changing any assignment input", async () => {
     mount("creative");
-    fireEvent.click(await screen.findByRole("button", { name: /Seleccionar todas las coincidencias/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Seleccionar resultados/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Configurar estilos y reparto/ }));
     fireEvent.change(screen.getByLabelText("Motivo del cambio"), { target: { value: "Acordado" } });
     fireEvent.click(screen.getByRole("button", { name: "Ver reparto antes de guardar" }));
     await screen.findByRole("button", { name: "Guardar esta asignación" });
@@ -62,8 +64,22 @@ describe("campaign bulk design", () => {
     expect(calls.some(([url]) => url === "/jobs")).toBe(false);
   });
   it("never offers generation to selections that are not approved", async () => {
+    head = { ...head, items: head.items.map(item => ({ ...item, status: "transcribed_pending" })) };
     mount("creative");
-    fireEvent.click(await screen.findByRole("button", { name: /Seleccionar todas las coincidencias/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Seleccionar resultados/ }));
     await waitFor(() => expect(screen.getByRole("button", { name: /Preparar generación de 0/ })).toBeDisabled());
+  });
+  it("filters and selects only songs that are ready to generate", async () => {
+    mount("creative");
+    fireEvent.click(await screen.findByRole("button", { name: /^Listas para generar 2$/ }));
+    expect(screen.getByText("Tema 0")).toBeInTheDocument();
+    expect(screen.getByText("Tema 1")).toBeInTheDocument();
+    expect(screen.queryByText("Tema 2")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Seleccionar listas para generar (2)" }));
+    expect(screen.getByLabelText(/2 seleccionadas/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Preparar generación de 2 aprobadas seleccionadas" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: /^Videos aprobados 1$/ }));
+    expect(screen.getByText("Tema 2")).toBeInTheDocument();
+    expect(screen.queryByText("Tema 0")).not.toBeInTheDocument();
   });
 });
