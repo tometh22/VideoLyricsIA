@@ -7268,6 +7268,30 @@ async def _run_transcription_for_job(
     from recognition_provenance import begin_collection as _begin_recognition
     from recognition_provenance import end_collection as _end_recognition
     _recognition_collector, _recognition_token = _begin_recognition()
+    from reconcile_capture import begin as _begin_reconcile_capture
+    _capture = _begin_reconcile_capture(
+        job_id, audio_path, route_context={
+            "requested_language": language, "live": live,
+            "reference_required": reference_required, "workload_class": workload_class,
+            "parallel_audio_reference": parallel_audio_reference,
+        },
+    )
+
+    def _captured_reconcile(wx_segments, canonical, *, route, alignment_path):
+        import whisperx_reconcile
+        _capture.audio("alignment:" + route, alignment_path)
+        _capture.record("reconcile_input", {
+            "route": route, "wx_segs": wx_segments,
+            "resolved_language": lang,
+            "reference_text": canonical, "kwargs": {},
+        })
+        try:
+            value = whisperx_reconcile.reconcile(wx_segments, canonical)
+        except Exception as exc:
+            _capture.record("reconcile_exception", {"type": type(exc).__name__})
+            raise
+        _capture.record("reconcile_output", value)
+        return value
 
     # Filled after the audio-first ASR exists.  `_emit_segments` reads this
     # state at the single output chokepoint so every downstream branch gets
@@ -7342,13 +7366,16 @@ async def _run_transcription_for_job(
         import lead_in as _lead_in
         from whisperx_transcribe import _split_long_segments as _split_long
         def _snap(segs):
-            return _lead_in.polish(
-                _chorus_trim.mark_repetitions(
-                    _beat_snap.apply(tmp_path,
-                        _split_long(segs)
-                    )
-                )
-            )
+            _capture.record("normalized_words", segs)
+            split = _split_long(segs)
+            _capture.record("split_output", split)
+            snapped = _beat_snap.apply(tmp_path, split, capture=_capture.beats)
+            _capture.record("beat_output", snapped)
+            repeated = _chorus_trim.mark_repetitions(snapped)
+            _capture.record("repetition_output", repeated)
+            polished = _lead_in.polish(repeated)
+            _capture.record("lead_hold_output", polished)
+            return polished
 
         # ─── single chokepoint for every segments-bearing return ──────
         # `_emit_segments` is the ONE allowed exit point of this
@@ -7380,6 +7407,13 @@ async def _run_transcription_for_job(
                             recovery_source=None,
                             coverage_warning: bool = False,
                             extra=None):
+            _capture.audio("presentation", tmp_path)
+            _capture.record("emit_input", {
+                "segments": segments, "source": source,
+                "reference_lyrics": reference_lyrics,
+                "content_reference_used": content_reference_used,
+                "reference_id": f"{artist}:{title}",
+            })
             segments = [
                 {
                     key: value for key, value in segment.items()
@@ -7420,7 +7454,9 @@ async def _run_transcription_for_job(
                     f"{artist}:{title}" if reference_used else None
                 ),
             )
+            _capture.record("annotated_output", frozen_segments)
             deduped = _dedup_collisions(frozen_segments)
+            _capture.record("dedup_output", deduped)
             if deduped and segments and len(deduped) != len(segments):
                 logger.info("[EMIT] deduped collisions: %d → %d segments (job=%s)",
                             len(segments), len(deduped), job_id)
@@ -7442,8 +7478,12 @@ async def _run_transcription_for_job(
                     "%s segments job=%s", len(polished), job_id,
                 )
             polished = normalized_polished
+            _capture.record("presentation_output", polished)
             out = {"job_id": job_id, "segments": polished,
                    "reference_lyrics": reference_lyrics}
+            _captured_stages = _capture.snapshot()
+            if _captured_stages is not None:
+                out["_reconcile_capture"] = _captured_stages
             recognition_snapshot = _recognition_collector.snapshot()
             out["_recognition_hypotheses"] = recognition_snapshot["hypotheses"]
             out["_recognition_attempt_count"] = recognition_snapshot[
@@ -8408,7 +8448,7 @@ async def _run_transcription_for_job(
                             return _emit_segments(
                                 _corrected, _WC_WX_REC, reference_lyrics=_canonical,
                             )
-                        _reconciled = _wxr.reconcile(_wx_segs, _canonical)
+                        _reconciled = _captured_reconcile(_wx_segs, _canonical, route="audio_truth_catalog", alignment_path=_aa)
                         if _reconciled:
                             logger.info("[WC] whisperX reconciled (%d/%d lines, canonical=%s) — audio-as-truth path",
                                         len(_reconciled),
@@ -8433,6 +8473,7 @@ async def _run_transcription_for_job(
                                 )
                             except Exception as _clgc_err:
                                 logger.warning("[WC] gap-cluster FAILED: %s", _clgc_err)
+                            _capture.record("gap_cluster_output", _reconciled)
                             from pipeline import _post_reconcile_cleanup as _prc
                             # The reconciler has already chosen the catalogue's
                             # human line structure. Its per-word array is an
@@ -8441,10 +8482,12 @@ async def _run_transcription_for_job(
                             # word gaps can create single-word and even reversed
                             # fragments. Keep line boundaries; still run end
                             # tightening and overlap clamping.
+                            _capture.record("cleanup_input", {"segments": _reconciled, "kwargs": {"split_long_lines": False}})
                             _reconciled = _prc(
                                 _reconciled,
                                 split_long_lines=False,
                             )
+                            _capture.record("cleanup_output", _reconciled)
                             return _emit_segments(
                                 _reconciled, _WC_WX_REC,
                                 reference_lyrics=_canonical,
@@ -9417,7 +9460,7 @@ async def _run_transcription_for_job(
                                                len(wx_warm_segs))
                             else:
                                 import whisperx_reconcile
-                                _reconciled = whisperx_reconcile.reconcile(wx_warm_segs, fa_text) if fa_text else None
+                                _reconciled = _captured_reconcile(wx_warm_segs, fa_text, route="warm_fallback", alignment_path=_aa) if fa_text else None
                                 final_segs = _reconciled if _reconciled else wx_warm_segs
                                 _src_tag_str = "whisperx_reconciled" if _reconciled else "whisperx"
                                 logger.info("[LYRICS] FA failed — warm-start whisperX took over with %s segments [%s]",
@@ -9486,7 +9529,7 @@ async def _run_transcription_for_job(
                         elif not _hall and len(wx_segs) >= 2:
                             # Reconcile: whisperX timing + lrclib canonical text
                             import whisperx_reconcile
-                            _reconciled = whisperx_reconcile.reconcile(wx_segs, fa_text_for_wx) if fa_text_for_wx else None
+                            _reconciled = _captured_reconcile(wx_segs, fa_text_for_wx, route="catalog_fallback", alignment_path=_aa) if fa_text_for_wx else None
                             final_segs = _reconciled if _reconciled else wx_segs
                             from timing_sources import WHISPERX_RECONCILED, WHISPERX
                             _src_tag = WHISPERX_RECONCILED if _reconciled else WHISPERX
@@ -10042,7 +10085,7 @@ async def _run_transcription_for_job(
                         # from reference + TIMING from whisperX (better than
                         # either alone — this beats Rotor on the text side).
                         import whisperx_reconcile
-                        _reconciled = whisperx_reconcile.reconcile(wx_segs, reference)
+                        _reconciled = _captured_reconcile(wx_segs, reference, route="gemini_fallback", alignment_path=_aa)
                         final_segs = _reconciled if _reconciled else wx_segs
                         from timing_sources import WHISPERX_RECONCILED, WHISPERX
                         _source_tag = WHISPERX_RECONCILED if _reconciled else WHISPERX

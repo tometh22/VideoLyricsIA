@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.18] - 2026-09-11
+
+### Added
+
+- Opt-in, expiring staging capture for six ordinary transcriptions: processed
+  reconciliation inputs, route/audio/code/config identity, and subsequent
+  cleanup and presentation evidence in the existing private machine snapshot.
+  Includes an offline baseline-first replay tool. The word-association behavior
+  candidate remains disabled; no extra transcription is scheduled.
+
 ## [1.1.17] - 2026-09-11
 
 ### Fixed

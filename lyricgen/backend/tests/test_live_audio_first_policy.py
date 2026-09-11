@@ -15,7 +15,7 @@ def test_live_audio_truth_bypasses_catalogue_reconciliation():
     src = inspect.getsource(main._run_transcription_for_job)
     truth = src.index("_live_audio_truth = bool(")
     branch = src.index("if _live_audio_truth:", truth)
-    reconcile = src.index("_reconciled = _wxr.reconcile", branch)
+    reconcile = src.index("_reconciled = _captured_reconcile", branch)
     assert branch < reconcile
     assert "emitting clean whisperX" in src[branch:reconcile]
     assert "return _emit_segments(" in src[branch:reconcile]
