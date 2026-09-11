@@ -50,8 +50,9 @@ test("39-song contract assignment survives reload, generates only approved selec
   const announcement = page.getByRole("dialog", { name: "Nuevo editor de letras" });
   await page.addLocatorHandler(announcement, async () => { await announcement.getByRole("button", { name: "Cancelar" }).click(); });
   await page.goto("/campaigns/chile1?view=creative");
-  await page.getByRole("button", { name: /Seleccionar todas las coincidencias/ }).click();
+  await page.getByRole("button", { name: /Seleccionar resultados/ }).click();
   await expect(page.getByText("39 seleccionadas")).toBeVisible();
+  await page.getByRole("button", { name: /Configurar estilos y reparto/ }).click();
   await page.getByLabel("Requisito del grupo 1").selectOption("photo_effect");
   await page.getByLabel("Nombre del grupo 1").fill("Foto fija con efecto");
   await page.getByLabel("Cantidad del grupo 1").fill("50");
@@ -73,8 +74,9 @@ test("39-song contract assignment survives reload, generates only approved selec
   await page.getByRole("button", { name: "Guardar esta asignación" }).click();
   await expect(page.getByRole("status").filter({ hasText: "Asignación guardada" })).toBeVisible();
   await page.reload();
+  await page.getByRole("button", { name: /Configurar estilos y reparto/ }).click();
   await expect(page.getByLabel("Nombre del grupo 1")).toHaveValue("Foto fija con efecto");
-  await page.getByRole("button", { name: /Seleccionar todas las coincidencias/ }).click();
+  await page.getByRole("button", { name: /Seleccionar resultados/ }).click();
   await page.getByRole("button", { name: "Preparar generación de 1 aprobadas seleccionadas" }).click();
   await page.getByRole("button", { name: "Confirmar generación", exact: true }).click();
   await expect(page.getByRole("status").filter({ hasText: "1 trabajos enviados" })).toBeVisible();
