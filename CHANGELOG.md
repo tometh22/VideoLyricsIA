@@ -3,6 +3,13 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.17] - 2026-09-11
+
+### Fixed
+
+- Open approved campaign lyrics directly in the transcription editor, even before a video exists; preserve the approved-list return context and keep final-video navigation separate.
+- Return an approved, unrendered campaign song to human review when its transcript actually changes. Keep unchanged saves approved, retain the previous approval in the audit/history, and allow approval of the corrected revision.
+
 ## [1.1.16] - 2026-09-11
 
 ### Fixed

@@ -49,7 +49,7 @@ def clean_batch_campaign_rows():
             ).delete(synchronize_session=False)
             session.query(BatchUploadSession).delete(synchronize_session=False)
             session.query(AuditLog).filter(
-                AuditLog.action == "batch.lyrics_and_timing_approved",
+                AuditLog.action.in_(("batch.lyrics_and_timing_approved", "batch.lyrics_approval_reopened")),
             ).delete(synchronize_session=False)
             session.query(BatchCampaignItem).delete(synchronize_session=False)
             session.query(BatchCampaign).delete(synchronize_session=False)
@@ -511,6 +511,46 @@ def test_human_approval_binds_every_line_audio_and_editor_revision(
     assert observation.id == repeated.id
     assert observation.label_tier == 'observed'
     assert observation.metrics['operational_history']['approved_version_id'] == response['approved_version_id']
+
+    # Reopening/unchanged autosave preserves approval; an actual edit returns
+    # this pre-render song to the queue and permits a new explicit approval.
+    from editor import save_document
+    from database import EditorVersion
+    document = db.query(EditorDocument).filter_by(job_id=job.job_id).one()
+    approved_revision = document.revision
+    document, _, applied = save_document(
+        db, job, document, user.id, document.revision,
+        list(document.current_segments), "draft",
+    )
+    assert not applied
+    assert job.status == "lyrics_approved"
+    assert batch.require_prebackground_approval(job) == approval
+    changed = [dict(line) for line in document.current_segments]
+    changed[0]["end"] = 0.9
+    document, _, applied = save_document(
+        db, job, document, user.id, document.revision, changed, "draft",
+    )
+    db.commit()
+    assert applied and document.revision == approved_revision + 1
+    assert job.status == "transcribed_pending"
+    assert job.approved_at is None and job.approved_by is None
+    assert batch._queue_state("lyrics", job, document) == "ready"
+    with pytest.raises(HTTPException) as missing:
+        batch.require_prebackground_approval(job)
+    assert missing.value.detail["code"] == "lyrics_and_timing_approval_missing"
+    event = db.query(AuditLog).filter_by(action="batch.lyrics_approval_reopened").one()
+    assert event.detail["previous_approval"] == approval
+    assert db.query(EditorVersion).filter_by(id=response["approved_version_id"]).one().is_approved
+    renewed = batch.approve_campaign_lyrics(
+        campaign.id, job.job_id,
+        batch.LyricsApprovalRequest(editor_revision=document.revision,
+            confirmed_line_ids=["line-1", "line-2"], lyrics_confirmed=True,
+            timings_confirmed=True, heard_against_audio=True),
+        {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}, db,
+    )
+    assert renewed["status"] == "lyrics_approved"
+    assert renewed["approved_version_id"] != response["approved_version_id"]
+    assert batch.require_prebackground_approval(job)["editor_revision"] == approved_revision + 1
 
 
 def test_human_approval_accepts_ordered_ids_for_legacy_document(db, monkeypatch):
