@@ -199,38 +199,48 @@ def polish_display_layout(result: dict) -> dict:
             segment["text"] = cleaned
             changed = True
 
-    for index in range(len(segments) - 1):
-        left = segments[index]
-        right = segments[index + 1]
-        left_tokens = _line_tokens(left.get("text") or "")
-        right_tokens = _line_tokens(right.get("text") or "")
-        suffix = _boundary_suffix(left_tokens)
-        retained = left_tokens[:-len(suffix)] if suffix else left_tokens
-        # A one-word or all-connector fragment needs editorial context; never
-        # guess by emptying a timestamped card automatically.
-        if not suffix or len(_lexical_tokens(" ".join(retained))) < 2:
-            continue
-        if not any(
-            _plain_token(token) not in _SPANISH_BOUNDARY_PREFIXES
-            for token in retained
-        ):
-            continue
-        if len(_lexical_tokens(" ".join(suffix + right_tokens))) > 12:
-            continue
-        if not _can_shift_boundary(left, right, suffix):
-            continue
+    # One shift can expose another connector immediately to its left:
+    # ``... y en / Mi corazón`` first becomes ``... y / En mi corazón``.
+    # Iterate to a fixed point so the public function is idempotent after one
+    # call.  Every accepted operation moves at least one word strictly right,
+    # therefore ``len(segments)`` passes is a conservative finite bound.
+    for _pass in range(len(segments)):
+        shifted = False
+        for index in range(len(segments) - 1):
+            left = segments[index]
+            right = segments[index + 1]
+            left_tokens = _line_tokens(left.get("text") or "")
+            right_tokens = _line_tokens(right.get("text") or "")
+            suffix = _boundary_suffix(left_tokens)
+            retained = left_tokens[:-len(suffix)] if suffix else left_tokens
+            # A one-word or all-connector fragment needs editorial context;
+            # never guess by emptying a timestamped card automatically.
+            if not suffix or len(_lexical_tokens(" ".join(retained))) < 2:
+                continue
+            if not any(
+                _plain_token(token) not in _SPANISH_BOUNDARY_PREFIXES
+                for token in retained
+            ):
+                continue
+            if len(_lexical_tokens(" ".join(suffix + right_tokens))) > 12:
+                continue
+            if not _can_shift_boundary(left, right, suffix):
+                continue
 
-        moved_words = list(left.get("words") or [])[-len(suffix):]
-        left["text"] = " ".join(retained).strip()
-        right_text = _lower_initial_if_grammar_word(
-            " ".join(right_tokens), list(right.get("words") or []),
-        )
-        moved_text = " ".join(suffix)
-        moved_text = moved_text[:1].upper() + moved_text[1:]
-        right["text"] = f"{moved_text} {right_text}".strip()
-        left["words"] = list(left.get("words") or [])[:-len(suffix)]
-        right["words"] = moved_words + list(right.get("words") or [])
-        changed = True
+            moved_words = list(left.get("words") or [])[-len(suffix):]
+            left["text"] = " ".join(retained).strip()
+            right_text = _lower_initial_if_grammar_word(
+                " ".join(right_tokens), list(right.get("words") or []),
+            )
+            moved_text = " ".join(suffix)
+            moved_text = moved_text[:1].upper() + moved_text[1:]
+            right["text"] = f"{moved_text} {right_text}".strip()
+            left["words"] = list(left.get("words") or [])[:-len(suffix)]
+            right["words"] = moved_words + list(right.get("words") or [])
+            shifted = True
+            changed = True
+        if not shifted:
+            break
 
     # A moved suffix can expose a period that used to be internal
     # (``mejillas. En`` -> ``mejillas.``); apply the display rule once more.
