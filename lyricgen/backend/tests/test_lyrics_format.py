@@ -276,6 +276,7 @@ def test_code_switch_prompt_preserves_each_lines_language():
     assert "code-switch" in prompt
     assert "ORIGINAL language of EACH line" in prompt
     assert "NEVER translate or paraphrase" in prompt
+    assert "NEVER end a lyric display line with a full stop" in prompt
 
 
 def test_lexical_guard_allows_only_orthographic_changes():
@@ -353,6 +354,149 @@ def test_openai_failure_returns_original(monkeypatch):
     r = _result([_seg("fragil espejo")])
     result = _run(lf.format_lyrics_pass(r, language="es"))
     assert result["segments"][0]["text"] == "fragil espejo"
+
+
+# ── display layout policy ─────────────────────────────────────────────────────
+
+def test_display_layout_repairs_vestido_de_besos_without_changing_timing():
+    """Regression from the 2026-09 Chile campaign screenshots."""
+    segs = [
+        _seg(
+            "En las mejillas. En", 42.5, 45.0381,
+            words=[
+                _word("en", 42.58, 42.74),
+                _word("las", 42.82, 43.26),
+                _word("mejillas", 43.34, 44.62),
+                _word("En", 45.26, 45.36),
+            ],
+        ),
+        _seg(
+            "Sus labios un rojo carmesí.", 45.4, 48.94,
+            words=[
+                _word("sus", 45.48, 45.84),
+                _word("labios", 46.0, 46.42),
+                _word("un", 46.48, 46.68),
+                _word("rojo", 46.84, 47.3),
+                _word("carmesí", 47.6, 48.44),
+            ],
+        ),
+    ]
+    before_timing = [(row["start"], row["end"]) for row in segs]
+    before_words = [word["word"] for row in segs for word in row["words"]]
+
+    out = lf.polish_display_layout(_result(segs))["segments"]
+
+    assert [row["text"] for row in out] == [
+        "En las mejillas",
+        "En sus labios un rojo carmesí",
+    ]
+    assert [(row["start"], row["end"]) for row in out] == before_timing
+    assert [word["word"] for row in out for word in row["words"]] == before_words
+
+
+def test_display_layout_moves_preposition_pair_and_keeps_exact_card_bounds():
+    segs = [
+        _seg(
+            "Somos parte de los", 10.125, 12.875,
+            words=[
+                _word("Somos", 10.2, 10.6),
+                _word("parte", 10.7, 11.1),
+                _word("de", 12.45, 12.58),
+                _word("los", 12.58, 12.7),
+            ],
+        ),
+        _seg(
+            "Rockers de verdad.", 12.9, 15.25,
+            words=[
+                _word("Rockers", 12.95, 13.5),
+                _word("de", 13.6, 13.75),
+                _word("verdad", 13.8, 14.4),
+            ],
+        ),
+    ]
+
+    out = lf.polish_display_layout(_result(segs))["segments"]
+
+    assert [row["text"] for row in out] == [
+        "Somos parte", "De los Rockers de verdad",
+    ]
+    assert [(row["start"], row["end"]) for row in out] == [
+        (10.125, 12.875), (12.9, 15.25),
+    ]
+
+
+def test_display_layout_does_not_guess_without_close_word_evidence():
+    no_words = [
+        _seg("Se abre por la", 10.0, 12.0),
+        _seg("Izquierda", 12.1, 13.0),
+    ]
+    far_from_boundary = [
+        _seg(
+            "Creo en", 20.0, 25.0,
+            words=[_word("Creo", 20.1, 20.5), _word("en", 21.0, 21.2)],
+        ),
+        _seg("Ti", 25.1, 26.0, words=[_word("Ti", 25.2, 25.5)]),
+    ]
+
+    assert lf.polish_display_layout(_result(no_words))["segments"] is no_words
+    assert lf.polish_display_layout(_result(far_from_boundary))["segments"] is far_from_boundary
+
+
+def test_display_layout_keeps_standalone_connector_card_for_human_review():
+    segs = [
+        _seg("Que", 30.0, 30.3, words=[_word("Que", 30.0, 30.2)]),
+        _seg("Al igual", 30.4, 31.2, words=[
+            _word("Al", 30.45, 30.6), _word("igual", 30.65, 31.0),
+        ]),
+    ]
+
+    assert lf.polish_display_layout(_result(segs))["segments"] is segs
+
+
+def test_display_layout_does_not_confuse_que_or_de_with_connectors():
+    segs = [
+        _seg(
+            "¿Por qué", 40.0, 41.0,
+            words=[_word("Por", 40.1, 40.4), _word("qué", 40.5, 40.8)],
+        ),
+        _seg("Los gringos", 41.1, 42.0, words=[
+            _word("Los", 41.15, 41.4), _word("gringos", 41.5, 41.9),
+        ]),
+        _seg(
+            "Al final me dé", 50.0, 51.0,
+            words=[
+                _word("Al", 50.1, 50.2), _word("final", 50.25, 50.5),
+                _word("me", 50.55, 50.7), _word("dé", 50.75, 50.9),
+            ],
+        ),
+        _seg("Igual", 51.1, 52.0, words=[_word("Igual", 51.15, 51.8)]),
+    ]
+
+    assert lf.polish_display_layout(_result(segs))["segments"] is segs
+
+
+def test_display_layout_only_removes_single_terminal_full_stops():
+    segs = [
+        _seg("Una loca yo me enamoré."),
+        _seg("¿Me escuchás?"),
+        _seg("Sigue..."),
+        _seg("Avíseme. Suele usar rubor"),
+    ]
+
+    out = lf.polish_display_layout(_result(segs))["segments"]
+
+    assert [row["text"] for row in out] == [
+        "Una loca yo me enamoré",
+        "¿Me escuchás?",
+        "Sigue...",
+        "Avíseme. Suele usar rubor",
+    ]
+
+
+def test_display_layout_runs_when_formatter_is_disabled(monkeypatch):
+    monkeypatch.setenv("LYRICS_FORMAT_ENABLED", "0")
+    result = _run(lf.format_lyrics_pass(_result([_seg("No sé.")])))
+    assert result["segments"][0]["text"] == "No sé"
 
 
 # ── _split_by_words unit tests (timing contract) ──────────────────────────────
