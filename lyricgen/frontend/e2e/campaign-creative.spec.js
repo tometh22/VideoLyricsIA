@@ -11,7 +11,7 @@ async function harness(page) {
     movement_style: { label: "Movimiento", group: "Movimiento y efectos", kind: "select", options: ["", "foto-parallax", "estandar"] },
   }, items: Array.from({ length: 39 }, (_, n) => ({ id: `i${n}`, job_id: `chilejob${String(n + 1).padStart(4, "0")}`, ordinal: n + 1,
     title: `Canción ${n + 1}`, artist: "Artista Chile", status: n === 0 ? "lyrics_approved" : "transcribed_pending", settings: {} })) };
-  const calls = { previews: [], generations: [] };
+  const calls = { previews: [], generations: [], approvals: [] };
   const videos = [];
   await page.route("**/*", async route => {
     const req = route.request(), path = new URL(req.url()).pathname;
@@ -34,10 +34,19 @@ async function harness(page) {
       return json({ revision: 1 });
     }
     if (path === "/status/chilejob0001") return json({ job_id: "chilejob0001", status: "lyrics_approved", segments_revision: 7, segments_json: [{ start: 0, end: 2, text: "Letra aprobada" }] });
+    if (path === "/media-token/chilejob0001/thumbnail" || path === "/media-token/chilejob0001/video") return json({ token: "e2e-media-token" });
+    if (path === "/preview/chilejob0001/thumbnail") return route.fulfill({ status: 302, headers: { location: "/fx_samples/foto_viva.jpg" } });
+    if (path === "/preview/chilejob0001/video") return route.fulfill({ status: 302, headers: { location: "/escenas_demo.mp4" } });
+    if (path === "/approve/chilejob0001") {
+      calls.approvals.push(req.postDataJSON());
+      Object.assign(videos[0], { status: "done", approved_at: new Date().toISOString() });
+      return json({ ok: true, status: "done", job_id: "chilejob0001" });
+    }
     if (path === "/generate") {
       calls.generations.push(req.postData()); head.items[0].status = "queued";
-      videos.push({ job_id: "chilejob0001", artist: "Artista Chile", title: "Canción 1", status: "queued", created_at: new Date().toISOString(),
-        assignment: head.items[0].assignment, settings: head.items[0].settings, evidence: {}, compliance: "pending", open_path: "/videos/chilejob0001" });
+      videos.push({ job_id: "chilejob0001", artist: "Artista Chile", title: "Canción 1", status: "pending_review", created_at: new Date().toISOString(),
+        assignment: head.items[0].assignment, settings: head.items[0].settings, evidence: { video_sha256: "e2e-video-v1" }, compliance: "pending",
+        video_url: "/download/chilejob0001/video", open_path: "/videos/chilejob0001" });
       return json({ job_id: "chilejob0001", status: "queued" });
     }
     return route.fallback();
@@ -88,6 +97,14 @@ test("39-song contract assignment survives reload, generates only approved selec
   await expect(page).toHaveURL(/view=history/);
   await expect(page.getByRole("heading", { name: "Videos de esta campaña (1)" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Canción 1", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Reproducir" }).click();
+  await expect(page.getByRole("dialog", { name: "Reproducir Canción 1" })).toBeVisible();
+  await expect(page.locator("video")).toBeVisible();
+  await page.getByRole("button", { name: "Cerrar", exact: true }).click();
+  await page.getByRole("button", { name: "Aprobar" }).click();
+  await page.getByRole("button", { name: "Confirmar aprobación" }).click();
+  await expect(page.getByText("Canción 1 quedó aprobado.")).toBeVisible();
+  expect(calls.approvals).toEqual([{ notes: "Aprobado desde el historial de campaña" }]);
   await page.screenshot({ path: "test-results/chile-campaign-video-history.png", fullPage: true });
   await page.getByRole("button", { name: "Contrato y cumplimiento", exact: true }).click();
   await expect(page.getByText("Contrato Chile: mitad foto con efecto, mitad Veo")).toBeVisible();

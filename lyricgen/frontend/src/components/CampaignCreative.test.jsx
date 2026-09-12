@@ -4,7 +4,10 @@ import { MemoryRouter } from "react-router-dom";
 import CampaignCreative from "./CampaignCreative";
 vi.mock("../i18n", () => ({ useI18n: () => ({ t: () => "" }) }));
 vi.mock("./WizardLivePreview", () => ({ default: () => <div>Vista previa visual</div> }));
-vi.mock("../mediaUrl", () => ({ useLazyMediaUrl: () => ({ ref: () => {}, url: "" }) }));
+vi.mock("../mediaUrl", () => ({
+  useLazyMediaUrl: () => ({ ref: () => {}, url: "/preview/thumbnail.jpg" }),
+  useMediaUrl: () => "/preview/video.mp4",
+}));
 let head, report, calls, generateGate, generateFailures;
 const response = data => ({ ok: true, json: async () => data });
 beforeEach(() => {
@@ -24,6 +27,11 @@ beforeEach(() => {
     if (url.endsWith("/preview")) return response({ preview_id: "p1", counts: [39], rounded: false, skipped: [], changes: head.items.map(i => ({ item_id: i.id, artist: i.artist, title: i.title, group: "Estilo 1", before: {}, after: { font: "anton" } })) });
     if (url.endsWith("/apply")) { head = { ...head, plan: { revision: 1 } }; return response({ revision: 1 }); }
     if (url.includes("/status/")) return response({ artist: "Artista", song_title: "Tema", segments_json: [], segments_revision: 2 });
+    if (url.includes("/approve/")) {
+      const jobId = url.split("/").pop();
+      report = { ...report, videos: report.videos.map(video => video.job_id === jobId ? { ...video, status: "done", approved_at: new Date().toISOString() } : video) };
+      return response({ ok: true, status: "done", job_id: jobId });
+    }
     if (url.endsWith("/generate")) { if (generateGate) await generateGate; const jobId = options.body.get("job_id"); return generateFailures.has(jobId) ? { ok: false, json: async () => ({ detail: "No disponible" }) } : response({ ok: true }); }
     throw new Error(`Unexpected request: ${url}`);
   }));
@@ -66,6 +74,57 @@ describe("campaign bulk design", () => {
     await screen.findByText("Videos de esta campaña (0)");
     expect(screen.getByText(/Todavía no hay videos generados/)).toBeInTheDocument();
     expect(calls.some(([url]) => url === "/jobs")).toBe(false);
+  });
+  it("uses a compact video list and only loads the medium player on demand", async () => {
+    report = { ...report, videos: [{
+      job_id: "video-1", title: "Tema para revisar", artist: "Artista Uno",
+      status: "pending_review", created_at: "2026-09-11T12:00:00Z",
+      video_url: "/download/video-1/video", open_path: "/videos/video-1",
+      assignment: { group_name: "Inspirado en letra" }, evidence: {},
+    }] };
+    const view = mount("history");
+    await screen.findByRole("list", { name: "Lista de videos de la campaña" });
+    expect(screen.getByText("Tema para revisar")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Editar" })).toBeEnabled();
+    expect(view.container.querySelector("video")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Reproducir" }));
+    expect(await screen.findByRole("dialog", { name: "Reproducir Tema para revisar" })).toBeInTheDocument();
+    expect(view.container.querySelector('video[src="/preview/video.mp4"]')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cerrar" }));
+    expect(screen.queryByRole("dialog", { name: "Reproducir Tema para revisar" })).not.toBeInTheDocument();
+  });
+  it("approves a pending campaign video from the list after explicit confirmation", async () => {
+    report = { ...report, videos: [{
+      job_id: "video-2", title: "Tema final", artist: "Artista Dos",
+      status: "pending_review", created_at: "2026-09-11T12:00:00Z",
+      video_url: "/download/video-2/video", open_path: "/videos/video-2",
+      assignment: {}, evidence: {},
+    }] };
+    mount("history");
+    fireEvent.click(await screen.findByRole("button", { name: "Aprobar" }));
+    expect(screen.getByRole("dialog", { name: "Aprobar Tema final" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar aprobación" }));
+    await screen.findByText("Tema final quedó aprobado.");
+    expect(screen.getByText("Aprobado")).toBeInTheDocument();
+    const approvalCall = calls.find(([url]) => url.endsWith("/approve/video-2"));
+    expect(JSON.parse(approvalCall[1].body)).toEqual({ notes: "Aprobado desde el historial de campaña" });
+  });
+  it("filters and paginates a large campaign video list", async () => {
+    report = { ...report, videos: Array.from({ length: 23 }, (_, index) => ({
+      job_id: `video-${index}`, title: `Video ${index}`, artist: "Artista",
+      status: index < 2 ? "pending_review" : "done",
+      created_at: "2026-09-11T12:00:00Z", video_url: `/download/video-${index}/video`,
+      open_path: `/videos/video-${index}`, assignment: {}, evidence: {},
+    })) };
+    mount("history");
+    await screen.findByText("Video 19");
+    expect(screen.queryByText("Video 20")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Siguiente" }));
+    expect(await screen.findByText("Video 20")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Pendientes 2$/ }));
+    expect(await screen.findByText("Video 0")).toBeInTheDocument();
+    expect(screen.getByText("Video 1")).toBeInTheDocument();
+    expect(screen.queryByText("Video 2")).not.toBeInTheDocument();
   });
   it("never offers generation to selections that are not approved", async () => {
     head = { ...head, items: head.items.map(item => ({ ...item, status: "transcribed_pending" })) };

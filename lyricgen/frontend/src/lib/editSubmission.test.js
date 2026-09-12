@@ -26,6 +26,7 @@ import {
   buildEditCurrent,
   resolveEditSubmission,
   backgroundEditBlockedReason,
+  buildCampaignEditApproval,
   EDIT_TYPE_PRIORITY,
 } from "./editSubmission.js";
 import { computeFieldDiff } from "./editWizardDiff.js";
@@ -135,6 +136,34 @@ describe("invariante estructural: baseline y current cubren las mismas claves", 
       const diff = computeFieldDiff({ ...baseline }, { ...current, [key]: current[key] });
       expect(diff, `clave ${key} produce diff sin haber cambiado`).toEqual({});
     }
+  });
+});
+
+describe("reaprobación de un edit de campaña", () => {
+  it("binds the exact durable revision and complete line identities", () => {
+    expect(buildCampaignEditApproval(
+      { campaignId: "campaign-1" },
+      { editorRevision: 21, editorVersionId: "version-21", confirmedLineIds: ["line-1", "line-2"] },
+    )).toEqual({
+      valid: true,
+      campaignId: "campaign-1",
+      body: {
+        editor_revision: 21,
+        editor_version_id: "version-21",
+        confirmed_line_ids: ["line-1", "line-2"],
+        lyrics_confirmed: true,
+        timings_confirmed: true,
+        heard_against_audio: true,
+      },
+    });
+  });
+
+  it("fails closed without a campaign, durable revision, or complete lines", () => {
+    expect(buildCampaignEditApproval({}, {})).toBeNull();
+    expect(buildCampaignEditApproval({ campaignId: "campaign-1" }, { editorRevision: 21 })).toEqual({
+      valid: false,
+      campaignId: "campaign-1",
+    });
   });
 });
 

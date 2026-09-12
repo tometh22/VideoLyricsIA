@@ -1278,15 +1278,21 @@ def approve_campaign_lyrics(
         )
     quality = dict(job.transcription_quality or {})
     existing = quality.get("pre_background_approval") or {}
-    if job.status == "lyrics_approved":
-        require_prebackground_approval(job)
-        if int(existing.get("editor_revision") if existing.get("editor_revision") is not None else -1) == body.editor_revision:
-            return {
-                "job_id": job_id, "status": job.status,
-                "approved_version_id": existing.get("editor_version_id"),
-                "deduplicated": True,
-            }
-    if job.status not in {"transcribed_pending", "transcribed"}:
+    post_render_statuses = {"pending_review", "done", "rejected"}
+    preserves_rendered_status = job.status in post_render_statuses
+    if job.status == "lyrics_approved" or preserves_rendered_status:
+        try:
+            require_prebackground_approval(job)
+        except HTTPException:
+            pass
+        else:
+            if int(existing.get("editor_revision") if existing.get("editor_revision") is not None else -1) == body.editor_revision:
+                return {
+                    "job_id": job_id, "status": job.status,
+                    "approved_version_id": existing.get("editor_version_id"),
+                    "deduplicated": True,
+                }
+    if job.status not in {"transcribed_pending", "transcribed", *post_render_statuses}:
         raise HTTPException(
             status_code=409,
             detail={"code": "job_not_awaiting_lyrics_review", "status": job.status},
@@ -1392,9 +1398,15 @@ def approve_campaign_lyrics(
     quality["reference_hypothesis"] = reference
     quality["pre_background_approval"] = approval
     job.transcription_quality = quality
-    job.status = "lyrics_approved"
-    job.current_step = "lyrics_and_timing_approved"
-    job.progress = 100
+    # Before the first render, approval advances the campaign item to the
+    # generation gate. During a post-render correction the video must remain
+    # in its current review state until /edit atomically queues the new render;
+    # otherwise a network failure between both requests makes the existing
+    # video disappear from final review as a misleading `lyrics_approved` row.
+    if not preserves_rendered_status:
+        job.status = "lyrics_approved"
+        job.current_step = "lyrics_and_timing_approved"
+        job.progress = 100
     db.add(AuditLog(
         user_id=current_user["id"],
         action="batch.lyrics_and_timing_approved",
@@ -1407,6 +1419,8 @@ def approve_campaign_lyrics(
             "editor_version_id": approval["editor_version_id"],
             "segments_sha256": approval["segments_sha256"],
             "confirmed_line_count": approval["confirmed_line_count"],
+            "post_render_reapproval": preserves_rendered_status,
+            "preserved_status": job.status if preserves_rendered_status else None,
         },
     ))
     db.add(ProductEvent(
@@ -1434,7 +1448,7 @@ def approve_campaign_lyrics(
         import logging
         logging.getLogger(__name__).warning('Correction outbox delivery pending: %s', type(exc).__name__)
     return {
-        "job_id": job_id, "status": "lyrics_approved",
+        "job_id": job_id, "status": job.status,
         "approved_version_id": version_id, "deduplicated": False,
     }
 
@@ -2564,6 +2578,11 @@ def enforce_render_capacity(db: Session, job: Job) -> None:
         Job.tenant_id == campaign.tenant_id,
         Job.workload_class == "batch",
         Job.status == "pending_review",
+        # Re-rendering one item already occupying the review buffer replaces
+        # that same slot; it does not add an eleventh deliverable. Counting the
+        # candidate itself made every correction impossible exactly when a
+        # campaign reached FINAL_REVIEW_LIMIT.
+        Job.job_id != job.job_id,
     ).scalar() or 0
     if final_review >= FINAL_REVIEW_LIMIT:
         raise HTTPException(
