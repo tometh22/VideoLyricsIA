@@ -3,6 +3,17 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.23] - 2026-09-11
+
+### Fixed
+
+- Keep short Spanish connectors and articles with the phrase that follows when
+  word timestamps prove they sit at the next caption boundary, without changing
+  segment count or any approved start/end value.
+- Stop adding prose-style full stops to lyric caption endings and remove a
+  single terminal period deterministically while preserving questions,
+  exclamations, ellipses, vocabulary, word order, and timing.
+
 ## [1.1.22] - 2026-09-11
 
 ### Changed
