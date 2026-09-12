@@ -69,6 +69,20 @@ describe("campaign bulk design", () => {
     fireEvent.change(screen.getByLabelText("Cantidad del grupo 1"), { target: { value: "50" } });
     expect(screen.queryByRole("button", { name: "Guardar esta asignación" })).not.toBeInTheDocument();
   });
+  it("blocks the distribution preview until the group weights add up, and says how much is missing", async () => {
+    mount("creative");
+    fireEvent.click(await screen.findByRole("button", { name: /Seleccionar resultados/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Configurar estilos y reparto/ }));
+    fireEvent.change(screen.getByLabelText("Motivo del cambio"), { target: { value: "Acordado" } });
+    expect(screen.getByText(/Suma de porcentajes/)).toHaveTextContent("Suma de porcentajes: 100% de 100% · listo para repartir");
+    expect(screen.getByRole("button", { name: "Ver reparto antes de guardar" })).toBeEnabled();
+    fireEvent.change(screen.getByLabelText("Cantidad del grupo 1"), { target: { value: "50" } });
+    expect(screen.getByText(/Suma de porcentajes/)).toHaveTextContent("Suma de porcentajes: 50% de 100% · faltan 50%");
+    expect(screen.getByRole("button", { name: "Ver reparto antes de guardar" })).toBeDisabled();
+    expect(calls.some(([url]) => url.endsWith("/preview"))).toBe(false);
+    fireEvent.change(screen.getByLabelText("Cantidad del grupo 1"), { target: { value: "100" } });
+    expect(screen.getByRole("button", { name: "Ver reparto antes de guardar" })).toBeEnabled();
+  });
   it("has a campaign-specific empty video history, never the account's global history", async () => {
     mount("history");
     await screen.findByText("Videos de esta campaña (0)");
