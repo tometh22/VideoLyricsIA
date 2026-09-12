@@ -424,6 +424,53 @@ def test_render_capacity_fails_closed_before_human_approval(db):
     assert exc.value.detail["code"] == "reference_hypothesis_missing"
 
 
+def test_render_capacity_reuses_the_current_final_review_slot(db, monkeypatch):
+    monkeypatch.setattr(batch, "FINAL_REVIEW_LIMIT", 2)
+    campaign = _campaign(db, 2)
+    items = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).order_by(BatchCampaignItem.ordinal).all()
+    user = db.query(User).first()
+    segments = [{"segment_id": "line-one", "start": 0, "end": 1, "text": "Hola"}]
+    audio_sha = "e" * 64
+    candidate = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=items[0].artist,
+        song_title=items[0].title, filename=items[0].filename,
+        status="pending_review", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=items[0].id,
+        segments_json=segments, segments_revision=3,
+        input_audio_sha256=audio_sha, audio_revision=1,
+        transcription_quality={
+            "reference_hypothesis": build_reference_hypothesis(
+                text="Hola", provider="lrclib", audio_sha256=audio_sha,
+                audio_revision=1, source_kind="catalogue_candidate_audio_verified",
+                complete_audio_verified=True,
+            ),
+            "pre_background_approval": {
+                "audio_sha256": audio_sha, "audio_revision": 1,
+                "editor_revision": 3,
+                "segments_sha256": segments_hash(segments),
+                "lyrics_confirmed": True, "timings_confirmed": True,
+                "heard_against_audio": True,
+            },
+        },
+    )
+    other = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=items[1].artist,
+        song_title=items[1].title, filename=items[1].filename,
+        status="pending_review", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=items[1].id,
+    )
+    db.add_all([candidate, other])
+    db.commit()
+
+    # Candidate + one other fills the two-slot buffer. Re-rendering the
+    # candidate replaces its own slot and must remain possible.
+    batch.enforce_render_capacity(db, candidate)
+
+
 @pytest.mark.parametrize("reference_available", [True, False])
 @pytest.mark.parametrize("admin_tenant", ["campaign", "platform-admin"])
 def test_human_approval_binds_every_line_audio_and_editor_revision(
@@ -605,6 +652,68 @@ def test_human_approval_accepts_ordered_ids_for_legacy_document(db, monkeypatch)
 
     assert response["status"] == "lyrics_approved"
     assert batch.require_prebackground_approval(job)["confirmed_line_count"] == 2
+
+
+def test_post_render_reapproval_restores_gate_without_hiding_video_from_review(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    segments = [
+        {"segment_id": "line-1", "start": 0, "end": 1, "text": "Hola"},
+        {"segment_id": "line-2", "start": 1, "end": 2, "text": "mundo"},
+    ]
+    audio_sha = "d" * 64
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="pending_review", current_step="thumbnail",
+        workload_class="batch", campaign_id=campaign.id,
+        campaign_item_id=item.id, segments_json=segments,
+        segments_revision=7, input_audio_sha256=audio_sha,
+        input_audio_etag=audio_sha, audio_revision=1,
+        video_url="/download/video", bg_r2_key_cached="background.mp4",
+        transcription_quality={
+            "reference_hypothesis": build_reference_hypothesis(
+                text="Hola\nmundo", provider="lrclib",
+                audio_sha256=audio_sha, audio_revision=1,
+                source_kind="catalogue_candidate_audio_verified",
+                complete_audio_verified=True,
+            ),
+        },
+    )
+    db.add(job)
+    db.add(EditorDocument(
+        job_id=job.job_id, tenant_id=campaign.tenant_id,
+        current_segments=segments, original_segments=segments, revision=7,
+    ))
+    db.commit()
+
+    response = batch.approve_campaign_lyrics(
+        campaign.id, job.job_id,
+        batch.LyricsApprovalRequest(
+            editor_revision=7,
+            confirmed_line_ids=["line-1", "line-2"],
+            lyrics_confirmed=True, timings_confirmed=True,
+            heard_against_audio=True,
+        ),
+        {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"},
+        db,
+    )
+
+    db.refresh(job)
+    assert response["status"] == "pending_review"
+    assert job.status == "pending_review"
+    assert job.current_step == "thumbnail"
+    assert batch.require_prebackground_approval(job)["editor_revision"] == 7
+    event = db.query(AuditLog).filter_by(
+        action="batch.lyrics_and_timing_approved",
+    ).order_by(AuditLog.id.desc()).first()
+    assert event.detail["post_render_reapproval"] is True
+    assert event.detail["preserved_status"] == "pending_review"
 
 
 def test_platform_admin_can_skip_to_next_job_in_foreign_tenant(db, monkeypatch):

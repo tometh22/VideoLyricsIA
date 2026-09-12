@@ -78,7 +78,7 @@ import { loadReviewWaveform } from "./lib/loadReviewWaveform";
 import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { backgroundRegenExtras } from "./lib/editWizardDiff";
-import { buildEditReview, buildEditCurrent, resolveEditSubmission, backgroundEditBlockedReason } from "./lib/editSubmission";
+import { buildEditReview, buildEditCurrent, resolveEditSubmission, backgroundEditBlockedReason, buildCampaignEditApproval } from "./lib/editSubmission";
 import { normalizeMovementCode } from "./lib/catalogCodes";
 import { buildVariantPayload } from "./lib/variantPayload";
 import { prefetchKey } from "./lib/prefetchKey";
@@ -1138,7 +1138,12 @@ function EditLyricsRoute({
         queue: [],
         queueIdx: 0,
         transcribeJobId: null,
-        referenceLyrics: "",
+        referenceLyrics: job.reference_lyrics || "",
+        // A rendered batch job still belongs to the campaign review contract.
+        // Keeping this identity in edit mode makes the CTA attest the exact
+        // line set again before /edit re-renders it.
+        campaignId: job.campaign_id || null,
+        campaignItemId: job.campaign_item_id || null,
       });
       // CRITICAL FIX 2026-05-27 (fix/edit-lyrics-set-wizard-stage): el
       // wizardScreen lee wizardStage para decidir qué renderear (upload
@@ -3986,6 +3991,52 @@ export default function App() {
           }
           if (saveMeta.editorVersionId) {
             payload.editor_version_id = saveMeta.editorVersionId;
+          }
+        }
+
+        // Campaign lyrics are approved against an exact editor/audio
+        // snapshot before their first background is generated. A real
+        // post-render correction invalidates that old snapshot during
+        // autosave, so renew the same explicit attestation before /edit.
+        // The backend keeps pending_review/done/rejected unchanged until the
+        // render request is accepted, avoiding a half-finished state if the
+        // second request loses the network race.
+        const campaignEditApproval = buildCampaignEditApproval(r, saveMeta);
+        if (campaignEditApproval) {
+          if (!campaignEditApproval.valid) {
+            alert({
+              title: t("edit.error_title") || "No pudimos aplicar el edit",
+              description: "No pudimos vincular la revisión completa de letra y timing. Volvé a revisar la versión actual e intentá nuevamente.",
+              tone: "error",
+            });
+            return { ok: false, reason: "campaign-approval-incomplete" };
+          }
+          let approvalResponse;
+          try {
+            approvalResponse = await authFetch(
+              `${API}/batch/campaigns/${campaignEditApproval.campaignId}/jobs/${editedJobId}/approve-lyrics`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(campaignEditApproval.body),
+              },
+            );
+          } catch {
+            alert({
+              title: t("edit.error_title") || "No pudimos aplicar el edit",
+              description: t("common.network_error") || "Error de red. Reintentá en unos segundos.",
+              tone: "error",
+            });
+            return { ok: false, reason: "campaign-approval-network" };
+          }
+          if (!approvalResponse.ok) {
+            const approvalData = await approvalResponse.json().catch(() => ({}));
+            alert({
+              title: t("edit.error_title") || "No pudimos aplicar el edit",
+              description: translateBackendError(approvalData?.detail, t) || `Error ${approvalResponse.status}`,
+              tone: "error",
+            });
+            return { ok: false, reason: `campaign-approval-${approvalResponse.status}` };
           }
         }
 
