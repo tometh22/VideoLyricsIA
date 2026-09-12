@@ -1007,6 +1007,11 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
     return snap
 
 
+# Variante de Demucs medida sobre el holdout; cualquier otra es una degradación
+# hasta que se mida con el ASR de producción y IC por canción.
+PROTECTED_SEPARATION_VARIANT = "mdx_extra"
+
+
 def quality_gates_snapshot(snap: dict | None = None) -> dict:
     """Estado ROJO/VERDE de las compuertas de calidad, visible en /health.
 
@@ -1088,5 +1093,26 @@ def quality_gates_snapshot(snap: dict | None = None) -> dict:
             reasons.append("fleet_runtime_token_mismatch")
     except Exception:
         payload["fleet_runtime_token_match"] = None
+    # Separación vocal: protegida. Sobre el holdout (11 canciones, IC 95% por
+    # canción) es el componente que más aporta al WER con el ASR de producción
+    # (stem vs mezcla −0,193 [−0,300, −0,088]; estudio −0,283 en 6/6 y borra
+    # la omisión). Apagarla o cambiar mdx_extra por una variante más barata se
+    # paga en letra entregada, así que /health lo muestra en rojo en vez de
+    # dejar que pase como un ahorro silencioso de env vars.
+    try:
+        from vocal_sep import _VARIANT as _sep_variant, is_enabled as _sep_enabled
+        enabled = bool(_sep_enabled())
+        variant = str(_sep_variant or "").strip()
+        payload["vocal_separation"] = {
+            "enabled": enabled, "variant": variant,
+            "protected_variant": PROTECTED_SEPARATION_VARIANT,
+        }
+        if not enabled:
+            reasons.append("vocal_separation_disabled")
+        elif variant != PROTECTED_SEPARATION_VARIANT:
+            reasons.append("vocal_separation_variant_downgraded")
+    except Exception:
+        payload["vocal_separation"] = {"enabled": None, "variant": None}
+        reasons.append("vocal_separation_unreadable")
     payload["state"] = "red" if reasons else "green"
     return payload
