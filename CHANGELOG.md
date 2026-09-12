@@ -3,6 +3,15 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.24] - 2026-09-12
+
+### Fixed
+
+- Resolve adjacent connector cascades at a caption boundary in one bounded,
+  idempotent pass, so phrases such as `y en / Mi corazón` and
+  `a mi / Alrededor` cannot require a second processing run. Segment count,
+  lexical content, word order, and every approved start/end value remain exact.
+
 ## [1.1.23] - 2026-09-11
 
 ### Fixed

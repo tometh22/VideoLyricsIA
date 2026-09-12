@@ -425,6 +425,71 @@ def test_display_layout_moves_preposition_pair_and_keeps_exact_card_bounds():
     ]
 
 
+@pytest.mark.parametrize(
+    ("left_text", "right_text", "left_words", "right_words", "bounds", "expected"),
+    [
+        (
+            "Creo en la libertad y en",
+            "Mi corazón hay un sitio",
+            [
+                _word("Creo", 30.524, 30.724),
+                _word("en", 30.844, 31.044),
+                _word("la", 31.444, 31.564),
+                _word("libertad", 31.644, 32.325),
+                _word("y", 32.345, 32.365),
+                _word("en", 32.385, 32.425),
+            ],
+            [
+                _word("mi", 32.865, 32.985),
+                _word("corazón", 33.065, 33.965),
+                _word("hay", 34.025, 34.185),
+                _word("un", 34.225, 34.325),
+                _word("sitio", 34.365, 34.645),
+            ],
+            (30.364, 32.695, 32.705, 37.006),
+            ("Creo en la libertad", "Y en mi corazón hay un sitio"),
+        ),
+        (
+            "Que veo brincar a mi",
+            "Alrededor tus labios sin voz",
+            [
+                _word("que", 54.3, 54.56),
+                _word("veo", 54.62, 54.94),
+                _word("brincar", 54.98, 56.58),
+                _word("a", 57.24, 57.4),
+                _word("mi", 57.42, 57.5),
+            ],
+            [
+                _word("alrededor", 57.6, 59.46),
+                _word("tus", 59.82, 60.02),
+                _word("labios", 60.18, 60.76),
+                _word("sin", 60.84, 61.4),
+                _word("voz", 61.5, 62.02),
+            ],
+            (54.22, 57.51, 57.52, 62.1),
+            ("Que veo brincar", "A mi alrededor tus labios sin voz"),
+        ),
+    ],
+)
+def test_display_layout_resolves_connector_cascades_in_one_idempotent_call(
+    left_text, right_text, left_words, right_words, bounds, expected,
+):
+    segs = [
+        _seg(left_text, bounds[0], bounds[1], words=left_words),
+        _seg(right_text, bounds[2], bounds[3], words=right_words),
+    ]
+    before_timing = [(row["start"], row["end"]) for row in segs]
+    before_words = [word["word"] for row in segs for word in row["words"]]
+
+    out = lf.polish_display_layout(_result(segs))["segments"]
+    again = lf.polish_display_layout(_result(out))["segments"]
+
+    assert tuple(row["text"] for row in out) == expected
+    assert [(row["start"], row["end"]) for row in out] == before_timing
+    assert [word["word"] for row in out for word in row["words"]] == before_words
+    assert again is out
+
+
 def test_display_layout_does_not_guess_without_close_word_evidence():
     no_words = [
         _seg("Se abre por la", 10.0, 12.0),
