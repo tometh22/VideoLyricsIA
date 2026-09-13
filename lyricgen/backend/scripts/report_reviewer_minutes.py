@@ -76,6 +76,33 @@ def task_seconds(samples: list[tuple[datetime, str]], max_gap_s: float) -> dict[
     return totals
 
 
+def _norm_line(text) -> str:
+    return " ".join(re.findall(r"\w+", str(text or "").lower()))
+
+
+def text_exact_ratio(original, current) -> float | None:
+    """Fase 0 (2026-09-13): ¿el TEXTO llegó bien al editor?
+
+    Fracción de líneas del documento actual que son idénticas (normalizadas:
+    minúsculas, sin puntuación) a las que entregó el pipeline
+    (``editor_documents.original_segments``). 1.0 = el revisor no reescribió
+    ninguna línea; sólo tocó timing. Se computa con difflib por bloques, así
+    una línea insertada o borrada no desplaza el resto.
+    """
+    from difflib import SequenceMatcher
+
+    a = [_norm_line(s.get("text")) for s in (original or []) if isinstance(s, dict)]
+    b = [_norm_line(s.get("text")) for s in (current or []) if isinstance(s, dict)]
+    if not a and not b:
+        return None
+    equal = sum(
+        i2 - i1
+        for tag, i1, i2, _j1, _j2 in SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
+        if tag == "equal"
+    )
+    return round(equal / max(len(a), len(b)), 3)
+
+
 def active_seconds(timestamps: list[datetime], max_gap_s: float) -> float:
     """Suma de huecos <= max_gap entre latidos consecutivos, sin importar sesión."""
     if not timestamps:
@@ -106,7 +133,7 @@ def main() -> int:
         if args.since else datetime.now(timezone.utc) - timedelta(days=30)
     )
 
-    from database import Job, ProductEvent, SessionLocal
+    from database import AuditLog, EditorDocument, Job, ProductEvent, SessionLocal
 
     db = SessionLocal()
     try:
@@ -145,9 +172,37 @@ def main() -> int:
             row.job_id: row
             for row in db.query(
                 Job.job_id, Job.tenant_id, Job.filename,
-                Job.segments_json, Job.transcription_quality,
+                Job.segments_json, Job.transcription_quality, Job.timing_source,
             ).filter(Job.job_id.in_(job_ids)).all()
         } if job_ids else {}
+        # Fase 0: texto máquina (original) vs texto final (current) por canción.
+        # Degrada a None si la base no tiene editor_documents (prod más viejo).
+        docs: dict[str, tuple] = {}
+        if job_ids:
+            try:
+                docs = {
+                    row.job_id: (row.original_segments, row.current_segments)
+                    for row in db.query(
+                        EditorDocument.job_id, EditorDocument.original_segments,
+                        EditorDocument.current_segments,
+                    ).filter(EditorDocument.job_id.in_(job_ids)).all()
+                }
+            except Exception as exc:  # noqa: BLE001 — métrica opcional
+                print(f"[fase0] editor_documents no disponible: {exc}", file=sys.stderr)
+                db.rollback()
+        # Fase 0: cuántas veces se usó "pegar letra oficial" en el período.
+        pasted_lyrics_uses = 0
+        try:
+            audit_q = db.query(AuditLog.detail).filter(AuditLog.action == "lyrics.reanchor")
+            if hasattr(AuditLog, "created_at"):
+                audit_q = audit_q.filter(AuditLog.created_at >= since)
+            pasted_lyrics_uses = sum(
+                1 for (detail,) in audit_q.all()
+                if isinstance(detail, dict) and detail.get("content_source") == "operator_pasted"
+            )
+        except Exception as exc:  # noqa: BLE001 — métrica opcional
+            print(f"[fase0] audit_log no disponible: {exc}", file=sys.stderr)
+            db.rollback()
 
         rows = []
         for (job_id, user_id), stamps in by_job.items():
@@ -164,12 +219,17 @@ def main() -> int:
             )
             seconds = active_seconds(stamps, args.max_gap_s)
             segments = job.segments_json if isinstance(job.segments_json, list) else []
+            doc = docs.get(job_id)
+            exact_ratio = text_exact_ratio(doc[0], doc[1]) if doc else None
             rows.append({
                 "job_id": job_id,
                 "tenant": str(job.tenant_id or ""),
                 "filename": (job.filename or "")[:52],
                 "reviewer_user_id": user_id,
                 "live": live,
+                "timing_source": str(job.timing_source or "unknown"),
+                "text_exact_ratio": exact_ratio,
+                "text_arrived_exact": (exact_ratio == 1.0) if exact_ratio is not None else None,
                 "lines": len(segments),
                 "heartbeats": len(stamps),
                 "sessions": len(sessions.get(job_id, set())),
@@ -214,9 +274,25 @@ def main() -> int:
             for key, value in sorted(totals.items(), key=lambda kv: -kv[1])
         }
 
+    def text_exactness(subset: list[dict]) -> dict:
+        ratios = [r["text_exact_ratio"] for r in subset if r.get("text_exact_ratio") is not None]
+        return {
+            "songs_with_document": len(ratios),
+            "exact_share": round(sum(1 for v in ratios if v == 1.0) / len(ratios), 3) if ratios else None,
+            "median_ratio": round(statistics.median(ratios), 3) if ratios else None,
+        }
+
+    by_source: dict[str, dict] = {}
+    for source in sorted({r["timing_source"] for r in rows}):
+        subset = [r for r in rows if r["timing_source"] == source]
+        by_source[source] = {**aggregate(subset), "text": text_exactness(subset)}
+
     summary = {
         "since": since.isoformat(),
         "max_gap_s": args.max_gap_s,
+        "text_exact_arrival": text_exactness(rows),
+        "by_timing_source": by_source,
+        "pasted_lyrics_uses": pasted_lyrics_uses,
         "task_minutes_all": task_totals(rows),
         "task_minutes_studio": task_totals([r for r in rows if not r["live"]]),
         "task_minutes_live": task_totals([r for r in rows if r["live"]]),
@@ -236,10 +312,12 @@ def main() -> int:
     else:
         for row in rows:
             kind = "vivo  " if row["live"] else "estudio"
+            exact = row["text_exact_ratio"]
+            exact_txt = f"texto={exact:.2f}" if exact is not None else "texto=  n/d"
             print(
                 f"{row['active_minutes']:7.2f} min  {kind}  lineas={row['lines']:3}  "
                 f"latidos={row['heartbeats']:4}  sesiones={row['sessions']:2}  "
-                f"{row['job_id']}  {row['filename']}"
+                f"{row['timing_source']:<12} {exact_txt}  {row['job_id']}  {row['filename']}"
             )
         print(json.dumps(summary, ensure_ascii=False, indent=1))
     return 0
