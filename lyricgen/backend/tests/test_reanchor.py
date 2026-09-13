@@ -413,3 +413,122 @@ def test_reanchor_persists_retimed_values_when_job_has_editor_document(client, m
         "editor_documents must carry the retimed values too — otherwise the "
         "editor shows stale timings and the next reconcile stomps one side"
     )
+
+
+# ---------------------------------------------------------------------------
+# Letra oficial pegada desde el editor (2026-09-13)
+# ---------------------------------------------------------------------------
+
+
+def _mock_align_from_lyrics(monkeypatch, seen=None):
+    """Motor genérico: devuelve una línea alineada por cada línea del ancla,
+    así el test puede pegar cualquier cantidad de líneas."""
+    async def _fake(result, audio_path, job_id, anchor_lyrics):
+        if seen is not None:
+            seen["anchor_lyrics"] = anchor_lyrics
+            seen["calls"] = seen.get("calls", 0) + 1
+        lines = [ln for ln in anchor_lyrics.splitlines() if ln.strip()]
+        out = dict(result)
+        out["segments"] = [
+            {"start": i * 2 + 0.5, "end": i * 2 + 2.0, "text": line, "words": []}
+            for i, line in enumerate(lines)
+        ]
+        out["timing_source"] = "anchor_ctc"
+        return out
+    monkeypatch.setattr(main_mod, "_maybe_anchor_align", _fake)
+
+
+PASTED_SAME_SHAPE = "\n".join([
+    "primera linea corregida",
+    "Segunda linea corregida",          # igual salvo mayúscula → bloque igual
+    "tercera linea OFICIAL distinta",   # cambia → reemplazo + review
+    "cuarta linea corregida",
+])
+
+
+def test_reanchor_pasted_merges_by_block_keeps_locked_and_flags_replaced(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    seen = {}
+    _mock_align_from_lyrics(monkeypatch, seen)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                      json={"lyrics_text": PASTED_SAME_SHAPE})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True
+    assert body["content_source"] == "operator_pasted"
+    assert body["lines_kept"] == 3
+    assert body["lines_replaced"] == 1
+    assert body["locked_kept"] == 1
+    assert body["locked_dropped"] == 0
+    assert body["structure"]["supported"] is True
+    assert seen["anchor_lyrics"] == PASTED_SAME_SHAPE
+
+    persisted = _db_segments(job_id)
+    assert len(persisted) == 4
+    # La línea locked conserva timing manual, identidad y texto tal cual.
+    locked = next(s for s in persisted if s.get("locked"))
+    assert (locked["start"], locked["end"], locked["_id"]) == (2.0, 4.0, 1)
+    assert locked["text"] == "segunda linea corregida"
+    # Bloque igual no locked: conserva _id, toma timing nuevo.
+    first = next(s for s in persisted if s.get("_id") == 0)
+    assert (first["start"], first["end"]) == (0.5, 2.0)
+    # Bloque distinto: entra la línea oficial, marcada para revisar.
+    replaced = next(s for s in persisted if s["text"] == "tercera linea OFICIAL distinta")
+    assert replaced.get("review") is True
+    assert "_id" not in replaced
+
+
+def test_reanchor_pasted_structure_divergent_409_then_confirm(client, monkeypatch):
+    """Color Esperanza (d323e1bc378c): letra íntegra de otra versión sobre
+    un audio más corto. Sin confirmación → 409 y NO se gasta alineación."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    seen = {}
+    _mock_align_from_lyrics(monkeypatch, seen)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    other_version = "\n".join(f"estrofa de otra version numero {i}" for i in range(12))
+
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                      json={"lyrics_text": other_version})
+    assert res.status_code == 409, res.text
+    body = res.json()
+    assert body["code"] == "reference_structure_unconfirmed"
+    assert "line_count_divergent" in body["structure"]["reasons"]
+    assert body["structure"]["pasted_line_count"] == 12
+    assert body["structure"]["current_line_count"] == 4
+    assert seen.get("calls", 0) == 0
+    assert [s["text"] for s in _db_segments(job_id)] == [s["text"] for s in SEGS]
+
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                      json={"lyrics_text": other_version, "confirm_structure": True})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["count"] == 12
+    assert body["lines_replaced"] == 12
+    assert body["review_count"] == 12
+    assert body["structure"]["supported"] is False
+    assert len(_db_segments(job_id)) == 12
+
+
+def test_reanchor_pasted_too_few_lines_422(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _mock_align_from_lyrics(monkeypatch)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                      json={"lyrics_text": "una sola linea\n\n"})
+    assert res.status_code == 422
+
+
+def test_reanchor_legacy_path_reports_editor_text_source(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _mock_align_ok(monkeypatch)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token), json={})
+    assert res.status_code == 200, res.text
+    assert res.json()["content_source"] == "editor_text"
+    assert res.json()["structure"] is None

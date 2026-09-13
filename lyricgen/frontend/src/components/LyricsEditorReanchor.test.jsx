@@ -147,3 +147,95 @@ describe("Re-sincronizar con IA", () => {
     expect(toastSpy.mock.calls[0][0].tone).toBe("error");
   });
 });
+
+describe("Pegar letra oficial y re-sincronizar", () => {
+  const openPaste = () => {
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+    fireEvent.click(screen.getByTestId("editor-overflow-btn"));
+    fireEvent.click(screen.getByTestId("paste-lyrics-btn"));
+  };
+
+  it("NO se muestra sin features.anchor_lyrics", () => {
+    render(<LyricsEditor {...baseProps({ user: { features: {} }, onReanchor: vi.fn() })} />);
+    expect(screen.queryByTestId("paste-lyrics-btn")).toBeNull();
+  });
+
+  it("envía lyrics_text al callback (tras flush) y aplica los segments nuevos", async () => {
+    const onPersistSegments = vi.fn(async () => ({ ok: true }));
+    const onReanchor = vi.fn(async () => ({
+      ok: true, count: 4, review_count: 1, lines_replaced: 1, lines_kept: 3,
+      segments: [
+        { start: 0.4, end: 2.1, text: "linea uno" },
+        { start: 2.6, end: 4.2, text: "linea dos" },
+        { start: 4.8, end: 6.3, text: "linea tres oficial", review: true },
+        { start: 6.9, end: 8.0, text: "linea cuatro" },
+      ],
+    }));
+    render(<LyricsEditor {...baseProps({ onPersistSegments, onReanchor })} />);
+    openPaste();
+    const pasted = "linea uno\nlinea dos\nlinea tres oficial\nlinea cuatro";
+    fireEvent.change(screen.getByTestId("paste-lyrics-textarea"), { target: { value: pasted } });
+    expect(screen.getByTestId("paste-lyrics-count")).toHaveTextContent("4 líneas");
+    fireEvent.click(screen.getByTestId("paste-lyrics-submit"));
+    await waitFor(() => expect(onReanchor).toHaveBeenCalledWith("job-reanchor", 0, {
+      lyrics_text: pasted, confirm_structure: false,
+    }));
+    expect(onPersistSegments).toHaveBeenCalled();
+    await waitFor(() => expect(toastSpy).toHaveBeenCalled());
+    expect(toastSpy.mock.calls[0][0].tone).toBe("success");
+    expect(toastSpy.mock.calls[0][0].message).toContain("1");
+    expect(screen.queryByTestId("paste-lyrics-textarea")).toBeNull();
+  });
+
+  it("con menos de 3 líneas el envío queda deshabilitado", () => {
+    const onReanchor = vi.fn();
+    render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor })} />);
+    openPaste();
+    fireEvent.change(screen.getByTestId("paste-lyrics-textarea"), { target: { value: "una\ndos" } });
+    expect(screen.getByTestId("paste-lyrics-submit")).toBeDisabled();
+    expect(onReanchor).not.toHaveBeenCalled();
+  });
+
+  it("409 reference_structure_unconfirmed → muestra el reporte y permite forzar con confirm_structure", async () => {
+    const onReanchor = vi.fn()
+      .mockResolvedValueOnce({
+        ok: false, status: 409, code: "reference_structure_unconfirmed",
+        structure: {
+          supported: false, reasons: ["line_count_divergent"],
+          metrics: { reference_token_coverage: 0.41, longest_unmatched_content_run: 2 },
+          pasted_line_count: 12, current_line_count: 3,
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true, count: 12, review_count: 12, lines_replaced: 12, lines_kept: 0,
+        segments: Array.from({ length: 12 }, (_, i) => ({ start: i, end: i + 0.9, text: `l${i}`, review: true })),
+      });
+    render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor })} />);
+    openPaste();
+    const other = Array.from({ length: 12 }, (_, i) => `estrofa ${i}`).join("\n");
+    fireEvent.change(screen.getByTestId("paste-lyrics-textarea"), { target: { value: other } });
+    fireEvent.click(screen.getByTestId("paste-lyrics-submit"));
+    const report = await screen.findByTestId("paste-lyrics-structure");
+    expect(report).toHaveTextContent("12 líneas pegadas vs 3");
+    expect(report).toHaveTextContent("41%");
+    // Nada se aplicó todavía: sigue abierto y sin toast.
+    expect(toastSpy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("paste-lyrics-confirm-anyway"));
+    await waitFor(() => expect(onReanchor).toHaveBeenCalledTimes(2));
+    expect(onReanchor.mock.calls[1][2]).toEqual({ lyrics_text: other, confirm_structure: true });
+    await waitFor(() => expect(toastSpy).toHaveBeenCalled());
+    expect(toastSpy.mock.calls[0][0].tone).toBe("success");
+  });
+
+  it("'Usar la letra de la planilla' prellena el textarea con la referencia de campaña", () => {
+    render(<LyricsEditor {...baseProps({
+      onPersistSegments: vi.fn(async () => ({ ok: true })),
+      onReanchor: vi.fn(),
+      sourceReference: { status: "candidate", artist: "X", track: "Y", text: "a\nb\nc" },
+    })} />);
+    openPaste();
+    fireEvent.click(screen.getByTestId("paste-lyrics-use-sheet"));
+    expect(screen.getByTestId("paste-lyrics-textarea")).toHaveValue("a\nb\nc");
+    expect(screen.getByTestId("paste-lyrics-submit")).toBeEnabled();
+  });
+});
