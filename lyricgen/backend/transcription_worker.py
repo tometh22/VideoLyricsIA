@@ -173,6 +173,96 @@ def _catalog_reference_summary(
     return summary
 
 
+def _lrclib_candidate_enabled() -> bool:
+    return os.environ.get("CAMPAIGN_LRCLIB_CANDIDATE_ENABLED", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+async def _maybe_lrclib_candidate(
+    artist: str,
+    title: str,
+    source_audio_sha256: str,
+    *,
+    audio_path: str,
+    live: bool,
+) -> dict | None:
+    """Fase 2 (2026-09-13): candidato de referencia desde lrclib cuando la
+    planilla no trae letra.
+
+    Medido en staging el 13-sep: 314 de 339 canciones de campaña no tenían
+    referencia alguna, y los caminos anclados a una referencia son los que
+    llegan al editor con el texto exacto. Devuelve un dict con el MISMO
+    contrato que la referencia de planilla (status candidate + binding
+    text_sha256 / source_audio_sha256) para que `_maybe_apply_catalog_reference`
+    lo someta a la MISMA atestación acústica. lrclib nunca es autor sin gate:
+    si la letra es de otra versión, la atestación la rechaza igual que a la
+    planilla. Vivos: se saltea (el gate sólo permitiría local_only).
+    Best-effort — nunca levanta.
+    """
+    if not _lrclib_candidate_enabled() or live or not artist or not title:
+        return None
+    try:
+        from pipeline import _fetch_lrclib, _audio_duration
+        from forced_align import lrc_to_plain_text
+        from database import SessionLocal
+        try:
+            duration = await asyncio.to_thread(_audio_duration, audio_path)
+        except Exception:  # noqa: BLE001 — la duración sólo afina la búsqueda
+            duration = None
+        db = SessionLocal()
+        try:
+            record = await asyncio.to_thread(_fetch_lrclib, artist, title, db, duration)
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("[LRCLIB-CANDIDATE] fetch failed artist=%r title=%r: %s",
+                       artist, title, exc)
+        return None
+    if not isinstance(record, dict):
+        return None
+    text = str(record.get("plain") or "").strip()
+    if not text and record.get("synced"):
+        text = lrc_to_plain_text(str(record.get("synced") or ""))
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 4:
+        return None
+    text = "\n".join(lines)
+    return {
+        "status": "candidate",
+        "source_kind": "lrclib",
+        "association_basis": "artist_title_lookup",
+        "artist": artist,
+        "track": title,
+        "text": text,
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "source_audio_sha256": str(source_audio_sha256 or "").lower(),
+        "lrclib_duration": record.get("duration"),
+        "row_numbers": [],
+    }
+
+
+async def _effective_catalog_reference(
+    catalog_reference: dict | None,
+    *,
+    artist: str,
+    title: str,
+    source_audio_sha256: str,
+    audio_path: str,
+    live: bool,
+    reference_required: bool,
+) -> tuple[dict | None, str]:
+    """Elegir qué referencia entra al gate: la planilla si trae letra; si no
+    (ausente o inexistente) y la campaña exige referencia, el candidato lrclib.
+    Devuelve (referencia, estado_de_planilla) para dejar provenance."""
+    sheet_status = str((catalog_reference or {}).get("status") or "none")
+    if sheet_status not in ("none", "absent") or not reference_required:
+        return catalog_reference, sheet_status
+    candidate = await _maybe_lrclib_candidate(
+        artist, title, source_audio_sha256, audio_path=audio_path, live=live,
+    )
+    return (candidate if candidate is not None else catalog_reference), sheet_status
+
+
 async def _maybe_apply_catalog_reference(
     result: dict,
     audio_path: str,
@@ -997,15 +1087,29 @@ def run_transcription_job(
             from line_evidence import freeze_result_provider_evidence
             r = freeze_result_provider_evidence(r)
             _record_reconcile_result(r, "post:freeze_result_provider_evidence")
+            _effective_live = live or _looks_live(title, filename)
+            _effective_reference, _sheet_status = await _effective_catalog_reference(
+                catalog_reference,
+                artist=artist, title=title,
+                source_audio_sha256=source_audio_sha256,
+                audio_path=audio_path, live=_effective_live,
+                reference_required=reference_required,
+            )
             r = await _maybe_apply_catalog_reference(
                 r,
                 audio_path,
                 job_id,
-                catalog_reference,
+                _effective_reference,
                 source_audio_sha256,
-                live=live or _looks_live(title, filename),
+                live=_effective_live,
                 aligner=_maybe_anchor_align,
             )
+            if (_effective_reference is not catalog_reference
+                    and isinstance(r, dict)
+                    and isinstance(r.get("catalog_reference"), dict)):
+                # Provenance: la planilla no traía letra; lo que entró al gate
+                # fue el candidato lrclib. Queda en transcription_quality.
+                r["catalog_reference"]["sheet_reference_status"] = _sheet_status
             _record_reconcile_result(r, "post:_maybe_apply_catalog_reference")
             # Post-pases gateados, en lockstep con los dos endpoints HTTP
             # (/transcribe y /transcribe-uploaded). ESTE es el camino que
