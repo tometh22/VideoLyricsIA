@@ -293,11 +293,18 @@ def build_machine_evidence(result: dict) -> dict:
         reported_attempt_count = inferred_attempt_count
     from reconcile_capture import durable_capture
     reconcile_capture = durable_capture(result)
+    receipt_capture = {}
+    if "_recognition_receipts" in result:
+        from recognition_receipts import validate_receipts
+        receipt_capture["recognition_receipts"] = validate_receipts(
+            result["_recognition_receipts"],
+        )
     return {
         "schema": SCHEMA,
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "hypotheses_by_family": hypotheses,
         "capture": {
+            **receipt_capture,
             **({"reconcile_stages": reconcile_capture} if reconcile_capture is not None else {}),
             "recognition_attempt_count": reported_attempt_count,
             "primary_present": bool(
@@ -320,6 +327,15 @@ def finalize_machine_evidence(
     """Bind captured hypotheses to the exact durable editor snapshot."""
     if not isinstance(evidence, dict) or evidence.get("schema") != SCHEMA:
         raise ValueError("machine evidence was not captured before persistence")
+    original_capture = evidence.get("capture")
+    if isinstance(original_capture, dict) and "recognition_receipts" in original_capture:
+        from recognition_receipts import validate_receipts
+        # Receipt identity must match the caller's actual values, before the
+        # legacy snapshot normalization coerces revisions or truncates hashes.
+        validate_receipts(
+            original_capture["recognition_receipts"],
+            audio_sha256=audio_sha256, audio_revision=audio_revision,
+        )
     payload = deepcopy(_safe_json(evidence))
     canonical_selected = _safe_json(original_segments or [])
     selected_found = False
@@ -345,6 +361,13 @@ def finalize_machine_evidence(
         "audio_sha256": str(audio_sha256 or "")[:64] or None,
         "audio_revision": max(0, int(audio_revision or 0)),
     }
+    if isinstance(payload.get("capture"), dict) and "recognition_receipts" in payload["capture"]:
+        from recognition_receipts import validate_receipts
+        payload["capture"]["recognition_receipts"] = validate_receipts(
+            payload["capture"]["recognition_receipts"],
+            audio_sha256=payload["pre_human"]["audio_sha256"],
+            audio_revision=payload["pre_human"]["audio_revision"],
+        )
     quality_payload = dict(quality) if isinstance(quality, dict) else {}
     payload["decisions"] = {
         "quality": _safe_json(quality_payload),
@@ -380,6 +403,16 @@ def validate_machine_evidence(evidence: Any, original_segments: Any) -> None:
         raise MachineSnapshotMissing("machine_pre_human_missing")
     if pre_human.get("segments_sha256") != snapshot_hash(original_segments or []):
         raise MachineSnapshotMissing("machine_snapshot_hash_mismatch")
+    if isinstance(evidence.get("capture"), dict) and "recognition_receipts" in evidence["capture"]:
+        from recognition_receipts import validate_receipts
+        try:
+            validate_receipts(
+                evidence["capture"]["recognition_receipts"],
+                audio_sha256=pre_human.get("audio_sha256"),
+                audio_revision=pre_human.get("audio_revision"),
+            )
+        except ValueError as exc:
+            raise MachineSnapshotMissing("machine_recognition_receipt_invalid") from exc
     evidence_schema = evidence.get("schema")
     if evidence_schema in {SCHEMA, "machine-transcription-evidence-v2"}:
         selected_matches_snapshot = False
