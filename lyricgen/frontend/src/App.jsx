@@ -3665,19 +3665,23 @@ export default function App() {
   // timing re-anclado respetando las líneas `locked`. Devuelve el payload
   // del endpoint ({ok, count, review_count, segments}) para que el
   // LyricsEditor refresque su estado y muestre el toast de resultado.
-  const reanchorSegmentsOnBackend = useCallback(async (jobId, baseRevision) => {
+  // `extra` (2026-09-13): { lyrics_text, confirm_structure } cuando el
+  // operador pega la letra oficial; vacío = re-anclar el texto ya editado.
+  const reanchorSegmentsOnBackend = useCallback(async (jobId, baseRevision, extra = {}) => {
     if (!jobId) return { ok: false, reason: "no-job" };
     try {
       const res = await authFetch(`${API}/jobs/${jobId}/reanchor`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base_revision: baseRevision }),
+        body: JSON.stringify({ base_revision: baseRevision, ...extra }),
       });
       if (!res.ok) {
         let detail = "";
-        try { detail = (await res.clone().json())?.detail || ""; } catch { /* non-JSON body */ }
-        console.warn("[reanchor] failed", res.status, detail);
-        return { ok: false, reason: `http-${res.status}`, status: res.status, detail };
+        let payload = null;
+        try { payload = await res.clone().json(); detail = payload?.detail || ""; } catch { /* non-JSON body */ }
+        console.warn("[reanchor] failed", res.status, detail || payload?.code || "");
+        return { ok: false, reason: `http-${res.status}`, status: res.status, detail,
+          code: payload?.code || null, structure: payload?.structure || null };
       }
       return await res.json();
     } catch (err) {

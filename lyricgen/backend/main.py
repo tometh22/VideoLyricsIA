@@ -15360,6 +15360,109 @@ _REANCHOR_ALLOWED = (
 
 class ReanchorSegmentsRequest(BaseModel):
     base_revision: int | None = Field(default=None, ge=0)
+    # 2026-09-13: letra oficial pegada por el operador desde el editor.
+    # Vacío = comportamiento histórico (re-anclar el texto ya editado).
+    # Con texto = ese texto es la letra ancla y el resultado se mergea por
+    # bloques contra segments_json (ver _merge_pasted_segments).
+    lyrics_text: str = Field(default="", max_length=20000)
+    # El operador vio el reporte de estructura (estrofas que no están en
+    # el audio, cantidad de líneas muy distinta, versión en vivo) y confirmó
+    # que la letra es de ESTA grabación. Sin esto, un desajuste estructural
+    # devuelve 409 reference_structure_unconfirmed y no se alinea nada
+    # (Color Esperanza d323e1bc378c: 81 líneas de otra versión sobre 44).
+    confirm_structure: bool = False
+
+
+_PASTED_MAX_LINES = 400
+
+
+def _pasted_lyric_lines(text: str) -> list[str]:
+    lines = [ln.strip() for ln in str(text or "").splitlines()]
+    return [ln for ln in lines if ln][:_PASTED_MAX_LINES]
+
+
+def _norm_lyric_line(text) -> str:
+    return " ".join(re.findall(r"\w+", str(text or "").lower()))
+
+
+def _pasted_structure_report(attestation, pasted_count: int, current_count: int) -> dict:
+    """Decide si la letra pegada puede alinearse sin confirmación humana.
+
+    Reusa la atestación referencia↔ASR (reference_attestation) y agrega
+    un chequeo de cantidad de líneas: el guard estructural del aligner es
+    inerte con CTC_ALIGN_SKIP_ARCS=0, así que esta es la única barrera
+    antes de que forced_align fuerce estrofas inexistentes sobre el audio.
+    """
+    metrics = dict((attestation or {}).get("metrics") or {})
+    reasons = list((attestation or {}).get("reasons") or [])
+    ratio = (pasted_count / current_count) if current_count else None
+    line_count_divergent = bool(
+        current_count and (pasted_count > current_count * 1.5
+                           or pasted_count * 1.5 < current_count)
+    )
+    if line_count_divergent:
+        reasons.append("line_count_divergent")
+    unmatched_passage = int(metrics.get("longest_unmatched_content_run") or 0) >= 4
+    return {
+        "supported": not (unmatched_passage or line_count_divergent),
+        "reasons": reasons,
+        "metrics": metrics,
+        "text_status": (attestation or {}).get("text_status"),
+        "pasted_line_count": int(pasted_count),
+        "current_line_count": int(current_count),
+        "line_ratio": round(ratio, 3) if ratio is not None else None,
+    }
+
+
+def _merge_pasted_segments(prev_segs: list[dict], anchored: list[dict]) -> tuple[list[dict], dict]:
+    """Merge por bloques (difflib sobre texto normalizado) entre los
+    segments actuales y la letra pegada ya alineada.
+
+    - Bloque igual: se conserva la identidad del segment (_id, estilo,
+      pos/scale) y su timing si está `locked`; si no, toma el timing nuevo
+      y el texto oficial (misma palabra, distinta puntuación/caso).
+    - Bloque distinto (insert/replace): entra el segment alineado nuevo,
+      SIEMPRE marcado `review: true`. Las líneas previas de ese bloque se
+      descartan (si alguna estaba locked, se cuenta en locked_dropped).
+    """
+    from difflib import SequenceMatcher
+
+    prev = [s for s in prev_segs if str(s.get("text") or "").strip()]
+    a = [_norm_lyric_line(s.get("text")) for s in prev]
+    b = [_norm_lyric_line(s.get("text")) for s in anchored]
+    merged: list[dict] = []
+    stats = {"review_count": 0, "locked_kept": 0, "lines_kept": 0,
+             "lines_replaced": 0, "locked_dropped": 0}
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            for seg, new_seg in zip(prev[i1:i2], anchored[j1:j2]):
+                stats["lines_kept"] += 1
+                if seg.get("locked"):
+                    stats["locked_kept"] += 1
+                    merged.append(seg)
+                    continue
+                m = dict(seg)
+                m["text"] = new_seg.get("text", seg.get("text"))
+                m["start"] = new_seg.get("start", seg.get("start"))
+                m["end"] = new_seg.get("end", seg.get("end"))
+                if new_seg.get("words") is not None:
+                    m["words"] = new_seg["words"]
+                if new_seg.get("review"):
+                    m["review"] = True
+                    stats["review_count"] += 1
+                else:
+                    m.pop("review", None)
+                merged.append(m)
+            continue
+        stats["locked_dropped"] += sum(1 for s in prev[i1:i2] if s.get("locked"))
+        for new_seg in anchored[j1:j2]:
+            m = dict(new_seg)
+            m["review"] = True
+            stats["lines_replaced"] += 1
+            stats["review_count"] += 1
+            merged.append(m)
+    merged.sort(key=lambda s: float(s.get("start", 0) or 0))
+    return merged, stats
 
 
 @app.post("/jobs/{job_id}/reanchor")
@@ -15440,7 +15543,12 @@ async def reanchor_segments(
 
     prev_segs = [dict(s) for s in (job.segments_json or [])
                  if isinstance(s, dict)]
-    anchor_lines = [(s.get("text") or "").strip() for s in prev_segs]
+    pasted_lines = _pasted_lyric_lines(body.lyrics_text)
+    pasted_mode = bool(pasted_lines)
+    if pasted_mode:
+        anchor_lines = list(pasted_lines)
+    else:
+        anchor_lines = [(s.get("text") or "").strip() for s in prev_segs]
     n_lines = sum(1 for _t in anchor_lines if _t)
     if n_lines < 3:
         # Mismo umbral que _maybe_anchor_align — con <3 líneas el motor
@@ -15450,6 +15558,33 @@ async def reanchor_segments(
             status_code=422,
             detail="Se necesitan al menos 3 líneas con texto para re-sincronizar.",
         )
+
+    structure = None
+    if pasted_mode:
+        # Gate estructural ANTES de bajar audio y gastar CTC: comparar la
+        # letra pegada con el ASR/texto actual. Se advierte, no se bloquea
+        # de por vida: el operador puede confirmar (confirm_structure).
+        from reference_attestation import assess_reference_attestation
+        _title = str(job.song_title or "").lower()
+        _is_live = "live" in _title or "en vivo" in _title
+        attestation = assess_reference_attestation(
+            "\n".join(pasted_lines), prev_segs,
+            reference_source="operator_pasted", is_live=_is_live,
+        )
+        _current_count = sum(
+            1 for s in prev_segs if str(s.get("text") or "").strip()
+        )
+        structure = _pasted_structure_report(
+            attestation, len(pasted_lines), _current_count,
+        )
+        if not structure["supported"] and not body.confirm_structure:
+            logger.info("[REANCHOR] pasted structure unconfirmed job=%s reasons=%s",
+                        job_id, structure["reasons"])
+            return JSONResponse(
+                status_code=409,
+                content={"code": "reference_structure_unconfirmed",
+                         "structure": structure},
+            )
 
     # SNAPSHOT + release (mismo patrón que /transcribe-uploaded, incidente
     # agus77 06/07): la descarga de R2 + el CTC pueden tardar minutos y no
@@ -15513,30 +15648,52 @@ async def reanchor_segments(
     merged = []
     review_count = 0
     locked_kept = 0
-    _ai = 0
-    for seg, _text in zip(prev_segs, anchor_lines):
-        if not _text:
-            merged.append(seg)
-            continue
-        new_seg = anchored[_ai]
-        _ai += 1
-        if seg.get("locked"):
-            locked_kept += 1
-            merged.append(seg)
-            continue
-        m = dict(seg)
-        m["start"] = new_seg.get("start", seg.get("start"))
-        m["end"] = new_seg.get("end", seg.get("end"))
-        if new_seg.get("words") is not None:
-            m["words"] = new_seg["words"]
-        if new_seg.get("review"):
-            m["review"] = True
-            review_count += 1
-        else:
-            m.pop("review", None)
-        merged.append(m)
-    # Mismo contrato de orden monotónico que /save-segments.
-    merged = sorted(merged, key=lambda s: float(s.get("start", 0) or 0))
+    lines_kept = lines_replaced = locked_dropped = 0
+    if pasted_mode:
+        merged, _stats = _merge_pasted_segments(prev_segs, anchored)
+        review_count = _stats["review_count"]
+        locked_kept = _stats["locked_kept"]
+        lines_kept = _stats["lines_kept"]
+        lines_replaced = _stats["lines_replaced"]
+        locked_dropped = _stats["locked_dropped"]
+    else:
+        _ai = 0
+        for seg, _text in zip(prev_segs, anchor_lines):
+            if not _text:
+                merged.append(seg)
+                continue
+            new_seg = anchored[_ai]
+            _ai += 1
+            if seg.get("locked"):
+                locked_kept += 1
+                merged.append(seg)
+                continue
+            m = dict(seg)
+            m["start"] = new_seg.get("start", seg.get("start"))
+            m["end"] = new_seg.get("end", seg.get("end"))
+            if new_seg.get("words") is not None:
+                m["words"] = new_seg["words"]
+            if new_seg.get("review"):
+                m["review"] = True
+                review_count += 1
+            else:
+                m.pop("review", None)
+            merged.append(m)
+        # Mismo contrato de orden monotónico que /save-segments.
+        merged = sorted(merged, key=lambda s: float(s.get("start", 0) or 0))
+    _pasted_audit = {}
+    if pasted_mode:
+        import hashlib as _hashlib
+        _pasted_audit = {
+            "content_source": "operator_pasted",
+            "lyrics_text_sha256": _hashlib.sha256(
+                "\n".join(pasted_lines).encode("utf-8")).hexdigest(),
+            "lines_kept": lines_kept,
+            "lines_replaced": lines_replaced,
+            "locked_dropped": locked_dropped,
+            "confirm_structure": bool(body.confirm_structure),
+            "structure": structure,
+        }
 
     # Persistir con sesión corta (la del request se soltó antes del I/O).
     from database import SessionLocal as _SL
@@ -15589,6 +15746,7 @@ async def reanchor_segments(
                     "locked_kept": locked_kept,
                     "base_revision": current_revision,
                     "revision": int(row.segments_revision or 0),
+                    **_pasted_audit,
                 },
             ))
         except Exception as e:  # noqa: BLE001 — audit best-effort
@@ -15635,8 +15793,8 @@ async def reanchor_segments(
     finally:
         _db2.close()
 
-    logger.info("[REANCHOR] ok job=%s lines=%d review=%d locked_kept=%d",
-                job_id, len(merged), review_count, locked_kept)
+    logger.info("[REANCHOR] ok job=%s lines=%d review=%d locked_kept=%d pasted=%s replaced=%d",
+                job_id, len(merged), review_count, locked_kept, pasted_mode, lines_replaced)
     return {
         "ok": True,
         "job_id": job_id,
@@ -15645,6 +15803,11 @@ async def reanchor_segments(
         "locked_kept": locked_kept,
         "segments": merged,
         "revision": persisted_revision,
+        "content_source": "operator_pasted" if pasted_mode else "editor_text",
+        "lines_kept": lines_kept,
+        "lines_replaced": lines_replaced,
+        "locked_dropped": locked_dropped,
+        "structure": structure,
     }
 
 
