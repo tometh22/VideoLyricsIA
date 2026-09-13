@@ -2136,6 +2136,72 @@ export default function LyricsEditor({
   }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, reanchoring, edited,
       pushEditHistory, toast, t, flushPendingSave]);
 
+  // 2026-09-13: pegar la letra OFICIAL y re-sincronizar desde ese texto.
+  // Mismo endpoint que el re-anclado (POST /jobs/{id}/reanchor) con
+  // lyrics_text; el backend mergea por bloques y devuelve 409
+  // reference_structure_unconfirmed si la letra no parece de esta
+  // grabación — ahí se muestra el reporte y el operador confirma o no.
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const [pasteBusy, setPasteBusy] = useState(false);
+  const [pasteStructure, setPasteStructure] = useState(null);
+  const [pasteError, setPasteError] = useState("");
+  const pasteLineCount = pasteText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).length;
+  const openPasteLyrics = useCallback(() => {
+    setPasteStructure(null);
+    setPasteError("");
+    setPasteOpen(true);
+  }, []);
+  const submitPasteLyrics = useCallback(async (confirmStructure = false) => {
+    if (!onReanchor || !transcribeJobId || pasteBusy) return;
+    if (pasteLineCount < 3) {
+      setPasteError(t("editor.paste_lyrics_min_lines") || "Pegá al menos 3 líneas.");
+      return;
+    }
+    setPasteBusy(true);
+    setPasteError("");
+    try {
+      let saved = null;
+      if (onPersistSegments) {
+        saved = await flushPendingSave(null, true);
+        if (saved?.ok === false) throw new Error(saved.reason || "save-failed");
+      }
+      const baseRevision = Number.isInteger(saved?.revision)
+        ? saved.revision
+        : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
+      const res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision, {
+        lyrics_text: pasteText,
+        confirm_structure: confirmStructure,
+      }));
+      if (res && res.ok && Array.isArray(res.segments) && res.segments.length) {
+        if (Number.isInteger(res.revision)) {
+          saveQueueRef.current.prime(transcribeJobId, res.revision);
+        }
+        pushEditHistory();
+        setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
+        setPasteOpen(false);
+        setPasteText("");
+        setPasteStructure(null);
+        toast({
+          message: (t("editor.paste_lyrics_done") || "Letra aplicada: {r} líneas nuevas, {k} conservadas, {m} para revisar")
+            .replace("{r}", String(res.lines_replaced ?? 0))
+            .replace("{k}", String(res.lines_kept ?? 0))
+            .replace("{m}", String(res.review_count ?? 0)),
+          tone: "success",
+        });
+      } else if (res && res.code === "reference_structure_unconfirmed" && res.structure) {
+        setPasteStructure(res.structure);
+      } else {
+        setPasteError(t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.");
+      }
+    } catch {
+      setPasteError(t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.");
+    } finally {
+      setPasteBusy(false);
+    }
+  }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, pasteBusy, pasteText,
+      pasteLineCount, pushEditHistory, toast, t, flushPendingSave]);
+
   const focusSegment = useCallback((id) => {
     setFocusedSegId(id);
   }, []);
@@ -4462,6 +4528,52 @@ export default function LyricsEditor({
         </div>
       </div>
 
+      {pasteOpen && createPortal(
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4">
+          <section role="dialog" aria-modal="true" aria-labelledby="paste-lyrics-title"
+            className="w-full max-w-2xl rounded-2xl bg-surface-1 p-6 shadow-2xl ring-1 ring-white/15">
+            <h2 id="paste-lyrics-title" className="text-lg font-semibold text-white">{t("editor.paste_lyrics") || "Pegar letra oficial y re-sincronizar"}</h2>
+            <p className="mt-2 text-sm text-ink-secondary">{t("editor.paste_lyrics_hint") || "Pegá la letra correcta, una línea por renglón. Las líneas iguales conservan su ajuste manual; las distintas se reemplazan y quedan marcadas para revisar."}</p>
+            {sourceReference?.text && (
+              <button type="button" data-testid="paste-lyrics-use-sheet" onClick={() => { setPasteText(sourceReference.text); setPasteStructure(null); }}
+                className="mt-3 rounded-lg bg-white/[0.06] px-3 py-1.5 text-xs text-white ring-1 ring-white/10">{t("editor.paste_lyrics_use_sheet") || "Usar la letra de la planilla"}</button>
+            )}
+            <textarea data-testid="paste-lyrics-textarea" aria-label={t("editor.paste_lyrics") || "Letra oficial"} value={pasteText}
+              onChange={(e) => { setPasteText(e.target.value); setPasteStructure(null); }} rows={12}
+              placeholder={t("editor.paste_lyrics_placeholder") || "Pegá acá la letra oficial…"}
+              className="mt-3 w-full rounded-xl bg-black/30 p-3 font-mono text-sm text-white ring-1 ring-white/15" />
+            <p className="mt-2 text-xs text-ink-tertiary" data-testid="paste-lyrics-count">{pasteLineCount} líneas pegadas · {edited.length} en el editor</p>
+            {pasteStructure && (
+              <div role="alert" data-testid="paste-lyrics-structure" className="mt-3 rounded-xl bg-amber-400/[0.08] p-3 text-xs text-amber-200 ring-1 ring-amber-400/30">
+                <p className="font-medium">{t("editor.paste_lyrics_structure_title") || "Esta letra no parece coincidir con la grabación"}</p>
+                <ul className="mt-1 list-disc pl-4">
+                  {pasteStructure.reasons?.includes("line_count_divergent") && <li>{`${pasteStructure.pasted_line_count} líneas pegadas vs ${pasteStructure.current_line_count} en el editor`}</li>}
+                  {pasteStructure.reasons?.includes("reference_contains_unmatched_passage") && <li>{`Hay un pasaje de ${pasteStructure.metrics?.longest_unmatched_content_run} palabras que no aparece en lo transcripto (¿estrofa de otra versión?)`}</li>}
+                  {Number.isFinite(pasteStructure.metrics?.reference_token_coverage) && <li>{`Cobertura: ${Math.round(pasteStructure.metrics.reference_token_coverage * 100)}% de la letra pegada se reconoce en el audio`}</li>}
+                </ul>
+                <p className="mt-1">{t("editor.paste_lyrics_structure_hint") || "Si escuchaste el audio y es esta versión, podés forzar la re-sincronización. Todas las líneas quedarán marcadas para revisar."}</p>
+              </div>
+            )}
+            {pasteError && <p role="alert" className="mt-3 text-sm text-red-300">{pasteError}</p>}
+            <div className="mt-5 flex justify-end gap-3">
+              <button type="button" disabled={pasteBusy} onClick={() => setPasteOpen(false)}
+                className="rounded-lg px-3 py-2 text-sm text-white">{t("editor.paste_lyrics_cancel") || "Cancelar"}</button>
+              {pasteStructure ? (
+                <button type="button" data-testid="paste-lyrics-confirm-anyway" disabled={pasteBusy} onClick={() => submitPasteLyrics(true)}
+                  className="rounded-lg bg-amber-500/80 px-4 py-2 text-sm font-medium text-black disabled:opacity-50">
+                  {pasteBusy ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.paste_lyrics_confirm_anyway") || "Es esta versión, re-sincronizar igual")}
+                </button>
+              ) : (
+                <button type="button" data-testid="paste-lyrics-submit" disabled={pasteBusy || pasteLineCount < 3} onClick={() => submitPasteLyrics(false)}
+                  className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
+                  {pasteBusy ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.paste_lyrics_submit") || "Reemplazar letra y re-sincronizar")}
+                </button>
+              )}
+            </div>
+          </section>
+        </div>, document.body,
+      )}
+
       {languageResolutionOpen && createPortal(
         <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4">
           <section role="dialog" aria-modal="true" aria-labelledby="language-resolution-title"
@@ -5464,6 +5576,11 @@ export default function LyricsEditor({
                   <button type="button" role="menuitem" onClick={() => { toggleFocusMode(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white">
                     <span className="block font-medium">{focusMode ? (t("editor.focus_exit") || "Salir de modo enfoque") : (t("editor.focus_enter") || "Trabajar a pantalla completa")}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Maximiza el espacio de edición</span>
                   </button>
+                  {canReanchor && !syncMode && (
+                    <button type="button" role="menuitem" data-testid="paste-lyrics-btn" disabled={reanchoring || pasteBusy} onClick={() => { openPasteLyrics(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white disabled:opacity-50">
+                      <span className="block font-medium">{t("editor.paste_lyrics") || "Pegar letra oficial y re-sincronizar"}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">{t("editor.paste_lyrics_menu_hint") || "Reemplaza el texto y realinea con el audio"}</span>
+                    </button>
+                  )}
                   {canReanchor && !syncMode && (
                     <button type="button" role="menuitem" data-testid="reanchor-btn" disabled={reanchoring} onClick={() => { handleReanchor(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white disabled:opacity-50">
                       <span className="block font-medium">{reanchoring ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.reanchor") || "Re-sincronizar con IA")}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Conserva los ajustes manuales</span>
