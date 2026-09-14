@@ -941,7 +941,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         body: JSON.stringify(body),
       });
       if (res.status === 409) {
-        const detail = (await res.json()).detail || {};
+        const detail = (await res.clone().json()).detail || {};
         if (detail.code === "youtube_already_published") {
           setSceneBusyKey(null);
           if (window.confirm(t("edit.youtube_drift_confirm") ||
