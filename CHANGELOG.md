@@ -3,6 +3,14 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.18-trial.2] - 2026-09-14
+
+### Fixed
+
+- Trial-only: correct lyric timestamp tenths and minute carry (14.1 no longer displays 14.0).
+- Preserve millisecond precision in timestamp inputs and leave stored timings untouched when
+  opening and closing an input without a change. No transcription, render or billing changes.
+
 ## [1.1.18-trial.1] - 2026-09-14
 
 ### Fixed
