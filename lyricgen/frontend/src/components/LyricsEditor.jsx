@@ -682,6 +682,11 @@ export default function LyricsEditor({
   // features.anchor_lyrics está activo (flag ANCHOR_LYRICS_ENABLED).
   onReanchor = null,
   onReanchorReconcile = null,
+  // Cuánto seguir sondeando al servidor tras perder la respuesta del
+  // re-anclado (ms). Tests lo bajan; default 8 min (CTC de 5 min de audio
+  // tarda ~5 min y un deploy del api en el medio corta la conexión).
+  reanchorWaitMs = 8 * 60 * 1000,
+  reanchorPollMs = 10 * 1000,
   // NOTE (PR E): el viejo `onEditedChange` (espejo sincrónico por keystroke
   // hacia App) fue eliminado — era la mitad del loop bidireccional del
   // reseed-storm. Los lectores externos (WizardLivePreview, snapshot de
@@ -2109,15 +2114,29 @@ export default function LyricsEditor({
   // 2026-09-14: si la respuesta se pierde (alineación >60 s, proxy que
   // re-envía, 409 del duplicado), consultar el estado real antes de declarar
   // fallo: si la revisión avanzó, el servidor ya aplicó el re-anclado.
+  // 2026-09-14 (Agus, Los Prisioneros 244558ff99aa): el cliente perdió la
+  // conexión a los ~2 min (deploy del api en el medio) y el servidor persistió
+  // recién 3 min después. Mirar UNA vez no alcanza: seguir sondeando hasta
+  // reanchorWaitMs, mostrando que seguimos esperando.
+  const [reanchorWaiting, setReanchorWaiting] = useState(null); // { since } | null
   const recoverReanchorFromServer = useCallback(async (baseRevision) => {
     if (!onReanchorReconcile || !transcribeJobId) return null;
+    const started = Date.now();
+    setReanchorWaiting({ since: started });
     try {
-      const r = await Promise.resolve(onReanchorReconcile(transcribeJobId, baseRevision));
-      if (r && r.ok && Array.isArray(r.segments) && r.segments.length
-          && Number.isInteger(r.revision) && r.revision > baseRevision) return r;
-    } catch { /* best effort */ }
-    return null;
-  }, [onReanchorReconcile, transcribeJobId]);
+      for (;;) {
+        try {
+          const r = await Promise.resolve(onReanchorReconcile(transcribeJobId, baseRevision));
+          if (r && r.ok && Array.isArray(r.segments) && r.segments.length
+              && Number.isInteger(r.revision) && r.revision > baseRevision) return r;
+        } catch { /* best effort */ }
+        if (Date.now() - started >= reanchorWaitMs) return null;
+        await new Promise((resolve) => setTimeout(resolve, reanchorPollMs));
+      }
+    } finally {
+      setReanchorWaiting(null);
+    }
+  }, [onReanchorReconcile, transcribeJobId, reanchorWaitMs, reanchorPollMs]);
   const applyReanchorResult = useCallback((res, message) => {
     if (Number.isInteger(res.revision)) {
       saveQueueRef.current.prime(transcribeJobId, res.revision);
@@ -4641,6 +4660,11 @@ export default function LyricsEditor({
                 </ul>
                 <p className="mt-1">{t("editor.paste_lyrics_structure_hint") || "Si escuchaste el audio y es esta versión, podés forzar la re-sincronización. Todas las líneas quedarán marcadas para revisar."}</p>
               </div>
+            )}
+            {reanchorWaiting && (
+              <p role="status" data-testid="paste-lyrics-waiting" className="mt-3 text-sm text-amber-200">
+                {t("editor.reanchor_waiting") || "La respuesta se perdió pero el servidor sigue re-sincronizando. Seguimos esperando (puede tardar unos minutos)…"}
+              </p>
             )}
             {pasteError && <p role="alert" className="mt-3 text-sm text-red-300">{pasteError}</p>}
             <div className="mt-5 flex justify-end gap-3">
