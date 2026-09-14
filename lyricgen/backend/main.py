@@ -13502,6 +13502,7 @@ async def get_background_url(
 def get_waveform(
     job_id: str,
     response: Response,
+    resolution: str = Query("overview", pattern="^(overview|hires)$"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -13539,7 +13540,20 @@ def get_waveform(
     # Delegate cache + compute + cache-write to the shared helper. Pipeline
     # uses the same function post-render so the cache key + payload shape
     # stay in sync across both call paths.
-    payload = compute_and_cache_waveform(job.job_id, job.input_r2_key)
+    payload = None
+    if resolution == "hires":
+        # Guided timing review (2026-09-14): ~40 buckets/s from the cached
+        # vocal stem when available. Falls back to the overview envelope so
+        # the editor never loses its waveform because the stem lookup or
+        # the long decode failed.
+        from waveform_compute import compute_and_cache_hires_waveform
+        payload = compute_and_cache_hires_waveform(job.job_id, job.input_r2_key)
+        if payload is None:
+            logger.info("[WAVEFORM] hires unavailable for %s; serving overview", job_id)
+    if payload is None:
+        payload = compute_and_cache_waveform(job.job_id, job.input_r2_key)
+        if payload is not None and resolution == "hires":
+            payload = {**payload, "source": "overview"}
     if payload is None:
         # Distinguish the two failure modes the helper bundles together so
         # the frontend can show a useful message. We re-check the source

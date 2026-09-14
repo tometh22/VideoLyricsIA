@@ -72,6 +72,28 @@ describe("GuidedTimingReview", () => {
     expect(onConfirm).toHaveBeenCalledWith(WINDOWS[0]);
   });
 
+  it("muestra la pregunta desde el principio y explica por qué no se puede confirmar", async () => {
+    render(<GuidedTimingReview {...props()} />);
+    // La pregunta es lo que se le pide al revisor: visible antes de escuchar,
+    // con las respuestas deshabilitadas y el motivo escrito.
+    expect(screen.getByText("¿La frase aparece cuando empieza la voz?")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sí, está bien" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "No, ajustar" })).toBeDisabled();
+    expect(screen.getByTestId("guided-alignment-question")).toHaveTextContent("Escuchá el fragmento para poder responder");
+    expect(screen.getByRole("button", { name: /confirmar y seguir/i })).toBeDisabled();
+    expect(screen.getByTestId("guided-confirm-blocked")).toHaveTextContent("primero escuchá el fragmento");
+    // Motivo del tramo en lenguaje de revisor, no código interno.
+    expect(screen.getByText("La frase puede entrar antes o después de la voz")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /Escuchar fragmento/ }));
+    expect(screen.getByRole("button", { name: "Sí, está bien" })).toBeEnabled();
+    expect(screen.getByTestId("guided-confirm-blocked")).toHaveTextContent("respondé si la frase coincide");
+
+    await userEvent.click(screen.getByRole("button", { name: "Sí, está bien" }));
+    expect(screen.queryByTestId("guided-confirm-blocked")).toBeNull();
+    expect(screen.getByRole("button", { name: /confirmar y seguir/i })).toBeEnabled();
+  });
+
   it("permite repetir el tutorial desde Cómo funciona", async () => {
     render(<GuidedTimingReview {...props()} />);
     await userEvent.click(screen.getByRole("button", { name: /cómo funciona/i }));
@@ -84,7 +106,7 @@ describe("GuidedTimingReview", () => {
 
     expect(screen.getByTestId("guided-timing-review")).toHaveTextContent("Encontramos 2 partes");
     expect(screen.getByText("Parte 1 de 2")).toBeInTheDocument();
-    expect(screen.getByText("El inicio o final puede estar corrido")).toBeInTheDocument();
+    expect(screen.getByText("La frase puede entrar antes o después de la voz")).toBeInTheDocument();
     expect(screen.getByText("Audio de la canción")).toBeInTheDocument();
     expect(screen.getByText("Los picos muestran dónde hay voz o sonido")).toBeInTheDocument();
     expect(screen.getAllByText("Primera frase")).toHaveLength(1);
@@ -120,7 +142,7 @@ describe("GuidedTimingReview", () => {
     expect(onStopPlayback).toHaveBeenCalled();
     expect(onConfirm).toHaveBeenCalledWith(WINDOWS[0]);
     expect(screen.getByText("Parte 2 de 2")).toBeInTheDocument();
-    expect(screen.getByText("Puede faltar o sobrar una frase")).toBeInTheDocument();
+    expect(screen.getByText("Puede faltar o sobrar una frase en este tramo")).toBeInTheDocument();
   });
 
   it("cancela un gesto interrumpido sin guardar el movimiento", async () => {

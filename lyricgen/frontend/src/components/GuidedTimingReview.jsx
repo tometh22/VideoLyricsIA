@@ -17,20 +17,22 @@ function formatTime(value, precise = false) {
 }
 
 function reasonLabel(window, t) {
+  // Lenguaje de revisor, no códigos internos: la tarjeta tiene que decir
+  // qué puede estar mal en ESTE tramo y qué se espera que haga.
   const codes = window?.reasons || [];
   if (codes.some((code) => /structur|cardinal|event_count|motif/.test(String(code)))) {
-    return t("editor.quality_reason_structure") || "Puede faltar o sobrar una frase";
+    return t("timing_review.reason_structure") || "Puede faltar o sobrar una frase en este tramo";
   }
   if (codes.some((code) => /timing|align|boundary|overlap|inversion|start|end/.test(String(code)))) {
-    return t("editor.quality_reason_timing") || "El inicio o final puede estar corrido";
+    return t("timing_review.reason_timing") || "La frase puede entrar antes o después de la voz";
   }
   if (codes.some((code) => /voic|coverage|uncovered|vocal/.test(String(code)))) {
-    return t("editor.quality_reason_voice") || "Detectamos voz sin una frase asociada";
+    return t("timing_review.reason_voice") || "Se escucha voz y no hay una frase que la cubra";
   }
   if (codes.some((code) => /text|lexical|asr|content/.test(String(code)))) {
-    return t("editor.quality_reason_text") || "La letra puede no coincidir con el audio";
+    return t("timing_review.reason_text") || "La letra puede no coincidir con lo que se canta";
   }
-  return t("editor.quality_reason_uncertain") || "Conviene escuchar este tramo";
+  return t("timing_review.reason_uncertain") || "Conviene escuchar este tramo con atención";
 }
 
 function segmentShiftBounds(segments, segment, duration) {
@@ -579,15 +581,22 @@ export default function GuidedTimingReview({
           />
         </div>
 
-        {hasListened && (
-          <div className="rounded-xl bg-brand/[0.07] px-3 py-3 ring-1 ring-brand/20" data-testid="guided-alignment-question" role="group" aria-labelledby="guided-alignment-question-title">
+        {/* La pregunta está siempre a la vista: es lo que se le pide al revisor.
+            Las respuestas se habilitan después de escuchar, y el motivo se
+            escribe al lado (antes la tarjeta abría con un botón verde muerto
+            y ninguna pista de por qué). */}
+        <div className={`rounded-xl px-3 py-3 ring-1 ${hasListened ? "bg-brand/[0.07] ring-brand/20" : "bg-white/[0.02] ring-white/[0.07]"}`} data-testid="guided-alignment-question" role="group" aria-labelledby="guided-alignment-question-title">
             <p id="guided-alignment-question-title" className="text-xs font-semibold text-white">{t("timing_review.alignment_question") || "¿La frase aparece cuando empieza la voz?"}</p>
-            <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary">{t("timing_review.confirm_without_move") || "Si ya coincide, no hay que mover nada."}</p>
+            <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary">
+              {hasListened
+                ? (t("timing_review.confirm_without_move") || "Si ya coincide, no hay que mover nada.")
+                : (t("timing_review.answer_after_listen") || "Escuchá el fragmento para poder responder.")}
+            </p>
             <div className="mt-3 flex flex-wrap gap-2">
-              <button type="button" onClick={() => { setAlignmentDecision("yes"); onStopPlayback?.(); }} className={`rounded-lg px-3 py-2 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light ${alignmentDecision === "yes" ? "bg-emerald-600 text-white" : "bg-white/[0.06] text-white ring-1 ring-white/[0.1] hover:bg-white/[0.1]"}`} aria-pressed={alignmentDecision === "yes"}>
+              <button type="button" disabled={!hasListened} onClick={() => { setAlignmentDecision("yes"); onStopPlayback?.(); }} className={`rounded-lg px-3 py-2 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light disabled:cursor-not-allowed disabled:opacity-40 ${alignmentDecision === "yes" ? "bg-emerald-600 text-white" : "bg-white/[0.06] text-white ring-1 ring-white/[0.1] hover:bg-white/[0.1]"}`} aria-pressed={alignmentDecision === "yes"}>
                 {t("timing_review.alignment_yes") || "Sí, está bien"}
               </button>
-              <button type="button" onClick={() => { setAlignmentDecision("no"); onStopPlayback?.(); }} className={`rounded-lg px-3 py-2 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light ${alignmentDecision === "no" ? "bg-brand text-white" : "bg-white/[0.06] text-white ring-1 ring-white/[0.1] hover:bg-white/[0.1]"}`} aria-pressed={alignmentDecision === "no"}>
+              <button type="button" disabled={!hasListened} onClick={() => { setAlignmentDecision("no"); onStopPlayback?.(); }} className={`rounded-lg px-3 py-2 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light disabled:cursor-not-allowed disabled:opacity-40 ${alignmentDecision === "no" ? "bg-brand text-white" : "bg-white/[0.06] text-white ring-1 ring-white/[0.1] hover:bg-white/[0.1]"}`} aria-pressed={alignmentDecision === "no"}>
                 {t("timing_review.alignment_no") || "No, ajustar"}
               </button>
             </div>
@@ -598,8 +607,7 @@ export default function GuidedTimingReview({
                   : (t("timing_review.confirm_after_adjust") || "Cuando termines el ajuste, confirmá para seguir.")}
               </p>
             )}
-          </div>
-        )}
+        </div>
 
         {adjustmentRequested && selectedSegment ? (
           <div className="mt-3 rounded-xl bg-black/20 px-3 py-3 ring-1 ring-white/[0.07]">
@@ -649,6 +657,13 @@ export default function GuidedTimingReview({
               {t("timing_review.confirm_next") || "Confirmar y seguir"}
             </button>
           </div>
+          {(audioAvailable && activeWindowPlayable && (!hasListened || !alignmentDecision)) && (
+            <p className="w-full text-right text-[10px] text-ink-tertiary" data-testid="guided-confirm-blocked">
+              {!hasListened
+                ? (t("timing_review.confirm_blocked_listen") || "Para confirmar, primero escuchá el fragmento.")
+                : (t("timing_review.confirm_blocked_decide") || "Para confirmar, respondé si la frase coincide con la voz.")}
+            </p>
+          )}
         </div>
       </div>
     </section>
