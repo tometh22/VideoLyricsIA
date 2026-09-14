@@ -3,6 +3,7 @@ import "./CampaignCreative.print.css";
 import { useNavigate } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS, AXIS_VALUE_LABELS, dynamicAxisLabel } from "../lib/optionLabels";
+import { translateBackendError } from "../lib/lyricsEditSubmit";
 import { campaignGenerateForm } from "../lib/campaignCreative";
 import WizardLivePreview from "./WizardLivePreview";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
@@ -37,7 +38,10 @@ async function request(path, options = {}) {
   const response = await fetch(`${API}${path}`, { cache: "no-store", ...options,
     headers: { Authorization: `Bearer ${localStorage.getItem("genly_token") || ""}`, ...options.headers } });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : data.detail?.message || data.detail?.code || data.code || `Error ${response.status}`);
+  if (!response.ok) {
+    const detail = translateBackendError(data.detail);
+    throw new Error(detail || `Error ${response.status}`);
+  }
   return data;
 }
 const post = (path, value) => request(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value) });
