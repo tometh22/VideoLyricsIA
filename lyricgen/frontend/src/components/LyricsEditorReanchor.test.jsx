@@ -279,7 +279,7 @@ describe("Recuperación tras respuesta perdida (2026-09-14)", () => {
   it("re-sincronizar con IA: fallo real (la revisión NO avanzó) → error, sin tocar nada", async () => {
     const onReanchor = vi.fn(async () => ({ ok: false, reason: "declined" }));
     const onReanchorReconcile = vi.fn(async () => ({ ok: false, reason: "not-advanced", revision: 0 }));
-    render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor, onReanchorReconcile })} />);
+    render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor, onReanchorReconcile, reanchorWaitMs: 60, reanchorPollMs: 10 })} />);
     fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
     fireEvent.click(screen.getByTestId("editor-overflow-btn"));
     fireEvent.click(screen.getByTestId("reanchor-btn"));
@@ -306,5 +306,50 @@ describe("Botón visible 'Pegar letra oficial' (2026-09-14)", () => {
     unmount();
     render(<LyricsEditor {...baseProps({ user: { features: {} }, onReanchor: vi.fn() })} />);
     expect(screen.queryByTestId("paste-lyrics-cta")).toBeNull();
+  });
+});
+
+describe("Seguir esperando al servidor (2026-09-14, caso Agus)", () => {
+  const RECOVERED = [
+    { start: 0.4, end: 2.1, text: "linea uno" },
+    { start: 2.6, end: 4.2, text: "linea dos", review: true },
+    { start: 4.8, end: 6.3, text: "linea tres" },
+  ];
+  const openPaste = () => {
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+    fireEvent.click(screen.getByTestId("editor-overflow-btn"));
+    fireEvent.click(screen.getByTestId("paste-lyrics-btn"));
+  };
+
+  it("la revisión avanza recién en el 3er sondeo → muestra la espera y termina en éxito", async () => {
+    const onReanchor = vi.fn(async () => { throw new Error("connection reset"); });
+    let polls = 0;
+    const onReanchorReconcile = vi.fn(async (jobId, base) => {
+      polls += 1;
+      if (polls < 3) return { ok: false, reason: "not-advanced", revision: base };
+      return { ok: true, recovered: true, revision: base + 1, count: 3, review_count: 1, segments: RECOVERED };
+    });
+    render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor, onReanchorReconcile, reanchorWaitMs: 5000, reanchorPollMs: 20 })} />);
+    openPaste();
+    fireEvent.change(screen.getByTestId("paste-lyrics-textarea"), { target: { value: "linea uno\nlinea dos\nlinea tres" } });
+    fireEvent.click(screen.getByTestId("paste-lyrics-submit"));
+    await screen.findByTestId("paste-lyrics-waiting");
+    await waitFor(() => expect(toastSpy).toHaveBeenCalled(), { timeout: 3000 });
+    expect(polls).toBeGreaterThanOrEqual(3);
+    expect(toastSpy.mock.calls[0][0].tone).toBe("success");
+    expect(screen.queryByTestId("paste-lyrics-textarea")).toBeNull();
+  });
+
+  it("si el servidor nunca avanza dentro del plazo → error, sin aplicar nada", async () => {
+    const onReanchor = vi.fn(async () => ({ ok: false, reason: "declined" }));
+    const onReanchorReconcile = vi.fn(async (jobId, base) => ({ ok: false, reason: "not-advanced", revision: base }));
+    render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor, onReanchorReconcile, reanchorWaitMs: 60, reanchorPollMs: 10 })} />);
+    openPaste();
+    fireEvent.change(screen.getByTestId("paste-lyrics-textarea"), { target: { value: "linea uno\nlinea dos\nlinea tres" } });
+    fireEvent.click(screen.getByTestId("paste-lyrics-submit"));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/No se pudo re-sincronizar/), { timeout: 3000 });
+    expect(onReanchorReconcile.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByTestId("paste-lyrics-waiting")).toBeNull();
+    expect(toastSpy).not.toHaveBeenCalled();
   });
 });
