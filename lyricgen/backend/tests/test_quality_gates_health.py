@@ -73,3 +73,39 @@ def test_snapshot_always_reports_a_token_and_a_state(monkeypatch):
     assert gates["state"] in {"red", "green"}
     assert isinstance(gates["runtime_token"], (str, type(None)))
     assert gates["policy_version"]
+
+
+def _separation_on(monkeypatch) -> None:
+    monkeypatch.setenv("VOCAL_SEP_ENABLED", "1")
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_test")
+    import vocal_sep
+    monkeypatch.setattr(vocal_sep, "_VARIANT", "mdx_extra")
+
+
+def test_vocal_separation_disabled_is_red(monkeypatch):
+    # La separación es el componente que más aporta sobre el holdout; apagarla
+    # por env var no puede ser silencioso.
+    monkeypatch.setenv("VOCAL_SEP_ENABLED", "0")
+    gates = quality_gates_snapshot({})
+    assert gates["state"] == "red"
+    assert gates["vocal_separation"]["enabled"] is False
+    assert "vocal_separation_disabled" in gates["reasons"]
+
+
+def test_vocal_separation_cheaper_variant_is_red(monkeypatch):
+    _separation_on(monkeypatch)
+    import vocal_sep
+    monkeypatch.setattr(vocal_sep, "_VARIANT", "htdemucs")
+    gates = quality_gates_snapshot({})
+    assert "vocal_separation_variant_downgraded" in gates["reasons"]
+    assert gates["vocal_separation"]["variant"] == "htdemucs"
+    assert gates["vocal_separation"]["protected_variant"] == "mdx_extra"
+
+
+def test_vocal_separation_protected_variant_adds_no_reason(monkeypatch):
+    _separation_on(monkeypatch)
+    gates = quality_gates_snapshot({})
+    assert gates["vocal_separation"] == {
+        "enabled": True, "variant": "mdx_extra", "protected_variant": "mdx_extra",
+    }
+    assert not [r for r in gates["reasons"] if r.startswith("vocal_separation")]
