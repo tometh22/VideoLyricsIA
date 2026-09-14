@@ -290,7 +290,7 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
     expect(screen.getByRole("tab", { name: "Timeline avanzada" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("quality-review-panel")).toBeInTheDocument();
     expect(screen.getAllByTestId("timeline-unsafe-window")).toHaveLength(2);
-    expect(screen.queryByRole("button", { name: /Confirmar y seguir/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Confirmar tramo/i })).toBeNull();
   });
 
   it("acepta explícitamente el contrato lyrics-quality-v6", async () => {
@@ -357,7 +357,7 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
     pauseSpy.mockClear();
     await userEvent.click(screen.getByRole("button", { name: /Reproducir este tramo en loop/i }));
     await userEvent.click(screen.getByRole("button", { name: "Sí, está bien" }));
-    await userEvent.click(screen.getByRole("button", { name: /Confirmar y seguir/i }));
+    await userEvent.click(screen.getByRole("button", { name: /Confirmar tramo/i }));
     expect(pauseSpy).toHaveBeenCalled();
     expect(screen.getByText("Parte 2 de 2")).toBeInTheDocument();
   });
