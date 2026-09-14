@@ -15533,6 +15533,14 @@ class ReanchorSegmentsRequest(BaseModel):
     # devuelve 409 reference_structure_unconfirmed y no se alinea nada
     # (Color Esperanza d323e1bc378c: 81 líneas de otra versión sobre 44).
     confirm_structure: bool = False
+    # 2026-09-14: "modo tarea". La alineación CTC tarda 2-5 min en canciones
+    # largas y el request HTTP no sobrevive: el proxy de Railway re-envía el
+    # POST a la otra réplica a los ~60 s y un swap de deploy corta la
+    # conexión mientras la réplica vieja sigue calculando y persiste minutos
+    # después (el cliente ve "No se pudo re-sincronizar" con todo aplicado).
+    # Con async_mode el POST devuelve 202 {task_id} al instante y el cliente
+    # consulta GET /jobs/{job_id}/reanchor/tasks/{task_id}.
+    async_mode: bool = False
 
 
 _PASTED_MAX_LINES = 400
@@ -15756,7 +15764,7 @@ async def reanchor_segments(
     - En éxito persiste el timing re-anclado en segments_json y devuelve
       los segments mergeados para que el editor se refresque sin re-fetch.
     """
-    from jobs import get_job_model, touch_user_activity
+    from jobs import get_job_model
 
     job = get_job_model(db, job_id)
     is_platform_admin = current_user.get("role") == "admin"
@@ -15766,6 +15774,192 @@ async def reanchor_segments(
                      or job.tenant_id != current_user["tenant_id"]))):
         raise HTTPException(status_code=404, detail="Job not found.")
     _audit_cross_tenant_access(db, current_user, job, "reanchor")
+    if not body.async_mode:
+        return await _reanchor_execute(job_id, body, current_user, db)
+    return _reanchor_task_start(job_id, body, current_user)
+
+
+# ---------------------------------------------------------------------------
+# Reanchor "modo tarea" (2026-09-14)
+#
+# Registro de tareas en Redis (clave reanchor:task:{task_id}, TTL 1 h) con
+# fallback a un dict en proceso cuando Redis no está (tests, dev). La
+# ejecución corre con asyncio.create_task en el MISMO proceso api — no hay
+# worker ni RQ: es el mismo código de siempre, sólo que ya no vive atado al
+# request HTTP que el proxy o un deploy pueden cortar.
+# ---------------------------------------------------------------------------
+
+_REANCHOR_TASK_TTL_S = 3600
+# Fallback sin Redis: task_id -> (expira_monotonic, record).
+_REANCHOR_TASK_LOCAL: dict[str, tuple[float, dict]] = {}
+# Tareas asyncio vivas (los tests las drenan; en prod sólo evita que el GC
+# cancele la task antes de terminar — asyncio guarda referencias débiles).
+_REANCHOR_TASKS: dict[str, "asyncio.Task"] = {}
+
+
+def _reanchor_task_key(task_id: str) -> str:
+    return f"reanchor:task:{task_id}"
+
+
+def _reanchor_task_redis():
+    try:
+        from queue_jobs import _init_redis
+        conn, _, _ = _init_redis()
+        return conn
+    except Exception as exc:  # pragma: no cover - defensivo
+        logger.warning("[REANCHOR-TASK] redis unavailable: %s", exc)
+        return None
+
+
+def _reanchor_task_local_prune() -> None:
+    now = time.monotonic()
+    for key in [k for k, (exp, _) in _REANCHOR_TASK_LOCAL.items() if exp <= now]:
+        _REANCHOR_TASK_LOCAL.pop(key, None)
+
+
+def _reanchor_task_save(task_id: str, record: dict) -> None:
+    conn = _reanchor_task_redis()
+    if conn is not None:
+        try:
+            conn.set(_reanchor_task_key(task_id), json.dumps(record, default=str),
+                     ex=_REANCHOR_TASK_TTL_S)
+            return
+        except Exception as exc:
+            logger.warning("[REANCHOR-TASK] redis set failed task=%s: %s", task_id, exc)
+    _reanchor_task_local_prune()
+    _REANCHOR_TASK_LOCAL[task_id] = (time.monotonic() + _REANCHOR_TASK_TTL_S, record)
+
+
+def _reanchor_task_load(task_id: str) -> dict | None:
+    conn = _reanchor_task_redis()
+    if conn is not None:
+        try:
+            raw = conn.get(_reanchor_task_key(task_id))
+            if raw:
+                return json.loads(raw)
+        except Exception as exc:
+            logger.warning("[REANCHOR-TASK] redis get failed task=%s: %s", task_id, exc)
+    _reanchor_task_local_prune()
+    entry = _REANCHOR_TASK_LOCAL.get(task_id)
+    return entry[1] if entry else None
+
+
+async def _reanchor_task_run(task_id: str, job_id: str,
+                             body: "ReanchorSegmentsRequest", current_user: dict) -> None:
+    """Corre _reanchor_execute con sesión propia y deja el resultado en el
+    registro. Nunca deja escapar una excepción (es una task suelta)."""
+    from database import SessionLocal as _SL
+
+    record = _reanchor_task_load(task_id) or {
+        "job_id": job_id, "user_id": current_user.get("id"), "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None, "http_status": None, "payload": None,
+    }
+    http_status: int = 500
+    payload: dict = {"detail": "reanchor_task_failed"}
+    session = _SL()
+    try:
+        try:
+            result = await _reanchor_execute(job_id, body, current_user, session)
+        except HTTPException as exc:
+            http_status, payload = int(exc.status_code), {"detail": exc.detail}
+        except Exception as exc:
+            logger.exception("[REANCHOR-TASK] failed task=%s job=%s", task_id, job_id)
+            http_status = 500
+            payload = {"detail": "reanchor_task_failed",
+                       "error_type": exc.__class__.__name__}
+        else:
+            if isinstance(result, JSONResponse):
+                http_status = int(result.status_code)
+                try:
+                    payload = json.loads(result.body)
+                except Exception:
+                    payload = {"detail": "reanchor_task_unparseable_response"}
+            else:
+                http_status, payload = 200, result
+    finally:
+        try:
+            # _reanchor_execute ya cierra la sesión antes del I/O largo;
+            # cerrar dos veces es inofensivo y garantiza no fugar en 4xx.
+            session.close()
+        except Exception:  # pragma: no cover - defensivo
+            pass
+        record.update({
+            "status": "done",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "http_status": http_status,
+            "payload": payload,
+        })
+        try:
+            _reanchor_task_save(task_id, record)
+        except Exception:  # pragma: no cover - defensivo
+            logger.exception("[REANCHOR-TASK] could not persist result task=%s", task_id)
+        _REANCHOR_TASKS.pop(task_id, None)
+        logger.info("[REANCHOR-TASK] done task=%s job=%s http=%s", task_id, job_id, http_status)
+
+
+def _reanchor_task_start(job_id: str, body: "ReanchorSegmentsRequest",
+                         current_user: dict) -> JSONResponse:
+    import uuid as _uuid
+
+    task_id = _uuid.uuid4().hex
+    _reanchor_task_save(task_id, {
+        "job_id": job_id,
+        "user_id": current_user.get("id"),
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "http_status": None,
+        "payload": None,
+    })
+    task = asyncio.create_task(_reanchor_task_run(task_id, job_id, body, current_user))
+    _REANCHOR_TASKS[task_id] = task
+    logger.info("[REANCHOR-TASK] started task=%s job=%s user=%s",
+                task_id, job_id, current_user.get("id"))
+    return JSONResponse(
+        status_code=202,
+        content={"task_id": task_id, "job_id": job_id, "status": "running"},
+    )
+
+
+@app.get("/jobs/{job_id}/reanchor/tasks/{task_id}")
+async def reanchor_task_status(
+    job_id: str,
+    task_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Estado de una tarea de re-anclado lanzada con async_mode. Misma
+    regla de acceso que el POST (owner+tenant, o admin de plataforma).
+    404 reanchor_task_unknown si el registro expiró, vive en otra réplica
+    sin Redis, o pertenece a otro job."""
+    from jobs import get_job_model
+
+    job = get_job_model(db, job_id)
+    is_platform_admin = current_user.get("role") == "admin"
+    if (not job
+            or (not is_platform_admin
+                and (job.user_id != current_user["id"]
+                     or job.tenant_id != current_user["tenant_id"]))):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    record = _reanchor_task_load(task_id)
+    if not record or record.get("job_id") != job_id:
+        return JSONResponse(status_code=404, content={"code": "reanchor_task_unknown"})
+    return {k: v for k, v in record.items() if k != "user_id"}
+
+
+async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
+                            current_user: dict, db) -> dict | JSONResponse:
+    """Cuerpo del re-anclado, movido tal cual desde `reanchor_segments`
+    (2026-09-14) para poder correrlo fuera del request HTTP. Auth y
+    auditoría quedan en el handler; acá se re-lee el job con la sesión
+    recibida (en modo tarea es una SessionLocal propia, la del request ya
+    se cerró al devolver el 202)."""
+    from jobs import get_job_model, touch_user_activity
+
+    job = get_job_model(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
     if not _anchor_lyrics_enabled():
         # Flag off → el server no tiene la Versión B habilitada. 409 (no
         # 404) para no confundir con "job inexistente"; el frontend ni

@@ -1709,6 +1709,44 @@ function VariantWizardRoute({
   return wizardScreen;
 }
 
+// Sondeo del modo tarea del re-anclado (ver reanchorSegmentsOnBackend).
+const REANCHOR_TASK_POLL_MS = 3000;
+const REANCHOR_TASK_TIMEOUT_MS = 12 * 60 * 1000;
+const pollReanchorTask = async (jobId, taskId, onProgress) => {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < REANCHOR_TASK_TIMEOUT_MS) {
+    await new Promise((resolve) => setTimeout(resolve, REANCHOR_TASK_POLL_MS));
+    const elapsedS = Math.round((Date.now() - startedAt) / 1000);
+    if (typeof onProgress === "function") {
+      try { onProgress({ elapsedS, taskId }); } catch { /* progress is best-effort */ }
+    }
+    let res;
+    try {
+      res = await authFetch(`${API}/jobs/${jobId}/reanchor/tasks/${taskId}`, { cache: "no-store" });
+    } catch (err) {
+      console.warn("[reanchor] task poll network error", err);
+      continue; // transient: keep polling until the deadline
+    }
+    if (res.status === 404) {
+      console.warn("[reanchor] task registry lost", taskId);
+      return { ok: false, reason: "task-lost" };
+    }
+    if (!res.ok) continue;
+    let record = null;
+    try { record = await res.json(); } catch { continue; }
+    if (record?.status !== "done") continue;
+    const httpStatus = Number(record.http_status);
+    const payload = record.payload || {};
+    if (httpStatus >= 200 && httpStatus < 300) return payload;
+    console.warn("[reanchor] task failed", httpStatus, payload?.detail || payload?.code || "");
+    return { ok: false, reason: `http-${httpStatus}`, status: httpStatus,
+      detail: payload?.detail || "", code: payload?.code || null,
+      structure: payload?.structure || null, structural: payload?.structural || null };
+  }
+  console.warn("[reanchor] task poll timed out", taskId);
+  return { ok: false, reason: "task-lost" };
+};
+
 export default function App() {
   const { t } = useI18n();
   const navigate = useNavigate();
@@ -3679,14 +3717,32 @@ export default function App() {
   // LyricsEditor refresque su estado y muestre el toast de resultado.
   // `extra` (2026-09-13): { lyrics_text, confirm_structure } cuando el
   // operador pega la letra oficial; vacío = re-anclar el texto ya editado.
+  // 2026-09-14 "modo tarea": la alineación tarda 2-5 min en canciones largas
+  // y el request no sobrevive (el proxy re-envía el POST a los ~60 s; un
+  // deploy corta la conexión mientras el server sigue y persiste igual).
+  // Pedimos async_mode: el backend contesta 202 {task_id} al instante y acá
+  // sondeamos GET /reanchor/tasks/{task_id} hasta que termine, devolviendo
+  // EXACTAMENTE la misma forma que el camino síncrono (LyricsEditor no
+  // cambia). Si el registro se perdió (404: réplica reemplazada) o el
+  // sondeo vence, devolvemos reason "task-lost" y el editor cae en su
+  // reconciliación por revisión. Un backend viejo responde 200/4xx directo
+  // y sigue el manejo síncrono de siempre.
   const reanchorSegmentsOnBackend = useCallback(async (jobId, baseRevision, extra = {}) => {
     if (!jobId) return { ok: false, reason: "no-job" };
+    const { onProgress, ...requestExtra } = extra || {};
     try {
       const res = await authFetch(`${API}/jobs/${jobId}/reanchor`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base_revision: baseRevision, ...extra }),
+        body: JSON.stringify({ base_revision: baseRevision, ...requestExtra, async_mode: true }),
       });
+      if (res.status === 202) {
+        let started = null;
+        try { started = await res.clone().json(); } catch { /* non-JSON body */ }
+        const taskId = started?.task_id;
+        if (!taskId) return { ok: false, reason: "task-lost" };
+        return await pollReanchorTask(jobId, taskId, onProgress);
+      }
       if (!res.ok) {
         let detail = "";
         let payload = null;
