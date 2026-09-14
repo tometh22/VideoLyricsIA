@@ -20,6 +20,27 @@ const job = {
 };
 
 describe("DeliveryQCPanel", () => {
+  it("permite actualizar un reporte desactualizado desde el video renderizado", async () => {
+    const onJobUpdate = vi.fn();
+    const staleJob = {
+      ...job,
+      delivery_qc: { ...job.delivery_qc, status: "STALE", issues: [] },
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ delivery_qc: { ...staleJob.delivery_qc, status: "COMPLETE" } }),
+    }));
+    render(<DeliveryQCPanel job={staleJob} onSeek={vi.fn()} onJobUpdate={onJobUpdate} onOpenEditor={vi.fn()} />);
+    fireEvent.click(screen.getByText("Actualizar preflight"));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining("/delivery-qc/recheck"),
+      expect.objectContaining({ method: "POST" }),
+    ));
+    expect(onJobUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      delivery_qc: expect.objectContaining({ status: "COMPLETE" }),
+    }));
+  });
+
   it("seeks to findings and persists a reviewer decision", async () => {
     const onSeek = vi.fn();
     const onJobUpdate = vi.fn();

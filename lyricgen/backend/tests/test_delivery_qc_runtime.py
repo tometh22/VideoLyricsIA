@@ -46,6 +46,18 @@ def test_ocr_compares_pixels_without_silently_fixing_text():
     assert issues[0]["auto_fixable"] is False
 
 
+def test_ocr_accepts_artist_plus_title_title_card():
+    issues = compare_ocr_observations(
+        [{
+            "kind": "title", "seconds": 1.0,
+            "text": "LOS HUASOS QUINCHEROS El Corralero", "confidence": .99,
+        }],
+        metadata={"artist": "Los Huasos Quincheros", "title": "El Corralero"},
+        segments=[],
+    )
+    assert issues == []
+
+
 def test_enforce_blocks_open_findings_but_observe_never_blocks():
     report = {"status": "COMPLETE", "issues": [{"issue_id": "x", "severity": "FAIL", "status": "OPEN"}]}
     assert approval_gate(report, "observe")["can_approve"] is True

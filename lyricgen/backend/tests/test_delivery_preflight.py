@@ -147,6 +147,24 @@ def test_clean_delivery_passes():
     assert report["issues"] == []
 
 
+def test_title_card_with_artist_and_title_matches_separate_metadata_fields():
+    report = build_delivery_preflight(
+        metadata={"artist": "Los Huasos Quincheros", "title": "El Corralero"},
+        asset={"rendered_title": "LOS HUASOS QUINCHEROS El Corralero"},
+        segments=[{"start": 1, "end": 3, "text": "Una letra"}],
+    )
+    assert not any(row["code"] == "METADATA_TITLE_MISMATCH" for row in report["issues"])
+
+
+def test_title_card_suffix_still_fails_metadata_check():
+    report = build_delivery_preflight(
+        metadata={"artist": "Los Huasos Quincheros", "title": "El Corralero"},
+        asset={"rendered_title": "LOS HUASOS QUINCHEROS El Corralero En Vivo"},
+        segments=[{"start": 1, "end": 3, "text": "Una letra"}],
+    )
+    assert any(row["code"] == "METADATA_TITLE_MISMATCH" for row in report["issues"])
+
+
 def test_terminal_line_period_preflight_blocks_only_single_final_periods():
     report = build_delivery_preflight(
         metadata={"artist": "Artist", "title": "Song"},

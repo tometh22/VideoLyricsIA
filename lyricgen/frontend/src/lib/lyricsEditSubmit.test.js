@@ -72,6 +72,17 @@ describe("layoutChanged", () => {
 });
 
 describe("translateBackendError", () => {
+  it("normaliza el bloqueo estructurado del preflight a texto accionable", () => {
+    const out = translateBackendError({
+      code: "delivery_qc_blocked",
+      message: "El preflight de entrega tiene hallazgos pendientes.",
+      delivery_qc: { blocked: true, reason: "open_fail" },
+    }, () => null);
+    expect(typeof out).toBe("string");
+    expect(out).toContain("preflight");
+    expect(out).not.toContain("[object Object]");
+  });
+
   it("maps the structured edit_in_progress conflict", () => {
     const out = translateBackendError(
       { code: "edit_in_progress", message: "An edit is already being rendered." },

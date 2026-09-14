@@ -78,6 +78,18 @@ export function translateBackendError(raw, t) {
     return tr("edit.error_revision_conflict") ||
       "La letra cambió en el servidor mientras editabas. Recargá el editor para traer la última versión y volvé a aplicar tus cambios.";
   }
+  if (raw && typeof raw === "object" && raw.code === "delivery_qc_blocked") {
+    return tr("detail.delivery_qc_blocked") ||
+      "El preflight de entrega tiene hallazgos pendientes. Actualizá el preflight y resolvé los checks del panel antes de aprobar.";
+  }
+  if (raw === "delivery_qc_report_stale" || (raw && typeof raw === "object" && raw.code === "fresh_preflight_required")) {
+    return tr("detail.delivery_qc_stale") ||
+      "El preflight quedó desactualizado. Actualizalo desde el panel del video antes de aprobar.";
+  }
+  if (raw === "mandatory_reviewer_check_requires_signed_manual_resolution") {
+    return tr("detail.delivery_qc_manual_required") ||
+      "Este check requiere una firma manual del revisor.";
+  }
   let str;
   if (typeof raw === "string") {
     str = raw;
@@ -86,7 +98,7 @@ export function translateBackendError(raw, t) {
       .map((e) => (e && typeof e === "object" && e.msg) ? e.msg : String(e))
       .join("; ");
   } else if (typeof raw === "object") {
-    str = raw.msg || raw.detail || JSON.stringify(raw);
+    str = raw.msg || (typeof raw.detail === "string" ? raw.detail : raw.message) || JSON.stringify(raw);
   } else {
     str = String(raw);
   }

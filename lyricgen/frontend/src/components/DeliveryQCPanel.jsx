@@ -17,6 +17,26 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
   const report = job?.delivery_qc;
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const refresh = async () => {
+    setBusy("refresh");
+    setError("");
+    try {
+      const response = await fetch(`${API}/jobs/${job.job_id}/delivery-qc/recheck`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = data.detail;
+        throw new Error(typeof detail === "string" ? detail : detail?.message || detail?.code || "No se pudo actualizar el preflight");
+      }
+      onJobUpdate?.({ ...job, delivery_qc: data.delivery_qc });
+    } catch (requestError) {
+      setError(String(requestError.message || requestError));
+    } finally {
+      setBusy("");
+    }
+  };
   const safeActions = useMemo(
     () => (report?.repairs?.actions || []).filter((row) => row.status === "APPLIED"),
     [report],
@@ -98,7 +118,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
         <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.summary?.open_count || 0}</div><div className="text-[10px] text-ink-secondary">abiertos</div></div>
       </div>
 
-      {report.status === "STALE" && <p className="text-xs text-amber-200 mb-3">Se está generando o falta analizar el render más reciente.</p>}
+      {report.status === "STALE" && <div className="mb-3 space-y-2"><p className="text-xs text-amber-200">El reporte corresponde a una versión anterior o todavía no fue generado.</p><button disabled={busy === "refresh"} onClick={refresh} className="btn-secondary h-9 px-3 text-xs">{busy === "refresh" ? "Actualizando preflight…" : "Actualizar preflight"}</button></div>}
       <div className="space-y-2">
         {(report.issues || []).map((issue) => (
           <div key={issue.issue_id} className="rounded-xl bg-white/[0.03] ring-1 ring-white/[0.06] p-3">
