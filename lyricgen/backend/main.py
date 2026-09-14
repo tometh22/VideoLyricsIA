@@ -15542,6 +15542,70 @@ def _edited_structure_report(db: Session, job, anchor_lines: list[str], *, is_li
         return None
 
 
+def _reanchor_already_applied(db, job_id: str, base_revision, lyrics_sha: str) -> dict | None:
+    """Idempotencia del re-anclado (2026-09-14).
+
+    Con 2 réplicas de api y alineaciones de >60 s (CTC sobre 4 min de audio
+    tarda ~120 s), el proxy re-envía el POST y el duplicado llegaba a
+    persistir con la revisión ya avanzada: devolvía 409 stale_revision y el
+    editor mostraba "no se pudo" aunque el primer pedido había aplicado todo
+    (job cb6887c4ffed: `[REANCHOR] ok … replaced=1` en el log, error en
+    pantalla). Si ya existe un `lyrics.reanchor` de este job desde la MISMA
+    base_revision y con la MISMA letra (sha; vacío en el camino legacy) en los
+    últimos 30 minutos, el duplicado es el mismo pedido y se responde con lo
+    ya persistido en vez de fallar.
+    """
+    if base_revision is None:
+        return None
+    from datetime import datetime, timedelta, timezone
+    from database import AuditLog
+    since = datetime.now(timezone.utc) - timedelta(minutes=30)
+    try:
+        rows = (
+            db.query(AuditLog)
+            .filter(AuditLog.action == "lyrics.reanchor")
+            .filter(AuditLog.created_at >= since)
+            .order_by(AuditLog.id.desc())
+            .limit(200)
+            .all()
+        )
+    except Exception as exc:  # noqa: BLE001 — la idempotencia es best-effort
+        logger.warning("[REANCHOR] idempotency lookup failed job=%s: %s", job_id, exc)
+        return None
+    for log in rows:
+        detail = log.detail if isinstance(log.detail, dict) else {}
+        if str(detail.get("job_id") or "") != job_id:
+            continue
+        try:
+            if int(detail.get("base_revision", -1)) != int(base_revision):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if str(detail.get("lyrics_text_sha256") or "") != str(lyrics_sha or ""):
+            continue
+        return detail
+    return None
+
+
+def _idempotent_reanchor_response(job_id: str, segments, revision: int, detail: dict) -> dict:
+    segs = [dict(s) for s in (segments or []) if isinstance(s, dict)]
+    return {
+        "ok": True,
+        "idempotent": True,
+        "job_id": job_id,
+        "count": len(segs),
+        "review_count": sum(1 for s in segs if s.get("review")),
+        "locked_kept": int(detail.get("locked_kept") or 0),
+        "segments": segs,
+        "revision": int(revision or 0),
+        "content_source": str(detail.get("content_source") or "editor_text"),
+        "lines_kept": int(detail.get("lines_kept") or 0),
+        "lines_replaced": int(detail.get("lines_replaced") or 0),
+        "locked_dropped": int(detail.get("locked_dropped") or 0),
+        "structure": detail.get("structure"),
+    }
+
+
 def _merge_pasted_segments(prev_segs: list[dict], anchored: list[dict]) -> tuple[list[dict], dict]:
     """Merge por bloques (difflib sobre texto normalizado) entre los
     segments actuales y la letra pegada ya alineada.
@@ -15654,7 +15718,19 @@ async def reanchor_segments(
             status_code=428,
             content={"code": "client_upgrade_required", "current_revision": initial_revision},
         )
+    _early_lines = _pasted_lyric_lines(body.lyrics_text)
+    _lyrics_sha = (
+        __import__("hashlib").sha256("\n".join(_early_lines).encode("utf-8")).hexdigest()
+        if _early_lines else ""
+    )
     if body.base_revision is not None and body.base_revision != initial_revision:
+        _applied = _reanchor_already_applied(db, job_id, body.base_revision, _lyrics_sha)
+        if _applied is not None:
+            logger.info("[REANCHOR] idempotent replay job=%s base=%s rev=%s",
+                        job_id, body.base_revision, initial_revision)
+            return _idempotent_reanchor_response(
+                job_id, job.segments_json, initial_revision, _applied,
+            )
         from ops_metrics import increment
         increment("segments_revision_conflict")
         return JSONResponse(
@@ -15929,6 +16005,16 @@ async def reanchor_segments(
                 content={"code": "client_upgrade_required", "current_revision": current_revision},
             )
         if body.base_revision is not None and current_revision != body.base_revision:
+            _applied = _reanchor_already_applied(_db2, job_id, body.base_revision, _lyrics_sha)
+            if _applied is not None:
+                # El primer pedido (idéntico) ya persistió mientras este
+                # duplicado corría la alineación: devolver lo aplicado.
+                logger.info("[REANCHOR] idempotent duplicate job=%s base=%s rev=%s",
+                            job_id, body.base_revision, current_revision)
+                _db2.rollback()
+                return _idempotent_reanchor_response(
+                    job_id, row.segments_json, current_revision, _applied,
+                )
             from ops_metrics import increment
             increment("segments_revision_conflict")
             return JSONResponse(
