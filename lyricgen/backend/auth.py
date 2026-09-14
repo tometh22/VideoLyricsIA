@@ -941,6 +941,7 @@ def get_current_user(
         user_dict = verify_api_key(db, api_key_value)
         if not user_dict:
             raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+        _enforce_trial_request(request, db, user_dict)
         return user_dict
 
     # JWT path (browser/app)
@@ -972,6 +973,8 @@ def get_current_user(
 
     jti = _validate_access_claims(payload, user)
     _validate_login_session(db, user, jti)
+
+    _enforce_trial_request(request, db, user.to_dict())
 
     return {
         "id": user.id,
@@ -1008,6 +1011,16 @@ def get_current_user(
             "editor_v2": editor_v2_enabled(user),
         },
     }
+
+
+def _enforce_trial_request(request, db, identity):
+    # Read access/downloads remain available; paid actions and saved mutations
+    # stop at the explicitly activated deadline, including already-issued JWTs.
+    if request.method not in ("GET", "HEAD", "OPTIONS") and not request.url.path.startswith(("/auth/", "/telemetry", "/events")):
+        from trial_policy import require_open, applies
+        require_open(db, identity)
+        if applies(identity) and request.url.path.startswith(("/batch/", "/pilot/", "/generate-preview")):
+            raise HTTPException(403, detail={"code": "trial_feature_unavailable", "message": "El trial incluye creación y edición de videos individuales, sin lotes ni previews IA pagos."})
 
 
 def get_current_user_from_token_param(token: str, db: Session) -> dict:
@@ -1138,6 +1151,10 @@ def get_plan_usage(db: Session, user_id: int, tenant_id: str, plan_id: str,
     la cuota es por tenant (comportamiento histórico).
     """
     from database import Job, User, CreditGrant
+
+    from trial_policy import configured_group, usage as trial_usage
+    if configured_group(billing_group):
+        return trial_usage(db, billing_group, scenes_credit_cost())
 
     now = datetime.now(timezone.utc)
     month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)

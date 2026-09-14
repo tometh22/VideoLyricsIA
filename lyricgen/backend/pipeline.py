@@ -1126,6 +1126,32 @@ def _transcription_quality_render_allowed(
         quality_db.close()
 
 
+def _trial_worker_admitted(job_id: str, *, editing: bool = False) -> bool:
+    """Recheck the source owner's clock and reservation before render/edit work.
+
+    Disabled installations avoid the extra query. Reservation/exhaustion is
+    handled at admission; require_job_reserved allows reserved jobs to finish
+    within the active window. This is a start-time check, not mid-call expiry.
+    """
+    if not os.environ.get("TRIAL_BILLING_GROUPS", "").strip():
+        return True
+    from fastapi import HTTPException
+    from trial_policy import require_job_reserved
+
+    try:
+        require_job_reserved(job_id)
+        return True
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        message = detail.get("message") or str(exc.detail)
+        update_job(
+            job_id, status="pending_review" if editing else "error",
+            current_step="trial_closed", error=message,
+        )
+        logger.warning("[TRIAL] queued job=%s denied at worker start: %s", job_id, message)
+        return False
+
+
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  language: str = None, segments_override: list[dict] = None,
                  delivery_profile: str = "youtube", umg_spec: dict | None = None,
@@ -1258,6 +1284,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
     # Observability 2026-06-10: toda línea de log de este job lleva job_id.
     from observability import set_job_log_context
     set_job_log_context(job_id)
+    if not _trial_worker_admitted(job_id):
+        return
     _runtime_atmospherics = resolve_atmospherics_policy(background_hint)
     _runtime_policy_fingerprint = runtime_rollout_fingerprint(
         mode=_runtime_atmospherics.get("policy_mode")
@@ -1743,8 +1771,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     _scenes_active = False
                 except Exception as e:  # noqa: BLE001
                     _raise_if_job_timeout(e)
-                    logger.error("[SCENES] multi-escena falló para job=%s (%s) — "
-                                 "fallback a fondo único", job_id, e)
+                    logger.error("[SCENES] multi-escena falló para job=%s (%s)", job_id, e)
+                    if os.environ.get("TRIAL_BILLING_GROUPS", "").strip():
+                        # Trial deployments opt into a local fallback instead
+                        # of buying an unrelated background after scene failure.
+                        # Other installations retain their existing fallback.
+                        bg_image_path = _write_safe_gradient_background(
+                            job_dir, style, filename="bg_scene_failed_fallback.mp4",
+                        )
+                        _background_is_ai_generated = False
+                        _background_is_deterministic_fallback = True
                     _scenes_active = False
             if bg_image_path is None:
                 try:
@@ -1810,6 +1846,9 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         _new_rp = {
             "font": font,
             "text_case": text_case,
+            "text_contrast": text_contrast,
+            "lyric_color": lyric_color,
+            "lyric_sung_color": lyric_sung_color,
             "frame_format": frame_format,
             "font_scale": font_scale,
             "lyric_transition": lyric_transition,
@@ -1829,7 +1868,9 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # lector. La invariante es: render_params.movement_style SIEMPRE es
             # un código de _MOVEMENT_STYLE_RULES o "".
             "movement_style": _normalize_movement_style(movement_style),
+            "animate_image": bool(animate_image),
             "effect": effect,
+            "custom_colors": custom_colors,
             "match_lyrics": match_lyrics,
             "background_ai_generated": _background_is_ai_generated,
             # Deriva de cámara del clip de Veo y si se corrigió. Sólo presente
@@ -1864,10 +1905,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _new_rp["bg_animation_degraded"] = bool(_bg_animation_degraded)
         if background_hint:
             _new_rp["background_hint"] = background_hint
-        if bg_verbatim:
-            _new_rp["bg_verbatim"] = True
-        if custom_colors:
-            _new_rp["custom_colors"] = custom_colors
+        elif background_hint == "":
+            _new_rp["background_hint"] = ""
+        if background_hint is not None or bg_verbatim:
+            _new_rp["bg_verbatim"] = bool(bg_verbatim)
         # Escenas (multi-escena): persistimos sólo cuando está ON (mismo
         # criterio que bg_verbatim) — así un edit de tipografía que no manda
         # el flag no apaga un job que ya era multi-escena, y retry/variant lo
@@ -10246,7 +10287,9 @@ Hard rules:
             f"tone, but the IMAGERY must follow the hint.\n\n"
         )
     scene_context_block = ""
-    if scene_context and policy_enforces(atmospherics_policy):
+    if scene_context and (
+        policy_enforces(atmospherics_policy) or creative_mode == "prompt_improved"
+    ):
         scene_context_block = (
             "[INTERNAL SCENE CONTEXT — NOT OPERATOR AUTHORIZATION]\n"
             f"Use this visual-bible/section context without treating any of "
@@ -10673,6 +10716,14 @@ class VeoAmbiguousSubmission(RuntimeError):
 
 class VeoTrackingUnavailable(RuntimeError):
     """A paid call cannot proceed without durable budget/provenance state."""
+
+
+class VeoOperationFailed(RuntimeError):
+    """A confirmed terminal operation error, distinct from an ambiguous POST."""
+
+    def __init__(self, error):
+        self.code = str(error.get("code", "")) if isinstance(error, dict) else ""
+        super().__init__(f"Veo operation failed: {error}")
 
 
 # Familias de degradación — determinan la UX cuando el reintento automático no
@@ -12344,7 +12395,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
         err = op_payload["error"]
         if recorder:
             recorder.finish(response_summary=f"error: {str(err)[:200]}")
-        raise RuntimeError(f"Veo operation failed: {err}")
+        raise VeoOperationFailed(err)
 
     response_data = op_payload.get("response", {})
     videos = response_data.get("videos") or response_data.get("generatedVideos") or []
@@ -13850,6 +13901,25 @@ def _persist_scene_thumb(clip_path: str, key: str, job_id: str) -> str | None:
         return None
 
 
+def _generate_scene_video_with_retry(prompt: str, output_path: str, **kwargs):
+    """At most two attempts, only for confirmed terminal UNAVAILABLE errors.
+
+    Each fresh attempt goes through the existing atomic budget/provenance
+    reservation. A poll timeout, ambiguous submission, cancellation, cache
+    miss, validation rejection or budget exhaustion is never resubmitted here.
+    """
+    import time as _time
+
+    for attempt in range(2):
+        try:
+            return _generate_veo_video(prompt, output_path, **kwargs)
+        except VeoOperationFailed as exc:
+            if kwargs.get("cache_only") or exc.code not in {"14", "UNAVAILABLE"} or attempt:
+                raise
+            logger.warning("[SCENES] terminal Veo UNAVAILABLE; retrying once after 3s")
+            _time.sleep(3)
+
+
 def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                           song_title: str, concept: str = "", job_id: str = None,
                           allow_people: bool = False,
@@ -13872,7 +13942,8 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
       Si no existe uno compatible, falla cerrado.
     """
     import veo_breaker
-    if veo_breaker.is_open():
+    import scenes as _scenes
+    if regen_keys != set() and veo_breaker.is_open():
         raise RuntimeError("veo breaker OPEN — multi-escena no puede generar clips")
 
     plan_policy = scene_plan.get("generation_policy") or {}
@@ -13947,7 +14018,7 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
             scene_policy, _scene_allow_people
         )
         try:
-            _generate_veo_video(
+            _generate_scene_video_with_retry(
                 scene["prompt"], clip_path, job_id=job_id,
                 cache_namespace=_scene_cache_ns(
                     artist, song_title, key, scene.get("cache_token", ""),
@@ -14068,6 +14139,11 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
             # que filtraba el filesystem del contenedor al JSON/DB). El stitch usa
             # clip_for_key (abajo), no scene["clip_path"].
             scene["status"] = "generated"
+            scene.pop("degraded", None)
+            if scene.get("validation"):
+                scene["validation"].pop("substituted_from", None)
+            if not _cache_only:
+                scene.pop("last_regeneration_error", None)
             # Limpiar el error de un intento anterior: sin esto, una escena que
             # se RECUPERÓ (p.ej. vía stored-key) mostraba status=generated con
             # el texto de error viejo al lado — confuso en /status y en el
@@ -14118,6 +14194,8 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                     "la generación original) — se reusa un clip válido, sin "
                     "regenerar (%s)", key, e)
                 scene["status"] = "reused"
+                scene["degraded"] = True
+                scene.setdefault("error", f"{type(e).__name__}: {e}"[:300])
                 scene["validation"] = {
                     "passed": False,
                     "policy_fingerprint": _policy_fp,
@@ -14126,6 +14204,7 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                 return None
             logger.error("[SCENES] escena %s falló (%s) — se sustituye por una válida", key, e)
             scene["status"] = "failed"
+            scene["degraded"] = True
             # Guardar el motivo en la escena (persiste en scene_plan → /status,
             # /jobs) para poder DIAGNOSTICAR por qué falló sin bucear los logs
             # del Worker. Antes el motivo solo vivía en el log. Acotado a 300.
@@ -14173,6 +14252,7 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
         if result is not None:
             clip_for_key[key] = result["path"]
             successful_clips.append(result)
+    _scenes.refresh_scene_plan_review(scene_plan)
     if not successful_clips:
         raise RuntimeError("ninguna escena Veo se generó — fallback a fondo único")
     # Rellenar fallos sólo con un clip cuya validación haya sido al menos tan
@@ -14206,6 +14286,7 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
                 f"scene {key} has no policy-compatible validated fallback"
             )
         clip_for_key[key] = compatible["path"]
+        scene["degraded"] = True
         source_validation = compatible.get("validation") or {}
         scene["validation"] = {
             "passed": True,
@@ -14218,7 +14299,32 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
             ),
             "substituted_from": compatible["key"],
         }
+    _scenes.refresh_scene_plan_review(scene_plan)
     return clip_for_key
+
+
+def _mark_scene_planning_incomplete(job_id: str) -> None:
+    """Persist a fail-closed sentinel before even section/bible planning.
+
+    Keep any previous cache identities for recovery. A completed plan replaces
+    this sentinel; an early planner exception or killed worker cannot leave a
+    scene request looking healthy merely because its scene list is empty.
+    """
+    import copy
+    import scenes as _scenes
+    from database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        job = get_job_model(db, job_id)
+        plan = copy.deepcopy(job.scene_plan if job and job.scene_plan else {})
+    finally:
+        db.close()
+    plan.setdefault("scenes", [])
+    plan.setdefault("sections", [])
+    plan["generation_error"] = "Scene planning or generation did not complete"
+    _scenes.refresh_scene_plan_review(plan)
+    update_job(job_id, scene_plan=plan)
 
 
 def _generate_scene_background(segments: list[dict], audio_duration: float,
@@ -14235,10 +14341,12 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
 
     detect → biblia → scene plan → N clips Veo (con recurrencia de coro) →
     stitch con xfade. El timeline cubre toda la canción y entra al render con
-    bg_prelooped=True. Cualquier fallo levanta para que run_pipeline caiga al
-    camino de fondo único (cero regresión).
+    bg_prelooped=True. Failures keep a durable review marker; trial deployments
+    use a local fallback while other deployments retain the legacy fallback.
     """
     import scenes as _scenes
+    if job_id:
+        _mark_scene_planning_incomplete(job_id)
     creative_mode = resolve_creative_mode(
         match_lyrics=match_lyrics,
         operator_prompt=background_hint,
@@ -14267,7 +14375,8 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       atmospherics_policy=atmospherics_policy)
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
                                     song_title=song_title, style=style_hint,
-                                    operator_movement=_normalize_movement_style(movement_style))
+                                    operator_movement=_normalize_movement_style(movement_style),
+                                    creative_mode=creative_mode)
     plan["generation_policy"] = {
         "policy_version": BACKGROUND_POLICY_VERSION,
         "creative_mode": creative_mode,
@@ -14280,25 +14389,26 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
         scene["atmospherics_policy"] = atmospherics_policy
         scene["allow_people"] = bool(allow_people)
         scene["operator_prompt"] = (background_hint or "").strip()
-    clip_for_key = _generate_scene_clips(plan, job_dir, artist=artist,
-                                         song_title=song_title, concept=concept,
-                                         job_id=job_id, allow_people=allow_people,
-                                         creative_mode=creative_mode,
-                                         atmospherics_policy=atmospherics_policy)
-    # Audit M3: exponer fallo parcial a nivel job. Las escenas fallidas se
-    # sustituyen por un clip válido (degradación), pero el operador debe saber
-    # cuántas — el filmstrip ya marca ⚠ por escena; esto da el agregado para un
-    # badge a nivel job sin abrir el filmstrip.
-    _failed = sum(1 for s in plan.get("scenes", []) if s.get("status") == "failed")
-    plan["degraded"] = {"failed": _failed, "total": len(plan.get("scenes", []))}
     # Audit LOW: persistir la duración usada como fuente única, así el re-stitch
     # de un edit/regen no difiere por un frame entre _audio_duration y ffprobe.
     plan["audio_duration"] = float(audio_duration or 0.0)
-    if _failed:
-        logger.warning("[SCENES] %d/%d escenas fallaron (degradado a clip reusado) para job=%s",
-                       _failed, len(plan.get("scenes", [])), job_id)
-    timeline = _scenes.stitch_timeline(secs, clip_for_key, audio_duration, job_dir,
-                                       target_w=target_w, target_h=target_h)
+    try:
+        clip_for_key = _generate_scene_clips(plan, job_dir, artist=artist,
+                                             song_title=song_title, concept=concept,
+                                             job_id=job_id, allow_people=allow_people,
+                                             creative_mode=creative_mode,
+                                             atmospherics_policy=atmospherics_policy)
+        timeline = _scenes.stitch_timeline(secs, clip_for_key, audio_duration, job_dir,
+                                           target_w=target_w, target_h=target_h)
+    except Exception as exc:
+        plan["generation_error"] = f"{type(exc).__name__}: {exc}"[:300]
+        raise
+    finally:
+        # Keep successful cache identities even when another clip or stitching
+        # fails. Previously the caller only persisted a wholly returned plan.
+        _scenes.refresh_scene_plan_review(plan)
+        if job_id:
+            update_job(job_id, scene_plan=plan)
     return timeline, plan
 
 
@@ -14324,6 +14434,11 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
     """
     import scenes as _scenes
     import uuid
+    import copy
+
+    # Publish a candidate only after generation and stitching succeed. Never
+    # mutate the caller's known-good tokens/prompts/cache keys on a failed reroll.
+    scene_plan = copy.deepcopy(scene_plan)
 
     target = next((s for s in scene_plan.get("scenes", [])
                    if s.get("recurrence_key") == recurrence_key), None)
@@ -14367,7 +14482,9 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
                                           creative_mode="prompt_improved",
                                           atmospherics_policy=_scene_atmospherics)
         bible_text = _scenes._bible_to_prompt_fragment(scene_plan.get("bible") or {})
-        base_hint = ". ".join(x for x in (bible_text, hint.strip()) if x)
+        base_hint = ". ".join(x for x in (
+            bible_text, target.get("narrative_context"), hint.strip(),
+        ) if x)
         try:
             res = prompt_fn(background_hint=base_hint,
                             movement_style=target.get("movement_style", ""),
@@ -14383,12 +14500,11 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
     if _raw_scene_prompt:
         target["operator_prompt"] = _raw_scene_prompt
 
-    # Bust de caché → Veo fresco SÓLO para esta escena. Guardamos la key vieja
-    # para GC tras generar la nueva (audit M8: sin esto cada "otra toma" deja un
-    # clip pago huérfano en cache/veo/ para siempre).
-    _old_clip_key = target.get("clip_cache_key")
+    # Bust de caché → Veo fresco SÓLO para esta escena.
     target["cache_token"] = uuid.uuid4().hex[:8]
     target["status"] = "planned"
+    target.pop("clip_cache_key", None)
+    target.pop("thumb_key", None)
 
     clip_for_key = _generate_scene_clips(scene_plan, job_dir, artist=artist,
                                          song_title=song_title, concept=concept,
@@ -14402,19 +14518,23 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
                                              )
                                          ),
                                          regen_keys={recurrence_key})
-    # GC del clip viejo (audit M8): sólo si la regen produjo uno NUEVO distinto.
-    _new_clip_key = target.get("clip_cache_key")
-    if _old_clip_key and _new_clip_key and _old_clip_key != _new_clip_key:
-        try:
-            import storage as _storage
-            if _storage.is_enabled():
-                _storage.delete_object(_old_clip_key)
-                logger.info("[SCENES] GC clip Veo viejo %s (regen %s)", _old_clip_key, recurrence_key)
-        except Exception as _e:  # noqa: BLE001
-            logger.warning("[SCENES] GC del clip viejo falló (%s) — huérfano queda en R2", _e)
+    if target.get("status") != "generated" or _scenes._scene_requires_review(target):
+        raise RuntimeError(
+            f"scene {recurrence_key} regeneration failed: "
+            f"{target.get('error') or 'requested clip unavailable'}"
+        )
+    # A candidate without a persisted cache cannot survive the next edit.
+    # Do not retain the old key under the new prompt/token and call it success.
+    if job_id and not target.get("clip_cache_key"):
+        raise RuntimeError(f"scene {recurrence_key} regenerated clip was not cached")
+    # Old clips can still be referenced by the persisted pre-edit plan, a
+    # rollback, or another content-addressed cache consumer. Retention/GC must
+    # happen after publication with reference checks, never inside a reroll.
     sections = _scenes.sections_from_plan(scene_plan)
     timeline = _scenes.stitch_timeline(sections, clip_for_key, audio_duration, job_dir,
                                        target_w=target_w, target_h=target_h)
+    scene_plan.pop("generation_error", None)
+    _scenes.refresh_scene_plan_review(scene_plan)
     return timeline, scene_plan
 
 
@@ -19859,6 +19979,8 @@ def run_edit_pipeline(
     # Observability 2026-06-10: toda línea de log de este job lleva job_id.
     from observability import set_job_log_context
     set_job_log_context(job_id)
+    if not _trial_worker_admitted(job_id, editing=True):
+        return
     _edit_runtime_policy = resolve_atmospherics_policy(None)
     _edit_runtime_fingerprint = runtime_rollout_fingerprint(
         mode=_edit_runtime_policy.get("policy_mode")
@@ -20423,6 +20545,13 @@ def run_edit_pipeline(
                         job_id, scene_key, _scene_generation_error,
                     )
                     scene_plan = _copy.deepcopy(_scene_plan_before_edit)
+                    import scenes as _scenes
+                    _scenes.mark_scene_regeneration_failed(
+                        scene_plan, scene_key, _scene_generation_error,
+                    )
+                    # Later fallback branches also restore this snapshot; they
+                    # must retain the failure instead of erasing the review gate.
+                    _scene_plan_before_edit = _copy.deepcopy(scene_plan)
                     bg_prelooped = False
                     _scene_timeline_from_current_clips = False
                     _pending_scene_recache = False

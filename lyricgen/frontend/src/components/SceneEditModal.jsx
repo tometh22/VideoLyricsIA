@@ -12,8 +12,8 @@ const _MOVES = [
 
 /**
  * Modal "Editar escena": redirige una escena con un hint libre (hereda la
- * biblia visual) y/o cambia el movimiento de cámara. Cuesta 1 clip Veo y
- * cuenta como un edit — igual que "Regenerar fondo".
+ * biblia visual) y/o cambia el movimiento de cámara. Usa el cupo de
+ * regeneraciones de escena, separado de las ediciones generales.
  *
  * Props: scene, onClose(), onSubmit({hint, movement_style})
  */
@@ -94,7 +94,7 @@ export default function SceneEditModal({ scene, onClose, onSubmit }) {
         )}
 
         <div className="mt-4 flex items-center justify-between">
-          <span className="text-[11px] text-ink-secondary">{t("scenes.edit_cost") || "~US$0.90 · cuenta como un edit"}</span>
+          <span className="text-[11px] text-ink-secondary">{t("scenes.edit_cost") || "Usa el cupo de regeneraciones de escena, separado de las ediciones generales."}</span>
           <div className="flex gap-2">
             <button
               onClick={onClose}

@@ -1,17 +1,10 @@
 import { useEffect, useState, useCallback } from "react";
 import { useI18n } from "../i18n";
-import { readCachedJson, writeCachedJson } from "../lib/cachedFetch";
+import TrialUsageSummary from "./TrialUsageSummary";
 
 const API = import.meta.env.VITE_API_URL || "";
 const REFRESH_INTERVAL_MS = 60_000; // 60s — fast enough that the operator sees a fresh count
                                     // after approving a video, slow enough to avoid load on /usage.
-// 2026-05-30 perf: cache the /usage response across sessions so the
-// badge paints from localStorage instantly on mount (no waiting on a
-// 600-700 ms backend round-trip from LATAM to Railway US-East). The
-// background refresh fires right after, so within 1 s the operator
-// sees the live value. TTL is 5 min — well above the 60 s polling
-// interval, so the cache only matters between sessions.
-const USAGE_CACHE_TTL_MS = 5 * 60_000;
 
 // Renders the operator's current monthly usage against their plan
 // limit (e.g. "12 / 250 este mes") with a slim progress bar underneath.
@@ -34,15 +27,10 @@ const USAGE_CACHE_TTL_MS = 5 * 60_000;
 // not an in-app surface for the operator.
 export default function UsageBadge({ user }) {
   const { t } = useI18n();
-  // 2026-05-30 perf: seed state from the per-user localStorage cache so
-  // the badge paints during the FIRST render — no 700 ms wait on the
-  // /usage round-trip. The background fetch below replaces this with
-  // the live value within ~1 s; if /usage 401s the operator never sees
-  // stale data because the parent route boots them out anyway.
+  // /usage owns trial membership and reservations. Wait for its live response:
+  // a cached free-plan balance can predate trial enrollment or activation.
   const cacheKey = user?.id ? `cache:usage:${user.id}` : null;
-  const [usage, setUsage] = useState(() =>
-    cacheKey ? readCachedJson(cacheKey, USAGE_CACHE_TTL_MS) : null,
-  );
+  const [usage, setUsage] = useState(null);
   const [error, setError] = useState(false);
 
   const fetchUsage = useCallback(async () => {
@@ -62,8 +50,7 @@ export default function UsageBadge({ user }) {
       const data = await res.json();
       setUsage(data);
       setError(false);
-      // 2026-05-30 perf: persist for the next mount.
-      if (cacheKey) writeCachedJson(cacheKey, data);
+      if (cacheKey) localStorage.removeItem(cacheKey);
     } catch (e) {
       // Network error — same fallback as above. Don't crash the sidebar
       // because /usage is down; let the rest of the app work.
@@ -75,11 +62,18 @@ export default function UsageBadge({ user }) {
     if (!user) return undefined;
     fetchUsage();
     const id = setInterval(fetchUsage, REFRESH_INTERVAL_MS);
-    return () => clearInterval(id);
+    window.addEventListener("focus", fetchUsage);
+    window.addEventListener("genly:usage-changed", fetchUsage);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener("focus", fetchUsage);
+      window.removeEventListener("genly:usage-changed", fetchUsage);
+    };
   }, [user, fetchUsage]);
 
   if (!user) return null;
   if (error || !usage) return null;
+  if (usage.trial) return <div className="px-5 pb-3"><TrialUsageSummary trial={usage.trial} /></div>;
   if (usage.plan === "unlimited") return null;
 
   const {

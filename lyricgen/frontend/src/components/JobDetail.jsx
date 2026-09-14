@@ -6,6 +6,7 @@ import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
 import DeliveryQCPanel from "./DeliveryQCPanel";
+import { translateBackendError } from "../lib/lyricsEditSubmit";
 import ArtTrackEditPanel from "./ArtTrackEditPanel";
 import ContentValidationToggle, { isUniversalAccount } from "./ContentValidationToggle";
 import { useAlert } from "./AlertProvider";
@@ -674,7 +675,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         const body = await res.json().catch(() => ({}));
         alert({
           title: "No se pudo reintentar el video",
-          description: body.detail || "Probá de nuevo en un momento.",
+          description: translateBackendError(body.detail, t) || "Probá de nuevo en un momento.",
           tone: "error",
         });
       }
@@ -856,17 +857,17 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   }, [isDone, job.job_id, driveFeatureEnabled]);
 
   const handleEditTriggered = (resp) => {
-    // Server already flipped status to "editing" + bumped edit_count.
+    // Scene rerolls use their own budget; ordinary edits use edit_count.
     // Reflect that immediately in the UI so the approve panel hides and
     // the editing overlay appears, then let polling take over.
     if (onJobUpdate) {
       onJobUpdate({
         ...job,
         status: "editing",
-        edit_count: resp?.edit_count ?? (job.edit_count || 0) + 1,
-        edits_remaining: resp?.edits_remaining ?? Math.max(0, (job.edits_remaining ?? 3) - 1),
+        edit_count: resp?.edit_count ?? (job.edit_count || 0) + (resp?.edit_type === "scene" ? 0 : 1),
+        edits_remaining: resp?.edits_remaining ?? (resp?.edit_type === "scene" ? job.edits_remaining : Math.max(0, (job.edits_remaining ?? 3) - 1)),
         edit_limit_exempt: resp?.edit_limit_exempt ?? job.edit_limit_exempt ?? false,
-        current_step: resp?.edit_type === "background" ? "background" : "video",
+        current_step: resp?.edit_type === "scene" ? "scenes" : resp?.edit_type === "background" ? "background" : "video",
         progress: 0,
       });
     }
@@ -952,7 +953,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       }
       if (!res.ok) {
         let msg = `Error ${res.status}`;
-        try { const j = await res.json(); if (j.detail && typeof j.detail === "string") msg = j.detail; } catch { /* keep */ }
+        try { const j = await res.json(); msg = translateBackendError(j.detail, t) || msg; } catch { /* keep */ }
         setSceneBusyKey(null);
         window.alert(msg);
         return;
@@ -960,6 +961,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       const resp = await res.json();
       setEditingScene(null);
       handleEditTriggered({ ...resp, edit_type: "scene" });
+      window.dispatchEvent(new Event("genly:usage-changed"));
     } catch {
       setSceneBusyKey(null);
       window.alert(t("scenes.regen_error") || "No se pudo regenerar la escena.");
@@ -1000,9 +1002,11 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                 {t("edit.in_progress_title") || "Aplicando tus cambios..."}
               </p>
               <p className="text-xs text-ink-secondary mt-0.5">
-                {job.current_step === "background"
+                {job.current_step === "scenes"
+                  ? t("edit.in_progress_scene")
+                  : job.current_step === "background"
                   ? (t("edit.in_progress_bg") || "Generando nuevo video cinemático · mantiene lyrics y tiempos · ~10-15 min")
-                  : (t("edit.in_progress_typo") || "Re-renderizando con la tipografía nueva · usa el fondo cacheado · ~5-10 min")}
+                  : t("edit.in_progress_render")}
               </p>
               <div className="mt-3 h-1.5 rounded-full bg-surface-3/60 overflow-hidden">
                 <div
@@ -1621,8 +1625,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || `${t("detail.approve_error_description")} (${res.status})`);
+        throw new Error(translateBackendError(data.detail, t) || `${t("detail.approve_error_description")} (${res.status})`);
       }
+      window.dispatchEvent(new Event("genly:usage-changed"));
       try {
         const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
         if (!statusRes.ok) throw new Error(`${t("detail.refresh_error_description")} (${statusRes.status})`);
@@ -2042,7 +2047,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           <p className="text-xs text-red-400/70 mb-3">{job.error}</p>
           <div className="px-3 py-2 rounded-xl bg-accent/[0.06] ring-1 ring-accent/20 mb-3">
             <p className="text-[11px] text-accent">
-              {t("detail.validation_no_quota") || "Este video NO consume tu cuota mensual — solo los aprobados cuentan."}
+              {t("detail.validation_no_quota") || "Consultá el saldo de tu cuenta para ver los créditos disponibles."}
             </p>
           </div>
           {/* Operator override toggle: only relevant on validation_failed,
@@ -2282,7 +2287,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           </p>
           <div className="px-3 py-2 rounded-xl bg-accent/[0.06] ring-1 ring-accent/20 mb-4">
             <p className="text-[11px] text-accent">
-              {t("review.reject_free") || "Rechazar es gratis — solo los videos aprobados cuentan en tu cuota mensual."}
+              {t("review.reject_free") || "Consultá el saldo de tu cuenta para ver los créditos disponibles y las reservas del trial."}
             </p>
           </div>
           <textarea

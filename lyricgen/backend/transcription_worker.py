@@ -700,6 +700,13 @@ def run_transcription_job(
     # Observability 2026-06-10: toda línea de log de este job lleva job_id.
     from observability import set_job_log_context
     set_job_log_context(job_id)
+    from fastapi import HTTPException
+    from trial_policy import require_transcription_admitted
+    try:
+        require_transcription_admitted(job_id)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return _fail(job_id, detail.get("message") or "El trial no está activo.")
     from reconcile_capture import record_result as _record_reconcile_result
     # Lazy import — main.py es pesado y el worker no debería pagarlo si
     # corre otros queues. asyncio.run abre/cierra su propio event loop por job,

@@ -4,6 +4,8 @@
  * resume adapter only read legacy top-level fields, silently dropping a long
  * operator prompt before POST /generate. Keep the mapping pure and tested.
  */
+export const DEFAULT_BG_VERBATIM = true;
+
 export function creativeFieldsForReviewResume(job = {}) {
   const params = job.render_params && typeof job.render_params === "object"
     ? job.render_params
@@ -16,7 +18,7 @@ export function creativeFieldsForReviewResume(job = {}) {
     backgroundHint: params.background_hint || job.background_hint || "",
     bgVerbatim: params.bg_verbatim != null
       ? !!params.bg_verbatim
-      : !!job.bg_verbatim,
+      : job.bg_verbatim != null ? !!job.bg_verbatim : DEFAULT_BG_VERBATIM,
     animateImage: params.animate_image === true || params.animate_image === "true",
   };
 }
