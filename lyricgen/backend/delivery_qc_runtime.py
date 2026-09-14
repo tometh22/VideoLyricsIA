@@ -181,6 +181,18 @@ def _check_status(rows: Sequence[Mapping[str, Any]]) -> str:
     return "PASS"
 
 
+def _check_evidence(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Combine detector evidence without treating a list as dict pairs."""
+    evidence = []
+    for row in rows:
+        value = row.get("evidence")
+        if isinstance(value, Mapping):
+            evidence.append(deepcopy(dict(value)))
+        elif isinstance(value, list):
+            evidence.extend(deepcopy(dict(item)) for item in value if isinstance(item, Mapping))
+    return evidence
+
+
 def _build_check_results(
     *,
     issues: Sequence[Mapping[str, Any]],
@@ -238,7 +250,7 @@ def _build_check_results(
                 for row in matched
             ),
             "issue_ids": [str(row.get("issue_id")) for row in matched if row.get("issue_id")],
-            "evidence": [dict(row.get("evidence") or {}) for row in matched],
+            "evidence": _check_evidence(matched),
             "reason": reason,
         })
 
