@@ -307,3 +307,89 @@ def test_collapsed_hosted_alignment_is_rejected(monkeypatch):
 
     assert out["anchor_alignment"]["status"] == "declined"
     assert "timing_source" not in out
+
+
+# ---------------------------------------------------------------------------
+# Veredicto acústico compartido (incidentes 13/14-sep-2026)
+# ---------------------------------------------------------------------------
+
+
+def _crammed_retimed():
+    """CTC over a lyric with verses the audio never sings: the 4-line anchor
+    comes back as four 0.4 s lines with score ≈ 0 (forced_align, no skips)."""
+    out = []
+    for i, text in enumerate(ANCHOR4.splitlines()):
+        out.append({
+            "start": 10.0 + i * 0.5, "end": 10.0 + i * 0.5 + 0.4, "text": text,
+            "words": [{"word": w, "start": 10.0 + i * 0.5, "end": 10.0 + i * 0.5 + 0.1,
+                       "score": 0.01} for w in text.split()],
+        })
+    return out
+
+
+ANCHOR4 = "\n".join([
+    "primera estrofa que no existe",
+    "segunda estrofa que no existe",
+    "tercera estrofa que no existe",
+    "cuarta estrofa que no existe",
+])
+
+
+def test_crammed_ctc_alignment_is_declined_on_upload_path(monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: _crammed_retimed())
+    out = _run(_result(), ANCHOR4)
+    aa = out["anchor_alignment"]
+    assert aa["status"] == "declined"
+    assert aa["reason"] == "structural_mismatch"
+    assert aa["timing_source"] == "ctc_timing_only"
+    assert aa["structural"]["crammed_run"] == 4
+    # Los segments del proveedor quedan tal cual: nada se publicó.
+    assert [s["text"] for s in out["segments"]] == [s["text"] for s in _result()["segments"]]
+
+
+def test_crammed_guard_can_be_disabled_on_upload_path(monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    monkeypatch.setenv("REANCHOR_CRAMMED_GUARD", "0")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: _crammed_retimed())
+    out = _run(_result(), ANCHOR4)
+    assert out["anchor_alignment"]["status"] == "applied"
+
+
+def test_whisper_fallback_mostly_interpolated_is_rejected(monkeypatch):
+    """Buseca (14-sep): Whisper-DP anchored 29/51 lines and guessed the rest.
+    A fallback that guessed more than 30 % of the song is not an alignment."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ctc_align, "last_decline_reason", "short_repeated_motif", raising=False)
+
+    def _fallback(_audio, lines, *, language=None, job_id=None):
+        segs = _retimed()
+        segs[1]["interpolated"] = True
+        segs[2]["interpolated"] = True
+        return segs
+
+    monkeypatch.setattr("lyrics_whisper_align.whisper_word_align", _fallback)
+    out = _run(_result(), ANCHOR)
+    assert out["anchor_alignment"]["status"] == "declined"
+    assert out["anchor_alignment"]["reason"] == "short_repeated_motif"
+
+
+def test_whisper_fallback_with_few_interpolated_lines_is_accepted(monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+
+    def _fallback(_audio, lines, *, language=None, job_id=None):
+        segs = _retimed()
+        segs[2]["interpolated"] = True  # 1 de 3 = 33 % > 30 %… tope subido abajo
+        return segs
+
+    monkeypatch.setattr("lyrics_whisper_align.whisper_word_align", _fallback)
+    monkeypatch.setenv("ANCHOR_MAX_INTERPOLATED_FRAC", "0.5")
+    out = _run(_result(), ANCHOR)
+    assert out["anchor_alignment"]["status"] == "applied"
+    assert out["anchor_alignment"]["timing_source"] == "whisper_align"
