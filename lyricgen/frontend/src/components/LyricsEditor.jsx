@@ -2781,7 +2781,7 @@ export default function LyricsEditor({
     const segment = targetSegment || edited.find((row) => row._id === focusedSegId);
     const properties = editorSeekProperties({
       from: a.currentTime, to: t, segment,
-      revision: editorV2Enabled ? durableEditor.revisionRef.current : undefined,
+      revision: editorV2Enabled && durableEditor.document ? durableEditor.revisionRef.current : undefined,
       targeted: Boolean(targetSegment),
       qualityMarked: segment ? unsafeNavigationIdsRef.current.has(segment._id) : false,
       unsavedChanges: isDirty,
@@ -2806,7 +2806,7 @@ export default function LyricsEditor({
       playAttempt.catch(() => {});
       trackEditorEvent("editor_seek", properties);
     }
-  }, [trackEditorEvent, edited, focusedSegId, editorV2Enabled, durableEditor.revisionRef, isDirty]);
+  }, [trackEditorEvent, edited, focusedSegId, editorV2Enabled, durableEditor.document, durableEditor.revisionRef, isDirty]);
 
   const playGuidedWindow = useCallback((qualityWindow) => {
     const audio = audioRef.current;
