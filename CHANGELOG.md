@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.25] - 2026-09-13
+
+### Fixed
+
+- Add opt-in prospective capture eligibility for first campaign transcriptions,
+  excluding technical smokes, previous outputs and existing editor documents
+  before reserving evidence slots. Preserve bounded private checkpoints across
+  retries independently of human document persistence. The association repair
+  remains disabled pending exact baseline replay and full-document evaluation.
+
 ## [1.1.24] - 2026-09-12
 
 ### Fixed
