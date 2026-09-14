@@ -45,6 +45,7 @@ def test_checkpoint_precedes_reconcile_and_survives_final_transport_removal(fres
     audio, calls = fresh
     trace = rc.begin('ordinary', audio, route_context={}, reserve=lambda *a: [1, 100, 604900])
     assert trace.snapshot()['admission']['attempt_id'] == 'first'
+    assert trace.snapshot()['configuration']['RECONCILE_CAPTURE_POLICY'] == rc.FRESH_POLICY
     assert len(calls) == 1 and not calls[0][0]['stages']
     wx = [{'text': 'hola', 'words': [{'word': 'hola', 'start': 1., 'end': 2.}]}]
     trace.record('reconcile_input', {'wx_segs': wx, 'reference_text': 'hola'})

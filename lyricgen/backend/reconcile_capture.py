@@ -21,6 +21,7 @@ FRESH_POLICY = 'fresh-campaign-v1'
 ARCHIVE_TTL = 7 * 86400
 logger = logging.getLogger(__name__)
 CONFIG_KEYS = (
+    'RECONCILE_CAPTURE_POLICY', 'RECONCILE_CAPTURE_CAMPAIGN_IDS',
     'ANCHOR_TEXT_GATE_ENABLED', 'RECONCILE_GAP_RECOVERY_ENABLED',
     'RECONCILE_MIN_AUDIO_COVERAGE', 'POST_RECONCILE_CLEANUP_ENABLED',
     'BEAT_SNAP_ENABLED', 'BEAT_SNAP_WINDOW_MS', 'LYRIC_LEAD_IN_S',
@@ -69,6 +70,7 @@ count = count + 1
 redis.call('HSET', KEYS[1], 'count', count, 'job:' .. ARGV[1], count)
 return {count, started, deadline}
 """
+
 
 def _fresh_campaign_context(job_id):
     """Read server-owned admission facts, never lyrics or an editor version."""
