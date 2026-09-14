@@ -288,3 +288,23 @@ describe("Recuperación tras respuesta perdida (2026-09-14)", () => {
     expect(toastSpy.mock.calls[0][0].tone).toBe("error");
   });
 });
+
+describe("Botón visible 'Pegar letra oficial' (2026-09-14)", () => {
+  it("aparece en la pestaña de texto (vista por defecto) y abre el modal sin pasar por Herramientas", () => {
+    render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor: vi.fn() })} />);
+    // Vista por defecto = "Revisar letra": no hay menú Herramientas ahí…
+    expect(screen.queryByTestId("editor-overflow-btn")).toBeNull();
+    // …pero el CTA sí está.
+    fireEvent.click(screen.getByTestId("paste-lyrics-cta"));
+    expect(screen.getByTestId("paste-lyrics-textarea")).toBeInTheDocument();
+  });
+
+  it("también está en 'Ajustar tiempos' y respeta el gate de features", () => {
+    const { unmount } = render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor: vi.fn() })} />);
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+    expect(screen.getByTestId("paste-lyrics-cta")).toBeInTheDocument();
+    unmount();
+    render(<LyricsEditor {...baseProps({ user: { features: {} }, onReanchor: vi.fn() })} />);
+    expect(screen.queryByTestId("paste-lyrics-cta")).toBeNull();
+  });
+});

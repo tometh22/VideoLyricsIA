@@ -5582,7 +5582,7 @@ export default function LyricsEditor({
              izquierda no renderiza — los controles ya están en el paso
              4 del stepper y el preview central del wizard refleja los
              cambios. El grid colapsa a 1 columna full-width. */}
-      <div className="relative mb-4 flex items-center gap-3 rounded-2xl bg-gradient-to-r from-surface-2/80 via-surface-2/45 to-brand/[0.055] p-2 ring-1 ring-white/[0.08] shadow-xl shadow-black/10" data-testid="editor-mode-explainer">
+      <div className="relative mb-4 flex flex-wrap items-center gap-3 rounded-2xl bg-gradient-to-r from-surface-2/80 via-surface-2/45 to-brand/[0.055] p-2 ring-1 ring-white/[0.08] shadow-xl shadow-black/10" data-testid="editor-mode-explainer">
         <div
           className="grid min-w-0 flex-1 grid-cols-2 gap-1 rounded-xl bg-black/20 p-1"
           role="tablist"
@@ -5634,6 +5634,23 @@ export default function LyricsEditor({
             </span>
           </button>
         </div>
+        {/* 2026-09-14: pegar la letra oficial es una acción de TEXTO, no de
+            timing: va visible en las dos pestañas, no escondida en el menú de
+            Herramientas (que sólo existe en "Ajustar tiempos" y se cortaba a
+            la derecha en ventanas angostas). El ítem del menú se conserva. */}
+        {canReanchor && !syncMode && (
+          <button
+            type="button"
+            data-testid="paste-lyrics-cta"
+            disabled={reanchoring || pasteBusy}
+            onClick={() => { openPasteLyrics(); setOverflowOpen(false); }}
+            title={t("editor.paste_lyrics_menu_hint") || "Reemplaza el texto y realinea con el audio"}
+            className="inline-flex h-10 shrink-0 items-center gap-2 rounded-xl bg-brand/15 px-3 text-[11px] font-semibold text-brand-light ring-1 ring-brand/30 transition-colors hover:bg-brand/25 hover:text-white disabled:opacity-50"
+          >
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M9 4h6a2 2 0 0 1 2 2v14H7V6a2 2 0 0 1 2-2zM9 4v2h6V4M10 11h4M10 15h4" strokeLinecap="round" strokeLinejoin="round" /></svg>
+            <span>{t("editor.paste_lyrics_short") || "Pegar letra oficial"}</span>
+          </button>
+        )}
         {viewMode === "advanced" && (
           <div className="relative shrink-0">
             <button
