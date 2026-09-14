@@ -750,3 +750,186 @@ def test_reanchor_legacy_duplicate_is_idempotent_too(client, monkeypatch):
     dup = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token), json={"base_revision": 3})
     assert dup.status_code == 200, dup.text
     assert dup.json()["idempotent"] is True and dup.json()["content_source"] == "editor_text"
+
+
+# ---------------------------------------------------------------------------
+# Modo tarea (async_mode, 2026-09-14): el POST devuelve 202 {task_id} y el
+# resultado se consulta por GET /jobs/{job_id}/reanchor/tasks/{task_id}.
+# ---------------------------------------------------------------------------
+
+def _poll_task(client, token, job_id, task_id, attempts=100):
+    """El TestClient corre la app en su propio loop; la task de asyncio
+    avanza entre requests, así que se sondea hasta ver status=done."""
+    import time as _time
+    last = None
+    for _ in range(attempts):
+        res = client.get(f"/jobs/{job_id}/reanchor/tasks/{task_id}", headers=auth(token))
+        assert res.status_code == 200, res.text
+        last = res.json()
+        if last["status"] == "done":
+            return last
+        _time.sleep(0.05)
+    raise AssertionError(f"task never finished: {last}")
+
+
+def test_reanchor_async_mode_returns_202_and_task_completes(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    seen = {}
+    _mock_align_from_lyrics(monkeypatch, seen)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                      json={"lyrics_text": PASTED_SAME_SHAPE, "async_mode": True})
+    assert res.status_code == 202, res.text
+    started = res.json()
+    assert started["job_id"] == job_id
+    assert started["status"] == "running"
+    task_id = started["task_id"]
+    assert task_id
+
+    record = _poll_task(client, token, job_id, task_id)
+    assert record["status"] == "done"
+    assert record["http_status"] == 200
+    assert "user_id" not in record
+    assert record["started_at"] and record["finished_at"]
+    payload = record["payload"]
+    assert payload["ok"] is True
+    assert payload["lines_replaced"] == 1
+    assert payload["content_source"] == "operator_pasted"
+    assert seen["anchor_lyrics"] == PASTED_SAME_SHAPE
+
+    persisted = _db_segments(job_id)
+    assert len(persisted) == 4
+    replaced = next(s for s in persisted if s["text"] == "tercera linea OFICIAL distinta")
+    assert replaced.get("review") is True
+    assert main_mod._REANCHOR_TASKS.get(task_id) is None
+
+
+def test_reanchor_async_mode_structure_unconfirmed_surfaces_409_in_task(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    seen = {}
+    _mock_align_from_lyrics(monkeypatch, seen)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    other_version = "\n".join(f"estrofa de otra version numero {i}" for i in range(12))
+
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                      json={"lyrics_text": other_version, "async_mode": True})
+    assert res.status_code == 202, res.text
+    record = _poll_task(client, token, job_id, res.json()["task_id"])
+    assert record["http_status"] == 409
+    assert record["payload"]["code"] == "reference_structure_unconfirmed"
+    assert "line_count_divergent" in record["payload"]["structure"]["reasons"]
+    assert seen.get("calls", 0) == 0
+    assert [s["text"] for s in _db_segments(job_id)] == [s["text"] for s in SEGS]
+
+
+def test_reanchor_async_mode_http_exception_surfaces_in_task(client, monkeypatch):
+    """Un HTTPException dentro de la ejecución (audio ausente) no se pierde:
+    queda como done + http_status + detail."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _mock_align_from_lyrics(monkeypatch)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS), r2_key=None,
+                       with_audio=False)
+
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                      json={"async_mode": True})
+    assert res.status_code == 202, res.text
+    record = _poll_task(client, token, job_id, res.json()["task_id"])
+    assert record["http_status"] == 409
+    assert "audio" in record["payload"]["detail"].lower()
+
+
+def test_reanchor_task_unknown_404(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    res = client.get(f"/jobs/{job_id}/reanchor/tasks/{uuid.uuid4().hex}", headers=auth(token))
+    assert res.status_code == 404, res.text
+    assert res.json()["code"] == "reanchor_task_unknown"
+
+
+def test_reanchor_task_belongs_to_other_job_404(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _mock_align_from_lyrics(monkeypatch)
+    token, user_id, tenant_id = _make_user(client)
+    job_a = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    job_b = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    res = client.post(f"/jobs/{job_a}/reanchor", headers=auth(token),
+                      json={"lyrics_text": PASTED_SAME_SHAPE, "async_mode": True})
+    assert res.status_code == 202, res.text
+    task_id = res.json()["task_id"]
+    _poll_task(client, token, job_a, task_id)
+    res = client.get(f"/jobs/{job_b}/reanchor/tasks/{task_id}", headers=auth(token))
+    assert res.status_code == 404
+    assert res.json()["code"] == "reanchor_task_unknown"
+
+
+def test_reanchor_task_other_users_job_404(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _mock_align_from_lyrics(monkeypatch)
+    token_a, user_a, tenant_a = _make_user(client)
+    token_b, _, _ = _make_user(client)
+    job_id = _seed_job(user_a, tenant_a, segments=list(SEGS))
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token_a),
+                      json={"lyrics_text": PASTED_SAME_SHAPE, "async_mode": True})
+    assert res.status_code == 202, res.text
+    task_id = res.json()["task_id"]
+    _poll_task(client, token_a, job_id, task_id)
+    res = client.get(f"/jobs/{job_id}/reanchor/tasks/{task_id}", headers=auth(token_b))
+    assert res.status_code == 404
+    assert res.json()["detail"] == "Job not found."
+
+
+def test_reanchor_sync_mode_ignores_task_registry(client, monkeypatch):
+    """async_mode=false (o ausente) sigue siendo síncrono: 200 con el
+    payload completo, sin crear ninguna tarea."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _mock_align_from_lyrics(monkeypatch)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    before = dict(main_mod._REANCHOR_TASK_LOCAL)
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                      json={"lyrics_text": PASTED_SAME_SHAPE, "async_mode": False})
+    assert res.status_code == 200, res.text
+    assert res.json()["ok"] is True
+    assert "task_id" not in res.json()
+    assert dict(main_mod._REANCHOR_TASK_LOCAL) == before
+
+
+class _FakeRedis:
+    """Mínimo set/get con TTL para cubrir el camino Redis del registro."""
+
+    def __init__(self):
+        self.store = {}
+        self.ttl = {}
+
+    def set(self, key, value, ex=None):
+        self.store[key] = value
+        self.ttl[key] = ex
+
+    def get(self, key):
+        return self.store.get(key)
+
+
+def test_reanchor_task_registry_uses_redis_when_available(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _mock_align_from_lyrics(monkeypatch)
+    fake = _FakeRedis()
+    monkeypatch.setattr(main_mod, "_reanchor_task_redis", lambda: fake)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                      json={"lyrics_text": PASTED_SAME_SHAPE, "async_mode": True})
+    assert res.status_code == 202, res.text
+    task_id = res.json()["task_id"]
+    record = _poll_task(client, token, job_id, task_id)
+    assert record["http_status"] == 200
+    assert record["payload"]["ok"] is True
+    key = f"reanchor:task:{task_id}"
+    assert key in fake.store
+    assert fake.ttl[key] == 3600
+    assert task_id not in main_mod._REANCHOR_TASK_LOCAL
