@@ -239,3 +239,52 @@ describe("Pegar letra oficial y re-sincronizar", () => {
     expect(screen.getByTestId("paste-lyrics-submit")).toBeEnabled();
   });
 });
+
+describe("Recuperación tras respuesta perdida (2026-09-14)", () => {
+  const RECOVERED = [
+    { start: 0.4, end: 2.1, text: "linea uno" },
+    { start: 2.6, end: 4.2, text: "linea dos", review: true },
+    { start: 4.8, end: 6.3, text: "linea tres" },
+  ];
+  const openPaste = () => {
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+    fireEvent.click(screen.getByTestId("editor-overflow-btn"));
+    fireEvent.click(screen.getByTestId("paste-lyrics-btn"));
+  };
+
+  it("pegar letra: 409 del duplicado + revisión avanzada en el servidor → éxito y modal cerrado", async () => {
+    const onReanchor = vi.fn(async () => ({ ok: false, reason: "http-409", status: 409, code: "stale_revision" }));
+    const onReanchorReconcile = vi.fn(async (jobId, base) => ({ ok: true, recovered: true, revision: base + 1, count: 3, review_count: 1, segments: RECOVERED }));
+    render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor, onReanchorReconcile })} />);
+    openPaste();
+    fireEvent.change(screen.getByTestId("paste-lyrics-textarea"), { target: { value: "linea uno\nlinea dos\nlinea tres" } });
+    fireEvent.click(screen.getByTestId("paste-lyrics-submit"));
+    await waitFor(() => expect(onReanchorReconcile).toHaveBeenCalledWith("job-reanchor", 0));
+    await waitFor(() => expect(toastSpy).toHaveBeenCalled());
+    expect(toastSpy.mock.calls[0][0].tone).toBe("success");
+    expect(screen.queryByTestId("paste-lyrics-textarea")).toBeNull();
+  });
+
+  it("re-sincronizar con IA: red cortada + revisión avanzada → éxito", async () => {
+    const onReanchor = vi.fn(async () => { throw new Error("network"); });
+    const onReanchorReconcile = vi.fn(async (jobId, base) => ({ ok: true, recovered: true, revision: base + 1, count: 3, review_count: 0, segments: RECOVERED }));
+    render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor, onReanchorReconcile })} />);
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+    fireEvent.click(screen.getByTestId("editor-overflow-btn"));
+    fireEvent.click(screen.getByTestId("reanchor-btn"));
+    await waitFor(() => expect(toastSpy).toHaveBeenCalled());
+    expect(toastSpy.mock.calls[0][0].tone).toBe("success");
+  });
+
+  it("re-sincronizar con IA: fallo real (la revisión NO avanzó) → error, sin tocar nada", async () => {
+    const onReanchor = vi.fn(async () => ({ ok: false, reason: "declined" }));
+    const onReanchorReconcile = vi.fn(async () => ({ ok: false, reason: "not-advanced", revision: 0 }));
+    render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor, onReanchorReconcile })} />);
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+    fireEvent.click(screen.getByTestId("editor-overflow-btn"));
+    fireEvent.click(screen.getByTestId("reanchor-btn"));
+    await waitFor(() => expect(toastSpy).toHaveBeenCalled());
+    expect(onReanchorReconcile).toHaveBeenCalled();
+    expect(toastSpy.mock.calls[0][0].tone).toBe("error");
+  });
+});

@@ -684,3 +684,69 @@ def test_reanchor_surfaces_helper_structural_decline(client, monkeypatch):
         assert row.detail["job_id"] == job_id and row.detail["timing_source"] == "whisper_align"
     finally:
         s.close()
+
+
+# ---------------------------------------------------------------------------
+# Idempotencia ante duplicados del proxy (2026-09-14)
+# ---------------------------------------------------------------------------
+
+
+def _set_revision(job_id, revision):
+    from database import Job, SessionLocal
+    s = SessionLocal()
+    try:
+        row = s.query(Job).filter(Job.job_id == job_id).first()
+        row.segments_revision = revision
+        s.commit()
+    finally:
+        s.close()
+
+
+def test_reanchor_duplicate_request_after_first_applied_is_idempotent(client, monkeypatch):
+    """Con 2 réplicas y CTC de >60 s el proxy re-envía el POST. El duplicado
+    llega con la misma base_revision cuando el primero ya persistió: antes
+    devolvía 409 stale_revision (y el editor decía "no se pudo" aunque todo
+    estaba aplicado). Ahora responde 200 con lo persistido."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    seen = {}
+    _mock_align_from_lyrics(monkeypatch, seen)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    _set_revision(job_id, 7)
+
+    first = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                        json={"base_revision": 7, "lyrics_text": PASTED_SAME_SHAPE})
+    assert first.status_code == 200, first.text
+    assert first.json()["revision"] == 8
+    assert seen["calls"] == 1
+
+    dup = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                      json={"base_revision": 7, "lyrics_text": PASTED_SAME_SHAPE})
+    assert dup.status_code == 200, dup.text
+    body = dup.json()
+    assert body["ok"] is True and body["idempotent"] is True
+    assert body["revision"] == 8
+    assert body["lines_replaced"] == 1 and body["lines_kept"] == 3
+    assert [s["text"] for s in body["segments"]] == [s["text"] for s in _db_segments(job_id)]
+    # No volvió a alinear ni a persistir.
+    assert seen["calls"] == 1
+    assert _db_segments(job_id) == first.json()["segments"]
+
+    # Otra letra desde la misma base sigue siendo un pedido distinto → 409.
+    other = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                        json={"base_revision": 7, "lyrics_text": PASTED_SAME_SHAPE + "\nlinea extra"})
+    assert other.status_code == 409
+    assert other.json()["code"] == "stale_revision"
+
+
+def test_reanchor_legacy_duplicate_is_idempotent_too(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _mock_align_ok(monkeypatch)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    _set_revision(job_id, 3)
+    first = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token), json={"base_revision": 3})
+    assert first.status_code == 200 and first.json()["revision"] == 4
+    dup = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token), json={"base_revision": 3})
+    assert dup.status_code == 200, dup.text
+    assert dup.json()["idempotent"] is True and dup.json()["content_source"] == "editor_text"

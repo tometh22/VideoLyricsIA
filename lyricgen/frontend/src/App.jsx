@@ -3690,6 +3690,29 @@ export default function App() {
     }
   }, []);
 
+  // 2026-09-14: la alineación puede tardar >60 s; el proxy re-envía el POST y
+  // el cliente puede recibir el error del duplicado (409 stale_revision) o un
+  // corte aunque el servidor ya aplicó todo. Antes de mostrar error, el editor
+  // mira el estado real: si la revisión avanzó, fue éxito.
+  const reanchorReconcileFromServer = useCallback(async (jobId, baseRevision) => {
+    if (!jobId) return { ok: false, reason: "no-job" };
+    try {
+      const res = await authFetch(`${API}/status/${jobId}`, { cache: "no-store" });
+      if (!res.ok) return { ok: false, reason: `http-${res.status}` };
+      const job = await res.json();
+      const revision = Number(job?.segments_revision);
+      const segments = Array.isArray(job?.segments_json) ? job.segments_json : [];
+      if (!Number.isInteger(revision) || revision <= Number(baseRevision ?? -1) || !segments.length) {
+        return { ok: false, reason: "not-advanced", revision };
+      }
+      return { ok: true, recovered: true, revision, segments, count: segments.length,
+        review_count: segments.filter((s) => s && s.review).length };
+    } catch (err) {
+      console.warn("[reanchor] reconcile error", err);
+      return { ok: false, reason: "network" };
+    }
+  }, []);
+
   // The editor flushes first and supplies its exact saved revision.
   const handleResolveLanguageReview = async ({ baseRevision } = {}) => {
     const jobId = currentReview?.transcribeJobId || currentReview?.editingJobId;
@@ -6072,6 +6095,7 @@ export default function App() {
             editorRequest={editorRequest}
             saveQueue={segmentsSaveQueueRef.current}
             onReanchor={reanchorSegmentsOnBackend}
+            onReanchorReconcile={reanchorReconcileFromServer}
             onReloadServer={({ draftKey, storeKey }) => {
               try { if (draftKey) localStorage.removeItem(draftKey); } catch { /* best effort */ }
               try { wizardPersistence.clear(); } catch { /* best effort */ }
