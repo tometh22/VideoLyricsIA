@@ -52,6 +52,97 @@ def _safe_exception_code(exc: BaseException) -> str:
     return name if isinstance(name, str) and _EXCEPTION_TYPE_RE.fullmatch(name) else "Exception"
 
 
+def _approved_reuse_enabled() -> bool:
+    return os.environ.get("APPROVED_TEXT_REUSE_ENABLED", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _approved_text_for_audio(
+    tenant_id: str, audio_sha256: str, *, exclude_job_id: str,
+) -> dict | None:
+    """Fase 3 (2026-09-13): texto ya APROBADO por un humano para este mismo
+    audio (jobs.input_audio_sha256) dentro del tenant.
+
+    Una canción que un revisor ya confirmó no debería volver a pasar por ASR
+    libre cuando llega de nuevo (re-subida, variante, otra campaña). El texto
+    aprobado entra como ancla (operator_reference) y el timing lo re-alinea
+    CTC — NO se copian segments: copiar exigiría fabricar evidencia máquina
+    (attempt_id, etc.) y esa es justo la clase de bug que dejó un canary en
+    0/30. Devuelve None si no hay versión aprobada de OTRO job del tenant.
+    Best-effort — nunca levanta.
+    """
+    if not tenant_id or not audio_sha256:
+        return None
+    from database import EditorVersion, Job, SessionLocal
+    db = SessionLocal()
+    try:
+        version = (
+            db.query(EditorVersion)
+            .join(Job, Job.job_id == EditorVersion.job_id)
+            .filter(EditorVersion.is_approved.is_(True))
+            .filter(EditorVersion.tenant_id == tenant_id)
+            .filter(Job.input_audio_sha256 == audio_sha256)
+            .filter(Job.job_id != exclude_job_id)
+            .order_by(EditorVersion.created_at.desc())
+            .first()
+        )
+        if version is None:
+            return None
+        lines = [
+            str(seg.get("text") or "").strip()
+            for seg in (version.segments or []) if isinstance(seg, dict)
+        ]
+        lines = [ln for ln in lines if ln]
+        if len(lines) < 3:
+            return None
+        return {
+            "text": "\n".join(lines),
+            "from_job_id": str(version.job_id),
+            "from_revision": int(version.revision or 0),
+            "line_count": len(lines),
+            "approved_at": version.created_at.isoformat() if version.created_at else None,
+        }
+    except Exception as exc:  # noqa: BLE001 — lookup opcional
+        logger.warning("[APPROVED-REUSE] lookup failed job=%s error_type=%s",
+                       exclude_job_id, _safe_exception_code(exc))
+        return None
+    finally:
+        db.close()
+
+
+async def _maybe_apply_approved_reuse(
+    result: dict, audio_path: str, job_id: str, reuse: dict | None, *, aligner,
+) -> dict:
+    """Anclar el texto aprobado por el MISMO camino que la letra pegada por
+    el operador (`_maybe_anchor_align`, fail-closed adentro). Diferencia
+    clave con el ancla del operador: si declina, NO falla el job — vuelve
+    al resultado ASR y deja provenance ``approved_text_reuse.used=False``.
+    """
+    if not isinstance(result, dict) or not isinstance(reuse, dict):
+        return result
+    provenance = {k: v for k, v in reuse.items() if k != "text"}
+    try:
+        aligned = await aligner(copy.deepcopy(result), audio_path, job_id, reuse["text"])
+    except Exception as exc:  # noqa: BLE001 — nunca rompe el pipeline
+        logger.warning("[APPROVED-REUSE] aligner failed job=%s error_type=%s",
+                       job_id, _safe_exception_code(exc))
+        aligned = None
+    status = ""
+    if isinstance(aligned, dict):
+        status = str((aligned.get("anchor_alignment") or {}).get("status") or "")
+    if status != "applied":
+        out = dict(result)
+        out["approved_text_reuse"] = {**provenance, "used": False,
+                                      "reason": status or "declined"}
+        logger.info("[APPROVED-REUSE] declined job=%s from=%s reason=%s",
+                    job_id, provenance.get("from_job_id"), status or "declined")
+        return out
+    aligned["approved_text_reuse"] = {**provenance, "used": True}
+    logger.info("[APPROVED-REUSE] applied job=%s from=%s lines=%s",
+                job_id, provenance.get("from_job_id"), provenance.get("line_count"))
+    return aligned
+
+
 def _catalog_reference_summary(
     reference: dict,
     *,
@@ -879,6 +970,7 @@ def run_transcription_job(
     # the server does not see their bytes; the first worker materialization
     # promotes that object to its content-addressed destination.
     from database import Job as _IdentityJob, SessionLocal as _IdentitySession
+    _reuse_tenant_id = ""
     _identity_db = _IdentitySession()
     try:
         _identity_row = (
@@ -919,6 +1011,7 @@ def run_transcription_job(
                 1, int(_identity_row.audio_revision or 0),
             )
         source_audio_revision = int(_identity_row.audio_revision or 0)
+        _reuse_tenant_id = str(_identity_row.tenant_id or "")
         _identity_db.commit()
     finally:
         _identity_db.close()
@@ -963,6 +1056,18 @@ def run_transcription_job(
                     os.unlink(stem_path)
                 except OSError:
                     pass
+
+    # Fase 3 (APPROVED_TEXT_REUSE_ENABLED, default off): si este mismo audio
+    # ya tiene una versión aprobada por un humano en el tenant, su texto entra
+    # como ancla. Nunca pisa una letra pegada por el operador.
+    approved_reuse = None
+    if _approved_reuse_enabled() and not (anchor_lyrics or "").strip():
+        approved_reuse = _approved_text_for_audio(
+            _reuse_tenant_id, source_audio_sha256, exclude_job_id=job_id,
+        )
+        if approved_reuse:
+            logger.info("[APPROVED-REUSE] candidate job=%s from=%s lines=%s",
+                        job_id, approved_reuse["from_job_id"], approved_reuse["line_count"])
 
     # 3. Llamar al pipeline async existente. `request` y `current_user` son
     #    ignorados dentro del cuerpo (verified) — passing None es seguro.
@@ -1031,6 +1136,11 @@ def run_transcription_job(
                     == "declined"
                 ):
                     raise RuntimeError("operator_reference_alignment_declined")
+            elif approved_reuse is not None:
+                r = await _maybe_apply_approved_reuse(
+                    r, audio_path, job_id, approved_reuse, aligner=_maybe_anchor_align,
+                )
+                _record_reconcile_result(r, "post:_maybe_apply_approved_reuse")
             if not (isinstance(r, dict)
                     and r.get("timing_source") == "anchor_ctc"):
                 r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
@@ -1081,6 +1191,10 @@ def run_transcription_job(
                 quality["catalog_reference"] = {
                     **r["catalog_reference"], "source_audio_revision": source_audio_revision,
                 }
+                r["transcription_quality"] = quality
+            if isinstance(r.get("approved_text_reuse"), dict):
+                quality = dict(r.get("transcription_quality") or {})
+                quality["approved_text_reuse"] = dict(r["approved_text_reuse"])
                 r["transcription_quality"] = quality
             from delivery_repair_shadow import attach_delivery_repair_shadow
             return attach_delivery_repair_shadow(
