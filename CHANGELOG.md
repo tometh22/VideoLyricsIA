@@ -3,6 +3,17 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.27] - 2026-09-14
+
+### Fixed
+
+- Show each delivery preflight check as `PASS`, `FAIL`, `REVIEW` or `NOT_RUN`.
+- Keep generic reviewer reminders visible without treating them as failed
+  videos, and block approval only for objective detector failures with
+  evidence.
+- Make technical and metadata mismatches deterministic blocking failures and
+  expose accurate failure/review counters to the operator.
+
 ## [1.1.26] - 2026-09-14
 
 ### Fixed

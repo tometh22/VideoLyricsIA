@@ -20,6 +20,26 @@ const job = {
 };
 
 describe("DeliveryQCPanel", () => {
+  it("muestra los checks que pasaron y distingue una revisión de un fallo", () => {
+    const checkedJob = {
+      ...job,
+      delivery_qc: {
+        ...job.delivery_qc,
+        checks: [
+          { check_id: "media_container", label: "Archivo de video válido", status: "PASS" },
+          { check_id: "umg_black_bars", label: "Sin franjas negras", status: "REVIEW" },
+          { check_id: "ocr_title", label: "Texto visible del title card", status: "NOT_RUN" },
+        ],
+        check_summary: { pass: 1 },
+      },
+    };
+    render(<DeliveryQCPanel job={checkedJob} onSeek={vi.fn()} onJobUpdate={vi.fn()} onOpenEditor={vi.fn()} />);
+    expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("Archivo de video válido");
+    expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("Pasó");
+    expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("Revisión");
+    expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("No ejecutado");
+  });
+
   it("permite actualizar un reporte desactualizado desde el video renderizado", async () => {
     const onJobUpdate = vi.fn();
     const staleJob = {
