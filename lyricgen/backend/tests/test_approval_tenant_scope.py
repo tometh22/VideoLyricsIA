@@ -111,6 +111,50 @@ def test_admin_can_approve_cross_tenant_job(
     assert access_log.detail["kind"] == "approve_job"
 
 
+def test_admin_override_can_approve_campaign_qc_blocker_with_audit(
+    client, admin_token, admin_user_id, db,
+):
+    _, owner = _register(client, "approval_override_owner")
+    job_id = _seed_pending_review(db, owner)
+    job = db.query(Job).filter(Job.job_id == job_id).one()
+    job.campaign_id = "campaign-override"
+    job.workload_class = "batch"
+    job.delivery_qc = {
+        "status": "COMPLETE",
+        "issues": [{
+            "issue_id": "title-mismatch",
+            "code": "UMG_TITLE_METADATA",
+            "severity": "FAIL",
+            "status": "OPEN",
+            "blocking": True,
+        }],
+    }
+    db.commit()
+
+    response = client.post(
+        f"/approve/{job_id}",
+        headers=_auth(admin_token),
+        json={
+            "notes": "Urgencia de campaña Chile",
+            "admin_override": True,
+            "override_reason": "Autorizado por Tomi para liberar campaña Chile y enviar a UMG Chile",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    db.expire_all()
+    assert db.query(Job).filter(Job.job_id == job_id).one().status == "done"
+    log = (
+        db.query(AuditLog)
+        .filter(AuditLog.action == "job.approve")
+        .order_by(AuditLog.id.desc())
+        .first()
+    )
+    assert log.detail["admin_override"] is True
+    assert "campaña Chile" in log.detail["override_reason"]
+    assert log.detail["cross_tenant_admin"] is True
+
+
 def test_regular_user_cannot_approve_other_tenant_job(client, db):
     _, owner = _register(client, "approval_owner")
     attacker_token, _ = _register(client, "approval_other")
