@@ -112,6 +112,7 @@ class AssociationPatch(BaseModel):
 
 class DeliveryCreate(BaseModel):
     item_ids: list[str] | None = Field(default=None, max_length=ART_TRACK_LIMIT)
+    job_ids: list[str] | None = Field(default=None, max_length=1000)
     destination_portal: str | None = Field(default=None, max_length=32)
     idempotency_key: str = Field(..., min_length=16, max_length=160)
 
@@ -169,6 +170,21 @@ def _campaign_art_or_409(db: Session, campaign_id: str, user: dict) -> BatchCamp
     campaign = _campaign_or_404(db, campaign_id, user)
     if campaign.kind != "art_track":
         raise HTTPException(status_code=409, detail="This campaign is not an art-track campaign.")
+    return campaign
+
+
+def _campaign_for_delivery(db: Session, campaign_id: str, user: dict) -> BatchCampaign:
+    """Return any enabled campaign that can publish approved video jobs.
+
+    Art-track ingestion keeps its own feature and account gate, while normal
+    lyric-video campaigns use the existing batch campaign scope. Both share
+    the durable delivery operation and portal isolation contract.
+    """
+    campaign = _campaign_or_404(db, campaign_id, user)
+    if campaign.kind == "art_track":
+        return _campaign_art_or_409(db, campaign_id, user)
+    if campaign.kind != "lyric_video":
+        raise HTTPException(status_code=409, detail="This campaign cannot publish videos.")
     return campaign
 
 
@@ -504,32 +520,59 @@ def _fingerprint(job: Job) -> str:
 @router.post("/art-track-campaigns/{campaign_id}/delivery-preview")
 @router.post("/campaigns/{campaign_id}/deliveries/preview")
 def delivery_preview(campaign_id: str, destination_portal: str | None = Query(default=None), current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_scope(current_user); campaign = _campaign_art_or_409(db, campaign_id, current_user)
+    _require_scope(current_user); campaign = _campaign_for_delivery(db, campaign_id, current_user)
     destination = (destination_portal or campaign.destination_portal or "argentina").lower()
     if destination not in DESTINATIONS: raise HTTPException(status_code=400, detail="destination_portal must be argentina or chile")
-    rows = db.query(BatchCampaignItem, Job).join(Job, Job.campaign_item_id == BatchCampaignItem.id).filter(BatchCampaignItem.campaign_id == campaign.id).all()
+    if campaign.kind == "art_track":
+        rows = db.query(BatchCampaignItem, Job).join(Job, Job.campaign_item_id == BatchCampaignItem.id).filter(BatchCampaignItem.campaign_id == campaign.id).all()
+    else:
+        rows = [(None, job) for job in db.query(Job).filter(
+            Job.campaign_id == campaign.id, Job.tenant_id == campaign.tenant_id,
+        ).order_by(Job.created_at.asc()).all()]
     eligible = []; blocked = []
     for item, job in rows:
-        if job.status == "done" and job.approved_at and job.render_params and job.render_params.get("art_track"):
-            eligible.append({"item_id": item.id, "job_id": job.job_id, "fingerprint": _fingerprint(job), "title": job.song_title, "artist": job.artist})
-        else: blocked.append({"item_id": item.id, "job_id": job.job_id, "reason": "approval_required" if job.status != "done" or not job.approved_at else "not_art_track"})
+        approved = job.status == "done" and job.approved_at and bool(job.video_url)
+        if campaign.kind == "art_track":
+            approved = approved and bool(job.render_params and job.render_params.get("art_track"))
+        if approved:
+            eligible.append({"item_id": item.id if item else None, "job_id": job.job_id, "fingerprint": _fingerprint(job), "title": job.song_title, "artist": job.artist})
+        else:
+            reason = "approval_required" if job.status != "done" or not job.approved_at else "deliverables_not_ready"
+            if campaign.kind == "art_track" and job.status == "done" and job.approved_at and not (job.render_params or {}).get("art_track"):
+                reason = "not_art_track"
+            blocked.append({"item_id": item.id if item else None, "job_id": job.job_id, "reason": reason})
     return {"destination_portal": destination, "hostname": DESTINATIONS[destination], "eligible": eligible, "blocked": blocked, "eligible_count": len(eligible)}
 
 
 @router.post("/art-track-campaigns/{campaign_id}/deliveries")
 @router.post("/campaigns/{campaign_id}/deliveries")
 def create_delivery_batch(campaign_id: str, body: DeliveryCreate, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db), ddb: Session = Depends(get_deliveries_db)):
-    _require_scope(current_user); campaign = _campaign_art_or_409(db, campaign_id, current_user); _require_manager(campaign, current_user)
+    _require_scope(current_user); campaign = _campaign_for_delivery(db, campaign_id, current_user); _require_manager(campaign, current_user)
+    if body.item_ids is not None and body.job_ids is not None:
+        raise HTTPException(status_code=400, detail="Elegí item_ids o job_ids, no ambos.")
     destination = (body.destination_portal or campaign.destination_portal or "argentina").lower()
     if destination not in DESTINATIONS: raise HTTPException(status_code=400, detail="destination_portal must be argentina or chile")
     existing = db.query(DeliveryBatch).filter(DeliveryBatch.campaign_id == campaign.id, DeliveryBatch.idempotency_key == body.idempotency_key).first()
     if existing:
         return {"operation_id": existing.id, "status": existing.status, "deduplicated": True}
-    query = db.query(BatchCampaignItem, Job).join(Job, Job.campaign_item_id == BatchCampaignItem.id).filter(BatchCampaignItem.campaign_id == campaign.id)
-    if body.item_ids is not None: query = query.filter(BatchCampaignItem.id.in_(body.item_ids))
-    selected = query.with_for_update().all()
-    candidates = [(item, job) for item, job in selected if job.status == "done" and job.approved_at and (job.render_params or {}).get("art_track")]
-    if not candidates: raise HTTPException(status_code=409, detail={"code": "no_approved_art_tracks"})
+    if campaign.kind == "art_track":
+        query = db.query(BatchCampaignItem, Job).join(Job, Job.campaign_item_id == BatchCampaignItem.id).filter(BatchCampaignItem.campaign_id == campaign.id)
+        if body.item_ids is not None: query = query.filter(BatchCampaignItem.id.in_(body.item_ids))
+        selected = query.with_for_update().all()
+    else:
+        query = db.query(Job).filter(Job.campaign_id == campaign.id, Job.tenant_id == campaign.tenant_id)
+        if body.job_ids is not None: query = query.filter(Job.job_id.in_(body.job_ids))
+        selected = [(None, job) for job in query.with_for_update().all()]
+    candidates = []
+    for item, job in selected:
+        approved = job.status == "done" and job.approved_at and bool(job.video_url)
+        if campaign.kind == "art_track":
+            approved = approved and bool((job.render_params or {}).get("art_track"))
+        if approved:
+            candidates.append((item, job))
+    if not candidates:
+        code = "no_approved_art_tracks" if campaign.kind == "art_track" else "no_approved_videos"
+        raise HTTPException(status_code=409, detail={"code": code})
     operation = DeliveryBatch(id=str(uuid.uuid4()), campaign_id=campaign.id, tenant_id=campaign.tenant_id, destination_portal=destination, status="queued", idempotency_key=body.idempotency_key, created_by=current_user["id"], total_count=len(candidates), created_at=_now(), updated_at=_now())
     db.add(operation); db.flush()
     for item, job in candidates:
@@ -592,6 +635,8 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
     try:
         op = db.query(DeliveryBatch).filter(DeliveryBatch.id == operation_id).with_for_update().first()
         if not op: return {"sent": 0, "failed": 0}
+        campaign = db.query(BatchCampaign).filter(BatchCampaign.id == op.campaign_id).first()
+        delivery_label = "Art Track" if campaign and campaign.kind == "art_track" else "Campaña"
         op.status = "sending"; db.commit()
         items = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.delivery_batch_id == op.id, DeliveryBatchItem.status.in_(("pending", "failed"))).with_for_update(skip_locked=True).all()
         from database import DeliveriesSessionLocal, deliveries_added_by
@@ -626,13 +671,13 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     delivery_query = delivery_query.filter(Delivery.portal_id == op.destination_portal)
                 active = delivery_query.first()
                 if active is None:
-                    delivery_kwargs = dict(job_id=job.job_id, label="Art Track", file_types=DELIVERY_FILE_TYPES, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"))
+                    delivery_kwargs = dict(job_id=job.job_id, label=delivery_label, file_types=DELIVERY_FILE_TYPES, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"))
                     if hasattr(Delivery, "portal_id"):
                         delivery_kwargs["portal_id"] = op.destination_portal
                     active = Delivery(**delivery_kwargs)
                     ddb.add(active); ddb.flush()
                 else:
-                    active.label = "Art Track"
+                    active.label = delivery_label
                     active.file_types = DELIVERY_FILE_TYPES
                     active.artist_snapshot = job.artist
                     active.song_title_snapshot = job.song_title or ""

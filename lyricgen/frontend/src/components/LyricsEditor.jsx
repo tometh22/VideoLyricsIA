@@ -681,6 +681,7 @@ export default function LyricsEditor({
   // El botón "Re-sincronizar con IA" solo se muestra si el padre lo pasa Y
   // features.anchor_lyrics está activo (flag ANCHOR_LYRICS_ENABLED).
   onReanchor = null,
+  onReanchorReconcile = null,
   // NOTE (PR E): el viejo `onEditedChange` (espejo sincrónico por keystroke
   // hacia App) fue eliminado — era la mitad del loop bidireccional del
   // reseed-storm. Los lectores externos (WizardLivePreview, snapshot de
@@ -2105,16 +2106,38 @@ export default function LyricsEditor({
   const [reanchoring, setReanchoring] = useState(false);
   const canReanchor = !!(onReanchor && transcribeJobId
     && user?.features?.anchor_lyrics === true);
+  // 2026-09-14: si la respuesta se pierde (alineación >60 s, proxy que
+  // re-envía, 409 del duplicado), consultar el estado real antes de declarar
+  // fallo: si la revisión avanzó, el servidor ya aplicó el re-anclado.
+  const recoverReanchorFromServer = useCallback(async (baseRevision) => {
+    if (!onReanchorReconcile || !transcribeJobId) return null;
+    try {
+      const r = await Promise.resolve(onReanchorReconcile(transcribeJobId, baseRevision));
+      if (r && r.ok && Array.isArray(r.segments) && r.segments.length
+          && Number.isInteger(r.revision) && r.revision > baseRevision) return r;
+    } catch { /* best effort */ }
+    return null;
+  }, [onReanchorReconcile, transcribeJobId]);
+  const applyReanchorResult = useCallback((res, message) => {
+    if (Number.isInteger(res.revision)) {
+      saveQueueRef.current.prime(transcribeJobId, res.revision);
+    }
+    pushEditHistory();
+    setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
+    toast({ message, tone: "success" });
+  }, [transcribeJobId, pushEditHistory, toast]);
+
   const handleReanchor = useCallback(async () => {
     if (!onReanchor || !transcribeJobId || reanchoring) return;
     setReanchoring(true);
+    let baseRevision = Number.isInteger(segmentsRevision) ? segmentsRevision : 0;
     try {
       let saved = null;
       if (onPersistSegments) {
         saved = await flushPendingSave(null, true);
         if (saved?.ok === false) throw new Error(saved.reason || "save-failed");
       }
-      const baseRevision = Number.isInteger(saved?.revision)
+      baseRevision = Number.isInteger(saved?.revision)
         ? saved.revision
         : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
       let res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision));
@@ -2153,21 +2176,31 @@ export default function LyricsEditor({
           tone: "error",
         });
       } else {
+        const recovered = await recoverReanchorFromServer(baseRevision);
+        if (recovered) {
+          applyReanchorResult(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
+        } else {
+          toast({
+            message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
+            tone: "error",
+          });
+        }
+      }
+    } catch {
+      const recovered = await recoverReanchorFromServer(baseRevision);
+      if (recovered) {
+        applyReanchorResult(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
+      } else {
         toast({
           message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
           tone: "error",
         });
       }
-    } catch {
-      toast({
-        message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
-        tone: "error",
-      });
     } finally {
       setReanchoring(false);
     }
   }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, reanchoring, edited,
-      pushEditHistory, toast, t, flushPendingSave]);
+      pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult]);
 
   // 2026-09-13: pegar la letra OFICIAL y re-sincronizar desde ese texto.
   // Mismo endpoint que el re-anclado (POST /jobs/{id}/reanchor) con
@@ -2193,13 +2226,20 @@ export default function LyricsEditor({
     }
     setPasteBusy(true);
     setPasteError("");
+    let baseRevision = Number.isInteger(segmentsRevision) ? segmentsRevision : 0;
+    const finishPaste = (res, message) => {
+      applyReanchorResult(res, message);
+      setPasteOpen(false);
+      setPasteText("");
+      setPasteStructure(null);
+    };
     try {
       let saved = null;
       if (onPersistSegments) {
         saved = await flushPendingSave(null, true);
         if (saved?.ok === false) throw new Error(saved.reason || "save-failed");
       }
-      const baseRevision = Number.isInteger(saved?.revision)
+      baseRevision = Number.isInteger(saved?.revision)
         ? saved.revision
         : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
       const res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision, {
@@ -2230,15 +2270,25 @@ export default function LyricsEditor({
             .replace("{n}", String(res.structural?.crammed_lines ?? "?")),
         );
       } else {
-        setPasteError(t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.");
+        const recovered = await recoverReanchorFromServer(baseRevision);
+        if (recovered) {
+          finishPaste(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
+        } else {
+          setPasteError(t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.");
+        }
       }
     } catch {
-      setPasteError(t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.");
+      const recovered = await recoverReanchorFromServer(baseRevision);
+      if (recovered) {
+        finishPaste(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
+      } else {
+        setPasteError(t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.");
+      }
     } finally {
       setPasteBusy(false);
     }
   }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, pasteBusy, pasteText,
-      pasteLineCount, pushEditHistory, toast, t, flushPendingSave]);
+      pasteLineCount, pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult]);
 
   const focusSegment = useCallback((id) => {
     setFocusedSegId(id);
@@ -5537,7 +5587,7 @@ export default function LyricsEditor({
              izquierda no renderiza — los controles ya están en el paso
              4 del stepper y el preview central del wizard refleja los
              cambios. El grid colapsa a 1 columna full-width. */}
-      <div className="relative mb-4 flex items-center gap-3 rounded-2xl bg-gradient-to-r from-surface-2/80 via-surface-2/45 to-brand/[0.055] p-2 ring-1 ring-white/[0.08] shadow-xl shadow-black/10" data-testid="editor-mode-explainer">
+      <div className="relative mb-4 flex flex-wrap items-center gap-3 rounded-2xl bg-gradient-to-r from-surface-2/80 via-surface-2/45 to-brand/[0.055] p-2 ring-1 ring-white/[0.08] shadow-xl shadow-black/10" data-testid="editor-mode-explainer">
         <div
           className="grid min-w-0 flex-1 grid-cols-2 gap-1 rounded-xl bg-black/20 p-1"
           role="tablist"
@@ -5589,6 +5639,23 @@ export default function LyricsEditor({
             </span>
           </button>
         </div>
+        {/* 2026-09-14: pegar la letra oficial es una acción de TEXTO, no de
+            timing: va visible en las dos pestañas, no escondida en el menú de
+            Herramientas (que sólo existe en "Ajustar tiempos" y se cortaba a
+            la derecha en ventanas angostas). El ítem del menú se conserva. */}
+        {canReanchor && !syncMode && (
+          <button
+            type="button"
+            data-testid="paste-lyrics-cta"
+            disabled={reanchoring || pasteBusy}
+            onClick={() => { openPasteLyrics(); setOverflowOpen(false); }}
+            title={t("editor.paste_lyrics_menu_hint") || "Reemplaza el texto y realinea con el audio"}
+            className="inline-flex h-10 shrink-0 items-center gap-2 rounded-xl bg-brand/15 px-3 text-[11px] font-semibold text-brand-light ring-1 ring-brand/30 transition-colors hover:bg-brand/25 hover:text-white disabled:opacity-50"
+          >
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M9 4h6a2 2 0 0 1 2 2v14H7V6a2 2 0 0 1 2-2zM9 4v2h6V4M10 11h4M10 15h4" strokeLinecap="round" strokeLinejoin="round" /></svg>
+            <span>{t("editor.paste_lyrics_short") || "Pegar letra oficial"}</span>
+          </button>
+        )}
         {viewMode === "advanced" && (
           <div className="relative shrink-0">
             <button

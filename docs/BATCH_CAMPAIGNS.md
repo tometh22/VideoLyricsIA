@@ -84,6 +84,13 @@ vigentes entran en la previsualización y operación durable de envío. El estad
 de la operación se consulta en `/batch/delivery-operations/{id}` y se reanuda
 desde el worker tras una caída.
 
+Las campañas `lyric_video` también pueden enviar en bloque desde **Historial de
+videos**: el operador marca **Seleccionar todos los aprobados** (o una parte),
+elige Argentina o Chile y confirma. La solicitud guarda una instantánea de los
+`job_ids` aprobados en `DeliveryBatch`; los trabajos pendientes, descartados o
+con una aprobación que cambió quedan fuera. Reenviar con otra idempotencia
+actualiza la entrega existente de ese portal sin duplicarla.
+
 El destino AR/CL se guarda por fila `Delivery.portal_id`, con filtros y tokens
 independientes para `umg.genly.pro` y `umgchile.genly.pro`.
 
