@@ -227,7 +227,12 @@ def test_preissued_media_token_blocks_uninvited_but_allows_invited_expired_read(
     ))
     db.flush()
     assert policy.snapshot(db, group)["state"] == "expired"
+    db.commit()
     # Invitation is refreshed from the owner; trial expiry stops writes, not
     # reads of existing media. The original token remains otherwise valid.
-    verified = auth_module.verify_media_token(token, "media-job", "preview", db)
+    # Match the endpoint's fresh scoped_db session. Earlier resilience tests
+    # reload database, leaving two mapped User classes in one test session;
+    # reusing that identity map can retain the pre-invitation auth.User row.
+    with database.SessionLocal() as media_db:
+        verified = auth_module.verify_media_token(token, "media-job", "preview", media_db)
     assert verified["id"] == owner.id
