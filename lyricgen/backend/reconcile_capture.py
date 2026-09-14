@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,9 @@ SCHEMA = 'reconcile-stage-capture-v1'
 MAX_BYTES = 4 * 1024 * 1024
 MAX_STAGES = 64
 MAX_JOBS = 6
+FRESH_POLICY = 'fresh-campaign-v1'
+ARCHIVE_TTL = 7 * 86400
+logger = logging.getLogger(__name__)
 CONFIG_KEYS = (
     'ANCHOR_TEXT_GATE_ENABLED', 'RECONCILE_GAP_RECOVERY_ENABLED',
     'RECONCILE_MIN_AUDIO_COVERAGE', 'POST_RECONCILE_CLEANUP_ENABLED',
@@ -66,6 +70,81 @@ redis.call('HSET', KEYS[1], 'count', count, 'job:' .. ARGV[1], count)
 return {count, started, deadline}
 """
 
+def _fresh_campaign_context(job_id):
+    """Read server-owned admission facts, never lyrics or an editor version."""
+    from sqlalchemy import Text, cast, exists, func, select, text
+    from database import EditorDocument, Job, SessionLocal
+    from jobs import _CURRENT_JOB_ATTEMPT
+    campaigns = set(filter(None, os.environ.get('RECONCILE_CAPTURE_CAMPAIGN_IDS', '').split(',')))
+    if not 1 <= len(campaigns) <= 16:
+        return None
+    attempt = _CURRENT_JOB_ATTEMPT.get()
+    if not attempt or attempt[0] != 'transcription':
+        return None
+    with SessionLocal() as db:
+        db.execute(text('SET TRANSACTION READ ONLY'))
+        db.execute(text("SET LOCAL statement_timeout='1000'"))
+        row = db.execute(select(
+            Job.campaign_id, Job.campaign_item_id, Job.workload_class,
+            Job.approved_at, Job.active_transcription_attempt_id,
+            Job.input_audio_sha256, Job.audio_revision,
+            func.coalesce(cast(Job.segments_json, Text), 'null').notin_(['null', '[]']).label('has_segments'),
+            exists().where(EditorDocument.job_id == Job.job_id).label('has_document'),
+        ).where(Job.job_id == job_id)).first()
+        return _fresh_admission(row, attempt, campaigns)
+
+
+def _fresh_admission(row, attempt, campaigns):
+    if (not row or not attempt or attempt[0] != 'transcription'
+            or row.campaign_id not in campaigns or not row.campaign_item_id
+            or row.workload_class != 'batch' or row.approved_at is not None
+            or row.has_segments or row.has_document
+            or row.active_transcription_attempt_id != attempt[1]):
+        return None
+    return {'policy': FRESH_POLICY, 'campaign_id': row.campaign_id,
+            'attempt_id': attempt[1], 'input_audio_sha256': row.input_audio_sha256,
+            'audio_revision': row.audio_revision,
+            'editor_document_existed': False, 'prior_segments_existed': False}
+
+
+def archive_checkpoint(payload, *, complete=False):
+    """Best-effort private Redis evidence, no document mutation or provider work."""
+    try:
+        admission = (payload or {}).get('admission') or {}
+        if (os.environ.get('ENVIRONMENT') != 'staging'
+                or admission.get('policy') != FRESH_POLICY):
+            return
+        body = json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True)
+        envelope = {'schema': 'reconcile-capture-checkpoint-v1', 'complete': complete,
+                    'attempt_id': admission['attempt_id'], 'trace': payload,
+                    'trace_sha256': hashlib.sha256(body.encode()).hexdigest()}
+        packed = json.dumps(envelope, ensure_ascii=False, allow_nan=False)
+        if len(packed.encode()) > MAX_BYTES:
+            raise ValueError('archive_byte_limit')
+        from redis import Redis
+        client = Redis.from_url(os.environ['REDIS_URL'], socket_connect_timeout=1, socket_timeout=1)
+        try:
+            key = 'reconcile-capture:' + hashlib.sha256(payload['cohort'].encode()).hexdigest()
+            ledger, archive = key + ':window', key + ':result:' + payload['job_id']
+            # WATCH fences both admission and completion. No retries or new
+            # recognition attempts when another writer wins or Redis fails.
+            with client.pipeline() as pipe:
+                pipe.watch(ledger, archive)
+                if int(pipe.hget(ledger, 'job:' + payload['job_id']) or 0) != payload['ordinal']:
+                    return
+                old = pipe.get(archive)
+                if old:
+                    previous = json.loads(old)
+                    if previous['attempt_id'] != admission['attempt_id'] or previous['complete']:
+                        return
+                pipe.multi()
+                pipe.set(archive, packed, ex=ARCHIVE_TTL)
+                pipe.execute()
+        finally:
+            client.close()
+    except Exception as exc:
+        logger.warning('reconcile capture checkpoint unavailable error_type=%s', type(exc).__name__)
+
 
 def _clone(value):
     # Reject lossy snapshots rather than inventing values for replay.
@@ -94,6 +173,8 @@ class Capture:
             if len(json.dumps(self.payload).encode()) + len(json.dumps(row).encode()) > MAX_BYTES:
                 raise ValueError('byte_limit')
             self.payload['stages'].append(row)
+            if stage == 'reconcile_input':
+                archive_checkpoint(self.payload)
         except Exception as exc:
             # Preserve a small explicit failure marker; transcription survives.
             self.payload['incomplete'] = type(exc).__name__
@@ -137,6 +218,14 @@ def begin(job_id, audio_path, *, route_context, now=None, reserve=None):
             ttl = int((until - now).total_seconds())
         if not 0 < ttl <= 7 * 86400:
             return empty
+        policy = os.environ.get('RECONCILE_CAPTURE_POLICY', '')
+        admission_context = None
+        if policy:
+            if policy != FRESH_POLICY or not window:
+                return empty
+            admission_context = _fresh_campaign_context(job_id)
+            if admission_context is None:
+                return empty
         window_metadata = None
         if reserve is None:
             from redis import Redis
@@ -171,7 +260,11 @@ def begin(job_id, audio_path, *, route_context, now=None, reserve=None):
             'route_context': _clone(route_context), 'audio': {}, 'stages': [],
         }
         result = Capture(payload)
+        if admission_context:
+            payload['admission'] = admission_context
+            payload['selection'] = 'first-six-first-transcriptions-of-allowlisted-campaigns'
         result.audio('uploaded_input', audio_path)
+        archive_checkpoint(payload)
         return result
     except Exception:
         return empty
@@ -190,7 +283,9 @@ def durable_capture(result):
             if key in ('timing_source', 'ctc_retime', 'anchor_alignment',
                        'phrase_segmentation', 'repetition_reconcile', 'coverage_warning')
         })
-        return trace.snapshot()
+        snapshot = trace.snapshot()
+        archive_checkpoint(snapshot, complete=not bool(snapshot.get('incomplete')))
+        return snapshot
     except Exception:
         return None
 
