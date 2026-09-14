@@ -650,3 +650,37 @@ def test_reanchor_edited_text_same_as_machine_snapshot_skips_gate(client, monkey
     res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token), json={"base_revision": 2})
     assert res.status_code == 200, res.text
     assert res.json()["ok"] is True
+
+
+def test_reanchor_surfaces_helper_structural_decline(client, monkeypatch):
+    """El veredicto ahora vive en _maybe_anchor_align (todos los motores y
+    flujos). El endpoint tiene que devolver el motivo, no un 'declined'
+    opaco, y auditar la decisión."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+
+    async def _fake(result, audio_path, job_id, anchor_lyrics):
+        out = dict(result)
+        out["anchor_alignment"] = {
+            "status": "declined", "reason": "structural_mismatch",
+            "timing_source": "whisper_align",
+            "structural": {"crammed_lines": 5, "crammed_run": 5, "crammed_fraction": 0.29},
+        }
+        return out
+    monkeypatch.setattr(main_mod, "_maybe_anchor_align", _fake)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token))
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is False
+    assert body["reason"] == "structural_mismatch"
+    assert body["structural"]["crammed_run"] == 5
+    assert _db_segments(job_id) == list(SEGS)
+    from database import AuditLog, SessionLocal
+    s = SessionLocal()
+    try:
+        row = (s.query(AuditLog).filter(AuditLog.action == "lyrics.reanchor_declined")
+               .order_by(AuditLog.id.desc()).first())
+        assert row.detail["job_id"] == job_id and row.detail["timing_source"] == "whisper_align"
+    finally:
+        s.close()

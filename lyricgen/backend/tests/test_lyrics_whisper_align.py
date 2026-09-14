@@ -487,3 +487,30 @@ def test_integration_638_like_synthetic():
     # Strict monotonicity.
     for i in range(1, len(segs)):
         assert segs[i]["start"] > segs[i - 1]["start"]
+
+
+def test_build_segments_marks_interpolated_lines():
+    """Lines whose start came from interpolation carry `interpolated: True`;
+    anchored lines do not (2026-09-14: the caller refuses mostly-guessed
+    fallbacks)."""
+    from lyrics_whisper_align import _build_segments, _tokens_with_line
+
+    lines = ["hola mundo", "linea sin anclar", "otra linea sin anclar", "chau mundo"]
+    tokens = _tokens_with_line(lines)
+    words = [
+        {"word": "hola", "start": 1.0, "end": 1.4},
+        {"word": "mundo", "start": 1.5, "end": 1.9},
+        {"word": "chau", "start": 9.0, "end": 9.4},
+        {"word": "mundo", "start": 9.5, "end": 9.9},
+    ]
+    mapping = []
+    for li, tok in tokens:
+        if li == 0:
+            mapping.append(0 if tok == "hola" else 1)
+        elif li == 3:
+            mapping.append(2 if tok == "chau" else 3)
+        else:
+            mapping.append(-1)
+    segs = _build_segments(lines, tokens, mapping, words, audio_dur=12.0)
+    assert [s["text"] for s in segs] == lines
+    assert [bool(s.get("interpolated")) for s in segs] == [False, True, True, False]
