@@ -1,9 +1,10 @@
 """Pure guardrails from anchor_structural_guard (incidente 2026-09-13).
 
 Calibration data (campaign snapshot, .context/campaign-draft-audit-20260913):
-Color Esperanza re-anchored over Diego Torres' full lyric → 36 crammed lines
-in two runs of 21 and 15; Zi Zi Zi → run of 13. None of the 240 healthy
-drafts had a run above 3 or a crammed fraction above 0.22.
+Color Esperanza re-anchored over Diego Torres' full lyric → run of 7 (31 %);
+Zi Zi Zi → run of 6; Buseca's Whisper-DP padding → run of 5. Among 311 live
+jobs no healthy one has a run above 3; hand-edited songs with many short
+lines reach a crammed fraction of 0.25-0.28, hence the 0.4 backstop.
 """
 
 import uuid
@@ -77,12 +78,39 @@ def test_fraction_threshold_trips_without_a_long_run():
     assert verdict["mismatch"] is True
 
 
-def test_lines_without_word_scores_never_count():
-    segs = [{"start": i * 0.5, "end": i * 0.5 + 0.3, "text": "dos palabras", "words": []}
-            for i in range(20)]
+def test_whisper_dp_interpolation_pads_trip_without_scores():
+    """Buseca y Vino Tinto (80af47d18113, 2026-09-14): CTC declined (short
+    repeated motif), hosted align was unsafe, Whisper-DP anchored 29/51 lines
+    and padded the rest to 0.6 s with a constant 0.6 word score. Five words in
+    0.6 s is not singing; the verdict must not depend on a low score."""
+    segs = _healthy(8)
+    t = segs[-1]["end"]
+    for i in range(5):
+        segs.append(_line(t + i * 0.6, t + i * 0.6 + 0.6, "y yo me quemo hasta los dientes", 0.6))
+    segs += [_line(t + 4 + i * 3.0, t + 4 + i * 3.0 + 2.4, "buseca y vino tinto", 0.6) for i in range(4)]
     verdict = crammed_line_verdict(segs)
-    assert verdict["mismatch"] is False
-    assert verdict["scored_lines"] == 0
+    assert verdict["mismatch"] is True
+    assert verdict["crammed_run"] == 5
+
+
+def test_lines_without_word_scores_count_only_when_too_dense():
+    slow = [{"start": i * 2.0, "end": i * 2.0 + 0.9, "text": "dos palabras", "words": []}
+            for i in range(20)]
+    assert crammed_line_verdict(slow)["mismatch"] is False  # 2.2 words/s
+    dense = [{"start": i * 0.5, "end": i * 0.5 + 0.3, "text": "cinco palabras en tres decimas", "words": []}
+             for i in range(20)]
+    verdict = crammed_line_verdict(dense)
+    assert verdict["mismatch"] is True
+    assert verdict["scored_lines"] == 20
+
+
+def test_fast_rap_lines_with_real_scores_are_fine():
+    """Two fast-but-real lines (4 words in 0.95 s, score 0.8) between sung
+    lines: under the run threshold and well scored."""
+    segs = _healthy(10)
+    segs[4] = _line(12.0, 12.95, "rapeo muy rapido aca", 0.8)
+    segs[5] = _line(13.0, 13.9, "otra linea veloz igual", 0.8)
+    assert crammed_line_verdict(segs)["mismatch"] is False
 
 
 def test_single_word_lines_never_count():

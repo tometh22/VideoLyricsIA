@@ -67,24 +67,37 @@ def crammed_line_verdict(
     min_words: int = 2,
     min_run: int | None = None,
     max_frac: float | None = None,
+    min_words_per_s: float | None = None,
 ) -> dict[str, Any]:
     """Detect lines the aligner squeezed in because the audio never sings them.
 
     A line counts as *crammed* when it has at least ``min_words`` words, lasts
-    less than ``max_line_s`` seconds and its median word score is below
-    ``max_score`` (lines without word scores are never counted — the engine
-    gave no acoustic opinion). The verdict is a structural mismatch when
-    ``min_run`` or more crammed lines are consecutive, or when crammed lines
-    are at least ``max_frac`` of the scored lines.
+    less than ``max_line_s`` seconds and EITHER its median word score is below
+    ``max_score`` OR it packs ``min_words_per_s`` words per second or more.
+    The second test needs no scores: the Whisper-DP fallback pads every line
+    it could not anchor to a fixed 0.6 s and stamps a constant 0.6 score on
+    whatever words fall inside (Buseca y Vino Tinto, 2026-09-14: 22 of 51
+    lines interpolated, runs of five 0.6 s lines with five words each), so a
+    score-only test waved it through. The verdict is a structural mismatch
+    when ``min_run`` or more crammed lines are consecutive, or when crammed
+    lines are at least ``max_frac`` of the lines that could be judged.
 
-    Calibrated on the 2026-09-13 campaign snapshot: Color Esperanza (run 21,
-    44 %) and Zi Zi Zi (run 13) trip it; none of the 240 healthy drafts has a
-    run above 3 or a fraction above 0.22. Pure; never raises on odd input.
+    Calibrated on the 2026-09-13 campaign snapshot (311 live jobs): Color
+    Esperanza (run 7, 31 %), Zi Zi Zi (run 6, 29 %) and the Buseca fallback
+    (run 5, 29 %) trip on the RUN test; the only healthy-looking job with a
+    run of 4 is a forced_align medley that is itself broken. The fraction
+    test is a backstop for scattered cramming and sits at 0.4 because
+    hand-edited songs with many short lines legitimately reach 0.25-0.28.
+    Pure; never raises on odd input.
     """
     max_line_s = _env_float("REANCHOR_CRAMMED_MAX_LINE_S", 1.0) if max_line_s is None else max_line_s
     max_score = _env_float("REANCHOR_CRAMMED_MAX_SCORE", 0.1) if max_score is None else max_score
     min_run = _env_int("REANCHOR_CRAMMED_MIN_RUN", 4) if min_run is None else min_run
-    max_frac = _env_float("REANCHOR_CRAMMED_MAX_FRAC", 0.25) if max_frac is None else max_frac
+    max_frac = _env_float("REANCHOR_CRAMMED_MAX_FRAC", 0.4) if max_frac is None else max_frac
+    min_words_per_s = (
+        _env_float("REANCHOR_CRAMMED_MIN_WORDS_PER_S", 4.0)
+        if min_words_per_s is None else min_words_per_s
+    )
 
     crammed_idx: list[int] = []
     scored = 0
@@ -93,16 +106,20 @@ def crammed_line_verdict(
         if not isinstance(seg, Mapping):
             continue
         total += 1
-        med = _line_median_score(seg)
-        if med is None:
-            continue
-        scored += 1
         try:
             dur = float(seg.get("end") or 0.0) - float(seg.get("start") or 0.0)
         except (TypeError, ValueError):
             continue
         n_words = len(str(seg.get("text") or "").split())
-        if n_words >= min_words and dur < max_line_s and med < max_score:
+        if n_words < min_words:
+            continue
+        scored += 1
+        if dur >= max_line_s:
+            continue
+        med = _line_median_score(seg)
+        low_score = med is not None and med < max_score
+        too_dense = n_words / max(dur, 0.01) >= min_words_per_s
+        if low_score or too_dense:
             crammed_idx.append(idx)
 
     run = best = 0
