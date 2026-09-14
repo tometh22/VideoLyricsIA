@@ -313,7 +313,10 @@ def _build_segments(
         if line_start[i] <= line_start[i - 1]:
             line_start[i] = line_start[i - 1] + MIN_SEG_DUR_S
 
-    # Build segments.
+    # Build segments. Lines placed by interpolation carry `interpolated` so
+    # the caller can refuse a fallback that guessed most of the song
+    # (2026-09-14: 22/51 guessed lines persisted as 0.6 s pads).
+    anchored_set = set(anchored)
     segments: list[dict] = []
     for i, line in enumerate(cleaned_lines):
         start = max(0.0, float(line_start[i]))
@@ -322,7 +325,10 @@ def _build_segments(
         else:
             end = max(start + MIN_SEG_DUR_S, audio_dur)
         end = min(end, audio_dur)
-        segments.append({"start": start, "end": end, "text": line})
+        seg = {"start": start, "end": end, "text": line}
+        if i not in anchored_set:
+            seg["interpolated"] = True
+        segments.append(seg)
 
     # ─── Fix A (2026-05-31): persist per-segment word stamps ────────────
     # Bucket whisper words into each segment's [start, end] window

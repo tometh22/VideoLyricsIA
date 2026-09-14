@@ -78,6 +78,13 @@ const _SAVE_ERROR_COPY = {
     detail: "Tus cambios siguen guardados localmente. Al volver la conexión compararemos primero la versión del equipo.",
     confirm: "Esperá a recuperar la conexión antes de aprobar.",
   },
+  velocity: {
+    short: "Frenamos el guardado: demasiadas canciones editadas en pocos minutos",
+    detail:
+      "Es un freno contra scripts automáticos. Tus cambios siguen acá; esperá unos minutos y el respaldo se reintenta solo. Si sos vos editando a mano, avisanos y subimos el tope.",
+    confirm:
+      "El respaldo está frenado por el tope de velocidad. Esperá a ver «Guardado» antes de aprobar.",
+  },
   server: {
     short: "No pudimos respaldar tu última edición en el servidor",
     detail:
@@ -96,6 +103,7 @@ function _saveErrorCategory(result) {
   if (reason === "network") return "network";
   if (status === 401 || status === 403) return "session";
   if (reason === "job-gone" || status === 404) return "job-gone";
+  if (reason === "velocity" || status === 429) return "velocity";
   // Revision drift is handled by the save queue's automatic rebase. If it
   // still cannot settle after bounded retries, show the generic retry copy;
   // never surface a collaboration/conflict banner to the operator.

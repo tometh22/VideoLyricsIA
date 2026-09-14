@@ -6851,6 +6851,28 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         return out
 
     def _apply(base, aligned, *, timing_source: str, decline_reason: str = ""):
+        # Veredicto acústico compartido por los tres motores (CTC, hosted,
+        # Whisper-DP) y por los dos flujos (subida con letra oficial y
+        # /reanchor). Una corrida de líneas apretadas es texto que el audio
+        # no canta: declinar es más honesto que persistirlo (incidentes
+        # Color Esperanza 13-sep y Buseca 14-sep).
+        from anchor_structural_guard import crammed_guard_enabled, crammed_line_verdict
+        if crammed_guard_enabled():
+            _verdict = crammed_line_verdict(aligned)
+            if _verdict.get("mismatch"):
+                logger.warning(
+                    "[ANCHOR] declined structural_mismatch source=%s crammed=%d "
+                    "run=%d frac=%.2f job=%s",
+                    timing_source, _verdict["crammed_lines"], _verdict["crammed_run"],
+                    _verdict["crammed_fraction"], job_id,
+                )
+                out = _declined(base, "structural_mismatch")
+                if isinstance(out, dict):
+                    out["anchor_alignment"]["timing_source"] = timing_source
+                    out["anchor_alignment"]["structural"] = {
+                        k: v for k, v in _verdict.items() if k != "crammed_indices"
+                    }
+                return out
         try:
             review_min = float(
                 os.environ.get("ANCHOR_REVIEW_MIN_SCORE", "0.25")
@@ -6930,6 +6952,20 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         except (TypeError, ValueError):
             return False
         if any(end <= start for start, end in zip(starts, ends)):
+            return False
+        # Whisper-DP marks the lines it could not anchor and had to place by
+        # interpolation. A fallback that guessed most of the song is not an
+        # alignment (Buseca 14-sep: 22 of 51 lines guessed, 0.6 s pads).
+        try:
+            max_interp = float(os.environ.get("ANCHOR_MAX_INTERPOLATED_FRAC", "0.3"))
+        except (TypeError, ValueError):
+            max_interp = 0.3
+        interpolated = sum(1 for segment in aligned if segment.get("interpolated"))
+        if aligned and interpolated / len(aligned) > max_interp:
+            logger.warning(
+                "[ANCHOR] rejected fallback: %d/%d lines interpolated (> %.0f%%) job=%s",
+                interpolated, len(aligned), max_interp * 100, job_id,
+            )
             return False
         # Equal starts are the classic repeated-chorus pile-up. Small line
         # overlaps are valid, but occurrence order must remain strict.
@@ -15717,6 +15753,41 @@ async def reanchor_segments(
             or len(anchored) != n_lines):
         # Decline seguro (flag/engine/mismatch de líneas) — los segments
         # del operador quedan intactos, igual que la Versión A en upload.
+        _aa = out.get("anchor_alignment") if isinstance(out, dict) else None
+        _aa = _aa if isinstance(_aa, dict) else {}
+        if _aa.get("reason") == "structural_mismatch":
+            logger.warning("[REANCHOR] declined structural_mismatch job=%s (n_lines=%d)",
+                           job_id, n_lines)
+            try:
+                from database import AuditLog, SessionLocal as _SLa
+                db_audit = _SLa()
+                try:
+                    db_audit.add(AuditLog(
+                        user_id=current_user["id"],
+                        action="lyrics.reanchor_declined",
+                        detail={
+                            "job_id": job_id, "reason": "structural_mismatch",
+                            "pasted": pasted_mode,
+                            "confirm_structure": bool(body.confirm_structure),
+                            "timing_source": _aa.get("timing_source"),
+                            **(_aa.get("structural") or {}),
+                        },
+                    ))
+                    db_audit.commit()
+                finally:
+                    db_audit.close()
+            except Exception as e:  # noqa: BLE001 — audit best-effort
+                logger.warning("[REANCHOR] audit log failed: %s", e)
+            return {
+                "ok": False,
+                "reason": "structural_mismatch",
+                "job_id": job_id,
+                "count": len(prev_segs),
+                "review_count": 0,
+                "locked_kept": 0,
+                "revision": initial_revision,
+                "structural": _aa.get("structural") or {},
+            }
         logger.info("[REANCHOR] declined job=%s (n_lines=%d)", job_id, n_lines)
         return {
             "ok": False,
