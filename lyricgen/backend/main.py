@@ -12915,6 +12915,53 @@ async def decide_delivery_qc_issue(
     return {"ok": True, "delivery_qc": report}
 
 
+@app.post("/jobs/{job_id}/delivery-qc/recheck")
+async def recheck_delivery_qc(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Rebuild final-render QC for an existing video before approval.
+
+    Older campaign renders can predate Delivery QC, and an edit marks a
+    report stale.  The operator must be able to refresh the report from the
+    immutable rendered MP4 without spending another generation.
+    """
+    query = db.query(Job).filter(Job.job_id == job_id)
+    if current_user.get("role") != "admin":
+        query = query.filter(Job.tenant_id == current_user["tenant_id"])
+    job = query.first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status not in {"pending_review", "done", "rejected"}:
+        raise HTTPException(status_code=409, detail="Job is not ready for delivery QC")
+
+    video_key = (job.s3_keys or {}).get("video") if isinstance(job.s3_keys, dict) else None
+    local_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP["video"])
+
+    async def _run(video_path: str):
+        from delivery_qc_runtime import run_delivery_qc_for_job
+        return await asyncio.to_thread(
+            run_delivery_qc_for_job, job_id, video_path,
+        )
+
+    if video_key and storage.is_enabled():
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix=f"genly-qc-{job_id}-") as folder:
+            video_path = os.path.join(folder, FILE_MAP["video"])
+            downloaded = await asyncio.to_thread(storage.download_object, video_key, video_path)
+            if not downloaded or not os.path.isfile(video_path):
+                raise HTTPException(status_code=404, detail="No se encontró el video renderizado en storage")
+            report = await _run(video_path)
+    elif os.path.isfile(local_path):
+        report = await _run(local_path)
+    else:
+        raise HTTPException(status_code=404, detail="No se encontró el video renderizado")
+    if not report:
+        raise HTTPException(status_code=409, detail="No se pudo generar el reporte de preflight")
+    return {"ok": True, "delivery_qc": report}
+
+
 @app.post("/jobs/{job_id}/delivery-qc/external-result")
 async def record_delivery_qc_external_result(
     job_id: str,
