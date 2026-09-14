@@ -66,6 +66,8 @@ import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
 import GiftCreditsBanner from "./components/GiftCreditsBanner";
 import ServiceStatusBanner from "./components/ServiceStatusBanner";
 import TrialUsageSummary from "./components/TrialUsageSummary";
+import TrialSupportChat from "./components/TrialSupportChat";
+import { supportUserKey } from "./lib/trialSupport";
 import { useAlert } from "./components/AlertProvider";
 import { ACTIVE_STATUSES, isTerminalStatus } from "./lib/jobStatus";
 import {
@@ -6186,6 +6188,7 @@ export default function App() {
   return (
     <>
       <RootEffects setUser={setUser} setResetToken={setResetToken} setBillingSuccess={setBillingSuccess} />
+      <TrialSupportChat userKey={token ? supportUserKey(user) : null} />
       {billingSuccess && <BillingSuccessToast onDismiss={() => setBillingSuccess(false)} />}
       {user && <WhatsNewModal user={user} />}
       <Routes>

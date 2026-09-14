@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.18-trial.3] - 2026-09-14
+
+### Added
+
+- Frontend-only Universal trial support chat, loaded on request only on trial.genly.pro.
+- Isolate support sessions on account changes, keep an email fallback, and exclude
+  the application DOM (including portals) from Crisp browsing assistance. No automatic
+  lyrics, prompts, audio or account-profile payloads; Crisp receives standard connection metadata.
+- No backend, transcription, render, credit, production or staging deployment changes.
+
 ## [1.1.18-trial.2] - 2026-09-14
 
 ### Fixed
