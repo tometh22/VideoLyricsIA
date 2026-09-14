@@ -1129,6 +1129,7 @@ function EditLyricsRoute({
         audioUnavailableReason: null,
         waveform: null,           // populated by Phase B
         waveformLoading: true,    // independent enhancement request in flight
+        waveformHiresLoading: true,
         bgUrl: null,              // populated by Phase B
         transcriptionQuality: job.transcription_quality || null,
         coverageWarning: !!job.coverage_warning,
@@ -1301,6 +1302,16 @@ function EditLyricsRoute({
         "waveform",
         (d) => d,
         { loadingKey: "waveformLoading" },
+      );
+      // Guía de audio a resolución de tramo para la revisión guiada (~40
+      // picos/s, stem de voz si está cacheado). Se pide aparte porque la
+      // primera vez puede tardar: el overview de 1000 picos llega antes y
+      // la revisión lo usa mientras tanto.
+      enhanceField(
+        `${API}/jobs/${id}/waveform?resolution=hires`,
+        "waveformHires",
+        (d) => d,
+        { loadingKey: "waveformHiresLoading", retries: 1 },
       );
       enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
     })();
@@ -1611,6 +1622,7 @@ function VariantWizardRoute({
       };
       enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null);
       enhanceField(`${API}/jobs/${id}/waveform`, "waveform", (d) => d);
+      enhanceField(`${API}/jobs/${id}/waveform?resolution=hires`, "waveformHires", (d) => d);
       enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
     })();
 
@@ -6035,6 +6047,8 @@ export default function App() {
                 : null}
             waveform={currentReview.waveform || null}
             waveformLoading={currentReview.waveformLoading ?? (!!currentReview.transcribeJobId && !currentReview.waveform)}
+            waveformHires={currentReview.waveformHires || null}
+            waveformHiresLoading={currentReview.waveformHiresLoading ?? false}
             referenceLyrics={currentReview.referenceLyrics || ""}
             referenceLinks={currentReview.referenceLinks || []}
             sourceReference={currentReview.sourceReference || null}

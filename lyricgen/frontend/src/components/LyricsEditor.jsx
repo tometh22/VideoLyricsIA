@@ -722,6 +722,11 @@ export default function LyricsEditor({
   // signed audio URL. Keep its loading state explicit so a slow enhancement
   // reads as progress, not as a broken/empty audio guide.
   waveformLoading = false,
+  // Guided timing review: per-second envelope (vocal stem when cached). The
+  // 1000-bucket overview is ~27 bars for a 7 s window of a 4-minute song;
+  // the guided cards need real detail to show where the voice starts.
+  waveformHires = null,
+  waveformHiresLoading = false,
   // Live preview: signed URL of the cached background video (post-render
   // modal). null → preview uses a style-tinted template gradient (wizard).
   previewBgUrl = null,
@@ -5861,8 +5866,8 @@ export default function LyricsEditor({
                         <GuidedTimingReview
                           windows={qualityGuidanceAvailable ? unsafeWindows : []}
                           segments={sanitizedEdited}
-                          waveform={waveform}
-                          waveformLoading={waveformLoading}
+                          waveform={waveformHires || waveform}
+                          waveformLoading={!waveformHires && !waveform && (waveformHiresLoading || waveformLoading)}
                           duration={duration}
                           audioAvailable={!!audioUrl && !audioError && audioMetadataReady}
                           audioLoading={audioLoading || (!!audioUrl && !audioError && !audioMetadataReady)}
