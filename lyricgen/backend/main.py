@@ -14945,6 +14945,20 @@ def _enforce_segment_write_velocity(db: Session, current_user: dict, job_id: str
     )
 
 
+def _is_platform_admin_user(current_user: dict) -> bool:
+    """Same contract as _editor_document_or_404 / _job_scope / campaigns.
+
+    Incidente 14-sep-2026 (Illapu, campaña Chile): la revisora (rol admin
+    de otro tenant, no listada en SUPER_ADMIN_USERS) editó 77 veces por
+    PATCH /editor y la aprobación de campaña la dejaba pasar, pero
+    /language-resolution exigía super-admin y devolvía 404 → el gate de
+    discrepancia quedaba imposible de resolver y "Aprobar" bloqueado.
+    """
+    return bool(
+        current_user.get("role") == "admin" or current_user.get("is_super_admin")
+    )
+
+
 @app.post("/jobs/{job_id}/save-segments")
 @limiter.limit("60/minute")
 async def save_segments(
@@ -14992,7 +15006,7 @@ async def save_segments(
     # y las ediciones no persistían. Para no-admins el editor se comparte
     # entre miembros del mismo workspace; el control optimista por revisión
     # detecta cualquier guardado sobre una versión vieja.
-    _is_platform_admin = bool(current_user.get("is_super_admin"))
+    _is_platform_admin = _is_platform_admin_user(current_user)
     if (not job
             or (not _is_platform_admin
                 and job.tenant_id != current_user["tenant_id"])):
@@ -15248,7 +15262,7 @@ async def resolve_language_review(
     does not touch the lyrics, approval status, or the saving path.
     """
     job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
-    is_platform_admin = bool(current_user.get("is_super_admin"))
+    is_platform_admin = _is_platform_admin_user(current_user)
     if (not job or (not is_platform_admin
                     and job.tenant_id != current_user["tenant_id"])):
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -15307,7 +15321,7 @@ async def acknowledge_transcription_quality(
 ):
     """Persist an explicit, revision+content-scoped operator decision."""
     job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
-    is_platform_admin = bool(current_user.get("is_super_admin"))
+    is_platform_admin = _is_platform_admin_user(current_user)
     if (not job or (not is_platform_admin
                     and job.tenant_id != current_user["tenant_id"])):
         raise HTTPException(status_code=404, detail="Job not found.")
