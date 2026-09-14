@@ -84,6 +84,22 @@ def test_enforce_does_not_block_a_non_deterministic_review():
     }
 
 
+def test_legacy_manual_reviewer_checks_do_not_block_approval():
+    report = {
+        "status": "COMPLETE",
+        "issues": [{
+            "issue_id": "legacy-black-bars",
+            "code": "UMG_BLACK_BARS",
+            "severity": "FAIL",
+            "status": "OPEN",
+        }],
+    }
+    gate = approval_gate(report, "enforce")
+    assert gate["blocked"] is False
+    assert gate["can_approve"] is True
+    assert gate["reason"] == "review_recommended"
+
+
 def test_refresh_check_results_marks_signed_manual_check_as_passed():
     report = {
         "decision": "BLOCK",
