@@ -1,4 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from "react";
+import { editorSeekProperties } from "../lib/editorSeekTelemetry";
+import { captureHandledError } from "../observability";
 import { classifyTask, isEditableTarget, readTaskAttr } from "../editorTaskClock";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
@@ -1146,6 +1148,7 @@ export default function LyricsEditor({
     editorSessionIdRef.current = globalThis.crypto?.randomUUID?.()
       || `editor-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
+  const telemetryFailureReportedRef = useRef(false);
   const trackEditorEvent = useCallback((name, properties = {}) => {
     if (!editorRequest || !transcribeJobId) return;
     editorRequest("/analytics/events", {
@@ -1156,7 +1159,18 @@ export default function LyricsEditor({
         job_id: transcribeJobId,
         properties: { ...properties, session_id: editorSessionIdRef.current },
       }] }),
-    }).catch(() => {});
+    }).then(async (response) => {
+      const receipt = await response.json();
+      if (!response.ok || receipt.accepted !== 1 || receipt.rejected !== 0) {
+        throw new Error("editor_telemetry_not_accepted");
+      }
+    }).catch(() => {
+      // Once per mounted editor, with no event payload/lyrics in diagnostics.
+      // Analytics failure must never interrupt playback or human editing.
+      if (telemetryFailureReportedRef.current) return;
+      telemetryFailureReportedRef.current = true;
+      captureHandledError(new Error("editor_telemetry_not_accepted"), { event_name: name });
+    });
   }, [editorRequest, transcribeJobId]);
   const shownOperatorProposalRef = useRef("");
   useEffect(() => {
@@ -2703,7 +2717,7 @@ export default function LyricsEditor({
     // Lead-in: scrub to ~1.5s before the chosen line so the operator
     // hears the run-up. Don't autoplay — let them press play when ready.
     const target = edited[safeIdx];
-    if (target) seekTo(Math.max(0, target.start - 1.5), false);
+    if (target) seekTo(Math.max(0, target.start - 1.5), false, target);
   };
 
   const enterSyncMode = () => enterSyncModeAt(0);
@@ -2757,21 +2771,42 @@ export default function LyricsEditor({
     if (audio) audio.pause();
   }, []);
 
-  const seekTo = useCallback((seconds, autoplay = true) => {
+  const seekTo = useCallback((seconds, autoplay = true, targetSegment = null, contextPlayback = false) => {
     const a = audioRef.current;
     if (!a) return;
     guidedPlaybackRangeRef.current = null;
     setGuidedPlayingWindowId(null);
-    const t = Math.max(0, seconds);
+    if (!Number.isFinite(seconds)) return;
+    const t = Math.min(Number.isFinite(a.duration) ? a.duration : Infinity, Math.max(0, seconds));
+    const segment = targetSegment || edited.find((row) => row._id === focusedSegId);
+    const properties = editorSeekProperties({
+      from: a.currentTime, to: t, segment,
+      revision: editorV2Enabled && durableEditor.document ? durableEditor.revisionRef.current : undefined,
+      targeted: Boolean(targetSegment),
+      qualityMarked: segment ? unsafeNavigationIdsRef.current.has(segment._id) : false,
+      unsavedChanges: isDirty,
+      lineIndex: segment ? edited.findIndex((row) => row._id === segment._id) : -1,
+    });
     a.currentTime = t;
     playbackTimeRef.current = t;
     lastPublishedTimeRef.current = t;
     // Refleja en el mismo frame del click. Sin esto hay que esperar al
     // próximo rAF tick (~16ms) y el playhead "se desliza" en vez de saltar.
     setCurrentTime(t);
-    if (autoplay && a.paused) a.play().catch(() => {});
-    trackEditorEvent("editor_seek", { position_ms: Math.round(t * 1000), source: "editor" });
-  }, [trackEditorEvent]);
+    const playAttempt = autoplay && a.paused ? a.play() : Promise.resolve();
+    if (contextPlayback) {
+      // Count successful playback, not a rejected browser play request. Capture
+      // gesture context above so promise latency cannot change its line/origin.
+      playAttempt.then(() => trackEditorEvent("editor_line_context_played", {
+        ...properties,
+        requested_lead_in_ms: 2000,
+        effective_lead_in_ms: Math.max(0, properties.line_start_ms - properties.position_ms),
+      })).catch(() => {});
+    } else {
+      playAttempt.catch(() => {});
+      trackEditorEvent("editor_seek", properties);
+    }
+  }, [trackEditorEvent, edited, focusedSegId, editorV2Enabled, durableEditor.document, durableEditor.revisionRef, isDirty]);
 
   const playGuidedWindow = useCallback((qualityWindow) => {
     const audio = audioRef.current;
@@ -3119,7 +3154,7 @@ export default function LyricsEditor({
     }
     if (seg) {
       setFocusedSegId(id);
-      seekTo(Math.max(0, seg.start), false);
+      seekTo(Math.max(0, seg.start), false, seg);
     }
     setFlashReviewId(id);
     setTimeout(() => setFlashReviewId((cur) => (cur === id ? null : cur)), 1200);
@@ -3155,7 +3190,7 @@ export default function LyricsEditor({
         const next = edited[(currentIndex + (e.shiftKey ? -1 : 1) + edited.length) % edited.length];
         if (next) {
           setFocusedSegId(next._id);
-          seekTo(Math.max(0, next.start), false);
+          seekTo(Math.max(0, next.start), false, next);
           rowRefs.current[next._id]?.querySelector('input[type="text"]')?.focus();
         }
       } else if ((e.metaKey || e.ctrlKey) && (e.key === "z" || e.key === "Z")) {
@@ -5828,7 +5863,7 @@ export default function LyricsEditor({
                 onSelect={(id) => {
                   focusSegment(id);
                   const seg = edited.find((s) => s._id === id);
-                  if (seg) seekTo(Math.max(0, seg.start), false);
+                  if (seg) seekTo(Math.max(0, seg.start), false, seg);
                 }}
                 onLayoutChange={handleLayoutChange}
                 onDragStart={pushEditHistory}
@@ -6158,7 +6193,7 @@ export default function LyricsEditor({
                         aria-label="Activar Sync desde esta línea"
                       />
                       <button
-                        onClick={() => seekTo(Math.max(0, seg.start), true)}
+                        onClick={() => seekTo(Math.max(0, seg.start), true, seg)}
                         onDoubleClick={() => startEditTimestamp(seg)}
                         aria-label={`Reproducir desde ${formatTimestamp(seg.start)}. Doble click para editar el tiempo de la línea ${idx + 1}`}
                         title={t("editor.timestamp_hint") || "Click: ir al tiempo · Doble click: editar"}
@@ -6174,6 +6209,20 @@ export default function LyricsEditor({
                             empujar el timestamp ni romper la grilla. */}
                         {isActive && <span className="text-brand-light mr-0.5" aria-hidden="true">▶</span>}
                         {formatTimestamp(seg.start)}
+                      </button>
+                      <button
+                        type="button"
+                        data-editor-task="listen"
+                        disabled={!audioUrl || syncMode}
+                        onClick={() => {
+                          setFocusedSegId(seg._id);
+                          seekTo(Math.max(0, seg.start - 2), true, seg, true);
+                        }}
+                        aria-label={(t("editor.listen_context_line") || "Escuchar 2 s antes de la línea {n}").replace("{n}", String(idx + 1))}
+                        title={t("editor.listen_context") || "Escuchar 2 s antes"}
+                        className="mt-1.5 rounded-md px-1.5 py-1 text-[11px] text-gray-300 hover:bg-brand/15 hover:text-brand-light focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {t("editor.listen_context") || "Escuchar 2 s antes"}
                       </button>
                       {wasRecentlyAnchored && (
                         <button
@@ -6242,7 +6291,7 @@ export default function LyricsEditor({
                         }
                       }}
                       onFocus={() => {
-                        seekTo(seg.start, false);
+                        seekTo(seg.start, false, seg);
                         setFocusedSegId(seg._id);
                         setTextEditStart({ id: seg._id, text: seg.text });
                       }}

@@ -9,7 +9,12 @@ MAX_BY_NUMBER = {
     "duration_ms": 86_400_000,
     "active_edit_ms": 14_400_000,
     "position_ms": 86_400_000,
+    "from_position_ms": 86_400_000,
+    "line_start_ms": 86_400_000,
+    "requested_lead_in_ms": 10_000,
+    "effective_lead_in_ms": 10_000,
     "line_count": 10_000,
+    "line_index": 10_000,
     "count": 10_000,
     "text_changes": 10_000,
     "timing_changes": 10_000,
@@ -32,8 +37,10 @@ MAX_BY_NUMBER = {
     "impact_ms": 3_600_000,
 }
 SIGNED_NUMBERS = {"delta_ms", "proposed_delta_ms", "chosen_delta_ms", "distance_to_proposal_ms"}
-BOOLEANS = {"quality_acknowledged", "automatic_recovery_available"}
+BOOLEANS = {"unsaved_changes", "quality_acknowledged", "automatic_recovery_available"}
 ENUMS = {
+    "line_context": {"target", "selected", "none"},
+    "review_marker": {"review", "quality_window", "both", "none", "unknown"},
     "kind": {"generated", "shown", "examined", "active_seconds"},
     "decision": {"accepted", "edited", "rejected", "applied", "manual_edit", "manual_override", "edited_after_accept"},
     "suggestion_type": {"text", "timing", "vocalization", "unknown"},
@@ -81,7 +88,7 @@ def valid_property(key: str, value) -> bool:
         return isinstance(value, str) and value in ENUMS[key]
     if key in SLUG_CATEGORIES:
         return isinstance(value, str) and bool(re.fullmatch(r"[a-z0-9_.:-]{1,40}", value))
-    if key in {"proposal_id", "window_id", "candidate_id", "event_id"}:
+    if key in {"proposal_id", "window_id", "candidate_id", "event_id", "line_id", "segment_id"}:
         return isinstance(value, str) and bool(re.fullmatch(r"[a-zA-Z0-9_.:-]{1,128}", value))
     if key == "pipeline_release":
         return isinstance(value, str) and bool(re.fullmatch(r"[a-zA-Z0-9_.+-]{1,64}", value))
