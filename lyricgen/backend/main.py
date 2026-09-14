@@ -690,18 +690,31 @@ def on_startup():
         VALID_POLICY_MODES as _bg_policy_modes,
         policy_mode as _bg_policy_mode,
     )
+    from lyric_anchors import (
+        ANCHORS_ENV as _lyric_anchors_env,
+        VALID_ANCHOR_MODES as _lyric_anchor_modes,
+        anchors_mode as _lyric_anchors_mode,
+    )
     from observability import _resolve_release as _resolve_runtime_release
     logger.info(
         "[BG_POLICY][STARTUP] process=api release=%s environment=%s "
-        "policy_version=%s policy_mode=%s cache_namespace=%s",
+        "policy_version=%s policy_mode=%s lyric_anchor_mode=%s "
+        "cache_namespace=%s",
         _resolve_runtime_release(), ENVIRONMENT,
-        _bg_policy_version, _bg_policy_mode(), _bg_policy_version,
+        _bg_policy_version, _bg_policy_mode(), _lyric_anchors_mode(),
+        _bg_policy_version,
     )
     _raw_bg_policy_mode = os.environ.get(_bg_policy_env, "off").strip().lower()
     if _raw_bg_policy_mode not in _bg_policy_modes:
         logger.warning(
             "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
             _bg_policy_env, _raw_bg_policy_mode,
+        )
+    _raw_lyric_anchor_mode = os.environ.get(_lyric_anchors_env, "off").strip().lower()
+    if _raw_lyric_anchor_mode not in _lyric_anchor_modes:
+        logger.warning(
+            "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
+            _lyric_anchors_env, _raw_lyric_anchor_mode,
         )
 
     # Background reaper. Daemon → dies with the container. Single
@@ -6838,6 +6851,28 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         return out
 
     def _apply(base, aligned, *, timing_source: str, decline_reason: str = ""):
+        # Veredicto acústico compartido por los tres motores (CTC, hosted,
+        # Whisper-DP) y por los dos flujos (subida con letra oficial y
+        # /reanchor). Una corrida de líneas apretadas es texto que el audio
+        # no canta: declinar es más honesto que persistirlo (incidentes
+        # Color Esperanza 13-sep y Buseca 14-sep).
+        from anchor_structural_guard import crammed_guard_enabled, crammed_line_verdict
+        if crammed_guard_enabled():
+            _verdict = crammed_line_verdict(aligned)
+            if _verdict.get("mismatch"):
+                logger.warning(
+                    "[ANCHOR] declined structural_mismatch source=%s crammed=%d "
+                    "run=%d frac=%.2f job=%s",
+                    timing_source, _verdict["crammed_lines"], _verdict["crammed_run"],
+                    _verdict["crammed_fraction"], job_id,
+                )
+                out = _declined(base, "structural_mismatch")
+                if isinstance(out, dict):
+                    out["anchor_alignment"]["timing_source"] = timing_source
+                    out["anchor_alignment"]["structural"] = {
+                        k: v for k, v in _verdict.items() if k != "crammed_indices"
+                    }
+                return out
         try:
             review_min = float(
                 os.environ.get("ANCHOR_REVIEW_MIN_SCORE", "0.25")
@@ -6917,6 +6952,20 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         except (TypeError, ValueError):
             return False
         if any(end <= start for start, end in zip(starts, ends)):
+            return False
+        # Whisper-DP marks the lines it could not anchor and had to place by
+        # interpolation. A fallback that guessed most of the song is not an
+        # alignment (Buseca 14-sep: 22 of 51 lines guessed, 0.6 s pads).
+        try:
+            max_interp = float(os.environ.get("ANCHOR_MAX_INTERPOLATED_FRAC", "0.3"))
+        except (TypeError, ValueError):
+            max_interp = 0.3
+        interpolated = sum(1 for segment in aligned if segment.get("interpolated"))
+        if aligned and interpolated / len(aligned) > max_interp:
+            logger.warning(
+                "[ANCHOR] rejected fallback: %d/%d lines interpolated (> %.0f%%) job=%s",
+                interpolated, len(aligned), max_interp * 100, job_id,
+            )
             return False
         # Equal starts are the classic repeated-chorus pile-up. Small line
         # overlaps are valid, but occurrence order must remain strict.
@@ -7268,6 +7317,30 @@ async def _run_transcription_for_job(
     from recognition_provenance import begin_collection as _begin_recognition
     from recognition_provenance import end_collection as _end_recognition
     _recognition_collector, _recognition_token = _begin_recognition()
+    from reconcile_capture import begin as _begin_reconcile_capture
+    _capture = _begin_reconcile_capture(
+        job_id, audio_path, route_context={
+            "requested_language": language, "live": live,
+            "reference_required": reference_required, "workload_class": workload_class,
+            "parallel_audio_reference": parallel_audio_reference,
+        },
+    )
+
+    def _captured_reconcile(wx_segments, canonical, *, route, alignment_path):
+        import whisperx_reconcile
+        _capture.audio("alignment:" + route, alignment_path)
+        _capture.record("reconcile_input", {
+            "route": route, "wx_segs": wx_segments,
+            "resolved_language": lang,
+            "reference_text": canonical, "kwargs": {},
+        })
+        try:
+            value = whisperx_reconcile.reconcile(wx_segments, canonical)
+        except Exception as exc:
+            _capture.record("reconcile_exception", {"type": type(exc).__name__})
+            raise
+        _capture.record("reconcile_output", value)
+        return value
 
     # Filled after the audio-first ASR exists.  `_emit_segments` reads this
     # state at the single output chokepoint so every downstream branch gets
@@ -7342,13 +7415,16 @@ async def _run_transcription_for_job(
         import lead_in as _lead_in
         from whisperx_transcribe import _split_long_segments as _split_long
         def _snap(segs):
-            return _lead_in.polish(
-                _chorus_trim.mark_repetitions(
-                    _beat_snap.apply(tmp_path,
-                        _split_long(segs)
-                    )
-                )
-            )
+            _capture.record("normalized_words", segs)
+            split = _split_long(segs)
+            _capture.record("split_output", split)
+            snapped = _beat_snap.apply(tmp_path, split, capture=_capture.beats)
+            _capture.record("beat_output", snapped)
+            repeated = _chorus_trim.mark_repetitions(snapped)
+            _capture.record("repetition_output", repeated)
+            polished = _lead_in.polish(repeated)
+            _capture.record("lead_hold_output", polished)
+            return polished
 
         # ─── single chokepoint for every segments-bearing return ──────
         # `_emit_segments` is the ONE allowed exit point of this
@@ -7380,6 +7456,13 @@ async def _run_transcription_for_job(
                             recovery_source=None,
                             coverage_warning: bool = False,
                             extra=None):
+            _capture.audio("presentation", tmp_path)
+            _capture.record("emit_input", {
+                "segments": segments, "source": source,
+                "reference_lyrics": reference_lyrics,
+                "content_reference_used": content_reference_used,
+                "reference_id": f"{artist}:{title}",
+            })
             segments = [
                 {
                     key: value for key, value in segment.items()
@@ -7420,7 +7503,9 @@ async def _run_transcription_for_job(
                     f"{artist}:{title}" if reference_used else None
                 ),
             )
+            _capture.record("annotated_output", frozen_segments)
             deduped = _dedup_collisions(frozen_segments)
+            _capture.record("dedup_output", deduped)
             if deduped and segments and len(deduped) != len(segments):
                 logger.info("[EMIT] deduped collisions: %d → %d segments (job=%s)",
                             len(segments), len(deduped), job_id)
@@ -7442,8 +7527,12 @@ async def _run_transcription_for_job(
                     "%s segments job=%s", len(polished), job_id,
                 )
             polished = normalized_polished
+            _capture.record("presentation_output", polished)
             out = {"job_id": job_id, "segments": polished,
                    "reference_lyrics": reference_lyrics}
+            _captured_stages = _capture.snapshot()
+            if _captured_stages is not None:
+                out["_reconcile_capture"] = _captured_stages
             recognition_snapshot = _recognition_collector.snapshot()
             out["_recognition_hypotheses"] = recognition_snapshot["hypotheses"]
             out["_recognition_attempt_count"] = recognition_snapshot[
@@ -8408,7 +8497,7 @@ async def _run_transcription_for_job(
                             return _emit_segments(
                                 _corrected, _WC_WX_REC, reference_lyrics=_canonical,
                             )
-                        _reconciled = _wxr.reconcile(_wx_segs, _canonical)
+                        _reconciled = _captured_reconcile(_wx_segs, _canonical, route="audio_truth_catalog", alignment_path=_aa)
                         if _reconciled:
                             logger.info("[WC] whisperX reconciled (%d/%d lines, canonical=%s) — audio-as-truth path",
                                         len(_reconciled),
@@ -8433,6 +8522,7 @@ async def _run_transcription_for_job(
                                 )
                             except Exception as _clgc_err:
                                 logger.warning("[WC] gap-cluster FAILED: %s", _clgc_err)
+                            _capture.record("gap_cluster_output", _reconciled)
                             from pipeline import _post_reconcile_cleanup as _prc
                             # The reconciler has already chosen the catalogue's
                             # human line structure. Its per-word array is an
@@ -8441,10 +8531,12 @@ async def _run_transcription_for_job(
                             # word gaps can create single-word and even reversed
                             # fragments. Keep line boundaries; still run end
                             # tightening and overlap clamping.
+                            _capture.record("cleanup_input", {"segments": _reconciled, "kwargs": {"split_long_lines": False}})
                             _reconciled = _prc(
                                 _reconciled,
                                 split_long_lines=False,
                             )
+                            _capture.record("cleanup_output", _reconciled)
                             return _emit_segments(
                                 _reconciled, _WC_WX_REC,
                                 reference_lyrics=_canonical,
@@ -9417,7 +9509,7 @@ async def _run_transcription_for_job(
                                                len(wx_warm_segs))
                             else:
                                 import whisperx_reconcile
-                                _reconciled = whisperx_reconcile.reconcile(wx_warm_segs, fa_text) if fa_text else None
+                                _reconciled = _captured_reconcile(wx_warm_segs, fa_text, route="warm_fallback", alignment_path=_aa) if fa_text else None
                                 final_segs = _reconciled if _reconciled else wx_warm_segs
                                 _src_tag_str = "whisperx_reconciled" if _reconciled else "whisperx"
                                 logger.info("[LYRICS] FA failed — warm-start whisperX took over with %s segments [%s]",
@@ -9486,7 +9578,7 @@ async def _run_transcription_for_job(
                         elif not _hall and len(wx_segs) >= 2:
                             # Reconcile: whisperX timing + lrclib canonical text
                             import whisperx_reconcile
-                            _reconciled = whisperx_reconcile.reconcile(wx_segs, fa_text_for_wx) if fa_text_for_wx else None
+                            _reconciled = _captured_reconcile(wx_segs, fa_text_for_wx, route="catalog_fallback", alignment_path=_aa) if fa_text_for_wx else None
                             final_segs = _reconciled if _reconciled else wx_segs
                             from timing_sources import WHISPERX_RECONCILED, WHISPERX
                             _src_tag = WHISPERX_RECONCILED if _reconciled else WHISPERX
@@ -10042,7 +10134,7 @@ async def _run_transcription_for_job(
                         # from reference + TIMING from whisperX (better than
                         # either alone — this beats Rotor on the text side).
                         import whisperx_reconcile
-                        _reconciled = whisperx_reconcile.reconcile(wx_segs, reference)
+                        _reconciled = _captured_reconcile(wx_segs, reference, route="gemini_fallback", alignment_path=_aa)
                         final_segs = _reconciled if _reconciled else wx_segs
                         from timing_sources import WHISPERX_RECONCILED, WHISPERX
                         _source_tag = WHISPERX_RECONCILED if _reconciled else WHISPERX
@@ -13827,6 +13919,7 @@ async def patch_editor_document(
     db: Session = Depends(get_db),
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
+    _enforce_segment_write_velocity(db, current_user, job_id)
     quality_outbox_id = None
     previous_editor_segments = [
         dict(item) for item in (document.current_segments or [])
@@ -14813,6 +14906,59 @@ class SaveSegmentsRequest(BaseModel):
     base_revision: int | None = Field(default=None, ge=0)
 
 
+def _enforce_segment_write_velocity(db: Session, current_user: dict, job_id: str) -> None:
+    """429 when one user writes segments to too many distinct jobs at once.
+
+    Incidente 2026-09-13: un script con token admin pisó 185 borradores de
+    una campaña vía /save-segments a un job por segundo. Un humano edita un
+    puñado de canciones cada diez minutos; la ventana y el tope viven en
+    SEGMENT_WRITE_MAX_DISTINCT_JOBS / SEGMENT_WRITE_WINDOW_S (0 = apagado).
+    Cuenta jobs distintos en audit_log (lyrics.segments_diff), así que un
+    guardado repetido sobre el mismo job nunca suma.
+    """
+    from anchor_structural_guard import segment_write_velocity_exceeded
+    exceeded, count, max_jobs = segment_write_velocity_exceeded(
+        db, current_user.get("id"), job_id,
+    )
+    if not exceeded:
+        return
+    logger.warning(
+        "[segments-velocity] rejected user=%s job=%s distinct_jobs=%d max=%d",
+        current_user.get("id"), job_id, count, max_jobs,
+    )
+    try:
+        from ops_metrics import increment
+        increment("segment_write_velocity_rejected")
+    except Exception:
+        pass
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "code": "segment_write_velocity",
+            "distinct_jobs": count,
+            "max_distinct_jobs": max_jobs,
+            "detail": (
+                "Demasiadas canciones editadas en poco tiempo. "
+                "Si es un script, frená: este endpoint es para el editor."
+            ),
+        },
+    )
+
+
+def _is_platform_admin_user(current_user: dict) -> bool:
+    """Same contract as _editor_document_or_404 / _job_scope / campaigns.
+
+    Incidente 14-sep-2026 (Illapu, campaña Chile): la revisora (rol admin
+    de otro tenant, no listada en SUPER_ADMIN_USERS) editó 77 veces por
+    PATCH /editor y la aprobación de campaña la dejaba pasar, pero
+    /language-resolution exigía super-admin y devolvía 404 → el gate de
+    discrepancia quedaba imposible de resolver y "Aprobar" bloqueado.
+    """
+    return bool(
+        current_user.get("role") == "admin" or current_user.get("is_super_admin")
+    )
+
+
 @app.post("/jobs/{job_id}/save-segments")
 @limiter.limit("60/minute")
 async def save_segments(
@@ -14860,12 +15006,13 @@ async def save_segments(
     # y las ediciones no persistían. Para no-admins el editor se comparte
     # entre miembros del mismo workspace; el control optimista por revisión
     # detecta cualquier guardado sobre una versión vieja.
-    _is_platform_admin = bool(current_user.get("is_super_admin"))
+    _is_platform_admin = _is_platform_admin_user(current_user)
     if (not job
             or (not _is_platform_admin
                 and job.tenant_id != current_user["tenant_id"])):
         raise HTTPException(status_code=404, detail="Job not found.")
     _audit_cross_tenant_access(db, current_user, job, "save_segments", commit=False)
+    _enforce_segment_write_velocity(db, current_user, job_id)
 
     # Wizard (transcribed_pending) is the original use case; pending_review
     # / rejected enable the post-approval /edit modal's autosave so text
@@ -15115,7 +15262,7 @@ async def resolve_language_review(
     does not touch the lyrics, approval status, or the saving path.
     """
     job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
-    is_platform_admin = bool(current_user.get("is_super_admin"))
+    is_platform_admin = _is_platform_admin_user(current_user)
     if (not job or (not is_platform_admin
                     and job.tenant_id != current_user["tenant_id"])):
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -15174,7 +15321,7 @@ async def acknowledge_transcription_quality(
 ):
     """Persist an explicit, revision+content-scoped operator decision."""
     job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
-    is_platform_admin = bool(current_user.get("is_super_admin"))
+    is_platform_admin = _is_platform_admin_user(current_user)
     if (not job or (not is_platform_admin
                     and job.tenant_id != current_user["tenant_id"])):
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -15304,6 +15451,210 @@ _REANCHOR_ALLOWED = (
 
 class ReanchorSegmentsRequest(BaseModel):
     base_revision: int | None = Field(default=None, ge=0)
+    # 2026-09-13: letra oficial pegada por el operador desde el editor.
+    # Vacío = comportamiento histórico (re-anclar el texto ya editado).
+    # Con texto = ese texto es la letra ancla y el resultado se mergea por
+    # bloques contra segments_json (ver _merge_pasted_segments).
+    lyrics_text: str = Field(default="", max_length=20000)
+    # El operador vio el reporte de estructura (estrofas que no están en
+    # el audio, cantidad de líneas muy distinta, versión en vivo) y confirmó
+    # que la letra es de ESTA grabación. Sin esto, un desajuste estructural
+    # devuelve 409 reference_structure_unconfirmed y no se alinea nada
+    # (Color Esperanza d323e1bc378c: 81 líneas de otra versión sobre 44).
+    confirm_structure: bool = False
+
+
+_PASTED_MAX_LINES = 400
+
+
+def _pasted_lyric_lines(text: str) -> list[str]:
+    lines = [ln.strip() for ln in str(text or "").splitlines()]
+    return [ln for ln in lines if ln][:_PASTED_MAX_LINES]
+
+
+def _norm_lyric_line(text) -> str:
+    return " ".join(re.findall(r"\w+", str(text or "").lower()))
+
+
+def _pasted_structure_report(attestation, pasted_count: int, current_count: int) -> dict:
+    """Decide si la letra pegada puede alinearse sin confirmación humana.
+
+    Reusa la atestación referencia↔ASR (reference_attestation) y agrega
+    un chequeo de cantidad de líneas: el guard estructural del aligner es
+    inerte con CTC_ALIGN_SKIP_ARCS=0, así que esta es la única barrera
+    antes de que forced_align fuerce estrofas inexistentes sobre el audio.
+    """
+    metrics = dict((attestation or {}).get("metrics") or {})
+    reasons = list((attestation or {}).get("reasons") or [])
+    ratio = (pasted_count / current_count) if current_count else None
+    line_count_divergent = bool(
+        current_count and (pasted_count > current_count * 1.5
+                           or pasted_count * 1.5 < current_count)
+    )
+    if line_count_divergent:
+        reasons.append("line_count_divergent")
+    unmatched_passage = int(metrics.get("longest_unmatched_content_run") or 0) >= 4
+    return {
+        "supported": not (unmatched_passage or line_count_divergent),
+        "reasons": reasons,
+        "metrics": metrics,
+        "text_status": (attestation or {}).get("text_status"),
+        "pasted_line_count": int(pasted_count),
+        "current_line_count": int(current_count),
+        "line_ratio": round(ratio, 3) if ratio is not None else None,
+    }
+
+
+def _edited_structure_report(db: Session, job, anchor_lines: list[str], *, is_live: bool):
+    """Estructura del texto editado vs el snapshot de máquina del editor.
+
+    Devuelve None cuando no hay snapshot (job anterior al Editor 2.0) o
+    cuando el texto editado es el mismo snapshot: ahí no hay nada que
+    comparar y el re-anclado sigue como siempre. Nunca lanza.
+    """
+    try:
+        from database import EditorDocument
+        from reference_attestation import assess_reference_attestation
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job.job_id,
+        ).first()
+        machine = [
+            s for s in (document.original_segments or [])
+            if isinstance(s, dict) and str(s.get("text") or "").strip()
+        ] if document is not None else []
+        if not machine:
+            return None
+        lines = [ln for ln in anchor_lines if ln]
+        if [_norm_lyric_line(ln) for ln in lines] == [
+            _norm_lyric_line(s.get("text")) for s in machine
+        ]:
+            return None
+        attestation = assess_reference_attestation(
+            "\n".join(lines), machine,
+            reference_source="operator_edited", is_live=is_live,
+        )
+        report = _pasted_structure_report(attestation, len(lines), len(machine))
+        report["reference"] = "machine_snapshot"
+        return report
+    except Exception as exc:  # noqa: BLE001 — el gate nunca rompe el re-anclado
+        logger.warning("[REANCHOR] structure report unavailable job=%s: %s",
+                       getattr(job, "job_id", "?"), exc)
+        return None
+
+
+def _reanchor_already_applied(db, job_id: str, base_revision, lyrics_sha: str) -> dict | None:
+    """Idempotencia del re-anclado (2026-09-14).
+
+    Con 2 réplicas de api y alineaciones de >60 s (CTC sobre 4 min de audio
+    tarda ~120 s), el proxy re-envía el POST y el duplicado llegaba a
+    persistir con la revisión ya avanzada: devolvía 409 stale_revision y el
+    editor mostraba "no se pudo" aunque el primer pedido había aplicado todo
+    (job cb6887c4ffed: `[REANCHOR] ok … replaced=1` en el log, error en
+    pantalla). Si ya existe un `lyrics.reanchor` de este job desde la MISMA
+    base_revision y con la MISMA letra (sha; vacío en el camino legacy) en los
+    últimos 30 minutos, el duplicado es el mismo pedido y se responde con lo
+    ya persistido en vez de fallar.
+    """
+    if base_revision is None:
+        return None
+    from datetime import datetime, timedelta, timezone
+    from database import AuditLog
+    since = datetime.now(timezone.utc) - timedelta(minutes=30)
+    try:
+        rows = (
+            db.query(AuditLog)
+            .filter(AuditLog.action == "lyrics.reanchor")
+            .filter(AuditLog.created_at >= since)
+            .order_by(AuditLog.id.desc())
+            .limit(200)
+            .all()
+        )
+    except Exception as exc:  # noqa: BLE001 — la idempotencia es best-effort
+        logger.warning("[REANCHOR] idempotency lookup failed job=%s: %s", job_id, exc)
+        return None
+    for log in rows:
+        detail = log.detail if isinstance(log.detail, dict) else {}
+        if str(detail.get("job_id") or "") != job_id:
+            continue
+        try:
+            if int(detail.get("base_revision", -1)) != int(base_revision):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if str(detail.get("lyrics_text_sha256") or "") != str(lyrics_sha or ""):
+            continue
+        return detail
+    return None
+
+
+def _idempotent_reanchor_response(job_id: str, segments, revision: int, detail: dict) -> dict:
+    segs = [dict(s) for s in (segments or []) if isinstance(s, dict)]
+    return {
+        "ok": True,
+        "idempotent": True,
+        "job_id": job_id,
+        "count": len(segs),
+        "review_count": sum(1 for s in segs if s.get("review")),
+        "locked_kept": int(detail.get("locked_kept") or 0),
+        "segments": segs,
+        "revision": int(revision or 0),
+        "content_source": str(detail.get("content_source") or "editor_text"),
+        "lines_kept": int(detail.get("lines_kept") or 0),
+        "lines_replaced": int(detail.get("lines_replaced") or 0),
+        "locked_dropped": int(detail.get("locked_dropped") or 0),
+        "structure": detail.get("structure"),
+    }
+
+
+def _merge_pasted_segments(prev_segs: list[dict], anchored: list[dict]) -> tuple[list[dict], dict]:
+    """Merge por bloques (difflib sobre texto normalizado) entre los
+    segments actuales y la letra pegada ya alineada.
+
+    - Bloque igual: se conserva la identidad del segment (_id, estilo,
+      pos/scale) y su timing si está `locked`; si no, toma el timing nuevo
+      y el texto oficial (misma palabra, distinta puntuación/caso).
+    - Bloque distinto (insert/replace): entra el segment alineado nuevo,
+      SIEMPRE marcado `review: true`. Las líneas previas de ese bloque se
+      descartan (si alguna estaba locked, se cuenta en locked_dropped).
+    """
+    from difflib import SequenceMatcher
+
+    prev = [s for s in prev_segs if str(s.get("text") or "").strip()]
+    a = [_norm_lyric_line(s.get("text")) for s in prev]
+    b = [_norm_lyric_line(s.get("text")) for s in anchored]
+    merged: list[dict] = []
+    stats = {"review_count": 0, "locked_kept": 0, "lines_kept": 0,
+             "lines_replaced": 0, "locked_dropped": 0}
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            for seg, new_seg in zip(prev[i1:i2], anchored[j1:j2]):
+                stats["lines_kept"] += 1
+                if seg.get("locked"):
+                    stats["locked_kept"] += 1
+                    merged.append(seg)
+                    continue
+                m = dict(seg)
+                m["text"] = new_seg.get("text", seg.get("text"))
+                m["start"] = new_seg.get("start", seg.get("start"))
+                m["end"] = new_seg.get("end", seg.get("end"))
+                if new_seg.get("words") is not None:
+                    m["words"] = new_seg["words"]
+                if new_seg.get("review"):
+                    m["review"] = True
+                    stats["review_count"] += 1
+                else:
+                    m.pop("review", None)
+                merged.append(m)
+            continue
+        stats["locked_dropped"] += sum(1 for s in prev[i1:i2] if s.get("locked"))
+        for new_seg in anchored[j1:j2]:
+            m = dict(new_seg)
+            m["review"] = True
+            stats["lines_replaced"] += 1
+            stats["review_count"] += 1
+            merged.append(m)
+    merged.sort(key=lambda s: float(s.get("start", 0) or 0))
+    return merged, stats
 
 
 @app.post("/jobs/{job_id}/reanchor")
@@ -15367,7 +15718,19 @@ async def reanchor_segments(
             status_code=428,
             content={"code": "client_upgrade_required", "current_revision": initial_revision},
         )
+    _early_lines = _pasted_lyric_lines(body.lyrics_text)
+    _lyrics_sha = (
+        __import__("hashlib").sha256("\n".join(_early_lines).encode("utf-8")).hexdigest()
+        if _early_lines else ""
+    )
     if body.base_revision is not None and body.base_revision != initial_revision:
+        _applied = _reanchor_already_applied(db, job_id, body.base_revision, _lyrics_sha)
+        if _applied is not None:
+            logger.info("[REANCHOR] idempotent replay job=%s base=%s rev=%s",
+                        job_id, body.base_revision, initial_revision)
+            return _idempotent_reanchor_response(
+                job_id, job.segments_json, initial_revision, _applied,
+            )
         from ops_metrics import increment
         increment("segments_revision_conflict")
         return JSONResponse(
@@ -15384,7 +15747,12 @@ async def reanchor_segments(
 
     prev_segs = [dict(s) for s in (job.segments_json or [])
                  if isinstance(s, dict)]
-    anchor_lines = [(s.get("text") or "").strip() for s in prev_segs]
+    pasted_lines = _pasted_lyric_lines(body.lyrics_text)
+    pasted_mode = bool(pasted_lines)
+    if pasted_mode:
+        anchor_lines = list(pasted_lines)
+    else:
+        anchor_lines = [(s.get("text") or "").strip() for s in prev_segs]
     n_lines = sum(1 for _t in anchor_lines if _t)
     if n_lines < 3:
         # Mismo umbral que _maybe_anchor_align — con <3 líneas el motor
@@ -15393,6 +15761,41 @@ async def reanchor_segments(
         raise HTTPException(
             status_code=422,
             detail="Se necesitan al menos 3 líneas con texto para re-sincronizar.",
+        )
+
+    structure = None
+    _title = str(job.song_title or "").lower()
+    _is_live = "live" in _title or "en vivo" in _title
+    if pasted_mode:
+        # Gate estructural ANTES de bajar audio y gastar CTC: comparar la
+        # letra pegada con el ASR/texto actual. Se advierte, no se bloquea
+        # de por vida: el operador puede confirmar (confirm_structure).
+        from reference_attestation import assess_reference_attestation
+        attestation = assess_reference_attestation(
+            "\n".join(pasted_lines), prev_segs,
+            reference_source="operator_pasted", is_live=_is_live,
+        )
+        _current_count = sum(
+            1 for s in prev_segs if str(s.get("text") or "").strip()
+        )
+        structure = _pasted_structure_report(
+            attestation, len(pasted_lines), _current_count,
+        )
+    else:
+        # Mismo gate para el re-anclado del texto YA guardado (incidente
+        # 2026-09-13: la letra íntegra de otra versión entró por
+        # /save-segments, no por el modal de pegar, y "Re-sincronizar con
+        # IA" la forzó entera sobre el audio). La referencia es el snapshot
+        # de máquina del editor (original_segments): si el texto actual
+        # tiene estrofas que la transcripción nunca oyó, pedimos confirmar.
+        structure = _edited_structure_report(db, job, anchor_lines, is_live=_is_live)
+    if structure is not None and not structure["supported"] and not body.confirm_structure:
+        logger.info("[REANCHOR] structure unconfirmed job=%s pasted=%s reasons=%s",
+                    job_id, pasted_mode, structure["reasons"])
+        return JSONResponse(
+            status_code=409,
+            content={"code": "reference_structure_unconfirmed",
+                     "structure": structure},
         )
 
     # SNAPSHOT + release (mismo patrón que /transcribe-uploaded, incidente
@@ -15440,6 +15843,41 @@ async def reanchor_segments(
             or len(anchored) != n_lines):
         # Decline seguro (flag/engine/mismatch de líneas) — los segments
         # del operador quedan intactos, igual que la Versión A en upload.
+        _aa = out.get("anchor_alignment") if isinstance(out, dict) else None
+        _aa = _aa if isinstance(_aa, dict) else {}
+        if _aa.get("reason") == "structural_mismatch":
+            logger.warning("[REANCHOR] declined structural_mismatch job=%s (n_lines=%d)",
+                           job_id, n_lines)
+            try:
+                from database import AuditLog, SessionLocal as _SLa
+                db_audit = _SLa()
+                try:
+                    db_audit.add(AuditLog(
+                        user_id=current_user["id"],
+                        action="lyrics.reanchor_declined",
+                        detail={
+                            "job_id": job_id, "reason": "structural_mismatch",
+                            "pasted": pasted_mode,
+                            "confirm_structure": bool(body.confirm_structure),
+                            "timing_source": _aa.get("timing_source"),
+                            **(_aa.get("structural") or {}),
+                        },
+                    ))
+                    db_audit.commit()
+                finally:
+                    db_audit.close()
+            except Exception as e:  # noqa: BLE001 — audit best-effort
+                logger.warning("[REANCHOR] audit log failed: %s", e)
+            return {
+                "ok": False,
+                "reason": "structural_mismatch",
+                "job_id": job_id,
+                "count": len(prev_segs),
+                "review_count": 0,
+                "locked_kept": 0,
+                "revision": initial_revision,
+                "structural": _aa.get("structural") or {},
+            }
         logger.info("[REANCHOR] declined job=%s (n_lines=%d)", job_id, n_lines)
         return {
             "ok": False,
@@ -15451,36 +15889,101 @@ async def reanchor_segments(
             "revision": initial_revision,
         }
 
+    # Veredicto ACÚSTICO después de alinear (incidente 2026-09-13): con
+    # CTC_ALIGN_SKIP_ARCS=0 el motor fuerza cada línea sí o sí, así que las
+    # estrofas que el audio no canta salen apretadas en <1 s con score ≈ 0.
+    # Eso nunca es un timing útil: se declina y los segments quedan intactos.
+    from anchor_structural_guard import crammed_guard_enabled, crammed_line_verdict
+    _crammed = crammed_line_verdict(anchored) if crammed_guard_enabled() else {"mismatch": False}
+    if _crammed.get("mismatch"):
+        logger.warning(
+            "[REANCHOR] declined structural_mismatch job=%s crammed=%d run=%d frac=%.2f of %d",
+            job_id, _crammed["crammed_lines"], _crammed["crammed_run"],
+            _crammed["crammed_fraction"], _crammed["scored_lines"],
+        )
+        try:
+            from database import AuditLog, SessionLocal as _SLa
+            db_audit = _SLa()
+            try:
+                db_audit.add(AuditLog(
+                    user_id=current_user["id"],
+                    action="lyrics.reanchor_declined",
+                    detail={
+                        "job_id": job_id,
+                        "reason": "structural_mismatch",
+                        "pasted": pasted_mode,
+                        "confirm_structure": bool(body.confirm_structure),
+                        **{k: v for k, v in _crammed.items() if k != "crammed_indices"},
+                    },
+                ))
+                db_audit.commit()
+            finally:
+                db_audit.close()
+        except Exception as e:  # noqa: BLE001 — audit best-effort
+            logger.warning("[REANCHOR] audit log failed: %s", e)
+        return {
+            "ok": False,
+            "reason": "structural_mismatch",
+            "job_id": job_id,
+            "count": len(prev_segs),
+            "review_count": 0,
+            "locked_kept": 0,
+            "revision": initial_revision,
+            "structural": {k: v for k, v in _crammed.items() if k != "crammed_indices"},
+        }
+
     # Merge: los segs re-anclados corresponden 1:1 (en orden) a los segs
     # previos con texto no vacío. Se preservan las keys extra del original
     # (_id, pos/scale/rot, estilo) y el timing de las líneas `locked`.
     merged = []
     review_count = 0
     locked_kept = 0
-    _ai = 0
-    for seg, _text in zip(prev_segs, anchor_lines):
-        if not _text:
-            merged.append(seg)
-            continue
-        new_seg = anchored[_ai]
-        _ai += 1
-        if seg.get("locked"):
-            locked_kept += 1
-            merged.append(seg)
-            continue
-        m = dict(seg)
-        m["start"] = new_seg.get("start", seg.get("start"))
-        m["end"] = new_seg.get("end", seg.get("end"))
-        if new_seg.get("words") is not None:
-            m["words"] = new_seg["words"]
-        if new_seg.get("review"):
-            m["review"] = True
-            review_count += 1
-        else:
-            m.pop("review", None)
-        merged.append(m)
-    # Mismo contrato de orden monotónico que /save-segments.
-    merged = sorted(merged, key=lambda s: float(s.get("start", 0) or 0))
+    lines_kept = lines_replaced = locked_dropped = 0
+    if pasted_mode:
+        merged, _stats = _merge_pasted_segments(prev_segs, anchored)
+        review_count = _stats["review_count"]
+        locked_kept = _stats["locked_kept"]
+        lines_kept = _stats["lines_kept"]
+        lines_replaced = _stats["lines_replaced"]
+        locked_dropped = _stats["locked_dropped"]
+    else:
+        _ai = 0
+        for seg, _text in zip(prev_segs, anchor_lines):
+            if not _text:
+                merged.append(seg)
+                continue
+            new_seg = anchored[_ai]
+            _ai += 1
+            if seg.get("locked"):
+                locked_kept += 1
+                merged.append(seg)
+                continue
+            m = dict(seg)
+            m["start"] = new_seg.get("start", seg.get("start"))
+            m["end"] = new_seg.get("end", seg.get("end"))
+            if new_seg.get("words") is not None:
+                m["words"] = new_seg["words"]
+            if new_seg.get("review"):
+                m["review"] = True
+                review_count += 1
+            else:
+                m.pop("review", None)
+            merged.append(m)
+        # Mismo contrato de orden monotónico que /save-segments.
+        merged = sorted(merged, key=lambda s: float(s.get("start", 0) or 0))
+    _pasted_audit = {}
+    if pasted_mode:
+        import hashlib as _hashlib
+        _pasted_audit = {
+            "content_source": "operator_pasted",
+            "lyrics_text_sha256": _hashlib.sha256(
+                "\n".join(pasted_lines).encode("utf-8")).hexdigest(),
+            "lines_kept": lines_kept,
+            "lines_replaced": lines_replaced,
+            "locked_dropped": locked_dropped,
+            "confirm_structure": bool(body.confirm_structure),
+            "structure": structure,
+        }
 
     # Persistir con sesión corta (la del request se soltó antes del I/O).
     from database import SessionLocal as _SL
@@ -15502,6 +16005,16 @@ async def reanchor_segments(
                 content={"code": "client_upgrade_required", "current_revision": current_revision},
             )
         if body.base_revision is not None and current_revision != body.base_revision:
+            _applied = _reanchor_already_applied(_db2, job_id, body.base_revision, _lyrics_sha)
+            if _applied is not None:
+                # El primer pedido (idéntico) ya persistió mientras este
+                # duplicado corría la alineación: devolver lo aplicado.
+                logger.info("[REANCHOR] idempotent duplicate job=%s base=%s rev=%s",
+                            job_id, body.base_revision, current_revision)
+                _db2.rollback()
+                return _idempotent_reanchor_response(
+                    job_id, row.segments_json, current_revision, _applied,
+                )
             from ops_metrics import increment
             increment("segments_revision_conflict")
             return JSONResponse(
@@ -15533,6 +16046,7 @@ async def reanchor_segments(
                     "locked_kept": locked_kept,
                     "base_revision": current_revision,
                     "revision": int(row.segments_revision or 0),
+                    **_pasted_audit,
                 },
             ))
         except Exception as e:  # noqa: BLE001 — audit best-effort
@@ -15579,8 +16093,8 @@ async def reanchor_segments(
     finally:
         _db2.close()
 
-    logger.info("[REANCHOR] ok job=%s lines=%d review=%d locked_kept=%d",
-                job_id, len(merged), review_count, locked_kept)
+    logger.info("[REANCHOR] ok job=%s lines=%d review=%d locked_kept=%d pasted=%s replaced=%d",
+                job_id, len(merged), review_count, locked_kept, pasted_mode, lines_replaced)
     return {
         "ok": True,
         "job_id": job_id,
@@ -15589,6 +16103,11 @@ async def reanchor_segments(
         "locked_kept": locked_kept,
         "segments": merged,
         "revision": persisted_revision,
+        "content_source": "operator_pasted" if pasted_mode else "editor_text",
+        "lines_kept": lines_kept,
+        "lines_replaced": lines_replaced,
+        "locked_dropped": locked_dropped,
+        "structure": structure,
     }
 
 

@@ -3,6 +3,104 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.25] - 2026-09-13
+
+### Fixed
+
+- Add opt-in prospective capture eligibility for first campaign transcriptions,
+  excluding technical smokes, previous outputs and existing editor documents
+  before reserving evidence slots. Preserve bounded private checkpoints across
+  retries independently of human document persistence. The association repair
+  remains disabled pending exact baseline replay and full-document evaluation.
+
+## [1.1.24] - 2026-09-12
+
+### Fixed
+
+- Resolve adjacent connector cascades at a caption boundary in one bounded,
+  idempotent pass, so phrases such as `y en / Mi corazón` and
+  `a mi / Alrededor` cannot require a second processing run. Segment count,
+  lexical content, word order, and every approved start/end value remain exact.
+
+## [1.1.23] - 2026-09-11
+
+### Fixed
+
+- Keep short Spanish connectors and articles with the phrase that follows when
+  word timestamps prove they sit at the next caption boundary, without changing
+  segment count or any approved start/end value.
+- Stop adding prose-style full stops to lyric caption endings and remove a
+  single terminal period deterministically while preserving questions,
+  exclamations, ellipses, vocabulary, word order, and timing.
+
+## [1.1.22] - 2026-09-11
+
+### Changed
+
+- Replace oversized campaign video cards with a searchable, paginated compact
+  list. Load one medium-sized player on demand and expose approval, editing,
+  detail, and delivery actions from each row.
+
+### Fixed
+
+- Show immediate, live progress while a campaign submits multiple video jobs,
+  including the current song, submitted count, and an explicit duplicate-click
+  warning instead of leaving a disabled confirmation modal that appears inert.
+- Renew the exact lyric-and-timing attestation before re-rendering a campaign
+  correction, preserve the existing final-review state between requests, and
+  let that re-render reuse its own bounded review slot.
+
+## [1.1.21] - 2026-09-11
+
+### Changed
+
+- Simplify the campaign style/background workspace around the daily workflow:
+  show status totals, filter ready/pending/generating/approved songs, select only
+  approved lyrics in one action, and keep the generation action above the table.
+- Collapse contractual style distribution and advanced visual controls until an
+  operator explicitly opens them, while retaining the complete audited workflow.
+
+### Fixed
+
+- Exclude discarded songs from the ready-to-generate bulk selection and display
+  the number of selected songs that are actually eligible before confirmation.
+
+## [1.1.20] - 2026-09-11
+
+### Added
+
+- Build lyric-inspired backgrounds from a lyric-only semantic pass whose visual
+  anchors must cite the supplied song, then compose a detailed 240–320 word
+  provider prompt around those verified anchors.
+- Check generated background frames for readable text, logos, black bars,
+  unstable lighting and scene changes before accepting them for lyric videos.
+
+### Fixed
+
+- Keep the API and rendering workers in one lyric-anchor rollout mode, reject
+  invented or partial-word anchor evidence, and retain a safe legacy fallback
+  when lyric analysis is unavailable.
+
+## [1.1.19] - 2026-09-11
+
+### Fixed
+
+- Separate local draft recovery from server save errors. Compare browser copies
+  before removing them, require an explicit recovery/discard choice for different
+  content, and preserve unreadable copies without changing server approval.
+  Copies that would change during normalization are retained, including zero or
+  sub-minimum durations that would otherwise falsely match the server.
+
+## [1.1.18] - 2026-09-11
+
+### Added
+
+- Opt-in, expiring staging capture for six ordinary transcriptions: processed
+  reconciliation inputs, route/audio/code/config identity, and subsequent
+  cleanup and presentation evidence in the existing private machine snapshot.
+  Includes an offline baseline-first replay tool. The word-association behavior
+  candidate remains disabled; no extra transcription is scheduled.
+
 ## [1.1.17] - 2026-09-11
 
 ### Fixed

@@ -7,6 +7,7 @@ import { useToast } from "./ToastProvider";
 import HelpTip from "./HelpCenter/HelpTip";
 import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
+import LocalDraftRecovery from "./LocalDraftRecovery";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { referenceSuggestionsById } from "../lib/referenceSuggestions";
 import { tierForLength } from "../lib/lyricTiers";
@@ -77,6 +78,13 @@ const _SAVE_ERROR_COPY = {
     detail: "Tus cambios siguen guardados localmente. Al volver la conexión compararemos primero la versión del equipo.",
     confirm: "Esperá a recuperar la conexión antes de aprobar.",
   },
+  velocity: {
+    short: "Frenamos el guardado: demasiadas canciones editadas en pocos minutos",
+    detail:
+      "Es un freno contra scripts automáticos. Tus cambios siguen acá; esperá unos minutos y el respaldo se reintenta solo. Si sos vos editando a mano, avisanos y subimos el tope.",
+    confirm:
+      "El respaldo está frenado por el tope de velocidad. Esperá a ver «Guardado» antes de aprobar.",
+  },
   server: {
     short: "No pudimos respaldar tu última edición en el servidor",
     detail:
@@ -95,6 +103,7 @@ function _saveErrorCategory(result) {
   if (reason === "network") return "network";
   if (status === 401 || status === 403) return "session";
   if (reason === "job-gone" || status === 404) return "job-gone";
+  if (reason === "velocity" || status === 429) return "velocity";
   // Revision drift is handled by the save queue's automatic rebase. If it
   // still cannot settle after bounded retries, show the generic retry copy;
   // never surface a collaboration/conflict banner to the operator.
@@ -672,6 +681,7 @@ export default function LyricsEditor({
   // El botón "Re-sincronizar con IA" solo se muestra si el padre lo pasa Y
   // features.anchor_lyrics está activo (flag ANCHOR_LYRICS_ENABLED).
   onReanchor = null,
+  onReanchorReconcile = null,
   // NOTE (PR E): el viejo `onEditedChange` (espejo sincrónico por keystroke
   // hacia App) fue eliminado — era la mitad del loop bidireccional del
   // reseed-storm. Los lectores externos (WizardLivePreview, snapshot de
@@ -961,6 +971,9 @@ export default function LyricsEditor({
   // sesión vencida, job expirado, etc. — ver _SAVE_ERROR_COPY). null cuando
   // no hay error. Se deriva de result.reason/status de persistSegments.
   const [saveErrorReason, setSaveErrorReason] = useState(null);
+  const [draftRecovery, setDraftRecovery] = useState(null);
+  const draftRecoveryRef = useRef(null);
+  draftRecoveryRef.current = draftRecovery;
   const [flushCounter, setFlushCounter] = useState(0);
   const [durableHydrated, setDurableHydrated] = useState(false);
   const saveConflictRef = useRef(false);
@@ -1289,7 +1302,7 @@ export default function LyricsEditor({
         });
       }
     }
-    if (status === "saved" && draftKey) {
+    if (status === "saved" && draftKey && !draftRecoveryRef.current) {
       // El snapshot confirmado se capturó hasta 800 ms (draft) o 5 s
       // (checkpoint) ANTES de este OK. Borrar el borrador a ciegas tiraba todo
       // lo tipeado en esa ventana: el efecto que reescribe el draft está
@@ -1323,7 +1336,7 @@ export default function LyricsEditor({
     setIsDirty(true);
   }, []);
   const { flush: flushDurableSave } = useEditorAutosave({
-    enabled: editorV2Enabled && durableHydrated && !durableEditor.loading,
+    enabled: editorV2Enabled && durableHydrated && !durableEditor.loading && !draftRecovery,
     segments: durableSegments,
     dirty: isDirty,
     save: durableEditor.save,
@@ -1353,81 +1366,45 @@ export default function LyricsEditor({
       let next = remote;
       let markDirty = false;
       if (draftKey) {
+        let raw = null;
+        let phase = "read";
         try {
-          const raw = localStorage.getItem(draftKey);
+          raw = localStorage.getItem(draftKey);
           if (raw) {
+            phase = "parse";
             const draft = JSON.parse(raw);
-            if (!Array.isArray(draft?.segments) || !draft.segments.length) {
-              setSaveStatus("error");
-              setSaveErrorReason("draft-corrupt");
+            phase = "compare";
+            // Validate before normalization: clamps/defaults must not make an
+            // unreadable copy look equivalent and eligible for deletion.
+            const valid = Array.isArray(draft?.segments) && draft.segments.length > 0
+              && draft.segments.every((row) => row && typeof row.text === "string"
+                && Number.isFinite(row.start) && Number.isFinite(row.end) && row.end >= row.start);
+            if (!valid) throw new Error("invalid_segments");
+            const local = sanitizeSegments(draft.segments);
+            // Even finite, nonnegative durations may be clamped by the editor.
+            // A normalized match must never authorize deleting different bytes.
+            if (!segmentsEquivalent(draft.segments, local)) {
+              throw new Error("draft_normalization_changes_content");
+            }
+            const pending = draft.pending_changes || draft.pending_ops?.length;
+            if (pending) throw new Error("uncomparable_pending_operations");
+            const sameContent = segmentsEquivalent(local, remote);
+            if (sameContent) {
+              phase = "remove";
+              // Do not remove a different copy written by another tab meanwhile.
+              if (localStorage.getItem(draftKey) !== raw) throw new Error("draft_changed");
+              localStorage.removeItem(draftKey);
             } else {
-              const local = sanitizeSegments(draft.segments);
-              // A local draft can outlive a background/typography edit. Those
-              // operations may advance the document revision or refresh
-              // renderer metadata without changing any operator-owned lyric
-              // content. Comparing raw JSON here made that harmless case look
-              // like a stale draft as soon as the editor reopened.
-              const sameContent = segmentsEquivalent(local, remote);
-              if (sameContent) {
-                localStorage.removeItem(draftKey);
-              } else if (Number.isInteger(draft.base_revision)
-                && draft.base_revision === durableEditor.document.revision) {
-                next = local;
-                markDirty = true;
-                setSaveStatus("local");
-              } else {
-                let baseSegments = Array.isArray(draft.base_segments)
-                  ? sanitizeSegments(draft.base_segments)
-                  : null;
-
-                // Drafts created before base_segments was introduced still
-                // carry base_revision (and the oldest drafts carry neither).
-                // Prefer the immutable checkpoint, but fall back to the
-                // original transcription if history is unavailable. The
-                // original is a safe three-way base: edits made only by this
-                // browser merge cleanly, while same-line changes still use
-                // the local snapshot when it is rebased and saved below.
-                if (!baseSegments && Number.isInteger(draft.base_revision)
-                  && draft.base_revision === 0) {
-                  baseSegments = remoteOriginal;
-                }
-                if (!baseSegments && Number.isInteger(draft.base_revision) && editorRequest) {
-                  try {
-                    const summariesResponse = await editorRequest(
-                      `/editor/${transcribeJobId}/versions?limit=50`,
-                    );
-                    const summaries = summariesResponse.ok
-                      ? (await summariesResponse.clone().json())?.versions || []
-                      : [];
-                    const baseVersion = summaries.find(
-                      (version) => version.revision === draft.base_revision,
-                    );
-                    if (baseVersion?.id) {
-                      const versionResponse = await editorRequest(
-                        `/editor/${transcribeJobId}/versions/${encodeURIComponent(baseVersion.id)}`,
-                      );
-                      if (versionResponse.ok) {
-                        const version = await versionResponse.clone().json();
-                        if (Array.isArray(version?.segments)) {
-                          baseSegments = sanitizeSegments(version.segments);
-                        }
-                      }
-                    }
-                  } catch { /* use the original transcription fallback */ }
-                }
-                if (!baseSegments) baseSegments = remoteOriginal;
-                if (cancelled) return;
-                const merged = mergeThreeWay(baseSegments, local, remote);
-                next = merged.merged;
-                markDirty = !segmentsEquivalent(next, remote);
-                if (markDirty) setSaveStatus("local");
-                else localStorage.removeItem(draftKey);
-              }
+              setDraftRecovery({ kind: "different", raw, local,
+                baseRevision: draft.base_revision, updatedAt: draft.updated_at });
             }
           }
         } catch {
-          setSaveStatus("error");
-          setSaveErrorReason("draft-corrupt");
+          const message = phase === "read" ? "El navegador no permitió leer la copia local."
+            : phase === "parse" ? "No pudimos interpretar el archivo de la copia local."
+              : phase === "remove" ? "La copia coincide con la guardada, pero no pudimos retirar el aviso de forma segura. Puede haber cambiado en otra pestaña o el navegador impidió borrarla."
+                : "La copia local no tiene un formato de letra y tiempos que podamos comparar sin alterarlo.";
+          setDraftRecovery({ kind: "unreadable", raw, message });
         }
       }
       if (cancelled) return;
@@ -1484,7 +1461,7 @@ export default function LyricsEditor({
       setSaveStatus(status);
       setSaveErrorReason(reason);
       if (status === "saved") setSavedAt(new Date());
-      if (status === "saved" && draftKey) {
+      if (status === "saved" && draftKey && !draftRecoveryRef.current) {
         try { localStorage.removeItem(draftKey); } catch { /* storage blocked */ }
       }
     });
@@ -1520,7 +1497,7 @@ export default function LyricsEditor({
   }, [draftKey, editorV2Enabled, segmentsRevision, setEdited]);
 
   useEffect(() => {
-    if (!draftKey || !isDirty) return;
+    if (!draftKey || !isDirty || draftRecoveryRef.current) return;
     try {
       const cleaned = sanitizeSegmentsForPersistence(edited);
       localStorage.setItem(draftKey, JSON.stringify({
@@ -2124,19 +2101,53 @@ export default function LyricsEditor({
   const [reanchoring, setReanchoring] = useState(false);
   const canReanchor = !!(onReanchor && transcribeJobId
     && user?.features?.anchor_lyrics === true);
+  // 2026-09-14: si la respuesta se pierde (alineación >60 s, proxy que
+  // re-envía, 409 del duplicado), consultar el estado real antes de declarar
+  // fallo: si la revisión avanzó, el servidor ya aplicó el re-anclado.
+  const recoverReanchorFromServer = useCallback(async (baseRevision) => {
+    if (!onReanchorReconcile || !transcribeJobId) return null;
+    try {
+      const r = await Promise.resolve(onReanchorReconcile(transcribeJobId, baseRevision));
+      if (r && r.ok && Array.isArray(r.segments) && r.segments.length
+          && Number.isInteger(r.revision) && r.revision > baseRevision) return r;
+    } catch { /* best effort */ }
+    return null;
+  }, [onReanchorReconcile, transcribeJobId]);
+  const applyReanchorResult = useCallback((res, message) => {
+    if (Number.isInteger(res.revision)) {
+      saveQueueRef.current.prime(transcribeJobId, res.revision);
+    }
+    pushEditHistory();
+    setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
+    toast({ message, tone: "success" });
+  }, [transcribeJobId, pushEditHistory, toast]);
+
   const handleReanchor = useCallback(async () => {
     if (!onReanchor || !transcribeJobId || reanchoring) return;
     setReanchoring(true);
+    let baseRevision = Number.isInteger(segmentsRevision) ? segmentsRevision : 0;
     try {
       let saved = null;
       if (onPersistSegments) {
         saved = await flushPendingSave(null, true);
         if (saved?.ok === false) throw new Error(saved.reason || "save-failed");
       }
-      const baseRevision = Number.isInteger(saved?.revision)
+      baseRevision = Number.isInteger(saved?.revision)
         ? saved.revision
         : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
-      const res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision));
+      let res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision));
+      // Gate estructural del backend (2026-09-13): el texto editado tiene
+      // estrofas que la transcripción nunca oyó. Igual que en el modal de
+      // pegar, el operador puede confirmar que ES esta versión.
+      if (res && res.code === "reference_structure_unconfirmed" && res.structure) {
+        const confirmed = window.confirm(
+          (t("editor.reanchor_structure_confirm") || "Esta letra no parece coincidir con la grabación ({p} líneas contra {c} transcriptas). Si escuchaste el audio y es esta versión, ¿re-sincronizar igual?")
+            .replace("{p}", String(res.structure.pasted_line_count ?? "?"))
+            .replace("{c}", String(res.structure.current_line_count ?? "?")),
+        );
+        if (!confirmed) return;
+        res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision, { confirm_structure: true }));
+      }
       if (res && res.ok && Array.isArray(res.segments) && res.segments.length) {
         if (Number.isInteger(res.revision)) {
           saveQueueRef.current.prime(transcribeJobId, res.revision);
@@ -2151,22 +2162,128 @@ export default function LyricsEditor({
             .replace("{m}", String(res.review_count ?? 0)),
           tone: "success",
         });
+      } else if (res && res.reason === "structural_mismatch") {
+        // Veredicto acústico: las líneas sobrantes salieron apretadas con
+        // score cero. El backend no persistió nada.
+        toast({
+          message: (t("editor.reanchor_structural_mismatch") || "No se re-sincronizó: {n} líneas no suenan en la grabación. El timing quedó como estaba.")
+            .replace("{n}", String(res.structural?.crammed_lines ?? "?")),
+          tone: "error",
+        });
+      } else {
+        const recovered = await recoverReanchorFromServer(baseRevision);
+        if (recovered) {
+          applyReanchorResult(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
+        } else {
+          toast({
+            message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
+            tone: "error",
+          });
+        }
+      }
+    } catch {
+      const recovered = await recoverReanchorFromServer(baseRevision);
+      if (recovered) {
+        applyReanchorResult(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
       } else {
         toast({
           message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
           tone: "error",
         });
       }
-    } catch {
-      toast({
-        message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
-        tone: "error",
-      });
     } finally {
       setReanchoring(false);
     }
   }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, reanchoring, edited,
-      pushEditHistory, toast, t, flushPendingSave]);
+      pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult]);
+
+  // 2026-09-13: pegar la letra OFICIAL y re-sincronizar desde ese texto.
+  // Mismo endpoint que el re-anclado (POST /jobs/{id}/reanchor) con
+  // lyrics_text; el backend mergea por bloques y devuelve 409
+  // reference_structure_unconfirmed si la letra no parece de esta
+  // grabación — ahí se muestra el reporte y el operador confirma o no.
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const [pasteBusy, setPasteBusy] = useState(false);
+  const [pasteStructure, setPasteStructure] = useState(null);
+  const [pasteError, setPasteError] = useState("");
+  const pasteLineCount = pasteText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).length;
+  const openPasteLyrics = useCallback(() => {
+    setPasteStructure(null);
+    setPasteError("");
+    setPasteOpen(true);
+  }, []);
+  const submitPasteLyrics = useCallback(async (confirmStructure = false) => {
+    if (!onReanchor || !transcribeJobId || pasteBusy) return;
+    if (pasteLineCount < 3) {
+      setPasteError(t("editor.paste_lyrics_min_lines") || "Pegá al menos 3 líneas.");
+      return;
+    }
+    setPasteBusy(true);
+    setPasteError("");
+    let baseRevision = Number.isInteger(segmentsRevision) ? segmentsRevision : 0;
+    const finishPaste = (res, message) => {
+      applyReanchorResult(res, message);
+      setPasteOpen(false);
+      setPasteText("");
+      setPasteStructure(null);
+    };
+    try {
+      let saved = null;
+      if (onPersistSegments) {
+        saved = await flushPendingSave(null, true);
+        if (saved?.ok === false) throw new Error(saved.reason || "save-failed");
+      }
+      baseRevision = Number.isInteger(saved?.revision)
+        ? saved.revision
+        : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
+      const res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision, {
+        lyrics_text: pasteText,
+        confirm_structure: confirmStructure,
+      }));
+      if (res && res.ok && Array.isArray(res.segments) && res.segments.length) {
+        if (Number.isInteger(res.revision)) {
+          saveQueueRef.current.prime(transcribeJobId, res.revision);
+        }
+        pushEditHistory();
+        setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
+        setPasteOpen(false);
+        setPasteText("");
+        setPasteStructure(null);
+        toast({
+          message: (t("editor.paste_lyrics_done") || "Letra aplicada: {r} líneas nuevas, {k} conservadas, {m} para revisar")
+            .replace("{r}", String(res.lines_replaced ?? 0))
+            .replace("{k}", String(res.lines_kept ?? 0))
+            .replace("{m}", String(res.review_count ?? 0)),
+          tone: "success",
+        });
+      } else if (res && res.code === "reference_structure_unconfirmed" && res.structure) {
+        setPasteStructure(res.structure);
+      } else if (res && res.reason === "structural_mismatch") {
+        setPasteError(
+          (t("editor.reanchor_structural_mismatch") || "No se re-sincronizó: {n} líneas no suenan en la grabación. El timing quedó como estaba.")
+            .replace("{n}", String(res.structural?.crammed_lines ?? "?")),
+        );
+      } else {
+        const recovered = await recoverReanchorFromServer(baseRevision);
+        if (recovered) {
+          finishPaste(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
+        } else {
+          setPasteError(t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.");
+        }
+      }
+    } catch {
+      const recovered = await recoverReanchorFromServer(baseRevision);
+      if (recovered) {
+        finishPaste(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
+      } else {
+        setPasteError(t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.");
+      }
+    } finally {
+      setPasteBusy(false);
+    }
+  }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, pasteBusy, pasteText,
+      pasteLineCount, pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult]);
 
   const focusSegment = useCallback((id) => {
     setFocusedSegId(id);
@@ -2989,6 +3106,7 @@ export default function LyricsEditor({
   // in sync mode so the operator can recover from a mistap.
   useEffect(() => {
     const onKey = (e) => {
+      if (draftRecoveryRef.current) return;
       const tag = (document.activeElement?.tagName || "").toUpperCase();
       const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
       if (editing) return;
@@ -3821,7 +3939,7 @@ export default function LyricsEditor({
       toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
       return;
     }
-    if (saveErrorReason === "draft-corrupt") {
+    if (draftRecovery) {
       toast({ message: "Descartá o recuperá manualmente el borrador local antes de aprobar.", tone: "error" });
       return;
     }
@@ -4022,7 +4140,7 @@ export default function LyricsEditor({
   };
 
   const handleBackSafely = useCallback(async (afterSave) => {
-    const result = await flushPendingSave();
+    const result = draftRecoveryRef.current ? { ok: true } : await flushPendingSave();
     if (result?.ok === false && result.reason === "stale-revision") return;
     if (typeof afterSave === "function") {
       await afterSave();
@@ -4162,12 +4280,39 @@ export default function LyricsEditor({
   // breathe: preview ~680 px wide (≈ 2× before), lines fit ≈ 60 chars per
   // row before scrolling. Timeline view stays at max-w-6xl (already wide
   // enough).
+  const resolveRecovery = (recover) => {
+    try {
+      if (localStorage.getItem(draftKey) !== draftRecovery.raw) {
+        setDraftRecovery({ ...draftRecovery, kind: "unreadable", message: "La copia cambió en otra pestaña. Recargá para compararla de nuevo; no borramos nada." });
+        return;
+      }
+      if (recover) {
+        // Only an explicit choice makes the local copy an editable draft.
+        // Keep its original bytes until the normal save path confirms them.
+        setEdited(reseedPreservingIds(editedRef.current, draftRecovery.local));
+        setIsDirty(true);
+        setSaveStatus("local");
+      } else {
+        localStorage.removeItem(draftKey);
+        setIsDirty(false);
+      }
+      draftRecoveryRef.current = null;
+      setDraftRecovery(null);
+    } catch {
+      setDraftRecovery({ ...draftRecovery, kind: "unreadable", message: "El navegador impidió resolver la copia local. La conservamos y no guardamos cambios en el servidor." });
+    }
+  };
+
   return (
     // UI F10 (2026-05-26): pb-28 (7 rem ≈ 112 px) garantiza safe-area
     // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
-    <div data-testid="lyrics-editor" aria-busy={editorInitializationBlocked} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+    <div data-testid="lyrics-editor" inert={draftRecovery ? "" : undefined} aria-busy={editorInitializationBlocked} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+      {draftRecovery && createPortal(<LocalDraftRecovery recovery={draftRecovery}
+        revision={durableEditor.document?.revision} remote={durableEditor.document?.segments || []}
+        onRecover={() => resolveRecovery(true)} onDiscard={() => resolveRecovery(false)}
+        onBack={() => onBack?.()} />, document.body)}
       {editorInitializationBlocked && createPortal(
         <div
           className="fixed inset-0 z-[80] flex items-center justify-center bg-surface-0/70 px-5 backdrop-blur-sm"
@@ -4441,7 +4586,7 @@ export default function LyricsEditor({
             onClick={handleApprove}
             disabled={isApproving || (!requireLineReview && (
               (editorV2Enabled && (!durableHydrated || durableEditor.loading))
-              || saveErrorReason === "draft-corrupt"
+              || !!draftRecovery
             ))}
             aria-busy={isApproving}
             aria-label={isApproving
@@ -4465,6 +4610,52 @@ export default function LyricsEditor({
           </button>
         </div>
       </div>
+
+      {pasteOpen && createPortal(
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4">
+          <section role="dialog" aria-modal="true" aria-labelledby="paste-lyrics-title"
+            className="w-full max-w-2xl rounded-2xl bg-surface-1 p-6 shadow-2xl ring-1 ring-white/15">
+            <h2 id="paste-lyrics-title" className="text-lg font-semibold text-white">{t("editor.paste_lyrics") || "Pegar letra oficial y re-sincronizar"}</h2>
+            <p className="mt-2 text-sm text-ink-secondary">{t("editor.paste_lyrics_hint") || "Pegá la letra correcta, una línea por renglón. Las líneas iguales conservan su ajuste manual; las distintas se reemplazan y quedan marcadas para revisar."}</p>
+            {sourceReference?.text && (
+              <button type="button" data-testid="paste-lyrics-use-sheet" onClick={() => { setPasteText(sourceReference.text); setPasteStructure(null); }}
+                className="mt-3 rounded-lg bg-white/[0.06] px-3 py-1.5 text-xs text-white ring-1 ring-white/10">{t("editor.paste_lyrics_use_sheet") || "Usar la letra de la planilla"}</button>
+            )}
+            <textarea data-testid="paste-lyrics-textarea" aria-label={t("editor.paste_lyrics") || "Letra oficial"} value={pasteText}
+              onChange={(e) => { setPasteText(e.target.value); setPasteStructure(null); }} rows={12}
+              placeholder={t("editor.paste_lyrics_placeholder") || "Pegá acá la letra oficial…"}
+              className="mt-3 w-full rounded-xl bg-black/30 p-3 font-mono text-sm text-white ring-1 ring-white/15" />
+            <p className="mt-2 text-xs text-ink-tertiary" data-testid="paste-lyrics-count">{pasteLineCount} líneas pegadas · {edited.length} en el editor</p>
+            {pasteStructure && (
+              <div role="alert" data-testid="paste-lyrics-structure" className="mt-3 rounded-xl bg-amber-400/[0.08] p-3 text-xs text-amber-200 ring-1 ring-amber-400/30">
+                <p className="font-medium">{t("editor.paste_lyrics_structure_title") || "Esta letra no parece coincidir con la grabación"}</p>
+                <ul className="mt-1 list-disc pl-4">
+                  {pasteStructure.reasons?.includes("line_count_divergent") && <li>{`${pasteStructure.pasted_line_count} líneas pegadas vs ${pasteStructure.current_line_count} en el editor`}</li>}
+                  {pasteStructure.reasons?.includes("reference_contains_unmatched_passage") && <li>{`Hay un pasaje de ${pasteStructure.metrics?.longest_unmatched_content_run} palabras que no aparece en lo transcripto (¿estrofa de otra versión?)`}</li>}
+                  {Number.isFinite(pasteStructure.metrics?.reference_token_coverage) && <li>{`Cobertura: ${Math.round(pasteStructure.metrics.reference_token_coverage * 100)}% de la letra pegada se reconoce en el audio`}</li>}
+                </ul>
+                <p className="mt-1">{t("editor.paste_lyrics_structure_hint") || "Si escuchaste el audio y es esta versión, podés forzar la re-sincronización. Todas las líneas quedarán marcadas para revisar."}</p>
+              </div>
+            )}
+            {pasteError && <p role="alert" className="mt-3 text-sm text-red-300">{pasteError}</p>}
+            <div className="mt-5 flex justify-end gap-3">
+              <button type="button" disabled={pasteBusy} onClick={() => setPasteOpen(false)}
+                className="rounded-lg px-3 py-2 text-sm text-white">{t("editor.paste_lyrics_cancel") || "Cancelar"}</button>
+              {pasteStructure ? (
+                <button type="button" data-testid="paste-lyrics-confirm-anyway" disabled={pasteBusy} onClick={() => submitPasteLyrics(true)}
+                  className="rounded-lg bg-amber-500/80 px-4 py-2 text-sm font-medium text-black disabled:opacity-50">
+                  {pasteBusy ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.paste_lyrics_confirm_anyway") || "Es esta versión, re-sincronizar igual")}
+                </button>
+              ) : (
+                <button type="button" data-testid="paste-lyrics-submit" disabled={pasteBusy || pasteLineCount < 3} onClick={() => submitPasteLyrics(false)}
+                  className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
+                  {pasteBusy ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.paste_lyrics_submit") || "Reemplazar letra y re-sincronizar")}
+                </button>
+              )}
+            </div>
+          </section>
+        </div>, document.body,
+      )}
 
       {languageResolutionOpen && createPortal(
         <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4">
@@ -5391,7 +5582,7 @@ export default function LyricsEditor({
              izquierda no renderiza — los controles ya están en el paso
              4 del stepper y el preview central del wizard refleja los
              cambios. El grid colapsa a 1 columna full-width. */}
-      <div className="relative mb-4 flex items-center gap-3 rounded-2xl bg-gradient-to-r from-surface-2/80 via-surface-2/45 to-brand/[0.055] p-2 ring-1 ring-white/[0.08] shadow-xl shadow-black/10" data-testid="editor-mode-explainer">
+      <div className="relative mb-4 flex flex-wrap items-center gap-3 rounded-2xl bg-gradient-to-r from-surface-2/80 via-surface-2/45 to-brand/[0.055] p-2 ring-1 ring-white/[0.08] shadow-xl shadow-black/10" data-testid="editor-mode-explainer">
         <div
           className="grid min-w-0 flex-1 grid-cols-2 gap-1 rounded-xl bg-black/20 p-1"
           role="tablist"
@@ -5443,6 +5634,23 @@ export default function LyricsEditor({
             </span>
           </button>
         </div>
+        {/* 2026-09-14: pegar la letra oficial es una acción de TEXTO, no de
+            timing: va visible en las dos pestañas, no escondida en el menú de
+            Herramientas (que sólo existe en "Ajustar tiempos" y se cortaba a
+            la derecha en ventanas angostas). El ítem del menú se conserva. */}
+        {canReanchor && !syncMode && (
+          <button
+            type="button"
+            data-testid="paste-lyrics-cta"
+            disabled={reanchoring || pasteBusy}
+            onClick={() => { openPasteLyrics(); setOverflowOpen(false); }}
+            title={t("editor.paste_lyrics_menu_hint") || "Reemplaza el texto y realinea con el audio"}
+            className="inline-flex h-10 shrink-0 items-center gap-2 rounded-xl bg-brand/15 px-3 text-[11px] font-semibold text-brand-light ring-1 ring-brand/30 transition-colors hover:bg-brand/25 hover:text-white disabled:opacity-50"
+          >
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M9 4h6a2 2 0 0 1 2 2v14H7V6a2 2 0 0 1 2-2zM9 4v2h6V4M10 11h4M10 15h4" strokeLinecap="round" strokeLinejoin="round" /></svg>
+            <span>{t("editor.paste_lyrics_short") || "Pegar letra oficial"}</span>
+          </button>
+        )}
         {viewMode === "advanced" && (
           <div className="relative shrink-0">
             <button
@@ -5468,6 +5676,11 @@ export default function LyricsEditor({
                   <button type="button" role="menuitem" onClick={() => { toggleFocusMode(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white">
                     <span className="block font-medium">{focusMode ? (t("editor.focus_exit") || "Salir de modo enfoque") : (t("editor.focus_enter") || "Trabajar a pantalla completa")}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Maximiza el espacio de edición</span>
                   </button>
+                  {canReanchor && !syncMode && (
+                    <button type="button" role="menuitem" data-testid="paste-lyrics-btn" disabled={reanchoring || pasteBusy} onClick={() => { openPasteLyrics(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white disabled:opacity-50">
+                      <span className="block font-medium">{t("editor.paste_lyrics") || "Pegar letra oficial y re-sincronizar"}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">{t("editor.paste_lyrics_menu_hint") || "Reemplaza el texto y realinea con el audio"}</span>
+                    </button>
+                  )}
                   {canReanchor && !syncMode && (
                     <button type="button" role="menuitem" data-testid="reanchor-btn" disabled={reanchoring} onClick={() => { handleReanchor(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white disabled:opacity-50">
                       <span className="block font-medium">{reanchoring ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.reanchor") || "Re-sincronizar con IA")}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Conserva los ajustes manuales</span>

@@ -291,11 +291,14 @@ def build_machine_evidence(result: dict) -> dict:
     reported_attempt_count = result.get("_recognition_attempt_count")
     if type(reported_attempt_count) is not int:
         reported_attempt_count = inferred_attempt_count
+    from reconcile_capture import durable_capture
+    reconcile_capture = durable_capture(result)
     return {
         "schema": SCHEMA,
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "hypotheses_by_family": hypotheses,
         "capture": {
+            **({"reconcile_stages": reconcile_capture} if reconcile_capture is not None else {}),
             "recognition_attempt_count": reported_attempt_count,
             "primary_present": bool(
                 recognition_attempts or result.get("_asr_words")

@@ -78,7 +78,7 @@ import { loadReviewWaveform } from "./lib/loadReviewWaveform";
 import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { backgroundRegenExtras } from "./lib/editWizardDiff";
-import { buildEditReview, buildEditCurrent, resolveEditSubmission, backgroundEditBlockedReason } from "./lib/editSubmission";
+import { buildEditReview, buildEditCurrent, resolveEditSubmission, backgroundEditBlockedReason, buildCampaignEditApproval } from "./lib/editSubmission";
 import { normalizeMovementCode } from "./lib/catalogCodes";
 import { buildVariantPayload } from "./lib/variantPayload";
 import { prefetchKey } from "./lib/prefetchKey";
@@ -1138,7 +1138,12 @@ function EditLyricsRoute({
         queue: [],
         queueIdx: 0,
         transcribeJobId: null,
-        referenceLyrics: "",
+        referenceLyrics: job.reference_lyrics || "",
+        // A rendered batch job still belongs to the campaign review contract.
+        // Keeping this identity in edit mode makes the CTA attest the exact
+        // line set again before /edit re-renders it.
+        campaignId: job.campaign_id || null,
+        campaignItemId: job.campaign_item_id || null,
       });
       // CRITICAL FIX 2026-05-27 (fix/edit-lyrics-set-wizard-stage): el
       // wizardScreen lee wizardStage para decidir qué renderear (upload
@@ -3660,24 +3665,51 @@ export default function App() {
   // timing re-anclado respetando las líneas `locked`. Devuelve el payload
   // del endpoint ({ok, count, review_count, segments}) para que el
   // LyricsEditor refresque su estado y muestre el toast de resultado.
-  const reanchorSegmentsOnBackend = useCallback(async (jobId, baseRevision) => {
+  // `extra` (2026-09-13): { lyrics_text, confirm_structure } cuando el
+  // operador pega la letra oficial; vacío = re-anclar el texto ya editado.
+  const reanchorSegmentsOnBackend = useCallback(async (jobId, baseRevision, extra = {}) => {
     if (!jobId) return { ok: false, reason: "no-job" };
     try {
       const res = await authFetch(`${API}/jobs/${jobId}/reanchor`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base_revision: baseRevision }),
+        body: JSON.stringify({ base_revision: baseRevision, ...extra }),
       });
       if (!res.ok) {
         let detail = "";
-        try { detail = (await res.clone().json())?.detail || ""; } catch { /* non-JSON body */ }
-        console.warn("[reanchor] failed", res.status, detail);
-        return { ok: false, reason: `http-${res.status}`, status: res.status, detail };
+        let payload = null;
+        try { payload = await res.clone().json(); detail = payload?.detail || ""; } catch { /* non-JSON body */ }
+        console.warn("[reanchor] failed", res.status, detail || payload?.code || "");
+        return { ok: false, reason: `http-${res.status}`, status: res.status, detail,
+          code: payload?.code || null, structure: payload?.structure || null };
       }
       return await res.json();
     } catch (err) {
       console.warn("[reanchor] network error", err);
       return { ok: false, reason: "network", error: String(err) };
+    }
+  }, []);
+
+  // 2026-09-14: la alineación puede tardar >60 s; el proxy re-envía el POST y
+  // el cliente puede recibir el error del duplicado (409 stale_revision) o un
+  // corte aunque el servidor ya aplicó todo. Antes de mostrar error, el editor
+  // mira el estado real: si la revisión avanzó, fue éxito.
+  const reanchorReconcileFromServer = useCallback(async (jobId, baseRevision) => {
+    if (!jobId) return { ok: false, reason: "no-job" };
+    try {
+      const res = await authFetch(`${API}/status/${jobId}`, { cache: "no-store" });
+      if (!res.ok) return { ok: false, reason: `http-${res.status}` };
+      const job = await res.json();
+      const revision = Number(job?.segments_revision);
+      const segments = Array.isArray(job?.segments_json) ? job.segments_json : [];
+      if (!Number.isInteger(revision) || revision <= Number(baseRevision ?? -1) || !segments.length) {
+        return { ok: false, reason: "not-advanced", revision };
+      }
+      return { ok: true, recovered: true, revision, segments, count: segments.length,
+        review_count: segments.filter((s) => s && s.review).length };
+    } catch (err) {
+      console.warn("[reanchor] reconcile error", err);
+      return { ok: false, reason: "network" };
     }
   }, []);
 
@@ -3986,6 +4018,52 @@ export default function App() {
           }
           if (saveMeta.editorVersionId) {
             payload.editor_version_id = saveMeta.editorVersionId;
+          }
+        }
+
+        // Campaign lyrics are approved against an exact editor/audio
+        // snapshot before their first background is generated. A real
+        // post-render correction invalidates that old snapshot during
+        // autosave, so renew the same explicit attestation before /edit.
+        // The backend keeps pending_review/done/rejected unchanged until the
+        // render request is accepted, avoiding a half-finished state if the
+        // second request loses the network race.
+        const campaignEditApproval = buildCampaignEditApproval(r, saveMeta);
+        if (campaignEditApproval) {
+          if (!campaignEditApproval.valid) {
+            alert({
+              title: t("edit.error_title") || "No pudimos aplicar el edit",
+              description: "No pudimos vincular la revisión completa de letra y timing. Volvé a revisar la versión actual e intentá nuevamente.",
+              tone: "error",
+            });
+            return { ok: false, reason: "campaign-approval-incomplete" };
+          }
+          let approvalResponse;
+          try {
+            approvalResponse = await authFetch(
+              `${API}/batch/campaigns/${campaignEditApproval.campaignId}/jobs/${editedJobId}/approve-lyrics`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(campaignEditApproval.body),
+              },
+            );
+          } catch {
+            alert({
+              title: t("edit.error_title") || "No pudimos aplicar el edit",
+              description: t("common.network_error") || "Error de red. Reintentá en unos segundos.",
+              tone: "error",
+            });
+            return { ok: false, reason: "campaign-approval-network" };
+          }
+          if (!approvalResponse.ok) {
+            const approvalData = await approvalResponse.json().catch(() => ({}));
+            alert({
+              title: t("edit.error_title") || "No pudimos aplicar el edit",
+              description: translateBackendError(approvalData?.detail, t) || `Error ${approvalResponse.status}`,
+              tone: "error",
+            });
+            return { ok: false, reason: `campaign-approval-${approvalResponse.status}` };
           }
         }
 
@@ -6017,6 +6095,7 @@ export default function App() {
             editorRequest={editorRequest}
             saveQueue={segmentsSaveQueueRef.current}
             onReanchor={reanchorSegmentsOnBackend}
+            onReanchorReconcile={reanchorReconcileFromServer}
             onReloadServer={({ draftKey, storeKey }) => {
               try { if (draftKey) localStorage.removeItem(draftKey); } catch { /* best effort */ }
               try { wizardPersistence.clear(); } catch { /* best effort */ }
