@@ -532,3 +532,121 @@ def test_reanchor_legacy_path_reports_editor_text_source(client, monkeypatch):
     assert res.status_code == 200, res.text
     assert res.json()["content_source"] == "editor_text"
     assert res.json()["structure"] is None
+
+
+# ---------------------------------------------------------------------------
+# Guardrails del incidente 2026-09-13 (bots pisaron 185 borradores y el
+# re-anclado forzó letras de otra versión sobre el audio)
+# ---------------------------------------------------------------------------
+
+
+def _crammed_retimed():
+    """Motor sobre una letra con estrofas que el audio no canta: las 4
+    líneas vuelven apretadas en <1 s con score ≈ 0 (forced_align sin
+    skip arcs). Es exactamente la forma de Color Esperanza rev 2."""
+    out = []
+    for i, text in enumerate(s["text"] for s in SEGS):
+        out.append({
+            "start": 10.0 + i * 0.5, "end": 10.0 + i * 0.5 + 0.4, "text": text,
+            "words": [{"word": w, "start": 10.0 + i * 0.5, "end": 10.0 + i * 0.5 + 0.1,
+                       "score": 0.01} for w in text.split()],
+        })
+    return out
+
+
+def _mock_align_crammed(monkeypatch):
+    async def _fake(result, audio_path, job_id, anchor_lyrics):
+        out = dict(result)
+        out["segments"] = _crammed_retimed()
+        out["timing_source"] = "anchor_ctc"
+        return out
+    monkeypatch.setattr(main_mod, "_maybe_anchor_align", _fake)
+
+
+def test_reanchor_declines_crammed_alignment_and_keeps_segments(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _mock_align_crammed(monkeypatch)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token))
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is False
+    assert body["reason"] == "structural_mismatch"
+    assert body["structural"]["crammed_run"] == 4
+    assert body["structural"]["crammed_lines"] == 4
+    assert _db_segments(job_id) == list(SEGS), "los segments del operador quedan intactos"
+
+    from database import AuditLog, SessionLocal
+    s = SessionLocal()
+    try:
+        row = (s.query(AuditLog).filter(AuditLog.action == "lyrics.reanchor_declined")
+               .order_by(AuditLog.id.desc()).first())
+        assert row is not None and row.detail["job_id"] == job_id
+        assert row.detail["reason"] == "structural_mismatch"
+    finally:
+        s.close()
+
+
+def test_reanchor_crammed_guard_can_be_disabled(client, monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    monkeypatch.setenv("REANCHOR_CRAMMED_GUARD", "0")
+    _mock_align_crammed(monkeypatch)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token))
+    assert res.status_code == 200, res.text
+    assert res.json()["ok"] is True
+
+
+def test_reanchor_edited_text_divergent_from_machine_snapshot_409_then_confirm(client, monkeypatch):
+    """Color Esperanza (d323e1bc378c) por el camino REAL del incidente: la
+    letra íntegra de otra versión entró por /save-segments (no por el modal
+    de pegar) y el operador apretó "Re-sincronizar con IA". El snapshot de
+    máquina del editor tiene 4 líneas; el texto editado, 12."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    seen = {}
+    _mock_align_from_lyrics(monkeypatch, seen)
+    token, user_id, tenant_id = _make_user(client)
+    machine = [{k: v for k, v in s.items() if k != "locked"} for s in SEGS]
+    edited = [
+        {"start": i * 2.0, "end": i * 2.0 + 1.5, "text": f"estrofa de otra version numero {i}", "_id": i}
+        for i in range(12)
+    ]
+    job_id = _seed_job(user_id, tenant_id, segments=edited)
+    _seed_editor_document(job_id, tenant_id, machine, revision=3)
+
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token), json={"base_revision": 3})
+    assert res.status_code == 409, res.text
+    body = res.json()
+    assert body["code"] == "reference_structure_unconfirmed"
+    assert body["structure"]["reference"] == "machine_snapshot"
+    assert "line_count_divergent" in body["structure"]["reasons"]
+    assert body["structure"]["pasted_line_count"] == 12
+    assert body["structure"]["current_line_count"] == 4
+    assert seen.get("calls", 0) == 0, "no se gasta CTC sin confirmación"
+    assert [s["text"] for s in _db_segments(job_id)] == [s["text"] for s in edited]
+
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token),
+                      json={"base_revision": 3, "confirm_structure": True})
+    assert res.status_code == 200, res.text
+    assert res.json()["ok"] is True
+    assert seen["calls"] == 1
+
+
+def test_reanchor_edited_text_same_as_machine_snapshot_skips_gate(client, monkeypatch):
+    """Correcciones chicas sobre el snapshot (misma estructura) no piden
+    confirmación — es el flujo diario del revisor."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    seen = {}
+    _mock_align_ok(monkeypatch, seen)
+    token, user_id, tenant_id = _make_user(client)
+    seeded = [{k: v for k, v in s.items() if k != "locked"} for s in SEGS]
+    edited = [dict(s) for s in seeded]
+    edited[1]["text"] = "segunda linea CORREGIDA por el revisor"
+    job_id = _seed_job(user_id, tenant_id, segments=edited)
+    _seed_editor_document(job_id, tenant_id, seeded, revision=2)
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token), json={"base_revision": 2})
+    assert res.status_code == 200, res.text
+    assert res.json()["ok"] is True

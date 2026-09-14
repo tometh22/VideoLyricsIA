@@ -13883,6 +13883,7 @@ async def patch_editor_document(
     db: Session = Depends(get_db),
 ):
     job, document = _editor_document_or_404(db, job_id, current_user)
+    _enforce_segment_write_velocity(db, current_user, job_id)
     quality_outbox_id = None
     previous_editor_segments = [
         dict(item) for item in (document.current_segments or [])
@@ -14869,6 +14870,45 @@ class SaveSegmentsRequest(BaseModel):
     base_revision: int | None = Field(default=None, ge=0)
 
 
+def _enforce_segment_write_velocity(db: Session, current_user: dict, job_id: str) -> None:
+    """429 when one user writes segments to too many distinct jobs at once.
+
+    Incidente 2026-09-13: un script con token admin pisó 185 borradores de
+    una campaña vía /save-segments a un job por segundo. Un humano edita un
+    puñado de canciones cada diez minutos; la ventana y el tope viven en
+    SEGMENT_WRITE_MAX_DISTINCT_JOBS / SEGMENT_WRITE_WINDOW_S (0 = apagado).
+    Cuenta jobs distintos en audit_log (lyrics.segments_diff), así que un
+    guardado repetido sobre el mismo job nunca suma.
+    """
+    from anchor_structural_guard import segment_write_velocity_exceeded
+    exceeded, count, max_jobs = segment_write_velocity_exceeded(
+        db, current_user.get("id"), job_id,
+    )
+    if not exceeded:
+        return
+    logger.warning(
+        "[segments-velocity] rejected user=%s job=%s distinct_jobs=%d max=%d",
+        current_user.get("id"), job_id, count, max_jobs,
+    )
+    try:
+        from ops_metrics import increment
+        increment("segment_write_velocity_rejected")
+    except Exception:
+        pass
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "code": "segment_write_velocity",
+            "distinct_jobs": count,
+            "max_distinct_jobs": max_jobs,
+            "detail": (
+                "Demasiadas canciones editadas en poco tiempo. "
+                "Si es un script, frená: este endpoint es para el editor."
+            ),
+        },
+    )
+
+
 @app.post("/jobs/{job_id}/save-segments")
 @limiter.limit("60/minute")
 async def save_segments(
@@ -14922,6 +14962,7 @@ async def save_segments(
                 and job.tenant_id != current_user["tenant_id"])):
         raise HTTPException(status_code=404, detail="Job not found.")
     _audit_cross_tenant_access(db, current_user, job, "save_segments", commit=False)
+    _enforce_segment_write_velocity(db, current_user, job_id)
 
     # Wizard (transcribed_pending) is the original use case; pending_review
     # / rejected enable the post-approval /edit modal's autosave so text
@@ -15414,6 +15455,43 @@ def _pasted_structure_report(attestation, pasted_count: int, current_count: int)
     }
 
 
+def _edited_structure_report(db: Session, job, anchor_lines: list[str], *, is_live: bool):
+    """Estructura del texto editado vs el snapshot de máquina del editor.
+
+    Devuelve None cuando no hay snapshot (job anterior al Editor 2.0) o
+    cuando el texto editado es el mismo snapshot: ahí no hay nada que
+    comparar y el re-anclado sigue como siempre. Nunca lanza.
+    """
+    try:
+        from database import EditorDocument
+        from reference_attestation import assess_reference_attestation
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job.job_id,
+        ).first()
+        machine = [
+            s for s in (document.original_segments or [])
+            if isinstance(s, dict) and str(s.get("text") or "").strip()
+        ] if document is not None else []
+        if not machine:
+            return None
+        lines = [ln for ln in anchor_lines if ln]
+        if [_norm_lyric_line(ln) for ln in lines] == [
+            _norm_lyric_line(s.get("text")) for s in machine
+        ]:
+            return None
+        attestation = assess_reference_attestation(
+            "\n".join(lines), machine,
+            reference_source="operator_edited", is_live=is_live,
+        )
+        report = _pasted_structure_report(attestation, len(lines), len(machine))
+        report["reference"] = "machine_snapshot"
+        return report
+    except Exception as exc:  # noqa: BLE001 — el gate nunca rompe el re-anclado
+        logger.warning("[REANCHOR] structure report unavailable job=%s: %s",
+                       getattr(job, "job_id", "?"), exc)
+        return None
+
+
 def _merge_pasted_segments(prev_segs: list[dict], anchored: list[dict]) -> tuple[list[dict], dict]:
     """Merge por bloques (difflib sobre texto normalizado) entre los
     segments actuales y la letra pegada ya alineada.
@@ -15560,13 +15638,13 @@ async def reanchor_segments(
         )
 
     structure = None
+    _title = str(job.song_title or "").lower()
+    _is_live = "live" in _title or "en vivo" in _title
     if pasted_mode:
         # Gate estructural ANTES de bajar audio y gastar CTC: comparar la
         # letra pegada con el ASR/texto actual. Se advierte, no se bloquea
         # de por vida: el operador puede confirmar (confirm_structure).
         from reference_attestation import assess_reference_attestation
-        _title = str(job.song_title or "").lower()
-        _is_live = "live" in _title or "en vivo" in _title
         attestation = assess_reference_attestation(
             "\n".join(pasted_lines), prev_segs,
             reference_source="operator_pasted", is_live=_is_live,
@@ -15577,14 +15655,22 @@ async def reanchor_segments(
         structure = _pasted_structure_report(
             attestation, len(pasted_lines), _current_count,
         )
-        if not structure["supported"] and not body.confirm_structure:
-            logger.info("[REANCHOR] pasted structure unconfirmed job=%s reasons=%s",
-                        job_id, structure["reasons"])
-            return JSONResponse(
-                status_code=409,
-                content={"code": "reference_structure_unconfirmed",
-                         "structure": structure},
-            )
+    else:
+        # Mismo gate para el re-anclado del texto YA guardado (incidente
+        # 2026-09-13: la letra íntegra de otra versión entró por
+        # /save-segments, no por el modal de pegar, y "Re-sincronizar con
+        # IA" la forzó entera sobre el audio). La referencia es el snapshot
+        # de máquina del editor (original_segments): si el texto actual
+        # tiene estrofas que la transcripción nunca oyó, pedimos confirmar.
+        structure = _edited_structure_report(db, job, anchor_lines, is_live=_is_live)
+    if structure is not None and not structure["supported"] and not body.confirm_structure:
+        logger.info("[REANCHOR] structure unconfirmed job=%s pasted=%s reasons=%s",
+                    job_id, pasted_mode, structure["reasons"])
+        return JSONResponse(
+            status_code=409,
+            content={"code": "reference_structure_unconfirmed",
+                     "structure": structure},
+        )
 
     # SNAPSHOT + release (mismo patrón que /transcribe-uploaded, incidente
     # agus77 06/07): la descarga de R2 + el CTC pueden tardar minutos y no
@@ -15640,6 +15726,49 @@ async def reanchor_segments(
             "review_count": 0,
             "locked_kept": 0,
             "revision": initial_revision,
+        }
+
+    # Veredicto ACÚSTICO después de alinear (incidente 2026-09-13): con
+    # CTC_ALIGN_SKIP_ARCS=0 el motor fuerza cada línea sí o sí, así que las
+    # estrofas que el audio no canta salen apretadas en <1 s con score ≈ 0.
+    # Eso nunca es un timing útil: se declina y los segments quedan intactos.
+    from anchor_structural_guard import crammed_guard_enabled, crammed_line_verdict
+    _crammed = crammed_line_verdict(anchored) if crammed_guard_enabled() else {"mismatch": False}
+    if _crammed.get("mismatch"):
+        logger.warning(
+            "[REANCHOR] declined structural_mismatch job=%s crammed=%d run=%d frac=%.2f of %d",
+            job_id, _crammed["crammed_lines"], _crammed["crammed_run"],
+            _crammed["crammed_fraction"], _crammed["scored_lines"],
+        )
+        try:
+            from database import AuditLog, SessionLocal as _SLa
+            db_audit = _SLa()
+            try:
+                db_audit.add(AuditLog(
+                    user_id=current_user["id"],
+                    action="lyrics.reanchor_declined",
+                    detail={
+                        "job_id": job_id,
+                        "reason": "structural_mismatch",
+                        "pasted": pasted_mode,
+                        "confirm_structure": bool(body.confirm_structure),
+                        **{k: v for k, v in _crammed.items() if k != "crammed_indices"},
+                    },
+                ))
+                db_audit.commit()
+            finally:
+                db_audit.close()
+        except Exception as e:  # noqa: BLE001 — audit best-effort
+            logger.warning("[REANCHOR] audit log failed: %s", e)
+        return {
+            "ok": False,
+            "reason": "structural_mismatch",
+            "job_id": job_id,
+            "count": len(prev_segs),
+            "review_count": 0,
+            "locked_kept": 0,
+            "revision": initial_revision,
+            "structural": {k: v for k, v in _crammed.items() if k != "crammed_indices"},
         }
 
     # Merge: los segs re-anclados corresponden 1:1 (en orden) a los segs
