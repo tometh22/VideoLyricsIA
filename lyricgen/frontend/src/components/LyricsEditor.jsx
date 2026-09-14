@@ -2104,7 +2104,19 @@ export default function LyricsEditor({
       const baseRevision = Number.isInteger(saved?.revision)
         ? saved.revision
         : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
-      const res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision));
+      let res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision));
+      // Gate estructural del backend (2026-09-13): el texto editado tiene
+      // estrofas que la transcripción nunca oyó. Igual que en el modal de
+      // pegar, el operador puede confirmar que ES esta versión.
+      if (res && res.code === "reference_structure_unconfirmed" && res.structure) {
+        const confirmed = window.confirm(
+          (t("editor.reanchor_structure_confirm") || "Esta letra no parece coincidir con la grabación ({p} líneas contra {c} transcriptas). Si escuchaste el audio y es esta versión, ¿re-sincronizar igual?")
+            .replace("{p}", String(res.structure.pasted_line_count ?? "?"))
+            .replace("{c}", String(res.structure.current_line_count ?? "?")),
+        );
+        if (!confirmed) return;
+        res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision, { confirm_structure: true }));
+      }
       if (res && res.ok && Array.isArray(res.segments) && res.segments.length) {
         if (Number.isInteger(res.revision)) {
           saveQueueRef.current.prime(transcribeJobId, res.revision);
@@ -2118,6 +2130,14 @@ export default function LyricsEditor({
             .replace("{n}", String(res.count ?? res.segments.length))
             .replace("{m}", String(res.review_count ?? 0)),
           tone: "success",
+        });
+      } else if (res && res.reason === "structural_mismatch") {
+        // Veredicto acústico: las líneas sobrantes salieron apretadas con
+        // score cero. El backend no persistió nada.
+        toast({
+          message: (t("editor.reanchor_structural_mismatch") || "No se re-sincronizó: {n} líneas no suenan en la grabación. El timing quedó como estaba.")
+            .replace("{n}", String(res.structural?.crammed_lines ?? "?")),
+          tone: "error",
         });
       } else {
         toast({
@@ -2191,6 +2211,11 @@ export default function LyricsEditor({
         });
       } else if (res && res.code === "reference_structure_unconfirmed" && res.structure) {
         setPasteStructure(res.structure);
+      } else if (res && res.reason === "structural_mismatch") {
+        setPasteError(
+          (t("editor.reanchor_structural_mismatch") || "No se re-sincronizó: {n} líneas no suenan en la grabación. El timing quedó como estaba.")
+            .replace("{n}", String(res.structural?.crammed_lines ?? "?")),
+        );
       } else {
         setPasteError(t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.");
       }
