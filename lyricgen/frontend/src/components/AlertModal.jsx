@@ -106,6 +106,10 @@ export default function AlertModal({
   if (!open) return null;
 
   const styles = TONE_STYLES[tone] || TONE_STYLES.error;
+  // Policy errors include metadata beside their human message. Keep a raw
+  // HTTP detail from becoming an invalid React child in an older caller.
+  const descriptionContent = description && typeof description === "object"
+    && typeof description.message === "string" ? description.message : description;
 
   return (
     <div
@@ -135,7 +139,7 @@ export default function AlertModal({
             </h3>
             {description && (
               <p className="text-[13px] text-ink-secondary mt-1.5 leading-relaxed whitespace-pre-wrap break-words">
-                {description}
+                {descriptionContent}
               </p>
             )}
           </div>

@@ -62,4 +62,28 @@ describe("trial scene actions", () => {
     await screen.findByText(message);
     expect(screen.queryByText(/\[object Object\]/)).not.toBeInTheDocument();
   });
+
+  it("preserves the server message for a non-YouTube scene conflict", async () => {
+    const message = "Este video no tiene créditos reservados en el trial actual.";
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      detail: { code: "trial_job_not_reserved", message },
+    }), { status: 409 })));
+    const alert = vi.spyOn(window, "alert").mockImplementation(() => {});
+    wrap(<JobDetail job={job} />);
+    fireEvent.click(screen.getByRole("button", { name: "Editar el prompt de esta escena" }));
+    fireEvent.change(screen.getByPlaceholderText(/primer plano de gotas/i), { target: { value: "Una vela amarilla" } });
+    fireEvent.click(screen.getByRole("button", { name: "Regenerar escena" }));
+    await waitFor(() => expect(alert).toHaveBeenCalledWith(message));
+  });
+
+  it("shows expiry on reject as text", async () => {
+    const message = "Finalizaron las 24 horas del trial.";
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      detail: { code: "trial_expired", message },
+    }), { status: 403 })));
+    wrap(<JobDetail job={job} />);
+    fireEvent.click(screen.getByRole("button", { name: "Rechazar", exact: true }));
+    await screen.findByText(message);
+    expect(screen.queryByText(/\[object Object\]/)).not.toBeInTheDocument();
+  });
 });

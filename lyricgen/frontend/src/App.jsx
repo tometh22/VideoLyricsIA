@@ -217,7 +217,7 @@ async function describeFetchError(err, res, t) {
     let detail = "";
     try {
       const body = await res.clone().json();
-      detail = body && body.detail ? `: ${String(body.detail).slice(0, 200)}` : "";
+      detail = body && body.detail ? `: ${(translateBackendError(body.detail, t) || "").slice(0, 200)}` : "";
     } catch {
       try {
         const text = (await res.clone().text()).slice(0, 200).trim();
@@ -229,7 +229,7 @@ async function describeFetchError(err, res, t) {
   // 4xx (other than 408/413) — try to read a server-provided detail.
   try {
     const body = await res.clone().json();
-    if (body && body.detail) return String(body.detail);
+    if (body && body.detail) return translateBackendError(body.detail, t);
   } catch {}
   return t("batch.error_http", { status: res.status, detail: "" });
 }
@@ -5065,7 +5065,7 @@ export default function App() {
         });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
-          failed.push({ jobId, reason: data.detail || `Error ${res.status}` });
+          failed.push({ jobId, reason: translateBackendError(data.detail, t) || `Error ${res.status}` });
           continue;
         }
         setJobs((prev) =>
@@ -5093,7 +5093,7 @@ export default function App() {
         const data = await res.json().catch(() => ({}));
         alert({
           title: "No se pudo eliminar el video",
-          description: data.detail || "Probá de nuevo en un momento.",
+          description: translateBackendError(data.detail, t) || "Probá de nuevo en un momento.",
           tone: "error",
         });
         return;
@@ -5121,7 +5121,7 @@ export default function App() {
         const data = await res.json().catch(() => ({}));
         alert({
           title: "No se pudieron eliminar los videos",
-          description: data.detail || "Probá de nuevo en un momento.",
+          description: translateBackendError(data.detail, t) || "Probá de nuevo en un momento.",
           tone: "error",
         });
         return;

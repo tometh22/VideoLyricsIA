@@ -158,7 +158,7 @@ function EditableMetadataField({
         body: JSON.stringify(body),
       });
       if (res.status === 409) {
-        const detail = (await res.json()).detail || {};
+        const detail = (await res.clone().json()).detail || {};
         if (detail.code === "youtube_already_published") {
           // Same UX as the lyrics flow's YouTube drift confirm.
           if (window.confirm(
@@ -1680,7 +1680,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || `${t("detail.reject_error_description")} (${res.status})`);
+        throw new Error(translateBackendError(data.detail, t) || `${t("detail.reject_error_description")} (${res.status})`);
       }
       // Refresh the job state for any listing in the parent so the row
       // shows "rejected", then go back. Staying on the detail screen
