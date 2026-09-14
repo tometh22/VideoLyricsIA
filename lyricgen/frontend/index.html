@@ -148,7 +148,8 @@
     <link rel="preconnect" href="https://api-staging-9b82.up.railway.app" crossorigin>
     <link rel="dns-prefetch" href="https://api-staging-9b82.up.railway.app">
   </head>
-  <body class="min-h-screen">
+  <!-- Support browsing assistance must exclude app content AND body portals. -->
+  <body class="min-h-screen" data-browsing-ignore>
     <div id="root">
       <!-- Crawlable first-paint shell. React replaces it on mount; bots and
            no-JS clients still receive an accurate, factual product summary. -->
