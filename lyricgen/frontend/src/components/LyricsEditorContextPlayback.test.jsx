@@ -16,9 +16,10 @@ const lines = [
 const reply = (body, status = 200) => new Response(JSON.stringify(body), { status });
 let key;
 
-function mount({ audioUrl = "https://example.test/synthetic.wav", rejectTelemetry = false } = {}) {
+function mount({ audioUrl = "https://example.test/synthetic.wav", rejectTelemetry = false, deferDocument = false } = {}) {
   key = `context-playback-${Math.random()}`;
   const request = vi.fn(async (path, options = {}) => {
+    if (deferDocument && path === `/editor/${key}` && !options.method) return new Promise(() => {});
     if (path === `/editor/${key}` && !options.method) return reply({
       job_id: key, revision: 4, segments: lines, original_segments: lines,
       lock: { active: false },
@@ -105,4 +106,12 @@ it("reports an HTTP-200 telemetry rejection once without preventing playback", a
   fireEvent.click(screen.getByRole("button", { name: "Escuchar 2 s antes de la línea 1" }));
   expect(container.querySelector("audio").currentTime).toBe(0);
   expect(captureHandledError).toHaveBeenCalledTimes(1);
+});
+
+
+it("does not invent revision zero while the durable document is still loading", async () => {
+  const { request } = mount({ deferDocument: true });
+  fireEvent.click(await screen.findByRole("button", { name: "Escuchar 2 s antes de la línea 1" }));
+  await waitFor(() => expect(events(request, "editor_line_context_played")).toHaveLength(1));
+  expect(events(request, "editor_line_context_played")[0].properties).not.toHaveProperty("revision");
 });
