@@ -8,6 +8,7 @@ import HelpTip from "./HelpCenter/HelpTip";
 import ContentValidationToggle, { isUniversalAccount } from "./ContentValidationToggle";
 import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
+import { DEFAULT_BG_VERBATIM } from "../lib/reviewResume";
 import { CONCEPT_CODES, EFFECT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
 import { canCreateArtTrack } from "../lib/artTrackAccess";
@@ -380,7 +381,7 @@ export default function UploadZone({
     // overrides genre/concept/lyrics. bgVerbatim TRUE by default = use the
     // operator's text as-is (people expect their prompt used, not rewritten);
     // the "Mejorar con IA" toggle opts INTO a Gemini rewrite (bgVerbatim=false).
-    backgroundHint: "", bgVerbatim: true,
+    backgroundHint: "", bgVerbatim: DEFAULT_BG_VERBATIM,
     // Title card customization (Full Rotor v1). Defaults = historical look:
     // auto layout, no size change, artist ExtraBold, song = lyric font.
     titleTemplate: "auto", titleSize: "1.0", titleArtistFont: "", titleSongFont: "",

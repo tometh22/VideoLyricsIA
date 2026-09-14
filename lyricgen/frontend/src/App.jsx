@@ -65,6 +65,7 @@ import TranscribingProgress from "./components/TranscribingProgress";
 import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
 import GiftCreditsBanner from "./components/GiftCreditsBanner";
 import ServiceStatusBanner from "./components/ServiceStatusBanner";
+import TrialUsageSummary from "./components/TrialUsageSummary";
 import { useAlert } from "./components/AlertProvider";
 import { ACTIVE_STATUSES, isTerminalStatus } from "./lib/jobStatus";
 import {
@@ -216,7 +217,7 @@ async function describeFetchError(err, res, t) {
     let detail = "";
     try {
       const body = await res.clone().json();
-      detail = body && body.detail ? `: ${String(body.detail).slice(0, 200)}` : "";
+      detail = body && body.detail ? `: ${(translateBackendError(body.detail, t) || "").slice(0, 200)}` : "";
     } catch {
       try {
         const text = (await res.clone().text()).slice(0, 200).trim();
@@ -228,7 +229,7 @@ async function describeFetchError(err, res, t) {
   // 4xx (other than 408/413) — try to read a server-provided detail.
   try {
     const body = await res.clone().json();
-    if (body && body.detail) return String(body.detail);
+    if (body && body.detail) return translateBackendError(body.detail, t);
   } catch {}
   return t("batch.error_http", { status: res.status, detail: "" });
 }
@@ -524,12 +525,23 @@ function UpgradeNudge({ user }) {
 
   useEffect(() => {
     let alive = true;
-    authFetch(`${API}/usage`)
+    const refresh = () => authFetch(`${API}/usage`)
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (alive && d) setUsage(d); })
-      .catch(() => { /* degrade silently — never block the shell on /usage */ });
-    return () => { alive = false; };
-  }, [user?.plan]);
+      .then((d) => { if (alive) setUsage(d); })
+      .catch(() => { if (alive) setUsage(null); });
+    refresh();
+    const interval = setInterval(refresh, 60_000);
+    window.addEventListener("focus", refresh);
+    window.addEventListener("genly:usage-changed", refresh);
+    return () => {
+      alive = false;
+      clearInterval(interval);
+      window.removeEventListener("focus", refresh);
+      window.removeEventListener("genly:usage-changed", refresh);
+    };
+  }, [user?.id, user?.plan]);
+
+  if (usage?.trial) return <div className="relative z-10 px-4 md:px-8 pt-4"><div className="px-4 py-3 rounded-card bg-brand/10 ring-1 ring-brand/25"><TrialUsageSummary trial={usage.trial} /></div></div>;
 
   if (dismissed) return null;
   if (user?.billing_status === "past_due") return null;   // PastDueBanner owns this
@@ -2866,6 +2878,11 @@ export default function App() {
   }, [token]);
 
   const pollJob = useCallback((jobId) => {
+    // Submission changes a transcribed row to active (or creates a new row).
+    // The root poller only knows history rows already marked active, so waiting
+    // for completion to refresh leaves the topbar at zero throughout rendering.
+    void fetchHistory();
+    window.dispatchEvent(new Event("genly:usage-changed"));
     // Use SSE when available; fall back to 3 s polling for proxies that buffer
     // text/event-stream (some corporate HTTPS interceptors).
     // Terminal set is the canonical one (src/lib/jobStatus.js), mirroring the
@@ -5048,7 +5065,7 @@ export default function App() {
         });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
-          failed.push({ jobId, reason: data.detail || `Error ${res.status}` });
+          failed.push({ jobId, reason: translateBackendError(data.detail, t) || `Error ${res.status}` });
           continue;
         }
         setJobs((prev) =>
@@ -5076,7 +5093,7 @@ export default function App() {
         const data = await res.json().catch(() => ({}));
         alert({
           title: "No se pudo eliminar el video",
-          description: data.detail || "Probá de nuevo en un momento.",
+          description: translateBackendError(data.detail, t) || "Probá de nuevo en un momento.",
           tone: "error",
         });
         return;
@@ -5104,7 +5121,7 @@ export default function App() {
         const data = await res.json().catch(() => ({}));
         alert({
           title: "No se pudieron eliminar los videos",
-          description: data.detail || "Probá de nuevo en un momento.",
+          description: translateBackendError(data.detail, t) || "Probá de nuevo en un momento.",
           tone: "error",
         });
         return;
@@ -5593,7 +5610,7 @@ export default function App() {
         // render_params → la semántica del diff no cambia. Auditado contra los
         // 60 consumidores de batchDefaults: no hay camino a un POST sin click
         // explícito del operador.
-        editSeed={(_wizardOnExistingJob || currentReview?.campaignId) ? {
+        editSeed={(_wizardOnExistingJob || currentReview?.transcribeJobId) ? {
           jobId: currentReview.editingJobId || currentReview.parentJobId || currentReview.transcribeJobId,
           genre: currentReview.genre,
           concept: currentReview.concept,

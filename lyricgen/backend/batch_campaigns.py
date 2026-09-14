@@ -169,6 +169,44 @@ def _require_manager(campaign: BatchCampaign, user: dict) -> None:
         raise HTTPException(status_code=403, detail="Only the campaign owner can change it.")
 
 
+def _has_trial_batch_owner(db: Session, *owner_ids: int) -> bool:
+    """Resolve current billing groups, including for tokens issued before opt-in."""
+    from trial_policy import private_only
+    if private_only():
+        return True
+    if not os.environ.get("TRIAL_BILLING_GROUPS", "").strip():
+        return False
+    from trial_policy import configured_group
+
+    return any(
+        configured_group(group)
+        for (group,) in db.query(User.billing_group).filter(
+            User.id.in_(owner_ids),
+        ).all()
+    )
+
+
+def _require_non_trial_batch_owner(db: Session, *owner_ids: int) -> None:
+    if _has_trial_batch_owner(db, *owner_ids):
+        raise HTTPException(status_code=403, detail={
+            "code": "trial_feature_unavailable",
+            "message": "El trial no incluye procesamiento por lotes.",
+        })
+
+
+def _require_non_trial_upload_session(db: Session, session: BatchUploadSession) -> None:
+    from trial_policy import private_only
+    if private_only():
+        _require_non_trial_batch_owner(db, session.created_by)
+    if not os.environ.get("TRIAL_BILLING_GROUPS", "").strip():
+        return
+    campaign_owner = db.query(BatchCampaign.created_by).filter(
+        BatchCampaign.id == session.campaign_id,
+    ).scalar()
+    # A platform admin can issue a token for another owner's campaign.
+    _require_non_trial_batch_owner(db, session.created_by, campaign_owner)
+
+
 def _hash_secret(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -737,6 +775,7 @@ def create_upload_session(
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
     _require_manager(campaign, current_user)
+    _require_non_trial_batch_owner(db, campaign.created_by, current_user["id"])
     # 48 bits, short enough to type but impractical to brute-force during
     # the ten-minute exchange window. The account JWT never leaves the tab.
     code = secrets.token_hex(6).upper()
@@ -772,6 +811,7 @@ def exchange_upload_session(body: PairExchange, db: Session = Depends(get_db)):
         or session.claimed_at is not None
     ):
         raise HTTPException(status_code=401, detail="Pairing code is invalid or expired.")
+    _require_non_trial_upload_session(db, session)
     token = secrets.token_urlsafe(32)
     session.token_hash = _hash_secret(token)
     session.token_expires_at = now + timedelta(hours=UPLOAD_TOKEN_HOURS)
@@ -784,6 +824,8 @@ def _upload_session_or_401(
     db: Session,
     token: str | None,
     campaign_id: str | None = None,
+    *,
+    read_only: bool = False,
 ) -> BatchUploadSession:
     if not token:
         raise HTTPException(status_code=401, detail="Missing batch upload token.")
@@ -798,6 +840,8 @@ def _upload_session_or_401(
         or (campaign_id and session.campaign_id != campaign_id)
     ):
         raise HTTPException(status_code=401, detail="Batch upload token is invalid or expired.")
+    if not read_only:
+        _require_non_trial_upload_session(db, session)
     return session
 
 
@@ -807,7 +851,7 @@ def inspect_upload_session(
     db: Session = Depends(get_db),
 ):
     """Read-only runner preflight and forced-expiry recovery target."""
-    session = _upload_session_or_401(db, x_batch_upload_token)
+    session = _upload_session_or_401(db, x_batch_upload_token, read_only=True)
     return {
         "campaign_id": session.campaign_id,
         "tenant_id": session.tenant_id,
@@ -2315,6 +2359,7 @@ def _create_stage_event(
     *,
     pipeline_stage: str,
 ) -> str:
+    _require_non_trial_batch_owner(db, campaign.created_by)
     from transactional_outbox import create_transcription_outbox_event
 
     job_id = create_job(
@@ -2364,6 +2409,8 @@ def _queue_full_stage_for_separated(
     *,
     room: int,
 ) -> list[str]:
+    if _has_trial_batch_owner(db, campaign.created_by):
+        return []
     from transactional_outbox import create_transcription_outbox_event
 
     pairs = db.query(Job, BatchCampaignItem).join(
@@ -2410,6 +2457,8 @@ def _queue_full_stage_for_separated(
 
 
 def _promote_campaign(db: Session, campaign: BatchCampaign) -> list[str]:
+    if _has_trial_batch_owner(db, campaign.created_by):
+        return []
     # Art tracks use the audio+cover path and must never enter the lyric
     # transcription feeder. Their renderer is promoted by the dedicated
     # reconciler in art_track_campaigns.py.
@@ -2520,6 +2569,8 @@ def reconcile_batch_campaigns() -> dict[str, int]:
             BatchCampaign.status == "active",
         ).order_by(BatchCampaign.created_at.asc()).all()
         for campaign in campaigns:
+            if _has_trial_batch_owner(db, campaign.created_by):
+                continue
             event_ids.extend(_promote_campaign(db, campaign))
             if (campaign.kind or "lyric_video") == "art_track":
                 try:
@@ -2560,6 +2611,7 @@ def enforce_render_capacity(db: Session, job: Job) -> None:
     ).with_for_update().first()
     if campaign is None or campaign.status != "active":
         raise HTTPException(status_code=409, detail="Campaign is not active.")
+    _require_non_trial_batch_owner(db, campaign.created_by, job.user_id)
     final_review = db.query(func.count(Job.id)).filter(
         Job.tenant_id == campaign.tenant_id,
         Job.workload_class == "batch",
@@ -2620,6 +2672,7 @@ def retry_campaign_item(
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
     _require_manager(campaign, current_user)
+    _require_non_trial_batch_owner(db, campaign.created_by)
     if campaign.status != "active":
         raise HTTPException(status_code=409, detail="Campaign is not active.")
     item = db.query(BatchCampaignItem).filter(

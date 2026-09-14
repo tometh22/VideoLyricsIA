@@ -110,6 +110,47 @@ def sections_from_plan(plan: dict) -> list["Section"]:
     return [Section.from_dict(s) for s in (plan or {}).get("sections", [])]
 
 
+def _scene_requires_review(scene: dict) -> bool:
+    return bool(
+        scene.get("status") in {"failed", "degraded"}
+        or scene.get("degraded")
+        or scene.get("last_regeneration_error")
+        or (scene.get("validation") or {}).get("substituted_from")
+    )
+
+
+def scene_plan_requires_review(plan: dict | None) -> bool:
+    """Approval gate for current and legacy degraded storyboards; no I/O.
+
+    Content-policy validation of a substitute does not establish that it
+    depicts the requested scene. Retain that distinction across later edits.
+    """
+    if not plan:
+        return False
+    return bool(
+        plan.get("review_required")
+        or (plan.get("degraded") or {}).get("failed")
+        or plan.get("generation_error")
+        or any(_scene_requires_review(s) for s in plan.get("scenes", []))
+    )
+
+
+def refresh_scene_plan_review(plan: dict) -> None:
+    """Recompute durable review metadata after clip generation/reuse."""
+    scenes = plan.get("scenes", [])
+    failed = sum(_scene_requires_review(s) for s in scenes)
+    plan["degraded"] = {"failed": failed, "total": len(scenes)}
+    plan["review_required"] = bool(failed or plan.get("generation_error"))
+
+
+def mark_scene_regeneration_failed(plan: dict, key: str, error: Exception) -> None:
+    """Keep the known-good scene identity while making a failed reroll visible."""
+    for scene in plan.get("scenes", []):
+        if scene.get("recurrence_key") == key:
+            scene["last_regeneration_error"] = f"{type(error).__name__}: {error}"[:300]
+    refresh_scene_plan_review(plan)
+
+
 # ── Normalización de texto para detectar repeticiones de coro ──────────────
 _WORD_RE = re.compile(r"[^\wáéíóúñü\s]", re.UNICODE)
 
@@ -537,6 +578,7 @@ def build_scene_plan(
     song_title: str = "",
     style: str = "",
     operator_movement: str = "",
+    creative_mode: str = "auto",
 ) -> dict:
     """Construye el storyboard: una escena por recurrence_key única.
 
@@ -564,12 +606,16 @@ def build_scene_plan(
     _forced_movement = _om if _om in ("estatico", "sutil", "animado", "foto-parallax") else None
     scenes: list[dict] = []
     seen: dict[str, dict] = {}
-    for sec in sections:
+    for section_index, sec in enumerate(sections):
         key = sec.recurrence_key
         if key in seen:
             continue
         movement = _forced_movement or energy_to_movement(sec.energy)
         hint = _scene_hint(bible_text, sec)
+        narrative_context = ""
+        if creative_mode == "prompt_improved":
+            narrative_context = _ordered_scene_context(sections, section_index)
+            hint = ". ".join(part for part in (hint, narrative_context) if part)
         try:
             result = prompt_fn(
                 background_hint=hint,
@@ -594,6 +640,8 @@ def build_scene_plan(
             "clip_cache_key": None,
             "status": "planned",
         }
+        if narrative_context:
+            scene["narrative_context"] = narrative_context
         seen[key] = scene
         scenes.append(scene)
 
@@ -643,6 +691,41 @@ def _scene_hint(bible_text: str, sec: Section) -> str:
     }.get(sec.type, "")
     bits = [b for b in (bible_text, beat) if b]
     return ". ".join(bits)
+
+
+def _ordered_scene_context(sections: list[Section], index: int) -> str:
+    """Allocate chronological intent without parsing or rewriting user prose.
+
+    This is guidance for the existing improved-mode planner, not a promise of
+    exact beats or identity. Recurrent keys still reuse a single paid clip.
+    Literal mode never receives this additional direction.
+    """
+    sec = sections[index]
+    positions = [i + 1 for i, s in enumerate(sections)
+                 if s.recurrence_key == sec.recurrence_key]
+    order = "; ".join(
+        f"{i + 1}: {s.recurrence_key} ({s.type}, {s.start:g}-{s.end:g}s)"
+        for i, s in enumerate(sections)
+    )
+    if len(positions) > 1:
+        role = "a recurring visual motif suitable for each listed occurrence"
+    elif len(sections) == 1:
+        role = "one representative moment from the requested story"
+    elif index == len(sections) - 1:
+        role = "the closing beat / destination, after the preceding action"
+    elif index == 0:
+        role = "the opening beat / departure, before the later action"
+    else:
+        role = "the intervening action, progressing from the opening toward the ending"
+    return (
+        f"ORDERED STORY CONTEXT: timeline [{order}]. "
+        f"Generate only scene {index + 1}/{len(sections)} ({sec.recurrence_key}); "
+        f"its role is {role}. Allocate the relevant part of the operator's "
+        "story to this scene; do not replay the entire story in every clip. "
+        "Preserve the explicitly requested subjects, visual style and identifying "
+        "details. Do not introduce new story events. "
+        f"This clip is used at timeline positions {positions}."
+    )
 
 
 def stitch_timeline(

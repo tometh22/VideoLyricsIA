@@ -86,6 +86,10 @@ export function translateBackendError(raw, t) {
       .map((e) => (e && typeof e === "object" && e.msg) ? e.msg : String(e))
       .join("; ");
   } else if (typeof raw === "object") {
+    // Trial and scene-completeness errors carry a human message alongside
+    // machine-readable policy data. Never display the whole policy object.
+    if (typeof raw.message === "string" && raw.message) return raw.message;
+    if (raw.detail && typeof raw.detail === "object") return translateBackendError(raw.detail, t);
     str = raw.msg || raw.detail || JSON.stringify(raw);
   } else {
     str = String(raw);

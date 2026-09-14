@@ -23,7 +23,17 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
   );
   if (!report) return null;
 
+  const observe = report.mode === "observe";
+  const multiScene = job.render_params?.enable_scenes === true || !!job.scene_plan?.scenes?.length;
+  // Only the unsigned checklist criterion is inapplicable in observe mode.
+  // A detected scene failure or an enforced delivery requirement stays visible.
+  const inapplicable = (issue) => observe && multiScene
+    && issue.manual_verification_required && issue.code === "UMG_SCENE_CHANGE";
+  const issues = report.issues || [];
+  const detectedFailures = issues.filter((issue) => issue.severity === "FAIL" && !issue.manual_verification_required).length;
+  const pendingChecks = issues.filter((issue) => issue.manual_verification_required && issue.status === "OPEN" && !inapplicable(issue)).length;
   const state = report.status === "STALE" ? "STALE" : (report.decision || "PASS");
+  const displayState = observe && state === "BLOCK" ? "REVIEW" : state;
   const updateDecision = async (issue, decision) => {
     setBusy(issue.issue_id);
     setError("");
@@ -87,28 +97,31 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
           <h3 className="text-sm font-semibold">Preflight de entrega</h3>
           <p className="text-xs text-ink-secondary mt-1">Control final tipo sello sobre el video renderizado.</p>
         </div>
-        <span className={`px-2.5 py-1 rounded-full text-[11px] font-semibold ring-1 ${TONES[state] || TONES.STALE}`}>
-          {state === "PASS" ? "Sin hallazgos" : state === "REVIEW" ? "Revisar" : state === "BLOCK" ? "Bloqueado" : "Desactualizado"}
+        <span className={`px-2.5 py-1 rounded-full text-[11px] font-semibold ring-1 ${TONES[displayState] || TONES.STALE}`}>
+          {report.status === "FAILED" ? "Falló el análisis" : displayState === "PASS" ? "Sin hallazgos" : displayState === "REVIEW" ? (observe ? "Revisar · no bloquea" : "Revisar") : displayState === "BLOCK" ? "Bloqueado" : "Desactualizado"}
         </span>
       </div>
 
-      <div className="grid grid-cols-3 gap-2 mb-4 text-center">
-        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.summary?.fail_count || 0}</div><div className="text-[10px] text-ink-secondary">críticos</div></div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4 text-center">
+        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{detectedFailures}</div><div className="text-[10px] text-ink-secondary">fallos detectados</div></div>
+        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{pendingChecks}</div><div className="text-[10px] text-ink-secondary">checks por revisar</div></div>
         <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.summary?.warn_count || 0}</div><div className="text-[10px] text-ink-secondary">avisos</div></div>
         <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.summary?.open_count || 0}</div><div className="text-[10px] text-ink-secondary">abiertos</div></div>
       </div>
 
       {report.status === "STALE" && <p className="text-xs text-amber-200 mb-3">Se está generando o falta analizar el render más reciente.</p>}
       <div className="space-y-2">
-        {(report.issues || []).map((issue) => (
+        {issues.map((issue) => (
           <div key={issue.issue_id} className="rounded-xl bg-white/[0.03] ring-1 ring-white/[0.06] p-3">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className={issue.severity === "FAIL" ? "text-red-300 text-[10px] font-bold" : "text-amber-200 text-[10px] font-bold"}>{issue.severity}</span>
-                  <p className="text-xs font-medium">{issue.summary}</p>
+                  <span className={issue.severity === "FAIL" && !issue.manual_verification_required ? "text-red-300 text-[10px] font-bold" : "text-amber-200 text-[10px] font-bold"}>{inapplicable(issue) ? "No aplica" : issue.manual_verification_required ? "Revisión manual" : issue.severity}</span>
+                  <p className="text-xs font-medium">{inapplicable(issue) ? "Cambios de escena previstos" : issue.summary}</p>
                 </div>
-                {issue.description && <p className="text-[11px] text-ink-secondary mt-1">{issue.description}</p>}
+                {inapplicable(issue)
+                  ? <p className="text-[11px] text-ink-secondary mt-1">Multi-escena incluye cortes entre escenas. El check de fondo continuo no aplica en este modo; revisá la continuidad visual y narrativa del resultado.</p>
+                  : issue.description && <p className="text-[11px] text-ink-secondary mt-1">{issue.description}</p>}
                 <div className="flex flex-wrap gap-1.5 mt-2">
                   {(issue.seconds || []).slice(0, 8).map((seconds, index) => (
                     <button key={`${seconds}-${index}`} onClick={() => onSeek?.(Number(seconds))} className="text-[10px] px-2 py-1 rounded-lg bg-brand/10 text-brand-light hover:bg-brand/20">
@@ -117,7 +130,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
                   ))}
                 </div>
               </div>
-              {issue.status === "OPEN" ? (
+              {inapplicable(issue) ? null : issue.status === "OPEN" ? (
                 <button disabled={busy === issue.issue_id} onClick={() => updateDecision(issue, issue.manual_verification_required ? "resolved_manual" : "acknowledged")} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50">{issue.manual_verification_required ? "Firmar check" : "Revisado"}</button>
               ) : <span className="text-[10px] text-emerald-300">{issue.status}</span>}
             </div>

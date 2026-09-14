@@ -1485,6 +1485,12 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
     user = authenticate_user(db, body.username, body.password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    from trial_policy import require_invited
+    try:
+        require_invited(user.to_dict())
+    except HTTPException as exc:
+        # Login historically returns a string detail, consumed by LoginPage.
+        raise HTTPException(exc.status_code, detail=exc.detail["message"]) from exc
     token = start_login_session(db, user, request)
 
     # Audit
@@ -1565,6 +1571,9 @@ async def create_lead(body: CreateLeadRequest, request: Request, db: Session = D
 @limiter.limit("5/minute")
 async def register(body: RegisterRequest, request: Request, db: Session = Depends(get_db)):
     """Public self-registration."""
+    from trial_policy import private_only
+    if private_only():
+        raise HTTPException(403, detail="Este trial es privado. Usá la cuenta invitada o contactá al equipo de Genly.")
     if len(body.username) < 3:
         raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
     try:
@@ -2440,6 +2449,12 @@ def usage(current_user: dict = Depends(get_current_user), db: Session = Depends(
     the cache this endpoint paid a fresh DB SELECT + 150 ms LATAM↔
     Railway round-trip on EVERY mount of the sidebar usage badge.
     """
+    from trial_policy import applies
+    if applies(current_user):
+        # Exact expiry and shared reservations must never use a per-user TTL.
+        return get_plan_usage(db, current_user["id"], current_user["tenant_id"],
+                              current_user.get("plan", "free"),
+                              billing_group=current_user.get("billing_group"))
     from cache import get_or_set_json, usage_key
     key = usage_key(current_user["tenant_id"], current_user["id"])
     return get_or_set_json(
@@ -2450,6 +2465,17 @@ def usage(current_user: dict = Depends(get_current_user), db: Session = Depends(
             billing_group=current_user.get("billing_group"),
         ),
     )
+
+
+@app.post("/admin/trials/{billing_group}/activate")
+def activate_trial(billing_group: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Explicit start: nine shared credits / 24 hours. Idempotent, no renewal."""
+    from trial_policy import activate
+    if current_user.get("role") != "admin":
+        raise HTTPException(403, detail="Admin access required")
+    result = activate(db, billing_group, current_user["id"])
+    db.commit()
+    return {"trial": result}
 
 
 @app.get("/plans")
@@ -3061,6 +3087,10 @@ def _enforce_plan_quota(
     tenant_id = current_user["tenant_id"]
     if lock_scope:
         _lock_quota_scope(db, current_user)
+    from trial_policy import applies, require_budget
+    if applies(current_user):
+        require_budget(db, current_user, credits_needed)
+        return
     usage = get_plan_usage(db, current_user["id"], tenant_id, plan,
                            billing_group=current_user.get("billing_group"))
     if send_alert and plan != "unlimited" and usage["percent"] >= 80:
@@ -3110,6 +3140,13 @@ def _commit_pipeline_publication(
     pipeline_kwargs.setdefault(
         "workload_class", getattr(job, "workload_class", "interactive") or "interactive",
     )
+
+    from trial_policy import reserve
+    owner = db.query(User).filter(User.id == job.user_id).first()
+    if owner is not None:
+        reserve(db, owner.to_dict(), job.job_id,
+                scenes_credit_cost() if pipeline_kwargs.get("enable_scenes") else 1,
+                purpose=purpose)
 
     event = create_pipeline_outbox_event(
         db,
@@ -4717,6 +4754,8 @@ async def transcribe_uploaded(
                     status_code=409,
                     detail="La letra ya tiene ediciones guardadas; creá una nueva transcripción para no sobrescribirlas.",
                 )
+            from trial_policy import admit_transcription
+            admit_transcription(_db2, current_user, job_id)
             _row2.status = "transcribing_queued"
             # Publish a frontend-recognised stage before enqueue. The wizard
             # used to sit at an unexplained 0% throughout the API-side R2
@@ -4801,6 +4840,8 @@ async def transcribe_uploaded(
         try:
             _row3 = get_job_model(_db3, job_id)
             if _row3 is not None:
+                from trial_policy import admit_transcription
+                admit_transcription(_db3, current_user, job_id)
                 # The job is not editor-ready until the finalizer commits its
                 # immutable pre-human snapshot and family hypotheses.
                 _row3.status = "transcribing"
@@ -5580,6 +5621,10 @@ async def transcribe_endpoint(
     # because we buffered the full payload in RAM.
     await _stream_upload_to_disk(file, audio_path)
     _validate_audio_file_on_disk(safe_audio_name, audio_path)
+
+    from trial_policy import admit_transcription
+    admit_transcription(db, current_user, job_id)
+    db.commit()
 
     # Cross-replica handoff. When the API and worker run in separate
     # containers (Railway production) the file written above is invisible
@@ -12681,13 +12726,19 @@ async def approve_job(
     approval_credits = (
         scenes_credit_cost() if scene_plan.get("scenes") is not None else 1
     )
-    _enforce_plan_quota(
-        db,
-        billing_identity,
-        credits_needed=approval_credits,
-        lock_scope=False,
-        send_alert=False,
-    )
+    from trial_policy import applies, require_open, latest_grant, reservations
+    if applies(billing_identity):
+        require_open(db, billing_identity)
+        if reservations(db, latest_grant(db, billing_identity["billing_group"])).get(job_id, 0) < approval_credits:
+            raise HTTPException(409, detail={"code": "trial_job_not_reserved", "message": "Este video no pertenece al cupo activo del trial."})
+        from scenes import scene_plan_requires_review
+        if scene_plan_requires_review(scene_plan):
+            raise HTTPException(409, detail={"code": "scenes_incomplete", "message": "Hay escenas sustituidas o fallidas. Regeneralas y revisá el resultado antes de aprobar."})
+    else:
+        _enforce_plan_quota(
+            db, billing_identity, credits_needed=approval_credits,
+            lock_scope=False, send_alert=False,
+        )
 
     is_cross_tenant_admin = (
         current_user.get("role") == "admin"
@@ -15756,6 +15807,9 @@ async def request_edit(
     if not _probe:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    from trial_policy import require_job_reserved
+    require_job_reserved(job_id)
+
     # A lost 202 can be retried after the worker has already consumed the
     # outbox event and moved the job back to pending_review/done.  In that
     # terminal window there is no ``editing`` fast-path to catch the retry,
@@ -16767,6 +16821,7 @@ def _scene_reroll_max() -> int:
 async def regenerate_scene(
     job_id: str,
     recurrence_key: str,
+    background_tasks: BackgroundTasks,
     body: RegenerateSceneRequest | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -16796,6 +16851,8 @@ async def regenerate_scene(
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    from trial_policy import require_job_reserved
+    require_job_reserved(job_id)
     if getattr(job, "workload_class", "interactive") == "batch":
         from batch_campaigns import enforce_render_capacity
         enforce_render_capacity(db, job)
@@ -16855,7 +16912,8 @@ async def regenerate_scene(
     # transitorio lockeaban la escena para siempre (audit escrito por intento).
     _target = next((s for s in plan["scenes"] if s.get("recurrence_key") == recurrence_key), None)
     _scene_succeeded = (_target or {}).get("status") != "failed"
-    if not _is_admin and _scene_succeeded and _prior_rerolls >= _reroll_cap:
+    from trial_policy import applies as _is_trial
+    if not _is_admin and (_scene_succeeded or _is_trial(current_user)) and _prior_rerolls >= _reroll_cap:
         raise HTTPException(
             status_code=400,
             detail=f"Llegaste al máximo de regeneraciones de esta escena ({_reroll_cap}). Editá el prompt o aprobá el job.",
@@ -16895,6 +16953,30 @@ async def regenerate_scene(
         detail={"job_id": job_id, "recurrence_key": recurrence_key,
                 "edit_params": edit_params, "reroll_index": _prior_rerolls + 1},
     ))
+    if _is_trial(current_user):
+        from transactional_outbox import create_outbox_event
+        event = create_outbox_event(
+            db, job_id=job_id, event_type="edit.enqueue",
+            dedupe_key=f"scene:{job_id}:{recurrence_key}:{_prior_rerolls + 1}",
+            payload={
+                "edit_type": "scene", "edit_params": edit_params,
+                "plan": current_user.get("plan", "100"),
+                "tenant_id": current_user.get("tenant_id", ""),
+                "workload_class": getattr(job, "workload_class", "interactive") or "interactive",
+            },
+        )
+        db.commit()
+        background_tasks.add_task(
+            _dispatch_outbox_after_response, event.id, edit_publisher=enqueue_edit,
+        )
+        return _accepted_job_response(
+            job_id=job_id, status="editing", status_url=f"/status/{job_id}",
+            event_id=event.id, queue_pending=True,
+            extra={"ok": True, "recurrence_key": recurrence_key,
+                   "edit_count": job.edit_count or 0,
+                   "edits_remaining": max(0, _MAX_EDITS - (job.edit_count or 0)),
+                   "edit_limit_exempt": _is_admin, "reroll_count": _prior_rerolls + 1},
+        )
     db.commit()
 
     try:

@@ -3,6 +3,21 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.18-trial.1] - 2026-09-14
+
+### Fixed
+
+- Trial-only release from the frozen Universal snapshot; no staging/production promotion.
+- Preserve contrast, lyric colors and literal prompt selections across review, rendering and edits.
+- Explicitly activated, opt-in 24-hour trials with nine shared credits, atomic render reservations,
+  finite retries, no free-plan credit leakage and uncached shared trial usage. Existing grants
+  do not activate a trial; activation is an idempotent admin operation.
+- Private trial mode excludes public signup, non-invited accounts and legacy batch tokens.
+- Keep degraded scenes visible and block trial delivery until failed/substituted scenes are repaired.
+  Preserve successful clips on failed regeneration; bound retries of confirmed provider failures.
+- Clarify advisory preflight, scene regeneration and trial-state messages; retain narrative context
+  in improved-prompt planning without altering literal prompts or guaranteeing generative identity.
+
 ## [1.1.18] - 2026-09-11
 
 ### Added
