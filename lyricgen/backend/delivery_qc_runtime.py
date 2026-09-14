@@ -31,12 +31,55 @@ MANDATORY_REVIEW_CHECKS = (
     ("UMG_IMAGE_NOT_STRETCHED", "Imagen sin estirar", "Confirmar proporción nativa/reencuadre sin deformación ni estiramiento."),
 )
 
+# A finding's severity describes its risk; its result describes what the
+# detector actually established.  Keeping both lets the UI distinguish an
+# unsigned human check from an objectively failed render.
+CHECK_DEFINITIONS = (
+    ("media_container", "Archivo de video válido", "ffprobe", {
+        "MEDIA_ASSET_MISSING", "MEDIA_PROBE_FAILED", "MEDIA_VIDEO_STREAM_MISSING",
+    }),
+    ("media_audio", "Pista de audio presente", "ffprobe", {"MEDIA_AUDIO_STREAM_MISSING"}),
+    ("media_duration", "Duración consistente", "ffprobe", {
+        "MEDIA_DURATION_INVALID", "MEDIA_DURATION_MISMATCH",
+    }),
+    ("media_delivery_spec", "Perfil técnico de entrega", "ffprobe", {
+        "MEDIA_WIDTH_MISMATCH", "MEDIA_HEIGHT_MISMATCH", "MEDIA_CODEC_MISMATCH",
+        "MEDIA_PIX_FMT_MISMATCH", "MEDIA_FPS_MISMATCH",
+    }),
+    ("metadata_title", "Título coincide con metadata", "metadata_vs_render_manifest", {
+        "METADATA_TITLE_MISMATCH", "OCR_TITLE_MISMATCH",
+    }),
+    ("metadata_artist", "Artista coincide con metadata", "metadata_vs_render_manifest", {
+        "METADATA_ARTIST_MISMATCH", "OCR_ARTIST_MISMATCH",
+    }),
+    ("metadata_version", "Versión coincide con metadata", "metadata_vs_render_manifest", {
+        "METADATA_VERSION_MISMATCH",
+    }),
+    ("timeline", "Timeline de letras válida", "timeline_invariants", {
+        "INVALID_LYRIC_RANGE", "LYRIC_OUTSIDE_ASSET", "LYRIC_OVERLAP",
+    }),
+    ("lyrics_quality", "Texto y calidad de transcripción", "transcription_quality_v6", {
+        "UPSTREAM_QUALITY_REVIEW", "REFERENCE_TEXT_UNATTESTED",
+        "REFERENCE_TIMELINE_INCOMPLETE", "LYRIC_ORTHOGRAPHY_MISMATCH",
+        "LYRIC_TOKEN_TYPO", "LYRIC_TERMINAL_PERIOD",
+    }),
+    ("ocr_title", "Texto visible del title card", "final_frame_ocr", {"OCR_TITLE_MISMATCH"}),
+    ("ocr_lyrics", "Texto visible de las letras", "final_frame_ocr", {"OCR_LYRIC_MISMATCH"}),
+)
+
 
 def mandatory_reviewer_issues() -> list[dict[str, Any]]:
-    """Unsigned contractual checks are failures, never abstentions."""
+    """Return unsigned checks as review requirements, not false failures.
+
+    ``severity=FAIL`` is retained for compatibility with existing persisted
+    reports and analytics.  ``result_status=REVIEW`` is the authoritative
+    meaning: the video has not failed this check; a reviewer still has to sign
+    it before a batch delivery is considered fully reviewed.
+    """
     return [{
         "code": code,
         "severity": "FAIL",
+        "result_status": "REVIEW",
         "category": "umg_manual_checklist",
         "summary": summary,
         "description": description,
@@ -45,6 +88,9 @@ def mandatory_reviewer_issues() -> list[dict[str, Any]]:
         "confidence": 1.0,
         "auto_fixable": False,
         "manual_verification_required": True,
+        # The reviewer can still sign this reminder, but an unsigned generic
+        # checklist is not evidence that the video failed.
+        "blocking": False,
     } for code, summary, description in MANDATORY_REVIEW_CHECKS]
 
 
@@ -84,6 +130,9 @@ def _normalise_issue(issue: Mapping[str, Any], *, fps: float) -> dict[str, Any]:
     row.setdefault("severity", "WARN")
     row.setdefault("category", "other")
     row.setdefault("confidence", 1.0)
+    if row.get("result_status") not in {"PASS", "FAIL", "REVIEW", "NOT_RUN"}:
+        row["result_status"] = "REVIEW" if row.get("manual_verification_required") or row.get("severity") != "FAIL" else "FAIL"
+    row.setdefault("blocking", bool(row.get("result_status") == "FAIL" or row.get("manual_verification_required")))
     row["issue_id"] = _issue_id(row)
     return row
 
@@ -106,18 +155,148 @@ def _merge_prior_decisions(issues: list[dict[str, Any]], previous: Mapping[str, 
     return issues
 
 
+def _issue_result_status(issue: Mapping[str, Any]) -> str:
+    value = str(issue.get("result_status") or "").upper()
+    if value in {"PASS", "FAIL", "REVIEW", "NOT_RUN"}:
+        return value
+    return "REVIEW" if issue.get("manual_verification_required") or issue.get("severity") != "FAIL" else "FAIL"
+
+
+def _check_status(rows: Sequence[Mapping[str, Any]]) -> str:
+    """Collapse findings for one detector into one honest check result."""
+    if any(row.get("status") == "OPEN" and _issue_result_status(row) == "FAIL" for row in rows):
+        return "FAIL"
+    if any(row.get("status") == "OPEN" and _issue_result_status(row) == "REVIEW" for row in rows):
+        return "REVIEW"
+    return "PASS"
+
+
+def _build_check_results(
+    *,
+    issues: Sequence[Mapping[str, Any]],
+    media: Mapping[str, Any],
+    ocr: Mapping[str, Any],
+    quality: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    rendered: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Build the operator-facing checklist from actual detector evidence.
+
+    A check is PASS only when its detector ran and found no issue.  Disabled,
+    unavailable, or uncalibrated detectors are explicitly NOT_RUN so their
+    absence can never look like a clean result.
+    """
+    rows = list(issues)
+    results: list[dict[str, Any]] = []
+    media_probe = media.get("probe") or {}
+    ocr_observations = list(ocr.get("observations") or [])
+    ocr_abstentions = list(ocr.get("abstentions") or [])
+    quality_verdict = str(quality.get("decision") or quality.get("verdict") or "").strip().lower()
+
+    for check_id, label, detector, codes in CHECK_DEFINITIONS:
+        matched = [row for row in rows if str(row.get("code")) in codes]
+        status = _check_status(matched)
+        reason = ""
+        if check_id == "media_delivery_spec" and not spec:
+            status, reason = "NOT_RUN", "No se definió un perfil técnico para comparar."
+        elif check_id == "metadata_title" and not matched and not rendered.get("rendered_title"):
+            status, reason = "NOT_RUN", "No hubo texto de title card para comparar."
+        elif check_id == "metadata_artist" and not matched and not rendered.get("rendered_artist"):
+            status, reason = "NOT_RUN", "No hubo texto de artista para comparar."
+        elif check_id == "metadata_version" and not matched and not rendered.get("rendered_version"):
+            status, reason = "NOT_RUN", "El render no informa una versión visible para comparar."
+        elif check_id in {"ocr_title", "ocr_lyrics"}:
+            kinds = {"title"} if check_id == "ocr_title" else {"lyric"}
+            has_kind = any(str(row.get("kind")) in kinds for row in ocr_observations)
+            if not has_kind and not matched:
+                status = "NOT_RUN"
+                reason = (ocr_abstentions[0].get("reason") if ocr_abstentions else "Sin observación OCR aplicable")
+        elif check_id == "lyrics_quality" and not quality_verdict and not matched:
+            # Deterministic timeline/text checks still ran, but the upstream
+            # quality verdict itself was not supplied by the transcription
+            # engine.
+            status, reason = "NOT_RUN", "El motor de calidad no entregó un veredicto."
+        elif check_id in {"media_container", "media_audio", "media_duration"} and not media_probe and not matched:
+            status, reason = "NOT_RUN", "No hubo un probe técnico disponible."
+        results.append({
+            "check_id": check_id,
+            "label": label,
+            "status": status,
+            "detector": detector,
+            "blocking": status == "FAIL" or any(
+                row.get("manual_verification_required") and row.get("status") == "OPEN"
+                for row in matched
+            ),
+            "issue_ids": [str(row.get("issue_id")) for row in matched if row.get("issue_id")],
+            "evidence": [dict(row.get("evidence") or {}) for row in matched],
+            "reason": reason,
+        })
+
+    for code, summary, description in MANDATORY_REVIEW_CHECKS:
+        matched = [row for row in rows if row.get("code") == code]
+        # These are always present for batch reports.  Their REVIEW status is
+        # intentional: they are awaiting an operator's visual attestation,
+        # while the gate remains reserved for objective failures.
+        results.append({
+            "check_id": code.lower(), "label": summary,
+            "status": "REVIEW" if any(row.get("status") == "OPEN" for row in matched) else "PASS",
+            "detector": "mandatory_signed_reviewer_checklist", "blocking": False,
+            "issue_ids": [str(row.get("issue_id")) for row in matched if row.get("issue_id")],
+            "evidence": [], "reason": description if matched else "No se ejecutó este check.",
+        })
+    return results
+
+
+def refresh_check_results(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Refresh check badges after a reviewer resolves one finding."""
+    row = dict(report)
+    checks = [dict(item) for item in (row.get("checks") or []) if isinstance(item, Mapping)]
+    if not checks:
+        return row
+    issues = {
+        str(item.get("issue_id")): item
+        for item in (row.get("issues") or []) if isinstance(item, Mapping)
+    }
+    for check in checks:
+        matched = [issues[issue_id] for issue_id in check.get("issue_ids") or [] if issue_id in issues]
+        if not matched:
+            continue
+        check["status"] = _check_status(matched)
+        check["blocking"] = check["status"] == "FAIL"
+    row["checks"] = checks
+    check_summary = {
+        "total": len(checks),
+        **{
+            status.lower(): sum(item.get("status") == status for item in checks)
+            for status in ("PASS", "FAIL", "REVIEW", "NOT_RUN")
+        },
+    }
+    row["check_summary"] = check_summary
+    blocking_checks = [item for item in checks if item.get("blocking") and item.get("status") in {"FAIL", "REVIEW"}]
+    row["decision"] = "BLOCK" if blocking_checks else "REVIEW" if check_summary["review"] or check_summary["not_run"] else "PASS"
+    return row
+
+
 def approval_gate(report: Mapping[str, Any] | None, mode: str | None = None) -> dict[str, Any]:
     actual_mode = mode or effective_delivery_qc_mode()
     if actual_mode != "enforce":
         return {"blocked": False, "can_approve": True, "reason": "observe_only"}
     if not report or report.get("status") in {"STALE", "RUNNING", "FAILED"}:
         return {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"}
-    open_fail = [row for row in report.get("issues") or [] if row.get("severity") == "FAIL" and row.get("status") == "OPEN"]
-    open_warn = [row for row in report.get("issues") or [] if row.get("severity") == "WARN" and row.get("status") == "OPEN"]
+    open_rows = [row for row in report.get("issues") or [] if row.get("status") == "OPEN"]
+    open_fail = [row for row in open_rows if _issue_result_status(row) == "FAIL" and row.get("blocking", True)]
     if open_fail:
-        return {"blocked": True, "can_approve": False, "reason": "open_fail", "issue_ids": [row["issue_id"] for row in open_fail]}
-    if open_warn:
-        return {"blocked": True, "can_approve": False, "reason": "warnings_not_acknowledged", "issue_ids": [row["issue_id"] for row in open_warn]}
+        return {
+            "blocked": True, "can_approve": False,
+            "reason": "open_fail", "issue_ids": [row["issue_id"] for row in open_fail],
+        }
+    open_review = [row for row in open_rows if _issue_result_status(row) == "REVIEW"]
+    if open_review:
+        return {
+            "blocked": False, "can_approve": True,
+            "reason": "review_recommended",
+            "issue_ids": [row["issue_id"] for row in open_review],
+        }
     return {"blocked": False, "can_approve": True, "reason": "all_findings_resolved"}
 
 
@@ -214,24 +393,40 @@ def build_runtime_report(
         deduped[row["issue_id"]] = row
     issues = _merge_prior_decisions(list(deduped.values()), previous)
     issues.sort(key=lambda row: ({"FAIL": 0, "WARN": 1}.get(row.get("severity"), 2), (row.get("seconds") or [0])[0]))
+    checks = _build_check_results(
+        issues=issues, media=media, ocr=ocr, quality=quality, spec=spec,
+        rendered={"rendered_title": (title_ocr or {}).get("text"),
+                  "rendered_artist": (artist_ocr or {}).get("text")},
+    )
+    check_summary = {
+        "total": len(checks),
+        **{
+            status.lower(): sum(row.get("status") == status for row in checks)
+            for status in ("PASS", "FAIL", "REVIEW", "NOT_RUN")
+        },
+    }
     open_rows = [row for row in issues if row.get("status") == "OPEN"]
     summary = {
         "issue_count": len(issues), "open_count": len(open_rows),
-        "fail_count": sum(row.get("severity") == "FAIL" for row in open_rows),
-        "warn_count": sum(row.get("severity") == "WARN" for row in open_rows),
+        # ``severity`` describes risk; ``result_status`` describes what the
+        # detector actually established.  Manual reminders retain FAIL
+        # severity for old analytics but must not inflate real-failure counts.
+        "fail_count": sum(_issue_result_status(row) == "FAIL" for row in open_rows),
+        "warn_count": sum(_issue_result_status(row) == "REVIEW" for row in open_rows),
         "segment_count": len(segments),
     }
+    blocking_checks = [row for row in checks if row.get("blocking") and row.get("status") in {"FAIL", "REVIEW"}]
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION, "mode": mode, "status": "COMPLETE",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "segments_revision": int(job.segments_revision or 0),
         "segments_hash": current_hash,
         "render_identity": {"path_basename": os.path.basename(video_path), "edit_count": int(job.edit_count or 0)},
-        "decision": "BLOCK" if summary["fail_count"] else "REVIEW" if summary["warn_count"] else "PASS",
-        "summary": summary, "issues": issues,
-        # Missing automation is represented by a blocking, signed reviewer
-        # check above.  The final report therefore has no ambiguous abstention
-        # state: each requirement is either open FAIL or signed/resolved.
+        "decision": "BLOCK" if blocking_checks else "REVIEW" if check_summary["review"] or check_summary["not_run"] else "PASS",
+        "summary": summary, "check_summary": check_summary,
+        "checks": checks, "issues": issues,
+        # Missing automation is explicit in each check as NOT_RUN. It can no
+        # longer masquerade as a failed video or silently become a pass.
         "abstentions": [],
         "detector_diagnostics": (
             list(base.get("abstentions") or [])
