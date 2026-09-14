@@ -31,6 +31,14 @@ MANDATORY_REVIEW_CHECKS = (
     ("UMG_IMAGE_NOT_STRETCHED", "Imagen sin estirar", "Confirmar proporción nativa/reencuadre sin deformación ni estiramiento."),
 )
 
+# Reports generated before the evidence-based checklist was introduced did
+# not persist ``result_status`` or ``manual_verification_required``. Keep
+# their stable UMG codes review-only when read by the approval gate, otherwise
+# an old generic reminder would be misclassified as an objective failure.
+LEGACY_MANUAL_CHECK_CODES = frozenset(
+    code for code, _summary, _description in MANDATORY_REVIEW_CHECKS
+)
+
 # A finding's severity describes its risk; its result describes what the
 # detector actually established.  Keeping both lets the UI distinguish an
 # unsigned human check from an objectively failed render.
@@ -159,6 +167,8 @@ def _issue_result_status(issue: Mapping[str, Any]) -> str:
     value = str(issue.get("result_status") or "").upper()
     if value in {"PASS", "FAIL", "REVIEW", "NOT_RUN"}:
         return value
+    if str(issue.get("code") or "") in LEGACY_MANUAL_CHECK_CODES:
+        return "REVIEW"
     return "REVIEW" if issue.get("manual_verification_required") or issue.get("severity") != "FAIL" else "FAIL"
 
 
