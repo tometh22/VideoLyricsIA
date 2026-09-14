@@ -122,6 +122,27 @@ def _identity_equal(left: Any, right: Any) -> bool:
     return _identity_tokens(left) == _identity_tokens(right)
 
 
+def _title_card_matches(metadata: Mapping[str, Any], rendered: Any) -> bool:
+    """Accept the standard artist + title card while rejecting suffix drift.
+
+    The UMG title card renders both fields on one graphic.  OCR therefore
+    commonly returns ``ARTIST TITLE`` as the title observation even though the
+    delivery metadata stores them separately.  Keep the check exact: accept
+    only the title itself or the two metadata fields concatenated in either
+    order, never an arbitrary prefix/suffix such as ``TITLE En Vivo``.
+    """
+    rendered_tokens = _identity_tokens(rendered)
+    title_tokens = _identity_tokens(metadata.get("title"))
+    artist_tokens = _identity_tokens(metadata.get("artist"))
+    if not title_tokens or not rendered_tokens:
+        return False
+    allowed = {tuple(title_tokens)}
+    if artist_tokens:
+        allowed.add(tuple(artist_tokens + title_tokens))
+        allowed.add(tuple(title_tokens + artist_tokens))
+    return tuple(rendered_tokens) in allowed
+
+
 def _line_similarity(left: str, right: str) -> float:
     return SequenceMatcher(None, _folded_line(left), _folded_line(right)).ratio()
 
@@ -400,7 +421,11 @@ def _metadata_occurrences(
     # fails this comparison, exactly like the label example.
     expected_display = expected_title
     rendered_title = _text(asset.get("rendered_title") or asset.get("title_card"))
-    if expected_display and rendered_title and not _identity_equal(expected_display, rendered_title):
+    if (
+        expected_display
+        and rendered_title
+        and not _title_card_matches(metadata, rendered_title)
+    ):
         seconds = _finite_number(asset.get("title_time")) or 0.0
         found.append((0, _Occurrence(
             code="METADATA_TITLE_MISMATCH",

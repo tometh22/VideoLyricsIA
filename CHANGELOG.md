@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.26] - 2026-09-14
+
+### Fixed
+
+- Allow operators to refresh stale Delivery QC reports from existing rendered
+  campaign videos before approval, and show structured approval errors as clear
+  actionable messages instead of `[object Object]`.
+- Accept the standard artist-plus-title title card in metadata and OCR checks
+  without weakening detection of title suffix mismatches.
+
 ## [1.1.25] - 2026-09-13
 
 ### Fixed

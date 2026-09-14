@@ -23,6 +23,24 @@ def _fold(value: Any) -> str:
     return " ".join(re.findall(r"[^\W_]+", text, re.UNICODE))
 
 
+def _title_card_matches(metadata: Mapping[str, Any], actual: Any) -> bool:
+    """Match the exact title card form rendered by the lyric-video template."""
+    def tokens(value: Any) -> list[str]:
+        normalized = unicodedata.normalize("NFKD", str(value or "").casefold())
+        folded = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+        return re.findall(r"[^\W_]+", folded, re.UNICODE)
+
+    rendered = tokens(actual)
+    title = tokens(metadata.get("title"))
+    artist = tokens(metadata.get("artist"))
+    if not rendered or not title:
+        return False
+    allowed = {tuple(title)}
+    if artist:
+        allowed.update({tuple(artist + title), tuple(title + artist)})
+    return tuple(rendered) in allowed
+
+
 def compare_ocr_observations(
     observations: Sequence[Mapping[str, Any]],
     *,
@@ -58,7 +76,8 @@ def compare_ocr_observations(
             except (TypeError, ValueError, IndexError):
                 continue
             expected = str(segment.get("text", segment.get("t", ""))).strip()
-        if expected and actual and _fold(actual) != _fold(expected):
+        title_card_match = kind == "title" and _title_card_matches(metadata, actual)
+        if expected and actual and _fold(actual) != _fold(expected) and not title_card_match:
             digest = hashlib.sha256(f"{code}|{seconds:.3f}|{actual}|{expected}".encode()).hexdigest()[:16]
             issues.append({
                 "issue_id": digest, "status": "OPEN", "severity": "WARN",

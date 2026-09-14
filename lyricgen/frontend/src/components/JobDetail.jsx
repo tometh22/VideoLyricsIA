@@ -21,6 +21,7 @@ import { SingleGeneratingHero } from "./BatchProgress";
 import { hasArtTrackAccess } from "../lib/artTrackAccess";
 import { reviewJobPath } from "../lib/reviewJobRoute";
 import { editorSessionHeaders } from "../lib/editorSession";
+import { translateBackendError } from "../lib/lyricsEditSubmit";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -1621,7 +1622,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || `${t("detail.approve_error_description")} (${res.status})`);
+        throw new Error(translateBackendError(data.detail, t) || `${t("detail.approve_error_description")} (${res.status})`);
       }
       try {
         const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
@@ -1675,7 +1676,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || `${t("detail.reject_error_description")} (${res.status})`);
+        throw new Error(translateBackendError(data.detail, t) || `${t("detail.reject_error_description")} (${res.status})`);
       }
       // Refresh the job state for any listing in the parent so the row
       // shows "rejected", then go back. Staying on the detail screen
