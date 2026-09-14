@@ -21,6 +21,10 @@ Do not deploy the parent Stockholm placeholder checkout; it is an older version.
 Opt in only the dedicated group with `TRIAL_BILLING_GROUPS=universal-es-trial-24h`
 on API and both workers. Keep the same flag on all three. An isolated QA group
 may be added during tests; remove it or deactivate its users after verification.
+Set `TRIAL_ONLY_MODE=1` on these three services. This is a private environment:
+public registration is disabled, non-invited accounts (including old JWT/API keys)
+cannot use it, and batch admission remains off. Admin provisioning still works.
+Do not enable this private-environment flag on shared staging or production.
 No schema migration is needed: dedicated CreditGrant reason `bounded_trial_v1`
 and append-only AuditLog reservations are used. Old bonus grants do not activate
 this trial or add free-plan credits.
@@ -65,8 +69,10 @@ artistic mistakes: inspect outputs and do not promise identical characters or
 perfect chronology. Validate a representative authorized song before claiming
 real music transcription accuracy; synthetic speech is only a control.
 
-Retain previous deployment IDs and frontend URL before promotion. For rollback,
-restore that exact previous release only on these trial services/frontend. If
-rolling back to code without the trial policy, deactivate the two customer trial
-users first; otherwise the old free-plan path reopens. Never roll back shared
-production/staging or erase ledger evidence.
+Retain previous deployment IDs and frontend URL before promotion. Roll back only
+these trial services/frontend, preferably to a policy-capable release. Do not
+expose the predecessor snapshot without invitation/clock guards: deactivating the
+customer accounts alone does not close its public registration. If that older
+code is needed for diagnosis, keep the trial API/workers stopped or inaccessible
+until the guards are restored. Never roll back shared production/staging or erase
+ledger evidence.

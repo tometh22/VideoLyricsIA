@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useI18n } from "../i18n";
 import BrandLockup from "./BrandLockup";
 import { fetchWithTimeout } from "../fetchWithTimeout";
+import { APP_ENV } from "../env";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -250,10 +251,10 @@ export default function LoginPage({ onLogin, onBack, resetToken, onResetComplete
                 </button>
               </form>
               <div className="mt-6 space-y-3 text-center">
-                <button onClick={() => { setMode("register"); setError(""); }}
+                {APP_ENV !== "trial" && <button onClick={() => { setMode("register"); setError(""); }}
                   className="text-sm text-brand hover:text-brand-light transition-colors">
                   {t("login.no_account")}
-                </button>
+                </button>}
                 <br />
                 <button onClick={() => { setMode("forgot"); setError(""); }}
                   className="text-xs text-gray-500 hover:text-gray-300 transition-colors">

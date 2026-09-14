@@ -28,6 +28,29 @@ def applies(identity):
     return configured_group(identity.get("billing_group"))
 
 
+def private_only():
+    """Explicit private-installation flag; ordinary environments stay public."""
+    return os.getenv("TRIAL_ONLY_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def require_invited(identity):
+    """Private trials admit configured groups and admins, even with an empty list.
+
+    Identity must come from authenticated/source-owner database state. This
+    invitation check does not waive the clock or reservation checks for an
+    admin who is themselves a member of a configured trial group.
+    """
+    if not private_only():
+        return
+    identity = identity or {}
+    if identity.get("role") == "admin" or applies(identity):
+        return
+    raise HTTPException(403, detail={
+        "code": "trial_invitation_required",
+        "message": "Este entorno es un trial privado. Necesitás una invitación del equipo de Genly para acceder.",
+    })
+
+
 def utc(value):
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
@@ -94,7 +117,7 @@ def require_open(db, identity):
 
 def require_job_open(job_id):
     """Worker admission, before storage/provider work. Fail closed on DB errors."""
-    if not os.getenv("TRIAL_BILLING_GROUPS", "").strip():
+    if not private_only() and not os.getenv("TRIAL_BILLING_GROUPS", "").strip():
         return
     from database import Job, User, SessionLocal
     with SessionLocal() as db:
@@ -102,7 +125,9 @@ def require_job_open(job_id):
         owner = db.query(User).filter(User.id == job.user_id).first() if job else None
         if owner is None:
             raise HTTPException(409, detail={"code": "trial_owner_missing", "message": "No se pudo verificar la cuenta del trabajo."})
-        require_open(db, owner.to_dict())
+        identity = owner.to_dict()
+        require_invited(identity)
+        require_open(db, identity)
 
 
 def transcription_attempts(db, grant):
@@ -121,7 +146,7 @@ def transcription_attempts(db, grant):
 
 def _require_recorded_job_admission(job_id, *, transcription):
     """Read only: workers verify the source owner's current grant, never admit."""
-    if not os.getenv("TRIAL_BILLING_GROUPS", "").strip():
+    if not private_only() and not os.getenv("TRIAL_BILLING_GROUPS", "").strip():
         return
     from database import Job, User, SessionLocal
     with SessionLocal() as db:
@@ -133,6 +158,7 @@ def _require_recorded_job_admission(job_id, *, transcription):
                 "message": "No se pudo verificar la cuenta del trabajo.",
             })
         identity = owner.to_dict()
+        require_invited(identity)
         info = require_open(db, identity)
         if info is None:
             return

@@ -1133,7 +1133,8 @@ def _trial_worker_admitted(job_id: str, *, editing: bool = False) -> bool:
     handled at admission; require_job_reserved allows reserved jobs to finish
     within the active window. This is a start-time check, not mid-call expiry.
     """
-    if not os.environ.get("TRIAL_BILLING_GROUPS", "").strip():
+    from trial_policy import private_only
+    if not os.environ.get("TRIAL_BILLING_GROUPS", "").strip() and not private_only():
         return True
     from fastapi import HTTPException
     from trial_policy import require_job_reserved

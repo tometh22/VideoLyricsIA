@@ -171,6 +171,9 @@ def _require_manager(campaign: BatchCampaign, user: dict) -> None:
 
 def _has_trial_batch_owner(db: Session, *owner_ids: int) -> bool:
     """Resolve current billing groups, including for tokens issued before opt-in."""
+    from trial_policy import private_only
+    if private_only():
+        return True
     if not os.environ.get("TRIAL_BILLING_GROUPS", "").strip():
         return False
     from trial_policy import configured_group
@@ -192,6 +195,9 @@ def _require_non_trial_batch_owner(db: Session, *owner_ids: int) -> None:
 
 
 def _require_non_trial_upload_session(db: Session, session: BatchUploadSession) -> None:
+    from trial_policy import private_only
+    if private_only():
+        _require_non_trial_batch_owner(db, session.created_by)
     if not os.environ.get("TRIAL_BILLING_GROUPS", "").strip():
         return
     campaign_owner = db.query(BatchCampaign.created_by).filter(

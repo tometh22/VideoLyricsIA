@@ -1014,6 +1014,8 @@ def get_current_user(
 
 
 def _enforce_trial_request(request, db, identity):
+    from trial_policy import require_invited
+    require_invited(identity)
     # Read access/downloads remain available; paid actions and saved mutations
     # stop at the explicitly activated deadline, including already-issued JWTs.
     if request.method not in ("GET", "HEAD", "OPTIONS") and not request.url.path.startswith(("/auth/", "/telemetry", "/events")):
@@ -1039,6 +1041,8 @@ def get_current_user_from_token_param(token: str, db: Session) -> dict:
         raise HTTPException(status_code=401, detail="User not found or inactive")
     jti = _validate_access_claims(payload, user)
     _validate_login_session(db, user, jti)
+    from trial_policy import require_invited
+    require_invited(user.to_dict())
     return {
         "id": user.id,
         "username": user.username,
@@ -1097,6 +1101,8 @@ def verify_media_token(token: str, job_id: str, file_type: str, db: Session) -> 
     # so a rolling API deploy does not break an already-open download URL.
     if int(payload.get("av", 0)) != int(getattr(user, "auth_version", 0) or 0):
         raise HTTPException(status_code=401, detail="Stale media token")
+    from trial_policy import require_invited
+    require_invited(user.to_dict())
     return {
         "id": user.id,
         "username": user.username,

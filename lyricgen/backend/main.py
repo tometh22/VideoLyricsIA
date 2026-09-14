@@ -1485,6 +1485,12 @@ async def login(body: LoginRequest, request: Request, db: Session = Depends(get_
     user = authenticate_user(db, body.username, body.password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    from trial_policy import require_invited
+    try:
+        require_invited(user.to_dict())
+    except HTTPException as exc:
+        # Login historically returns a string detail, consumed by LoginPage.
+        raise HTTPException(exc.status_code, detail=exc.detail["message"]) from exc
     token = start_login_session(db, user, request)
 
     # Audit
@@ -1565,6 +1571,9 @@ async def create_lead(body: CreateLeadRequest, request: Request, db: Session = D
 @limiter.limit("5/minute")
 async def register(body: RegisterRequest, request: Request, db: Session = Depends(get_db)):
     """Public self-registration."""
+    from trial_policy import private_only
+    if private_only():
+        raise HTTPException(403, detail="Este trial es privado. Usá la cuenta invitada o contactá al equipo de Genly.")
     if len(body.username) < 3:
         raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
     try:
