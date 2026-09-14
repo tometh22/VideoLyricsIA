@@ -26,6 +26,7 @@ beforeEach(() => {
     if (url.endsWith("/backgrounds")) return response([]);
     if (url.endsWith("/preview")) return response({ preview_id: "p1", counts: [39], rounded: false, skipped: [], changes: head.items.map(i => ({ item_id: i.id, artist: i.artist, title: i.title, group: "Estilo 1", before: {}, after: { font: "anton" } })) });
     if (url.endsWith("/apply")) { head = { ...head, plan: { revision: 1 } }; return response({ revision: 1 }); }
+    if (url.endsWith("/deliveries")) return response({ operation_id: "op1", total_count: 2, status: "queued" });
     if (url.includes("/status/")) return response({ artist: "Artista", song_title: "Tema", segments_json: [], segments_revision: 2 });
     if (url.includes("/approve/")) {
       const jobId = url.split("/").pop();
@@ -74,6 +75,22 @@ describe("campaign bulk design", () => {
     await screen.findByText("Videos de esta campaña (0)");
     expect(screen.getByText(/Todavía no hay videos generados/)).toBeInTheDocument();
     expect(calls.some(([url]) => url === "/jobs")).toBe(false);
+  });
+  it("selects every approved history video and sends the snapshot to the chosen portal", async () => {
+    report = { ...report, videos: [
+      { job_id: "j1", title: "A", artist: "Artist", status: "done", approved_at: new Date().toISOString(), evidence: { video_sha256: "a".repeat(64) }, assignment: {}, created_at: new Date().toISOString(), video_url: "/download/j1/video" },
+      { job_id: "j2", title: "B", artist: "Artist", status: "done", approved_at: new Date().toISOString(), evidence: { video_sha256: "b".repeat(64) }, assignment: {}, created_at: new Date().toISOString(), video_url: "/download/j2/video" },
+      { job_id: "j3", title: "Pending", artist: "Artist", status: "pending_review", approved_at: null, evidence: {}, assignment: {}, created_at: new Date().toISOString(), video_url: "/download/j3/video" },
+    ] };
+    mount("history");
+    fireEvent.click(await screen.findByRole("button", { name: "Seleccionar todos los aprobados (2)" }));
+    expect(screen.getByLabelText("2 videos aprobados seleccionados")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Enviar seleccionados a un portal" }));
+    fireEvent.change(screen.getByLabelText("Portal de destino"), { target: { value: "chile" } });
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar envío" }));
+    await waitFor(() => expect(screen.getByText(/Envío iniciado para 2 videos a Chile/)).toBeInTheDocument());
+    const deliveryCall = calls.find(([url]) => url.endsWith("/deliveries"));
+    expect(JSON.parse(deliveryCall[1].body)).toEqual(expect.objectContaining({ job_ids: ["j1", "j2"], destination_portal: "chile" }));
   });
   it("uses a compact video list and only loads the medium player on demand", async () => {
     report = { ...report, videos: [{

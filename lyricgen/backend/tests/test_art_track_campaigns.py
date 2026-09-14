@@ -2,6 +2,7 @@
 
 import hashlib
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 
@@ -105,3 +106,49 @@ def test_art_render_never_creates_transcription_and_is_idempotent(client, admin_
     again = client.post(f"/batch/art-track-campaigns/{campaign_id}/start-rendering", headers=auth)
     assert again.status_code == 200
     assert again.json()["created_count"] == 0
+
+
+def test_lyric_campaign_delivery_selects_only_approved_videos(client, admin_token, monkeypatch):
+    """The campaign history can publish approved lyric-video jobs in bulk."""
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    created = client.post(
+        "/batch/campaigns", headers={"Authorization": f"Bearer {admin_token}"},
+        json={"name": "Lyrics AR", "expected_count": 2, "kind": "lyric_video"},
+    )
+    assert created.status_code == 200, created.text
+    campaign_id = created.json()["id"]
+    db = SessionLocal()
+    try:
+        campaign = db.query(BatchCampaign).filter(BatchCampaign.id == campaign_id).one()
+        approved = Job(
+            job_id=uuid.uuid4().hex[:12], user_id=campaign.created_by,
+            tenant_id=campaign.tenant_id, workload_class="batch", campaign_id=campaign.id,
+            artist="Artist", song_title="Approved", filename="approved.mp3",
+            status="done", approved_at=datetime.now(timezone.utc), video_url="approved.mp4",
+            render_params={"campaign_render_evidence": {"video_sha256": _digest("approved")}},
+        )
+        pending = Job(
+            job_id=uuid.uuid4().hex[:12], user_id=campaign.created_by,
+            tenant_id=campaign.tenant_id, workload_class="batch", campaign_id=campaign.id,
+            artist="Artist", song_title="Pending", filename="pending.mp3",
+            status="pending_review", video_url="pending.mp4",
+        )
+        db.add_all([approved, pending]); db.commit()
+        approved_id = approved.job_id
+    finally:
+        db.close()
+    response = client.post(
+        f"/batch/campaigns/{campaign_id}/deliveries",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"destination_portal": "chile", "idempotency_key": "lyric-bulk-operation-1"},
+    )
+    assert response.status_code == 202, response.text
+    payload = response.json()
+    assert payload["destination_portal"] == "chile"
+    assert payload["total_count"] == 1
+    db = SessionLocal()
+    try:
+        item = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.delivery_batch_id == payload["operation_id"]).one()
+        assert item.job_id == approved_id
+    finally:
+        db.close()
