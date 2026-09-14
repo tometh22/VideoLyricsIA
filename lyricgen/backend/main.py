@@ -12885,13 +12885,23 @@ async def decide_delivery_qc_issue(
         raise HTTPException(status_code=404, detail="delivery_qc_issue_not_found")
     report["issues"] = issues
     open_rows = [row for row in issues if row.get("status") == "OPEN"]
+    from delivery_qc_runtime import (
+        _issue_result_status, approval_gate, effective_delivery_qc_mode,
+        refresh_check_results,
+    )
     report["summary"] = {
         **dict(report.get("summary") or {}),
         "open_count": len(open_rows),
-        "fail_count": sum(row.get("severity") == "FAIL" for row in open_rows),
-        "warn_count": sum(row.get("severity") == "WARN" for row in open_rows),
+        "fail_count": sum(
+            _issue_result_status(row) == "FAIL"
+            for row in open_rows
+        ),
+        "warn_count": sum(
+            _issue_result_status(row) == "REVIEW"
+            for row in open_rows
+        ),
     }
-    from delivery_qc_runtime import approval_gate, effective_delivery_qc_mode
+    report = refresh_check_results(report)
     report["approval"] = approval_gate(
         report,
         "enforce" if job.workload_class == "batch" else effective_delivery_qc_mode(),

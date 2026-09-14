@@ -39,13 +39,19 @@ line automatically.  This is especially important for live songs.
   review signal, never an automatic correction.
 - Reports persist on `Job.delivery_qc`, are bound to segment revision/hash and
   become `STALE` on every editor mutation.
+- Every check exposes an explicit result: `PASS`, `FAIL`, `REVIEW` or
+  `NOT_RUN`. `PASS` means the detector ran and found no finding; `NOT_RUN`
+  makes disabled or unavailable automation visible instead of treating it as
+  a clean video.
 - Job Detail shows a clickable checklist, frame seeks, acknowledgements, safe
   repair buttons and a direct editor link.
 - Reviewer decisions, accepted repair types, approval outcome and later label QC
   finding counts are structured product events. Existing editor `active_edit_ms`
   supplies minutes-per-song before/after.
 - `DELIVERY_QC_MODE=observe` never blocks approval. `enforce` requires a fresh
-  report, blocks open FAIL and requires acknowledgement of WARN.
+  report and blocks only objective open `FAIL` findings. Open `REVIEW`
+  findings, including unsigned generic reviewer reminders, remain visible as
+  recommendations and do not become automatic failures.
 
 ## Deliberately not automatic yet
 
