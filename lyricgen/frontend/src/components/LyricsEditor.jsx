@@ -174,11 +174,20 @@ function formatTime(seconds) {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-function formatTimestamp(seconds) {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  const ms = Math.floor((seconds % 1) * 10);
-  return `${m}:${s.toString().padStart(2, "0")}.${ms}`;
+function formatTimestamp(seconds, precision = 1) {
+  // Round the whole timestamp before splitting it: fractional flooring turns
+  // 14.1 into 14.0 in binary floating point and misses carries into a minute.
+  const scale = 10 ** precision;
+  const ticks = Math.round((Number.isFinite(seconds) ? Math.max(0, seconds) : 0) * scale);
+  const m = Math.floor(ticks / (60 * scale));
+  const s = Math.floor(ticks / scale) % 60;
+  const fraction = (ticks % scale).toString().padStart(precision, "0");
+  return `${m}:${s.toString().padStart(2, "0")}.${fraction}`;
+}
+
+function formatTimestampInput(seconds) {
+  // Labels use tenths, but an existing alignment can have millisecond precision.
+  return formatTimestamp(seconds, 3).replace(/0+$/, "").replace(/\.$/, ".0");
 }
 
 function fallbackIdempotencyDigest(value) {
@@ -1922,6 +1931,7 @@ export default function LyricsEditor({
   // Single-click on a timestamp seeks; double-click switches to edit.
   const [editingId, setEditingId] = useState(null);
   const [editValue, setEditValue] = useState("");
+  const timestampEditRef = useRef(null);
   // Repeat-line propagation. `textEditStart` snapshots {id, text} when the
   // operator focuses a line's text input, so on blur we can compare against
   // the pre-edit text and find other lines that were identical to it.
@@ -2173,15 +2183,29 @@ export default function LyricsEditor({
   }, []);
 
   const startEditTimestamp = (seg) => {
+    const initialValue = formatTimestampInput(seg.start);
+    timestampEditRef.current = { id: seg._id, initialValue };
     setEditingId(seg._id);
-    setEditValue(formatTimestamp(seg.start));
+    setEditValue(initialValue);
   };
   const cancelEditTimestamp = () => {
+    timestampEditRef.current = null;
     setEditingId(null);
     setEditValue("");
   };
 
   const commitEditTimestamp = (seg) => {
+    const session = timestampEditRef.current;
+    if (!session || session.id !== seg._id) return;
+    // Enter can be followed by blur before React flushes state. Consume the
+    // edit synchronously so those events cannot record the same change twice.
+    timestampEditRef.current = null;
+    // Merely opening/closing the input must not round the stored value, even
+    // when the source has sub-millisecond precision or a very short duration.
+    if (editValue === session.initialValue) {
+      cancelEditTimestamp();
+      return;
+    }
     const parsed = parseTimestamp(editValue);
     if (parsed == null) {
       // Bad input — silently revert.
@@ -2202,6 +2226,11 @@ export default function LyricsEditor({
     const minAllowed = prevSeg ? prevSeg.end : 0;
     const maxAllowed = nextSeg ? Math.max(minAllowed, nextSeg.start - 0.1) : (duration || parsed);
     const newStart = Math.max(minAllowed, Math.min(parsed, maxAllowed));
+
+    if (newStart === seg.start) {
+      cancelEditTimestamp();
+      return;
+    }
 
     // No-op edits (clamped value identical to current) shouldn't pollute
     // the undo stack — the user's Ctrl+Z would feel broken otherwise.

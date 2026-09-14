@@ -246,7 +246,8 @@ describe("LyricsEditor — revisión focalizada transcription quality v5", () =>
 
     const panel = screen.getByTestId("quality-review-panel");
     expect(within(panel).getByText("0:43.0–0:52.5")).toBeInTheDocument();
-    expect(within(panel).getByText("1:00.8–1:23.2")).toBeInTheDocument();
+    // Labels round to tenths; navigation below retains the exact 60.85s.
+    expect(within(panel).getByText("1:00.9–1:23.3")).toBeInTheDocument();
     expect(within(panel).getByText("Letra incierta")).toBeInTheDocument();
     expect(within(panel).getByText("Cantidad o estructura vocal incierta")).toBeInTheDocument();
 

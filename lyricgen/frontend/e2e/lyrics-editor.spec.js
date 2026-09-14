@@ -11,6 +11,40 @@ import {
 } from "./editor-harness.js";
 
 test.describe("lyrics editor browser contract", () => {
+  test("retains timestamp tenths through typing, blur, autosave and reload", async ({ page }) => {
+    const harness = await installEditorHarness(page, {
+      editorV2: true,
+      durationSeconds: 20,
+      segments: [
+        { _id: "first", start: 1, end: 2, text: "Primera línea" },
+        { _id: "target", start: 14, end: 15.5, text: "Segunda línea" },
+        { _id: "last", start: 18, end: 19, text: "Última línea" },
+      ],
+    });
+    await harness.open();
+    const timestamp = () => page.getByRole("button", {
+      name: /Doble click para editar el tiempo de la línea 2$/,
+    });
+    await timestamp().dblclick();
+    const field = page.getByRole("textbox", { name: "Tiempo de inicio de la línea 2" });
+    await field.fill("0:14.1");
+    await field.press("Enter");
+    await expect(timestamp()).toContainText("0:14.1");
+    await expect.poll(() => harness.saves.at(-1)?.segments[1]?.start).toBe(14.1);
+
+    // A fresh navigation must read the persisted editor document, not only
+    // the current React state. Opening then blurring must not rewrite 14.1.
+    await harness.open();
+    await expect(timestamp()).toContainText("0:14.1");
+    await timestamp().dblclick();
+    await expect(field).toHaveValue("0:14.1");
+    await field.press("Tab");
+    await expect(timestamp()).toContainText("0:14.1");
+    await page.getByRole("button", { name: "Aprobar y generar", exact: true }).click();
+    await expect.poll(() => harness.approvals.length).toBe(1);
+    expect(harness.approvals[0].segments[1].start).toBe(14.1);
+  });
+
   test("switches basic and advanced views over the same lines", async ({ page }) => {
     const harness = await installEditorHarness(page);
     await harness.open();

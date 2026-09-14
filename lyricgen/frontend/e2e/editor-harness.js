@@ -71,7 +71,7 @@ export async function installEditorHarness(page, options = {}) {
   const versions = [];
   const heartbeats = [];
   let sourceAudioRequests = 0;
-  const audioBytes = createSyntheticWav();
+  const audioBytes = createSyntheticWav({ durationSeconds: options.durationSeconds ?? 4 });
 
   await page.addInitScript(({ token, role }) => {
     localStorage.clear();

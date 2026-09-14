@@ -1,4 +1,4 @@
-# Frozen Universal trial — 1.1.18-trial.1
+# Frozen Universal trial — 1.1.18-trial.2
 
 ## Isolation and release
 
