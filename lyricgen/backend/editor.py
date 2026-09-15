@@ -407,7 +407,6 @@ def _record_training_delta(
                 "job_id": job.job_id,
                 "n_lines": len(current),
                 "checkpoint": checkpoint,
-                "author_kind": "machine_candidate" if checkpoint == "reviewer_candidate" else None,
                 "changed": changed,
                 "reorder": reordered,
                 "correction_summary": {
