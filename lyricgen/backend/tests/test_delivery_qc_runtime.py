@@ -258,3 +258,50 @@ def test_runtime_report_blocks_only_an_objective_detector_failure(tmp_path, monk
     assert report["summary"]["fail_count"] == 1
     assert report["approval"]["reason"] == "open_fail"
     assert report["approval"]["can_approve"] is False
+
+
+def test_runtime_report_preserves_detector_evidence_after_edit(tmp_path, monkeypatch):
+    """Real preflight/OCR findings carry lists; older detectors use mappings."""
+    monkeypatch.setenv("DELIVERY_QC_MODE", "observe")
+    monkeypatch.setattr(
+        "delivery_qc_runtime.inspect_delivery_media",
+        lambda *_args, **_kwargs: {
+            "probe": {"duration": 2.0, "video": {"fps": 30}, "audio_streams": 0},
+            "issues": [{
+                "code": "MEDIA_AUDIO_STREAM_MISSING", "severity": "FAIL",
+                "evidence": {"audio_streams": 0},
+            }],
+            "abstentions": [],
+        },
+    )
+    segments = [{"start": 0, "end": 3, "text": "JAMÁS"}]
+    observations = [{
+        "kind": "lyric", "segment_index": 0, "seconds": 1,
+        "text": "JAMAS", "confidence": .99,
+    }]
+    monkeypatch.setattr(
+        "delivery_qc_runtime.inspect_rendered_text",
+        lambda *_args, **_kwargs: {
+            "observations": observations,
+            "issues": compare_ocr_observations(observations, metadata={}, segments=segments),
+            "abstentions": [],
+        },
+    )
+    job = SimpleNamespace(
+        artist="Artista", song_title="Tema", filename="tema.wav", umg_spec=None,
+        transcription_quality={}, segments_revision=3, edit_count=1,
+    )
+    previous = mark_delivery_qc_stale({"status": "COMPLETE", "issues": []}, revision=3, reason="edit")
+    report = build_runtime_report(
+        job=job, video_path=str(tmp_path / "video.mp4"), segments=segments, previous=previous,
+    )
+    assert report["status"] == "COMPLETE"
+    assert report["segments_revision"] == 3
+    assert report["render_identity"]["edit_count"] == 1
+    checks = {row["check_id"]: row for row in report["checks"]}
+    assert checks["media_audio"]["evidence"] == [{"audio_streams": 0}]
+    assert checks["ocr_lyrics"]["evidence"] == [{"segment_index": 0}]
+    assert checks["timeline"]["evidence"] == [{"segment_index": 0, "start": 0.0, "end": 3.0, "duration": 2.0}]
+    assert checks["timeline"]["status"] == "FAIL"
+    assert report["approval"]["blocked"] is False
+    assert approval_gate(report, "enforce")["blocked"] is True

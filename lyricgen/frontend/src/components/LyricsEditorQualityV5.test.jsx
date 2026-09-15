@@ -61,6 +61,53 @@ afterEach(() => {
 });
 
 describe("LyricsEditor — revisión focalizada transcription quality v5", () => {
+  it.each(["success", "recovered"])("refresca quality tras reanchor %s sin reemplazar nuevas ediciones", async (mode) => {
+    let resolveQuality;
+    const editorRequest = vi.fn().mockImplementation((path) => path.startsWith("/editor/")
+      ? new Promise((resolve) => { resolveQuality = resolve; }) : Promise.resolve(new Response("{}")));
+    const retimed = { ok: true, revision: 8, count: 2, segments: [
+      { start: 42.5, end: 55.5, text: "Primera zona" },
+      { start: 60.5, end: 84.5, text: "Segunda zona" },
+    ] };
+    render(<LyricsEditor {...baseProps({
+      editorRequest, disableAutosave: true,
+      user: { features: { anchor_lyrics: true } },
+      onReanchor: vi.fn().mockResolvedValue(mode === "success" ? retimed : { ok: false }),
+      onReanchorReconcile: vi.fn().mockResolvedValue(retimed),
+    })} />);
+    expect(editorRequest.mock.calls.some(([path]) => path.startsWith("/editor/"))).toBe(false);
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+    fireEvent.click(screen.getByTestId("editor-overflow-btn"));
+    fireEvent.click(screen.getByTestId("reanchor-btn"));
+    await waitFor(() => expect(resolveQuality).toBeTypeOf("function"));
+    expect(screen.getByTestId("quality-analysis-pending")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "Revisar letra" }));
+    fireEvent.change(screen.getByDisplayValue("Primera zona"), { target: { value: "Edición posterior al reanchor" } });
+    resolveQuality(new Response(JSON.stringify({ revision: 8, segments: retimed.segments,
+      transcription_quality: { ...V5_QUALITY, evaluated_revision: 8, segments_hash: "retimed-hash",
+        unsafe_windows: [{ id: "fresh", start: 42.5, end: 55.5, reasons: ["text_mismatch"] }] },
+    }), { status: 200 }));
+    await waitFor(() => expect(screen.queryByTestId("quality-analysis-pending")).toBeNull());
+    expect(screen.getByDisplayValue("Edición posterior al reanchor")).toBeInTheDocument();
+    expect(screen.getByTestId("editor-confidence")).toHaveTextContent("1 parte");
+  });
+
+  it("sigue consultando la calidad invalidada mientras el outbox publica el análisis", async () => {
+    const responses = [
+      { ...V5_QUALITY, evaluated_revision: 8, analysis_status: "superseded_by_edit", analysis_pending: false },
+      { ...V5_QUALITY, evaluated_revision: 8, analysis_status: "complete", analysis_pending: false },
+    ];
+    const editorRequest = vi.fn().mockImplementation((path) => Promise.resolve(new Response(JSON.stringify(
+      path.startsWith("/editor/") ? { transcription_quality: responses.shift() || V5_QUALITY } : {},
+    ), { status: 200 })));
+    render(<LyricsEditor {...baseProps({
+      transcriptionQuality: responses[0], editorRequest, disableAutosave: true,
+    })} />);
+    expect(screen.getByTestId("quality-analysis-pending")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("quality-analysis-pending")).toBeNull(), { timeout: 4000 });
+    expect(editorRequest.mock.calls.filter(([path]) => path.startsWith("/editor/"))).toHaveLength(2);
+  });
+
   it("actualiza analysis_pending después de abrir sin pisar la edición local", async () => {
     let resolveQuality;
     const editorRequest = vi.fn().mockReturnValue(new Promise((resolve) => {

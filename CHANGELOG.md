@@ -3,6 +3,25 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.29] - 2026-09-15
+
+### Fixed
+
+- Bind quality checks to the new re-anchored revision and atomically queue
+  their reanalysis, preserving recovery if queue publication is delayed.
+- Refresh quality warnings after re-anchoring or pasting lyrics, including
+  recovered requests, without overwriting edits made while checks run.
+- Avoid presenting per-line alignment flags as the total quality review count
+  in successful re-anchor and paste notifications.
+
+## [1.1.28] - 2026-09-14
+
+### Fixed
+
+- Preserve list and mapping evidence from delivery detectors when building
+  final-render checks, so real findings no longer prevent fresh QC reports
+  from being saved after rendering or editing a video.
+
 ## [1.1.27] - 2026-09-14
 
 ### Fixed

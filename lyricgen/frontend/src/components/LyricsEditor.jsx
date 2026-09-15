@@ -312,7 +312,9 @@ function isQualityAnalysisPending(quality) {
   if (quality?.analysis_pending === true) return true;
   const explicitAnalysisStatus = quality?.analysis_status ?? quality?.status;
   const status = String(explicitAnalysisStatus ?? quality?.decision ?? "").toLowerCase();
-  return status === "analysis_pending" || status === "pending" || status === "analyzing";
+  // The transactional outbox may still be publishing this fresh snapshot.
+  return status === "analysis_pending" || status === "pending" || status === "analyzing"
+    || status === "superseded_by_edit";
 }
 
 function qualityFromEditorPayload(payload) {
@@ -807,7 +809,9 @@ export default function LyricsEditor({
     });
   }, [transcribeJobId, transcriptionQualityProp]);
 
-  const qualityAnalysisPending = isQualityAnalysisPending(transcriptionQuality);
+  const [qualityRefresh, setQualityRefresh] = useState(null);
+  const qualityRefreshPending = qualityRefresh?.jobId === transcribeJobId;
+  const qualityAnalysisPending = qualityRefreshPending || isQualityAnalysisPending(transcriptionQuality);
   useEffect(() => {
     if (!qualityAnalysisPending || !transcribeJobId || !editorRequest) return undefined;
     let cancelled = false;
@@ -840,10 +844,14 @@ export default function LyricsEditor({
           } catch { /* a transient/non-JSON response is retried */ }
           nextQuality = qualityFromEditorPayload(body);
           if (!cancelled && nextQuality) {
-            accepted = shouldAcceptQualityUpdate(transcriptionQualityRef.current, nextQuality);
+            const refreshedRevision = Number(nextQuality.evaluated_revision);
+            const refreshCurrent = !qualityRefreshPending || qualityRefresh.revision == null
+              || (Number.isFinite(refreshedRevision) && refreshedRevision >= qualityRefresh.revision);
+            accepted = refreshCurrent && shouldAcceptQualityUpdate(transcriptionQualityRef.current, nextQuality);
             if (accepted) {
               transcriptionQualityRef.current = nextQuality;
               setTranscriptionQuality(nextQuality);
+              if (qualityRefreshPending) setQualityRefresh(null);
             }
           }
         }
@@ -859,7 +867,7 @@ export default function LyricsEditor({
       if (timer) window.clearTimeout(timer);
       controller?.abort();
     };
-  }, [editorRequest, qualityAnalysisPending, transcribeJobId]);
+  }, [editorRequest, qualityAnalysisPending, transcribeJobId, qualityRefresh, qualityRefreshPending]);
 
   // PR E (2026-07): `edited` vive en el segmentsStore (Map por jobId a
   // nivel módulo), NO en un useState local. El store SOBREVIVE al unmount:
@@ -2105,7 +2113,7 @@ export default function LyricsEditor({
   //   2. POST /jobs/{id}/reanchor vía el callback del padre.
   //   3. Éxito → reemplazar `edited` con los segments re-anclados (mismo
   //      seed que el mount; las líneas `locked` vuelven intactas del
-  //      backend) + toast "N re-sincronizadas, M para revisar".
+  //      backend) y refrescar la evaluación de calidad de esa revisión.
   //      Decline / error → toast de error, timings quedan como estaban.
   // El snapshot pre-reanchor va al edit history, así Cmd+Z lo revierte.
   const [reanchoring, setReanchoring] = useState(false);
@@ -2143,8 +2151,9 @@ export default function LyricsEditor({
     }
     pushEditHistory();
     setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
+    if (editorRequest) setQualityRefresh({ jobId: transcribeJobId, revision: res.revision ?? null });
     toast({ message, tone: "success" });
-  }, [transcribeJobId, pushEditHistory, toast]);
+  }, [transcribeJobId, pushEditHistory, toast, editorRequest]);
 
   const handleReanchor = useCallback(async () => {
     if (!onReanchor || !transcribeJobId || reanchoring) return;
@@ -2180,10 +2189,10 @@ export default function LyricsEditor({
         // PR E: ids frescos vía el mismo helper que el seed inicial —
         // consistencia con la identidad estable del store (PR D).
         setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
+        if (editorRequest) setQualityRefresh({ jobId: transcribeJobId, revision: res.revision ?? null });
         toast({
-          message: (t("editor.reanchor_done") || "{n} líneas re-sincronizadas, {m} para revisar")
-            .replace("{n}", String(res.count ?? res.segments.length))
-            .replace("{m}", String(res.review_count ?? 0)),
+          message: (t("editor.reanchor_done") || "{n} líneas re-sincronizadas")
+            .replace("{n}", String(res.count ?? res.segments.length)),
           tone: "success",
         });
       } else if (res && res.reason === "structural_mismatch") {
@@ -2219,7 +2228,7 @@ export default function LyricsEditor({
       setReanchoring(false);
     }
   }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, reanchoring, edited,
-      pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult]);
+      pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult, editorRequest]);
 
   // 2026-09-13: pegar la letra OFICIAL y re-sincronizar desde ese texto.
   // Mismo endpoint que el re-anclado (POST /jobs/{id}/reanchor) con
@@ -2271,14 +2280,14 @@ export default function LyricsEditor({
         }
         pushEditHistory();
         setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
+        if (editorRequest) setQualityRefresh({ jobId: transcribeJobId, revision: res.revision ?? null });
         setPasteOpen(false);
         setPasteText("");
         setPasteStructure(null);
         toast({
-          message: (t("editor.paste_lyrics_done") || "Letra aplicada: {r} líneas nuevas, {k} conservadas, {m} para revisar")
+          message: (t("editor.paste_lyrics_done") || "Letra aplicada: {r} líneas nuevas, {k} conservadas")
             .replace("{r}", String(res.lines_replaced ?? 0))
-            .replace("{k}", String(res.lines_kept ?? 0))
-            .replace("{m}", String(res.review_count ?? 0)),
+            .replace("{k}", String(res.lines_kept ?? 0)),
           tone: "success",
         });
       } else if (res && res.code === "reference_structure_unconfirmed" && res.structure) {
@@ -2307,7 +2316,7 @@ export default function LyricsEditor({
       setPasteBusy(false);
     }
   }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, pasteBusy, pasteText,
-      pasteLineCount, pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult]);
+      pasteLineCount, pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult, editorRequest]);
 
   const focusSegment = useCallback((id) => {
     setFocusedSegId(id);

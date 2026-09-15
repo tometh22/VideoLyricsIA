@@ -16279,6 +16279,7 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
     from database import SessionLocal as _SL
     _db2 = _SL()
     persisted_revision = initial_revision
+    quality_outbox_id = None
     try:
         row = (
             _db2.query(Job)
@@ -16323,6 +16324,10 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
             current_revision + 1 if body.base_revision is not None else current_revision
         )
         persisted_revision = int(row.segments_revision or 0)
+        row.transcription_quality = _invalidate_quality_after_editor_save(
+            row, revision=persisted_revision, segments=merged,
+            previous_segments=prev_segs,
+        )
         touch_user_activity(_db2, row)
         try:
             from database import AuditLog
@@ -16379,9 +16384,17 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
                 status_code=409,
                 detail={"code": "editor_state_conflict", "detail": str(exc)},
             ) from exc
+        from correction_learning import invalidate_job_observations
+        invalidate_job_observations(_db2, job_id, "later_editor_revision")
+        quality_outbox_id = _create_editor_quality_outbox(
+            _db2, row, revision=persisted_revision, segments=merged,
+            quality=row.transcription_quality, reason="lyrics_reanchor",
+        )
         _db2.commit()
     finally:
         _db2.close()
+
+    _dispatch_editor_quality_outbox(quality_outbox_id)
 
     logger.info("[REANCHOR] ok job=%s lines=%d review=%d locked_kept=%d pasted=%s replaced=%d",
                 job_id, len(merged), review_count, locked_kept, pasted_mode, lines_replaced)
