@@ -1733,12 +1733,18 @@ export default function LyricsEditor({
   const audioUrl = usingLocalAudio ? blobAudioUrl : audioUrlProp;
   const audioTemporarilyUnavailable = !audioUrl && audioUnavailableReason === "temporary";
 
+  const [playbackRate, setPlaybackRate] = useState(1);
   const audioRef = useRef(null);
   const lastMountedAudioRef = useRef(null);
   const setAudioElementRef = useCallback((element) => {
     audioRef.current = element;
-    if (element) lastMountedAudioRef.current = element;
-  }, []);
+    if (element) {
+      lastMountedAudioRef.current = element;
+      element.defaultPlaybackRate = playbackRate;
+      element.playbackRate = playbackRate;
+      element.preservesPitch = true;
+    }
+  }, [playbackRate]);
   const listRef = useRef(null);
   const rowRefs = useRef({});
   const rafRef = useRef(null);
@@ -3141,7 +3147,7 @@ export default function LyricsEditor({
     const onKey = (e) => {
       if (draftRecoveryRef.current) return;
       const tag = (document.activeElement?.tagName || "").toUpperCase();
-      const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
+      const editing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || document.activeElement?.isContentEditable;
       if (editing) return;
       if (e.code === "Space") {
         // Ignore keyboard autorepeat / sustained press so the operator
@@ -4403,6 +4409,7 @@ export default function LyricsEditor({
             }
           }}
           onLoadedMetadata={(e) => {
+            e.currentTarget.playbackRate = playbackRate;
             const mediaDuration = Number(e.currentTarget.duration);
             setAudioError(false);
             autoRecoveryAttemptedUrlRef.current = null;
@@ -5067,6 +5074,17 @@ export default function LyricsEditor({
           <span className="text-xs text-gray-500 tabular-nums shrink-0 w-10">
             {formatTime(duration)}
           </span>
+          <select
+            aria-label={t("editor.playback_speed") || "Velocidad de reproducción"}
+            title={t("editor.playback_speed") || "Velocidad de reproducción"}
+            value={playbackRate}
+            onChange={(event) => setPlaybackRate(Number(event.target.value))}
+            className="h-9 shrink-0 rounded-lg border border-white/10 bg-surface-2 px-1.5 text-xs font-semibold tabular-nums text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light"
+          >
+            <option value={1}>1×</option>
+            <option value={1.5}>1.5×</option>
+            <option value={2}>2×</option>
+          </select>
           </>) : audioLoading ? (
             /* Cargando: el padre todavía está trayendo la URL del audio.
                NO mostrar "no disponible" acá — es un falso alarma mientras
