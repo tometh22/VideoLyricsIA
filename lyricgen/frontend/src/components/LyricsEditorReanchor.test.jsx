@@ -10,7 +10,7 @@
  *    segments re-anclados que devuelve el endpoint.
  *  - Decline / error → toast de error y los timings quedan como estaban.
  */
-import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, cleanup, fireEvent, waitFor, act } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import LyricsEditor from "./LyricsEditor";
 
@@ -201,8 +201,8 @@ describe("Pegar letra oficial y re-sincronizar", () => {
       .mockResolvedValueOnce({
         ok: false, status: 409, code: "reference_structure_unconfirmed",
         structure: {
-          supported: false, reasons: ["line_count_divergent"],
-          metrics: { reference_token_coverage: 0.41, longest_unmatched_content_run: 2 },
+          supported: false, reasons: ["line_count_divergent", "reference_contains_unmatched_passage"],
+          metrics: { reference_token_coverage: 0.79, longest_unmatched_content_run: 8 },
           pasted_line_count: 12, current_line_count: 3,
         },
       })
@@ -217,7 +217,13 @@ describe("Pegar letra oficial y re-sincronizar", () => {
     fireEvent.click(screen.getByTestId("paste-lyrics-submit"));
     const report = await screen.findByTestId("paste-lyrics-structure");
     expect(report).toHaveTextContent("12 líneas pegadas vs 3");
-    expect(report).toHaveTextContent("41%");
+    expect(screen.queryByTestId("reanchor-progress-overlay")).toBeNull();
+    expect(report).toHaveTextContent("Hay diferencias con el texto del editor");
+    expect(report).toHaveTextContent("tramo de 8 palabras diferentes entre ambos textos");
+    expect(report).toHaveTextContent("Coincidencia de palabras con el texto del editor: 79%");
+    expect(report).toHaveTextContent("Este aviso no demuestra que tu letra esté mal");
+    expect(report).not.toHaveTextContent("se reconoce en el audio");
+    expect(report).not.toHaveTextContent("otra versión");
     // Nada se aplicó todavía: sigue abierto y sin toast.
     expect(toastSpy).not.toHaveBeenCalled();
     fireEvent.click(screen.getByTestId("paste-lyrics-confirm-anyway"));
@@ -334,6 +340,7 @@ describe("Seguir esperando al servidor (2026-09-14, caso Agus)", () => {
     fireEvent.change(screen.getByTestId("paste-lyrics-textarea"), { target: { value: "linea uno\nlinea dos\nlinea tres" } });
     fireEvent.click(screen.getByTestId("paste-lyrics-submit"));
     await screen.findByTestId("paste-lyrics-waiting");
+    expect(screen.getByTestId("reanchor-progress-overlay")).toHaveTextContent("Estamos comprobando si la re-sincronización terminó");
     await waitFor(() => expect(toastSpy).toHaveBeenCalled(), { timeout: 3000 });
     expect(polls).toBeGreaterThanOrEqual(3);
     expect(toastSpy.mock.calls[0][0].tone).toBe("success");
@@ -350,6 +357,60 @@ describe("Seguir esperando al servidor (2026-09-14, caso Agus)", () => {
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/No se pudo re-sincronizar/), { timeout: 3000 });
     expect(onReanchorReconcile.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(screen.queryByTestId("paste-lyrics-waiting")).toBeNull();
+    expect(screen.queryByTestId("reanchor-progress-overlay")).toBeNull();
     expect(toastSpy).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("Loader bloqueante de re-sincronización", () => {
+  function start(mode) {
+    fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+    fireEvent.click(screen.getByTestId("editor-overflow-btn"));
+    if (mode === "paste") {
+      fireEvent.click(screen.getByTestId("paste-lyrics-btn"));
+      fireEvent.change(screen.getByTestId("paste-lyrics-textarea"), { target: { value: "linea uno\nlinea dos\nlinea tres" } });
+      fireEvent.click(screen.getByTestId("paste-lyrics-submit"));
+    } else fireEvent.click(screen.getByTestId("reanchor-btn"));
+  }
+
+  it.each(["editor", "paste"])("%s: bloquea desde el guardado hasta aplicar la respuesta", async (mode) => {
+    let finishSave;
+    let finishReanchor;
+    const onPersistSegments = vi.fn(() => new Promise((resolve) => { finishSave = resolve; }));
+    const onReanchor = vi.fn(() => new Promise((resolve) => { finishReanchor = resolve; }));
+    const { container } = render(<LyricsEditor {...baseProps({ onPersistSegments, onReanchor })} />);
+    start(mode);
+    const loader = screen.getByRole("dialog", { name: "Re-sincronizando…" });
+    expect(loader).toHaveFocus();
+    expect(container).toHaveAttribute("inert");
+    expect(screen.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "true");
+    expect(onReanchor).not.toHaveBeenCalled();
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.click(screen.getByTestId("reanchor-progress-overlay"));
+    expect(loader).toBeInTheDocument();
+    await act(async () => { finishSave({ ok: true, revision: 1 }); });
+    await waitFor(() => expect(onReanchor).toHaveBeenCalledTimes(1));
+    expect(loader).toBeInTheDocument();
+    await act(async () => { finishReanchor({ ok: true, revision: 2, segments: SEGMENTS, count: 3 }); });
+    await waitFor(() => expect(screen.queryByTestId("reanchor-progress-overlay")).toBeNull());
+    expect(container).not.toHaveAttribute("inert");
+    expect(screen.getByTestId("lyrics-editor")).toHaveAttribute("aria-busy", "false");
+    expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ tone: "success" }));
+  });
+
+  it.each(["editor", "paste"])("%s: desbloquea al fallar sin descartar el texto", async (mode) => {
+    let fail;
+    const onReanchor = vi.fn(() => new Promise((_, reject) => { fail = reject; }));
+    const { container } = render(<LyricsEditor {...baseProps({ onReanchor })} />);
+    start(mode);
+    expect(screen.getByTestId("reanchor-progress-overlay")).toBeInTheDocument();
+    await act(async () => { fail(new Error("network")); });
+    await waitFor(() => expect(screen.queryByTestId("reanchor-progress-overlay")).toBeNull());
+    expect(container).not.toHaveAttribute("inert");
+    if (mode === "paste") {
+      expect(screen.getByTestId("paste-lyrics-textarea")).toHaveValue("linea uno\nlinea dos\nlinea tres");
+      expect(screen.getByRole("alert")).toHaveTextContent("No se pudo re-sincronizar");
+    } else expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ tone: "error" }));
   });
 });

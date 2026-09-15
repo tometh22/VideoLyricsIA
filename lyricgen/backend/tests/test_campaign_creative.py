@@ -35,7 +35,7 @@ def setup(db, monkeypatch):
 def request(items, **kw):
     return creative.PlanRequest(revision=0, item_ids=[i.id for i in items], reason="Acuerdo de estilos", groups=[
         creative.Group(id="photo", name="Foto y efecto", weight=50, requirement="photo_effect", settings={"movement_style": "foto-parallax", "effect": "rain"}),
-        creative.Group(id="veo", name="Veo", weight=50, requirement="veo", model="veo-3.1-fast-generate-001", settings={"movement_style": "estandar"})], **kw)
+        creative.Group(id="veo", name="Veo", weight=50, requirement="veo", model="veo-3.1-lite-generate-001", settings={"movement_style": "estandar"})], **kw)
 
 
 def test_repartition_stable_exact_preserves_sources_and_native_settings(db, setup):
@@ -229,7 +229,7 @@ def test_generation_snapshot_is_revision_bound_and_native(db, setup):
     assert job.status == "lyrics_approved"  # only the native generate endpoint publishes work
 
 
-def test_lite_is_an_explicit_campaign_model_without_changing_ordinary_jobs(db, setup):
+def test_lite_is_mandatory_for_campaign_and_ordinary_jobs(db, setup):
     from campaign_models import VEO_LITE, model_for_campaign_job
     campaign, items, actor = setup
     body = creative.PlanRequest(revision=0, item_ids=[items[0].id], reason="Contrato Lite", groups=[
@@ -243,11 +243,11 @@ def test_lite_is_an_explicit_campaign_model_without_changing_ordinary_jobs(db, s
     settings = creative.effective_settings(campaign, items[0].render_overrides)
     creative.generation_receipt(db, job, "1", settings, actor); db.commit()
     assert model_for_campaign_job(job.job_id, "ordinary-static-model") == VEO_LITE
-    assert model_for_campaign_job(None, "ordinary-static-model") == "ordinary-static-model"
+    assert model_for_campaign_job(None, "ordinary-static-model") == VEO_LITE
     other = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id,
                 artist="Ordinary", filename="test.wav", status="done", render_params=job.render_params)
     db.add(other); db.commit()
-    assert model_for_campaign_job(other.job_id, "ordinary-static-model") == "ordinary-static-model"
+    assert model_for_campaign_job(other.job_id, "ordinary-static-model") == VEO_LITE
     body.groups[0].model = "untrusted-model"
     body.revision = 1
     with pytest.raises(HTTPException):
@@ -305,3 +305,25 @@ def test_http_assignment_approval_generate_outbox_history_chain(db, setup, clien
     again = client.post("/generate", headers=auth, data=fields)
     assert again.status_code in (200, 409)
     assert db.query(JobOutboxEvent).filter_by(job_id=job.job_id, event_type="pipeline.enqueue").count() == 1
+
+
+def test_legacy_fast_assignment_generates_lite_without_rewriting_history(db, setup):
+    from campaign_models import VEO_LITE
+    campaign, items, actor = setup
+    old = {"group_id": "legacy", "group_name": "Legacy", "requirement": "veo",
+           "model": "veo-3.1-fast-generate-001", "revision": 0}
+    item = items[0]
+    item.render_overrides = {creative.ASSIGNMENT: old, "movement_style": "estandar"}
+    job = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id,
+              campaign_id=campaign.id, campaign_item_id=item.id, workload_class="batch",
+              artist="Test", filename="synthetic.wav", status="lyrics_approved")
+    db.add(job); db.flush()
+    creative.generation_receipt(db, job, "0", creative.effective_settings(campaign, item.render_overrides), actor)
+    db.commit()
+    assignment = job.render_params["campaign_creative_receipt"]["assignment"]
+    assert assignment["model"] == VEO_LITE
+    assert assignment["requested_model"] == old["model"]
+    assert item.render_overrides[creative.ASSIGNMENT] == old
+    live = creative.get_creative(campaign.id, actor, db)
+    assert live["veo_model"] == VEO_LITE
+    assert live["items"][0]["assignment"]["model"] == VEO_LITE

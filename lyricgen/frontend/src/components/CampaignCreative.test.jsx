@@ -15,7 +15,7 @@ beforeEach(() => {
   generateGate = null;
   generateFailures = new Set();
   generateCapacity = null;
-  head = { plan: { revision: 0 }, can_manage: true, veo_model: "veo-3.1-fast-generate-001", fields: {
+  head = { plan: { revision: 0 }, can_manage: true, veo_model: "veo-3.1-lite-generate-001", fields: {
     font: { label: "Tipografía", group: "Letra", kind: "select", options: ["", "anton"] },
     effect: { label: "Efecto", group: "Movimiento y efectos", kind: "select", options: ["", "bokeh", "rain"] },
   }, operations: [], items: Array.from({ length: 39 }, (_, i) => ({ id: `i${i}`, job_id: `j${i}`, title: `Tema ${i}`, artist: "Artista", status: i < 2 ? "lyrics_approved" : i === 2 ? "done" : "transcribed_pending", settings: {} })) };
@@ -227,4 +227,21 @@ describe("campaign bulk design", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(calls.filter(([url]) => url.endsWith("/generate"))).toHaveLength(1);
   });
+});
+
+
+it("forces Lite for saved Fast groups even with stale API metadata", async () => {
+  head.veo_model = "veo-3.1-fast-generate-001";
+  head.veo_models = [{ id: head.veo_model, label: "Veo Fast" }];
+  head.plan.groups = [{ id: "legacy", name: "Legacy", weight: 100, requirement: "veo", model: head.veo_model, settings: { movement_style: "estandar" } }];
+  mount("creative");
+  fireEvent.click(await screen.findByRole("button", { name: /Seleccionar resultados/ }));
+  fireEvent.click(screen.getByRole("button", { name: /Configurar estilos y reparto/ }));
+  expect(screen.getByText(/Modelo de fondo: Veo Lite/)).toBeInTheDocument();
+  expect(screen.queryByLabelText(/Modelo del grupo/)).not.toBeInTheDocument();
+  expect(screen.queryByText("Veo Fast")).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Motivo del cambio"), { target: { value: "Lite obligatorio" } });
+  fireEvent.click(screen.getByRole("button", { name: "Ver reparto antes de guardar" }));
+  await screen.findByRole("button", { name: "Guardar esta asignación" });
+  expect(JSON.parse(calls.find(([url]) => url.endsWith("/preview"))[1].body).groups[0].model).toBe("veo-3.1-lite-generate-001");
 });

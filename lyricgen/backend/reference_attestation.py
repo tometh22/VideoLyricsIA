@@ -27,14 +27,14 @@ _STOP = {
 }
 
 
-def _tokens(value: Any) -> list[str]:
+def _tokens(value: Any, *, include_stop_words: bool = False) -> list[str]:
     normalized = unicodedata.normalize("NFKD", str(value or "").casefold())
     normalized = "".join(
         char for char in normalized if unicodedata.category(char) != "Mn"
     )
     return [
         token for token in re.findall(r"[^\W_]+", normalized, re.UNICODE)
-        if token not in _STOP
+        if include_stop_words or token not in _STOP
     ]
 
 
@@ -162,6 +162,13 @@ def assess_reference_attestation(
         "require_local_alignment": not global_alignment_supported,
         "reasons": reasons,
         "metrics": {
+            # Line wrapping is editorial, not evidence of another recording.
+            # Keep all words here: the content-token score omits stop words.
+            "normalized_text_matches": bool(
+                _tokens(reference_text, include_stop_words=True)
+                and _tokens(reference_text, include_stop_words=True)
+                == _tokens(_segments_text(asr_segments), include_stop_words=True)
+            ),
             "reference_token_count": len(reference_tokens),
             "asr_token_count": len(asr_tokens),
             "ordered_similarity": round(ordered_similarity, 6),

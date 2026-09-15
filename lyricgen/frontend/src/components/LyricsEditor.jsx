@@ -8,6 +8,7 @@ import HelpTip from "./HelpCenter/HelpTip";
 import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
 import LocalDraftRecovery from "./LocalDraftRecovery";
+import ReanchorProgressDialog from "./ReanchorProgressDialog";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { referenceSuggestionsById } from "../lib/referenceSuggestions";
 import { tierForLength } from "../lib/lyricTiers";
@@ -1733,12 +1734,18 @@ export default function LyricsEditor({
   const audioUrl = usingLocalAudio ? blobAudioUrl : audioUrlProp;
   const audioTemporarilyUnavailable = !audioUrl && audioUnavailableReason === "temporary";
 
+  const [playbackRate, setPlaybackRate] = useState(1);
   const audioRef = useRef(null);
   const lastMountedAudioRef = useRef(null);
   const setAudioElementRef = useCallback((element) => {
     audioRef.current = element;
-    if (element) lastMountedAudioRef.current = element;
-  }, []);
+    if (element) {
+      lastMountedAudioRef.current = element;
+      element.defaultPlaybackRate = playbackRate;
+      element.playbackRate = playbackRate;
+      element.preservesPitch = true;
+    }
+  }, [playbackRate]);
   const listRef = useRef(null);
   const rowRefs = useRef({});
   const rafRef = useRef(null);
@@ -2117,6 +2124,7 @@ export default function LyricsEditor({
   //      Decline / error → toast de error, timings quedan como estaban.
   // El snapshot pre-reanchor va al edit history, así Cmd+Z lo revierte.
   const [reanchoring, setReanchoring] = useState(false);
+  const reanchorReturnFocusRef = useRef(null);
   const canReanchor = !!(onReanchor && transcribeJobId
     && user?.features?.anchor_lyrics === true);
   // 2026-09-14: si la respuesta se pierde (alineación >60 s, proxy que
@@ -2174,7 +2182,7 @@ export default function LyricsEditor({
       // pegar, el operador puede confirmar que ES esta versión.
       if (res && res.code === "reference_structure_unconfirmed" && res.structure) {
         const confirmed = window.confirm(
-          (t("editor.reanchor_structure_confirm") || "Esta letra no parece coincidir con la grabación ({p} líneas contra {c} transcriptas). Si escuchaste el audio y es esta versión, ¿re-sincronizar igual?")
+          (t("editor.reanchor_structure_confirm") || "Hay diferencias con la transcripción automática ({p} líneas contra {c} transcriptas). La transcripción puede tener errores. Si verificaste la letra con el audio, ¿re-sincronizar con esta letra?")
             .replace("{p}", String(res.structure.pasted_line_count ?? "?"))
             .replace("{c}", String(res.structure.current_line_count ?? "?")),
         );
@@ -3141,7 +3149,7 @@ export default function LyricsEditor({
     const onKey = (e) => {
       if (draftRecoveryRef.current) return;
       const tag = (document.activeElement?.tagName || "").toUpperCase();
-      const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
+      const editing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || document.activeElement?.isContentEditable;
       if (editing) return;
       if (e.code === "Space") {
         // Ignore keyboard autorepeat / sustained press so the operator
@@ -4345,7 +4353,9 @@ export default function LyricsEditor({
     // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
-    <div data-testid="lyrics-editor" inert={draftRecovery ? "" : undefined} aria-busy={editorInitializationBlocked} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+    <div ref={reanchorReturnFocusRef} tabIndex={-1} data-testid="lyrics-editor" inert={draftRecovery ? "" : undefined} aria-busy={editorInitializationBlocked || reanchoring || pasteBusy} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+      {(reanchoring || pasteBusy) && <ReanchorProgressDialog
+        waiting={!!reanchorWaiting} returnFocusRef={reanchorReturnFocusRef} />}
       {draftRecovery && createPortal(<LocalDraftRecovery recovery={draftRecovery}
         revision={durableEditor.document?.revision} remote={durableEditor.document?.segments || []}
         onRecover={() => resolveRecovery(true)} onDiscard={() => resolveRecovery(false)}
@@ -4407,6 +4417,7 @@ export default function LyricsEditor({
             }
           }}
           onLoadedMetadata={(e) => {
+            e.currentTarget.playbackRate = playbackRate;
             const mediaDuration = Number(e.currentTarget.duration);
             setAudioError(false);
             autoRecoveryAttemptedUrlRef.current = null;
@@ -4665,13 +4676,13 @@ export default function LyricsEditor({
             <p className="mt-2 text-xs text-ink-tertiary" data-testid="paste-lyrics-count">{pasteLineCount} líneas pegadas · {edited.length} en el editor</p>
             {pasteStructure && (
               <div role="alert" data-testid="paste-lyrics-structure" className="mt-3 rounded-xl bg-amber-400/[0.08] p-3 text-xs text-amber-200 ring-1 ring-amber-400/30">
-                <p className="font-medium">{t("editor.paste_lyrics_structure_title") || "Esta letra no parece coincidir con la grabación"}</p>
+                <p className="font-medium">{t("editor.paste_lyrics_structure_title") || "Hay diferencias con el texto del editor"}</p>
                 <ul className="mt-1 list-disc pl-4">
-                  {pasteStructure.reasons?.includes("line_count_divergent") && <li>{`${pasteStructure.pasted_line_count} líneas pegadas vs ${pasteStructure.current_line_count} en el editor`}</li>}
-                  {pasteStructure.reasons?.includes("reference_contains_unmatched_passage") && <li>{`Hay un pasaje de ${pasteStructure.metrics?.longest_unmatched_content_run} palabras que no aparece en lo transcripto (¿estrofa de otra versión?)`}</li>}
-                  {Number.isFinite(pasteStructure.metrics?.reference_token_coverage) && <li>{`Cobertura: ${Math.round(pasteStructure.metrics.reference_token_coverage * 100)}% de la letra pegada se reconoce en el audio`}</li>}
+                  {pasteStructure.reasons?.includes("line_count_divergent") && <li>{(t("editor.paste_lyrics_structure_lines") || "{p} líneas pegadas vs {c} en el editor; los saltos de línea pueden ser distintos.").replace("{p}", String(pasteStructure.pasted_line_count)).replace("{c}", String(pasteStructure.current_line_count))}</li>}
+                  {pasteStructure.reasons?.includes("reference_contains_unmatched_passage") && <li>{(t("editor.paste_lyrics_structure_passage") || "La comparación encontró un tramo de {n} palabras diferentes entre ambos textos.").replace("{n}", String(pasteStructure.metrics?.longest_unmatched_content_run ?? "?"))}</li>}
+                  {Number.isFinite(pasteStructure.metrics?.reference_token_coverage) && <li>{(t("editor.paste_lyrics_structure_coverage") || "Coincidencia de palabras con el texto del editor: {p}% (no mide la exactitud de la letra en el audio).").replace("{p}", String(Math.round(pasteStructure.metrics.reference_token_coverage * 100)))}</li>}
                 </ul>
-                <p className="mt-1">{t("editor.paste_lyrics_structure_hint") || "Si escuchaste el audio y es esta versión, podés forzar la re-sincronización. Todas las líneas quedarán marcadas para revisar."}</p>
+                <p className="mt-1">{t("editor.paste_lyrics_structure_hint") || "La transcripción automática puede omitir o confundir palabras. Este aviso no demuestra que tu letra esté mal. Si verificaste que corresponde a este audio, podés continuar; después revisá la sincronización."}</p>
               </div>
             )}
             {reanchorWaiting && (
@@ -4686,7 +4697,7 @@ export default function LyricsEditor({
               {pasteStructure ? (
                 <button type="button" data-testid="paste-lyrics-confirm-anyway" disabled={pasteBusy} onClick={() => submitPasteLyrics(true)}
                   className="rounded-lg bg-amber-500/80 px-4 py-2 text-sm font-medium text-black disabled:opacity-50">
-                  {pasteBusy ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.paste_lyrics_confirm_anyway") || "Es esta versión, re-sincronizar igual")}
+                  {pasteBusy ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.paste_lyrics_confirm_anyway") || "Confirmar letra y re-sincronizar")}
                 </button>
               ) : (
                 <button type="button" data-testid="paste-lyrics-submit" disabled={pasteBusy || pasteLineCount < 3} onClick={() => submitPasteLyrics(false)}
@@ -5071,6 +5082,17 @@ export default function LyricsEditor({
           <span className="text-xs text-gray-500 tabular-nums shrink-0 w-10">
             {formatTime(duration)}
           </span>
+          <select
+            aria-label={t("editor.playback_speed") || "Velocidad de reproducción"}
+            title={t("editor.playback_speed") || "Velocidad de reproducción"}
+            value={playbackRate}
+            onChange={(event) => setPlaybackRate(Number(event.target.value))}
+            className="h-9 shrink-0 rounded-lg border border-white/10 bg-surface-2 px-1.5 text-xs font-semibold tabular-nums text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light"
+          >
+            <option value={1}>1×</option>
+            <option value={1.5}>1.5×</option>
+            <option value={2}>2×</option>
+          </select>
           </>) : audioLoading ? (
             /* Cargando: el padre todavía está trayendo la URL del audio.
                NO mostrar "no disponible" acá — es un falso alarma mientras

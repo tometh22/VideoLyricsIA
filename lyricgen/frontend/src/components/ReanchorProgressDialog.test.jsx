@@ -1,0 +1,41 @@
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, expect, it, vi } from "vitest";
+import ReanchorProgressDialog from "./ReanchorProgressDialog";
+
+vi.mock("../i18n", () => ({ useI18n: () => ({ t: () => "" }) }));
+afterEach(cleanup);
+
+it("blocks background focus and shortcuts, then restores focus and existing locks", () => {
+  const background = document.createElement("button");
+  const alreadyLocked = document.createElement("div");
+  alreadyLocked.setAttribute("inert", "");
+  document.body.append(background, alreadyLocked);
+  background.focus();
+  document.body.style.overflow = "auto";
+  const shortcut = vi.fn();
+  window.addEventListener("keydown", shortcut);
+  const { unmount } = render(<ReanchorProgressDialog />);
+  const dialog = screen.getByRole("dialog", { name: "Re-sincronizando…" });
+  expect(dialog).toHaveFocus();
+  expect(background).toHaveAttribute("inert");
+  expect(document.body.style.overflow).toBe("hidden");
+  background.focus();
+  expect(dialog).toHaveFocus();
+  fireEvent.keyDown(window, { key: " ", code: "Space" });
+  fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+  fireEvent.keyDown(dialog, { key: "Tab" });
+  fireEvent.keyDown(dialog, { key: "Escape" });
+  expect(shortcut).not.toHaveBeenCalled();
+  expect(dialog).toHaveFocus();
+  unmount();
+  expect(background).not.toHaveAttribute("inert");
+  expect(alreadyLocked).toHaveAttribute("inert");
+  expect(background).toHaveFocus();
+  expect(document.body.style.overflow).toBe("auto");
+  fireEvent.keyDown(window, { key: " " });
+  expect(shortcut).toHaveBeenCalledTimes(1);
+  window.removeEventListener("keydown", shortcut);
+  document.body.style.overflow = "";
+  background.remove();
+  alreadyLocked.remove();
+});

@@ -473,6 +473,65 @@ describe("LyricsEditor — recuperación de audio remoto post-mount", () => {
   });
 });
 
+describe("LyricsEditor — playback speed", () => {
+  it("changes advanced timeline playback speed without seeking or editing lyrics", async () => {
+    const onPersistSegments = vi.fn();
+    const props = baseProps({ audioUrl: "blob:mock-audio", onPersistSegments });
+    const { container } = render(<LyricsEditor {...props} />);
+    const audio = container.querySelector("audio");
+    Object.defineProperty(audio, "duration", { configurable: true, value: 60 });
+    fireEvent.loadedMetadata(audio);
+    await userEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
+    expect(screen.getByRole("tab", { name: "Timeline avanzada" })).toHaveAttribute("aria-selected", "true");
+    const speed = screen.getByRole("combobox", { name: "Velocidad de reproducción" });
+    expect(speed).toHaveValue("1");
+    audio.currentTime = 1.25;
+    fireEvent.timeUpdate(audio);
+    fireEvent.play(audio);
+
+    for (const rate of [1.5, 2, 1]) {
+      await userEvent.selectOptions(speed, String(rate));
+      expect(audio.playbackRate).toBe(rate);
+      expect(audio.defaultPlaybackRate).toBe(rate);
+      expect(audio.preservesPitch).toBe(true);
+      expect(audio.currentTime).toBe(1.25);
+      expect(screen.getByRole("button", { name: "Pausar" })).toBeInTheDocument();
+    }
+    expect(onPersistSegments).not.toHaveBeenCalled();
+  });
+
+  it("retains speed across pause, source renewal and audio remount", async () => {
+    const props = baseProps({ audioUrl: "https://media.example.test/old.wav" });
+    const { container, rerender } = render(<LyricsEditor {...props} />);
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Velocidad de reproducción" }), "2");
+    const audio = container.querySelector("audio");
+    fireEvent.play(audio);
+    fireEvent.pause(audio);
+    expect(audio.playbackRate).toBe(2);
+
+    rerender(<LyricsEditor {...props} audioUrl="https://media.example.test/renewed.wav" />);
+    // Resource selection may reset the media rate before metadata arrives.
+    audio.playbackRate = 1;
+    fireEvent.loadedMetadata(audio);
+    expect(audio.playbackRate).toBe(2);
+    rerender(<LyricsEditor {...props} audioUrl={null} />);
+    rerender(<LyricsEditor {...props} />);
+    expect(container.querySelector("audio").playbackRate).toBe(2);
+    expect(screen.getByRole("combobox", { name: "Velocidad de reproducción" })).toHaveValue("2");
+  });
+
+  it("lets the native speed selector handle Space without toggling audio", () => {
+    const { container } = render(<LyricsEditor {...baseProps({ audioUrl: "blob:mock-audio" })} />);
+    const audio = container.querySelector("audio");
+    const play = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(audio, "play", { configurable: true, value: play });
+    const speed = screen.getByRole("combobox", { name: "Velocidad de reproducción" });
+    speed.focus();
+    fireEvent.keyDown(speed, { key: " ", code: "Space" });
+    expect(play).not.toHaveBeenCalled();
+  });
+});
+
 describe("LyricsEditor — advanced shell and timing safety", () => {
   it("keeps the advanced shell explicit while audio is loading and offers a basic-view escape", async () => {
     render(<LyricsEditor {...baseProps({ audioLoading: true, audioUrl: null })} />);

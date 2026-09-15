@@ -305,12 +305,11 @@ def _anchors_env(value):
             os.environ["BG_LYRIC_ANCHORS"] = prev
 
 
-def test_off_no_invalida_el_cache_existente():
-    """Con el flag apagado las claves quedan byte-idénticas.
+def test_off_preserva_el_cache_lite_sin_agregar_modo_de_anclas():
+    """Apagar anclas conserva la clave Lite sin agregar el flag al hash.
 
-    Si el modo entrara siempre al hash, mergear esto tiraría a la basura todo
-    el caché de fondos y de escenas en R2 y se re-pagaría Veo sin motivo. Es la
-    diferencia entre "output-neutral" y "output-neutral pero carísimo".
+    La política Lite sí separa previews nuevos del caché histórico sin modelo;
+    esa invalidación deliberada no depende del modo de anclas.
     """
     import bg_preview
     import pipeline
@@ -326,6 +325,7 @@ def test_off_no_invalida_el_cache_existente():
                                    resolve_creative_mode)
     canonical = {
         "_cache_version": bg_preview.CACHE_VERSION,
+        "_veo_model": "veo-3.1-lite-generate-001",
         "_creative_mode": resolve_creative_mode(match_lyrics=True, operator_prompt="",
                                                 verbatim=False),
         "_policy_fingerprint": cache_policy_fingerprint(resolve_atmospherics_policy("")),
@@ -338,6 +338,12 @@ def test_off_no_invalida_el_cache_existente():
         json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:12]
     assert key_off == expected
+    # A cached Fast/unknown preview cannot satisfy a new Lite request.
+    canonical.pop("_veo_model")
+    legacy = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:12]
+    assert key_off != legacy
 
 
 def test_on_separa_el_cache_del_motor_viejo():

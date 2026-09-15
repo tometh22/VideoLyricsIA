@@ -52,17 +52,30 @@ it("finds saved drafts and preserves the drafts tab when resuming", async () => 
   });
   mount("/campaigns/campaign-1");
   await screen.findByText(ready.title);
-  fireEvent.click(screen.getByRole("tab", { name: "Borradores 1" }));
-  await screen.findByText("Borrador guardado");
+  fireEvent.click(screen.getByRole("button", { name: "Con cambios humanos guardados 1" }));
+  await screen.findByText("Con cambios humanos guardados");
   expect(screen.getByText(/Guardado por Agus/)).toBeInTheDocument();
   expect(screen.getByRole("combobox", { name: "Orden" })).toBeDisabled();
   expect(screen.queryByText(failed.title)).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Continuar borrador" }));
+  fireEvent.click(screen.getByRole("button", { name: "Continuar revisión" }));
   await screen.findByText("Editor");
   expect(decodeURIComponent(screen.getByTestId("location").textContent)).toContain("tab=drafts");
   fireEvent.click(screen.getByRole("button", { name: "Volver navegador" }));
-  await screen.findByText("Borrador guardado");
-  expect(screen.getByRole("tab", { name: "Borradores 1" })).toHaveAttribute("aria-selected", "true");
+  await screen.findByText("Con cambios humanos guardados");
+  expect(screen.getByRole("button", { name: "Con cambios humanos guardados 1" })).toHaveAttribute("aria-pressed", "true");
+});
+
+it("shows the 300-song total without adding the nested saved-changes filter", async () => {
+  setupFetch((url) => url.pathname.endsWith("/review-queue") ? response({
+    ...payload("pending"), campaign,
+    campaign_totals: { songs: 300, approved: 79, discarded: 13, drafts: 12 },
+  }) : null);
+  mount("/campaigns/campaign-1");
+  await screen.findByText(ready.title);
+  expect(screen.getByText("300 canciones en total = 208 por revisar + 79 aprobadas + 13 descartadas.")).toBeInTheDocument();
+  expect(screen.getAllByRole("tab", { name: /Por revisar|Aprobadas|Todas|Descartadas/ })).toHaveLength(4);
+  expect(screen.queryByRole("tab", { name: /Borradores|cambios humanos/ })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Con cambios humanos guardados 12" })).toHaveAttribute("aria-pressed", "false");
 });
 
 it("loads the campaign once and discards/restores with a visible reason", async () => {

@@ -129,8 +129,10 @@ def compute_bg_cache_key(params: dict) -> str:
     )
     atmospheric_policy = resolve_atmospherics_policy(raw_operator_prompt)
 
+    from campaign_models import VEO_LITE
     canonical = {
         "_cache_version": CACHE_VERSION,
+        "_veo_model": VEO_LITE,
         "_creative_mode": creative_mode,
         "_policy_fingerprint": cache_policy_fingerprint(atmospheric_policy),
         "artist":          (params.get("artist") or "").strip(),

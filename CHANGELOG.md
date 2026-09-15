@@ -3,6 +3,46 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.39] - 2026-09-15
+
+### Fixed
+
+- Explain pasted-lyric differences as a comparison with editor text, without
+  presenting transcript overlap as proof of accuracy against the recording.
+- Accept identical normalized lyrics with different line breaks without an
+  unnecessary structure confirmation; retain guards for unmatched passages.
+- Show a blocking progress dialog throughout lyric re-synchronization and
+  delayed-response recovery, restoring editor interaction on completion or error.
+
+## [1.1.38] - 2026-09-15
+
+### Added
+
+- Add 1×, 1.5× and 2× playback speeds to the lyrics editor audio toolbar,
+  preserving pitch and lyric timestamps while reviewing the advanced timeline.
+- Keep the selected speed across pauses and audio-source renewals, with
+  keyboard-accessible controls in Spanish, English and Portuguese.
+
+## [1.1.37] - 2026-09-15
+
+### Fixed
+
+- Require material saves paired with active-editor activity before identifying
+  saved human changes; automatic saves no longer inflate that filter.
+- Show saved human changes inside pending songs and explain the campaign total
+  as pending plus approved plus discarded, preserving existing review links.
+
+## [1.1.36] - 2026-09-15
+
+### Fixed
+
+- Enforce Veo Lite for every new video background, including static shots,
+  previews, scenes and edits; remove Fast and environment model overrides.
+- Apply the Lite policy to older campaign assignments for future generation,
+  preserving the original requested model in new receipts and historical audit.
+- Bind preview caches and model disclosures to Lite; restrict generation tools
+  to the same policy and remove the campaign model selector.
+
 ## [1.1.32] - 2026-09-15
 
 ### Fixed
