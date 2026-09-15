@@ -3,6 +3,20 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.44] - 2026-09-15
+
+### Fixed
+
+- Stop the bulk campaign publish from promising a ProRes that nothing will
+  create. It listed both `.mov` deliverables in `file_types` without checking
+  them, on the assumption that the portal materialises ProRes on first
+  download — it does not: the portal signs the deterministic R2 key and never
+  goes through `ensure_prores_exists`. Measured on the Chile portal on
+  2026-09-15: 28 of 34 active deliveries were offering UMG a "ProRes Master
+  (broadcast)" that does not exist in R2. A job without `umg_spec` cannot
+  produce one, so it is now published as a partial delivery instead; a job
+  with a spec gets the transcode queued so the file actually appears.
+
 ## [1.1.43] - 2026-09-15
 
 ### Fixed

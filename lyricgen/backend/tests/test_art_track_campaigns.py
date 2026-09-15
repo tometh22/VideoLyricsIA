@@ -2,6 +2,7 @@
 
 import hashlib
 import uuid
+from unittest.mock import patch
 from datetime import datetime, timezone
 
 import pytest
@@ -182,3 +183,125 @@ def test_cross_tenant_admin_can_read_delivery_operation_without_exposing_it_to_o
         with pytest.raises(HTTPException) as denied:
             get_delivery_batch(operation_id, {**owner, "tenant_id": "foreign-operator"}, db)
         assert denied.value.status_code == 404
+
+
+def _seed_campaign_job(campaign, *, umg_spec=None, s3_keys=None):
+    from database import Job as JobModel
+    db = SessionLocal()
+    try:
+        job = JobModel(
+            job_id=uuid.uuid4().hex[:12], user_id=campaign.created_by,
+            tenant_id=campaign.tenant_id, workload_class="batch",
+            campaign_id=campaign.id, artist="Artist", song_title="Song",
+            filename="song.mp3", status="done",
+            approved_at=datetime.now(timezone.utc), video_url="v.mp4",
+            umg_spec=umg_spec, s3_keys=s3_keys or {},
+        )
+        db.add(job); db.commit()
+        return job.job_id
+    finally:
+        db.close()
+
+
+def _run_bulk_delivery(client, admin_token, campaign_id, key):
+    res = client.post(
+        f"/batch/campaigns/{campaign_id}/deliveries",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"destination_portal": "chile", "idempotency_key": key},
+    )
+    assert res.status_code == 202, res.text
+    return res.json()["operation_id"]
+
+
+def _campaign_for(client, admin_token, name):
+    created = client.post(
+        "/batch/campaigns", headers={"Authorization": f"Bearer {admin_token}"},
+        json={"name": name, "expected_count": 1, "kind": "lyric_video"},
+    )
+    assert created.status_code == 200, created.text
+    db = SessionLocal()
+    try:
+        return db.query(BatchCampaign).filter(BatchCampaign.id == created.json()["id"]).one()
+    finally:
+        db.close()
+
+
+def test_bulk_publish_does_not_promise_a_prores_nothing_will_create(
+    client, admin_token, monkeypatch,
+):
+    """Medido en el portal de Chile el 2026-09-15: 28 de 34 entregas activas
+    ofrecían un "ProRes Master (broadcast)" que no existe en R2.
+
+    Esta ruta publicaba los dos .mov en `file_types` sin verificarlos, apoyada
+    en que el portal los transcodifica al primer download. No lo hace: firma la
+    key determinística de R2 y nunca pasa por `ensure_prores_exists`. Un job
+    sin `umg_spec` ni siquiera puede producirlos, así que se entrega parcial en
+    vez de prometer un archivo inexistente.
+    """
+    from database import Delivery
+    import art_track_campaigns as atc
+
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign_for(client, admin_token, "Chile sin spec")
+    job_id = _seed_campaign_job(campaign, umg_spec=None, s3_keys={
+        "video": "t/j/lyric_video.mp4", "short": "t/j/short.mp4",
+        "thumbnail": "t/j/thumbnail.jpg",
+    })
+    op = _run_bulk_delivery(client, admin_token, campaign.id, "bulk-sin-spec-000001")
+
+    def only_render_outputs(key):
+        return bool(key) and not str(key).endswith(".mov")
+
+    with (
+        patch.object(atc.storage, "is_enabled", return_value=True),
+        patch.object(atc.storage, "object_exists", side_effect=only_render_outputs),
+        patch.object(atc, "enqueue_prores_prewarm") as enqueue,
+    ):
+        atc.process_delivery_batch(op)
+
+    db = SessionLocal()
+    try:
+        row = db.query(Delivery).filter(Delivery.job_id == job_id).one()
+        assert "umg_master" not in row.file_types
+        assert "umg_short" not in row.file_types
+        assert row.file_types == ["video", "short", "thumbnail"]
+    finally:
+        db.close()
+    # Sin spec no hay con qué transcodificar: encolar sería girar en falso.
+    enqueue.assert_not_called()
+
+
+def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
+    client, admin_token, monkeypatch,
+):
+    """Con spec sí se puede: se publica el entregable y se encola el transcode,
+    así el archivo aparece en vez de quedar prometido para siempre."""
+    from database import Delivery
+    import art_track_campaigns as atc
+
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign_for(client, admin_token, "Chile con spec")
+    job_id = _seed_campaign_job(
+        campaign,
+        umg_spec={"frame_size": "HD", "fps": 24.0, "prores_profile": 3},
+        s3_keys={"video": "t/j/lyric_video.mp4", "short": "t/j/short.mp4",
+                 "thumbnail": "t/j/thumbnail.jpg"},
+    )
+    op = _run_bulk_delivery(client, admin_token, campaign.id, "bulk-con-spec-000001")
+
+    with (
+        patch.object(atc.storage, "is_enabled", return_value=True),
+        patch.object(atc.storage, "object_exists",
+                     side_effect=lambda key: bool(key) and not str(key).endswith(".mov")),
+        patch.object(atc, "enqueue_prores_prewarm") as enqueue,
+    ):
+        atc.process_delivery_batch(op)
+
+    db = SessionLocal()
+    try:
+        row = db.query(Delivery).filter(Delivery.job_id == job_id).one()
+        assert "umg_master" in row.file_types and "umg_short" in row.file_types
+    finally:
+        db.close()
+    assert sorted(c.args[1] for c in enqueue.call_args_list) == ["umg_master", "umg_short"]
+    assert all(c.kwargs == {"force": True} for c in enqueue.call_args_list)

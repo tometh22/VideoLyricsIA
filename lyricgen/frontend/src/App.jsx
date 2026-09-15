@@ -1,6 +1,7 @@
 import { reviewCreativeSettings } from "./lib/campaignCreative";
 import useCampaignCreativeSave from "./hooks/useCampaignCreativeSave";
 import { resolveSavedLanguageReview } from "./lib/languageResolution";
+import { reanchorHttpFailure } from "./lib/reanchorResult";
 import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
 import { safeReviewReturnPath } from "./lib/reviewerNavigation";
 import {
@@ -1739,9 +1740,7 @@ const pollReanchorTask = async (jobId, taskId, onProgress) => {
     const payload = record.payload || {};
     if (httpStatus >= 200 && httpStatus < 300) return payload;
     console.warn("[reanchor] task failed", httpStatus, payload?.detail || payload?.code || "");
-    return { ok: false, reason: `http-${httpStatus}`, status: httpStatus,
-      detail: payload?.detail || "", code: payload?.code || null,
-      structure: payload?.structure || null, structural: payload?.structural || null };
+    return reanchorHttpFailure(httpStatus, payload, { terminal: true });
   }
   console.warn("[reanchor] task poll timed out", taskId);
   return { ok: false, reason: "task-lost" };
@@ -3748,8 +3747,7 @@ export default function App() {
         let payload = null;
         try { payload = await res.clone().json(); detail = payload?.detail || ""; } catch { /* non-JSON body */ }
         console.warn("[reanchor] failed", res.status, detail || payload?.code || "");
-        return { ok: false, reason: `http-${res.status}`, status: res.status, detail,
-          code: payload?.code || null, structure: payload?.structure || null };
+        return reanchorHttpFailure(res.status, payload);
       }
       return await res.json();
     } catch (err) {
