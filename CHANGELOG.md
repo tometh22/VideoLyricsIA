@@ -3,6 +3,15 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.31] - 2026-09-15
+
+### Fixed
+
+- Explain when campaign generation reaches the render or final-review capacity
+  limit, stop further submissions, and keep unsent songs selected for retry.
+- Show each failed song's rejection reason and preserve submission results
+  when refreshing campaign status fails.
+
 ## [1.1.30] - 2026-09-15
 
 ### Fixed

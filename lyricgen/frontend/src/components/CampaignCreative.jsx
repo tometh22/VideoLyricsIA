@@ -40,7 +40,9 @@ async function request(path, options = {}) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const detail = translateBackendError(data.detail);
-    throw new Error(detail || `Error ${response.status}`);
+    throw Object.assign(new Error(detail || `Error ${response.status}`), {
+      status: response.status, code: data.detail?.code,
+    });
   }
   return data;
 }
@@ -109,6 +111,7 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
   const [selectedVideoIds, setSelectedVideoIds] = useState(new Set()), [bulkDelivery, setBulkDelivery] = useState(null), [deliveryPortal, setDeliveryPortal] = useState("");
   const [generation, setGeneration] = useState(null);
   const [generationProgress, setGenerationProgress] = useState(null);
+  const [generationNotice, setGenerationNotice] = useState("");
   const [previewStyle, setPreviewStyle] = useState(null);
   const [configurationOpen, setConfigurationOpen] = useState(false);
   const [videoQuery, setVideoQuery] = useState("");
@@ -153,6 +156,10 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
     const batch = [...(generation || [])];
     let sent = 0;
     const failures = [];
+    const sentIds = new Set();
+    let deferred = [];
+    let capacityMessage = "";
+    setGenerationNotice("");
     setGenerationProgress({ attempted: 0, sent: 0, total: batch.length, current: batch[0]?.title || "" });
     for (const [index, item] of batch.entries()) {
       setGenerationProgress({ attempted: index, sent, total: batch.length, current: item.title });
@@ -160,19 +167,31 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
         const job = await request(`/status/${item.job_id}`);
         await request("/generate", { method: "POST", body: campaignGenerateForm(item, job) });
         sent++;
+        sentIds.add(item.id);
       } catch (submissionError) {
+        if (submissionError.status === 429 && ["batch_render_window_full", "batch_final_review_full"].includes(submissionError.code)) {
+          deferred = batch.slice(index);
+          capacityMessage = submissionError.message;
+          break;
+        }
         failures.push({ title: item.title, message: submissionError.message });
       }
       setGenerationProgress({ attempted: index + 1, sent, total: batch.length, current: batch[index + 1]?.title || "" });
     }
     setGenerationProgress(null);
     setGeneration(null);
-    await load();
+    setSelected(previous => new Set([...previous].filter(id => !sentIds.has(id))));
     setMessage(`${sent} ${sent === 1 ? "trabajo enviado" : "trabajos enviados"}${failures.length ? ` · ${failures.length} no se enviaron` : ""}; consultá el historial de esta campaña.`);
-    if (failures.length) {
-      const titles = failures.map(failure => failure.title).join(", ");
-      throw new Error(`No se pudieron enviar ${failures.length} ${failures.length === 1 ? "video" : "videos"}: ${titles}. Los demás continuaron.`);
+    if (deferred.length) {
+      setGenerationNotice(`${capacityMessage} ${deferred.length} ${deferred.length === 1 ? "video quedó sin enviar y sigue seleccionado" : "videos quedaron sin enviar y siguen seleccionados"}. Actualizá el estado y volvé a generar los pendientes cuando haya lugar.`);
     }
+    let refreshError;
+    try { await load(); } catch (e) { refreshError = e; }
+    if (failures.length) {
+      const details = failures.map(failure => `${failure.title}: ${failure.message}`).join("; ");
+      throw new Error(`No se pudieron enviar ${failures.length} ${failures.length === 1 ? "video" : "videos"}: ${details}.${refreshError ? " No se pudo actualizar el estado; volvé a actualizarlo." : ""}`);
+    }
+    if (refreshError) throw new Error("El resultado del envío está indicado arriba, pero no se pudo actualizar el estado. Volvé a actualizarlo.");
   });
   const change = fn => { setPreview(null); fn(); };
   const updateGroup = (i, patch) => change(() => setGroups(old => old.map((g, n) => n === i ? { ...g, ...patch } : g)));
@@ -214,6 +233,7 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
   return <section className="space-y-5" aria-label="Configuración de campaña">
     {error && <p role="alert" className="rounded-xl bg-red-500/15 p-3 text-red-200">{error}</p>}
     {message && <p role="status" className="rounded-xl bg-emerald-500/15 p-3 text-emerald-200">{message}</p>}
+    {generationNotice && <p role="status" className="rounded-xl bg-amber-500/15 p-3 text-amber-200">{generationNotice}</p>}
     <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-sm text-ink-secondary">Configuración guardada · versión {data.plan.revision}</p><button className={button} disabled={busy} onClick={() => run(() => load())}>Actualizar estado</button></div>
     {view === "creative" && <>
       <div className="overflow-hidden rounded-2xl bg-surface-2/40 ring-1 ring-white/10">

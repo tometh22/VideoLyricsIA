@@ -8,12 +8,13 @@ vi.mock("../mediaUrl", () => ({
   useLazyMediaUrl: () => ({ ref: () => {}, url: "/preview/thumbnail.jpg" }),
   useMediaUrl: () => "/preview/video.mp4",
 }));
-let head, report, calls, generateGate, generateFailures;
+let head, report, calls, generateGate, generateFailures, generateCapacity;
 const response = data => ({ ok: true, json: async () => data });
 beforeEach(() => {
   calls = [];
   generateGate = null;
   generateFailures = new Set();
+  generateCapacity = null;
   head = { plan: { revision: 0 }, can_manage: true, veo_model: "veo-3.1-fast-generate-001", fields: {
     font: { label: "Tipografía", group: "Letra", kind: "select", options: ["", "anton"] },
     effect: { label: "Efecto", group: "Movimiento y efectos", kind: "select", options: ["", "bokeh", "rain"] },
@@ -33,7 +34,14 @@ beforeEach(() => {
       report = { ...report, videos: report.videos.map(video => video.job_id === jobId ? { ...video, status: "done", approved_at: new Date().toISOString() } : video) };
       return response({ ok: true, status: "done", job_id: jobId });
     }
-    if (url.endsWith("/generate")) { if (generateGate) await generateGate; const jobId = options.body.get("job_id"); return generateFailures.has(jobId) ? { ok: false, json: async () => ({ detail: "No disponible" }) } : response({ ok: true }); }
+    if (url.endsWith("/generate")) {
+      if (generateGate) await generateGate;
+      const jobId = options.body.get("job_id");
+      if (generateCapacity && calls.filter(([path]) => path.endsWith("/generate")).length > generateCapacity.accepted) {
+        return { ok: false, status: 429, json: async () => ({ detail: { code: generateCapacity.code, limit: 10 } }) };
+      }
+      return generateFailures.has(jobId) ? { ok: false, status: 503, json: async () => ({ detail: "No disponible" }) } : response({ ok: true });
+    }
     throw new Error(`Unexpected request: ${url}`);
   }));
 });
@@ -183,7 +191,40 @@ describe("campaign bulk design", () => {
     fireEvent.click(screen.getByRole("button", { name: "Preparar generación de 2 aprobadas seleccionadas" }));
     fireEvent.click(screen.getByRole("button", { name: "Confirmar generación" }));
     await screen.findByText("1 trabajo enviado · 1 no se enviaron; consultá el historial de esta campaña.");
-    expect(screen.getByRole("alert")).toHaveTextContent("No se pudieron enviar 1 video: Tema 0");
+    expect(screen.getByRole("alert")).toHaveTextContent("No se pudieron enviar 1 video: Tema 0: No disponible");
     expect(calls.filter(([url]) => url.endsWith("/generate"))).toHaveLength(2);
+  });
+  it("leaves eight of eighteen songs selected when the render window fills and retries only those songs", async () => {
+    head = { ...head, items: head.items.slice(0, 18).map(item => ({ ...item, status: "lyrics_approved" })) };
+    generateCapacity = { accepted: 10, code: "batch_render_window_full" };
+    mount("creative");
+    fireEvent.click(await screen.findByRole("button", { name: "Seleccionar listas para generar (18)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preparar generación de 18 aprobadas seleccionadas" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar generación" }));
+    await screen.findByText(/8 videos quedaron sin enviar y siguen seleccionados/);
+    expect(screen.getByText(/La cola de generación de tu equipo está completa/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(calls.filter(([url]) => url.endsWith("/generate"))).toHaveLength(11);
+    expect(screen.getByLabelText(/8 seleccionadas/)).toBeInTheDocument();
+    // Even if the refresh still reports the accepted songs as ready, their
+    // selection is removed so a second submission never includes them.
+    generateCapacity = null;
+    fireEvent.click(screen.getByRole("button", { name: "Preparar generación de 8 aprobadas seleccionadas" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar generación" }));
+    await screen.findByText("8 trabajos enviados; consultá el historial de esta campaña.");
+    expect(calls.filter(([url]) => url.endsWith("/generate")).slice(11).map(([, options]) => options.body.get("job_id")))
+      .toEqual(Array.from({ length: 8 }, (_, i) => `j${i + 10}`));
+    expect(screen.queryByText(/quedaron sin enviar y siguen seleccionados/)).not.toBeInTheDocument();
+  });
+  it("explains that the final review buffer needs approval instead of reporting failed videos", async () => {
+    generateCapacity = { accepted: 0, code: "batch_final_review_full" };
+    mount("creative");
+    fireEvent.click(await screen.findByRole("button", { name: "Seleccionar listas para generar (2)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preparar generación de 2 aprobadas seleccionadas" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar generación" }));
+    await screen.findByText(/Revisá y aprobá o rechazá algunos/);
+    expect(screen.getByText(/2 videos quedaron sin enviar y siguen seleccionados/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(calls.filter(([url]) => url.endsWith("/generate"))).toHaveLength(1);
   });
 });
