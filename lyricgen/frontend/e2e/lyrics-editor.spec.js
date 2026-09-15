@@ -12,6 +12,39 @@ import {
 
 test.describe("lyrics editor browser contract", () => {
 
+  test("advanced opens the real timeline; inline spaces autosave before blur and line rail navigates", async ({ page }) => {
+    const harness = await installEditorHarness(page, { editorV2: true, segments: DEFAULT_SEGMENTS.map((line, index) => ({ ...line, segment_id: `stable-${index}` })), transcriptionQuality: {
+      schema_version: 6, policy_version: "lyrics-quality-v6", mode: "enforce", decision: "review_required",
+      unsafe_windows: [{ id: "first", start: 0.4, end: 1, reasons: ["timing"] }],
+    } });
+    await harness.open();
+    await page.getByRole("tab", { name: "Ajustar tiempos", exact: true }).click();
+    await expect(page.getByTestId("timeline-lane")).toBeVisible();
+    await expect(page.getByTestId("guided-timing-review")).toHaveCount(0);
+    const second = page.getByTestId("timeline-segment").nth(1);
+    await second.locator('[data-testid="timeline-segment-body"]').dblclick();
+    const input = second.locator('input');
+    await input.press("End");
+    await input.pressSequentially(" con espacios");
+    await expect(input).toHaveValue("Segunda línea con espacios");
+    await expect(input).toBeFocused();
+    await expect.poll(() => harness.saves.some(save => save.segments.some(line => line.text === "Segunda línea con espacios")), { timeout: 10000 }).toBe(true);
+    await expect(input).toBeFocused();
+    await input.press("Enter");
+    await page.getByTestId("timeline-label-row").nth(2).click();
+    await expect.poll(() => page.locator('audio').evaluate(audio => audio.currentTime)).toBeCloseTo(2, 1);
+    await expect(page.getByTestId("timeline-label-row").nth(2)).toHaveAttribute("data-selected", "true");
+    await page.getByRole("button", { name: "Duplicar línea", exact: true }).click();
+    await expect(page.getByTestId("timeline-segment")).toHaveCount(6);
+    await expect.poll(() => harness.saves.some(save => save.segments.length === 6)).toBe(true);
+    const latest = harness.saves.at(-1).segments;
+    expect(new Set(latest.map(line => line.segment_id)).size).toBe(6);
+    for (const line of latest) expect(line.end).toBeGreaterThan(line.start);
+    await page.getByRole("tab", { name: "Revisar letra", exact: true }).click();
+    await page.getByRole("tab", { name: "Ajustar tiempos", exact: true }).click();
+    await expect(page.getByTestId("timeline-lane")).toBeVisible();
+  });
+
   test("plays the context before a line without changing its text or timing", async ({ page }) => {
     const harness = await installEditorHarness(page);
     const analytics = [];
@@ -49,7 +82,7 @@ test.describe("lyrics editor browser contract", () => {
 
     await openAdvanced(page);
     await expect(page.getByTestId("timeline-segment")).toHaveCount(DEFAULT_SEGMENTS.length);
-    await expect(page.getByTestId("editor-mode-explainer")).toContainText("Revisión guiada y ajustes precisos");
+    await expect(page.getByTestId("editor-mode-explainer")).toContainText("Mover y editar líneas en la timeline");
 
     await page.getByRole("tab", { name: "Revisar letra" }).click();
     await expect(page.getByRole("tab", { name: "Revisar letra" })).toHaveAttribute("aria-selected", "true");
@@ -144,7 +177,7 @@ test.describe("lyrics editor browser contract", () => {
     await harness.open();
     await openAdvanced(page);
 
-    await expect(page.getByTestId("timeline-selection-help")).toContainText("Arrastrá el fondo");
+    await expect(page.getByTestId("timeline-selection-help")).toContainText("Arrastrá para seleccionar varias líneas");
 
     const rows = page.getByTestId("timeline-label-row");
     const firstRow = await rows.first().boundingBox();

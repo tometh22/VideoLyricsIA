@@ -1,6 +1,7 @@
 # Escuchar una línea con contexto
 
-La acción **Escuchar 2 s antes** de cada fila reproduce desde
+La acción **Escuchar 2 s antes** del panel de la línea seleccionada en campañas
+(y de cada fila en el editor de creación) reproduce desde
 `max(0, line.start - 2)`. Se puede repetir y no cambia texto, tiempos ni
 confirmaciones. El timestamp sigue reproduciendo desde el inicio exacto.
 Sin audio o durante Sync, la acción no está disponible.
@@ -56,5 +57,6 @@ seek→primera tecla. Una comparación antes/después de seeks requiere una vent
 prospectiva con telemetría reparada. `search` también incluye navegación visual:
 su descenso no demuestra por sí solo reducción de búsqueda auditiva.
 
-Esta entrega prepara un PR contra **staging únicamente**. No acredita ahorro
-medido, despliegue ni cambios de producción.
+Esta entrega se prueba primero en la rama local `feat/editor-unified-review`.
+Un eventual PR será contra **staging únicamente**, después de la revisión local
+de Tomi. No acredita ahorro medido, despliegue ni cambios de producción.

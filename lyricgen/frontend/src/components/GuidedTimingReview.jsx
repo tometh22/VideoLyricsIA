@@ -427,18 +427,20 @@ export default function GuidedTimingReview({
     onOpenAdvanced?.();
   };
 
-  const handlePlayWindow = () => {
+  const handlePlayWindow = async () => {
     if (!activeWindow || !audioAvailable || !activeWindowPlayable) return;
-    if (!hasListened) {
-      setHasListened(true);
-      setAlignmentDecision(null);
-    }
-    onPlayWindow?.(activeWindow);
+    const signature = activeWindowSignature;
+    try {
+      const started = await onPlayWindow?.(activeWindow);
+      if (started !== true || activeWindowSignatureRef.current !== signature) return;
+      if (!hasListened) {
+        setHasListened(true);
+        setAlignmentDecision(null);
+      }
+    } catch { /* A failed play request is not a completed listen. */ }
   };
 
   const restartTutorial = () => {
-    setHasListened(false);
-    setAlignmentDecision(null);
     setShowHowItWorks(true);
   };
 

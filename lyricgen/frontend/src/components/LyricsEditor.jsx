@@ -9,6 +9,7 @@ import { useToast } from "./ToastProvider";
 import HelpTip from "./HelpCenter/HelpTip";
 import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
+import CampaignLyricsReview from "./CampaignLyricsReview";
 import LocalDraftRecovery from "./LocalDraftRecovery";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { referenceSuggestionsById } from "../lib/referenceSuggestions";
@@ -918,7 +919,7 @@ export default function LyricsEditor({
   // "Ajustar tiempos" opens on a focused, one-problem-at-a-time workflow.
   // The full DAW-like surface is still available, but is an explicit expert
   // choice instead of the first thing every operator has to understand.
-  const [timingWorkspaceMode, setTimingWorkspaceMode] = useState("guided"); // guided | timeline
+  const [timingWorkspaceMode, setTimingWorkspaceMode] = useState("timeline"); // guided is an explicit, optional workspace
   const [previewDockOpen, setPreviewDockOpen] = useState(false);
   // 2026-05-25 Studio Console — Modo enfoque. Toggle persistente que
   // agranda max-h de la lista + MAX_VH del timeline. Operador con 30-50
@@ -2817,7 +2818,7 @@ export default function LyricsEditor({
     }
   }, [trackEditorEvent, edited, focusedSegId, editorV2Enabled, durableEditor.document, durableEditor.revisionRef, isDirty]);
 
-  const playGuidedWindow = useCallback((qualityWindow) => {
+  const playGuidedWindow = useCallback(async (qualityWindow) => {
     const audio = audioRef.current;
     if (!audio || !qualityWindow || audio.readyState < 1) return;
     if (guidedPlayingWindowId === qualityWindow.id && !audio.paused) {
@@ -2850,15 +2851,22 @@ export default function LyricsEditor({
     playbackTimeRef.current = start;
     lastPublishedTimeRef.current = start;
     setCurrentTime(start);
-    audio.play().catch(() => {
-      guidedPlaybackRangeRef.current = null;
-      setGuidedPlayingWindowId(null);
-    });
-    trackEditorEvent("editor_guided_window_played", {
-      window_id: qualityWindow.id,
-      start_ms: Math.round(start * 1000),
-      end_ms: Math.round(end * 1000),
-    });
+    try {
+      await audio.play();
+      if (guidedPlaybackRangeRef.current?.id !== qualityWindow.id) return false;
+      trackEditorEvent("editor_guided_window_played", {
+        window_id: qualityWindow.id,
+        start_ms: Math.round(start * 1000),
+        end_ms: Math.round(end * 1000),
+      });
+      return true;
+    } catch {
+      if (guidedPlaybackRangeRef.current?.id === qualityWindow.id) {
+        guidedPlaybackRangeRef.current = null;
+        setGuidedPlayingWindowId(null);
+      }
+      return false;
+    }
   }, [duration, guidedPlayingWindowId, stopGuidedPlayback, trackEditorEvent, waveform?.duration]);
 
   useEffect(() => () => {
@@ -3140,6 +3148,7 @@ export default function LyricsEditor({
       .filter((s) => s.review || unsafeIds.has(s._id))
       .map((s) => s._id);
     if (!reviewIds.length) return;
+    setTimingWorkspaceMode("timeline");
     // El chip del header pasa el EVENTO como primer argumento, así que sólo un
     // número cuenta como dirección explícita.
     const step = (typeof direction === "number" && direction < 0) ? -1 : 1;
@@ -3174,10 +3183,11 @@ export default function LyricsEditor({
   // in sync mode so the operator can recover from a mistap.
   useEffect(() => {
     const onKey = (e) => {
-      if (draftRecoveryRef.current) return;
+      if (draftRecoveryRef.current || e.defaultPrevented) return;
       const tag = (document.activeElement?.tagName || "").toUpperCase();
       const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
-      if (editing) return;
+      if (editing || tag === "SELECT") return;
+      if ((tag === "BUTTON" || tag === "A") && [" ", "Enter", "ArrowLeft", "ArrowRight"].includes(e.key)) return;
       if (e.code === "Space") {
         // Ignore keyboard autorepeat / sustained press so the operator
         // doesn't anchor 3 lines from one apparent tap. Native autorepeat
@@ -3193,15 +3203,6 @@ export default function LyricsEditor({
       } else if (requireLineReview && e.key === "ArrowRight") {
         e.preventDefault();
         seekTo(Math.min(duration || currentTime + 2, currentTime + 2), false);
-      } else if (requireLineReview && e.key === "Tab") {
-        e.preventDefault();
-        const currentIndex = Math.max(0, edited.findIndex((segment) => segment._id === focusedSegId));
-        const next = edited[(currentIndex + (e.shiftKey ? -1 : 1) + edited.length) % edited.length];
-        if (next) {
-          setFocusedSegId(next._id);
-          seekTo(Math.max(0, next.start), false, next);
-          rowRefs.current[next._id]?.querySelector('input[type="text"]')?.focus();
-        }
       } else if ((e.metaKey || e.ctrlKey) && (e.key === "z" || e.key === "Z")) {
         // Cmd/Ctrl+Z: undo. Sync Mode rolls back the last anchor (with
         // its propagated future); outside Sync Mode it pops the manual
@@ -3585,21 +3586,26 @@ export default function LyricsEditor({
     recordEditorAction("duplicate", { id, segments: Array.isArray(edited) ? edited.length : null });
     if (!edited.some((seg) => seg._id === id)) return;
     pushEditHistory();
+    const nextId = edited.reduce((m, s) => Math.max(m, s._id), -1) + 1;
     setEdited((prev) => {
       const idx = prev.findIndex((s) => s._id === id);
       if (idx === -1) return prev;
-      const orig = prev[idx];
+      const orig = { ...prev[idx], segment_id: prev[idx].segment_id ?? mintSegmentId() };
       const segDur = Math.max(0.5, orig.end - orig.start);
-      const newStart = Math.min(duration || orig.end + segDur, orig.end);
-      const newEnd = Math.min(duration || newStart + segDur, newStart + segDur);
-      const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
+      const newEnd = duration > 0 ? Math.min(duration, orig.end + segDur) : orig.end + segDur;
+      const newStart = orig.end < newEnd ? orig.end : Math.max(0, Math.min(orig.start, newEnd - 0.1));
+      // A copy has a fresh identity and needs its own timing review. Word
+      // timestamps and timing locks belong to the original occurrence.
+      const { words: _words, locked: _locked, ...copy } = orig;
       const dup = {
-        ...orig, _id: nextId, segment_id: mintSegmentId(),
-        start: newStart, end: newEnd,
+        ...copy, _id: nextId, segment_id: mintSegmentId(),
+        start: newStart, end: newEnd, review: true,
       };
-      return [...prev.slice(0, idx + 1), dup, ...prev.slice(idx + 1)];
+      return [...prev.slice(0, idx), orig, dup, ...prev.slice(idx + 1)];
     });
+    setFocusedSegId(nextId);
     setFlushCounter((c) => c + 1);
+    return nextId;
   };
 
   // Append a blank line at the end of the list. Operator types the
@@ -3894,6 +3900,7 @@ export default function LyricsEditor({
 
   const jumpToUnsafeWindow = useCallback((qualityWindow) => {
     if (!qualityWindow) return;
+    setTimingWorkspaceMode("timeline");
     seekTo(qualityWindow.start, false);
     const overlapping = sanitizedEdited.find(
       (segment) => segment.end >= qualityWindow.start && segment.start <= qualityWindow.end,
@@ -4292,7 +4299,7 @@ export default function LyricsEditor({
   const confidenceParts = [];
   if (unvalidatedTimingCount > 0) {
     confidenceParts.push(`Timing no validado · ${unvalidatedTimingCount} líneas a revisar`);
-  } else if (reviewSegCount > 0) confidenceParts.push(t("editor.confidence_synced") || "Sincronizado con tu letra");
+  } else if (reviewSegCount > 0) confidenceParts.push(t("editor.review_pending") || "Pendiente de revisión");
   // Orientación al abrir (56 s medidos hasta la primera edición): cuántas zonas
   // marcó el análisis de calidad. Se AGREGA a la señal calma existente
   // ("señal review calma", 2026-07) en vez de reemplazarla — es un dato para
@@ -4574,19 +4581,19 @@ export default function LyricsEditor({
         </details>
       )}
       {requireLineReview && (
-        <div className="mb-3 rounded-xl bg-brand/[0.08] px-4 py-3 text-xs ring-1 ring-brand/25" data-testid="line-review-gate">
-          <div className="flex flex-wrap items-center justify-between gap-3">
+        <details className="mb-3 rounded-xl bg-brand/[0.08] px-4 py-3 text-xs ring-1 ring-brand/25" data-testid="line-review-gate">
+          <summary className="cursor-pointer font-medium">
             <span className="font-semibold text-brand-light">Revisión por canción</span>
             {unsafeWindows.length > 0 && (
-              <span className="font-semibold tabular-nums text-amber-100" data-testid="campaign-guidance-count">
+              <span className="ml-2 font-semibold tabular-nums text-amber-100" data-testid="campaign-guidance-count">
                 {unsafeWindows.length} {unsafeWindows.length === 1 ? "parte sugerida" : "partes sugeridas"}
               </span>
             )}
-          </div>
+          </summary>
           <p className="mt-2 leading-relaxed text-ink-secondary">
             Escuchá y corregí lo necesario. Las partes marcadas son una guía, no requieren clics. “Aprobar letra y timing” confirma una vez la canción completa. Tus cambios se guardan automáticamente aunque salgas sin aprobar.
           </p>
-        </div>
+        </details>
       )}
 
       {/* Header: back + title (non-sticky). The primary CTA is a FIXED
@@ -4857,7 +4864,7 @@ export default function LyricsEditor({
         </div>
       )}
 
-      {!qualityAnalysisPending
+      {!requireLineReview && !qualityAnalysisPending
         && ["review_required", "retry_failed"].includes(transcriptionQuality?.decision)
         && !(qualityGuidanceAvailable && viewMode === "advanced" && timingWorkspaceMode === "guided")
         && (!isTranscriptionQualityV5(transcriptionQuality)
@@ -4912,6 +4919,8 @@ export default function LyricsEditor({
               </button>
             )}
             {unsafeWindows.length > 0 && (
+              <details className="mt-3" open={qualityConfirmationActive ? true : undefined}>
+              <summary className="cursor-pointer rounded-lg py-2 text-xs font-medium text-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-100">{t("editor.show_review_zones") || "Ver zonas marcadas"} ({unsafeWindows.length})</summary>
               <ul className="mt-3 grid gap-2 sm:grid-cols-2" aria-label={t("editor.quality_windows_label") || "Zonas para revisar"}>
                 {unsafeWindows.map((qualityWindow, index) => {
                   const confirmed = confirmedUnsafeWindowIds.has(qualityWindow.id);
@@ -4964,6 +4973,7 @@ export default function LyricsEditor({
                   );
                 })}
               </ul>
+              </details>
             )}
             {qualityConfirmationActive && (
               <p className="mt-2 text-[10px] leading-relaxed text-amber-100/60">
@@ -5166,9 +5176,7 @@ export default function LyricsEditor({
           cuando va portaleado. */}
       {(() => { const _conf = (
         <div className={`${playerSlot ? "mt-2" : ""} mb-1 pl-3 flex items-center gap-1.5 text-xs text-ink-secondary min-w-0`} data-testid="editor-confidence">
-          <svg className="w-3.5 h-3.5 text-emerald-400 shrink-0" fill="none" stroke="currentColor" strokeWidth="2.4" viewBox="0 0 24 24">
-            <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
+          <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${reviewSegCount > 0 || unsafeWindows.length > 0 ? "bg-amber-300" : "bg-ink-tertiary"}`} aria-hidden="true" />
           <span className="truncate">{confidenceText}</span>
         </div>
       ); return playerSlot ? createPortal(_conf, playerSlot) : _conf; })()}
@@ -5657,7 +5665,7 @@ export default function LyricsEditor({
              cambios. El grid colapsa a 1 columna full-width. */}
       <div className="relative mb-4 flex flex-wrap items-center gap-3 rounded-2xl bg-gradient-to-r from-surface-2/80 via-surface-2/45 to-brand/[0.055] p-2 ring-1 ring-white/[0.08] shadow-xl shadow-black/10" data-testid="editor-mode-explainer">
         <div
-          className="grid min-w-0 flex-1 grid-cols-2 gap-1 rounded-xl bg-black/20 p-1"
+          className="grid min-w-0 basis-full flex-1 grid-cols-2 gap-1 rounded-xl bg-black/20 p-1 sm:basis-0"
           role="tablist"
           aria-label={t("editor.mode_label") || "Modo de edición"}
           onKeyDown={(event) => {
@@ -5666,7 +5674,7 @@ export default function LyricsEditor({
             const next = event.key === "ArrowLeft" || event.key === "Home" ? "basic" : "advanced";
             setViewMode(next);
             if (next === "basic") { setSyncMode(false); stopGuidedPlayback(); }
-            else setTimingWorkspaceMode(qualityGuidanceAvailable ? "guided" : "timeline");
+            else setTimingWorkspaceMode("timeline");
             event.currentTarget.querySelector(`[data-editor-view="${next}"]`)?.focus();
           }}
         >
@@ -5694,7 +5702,7 @@ export default function LyricsEditor({
             aria-selected={viewMode === "advanced"}
             tabIndex={viewMode === "advanced" ? 0 : -1}
             data-editor-view="advanced"
-            onClick={() => { setViewMode("advanced"); setTimingWorkspaceMode(qualityGuidanceAvailable ? "guided" : "timeline"); setOverflowOpen(false); }}
+            onClick={() => { setViewMode("advanced"); setTimingWorkspaceMode("timeline"); setOverflowOpen(false); }}
             aria-label={t("editor.advanced_view") || "Ajustar tiempos"}
             className={`group flex min-w-0 items-center gap-2.5 rounded-lg px-3 py-2.5 text-left transition-all ${viewMode === "advanced" ? "bg-brand/20 text-white ring-1 ring-brand/35 shadow-lg shadow-brand/10" : "text-ink-secondary hover:bg-white/[0.04] hover:text-white"}`}
           >
@@ -5703,7 +5711,7 @@ export default function LyricsEditor({
             </span>
             <span className="min-w-0">
               <span className="block truncate text-[12px] font-semibold">{t("editor.advanced_view") || "Ajustar tiempos"}</span>
-              <span className="hidden truncate text-[10px] text-ink-tertiary sm:block">Revisión guiada y ajustes precisos</span>
+              <span className="hidden truncate text-[10px] text-ink-tertiary sm:block">{t("review_workspace.timeline_hint") || "Mover y editar líneas en la timeline"}</span>
             </span>
           </button>
         </div>
@@ -5724,7 +5732,7 @@ export default function LyricsEditor({
             <span>{t("editor.paste_lyrics_short") || "Pegar letra oficial"}</span>
           </button>
         )}
-        {viewMode === "advanced" && (
+        {(
           <div className="relative shrink-0">
             <button
               type="button"
@@ -6035,11 +6043,12 @@ export default function LyricsEditor({
                           waveformLoading={waveformLoading}
                           gapS={MIN_GAP_S}
                           focusMode={workspaceFocusMode}
-                          onSeek={(s) => seekTo(s, false)}
+                          onSeek={(s, segment) => seekTo(s, false, segment)}
                           onDragStart={pushEditHistory}
                           onTimingChange={handleTimelineTimingChange}
                           onTimingChangeBatch={handleTimelineTimingChangeBatch}
                           onTextChange={updateText}
+                          onDuplicateLine={duplicateSeg}
                           onDeleteSelection={deleteSegments}
                           onFocus={focusSegment}
                           onReset={resetTimings}
@@ -6054,6 +6063,18 @@ export default function LyricsEditor({
                   </>
                 )}
               </div>
+            ) : requireLineReview && !syncMode ? (
+              <CampaignLyricsReview
+                segments={sanitizedEdited} focusedId={focusedSegId} markedIds={unsafeNavigationIdsRef.current}
+                audioAvailable={!!audioUrl && !audioError && audioMetadataReady}
+                onSelect={(line) => { setFocusedSegId(line._id); seekTo(line.start, false, line); }}
+                onTextChange={updateText} onListen={(line) => seekTo(Math.max(0, line.start - 2), true, line, true)}
+                onAdvanced={(line) => { setFocusedSegId(line._id); setTimingWorkspaceMode("timeline"); setViewMode("advanced"); }}
+                onDuplicate={duplicateSeg} onMerge={mergeSeg} onDelete={deleteSeg} onAdd={addLineSmart} onSplit={splitSegAt}
+                onUndo={undoEdit} canUndo={hasUndo} rowRefs={rowRefs}
+                onTextFocus={(line) => { setFocusedSegId(line._id); setTextEditStart({ id: line._id, text: line.text }); }}
+                onTextBlur={handleTextBlur}
+              />
             ) : (
               <>
                 <p className="text-[11px] text-gray-200 mb-2 px-1">
@@ -6300,7 +6321,6 @@ export default function LyricsEditor({
                         }
                       }}
                       onFocus={() => {
-                        seekTo(seg.start, false, seg);
                         setFocusedSegId(seg._id);
                         setTextEditStart({ id: seg._id, text: seg.text });
                       }}

@@ -1,6 +1,7 @@
 import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import LyricsTimeline from "./LyricsTimeline";
+import userEvent from "@testing-library/user-event";
 
 afterEach(cleanup);
 
@@ -255,8 +256,8 @@ describe("LyricsTimeline", () => {
     const help = screen.getByTestId("timeline-selection-help");
     const block = screen.getAllByTestId("timeline-segment")[0];
     const edge = block.querySelector('[data-testid="timeline-edge-end"]');
-    expect(help).toHaveTextContent("Papelera: elimina una línea");
-    expect(help).toHaveTextContent("Arrastrá el fondo");
+    expect(help).toHaveTextContent("Mover selección");
+    expect(help).toHaveTextContent("0 líneas");
     expect(block.className).toContain("cursor-grab");
     expect(edge.className).toContain("cursor-ew-resize");
     expect(edge.style.width).toBe("22px");
@@ -403,6 +404,44 @@ describe("LyricsTimeline", () => {
     fireEvent.change(input, { target: { value: "segunda línea corregida" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(props.onTextChange).toHaveBeenCalledWith(1, "segunda línea corregida");
+  });
+
+  it("lets spaces reach the text input and publishes edits before blur for autosave", () => {
+    const props = setup();
+    const block = screen.getAllByTestId("timeline-segment")[1];
+    fireEvent.doubleClick(block.querySelector("span[title*='Doble-click']"));
+    const input = screen.getByDisplayValue("segunda línea");
+    expect(fireEvent.keyDown(input, { key: " ", code: "Space" })).toBe(true);
+    expect(block).not.toHaveAttribute("aria-pressed");
+    fireEvent.change(input, { target: { value: "segunda línea con espacios" } });
+    expect(input).toHaveFocus();
+    expect(props.onTextChange).toHaveBeenCalledExactlyOnceWith(1, "segunda línea con espacios");
+    fireEvent.blur(input);
+    expect(props.onTextChange).toHaveBeenCalledTimes(1);
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+  });
+
+  it("clicking the line column navigates to the exact start and enables duplication", () => {
+    const props = setup({ onDuplicateLine: vi.fn() });
+    const row = screen.getAllByTestId("timeline-label-row")[1];
+    fireEvent.pointerDown(row, { clientX: 80, clientY: 80, pointerId: 1, button: 0 });
+    fireEvent.pointerUp(row, { clientX: 80, clientY: 80, pointerId: 1, button: 0 });
+    expect(props.onFocus).toHaveBeenCalledExactlyOnceWith(1);
+    expect(props.onSeek).toHaveBeenCalledExactlyOnceWith(10, expect.objectContaining({ _id: 1 }));
+    expect(props.onTimingChange).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Duplicar línea" }));
+    expect(props.onDuplicateLine).toHaveBeenCalledExactlyOnceWith(1);
+    expect(props.onDeleteSelection).not.toHaveBeenCalled();
+  });
+
+  it("supports keyboard navigation in the line column without toggling playback", async () => {
+    const props = setup();
+    const row = screen.getAllByTestId("timeline-label-row")[1];
+    row.querySelector("button").focus();
+    await userEvent.keyboard("{Enter} ");
+    expect(props.onFocus).toHaveBeenCalledTimes(2);
+    expect(props.onSeek).toHaveBeenLastCalledWith(10, expect.objectContaining({ _id: 1 }));
+    expect(row).toHaveAttribute("data-selected", "true");
   });
 
   it("renders waveform only when waveform data exists", () => {

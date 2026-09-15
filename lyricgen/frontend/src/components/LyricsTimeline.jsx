@@ -118,6 +118,7 @@ export default function LyricsTimeline({
   onTimingChange,
   onTimingChangeBatch,
   onTextChange,
+  onDuplicateLine,
   onFocus,
   onReset,
   onDeleteSelection,
@@ -251,6 +252,16 @@ export default function LyricsTimeline({
     onSelectionCreated?.({ count: next.size, method: "range" });
   }, [normalizedSegments, onSelectionCreated, rowOfId]);
 
+  const navigateToLine = useCallback((id) => {
+    const segment = normalizedSegments.find((item) => item._id === id);
+    if (!segment) return;
+    selectionAnchorRef.current = id;
+    setSelectedIds(new Set([id]));
+    onFocus?.(id);
+    onSeek?.(segment.start, segment);
+    markInteraction();
+  }, [markInteraction, normalizedSegments, onFocus, onSeek]);
+
   const beginMarquee = useCallback((event, anchorId = null) => {
     if (event.button !== 0) return;
     event.preventDefault();
@@ -262,6 +273,8 @@ export default function LyricsTimeline({
       currentX: event.clientX,
       currentY: event.clientY,
       anchorId,
+      shiftKey: event.shiftKey,
+      additive: event.metaKey || event.ctrlKey,
       moved: false,
       startedAt: performance.now(),
     };
@@ -287,7 +300,11 @@ export default function LyricsTimeline({
     event.stopPropagation();
     if (!current.moved) {
       suppressNextClick();
-      if (current.anchorId != null) toggleSelection(current.anchorId);
+      if (current.anchorId != null) {
+        if (current.shiftKey) selectRangeTo(current.anchorId);
+        else if (current.additive) toggleSelection(current.anchorId);
+        else navigateToLine(current.anchorId);
+      }
       else seekAt(event.clientX);
       return;
     }
@@ -318,7 +335,7 @@ export default function LyricsTimeline({
     });
     if (ids.length) selectionAnchorRef.current = ids[0];
     markInteraction();
-  }, [markInteraction, normalizedSegments, onSelectionCreated, pxPerSec, rowOfId, seekAt, toggleSelection, total]);
+  }, [markInteraction, navigateToLine, normalizedSegments, onSelectionCreated, pxPerSec, rowOfId, seekAt, selectRangeTo, suppressNextClick, toggleSelection, total]);
 
   const startDrag = useCallback((event, segment, mode) => {
     event.preventDefault();
@@ -472,7 +489,8 @@ export default function LyricsTimeline({
     event.stopPropagation();
     if (!drag.moved) {
       onFocus?.(segment._id);
-      seekAt(event.clientX);
+      onSeek?.(xToTime(event.clientX), segment);
+      markInteraction();
       return;
     }
     if (current.changes?.length > 1) {
@@ -495,7 +513,7 @@ export default function LyricsTimeline({
         operation: drag.mode === "end" && drag.ripple ? "ripple_resize" : drag.mode === "move" ? "move" : "resize",
       });
     }
-  }, [finishMarquee, onDragStart, onFocus, onGroupMoved, onTimingChange, onTimingChangeBatch, preview, seekAt]);
+  }, [finishMarquee, markInteraction, onDragStart, onFocus, onGroupMoved, onSeek, onTimingChange, onTimingChangeBatch, preview, xToTime]);
 
   const cancelPointerInteraction = useCallback((event) => {
     dragRef.current = null;
@@ -616,10 +634,9 @@ export default function LyricsTimeline({
     setEditingTextId(segment._id);
     setDraftText(segment.text || "");
   }, []);
-  const commitTextEdit = useCallback((id) => {
+  const commitTextEdit = useCallback(() => {
     setEditingTextId(null);
-    onTextChange?.(id, draftText);
-  }, [draftText, onTextChange]);
+  }, []);
 
   const clearSelection = useCallback(() => {
     selectionAnchorRef.current = null;
@@ -788,19 +805,36 @@ export default function LyricsTimeline({
         </div>
       )}
 
-      {selectedIds.size > 0 ? (
+      {(
         <div data-testid="timeline-selection-help" aria-live="polite" className="flex items-center gap-2.5 border-b border-brand/20 bg-gradient-to-r from-brand/20 via-brand/10 to-transparent px-4 sm:px-5 py-2.5 flex-wrap">
           <span className="inline-flex h-7 items-center rounded-lg bg-brand px-2.5 text-[11px] font-semibold text-white shadow-lg shadow-brand/20">{selectedIds.size} {selectedIds.size === 1 ? "línea" : "líneas"}</span>
           <span className="text-[11px] text-ink-secondary">{t("timeline.move_selection", "Mover selección")}</span>
           <div className="inline-flex overflow-hidden rounded-lg ring-1 ring-white/[0.12]">
-            <button type="button" onClick={() => nudgeSelection(-0.1)} className="h-7 px-2.5 text-[10px] text-ink-secondary hover:bg-white/[0.07] hover:text-white">{t("timeline.nudge_back", "−100 ms")}</button>
-            <button type="button" onClick={() => nudgeSelection(0.1)} className="h-7 border-l border-white/[0.08] px-2.5 text-[10px] text-ink-secondary hover:bg-white/[0.07] hover:text-white">{t("timeline.nudge_forward", "+100 ms")}</button>
+            <button type="button" disabled={!selectedIds.size} onClick={() => nudgeSelection(-0.1)} className="h-7 px-2.5 text-[10px] text-ink-secondary hover:bg-white/[0.07] hover:text-white">{t("timeline.nudge_back", "−100 ms")}</button>
+            <button type="button" disabled={!selectedIds.size} onClick={() => nudgeSelection(0.1)} className="h-7 border-l border-white/[0.08] px-2.5 text-[10px] text-ink-secondary hover:bg-white/[0.07] hover:text-white">{t("timeline.nudge_forward", "+100 ms")}</button>
           </div>
-          <span className="hidden sm:inline text-[10px] text-ink-tertiary">{t("timeline.move_selection_hint", "o arrastrá cualquier bloque seleccionado")}</span>
+          <span className="hidden sm:inline text-[10px] text-ink-tertiary">{t("timeline.paint_rows_hint", "Arrastrá para seleccionar varias líneas")}</span>
           <div className="ml-auto flex items-center gap-1.5">
+            {onDuplicateLine && (
+              <button
+                type="button"
+                disabled={selectedIds.size !== 1}
+                onClick={() => {
+                  const copiedId = onDuplicateLine([...selectedIds][0]);
+                  if (copiedId != null) {
+                    setSelectedIds(new Set([copiedId]));
+                    selectionAnchorRef.current = copiedId;
+                  }
+                }}
+                className="h-8 rounded-lg bg-white/[0.08] px-3 text-[11px] font-medium text-white ring-1 ring-white/[0.15] hover:bg-white/[0.14] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {t("timeline.duplicate_line", "Duplicar línea")}
+              </button>
+            )}
             <button
               type="button"
               onClick={deleteSelection}
+              disabled={!selectedIds.size}
               aria-keyshortcuts="Delete Backspace"
               className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-red-400/10 px-3 text-[10px] font-semibold text-red-200 ring-1 ring-red-300/20 transition-colors hover:bg-red-400/20 hover:ring-red-300/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-200"
             >
@@ -812,13 +846,8 @@ export default function LyricsTimeline({
                 : t("timeline.delete_selected_many", "Eliminar {n} líneas")
               ).replace("{n}", selectedIds.size)}
             </button>
-            <button type="button" onClick={clearSelection} className="h-7 px-2.5 rounded-lg text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.clear_selection", "Limpiar selección")}>{t("timeline.clear", "Limpiar")}</button>
+            <button type="button" onClick={clearSelection} disabled={!selectedIds.size} className="h-7 px-2.5 rounded-lg text-[10px] text-ink-secondary hover:text-white hover:bg-white/[0.06]" aria-label={t("timeline.clear_selection", "Limpiar selección")}>{t("timeline.clear", "Limpiar")}</button>
           </div>
-        </div>
-      ) : (
-        <div data-testid="timeline-selection-help" className="flex items-center gap-2 border-b border-white/[0.06] bg-surface-1/25 px-4 sm:px-5 py-2 text-[10px] text-ink-tertiary">
-          <span className="inline-block h-1.5 w-1.5 rounded-full bg-brand-light shadow-glow" aria-hidden="true" />
-          <span>{t("timeline.paint_hint", "Papelera: elimina una línea · Arrastrá el fondo: seleccioná varias para moverlas o eliminarlas")}</span>
         </div>
       )}
       <div
@@ -913,11 +942,17 @@ export default function LyricsTimeline({
                     onPointerUp={finishMarquee}
                     onPointerCancel={cancelPointerInteraction}
                   >
+                    <button type="button" className="flex min-w-0 flex-1 items-center gap-2 self-stretch text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light"
+                      aria-label={`${t("timeline.go_to_line", "Ir a la línea")} ${index + 1}: ${segment.text}`}
+                      onClick={(event) => {
+                        if (event.detail === 0) { event.stopPropagation(); navigateToLine(segment._id); }
+                      }}>
                     {isActive && <span className="absolute inset-y-1.5 left-0 w-0.5 rounded-full bg-cyan-300 shadow-[0_0_10px_rgba(103,232,249,.8)]" aria-hidden="true" />}
                     <span className={`grid h-5 w-5 shrink-0 place-items-center rounded-md text-[9px] font-semibold tabular-nums ${isActive ? "bg-cyan-300 text-slate-950" : isSelected ? "bg-brand text-white" : "bg-white/[0.05] text-ink-tertiary"}`}>{isActive ? (isPlaying ? "▶" : "•") : index + 1}</span>
                     <span className={`min-w-0 flex-1 truncate text-[11px] ${isActive ? "font-medium text-white" : "text-ink-secondary"}`}>{segment.text || "Línea sin texto"}</span>
                     {isActive && <span className="hidden shrink-0 text-[8px] font-semibold uppercase tracking-[0.12em] text-cyan-200 xl:inline">{isPlaying ? t("timeline.playing", "Sonando") : t("timeline.current", "Actual")}</span>}
                     <span className="shrink-0 text-[9px] tabular-nums text-ink-tertiary">{fmt(segment.start)}</span>
+                    </button>
                     <button
                       type="button"
                       data-testid="timeline-delete-line"
@@ -969,14 +1004,15 @@ export default function LyricsTimeline({
                   key={segment._id}
                   title={`${fmt(start)} → ${fmt(end)}`}
                   data-testid="timeline-segment"
-                  tabIndex={0}
-                  role="button"
-                  aria-pressed={isSelected}
+                  tabIndex={editingTextId === segment._id ? -1 : 0}
+                  role={editingTextId === segment._id ? undefined : "button"}
+                  aria-pressed={editingTextId === segment._id ? undefined : isSelected}
                   aria-label={`Línea ${index + 1}: ${segment.text}. ${fmt(start)} a ${fmt(end)}`}
                   className={`absolute z-10 cursor-grab active:cursor-grabbing rounded-lg ring-1 transition-all select-none ${isSelected ? "bg-brand/30" : isActive ? "bg-cyan-400/25 shadow-[0_0_22px_rgba(34,211,238,.16)]" : "bg-surface-3/95"} ${isSelected ? "ring-2 ring-brand-light shadow-[0_0_0_3px_rgba(139,92,246,.13)]" : isActive ? "ring-cyan-300/60" : "ring-white/[0.18] hover:ring-white/[0.32]"} ${isFocused ? "outline outline-1 outline-white/80" : ""} ${isRecent ? "ring-accent" : ""}`}
                   style={{ left: start * pxPerSec, top: index * ROW_H + 7, width, height: ROW_H - 14, touchAction: "none", scrollMarginLeft: LABEL_W + 12 }}
                   onClick={(event) => event.stopPropagation()}
                   onKeyDown={(event) => {
+                    if (event.target !== event.currentTarget) return;
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
                       toggleSelection(segment._id);
@@ -1011,13 +1047,18 @@ export default function LyricsTimeline({
                     {editingTextId === segment._id ? (
                       <input
                         autoFocus
+                        aria-label={`${t("review_workspace.text", "Letra de esta línea")} ${index + 1}`}
                         type="text"
                         value={draftText}
-                        onChange={(event) => setDraftText(event.target.value)}
+                        onChange={(event) => {
+                          setDraftText(event.target.value);
+                          onTextChange?.(segment._id, event.target.value);
+                        }}
                         onPointerDown={(event) => event.stopPropagation()}
                         onClick={(event) => event.stopPropagation()}
                         onBlur={() => commitTextEdit(segment._id)}
                         onKeyDown={(event) => {
+                          event.stopPropagation();
                           if (event.key === "Enter") { event.preventDefault(); commitTextEdit(segment._id); }
                           if (event.key === "Escape") { event.preventDefault(); setEditingTextId(null); }
                         }}

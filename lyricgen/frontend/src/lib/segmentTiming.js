@@ -447,7 +447,11 @@ export function canonicalizeEditorSegments(segments) {
     if (!segment || typeof segment !== "object") return;
     const start = Number(segment.start);
     const duplicate = cleaned.find((previous) => (
-      (collisionText(previous) === collisionText(segment) || nearCollision(previous, segment))
+      // Distinct durable identities are distinct editor lines, even when an
+      // intentional copy initially shares the original's text and timing.
+      (previous.segment_id == null || segment.segment_id == null
+        || String(previous.segment_id) === String(segment.segment_id))
+      && (collisionText(previous) === collisionText(segment) || nearCollision(previous, segment))
       && Math.abs(Number(previous.start) - start) < 0.35
     ));
     if (duplicate) {

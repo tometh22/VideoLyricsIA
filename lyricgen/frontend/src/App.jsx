@@ -6004,7 +6004,7 @@ export default function App() {
     if (currentReview) {
       return (
         <div className="flex justify-center">
-          <div className="w-full max-w-[980px]">
+          <div className={`w-full ${currentReview.campaignId ? "max-w-[1600px]" : "max-w-[980px]"}`}>
           {currentReview.transcribeJobId && (
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/[0.08] bg-surface-2/50 px-4 py-3">
               <div className="min-w-0">
@@ -6013,7 +6013,7 @@ export default function App() {
                   {reviewJobPath(currentReview.transcribeJobId)}
                 </p>
               </div>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 {currentReview.campaignId && (
                   <>
                     <button
@@ -6045,7 +6045,7 @@ export default function App() {
                         if (safeExit) void safeExit(handleCampaignReviewNext);
                         else void handleCampaignReviewNext();
                       }}
-                      className="btn-primary shrink-0 px-4 py-2 text-xs"
+                      className="btn-secondary shrink-0 px-4 py-2 text-xs"
                     >
                       Siguiente
                     </button>
@@ -6069,7 +6069,7 @@ export default function App() {
           <LyricsEditor
             // 2026-07-16: cuando el wizard pasa un slot (bajo el video), el
             // player bar se portalea ahí; null (modal/inline) → inline.
-            playerSlot={playerSlotEl}
+            playerSlot={currentReview.campaignId ? null : playerSlotEl}
             // key forces a fresh mount when stepping forward/backward
             // through the batch — LyricsEditor seeds its `edited` state
             // from props.segments only on mount, so without the key the
@@ -6298,7 +6298,7 @@ export default function App() {
   const requestedReviewId = reviewJobIdFromLocation(location.pathname, location.search);
   const wizardScreen = requestedReviewId && currentReview?.transcribeJobId !== requestedReviewId
     ? <div role="status" className="mx-auto max-w-xl p-12 text-center text-ink-secondary">Cargando la canción seleccionada…</div>
-    : newBatchScreen;
+    : currentReview?.campaignId ? reviewScreen : newBatchScreen;
 
   const generatingScreen = jobs.length > 0
     ? (
