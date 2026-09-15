@@ -424,6 +424,65 @@ def test_portal_can_prepare_missing_prores_for_its_delivery(
     enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True)
 
 
+def test_portal_can_prepare_staging_delivery_without_local_job(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    """The shared portal DB contains deliveries created by staging, while
+    production's jobs DB deliberately does not contain those Job rows."""
+    from database import Job
+
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+    db.query(Job).filter(Job.id == approved_job.id).delete()
+    db.commit()
+
+    with patch(
+        "main.enqueue_delivery_prores_prewarm", return_value="portal-prewarm:test",
+    ) as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_master"},
+        )
+
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "queued"
+    enqueue.assert_called_once_with(
+        approved_job.job_id, "umg_master", "default", frame_size="HD",
+    )
+
+
+def test_portal_can_prepare_legacy_mp4_only_delivery(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+    approved_job.umg_spec = None
+    db.commit()
+
+    with patch(
+        "main.enqueue_delivery_prores_prewarm", return_value="portal-prewarm:test",
+    ) as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_short"},
+        )
+
+    assert res.status_code == 202, res.text
+    enqueue.assert_called_once_with(
+        approved_job.job_id, "umg_short", "default", frame_size="HD",
+    )
+
+
 def test_portal_cannot_prepare_prores_from_the_other_portal(
     client, admin_token, approved_job, all_r2_files_present,
 ):

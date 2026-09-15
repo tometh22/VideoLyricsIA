@@ -130,7 +130,10 @@ from observability import init_sentry, init_logging, health_snapshot
 from pipeline import (run_pipeline, transcribe, _normalize_movement_style,
                       CANVAS_FILE_TYPES)
 from segment_timing import normalize_segments_timing, normalize_editor_segments, timing_anomalies
-from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
+from queue_jobs import (
+    enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm,
+    enqueue_delivery_prores_prewarm, enqueue_drive_delivery,
+)
 from render_spec import umg_catalog, validate_umg_config
 from transcription_language import (
     build_language_contract,
@@ -20201,8 +20204,10 @@ async def portal_prepare_prores(
     ProRes is intentionally lazy because a master can take minutes and
     several GB. The portal listing used to render a missing derivative as a
     permanently disabled button, leaving UMG with no way to start it. Keep
-    the same portal row-level authorization as approve/delete, then reuse the
-    canonical prewarm queue with the job's already-persisted UMG spec.
+    the same portal row-level authorization as approve/delete. If this API
+    owns the source Job, reuse its exact persisted UMG spec; deliveries sent
+    from staging fall back to their immutable R2 snapshot so the shared
+    production portal can prepare them too.
     """
     portal_id = _verify_portal_token(x_portal_token, x_portal_id)
     file_type = body.get("file_type") if isinstance(body, dict) else None
@@ -20221,22 +20226,28 @@ async def portal_prepare_prores(
         raise HTTPException(status_code=404, detail="Archivo no disponible para esta entrega.")
 
     job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job no encontrado.")
-    if job.status != "done":
+    if job is not None and job.status != "done":
         raise HTTPException(status_code=400, detail="El video todavía no terminó de procesarse.")
-    if not job.umg_spec:
-        raise HTTPException(
-            status_code=409,
-            detail="Esta entrega no tiene una configuración ProRes guardada.",
-        )
 
     try:
-        rq_id = enqueue_prores_prewarm(job.job_id, file_type, force=True)
+        if job is not None and job.umg_spec:
+            rq_id = enqueue_prores_prewarm(job.job_id, file_type, force=True)
+            prepare_source = "job"
+        else:
+            # Cross-environment/legacy campaign delivery. Its source MP4 is
+            # already validated by the portal listing and lives at the
+            # deterministic R2 key captured by the Delivery snapshot.
+            rq_id = enqueue_delivery_prores_prewarm(
+                delivery.job_id,
+                file_type,
+                delivery.tenant_snapshot,
+                frame_size=delivery.frame_size_snapshot,
+            )
+            prepare_source = "delivery_snapshot"
     except Exception as exc:
         logger.warning(
             "[PORTAL-PRORES] enqueue failed delivery=%s job=%s type=%s: %s",
-            delivery_id, job.job_id, file_type, exc,
+            delivery_id, delivery.job_id, file_type, exc,
         )
         raise HTTPException(
             status_code=503,
@@ -20248,9 +20259,10 @@ async def portal_prepare_prores(
         action="delivery.prores.prepare",
         detail={
             "delivery_id": delivery_id,
-            "job_id": job.job_id,
+            "job_id": delivery.job_id,
             "portal_id": portal_id,
             "file_type": file_type,
+            "prepare_source": prepare_source,
         },
     ))
     db.commit()
@@ -20260,7 +20272,7 @@ async def portal_prepare_prores(
             "ok": True,
             "status": "queued",
             "delivery_id": delivery_id,
-            "job_id": job.job_id,
+            "job_id": delivery.job_id,
             "file_type": file_type,
             "rq_id": rq_id,
             "retry_after": 60,
