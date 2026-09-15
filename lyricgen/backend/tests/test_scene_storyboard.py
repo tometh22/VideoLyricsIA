@@ -135,3 +135,14 @@ def test_narrative_lyric_edit_keeps_order_and_uses_cache_only(monkeypatch, tmp_p
     assert path == "timeline.mp4"
     assert generate.call_args.kwargs["regen_keys"] == set()
     assert [s["recurrence_key"] for s in result["sections"]] == [s["recurrence_key"] for s in p["sections"]]
+
+
+def test_shortened_structure_keeps_existing_complete_story_without_provider(monkeypatch, tmp_path):
+    p = plan()
+    p["narrative_sequence"] = True
+    monkeypatch.setattr(scenes, "detect_sections", lambda *a: sections()[:2])
+    generate = Mock()
+    monkeypatch.setattr(pipeline, "_generate_scene_clips", generate)
+    path, result = pipeline._restitch_scenes_for_edit(p, [], 234, str(tmp_path), artist="A", song_title="S")
+    assert path is None and result is p
+    generate.assert_not_called()

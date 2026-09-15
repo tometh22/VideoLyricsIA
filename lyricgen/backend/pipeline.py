@@ -13808,6 +13808,8 @@ def _apply_operator_storyboard(plan, operator_prompt, *, allow_people=False,
                                  [s["recurrence_key"] for s in plan["scenes"]])
         prompts = {key: sanitize_generated_text(value, atmospherics_policy)
                    for key, value in prompts.items()}
+        prompts = validate_shots({"shots": [{"id": key, "prompt": value}
+                                            for key, value in prompts.items()]}, list(prompts))
         if not allow_people and any(
             _prompt_explicitly_requests_people(value)
             or _re.search(r"\b(?:pregnant|embarazada|gestante)\b", value, _re.I)
@@ -14632,6 +14634,11 @@ def _restitch_scenes_for_edit(scene_plan: dict, segments: list[dict],
     new_secs = _scenes.detect_sections(segments, audio_duration)
     if scene_plan.get("narrative_sequence"):
         from scene_storyboard import sequence_sections
+        # A radically shorter edit cannot represent every existing story beat
+        # at its musical boundaries. Reuse the complete old timeline instead
+        # of silently dropping the closing shots or buying replacement clips.
+        if len(new_secs) < len(scene_plan.get("scenes", [])):
+            return None, scene_plan
         new_secs = sequence_sections(new_secs, count=len(scene_plan.get("scenes", [])))
     new_keys = {s.recurrence_key for s in new_secs}
     have_keys = {sc.get("recurrence_key") for sc in scene_plan.get("scenes", [])}
