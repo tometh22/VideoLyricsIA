@@ -2163,6 +2163,36 @@ export default function LyricsEditor({
     toast({ message, tone: "success" });
   }, [transcribeJobId, pushEditHistory, toast, editorRequest]);
 
+  // 2026-09-15 ("Pa Pa Pa", job 577d105e95c9): el backend ya sabía por qué
+  // declinaba (CTC cortado por el estribillo repetido, Whisper-DP con 14 de
+  // 45 líneas adivinadas) y el editor lo colapsaba todo en "no se pudo".
+  // El operador reintentó cuatro veces un fallo determinístico. Traducir el
+  // `decline` a algo accionable es la diferencia entre reintentar y corregir.
+  const describeReanchorDecline = useCallback((decline) => {
+    const reason = String(decline?.reason || "");
+    let head;
+    if (reason === "short_repeated_motif") {
+      head = t("editor.reanchor_declined_motif")
+        || "El estribillo repetido (varias líneas cortas seguidas que empiezan igual) no le deja referencias al motor para ubicar la letra. Probá pegando ese tramo en una sola línea.";
+    } else if (reason === "feature_disabled") {
+      head = t("editor.reanchor_declined_disabled")
+        || "La re-sincronización automática está desactivada en este servidor.";
+    } else {
+      head = t("editor.reanchor_declined_generic")
+        || "El motor no pudo alinear esta letra con el audio.";
+    }
+    const anchored = Number(decline?.anchored);
+    const lines = Number(decline?.lines);
+    const detail = (Number.isFinite(anchored) && Number.isFinite(lines) && lines > 0)
+      ? (t("editor.reanchor_declined_partial")
+          || " Ancló {a} de {n} líneas y descartó el resto porque el timing no era confiable.")
+        .replace("{a}", String(anchored)).replace("{n}", String(lines))
+      : "";
+    const tail = t("editor.reanchor_declined_tail")
+      || " El timing quedó como estaba: ajustá las líneas a mano o revisá que la letra sea de esta versión. Reintentar da el mismo resultado.";
+    return `${head}${detail}${tail}`;
+  }, [t]);
+
   const handleReanchor = useCallback(async () => {
     if (!onReanchor || !transcribeJobId || reanchoring) return;
     setReanchoring(true);
@@ -2211,6 +2241,9 @@ export default function LyricsEditor({
             .replace("{n}", String(res.structural?.crammed_lines ?? "?")),
           tone: "error",
         });
+      } else if (res && res.reason === "declined") {
+        // Veredicto definitivo del servidor (200): no hay nada que reconciliar.
+        toast({ message: describeReanchorDecline(res.decline), tone: "error" });
       } else {
         const recovered = await recoverReanchorFromServer(baseRevision);
         if (recovered) {
@@ -2236,7 +2269,7 @@ export default function LyricsEditor({
       setReanchoring(false);
     }
   }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, reanchoring, edited,
-      pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult, editorRequest]);
+      pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult, editorRequest, describeReanchorDecline]);
 
   // 2026-09-13: pegar la letra OFICIAL y re-sincronizar desde ese texto.
   // Mismo endpoint que el re-anclado (POST /jobs/{id}/reanchor) con
@@ -2305,6 +2338,9 @@ export default function LyricsEditor({
           (t("editor.reanchor_structural_mismatch") || "No se re-sincronizó: {n} líneas no suenan en la grabación. El timing quedó como estaba.")
             .replace("{n}", String(res.structural?.crammed_lines ?? "?")),
         );
+      } else if (res && res.reason === "declined") {
+        // Veredicto definitivo del servidor (200): no hay nada que reconciliar.
+        setPasteError(describeReanchorDecline(res.decline));
       } else {
         const recovered = await recoverReanchorFromServer(baseRevision);
         if (recovered) {
@@ -2324,7 +2360,7 @@ export default function LyricsEditor({
       setPasteBusy(false);
     }
   }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, pasteBusy, pasteText,
-      pasteLineCount, pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult, editorRequest]);
+      pasteLineCount, pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult, editorRequest, describeReanchorDecline]);
 
   const focusSegment = useCallback((id) => {
     setFocusedSegId(id);

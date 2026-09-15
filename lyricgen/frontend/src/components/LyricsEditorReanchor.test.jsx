@@ -233,6 +233,34 @@ describe("Pegar letra oficial y re-sincronizar", () => {
     expect(toastSpy.mock.calls[0][0].tone).toBe("success");
   });
 
+  it("decline del motor → dice POR QUÉ y cuántas líneas ancló, no 'no se pudo'", async () => {
+    // "Pa Pa Pa" (15-sep, job 577d105e95c9): CTC se cortó por el estribillo
+    // repetido y Whisper-DP ancló 31 de 45. El editor mostraba el mensaje
+    // genérico y el operador reintentó cuatro veces un fallo determinístico.
+    const onReanchor = vi.fn(async () => ({
+      ok: false, reason: "declined",
+      decline: {
+        reason: "short_repeated_motif", lines: 45, anchored: 31,
+        interpolated: 14, unsafe_reason: "too_many_interpolated",
+      },
+    }));
+    render(<LyricsEditor {...baseProps({
+      onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor,
+    })} />);
+    openPaste();
+    fireEvent.change(screen.getByTestId("paste-lyrics-textarea"),
+      { target: { value: "linea uno\nlinea dos\nlinea tres" } });
+    fireEvent.click(screen.getByTestId("paste-lyrics-submit"));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("estribillo repetido");
+    expect(alert).toHaveTextContent("Ancló 31 de 45 líneas");
+    expect(alert).toHaveTextContent("Reintentar da el mismo resultado");
+    expect(alert).not.toHaveTextContent("No se pudo re-sincronizar");
+    // El decline es un 200 definitivo: no se sondea el estado del servidor.
+    expect(screen.getByTestId("paste-lyrics-textarea")).toHaveValue("linea uno\nlinea dos\nlinea tres");
+  });
+
   it("'Usar la letra de la planilla' prellena el textarea con la referencia de campaña", () => {
     render(<LyricsEditor {...baseProps({
       onPersistSegments: vi.fn(async () => ({ ok: true })),
@@ -283,7 +311,10 @@ describe("Recuperación tras respuesta perdida (2026-09-14)", () => {
   });
 
   it("re-sincronizar con IA: fallo real (la revisión NO avanzó) → error, sin tocar nada", async () => {
-    const onReanchor = vi.fn(async () => ({ ok: false, reason: "declined" }));
+    // Respuesta AMBIGUA (se cortó la conexión): es el único caso que hay que
+    // reconciliar contra el servidor. Un `declined` es un 200 explícito —
+    // el servidor no persistió nada y sondearlo sólo hace esperar al operador.
+    const onReanchor = vi.fn(async () => ({ ok: false, reason: "network" }));
     const onReanchorReconcile = vi.fn(async () => ({ ok: false, reason: "not-advanced", revision: 0 }));
     render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor, onReanchorReconcile, reanchorWaitMs: 60, reanchorPollMs: 10 })} />);
     fireEvent.click(screen.getByRole("tab", { name: "Ajustar tiempos" }));
@@ -348,7 +379,7 @@ describe("Seguir esperando al servidor (2026-09-14, caso Agus)", () => {
   });
 
   it("si el servidor nunca avanza dentro del plazo → error, sin aplicar nada", async () => {
-    const onReanchor = vi.fn(async () => ({ ok: false, reason: "declined" }));
+    const onReanchor = vi.fn(async () => ({ ok: false, reason: "network" }));
     const onReanchorReconcile = vi.fn(async (jobId, base) => ({ ok: false, reason: "not-advanced", revision: base }));
     render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor, onReanchorReconcile, reanchorWaitMs: 60, reanchorPollMs: 10 })} />);
     openPaste();
