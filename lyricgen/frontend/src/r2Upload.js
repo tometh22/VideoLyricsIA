@@ -27,19 +27,24 @@
  * with /transcribe-uploaded (editor flow) or /generate (direct).
  */
 
+import { fetchWithTimeout } from "./fetchWithTimeout";
+
 const API = import.meta.env.VITE_API_URL || "";
+const API_POST_TIMEOUT_MS = 15_000;
+const UPLOAD_STALL_TIMEOUT_MS = 60_000;
 
 function authHeaders() {
   const token = localStorage.getItem("genly_token");
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-async function apiPost(path, body) {
-  const res = await fetch(`${API}${path}`, {
+async function apiPost(path, body, { signal = null, timeoutMs = API_POST_TIMEOUT_MS } = {}) {
+  const res = await fetchWithTimeout(`${API}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
-  });
+    signal,
+  }, timeoutMs);
   if (!res.ok) {
     let detail = "";
     try {
@@ -62,14 +67,39 @@ async function apiPost(path, body) {
  * `upload.onprogress` is the only browser-portable way to get a real
  * 0-100% bar during the PUT.
  */
-function putToR2WithProgress(url, blob, contentType, onProgress, signal) {
+function putToR2WithProgress(
+  url, blob, contentType, onProgress, signal,
+  stallTimeoutMs = UPLOAD_STALL_TIMEOUT_MS,
+) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    let settled = false;
+    let stalled = false;
+    let stallTimer = null;
+    let abortListener = null;
+    const cleanup = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      if (signal && abortListener) signal.removeEventListener("abort", abortListener);
+    };
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const resetStallTimer = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => {
+        stalled = true;
+        xhr.abort();
+      }, stallTimeoutMs);
+    };
     xhr.open("PUT", url, true);
     if (contentType) xhr.setRequestHeader("Content-Type", contentType);
-    if (xhr.upload && onProgress) {
+    if (xhr.upload) {
       xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) onProgress(e.loaded, e.total);
+        resetStallTimer();
+        if (onProgress && e.lengthComputable) onProgress(e.loaded, e.total);
       };
     }
     xhr.onload = () => {
@@ -78,20 +108,27 @@ function putToR2WithProgress(url, blob, contentType, onProgress, signal) {
         // policy must expose it via ExposeHeaders: ["ETag"] (see
         // scripts/r2_cors.json). If the policy is missing, ETag reads
         // as null and the multipart upload finalizes broken.
-        resolve({ etag: xhr.getResponseHeader("ETag") || null });
+        finish(resolve, { etag: xhr.getResponseHeader("ETag") || null });
       } else {
-        reject(new Error(`R2 PUT failed: ${xhr.status} ${xhr.statusText}`));
+        finish(reject, new Error(`R2 PUT failed: ${xhr.status} ${xhr.statusText}`));
       }
     };
-    xhr.onerror = () => reject(new Error("R2 PUT network error"));
-    xhr.onabort = () => reject(Object.assign(new Error("aborted"), { aborted: true }));
+    xhr.onerror = () => finish(reject, new Error("R2 PUT network error"));
+    xhr.onabort = () => finish(
+      reject,
+      stalled
+        ? Object.assign(new Error("R2 PUT stalled"), { timedOut: true })
+        : Object.assign(new Error("aborted"), { aborted: true }),
+    );
     if (signal) {
       if (signal.aborted) {
         xhr.abort();
         return;
       }
-      signal.addEventListener("abort", () => xhr.abort(), { once: true });
+      abortListener = () => xhr.abort();
+      signal.addEventListener("abort", abortListener, { once: true });
     }
+    resetStallTimer();
     xhr.send(blob);
   });
 }
@@ -193,7 +230,7 @@ async function multipartUpload({
           } else {
             const resp = await apiPost("/upload-multipart-part-url", {
               job_id: jobId, part_number: partNumber,
-            });
+            }, { signal });
             url = resp.url;
           }
           const res = await putToR2WithProgress(
@@ -260,7 +297,7 @@ async function multipartUpload({
   await apiPost("/upload-multipart-complete", {
     job_id: jobId,
     parts,
-  });
+  }, { signal });
   return { jobId, key };
 }
 
@@ -286,7 +323,7 @@ export async function uploadFileToR2(
     size_bytes: file.size,
     artist: meta.artist || "",
     title: meta.title || "",
-  });
+  }, { signal });
 
   const contentType = file.type || "application/octet-stream";
 
@@ -327,7 +364,7 @@ export async function uploadFileToR2(
     filename: file.name,
     content_type: contentType,
     expected_parts: expectedParts,
-  });
+  }, { signal });
 
   return multipartUpload({
     file,
@@ -341,3 +378,11 @@ export async function uploadFileToR2(
     signal,
   });
 }
+
+export const __test__ = {
+  apiPost,
+  putToR2WithProgress,
+  withRetry,
+  API_POST_TIMEOUT_MS,
+  UPLOAD_STALL_TIMEOUT_MS,
+};

@@ -8,7 +8,11 @@ import pytest
 from database import Job, SessionLocal
 from job_retry import render_failure_fields
 from jobs import update_job
-from queue_jobs import pipeline_failure_callback, edit_failure_callback
+from queue_jobs import (
+    edit_failure_callback,
+    pipeline_failure_callback,
+    transcription_failure_callback,
+)
 
 
 @pytest.mark.parametrize("budget", [None, 0, -1, "1", True, MagicMock()])
@@ -81,12 +85,36 @@ def test_stale_attempt_cannot_change_new_attempt(saved_job):
     assert state(saved_job)["current_step"] == "background"
 
 
+def test_transcription_retry_stays_active_until_budget_is_exhausted(saved_job):
+    job = SimpleNamespace(
+        id=f"transcribe:{saved_job}", retries_left=1,
+        meta={"db_job_id": saved_job},
+    )
+    transcription_failure_callback(
+        job, None, RuntimeError, RuntimeError("temporary ASR outage"), None,
+    )
+    first = state(saved_job)
+    assert first["status"] == "transcribing"
+    assert first["current_step"] == "retrying"
+    assert first["completed_at"] is None
+    assert first["error"] is None
+    assert first["segments_json"] == [{"text": "saved correction"}]
+
+
 def _rq_render_attempt(jid, always_fail):
     """No paid provider calls: execute real RQ retry lifecycle with injected failure."""
     from rq import get_current_job
     if always_fail or get_current_job().retries_left > 0:
         raise RuntimeError("injected transient provider outage")
     update_job(jid, status="pending_review", progress=100)
+
+
+def _rq_transcription_attempt(jid, always_fail):
+    """Exercise RQ's callback-before-retry ordering without any ASR call."""
+    from rq import get_current_job
+    if always_fail or get_current_job().retries_left > 0:
+        raise RuntimeError("injected transient transcription outage")
+    update_job(jid, status="transcribed_pending", progress=70)
 
 
 @pytest.mark.parametrize("always_fail,expected", [(False, "pending_review"), (True, "error")])
@@ -114,4 +142,41 @@ def test_real_rq_retry_is_bounded_and_publishes_terminal_only_at_end(saved_job, 
     assert state(saved_job)["status"] == expected
     if always_fail:
         assert writes == ["processing", "error"]
+        assert state(saved_job)["completed_at"] is not None
+
+
+@pytest.mark.parametrize(
+    "always_fail,expected", [(False, "transcribed_pending"), (True, "transcription_failed")],
+)
+def test_real_transcription_retry_publishes_terminal_only_at_end(
+    saved_job, always_fail, expected, monkeypatch,
+):
+    from fakeredis import FakeStrictRedis
+    from rq import Queue, Retry, SimpleWorker
+    import jobs
+
+    writes = []
+    original = jobs.update_job
+
+    def record(jid, **fields):
+        original(jid, **fields)
+        writes.append(state(jid)["status"])
+
+    monkeypatch.setattr(jobs, "update_job", record)
+    connection = FakeStrictRedis()
+    queue = Queue("isolated-trial-transcription-retry-test", connection=connection)
+    queued = queue.enqueue(
+        _rq_transcription_attempt, saved_job, always_fail,
+        job_id=f"transcribe:{saved_job}", retry=Retry(max=1, interval=0),
+        meta={"db_job_id": saved_job},
+        on_failure=transcription_failure_callback,
+    )
+    SimpleWorker([queue], connection=connection).work(burst=True)
+    queued.refresh()
+    assert queued.retries_left == 0
+    assert queue.count == 0
+    assert writes[0] == "transcribing"
+    assert state(saved_job)["status"] == expected
+    if always_fail:
+        assert writes == ["transcribing", "transcription_failed"]
         assert state(saved_job)["completed_at"] is not None

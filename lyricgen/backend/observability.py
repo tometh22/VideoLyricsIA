@@ -767,7 +767,8 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
                 from rq import Queue, Worker
                 queues = {}
                 queue_names = [
-                    "transcription", "bg_preview", "enterprise", "default",
+                    "transcription", "bg_preview", "audio_preview",
+                    "enterprise", "default",
                     "transcription_batch", "batch_render", "campaign_control",
                 ]
                 if os.environ.get(

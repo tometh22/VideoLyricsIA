@@ -3270,6 +3270,7 @@ def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
         db.query(Job)
         .filter(Job.user_id == user_id)
         .filter(Job.tenant_id == tenant_id)
+        .filter(Job.archived_at.is_(None))
         .filter(Job.workload_class != "batch")
         .filter(Job.status.in_(_BACKLOG_STATUSES))
         .count()
@@ -3288,6 +3289,7 @@ def _enforce_tenant_backlog(db: Session, current_user: dict) -> None:
     tenant_in_flight = (
         db.query(Job)
         .filter(Job.tenant_id == tenant_id)
+        .filter(Job.archived_at.is_(None))
         .filter(Job.workload_class != "batch")
         .filter(Job.status.in_(_BACKLOG_STATUSES))
         .count()
@@ -11280,6 +11282,32 @@ def status(
         job_model = db.query(Job).filter(Job.job_id == job_id).first()
         if job_model is not None:
             campaign_context = context_for_job(db, job_model)
+    # The deliveries database can be an external production-owned service.
+    # It is irrelevant until approval and must never make core trial status
+    # polling slow or unavailable. Approved jobs get one best-effort query;
+    # an outage only hides the optional portal badge for this response.
+    delivery_portals = []
+    if job.get("approved_at"):
+        try:
+            delivery_rows = (
+                ddb.query(Delivery.portal_id)
+                .filter(Delivery.job_id == job_id)
+                .filter(Delivery.removed_at.is_(None))
+                .all()
+            )
+            delivery_portals = sorted({
+                (portal or "argentina") for (portal,) in delivery_rows
+            })
+        except Exception as exc:
+            try:
+                ddb.rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "[STATUS] deliveries lookup unavailable for job=%s — "
+                "returning core status without portal badges: %s",
+                job_id, exc,
+            )
     return {
         "job_id": job["job_id"],
         "workload_class": job.get("workload_class", "interactive"),
@@ -11379,21 +11407,8 @@ def status(
         # aprobados, así que para el caso común (job no aprobado, polleado sin
         # parar por JobDetail) devolvemos False sin pegarle a la DB externa —
         # evita latencia/egress/checkout de conexión de prod en cada poll.
-        "is_in_umg_portal": bool(
-            job.get("approved_at")
-            and ddb.query(Delivery.id)
-            .filter(Delivery.job_id == job_id)
-            .filter(Delivery.removed_at.is_(None))
-            .first()
-            is not None
-        ),
-        "umg_portals": sorted({
-            (portal or "argentina")
-            for (portal,) in ddb.query(Delivery.portal_id)
-            .filter(Delivery.job_id == job_id)
-            .filter(Delivery.removed_at.is_(None))
-            .all()
-        }),
+        "is_in_umg_portal": bool(delivery_portals),
+        "umg_portals": delivery_portals,
         "youtube": job.get("youtube"),
         "youtube_short": job.get("youtube_short"),
     }
@@ -17353,15 +17368,22 @@ async def retry_job(
     # there and would false-trigger this gate).
     try:
         import storage as _storage
-        if _storage.is_enabled() and not _storage.object_exists(job.input_r2_key):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "El audio original ya no está en storage. "
-                    "Probablemente fue limpiado o un job hermano lo borró. "
-                    "Subí el MP3 de nuevo para regenerar el video."
-                ),
-            )
+        if _storage.is_enabled():
+            _source_status = _storage.object_status(job.input_r2_key)
+            if _source_status == "missing":
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "El audio original ya no está en storage. "
+                        "Probablemente fue limpiado o un job hermano lo borró. "
+                        "Subí el MP3 de nuevo para regenerar el video."
+                    ),
+                )
+            if _source_status == "unavailable":
+                logger.warning(
+                    "[RETRY] R2 pre-check unavailable for %s key=%r — proceeding anyway",
+                    job_id, job.input_r2_key,
+                )
     except HTTPException:
         raise
     except Exception as _exc:
@@ -17692,14 +17714,21 @@ async def edit_art_track(
         )
     try:
         import storage as _storage
-        if _storage.is_enabled() and not _storage.object_exists(job.input_r2_key):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "El audio original ya no está en storage. "
-                    "Volvé a generar el video."
-                ),
-            )
+        if _storage.is_enabled():
+            _source_status = _storage.object_status(job.input_r2_key)
+            if _source_status == "missing":
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "El audio original ya no está en storage. "
+                        "Volvé a generar el video."
+                    ),
+                )
+            if _source_status == "unavailable":
+                logger.warning(
+                    "[ART-EDIT] R2 pre-check unavailable for %s key=%r — proceeding",
+                    job_id, job.input_r2_key,
+                )
     except HTTPException:
         raise
     except Exception as _exc:
@@ -18049,14 +18078,21 @@ async def create_variant(
     # when R2 is disabled (dev/test).
     try:
         import storage as _storage
-        if _storage.is_enabled() and not _storage.object_exists(parent.input_r2_key):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "El audio del job padre ya no está en storage — "
-                    "no se puede crear variante. Subí el MP3 de nuevo."
-                ),
-            )
+        if _storage.is_enabled():
+            _source_status = _storage.object_status(parent.input_r2_key)
+            if _source_status == "missing":
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "El audio del job padre ya no está en storage — "
+                        "no se puede crear variante. Subí el MP3 de nuevo."
+                    ),
+                )
+            if _source_status == "unavailable":
+                logger.warning(
+                    "[VARIANT] R2 pre-check unavailable for parent=%s key=%r — proceeding anyway",
+                    parent_job_id, parent.input_r2_key,
+                )
     except HTTPException:
         raise
     except Exception as _exc:

@@ -57,13 +57,15 @@ def _seed_done_job(db, *, status: str, owner_id: int, tenant_id: str,
 
 
 def _patch_object_exists(monkeypatch, exists: bool):
-    """Stub storage.object_exists so the endpoint sees R2 as present
+    """Stub storage.object_status so the endpoint sees R2 as present
     or absent without hitting Cloudflare. Also stubs is_enabled to
     True — without R2 enabled the pre-check is skipped entirely, so
     we can't assert its behavior."""
     import storage
     monkeypatch.setattr(storage, "is_enabled", lambda: True)
-    monkeypatch.setattr(storage, "object_exists", lambda _key: exists)
+    monkeypatch.setattr(
+        storage, "object_status", lambda _key: "exists" if exists else "missing",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +147,7 @@ def test_retry_proceeds_when_storage_probe_throws(
         raise RuntimeError("R2 probe network timeout")
 
     monkeypatch.setattr(storage, "is_enabled", lambda: True)
-    monkeypatch.setattr(storage, "object_exists", _boom)
+    monkeypatch.setattr(storage, "object_status", _boom)
 
     import main
     monkeypatch.setattr(main, "enqueue_pipeline", lambda **kw: kw["job_id"])
@@ -155,6 +157,26 @@ def test_retry_proceeds_when_storage_probe_throws(
         headers={"Authorization": f"Bearer {user_token}"},
     )
     # Probe error → permissive: retry proceeds.
+    assert res.status_code == 200, res.text
+
+
+def test_retry_proceeds_when_storage_probe_is_unavailable(
+    client, user_token, db, monkeypatch,
+):
+    """A bounded HEAD timeout is not proof that the object is missing."""
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"}).json()
+    job_id = _seed_done_job(
+        db, status="error", owner_id=me["id"], tenant_id=me["tenant_id"],
+    )
+    import storage
+    import main
+    monkeypatch.setattr(storage, "is_enabled", lambda: True)
+    monkeypatch.setattr(storage, "object_status", lambda _key: "unavailable")
+    monkeypatch.setattr(main, "enqueue_pipeline", lambda **kw: kw["job_id"])
+
+    res = client.post(
+        f"/retry/{job_id}", headers={"Authorization": f"Bearer {user_token}"},
+    )
     assert res.status_code == 200, res.text
 
 
@@ -185,6 +207,33 @@ def test_edit_returns_422_when_input_r2_key_missing_from_r2(
     assert "storage" in msg or "audio" in msg
 
 
+def test_art_track_edit_proceeds_when_storage_probe_is_unavailable(
+    client, user_token, db, monkeypatch,
+):
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"}).json()
+    job_id = _seed_done_job(
+        db, status="pending_review", owner_id=me["id"], tenant_id=me["tenant_id"],
+    )
+    from database import Job
+    row = db.query(Job).filter(Job.job_id == job_id).one()
+    row.render_params = {"art_track": True}
+    db.commit()
+
+    import storage
+    import main
+    monkeypatch.setattr(storage, "is_enabled", lambda: True)
+    monkeypatch.setattr(storage, "object_status", lambda _key: "unavailable")
+    monkeypatch.setattr(main, "has_art_track_access", lambda _user: True)
+    monkeypatch.setattr(main, "_commit_pipeline_publication", lambda *a, **k: None)
+
+    res = client.post(
+        f"/jobs/{job_id}/edit-art-track",
+        headers={"Authorization": f"Bearer {user_token}"},
+        data={"effect": ""},
+    )
+    assert res.status_code == 200, res.text
+
+
 # ---------------------------------------------------------------------------
 # /jobs/{parent}/variant
 # ---------------------------------------------------------------------------
@@ -210,3 +259,26 @@ def test_variant_returns_422_when_parent_input_r2_key_missing_from_r2(
     assert res.status_code == 422, res.text
     msg = (res.json().get("detail") or "").lower()
     assert "audio" in msg
+
+
+def test_variant_proceeds_when_storage_probe_is_unavailable(
+    client, user_token, db, monkeypatch,
+):
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {user_token}"}).json()
+    parent_id = _seed_done_job(
+        db, status="done", owner_id=me["id"], tenant_id=me["tenant_id"],
+    )
+
+    import storage
+    import main
+    monkeypatch.setattr(storage, "is_enabled", lambda: True)
+    monkeypatch.setattr(storage, "object_status", lambda _key: "unavailable")
+    monkeypatch.setattr(storage, "copy_object", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(main, "_commit_pipeline_publication", lambda *a, **k: None)
+
+    res = client.post(
+        f"/jobs/{parent_id}/variant",
+        headers={"Authorization": f"Bearer {user_token}"},
+        json={"background_hint": "abstract neon"},
+    )
+    assert res.status_code == 200, res.text

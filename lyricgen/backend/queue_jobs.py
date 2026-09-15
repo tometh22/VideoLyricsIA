@@ -390,6 +390,24 @@ def transcription_failure_callback(job, connection, type_, value, traceback) -> 
             job_id_db = rq_job_id
         if not job_id_db:
             return
+        # RQ 1.16 invokes failure callbacks before consuming ``retries_left``.
+        # Keep the public row active until the bounded retry budget is truly
+        # exhausted; otherwise update_job's terminal-state guard prevents a
+        # later successful attempt from publishing ``transcribed_pending``.
+        from job_retry import render_failure_fields
+        retry_fields = render_failure_fields(job, active_status="transcribing")
+        if retry_fields["status"] != "error":
+            event_id = str(meta.get("outbox_event_id") or "")
+            if event_id:
+                with bind_job_attempt("transcription", event_id):
+                    update_job(job_id_db, **retry_fields)
+            else:
+                update_job(job_id_db, **retry_fields)
+            logger.warning(
+                "[transcription-retry] job=%s retries_left=%s",
+                job_id_db, getattr(job, "retries_left", None),
+            )
+            return
         # Surface to Sentry BEFORE touching the DB — this hook also covers
         # the SIGKILL case where transcription_worker's in-process capture
         # never got the chance to run.
