@@ -6835,6 +6835,26 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         for line in anchor_text.splitlines() if line.strip()
     ]
 
+    # Por qué rechazó el último candidato `_safe_alignment`, con sus números.
+    # Sin esto el decline llega al operador como "no se pudo" y punto: el
+    # 15-sep ("Pa Pa Pa", job 577d105e95c9) Whisper-DP ancló 31 de 45 líneas
+    # y el gate lo tiró por 14 interpoladas — 31,1 % contra un tope de 30 % —
+    # y el editor sólo supo decir que el timing quedó como estaba.
+    alignment_diag: dict = {}
+
+    def _alignment_stats(aligned) -> dict:
+        if not isinstance(aligned, list) or not aligned:
+            return {}
+        interpolated = sum(
+            1 for segment in aligned
+            if isinstance(segment, dict) and segment.get("interpolated")
+        )
+        return {
+            "lines": len(aligned),
+            "interpolated": interpolated,
+            "anchored": len(aligned) - interpolated,
+        }
+
     def _declined(base, reason: str, *, error_type: str = ""):
         out = dict(base) if isinstance(base, dict) else base
         if isinstance(out, dict):
@@ -6847,6 +6867,9 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                 "original_provider_segment_count": len(
                     (base or {}).get("segments") or []
                 ),
+                # Mejor intento real de la cascada (ver `alignment_diag`):
+                # cuántas líneas se anclaron y qué gate las rechazó.
+                "diagnostics": dict(alignment_diag),
             }
         return out
 
@@ -6939,20 +6962,31 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
         return out
 
     def _safe_alignment(aligned) -> bool:
-        """Reject partial, reordered, or occurrence-collapsed fallbacks."""
+        """Reject partial, reordered, or occurrence-collapsed fallbacks.
+
+        Every rejection records WHY in `alignment_diag` so the decline can be
+        explained to the operator instead of surfacing as an opaque failure.
+        """
+        def _unsafe(reason: str) -> bool:
+            alignment_diag.update(_alignment_stats(aligned))
+            alignment_diag["unsafe_reason"] = reason
+            return False
+
         if not isinstance(aligned, list) or len(aligned) != len(psegs):
+            alignment_diag["unsafe_reason"] = "incomplete"
+            alignment_diag["expected_lines"] = len(psegs)
             return False
         expected_texts = [segment["text"] for segment in psegs]
         actual_texts = [str(segment.get("text") or "").strip() for segment in aligned]
         if actual_texts != expected_texts:
-            return False
+            return _unsafe("text_mismatch")
         try:
             starts = [float(segment.get("start")) for segment in aligned]
             ends = [float(segment.get("end")) for segment in aligned]
         except (TypeError, ValueError):
-            return False
+            return _unsafe("unparseable_times")
         if any(end <= start for start, end in zip(starts, ends)):
-            return False
+            return _unsafe("empty_line_span")
         # Whisper-DP marks the lines it could not anchor and had to place by
         # interpolation. A fallback that guessed most of the song is not an
         # alignment (Buseca 14-sep: 22 of 51 lines guessed, 0.6 s pads).
@@ -6966,10 +7000,13 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                 "[ANCHOR] rejected fallback: %d/%d lines interpolated (> %.0f%%) job=%s",
                 interpolated, len(aligned), max_interp * 100, job_id,
             )
-            return False
+            alignment_diag["max_interpolated_frac"] = max_interp
+            return _unsafe("too_many_interpolated")
         # Equal starts are the classic repeated-chorus pile-up. Small line
         # overlaps are valid, but occurrence order must remain strict.
-        return all(right > left for left, right in zip(starts, starts[1:]))
+        if not all(right > left for left, right in zip(starts, starts[1:])):
+            return _unsafe("non_monotonic")
+        return True
 
     try:
         if not (_anchor_lyrics_enabled() if enabled is None else enabled):
@@ -7089,6 +7126,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                     "[ANCHOR] rejected unsafe hosted alignment lines=%d job=%s",
                     len(retimed), job_id,
                 )
+                alignment_diag["stage"] = "forced_align"
 
             logger.info(
                 "[ANCHOR] hosted alignment declined job=%s; trying "
@@ -7105,8 +7143,15 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                 # mix as an independent acoustic view before declining.
                 fallback_sources = list(dict.fromkeys((align_src, audio_path)))
                 retimed = None
+                # Cuando ninguna fuente pasa el gate, el que sobrevive tiene
+                # que ser el MEJOR intento (menos líneas adivinadas), no el
+                # último: es el número que después le mostramos al operador.
+                # Antes ganaba siempre la mezcla y el diagnóstico mentía
+                # ("24 de 45" cuando el stem había anclado 31 de 45).
+                best_rejected = None
+                best_rejected_diag: dict = {}
                 for fallback_source in fallback_sources:
-                    retimed = await asyncio.wait_for(
+                    candidate = await asyncio.wait_for(
                         asyncio.to_thread(
                             whisper_word_align,
                             fallback_source,
@@ -7116,24 +7161,45 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                         ),
                         timeout=240,
                     )
-                    if _safe_alignment(retimed):
+                    if _safe_alignment(candidate):
+                        retimed = candidate
                         break
                     logger.info(
                         "[ANCHOR] Whisper-DP declined source=%s job=%s",
                         "stem" if fallback_source == _stem else "mix",
                         job_id,
                     )
+                    _interpolated = alignment_diag.get("interpolated")
+                    _best = best_rejected_diag.get("interpolated")
+                    if candidate is not None and (
+                        _best is None
+                        or (_interpolated is not None and _interpolated < _best)
+                    ):
+                        best_rejected = candidate
+                        best_rejected_diag = dict(alignment_diag)
+                        best_rejected_diag["stage"] = "whisper_dp"
+                        best_rejected_diag["source"] = (
+                            "stem" if fallback_source == _stem else "mix"
+                        )
+                if retimed is None and best_rejected is not None:
+                    retimed = best_rejected
+                    alignment_diag.clear()
+                    alignment_diag.update(best_rejected_diag)
+                    safe_fallback = False
+                else:
+                    safe_fallback = retimed is not None
             except Exception as fallback_exc:
                 logger.warning(
                     "[ANCHOR] Whisper fallback failed error_type=%s job=%s",
                     type(fallback_exc).__name__, job_id,
                 )
                 retimed = None
-            if not _safe_alignment(retimed):
+                safe_fallback = False
+            if not safe_fallback:
                 logger.error(
                     "[ANCHOR] fail-closed: official lyrics received but both "
-                    "aligners declined ctc_reason=%s job=%s",
-                    decline_reason, job_id,
+                    "aligners declined ctc_reason=%s diag=%s job=%s",
+                    decline_reason, alignment_diag, job_id,
                 )
                 result = _declined(result, decline_reason)
             else:
@@ -16169,7 +16235,35 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
                 "revision": initial_revision,
                 "structural": _aa.get("structural") or {},
             }
-        logger.info("[REANCHOR] declined job=%s (n_lines=%d)", job_id, n_lines)
+        # El motivo del decline viaja al editor (15-sep, "Pa Pa Pa"): sin
+        # esto el operador ve "no se pudo" y reintenta un fallo determinístico
+        # — cuatro veces esa tarde. `decline` dice qué motor se plantó, cuántas
+        # líneas llegó a anclar y contra qué tope las rechazó.
+        _diag = _aa.get("diagnostics") if isinstance(_aa.get("diagnostics"), dict) else {}
+        _decline = {
+            "reason": str(_aa.get("reason") or "unknown"),
+            "error_type": str(_aa.get("error_type") or ""),
+            **{k: v for k, v in _diag.items() if k != "expected_lines"},
+        }
+        logger.info("[REANCHOR] declined job=%s (n_lines=%d) reason=%s diag=%s",
+                    job_id, n_lines, _decline["reason"], _diag)
+        try:
+            from database import AuditLog, SessionLocal as _SLd
+            db_audit = _SLd()
+            try:
+                db_audit.add(AuditLog(
+                    user_id=current_user["id"],
+                    action="lyrics.reanchor_declined",
+                    detail={"job_id": job_id, "n_lines": n_lines,
+                            "pasted": pasted_mode,
+                            "confirm_structure": bool(body.confirm_structure),
+                            **_decline},
+                ))
+                db_audit.commit()
+            finally:
+                db_audit.close()
+        except Exception as e:  # noqa: BLE001 — audit best-effort
+            logger.warning("[REANCHOR] audit log failed: %s", e)
         return {
             "ok": False,
             "reason": "declined",
@@ -16178,6 +16272,7 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
             "review_count": 0,
             "locked_kept": 0,
             "revision": initial_revision,
+            "decline": _decline,
         }
 
     # Veredicto ACÚSTICO después de alinear (incidente 2026-09-13): con

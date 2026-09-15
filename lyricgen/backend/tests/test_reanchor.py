@@ -688,6 +688,47 @@ def test_reanchor_surfaces_helper_structural_decline(client, monkeypatch):
         s.close()
 
 
+def test_reanchor_decline_surfaces_reason_and_counts(client, monkeypatch):
+    """"Pa Pa Pa" (15-sep, job 577d105e95c9): el endpoint devolvía un
+    `declined` pelado y el editor sólo sabía decir "no se pudo". El operador
+    reintentó cuatro veces un fallo determinístico. El decline tiene que
+    viajar con el motivo y los números, y quedar auditado."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+
+    async def _fake(result, audio_path, job_id, anchor_lyrics):
+        out = dict(result)
+        out["anchor_alignment"] = {
+            "status": "declined", "reason": "short_repeated_motif",
+            "error_type": "",
+            "diagnostics": {"lines": 45, "anchored": 31, "interpolated": 14,
+                            "unsafe_reason": "too_many_interpolated",
+                            "max_interpolated_frac": 0.3,
+                            "stage": "whisper_dp", "source": "stem"},
+        }
+        return out
+    monkeypatch.setattr(main_mod, "_maybe_anchor_align", _fake)
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=list(SEGS))
+    res = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token))
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is False and body["reason"] == "declined"
+    assert body["decline"]["reason"] == "short_repeated_motif"
+    assert (body["decline"]["anchored"], body["decline"]["lines"]) == (31, 45)
+    assert body["decline"]["unsafe_reason"] == "too_many_interpolated"
+    assert _db_segments(job_id) == list(SEGS)
+    from database import AuditLog, SessionLocal
+    s = SessionLocal()
+    try:
+        row = (s.query(AuditLog).filter(AuditLog.action == "lyrics.reanchor_declined")
+               .order_by(AuditLog.id.desc()).first())
+        assert row.detail["job_id"] == job_id
+        assert row.detail["reason"] == "short_repeated_motif"
+        assert row.detail["anchored"] == 31
+    finally:
+        s.close()
+
+
 # ---------------------------------------------------------------------------
 # Idempotencia ante duplicados del proxy (2026-09-14)
 # ---------------------------------------------------------------------------

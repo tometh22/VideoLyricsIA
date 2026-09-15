@@ -393,3 +393,57 @@ def test_whisper_fallback_with_few_interpolated_lines_is_accepted(monkeypatch):
     out = _run(_result(), ANCHOR)
     assert out["anchor_alignment"]["status"] == "applied"
     assert out["anchor_alignment"]["timing_source"] == "whisper_align"
+
+
+def test_declined_carries_diagnostics_for_the_operator(monkeypatch):
+    """"Pa Pa Pa" (15-sep, job 577d105e95c9): el decline llegaba al editor sin
+    un solo número y el operador reintentó cuatro veces un fallo determinístico.
+    El veredicto tiene que decir qué gate se plantó y cuántas líneas ancló."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ctc_align, "last_decline_reason", "short_repeated_motif",
+                        raising=False)
+    monkeypatch.setattr("forced_align.forced_align_lyrics", lambda *_a, **_kw: None)
+
+    def _fallback(_audio, lines, *, language=None, job_id=None):
+        segs = _retimed()
+        segs[1]["interpolated"] = True
+        segs[2]["interpolated"] = True
+        return segs
+
+    monkeypatch.setattr("lyrics_whisper_align.whisper_word_align", _fallback)
+    out = _run(_result(), ANCHOR)
+    diag = out["anchor_alignment"]["diagnostics"]
+    assert out["anchor_alignment"]["reason"] == "short_repeated_motif"
+    assert diag["unsafe_reason"] == "too_many_interpolated"
+    assert (diag["lines"], diag["anchored"], diag["interpolated"]) == (3, 1, 2)
+    assert diag["max_interpolated_frac"] == 0.3
+
+
+def test_declined_reports_the_best_source_not_the_last(monkeypatch):
+    """El stem ancló más que la mezcla y ninguno pasó el gate. El diagnóstico
+    que ve el operador tiene que ser el del MEJOR intento: antes ganaba
+    siempre el último (la mezcla) y el número que mostrábamos era el peor."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    monkeypatch.setattr(vocal_sep, "separate_vocals",
+                        lambda path, cache_only=False: "/tmp/stem.wav")
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ctc_align, "last_decline_reason", "short_repeated_motif",
+                        raising=False)
+    monkeypatch.setattr("forced_align.forced_align_lyrics", lambda *_a, **_kw: None)
+
+    def _fallback(audio, lines, *, language=None, job_id=None):
+        segs = _retimed()
+        # stem: 2 de 3 ancladas; mezcla: 1 de 3 — ambas sobre el tope de 30 %.
+        segs[2]["interpolated"] = True
+        if audio != "/tmp/stem.wav":
+            segs[1]["interpolated"] = True
+        return segs
+
+    monkeypatch.setattr("lyrics_whisper_align.whisper_word_align", _fallback)
+    out = _run(_result(), ANCHOR)
+    diag = out["anchor_alignment"]["diagnostics"]
+    assert out["anchor_alignment"]["status"] == "declined"
+    assert diag["source"] == "stem"
+    assert (diag["anchored"], diag["interpolated"]) == (2, 1)
