@@ -64,6 +64,97 @@ def _write_clip(prompt, path, **kwargs):
     return path
 
 
+def _eight_key_sections():
+    # Same recurrence topology as the incident, without customer lyrics.
+    keys = ["intro", "coro_1", "puente", "coro_1", "puente", "coro_1",
+            "puente", "coro_3", "coro_5", "coro_6", "puente", "coro_7", "outro"]
+    return [scenes.Section(key.split("_")[0], i * 18, (i + 1) * 18,
+                           recurrence_key=key, text=f"original line {i}")
+            for i, key in enumerate(keys)]
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 4, 5, 6, 12])
+def test_scene_cap_includes_choruses_and_preserves_song(monkeypatch, limit):
+    monkeypatch.setattr(scenes, "MAX_UNIQUE_SCENES", limit)
+    sections = _eight_key_sections()
+    before = copy.deepcopy(sections)
+    result = scenes._cap_unique_scenes(sections)
+    assert len({s.recurrence_key for s in result}) == min(limit, 6)
+    assert [(s.start, s.end, s.text, s.type, s.energy) for s in result] == [
+        (s.start, s.end, s.text, s.type, s.energy) for s in before]
+    for key in {s.recurrence_key for s in before}:
+        assert len({result[i].recurrence_key for i, s in enumerate(before)
+                    if s.recurrence_key == key}) == 1
+    assert result[0].recurrence_key == "intro"
+    if limit >= 2:
+        assert result[-1].recurrence_key == "outro"
+    if limit >= 4:
+        assert result[2].recurrence_key == "puente"
+        assert all(s.recurrence_key.startswith("coro") for s in result if s.type == "coro")
+    snapshot = copy.deepcopy(result)
+    assert scenes._cap_unique_scenes(result) == snapshot
+
+
+def test_uncapped_builder_makes_at_most_six_prompts_and_provider_calls(
+    monkeypatch, tmp_path, offline_scenes,
+):
+    sections = _eight_key_sections()
+    prompt = Mock(return_value={"prompt": "one shot"})
+    plan = scenes.build_scene_plan(sections, {}, prompt)
+    provider = Mock(side_effect=_write_clip)
+    monkeypatch.setattr(pipeline, "_generate_veo_video", provider)
+    clips = pipeline._generate_scene_clips(plan, str(tmp_path), artist="A", song_title="S")
+    assert prompt.call_count == provider.call_count == len(clips) == 6
+    assert len(plan["sections"]) == 13
+    assert all(s.recurrence_key in clips for s in sections)
+    assert plan["degraded"] == {"failed": 0, "total": 6}
+
+
+@pytest.mark.parametrize("regen_keys", [None, {f"key{i}" for i in range(8)}])
+def test_oversized_fresh_plan_is_rejected_before_provider(
+    monkeypatch, tmp_path, offline_scenes, regen_keys,
+):
+    plan = {"scenes": [{"recurrence_key": f"key{i}"} for i in range(8)]}
+    provider = Mock()
+    monkeypatch.setattr(pipeline, "_generate_veo_video", provider)
+    with pytest.raises(ValueError, match="six unique"):
+        pipeline._generate_scene_clips(plan, str(tmp_path), artist="A", song_title="S",
+                                       regen_keys=regen_keys)
+    provider.assert_not_called()
+
+
+def test_historical_eight_scene_plan_can_regenerate_only_one_target(
+    monkeypatch, tmp_path, offline_scenes,
+):
+    plan = {"scenes": [{"recurrence_key": f"key{i}", "prompt": f"shot{i}",
+                        "clip_cache_key": f"cache/veo/old{i}.mp4"} for i in range(8)]}
+    provider = Mock(side_effect=_write_clip)
+    monkeypatch.setattr(pipeline, "_generate_veo_video", provider)
+    clips = pipeline._generate_scene_clips(plan, str(tmp_path), artist="A", song_title="S",
+                                           regen_keys={"key3"})
+    assert len(clips) == 8
+    assert sum(not call.kwargs["cache_only"] for call in provider.call_args_list) == 1
+
+
+@pytest.mark.parametrize("value,expected", [(None, 8), ("", 8), ("8", 8), ("4", 4)])
+def test_veo_duration_request_is_explicit(monkeypatch, value, expected):
+    # Execute the production request-parameter block with no provider/network.
+    tree = ast.parse(inspect.getsource(pipeline._generate_veo_video))
+    nodes = tree.body[0].body
+    begin = next(i for i, n in enumerate(nodes) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "veo_params" for t in n.targets))
+    end = next(i for i in range(begin + 1, len(nodes)) if isinstance(nodes[i], ast.Try))
+    if value is None:
+        monkeypatch.delenv("VEO_CLIP_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("VEO_CLIP_SECONDS", value)
+    import os
+    context = {"os": os, "logger": Mock()}
+    exec(compile(ast.Module(body=nodes[begin:end], type_ignores=[]), "veo_params", "exec"), context)
+    assert context["veo_params"]["durationSeconds"] == expected
+    assert context["veo_params"]["sampleCount"] == 1
+
+
 def test_initial_settings_roundtrip_includes_all_selected_visual_controls():
     # Execute the actual persistence map in isolation, without rendering or
     # database setup; then perform the same JSON round trip as render_params.

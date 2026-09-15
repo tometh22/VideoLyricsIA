@@ -3,6 +3,20 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.18-trial.6] - 2026-09-15
+
+### Fixed
+
+- Enforce a hard six-unique-scene ceiling across choruses, bridges, intro and
+  outro, not only verses. Preserve full-song timing, repeated-section identity,
+  opening/ending shots and musical-type representatives within the budget.
+- Apply the ceiling at storyboard construction and before fresh provider calls;
+  historical larger plans remain editable without silently rewriting their clips.
+- Send the native Veo duration explicitly (default eight seconds; existing
+  VEO_CLIP_SECONDS remains authoritative). Trial rollout requires eight seconds
+  on API/render/short worker together so provider requests and cost estimates agree.
+- No provider/model, retry budget, literal-prompt, customer-credit or expiry change.
+
 ## [1.1.18-trial.5] - 2026-09-15
 
 ### Fixed
