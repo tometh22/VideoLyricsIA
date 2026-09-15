@@ -3,6 +3,19 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.18-trial.5] - 2026-09-15
+
+### Fixed
+
+- Keep renders and edits active while RQ still has automatic retries, instead of
+  publishing a terminal error that closes the progress stream before eventual success.
+- Show an explicit automatic-retry message without inventing an ETA. Exhausted
+  retries still produce actionable terminal errors; saved corrections and terminal
+  state/attempt guards remain intact.
+- Cover the real bounded RQ retry lifecycle with injected failures and the UI's
+  retry-to-result and exhausted-to-recovery transitions. No changes to provider
+  models, retry budgets, credit policy, trial expiry, production or staging.
+
 ## [1.1.18-trial.4] - 2026-09-15
 
 ### Fixed

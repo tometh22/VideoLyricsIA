@@ -37,6 +37,28 @@ function renderBatch(job) {
 }
 
 describe("SingleGeneratingHero (honest progress)", () => {
+  it("keeps transient retries active and automatically delivers the eventual result", () => {
+    const onSingleDone = vi.fn();
+    const job = { job_id: "retry-qa", filename: "qa.mp3", status: "processing",
+      current_step: "retrying", progress: 22 };
+    const { rerender } = render(<BatchProgress jobs={[job]} onSingleDone={onSingleDone} />);
+    expect(screen.getByText(/Reintentando automáticamente/)).toBeTruthy();
+    expect(screen.queryByText("hero.error_title")).toBeNull();
+    expect(onSingleDone).not.toHaveBeenCalled();
+    rerender(<BatchProgress jobs={[{ ...job, status: "pending_review", progress: 100 }]}
+      onSingleDone={onSingleDone} />);
+    expect(onSingleDone).toHaveBeenCalled();
+  });
+
+  it("shows a recoverable terminal error when the retry budget is exhausted", () => {
+    const onRecoverFailed = vi.fn();
+    render(<BatchProgress jobs={[{ job_id: "exhausted", status: "error", error: "Tu trabajo está guardado" }]}
+      onRecoverFailed={onRecoverFailed} />);
+    expect(screen.getByText("hero.error_title")).toBeTruthy();
+    expect(screen.queryByText(/Reintentando automáticamente/)).toBeNull();
+    screen.getByRole("button", { name: "hero.error_recover_action" }).click();
+    expect(onRecoverFailed).toHaveBeenCalledOnce();
+  });
   beforeEach(() => {
     vi.useFakeTimers();
   });

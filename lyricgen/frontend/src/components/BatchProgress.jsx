@@ -60,6 +60,7 @@ export function SingleGeneratingHero({
   // We keep this i18n fallback for older worker versions / unexpected
   // step names — minimum surface area.
   const STEP_TEXT_FALLBACK = {
+    retrying: "Hubo una interrupción. Reintentando automáticamente; tu trabajo sigue guardado.",
     starting: t("hero.step_starting") || "Preparando…",
     whisper: t("hero.step_starting") || "Preparando…",
     background: t("hero.step_bg") || "Generando el fondo cinematográfico",
