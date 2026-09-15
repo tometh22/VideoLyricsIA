@@ -4117,7 +4117,11 @@ export default function LyricsEditor({
       }
       if (approvalResult?.ok === false) {
         setIsDirty(true);
-        toast({ message: "No pudimos confirmar todavía. Tus cambios siguen en pantalla y se reintentarán al guardar.", tone: "info" });
+        toast({
+          message: approvalResult.message
+            || "No pudimos confirmar todavía. Tus cambios siguen en pantalla y se reintentarán al guardar.",
+          tone: approvalResult.message ? "error" : "info",
+        });
         return;
       }
       setIsDirty(false);

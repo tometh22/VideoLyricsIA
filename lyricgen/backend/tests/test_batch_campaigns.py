@@ -11,6 +11,7 @@ from database import (
     EditorDocument, Job, JobOutboxEvent, ProductEvent, SessionLocal, User,
 )
 from editor import acquire_lock, release_lock
+from machine_evidence import build_machine_evidence, finalize_machine_evidence
 from reference_hypothesis import build as build_reference_hypothesis
 from reference_hypothesis import build_unavailable as build_unavailable_reference
 from transcription_quality import segments_hash
@@ -49,7 +50,11 @@ def clean_batch_campaign_rows():
             ).delete(synchronize_session=False)
             session.query(BatchUploadSession).delete(synchronize_session=False)
             session.query(AuditLog).filter(
-                AuditLog.action.in_(("batch.lyrics_and_timing_approved", "batch.lyrics_approval_reopened")),
+                AuditLog.action.in_((
+                    "batch.lyrics_and_timing_approved",
+                    "batch.lyrics_approval_reopened",
+                    "batch.reference_hypothesis_recovered",
+                )),
             ).delete(synchronize_session=False)
             session.query(BatchCampaignItem).delete(synchronize_session=False)
             session.query(BatchCampaign).delete(synchronize_session=False)
@@ -654,6 +659,89 @@ def test_human_approval_accepts_ordered_ids_for_legacy_document(db, monkeypatch)
     assert batch.require_prebackground_approval(job)["confirmed_line_count"] == 2
 
 
+def test_human_approval_recovers_missing_reference_from_machine_evidence(
+    db, monkeypatch,
+):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    segments = [
+        {"segment_id": "line-1", "start": 0, "end": 1, "text": "Hola"},
+        {"segment_id": "line-2", "start": 1, "end": 2, "text": "mundo"},
+    ]
+    audio_sha = "9" * 64
+    quality = {
+        "pipeline_release": "historical-release",
+        "pipeline_config_fingerprint": "historical-config",
+        "reference_attestation": {"text_status": "audio_attested"},
+    }
+    captured = build_machine_evidence({
+        "segments": segments,
+        "_recognition_attempt_count": 1,
+        "_recognition_hypotheses": [{
+            "family": "google/gemini-2.5-flash-audio",
+            "kind": "text",
+            "events": [{"text": "Hola\nmundo"}],
+            "attempt_id": 0,
+            "view": "full_audio_with_reference",
+            "transformation": "gemini_cleanup_raw",
+        }],
+    })
+    evidence = finalize_machine_evidence(
+        captured,
+        original_segments=segments,
+        quality=quality,
+        audio_sha256=audio_sha,
+        audio_revision=1,
+    )
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+        segments_json=segments, segments_revision=0,
+        input_audio_sha256=audio_sha, input_audio_etag=audio_sha,
+        audio_revision=1, transcription_quality=quality,
+        machine_snapshot_required=True,
+    )
+    document = EditorDocument(
+        job_id=job.job_id, tenant_id=campaign.tenant_id,
+        current_segments=segments, original_segments=segments, revision=0,
+        machine_evidence=evidence,
+    )
+    db.add_all([job, document])
+    db.commit()
+
+    response = batch.approve_campaign_lyrics(
+        campaign.id,
+        job.job_id,
+        batch.LyricsApprovalRequest(
+            editor_revision=0,
+            confirmed_line_ids=["line-1", "line-2"],
+            lyrics_confirmed=True,
+            timings_confirmed=True,
+            heard_against_audio=True,
+        ),
+        {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"},
+        db,
+    )
+
+    assert response["status"] == "lyrics_approved"
+    db.refresh(job)
+    recovered = job.transcription_quality["reference_hypothesis"]
+    assert recovered["reference_text"] == "Hola\nmundo"
+    assert recovered["review_status"] == "human_line_review_approved"
+    repair = db.query(AuditLog).filter_by(
+        action="batch.reference_hypothesis_recovered",
+    ).one()
+    assert repair.detail["job_id"] == job.job_id
+    assert repair.detail["source"] == "editor_document.machine_evidence"
+
+
 def test_post_render_reapproval_restores_gate_without_hiding_video_from_review(db, monkeypatch):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
     campaign = _campaign(db, 1)
@@ -1070,12 +1158,21 @@ def test_review_queue_scope_keeps_pending_categories_and_approved_filter_aligned
             updated_at=datetime(2026, 9, 9, index, tzinfo=timezone.utc),
         ))
     db.commit()
+    # An automatic document update is not human work, even with an actor.
+    assert batch.review_queue(campaign.id, scope="drafts", **args)["items"] == []
+    db.add(AuditLog(user_id=user.id, action="editor.review_saved", detail={
+        "job_id": jobs[1].job_id, "checkpoint": "draft",
+    }, created_at=datetime(2026, 9, 9, 1, tzinfo=timezone.utc)))
+    db.commit()
     drafts = batch.review_queue(campaign.id, scope="drafts", **args)
     assert [row["job_id"] for row in drafts["items"]] == [jobs[1].job_id]
     assert drafts["items"][0]["is_draft"] is True
     assert drafts["campaign_totals"]["drafts"] == 1
     document = db.query(EditorDocument).filter_by(job_id=jobs[2].job_id).one()
     document.updated_by = user.id
+    db.add(AuditLog(user_id=user.id, action="editor.review_saved", detail={
+        "job_id": jobs[2].job_id, "checkpoint": "manual",
+    }, created_at=datetime(2026, 9, 9, 2, tzinfo=timezone.utc)))
     db.commit()
     drafts = batch.review_queue(campaign.id, scope="drafts", **{**args, "order": "learning"})
     assert drafts["order"] == "recent"

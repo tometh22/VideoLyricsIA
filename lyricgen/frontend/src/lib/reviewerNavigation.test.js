@@ -5,8 +5,8 @@ describe("reviewer navigation contract", () => {
   it("keeps drafts pending and resumes them without bypassing another editor's lock", () => {
     expect(reviewCounts({ campaign_totals: { songs: 10, approved: 2, drafts: 3 } }).pending).toBe(8);
     const draft = { job_id: "draft", state: "ready", is_draft: true };
-    expect(reviewStateLabel(draft)).toBe("Borrador guardado");
-    expect(reviewActionLabel(draft)).toBe("Continuar borrador");
+    expect(reviewStateLabel(draft)).toBe("Con cambios humanos guardados");
+    expect(reviewActionLabel(draft)).toBe("Continuar revisión");
     expect(reviewActionLabel({ ...draft, reviewer_lock_active: true })).toBeNull();
     expect(reviewActionLabel({ ...draft, state: "approved" })).toBe("Editar transcripción");
   });
@@ -17,7 +17,7 @@ describe("reviewer navigation contract", () => {
   });
   it.each([
     ["pending", "Pendiente de procesamiento", null], ["processing", "Procesando", null],
-    ["ready", "Sin revisar", "Revisar"], ["reviewing", "En revisión", "Revisar"],
+    ["ready", "Sin cambios humanos registrados", "Revisar"], ["reviewing", "En revisión", "Revisar"],
     ["approved", "Aprobada", "Editar transcripción"], ["exported", "Exportada", "Editar transcripción"],
     ["failed", "Fallida", null], ["unknown", "Estado no disponible", null],
   ])("renders state %s honestly", (state, label, action) => {
@@ -35,7 +35,7 @@ describe("reviewer navigation contract", () => {
     expect(reviewActionLabel({ ...row, state: "approved" }, "final")).toBe("Ver video");
   });
   it("does not assign the previous reviewer to an unreviewed row", () => {
-    expect(reviewStateLabel({ state: "ready", reviewer_name: "Agus" })).toBe("Sin revisar");
+    expect(reviewStateLabel({ state: "ready", reviewer_name: "Agus" })).toBe("Sin cambios humanos registrados");
   });
   it("opens approved lyrics in the editor and preserves the return filter", () => {
     expect(reviewDestination({ job_id: "a/b", state: "approved" }, "/admin/cola?scope=approved"))

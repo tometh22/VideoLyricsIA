@@ -8,6 +8,7 @@ and per-tab review claims. No background generation happens here.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import re
@@ -42,6 +43,7 @@ import storage
 
 
 router = APIRouter(prefix="/batch", tags=["batch-campaigns"])
+logger = logging.getLogger(__name__)
 
 CAMPAIGN_STATUSES = frozenset({"active", "paused", "completed", "cancelled"})
 ITEM_LIMIT = int(os.environ.get("BATCH_CAMPAIGN_ITEM_LIMIT", "1000"))
@@ -1297,6 +1299,48 @@ def approve_campaign_lyrics(
             status_code=409,
             detail={"code": "job_not_awaiting_lyrics_review", "status": job.status},
         )
+    # A historical quality-replay race could replace transcription_quality
+    # after the worker attached the durable reference. The immutable private
+    # machine snapshot still owns the original full-audio hypothesis. Recover
+    # only from that validated, audio-bound source; never from edited lyrics or
+    # an external catalogue. The repair commits atomically with the approval.
+    if not quality.get("reference_hypothesis"):
+        document_for_recovery = db.query(EditorDocument).filter(
+            EditorDocument.job_id == job.job_id,
+            EditorDocument.tenant_id == job.tenant_id,
+        ).with_for_update().first()
+        if document_for_recovery is not None:
+            from reference_hypothesis import recover_from_machine_evidence
+            recovered_reference, recovery_reason = recover_from_machine_evidence(
+                document_for_recovery.machine_evidence,
+                original_segments=list(document_for_recovery.original_segments or []),
+                audio_sha256=str(job.input_audio_sha256 or ""),
+                audio_revision=int(job.audio_revision or 0),
+            )
+            if recovered_reference is not None:
+                quality["reference_hypothesis"] = recovered_reference
+                quality.pop("reference_hypothesis_unavailable", None)
+                quality.pop("manual_full_review_required", None)
+                job.transcription_quality = quality
+                db.add(AuditLog(
+                    user_id=current_user["id"],
+                    action="batch.reference_hypothesis_recovered",
+                    detail={
+                        "campaign_id": campaign.id,
+                        "job_id": job.job_id,
+                        "audio_revision": int(job.audio_revision or 0),
+                        "segments_revision": int(job.segments_revision or 0),
+                        "reference_sha256": recovered_reference["reference_sha256"],
+                        "source": "editor_document.machine_evidence",
+                    },
+                ))
+            else:
+                # The existing fail-closed binding check below remains
+                # authoritative. Log the private reason for operator repair.
+                logger.warning(
+                    "Batch reference recovery refused job=%s reason=%s",
+                    job.job_id, recovery_reason,
+                )
     # Server-side language/discrepancy gate (same contract as /approve and the
     # reload serializers). Recomputed from persisted segments + reference so an
     # old client cannot approve output that diverges from its own audio-derived
@@ -1856,10 +1900,13 @@ def review_queue(
     } if job_ids else {}
     from reviewer_campaign_product import campaign_payload
     reviewer_summary, reviewer_rows = campaign_payload(db, campaign.id, pairs, documents)
-    reviewer_ids = {
+    from campaign_review_history import saved_review_history
+    review_history = saved_review_history(db, job_ids) if stage == "lyrics" else {}
+    reviewer_ids = {entry["user_id"] for entry in review_history.values()}
+    reviewer_ids.update({
         int(row.lock_user_id) for row in documents.values()
         if row.lock_user_id is not None
-    }
+    })
     reviewer_ids.update(
         int(row.updated_by) for row in documents.values()
         if row.updated_by is not None
@@ -1883,7 +1930,7 @@ def review_queue(
     draft_ids = {
         job.job_id for _, job in pairs
         if job and (document := documents.get(job.job_id))
-        and document.updated_by is not None
+        and job.job_id in review_history
         and _queue_state("lyrics", job, document) in {"ready", "reviewing"}
     } if stage == "lyrics" else set()
     allowed_states = {state} if state in _ALL_REVIEW_STATES else (
@@ -1895,6 +1942,9 @@ def review_queue(
     rows: list[dict[str, Any]] = []
     for item, job in pairs:
         document = documents.get(job.job_id) if job else None
+        history = review_history.get(job.job_id) if job else None
+        if stage == "final" and document and document.updated_by is not None:
+            history = {"user_id": document.updated_by, "at": document.updated_at}
         queue_state = _queue_state(stage, job, document)
         if scope == "drafts" and (not job or job.job_id not in draft_ids):
             continue
@@ -1927,9 +1977,12 @@ def review_queue(
             if effective_scope == "approved":
                 if not job or job.approved_by != current_user.get("id"):
                     continue
-            elif not document or current_user.get("id") not in {
-                document.updated_by, document.lock_user_id,
-            }:
+            elif stage == "final":
+                if not document or current_user.get("id") not in {
+                    document.updated_by, document.lock_user_id,
+                }:
+                    continue
+            elif not history or history["user_id"] != current_user.get("id"):
                 continue
         verdict = verdicts.get(job.job_id, {}) if job else {}
         color = str(verdict.get("color") or "red").lower()
@@ -2003,12 +2056,12 @@ def review_queue(
                 document and document.lock_user_id is not None
                 and _aware(document.lock_expires_at) and _aware(document.lock_expires_at) > _now()
             ),
-            "last_reviewed_by": document.updated_by if document else None,
-            "last_reviewed_name": reviewers.get(document.updated_by) if document else None,
-            "last_reviewed_at": document.updated_at.isoformat() if document and document.updated_at else None,
+            "last_reviewed_by": history["user_id"] if history else None,
+            "last_reviewed_name": reviewers.get(history["user_id"]) if history else None,
+            "last_reviewed_at": history["at"].isoformat() if history and history["at"] else None,
             "resume_available": bool(
-                queue_state in _PENDING_REVIEW_STATES and document
-                and document.updated_by == current_user.get("id")
+                queue_state in _PENDING_REVIEW_STATES and history
+                and history["user_id"] == current_user.get("id")
             ),
             "approval": {
                 "user_id": job.approved_by if job else None,
