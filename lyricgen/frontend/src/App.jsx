@@ -74,6 +74,7 @@ import {
 } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
 import { campaignApprovalFailure, translateBackendError } from "./lib/lyricsEditSubmit";
+import { requestIdempotencyKey } from "./lib/idempotency";
 import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
 import { loadReviewWaveform } from "./lib/loadReviewWaveform";
 import { persistSegments } from "./lib/persistSegments";
@@ -3197,7 +3198,10 @@ export default function App() {
           .find((e) => e?.file && prefetchKey(e.file) === key) || entry;
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": requestIdempotencyKey(`transcribe-${jobId}`),
+          },
           body: JSON.stringify({
             job_id: jobId,
             language: entry.language || "",
@@ -3507,7 +3511,10 @@ export default function App() {
       });
       transcribeRes = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": requestIdempotencyKey(`transcribe-${uploadJobId}`),
+        },
         body: JSON.stringify({
           job_id: uploadJobId,
           language: entry.language || "",

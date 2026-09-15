@@ -11359,6 +11359,46 @@ def status(
         job_model = db.query(Job).filter(Job.job_id == job_id).first()
         if job_model is not None:
             campaign_context = context_for_job(db, job_model)
+    # Delivery publication is an optional, external concern.  Never query the
+    # portal database for the normal trial polling path: most jobs are not
+    # approved and their status must remain available even if the portal DB is
+    # slow or unavailable.  Approved jobs get a bounded best-effort snapshot;
+    # the core job status is still returned when that optional lookup fails.
+    is_in_umg_portal = False
+    umg_portals = []
+    delivery_status_unavailable = False
+    if job.get("approved_at"):
+        try:
+            # PostgreSQL's connect_timeout bounds checkout/connect.  This
+            # statement timeout also bounds an established but unresponsive
+            # portal query.  SQLite test sessions do not support set_config.
+            delivery_dialect = getattr(getattr(ddb, "bind", None), "dialect", None)
+            if getattr(delivery_dialect, "name", None) == "postgresql":
+                ddb.execute(
+                    text("SELECT set_config('statement_timeout', :value, true)"),
+                    {"value": f"{int(os.environ.get('DELIVERIES_STATUS_TIMEOUT_MS', '2500'))}ms"},
+                )
+            is_in_umg_portal = (
+                ddb.query(Delivery.id)
+                .filter(Delivery.job_id == job_id)
+                .filter(Delivery.removed_at.is_(None))
+                .first()
+                is not None
+            )
+            umg_portals = sorted({
+                (portal or "argentina")
+                for (portal,) in ddb.query(Delivery.portal_id)
+                .filter(Delivery.job_id == job_id)
+                .filter(Delivery.removed_at.is_(None))
+                .all()
+            })
+        except Exception as exc:  # optional external system must not break /status
+            delivery_status_unavailable = True
+            logger.warning("[STATUS] delivery snapshot unavailable job=%s: %s", job_id, exc)
+            try:
+                ddb.rollback()
+            except Exception:
+                pass
     return {
         "job_id": job["job_id"],
         "workload_class": job.get("workload_class", "interactive"),
@@ -11458,21 +11498,9 @@ def status(
         # aprobados, así que para el caso común (job no aprobado, polleado sin
         # parar por JobDetail) devolvemos False sin pegarle a la DB externa —
         # evita latencia/egress/checkout de conexión de prod en cada poll.
-        "is_in_umg_portal": bool(
-            job.get("approved_at")
-            and ddb.query(Delivery.id)
-            .filter(Delivery.job_id == job_id)
-            .filter(Delivery.removed_at.is_(None))
-            .first()
-            is not None
-        ),
-        "umg_portals": sorted({
-            (portal or "argentina")
-            for (portal,) in ddb.query(Delivery.portal_id)
-            .filter(Delivery.job_id == job_id)
-            .filter(Delivery.removed_at.is_(None))
-            .all()
-        }),
+        "is_in_umg_portal": is_in_umg_portal,
+        "umg_portals": umg_portals,
+        "delivery_status_unavailable": delivery_status_unavailable,
         "youtube": job.get("youtube"),
         "youtube_short": job.get("youtube_short"),
     }
@@ -17627,6 +17655,7 @@ async def regenerate_scene(
     job_id: str,
     recurrence_key: str,
     body: RegenerateSceneRequest | None = None,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -17641,6 +17670,18 @@ async def regenerate_scene(
     from database import Job as JobModel, AuditLog
 
     body = body or RegenerateSceneRequest()
+    _scene_idempotency_hash = _idempotency_header_hash(idempotency_key)
+    _scene_request_fingerprint = _request_fingerprint(
+        "scene-regenerate.v1",
+        {
+            "job_id": job_id,
+            "recurrence_key": recurrence_key,
+            "prompt": (body.prompt or "").strip(),
+            "hint": (body.hint or "").strip(),
+            "movement_style": (body.movement_style or "").strip(),
+            "allow_youtube_drift": bool(body.allow_youtube_drift),
+        },
+    )
     if not has_scenes_access(current_user):
         raise HTTPException(status_code=403, detail="Escenas no habilitado para esta cuenta.")
 
@@ -17655,6 +17696,36 @@ async def regenerate_scene(
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # A lost response must replay the accepted scene regeneration instead of
+    # charging another provider call.  The audit row is durable and scoped by
+    # the hashed caller key plus the request fingerprint, matching /edit's
+    # existing idempotency contract without storing the raw key.
+    if _scene_idempotency_hash:
+        for (_detail,) in db.query(AuditLog.detail).filter(
+            AuditLog.action == "job.scene_regenerate"
+        ).all():
+            if not isinstance(_detail, dict):
+                continue
+            if _detail.get("job_id") != job_id or _detail.get("recurrence_key") != recurrence_key:
+                continue
+            if _detail.get("idempotency_key_hash") != _scene_idempotency_hash:
+                continue
+            if _detail.get("request_fingerprint") != _scene_request_fingerprint:
+                raise HTTPException(status_code=409, detail={
+                    "code": "idempotency_key_conflict",
+                    "message": "Idempotency-Key was already used with a different scene regeneration payload.",
+                })
+            return {
+                "ok": True,
+                "job_id": job_id,
+                "recurrence_key": recurrence_key,
+                "edit_count": job.edit_count or 0,
+                "edits_remaining": max(0, _MAX_EDITS - (job.edit_count or 0)),
+                "edit_limit_exempt": current_user.get("role") == "admin",
+                "reroll_count": _detail.get("reroll_index"),
+                "idempotent": True,
+            }
     if getattr(job, "workload_class", "interactive") == "batch":
         from batch_campaigns import enforce_render_capacity
         enforce_render_capacity(db, job)
@@ -17752,7 +17823,9 @@ async def regenerate_scene(
         user_id=current_user["id"],
         action="job.scene_regenerate",
         detail={"job_id": job_id, "recurrence_key": recurrence_key,
-                "edit_params": edit_params, "reroll_index": _prior_rerolls + 1},
+                "edit_params": edit_params, "reroll_index": _prior_rerolls + 1,
+                "idempotency_key_hash": _scene_idempotency_hash,
+                "request_fingerprint": _scene_request_fingerprint},
     ))
     db.commit()
 

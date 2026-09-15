@@ -149,6 +149,34 @@ def test_regen_scene_happy_does_not_touch_edit_count(client, admin_token, db, mo
     assert fresh.edit_count == 0 and fresh.status == "editing"
 
 
+def test_regen_scene_replays_same_idempotency_key_without_second_enqueue(
+    client, admin_token, db, monkeypatch,
+):
+    """A lost response must not charge/enqueue the same scene twice."""
+    import main
+
+    calls = []
+    monkeypatch.setattr(main, "enqueue_edit", lambda **k: calls.append(k) or "edit:fake")
+    me = client.get("/auth/me", headers=_hdr(admin_token)).json()
+    jid = _make_scene_job(db, me["tenant_id"])
+    headers = {**_hdr(admin_token), "Idempotency-Key": "scene-retry-0001"}
+
+    first = client.post(
+        f"/jobs/{jid}/scenes/coro_1/regenerate",
+        headers=headers,
+        json={"hint": "más oscuro"},
+    )
+    assert first.status_code == 200, first.text
+    second = client.post(
+        f"/jobs/{jid}/scenes/coro_1/regenerate",
+        headers=headers,
+        json={"hint": "más oscuro"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["idempotent"] is True
+    assert len(calls) == 1
+
+
 def test_regen_scene_rejected_clears_rejection_timestamp(
     client, admin_token, db, monkeypatch,
 ):
@@ -336,6 +364,36 @@ def test_status_includes_scene_plan(client, admin_token, db):
     assert r.status_code == 200, r.text
     sp = r.json().get("scene_plan")
     assert sp and sp.get("scenes"), "/status debe traer scene_plan.scenes en un job de escenas"
+
+
+def test_status_does_not_touch_delivery_db_before_approval(
+    client, admin_token, db,
+):
+    """The normal trial poll must survive an unavailable portal DB."""
+    import main
+    from database import get_deliveries_db
+
+    class ExplodingDeliverySession:
+        bind = None
+
+        def query(self, *_args, **_kwargs):
+            raise AssertionError("unapproved /status must not query deliveries")
+
+        def close(self):
+            pass
+
+    def _override():
+        yield ExplodingDeliverySession()
+
+    me = client.get("/auth/me", headers=_hdr(admin_token)).json()
+    jid = _make_scene_job(db, me["tenant_id"], user_id=me["id"])
+    main.app.dependency_overrides[get_deliveries_db] = _override
+    try:
+        response = client.get(f"/status/{jid}", headers=_hdr(admin_token))
+    finally:
+        main.app.dependency_overrides.pop(get_deliveries_db, None)
+    assert response.status_code == 200, response.text
+    assert response.json()["delivery_status_unavailable"] is False
 
 
 def test_regen_failed_scene_not_capped(client, user_token, db, monkeypatch):

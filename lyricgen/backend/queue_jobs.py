@@ -2180,7 +2180,7 @@ def queue_depth() -> dict:
     if q_default is None:
         return {
             "default": 0, "enterprise": 0, "transcription": 0,
-            "bg_preview": 0, "transcription_batch": 0,
+            "bg_preview": 0, "audio_preview": 0, "transcription_batch": 0,
             "batch_render": 0, "campaign_control": 0, "backend": "threads",
         }
     from rq import Queue
@@ -2189,7 +2189,7 @@ def queue_depth() -> dict:
         "enterprise": len(q_enterprise),
     }
     for name in (
-        "transcription", "bg_preview", "transcription_batch",
+        "transcription", "bg_preview", "audio_preview", "transcription_batch",
         "batch_render", "campaign_control",
     ):
         result[name] = len(Queue(name, connection=redis))
