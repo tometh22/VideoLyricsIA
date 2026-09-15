@@ -27,6 +27,27 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   — another song's lyric (Color Esperanza) and the same lyric duplicated to
   80 lines. Kill switch: `ANCHOR_LOCAL_ALIGN_ENABLED=0`.
 
+## [1.1.45] - 2026-09-15
+
+### Added
+
+- Audit what the portal promises, once a day, in the reaper's single-runner
+  cycle. Two classes of failure were invisible until someone asked about
+  something else: a row advertising a file that is not in R2 (28 of 34 Chile
+  deliveries on 2026-09-15), and a delivery whose render changed after it was
+  published. It only reports — repairing a deliverable is always a decision
+  with a human in it, because the row can lie in both directions. Rows with
+  no fingerprint and jobs owned by another environment are counted as
+  unevaluable rather than flagged, and an R2 network failure is never
+  reported as a missing file.
+
+### Improved
+
+- Show the published version, the in-flight state and "atendido en la versión
+  N" on the client portal, and make a missing ProRes read as the download it
+  is — clicking it generates the file and then starts the download, instead of
+  asking for a second click three minutes later.
+
 ## [1.1.44] - 2026-09-15
 
 ### Fixed
