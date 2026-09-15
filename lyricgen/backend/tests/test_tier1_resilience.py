@@ -14,10 +14,6 @@ absence reintroduces an indefinite hang during a Railway private-networking
 blip. A cheap presence test is the right guard against an accidental revert.
 """
 
-import importlib
-import os
-
-
 # --------------------------------------------------------------------------
 # C4 — DB connect_timeout
 # --------------------------------------------------------------------------
@@ -33,12 +29,10 @@ def test_pg_connect_args_have_connect_timeout():
 def test_pg_connect_timeout_env_override(monkeypatch):
     monkeypatch.setenv("DB_CONNECT_TIMEOUT", "3")
     import database
-    importlib.reload(database)
-    try:
-        assert database._build_pg_connect_args()["connect_timeout"] == 3
-    finally:
-        monkeypatch.delenv("DB_CONNECT_TIMEOUT", raising=False)
-        importlib.reload(database)
+    # This helper reads the environment on each call. Reloading the shared
+    # module recreates ORM registries while startup daemon threads still use
+    # the old models, and can poison every subsequent database test.
+    assert database._build_pg_connect_args()["connect_timeout"] == 3
 
 
 # --------------------------------------------------------------------------
