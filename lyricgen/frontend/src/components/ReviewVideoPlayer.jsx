@@ -1,4 +1,11 @@
-import { forwardRef, useImperativeHandle, useRef, useState } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
 
 
 function formatMediaTime(seconds) {
@@ -28,19 +35,75 @@ const ReviewVideoPlayer = forwardRef(function ReviewVideoPlayer({
   const [duration, setDuration] = useState(0);
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(1);
+  const [preparing, setPreparing] = useState(false);
+  const playIntentRef = useRef(false);
+  const recoveryTimerRef = useRef(null);
 
   useImperativeHandle(forwardedRef, () => videoRef.current);
+
+  const clearRecoveryTimer = useCallback(() => {
+    if (recoveryTimerRef.current !== null) {
+      clearTimeout(recoveryTimerRef.current);
+      recoveryTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleRecovery = useCallback(() => {
+    clearRecoveryTimer();
+    recoveryTimerRef.current = setTimeout(() => {
+      recoveryTimerRef.current = null;
+      const video = videoRef.current;
+      if (
+        playIntentRef.current
+        && video
+        && (video.paused || video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA)
+      ) {
+        onError?.({ type: "playback-stalled", currentTarget: video });
+      }
+    }, 3000);
+  }, [clearRecoveryTimer, onError]);
+
+  const requestPlayback = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    playIntentRef.current = true;
+    setPreparing(true);
+    scheduleRecovery();
+    const playRequest = video.play();
+    if (playRequest?.catch) {
+      playRequest.catch((error) => {
+        // A source refresh can abort an in-flight play request. `canplay`
+        // below retries it while preserving the original user intent.
+        if (error?.name === "AbortError") return;
+        onError?.({ type: "playback-rejected", error, currentTarget: video });
+      });
+    }
+  }, [onError, scheduleRecovery]);
 
   const togglePlayback = () => {
     const video = videoRef.current;
     if (!video) return;
-    if (video.paused || video.ended) {
-      const playRequest = video.play();
-      if (playRequest?.catch) playRequest.catch(() => {});
-    } else {
+    if (preparing || (!video.paused && !video.ended)) {
+      playIntentRef.current = false;
+      setPreparing(false);
+      clearRecoveryTimer();
       video.pause();
+      return;
     }
+    requestPlayback();
   };
+
+  // Keep the user's Play intent across a cache-busted source refresh. This
+  // is what removes the need for a manual page reload after a just-finished
+  // render or edit.
+  useEffect(() => {
+    if (playIntentRef.current) {
+      setPreparing(true);
+      scheduleRecovery();
+    }
+  }, [src, scheduleRecovery]);
+
+  useEffect(() => clearRecoveryTimer, [clearRecoveryTimer]);
 
   const seek = (value) => {
     const video = videoRef.current;
@@ -86,7 +149,7 @@ const ReviewVideoPlayer = forwardRef(function ReviewVideoPlayer({
           : "job-detail-video-player--landscape"
       }`}
     >
-      <div className={`job-detail-media-frame rounded-t-card bg-black overflow-hidden ${
+      <div className={`job-detail-media-frame relative rounded-t-card bg-black overflow-hidden ${
         isShort
           ? "job-detail-media-frame--short"
           : "job-detail-media-frame--landscape"
@@ -96,16 +159,61 @@ const ReviewVideoPlayer = forwardRef(function ReviewVideoPlayer({
           src={src}
           preload="metadata"
           playsInline
-          onError={onError}
+          onError={(event) => {
+            setPlaying(false);
+            setPreparing(playIntentRef.current);
+            onError?.(event);
+          }}
           onClick={togglePlayback}
           onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
           onDurationChange={(event) => setDuration(event.currentTarget.duration || 0)}
           onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime || 0)}
-          onPlay={() => setPlaying(true)}
-          onPause={() => setPlaying(false)}
-          onEnded={() => setPlaying(false)}
+          onCanPlay={() => {
+            clearRecoveryTimer();
+            if (playIntentRef.current && videoRef.current?.paused) requestPlayback();
+            else setPreparing(false);
+          }}
+          onWaiting={() => {
+            if (playIntentRef.current) {
+              setPreparing(true);
+              scheduleRecovery();
+            }
+          }}
+          onStalled={() => {
+            if (playIntentRef.current) {
+              setPreparing(true);
+              scheduleRecovery();
+            }
+          }}
+          onPlay={() => {
+            clearRecoveryTimer();
+            setPlaying(true);
+            setPreparing(false);
+          }}
+          onPause={() => {
+            setPlaying(false);
+            setPreparing(playIntentRef.current);
+          }}
+          onEnded={() => {
+            playIntentRef.current = false;
+            clearRecoveryTimer();
+            setPlaying(false);
+            setPreparing(false);
+          }}
           className="job-detail-media-video w-full h-full block object-contain bg-black/40 cursor-pointer"
         />
+        {preparing && (
+          <div
+            className="absolute inset-0 pointer-events-none flex items-center justify-center bg-black/20"
+            role="status"
+            aria-live="polite"
+          >
+            <span className="inline-flex items-center gap-2 rounded-full bg-black/70 px-3 py-1.5 text-xs text-white shadow-lg">
+              <span className="h-3.5 w-3.5 rounded-full border-2 border-white/35 border-t-white animate-spin" aria-hidden="true" />
+              Preparando video…
+            </span>
+          </div>
+        )}
       </div>
 
       <div
@@ -117,10 +225,10 @@ const ReviewVideoPlayer = forwardRef(function ReviewVideoPlayer({
           type="button"
           onClick={togglePlayback}
           className="w-8 h-8 shrink-0 rounded-lg flex items-center justify-center text-white hover:bg-white/[0.08] transition-colors"
-          aria-label={playing ? "Pausar" : "Reproducir"}
-          title={playing ? "Pausar" : "Reproducir"}
+          aria-label={playing ? "Pausar" : preparing ? "Cancelar reproducción" : "Reproducir"}
+          title={playing ? "Pausar" : preparing ? "Cancelar reproducción" : "Reproducir"}
         >
-          {playing ? (
+          {playing || preparing ? (
             <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
               <path d="M6 5h4v14H6zm8 0h4v14h-4z" />
             </svg>

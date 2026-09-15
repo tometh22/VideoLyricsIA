@@ -22,4 +22,13 @@ describe("JobDetail media frame sizing contract", () => {
     expect(css).toContain("width: min(100%, 337.5px, 33.75vh)");
     expect(css).toMatch(/job-detail-media-video:fullscreen[\s\S]*width:\s*100vw[\s\S]*height:\s*100vh/);
   });
+
+  it("uses a fresh preview URL without remounting away the Play intent", () => {
+    const component = fs.readFileSync(path.resolve("src/components/JobDetail.jsx"), "utf8");
+
+    expect(component).toContain('const previewVersion = `${mediaVersion}-retry-${videoReloadKey}`');
+    expect(component).toContain('useMediaUrl(job.job_id, previewMediaType, "preview", previewVersion)');
+    expect(component).toContain('key={`${activeTab}-${mediaVersion}`}');
+    expect(component).not.toContain('key={`${activeTab}-${videoReloadKey}-${mediaVersion}`}');
+  });
 });
