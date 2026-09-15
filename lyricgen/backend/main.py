@@ -127,7 +127,10 @@ from observability import init_sentry, init_logging, health_snapshot
 from pipeline import (run_pipeline, transcribe, _normalize_movement_style,
                       CANVAS_FILE_TYPES)
 from segment_timing import normalize_segments_timing, normalize_editor_segments, timing_anomalies
-from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
+from queue_jobs import (
+    enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm,
+    enqueue_delivery_prores_prewarm, enqueue_drive_delivery,
+)
 from render_spec import umg_catalog, validate_umg_config
 from transcription_language import (
     detect_text_languages,
@@ -10932,15 +10935,25 @@ def status(
         # the frontend reads job.approved_by directly from /status.
         "approved_by": job.get("approved_by"),
         "approved_at": job.get("approved_at"),
-        # Whether this job is currently published on the UMG deliverables
-        # portal. Drives the "Enviar a UMG" button state in JobDetail.jsx
-        # (hidden / available / "✓ Ya en UMG"). Single boolean is enough —
-        # JobDetail doesn't need the delivery id, just the on/off state.
+        # Whether this job is currently published on any UMG deliverables
+        # portal. Keep the boolean for older clients; `umg_portals` below is
+        # the destination-aware source for the admin publish selector.
         # El flag vive en la DB de deliveries (`ddb`, posible externa de prod).
         # Gateado por approved_at: el botón "Enviar a UMG" solo aparece en jobs
         # aprobados, así que para el caso común (job no aprobado, polleado sin
         # parar por JobDetail) devolvemos False sin pegarle a la DB externa —
         # evita latencia/egress/checkout de conexión de prod en cada poll.
+        # Keep the historical boolean for old clients, and expose the
+        # destinations separately so an admin can publish the same job to
+        # Argentina and Chile without the UI treating the first publish as a
+        # global one-shot action.
+        "umg_portals": sorted({
+            (portal_id or "argentina")
+            for portal_id, in ddb.query(Delivery.portal_id)
+            .filter(Delivery.job_id == job_id)
+            .filter(Delivery.removed_at.is_(None))
+            .all()
+        }) if job.get("approved_at") else [],
         "is_in_umg_portal": bool(
             job.get("approved_at")
             and ddb.query(Delivery.id)
@@ -18009,22 +18022,91 @@ def _delivery_safe_filename(artist: str, song: str) -> str:
     return out.replace(" ", "_") or "video"
 
 
-def _verify_portal_token(authorization: str | None) -> None:
+_PORTAL_IDS = {"argentina", "chile"}
+
+
+def _portal_tenant_scope(portal_id: str) -> set[str] | None:
+    """Return the legacy tenant allow-list, or None for an unfiltered list.
+
+    Argentina historically listed legacy deliveries from several tenant
+    snapshots, so it remains unfiltered unless explicitly configured. New
+    deliveries are scoped by their row-level ``portal_id``; tenant filtering
+    is therefore only applied to Argentina for backwards compatibility.
+    """
+    if portal_id == "chile":
+        return None
+    env_name = f"DELIVERY_PORTAL_TENANTS_{portal_id.upper()}"
+    raw = os.environ.get(env_name)
+    if raw is not None:
+        tenants = {part.strip() for part in raw.split(",") if part.strip()}
+        return tenants or set()
+    return None
+
+
+def _portal_id(raw: str | None) -> str:
+    portal_id = (raw or "argentina").strip().lower()
+    if portal_id not in _PORTAL_IDS:
+        raise HTTPException(status_code=400, detail="Portal inválido")
+    return portal_id
+
+
+def _portal_delivery_query(query, portal_id: str):
+    # A delivery's explicit destination is authoritative. Tenant filtering is
+    # retained for Argentina's legacy allow-list, but Chile must be able to
+    # receive an admin-selected delivery from either staging or production
+    # source tenant; otherwise the new destination selector would silently
+    # hide valid Chile deliveries.
+    tenants = _portal_tenant_scope(portal_id) if portal_id == "argentina" else None
+    # New rows carry an explicit destination. The migration backfills
+    # historical rows as Argentina; the NULL fallback keeps this safe during
+    # a rolling deploy against a database that has not run it yet.
+    if portal_id == "argentina":
+        from sqlalchemy import or_
+        query = query.filter(
+            or_(Delivery.portal_id == portal_id, Delivery.portal_id.is_(None))
+        )
+    else:
+        query = query.filter(Delivery.portal_id == portal_id)
+    if tenants is not None:
+        query = query.filter(Delivery.tenant_snapshot.in_(tenants))
+    return query
+
+
+def _verify_portal_token(
+    authorization: str | None,
+    portal_id: str | None = None,
+) -> str:
     """Raise 401 unless the X-Portal-Token header matches the configured
     portal password. The portal is a static page so we can't use JWT —
-    this is the same shared password Universal enters in the portal UI."""
-    expected = os.environ.get("DELIVERY_PORTAL_TOKEN") or os.environ.get("DELIVERY_PASSWORD")
+    this is the same shared password Universal enters in the portal UI.
+
+    The Chile portal has its own token env var. This keeps the two portal
+    surfaces isolated even though they share the delivery database and R2
+    bucket. The Argentina path remains backward-compatible with the original
+    single-token deployment.
+    """
+    portal_id = _portal_id(portal_id)
+    token_env = f"DELIVERY_PORTAL_TOKEN_{portal_id.upper()}"
+    expected = os.environ.get(token_env)
+    if expected is None:
+        # Keep one shared password working for the existing Argentina portal
+        # and the first Chile rollout. Production can set
+        # DELIVERY_PORTAL_TOKEN_CHILE later for cryptographic separation;
+        # tenant filtering remains active either way.
+        expected = os.environ.get("DELIVERY_PORTAL_TOKEN") or os.environ.get("DELIVERY_PASSWORD")
     if not expected:
         # If the env var isn't set the portal endpoints are effectively
         # disabled — better than silently allowing unauth access.
         raise HTTPException(status_code=503, detail="Portal not configured")
     if not authorization or authorization != expected:
         raise HTTPException(status_code=401, detail="Invalid portal token")
+    return portal_id
 
 
 class SendToUMGRequest(BaseModel):
     """Optional overrides when publishing a job to the portal."""
     label: str | None = None  # default: "Renderizado" or "Opción N"
+    portal_id: str = "argentina"  # destino visible: argentina | chile
 
 
 @app.post("/admin/deliveries/from-job/{job_id}")
@@ -18049,6 +18131,8 @@ async def admin_create_delivery_from_job(
     """
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
+
+    portal_id = _portal_id(body.portal_id if body else None)
 
     job = db.query(Job).filter(Job.job_id == job_id).first()
     if job is None:
@@ -18148,7 +18232,7 @@ async def admin_create_delivery_from_job(
     # delivery for this song gets "Renderizado"; subsequent ones get
     # "Opción N". Matches the manual items.json conventions.
     label = (body.label if body else None) or _compute_default_delivery_label(
-        ddb, job.artist, job.song_title
+        ddb, job.artist, job.song_title, portal_id
     )
 
     # added_by_user_id es FK NOT NULL a users.id de la DB de deliveries. Con
@@ -18163,6 +18247,7 @@ async def admin_create_delivery_from_job(
     existing = (
         ddb.query(Delivery)
         .filter(Delivery.job_id == job_id)
+        .filter(Delivery.portal_id == portal_id)
         .filter(Delivery.removed_at.is_(None))
         .first()
     )
@@ -18176,6 +18261,7 @@ async def admin_create_delivery_from_job(
         existing.artist_snapshot = job.artist
         existing.song_title_snapshot = job.song_title or ""
         existing.tenant_snapshot = job.tenant_id
+        existing.portal_id = portal_id
         existing.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
         delivery = existing
         action = "delivery.update"
@@ -18187,6 +18273,7 @@ async def admin_create_delivery_from_job(
             artist_snapshot=job.artist,
             song_title_snapshot=job.song_title or "",
             tenant_snapshot=job.tenant_id,
+            portal_id=portal_id,
             frame_size_snapshot=(job.umg_spec or {}).get("frame_size"),
             added_by_user_id=added_by,
             added_at=datetime.now(timezone.utc),
@@ -18203,7 +18290,13 @@ async def admin_create_delivery_from_job(
     db.add(AuditLog(
         user_id=current_user["id"],
         action=action,
-        detail={"job_id": job_id, "label": label, "artist": job.artist, "song": job.song_title},
+        detail={
+            "job_id": job_id,
+            "label": label,
+            "portal_id": portal_id,
+            "artist": job.artist,
+            "song": job.song_title,
+        },
     ))
     db.commit()
 
@@ -18214,11 +18307,17 @@ async def admin_create_delivery_from_job(
         "label": delivery.label,
         "artist": delivery.artist_snapshot,
         "song": delivery.song_title_snapshot,
+        "portal_id": delivery.portal_id or "argentina",
         "replaced": action == "delivery.update",
     }
 
 
-def _compute_default_delivery_label(db: Session, artist: str, song_title: str | None) -> str:
+def _compute_default_delivery_label(
+    db: Session,
+    artist: str,
+    song_title: str | None,
+    portal_id: str = "argentina",
+) -> str:
     """Default label for a new delivery.
 
     Rule: first active delivery for an (artist, song) gets "Renderizado".
@@ -18230,6 +18329,7 @@ def _compute_default_delivery_label(db: Session, artist: str, song_title: str | 
         db.query(Delivery)
         .filter(Delivery.artist_snapshot == artist)
         .filter(Delivery.song_title_snapshot == (song_title or ""))
+        .filter(Delivery.portal_id == portal_id)
         .filter(Delivery.removed_at.is_(None))
         .count()
     )
@@ -18251,11 +18351,20 @@ async def admin_delete_delivery(
     return _soft_delete_delivery(ddb, db, delivery_id, current_user["id"])
 
 
-def _soft_delete_delivery(ddb: Session, db: Session, delivery_id: int, actor_user_id: int | None):
+def _soft_delete_delivery(
+    ddb: Session,
+    db: Session,
+    delivery_id: int,
+    actor_user_id: int | None,
+    portal_id: str | None = None,
+):
     """Soft-delete: la fila Delivery vive en `ddb` (posible DB externa del
     portal); el AuditLog en la `db` local. removed_by_user_id es FK a los
     users de la DB de deliveries → mapear el id local a uno válido de esa DB."""
-    delivery = ddb.query(Delivery).filter(Delivery.id == delivery_id).first()
+    query = ddb.query(Delivery).filter(Delivery.id == delivery_id)
+    if portal_id is not None:
+        query = _portal_delivery_query(query, portal_id)
+    delivery = query.first()
     if delivery is None or delivery.removed_at is not None:
         raise HTTPException(status_code=404, detail="Delivery not found")
     delivery.removed_at = datetime.now(timezone.utc)
@@ -18281,16 +18390,110 @@ def _soft_delete_delivery(ddb: Session, db: Session, delivery_id: int, actor_use
 async def portal_delete_delivery(
     delivery_id: int,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
     """Soft-delete from the portal itself. Auth: shared portal token."""
-    _verify_portal_token(x_portal_token)
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
     # actor_user_id=None because the portal has no per-user identity.
     # The audit log entry records the action and which delivery; if we
     # later add per-recipient logins to the portal this will carry their
     # user id instead.
-    return _soft_delete_delivery(ddb, db, delivery_id, actor_user_id=None)
+    return _soft_delete_delivery(
+        ddb, db, delivery_id, actor_user_id=None, portal_id=portal_id,
+    )
+
+
+@app.post("/api/deliveries/{delivery_id}/prepare-prores")
+async def portal_prepare_prores(
+    delivery_id: int,
+    body: dict,
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """Queue a missing ProRes derivative from the delivery portal.
+
+    ProRes is intentionally lazy because a master can take minutes and
+    several GB. The portal listing used to render a missing derivative as a
+    permanently disabled button, leaving UMG with no way to start it. Keep
+    the same portal row-level authorization as approve/delete. If this API
+    owns the source Job, reuse its exact persisted UMG spec; deliveries sent
+    from staging fall back to their immutable R2 snapshot so the shared
+    production portal can prepare them too.
+    """
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    file_type = body.get("file_type") if isinstance(body, dict) else None
+    if file_type not in ("umg_master", "umg_short"):
+        raise HTTPException(status_code=400, detail="Archivo ProRes inválido.")
+
+    delivery = _portal_delivery_query(
+        ddb.query(Delivery), portal_id,
+    ).filter(
+        Delivery.id == delivery_id,
+        Delivery.removed_at.is_(None),
+    ).first()
+    if delivery is None:
+        raise HTTPException(status_code=404, detail="Delivery no encontrada.")
+    if file_type not in (delivery.file_types or []):
+        raise HTTPException(status_code=404, detail="Archivo no disponible para esta entrega.")
+
+    job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
+    if job is not None and job.status != "done":
+        raise HTTPException(status_code=400, detail="El video todavía no terminó de procesarse.")
+
+    try:
+        if job is not None and job.umg_spec:
+            rq_id = enqueue_prores_prewarm(job.job_id, file_type, force=True)
+            prepare_source = "job"
+        else:
+            # Cross-environment/legacy campaign delivery. Its source MP4 is
+            # already validated by the portal listing and lives at the
+            # deterministic R2 key captured by the Delivery snapshot.
+            rq_id = enqueue_delivery_prores_prewarm(
+                delivery.job_id,
+                file_type,
+                delivery.tenant_snapshot,
+                frame_size=delivery.frame_size_snapshot,
+            )
+            prepare_source = "delivery_snapshot"
+    except Exception as exc:
+        logger.warning(
+            "[PORTAL-PRORES] enqueue failed delivery=%s job=%s type=%s: %s",
+            delivery_id, delivery.job_id, file_type, exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo iniciar la preparación ProRes. Probá de nuevo en un momento.",
+        ) from exc
+
+    db.add(AuditLog(
+        user_id=None,
+        action="delivery.prores.prepare",
+        detail={
+            "delivery_id": delivery_id,
+            "job_id": delivery.job_id,
+            "portal_id": portal_id,
+            "file_type": file_type,
+            "prepare_source": prepare_source,
+        },
+    ))
+    db.commit()
+    return JSONResponse(
+        status_code=202,
+        content={
+            "ok": True,
+            "status": "queued",
+            "delivery_id": delivery_id,
+            "job_id": delivery.job_id,
+            "file_type": file_type,
+            "rq_id": rq_id,
+            "retry_after": 60,
+        },
+        headers={"Retry-After": "60"},
+    )
 
 
 @app.post("/api/deliveries/{delivery_id}/change-request")
@@ -18298,6 +18501,7 @@ async def portal_submit_change_request(
     delivery_id: int,
     body: dict,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
@@ -18308,7 +18512,7 @@ async def portal_submit_change_request(
 
     Auth via X-Portal-Token (same shared password as the rest of /api).
     """
-    _verify_portal_token(x_portal_token)
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
     comment = (body.get("comment") or "").strip() if isinstance(body, dict) else ""
     if not comment:
         raise HTTPException(status_code=400, detail="El comentario no puede estar vacío.")
@@ -18319,12 +18523,13 @@ async def portal_submit_change_request(
             status_code=400,
             detail="El comentario es demasiado largo (máximo 5000 caracteres).",
         )
-    delivery = (
-        ddb.query(Delivery)
-        .filter(Delivery.id == delivery_id)
-        .filter(Delivery.removed_at.is_(None))
-        .first()
-    )
+    delivery = _portal_delivery_query(
+        ddb.query(Delivery), portal_id,
+    ).filter(
+        Delivery.id == delivery_id,
+    ).filter(
+        Delivery.removed_at.is_(None),
+    ).first()
     if not delivery:
         raise HTTPException(status_code=404, detail="Delivery no encontrada.")
     cr = DeliveryChangeRequest(
@@ -18384,6 +18589,7 @@ async def portal_submit_change_request(
 async def portal_approve_delivery(
     delivery_id: int,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
@@ -18397,13 +18603,14 @@ async def portal_approve_delivery(
 
     Auth: shared portal token (same envelope as the rest of /api).
     """
-    _verify_portal_token(x_portal_token)
-    delivery = (
-        ddb.query(Delivery)
-        .filter(Delivery.id == delivery_id)
-        .filter(Delivery.removed_at.is_(None))
-        .first()
-    )
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    delivery = _portal_delivery_query(
+        ddb.query(Delivery), portal_id,
+    ).filter(
+        Delivery.id == delivery_id,
+    ).filter(
+        Delivery.removed_at.is_(None),
+    ).first()
     if not delivery:
         raise HTTPException(status_code=404, detail="Delivery no encontrada.")
     if delivery.approved_at is not None:
@@ -18439,6 +18646,7 @@ async def portal_approve_delivery(
 async def portal_unapprove_delivery(
     delivery_id: int,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
@@ -18446,13 +18654,14 @@ async def portal_unapprove_delivery(
     approved_by_label so the row goes back to pending state on the
     portal listing. Idempotent — calling on an unapproved row is a no-op.
     """
-    _verify_portal_token(x_portal_token)
-    delivery = (
-        ddb.query(Delivery)
-        .filter(Delivery.id == delivery_id)
-        .filter(Delivery.removed_at.is_(None))
-        .first()
-    )
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    delivery = _portal_delivery_query(
+        ddb.query(Delivery), portal_id,
+    ).filter(
+        Delivery.id == delivery_id,
+    ).filter(
+        Delivery.removed_at.is_(None),
+    ).first()
     if not delivery:
         raise HTTPException(status_code=404, detail="Delivery no encontrada.")
     if delivery.approved_at is None:
@@ -18477,9 +18686,10 @@ async def portal_unapprove_delivery(
 @app.get("/api/deliveries/meta")
 async def portal_get_meta(
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
 ):
     """Title/description/expiry for the portal header. Public (portal token)."""
-    _verify_portal_token(x_portal_token)
+    _verify_portal_token(x_portal_token, x_portal_id)
     import time
     return {
         "title": "Entregables — GenLy AI",
@@ -18497,7 +18707,9 @@ async def portal_get_meta(
 
 @app.get("/api/deliveries/items")
 async def portal_get_items(
+    response: Response,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_deliveries_db),
 ):
     """Return the portal listing in the shape the frontend expects.
@@ -18505,17 +18717,23 @@ async def portal_get_items(
     Queries the DB fresh on every call. Previous in-process cache broke
     under Railway's multi-worker setup — see the module-level note next
     to _DELIVERY_URL_EXPIRY_S."""
-    _verify_portal_token(x_portal_token)
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    # The listing contains private, short-lived R2 URLs and is served through
+    # both UMG hostnames. Never let a CDN/proxy reuse one portal's response
+    # for the other portal (or expose signed URLs from a shared cache).
+    response.headers["Cache-Control"] = "private, no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     import time
     from concurrent.futures import ThreadPoolExecutor
 
     now = time.time()
-    deliveries = (
-        db.query(Delivery)
-        .filter(Delivery.removed_at.is_(None))
-        .order_by(Delivery.artist_snapshot, Delivery.song_title_snapshot, Delivery.added_at)
-        .all()
-    )
+    deliveries = _portal_delivery_query(
+        db.query(Delivery), portal_id,
+    ).filter(
+        Delivery.removed_at.is_(None),
+    ).order_by(
+        Delivery.artist_snapshot, Delivery.song_title_snapshot, Delivery.added_at,
+    ).all()
 
     # Resolve every (delivery, file) pair's R2 size in parallel BEFORE
     # building the response. Sequential head_object calls were the root
@@ -18670,6 +18888,10 @@ async def portal_get_items(
     return {
         "songs": list(songs.values()),
         "file_type_labels": file_type_labels,
+        # The static Chile portal uses this marker as a fail-closed guard
+        # while the backend rollout is in progress. Without it, an older
+        # backend would return the global legacy listing to Chile.
+        "portal_id": portal_id,
         "expires_at_ts": now + _DELIVERY_URL_EXPIRY_S,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

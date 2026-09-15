@@ -275,6 +275,8 @@ def test_portal_items_lists_active_deliveries(client, admin_token, approved_job,
     # Then list
     res = client.get("/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN})
     assert res.status_code == 200
+    assert res.headers["cache-control"] == "private, no-store, max-age=0"
+    assert res.headers["pragma"] == "no-cache"
     payload = res.json()
     assert "songs" in payload
     assert "file_type_labels" in payload
@@ -290,6 +292,83 @@ def test_portal_items_lists_active_deliveries(client, admin_token, approved_job,
     assert isinstance(v.get("delivery_id"), int)
     # 5 files expected (umg_master, umg_short, video, short, thumbnail)
     assert len(v["files"]) == 5
+
+
+def test_chile_portal_does_not_expose_non_chile_delivery(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The Chile surface only exposes rows explicitly sent to Chile.
+
+    The fixture is published with the default Argentina destination, which
+    Chile must not inherit even when both portals use the same token.
+    """
+    client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    res = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    )
+    assert res.status_code == 200
+    assert not any(
+        song["artist"] == "Test Artist" for song in res.json()["songs"]
+    )
+
+
+def test_same_job_can_be_published_to_both_portals(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The destination is part of the delivery identity, not the job.
+
+    This is the regression test for the admin workflow: a video sent first to
+    Argentina must remain independently publishable to Chile.
+    """
+    argentina = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    chile = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert argentina.status_code == 200, argentina.text
+    assert chile.status_code == 200, chile.text
+    assert argentina.json()["portal_id"] == "argentina"
+    assert chile.json()["portal_id"] == "chile"
+    assert argentina.json()["delivery_id"] != chile.json()["delivery_id"]
+
+    argentina_items = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "argentina"},
+    ).json()
+    chile_items = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    ).json()
+    assert any(song["artist"] == "Test Artist" for song in argentina_items["songs"])
+    assert any(song["artist"] == "Test Artist" for song in chile_items["songs"])
+
+    status = client.get(
+        f"/status/{approved_job.job_id}", headers=auth(admin_token),
+    ).json()
+    assert set(status["umg_portals"]) == {"argentina", "chile"}
+
+
+def test_chile_publish_accepts_source_from_any_tenant(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The selected Chile destination, not the source tenant, controls visibility."""
+    res = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert res.status_code == 200, res.text
+    items = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    ).json()
+    assert any(song["artist"] == "Test Artist" for song in items["songs"])
 
 
 def test_portal_can_delete(client, admin_token, approved_job, all_r2_files_present):
@@ -322,6 +401,104 @@ def test_admin_delete_via_jwt(client, admin_token, approved_job, all_r2_files_pr
 
     res = client.delete(f"/admin/deliveries/{delivery_id}", headers=auth(admin_token))
     assert res.status_code == 200
+
+
+def test_portal_can_prepare_missing_prores_for_its_delivery(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+
+    with patch("main.enqueue_prores_prewarm", return_value="prewarm:test") as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_master"},
+        )
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "queued"
+    enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True)
+
+
+def test_portal_can_prepare_staging_delivery_without_local_job(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    """The shared portal DB contains deliveries created by staging, while
+    production's jobs DB deliberately does not contain those Job rows."""
+    from database import Job
+
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+    db.query(Job).filter(Job.id == approved_job.id).delete()
+    db.commit()
+
+    with patch(
+        "main.enqueue_delivery_prores_prewarm", return_value="portal-prewarm:test",
+    ) as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_master"},
+        )
+
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "queued"
+    enqueue.assert_called_once_with(
+        approved_job.job_id, "umg_master", "default", frame_size="HD",
+    )
+
+
+def test_portal_can_prepare_legacy_mp4_only_delivery(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+    approved_job.umg_spec = None
+    db.commit()
+
+    with patch(
+        "main.enqueue_delivery_prores_prewarm", return_value="portal-prewarm:test",
+    ) as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_short"},
+        )
+
+    assert res.status_code == 202, res.text
+    enqueue.assert_called_once_with(
+        approved_job.job_id, "umg_short", "default", frame_size="HD",
+    )
+
+
+def test_portal_cannot_prepare_prores_from_the_other_portal(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    chile_delivery_id = published.json()["delivery_id"]
+    with patch("main.enqueue_prores_prewarm"):
+        res = client.post(
+            f"/api/deliveries/{chile_delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "argentina"},
+            json={"file_type": "umg_master"},
+        )
+    assert res.status_code == 404
 
 
 def test_status_endpoint_includes_is_in_umg_portal(

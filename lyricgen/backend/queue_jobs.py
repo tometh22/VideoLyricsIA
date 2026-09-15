@@ -1909,6 +1909,64 @@ def enqueue_prores_prewarm(
     return rq_job.id
 
 
+def enqueue_delivery_prores_prewarm(
+    job_id: str,
+    file_type: str,
+    tenant_id: str,
+    *,
+    frame_size: str | None = None,
+) -> str:
+    """Prepare ProRes from an immutable portal-delivery snapshot.
+
+    Staging and production publish into the same deliveries database, but
+    their ``jobs`` tables are intentionally separate.  The central portal
+    therefore cannot always load the originating Job row.  A Delivery still
+    has everything needed to materialise the derivative: tenant + job id
+    identify the deterministic R2 source keys, and legacy MP4-only campaign
+    renders are HD/24fps.  Enqueue the existing DB-independent transcode
+    primitive with that snapshot instead of requiring a local Job row.
+
+    This is only used for an explicit portal click, so it intentionally
+    bypasses the optional/background prewarm flag and queue-depth backpressure.
+    """
+    _require_submissions_open()
+    global prewarm_enqueued_total
+    if file_type not in ("umg_master", "umg_short"):
+        raise ValueError(f"Unsupported ProRes file type: {file_type!r}")
+
+    _, _, q_enterprise = _init_redis()
+    if q_enterprise is None:
+        raise RuntimeError("ProRes queue unavailable")
+
+    safe_tenant = storage._safe_filename(tenant_id)
+    safe_job_id = storage._safe_filename(job_id)
+    selected_frame_size = frame_size if frame_size in {
+        "HD", "UHD-4K", "DCI-2K", "DCI-4K",
+    } else "HD"
+    job_snapshot = {
+        "umg_spec": {
+            "frame_size": selected_frame_size,
+            "fps": 24.0,
+            "prores_profile": 3,
+        },
+        "s3_keys": {
+            "video": f"{safe_tenant}/{safe_job_id}/lyric_video.mp4",
+            "short": f"{safe_tenant}/{safe_job_id}/short.mp4",
+        },
+    }
+    rq_job = q_enterprise.enqueue(
+        "prores.ensure_prores_exists",
+        args=(job_id, file_type, job_snapshot, tenant_id),
+        job_timeout=PRORES_PREWARM_TIMEOUT,
+        result_ttl=RESULT_TTL,
+        failure_ttl=FAILURE_TTL,
+        meta=rq_payload_metadata("prores_prewarm"),
+        job_id=f"portal-prewarm:{job_id}:{file_type}",
+    )
+    prewarm_enqueued_total += 1
+    return rq_job.id
+
+
 def edit_failure_callback(job, connection, type_, value, traceback) -> None:
     """RQ on_failure hook for run_edit_pipeline.
 

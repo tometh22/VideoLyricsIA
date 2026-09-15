@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.1] - 2026-09-15
+
+### Fixed
+
+- Isolated Argentina and Chile delivery listings so CDN or process caches
+  cannot reuse one portal's private response for the other.
+- Added on-demand ProRes preparation to both UMG portals, including legacy
+  MP4-only deliveries and deliveries published from staging into the shared
+  production portal.
+
 ## [1.0.0] - 2026-05-22
 
 **Public launch.** First customer: Universal Music Argentina (200 videos/month).
