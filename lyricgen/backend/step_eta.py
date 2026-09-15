@@ -97,6 +97,7 @@ STEP_ORDER: list[str] = [
 # SSE payload self-describing for debug pages or third-party
 # consumers (admin dashboards).
 STEP_USER_TEXT_ES: dict[str, str] = {
+    "retrying":   "Hubo una interrupción. Reintentando automáticamente; tu trabajo sigue guardado.",
     "starting":   "Preparando…",
     "whisper":    "Preparando…",
     "background": "Generando el fondo cinematográfico",

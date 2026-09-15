@@ -21,6 +21,7 @@ _POLICY = Path(__file__).resolve().parent.parent / "scripts" / "r2_cors.json"
 _CANONICAL = {
     "https://app.genly.pro",        # producción
     "https://staging.genly.pro",    # staging (incidente 06/07)
+    "https://trial.genly.pro",      # trial España (incidente 15/09)
 }
 
 
@@ -40,3 +41,18 @@ def test_cors_policy_exposes_etag():
     complete (el JS lee etag=null) — fallo carísimo de diagnosticar."""
     rules = json.loads(_POLICY.read_text())["CORSRules"]
     assert any("ETag" in (r.get("ExposeHeaders") or []) for r in rules)
+
+
+def test_each_canonical_origin_supports_upload_and_media():
+    """An unrelated origin's ETag/PUT rule cannot make the trial work."""
+    rules = json.loads(_POLICY.read_text())["CORSRules"]
+    for origin in _CANONICAL:
+        matching = [r for r in rules if origin in r.get("AllowedOrigins", [])]
+        assert any(
+            {"PUT", "GET", "HEAD"} <= set(r.get("AllowedMethods", []))
+            and {"content-type", "range"} <= {
+                h.lower() for h in r.get("AllowedHeaders", [])
+            }
+            and "etag" in {h.lower() for h in r.get("ExposeHeaders", [])}
+            for r in matching
+        ), f"{origin} needs single/multipart upload and media CORS support"

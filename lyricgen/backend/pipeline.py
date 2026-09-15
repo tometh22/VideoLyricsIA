@@ -21376,8 +21376,14 @@ def run_edit_pipeline(
         error_code, error_message = public_error(
             exc, context="edit", category=error_category,
         )
-        update_job(job_id, status="error", error=error_message,
-                   error_category=error_category, error_code=error_code)
+        # Unlike run_pipeline's generic catch, this branch re-raises to RQ.
+        # Publishing a terminal error here would stop SSE before RQ retries.
+        from rq import get_current_job
+        from job_retry import render_failure_fields
+        update_job(job_id, **render_failure_fields(
+            get_current_job(), active_status="editing", error=error_message,
+            error_category=error_category, error_code=error_code,
+        ))
         _write_edit_audit(
             action="job.edit_failed",
             detail={

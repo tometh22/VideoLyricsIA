@@ -466,8 +466,8 @@ def _background_attention_from_exc(type_, value):
 
 
 def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
-    """RQ on_failure hook for run_pipeline. Fires when retries are
-    exhausted (i.e. the job is permanently dead). Updates the Postgres
+    """RQ on_failure hook for run_pipeline. Fires on EVERY failed attempt,
+    before RQ decides whether to retry. Updates the Postgres
     row so the user sees a clear "Reintentar sin re-subir" affordance
     instead of a frozen "Generando" or a generic infra error.
 
@@ -498,6 +498,17 @@ def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
         meta = dict(getattr(job, "meta", None) or {})
         job_id_db = str(meta.get("db_job_id") or rq_job_id)
         if not job_id_db:
+            return
+        from job_retry import render_failure_fields
+        retry_fields = render_failure_fields(job)
+        if retry_fields["status"] != "error":
+            event_id = str(meta.get("outbox_event_id") or "")
+            if event_id:
+                with bind_job_attempt("pipeline", event_id):
+                    update_job(job_id_db, **retry_fields)
+            else:
+                update_job(job_id_db, **retry_fields)
+            logger.warning("[render-retry] job=%s retries_left=%s", job_id_db, job.retries_left)
             return
         # Surface to Sentry tagged with job/tenant — a permanently-dead
         # render is always incident-worthy, doubly so for a B2B tenant.
@@ -1930,8 +1941,7 @@ def enqueue_prores_prewarm(
 def edit_failure_callback(job, connection, type_, value, traceback) -> None:
     """RQ on_failure hook for run_edit_pipeline.
 
-    Fires when retries are EXHAUSTED (PIPELINE_RETRY_MAX consecutive
-    worker deaths) or on a real exception inside the pipeline. With
+    Fires on every failed attempt, BEFORE RQ consumes its retry budget. With
     Retry configured in enqueue_edit (2026-05-26), a single worker
     death no longer surfaces an error — RQ re-enqueues automatically
     and a fresh worker picks the job up after the backoff interval.
@@ -1953,6 +1963,12 @@ def edit_failure_callback(job, connection, type_, value, traceback) -> None:
             # the domain id in metadata and must never parse a UUID as job id.
             rq_job_id = edit_id[len("edit:"):] if edit_id.startswith("edit:") else edit_id
         if not rq_job_id:
+            return
+        from job_retry import render_failure_fields
+        retry_fields = render_failure_fields(job, active_status="editing")
+        if retry_fields["status"] != "error":
+            update_job(rq_job_id, **retry_fields)
+            logger.warning("[edit-retry] job=%s retries_left=%s", rq_job_id, job.retries_left)
             return
         # Surface to Sentry tagged with job/tenant before the DB write.
         _capture_job_failure("edit", rq_job_id, type_, value)

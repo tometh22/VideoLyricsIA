@@ -66,6 +66,8 @@ import WhatsNewModal from "./components/WhatsNew/WhatsNewModal";
 import GiftCreditsBanner from "./components/GiftCreditsBanner";
 import ServiceStatusBanner from "./components/ServiceStatusBanner";
 import TrialUsageSummary from "./components/TrialUsageSummary";
+import TrialSupportChat from "./components/TrialSupportChat";
+import { supportUserKey } from "./lib/trialSupport";
 import { useAlert } from "./components/AlertProvider";
 import { ACTIVE_STATUSES, isTerminalStatus } from "./lib/jobStatus";
 import {
@@ -2168,6 +2170,10 @@ export default function App() {
   const [resumableWizard, setResumableWizard] = useState(() => {
     const snap = wizardPersistence.load();
     if (!snap) return null;
+    // Direct review URLs recover their audio through the authorized API,
+    // so a matching saved job does not require a local File after refresh.
+    const routeJobId = reviewJobIdFromLocation(location.pathname, location.search);
+    if (routeJobId && snap.currentReview?.transcribeJobId === routeJobId) return snap;
     if (wizardPersistence.hasResumableContent(snap)) return snap;
     // Skeletal snapshot. Wipe it so the autosave doesn't immediately
     // re-persist and so future renders don't see ghost state.
@@ -2295,6 +2301,11 @@ export default function App() {
   useEffect(() => {
     const resumeJobId = reviewJobIdFromLocation(location.pathname, location.search);
     if (!resumeJobId) return;
+    // Fresh transcription already owns its complete wizard state. Giving it
+    // a canonical URL is not a cold resume: reloading sparse /status here
+    // erased Scenes, typography, prompts, metadata and the remaining batch.
+    if (currentReview?.transcribeJobId === resumeJobId) return;
+    const savedWizard = wizardPersistence.load();
     const attempt = beginReviewResume(resumeJobAttemptedRef, resumeJobId);
     if (!attempt) return;
     (async () => {
@@ -2309,7 +2320,14 @@ export default function App() {
         }
         const segments = job.segments || job.segments_json || [];
         const resumedCreativeFields = creativeFieldsForReviewResume(job);
+        // Only restore this tab's creative choices for this exact authorized
+        // job. Lyrics, revisions and review gates always come from the server.
+        const saved = !job.campaign_id && savedWizard?.currentReview?.transcribeJobId === resumeJobId
+          ? savedWizard : null;
         const campaignPreset = {
+          ...(saved?.currentReview || {}),
+          ...(saved?.topLevel || {}),
+          ...(saved?.topLevel?.delivery || {}),
           ...(job.campaign?.default_render_params || {}),
           ...(job.campaign?.render_overrides || {}),
         };
@@ -2324,8 +2342,8 @@ export default function App() {
           audioPreviewRetryAt: null,
           audioLoading: true,
           audioUnavailableReason: null,
-          artist: job.artist || "",
-          songTitle: job.song_title || "",
+          artist: saved?.currentReview?.artist ?? job.artist ?? "",
+          songTitle: saved?.currentReview?.songTitle ?? job.song_title ?? "",
           // Do NOT coerce an unknown language to "es" on reload: that silently
           // relabels a mis-transcribed song as Spanish. Leave it empty (auto)
           // and let the recomputed flags below drive the warning.
@@ -2394,18 +2412,20 @@ export default function App() {
         // que IA es el default correcto.
         setBackgroundFile(null);
         const presetBackgroundId = preset("background_id", "backgroundId", null);
-        setBackgroundId(job.campaign_id ? presetBackgroundId : null);
-        setBgSelectMode(job.campaign_id && presetBackgroundId ? "library" : "auto");
+        setBackgroundId(job.campaign_id || saved ? presetBackgroundId : null);
+        // Keep custom mode without its non-serializable File: the existing
+        // approval guard asks for re-upload instead of silently generating AI.
+        setBgSelectMode(saved?.topLevel?.bgSelectMode || ((job.campaign_id || saved) && presetBackgroundId ? "library" : "auto"));
         setBackgroundMode(preset("background_mode", "backgroundMode", "as_is") === "variation" ? "variation" : "as_is");
-        setAnimateImage(job.campaign_id
+        setAnimateImage(job.campaign_id || saved
           ? preset("animate_image", "animateImage", false) === true
           : !!resumedCreativeFields.animateImage);
-        setEnableScenes(job.campaign_id ? preset("enable_scenes", "enableScenes", false) === true : false);
+        setEnableScenes(preset("enable_scenes", "enableScenes", job.render_params?.enable_scenes === true) === true);
         setArtTrack(false);
-        if (job.campaign_id) {
+        if (job.campaign_id || saved) {
           setStyle(preset("style", "style", "auto"));
           setCustomColors(preset("custom_colors", "customColors", ""));
-          setInspiredByLyrics(preset("match_lyrics", "matchLyrics", true) !== false);
+          setInspiredByLyrics(preset("match_lyrics", "matchLyrics", saved?.topLevel?.inspiredByLyrics ?? true) !== false);
           setDelivery((current) => ({
             ...current,
             delivery_profile: preset("delivery_profile", "deliveryProfile", "youtube"),
@@ -2415,6 +2435,7 @@ export default function App() {
           }));
         }
         setWizardStage("review");
+        if (saved) setResumableWizard(null);
         // Canonicalize legacy /new?resume= links without adding a history
         // entry. Direct /review/:jobId links already point at this target.
         if (location.pathname === "/new") {
@@ -2433,7 +2454,7 @@ export default function App() {
       }
     })();
     return () => attempt.cancel();
-  }, [location.pathname, location.search, navigate, retryTranscriptionReviewAudio]);
+  }, [location.pathname, location.search, navigate, retryTranscriptionReviewAudio, currentReview?.transcribeJobId]);
 
   // Imperative resume — called by the banner's "Continuar" button.
   const resumeWizard = useCallback(() => {
@@ -6186,6 +6207,7 @@ export default function App() {
   return (
     <>
       <RootEffects setUser={setUser} setResetToken={setResetToken} setBillingSuccess={setBillingSuccess} />
+      <TrialSupportChat userKey={token ? supportUserKey(user) : null} />
       {billingSuccess && <BillingSuccessToast onDismiss={() => setBillingSuccess(false)} />}
       {user && <WhatsNewModal user={user} />}
       <Routes>

@@ -3,6 +3,42 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.18-trial.5] - 2026-09-15
+
+### Fixed
+
+- Keep renders and edits active while RQ still has automatic retries, instead of
+  publishing a terminal error that closes the progress stream before eventual success.
+- Show an explicit automatic-retry message without inventing an ETA. Exhausted
+  retries still produce actionable terminal errors; saved corrections and terminal
+  state/attempt guards remain intact.
+- Cover the real bounded RQ retry lifecycle with injected failures and the UI's
+  retry-to-result and exhausted-to-recovery transitions. No changes to provider
+  models, retry budgets, credit policy, trial expiry, production or staging.
+
+## [1.1.18-trial.4] - 2026-09-15
+
+### Fixed
+
+- Trial frontend: keep Multi-scene, typography, prompts and metadata when fresh
+  transcription navigates to its canonical review URL instead of treating it as a cold resume.
+- Restore matching-tab creative settings on review reload; fetch authoritative lyrics,
+  revisions and review gates from the API. Never inherit another song's local settings.
+- Retain custom-background mode after reload so the existing missing-file guard asks
+  for re-upload instead of silently replacing the background with AI.
+- Include trial.genly.pro in the storage CORS policy and test PUT/GET/HEAD access for
+  every supported origin. No backend source, production or staging deployment changes.
+
+## [1.1.18-trial.3] - 2026-09-14
+
+### Added
+
+- Frontend-only Universal trial support chat, loaded on request only on trial.genly.pro.
+- Isolate support sessions on account changes, keep an email fallback, and exclude
+  the application DOM (including portals) from Crisp browsing assistance. No automatic
+  lyrics, prompts, audio or account-profile payloads; Crisp receives standard connection metadata.
+- No backend, transcription, render, credit, production or staging deployment changes.
+
 ## [1.1.18-trial.2] - 2026-09-14
 
 ### Fixed
