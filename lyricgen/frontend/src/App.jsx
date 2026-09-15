@@ -271,26 +271,65 @@ async function authFetchCriticalRead(url, opts = {}, {
   throw lastError || new Error("critical_read_failed");
 }
 
-// authFetch + client-side retry on 503 with Retry-After header. Used for
-// endpoints that may transiently saturate (Whisper transcription on burst
-// load, where the server retries internally but if it exhausts retries
-// it surfaces 503 with Retry-After).
+// Bounded authenticated fetch with client-side retry on 503, timeout and
+// network interruption. Used only by safe reads and by transcription
+// admission, whose POST carries a stable Idempotency-Key across retries.
 //
 // Backend retry handles fast transients (1-30s); this client retry handles
 // the rare case where backend exhausts its retries — operator gets
 // "Reintentando..." instead of a hard error.
 //
 // maxRetries=3, max wait 60s per try (cap honors backend's "Retry-After: 60").
-async function authFetchWithRetryOn503(url, opts = {}, { maxRetries = 3, onRetry = null } = {}) {
+function retryDelay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const error = new Error("aborted");
+      error.name = "AbortError";
+      reject(error);
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      const error = new Error("aborted");
+      error.name = "AbortError";
+      reject(error);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function requestIdempotencyKey(prefix, jobId) {
+  const random = globalThis.crypto?.randomUUID?.()
+    || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}:${jobId}:${random}`.slice(0, 160);
+}
+
+async function authFetchWithRetryOn503(url, opts = {}, {
+  maxRetries = 3, onRetry = null, timeoutMs = 15_000,
+} = {}) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const res = await authFetch(url, opts);
+    let res;
+    try {
+      res = await authFetchWithTimeout(url, opts, timeoutMs);
+    } catch (error) {
+      if (opts.signal?.aborted || attempt === maxRetries) throw error;
+      const waitS = Math.min(2 ** attempt, 5);
+      if (onRetry) onRetry({ attempt: attempt + 1, waitS, reason: "network" });
+      await retryDelay(waitS * 1000, opts.signal);
+      continue;
+    }
     if (res.status !== 503 || attempt === maxRetries) return res;
     // 503 → check Retry-After (seconds). Cap at 60s to avoid waiting forever.
     let waitS = parseInt(res.headers.get("Retry-After") || "10", 10);
     if (!Number.isFinite(waitS) || waitS <= 0) waitS = 10;
     waitS = Math.min(waitS, 60);
     if (onRetry) onRetry({ attempt: attempt + 1, waitS });
-    await new Promise((r) => setTimeout(r, waitS * 1000));
+    await retryDelay(waitS * 1000, opts.signal);
   }
   // Unreachable, but TS-style return for clarity.
   return authFetch(url, opts);
@@ -3179,9 +3218,13 @@ export default function App() {
         // manda, no el contenido del textarea).
         const fresh = (filesRef.current || [])
           .find((e) => e?.file && prefetchKey(e.file) === key) || entry;
+        const transcribeIdempotencyKey = requestIdempotencyKey("transcribe", jobId);
         const res = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": transcribeIdempotencyKey,
+          },
           body: JSON.stringify({
             job_id: jobId,
             language: entry.language || "",
@@ -3489,9 +3532,13 @@ export default function App() {
         jobId: uploadJobId,
         fileName: entry.file?.name || "",
       });
+      const transcribeIdempotencyKey = requestIdempotencyKey("transcribe", uploadJobId);
       transcribeRes = await authFetchWithRetryOn503(`${API}/transcribe-uploaded`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": transcribeIdempotencyKey,
+        },
         body: JSON.stringify({
           job_id: uploadJobId,
           language: entry.language || "",

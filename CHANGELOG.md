@@ -3,6 +3,24 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.18-trial.9] - 2026-09-15
+
+### Fixed
+
+- Keep transient transcription failures active through RQ's bounded retries;
+  successful retries can now publish their saved lyrics instead of remaining
+  stuck behind an early terminal state.
+- Exclude archived drafts from user and tenant backlog slots, and distinguish
+  a confirmed missing source audio object from a temporarily unavailable R2
+  probe on retry, Art Track edit and variant creation.
+- Remove the external deliveries database from unapproved status polling and
+  fail open for the optional portal badge when that database is unavailable.
+- Monitor and serve the editor audio-preview queue, bound browser API calls,
+  retry transcription admission with a stable idempotency key, and fail/retry
+  direct R2 uploads that make no progress for 60 seconds.
+- Preconnect the isolated Universal trial API. Trial-only release: no staging,
+  production, model, scene-budget, customer-credit or expiry changes.
+
 ## [1.1.18-trial.8] - 2026-09-15
 
 ### Fixed

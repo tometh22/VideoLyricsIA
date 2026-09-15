@@ -220,6 +220,48 @@ def test_non_campaign_scope_keeps_regular_backlog_limit(db, monkeypatch):
     assert exc.value.status_code == 429
 
 
+def test_archived_drafts_do_not_consume_user_backlog(db, monkeypatch):
+    from database import Job
+    import main
+
+    monkeypatch.setattr(main, "USER_BACKLOG_LIMIT", 1)
+    monkeypatch.setattr(main, "TENANT_BACKLOG_LIMIT", 5)
+    db.add(Job(
+        job_id="archuser0001", user_id=81, tenant_id="archived-user",
+        artist="Test", filename="same.wav", status="awaiting_upload",
+        archived_at=datetime.now(timezone.utc),
+    ))
+    db.flush()
+    _enforce_tenant_backlog(
+        db, {"id": 81, "tenant_id": "archived-user", "role": "user"},
+    )
+
+
+def test_archived_drafts_do_not_consume_tenant_backlog(db, monkeypatch):
+    from database import Job
+    import main
+
+    monkeypatch.setattr(main, "USER_BACKLOG_LIMIT", 5)
+    monkeypatch.setattr(main, "TENANT_BACKLOG_LIMIT", 1)
+    user = {"id": 91, "tenant_id": "archived-tenant", "role": "user"}
+    db.add(Job(
+        job_id="archtenant01", user_id=92, tenant_id="archived-tenant",
+        artist="Test", filename="old.wav", status="pending_review",
+        archived_at=datetime.now(timezone.utc),
+    ))
+    db.flush()
+    _enforce_tenant_backlog(db, user)
+
+    db.add(Job(
+        job_id="activetenant", user_id=92, tenant_id="archived-tenant",
+        artist="Test", filename="live.wav", status="pending_review",
+    ))
+    db.flush()
+    with pytest.raises(HTTPException) as exc:
+        _enforce_tenant_backlog(db, user)
+    assert exc.value.status_code == 429
+
+
 def test_batch_capacity_endpoint_exposes_effective_campaign_window(
     client, user_token, monkeypatch,
 ):

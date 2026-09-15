@@ -419,6 +419,72 @@ def test_status_endpoint_includes_is_in_umg_portal(
     assert after.get("is_in_umg_portal") is True
 
 
+class _UnavailableDeliveriesDb:
+    def __init__(self):
+        self.query_calls = 0
+
+    def query(self, *_args, **_kwargs):
+        self.query_calls += 1
+        raise RuntimeError("external deliveries database unavailable")
+
+    def rollback(self):
+        return None
+
+    def close(self):
+        return None
+
+
+def test_unapproved_status_does_not_touch_external_deliveries_db(
+    client, admin_token, approved_job, db,
+):
+    import main
+    from database import get_deliveries_db
+
+    approved_job.approved_at = None
+    approved_job.approved_by = None
+    db.commit()
+    unavailable = _UnavailableDeliveriesDb()
+
+    def _override_ddb():
+        yield unavailable
+
+    main.app.dependency_overrides[get_deliveries_db] = _override_ddb
+    try:
+        res = client.get(
+            f"/status/{approved_job.job_id}", headers=auth(admin_token),
+        )
+        assert res.status_code == 200, res.text
+        assert unavailable.query_calls == 0
+        assert res.json()["is_in_umg_portal"] is False
+        assert res.json()["umg_portals"] == []
+    finally:
+        main.app.dependency_overrides.pop(get_deliveries_db, None)
+
+
+def test_approved_status_survives_external_deliveries_db_outage(
+    client, admin_token, approved_job,
+):
+    import main
+    from database import get_deliveries_db
+
+    unavailable = _UnavailableDeliveriesDb()
+
+    def _override_ddb():
+        yield unavailable
+
+    main.app.dependency_overrides[get_deliveries_db] = _override_ddb
+    try:
+        res = client.get(
+            f"/status/{approved_job.job_id}", headers=auth(admin_token),
+        )
+        assert res.status_code == 200, res.text
+        assert unavailable.query_calls == 1
+        assert res.json()["is_in_umg_portal"] is False
+        assert res.json()["umg_portals"] == []
+    finally:
+        main.app.dependency_overrides.pop(get_deliveries_db, None)
+
+
 def test_deliveries_routed_to_external_db(
     client, admin_token, approved_job, all_r2_files_present, db, tmp_path, monkeypatch,
 ):

@@ -32,6 +32,7 @@ def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None,
           editing_started_minutes_ago: float | None = None,
           last_progress_minutes_ago: float | None = None,
           last_user_activity_minutes_ago: float | None = None,
+          active_transcription_attempt_id: str | None = None,
           segments_json=_UNSET,
           edit_count: int = 0,
           progress: int = 20,
@@ -75,6 +76,7 @@ def _seed(db, *, status: str, age_minutes: float, job_id: str | None = None,
         editing_started_at=editing_started_at,
         last_progress_at=last_progress_at,
         last_user_activity_at=last_user_activity_at,
+        active_transcription_attempt_id=active_transcription_attempt_id,
         created_at=datetime.now(timezone.utc) - timedelta(minutes=age_minutes),
     )
     if segments_json is not _UNSET:
@@ -1153,10 +1155,17 @@ def test_stuck_transcription_cancels_outbox_attempt_id(monkeypatch):
     db = SessionLocal()
     try:
         _cleanup(db)
-        jid = _seed(db, status="transcribing_queued", age_minutes=130)
-        row = db.query(Job).filter(Job.job_id == jid).first()
-        row.active_transcription_attempt_id = "attempt-123"
-        db.commit()
+        # Publish the old timestamp and durable attempt id atomically.  The
+        # full suite may have a FastAPI reaper daemon left running by an
+        # earlier lifespan test; committing the stale row first creates a
+        # real race where that daemon can cancel the legacy id before this
+        # test stores the attempt id.
+        jid = _seed(
+            db,
+            status="transcribing_queued",
+            age_minutes=130,
+            active_transcription_attempt_id="attempt-123",
+        )
         _reap_seeded_transcription(db, jid)
         assert "transcription:attempt-123" in calls
         assert f"transcribe:{jid}" not in calls
