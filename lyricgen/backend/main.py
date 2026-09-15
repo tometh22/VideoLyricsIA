@@ -19791,6 +19791,30 @@ async def admin_create_delivery_from_job(
                 ),
             )
         if missing_prores and not job.umg_spec:
+            # Sin `umg_spec` no hay con qué transcodificar (frame size, fps,
+            # perfil), así que en los dos casos hay que frenar. Pero decir lo
+            # mismo sería mentir en uno: un master DESFASADO significa que
+            # este video ya se entregó como UMG y que el portal está
+            # sirviendo el corte anterior ahora mismo, no que sea un video
+            # "sólo para YouTube". Es el caso de la entrega 289 (2026-09-15):
+            # `delivery_profile="youtube"` y `umg_spec` en JSON null sobre un
+            # job que igual tiene un master de 4,3 GB publicado.
+            if stale_prores:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "prores_stale_without_spec",
+                        "message": (
+                            "El portal está entregando el master ProRes de "
+                            "ANTES de la edición y este video perdió su "
+                            "configuración ProRes, así que no se puede "
+                            "regenerar solo. Volvé a elegir la configuración "
+                            "ProRes del video antes de publicar la corrección."
+                        ),
+                        "stale": stale_prores,
+                        "missing": missing_prores,
+                    },
+                )
             raise HTTPException(
                 status_code=409,
                 detail={
