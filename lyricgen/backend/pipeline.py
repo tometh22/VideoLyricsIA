@@ -13781,6 +13781,7 @@ def _apply_operator_storyboard(plan, operator_prompt, *, allow_people=False,
     from google import genai
     from provenance import record_ai_call
     from scene_storyboard import storyboard_request, validate_shots
+    import re as _re
 
     duration = int(os.environ.get("VEO_CLIP_SECONDS", "8") or "8")
     system, user = storyboard_request(plan, operator_prompt, allow_people, duration)
@@ -13805,9 +13806,16 @@ def _apply_operator_storyboard(plan, operator_prompt, *, allow_people=False,
         )
         prompts = validate_shots(_parse_json_object(response.text or ""),
                                  [s["recurrence_key"] for s in plan["scenes"]])
+        prompts = {key: sanitize_generated_text(value, atmospherics_policy)
+                   for key, value in prompts.items()}
+        if not allow_people and any(
+            _prompt_explicitly_requests_people(value)
+            or _re.search(r"\b(?:pregnant|embarazada|gestante)\b", value, _re.I)
+            for value in prompts.values()
+        ):
+            raise ValueError("Narrative storyboard conflicts with the no-people policy; no clips generated")
         for scene in plan["scenes"]:
-            scene["prompt"] = sanitize_generated_text(
-                prompts[scene["recurrence_key"]], atmospherics_policy)
+            scene["prompt"] = prompts[scene["recurrence_key"]]
         plan["narrative_sequence"] = True
         plan["storyboard_version"] = 1
         if recorder:

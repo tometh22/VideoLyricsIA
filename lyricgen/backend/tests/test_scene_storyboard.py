@@ -52,7 +52,7 @@ def test_incomplete_storyboard_is_rejected(bad):
         validate_shots(bad, ["story_1", "story_2"])
 
 
-@pytest.mark.parametrize("defect", ["duplicate", "order", "empty", "extra"])
+@pytest.mark.parametrize("defect", ["duplicate", "order", "empty", "extra", "memory"])
 def test_invalid_storyboard_is_rejected(defect):
     p = plan()
     raw = response_for(p)
@@ -62,6 +62,8 @@ def test_invalid_storyboard_is_rejected(defect):
         raw["shots"].reverse()
     elif defect == "empty":
         raw["shots"][0]["prompt"] = ""
+    elif defect == "memory":
+        raw["shots"][0]["prompt"] += " Continue from the previous scene."
     else:
         raw["shots"].append(raw["shots"][0])
     with pytest.raises(ValueError):
@@ -105,6 +107,21 @@ def test_invalid_joint_plan_stops_before_veo(monkeypatch, tmp_path):
                                             lyrics_text="lyrics", artist="A", match_lyrics=False,
                                             background_hint="boat crossing the ocean", bg_verbatim=False)
     provider.assert_not_called()
+
+
+@pytest.mark.parametrize("subject", ["weathered hands holding an ember", "a golden pregnant form"])
+def test_planner_cannot_override_people_policy_or_partially_mutate_plan(monkeypatch, subject):
+    p = plan()
+    before = copy.deepcopy(p)
+    raw = response_for(p)
+    raw["shots"][3]["prompt"] = "A cinematic close-up of " + subject + " in warm soft light."
+    monkeypatch.setattr(pipeline, "_get_genai_client", lambda: SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kw: SimpleNamespace(text=json.dumps(raw)))))
+    monkeypatch.setattr(pipeline, "_call_with_timeout", lambda fn, **kw: fn())
+    with pytest.raises(ValueError, match="no-people policy"):
+        pipeline._apply_operator_storyboard(p, "original story", atmospherics_policy=
+                                            resolve_atmospherics_policy("original story"))
+    assert p == before
 
 
 def test_narrative_lyric_edit_keeps_order_and_uses_cache_only(monkeypatch, tmp_path):

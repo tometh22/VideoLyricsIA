@@ -1,5 +1,6 @@
 """Deterministic contracts for a jointly planned, forward-only visual story."""
 import json
+import re
 
 
 def sequence_sections(sections, count=None):
@@ -26,6 +27,8 @@ def validate_shots(raw, keys):
         if not isinstance(prompt, str) or not 30 <= len(prompt.strip()) <= 3000:
             raise ValueError("Narrative storyboard contains an invalid shot")
         prompts[key] = prompt.strip()
+        if re.search(r"\b(?:previous|next)\s+(?:scene|shot)\b", prompt, re.I):
+            raise ValueError("Narrative shots must be self-contained")
     if len({p.casefold() for p in prompts.values()}) != len(keys):
         raise ValueError("Narrative storyboard repeats the same shot")
     return prompts
@@ -43,6 +46,7 @@ def storyboard_request(plan, operator_prompt, allow_people, duration_seconds):
         "must be self-contained in English because video calls share no memory. Include "
         "the same concise visual identity in each prompt, but a DIFFERENT story beat. "
         "No cross-scene morphs, montage, multiple time jumps, readable text or logos. "
+        "Never refer to a 'previous scene', 'next scene', 'previous shot' or 'next shot'. "
         "Respect each camera_mode: estatico means locked camera; sutil means gentle slow "
         "movement; dinamico means moving camera; animado means illustration; foto-parallax "
         "means a still photograph with subtle parallax. Do not add contradictory camera "
@@ -53,7 +57,9 @@ def storyboard_request(plan, operator_prompt, allow_people, duration_seconds):
     )
     system += ("People may appear only as explicitly requested. " if allow_people else
                "NO people, faces, bodies, hands or human silhouettes. Express human themes "
-               "through objects and nature, without human imagery. ")
+               "through objects and nature, without human imagery. For example birth can "
+               "be a sprouting seed and faith a glowing ember resting on stone. NEVER use "
+               "pregnant forms, disembodied hands or abstract human figures as substitutes. ")
     user = json.dumps({"operator_story": operator_prompt, "shared_visual_world": plan["bible"],
                        "clip_duration_seconds": duration_seconds, "shots": slots}, ensure_ascii=False)
     return system, user
