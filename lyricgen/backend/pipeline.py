@@ -21799,6 +21799,16 @@ def run_edit_pipeline(
                     enqueue_prores_prewarm(job_id, "umg_short", force=True)
             except Exception as _e:
                 logger.warning("[EDIT] prores prewarm re-enqueue skipped: %s", _e)
+            # El MP4 nuevo ya está en R2; el master de broadcast todavía es
+            # el viejo hasta que termine el prewarm. Precisar el motivo hace
+            # que el operador vea la razón real por la que todavía no puede
+            # publicar, en vez de un genérico "en edición" sobre un job que
+            # para él ya terminó de renderizar.
+            try:
+                from delivery_freshness import mark_deliveries_stale, STALE_PRORES
+                mark_deliveries_stale(job_id, STALE_PRORES)
+            except Exception as _e:
+                logger.warning("[EDIT] delivery stale flag skipped: %s", _e)
 
         _cleanup_local_intermediates(job_dir)
 
@@ -21880,6 +21890,15 @@ def run_edit_pipeline(
         )
         update_job(job_id, status="error", error=error_message,
                    error_category=error_category, error_code=error_code)
+        # El re-render murió. La fila sigue marcada —el operador tiene que
+        # mirarla— pero el motivo cambia, porque dejarle al cliente un
+        # "estamos aplicando cambios" indefinido mientras nadie está
+        # trabajando es prometer algo que no se va a cumplir.
+        try:
+            from delivery_freshness import mark_deliveries_stale, STALE_FAILED
+            mark_deliveries_stale(job_id, STALE_FAILED)
+        except Exception as _e:
+            logger.warning("[EDIT] delivery stale reason not updated: %s", _e)
         _write_edit_audit(
             action="job.edit_failed",
             detail={

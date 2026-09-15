@@ -23,6 +23,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy.orm import Session
 
+import delivery_freshness
 from auth import get_current_user, has_scenes_access
 from database import AuditLog, BackgroundAsset, BatchCampaign, BatchCampaignItem, Delivery, DeliveryChangeRequest, EditorDocument, Job, get_db, scoped_deliveries_db
 from batch_campaigns import _campaign_or_404, _require_manager, _require_scope, _aware
@@ -529,20 +530,48 @@ def portal_history(job_ids, tenant_id):
         publications = ddb.query(
             Delivery.job_id, Delivery.portal_id,
             func.count(DeliveryChangeRequest.id),
+            Delivery.published_render_fingerprint, Delivery.published_revision,
+            Delivery.stale_since, Delivery.stale_reason,
+            Delivery.approved_at, Delivery.content_updated_at,
         ).outerjoin(DeliveryChangeRequest, and_(
             DeliveryChangeRequest.delivery_id == Delivery.id,
             DeliveryChangeRequest.resolved_at.is_(None),
         )).filter(
             Delivery.job_id.in_(job_ids), Delivery.tenant_snapshot == tenant_id,
             Delivery.removed_at.is_(None),
-        ).group_by(Delivery.job_id, Delivery.portal_id).all()
+        ).group_by(
+            Delivery.job_id, Delivery.portal_id,
+            Delivery.published_render_fingerprint, Delivery.published_revision,
+            Delivery.stale_since, Delivery.stale_reason,
+            Delivery.approved_at, Delivery.content_updated_at,
+        ).all()
     result = {}
-    for job_id, portal_id, pending in publications:
-        row = result.setdefault(job_id, {"umg_portals": [], "pending_change_requests": 0})
+    for (job_id, portal_id, pending, fingerprint, revision,
+         stale_since, stale_reason, approved_at, content_updated_at) in publications:
+        row = result.setdefault(job_id, {
+            "umg_portals": [], "pending_change_requests": 0,
+            # Fingerprints publicados, para que el llamador compare contra el
+            # render actual sin volver a la DB del portal.
+            "published_fingerprints": [], "published_revision": 1,
+            "portal_updating": False, "portal_awaiting_review": False,
+        })
         portal = portal_id or "argentina"
         if portal not in row["umg_portals"]:
             row["umg_portals"].append(portal)
         row["pending_change_requests"] += pending
+        if fingerprint:
+            row["published_fingerprints"].append(fingerprint)
+        row["published_revision"] = max(row["published_revision"], revision or 1)
+        # Mismo criterio que el portal: un edit que murió queda marcado para
+        # el operador, pero no se muestra como trabajo en curso.
+        row["portal_updating"] = row["portal_updating"] or (
+            stale_since is not None
+            and (stale_reason or "") in delivery_freshness.STALE_IN_FLIGHT
+        )
+        row["portal_awaiting_review"] = (
+            row["portal_awaiting_review"]
+            or bool(content_updated_at and approved_at is None)
+        )
     for row in result.values():
         row["umg_portals"].sort()
     return result
@@ -550,8 +579,10 @@ def portal_history(job_ids, tenant_id):
 
 def history_rows(db, campaign):
     rows = []
+    jobs_by_id = {}
     codes = {item.id: item.technical_code for item in _items(db, campaign)}
     for j in sorted(campaign_jobs(db, campaign), key=lambda j: (str(j.created_at), j.job_id), reverse=True):
+        jobs_by_id[j.job_id] = j
         rp = j.render_params or {}
         if not j.video_url and not rp.get("campaign_creative_receipt") and j.status not in {"queued", "processing", "rendering", "editing", "pending_review", "done"}:
             continue
@@ -580,6 +611,20 @@ def history_rows(db, campaign):
         row["umg_portals"] = publication.get("umg_portals", [])
         row["is_in_umg_portal"] = bool(row["umg_portals"])
         row["pending_change_requests"] = publication.get("pending_change_requests", 0)
+        row["portal_revision"] = publication.get("published_revision", 0) if row["is_in_umg_portal"] else 0
+        row["portal_updating"] = bool(publication.get("portal_updating"))
+        row["portal_awaiting_review"] = bool(publication.get("portal_awaiting_review"))
+        # El portal sirve la key determinística del job, así que un
+        # re-render ya reemplazó (o está por reemplazar) lo que el cliente
+        # baja, sin que la fila publicada lo diga. Comparar el fingerprint
+        # publicado contra el render actual es lo que convierte eso en una
+        # pregunta contestable desde la campaña: "esto todavía no lo mandé".
+        published = publication.get("published_fingerprints") or []
+        job = jobs_by_id.get(row["job_id"])
+        current = delivery_freshness.render_fingerprint(job) if job is not None else None
+        row["portal_outdated"] = bool(
+            published and current and any(fp != current for fp in published)
+        )
     return rows
 
 

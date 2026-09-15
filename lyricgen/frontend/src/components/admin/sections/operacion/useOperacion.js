@@ -176,6 +176,56 @@ export default function useOperacion() {
     }
   }, [flashError, loadChangeRequests]);
 
+  // Publicar la corrección en el portal. Es la acción que realmente cierra
+  // un pedido de cambios: el backend detecta que el render cambió, sube la
+  // versión, baja la aprobación vieja (el cliente vuelve a ver "Aprobar") y
+  // marca los pedidos pendientes de esa entrega como resueltos.
+  //
+  // El 202 no es un error: el master de broadcast se re-transcodifica
+  // asincrónicamente y publicar en esa ventana entregaría el MP4 nuevo con
+  // el ProRes viejo. El backend lo encola y pide reintentar.
+  const [crPublishingId, setCrPublishingId] = useState(null);
+  const [crPublishNotice, setCrPublishNotice] = useState(null);
+
+  const publishDeliveryUpdate = useCallback(async (jobId, portalId, crId) => {
+    setCrPublishingId(crId ?? jobId);
+    setCrPublishNotice(null);
+    try {
+      const data = await fetchJson(`${API}/admin/deliveries/from-job/${jobId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ portal_id: portalId || "argentina" }),
+      });
+      if (data.ok === false && data.status === "preparing_prores") {
+        setCrPublishNotice({
+          tone: "wait",
+          text: data.stale?.length
+            ? "El master ProRes todavía es el corte anterior. Se está regenerando con la corrección: reintentá en un minuto."
+            : "Falta preparar el master ProRes. Ya se encoló: reintentá en un minuto.",
+        });
+      } else if (data.content_changed) {
+        setCrPublishNotice({
+          tone: "ok",
+          text: `Publicada la versión ${data.revision}. El cliente la ve como pendiente de aprobar${
+            data.resolved_change_requests?.length
+              ? ` y se cerraron ${data.resolved_change_requests.length} pedido(s)`
+              : ""
+          }.`,
+        });
+      } else {
+        setCrPublishNotice({
+          tone: "ok",
+          text: "Reenviado. El render es el mismo que ya estaba publicado, así que la versión y la aprobación no cambian.",
+        });
+      }
+      await loadChangeRequests();
+    } catch (err) {
+      flashError(`No pude publicar la actualización: ${err.message || err}`);
+    } finally {
+      setCrPublishingId(null);
+    }
+  }, [flashError, loadChangeRequests]);
+
   const reopenChangeRequest = useCallback(async (id) => {
     setCrResolvingId(id);
     try {
@@ -216,5 +266,9 @@ export default function useOperacion() {
     crResolvingId,
     resolveChangeRequest,
     reopenChangeRequest,
+    crPublishingId,
+    crPublishNotice,
+    setCrPublishNotice,
+    publishDeliveryUpdate,
   };
 }

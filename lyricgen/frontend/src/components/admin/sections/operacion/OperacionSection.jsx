@@ -76,6 +76,10 @@ export default function OperacionSection() {
             crResolvingId={op.crResolvingId}
             resolveChangeRequest={op.resolveChangeRequest}
             reopenChangeRequest={op.reopenChangeRequest}
+            crPublishingId={op.crPublishingId}
+            crPublishNotice={op.crPublishNotice}
+            dismissPublishNotice={() => op.setCrPublishNotice(null)}
+            publishDeliveryUpdate={op.publishDeliveryUpdate}
           />
         </div>
         <div className="lg:col-span-3">

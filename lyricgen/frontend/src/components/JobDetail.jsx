@@ -565,10 +565,27 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         ...new Set([...previous, targetPortal]),
       ]);
       const label = result.label || "";
-      const verbed = result.replaced ? "actualizado" : "publicado";
+      // Decir QUÉ pasó, no sólo que salió bien. Un reenvío del mismo corte y
+      // una versión nueva se ven igual desde acá y significan cosas opuestas
+      // para el cliente: en el segundo caso su aprobación anterior se dio de
+      // baja y tiene que volver a revisar.
+      const resolved = result.resolved_change_requests?.length || 0;
+      const parts = [label ? `Aparece como "${label}".` : null];
+      if (result.content_changed) {
+        parts.push(
+          `Es la versión ${result.revision}: el cliente la ve como pendiente de aprobar.`,
+        );
+        if (resolved) {
+          parts.push(
+            `Se cerr${resolved === 1 ? "ó" : "aron"} ${resolved} pedido${resolved === 1 ? "" : "s"} de cambio.`,
+          );
+        }
+      } else if (result.replaced) {
+        parts.push("Es el mismo corte que ya estaba publicado: la aprobación del cliente sigue vigente.");
+      }
       alert({
-        title: `Video ${verbed} en ${target.host}`,
-        description: label ? `Aparece como "${label}".` : undefined,
+        title: `Video ${result.replaced ? "actualizado" : "publicado"} en ${target.host}`,
+        description: parts.filter(Boolean).join(" ") || undefined,
         tone: "success",
       });
     } catch (err) {
