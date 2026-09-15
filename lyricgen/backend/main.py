@@ -86,6 +86,7 @@ from auth import (
     is_super_admin,
 )
 import storage
+import delivery_freshness
 from machine_evidence import MachineSnapshotMissing, SCHEMA as MACHINE_EVIDENCE_SCHEMA
 from datetime import datetime, timedelta, timezone
 
@@ -10736,6 +10737,11 @@ async def generate_with_segments(
 
     tenant_id = current_user["tenant_id"]
 
+    # Sólo el camino de reuso puede estar re-renderizando algo ya publicado;
+    # inicializado acá porque el aviso al portal se manda al final, después
+    # del commit, y ese return lo comparten los dos caminos.
+    _republish_pending = False
+
     if reuse:
         # Promote the existing transcribed_pending row in place — fill in
         # the fields the editor finalised + flip status to queued.
@@ -10887,6 +10893,18 @@ async def generate_with_segments(
         job_row.progress = 0
         job_row.error = None
         job_row.last_progress_at = datetime.now(timezone.utc)
+        # Re-render de un job que ya tiene entregables: los archivos que el
+        # portal sirve se van a reemplazar EN SU LUGAR (la key de R2 es
+        # determinística). Sólo se registra la intención acá; el flag se
+        # escribe después del commit, porque vive en OTRA base (la del
+        # portal) y no participa de este rollback: marcarlo ahora y fallar
+        # después —un 409 de snapshot, una validación— dejaría al cliente
+        # con un "estamos aplicando cambios" sobre un re-render que nunca
+        # arrancó, y sólo publicar limpia ese flag.
+        #
+        # `s3_keys` vacío = primera generación: no hay nada publicado que
+        # marcar, y este camino lo recorre cada canción de una campaña.
+        _republish_pending = bool(job_row.s3_keys)
         # approve_document/get_or_create_document may refresh this ORM row
         # from the database while SessionLocal has autoflush disabled.  Apply
         # the revival again at the final locked transition so it is guaranteed
@@ -11235,6 +11253,15 @@ async def generate_with_segments(
             _batch_generation or selected_editor_version is not None
         ),
     )
+
+    # El re-render está publicado y encolado: ahora sí es cierto que los
+    # archivos del portal se van a reemplazar. Avisarlo antes de que el
+    # worker los pise — cuando el MP4 aterriza, el master de broadcast
+    # todavía es el viejo y no queremos que esa ventana se vea final.
+    if _republish_pending:
+        delivery_freshness.mark_deliveries_stale(
+            job_id, delivery_freshness.STALE_EDITING,
+        )
 
     return {
         "job_id": job_id,
@@ -18145,6 +18172,14 @@ async def retry_job(
         )
     )
 
+    # Un /retry de un job publicado también reemplaza lo que el portal
+    # sirve. Marcar antes del reset: dos líneas más abajo `s3_keys` se
+    # limpia y se pierde la señal de que había entregables.
+    if job.s3_keys:
+        delivery_freshness.mark_deliveries_stale(
+            job_id, delivery_freshness.STALE_EDITING,
+        )
+
     # Reset job to initial processing state before re-enqueueing.
     job.status = "processing"
     job.current_step = "whisper"
@@ -18448,6 +18483,13 @@ async def edit_art_track(
         job.song_title = song_title.strip()
     if artist is not None:
         job.artist = artist.strip()
+
+    # Mismo motivo que en /retry: el portal sirve estas mismas keys y el
+    # reset de abajo borra la evidencia de que ya había entregables.
+    if job.s3_keys:
+        delivery_freshness.mark_deliveries_stale(
+            job_id, delivery_freshness.STALE_EDITING,
+        )
 
     # Reset del row a estado de re-render limpio (mismo patrón que /retry),
     # para que los entregables viejos no queden pegados si el nuevo render
@@ -19719,10 +19761,23 @@ async def admin_create_delivery_from_job(
             "[DELIVERY] job=%s es una entrega PARCIAL: se publica sin %s",
             job_id, sorted(never_produced),
         )
-    if missing:
+    # "El objeto existe en R2" NO alcanza para el ProRes. Tras un edit, el
+    # .mov PRE-EDIT sigue en su key determinística — responde el HEAD de
+    # arriba — mientras el re-transcode corre asincrónico y lo pisa minutos
+    # después. Con la sola prueba de existencia, el gate daba OK y el portal
+    # entregaba el master viejo al lado del MP4 nuevo (incidente 2026-08-03).
+    # El oráculo correcto es `job.s3_keys`: run_edit_pipeline borra esa key al
+    # invalidar y el prewarm la reescribe recién cuando el master fresco está
+    # arriba. Publicar se bloquea en esa ventana en vez de entregar un par
+    # desparejo.
+    stale_prores = [
+        ft for ft in delivery_freshness.prores_pending(job, delivery_file_types)
+        if ft not in missing
+    ]
+    if missing or stale_prores:
         missing_prores = [
             ft for ft in missing if ft in ("umg_master", "umg_short")
-        ]
+        ] + stale_prores
         missing_render_outputs = [
             ft for ft in missing if ft not in ("umg_master", "umg_short")
         ]
@@ -19768,6 +19823,15 @@ async def admin_create_delivery_from_job(
                     "Probá de nuevo en un momento."
                 ),
             ) from exc
+        # `stale` separa los dos casos para el operador: "todavía no existe"
+        # (primera publicación) vs "existe pero es el corte anterior" (se
+        # editó y el master se está regenerando). En el segundo caso el
+        # portal ya está mostrando un par desparejo, así que la fila activa
+        # queda marcada como en vuelo mientras esperamos.
+        if stale_prores:
+            delivery_freshness.mark_deliveries_stale(
+                job_id, delivery_freshness.STALE_PRORES,
+            )
         return JSONResponse(
             status_code=202,
             content={
@@ -19775,6 +19839,7 @@ async def admin_create_delivery_from_job(
                 "status": "preparing_prores",
                 "job_id": job_id,
                 "missing": missing_prores,
+                "stale": stale_prores,
                 "enqueued": enqueued,
                 "retry_after": 10,
             },
@@ -19804,11 +19869,26 @@ async def admin_create_delivery_from_job(
         .filter(Delivery.removed_at.is_(None))
         .first()
     )
+    # Identidad del corte que está en R2 ahora. Comparada contra la que se
+    # publicó, es lo que separa "corregí esto y lo mando" de "toqué el botón
+    # dos veces": las keys de R2 son determinísticas, así que sin esto la
+    # fila no tenía forma de saber que los bytes que sirve cambiaron.
+    fingerprint = delivery_freshness.render_fingerprint(job)
+    now = datetime.now(timezone.utc)
+
     if existing:
+        # Contenido nuevo salvo que el fingerprint diga lo contrario. Una
+        # fila publicada antes de que existiera la columna no tiene con qué
+        # comparar: se la trata como reenvío para no anular una aprobación
+        # legítima de UMG por una migración.
+        content_changed = bool(
+            existing.published_render_fingerprint
+            and existing.published_render_fingerprint != fingerprint
+        )
         existing.label = label
         existing.file_types = delivery_file_types
         existing.added_by_user_id = added_by
-        existing.added_at = datetime.now(timezone.utc)
+        existing.added_at = now
         # Refresh snapshot in case the artist/title was corrected on the
         # job row between the original publish and now.
         existing.artist_snapshot = job.artist
@@ -19816,9 +19896,25 @@ async def admin_create_delivery_from_job(
         existing.tenant_snapshot = job.tenant_id
         existing.portal_id = portal_id
         existing.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
+        existing.published_render_fingerprint = fingerprint
+        # Un reenvío del mismo corte no reabre nada: la aprobación de UMG
+        # sigue valiendo y la versión no avanza.
+        if content_changed:
+            existing.published_revision = (existing.published_revision or 1) + 1
+            existing.content_updated_at = now
+            # La aprobación era sobre el corte anterior. Dejarla puesta es
+            # lo que hacía que el cliente viera su pastilla verde sobre un
+            # video que nunca miró — y que no le apareciera "Aprobar" para
+            # revisar la corrección que él mismo pidió.
+            existing.approved_at = None
+            existing.approved_by_label = None
+        # El re-render terminó y ya está publicado: se cierra la ventana.
+        existing.stale_since = None
+        existing.stale_reason = None
         delivery = existing
         action = "delivery.update"
     else:
+        content_changed = False
         delivery = Delivery(
             job_id=job_id,
             label=label,
@@ -19829,10 +19925,35 @@ async def admin_create_delivery_from_job(
             portal_id=portal_id,
             frame_size_snapshot=(job.umg_spec or {}).get("frame_size"),
             added_by_user_id=added_by,
-            added_at=datetime.now(timezone.utc),
+            added_at=now,
+            published_render_fingerprint=fingerprint,
+            published_revision=1,
+            content_updated_at=now,
         )
         ddb.add(delivery)
         action = "delivery.create"
+
+    # Publicar la corrección ES la respuesta al pedido de cambios. Cerrarlos
+    # a mano después era un paso que se olvidaba, y el cliente veía su pedido
+    # "pendiente" indefinidamente sobre una versión que ya lo contemplaba.
+    # Sólo se cierran los de ESTA fila y sólo cuando hubo contenido nuevo.
+    resolved_requests = []
+    if content_changed:
+        pending_requests = (
+            ddb.query(DeliveryChangeRequest)
+            .filter(DeliveryChangeRequest.delivery_id == delivery.id)
+            .filter(DeliveryChangeRequest.resolved_at.is_(None))
+            .all()
+        )
+        for request in pending_requests:
+            request.resolved_at = now
+            request.resolved_by_user_id = added_by
+            request.resolved_by_revision = delivery.published_revision
+            request.resolution_source = "publication"
+            request.resolution_note = (
+                f"Resuelto al publicar la versión {delivery.published_revision}."
+            )
+            resolved_requests.append(request.id)
 
     # Commit del delivery (DB externa) PRIMERO: si falla, el AuditLog local no
     # se escribe y no queda fila de auditoría huérfana. El Job local solo se
@@ -19840,10 +19961,27 @@ async def admin_create_delivery_from_job(
     ddb.commit()
     ddb.refresh(delivery)
 
+    # El listado del portal cachea el tamaño de cada objeto 30 días (son
+    # inmutables… salvo los nuestros). Tras un re-render mostraba el peso del
+    # archivo anterior: el único indicio que tenía el cliente de que algo
+    # había cambiado, apuntando justo para el otro lado.
+    if content_changed:
+        delivery_freshness.clear_size_cache(
+            _r2_key_for_delivery(delivery.tenant_snapshot, delivery.job_id, ft)
+            for ft in (delivery.file_types or [])
+            if ft in _DELIVERY_FILE_TYPES
+        )
+
     db.add(AuditLog(
         user_id=current_user["id"],
         action=action,
-        detail={"job_id": job_id, "label": label, "portal_id": portal_id, "artist": job.artist, "song": job.song_title},
+        detail={
+            "job_id": job_id, "label": label, "portal_id": portal_id,
+            "artist": job.artist, "song": job.song_title,
+            "revision": delivery.published_revision,
+            "content_changed": content_changed,
+            "resolved_change_requests": resolved_requests,
+        },
     ))
     db.commit()
 
@@ -19856,6 +19994,9 @@ async def admin_create_delivery_from_job(
         "song": delivery.song_title_snapshot,
         "portal_id": delivery.portal_id or portal_id,
         "replaced": action == "delivery.update",
+        "revision": delivery.published_revision,
+        "content_changed": content_changed,
+        "resolved_change_requests": resolved_requests,
     }
 
 
@@ -20262,6 +20403,11 @@ async def portal_get_items(
                 "submitted_at": cr.submitted_at.isoformat() if cr.submitted_at else None,
                 "resolved_at": cr.resolved_at.isoformat() if cr.resolved_at else None,
                 "resolution_note": cr.resolution_note,
+                # Qué versión publicada contestó el pedido, para que el
+                # portal diga "atendido en la versión 2" y el cliente sepa
+                # qué archivo tiene que volver a mirar.
+                "resolved_by_revision": cr.resolved_by_revision,
+                "resolution_source": cr.resolution_source,
             })
 
     # Group by (artist, song). Within each group, versions stay in
@@ -20320,8 +20466,38 @@ async def portal_get_items(
             # Portal-side approval state. The portal hides Aprobar/
             # Rechazar when approved_at is set and shows a green pill
             # + "deshacer" link instead.
+            #
+            # Publicar contenido nuevo la borra (ver
+            # admin_create_delivery_from_job): la aprobación era sobre el
+            # corte anterior, así que el portal vuelve a ofrecer Aprobar /
+            # Rechazar sin que haya que tocar nada del lado del cliente.
             "approved_at": d.approved_at.isoformat() if d.approved_at else None,
             "approved_by_label": d.approved_by_label,
+            # Estado de frescura de lo que se está sirviendo. El archivo
+            # detrás de la descarga se reemplaza en su lugar, así que sin
+            # esto el cliente no tiene forma de enterarse de que hay un
+            # corte nuevo — ni de que hay uno en camino.
+            "revision": d.published_revision or 1,
+            "content_updated_at": (
+                d.content_updated_at.isoformat() if d.content_updated_at else None
+            ),
+            # True mientras se está re-renderizando: el MP4 puede haberse
+            # reemplazado ya y el master de broadcast todavía no. Un edit que
+            # murió NO cuenta (stale_reason=edit_failed): la fila sigue
+            # marcada para el operador, pero al cliente no se le promete un
+            # trabajo en curso que no existe.
+            "updating": (
+                d.stale_since is not None
+                and (d.stale_reason or "") in delivery_freshness.STALE_IN_FLIGHT
+            ),
+            "updating_since": (
+                d.stale_since.isoformat() if d.stale_since else None
+            ),
+            "updating_reason": d.stale_reason,
+            # Hay una versión nueva que el cliente todavía no aprobó.
+            "awaiting_review": bool(
+                d.content_updated_at and d.approved_at is None
+            ),
         })
 
     return {
@@ -20450,6 +20626,15 @@ async def admin_list_change_requests(
             "resolved_at": cr.resolved_at.isoformat() if cr.resolved_at else None,
             "resolution_note": cr.resolution_note,
             "resolved_by": resolver.username if resolver else None,
+            "resolved_by_revision": cr.resolved_by_revision,
+            "resolution_source": cr.resolution_source,
+            # Estado de la publicación frente al render actual del job.
+            # Sin esto el operador no podía responder la única pregunta que
+            # importa después de corregir: ¿lo que el cliente puede bajar
+            # AHORA es lo que acabo de arreglar?
+            "publication": (
+                delivery_freshness.publication_state(job, d) if d else None
+            ),
             "delivery": (
                 {
                     "id": d.id,
@@ -20459,6 +20644,7 @@ async def admin_list_change_requests(
                     "frame_size": d.frame_size_snapshot,
                     "job_id": d.job_id,
                     "tenant": d.tenant_snapshot,
+                    "portal_id": d.portal_id or "argentina",
                     "removed_at": d.removed_at.isoformat() if d.removed_at else None,
                     # Who generated the video — so the operator knows whom to
                     # ask when correcting. Falls back gracefully if the job
@@ -20780,6 +20966,10 @@ async def admin_resolve_change_request(
     # resolved_by_user_id es FK a users de la DB de deliveries → mapear.
     cr.resolved_by_user_id = deliveries_added_by(current_user["id"])
     cr.resolution_note = note or None
+    # Cerrado a mano: el operador decidió que está atendido (puede no haber
+    # versión nueva — una aclaración, un pedido descartado). Se distingue
+    # del cierre automático al publicar una corrección.
+    cr.resolution_source = "manual"
     ddb.commit()
     db.add(AuditLog(
         user_id=current_user["id"],
@@ -20814,6 +21004,8 @@ async def admin_reopen_change_request(
     cr.resolved_at = None
     cr.resolved_by_user_id = None
     cr.resolution_note = None
+    cr.resolved_by_revision = None
+    cr.resolution_source = None
     ddb.commit()
     db.add(AuditLog(
         user_id=current_user["id"],

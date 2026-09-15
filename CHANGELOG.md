@@ -3,6 +3,40 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.42] - 2026-09-15
+
+### Fixed
+
+- Refuse to publish a delivery while its broadcast master is still the
+  pre-edit cut. The portal signs the deterministic R2 key, where an edit
+  leaves the old `.mov` answering a HEAD until the asynchronous re-transcode
+  overwrites it, so the existence check passed and Universal could download
+  a stale ProRes master beside the corrected MP4. The gate now reads the
+  job's tracked keys and force-queues the missing master instead.
+- Take a portal approval down when new content is published over it. The
+  client kept seeing their own green "approved" pill, and no Approve button,
+  on a version they had never reviewed.
+- Invalidate the portal's cached file size when the published content
+  changes. It has a 30-day TTL, so a re-render advertised the previous
+  file's weight — the one clue the client had that anything had changed.
+
+### Improved
+
+- Track publication revision, render fingerprint and in-flight state per
+  delivery, and expose them to the portal: a re-send of the same cut is now
+  distinguishable from a new version, and a re-render in progress no longer
+  presents the download as final.
+- Close a change request by publishing the correction that answers it,
+  recording which revision did so. Resolving by hand stays available for
+  what is answered without a re-render, and is labelled as such.
+- Show each change request's real publication state in the admin, with
+  "editar letra" and "publicar actualización" on the card. The three steps
+  of a correction used to be spread across three screens with nothing
+  connecting them.
+- Flag campaign videos whose portal publication is outdated, with a filter
+  for them: a corrected video that was never re-published looked identical
+  to one that was.
+
 ## [1.1.41] - 2026-09-15
 
 ### Improved

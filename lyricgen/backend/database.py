@@ -1333,6 +1333,37 @@ class Delivery(Base):
     # leave room for per-user portal logins to write usernames here later.
     approved_at = Column(DateTime(timezone=True), nullable=True, index=True)
     approved_by_label = Column(String(120), nullable=True)
+    # ── Freshness of the published content ────────────────────────────
+    # The portal does not store a file or a frozen URL: it rebuilds the
+    # R2 key from (tenant, job_id, file_type) and signs it on demand, so
+    # a re-render silently replaces what the client downloads. That is
+    # the behaviour we want (a correction reaches them without a new
+    # link) and also the hazard: the row kept saying "approved by UMG,
+    # published on <old date>" about content they never saw.
+    #
+    # These four columns make the row describe the content it is
+    # actually serving, so both the portal and the operator can tell a
+    # re-send of the same cut from a genuinely new version.
+    #
+    # published_render_fingerprint: identity of the render that was in
+    # R2 at publish time (delivery_freshness.render_fingerprint). A
+    # publish whose fingerprint differs is new content, not a re-send.
+    published_render_fingerprint = Column(String(64), nullable=True)
+    # Human-facing version counter. Starts at 1 and only advances when
+    # the fingerprint changes, so "Versión 2" always means the client
+    # has something new to look at.
+    published_revision = Column(
+        Integer, nullable=False, default=1, server_default="1",
+    )
+    # When the served files last changed. Distinct from added_at, which
+    # also moves on a plain re-send.
+    content_updated_at = Column(DateTime(timezone=True), nullable=True)
+    # Set while a re-render is in flight for this job: the files in R2
+    # are about to be replaced (or already partially were — the MP4
+    # lands minutes before the ProRes master). Cleared on the next
+    # publish. Non-null means "do not treat this download as final".
+    stale_since = Column(DateTime(timezone=True), nullable=True)
+    stale_reason = Column(String(40), nullable=True)
 
     def to_dict(self):
         return {
@@ -1349,6 +1380,15 @@ class Delivery(Base):
             "removed_at": self.removed_at.isoformat() if self.removed_at else None,
             "approved_at": self.approved_at.isoformat() if self.approved_at else None,
             "approved_by_label": self.approved_by_label,
+            "published_revision": self.published_revision or 1,
+            "content_updated_at": (
+                self.content_updated_at.isoformat()
+                if self.content_updated_at else None
+            ),
+            "stale_since": (
+                self.stale_since.isoformat() if self.stale_since else None
+            ),
+            "stale_reason": self.stale_reason,
         }
 
 
@@ -1380,6 +1420,14 @@ class DeliveryChangeRequest(Base):
         Integer, ForeignKey("users.id"), nullable=True,
     )
     resolution_note = Column(Text, nullable=True)
+    # Which published revision answered this request, when it was closed
+    # by actually shipping a new cut rather than by hand. Lets the portal
+    # say "atendido en la versión 2" instead of a bare "resuelto", and
+    # lets the operator see that a request was auto-closed.
+    resolved_by_revision = Column(Integer, nullable=True)
+    # "manual" (operator ticked it off) | "publication" (a new revision
+    # was published). Null on rows predating this column.
+    resolution_source = Column(String(20), nullable=True)
 
     def to_dict(self):
         return {
@@ -1389,6 +1437,8 @@ class DeliveryChangeRequest(Base):
             "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "resolution_note": self.resolution_note,
+            "resolved_by_revision": self.resolved_by_revision,
+            "resolution_source": self.resolution_source,
         }
 
 
@@ -2487,6 +2537,18 @@ def _migrate_user_columns():
         # release runner.
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS portal_id VARCHAR(20) DEFAULT 'argentina' NOT NULL",
         "CREATE INDEX IF NOT EXISTS ix_deliveries_portal_id ON deliveries(portal_id)",
+        # Publication freshness. The portal serves whatever sits at the
+        # deterministic R2 key, so a re-render replaces the client's
+        # download in place; these columns let the row say which cut it
+        # is actually serving. Alembic (b4c6d8e0f2a4) is canonical — this
+        # mirror keeps older databases self-healing on boot.
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_render_fingerprint VARCHAR(64)",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_revision INTEGER DEFAULT 1 NOT NULL",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS content_updated_at TIMESTAMPTZ",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_reason VARCHAR(40)",
+        "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolved_by_revision INTEGER",
+        "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolution_source VARCHAR(20)",
         # Categoría del error para el dashboard de actividad (PR telemetría).
         # Se setea en los sinks de error del pipeline/reaper vía
         # error_taxonomy.classify_error(). Espejo de la migración Alembic

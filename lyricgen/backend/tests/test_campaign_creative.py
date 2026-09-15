@@ -347,17 +347,31 @@ def test_history_reads_external_active_portals_and_pending_changes_while_editing
     # Separate physical database: using the application DB would miss these.
     external = create_engine("sqlite://")
     with external.begin() as conn:
-        conn.execute(text("CREATE TABLE deliveries (id INTEGER, job_id TEXT, portal_id TEXT, tenant_snapshot TEXT, removed_at TEXT)"))
+        conn.execute(text(
+            "CREATE TABLE deliveries (id INTEGER, job_id TEXT, portal_id TEXT,"
+            " tenant_snapshot TEXT, removed_at TEXT,"
+            # Frescura de la publicación: la fila del portal describe el corte
+            # que sirve, no sólo que existe.
+            " published_render_fingerprint TEXT, published_revision INTEGER,"
+            " stale_since TEXT, stale_reason TEXT, approved_at TEXT,"
+            " content_updated_at TEXT)"
+        ))
         conn.execute(text("CREATE TABLE delivery_change_requests (id INTEGER, delivery_id INTEGER, resolved_at TEXT)"))
-        for n, job, portal, tenant, removed in [
-            (1, jobs[0].job_id, "chile", campaign.tenant_id, None),
-            (2, jobs[0].job_id, None, campaign.tenant_id, None),
-            (3, jobs[1].job_id, "chile", campaign.tenant_id, "removed"),
-            (4, jobs[2].job_id, "chile", "foreign", None),
-            (5, "outside", "chile", campaign.tenant_id, None),
+        # `fingerprint` es el del render publicado. "viejo" no coincide con
+        # ningún render actual, así que esa fila queda desactualizada: es el
+        # caso que el portal ocultaba (mismo label, misma fecha, corte anterior).
+        for n, job, portal, tenant, removed, fingerprint, revision in [
+            (1, jobs[0].job_id, "chile", campaign.tenant_id, None, "viejo", 2),
+            (2, jobs[0].job_id, None, campaign.tenant_id, None, None, 1),
+            (3, jobs[1].job_id, "chile", campaign.tenant_id, "removed", None, 1),
+            (4, jobs[2].job_id, "chile", "foreign", None, None, 1),
+            (5, "outside", "chile", campaign.tenant_id, None, None, 1),
         ]:
-            conn.execute(text("INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,:removed)"),
-                         dict(n=n, job=job, portal=portal, tenant=tenant, removed=removed))
+            conn.execute(text(
+                "INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,:removed,"
+                ":fingerprint,:revision,NULL,NULL,NULL,NULL)"
+            ), dict(n=n, job=job, portal=portal, tenant=tenant, removed=removed,
+                    fingerprint=fingerprint, revision=revision))
         conn.execute(text("INSERT INTO delivery_change_requests VALUES (1,1,NULL),(2,1,'resolved'),(3,2,NULL),(4,3,NULL),(5,4,NULL),(6,5,NULL)"))
 
     @contextmanager
@@ -374,9 +388,16 @@ def test_history_reads_external_active_portals_and_pending_changes_while_editing
             assert sent["is_in_umg_portal"] is True
             assert sent["umg_portals"] == ["argentina", "chile"]
             assert sent["pending_change_requests"] == 2
+            # El portal tiene un corte que ya no es el del job: hasta que se
+            # vuelva a publicar sigue entregando el anterior, sin decirlo.
+            assert sent["portal_outdated"] is True
+            assert sent["portal_revision"] == 2
             for job in jobs[1:]:
                 assert indexed[job.job_id]["is_in_umg_portal"] is False
                 assert indexed[job.job_id]["umg_portals"] == []
                 assert indexed[job.job_id]["pending_change_requests"] == 0
+                # Sin publicación activa no hay nada desactualizado que avisar.
+                assert indexed[job.job_id]["portal_outdated"] is False
+                assert indexed[job.job_id]["portal_revision"] == 0
     finally:
         external.dispose()
