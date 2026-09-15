@@ -8,6 +8,7 @@ import HelpTip from "./HelpCenter/HelpTip";
 import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
 import LocalDraftRecovery from "./LocalDraftRecovery";
+import ReanchorProgressDialog from "./ReanchorProgressDialog";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { referenceSuggestionsById } from "../lib/referenceSuggestions";
 import { tierForLength } from "../lib/lyricTiers";
@@ -2123,6 +2124,7 @@ export default function LyricsEditor({
   //      Decline / error → toast de error, timings quedan como estaban.
   // El snapshot pre-reanchor va al edit history, así Cmd+Z lo revierte.
   const [reanchoring, setReanchoring] = useState(false);
+  const reanchorReturnFocusRef = useRef(null);
   const canReanchor = !!(onReanchor && transcribeJobId
     && user?.features?.anchor_lyrics === true);
   // 2026-09-14: si la respuesta se pierde (alineación >60 s, proxy que
@@ -4351,7 +4353,9 @@ export default function LyricsEditor({
     // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
-    <div data-testid="lyrics-editor" inert={draftRecovery ? "" : undefined} aria-busy={editorInitializationBlocked} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+    <div ref={reanchorReturnFocusRef} tabIndex={-1} data-testid="lyrics-editor" inert={draftRecovery ? "" : undefined} aria-busy={editorInitializationBlocked || reanchoring || pasteBusy} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+      {(reanchoring || pasteBusy) && <ReanchorProgressDialog
+        waiting={!!reanchorWaiting} returnFocusRef={reanchorReturnFocusRef} />}
       {draftRecovery && createPortal(<LocalDraftRecovery recovery={draftRecovery}
         revision={durableEditor.document?.revision} remote={durableEditor.document?.segments || []}
         onRecover={() => resolveRecovery(true)} onDiscard={() => resolveRecovery(false)}
