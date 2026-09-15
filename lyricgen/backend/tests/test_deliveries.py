@@ -403,6 +403,45 @@ def test_admin_delete_via_jwt(client, admin_token, approved_job, all_r2_files_pr
     assert res.status_code == 200
 
 
+def test_portal_can_prepare_missing_prores_for_its_delivery(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+
+    with patch("main.enqueue_prores_prewarm", return_value="prewarm:test") as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_master"},
+        )
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "queued"
+    enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True)
+
+
+def test_portal_cannot_prepare_prores_from_the_other_portal(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    chile_delivery_id = published.json()["delivery_id"]
+    with patch("main.enqueue_prores_prewarm"):
+        res = client.post(
+            f"/api/deliveries/{chile_delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "argentina"},
+            json={"file_type": "umg_master"},
+        )
+    assert res.status_code == 404
+
+
 def test_status_endpoint_includes_is_in_umg_portal(
     client, admin_token, approved_job, all_r2_files_present,
 ):

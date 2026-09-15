@@ -20187,6 +20187,88 @@ async def portal_delete_delivery(
     return _soft_delete_delivery(ddb, db, delivery_id, actor_user_id=None, portal_id=portal_id)
 
 
+@app.post("/api/deliveries/{delivery_id}/prepare-prores")
+async def portal_prepare_prores(
+    delivery_id: int,
+    body: dict,
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """Queue a missing ProRes derivative from the delivery portal.
+
+    ProRes is intentionally lazy because a master can take minutes and
+    several GB. The portal listing used to render a missing derivative as a
+    permanently disabled button, leaving UMG with no way to start it. Keep
+    the same portal row-level authorization as approve/delete, then reuse the
+    canonical prewarm queue with the job's already-persisted UMG spec.
+    """
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    file_type = body.get("file_type") if isinstance(body, dict) else None
+    if file_type not in ("umg_master", "umg_short"):
+        raise HTTPException(status_code=400, detail="Archivo ProRes inválido.")
+
+    delivery = _portal_delivery_query(
+        ddb.query(Delivery), portal_id,
+    ).filter(
+        Delivery.id == delivery_id,
+        Delivery.removed_at.is_(None),
+    ).first()
+    if delivery is None:
+        raise HTTPException(status_code=404, detail="Delivery no encontrada.")
+    if file_type not in (delivery.file_types or []):
+        raise HTTPException(status_code=404, detail="Archivo no disponible para esta entrega.")
+
+    job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job no encontrado.")
+    if job.status != "done":
+        raise HTTPException(status_code=400, detail="El video todavía no terminó de procesarse.")
+    if not job.umg_spec:
+        raise HTTPException(
+            status_code=409,
+            detail="Esta entrega no tiene una configuración ProRes guardada.",
+        )
+
+    try:
+        rq_id = enqueue_prores_prewarm(job.job_id, file_type, force=True)
+    except Exception as exc:
+        logger.warning(
+            "[PORTAL-PRORES] enqueue failed delivery=%s job=%s type=%s: %s",
+            delivery_id, job.job_id, file_type, exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo iniciar la preparación ProRes. Probá de nuevo en un momento.",
+        ) from exc
+
+    db.add(AuditLog(
+        user_id=None,
+        action="delivery.prores.prepare",
+        detail={
+            "delivery_id": delivery_id,
+            "job_id": job.job_id,
+            "portal_id": portal_id,
+            "file_type": file_type,
+        },
+    ))
+    db.commit()
+    return JSONResponse(
+        status_code=202,
+        content={
+            "ok": True,
+            "status": "queued",
+            "delivery_id": delivery_id,
+            "job_id": job.job_id,
+            "file_type": file_type,
+            "rq_id": rq_id,
+            "retry_after": 60,
+        },
+        headers={"Retry-After": "60"},
+    )
+
+
 @app.post("/api/deliveries/{delivery_id}/change-request")
 async def portal_submit_change_request(
     delivery_id: int,
