@@ -259,6 +259,10 @@ def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: S
     campaign = _campaign(db, campaign_id, current_user)
     jobs = {j.campaign_item_id: j for j in db.query(Job).filter_by(campaign_id=campaign.id).all() if j.campaign_item_id}
     return {"campaign_id": campaign.id, "plan": _plan(campaign), "fields": FIELDS,
+            # 2026-09-14: el preset de la campaña (defaults creativos) era invisible en la
+            # UI aunque effective_settings lo aplicaba a cada canción sin estilo asignado.
+            "defaults": effective_settings(campaign, {}),
+            "defaults_explicit": campaign_defaults_explicit(campaign),
             "veo_model": os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip(),
             "veo_models": veo_models(),
             "can_manage": current_user.get("role") == "admin" or campaign.created_by == current_user.get("id"),
@@ -460,6 +464,58 @@ def generation_receipt(db, job, submitted_revision, settings, actor):
 class IndividualRequest(Strict):
     revision: int = Field(ge=0)
     settings: dict[str, Any]
+
+
+def campaign_defaults_explicit(campaign):
+    """Sólo las claves creativas fijadas en la campaña (sin DEFAULTS del código
+    ni claves de pipeline como review_queue/stage1_pipeline/creative_plan)."""
+    return {k: v for k, v in (campaign.default_render_params or {}).items() if k in RENDER_KEYS}
+
+
+class DefaultsRequest(Strict):
+    revision: int = Field(ge=0)
+    # clave → valor; null borra la clave (vuelve al DEFAULT del código)
+    settings: dict[str, Any]
+    reason: str = Field(min_length=3, max_length=200)
+
+
+@router.post("/{campaign_id}/creative/defaults")
+def save_defaults(campaign_id: str, body: DefaultsRequest,
+                  current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    """Preset de la campaña: defaults creativos que effective_settings aplica a toda
+    canción sin estilo asignado. MERGEA sobre default_render_params: nunca toca
+    review_queue / stage1_pipeline / creative_plan (el PATCH genérico de campañas
+    reemplaza el JSON entero y por eso rechaza cambios creativos)."""
+    campaign = _campaign(db, campaign_id, current_user, True)
+    plan = _plan(campaign)
+    if plan["revision"] != body.revision:
+        fail("La configuración cambió; recargá antes de guardar el preset", 409)
+    clears = {k for k, v in body.settings.items() if v is None}
+    for key in clears:
+        if key not in FIELDS or key not in RENDER_KEYS:
+            fail(f"Ajuste no permitido: {key}")
+    patch = normalize_settings({k: v for k, v in body.settings.items() if v is not None})
+    current = dict(campaign.default_render_params or {})
+    before = {k: v for k, v in current.items() if k in RENDER_KEYS}
+    merged = {k: v for k, v in current.items() if k not in clears}
+    merged.update(patch)
+    after = {k: v for k, v in merged.items() if k in RENDER_KEYS}
+    if after == before:
+        return {"revision": plan["revision"], "unchanged": True,
+                "defaults": effective_settings(campaign, {}), "defaults_explicit": before}
+    effective = {k: v for k, v in {**DEFAULTS, **after}.items() if k in RENDER_KEYS}
+    if effective.get("background_mode") not in {"as_is", "variation"}:
+        effective["background_mode"] = "as_is"
+    group = Group(id="campaign-default", name="Preset de la campaña", weight=100, requirement="creative", model="")
+    validate_combination(db, campaign, effective, group, current_user)
+    plan["revision"] += 1
+    merged[KEY] = plan
+    campaign.default_render_params = merged
+    _log(db, campaign, "defaults", current_user["id"], {"before": before, "after": after,
+          "reason": body.reason, "revision": plan["revision"]})
+    db.commit()
+    return {"revision": plan["revision"], "defaults": effective_settings(campaign, {}),
+            "defaults_explicit": campaign_defaults_explicit(campaign)}
 
 
 @router.post("/{campaign_id}/creative/items/{item_id}")
