@@ -39,7 +39,7 @@ async function installCampaign(page) {
   });
   const announcement = page.getByRole("dialog", { name: "Nuevo editor de letras" });
   await page.addLocatorHandler(announcement, () => announcement.getByRole("button", { name: "Cancelar" }).click());
-  return calls;
+  return { ...calls, videos };
 }
 
 for (const width of [1440, 390]) {
@@ -82,5 +82,33 @@ for (const width of [1440, 390]) {
     await expect(page.getByText(/2 de 2 enviados/)).toBeVisible();
     await page.screenshot({ path: `test-results/campaign-delivery-${width}.png`, fullPage: true });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  });
+}
+
+
+for (const width of [1440, 390]) {
+  test(`campaign portal badges and sent filter retain editor return context at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 1000 });
+    const { videos, deliveries, approvals } = await installCampaign(page);
+    videos.forEach(video => Object.assign(video, { is_in_umg_portal: false, umg_portals: [] }));
+    Object.assign(videos[1], { status: "done", approved_at: "2026-09-15", is_in_umg_portal: true, umg_portals: ["chile"], pending_change_requests: 1 });
+    await page.goto("/campaigns/workflow?view=history");
+    await expect(page.getByText("Enviado a Chile", { exact: true })).toBeVisible();
+    await expect(page.getByText("1 cambio solicitado", { exact: true })).toBeVisible();
+    await page.getByLabel("Filtrar por envío al portal").selectOption("sent");
+    await expect(page.getByText("Corazón 1", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Corazón 2", { exact: true })).toBeVisible();
+    await page.getByRole("searchbox", { name: "Buscar videos de la campaña" }).fill("garcia");
+    await page.reload();
+    await expect(page.getByLabel("Filtrar por envío al portal")).toHaveValue("sent");
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.screenshot({ path: `test-results/campaign-portal-${width}.png`, fullPage: true });
+    await page.getByRole("button", { name: "Editar", exact: true }).click();
+    await expect(page).toHaveURL(/videos\/song-1\/edit-lyrics/);
+    const back = new URL(new URL(page.url()).searchParams.get("return_to"), "http://localhost");
+    expect(back.searchParams.get("portal_state")).toBe("sent");
+    expect(back.searchParams.get("q")).toBe("garcia");
+    expect(deliveries).toHaveLength(0);
+    expect(approvals).toHaveLength(0);
   });
 }

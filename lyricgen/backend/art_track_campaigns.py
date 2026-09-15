@@ -589,11 +589,16 @@ def create_delivery_batch(campaign_id: str, body: DeliveryCreate, current_user: 
 @router.get("/delivery-operations/{operation_id}")
 def get_delivery_batch(operation_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     _require_scope(current_user)
-    operation = db.query(DeliveryBatch).filter(
-        DeliveryBatch.id == operation_id,
-        DeliveryBatch.tenant_id == current_user["tenant_id"],
-    ).first()
+    query = db.query(DeliveryBatch).filter(DeliveryBatch.id == operation_id)
+    if current_user.get("role") != "admin":
+        query = query.filter(DeliveryBatch.tenant_id == current_user["tenant_id"])
+    operation = query.first()
     if operation is None:
+        raise HTTPException(status_code=404, detail="Delivery operation not found.")
+    # Use the same campaign authorization as creation: a platform admin may
+    # publish for another tenant and must be able to read that operation.
+    campaign = _campaign_for_delivery(db, operation.campaign_id, current_user)
+    if campaign.tenant_id != operation.tenant_id:
         raise HTTPException(status_code=404, detail="Delivery operation not found.")
     rows = db.query(DeliveryBatchItem).filter(
         DeliveryBatchItem.delivery_batch_id == operation.id,

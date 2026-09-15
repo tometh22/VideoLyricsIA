@@ -33,6 +33,11 @@ const videoFilters = [
   { id: "processing", label: "En proceso", matches: video => videoProcessingStatuses.has(video.status) },
 ];
 const deliveryPortals = [{ id: "argentina", label: "Argentina", host: "umg.genly.pro" }, { id: "chile", label: "Chile", host: "umgchile.genly.pro" }];
+const portalFilters = [
+  { id: "all", label: "Todos los envíos", matches: () => true },
+  { id: "sent", label: "Enviados al portal", matches: video => video.is_in_umg_portal === true },
+  { id: "unsent", label: "No enviados al portal", matches: video => video.is_in_umg_portal === false },
+];
 
 const songFilters = [
   { id: "all", label: "Todas", matches: () => true },
@@ -125,6 +130,7 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
   const videoQuery = query;
   const songFilter = searchParams.get("song_state") || "all";
   const videoFilter = view === "deliveries" ? "approved" : searchParams.get("video_state") || "all";
+  const portalFilter = searchParams.get("portal_state") || "all";
   const page = Math.max(1, Number(searchParams.get("cpage")) || 1);
   const videoPage = Math.max(1, Number(searchParams.get("vpage")) || 1);
   const setPage = value => writeParams({ cpage: typeof value === "function" ? value(page) : value });
@@ -133,6 +139,7 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
   const setVideoQuery = setQuery;
   const setSongFilter = value => { setSelected(new Set()); writeParams({ song_state: value, cpage: null }); };
   const setVideoFilter = value => { setSelectedVideoIds(new Set()); writeParams({ video_state: value, vpage: null }); };
+  const setPortalFilter = value => { setSelectedVideoIds(new Set()); writeParams({ portal_state: value, vpage: null }); };
   const returnPath = `/campaigns/${encodeURIComponent(campaignId)}?${searchParams}`;
   const openVideo = path => navigate(`${path}?return_to=${encodeURIComponent(returnPath)}`);
   const deliveryKey = useRef(null);
@@ -259,7 +266,9 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
   const visible = filtered.slice((currentPage - 1) * 20, currentPage * 20);
   const activeVideoFilter = videoFilters.find(filter => filter.id === videoFilter) || videoFilters[0];
   const searchedVideos = (report?.videos || []).filter(video => matchesCampaignSong(videoQuery, video));
-  const filteredVideos = searchedVideos.filter(activeVideoFilter.matches);
+  const stateVideos = searchedVideos.filter(activeVideoFilter.matches);
+  const activePortalFilter = portalFilters.find(filter => filter.id === portalFilter) || portalFilters[0];
+  const filteredVideos = stateVideos.filter(activePortalFilter.matches);
   const videoFilterCounts = Object.fromEntries(videoFilters.map(filter => [filter.id, searchedVideos.filter(filter.matches).length]));
   const videoPages = Math.max(1, Math.ceil(filteredVideos.length / 20));
   const currentVideoPage = Math.min(videoPage, videoPages);
@@ -355,13 +364,14 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
       {!!report.videos.length && <div className="overflow-hidden rounded-2xl bg-surface-2/30 ring-1 ring-white/10">
         <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-center">
           <CampaignSearch className="w-full lg:max-w-sm" label="Buscar videos de la campaña" value={videoQuery} onChange={setVideoQuery} />
+          <label className="text-sm text-ink-secondary">Envío al portal<select aria-label="Filtrar por envío al portal" className={input + " mt-1"} value={activePortalFilter.id} onChange={event => setPortalFilter(event.target.value)}>{portalFilters.map(filter => <option key={filter.id} value={filter.id}>{filter.label} ({stateVideos.filter(filter.matches).length})</option>)}</select></label>
           {view !== "deliveries" && <div className="flex flex-wrap gap-2" role="group" aria-label="Filtrar videos por estado">{videoFilters.map(filter => <button key={filter.id} type="button" aria-pressed={videoFilter === filter.id} className={`rounded-full px-3 py-2 text-sm ring-1 ${videoFilter === filter.id ? "bg-brand/25 text-brand-light ring-brand/50" : "bg-black/20 text-ink-secondary ring-white/10"}`} onClick={() => { setVideoFilter(filter.id); }}>{filter.label} <span className="opacity-70">{videoFilterCounts[filter.id]}</span></button>)}</div>}
         </div>
         {!visibleVideos.length && <p className="border-t border-white/10 p-8 text-center text-ink-secondary">No hay videos que coincidan con este filtro.</p>}
         <ul aria-label="Lista de videos de la campaña" className="divide-y divide-white/10 border-t border-white/10">{visibleVideos.map(video => <li key={video.job_id} className="grid gap-4 p-4 hover:bg-white/[0.025] lg:grid-cols-[160px_minmax(220px,1fr)_minmax(150px,auto)_auto] lg:items-center">
           <VideoThumbnail video={video} compact />
           <div className="min-w-0"><h3 className="truncate font-semibold">{video.title}</h3><p className="truncate text-sm text-ink-secondary">{video.artist}</p><p className="mt-1 text-xs text-ink-secondary">{new Date(video.created_at).toLocaleString()}{video.parent_job_id ? " · Variante" : ""}</p></div>
-          <div><span className={`inline-flex rounded-full px-2.5 py-1 text-xs ${video.status === "pending_review" ? "bg-amber-500/15 text-amber-200" : video.status === "done" ? "bg-emerald-500/15 text-emerald-200" : videoProcessingStatuses.has(video.status) ? "bg-brand/20 text-brand-light" : "bg-white/5 text-ink-secondary"}`}>{statusLabels[video.status] || "En preparación"}</span><p className="mt-2 max-w-52 truncate text-xs text-ink-secondary">{video.assignment.group_name || "Sin clasificación contractual"}</p></div>
+          <div><span className={`inline-flex rounded-full px-2.5 py-1 text-xs ${video.status === "pending_review" ? "bg-amber-500/15 text-amber-200" : video.status === "done" ? "bg-emerald-500/15 text-emerald-200" : videoProcessingStatuses.has(video.status) ? "bg-brand/20 text-brand-light" : "bg-white/5 text-ink-secondary"}`}>{statusLabels[video.status] || "En preparación"}</span><div className="mt-2 flex flex-wrap gap-1.5"><span className={`inline-flex rounded-full px-2.5 py-1 text-xs ${video.is_in_umg_portal ? "bg-sky-500/15 text-sky-200" : "bg-white/5 text-ink-secondary"}`}>{video.is_in_umg_portal === true ? `Enviado a ${(video.umg_portals || []).map(id => deliveryPortals.find(portal => portal.id === id)?.label || id).join(" y ") || "portal"}` : video.is_in_umg_portal === false ? "No enviado al portal" : "Envío sin verificar"}</span>{video.pending_change_requests > 0 && <span className="rounded-full bg-amber-500/15 px-2.5 py-1 text-xs text-amber-200">{video.pending_change_requests} {video.pending_change_requests === 1 ? "cambio solicitado" : "cambios solicitados"}</span>}</div><p className="mt-2 max-w-52 truncate text-xs text-ink-secondary">{video.assignment.group_name || "Sin clasificación contractual"}</p></div>
           <div className="flex flex-wrap gap-2 lg:max-w-72 lg:justify-end">
             {data.can_manage && video.status === "done" && video.approved_at && <label className="flex items-center gap-2 text-sm text-emerald-100"><input type="checkbox" aria-label={`Seleccionar video ${video.title}`} checked={selectedVideoIds.has(video.job_id)} onChange={event => setSelectedVideoIds(old => { const next = new Set(old); if (event.target.checked) next.add(video.job_id); else next.delete(video.job_id); return next; })} />Seleccionar para enviar</label>}
             <button type="button" className={primaryButton} disabled={!video.video_url || busy} onClick={() => setPlayingVideo(video)}>Reproducir</button>

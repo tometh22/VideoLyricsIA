@@ -327,3 +327,56 @@ def test_legacy_fast_assignment_generates_lite_without_rewriting_history(db, set
     live = creative.get_creative(campaign.id, actor, db)
     assert live["veo_model"] == VEO_LITE
     assert live["items"][0]["assignment"]["model"] == VEO_LITE
+
+
+def test_history_reads_external_active_portals_and_pending_changes_while_editing(db, setup, monkeypatch):
+    from contextlib import contextmanager
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import Session
+
+    campaign, items, actor = setup
+    jobs = []
+    for status in ("editing", "done", "done"):
+        job = Job(job_id=uuid.uuid4().hex[:12], user_id=actor["id"], tenant_id=campaign.tenant_id,
+                  campaign_id=campaign.id, campaign_item_id=items[len(jobs)].id,
+                  artist="A", filename="a.wav", status=status, video_url="video", workload_class="batch",
+                  approved_at=None if status == "editing" else datetime.now(timezone.utc))
+        db.add(job)
+        jobs.append(job)
+    db.commit()
+    # Separate physical database: using the application DB would miss these.
+    external = create_engine("sqlite://")
+    with external.begin() as conn:
+        conn.execute(text("CREATE TABLE deliveries (id INTEGER, job_id TEXT, portal_id TEXT, tenant_snapshot TEXT, removed_at TEXT)"))
+        conn.execute(text("CREATE TABLE delivery_change_requests (id INTEGER, delivery_id INTEGER, resolved_at TEXT)"))
+        for n, job, portal, tenant, removed in [
+            (1, jobs[0].job_id, "chile", campaign.tenant_id, None),
+            (2, jobs[0].job_id, None, campaign.tenant_id, None),
+            (3, jobs[1].job_id, "chile", campaign.tenant_id, "removed"),
+            (4, jobs[2].job_id, "chile", "foreign", None),
+            (5, "outside", "chile", campaign.tenant_id, None),
+        ]:
+            conn.execute(text("INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,:removed)"),
+                         dict(n=n, job=job, portal=portal, tenant=tenant, removed=removed))
+        conn.execute(text("INSERT INTO delivery_change_requests VALUES (1,1,NULL),(2,1,'resolved'),(3,2,NULL),(4,3,NULL),(5,4,NULL),(6,5,NULL)"))
+
+    @contextmanager
+    def portal_db():
+        with Session(external) as session:
+            yield session
+
+    monkeypatch.setattr(creative, "scoped_deliveries_db", portal_db)
+    try:
+        for rows in [creative.video_history(campaign.id, actor, db)["items"], creative.report(campaign.id, actor, db)["videos"]]:
+            indexed = {row["job_id"]: row for row in rows}
+            sent = indexed[jobs[0].job_id]
+            assert sent["status"] == "editing"
+            assert sent["is_in_umg_portal"] is True
+            assert sent["umg_portals"] == ["argentina", "chile"]
+            assert sent["pending_change_requests"] == 2
+            for job in jobs[1:]:
+                assert indexed[job.job_id]["is_in_umg_portal"] is False
+                assert indexed[job.job_id]["umg_portals"] == []
+                assert indexed[job.job_id]["pending_change_requests"] == 0
+    finally:
+        external.dispose()

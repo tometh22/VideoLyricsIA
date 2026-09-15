@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import CampaignCreative from "./CampaignCreative";
 vi.mock("../i18n", () => ({ useI18n: () => ({ t: () => "" }) }));
 vi.mock("./WizardLivePreview", () => ({ default: () => <div>Vista previa visual</div> }));
@@ -301,4 +301,43 @@ it("reuses the same delivery key after a lost response instead of creating anoth
   await screen.findByText(/Envío completado/);
   expect(bodies).toHaveLength(2);
   expect(bodies[0].idempotency_key).toBe(bodies[1].idempotency_key);
+});
+
+
+function CurrentLocation() {
+  const location = useLocation();
+  return <output data-testid="location">{location.pathname}{location.search}</output>;
+}
+
+it("filters actual publications, preserves editing and campaign return context", async () => {
+  const video = (job_id, title, extra = {}) => ({ job_id, title, artist: "Lucybell", status: "done", approved_at: "2026-09-15", created_at: "2026-09-15", video_url: `/download/${job_id}/video`, evidence: {}, assignment: {}, ...extra });
+  report.videos = [
+    video("sent", "Mataz", { is_in_umg_portal: true, umg_portals: ["chile"], pending_change_requests: 1 }),
+    video("unsent", "Carnaval", { is_in_umg_portal: false, umg_portals: [] }),
+    video("editing", "Otra", { status: "editing", approved_at: null, is_in_umg_portal: true, umg_portals: ["argentina"] }),
+    video("unknown", "Antiguo"),
+  ];
+  render(<MemoryRouter initialEntries={["/campaigns/c1?view=history"]}><CampaignCreative campaignId="c1" view="history" /><CurrentLocation /></MemoryRouter>);
+  expect(await screen.findByText("Enviado a Chile")).toBeInTheDocument();
+  expect(screen.getByText("1 cambio solicitado")).toBeInTheDocument();
+  expect(screen.getByText("Enviado a Argentina")).toBeInTheDocument();
+  expect(screen.getByText("Envío sin verificar")).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Filtrar por envío al portal"), { target: { value: "unsent" } });
+  expect(screen.getByText("Carnaval")).toBeInTheDocument();
+  expect(screen.queryByText("Mataz")).not.toBeInTheDocument();
+  expect(screen.queryByText("Antiguo")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Seleccionar aprobados del resultado (1)" }));
+  expect(screen.getByLabelText("1 videos aprobados seleccionados")).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Filtrar por envío al portal"), { target: { value: "sent" } });
+  expect(screen.getByLabelText("0 videos aprobados seleccionados")).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Buscar videos de la campaña"), { target: { value: "Mataz" } });
+  expect(screen.queryByText("Otra")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Editar" }));
+  const url = new URL(screen.getByTestId("location").textContent, "http://localhost");
+  expect(url.pathname).toBe("/videos/sent/edit-lyrics");
+  const back = new URL(url.searchParams.get("return_to"), "http://localhost");
+  expect(back.pathname).toBe("/campaigns/c1");
+  expect(back.searchParams.get("portal_state")).toBe("sent");
+  expect(back.searchParams.get("q")).toBe("Mataz");
+  expect(calls.some(([path]) => path.includes("/edit/") || path.includes("/deliveries"))).toBe(false);
 });

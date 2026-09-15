@@ -152,3 +152,33 @@ def test_lyric_campaign_delivery_selects_only_approved_videos(client, admin_toke
         assert item.job_id == approved_id
     finally:
         db.close()
+
+
+def test_cross_tenant_admin_can_read_delivery_operation_without_exposing_it_to_other_tenants(client, admin_token, monkeypatch):
+    from fastapi import HTTPException
+    from art_track_campaigns import get_delivery_batch
+
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    monkeypatch.setenv("BATCH_CAMPAIGN_SCOPES", "portal-owner,foreign-operator")
+    auth = {"Authorization": f"Bearer {admin_token}"}
+    created = client.post("/batch/campaigns", headers=auth,
+                          json={"name": "Chile publication", "kind": "lyric_video"})
+    assert created.status_code == 200
+    with SessionLocal() as db:
+        campaign = db.query(BatchCampaign).filter_by(id=created.json()["id"]).one()
+        campaign.tenant_id = "portal-owner"
+        operation = DeliveryBatch(id=str(uuid.uuid4()), campaign_id=campaign.id,
+                                  tenant_id=campaign.tenant_id, destination_portal="chile",
+                                  idempotency_key="cross-tenant-operation", created_by=campaign.created_by,
+                                  total_count=0, status="completed")
+        db.add(operation)
+        db.commit()
+        operation_id = operation.id
+        response = client.get(f"/batch/delivery-operations/{operation_id}", headers=auth)
+        assert response.status_code == 200, response.text
+        assert response.json()["destination_portal"] == "chile"
+        owner = {"id": campaign.created_by, "role": "user", "tenant_id": "portal-owner"}
+        assert get_delivery_batch(operation_id, owner, db)["status"] == "completed"
+        with pytest.raises(HTTPException) as denied:
+            get_delivery_batch(operation_id, {**owner, "tenant_id": "foreign-operator"}, db)
+        assert denied.value.status_code == 404
