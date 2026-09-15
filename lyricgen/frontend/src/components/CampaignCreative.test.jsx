@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import CampaignCreative from "./CampaignCreative";
 vi.mock("../i18n", () => ({ useI18n: () => ({ t: () => "" }) }));
@@ -14,7 +14,9 @@ beforeEach(() => {
   calls = [];
   generateGate = null;
   generateFailures = new Set();
-  head = { plan: { revision: 0 }, can_manage: true, veo_model: "veo-3.1-fast-generate-001", fields: {
+  head = { plan: { revision: 0 }, can_manage: true, veo_model: "veo-3.1-fast-generate-001",
+    defaults: { font: "anton", font_scale: 1.3, text_case: "upper", style: "auto", movement_style: "estandar", line_transition: "dissolve_blur", lyrics_animation: "none", effect: "", background_mode: "as_is", frame_format: "full" },
+    defaults_explicit: { font: "anton", movement_style: "estandar" }, fields: {
     font: { label: "Tipografía", group: "Letra", kind: "select", options: ["", "anton"] },
     effect: { label: "Efecto", group: "Movimiento y efectos", kind: "select", options: ["", "bokeh", "rain"] },
   }, operations: [], items: Array.from({ length: 39 }, (_, i) => ({ id: `i${i}`, job_id: `j${i}`, title: `Tema ${i}`, artist: "Artista", status: i < 2 ? "lyrics_approved" : i === 2 ? "done" : "transcribed_pending", settings: {} })) };
@@ -26,6 +28,7 @@ beforeEach(() => {
     if (url.endsWith("/backgrounds")) return response([]);
     if (url.endsWith("/preview")) return response({ preview_id: "p1", counts: [39], rounded: false, skipped: [], changes: head.items.map(i => ({ item_id: i.id, artist: i.artist, title: i.title, group: "Estilo 1", before: {}, after: { font: "anton" } })) });
     if (url.endsWith("/apply")) { head = { ...head, plan: { revision: 1 } }; return response({ revision: 1 }); }
+    if (url.endsWith("/creative/defaults")) { head = { ...head, plan: { revision: 1 }, defaults: { ...head.defaults, font: "" }, defaults_explicit: { movement_style: "estandar" } }; return response({ revision: 1 }); }
     if (url.endsWith("/deliveries")) return response({ operation_id: "op1", total_count: 2, status: "queued" });
     if (url.includes("/status/")) return response({ artist: "Artista", song_title: "Tema", segments_json: [], segments_revision: 2 });
     if (url.includes("/approve/")) {
@@ -185,5 +188,34 @@ describe("campaign bulk design", () => {
     await screen.findByText("1 trabajo enviado · 1 no se enviaron; consultá el historial de esta campaña.");
     expect(screen.getByRole("alert")).toHaveTextContent("No se pudieron enviar 1 video: Tema 0");
     expect(calls.filter(([url]) => url.endsWith("/generate"))).toHaveLength(2);
+  });
+});
+
+describe("preset de la campaña (2026-09-14)", () => {
+  it("muestra el preset guardado en Paso 2 y nombra el preset en la tabla", async () => {
+    mount("creative");
+    await screen.findByRole("button", { name: /Seleccionar resultados/ });
+    expect(screen.getAllByText("Preset de la campaña").length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: /Configurar estilos y reparto/ }));
+    const card = screen.getByTestId("campaign-preset");
+    expect(card).toHaveTextContent("Tipografía");
+    expect(card.textContent).toMatch(/anton/i);
+    expect(card).toHaveTextContent("(por defecto)");
+  });
+
+  it("editar preset envía sólo lo cambiado (null para destildar) y recarga", async () => {
+    mount("creative");
+    await screen.findByRole("button", { name: /Seleccionar resultados/ });
+    fireEvent.click(screen.getByRole("button", { name: /Configurar estilos y reparto/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Editar preset" }));
+    // Tipografía viene tildada (explícita): destildarla la manda como null.
+    fireEvent.click(within(screen.getByTestId("campaign-preset")).getByText("Cambiar Tipografía"));
+    fireEvent.change(screen.getByLabelText("Motivo del preset"), { target: { value: "Ajuste de preset" } });
+    fireEvent.click(screen.getByRole("button", { name: "Guardar preset" }));
+    await screen.findByText(/Preset guardado/);
+    const body = JSON.parse(calls.find(([url]) => url.endsWith("/creative/defaults"))[1].body);
+    expect(body.revision).toBe(0);
+    expect(body.reason).toBe("Ajuste de preset");
+    expect(body.settings).toEqual({ movement_style: "estandar", font: null });
   });
 });
