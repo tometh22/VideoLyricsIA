@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 MIN_SCENE_DURATION = float(os.environ.get("SCENES_MIN_DURATION", "14.0"))
 # Tope de escenas ÚNICAS por canción (costo Veo + coherencia visual). Los
 # coros recurrentes comparten escena, así que esto acota los versos.
-MAX_UNIQUE_SCENES = int(os.environ.get("SCENES_MAX_UNIQUE", "6"))
+MAX_UNIQUE_SCENES = max(1, min(6, int(os.environ.get("SCENES_MAX_UNIQUE", "6"))))
 # A continuous vocal block has no repetition/gap signal, but it still must not
 # become a single background for a whole 3–5 minute song.  Keep the fallback
 # cuts infrequent and musical while guaranteeing that the multi-scene opt-in
@@ -527,32 +527,46 @@ def _merge_short_sections(sections: list[Section]) -> list[Section]:
 
 
 def _cap_unique_scenes(sections: list[Section]) -> list[Section]:
-    """Limita el nº de escenas ÚNICAS a MAX_UNIQUE_SCENES.
+    """Hard cap across ALL section types, without changing musical boundaries.
 
-    Los coros ya comparten escena. Si los versos hacen pasar el tope, los
-    versos extra reusan claves de versos previos (round-robin) — siguen
-    progresando dentro del mismo mundo (la biblia), pero acotamos costo Veo.
+    Keep opening/ending identities and a representative of each musical type
+    when the budget allows. Fill remaining slots across the story, then reuse
+    the nearest retained key of the same type. Repeated keys always map as a
+    unit. The former verse-only cap silently admitted eight chorus/bridge keys.
     """
-    order: list[str] = []
+    canonical: dict[str, Section] = {}
     for sec in sections:
-        if sec.recurrence_key not in order:
-            order.append(sec.recurrence_key)
-    if len(order) <= MAX_UNIQUE_SCENES:
+        canonical.setdefault(sec.recurrence_key, sec)
+    order = list(canonical)
+    limit = max(1, min(6, MAX_UNIQUE_SCENES))
+    if len(order) <= limit:
         return sections
-    # Versos son los candidatos a colapsar (coros/instrumentales se preservan).
-    verse_keys = [k for k in order if k.startswith("verso_")]
-    keep_verses = max(1, MAX_UNIQUE_SCENES - (len(order) - len(verse_keys)))
-    if keep_verses >= len(verse_keys):
-        return sections
-    canonical = verse_keys[:keep_verses]
+    kept = [order[0]]
+    if limit > 1:
+        kept.append(order[-1])
+    for key in order:
+        if len(kept) >= limit:
+            break
+        if canonical[key].type not in {canonical[k].type for k in kept}:
+            kept.append(key)
+    while len(kept) < limit:
+        # Stable tie-breaking: max returns the earliest key on equal distance.
+        kept.append(max(
+            (key for key in order if key not in kept),
+            key=lambda key: min(abs(canonical[key].start - canonical[k].start)
+                                for k in kept),
+        ))
+    kept = [key for key in order if key in kept]
     remap = {}
-    for idx, k in enumerate(verse_keys):
-        remap[k] = canonical[idx % keep_verses]
+    for key in order:
+        if key in kept:
+            remap[key] = key
+            continue
+        candidates = [k for k in kept if canonical[k].type == canonical[key].type] or kept
+        remap[key] = min(candidates, key=lambda k: abs(canonical[k].start - canonical[key].start))
     for sec in sections:
-        if sec.recurrence_key in remap:
-            sec.recurrence_key = remap[sec.recurrence_key]
-    logger.info("[SCENES] cap escenas únicas: %d→%d (versos colapsados a %d)",
-                len(order), MAX_UNIQUE_SCENES, keep_verses)
+        sec.recurrence_key = remap[sec.recurrence_key]
+    logger.info("[SCENES] cap escenas únicas: %d→%d", len(order), len(kept))
     return sections
 
 
@@ -601,6 +615,9 @@ def build_scene_plan(
     "estandar" y "" (Auto) SÍ caen al energy-derived (varían la cámara por
     sección, todas fotorrealistas → sin romper la intención).
     """
+    # Defensive boundary for callers that build a plan without detect_sections.
+    # Mutate keys in the shared sections list so stitching uses the same map.
+    sections = _cap_unique_scenes(sections)
     bible_text = _bible_to_prompt_fragment(bible)
     _om = (operator_movement or "").strip().lower()
     _forced_movement = _om if _om in ("estatico", "sutil", "animado", "foto-parallax") else None

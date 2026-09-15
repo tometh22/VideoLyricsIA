@@ -11899,7 +11899,7 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
     # lengths are forwarded so an out-of-range value can never make Vertex
     # reject the request. Keep provenance._VEO_CLIP_SECONDS in sync for the
     # cost dashboard.
-    _veo_clip_seconds_raw = os.environ.get("VEO_CLIP_SECONDS", "").strip()
+    _veo_clip_seconds_raw = os.environ.get("VEO_CLIP_SECONDS", "8").strip() or "8"
     if _veo_clip_seconds_raw:
         try:
             _veo_clip_seconds = int(float(_veo_clip_seconds_raw))
@@ -13973,6 +13973,13 @@ def _generate_scene_clips(scene_plan: dict, job_dir: str, *, artist: str,
             continue
         canonical_scene[key] = scene
         unique_scenes.append(scene)
+
+    # Never spend on an oversized NEW storyboard, even if a caller bypassed
+    # planning. Existing >6-scene videos retain their identities: cache-only
+    # edits and a targeted regeneration may still use their historical plan.
+    fresh_keys = set(canonical_scene) if regen_keys is None else set(regen_keys) & set(canonical_scene)
+    if len(fresh_keys) > max(1, min(6, _scenes.MAX_UNIQUE_SCENES)):
+        raise ValueError("Scenes generation is limited to six unique clips")
 
     def _gen_unique(scene: dict):
         """Genera + valida UNA escena única. Muta sólo su propio `scene`.
