@@ -7131,12 +7131,60 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                 )
                 retimed = None
             if not _safe_alignment(retimed):
-                logger.error(
-                    "[ANCHOR] fail-closed: official lyrics received but both "
-                    "aligners declined ctc_reason=%s job=%s",
-                    decline_reason, job_id,
-                )
-                result = _declined(result, decline_reason)
+                # Last acoustic witness before giving the operator nothing:
+                # LOCAL Whisper forced alignment. It is not a looser version
+                # of the stages above — the decoder is constrained to the
+                # pasted text (Whisper-DP transcribes freely and DP-matches,
+                # which is what collapses on guitar-heavy folk material), the
+                # backbone is not wav2vec2, and it interpolates no line.
+                # Staging job 18dc85ecd8d6 "Navidad de Aimogasta" (15-sep):
+                # CTC 0.29 < 0.30, hosted declined, Whisper-DP 23/40 lines
+                # guessed — this stage timed all 40 with zero crammed lines.
+                # Same stem-then-mix order, same _safe_alignment verdict, and
+                # the crammed guard inside _apply still has the final word.
+                try:
+                    from lyrics_local_forced_align import local_forced_align
+                    local_sources = list(dict.fromkeys((align_src, audio_path)))
+                    retimed = None
+                    for local_source in local_sources:
+                        retimed = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                local_forced_align,
+                                local_source,
+                                [segment["text"] for segment in psegs],
+                                language=resolve_transcription_language(
+                                    "", reference_text=anchor_text,
+                                ),
+                                job_id=job_id,
+                            ),
+                            timeout=600,
+                        )
+                        if _safe_alignment(retimed):
+                            break
+                        logger.info(
+                            "[ANCHOR] local forced align declined source=%s job=%s",
+                            "stem" if local_source == _stem else "mix", job_id,
+                        )
+                except Exception as local_exc:
+                    logger.warning(
+                        "[ANCHOR] local forced align failed error_type=%s job=%s",
+                        type(local_exc).__name__, job_id,
+                    )
+                    retimed = None
+                if _safe_alignment(retimed):
+                    result = _apply(
+                        result,
+                        retimed,
+                        timing_source="local_forced_align",
+                        decline_reason=decline_reason,
+                    )
+                else:
+                    logger.error(
+                        "[ANCHOR] fail-closed: official lyrics received but every "
+                        "aligner declined ctc_reason=%s job=%s",
+                        decline_reason, job_id,
+                    )
+                    result = _declined(result, decline_reason)
             else:
                 result = _apply(
                     result,
