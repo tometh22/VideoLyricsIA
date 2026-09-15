@@ -23,6 +23,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+import logging
+
 import storage
 from auth import get_current_user, has_art_track_access
 from batch_campaigns import _campaign_or_404, _now, _require_manager, _require_scope
@@ -31,7 +33,10 @@ from database import (
     DeliveryBatchItem, Job, JobOutboxEvent, SessionLocal, get_db, get_deliveries_db,
 )
 from jobs import create_job
+from queue_jobs import enqueue_prores_prewarm
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/batch", tags=["art-track-campaigns"])
 ART_TRACK_LIMIT = min(int(os.environ.get("BATCH_ART_TRACK_ITEM_LIMIT", "500")), 500)
@@ -653,13 +658,46 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     row.status = "failed"; row.error_code = "stale_approval"; row.error_detail = "Approval or render version changed."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
                 if storage.is_enabled():
                     # The MP4/short/thumbnail are produced by the render.
-                    # UMG ProRes is lazy in the existing individual flow and
-                    # is materialized on first portal download, so it is
-                    # intentionally included in file_types without blocking
-                    # the durable publication snapshot here.
                     missing = [ft for ft in ("video", "short", "thumbnail") if not (job.s3_keys or {}).get(ft) or not storage.object_exists((job.s3_keys or {}).get(ft))]
                     if missing:
                         row.status = "failed"; row.error_code = "deliverables_not_ready"; row.error_detail = ", ".join(missing); row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
+                # ProRes NO se materializa solo. Esto publicaba los dos .mov en
+                # `file_types` sin verificarlos, apoyado en que el portal los
+                # transcodifica al primer download — y no lo hace: el portal
+                # firma la key determinística de R2 y nunca pasa por
+                # `ensure_prores_exists` (documentado desde el incidente
+                # 2026-08-03). Resultado medido el 2026-09-15 en el portal de
+                # Chile: 28 de 34 entregas activas ofrecían un "ProRes Master
+                # (broadcast)" que no existe en R2 y que nada iba a crear.
+                #
+                # Un job sin `umg_spec` no puede producirlos (no hay frame
+                # size, fps ni perfil), así que se publica como entrega
+                # PARCIAL —igual que un job sin short vertical— en vez de
+                # prometer un archivo inexistente. Uno con spec sí puede: se
+                # encola el prewarm y se publica; el archivo aparece cuando el
+                # transcode termina.
+                delivery_file_types = list(DELIVERY_FILE_TYPES)
+                prores_absent = [
+                    ft for ft in ("umg_master", "umg_short")
+                    if not storage.is_enabled()
+                    or not (job.s3_keys or {}).get(ft)
+                    or not storage.object_exists((job.s3_keys or {}).get(ft))
+                ]
+                if prores_absent and not job.umg_spec:
+                    delivery_file_types = [ft for ft in delivery_file_types if ft not in prores_absent]
+                    logger.warning(
+                        "[DELIVERY] job=%s se publica SIN %s: no tiene umg_spec, "
+                        "nada los puede generar", job.job_id, sorted(prores_absent),
+                    )
+                elif prores_absent:
+                    for ft in prores_absent:
+                        try:
+                            enqueue_prores_prewarm(job.job_id, ft, force=True)
+                        except Exception as exc:
+                            logger.warning(
+                                "[DELIVERY] no se pudo encolar %s de job=%s: %s",
+                                ft, job.job_id, exc,
+                            )
                 # Never write an AR/CL operation through the legacy
                 # single-portal schema. Without the portal_id migration,
                 # doing so would make a Chile delivery visible in Argentina
@@ -676,14 +714,14 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     delivery_query = delivery_query.filter(Delivery.portal_id == op.destination_portal)
                 active = delivery_query.first()
                 if active is None:
-                    delivery_kwargs = dict(job_id=job.job_id, label=delivery_label, file_types=DELIVERY_FILE_TYPES, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"))
+                    delivery_kwargs = dict(job_id=job.job_id, label=delivery_label, file_types=delivery_file_types, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"))
                     if hasattr(Delivery, "portal_id"):
                         delivery_kwargs["portal_id"] = op.destination_portal
                     active = Delivery(**delivery_kwargs)
                     ddb.add(active); ddb.flush()
                 else:
                     active.label = delivery_label
-                    active.file_types = DELIVERY_FILE_TYPES
+                    active.file_types = delivery_file_types
                     active.artist_snapshot = job.artist
                     active.song_title_snapshot = job.song_title or ""
                     active.tenant_snapshot = job.tenant_id

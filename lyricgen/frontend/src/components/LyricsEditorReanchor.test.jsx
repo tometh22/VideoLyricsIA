@@ -290,7 +290,7 @@ describe("Recuperación tras respuesta perdida (2026-09-14)", () => {
     fireEvent.click(screen.getByTestId("editor-overflow-btn"));
     fireEvent.click(screen.getByTestId("reanchor-btn"));
     await waitFor(() => expect(toastSpy).toHaveBeenCalled());
-    expect(onReanchorReconcile).toHaveBeenCalled();
+    expect(onReanchorReconcile).not.toHaveBeenCalled();
     expect(toastSpy.mock.calls[0][0].tone).toBe("error");
   });
 });
@@ -348,13 +348,13 @@ describe("Seguir esperando al servidor (2026-09-14, caso Agus)", () => {
   });
 
   it("si el servidor nunca avanza dentro del plazo → error, sin aplicar nada", async () => {
-    const onReanchor = vi.fn(async () => ({ ok: false, reason: "declined" }));
+    const onReanchor = vi.fn(async () => ({ ok: false, reason: "network" }));
     const onReanchorReconcile = vi.fn(async (jobId, base) => ({ ok: false, reason: "not-advanced", revision: base }));
     render(<LyricsEditor {...baseProps({ onPersistSegments: vi.fn(async () => ({ ok: true })), onReanchor, onReanchorReconcile, reanchorWaitMs: 60, reanchorPollMs: 10 })} />);
     openPaste();
     fireEvent.change(screen.getByTestId("paste-lyrics-textarea"), { target: { value: "linea uno\nlinea dos\nlinea tres" } });
     fireEvent.click(screen.getByTestId("paste-lyrics-submit"));
-    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/No se pudo re-sincronizar/), { timeout: 3000 });
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/No se pudo confirmar/), { timeout: 3000 });
     expect(onReanchorReconcile.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(screen.queryByTestId("paste-lyrics-waiting")).toBeNull();
     expect(screen.queryByTestId("reanchor-progress-overlay")).toBeNull();
@@ -373,6 +373,56 @@ describe("Loader bloqueante de re-sincronización", () => {
       fireEvent.click(screen.getByTestId("paste-lyrics-submit"));
     } else fireEvent.click(screen.getByTestId("reanchor-btn"));
   }
+
+  it.each(["editor", "paste"])("%s: a failed save never recovers an unrelated revision as re-sync success", async (mode) => {
+    const onPersistSegments = vi.fn(async () => ({ ok: false, reason: "network" }));
+    const onReanchor = vi.fn();
+    const onReanchorReconcile = vi.fn(async () => ({ ok: true, revision: 9, segments: SEGMENTS }));
+    render(<LyricsEditor {...baseProps({ onPersistSegments, onReanchor, onReanchorReconcile })} />);
+    start(mode);
+    await waitFor(() => expect(screen.queryByTestId("reanchor-progress-overlay")).toBeNull());
+    expect(onReanchor).not.toHaveBeenCalled();
+    expect(onReanchorReconcile).not.toHaveBeenCalled();
+    if (mode === "paste") {
+      expect(screen.getByRole("alert")).toHaveTextContent("no se pudieron guardar tus cambios");
+      expect(screen.getByTestId("paste-lyrics-textarea")).toHaveValue("linea uno\nlinea dos\nlinea tres");
+    } else {
+      expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({
+        tone: "error", message: expect.stringContaining("no se pudieron guardar tus cambios"),
+      }));
+    }
+  });
+
+  it("confirmation shows the completed task's real error and keeps the pasted lyrics", async () => {
+    const onReanchor = vi.fn()
+      .mockResolvedValueOnce({ ok: false, code: "reference_structure_unconfirmed", structure: {
+        pasted_line_count: 40, current_line_count: 18, reasons: ["line_count_divergent"], metrics: {},
+      } })
+      .mockResolvedValueOnce({ ok: false, status: 409, terminal: true,
+        detail: "El audio original ya no está disponible para este job." });
+    const onReanchorReconcile = vi.fn(async () => ({ ok: true, revision: 9, segments: SEGMENTS }));
+    render(<LyricsEditor {...baseProps({ onReanchor, onReanchorReconcile })} />);
+    start("paste");
+    await waitFor(() => expect(screen.getByTestId("paste-lyrics-confirm-anyway")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("paste-lyrics-confirm-anyway"));
+    expect(await screen.findByText("El audio original ya no está disponible para este job.")).toHaveAttribute("role", "alert");
+    expect(onReanchor).toHaveBeenLastCalledWith("job-reanchor", 0, {
+      lyrics_text: "linea uno\nlinea dos\nlinea tres", confirm_structure: true,
+    });
+    expect(onReanchorReconcile).not.toHaveBeenCalled();
+    expect(screen.getByTestId("paste-lyrics-textarea")).toHaveValue("linea uno\nlinea dos\nlinea tres");
+    expect(toastSpy).not.toHaveBeenCalled();
+  });
+
+  it("an alignment decline never loads unrelated server lyrics", async () => {
+    const onReanchor = vi.fn(async () => ({ ok: false, reason: "declined" }));
+    const onReanchorReconcile = vi.fn(async () => ({ ok: true, revision: 9, segments: SEGMENTS }));
+    render(<LyricsEditor {...baseProps({ onReanchor, onReanchorReconcile })} />);
+    start("paste");
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("alineación utilizable"));
+    expect(onReanchorReconcile).not.toHaveBeenCalled();
+    expect(toastSpy).not.toHaveBeenCalled();
+  });
 
   it.each(["editor", "paste"])("%s: bloquea desde el guardado hasta aplicar la respuesta", async (mode) => {
     let finishSave;
@@ -410,7 +460,7 @@ describe("Loader bloqueante de re-sincronización", () => {
     expect(container).not.toHaveAttribute("inert");
     if (mode === "paste") {
       expect(screen.getByTestId("paste-lyrics-textarea")).toHaveValue("linea uno\nlinea dos\nlinea tres");
-      expect(screen.getByRole("alert")).toHaveTextContent("No se pudo re-sincronizar");
+      expect(screen.getByRole("alert")).toHaveTextContent("No se pudo confirmar");
     } else expect(toastSpy).toHaveBeenCalledWith(expect.objectContaining({ tone: "error" }));
   });
 });

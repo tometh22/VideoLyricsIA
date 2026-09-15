@@ -9,6 +9,7 @@ import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
 import LocalDraftRecovery from "./LocalDraftRecovery";
 import ReanchorProgressDialog from "./ReanchorProgressDialog";
+import { reanchorFailureMessage, shouldRecoverReanchor } from "../lib/reanchorResult";
 import LyricVideoPreview from "./LyricVideoPreview";
 import { referenceSuggestionsById } from "../lib/referenceSuggestions";
 import { tierForLength } from "../lib/lyricTiers";
@@ -2167,15 +2168,20 @@ export default function LyricsEditor({
     if (!onReanchor || !transcribeJobId || reanchoring) return;
     setReanchoring(true);
     let baseRevision = Number.isInteger(segmentsRevision) ? segmentsRevision : 0;
+    let requestStarted = false;
     try {
       let saved = null;
       if (onPersistSegments) {
         saved = await flushPendingSave(null, true);
-        if (saved?.ok === false) throw new Error(saved.reason || "save-failed");
+        if (saved?.ok === false) {
+          toast({ message: reanchorFailureMessage({ ...saved, phase: "save" }, t), tone: "error" });
+          return;
+        }
       }
       baseRevision = Number.isInteger(saved?.revision)
         ? saved.revision
         : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
+      requestStarted = true;
       let res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision));
       // Gate estructural del backend (2026-09-13): el texto editado tiene
       // estrofas que la transcripción nunca oyó. Igual que en el modal de
@@ -2212,23 +2218,23 @@ export default function LyricsEditor({
           tone: "error",
         });
       } else {
-        const recovered = await recoverReanchorFromServer(baseRevision);
+        const recovered = shouldRecoverReanchor(res) ? await recoverReanchorFromServer(baseRevision) : null;
         if (recovered) {
           applyReanchorResult(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
         } else {
           toast({
-            message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
+            message: reanchorFailureMessage(res, t),
             tone: "error",
           });
         }
       }
     } catch {
-      const recovered = await recoverReanchorFromServer(baseRevision);
+      const recovered = requestStarted ? await recoverReanchorFromServer(baseRevision) : null;
       if (recovered) {
         applyReanchorResult(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
       } else {
         toast({
-          message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
+          message: reanchorFailureMessage(requestStarted ? null : { phase: "save" }, t),
           tone: "error",
         });
       }
@@ -2263,6 +2269,7 @@ export default function LyricsEditor({
     setPasteBusy(true);
     setPasteError("");
     let baseRevision = Number.isInteger(segmentsRevision) ? segmentsRevision : 0;
+    let requestStarted = false;
     const finishPaste = (res, message) => {
       applyReanchorResult(res, message);
       setPasteOpen(false);
@@ -2273,11 +2280,15 @@ export default function LyricsEditor({
       let saved = null;
       if (onPersistSegments) {
         saved = await flushPendingSave(null, true);
-        if (saved?.ok === false) throw new Error(saved.reason || "save-failed");
+        if (saved?.ok === false) {
+          setPasteError(reanchorFailureMessage({ ...saved, phase: "save" }, t));
+          return;
+        }
       }
       baseRevision = Number.isInteger(saved?.revision)
         ? saved.revision
         : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
+      requestStarted = true;
       const res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision, {
         lyrics_text: pasteText,
         confirm_structure: confirmStructure,
@@ -2306,19 +2317,19 @@ export default function LyricsEditor({
             .replace("{n}", String(res.structural?.crammed_lines ?? "?")),
         );
       } else {
-        const recovered = await recoverReanchorFromServer(baseRevision);
+        const recovered = shouldRecoverReanchor(res) ? await recoverReanchorFromServer(baseRevision) : null;
         if (recovered) {
           finishPaste(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
         } else {
-          setPasteError(t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.");
+          setPasteError(reanchorFailureMessage(res, t));
         }
       }
     } catch {
-      const recovered = await recoverReanchorFromServer(baseRevision);
+      const recovered = requestStarted ? await recoverReanchorFromServer(baseRevision) : null;
       if (recovered) {
         finishPaste(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
       } else {
-        setPasteError(t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.");
+        setPasteError(reanchorFailureMessage(requestStarted ? null : { phase: "save" }, t));
       }
     } finally {
       setPasteBusy(false);
