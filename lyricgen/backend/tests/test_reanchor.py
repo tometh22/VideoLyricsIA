@@ -16,6 +16,8 @@ contrato ya está cubierto por tests/test_anchor_lyrics.py.
 import os
 import uuid
 
+import pytest
+
 import main as main_mod
 from tests.conftest import auth
 
@@ -935,7 +937,8 @@ def test_reanchor_task_registry_uses_redis_when_available(client, monkeypatch):
     assert task_id not in main_mod._REANCHOR_TASK_LOCAL
 
 
-def test_reanchor_renews_quality_and_commits_outbox_before_dispatch(client, monkeypatch):
+@pytest.mark.parametrize("engine_precision", [False, True])
+def test_reanchor_renews_quality_and_commits_outbox_before_dispatch(client, monkeypatch, engine_precision):
     from database import Job, SessionLocal
     from transcription_quality import segments_hash
 
@@ -956,6 +959,14 @@ def test_reanchor_renews_quality_and_commits_outbox_before_dispatch(client, monk
     finally:
         db.close()
 
+    if engine_precision:
+        async def precise_align(result, audio_path, job_id, anchor_lyrics):
+            retimed = _retimed()
+            retimed[2]["start"] = 4.70000274658203
+            retimed[3]["end"] = 8.40000305175781
+            return {**result, "segments": retimed, "timing_source": "anchor_ctc"}
+        monkeypatch.setattr(main_mod, "_maybe_anchor_align", precise_align)
+
     dispatched = []
     def dispatch(event_id):
         from database import JobOutboxEvent
@@ -973,6 +984,8 @@ def test_reanchor_renews_quality_and_commits_outbox_before_dispatch(client, monk
     quality = client.get(f"/editor/{job_id}", headers=auth(token)).json()["transcription_quality"]
     assert quality["evaluated_revision"] == result.json()["revision"] == 1
     assert quality["segments_hash"] == segments_hash(result.json()["segments"])
+    assert quality["segments_hash"] == segments_hash(_db_segments(job_id))
+    assert result.json()["segments"] == _db_segments(job_id)
     assert quality["analysis_status"] == "superseded_by_edit"
     assert quality["render_blocked"] is True
     assert quality["unsafe_windows"]

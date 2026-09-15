@@ -3,6 +3,14 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.30] - 2026-09-15
+
+### Fixed
+
+- Canonicalize re-anchored timestamps before persisting and scheduling quality
+  analysis, so real aligner precision cannot leave quality checks waiting on
+  a snapshot hash that differs from the editor's saved revision.
+
 ## [1.1.29] - 2026-09-15
 
 ### Fixed
