@@ -3,6 +3,26 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.43] - 2026-09-15
+
+### Fixed
+
+- Stop renaming a delivery when it is re-published. The default label counts
+  the active deliveries for that song and the row being updated counted
+  itself, so shipping a correction rebaptised "Campaña" as "Opción 2" — a
+  second option that does not exist — on the client's screen. An explicit
+  label still wins, and a genuinely new delivery of the same song still gets
+  "Opción N".
+- Read the ProRes obligation from the delivery's own `file_types` instead of
+  the job's profile columns. A job can carry `delivery_profile="youtube"` and
+  `umg_spec` as JSON `null` — which is not SQL NULL, so `umg_spec IS NOT NULL`
+  returns true and misleads every diagnostic query — and still have a
+  published broadcast master. In that shape the freshness check found nothing
+  and the portal kept serving a pre-edit master.
+- Say what is actually wrong when a stale master has no ProRes spec, instead
+  of "this video was generated for YouTube only" about a video the client
+  already received as a delivery.
+
 ## [1.1.42] - 2026-09-15
 
 ### Fixed
