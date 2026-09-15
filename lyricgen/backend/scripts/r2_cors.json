@@ -5,6 +5,7 @@
       "AllowedOrigins": [
         "https://app.genly.pro",
         "https://staging.genly.pro",
+        "https://trial.genly.pro",
         "https://staging.app.genly.pro",
         "https://genly.pro",
         "https://www.genly.pro",
