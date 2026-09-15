@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.32] - 2026-09-15
+
+### Fixed
+
+- Recover missing campaign audio references only from the validated immutable
+  full-audio machine snapshot bound to the same recording and revision, so
+  legacy quality replays cannot leave an otherwise reviewed song blocked.
+- Show the specific audio-reference rejection during campaign approval and
+  reserve automatic revision retries for real editor conflicts.
+
 ## [1.1.31] - 2026-09-15
 
 ### Fixed

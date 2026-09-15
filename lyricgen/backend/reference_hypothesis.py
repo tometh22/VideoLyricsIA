@@ -12,6 +12,11 @@ from typing import Any
 
 
 SCHEMA = "batch-reference-hypothesis-v1"
+_RECOVERABLE_EVIDENCE_VIEW = "full_audio_with_reference"
+_RECOVERABLE_EVIDENCE_TRANSFORMATIONS = {
+    "gemini_cleanup_raw",
+    "gemini_reference_hypothesis_raw",
+}
 
 
 def audio_only_batch_mode(*, reference_required: bool, workload_class: str) -> bool:
@@ -143,6 +148,98 @@ def build_from_candidate(
         complete_audio_verified=bool(candidate.get("complete_audio_verified")),
         **common,
     ), False
+
+
+def recover_from_machine_evidence(
+    evidence: Any,
+    *,
+    original_segments: list[dict[str, Any]],
+    audio_sha256: str,
+    audio_revision: int,
+) -> tuple[dict[str, Any] | None, str]:
+    """Recover a missing reference from an immutable full-audio snapshot.
+
+    A historical quality-replay race could replace ``transcription_quality``
+    after the worker attached ``reference_hypothesis``. Recovery is deliberately
+    narrow: every machine-evidence hash, the selected pre-human snapshot and the
+    exact audio identity must validate. Edited lyrics, catalogues, memory and
+    partial ASR streams are never accepted as substitutes.
+    """
+    from machine_evidence import (
+        MachineSnapshotMissing,
+        SCHEMA as MACHINE_EVIDENCE_SCHEMA,
+        validate_machine_evidence,
+    )
+
+    if not isinstance(evidence, dict) or evidence.get("schema") != MACHINE_EVIDENCE_SCHEMA:
+        return None, "reference_recovery_machine_evidence_missing"
+    if (
+        not isinstance(audio_sha256, str)
+        or len(audio_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in audio_sha256)
+    ):
+        return None, "reference_recovery_audio_identity_missing"
+    try:
+        validate_machine_evidence(evidence, original_segments)
+    except MachineSnapshotMissing as exc:
+        return None, str(exc) or "reference_recovery_machine_evidence_invalid"
+
+    pre_human = evidence.get("pre_human") or {}
+    if str(pre_human.get("audio_sha256") or "") != audio_sha256:
+        return None, "reference_recovery_audio_mismatch"
+    if int(pre_human.get("audio_revision") or 0) != int(audio_revision or 0):
+        return None, "reference_recovery_audio_revision_mismatch"
+
+    candidates = [
+        candidate
+        for candidate in (evidence.get("hypotheses_by_family") or [])
+        if isinstance(candidate, dict)
+        and candidate.get("role") == "primary"
+        and candidate.get("kind") == "text"
+        and candidate.get("view") == _RECOVERABLE_EVIDENCE_VIEW
+        and candidate.get("transformation")
+        in _RECOVERABLE_EVIDENCE_TRANSFORMATIONS
+        and "gemini" in str(candidate.get("family") or "").casefold()
+    ]
+    if len(candidates) != 1:
+        return None, "reference_recovery_candidate_missing"
+    events = candidates[0].get("events") or []
+    if len(events) != 1 or not isinstance(events[0], dict):
+        return None, "reference_recovery_candidate_invalid"
+    text = str(events[0].get("text") or "").strip()
+    if not text:
+        return None, "reference_recovery_candidate_empty"
+
+    quality = (evidence.get("decisions") or {}).get("quality") or {}
+    hypothesis = build(
+        text=text,
+        provider=str(candidates[0].get("family") or "gemini-2.5-flash-audio"),
+        audio_sha256=audio_sha256,
+        audio_revision=audio_revision,
+        source_kind="gemini_complete_audio_derived",
+        complete_audio_verified=True,
+        attestation=(
+            quality.get("reference_attestation")
+            if isinstance(quality, dict) else {}
+        ) or {},
+        source_version={
+            "pipeline_release": (
+                quality.get("pipeline_release")
+                if isinstance(quality, dict) else None
+            ),
+            "pipeline_config_fingerprint": (
+                quality.get("pipeline_config_fingerprint")
+                if isinstance(quality, dict) else None
+            ),
+            "recovered_from": "machine_evidence",
+        },
+    )
+    valid, reason = validate_binding(
+        hypothesis,
+        audio_sha256=audio_sha256,
+        audio_revision=audio_revision,
+    )
+    return (hypothesis, "ok") if valid else (None, reason)
 
 
 def validate_binding(

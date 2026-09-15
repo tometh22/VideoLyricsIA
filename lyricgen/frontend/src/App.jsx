@@ -72,7 +72,7 @@ import {
   useBackgroundPreview,
 } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
-import { translateBackendError } from "./lib/lyricsEditSubmit";
+import { campaignApprovalFailure, translateBackendError } from "./lib/lyricsEditSubmit";
 import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
 import { loadReviewWaveform } from "./lib/loadReviewWaveform";
 import { persistSegments } from "./lib/persistSegments";
@@ -4239,11 +4239,7 @@ export default function App() {
         );
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {
-          return {
-            ok: false,
-            reason: response.status === 409 ? "conflict" : `http-${response.status}`,
-            conflict: body?.detail || null,
-          };
+          return campaignApprovalFailure(response, body, t);
         }
         wizardPersistence.clear();
         segmentsStore.evict(reviewStoreKey(r));
