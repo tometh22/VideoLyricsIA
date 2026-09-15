@@ -25,7 +25,7 @@ El recorrido de lyric videos tiene cuatro pasos visibles: **Letras → Generar v
 - La mejora del editor interno que se prepara en `feat/editor-unified-review` sigue separada. Aquí se corrigen entradas, salidas y continuidad de revisión; no se reemplazan letra, tiempos ni audio del cliente.
 - La interfaz no acelera el render del proveedor ni certifica la calidad de las letras. La reducción de tiempo operativo todavía debe medirse con uso real.
 - Ninguna aprobación ni entrega real fue ejecutada al validar. Las pruebas de navegador usan datos y respuestas simulados.
-- Es una implementación local sobre staging `56602592` (1.1.39); esta revisión no incluye publicación ni migraciones.
+- Release de staging 1.1.40, basado en `56602592` (1.1.39). Sin migraciones.
 
 ## Validación
 
