@@ -1041,3 +1041,86 @@ def test_stale_master_without_a_prores_spec_says_what_is_actually_wrong(
     assert "ANTES de la edición" in detail["message"]
     # No se encola nada: sin spec no hay con qué transcodificar.
     enqueue.assert_not_called()
+
+
+def test_republishing_does_not_rename_the_delivery(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Visto en vivo al reparar la entrega 289 (2026-09-15).
+
+    `_compute_default_delivery_label` cuenta las entregas activas de esa
+    canción, y la fila que se está actualizando se cuenta a sí misma: publicar
+    de nuevo rebautizaba "Campaña" como "Opción 2" — una segunda opción que no
+    existe, en la pantalla del cliente. Con "Publicar actualización" como
+    botón, pasaría en cada corrección.
+    """
+    from database import Delivery
+
+    first = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"label": "Campaña"},
+    )
+    assert first.status_code == 200, first.text
+    delivery_id = first.json()["delivery_id"]
+    assert first.json()["label"] == "Campaña"
+
+    _edit_the_render(db, approved_job)
+    again = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["label"] == "Campaña"
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    db.refresh(row)
+    assert row.label == "Campaña"
+
+    # Un label explícito sigue mandando.
+    renamed = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"label": "Renderizado v3"},
+    )
+    assert renamed.json()["label"] == "Renderizado v3"
+
+
+def test_a_genuinely_new_delivery_still_gets_opcion_n(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """El contrapeso: la convención de "Opción N" es para una entrega nueva de
+    la misma canción, y esa sí tiene que numerarse."""
+    client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    # Otro job, misma canción y artista: es una segunda opción de verdad.
+    from database import Job
+    me = client.get("/auth/me", headers=auth(admin_token)).json()
+    sibling = Job(
+        job_id="testjob54321", user_id=me["id"], tenant_id="default",
+        artist=approved_job.artist, song_title=approved_job.song_title,
+        filename="test.mp3", status="done", delivery_profile="umg",
+        umg_spec={"frame_size": "HD", "fps": 24.0, "prores_profile": 3},
+        approved_by=me["id"], approved_at=datetime.now(timezone.utc),
+        video_url="/download/testjob54321/video",
+        short_url="/download/testjob54321/short",
+        thumbnail_url="/download/testjob54321/thumbnail",
+    )
+    db.add(sibling)
+    db.commit()
+    try:
+        res = client.post(
+            f"/admin/deliveries/from-job/{sibling.job_id}",
+            headers=auth(admin_token), json={},
+        )
+        assert res.status_code == 200, res.text
+        assert res.json()["label"] == "Opción 2"
+    finally:
+        from database import Delivery, DeliveryChangeRequest
+        ids = [d.id for d in db.query(Delivery).filter(Delivery.job_id == "testjob54321").all()]
+        if ids:
+            db.query(DeliveryChangeRequest).filter(
+                DeliveryChangeRequest.delivery_id.in_(ids)
+            ).delete(synchronize_session=False)
+        db.query(Delivery).filter(Delivery.job_id == "testjob54321").delete()
+        db.query(Job).filter(Job.job_id == "testjob54321").delete()
+        db.commit()

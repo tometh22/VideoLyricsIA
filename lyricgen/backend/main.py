@@ -19870,13 +19870,6 @@ async def admin_create_delivery_from_job(
             headers={"Retry-After": "10"},
         )
 
-    # Compute label. If caller passed one, honor it. Otherwise: first
-    # delivery for this song gets "Renderizado"; subsequent ones get
-    # "Opción N". Matches the manual items.json conventions.
-    label = (body.label if body else None) or _compute_default_delivery_label(
-        ddb, job.artist, job.song_title, portal_id
-    )
-
     # added_by_user_id es FK NOT NULL a users.id de la DB de deliveries. Con
     # DB externa (prod) el id de staging no existe allí → mapear a un admin
     # de prod vía deliveries_added_by(). Sin DB externa, es el current_user.
@@ -19884,8 +19877,8 @@ async def admin_create_delivery_from_job(
 
     # Replace-not-duplicate: if there's already an active Delivery for
     # this job_id, update it in place. Operator clicks "Enviar a UMG"
-    # again after a re-render → we refresh the label + timestamp, the
-    # R2 files stay the same (worker overwrites on edit).
+    # again after a re-render → we refresh the timestamp, the R2 files
+    # stay the same (worker overwrites on edit).
     existing = (
         ddb.query(Delivery)
         .filter(Delivery.job_id == job_id)
@@ -19893,6 +19886,22 @@ async def admin_create_delivery_from_job(
         .filter(Delivery.removed_at.is_(None))
         .first()
     )
+
+    # El label por defecto es para una entrega NUEVA: primera de esa canción
+    # = "Renderizado", siguientes = "Opción N" (convención heredada del
+    # items.json manual). Re-publicar NO renombra: _compute_default_delivery_
+    # label cuenta las entregas activas y la fila que estamos actualizando se
+    # cuenta a sí misma, así que actualizar "Campaña" la rebautizaba
+    # "Opción 2" — una segunda opción que no existe, sobre la pantalla del
+    # cliente. Visto en vivo al reparar la entrega 289 (2026-09-15), y ahora
+    # que publicar una corrección es un botón, pasaría en cada corrección.
+    explicit_label = (body.label if body else None)
+    if existing is not None:
+        label = explicit_label or existing.label
+    else:
+        label = explicit_label or _compute_default_delivery_label(
+            ddb, job.artist, job.song_title, portal_id
+        )
     # Identidad del corte que está en R2 ahora. Comparada contra la que se
     # publicó, es lo que separa "corregí esto y lo mando" de "toqué el botón
     # dos veces": las keys de R2 son determinísticas, así que sin esto la
