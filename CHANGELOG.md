@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.18-trial.8] - 2026-09-15
+
+### Fixed
+
+- Preserve an immediate Play request while a just-finished render is still being
+  prepared by the browser; show explicit progress instead of silently ignoring it.
+- Recover bounded playback rejections and stalls with a fresh cache-busted preview
+  URL while keeping the operator's Play intent. No backend, generation, scenes,
+  credits, production or staging changes.
+
 ## [1.1.18-trial.7] - 2026-09-15
 
 ### Fixed

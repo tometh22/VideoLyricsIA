@@ -712,24 +712,39 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // (pending_review→editing), not when it completes — status flipping back
   // to pending_review is the completion signal that must swap the URL.
   const mediaVersion = `${job.edit_count || 0}-${job.status || ""}`;
-  const previewSrc = useMediaUrl(job.job_id, previewMediaType, "preview", mediaVersion);
+  const [videoReloadKey, setVideoReloadKey] = useState(0);
+  // Every recovery gets a distinct URL. Remounting a <video> with the same
+  // URL is not enough: Chromium may reuse a stalled response or an expired
+  // redirect. The retry suffix forces a fresh API redirect while the player
+  // component itself stays mounted, preserving an operator's Play intent.
+  const previewVersion = `${mediaVersion}-retry-${videoReloadKey}`;
+  const previewSrc = useMediaUrl(job.job_id, previewMediaType, "preview", previewVersion);
   const downloadHref = useMediaUrl(job.job_id, previewMediaType, "download", mediaVersion);
 
-  // Auto-retry the <video> load. A just-finished job flips to
-  // pending_review the instant the DB row updates, but the MP4 can lag a
-  // beat landing in R2. The <video> loads once, fails, and (without this)
-  // shows a crossed-out play button until the operator manually switches
-  // tabs and back — which remounts the element and reloads. We reproduce
-  // that remount automatically on error, with backoff to let R2 settle.
-  const [videoReloadKey, setVideoReloadKey] = useState(0);
+  // Auto-retry errors and playback stalls. A just-finished MP4 can still be
+  // preparing in the browser even though the API and R2 already have it.
   const videoRetriesRef = useRef(0);
-  // Fresh retry budget whenever the source or tab changes (new media).
-  useEffect(() => { videoRetriesRef.current = 0; }, [previewSrc, activeTab]);
+  const videoRetryTimersRef = useRef(new Set());
+  // Fresh retry budget only for genuinely new media. `previewSrc` also
+  // changes on a retry and must not reset the budget (that would loop).
+  useEffect(() => {
+    videoRetriesRef.current = 0;
+    for (const timer of videoRetryTimersRef.current) clearTimeout(timer);
+    videoRetryTimersRef.current.clear();
+  }, [job.job_id, mediaVersion, activeTab]);
+  useEffect(() => () => {
+    for (const timer of videoRetryTimersRef.current) clearTimeout(timer);
+    videoRetryTimersRef.current.clear();
+  }, []);
   const handleVideoError = useCallback(() => {
     if (videoRetriesRef.current < 4) {
       videoRetriesRef.current += 1;
       const delay = 1500 * videoRetriesRef.current; // 1.5s, 3s, 4.5s, 6s
-      setTimeout(() => setVideoReloadKey((k) => k + 1), delay);
+      const timer = setTimeout(() => {
+        videoRetryTimersRef.current.delete(timer);
+        setVideoReloadKey((k) => k + 1);
+      }, delay);
+      videoRetryTimersRef.current.add(timer);
     }
   }, []);
 
@@ -2176,7 +2191,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           ) : (
             previewSrc ? (
               <ReviewVideoPlayer
-                key={`${activeTab}-${videoReloadKey}-${mediaVersion}`}
+                key={`${activeTab}-${mediaVersion}`}
                 ref={activeTab === "video" ? videoRef : undefined}
                 src={previewSrc}
                 isShort={activeTab === "short"}
