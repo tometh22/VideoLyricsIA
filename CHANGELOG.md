@@ -3,6 +3,19 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.18-trial.4] - 2026-09-15
+
+### Fixed
+
+- Trial frontend: keep Multi-scene, typography, prompts and metadata when fresh
+  transcription navigates to its canonical review URL instead of treating it as a cold resume.
+- Restore matching-tab creative settings on review reload; fetch authoritative lyrics,
+  revisions and review gates from the API. Never inherit another song's local settings.
+- Retain custom-background mode after reload so the existing missing-file guard asks
+  for re-upload instead of silently replacing the background with AI.
+- Include trial.genly.pro in the storage CORS policy and test PUT/GET/HEAD access for
+  every supported origin. No backend source, production or staging deployment changes.
+
 ## [1.1.18-trial.3] - 2026-09-14
 
 ### Added
