@@ -67,6 +67,12 @@ export function layoutChanged(baseline, payloadSegments) {
 export function translateBackendError(raw, t) {
   if (raw == null) return null;
   const tr = typeof t === "function" ? t : () => null;
+  if (raw && typeof raw === "object" && raw.code === "batch_render_window_full") {
+    return "La cola de generación de tu equipo está completa. Esperá a que terminen algunos videos para enviar los siguientes.";
+  }
+  if (raw && typeof raw === "object" && raw.code === "batch_final_review_full") {
+    return "Tu equipo tiene demasiados videos pendientes de revisión final. Revisá y aprobá o rechazá algunos para poder generar más.";
+  }
   if (raw && typeof raw === "object" && raw.code === "edit_in_progress") {
     return tr("edit.error_already_editing") ||
       "Este video se está re-renderizando ahora. Esperá a que termine (revisalo en la página del video) y volvé a aplicar tus cambios.";
