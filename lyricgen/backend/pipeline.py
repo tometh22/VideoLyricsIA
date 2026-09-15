@@ -12219,33 +12219,12 @@ def _generate_veo_video(prompt: str, output_path: str, job_id: str = None,
             f"{_legibility_cap}"
         )
 
-    # veo-3.1-fast at $0.10/s (no audio) is 75% cheaper than the standard
-    # veo-3.1-generate at $0.40/s. Visual quality is slightly softer; we
-    # apply a small gaussian blur after generation to smooth edges and
-    # improve lyric legibility on top of the background.
-    #
-    # Blur sigma was 2.0 originally — UMG flagged the rendered backgrounds
-    # as low-definition during the live demo, and the heavy blur was the
-    # main culprit (compounding the softness Veo Fast already has). Now
-    # 1.0 by default — preserves more detail while still smoothing micro
-    # artefacts. Tune via env var without redeploy if needed.
-    model = os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip()
-    # Static / verbatim renders are exactly the cases where prompt adherence
-    # matters most (the user asked for a precise, often locked-camera result).
-    # The fast model has a stronger drift prior; the standard model follows
-    # "static shot" better but costs ~4x. Route ONLY these renders to a
-    # higher-fidelity model when VEO_MODEL_STATIC is set — leaves the default
-    # untouched for everything else, and lets us A/B fast-vs-standard + measure
-    # real cost without a redeploy (see plan Phase 5).
-    _static_model = os.environ.get("VEO_MODEL_STATIC", "").strip()
-    if _static_model and (high_fidelity or _norm_move in {"estatico", "foto-estatica"}):
-        model = _static_model
-        logger.info("[BG] high-fidelity render → model=%s (movement=%s, verbatim=%s)",
-                    model, _norm_move or "auto", high_fidelity)
-    # The campaign's frozen model choice wins over ordinary/default routing.
-    # It participates in the existing cache key, budget and provenance below.
+    # Cost policy is enforced at the provider boundary, including ordinary
+    # jobs, campaign jobs, previews, edits and static/high-fidelity requests.
+    # Neither stale environment overrides nor saved Fast contracts may spend
+    # on a different Veo model. The model remains part of cache/provenance.
     from campaign_models import model_for_campaign_job
-    model = model_for_campaign_job(job_id, model)
+    model = model_for_campaign_job(job_id)
     veo_params = {
         "aspectRatio": "16:9",
         "sampleCount": 1,
@@ -15556,10 +15535,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             if _norm_move_bg in {"estatico", "foto-estatica"}:
                 _drift = _measure_camera_drift(bg_path)
                 if _drift:
-                    # El modelo va en la línea porque es la variable que se
-                    # quiere correlacionar: veo-3.1-fast tiene un drift prior
-                    # más fuerte que el standard, y VEO_MODEL_STATIC (hoy sin
-                    # setear) es la mitigación a evaluar con estos datos.
+                    # Record the enforced model alongside drift measurements.
+                    from campaign_models import VEO_LITE
                     # `attempt` va en la línea porque este bloque corre DENTRO
                     # del loop de reintentos: si hay un re-roll por calidad o
                     # por corte de escena, se mide también el clip descartado.
@@ -15570,8 +15547,7 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                         "[BG][DRIFT] job=%s attempt=%s movement=estatico model=%s "
                         "drift_pct=%.2f drift_pct_borders=%.2f peak_px=%.1f frames=%s",
                         job_id, attempt,
-                        (os.environ.get("VEO_MODEL_STATIC", "").strip()
-                         or os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip()),
+                        VEO_LITE,
                         _drift["pct_width"], _drift["pct_width_borders"],
                         _drift["peak_px"], _drift["frames"],
                     )
