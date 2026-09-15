@@ -3,6 +3,17 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.36] - 2026-09-15
+
+### Fixed
+
+- Enforce Veo Lite for every new video background, including static shots,
+  previews, scenes and edits; remove Fast and environment model overrides.
+- Apply the Lite policy to older campaign assignments for future generation,
+  preserving the original requested model in new receipts and historical audit.
+- Bind preview caches and model disclosures to Lite; restrict generation tools
+  to the same policy and remove the campaign model selector.
+
 ## [1.1.32] - 2026-09-15
 
 ### Fixed

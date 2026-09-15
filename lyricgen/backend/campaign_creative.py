@@ -13,7 +13,6 @@ import hashlib
 import io
 import json
 import math
-import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +26,7 @@ from sqlalchemy.orm import Session
 from auth import get_current_user, has_scenes_access
 from database import AuditLog, BackgroundAsset, BatchCampaign, BatchCampaignItem, EditorDocument, Job, get_db
 from batch_campaigns import _campaign_or_404, _require_manager, _require_scope, _aware
-from campaign_models import veo_models
+from campaign_models import VEO_LITE, effective_veo_assignment, veo_models
 
 router = APIRouter(prefix="/batch/campaigns", tags=["campaign-creative"])
 KEY = "creative_plan"
@@ -258,8 +257,13 @@ def validate_combination(db, campaign, settings, group, user):
 def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
     campaign = _campaign(db, campaign_id, current_user)
     jobs = {j.campaign_item_id: j for j in db.query(Job).filter_by(campaign_id=campaign.id).all() if j.campaign_item_id}
-    return {"campaign_id": campaign.id, "plan": _plan(campaign), "fields": FIELDS,
-            "veo_model": os.environ.get("VEO_MODEL", "veo-3.1-fast-generate-001").strip(),
+    plan = _plan(campaign)
+    plan = {**plan, "groups": [
+        {**group, "model": VEO_LITE} if group.get("requirement") == "veo" else group
+        for group in plan.get("groups", [])
+    ]}
+    return {"campaign_id": campaign.id, "plan": plan, "fields": FIELDS,
+            "veo_model": VEO_LITE,
             "veo_models": veo_models(),
             "can_manage": current_user.get("role") == "admin" or campaign.created_by == current_user.get("id"),
             "items": [{"id": i.id, "ordinal": i.ordinal, "artist": i.artist, "title": i.title or i.filename,
@@ -267,7 +271,7 @@ def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: S
                        "job_id": jobs[i.id].job_id if i.id in jobs else None,
                        "status": jobs[i.id].status if i.id in jobs else "waiting",
                        "settings": effective_settings(campaign, i.render_overrides),
-                       "assignment": (i.render_overrides or {}).get(ASSIGNMENT)} for i in _items(db, campaign)],
+                       "assignment": effective_veo_assignment((i.render_overrides or {}).get(ASSIGNMENT))} for i in _items(db, campaign)],
             "operations": [{"id": r.detail.get("operation_id"), "at": str(r.created_at), "actor": r.user_id,
                             "reason": r.detail.get("reason"), "revision": r.detail.get("revision")}
                            for r in _logs(db, campaign, "applied").limit(100).all()]}
@@ -443,7 +447,7 @@ def generation_receipt(db, job, submitted_revision, settings, actor):
         return
     campaign = db.query(BatchCampaign).filter_by(id=job.campaign_id).one()
     item = db.query(BatchCampaignItem).filter_by(id=job.campaign_item_id).first()
-    assignment = (item.render_overrides or {}).get(ASSIGNMENT) if item else None
+    assignment = effective_veo_assignment((item.render_overrides or {}).get(ASSIGNMENT) if item else None)
     if not assignment:
         return
     if str(assignment["revision"]) != str(submitted_revision):

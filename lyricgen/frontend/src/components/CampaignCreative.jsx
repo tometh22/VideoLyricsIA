@@ -10,6 +10,7 @@ import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBa
 import { useLazyMediaUrl, useMediaUrl } from "../mediaUrl";
 
 const API = import.meta.env.VITE_API_URL || "";
+const VEO_LITE = "veo-3.1-lite-generate-001";
 const input = "w-full rounded-lg bg-black/30 px-3 py-2 text-sm text-white ring-1 ring-white/15";
 const button = "rounded-lg bg-brand/20 px-4 py-2 text-sm text-brand-light disabled:opacity-40";
 const primaryButton = "rounded-lg bg-brand px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-brand/20 disabled:cursor-not-allowed disabled:opacity-40";
@@ -123,7 +124,7 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
     const [head, backgrounds, receipt] = await Promise.all([request(`${base}/creative`), request("/backgrounds"), request(`${base}/creative/report`)]);
     setData(head); setAssets(backgrounds); setReport(receipt);
     if (initialize) {
-      setGroups(head.plan.groups?.length ? head.plan.groups : [{ id: "estilo-1", name: "Estilo 1", weight: 100, requirement: "creative", model: "", settings: {} }]);
+      setGroups(head.plan.groups?.length ? head.plan.groups.map(g => g.requirement === "veo" ? { ...g, model: VEO_LITE } : g) : [{ id: "estilo-1", name: "Estilo 1", weight: 100, requirement: "creative", model: "", settings: {} }]);
       setMode(head.plan.mode || "percent");
       setAgreement(head.plan.contract?.agreement || ""); setRounding(head.plan.contract?.rounding_note || "");
     }
@@ -198,7 +199,7 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
   const chooseRequirement = (i, value) => {
     const patch = value === "photo_effect" ? { movement_style: "foto-parallax", effect: "bokeh", animate_image: false, enable_scenes: false, background_mode: "as_is" }
       : value === "veo" ? { movement_style: "estandar", background_id: null, animate_image: false, effect: "" } : {};
-    updateGroup(i, { requirement: value, model: value === "veo" ? data.veo_model : "", settings: { ...groups[i].settings, ...patch } });
+    updateGroup(i, { requirement: value, model: value === "veo" ? VEO_LITE : "", settings: { ...groups[i].settings, ...patch } });
   };
   const download = async ext => {
     const response = await fetch(`${API}${base}/creative/export.${ext}`, { headers: { Authorization: `Bearer ${localStorage.getItem("genly_token") || ""}` } });
@@ -272,7 +273,7 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
           <div className="grid gap-3 md:grid-cols-3"><label>Nombre del estilo<input aria-label={`Nombre del grupo ${i + 1}`} className={input} value={g.name} onChange={e => updateGroup(i, { name: e.target.value })} /></label>
             <label>{mode === "percent" ? "Porcentaje de canciones" : "Cantidad de canciones"}<input aria-label={`Cantidad del grupo ${i + 1}`} className={input} type="number" min="0" value={g.weight} onChange={e => updateGroup(i, { weight: Number(e.target.value) })} /></label>
             <label>Requisito<select aria-label={`Requisito del grupo ${i + 1}`} className={input} value={g.requirement} onChange={e => chooseRequirement(i, e.target.value)}><option value="creative">Ajustes creativos</option><option value="photo_effect">Foto fija + efecto</option><option value="veo">Fondo generado con Veo</option></select></label></div>
-          {g.requirement === "veo" && <div className="space-y-2"><label>Modelo de Veo<select aria-label={`Modelo del grupo ${i + 1}`} className={input} value={g.model} onChange={e => updateGroup(i, { model: e.target.value })}>{(data.veo_models || [{ id: data.veo_model, label: "Veo configurado" }]).map(m => <option key={m.id} value={m.id}>{m.label}</option>)}</select></label><p className="text-xs text-ink-secondary">Modelo comprometido: {g.model}. Se contrasta con la evidencia del fondo generado.</p></div>}
+          {g.requirement === "veo" && <div className="space-y-2"><p className="text-sm font-semibold">Modelo de fondo: Veo Lite</p><p className="text-xs text-ink-secondary">Todos los fondos nuevos usan Veo Lite. No se cambia automáticamente a un modelo más caro.</p></div>}
           <Controls fields={data.fields} values={g.settings} assets={assets} label={g.name} update={(k, v) => { const settings = { ...g.settings }; if (v === undefined) delete settings[k]; else settings[k] = v; updateGroup(i, { settings }); }} />
           <button className={button} onClick={() => setPreviewStyle(old => old === g.id ? null : g.id)}>Ver muestra del estilo</button>
           {previewStyle === g.id && <StylePreview settings={g.settings} assets={assets} />}
