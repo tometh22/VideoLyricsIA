@@ -3,6 +3,19 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.40] - 2026-09-15
+
+### Improved
+
+- Make the campaign workflow explicit: lyrics, video generation, video review,
+  and deliverables, preserving search and navigation context between steps.
+- Search campaign songs by title, artist, code, or filename regardless of
+  accents and word order; keep bulk actions within the filtered selection.
+- Approve and advance inside the campaign player, and track portal deliveries
+  with visible errors and stable retry identifiers.
+- Paginate large review queues, adapt rows and dialogs to mobile, and correct
+  art-track delivery previews and their result messages.
+
 ## [1.1.39] - 2026-09-15
 
 ### Fixed

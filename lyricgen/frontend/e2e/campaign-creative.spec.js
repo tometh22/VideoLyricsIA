@@ -18,6 +18,7 @@ async function harness(page) {
     const json = value => route.fulfill({ contentType: "application/json", body: JSON.stringify(value) });
     if (path === "/service-status/summary") return json({ status: "operational", incidents: [] });
     if (path.endsWith("/review-queue")) return json({ campaign, items: [], campaign_totals: { songs: 39, approved: 1 }, pages: 1, scope: { total: 0 }, counters: {} });
+    if (path === "/batch/campaigns/chile1") return json(campaign);
     if (path === "/batch/campaigns/chile1/creative") return json(head);
     if (path === "/backgrounds") return json([]);
     if (path.endsWith("/creative/report")) return json({ campaign_id: "chile1", name: campaign.name, at: new Date().toISOString(), contract: head.plan.contract || {}, groups: [], videos, history: [] });
@@ -94,15 +95,15 @@ test("39-song contract assignment survives reload, generates only approved selec
   expect(calls.generations[0]).toContain('name="effect"\r\n\r\nbokeh');
   expect(calls.generations[0]).toContain('name="campaign_creative_revision"\r\n\r\n1');
   expect(calls.generations[0]).toContain('name="base_revision"\r\n\r\n7');
-  await page.getByRole("button", { name: "Historial de videos", exact: true }).click();
+  await page.getByRole("button", { name: /3. Revisar videos/ }).click();
   await expect(page).toHaveURL(/view=history/);
   await expect(page.getByRole("heading", { name: "Videos de esta campaña (1)" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Canción 1", exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Reproducir" }).click();
+  await page.getByRole("button", { name: "Reproducir", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Reproducir Canción 1" })).toBeVisible();
   await expect(page.locator("video")).toBeVisible();
   await page.getByRole("button", { name: "Cerrar", exact: true }).click();
-  await page.getByRole("button", { name: "Aprobar" }).click();
+  await page.getByRole("button", { name: "Aprobar", exact: true }).click();
   await page.getByRole("button", { name: "Confirmar aprobación" }).click();
   await expect(page.getByText("Canción 1 quedó aprobado.")).toBeVisible();
   expect(calls.approvals).toEqual([{ notes: "Aprobado desde el historial de campaña" }]);

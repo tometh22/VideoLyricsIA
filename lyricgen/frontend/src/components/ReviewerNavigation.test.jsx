@@ -206,3 +206,50 @@ it("does not show a false empty campaign list while loading", async () => {
   fireEvent.click(await screen.findByRole("button", { name: /Campaña de prueba/ }));
   expect(screen.getByTestId("location")).toHaveTextContent("/campaigns/campaign-1");
 });
+
+it("keeps next inside the visible matching queue instead of claiming a different song", async () => {
+  const mock = setupFetch(url => url.pathname.endsWith("/review-queue") ? response({ ...payload("pending"), campaign, items: [{ ...ready, title: "Resultado encontrado" }] }) : null);
+  mount("/campaigns/campaign-1?q=garcia&tab=drafts");
+  await screen.findByText("Resultado encontrado");
+  fireEvent.click(screen.getByRole("button", { name: "Revisar siguiente canción" }));
+  await screen.findByText("Editor");
+  expect(screen.getByTestId("location")).toHaveTextContent("/review/j1?");
+  expect(decodeURIComponent(screen.getByTestId("location").textContent)).toContain("q=garcia");
+  expect(mock.mock.calls.some(([url]) => String(url).includes("/next"))).toBe(false);
+});
+
+it("paginates 300 songs without fetching again and preserves the page on return", async () => {
+  const mock = setupFetch(url => url.pathname.endsWith("/review-queue") ? response({ ...payload("pending"), campaign, items: Array.from({ length: 300 }, (_, i) => ({ ...ready, item_id: `i${i}`, job_id: `j${i}`, title: `Canción ${i}` })) }) : null);
+  mount("/campaigns/campaign-1");
+  await screen.findByText("Canción 24");
+  expect(screen.queryByText("Canción 25")).not.toBeInTheDocument();
+  const requests = mock.mock.calls.length;
+  fireEvent.click(within(screen.getByRole("navigation", { name: "Páginas de canciones" })).getByRole("button", { name: "Siguiente" }));
+  await screen.findByText("Canción 25");
+  expect(mock).toHaveBeenCalledTimes(requests);
+  fireEvent.click(screen.getAllByRole("button", { name: "Revisar", exact: true })[0]);
+  await screen.findByText("Editor");
+  expect(decodeURIComponent(screen.getByTestId("location").textContent)).toContain("rpage=2");
+});
+
+it("selects the requested campaign and searches the server without reloading the campaign list", async () => {
+  const mock = setupFetch(url => url.pathname === "/batch/campaigns" ? response({ items: [campaign, { ...campaign, id: "second", name: "Segunda campaña" }] }) : null);
+  mount("/admin/cola?campaign=second");
+  await screen.findByText(ready.title);
+  expect(screen.getByRole("combobox", { name: "Campaña de la cola" })).toHaveValue("second");
+  fireEvent.change(screen.getByRole("searchbox", { name: "Buscar canción o artista" }), { target: { value: "corazon garcia" } });
+  await waitFor(() => expect(mock.mock.calls.some(([url]) => String(url).includes("/second/review-queue") && String(url).includes("corazon%20garcia"))).toBe(true));
+  expect(mock.mock.calls.filter(([url]) => String(url) === "/batch/campaigns")).toHaveLength(1);
+});
+
+it("requests the art-track delivery preview using the backend POST contract", async () => {
+  const mock = setupFetch(url => {
+    if (url.pathname.endsWith("/review-queue")) return response({ ...payload("pending"), campaign: { ...campaign, kind: "art_track" } });
+    if (url.pathname.endsWith("/delivery-preview")) return response({ eligible_count: 2, hostname: "umgchile.genly.pro" });
+    return null;
+  });
+  mount("/campaigns/campaign-1");
+  fireEvent.click(await screen.findByRole("button", { name: "Previsualizar envíos" }));
+  await screen.findByText("2 art tracks aprobados para umgchile.genly.pro.");
+  expect(mock.mock.calls.find(([url]) => String(url).endsWith("/delivery-preview"))[1].method).toBe("POST");
+});

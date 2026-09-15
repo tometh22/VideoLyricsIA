@@ -1411,3 +1411,38 @@ def test_two_tabs_and_skip_claim_different_ready_jobs(client, admin_token, monke
     assert len({
         first.json()["job_id"], skipped.json()["job_id"], second.json()["job_id"],
     }) == 3
+
+@pytest.mark.parametrize("stage,status", [("lyrics", "transcribed_pending"), ("final", "pending_review")])
+def test_queue_and_next_share_accent_code_and_unordered_search(db, monkeypatch, stage, status):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 2)
+    user = db.query(User).first()
+    actor = {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}
+    items = db.query(BatchCampaignItem).filter_by(campaign_id=campaign.id).order_by(BatchCampaignItem.ordinal).all()
+    ids = []
+    for index, item in enumerate(items):
+        item.title = "Corazón en vivo" if index == 1 else "Otra canción"
+        item.artist = "Charly García" if index == 1 else "Divididos"
+        item.technical_code = f"ARUM-{index}"
+        job = Job(job_id=uuid.uuid4().hex[:12], user_id=user.id, tenant_id=campaign.tenant_id,
+                  artist=item.artist, song_title=item.title, filename=item.filename,
+                  campaign_id=campaign.id, campaign_item_id=item.id, workload_class="batch",
+                  status=status, segments_json=[{"start": 0, "end": 1, "text": "Letra"}])
+        db.add(job); ids.append(job.job_id)
+    db.commit()
+    query = "garcia ARUM 1 corazon"
+    args = dict(stage=stage, order="effort", scope="pending", state=None, version=None,
+                background_mode=None, artist=None, search=query, reviewed_by=None,
+                audit_preapproved=False, page=1, limit=1000, current_user=actor, db=db)
+    rows = batch.review_queue(campaign.id, **args)["items"]
+    assert [row["job_id"] for row in rows] == [ids[1]]
+    assert rows[0]["technical_code"] == "ARUM-1"
+    result = batch.claim_next_stage_review(campaign.id, stage=stage, skip_job_id=None,
+             search=query, version=None, artist=None, reviewed_by=None,
+             x_editor_session="campaign_search_session", current_user=actor, db=db)
+    assert result["job_id"] == ids[1]
+    if stage == "lyrics":
+        result = batch.claim_next_stage_review(campaign.id, stage=stage, skip_job_id=None,
+                 search="divididos otra", version=None, artist=None, reviewed_by=None,
+                 x_editor_session="campaign_search_session", current_user=actor, db=db)
+        assert result["job_id"] == ids[0]
