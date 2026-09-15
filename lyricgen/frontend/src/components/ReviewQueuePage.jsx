@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import CampaignSearch from "./CampaignSearch";
 import ReviewScopes from "./ReviewScopes";
 import useLatestReviewRequest from "../hooks/useLatestReviewRequest";
 import { reviewCounts, reviewStateLabel, reviewActionLabel, reviewDestination, validReviewScope } from "../lib/reviewerNavigation";
@@ -56,6 +57,10 @@ function exportMinutes(rows) {
 export default function ReviewQueuePage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  const [campaigns, setCampaigns] = useState([]);
+  const campaignsRef = useRef(null);
+  const query = searchParams.get("q") || "";
+  const campaignId = searchParams.get("campaign") || "";
   const [campaign, setCampaign] = useState(null);
   const [queue, setQueue] = useState(null);
   const [error, setError] = useState("");
@@ -76,14 +81,19 @@ export default function ReviewQueuePage() {
     const request = start();
     const options = { signal: request.signal };
     try {
-      const campaigns = await api("/batch/campaigns", options);
-      const current = (campaigns.items || []).find((row) => row.status === "active")
-        || (campaigns.items || [])[0];
-      if (!current) throw new Error("No hay una campaña activa.");
+      if (!campaignsRef.current) {
+        const result = await api("/batch/campaigns", options);
+        if (!request.current()) return;
+        campaignsRef.current = result.items || [];
+        setCampaigns(campaignsRef.current);
+      }
+      const current = campaignId ? campaignsRef.current.find(row => row.id === campaignId)
+        : campaignsRef.current.find(row => row.status === "active") || campaignsRef.current[0];
+      if (!current) throw new Error(campaignId ? "No encontramos esta campaña. Elegí otra campaña." : "No hay una campaña activa.");
       if (!request.current()) return;
       setCampaign(current);
       const firstPage = await api(
-        `/batch/campaigns/${current.id}/review-queue?stage=lyrics&order=effort&scope=${scope}&limit=100`,
+        `/batch/campaigns/${current.id}/review-queue?stage=lyrics&order=effort&scope=${scope}&search=${encodeURIComponent(query)}&limit=1000`,
         options,
       );
       if (!request.current()) return;
@@ -91,7 +101,7 @@ export default function ReviewQueuePage() {
       setLoadingMore(Number(firstPage.pages || 1) > 1);
       const remainingPages = await Promise.all(
         Array.from({ length: Math.max(0, Number(firstPage.pages || 1) - 1) }, (_, index) => (
-          api(`/batch/campaigns/${current.id}/review-queue?stage=lyrics&order=effort&scope=${scope}&limit=100&page=${index + 2}`, options)
+          api(`/batch/campaigns/${current.id}/review-queue?stage=lyrics&order=effort&scope=${scope}&search=${encodeURIComponent(query)}&limit=1000&page=${index + 2}`, options)
         )),
       );
       const data = {
@@ -110,9 +120,9 @@ export default function ReviewQueuePage() {
       if (request.current()) { setLoading(false); setLoadingMore(false); }
       request.finish();
     }
-  }, [scope, start]);
+  }, [scope, campaignId, query, start]);
 
-  useEffect(() => { setQueue(null); setLoading(true); void load(); return cancel; }, [load, cancel]);
+  useEffect(() => { setQueue(null); setLoading(true); const timer = setTimeout(load, query ? 250 : 0); return () => { clearTimeout(timer); cancel(); }; }, [load, cancel, query]);
   useEffect(() => {
     const refresh = () => {
       if (document.visibilityState === "visible" && !active.current) void load();
@@ -140,7 +150,7 @@ export default function ReviewQueuePage() {
     return (tail.find(available) || rows.find(available))?.job_id || null;
   }, [rows, searchParams]);
   const scopeTotal = queue?.scope?.total || 0;
-  const open = (row) => reviewActionLabel(row) && navigate(reviewDestination(row, `/admin/cola?${searchParams}`));
+  const open = (row) => { const context = new URLSearchParams(searchParams); if (campaign) context.set("campaign", campaign.id); if (reviewActionLabel(row)) navigate(reviewDestination(row, `/admin/cola?${context}`)); };
   const next = rows.find((row) => row.job_id === highlightedJobId);
   const counts = reviewCounts({ campaign_totals: totals }, campaign);
 
@@ -153,13 +163,13 @@ export default function ReviewQueuePage() {
           <p className="mt-2 text-sm text-ink-secondary">{campaign?.name || "Campaña actual"} · guardado automático activo</p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <button onClick={() => next && open(next)} disabled={loading || !!error || !next || scope !== "pending"} className="rounded-xl bg-brand px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-40">Siguiente</button>
+          <button onClick={() => next && open(next)} disabled={loading || !!error || !next || !["pending", "drafts", "all"].includes(scope)} className="rounded-xl bg-brand px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-40">Siguiente</button>
           <button disabled={loading || loadingMore || !!error || !rows.length} onClick={() => exportMinutes(rows)} className="rounded-xl bg-white/[0.07] px-4 py-2.5 text-sm text-white">Exportar minutos</button>
         </div>
       </div>
 
       {error && <div role="alert" className="rounded-xl bg-red-500/10 p-4 text-sm text-red-200 ring-1 ring-red-500/30">{error} <button onClick={load} className="ml-2 underline">Reintentar</button></div>}
-      <ReviewScopes cards value={scope} counts={counts} onChange={selectScope} />
+      <div className="flex flex-col gap-3 sm:flex-row"><label className="text-sm text-ink-secondary">Campaña<select aria-label="Campaña de la cola" className="ml-2 rounded-lg bg-surface-2 p-2" value={campaignId || campaign?.id || ""} onChange={event => { cancel(); const next = new URLSearchParams(searchParams); next.set("campaign", event.target.value); next.delete("approved"); setSearchParams(next); }}>{campaigns.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><CampaignSearch className="flex-1" value={query} onChange={value => { cancel(); setLoading(true); const next = new URLSearchParams(searchParams); value ? next.set("q", value) : next.delete("q"); setSearchParams(next, { replace: true }); }} />{campaign && <button className="text-sm text-brand-light underline" onClick={() => navigate(`/campaigns/${campaign.id}?q=${encodeURIComponent(query)}`)}>Abrir campaña completa</button>}</div>
       <ReviewScopes value={scope} counts={counts} onChange={selectScope} />
       {loading && <p role="status" className="p-4 text-sm text-ink-secondary">Cargando canciones…</p>}
       {loadingMore && <p role="status" className="text-sm text-ink-secondary">Mostrando {rows.length} de {scopeTotal} canciones. Cargando el resto…</p>}
@@ -180,7 +190,7 @@ export default function ReviewQueuePage() {
             </tr>;
           })}</tbody>
         </table>
-        {!rows.length && !error && !loading && <div className="p-10 text-center text-sm text-ink-tertiary">{scope === "approved" ? "Todavía no hay canciones aprobadas en esta campaña." : scope === "pending" ? "No quedan canciones por revisar en esta campaña." : "No hay canciones en esta campaña."}</div>}
+        {!rows.length && !error && !loading && <div className="p-10 text-center text-sm text-ink-tertiary">{query ? "No hay coincidencias con esta búsqueda. Probá otro término o limpiá los filtros." : scope === "approved" ? "Todavía no hay canciones aprobadas en esta campaña." : scope === "pending" ? "No quedan canciones por revisar en esta campaña." : "No hay canciones en esta campaña."}</div>}
       </div>
       <p className="text-xs text-ink-tertiary">La prioridad operativa usa reglas explícitas de alcance de trabajo; no es confianza calibrada ni automatiza aprobaciones. “Sin telemetría” queda fuera del cálculo de minutos. Esta pantalla no genera fondos ni renders.</p>
     </div>

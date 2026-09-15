@@ -7,6 +7,8 @@ and per-tab review claims. No background generation happens here.
 
 from __future__ import annotations
 
+from campaign_search import matches_search, matches_song
+
 import hashlib
 import logging
 import math
@@ -1108,7 +1110,14 @@ def claim_next_review(
     ).first()
     if existing:
         job, _ = existing
-        return {"job_id": job.job_id, "deduplicated": True}
+        item = db.query(BatchCampaignItem).filter(BatchCampaignItem.id == job.campaign_item_id).first()
+        live = bool(item and ("live" in f"{item.title or ''} {item.filename or ''}".lower() or "en vivo" in f"{item.title or ''} {item.filename or ''}".lower()))
+        from campaign_review_history import saved_review_history
+        history = saved_review_history(db, [job.job_id]) if reviewed_by == "me" else {}
+        if item and matches_song(search, item, job) and matches_search(artist, item.artist, job.artist) and (
+            version not in {"studio", "live"} or live == (version == "live")
+        ) and (reviewed_by != "me" or history.get(job.job_id, {}).get("user_id") == current_user["id"]):
+            return {"job_id": job.job_id, "deduplicated": True}
 
     candidate_pairs = db.query(Job, BatchCampaignItem).join(
         BatchCampaignItem, BatchCampaignItem.id == Job.campaign_item_id,
@@ -1123,21 +1132,9 @@ def claim_next_review(
             EditorDocument.lock_expires_at <= now,
         ),
     ).all()
-    normalized_search = str(search or "").strip().lower()
-    normalized_artist = str(artist or "").strip().lower()
-    if normalized_search:
-        candidate_pairs = [
-            pair for pair in candidate_pairs
-            if normalized_search in " ".join(
-                str(value or "").lower()
-                for value in (pair[0].song_title, pair[0].artist, pair[1].title, pair[1].artist)
-            )
-        ]
-    if normalized_artist:
-        candidate_pairs = [
-            pair for pair in candidate_pairs
-            if normalized_artist in str(pair[1].artist or pair[0].artist or "").lower()
-        ]
+    candidate_pairs = [pair for pair in candidate_pairs
+                       if matches_song(search, pair[1], pair[0])
+                       and matches_search(artist, pair[1].artist, pair[0].artist)]
     if version in {"studio", "live"}:
         candidate_pairs = [
             pair for pair in candidate_pairs
@@ -1145,16 +1142,9 @@ def claim_next_review(
                 or "en vivo" in f"{pair[1].title or ''} {pair[1].filename or ''}".lower()) == (version == "live")
         ]
     if reviewed_by == "me":
-        mine_ids = {
-            row.job_id for row in db.query(EditorDocument).filter(
-                EditorDocument.job_id.in_([job.job_id for job, _item in candidate_pairs]),
-                or_(
-                    EditorDocument.updated_by == current_user["id"],
-                    EditorDocument.lock_user_id == current_user["id"],
-                ),
-            ).all()
-        }
-        candidate_pairs = [pair for pair in candidate_pairs if pair[0].job_id in mine_ids]
+        from campaign_review_history import saved_review_history
+        history = saved_review_history(db, [job.job_id for job, _ in candidate_pairs])
+        candidate_pairs = [pair for pair in candidate_pairs if history.get(pair[0].job_id, {}).get("user_id") == current_user["id"]]
     verdicts = _latest_semaforo_verdicts(
         db, [job.job_id for job, _item in candidate_pairs],
     )
@@ -1965,13 +1955,9 @@ def review_queue(
             continue
         if background_mode and bg_mode != background_mode:
             continue
-        if artist and artist.lower() not in str(item.artist or "").lower():
+        if not matches_search(artist, item.artist, job.artist if job else ""):
             continue
-        normalized_search = str(search or "").strip().lower()
-        if normalized_search and normalized_search not in " ".join(
-            str(value or "").lower()
-            for value in (item.title, item.artist, item.filename, job.song_title if job else "", job.artist if job else "")
-        ):
+        if not matches_song(search, item, job):
             continue
         if reviewed_by == "me":
             if effective_scope == "approved":
@@ -2014,7 +2000,7 @@ def review_queue(
         ]
         manual_full_review = classification["review_priority"] == "manual_full"
         rows.append({
-            "item_id": item.id,
+            "item_id": item.id, "technical_code": item.technical_code, "filename": item.filename,
             "discard": item.discard_record,
             "can_discard": bool(job and job.status in _DISCARDABLE),
             "is_draft": bool(job and job.job_id in draft_ids),
@@ -2281,6 +2267,20 @@ def claim_next_stage_review(
             EditorDocument.lock_expires_at <= now,
         ),
     ).all()
+    candidate_pairs = [pair for pair in candidate_pairs if pair[0].job_id != skip_job_id
+                       and matches_song(search, pair[1], pair[0])
+                       and matches_search(artist, pair[1].artist, pair[0].artist)]
+    if version in {"studio", "live"}:
+        candidate_pairs = [pair for pair in candidate_pairs if (
+            "live" in f"{pair[1].title or ''} {pair[1].filename or ''}".lower()
+            or "en vivo" in f"{pair[1].title or ''} {pair[1].filename or ''}".lower()
+        ) == (version == "live")]
+    if reviewed_by == "me":
+        mine_ids = {row.job_id for row in db.query(EditorDocument).filter(
+            EditorDocument.job_id.in_([job.job_id for job, _ in candidate_pairs]),
+            or_(EditorDocument.updated_by == current_user["id"], EditorDocument.lock_user_id == current_user["id"]),
+        ).all()}
+        candidate_pairs = [pair for pair in candidate_pairs if pair[0].job_id in mine_ids]
     verdicts = _latest_semaforo_verdicts(
         db, [job.job_id for job, _item in candidate_pairs],
     )

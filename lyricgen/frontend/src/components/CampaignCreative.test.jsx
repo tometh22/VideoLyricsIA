@@ -27,6 +27,7 @@ beforeEach(() => {
     if (url.endsWith("/backgrounds")) return response([]);
     if (url.endsWith("/preview")) return response({ preview_id: "p1", counts: [39], rounded: false, skipped: [], changes: head.items.map(i => ({ item_id: i.id, artist: i.artist, title: i.title, group: "Estilo 1", before: {}, after: { font: "anton" } })) });
     if (url.endsWith("/apply")) { head = { ...head, plan: { revision: 1 } }; return response({ revision: 1 }); }
+    if (url.includes("/delivery-operations/")) return response({ operation_id: "op1", total_count: 2, sent_count: 2, failed_count: 0, status: "completed", destination_portal: "chile", items: [] });
     if (url.endsWith("/deliveries")) return response({ operation_id: "op1", total_count: 2, status: "queued" });
     if (url.includes("/status/")) return response({ artist: "Artista", song_title: "Tema", segments_json: [], segments_revision: 2 });
     if (url.includes("/approve/")) {
@@ -91,7 +92,7 @@ describe("campaign bulk design", () => {
       { job_id: "j3", title: "Pending", artist: "Artist", status: "pending_review", approved_at: null, evidence: {}, assignment: {}, created_at: new Date().toISOString(), video_url: "/download/j3/video" },
     ] };
     mount("history");
-    fireEvent.click(await screen.findByRole("button", { name: "Seleccionar todos los aprobados (2)" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Seleccionar aprobados del resultado (2)" }));
     expect(screen.getByLabelText("2 videos aprobados seleccionados")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Enviar seleccionados a un portal" }));
     fireEvent.change(screen.getByLabelText("Portal de destino"), { target: { value: "chile" } });
@@ -114,7 +115,7 @@ describe("campaign bulk design", () => {
     expect(view.container.querySelector("video")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Reproducir" }));
     expect(await screen.findByRole("dialog", { name: "Reproducir Tema para revisar" })).toBeInTheDocument();
-    expect(view.container.querySelector('video[src="/preview/video.mp4"]')).toBeInTheDocument();
+    expect(document.body.querySelector('video[src="/preview/video.mp4"]')).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Cerrar" }));
     expect(screen.queryByRole("dialog", { name: "Reproducir Tema para revisar" })).not.toBeInTheDocument();
   });
@@ -244,4 +245,60 @@ it("forces Lite for saved Fast groups even with stale API metadata", async () =>
   fireEvent.click(screen.getByRole("button", { name: "Ver reparto antes de guardar" }));
   await screen.findByRole("button", { name: "Guardar esta asignación" });
   expect(JSON.parse(calls.find(([url]) => url.endsWith("/preview"))[1].body).groups[0].model).toBe("veo-3.1-lite-generate-001");
+});
+
+it("searches unordered words without accents and never sends hidden approvals", async () => {
+  report.videos = [
+    { job_id: "a", title: "Corazón", artist: "Charly García", status: "done", approved_at: "2026-09-15", evidence: {}, assignment: {} },
+    { job_id: "b", title: "Otra canción", artist: "Divididos", status: "done", approved_at: "2026-09-15", evidence: {}, assignment: {} },
+  ];
+  mount("history");
+  fireEvent.click(await screen.findByRole("button", { name: "Seleccionar aprobados del resultado (2)" }));
+  fireEvent.change(screen.getByRole("searchbox", { name: "Buscar videos de la campaña" }), { target: { value: "garcia corazon" } });
+  expect(screen.queryByText("Otra canción")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Enviar seleccionados a un portal" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Seleccionar aprobados del resultado (1)" }));
+  fireEvent.click(screen.getByRole("button", { name: "Enviar seleccionados a un portal" }));
+  fireEvent.change(screen.getByLabelText("Portal de destino"), { target: { value: "chile" } });
+  fireEvent.click(screen.getByRole("button", { name: "Confirmar envío" }));
+  await screen.findByText(/Envío iniciado para/);
+  expect(JSON.parse(calls.find(([url]) => url.endsWith("/deliveries"))[1].body).job_ids).toEqual(["a"]);
+});
+
+it("approves only the playing video and advances inside the current search", async () => {
+  report.videos = [
+    { job_id: "a", title: "Uno", artist: "García", status: "pending_review", video_url: "/video/a", evidence: {}, assignment: {} },
+    { job_id: "hidden", title: "Oculto", artist: "Otro", status: "pending_review", video_url: "/video/x", evidence: {}, assignment: {} },
+    { job_id: "b", title: "Dos", artist: "García", status: "pending_review", video_url: "/video/b", evidence: {}, assignment: {} },
+  ];
+  mount("history");
+  fireEvent.change(await screen.findByRole("searchbox", { name: "Buscar videos de la campaña" }), { target: { value: "garcia" } });
+  fireEvent.click(screen.getAllByRole("button", { name: "Reproducir" })[0]);
+  fireEvent.click(screen.getByRole("button", { name: "Aprobar y siguiente" }));
+  await screen.findByRole("dialog", { name: "Reproducir Dos" });
+  const approvals = calls.filter(([path]) => path.includes("/approve/"));
+  expect(approvals).toHaveLength(1);
+  expect(approvals[0][0]).toBe("/approve/a");
+  expect(JSON.parse(approvals[0][1].body)).not.toHaveProperty("admin_override");
+  expect(screen.queryByRole("button", { name: "Liberar pendientes autorizados" })).not.toBeInTheDocument();
+});
+
+it("reuses the same delivery key after a lost response instead of creating another batch", async () => {
+  report.videos = [{ job_id: "a", title: "Uno", artist: "García", status: "done", approved_at: "2026-09-15", evidence: {}, assignment: {} }];
+  const original = globalThis.fetch;
+  const bodies = [];
+  vi.stubGlobal("fetch", async (url, options) => {
+    if (url.endsWith("/deliveries")) { bodies.push(JSON.parse(options.body)); if (bodies.length === 1) throw new Error("Conexión interrumpida"); }
+    return original(url, options);
+  });
+  mount("deliveries");
+  fireEvent.click(await screen.findByRole("button", { name: "Seleccionar aprobados del resultado (1)" }));
+  fireEvent.click(screen.getByRole("button", { name: "Enviar seleccionados a un portal" }));
+  fireEvent.change(screen.getByLabelText("Portal de destino"), { target: { value: "chile" } });
+  fireEvent.click(screen.getByRole("button", { name: "Confirmar envío" }));
+  await screen.findByText("Conexión interrumpida");
+  fireEvent.click(screen.getByRole("button", { name: "Confirmar envío" }));
+  await screen.findByText(/Envío completado/);
+  expect(bodies).toHaveLength(2);
+  expect(bodies[0].idempotency_key).toBe(bodies[1].idempotency_key);
 });

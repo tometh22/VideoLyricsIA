@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
@@ -19,6 +19,7 @@ import ReviewVideoPlayer from "./ReviewVideoPlayer";
 import JobSettingsCard from "./JobSettingsCard";
 import { SingleGeneratingHero } from "./BatchProgress";
 import { hasArtTrackAccess } from "../lib/artTrackAccess";
+import { safeReviewReturnPath } from "../lib/reviewerNavigation";
 import { reviewJobPath } from "../lib/reviewJobRoute";
 import { editorSessionHeaders } from "../lib/editorSession";
 import { translateBackendError } from "../lib/lyricsEditSubmit";
@@ -396,6 +397,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const { t } = useI18n();
   const { alert } = useAlert();
   const navigate = useNavigate();
+  const location = useLocation();
+  const campaignReturn = safeReviewReturnPath(new URLSearchParams(location.search).get("return_to"));
+  const withReturn = path => campaignReturn ? `${path}?return_to=${encodeURIComponent(campaignReturn)}` : path;
   const [activeTab, setActiveTab] = useState("video");
   const [uploading, setUploading] = useState(false);
   const [youtubeResult, setYoutubeResult] = useState(job.youtube || null);
@@ -1230,7 +1234,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     const body = job.error || (isContent
       ? (t("detail.bg_attention_content_body") || "El fondo generado no cumplió con las reglas de contenido y el ajuste automático no alcanzó. Probá con otra descripción o estilo para el fondo.")
       : (t("detail.bg_attention_provider_body") || "El servicio de fondos tuvo una interrupción momentánea y no pudimos generar tu fondo. Tu trabajo está guardado — reintentá el fondo en un momento."));
-    const goAdjust = () => navigate(`/videos/${job.job_id}/edit-lyrics`);
+    const goAdjust = () => navigate(withReturn(`/videos/${job.job_id}/edit-lyrics`));
     return (
       <div className="w-full max-w-2xl animate-fade-in">
         <div className="flex items-center gap-3 mb-6">
@@ -1638,16 +1642,26 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         });
       }
       if (job.campaign_id) {
-        await fetch(`${API}/editor/${job.job_id}/lock`, {
+        const releaseRes = await fetch(`${API}/editor/${job.job_id}/lock`, {
           method: "DELETE",
           headers: { ...authHeaders(), ...editorSessionHeaders() },
         });
+        // Approval already succeeded. If release fails, return to the queue
+        // instead of claiming another song while this lock may still be held.
+        if (!releaseRes.ok) {
+          navigate(campaignReturn || `/campaigns/${job.campaign_id}?view=history`);
+          return;
+        }
+        const nextQuery = new URLSearchParams({ stage: "final", skip_job_id: job.job_id });
+        const filters = new URLSearchParams(campaignReturn?.split("?")[1] || "");
+        if (filters.get("q")) nextQuery.set("search", filters.get("q"));
+        if (filters.get("artist")) nextQuery.set("artist", filters.get("artist"));
         const nextRes = await fetch(
-          `${API}/batch/campaigns/${job.campaign_id}/review-queue/next?stage=final`,
+          `${API}/batch/campaigns/${job.campaign_id}/review-queue/next?${nextQuery}`,
           { method: "POST", headers: { ...authHeaders(), ...editorSessionHeaders() } },
         );
         const next = await nextRes.json().catch(() => ({}));
-        navigate(nextRes.ok && next.job_id ? (next.open_path || `/videos/${next.job_id}`) : `/campaigns/${job.campaign_id}`);
+        navigate(nextRes.ok && next.job_id ? withReturn(next.open_path || `/videos/${next.job_id}`) : campaignReturn || `/campaigns/${job.campaign_id}?view=history`);
       }
     } catch (err) {
       alert({
@@ -2247,7 +2261,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           job={job}
           // Única acción: abrir el Studio Console (mismo layout 3-col que
           // /new). Todo el editing —incluido el fondo— vive ahí ahora.
-          onLyricsClick={() => navigate(`/videos/${job.job_id}/edit-lyrics`)}
+          onLyricsClick={() => navigate(withReturn(`/videos/${job.job_id}/edit-lyrics`))}
         />
       )}
 
@@ -2260,7 +2274,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           job={job}
           onJobUpdate={onJobUpdate}
           onSeek={seekVideo}
-          onOpenEditor={() => navigate(`/videos/${job.job_id}/edit-lyrics`)}
+          onOpenEditor={() => navigate(withReturn(`/videos/${job.job_id}/edit-lyrics`))}
         />
       )}
 

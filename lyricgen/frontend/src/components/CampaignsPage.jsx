@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { editorSessionHeaders } from "../lib/editorSession";
 import { CampaignReviewerRow, CampaignReviewerSummary } from "./CampaignReviewerStatus";
 import ReviewScopes from "./ReviewScopes";
 import CampaignReviewWork from "./CampaignReviewWork";
 import CampaignCreative from "./CampaignCreative";
+import CampaignWorkflow from "./CampaignWorkflow";
+import CampaignSearch from "./CampaignSearch";
+import { matchesCampaignSearch } from "../lib/campaignSearch";
 import useLatestReviewRequest from "../hooks/useLatestReviewRequest";
 import { reviewCounts, reviewStateLabel, reviewActionLabel, reviewDestination, validReviewScope, reviewStateFilter } from "../lib/reviewerNavigation";
 
@@ -43,6 +45,7 @@ function contextPath(id, values = {}) {
     artist: values.artist || "",
     phase: values.phase || "",
     focus: values.focus || "",
+    rpage: values.rpage > 1 ? String(values.rpage) : "",
     scroll: values.scroll ? String(Math.round(values.scroll)) : "",
   };
   Object.entries(entries).forEach(([key, value]) => { if (value) params.set(key, value); });
@@ -68,6 +71,9 @@ async function api(path, options = {}) {
 
 function CampaignList() {
   const navigate = useNavigate();
+  const [listParams, setListParams] = useSearchParams();
+  const listQuery = listParams.get("q") || "";
+  const listStatus = listParams.get("status") || "";
   const [items, setItems] = useState([]);
   const [name, setName] = useState("");
   const [expected, setExpected] = useState(500);
@@ -115,17 +121,18 @@ function CampaignList() {
         <h1 className="mt-2 text-3xl font-bold text-white">Campañas</h1>
         <p className="mt-2 text-sm text-ink-secondary">Subí todos los audios, corregí letras y generá sin bloquear los videos normales.</p>
       </div>
-      <form onSubmit={create} className="grid gap-3 rounded-2xl bg-surface-2/50 p-5 ring-1 ring-white/[0.06] md:grid-cols-[1fr_150px_170px_150px_auto]">
+      <div className="flex flex-col gap-3 sm:flex-row"><CampaignSearch className="flex-1" label="Buscar campañas" placeholder="Nombre de campaña" value={listQuery} onChange={q => { const next = new URLSearchParams(listParams); q ? next.set("q", q) : next.delete("q"); setListParams(next, { replace: true }); }} /><select aria-label="Estado de campaña" value={listStatus} onChange={e => { const next = new URLSearchParams(listParams); e.target.value ? next.set("status", e.target.value) : next.delete("status"); setListParams(next); }} className="rounded-xl bg-surface-2 px-3 py-2 text-sm"><option value="">Todos los estados</option><option value="active">Activas</option><option value="paused">Pausadas</option><option value="completed">Completadas</option></select></div>
+      <details className="rounded-2xl ring-1 ring-white/10"><summary className="cursor-pointer p-4 text-sm font-semibold">Crear nueva campaña</summary><form onSubmit={create} className="grid gap-3 rounded-2xl bg-surface-2/50 p-5 ring-1 ring-white/[0.06] md:grid-cols-[1fr_150px_170px_150px_auto]">
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nombre de la campaña" maxLength={160} className="rounded-xl bg-black/20 px-4 py-3 text-sm text-white ring-1 ring-white/10 outline-none focus:ring-brand/50" />
         <input value={expected} onChange={(e) => setExpected(e.target.value)} type="number" min="1" max={kind === "art_track" ? 500 : 1000} aria-label="Cantidad esperada" className="rounded-xl bg-black/20 px-4 py-3 text-sm text-white ring-1 ring-white/10 outline-none focus:ring-brand/50" />
         <select value={kind} onChange={(e) => setKind(e.target.value)} aria-label="Tipo de campaña" className="rounded-xl bg-black/20 px-4 py-3 text-sm text-white ring-1 ring-white/10 outline-none"><option value="lyric_video">Lyric videos</option><option value="art_track">Art tracks</option></select>
         <select value={destination} onChange={(e) => setDestination(e.target.value)} disabled={kind !== "art_track"} aria-label="Portal de destino" className="rounded-xl bg-black/20 px-4 py-3 text-sm text-white ring-1 ring-white/10 outline-none"><option value="argentina">UMG Argentina</option><option value="chile">UMG Chile</option></select>
         <button disabled={busy || !name.trim()} className="rounded-xl bg-brand px-5 py-3 text-sm font-semibold text-white disabled:opacity-50">{busy ? "Creando…" : "Nueva campaña"}</button>
-      </form>
+      </form></details>
       {error && <div className="rounded-xl bg-red-500/10 p-4 text-sm text-red-200 ring-1 ring-red-500/25">{error}</div>}
       {loading && <p role="status" className="text-sm text-ink-secondary">Cargando campañas…</p>}
       <div className="grid gap-3">
-        {items.map((campaign) => (
+        {items.filter(c => matchesCampaignSearch(listQuery, c.name, c.id) && (!listStatus || c.status === listStatus)).map((campaign) => (
           <button key={campaign.id} onClick={() => navigate(`/campaigns/${campaign.id}`)} className="flex items-center gap-4 rounded-2xl bg-surface-2/40 p-5 text-left ring-1 ring-white/[0.06] hover:ring-brand/30">
             <div className="min-w-0 flex-1">
               <div className="truncate font-semibold text-white">{campaign.name}</div>
@@ -134,6 +141,7 @@ function CampaignList() {
             <span className="rounded-full bg-white/[0.06] px-3 py-1 text-xs text-ink-secondary">{{ active: "Activa", paused: "Pausada", completed: "Completada", cancelled: "Cancelada" }[campaign.status] || "Estado no disponible"}</span>
           </button>
         ))}
+        {!!items.length && !loading && !items.some(c => matchesCampaignSearch(listQuery, c.name, c.id) && (!listStatus || c.status === listStatus)) && <p className="p-8 text-center text-sm text-ink-secondary">No hay campañas con estos filtros. <button className="underline" onClick={() => setListParams({})}>Limpiar filtros</button></p>}
         {!items.length && !error && !loading && <div className="rounded-2xl border border-dashed border-white/10 p-10 text-center text-sm text-ink-tertiary">Todavía no hay campañas.</div>}
       </div>
     </div>
@@ -143,9 +151,12 @@ function CampaignList() {
 function CampaignDetail({ id }) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  const workspaceView = ["creative", "contract", "history", "deliveries"].includes(searchParams.get("view")) ? searchParams.get("view") : "review";
+  const reviewPage = Math.max(1, Number(searchParams.get("rpage")) || 1);
   const initialScope = validReviewScope(searchParams.get("tab"));
   const initialOrder = searchParams.get("order") === "learning" ? "learning" : "effort";
   const [campaign, setCampaign] = useState(null);
+  const [campaignWorking, setCampaignWorking] = useState(false);
   const [items, setItems] = useState([]);
   const [adminOpen, setAdminOpen] = useState(false);
   const [phase, setPhase] = useState(() => searchParams.get("phase") || "");
@@ -210,17 +221,18 @@ function CampaignDetail({ id }) {
   const saveContext = useCallback((overrides = {}, push = false) => {
     const values = {
       tab: queueScope, q: queueSearch, mine: queueMine, order: queueOrder,
-      page, stage: queueStage, version: queueVersion, state: queueState,
+      page, rpage: reviewPage, stage: queueStage, version: queueVersion, state: queueState,
       artist: queueArtist, phase, ...overrides,
     };
     const next = new URLSearchParams(searchParams);
-    ["tab", "q", "mine", "order", "page", "stage", "version", "state", "artist", "phase", "focus", "scroll"].forEach((key) => next.delete(key));
+    ["tab", "q", "mine", "order", "page", "stage", "version", "state", "artist", "phase", "focus", "scroll", "rpage"].forEach((key) => next.delete(key));
+    if (["q", "tab", "state", "artist", "version", "mine", "order"].some(key => Object.hasOwn(overrides, key))) values.rpage = 1;
     const path = contextPath(id, values);
     const query = path.split("?")[1];
     if (query) new URLSearchParams(query).forEach((value, key) => next.set(key, value));
     setSearchParams(next, { replace: !push });
     try { sessionStorage.setItem(`campaign-review-context:${id}`, JSON.stringify(values)); } catch { /* best effort */ }
-  }, [id, page, phase, queueStage, queueVersion, queueState, queueArtist, queueMine, queueOrder, queueScope, queueSearch, searchParams, setSearchParams]);
+  }, [id, page, reviewPage, phase, queueStage, queueVersion, queueState, queueArtist, queueMine, queueOrder, queueScope, queueSearch, searchParams, setSearchParams]);
 
   const selectScope = (scope) => {
     if (scope === queueScope && !queueState) return;
@@ -234,17 +246,22 @@ function CampaignDetail({ id }) {
     if (!row?.job_id) return;
     const context = {
       tab: queueScope, q: queueSearch, mine: queueMine, order: queueOrder,
-      page, stage: queueStage, version: queueVersion, state: queueState,
+      page, rpage: reviewPage, stage: queueStage, version: queueVersion, state: queueState,
       artist: queueArtist, phase, focus: row.job_id, scroll: window.scrollY,
     };
     try { sessionStorage.setItem(`campaign-review-context:${id}`, JSON.stringify(context)); } catch { /* best effort */ }
     navigate(reviewDestination(row, contextPath(id, context), queueStage));
-  }, [id, navigate, page, phase, queueStage, queueVersion, queueState, queueArtist, queueMine, queueOrder, queueScope, queueSearch]);
+  }, [id, navigate, page, reviewPage, phase, queueStage, queueVersion, queueState, queueArtist, queueMine, queueOrder, queueScope, queueSearch]);
 
   const load = useCallback(async () => {
     const request = start();
     const options = { signal: request.signal };
     try {
+      if (workspaceView !== "review") {
+        const head = await api(`/batch/campaigns/${id}`, options);
+        if (request.current()) { setCampaign(head); setError(""); }
+        return;
+      }
       const queueQuery = `stage=${queueStage}&order=${queueOrder}&scope=${queueScope}&limit=1000${queueVersion ? `&version=${queueVersion}` : ""}${queueState ? `&state=${encodeURIComponent(queueState)}` : ""}${queueStage === "final" && queueBackground ? `&background_mode=${encodeURIComponent(queueBackground)}` : ""}${queueArtist ? `&artist=${encodeURIComponent(queueArtist)}` : ""}${queueSearch ? `&search=${encodeURIComponent(queueSearch)}` : ""}${queueMine ? "&reviewed_by=me" : ""}${queueAudit ? "&audit_preapproved=true" : ""}`;
       const firstReview = await api(`/batch/campaigns/${id}/review-queue?${queueQuery}`, options);
       const head = firstReview.campaign || await api(`/batch/campaigns/${id}`, options);
@@ -270,7 +287,7 @@ function CampaignDetail({ id }) {
       if (request.current()) { setQueueLoading(false); setLoadingMore(false); }
       request.finish();
     }
-  }, [id, page, phase, queueStage, queueOrder, queueScope, queueVersion, queueState, queueBackground, queueArtist, queueSearch, queueMine, queueAudit, start]);
+  }, [id, page, phase, queueStage, queueOrder, queueScope, queueVersion, queueState, queueBackground, queueArtist, queueSearch, queueMine, queueAudit, workspaceView, start]);
   useEffect(() => {
     setQueueLoading(true);
     const timer = window.setTimeout(load, queueSearch ? 300 : 0);
@@ -331,17 +348,9 @@ function CampaignDetail({ id }) {
       await load();
     } catch (e) { setError(e.message); }
   };
-  const takeNext = async (stage = queueStage) => {
-    try {
-      const params = new URLSearchParams({ stage });
-      if (queueSearch) params.set("search", queueSearch);
-      if (queueVersion) params.set("version", queueVersion);
-      if (queueArtist) params.set("artist", queueArtist);
-      if (queueMine) params.set("reviewed_by", "me");
-      const data = await api(`/batch/campaigns/${id}/review-queue/next?${params.toString()}`, { method: "POST", headers: editorSessionHeaders() });
-      if (data.job_id) openReview({ job_id: data.job_id });
-      else setError(stage === "lyrics" ? "Todavía no hay letras listas para corregir." : "Todavía no hay renders listos para QC final.");
-    } catch (e) { setError(e.message); }
+  const takeNext = () => {
+    const next = (reviewQueue?.items || []).find(row => ["ready", "reviewing"].includes(row.state) && reviewActionLabel(row, queueStage));
+    if (next) openReview(next);
   };
   const editMetadata = async (item) => {
     const title = window.prompt("Título", item.title || ""); if (title == null) return;
@@ -427,7 +436,7 @@ function CampaignDetail({ id }) {
     } catch (e) { setError(e.message); }
   };
   const previewDeliveries = async () => {
-    try { const result = await api(`/batch/art-track-campaigns/${id}/delivery-preview`); setDeliveryMessage(`${result.eligible_count} art tracks aprobados para ${result.hostname}.`); }
+    try { const result = await api(`/batch/art-track-campaigns/${id}/delivery-preview`, { method: "POST" }); setDeliveryMessage(`${result.eligible_count} art tracks aprobados para ${result.hostname}.`); }
     catch (e) { setError(e.message); }
   };
   const createDeliveries = async () => {
@@ -446,21 +455,31 @@ function CampaignDetail({ id }) {
     setHighlightedJobId(null); saveContext({ q: "", mine: false, version: "", artist: "", state: "", focus: null, scroll: null });
     try { sessionStorage.setItem(`campaign-review-context:${id}`, JSON.stringify({ tab: queueScope, order: queueOrder, page })); } catch { /* best effort */ }
   };
-  const workspaceView = ["creative", "contract", "history"].includes(searchParams.get("view")) ? searchParams.get("view") : "review";
-  const workspaceNav = campaign.kind !== "art_track" && <nav aria-label="Secciones de campaña" className="flex flex-wrap gap-2">{[["review", "Revisión de letras"], ["creative", "Estilo y fondos"], ["contract", "Contrato y cumplimiento"], ["history", "Historial de videos"]].map(([value, label]) => <button key={value} aria-current={workspaceView === value ? "page" : undefined} className={`rounded-xl px-4 py-2 text-sm ${workspaceView === value ? "bg-brand/20 text-brand-light" : "bg-white/5 text-ink-secondary"}`} onClick={() => { const params = new URLSearchParams(searchParams); params.set("view", value); setSearchParams(params); }}>{label}</button>)}</nav>;
-  if (campaign.kind !== "art_track" && workspaceView !== "review") return <div className="mx-auto max-w-7xl space-y-6"><button className="text-sm text-ink-secondary" onClick={() => navigate("/campaigns")}>← Campañas</button><h1 className="text-3xl font-bold">{campaign.name}</h1>{workspaceNav}<CampaignCreative key={id} campaignId={id} view={workspaceView} /></div>;
-  const queueRows = reviewQueue?.items || [];
+  const workspaceNav = campaign.kind !== "art_track" && <CampaignWorkflow disabled={campaignWorking} view={workspaceView} onChange={view => {
+    const params = new URLSearchParams(searchParams);
+    params.set("view", view);
+    if (view === "history") { params.set("video_state", "review"); params.delete("vpage"); }
+    if (view === "deliveries") { params.set("video_state", "approved"); params.delete("vpage"); }
+    setSearchParams(params);
+  }} />;
+  if (campaign.kind !== "art_track" && workspaceView !== "review") return <div className="mx-auto max-w-7xl space-y-6"><button disabled={campaignWorking} className="text-sm text-ink-secondary disabled:opacity-40" onClick={() => navigate("/campaigns")}>← Campañas</button><h1 className="text-3xl font-bold">{campaign.name}</h1>{workspaceNav}<CampaignCreative key={id} campaignId={id} view={workspaceView} onBusyChange={setCampaignWorking} /></div>;
+  const allQueueRows = reviewQueue?.items || [];
+  const reviewPages = Math.max(1, Math.ceil(allQueueRows.length / 25));
+  const currentReviewPage = Math.min(reviewPage, reviewPages);
+  const queueRows = allQueueRows.slice((currentReviewPage - 1) * 25, currentReviewPage * 25);
+  const hasNext = allQueueRows.some(row => ["ready", "reviewing"].includes(row.state) && reviewActionLabel(row, queueStage));
   return (
     <div className="mx-auto max-w-7xl space-y-6">
       <button onClick={() => navigate("/campaigns")} className="text-sm text-ink-secondary hover:text-white">← Campañas</button>
       <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div className="min-w-0"><h1 className="truncate text-3xl font-bold text-white">{campaign.name}</h1><p className="mt-2 text-sm text-ink-secondary">{campaign.kind === "art_track" ? `${campaign.registered_count}/${campaign.expected_count || "—"} art tracks registrados` : `${approvedCount} de ${songCount} letras aprobadas`} · {campaign.status === "active" ? "campaña activa" : campaign.status}</p></div>
-        {campaign.kind !== "art_track" && <button onClick={() => takeNext(queueStage)} disabled={queueLoading || !!error || queueScope !== "pending" || !reviewQueue?.counters?.ready} className="rounded-xl bg-brand px-5 py-3 text-sm font-semibold text-white disabled:opacity-40">Revisar siguiente canción</button>}
+        {campaign.kind !== "art_track" && <button onClick={() => takeNext(queueStage)} disabled={queueLoading || !!error || !["pending", "drafts", "all"].includes(queueScope) || !hasNext} className="rounded-xl bg-brand px-5 py-3 text-sm font-semibold text-white disabled:opacity-40">Revisar siguiente canción</button>}
       </div>
       {campaign.kind === "art_track" && <section className="rounded-2xl bg-surface-2/40 p-5 ring-1 ring-white/[0.06]"><div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="font-semibold text-white">Art tracks · audio + cover</h2><p className="mt-1 text-sm text-ink-secondary">Seleccioná una carpeta con hasta 500 audios y portadas. Los conflictos quedan bloqueados para corrección manual.</p></div><input ref={fileInput} type="file" multiple webkitdirectory="" directory="" accept=".wav,.mp3,.jpg,.jpeg,.png" onChange={importArtFiles} className="max-w-[260px] text-xs text-ink-secondary" /></div><div className="mt-4 flex flex-wrap gap-2"><button disabled={assetBusy} onClick={confirmAndRender} className="rounded-xl bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{assetBusy ? "Subiendo…" : "Confirmar asociados y generar"}</button><button onClick={previewDeliveries} className="rounded-xl bg-white/[0.07] px-4 py-2 text-sm text-white">Previsualizar envíos</button><button onClick={createDeliveries} className="rounded-xl bg-white/[0.07] px-4 py-2 text-sm text-white">Enviar aprobados</button></div></section>}
       {selectedRow?.resume_available && <div className="flex items-center justify-between gap-3 rounded-xl bg-brand/10 p-4 text-sm text-brand-light ring-1 ring-brand/25"><span>Tenés una revisión guardada: <strong>{selectedRow.title}</strong>.</span><button onClick={() => openReview(selectedRow)} className="rounded-lg bg-brand px-3 py-2 text-xs font-semibold text-white">Continuar {selectedRow.title}</button></div>}
       {!queueLoading && !loadingMore && highlightedJobId && !selectedRow && <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-amber-500/10 p-4 text-sm text-amber-100 ring-1 ring-amber-500/25"><span>La canción recién abierta ya no coincide con este filtro. Puede haber cambiado de estado o estar aprobada en otra pestaña.</span><button onClick={() => selectScope("approved")} className="rounded-lg bg-amber-500/20 px-3 py-2 text-xs font-semibold">Buscar en Aprobadas</button></div>}
       {error && <div role="alert" className="rounded-xl bg-amber-500/10 p-4 text-sm text-amber-100 ring-1 ring-amber-500/25">{error} <button onClick={load} className="underline">Reintentar</button></div>}
+      {deliveryMessage && <p role="status" className="rounded-xl bg-brand/10 p-4 text-sm text-brand-light">{deliveryMessage}</p>}
       {workspaceNav}
       <ReviewScopes showSavedChanges={queueStage === "lyrics"} value={queueScope} counts={counts} onChange={selectScope} />
       <p className="text-xs text-ink-secondary">Las alertas orientan la revisión; no son un porcentaje de acierto. La confianza todavía no está calibrada.</p>
@@ -485,10 +504,12 @@ function CampaignDetail({ id }) {
         }} className="rounded-lg bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-40">{discardBusy ? "Guardando…" : discardTarget.state === "discarded" ? "Confirmar recuperación" : "Confirmar descarte"}</button><button disabled={discardBusy} onClick={() => setDiscardTarget(null)} className="text-sm text-ink-secondary">Cancelar</button></div>
       </div></section>}
       <section className="space-y-4 rounded-2xl bg-surface-2/40 p-5 ring-1 ring-white/[0.06]">
-        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between"><div><h2 className="font-semibold text-white">Encontrá una canción y empezá a trabajar</h2><p className="mt-1 text-xs text-ink-tertiary">{queueScope === "drafts" ? "Pendientes con cambios humanos registrados, todavía sin aprobar. Los últimos editados aparecen primero; usá Continuar revisión para retomarlos." : "Primero aparecen las canciones con menos alertas. Todas requieren escuchar y confirmar letra y tiempos."}</p></div><div className="flex flex-wrap gap-2"><input value={queueSearch} onChange={(e) => { setQueueSearch(e.target.value); saveContext({ q: e.target.value, focus: null }); }} placeholder="Buscar canción o artista" aria-label="Buscar canción o artista" className="w-56 rounded-lg bg-black/25 px-3 py-2 text-sm text-white ring-1 ring-white/10" /><select disabled={queueScope === "drafts"} value={queueScope === "drafts" ? "recent" : queueOrder} onChange={(e) => { setQueueOrder(e.target.value); saveContext({ order: e.target.value }); }} aria-label="Orden" className="rounded-lg bg-black/25 px-3 py-2 text-sm text-white ring-1 ring-white/10">{queueScope === "drafts" && <option value="recent">Últimos guardados primero</option>}<option value="effort">Menos alertas primero</option><option value="learning">Aprendizaje (20%)</option></select><button onClick={() => { const next = !queueMine; setQueueMine(next); saveContext({ mine: next }); }} className={`rounded-lg px-3 py-2 text-sm ring-1 ${queueMine ? "bg-brand/15 text-brand-light ring-brand/30" : "bg-black/25 text-ink-secondary ring-white/10"}`}>Revisadas por mí</button></div></div>
+        <div className="flex flex-col gap-3"><div><h2 className="font-semibold text-white">Encontrá una canción y empezá a trabajar</h2><p className="mt-1 text-xs text-ink-tertiary">{queueScope === "drafts" ? "Pendientes con cambios humanos registrados, todavía sin aprobar. Los últimos editados aparecen primero; usá Continuar revisión para retomarlos." : "Primero aparecen las canciones con menos alertas. Todas requieren escuchar y confirmar letra y tiempos."}</p></div><div className="flex flex-wrap gap-2"><CampaignSearch className="w-full sm:max-w-md sm:flex-1" value={queueSearch} onChange={q => { cancel(); setQueueLoading(true); setQueueSearch(q); saveContext({ q, focus: null }); }} /><select disabled={queueScope === "drafts"} value={queueScope === "drafts" ? "recent" : queueOrder} onChange={(e) => { setQueueOrder(e.target.value); saveContext({ order: e.target.value }); }} aria-label="Orden" className="rounded-lg bg-black/25 px-3 py-2 text-sm text-white ring-1 ring-white/10">{queueScope === "drafts" && <option value="recent">Últimos guardados primero</option>}<option value="effort">Menos alertas primero</option><option value="learning">Aprendizaje (20%)</option></select><button onClick={() => { const next = !queueMine; setQueueMine(next); saveContext({ mine: next }); }} className={`rounded-lg px-3 py-2 text-sm ring-1 ${queueMine ? "bg-brand/15 text-brand-light ring-brand/30" : "bg-black/25 text-ink-secondary ring-white/10"}`}>Revisadas por mí</button></div></div>
         {(queueSearch || queueMine || queueVersion || queueArtist || queueState) && <div className="flex flex-wrap items-center gap-2 text-xs text-ink-secondary"><span>Filtros activos:</span>{queueSearch && <span className="rounded-full bg-white/[0.07] px-2 py-1">“{queueSearch}”</span>}{queueMine && <span className="rounded-full bg-white/[0.07] px-2 py-1">Revisadas por mí</span>}<button onClick={clearFilters} className="underline hover:text-white">Limpiar</button></div>}
         <div className="flex flex-wrap items-center gap-2 text-xs"><span className="rounded-full bg-white/[0.06] px-2.5 py-1 text-ink-secondary">Sin alertas concretas: {reviewQueue?.classification_counts?.standard || 0}</span><span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-amber-200">Con alertas de tiempos: {reviewQueue?.classification_counts?.timing_targeted || 0}</span><span className="rounded-full bg-red-500/10 px-2.5 py-1 text-red-200">Requieren comprobación completa: {reviewQueue?.classification_counts?.manual_full || 0}</span><span className="text-ink-tertiary">{reviewQueue?.scope?.total || 0} canciones en este alcance</span></div>
-        <div className="overflow-x-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="border-b border-white/[0.06] text-xs text-ink-tertiary"><tr><th className="p-3">Canción</th><th className="p-3">Duración</th><th className="p-3">Estado</th><th className="p-3">Qué revisar y por qué</th><th className="p-3" /></tr></thead><tbody>{queueRows.map((row) => { const action = reviewActionLabel(row, queueStage); return <tr key={row.item_id} data-review-job={row.job_id || undefined} className={`border-b border-white/[0.045] ${row.job_id === highlightedJobId ? "bg-brand/10 ring-1 ring-inset ring-brand/30" : ""}`}><td className="p-3"><div className="font-medium text-white">{row.title}</div><div className="text-xs text-ink-tertiary">{row.artist || "Artista no informado"}</div>{row.approval?.user_id && <div className="mt-1 text-xs text-emerald-200">Aprobó {row.approval.name || "otro operador"}{row.approval.at ? ` · ${new Date(row.approval.at).toLocaleString()}` : ""}</div>}</td><td className="p-3 text-ink-secondary">{row.duration_seconds ? timestamp(row.duration_seconds) : "—"}</td><td className="p-3 text-ink-secondary">{reviewStateLabel(row)}{row.is_draft && <div className="mt-1 text-xs text-ink-tertiary">Guardado por {row.last_reviewed_name || "otro operador"}{row.last_reviewed_at ? ` · ${new Date(row.last_reviewed_at).toLocaleString()}` : ""}</div>}</td><td className="p-3"><CampaignReviewWork row={row} timestamp={timestamp} /></td><td className="p-3 text-right">{action ? <button onClick={() => openReview(row)} disabled={queueLoading} className="rounded-lg bg-brand/15 px-3 py-2 text-xs font-semibold text-brand-light disabled:cursor-not-allowed disabled:bg-white/[0.05] disabled:text-ink-tertiary">{action}</button> : <span className="text-xs text-ink-tertiary">{row.reviewer_lock_active ? "Otra persona está revisando" : "No disponible para revisión"}</span>}{(row.can_discard || row.state === "discarded") && <button disabled={queueLoading || (row.reviewer_lock_active && !row.reviewer_is_current_user)} onClick={() => setDiscardTarget(row)} className="mt-2 block w-full rounded-lg px-3 py-2 text-xs text-ink-secondary hover:bg-white/10 disabled:opacity-40">{row.state === "discarded" ? "Recuperar" : "Descartar"}</button>}</td></tr>; })}</tbody></table>{!queueRows.length && !error && !queueLoading && <div className="p-10 text-center text-sm text-ink-tertiary">{queueSearch || queueMine ? "No hay coincidencias con los filtros actuales." : queueScope === "drafts" ? "No hay pendientes con cambios humanos registrados. Los cambios que guardes antes de aprobar aparecerán acá." : queueScope === "approved" ? "Todavía no hay canciones aprobadas en este alcance." : "No hay canciones pendientes para revisar."}</div>}</div>
+        {reviewPages > 1 && <nav aria-label="Páginas de canciones" className="flex items-center justify-between gap-3 border-t border-white/10 pt-4 text-sm"><span>{(currentReviewPage - 1) * 25 + 1}–{Math.min(currentReviewPage * 25, allQueueRows.length)} de {allQueueRows.length} canciones</span><div className="flex gap-2"><button disabled={currentReviewPage <= 1 || queueLoading} className="rounded-lg bg-white/5 px-3 py-2 disabled:opacity-40" onClick={() => saveContext({ rpage: currentReviewPage - 1 }, true)}>Anterior</button><button disabled={currentReviewPage >= reviewPages || queueLoading} className="rounded-lg bg-white/5 px-3 py-2 disabled:opacity-40" onClick={() => saveContext({ rpage: currentReviewPage + 1 }, true)}>Siguiente</button></div></nav>}
+        <div className="overflow-x-auto"><table className="block w-full text-left text-sm sm:table"><thead className="hidden border-b border-white/[0.06] text-xs text-ink-tertiary sm:table-header-group"><tr><th className="p-3">Canción</th><th className="hidden p-3 sm:table-cell">Duración</th><th className="p-3">Estado</th><th className="p-3" /></tr></thead><tbody className="block sm:table-row-group">{queueRows.map((row) => { const action = reviewActionLabel(row, queueStage); return <tr key={row.item_id} data-review-job={row.job_id || undefined} className={`grid grid-cols-[minmax(0,1fr)_auto] border-b border-white/[0.045] sm:table-row ${row.job_id === highlightedJobId ? "bg-brand/10 ring-1 ring-inset ring-brand/30" : ""}`}><td className="min-w-0 p-3 pb-1 sm:pb-3"><div className="break-words font-medium text-white">{row.title}</div><div className="text-xs text-ink-tertiary">{row.artist || "Artista no informado"}</div><details className="mt-2 max-w-lg text-xs"><summary className="cursor-pointer text-brand-light">{row.review_priority === "manual_full" ? "Requiere revisión completa" : row.timing_evidence?.length ? `${row.timing_evidence.length} fragmentos para comprobar` : "Qué revisar"}</summary><div className="mt-2"><CampaignReviewWork row={row} timestamp={timestamp} /></div></details>{row.approval?.user_id && <div className="mt-1 text-xs text-emerald-200">Aprobó {row.approval.name || "otro operador"}{row.approval.at ? ` · ${new Date(row.approval.at).toLocaleString()}` : ""}</div>}</td><td className="hidden p-3 text-ink-secondary sm:table-cell">{row.duration_seconds ? timestamp(row.duration_seconds) : "—"}</td><td className="col-start-1 row-start-2 px-3 pb-3 text-xs text-ink-secondary sm:p-3 sm:text-sm">{reviewStateLabel(row)}{row.is_draft && <div className="mt-1 text-xs text-ink-tertiary">Guardado por {row.last_reviewed_name || "otro operador"}{row.last_reviewed_at ? ` · ${new Date(row.last_reviewed_at).toLocaleString()}` : ""}</div>}</td><td className="col-start-2 row-start-1 row-span-2 p-3 text-right">{action ? <button onClick={() => openReview(row)} disabled={queueLoading} className="rounded-lg bg-brand/15 px-3 py-2 text-xs font-semibold text-brand-light disabled:cursor-not-allowed disabled:bg-white/[0.05] disabled:text-ink-tertiary">{action}</button> : <span className="text-xs text-ink-tertiary">{row.reviewer_lock_active ? "Otra persona está revisando" : "No disponible para revisión"}</span>}{(row.can_discard || row.state === "discarded") && <button disabled={queueLoading || (row.reviewer_lock_active && !row.reviewer_is_current_user)} onClick={() => setDiscardTarget(row)} className="mt-2 block w-full rounded-lg px-3 py-2 text-xs text-ink-secondary hover:bg-white/10 disabled:opacity-40">{row.state === "discarded" ? "Recuperar" : "Descartar"}</button>}</td></tr>; })}</tbody></table>{!queueRows.length && !error && !queueLoading && <div className="p-10 text-center text-sm text-ink-tertiary">{queueSearch || queueMine ? "No hay coincidencias con los filtros actuales." : queueScope === "drafts" ? "No hay pendientes con cambios humanos registrados. Los cambios que guardes antes de aprobar aparecerán acá." : queueScope === "approved" ? "Todavía no hay canciones aprobadas en este alcance." : "No hay canciones pendientes para revisar."}</div>}</div>
+        {!queueRows.length && queueSearch && !queueLoading && queueScope !== "all" && <button className="text-sm text-brand-light underline" onClick={() => selectScope("all")}>Buscar en todas las canciones de la campaña</button>}
       </section>
       <details className="rounded-2xl bg-surface-2/30 p-4 ring-1 ring-white/[0.06]"><summary className="cursor-pointer text-sm font-semibold text-white">Opciones avanzadas y trazabilidad</summary><div className="mt-4 space-y-4"><div className="flex flex-wrap gap-2"><select value={queueStage} onChange={(e) => { setQueueStage(e.target.value); saveContext({ stage: e.target.value }); }} className="rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10"><option value="lyrics">Letra y timing</option><option value="final">QC final</option></select><select value={queueVersion} onChange={(e) => { setQueueVersion(e.target.value); saveContext({ version: e.target.value }); }} className="rounded-lg bg-black/25 px-3 py-2 text-xs text-white ring-1 ring-white/10"><option value="">Studio + live</option><option value="studio">Studio</option><option value="live">Live</option></select><select value={queueState} aria-label="Estado de revisión" onChange={(e) => {
       const state = e.target.value;

@@ -1,6 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "./CampaignCreative.print.css";
-import { useNavigate } from "react-router-dom";
+import { createPortal } from "react-dom";
+import CampaignSearch from "./CampaignSearch";
+import CampaignDeliveryProgress from "./CampaignDeliveryProgress";
+import useLatestReviewRequest from "../hooks/useLatestReviewRequest";
+import useDialogA11y from "../hooks/useDialogA11y";
+import { matchesCampaignSong } from "../lib/campaignSearch";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS, AXIS_VALUE_LABELS, dynamicAxisLabel } from "../lib/optionLabels";
 import { translateBackendError } from "../lib/lyricsEditSubmit";
@@ -16,13 +22,14 @@ const button = "rounded-lg bg-brand/20 px-4 py-2 text-sm text-brand-light disabl
 const primaryButton = "rounded-lg bg-brand px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-brand/20 disabled:cursor-not-allowed disabled:opacity-40";
 const statusLabels = { waiting: "Esperando audio", transcribing: "Transcribiendo", transcribing_queued: "Transcripción en cola", transcribed: "Lista para revisar", transcribed_pending: "Lista para revisar", lyrics_approved: "Letra aprobada", queued: "En cola de generación", processing: "Generando", rendering: "Renderizando", editing: "Generando nueva versión", pending_review: "Pendiente de revisión final", done: "Aprobado", error: "Requiere atención", rejected: "Rechazado", discarded: "Descartada" };
 const sourceLabels = { lyrics: "Inspirado en la letra", auto: "Automático", prompt_literal: "Prompt exacto", prompt_improved: "Prompt mejorado con IA", as_is: "Usar tal cual", variation: "Crear variación" };
-const generationStatuses = new Set(["queued", "processing", "rendering", "editing", "pending_review"]);
+const generationStatuses = new Set(["queued", "processing", "rendering", "editing"]);
 const videoProcessingStatuses = new Set(["queued", "processing", "rendering", "editing"]);
 
 const videoFilters = [
   { id: "all", label: "Todos", matches: () => true },
   { id: "review", label: "Pendientes", matches: video => video.status === "pending_review" },
   { id: "approved", label: "Aprobados", matches: video => video.status === "done" },
+  { id: "failed", label: "Requieren atención", matches: video => ["error", "rejected"].includes(video.status) },
   { id: "processing", label: "En proceso", matches: video => videoProcessingStatuses.has(video.status) },
 ];
 const deliveryPortals = [{ id: "argentina", label: "Argentina", host: "umg.genly.pro" }, { id: "chile", label: "Chile", host: "umgchile.genly.pro" }];
@@ -30,8 +37,10 @@ const deliveryPortals = [{ id: "argentina", label: "Argentina", host: "umg.genly
 const songFilters = [
   { id: "all", label: "Todas", matches: () => true },
   { id: "ready", label: "Listas para generar", matches: item => item.status === "lyrics_approved" },
-  { id: "review", label: "Pendientes de aprobación", matches: item => ["transcribed", "transcribed_pending"].includes(item.status) },
+  { id: "review", label: "Letras por revisar", matches: item => ["transcribed", "transcribed_pending"].includes(item.status) },
   { id: "generating", label: "En generación", matches: item => generationStatuses.has(item.status) },
+  { id: "final", label: "Videos por revisar", matches: item => item.status === "pending_review" },
+  { id: "failed", label: "Requieren atención", matches: item => ["error", "rejected"].includes(item.status) },
   { id: "approved", label: "Videos aprobados", matches: item => item.status === "done" },
 ];
 
@@ -67,16 +76,25 @@ function VideoThumbnail({ video, compact = false }) {
   return <div ref={ref} className={`${compact ? "h-[72px] w-32 sm:h-[90px] sm:w-40" : "aspect-video"} shrink-0 overflow-hidden rounded-lg bg-black/30`}>{url ? <img src={url} alt={`Video de ${video.title}`} className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center px-2 text-center text-xs text-ink-secondary">{video.video_url ? "Vista previa" : "Generación en curso"}</div>}</div>;
 }
 
-function CampaignVideoPlayer({ video, onClose }) {
+function CampaignModal({ label, busy, onClose, children }) {
+  const dialogRef = useDialogA11y({ onClose, closeOnEscape: !busy });
+  return createPortal(<div ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label={label}
+    className="fixed inset-0 z-[80] grid place-items-center overflow-y-auto bg-black/80 p-4 text-white [&>div]:max-h-[calc(100dvh-2rem)] [&>div]:overflow-y-auto"
+    onMouseDown={event => { if (!busy && event.target === event.currentTarget) onClose(); }}>{children}</div>, document.body);
+}
+
+function CampaignVideoPlayer({ video, onClose, onApprove, onEdit, busy, error }) {
   const url = useMediaUrl(video.job_id, "video", "preview", video.evidence?.video_sha256 || "");
-  return <div role="dialog" aria-modal="true" aria-label={`Reproducir ${video.title}`} className="fixed inset-0 z-50 grid place-items-center bg-black/80 p-4" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
-    <div className="w-full max-w-4xl space-y-4 rounded-2xl bg-surface-2 p-4 shadow-2xl ring-1 ring-white/15 sm:p-5">
-      <div className="flex items-start justify-between gap-4"><div><h2 className="text-lg font-semibold">{video.title}</h2><p className="text-sm text-ink-secondary">{video.artist}</p></div><button type="button" className={button} onClick={onClose}>Cerrar</button></div>
+  return <CampaignModal label={`Reproducir ${video.title}`} busy={busy} onClose={onClose}>
+    <div className="max-h-[95dvh] w-full max-w-4xl overflow-y-auto space-y-4 rounded-2xl bg-surface-2 p-4 shadow-2xl ring-1 ring-white/15 sm:p-5">
+      <div className="flex items-start justify-between gap-4"><div><h2 className="text-lg font-semibold">{video.title}</h2><p className="text-sm text-ink-secondary">{video.artist}</p></div><button type="button" className={button} disabled={busy} onClick={onClose}>Cerrar</button></div>
       <div className="mx-auto flex min-h-52 max-h-[58vh] max-w-3xl items-center justify-center overflow-hidden rounded-xl bg-black">
-        {url ? <video className="max-h-[58vh] w-full" src={url} controls autoPlay playsInline preload="metadata">Tu navegador no puede reproducir este video.</video> : <p role="status" className="p-8 text-sm text-ink-secondary">Preparando el reproductor…</p>}
+        {url ? <video className="max-h-[58vh] w-full" key={video.job_id} src={url} controls autoPlay playsInline preload="metadata">Tu navegador no puede reproducir este video.</video> : <p role="status" className="p-8 text-sm text-ink-secondary">Preparando el reproductor…</p>}
       </div>
+      {error && <p role="alert" className="text-sm text-red-200">{error}</p>}
+      <div className="flex flex-wrap items-center justify-between gap-3"><button className={button} disabled={busy} onClick={onEdit}>Corregir letra o tiempos</button>{video.status === "pending_review" && <div className="space-y-2 text-right"><p className="text-xs text-ink-secondary">Al aprobar confirmás que revisaste el video completo.</p><button className={primaryButton} disabled={busy || !url} onClick={onApprove}>{busy ? "Aprobando…" : "Aprobar y siguiente"}</button></div>}</div>
     </div>
-  </div>;
+  </CampaignModal>;
 }
 
 function Controls({ fields, values, update, assets, label }) {
@@ -99,11 +117,31 @@ function Controls({ fields, values, update, assets, label }) {
   </details>)}</div>;
 }
 
-export default function CampaignCreative({ campaignId, view = "creative" }) {
+export default function CampaignCreative({ campaignId, view = "creative", onBusyChange }) {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const writeParams = patch => setSearchParams(previous => { const next = new URLSearchParams(previous); Object.entries(patch).forEach(([key, value]) => { if (value == null || value === "") next.delete(key); else next.set(key, String(value)); }); return next; }, { replace: true });
+  const query = searchParams.get("q") || "";
+  const videoQuery = query;
+  const songFilter = searchParams.get("song_state") || "all";
+  const videoFilter = view === "deliveries" ? "approved" : searchParams.get("video_state") || "all";
+  const page = Math.max(1, Number(searchParams.get("cpage")) || 1);
+  const videoPage = Math.max(1, Number(searchParams.get("vpage")) || 1);
+  const setPage = value => writeParams({ cpage: typeof value === "function" ? value(page) : value });
+  const setVideoPage = value => writeParams({ vpage: typeof value === "function" ? value(videoPage) : value });
+  const setQuery = value => { setSelected(new Set()); setSelectedVideoIds(new Set()); writeParams({ q: value, cpage: null, vpage: null }); };
+  const setVideoQuery = setQuery;
+  const setSongFilter = value => { setSelected(new Set()); writeParams({ song_state: value, cpage: null }); };
+  const setVideoFilter = value => { setSelectedVideoIds(new Set()); writeParams({ video_state: value, vpage: null }); };
+  const returnPath = `/campaigns/${encodeURIComponent(campaignId)}?${searchParams}`;
+  const openVideo = path => navigate(`${path}?return_to=${encodeURIComponent(returnPath)}`);
+  const deliveryKey = useRef(null);
+  const runningAction = useRef(false);
+  const initialized = useRef(false);
+  const { start, cancel, active } = useLatestReviewRequest();
   const base = `/batch/campaigns/${campaignId}`;
   const [data, setData] = useState(null), [assets, setAssets] = useState([]), [report, setReport] = useState(null);
-  const [selected, setSelected] = useState(new Set()), [query, setQuery] = useState(""), [songFilter, setSongFilter] = useState("all"), [page, setPage] = useState(1);
+  const [selected, setSelected] = useState(new Set());
   const [groups, setGroups] = useState([]), [mode, setMode] = useState("percent"), [contract, setContract] = useState(false);
   const [agreement, setAgreement] = useState(""), [rounding, setRounding] = useState(""), [reason, setReason] = useState("");
   const [replace, setReplace] = useState(false), [pin, setPin] = useState(false), [preview, setPreview] = useState(null);
@@ -115,44 +153,45 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
   const [generationNotice, setGenerationNotice] = useState("");
   const [previewStyle, setPreviewStyle] = useState(null);
   const [configurationOpen, setConfigurationOpen] = useState(false);
-  const [videoQuery, setVideoQuery] = useState("");
-  const [videoFilter, setVideoFilter] = useState("all");
-  const [videoPage, setVideoPage] = useState(1);
+  useEffect(() => { onBusyChange?.(busy); return () => onBusyChange?.(false); }, [busy, onBusyChange]);
+  useEffect(() => {
+    if (!busy) return;
+    const warn = event => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [busy]);
   const [playingVideo, setPlayingVideo] = useState(null);
   const [approvalVideo, setApprovalVideo] = useState(null);
   const load = useCallback(async (initialize = false) => {
-    const [head, backgrounds, receipt] = await Promise.all([request(`${base}/creative`), request("/backgrounds"), request(`${base}/creative/report`)]);
-    setData(head); setAssets(backgrounds); setReport(receipt);
-    if (initialize) {
-      setGroups(head.plan.groups?.length ? head.plan.groups.map(g => g.requirement === "veo" ? { ...g, model: VEO_LITE } : g) : [{ id: "estilo-1", name: "Estilo 1", weight: 100, requirement: "creative", model: "", settings: {} }]);
-      setMode(head.plan.mode || "percent");
-      setAgreement(head.plan.contract?.agreement || ""); setRounding(head.plan.contract?.rounding_note || "");
-    }
-  }, [base]);
-  useEffect(() => { let alive = true; load(true).catch(e => { if (alive) setError(e.message); }); return () => { alive = false; }; }, [load]);
-  useEffect(() => { if (view === "history") { const timer = setInterval(() => load().catch(e => setError(e.message)), 15000); return () => clearInterval(timer); } }, [load, view]);
-  const run = async fn => { setBusy(true); setError(""); setMessage(""); try { await fn(); } catch (e) { setError(e.message); } finally { setBusy(false); } };
-  const approveAllHistory = () => run(async () => {
-    const pending = (report?.videos || []).filter(video => video.status === "pending_review");
-    const reason = `Autorización urgente de Tomi · campaña ${campaignId} · envío a UMG Chile`;
-    let approved = 0;
-    const failures = [];
-    for (const video of pending) {
-      try {
-        await post(`/approve/${video.job_id}`, {
-          notes: "Aprobación masiva autorizada para liberar entrega a UMG Chile",
-          admin_override: true,
-          override_reason: reason,
-        });
-        approved++;
-      } catch (approvalError) {
-        failures.push(`${video.artist} · ${video.title}: ${approvalError.message}`);
+    const latest = start();
+    try {
+      const options = { signal: latest.signal };
+      const [head, receipt] = await Promise.all([request(`${base}/creative`, options), request(`${base}/creative/report`, options)]);
+      if (!latest.current()) return null;
+      setData(head); setReport(receipt);
+      if (initialize && !initialized.current) {
+        initialized.current = true;
+        setGroups(head.plan.groups?.length ? head.plan.groups.map(g => g.requirement === "veo" ? { ...g, model: VEO_LITE } : g) : [{ id: "estilo-1", name: "Estilo 1", weight: 100, requirement: "creative", model: "", settings: {} }]);
+        setMode(head.plan.mode || "percent");
+        setAgreement(head.plan.contract?.agreement || ""); setRounding(head.plan.contract?.rounding_note || "");
       }
-    }
-    await load();
-    setMessage(`${approved} videos aprobados${failures.length ? ` · ${failures.length} no se pudieron aprobar` : ""}.`);
-    if (failures.length) throw new Error(failures.join(" | "));
-  });
+      return receipt;
+    } catch (e) { if (latest.current()) throw e; return null; }
+    finally { latest.finish(); }
+  }, [base, start]);
+  useEffect(() => { load(true).catch(e => setError(e.message)); return cancel; }, [load, cancel]);
+  useEffect(() => {
+    if (!configurationOpen) return;
+    const controller = new AbortController();
+    request("/backgrounds", { signal: controller.signal }).then(result => { if (!controller.signal.aborted) setAssets(result); }).catch(e => { if (!controller.signal.aborted) setError(e.message); });
+    return () => controller.abort();
+  }, [configurationOpen]);
+  useEffect(() => {
+    if (busy) return;
+    const timer = setInterval(() => { if (document.visibilityState === "visible" && !active.current) load().catch(e => setError(e.message)); }, 30000);
+    return () => clearInterval(timer);
+  }, [load, busy, active]);
+  const run = async fn => { if (runningAction.current) return; runningAction.current = true; setBusy(true); setError(""); setMessage(""); try { await fn(); } catch (e) { setError(e.message); } finally { runningAction.current = false; setBusy(false); } };
   const submitGeneration = () => run(async () => {
     const batch = [...(generation || [])];
     let sent = 0;
@@ -208,23 +247,24 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
   };
   if (!data) return <div role={error ? "alert" : "status"}>{error || "Cargando configuración…"}</div>;
   const activeFilter = songFilters.find(filter => filter.id === songFilter) || songFilters[0];
-  const searched = data.items.filter(i => `${i.artist} ${i.title}`.toLowerCase().includes(query.toLowerCase()));
+  const searched = data.items.filter(i => matchesCampaignSong(query, i));
   const filtered = searched.filter(activeFilter.matches);
-  const eligible = data.items.filter(i => selected.has(i.id) && i.status === "lyrics_approved" && !i.discarded);
+  const eligible = filtered.filter(i => selected.has(i.id) && i.status === "lyrics_approved" && !i.discarded);
   const ready = searched.filter(i => songFilters[1].matches(i) && !i.discarded);
   const filterCounts = Object.fromEntries(songFilters.map(filter => [filter.id, searched.filter(filter.matches).length]));
+  const hiddenSelections = [...selected].filter(id => !filtered.some(item => item.id === id)).length;
   const selectable = filtered.filter(i => !i.discarded);
   const pages = Math.max(1, Math.ceil(filtered.length / 20));
   const currentPage = Math.min(page, pages);
   const visible = filtered.slice((currentPage - 1) * 20, currentPage * 20);
   const activeVideoFilter = videoFilters.find(filter => filter.id === videoFilter) || videoFilters[0];
-  const searchedVideos = (report?.videos || []).filter(video => `${video.artist} ${video.title}`.toLowerCase().includes(videoQuery.toLowerCase()));
+  const searchedVideos = (report?.videos || []).filter(video => matchesCampaignSong(videoQuery, video));
   const filteredVideos = searchedVideos.filter(activeVideoFilter.matches);
   const videoFilterCounts = Object.fromEntries(videoFilters.map(filter => [filter.id, searchedVideos.filter(filter.matches).length]));
   const videoPages = Math.max(1, Math.ceil(filteredVideos.length / 20));
   const currentVideoPage = Math.min(videoPage, videoPages);
   const visibleVideos = filteredVideos.slice((currentVideoPage - 1) * 20, currentVideoPage * 20);
-  const approvedVideos = (report?.videos || []).filter(video => video.status === "done" && video.approved_at);
+  const approvedVideos = filteredVideos.filter(video => video.status === "done" && video.approved_at);
   const selectedApprovedVideos = approvedVideos.filter(video => selectedVideoIds.has(video.job_id));
   const allApprovedSelected = approvedVideos.length > 0 && selectedApprovedVideos.length === approvedVideos.length;
   const trim = n => (Number.isInteger(n) ? n : Number(n.toFixed(2)));
@@ -232,28 +272,29 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
   const distributionTarget = mode === "percent" ? 100 : selected.size;
   const distributionBalanced = groups.length > 0 && Math.abs(weightSum - distributionTarget) < 1e-6;
   return <section className="space-y-5" aria-label="Configuración de campaña">
-    {error && <p role="alert" className="rounded-xl bg-red-500/15 p-3 text-red-200">{error}</p>}
+    {error && !bulkDelivery && !playingVideo && !approvalVideo && <p role="alert" className="rounded-xl bg-red-500/15 p-3 text-red-200">{error}</p>}
     {message && <p role="status" className="rounded-xl bg-emerald-500/15 p-3 text-emerald-200">{message}</p>}
     {generationNotice && <p role="status" className="rounded-xl bg-amber-500/15 p-3 text-amber-200">{generationNotice}</p>}
-    <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-sm text-ink-secondary">Configuración guardada · versión {data.plan.revision}</p><button className={button} disabled={busy} onClick={() => run(() => load())}>Actualizar estado</button></div>
+    <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-sm text-ink-secondary">Estilo guardado de la campaña</p><button className={button} disabled={busy} onClick={() => run(() => load())}>Actualizar estado</button></div>
+    {searchParams.get("delivery_op") && <CampaignDeliveryProgress operationId={searchParams.get("delivery_op")} request={request} onSelectFailed={ids => { setSelectedVideoIds(new Set(ids)); writeParams({ q: null, video_state: "approved", vpage: null }); }} />}
     {view === "creative" && <>
       <div className="overflow-hidden rounded-2xl bg-surface-2/40 ring-1 ring-white/10">
         <div className="space-y-4 p-5">
           <div><p className="text-xs font-semibold uppercase tracking-wider text-brand-light">Paso 1</p><h2 className="text-lg font-semibold">Elegí qué canciones trabajar</h2><p className="mt-1 text-sm text-ink-secondary">Filtrá las que ya tienen letra y tiempos aprobados para generar sólo esas.</p></div>
           <div className="grid gap-3 sm:grid-cols-3">
-            <button type="button" className="rounded-xl bg-emerald-500/10 p-3 text-left ring-1 ring-emerald-400/20" onClick={() => { setSongFilter("ready"); setPage(1); }}><strong className="block text-2xl text-emerald-200">{filterCounts.ready}</strong><span className="text-sm text-emerald-100">Listas para generar</span></button>
-            <button type="button" className="rounded-xl bg-white/5 p-3 text-left ring-1 ring-white/10" onClick={() => { setSongFilter("review"); setPage(1); }}><strong className="block text-2xl">{filterCounts.review}</strong><span className="text-sm text-ink-secondary">Pendientes de aprobación</span></button>
-            <button type="button" className="rounded-xl bg-white/5 p-3 text-left ring-1 ring-white/10" onClick={() => { setSongFilter("approved"); setPage(1); }}><strong className="block text-2xl">{filterCounts.approved}</strong><span className="text-sm text-ink-secondary">Videos aprobados</span></button>
+            <button type="button" className="rounded-xl bg-emerald-500/10 p-3 text-left ring-1 ring-emerald-400/20" onClick={() => { setSongFilter("ready"); }}><strong className="block text-2xl text-emerald-200">{filterCounts.ready}</strong><span className="text-sm text-emerald-100">Listas para generar</span></button>
+            <button type="button" className="rounded-xl bg-white/5 p-3 text-left ring-1 ring-white/10" onClick={() => { setSongFilter("review"); }}><strong className="block text-2xl">{filterCounts.review}</strong><span className="text-sm text-ink-secondary">Pendientes de aprobación</span></button>
+            <button type="button" className="rounded-xl bg-white/5 p-3 text-left ring-1 ring-white/10" onClick={() => { setSongFilter("approved"); }}><strong className="block text-2xl">{filterCounts.approved}</strong><span className="text-sm text-ink-secondary">Videos aprobados</span></button>
           </div>
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
-            <input className={input + " lg:max-w-sm"} aria-label="Buscar para asignar" placeholder="Buscar canción o artista" value={query} onChange={e => { setQuery(e.target.value); setPage(1); }} />
-            <div className="flex flex-wrap gap-2" role="group" aria-label="Filtrar canciones por estado">{songFilters.map(filter => <button key={filter.id} type="button" aria-pressed={songFilter === filter.id} className={`rounded-full px-3 py-2 text-sm ring-1 ${songFilter === filter.id ? "bg-brand/25 text-brand-light ring-brand/50" : "bg-black/20 text-ink-secondary ring-white/10"}`} onClick={() => { setSongFilter(filter.id); setPage(1); }}>{filter.label} <span className="opacity-70">{filterCounts[filter.id]}</span></button>)}</div>
+            <CampaignSearch className="w-full lg:max-w-sm" label="Buscar para asignar" value={query} onChange={setQuery} />
+            <div className="flex flex-wrap gap-2" role="group" aria-label="Filtrar canciones por estado">{songFilters.map(filter => <button key={filter.id} type="button" aria-pressed={songFilter === filter.id} className={`rounded-full px-3 py-2 text-sm ring-1 ${songFilter === filter.id ? "bg-brand/25 text-brand-light ring-brand/50" : "bg-black/20 text-ink-secondary ring-white/10"}`} onClick={() => { setSongFilter(filter.id); }}>{filter.label} <span className="opacity-70">{filterCounts[filter.id]}</span></button>)}</div>
           </div>
           <div className="flex flex-wrap items-center gap-2 rounded-xl bg-black/20 p-3">
             <button className={button} disabled={!selectable.length} onClick={() => change(() => setSelected(new Set(selectable.map(i => i.id))))}>Seleccionar resultados ({selectable.length})</button>
             <button className={button} disabled={!ready.length} onClick={() => change(() => setSelected(new Set(ready.map(i => i.id))))}>Seleccionar listas para generar ({ready.length})</button>
             <button className={button} disabled={!selected.size} onClick={() => change(() => setSelected(new Set()))}>Limpiar</button>
-            <span className="text-sm" aria-label={`${selected.size} seleccionadas; ${eligible.length} listas para generar`}><strong>{selected.size}</strong> seleccionadas · <strong className="text-emerald-200">{eligible.length}</strong> listas para generar</span>
+            <span className="text-sm" aria-label={`${selected.size} seleccionadas; ${eligible.length} listas para generar`}><strong>{selected.size}</strong> seleccionadas · <strong className="text-emerald-200">{eligible.length}</strong> listas para generar{hiddenSelections > 0 && <span className="block text-xs text-amber-200">{hiddenSelections} fuera del filtro; no se generarán.</span>}</span>
             <button aria-label={`Preparar generación de ${eligible.length} aprobadas seleccionadas`} className={primaryButton + " ml-auto"} disabled={busy || !eligible.length} onClick={() => { setGenerationProgress(null); setGeneration(eligible); }}>{eligible.length ? `Generar ${eligible.length} ${eligible.length === 1 ? "video" : "videos"}` : "Generar videos"}</button>
           </div>
         </div>
@@ -295,7 +336,8 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
         {data.operations[0]?.revision === data.plan.revision && <button className={button} disabled={reason.trim().length < 3} onClick={() => run(async () => { await post(`${base}/creative/undo`, { revision: data.plan.revision, operation_id: data.operations[0].id, reason }); setPreview(null); await load(); setMessage("Última asignación deshecha."); })}>Deshacer última asignación</button>}
       </fieldset>}</div>}
     </>}
-    {generation && <div role="dialog" aria-modal="true" aria-label="Confirmar generación" className="fixed inset-0 z-50 grid place-items-center bg-black/80 p-5"><div className="w-full max-w-lg space-y-4 rounded-2xl bg-surface-2 p-6"><h2 className="text-xl font-semibold">Generar {generation.length} videos</h2><p>Esta acción genera fondos y videos y consume el cupo correspondiente. La configuración y el grupo de cada canción quedarán registrados.</p><ul className="max-h-40 overflow-auto">{generation.map(i => <li key={i.id}>{i.title} · {i.assignment?.group_name || "Configuración actual"}</li>)}</ul>{generationProgress && <div role="status" aria-live="polite" className="space-y-2 rounded-xl bg-brand/10 p-4 ring-1 ring-brand/30"><div className="flex items-center gap-3"><span className="h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-brand-light/30 border-t-brand-light" aria-hidden="true" /><div><strong className="block">{generationProgress.attempted < generationProgress.total ? `Enviando ${generationProgress.attempted + 1} de ${generationProgress.total}` : `Finalizando · ${generationProgress.sent} enviados`}</strong><span className="text-sm text-ink-secondary">{generationProgress.current || "Actualizando el estado de la campaña…"}</span></div></div><div className="h-2 overflow-hidden rounded-full bg-black/30"><div className="h-full rounded-full bg-brand transition-all" style={{ width: `${Math.max(5, 100 * generationProgress.attempted / generationProgress.total)}%` }} /></div><p className="text-xs text-ink-secondary">Podés esperar en esta pantalla. No vuelvas a confirmar: cada video se envía una sola vez.</p></div>}<button className={generationProgress ? primaryButton : button} disabled={busy} onClick={submitGeneration}>{generationProgress ? generationProgress.attempted < generationProgress.total ? `Enviando ${generationProgress.attempted + 1} de ${generationProgress.total}…` : "Actualizando estado…" : "Confirmar generación"}</button><button className={button} disabled={busy} onClick={() => { setGenerationProgress(null); setGeneration(null); }}>Cancelar</button></div></div>}
+    {query && <p className="text-xs text-ink-secondary">La búsqueda ignora tildes y el orden de las palabras. <button className="underline" onClick={() => setQuery("")}>Limpiar búsqueda</button></p>}
+    {generation && <CampaignModal label="Confirmar generación" busy={busy} onClose={() => { setGenerationProgress(null); setGeneration(null); }}><div className="w-full max-w-lg space-y-4 rounded-2xl bg-surface-2 p-6"><h2 className="text-xl font-semibold">Generar {generation.length} videos</h2><p>Esta acción genera fondos y videos y consume el cupo correspondiente. La configuración y el grupo de cada canción quedarán registrados.</p><ul className="max-h-40 overflow-auto">{generation.map(i => <li key={i.id}>{i.title} · {i.assignment?.group_name || "Configuración actual"}</li>)}</ul>{generationProgress && <div role="status" aria-live="polite" className="space-y-2 rounded-xl bg-brand/10 p-4 ring-1 ring-brand/30"><div className="flex items-center gap-3"><span className="h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-brand-light/30 border-t-brand-light" aria-hidden="true" /><div><strong className="block">{generationProgress.attempted < generationProgress.total ? `Enviando ${generationProgress.attempted + 1} de ${generationProgress.total}` : `Finalizando · ${generationProgress.sent} enviados`}</strong><span className="text-sm text-ink-secondary">{generationProgress.current || "Actualizando el estado de la campaña…"}</span></div></div><div className="h-2 overflow-hidden rounded-full bg-black/30"><div className="h-full rounded-full bg-brand transition-all" style={{ width: `${Math.max(5, 100 * generationProgress.attempted / generationProgress.total)}%` }} /></div><p className="text-xs text-ink-secondary">Podés esperar en esta pantalla. No vuelvas a confirmar: cada video se envía una sola vez.</p></div>}<button className={generationProgress ? primaryButton : button} disabled={busy} onClick={submitGeneration}>{generationProgress ? generationProgress.attempted < generationProgress.total ? `Enviando ${generationProgress.attempted + 1} de ${generationProgress.total}…` : "Actualizando estado…" : "Confirmar generación"}</button><button className={button} disabled={busy} onClick={() => { setGenerationProgress(null); setGeneration(null); }}>Cancelar</button></div></CampaignModal>}
     {view === "contract" && report && <div id="campaign-contract-report" className="space-y-4">
       <h2 className="text-xl font-semibold">Contrato y cumplimiento · {report.name}</h2><p className="text-sm">Informe: {new Date(report.at).toLocaleString()} · Acuerdo versión {report.contract.revision || "Sin registrar"}</p>
       <p className="whitespace-pre-wrap">{report.contract.agreement || "Todavía no se registró un compromiso contractual."}</p><p>{report.contract.rounding_note}</p>
@@ -306,14 +348,14 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
       <h3 className="font-semibold">Registro por video</h3>{report.videos.map(v => <details key={v.job_id}><summary>{v.artist} — {v.title} · {v.assignment.group_name || "Sin clasificación"} · {v.compliance === "verified" ? "Verificado" : v.compliance === "deviation" ? "Desviación" : "Evidencia pendiente"}</summary><p className="text-xs break-all">Efecto aplicado: {v.evidence.effect_applied || "No acreditado"} · Modelos: {v.evidence.models?.join(", ") || "No acreditados"} · Huella: {v.evidence.video_sha256 || "Pendiente"}</p></details>)}
       <h3 className="font-semibold">Historial de cambios</h3>{report.history.map((h, i) => <details key={i}><summary>{new Date(h.at).toLocaleString()} · Usuario {h.actor} · {h.detail.reason || h.detail.destination || "Cambio registrado"}</summary><p>Versión {h.detail.revision || h.detail.after?.revision || "—"}</p>{(h.detail.changes || (h.detail.item_id ? [h.detail] : [])).map(c => <div key={c.item_id} className="ml-4 text-sm"><p>{c.artist} · {c.title || data.items.find(item => item.id === c.item_id)?.title || c.item_id}</p>{Object.entries(c.after || {}).filter(([k, value]) => data.fields[k] && JSON.stringify(c.before?.[k]) !== JSON.stringify(value)).map(([k, value]) => <p key={k}>{data.fields[k].label}: {String(c.before?.[k] ?? "Heredado")} → {String(value)}</p>)}</div>)}</details>)}
     </div>}
-    {view === "history" && report && <div className="space-y-4">
-      <div><h2 className="text-xl font-semibold">Videos de esta campaña ({report.videos.length})</h2><p className="mt-1 text-sm text-ink-secondary">Reproducí, aprobá o editá cada video sin recorrer tarjetas gigantes. Sólo se carga el video que abrís.</p></div>
-      {!report.videos.length && <p className="rounded-xl bg-surface-2/40 p-8">Todavía no hay videos generados. Primero aprobá letras y tiempos, y luego iniciá la generación desde Estilo y fondos.</p>}
-      {data.can_manage && (approvedVideos.length > 0 || (report?.videos || []).some(video => video.status === "pending_review")) && <div className="flex flex-wrap items-center gap-2 rounded-xl bg-emerald-500/10 p-3 ring-1 ring-emerald-400/20"><button className={button} disabled={busy} onClick={() => setSelectedVideoIds(allApprovedSelected ? new Set() : new Set(approvedVideos.map(video => video.job_id)))}>{allApprovedSelected ? "Limpiar aprobados" : `Seleccionar todos los aprobados (${approvedVideos.length})`}</button><span className="text-sm" aria-label={`${selectedApprovedVideos.length} videos aprobados seleccionados`}><strong>{selectedApprovedVideos.length}</strong> seleccionados para enviar</span><button className={primaryButton + " ml-auto"} disabled={busy || !selectedApprovedVideos.length} onClick={() => { setBulkDelivery(selectedApprovedVideos); setDeliveryPortal(""); }}>Enviar seleccionados a un portal</button>{(report?.videos || []).some(video => video.status === "pending_review") && <button className={button} disabled={busy} onClick={approveAllHistory}>Liberar pendientes autorizados</button>}</div>}
+    {["history", "deliveries"].includes(view) && report && <div className="space-y-4">
+      <div><h2 className="text-xl font-semibold">{view === "deliveries" ? `Entregables · ${approvedVideos.length} videos aprobados` : `Videos de esta campaña (${report.videos.length})`}</h2><p className="mt-1 text-sm text-ink-secondary">{view === "deliveries" ? "Seleccioná los aprobados, elegí el portal y seguí el avance del envío." : "Reproducí y aprobá el siguiente sin salir del reproductor. La búsqueda y los filtros se conservan al volver."}</p></div>
+      {!report.videos.length && <p className="rounded-xl bg-surface-2/40 p-8">Todavía no hay videos generados. Primero aprobá letras y tiempos, y luego abrí Generar videos.</p>}
+      {data.can_manage && approvedVideos.length > 0 && <div className="flex flex-wrap items-center gap-2 rounded-xl bg-emerald-500/10 p-3 ring-1 ring-emerald-400/20"><button className={button} disabled={busy} onClick={() => setSelectedVideoIds(allApprovedSelected ? new Set() : new Set(approvedVideos.map(video => video.job_id)))}>{allApprovedSelected ? "Limpiar aprobados" : `Seleccionar aprobados del resultado (${approvedVideos.length})`}</button><span className="text-sm" aria-label={`${selectedApprovedVideos.length} videos aprobados seleccionados`}><strong>{selectedApprovedVideos.length}</strong> seleccionados para enviar</span><button className={primaryButton + " ml-auto"} disabled={busy || !selectedApprovedVideos.length} onClick={() => { deliveryKey.current = null; setBulkDelivery(selectedApprovedVideos); setDeliveryPortal(""); }}>Enviar seleccionados a un portal</button></div>}
       {!!report.videos.length && <div className="overflow-hidden rounded-2xl bg-surface-2/30 ring-1 ring-white/10">
         <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-center">
-          <input className={input + " lg:max-w-sm"} aria-label="Buscar videos de la campaña" placeholder="Buscar canción o artista" value={videoQuery} onChange={event => { setVideoQuery(event.target.value); setVideoPage(1); }} />
-          <div className="flex flex-wrap gap-2" role="group" aria-label="Filtrar videos por estado">{videoFilters.map(filter => <button key={filter.id} type="button" aria-pressed={videoFilter === filter.id} className={`rounded-full px-3 py-2 text-sm ring-1 ${videoFilter === filter.id ? "bg-brand/25 text-brand-light ring-brand/50" : "bg-black/20 text-ink-secondary ring-white/10"}`} onClick={() => { setVideoFilter(filter.id); setVideoPage(1); }}>{filter.label} <span className="opacity-70">{videoFilterCounts[filter.id]}</span></button>)}</div>
+          <CampaignSearch className="w-full lg:max-w-sm" label="Buscar videos de la campaña" value={videoQuery} onChange={setVideoQuery} />
+          {view !== "deliveries" && <div className="flex flex-wrap gap-2" role="group" aria-label="Filtrar videos por estado">{videoFilters.map(filter => <button key={filter.id} type="button" aria-pressed={videoFilter === filter.id} className={`rounded-full px-3 py-2 text-sm ring-1 ${videoFilter === filter.id ? "bg-brand/25 text-brand-light ring-brand/50" : "bg-black/20 text-ink-secondary ring-white/10"}`} onClick={() => { setVideoFilter(filter.id); }}>{filter.label} <span className="opacity-70">{videoFilterCounts[filter.id]}</span></button>)}</div>}
         </div>
         {!visibleVideos.length && <p className="border-t border-white/10 p-8 text-center text-ink-secondary">No hay videos que coincidan con este filtro.</p>}
         <ul aria-label="Lista de videos de la campaña" className="divide-y divide-white/10 border-t border-white/10">{visibleVideos.map(video => <li key={video.job_id} className="grid gap-4 p-4 hover:bg-white/[0.025] lg:grid-cols-[160px_minmax(220px,1fr)_minmax(150px,auto)_auto] lg:items-center">
@@ -324,17 +366,27 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
             {data.can_manage && video.status === "done" && video.approved_at && <label className="flex items-center gap-2 text-sm text-emerald-100"><input type="checkbox" aria-label={`Seleccionar video ${video.title}`} checked={selectedVideoIds.has(video.job_id)} onChange={event => setSelectedVideoIds(old => { const next = new Set(old); if (event.target.checked) next.add(video.job_id); else next.delete(video.job_id); return next; })} />Seleccionar para enviar</label>}
             <button type="button" className={primaryButton} disabled={!video.video_url || busy} onClick={() => setPlayingVideo(video)}>Reproducir</button>
             {video.status === "pending_review" && <button type="button" className={button} disabled={busy} onClick={() => setApprovalVideo(video)}>Aprobar</button>}
-            {["pending_review", "done", "rejected"].includes(video.status) && <button type="button" className={button} disabled={busy} onClick={() => navigate(`/videos/${video.job_id}/edit-lyrics`)}>Editar</button>}
-            <button type="button" className={button} disabled={busy} onClick={() => navigate(video.open_path)}>Detalle</button>
+            {["pending_review", "done", "rejected"].includes(video.status) && <button type="button" className={button} disabled={busy} onClick={() => openVideo(`/videos/${video.job_id}/edit-lyrics`)}>Editar</button>}
+            <button type="button" className={button} disabled={busy} onClick={() => openVideo(video.open_path || `/videos/${video.job_id}`)}>Detalle</button>
             {data.can_manage && video.status === "done" && video.approved_at && video.evidence.video_sha256 && <button type="button" className={button} disabled={busy} onClick={() => { setDelivery(video); setDestination(""); }}>Registrar entrega</button>}
           </div>
         </li>)}</ul>
         <div className="flex items-center justify-between gap-3 border-t border-white/10 p-4"><span className="text-sm text-ink-secondary">{filteredVideos.length} resultados · Página {currentVideoPage} de {videoPages}</span><div className="flex gap-2"><button className={button} disabled={currentVideoPage <= 1} onClick={() => setVideoPage(value => value - 1)}>Anterior</button><button className={button} disabled={currentVideoPage >= videoPages} onClick={() => setVideoPage(value => value + 1)}>Siguiente</button></div></div>
       </div>}
     </div>}
-    {playingVideo && <CampaignVideoPlayer video={playingVideo} onClose={() => setPlayingVideo(null)} />}
-    {approvalVideo && <div role="dialog" aria-modal="true" aria-label={`Aprobar ${approvalVideo.title}`} className="fixed inset-0 z-50 grid place-items-center bg-black/80 p-5"><div className="w-full max-w-lg space-y-4 rounded-2xl bg-surface-2 p-6 ring-1 ring-white/15"><h2 className="text-xl font-semibold">Aprobar {approvalVideo.title}</h2><p>Confirmá que revisaste el video completo. Quedará aprobado como la versión final vigente.</p><div className="flex flex-wrap justify-end gap-2"><button className={button} disabled={busy} onClick={() => setApprovalVideo(null)}>Cancelar</button><button className={primaryButton} disabled={busy} onClick={() => run(async () => { await post(`/approve/${approvalVideo.job_id}`, { notes: "Aprobado desde el historial de campaña" }); setApprovalVideo(null); await load(); setMessage(`${approvalVideo.title} quedó aprobado.`); })}>{busy ? "Aprobando…" : "Confirmar aprobación"}</button></div></div></div>}
-    {bulkDelivery && <div role="dialog" aria-modal="true" aria-label="Enviar videos aprobados" className="fixed inset-0 z-50 grid place-items-center bg-black/80 p-5"><div className="max-w-lg space-y-4 rounded-xl bg-surface-2 p-6"><h2>Enviar {bulkDelivery.length} videos aprobados</h2><p>Se creará una operación durable y cada video se actualizará en el portal elegido. Podés cerrar esta ventana mientras se procesa.</p><label className="block text-sm">Portal de destino<select aria-label="Portal de destino" className={input + " mt-2"} value={deliveryPortal} onChange={event => setDeliveryPortal(event.target.value)}><option value="">Elegí un portal</option>{deliveryPortals.map(portal => <option key={portal.id} value={portal.id}>{portal.label} · {portal.host}</option>)}</select></label><ul className="max-h-40 overflow-auto text-sm text-ink-secondary">{bulkDelivery.map(video => <li key={video.job_id}>{video.artist} · {video.title}</li>)}</ul><button className={primaryButton} disabled={busy || !deliveryPortal} onClick={() => run(async () => { const key = `campaign-${campaignId}-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`}`; const operation = await post(`${base}/deliveries`, { job_ids: bulkDelivery.map(video => video.job_id), destination_portal: deliveryPortal, idempotency_key: key }); setBulkDelivery(null); setMessage(`Envío iniciado para ${operation.total_count || bulkDelivery.length} videos a ${deliveryPortals.find(portal => portal.id === deliveryPortal)?.label || deliveryPortal}. La operación sigue en segundo plano.`); })}>Confirmar envío</button><button className={button} disabled={busy} onClick={() => setBulkDelivery(null)}>Cancelar</button></div></div>}
-    {delivery && <div role="dialog" aria-modal="true" aria-label="Registrar entrega" className="fixed inset-0 z-50 grid place-items-center bg-black/80 p-5"><div className="max-w-lg space-y-4 rounded-xl bg-surface-2 p-6"><h2>Registrar entrega de {delivery.title}</h2><p>Confirmá dónde entregaste esta versión aprobada. Este registro no envía el archivo.</p><input aria-label="Destino de entrega" className={input} value={destination} onChange={e => setDestination(e.target.value)} placeholder="Portal, carpeta o destinatario y referencia" /><button className={button} disabled={busy || destination.trim().length < 3} onClick={() => run(async () => { await post(`${base}/creative/deliveries`, { job_id: delivery.job_id, video_sha256: delivery.evidence.video_sha256, destination }); setDelivery(null); await load(); setMessage("Entrega registrada."); })}>Confirmar entrega realizada</button><button className={button} disabled={busy} onClick={() => setDelivery(null)}>Cancelar</button></div></div>}
+    {playingVideo && <CampaignVideoPlayer video={playingVideo} busy={busy} error={error} onClose={() => setPlayingVideo(null)} onEdit={() => openVideo(`/videos/${playingVideo.job_id}/edit-lyrics`)} onApprove={() => run(async () => {
+      const current = playingVideo;
+      await post(`/approve/${current.job_id}`, { notes: "Revisión final desde el reproductor de campaña" });
+      setPlayingVideo(null);
+      setReport(previous => ({ ...previous, videos: previous.videos.map(video => video.job_id === current.job_id ? { ...video, status: "done", approved_at: new Date().toISOString() } : video) }));
+      setMessage(`${current.title} quedó aprobado.`);
+      const latest = await load();
+      const next = latest?.videos?.find(video => video.job_id !== current.job_id && video.status === "pending_review" && matchesCampaignSong(videoQuery, video) && activeVideoFilter.matches(video));
+      setPlayingVideo(next || null);
+      setMessage(`${current.title} quedó aprobado.${next ? " Continuá con el siguiente video." : " No quedan videos por aprobar en este filtro."}`);
+    })} />}
+    {approvalVideo && <CampaignModal label={`Aprobar ${approvalVideo.title}`} busy={busy} onClose={() => setApprovalVideo(null)}><div className="w-full max-w-lg space-y-4 rounded-2xl bg-surface-2 p-6 ring-1 ring-white/15"><h2 className="text-xl font-semibold">Aprobar {approvalVideo.title}</h2>{error && <p role="alert" className="text-sm text-red-200">{error}</p>}<p>Confirmá que revisaste el video completo. Quedará aprobado como la versión final vigente.</p><div className="flex flex-wrap justify-end gap-2"><button className={button} disabled={busy} onClick={() => setApprovalVideo(null)}>Cancelar</button><button className={primaryButton} disabled={busy} onClick={() => run(async () => { await post(`/approve/${approvalVideo.job_id}`, { notes: "Aprobado desde el historial de campaña" }); setApprovalVideo(null); await load(); setMessage(`${approvalVideo.title} quedó aprobado.`); })}>{busy ? "Aprobando…" : "Confirmar aprobación"}</button></div></div></CampaignModal>}
+    {bulkDelivery && <CampaignModal label="Enviar videos aprobados" busy={busy} onClose={() => setBulkDelivery(null)}><div className="max-w-lg space-y-4 rounded-xl bg-surface-2 p-6"><h2>Enviar {bulkDelivery.length} videos aprobados</h2>{error && <p role="alert" className="text-sm text-red-200">{error}</p>}<p>Se enviarán únicamente los videos de esta lista al portal elegido. El envío continúa en segundo plano y podés consultar su avance aquí.</p><label className="block text-sm">Portal de destino<select aria-label="Portal de destino" className={input + " mt-2"} value={deliveryPortal} onChange={event => setDeliveryPortal(event.target.value)}><option value="">Elegí un portal</option>{deliveryPortals.map(portal => <option key={portal.id} value={portal.id}>{portal.label} · {portal.host}</option>)}</select></label><ul className="max-h-40 overflow-auto text-sm text-ink-secondary">{bulkDelivery.map(video => <li key={video.job_id}>{video.artist} · {video.title}</li>)}</ul><button className={primaryButton} disabled={busy || !deliveryPortal} onClick={() => run(async () => { const signature = JSON.stringify([deliveryPortal, bulkDelivery.map(video => video.job_id).sort()]); if (deliveryKey.current?.signature !== signature) deliveryKey.current = { signature, key: `campaign-${campaignId}-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`}` }; const key = deliveryKey.current.key; const operation = await post(`${base}/deliveries`, { job_ids: bulkDelivery.map(video => video.job_id), destination_portal: deliveryPortal, idempotency_key: key }); setBulkDelivery(null); setSelectedVideoIds(new Set()); writeParams({ delivery_op: operation.operation_id }); setMessage(`Envío iniciado para ${operation.total_count || bulkDelivery.length} videos a ${deliveryPortals.find(portal => portal.id === deliveryPortal)?.label || deliveryPortal}. La operación sigue en segundo plano.`); })}>Confirmar envío</button><button className={button} disabled={busy} onClick={() => setBulkDelivery(null)}>Cancelar</button></div></CampaignModal>}
+    {delivery && <CampaignModal label="Registrar entrega" busy={busy} onClose={() => setDelivery(null)}><div className="max-w-lg space-y-4 rounded-xl bg-surface-2 p-6"><h2>Registrar entrega de {delivery.title}</h2><p>Confirmá dónde entregaste esta versión aprobada. Este registro no envía el archivo.</p><input aria-label="Destino de entrega" className={input} value={destination} onChange={e => setDestination(e.target.value)} placeholder="Portal, carpeta o destinatario y referencia" /><button className={button} disabled={busy || destination.trim().length < 3} onClick={() => run(async () => { await post(`${base}/creative/deliveries`, { job_id: delivery.job_id, video_sha256: delivery.evidence.video_sha256, destination }); setDelivery(null); await load(); setMessage("Entrega registrada."); })}>Confirmar entrega realizada</button><button className={button} disabled={busy} onClick={() => setDelivery(null)}>Cancelar</button></div></CampaignModal>}
   </section>;
 }

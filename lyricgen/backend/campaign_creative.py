@@ -267,6 +267,7 @@ def get_creative(campaign_id: str, current_user=Depends(get_current_user), db: S
             "veo_models": veo_models(),
             "can_manage": current_user.get("role") == "admin" or campaign.created_by == current_user.get("id"),
             "items": [{"id": i.id, "ordinal": i.ordinal, "artist": i.artist, "title": i.title or i.filename,
+                       "filename": i.filename, "technical_code": i.technical_code,
                        "discarded": bool(i.discard_record and not i.discard_record.get("restored_at")),
                        "job_id": jobs[i.id].job_id if i.id in jobs else None,
                        "status": jobs[i.id].status if i.id in jobs else "waiting",
@@ -515,6 +516,7 @@ def campaign_jobs(db, campaign):
 
 def history_rows(db, campaign):
     rows = []
+    codes = {item.id: item.technical_code for item in _items(db, campaign)}
     for j in sorted(campaign_jobs(db, campaign), key=lambda j: (str(j.created_at), j.job_id), reverse=True):
         rp = j.render_params or {}
         if not j.video_url and not rp.get("campaign_creative_receipt") and j.status not in {"queued", "processing", "rendering", "editing", "pending_review", "done"}:
@@ -533,6 +535,7 @@ def history_rows(db, campaign):
                 outcome = "unverified"
         rows.append({"job_id": j.job_id, "parent_job_id": j.parent_job_id, "item_id": j.campaign_item_id,
                      "artist": j.artist, "title": j.song_title or j.filename, "status": j.status,
+                     "filename": j.filename, "technical_code": codes.get(j.campaign_item_id),
                      "created_at": str(j.created_at), "approved_at": str(j.approved_at) if j.approved_at else None,
                      "video_url": f"/download/{j.job_id}/video" if j.video_url else None,
                      "open_path": f"/videos/{j.job_id}", "assignment": assignment,
