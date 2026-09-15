@@ -3,6 +3,20 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.41] - 2026-09-15
+
+### Improved
+
+- Show actual Argentina/Chile portal publication badges and pending customer
+  change-request counts in campaign video history, including videos being edited.
+- Filter sent and unsent videos alongside search and approval status; preserve
+  the filter when opening the existing lyrics editor and returning to the campaign.
+- Read active publications from the portal database, excluding removed deliveries
+  and unrelated tenants instead of treating approval as proof of delivery.
+
+- Let platform administrators read the delivery operations they created for
+  another campaign tenant, preserving ordinary tenant isolation.
+
 ## [1.1.40] - 2026-09-15
 
 ### Improved

@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy.orm import Session
 
 from auth import get_current_user, has_scenes_access
-from database import AuditLog, BackgroundAsset, BatchCampaign, BatchCampaignItem, EditorDocument, Job, get_db
+from database import AuditLog, BackgroundAsset, BatchCampaign, BatchCampaignItem, Delivery, DeliveryChangeRequest, EditorDocument, Job, get_db, scoped_deliveries_db
 from batch_campaigns import _campaign_or_404, _require_manager, _require_scope, _aware
 from campaign_models import VEO_LITE, effective_veo_assignment, veo_models
 
@@ -514,6 +514,40 @@ def campaign_jobs(db, campaign):
     return db.query(Job).filter(Job.job_id.in_(select(lineage.c.job_id)), Job.tenant_id == campaign.tenant_id).all()
 
 
+def portal_history(job_ids, tenant_id):
+    """Read actual active publications from the portal DB in one bounded query.
+
+    Approval, a delivery operation, and a manual creative receipt are not proof
+    that a video is published. Keep this independent of the current job status:
+    an already published video can be back in editing after a client request.
+    """
+    if not job_ids:
+        return {}
+    from sqlalchemy import and_, func
+
+    with scoped_deliveries_db() as ddb:
+        publications = ddb.query(
+            Delivery.job_id, Delivery.portal_id,
+            func.count(DeliveryChangeRequest.id),
+        ).outerjoin(DeliveryChangeRequest, and_(
+            DeliveryChangeRequest.delivery_id == Delivery.id,
+            DeliveryChangeRequest.resolved_at.is_(None),
+        )).filter(
+            Delivery.job_id.in_(job_ids), Delivery.tenant_snapshot == tenant_id,
+            Delivery.removed_at.is_(None),
+        ).group_by(Delivery.job_id, Delivery.portal_id).all()
+    result = {}
+    for job_id, portal_id, pending in publications:
+        row = result.setdefault(job_id, {"umg_portals": [], "pending_change_requests": 0})
+        portal = portal_id or "argentina"
+        if portal not in row["umg_portals"]:
+            row["umg_portals"].append(portal)
+        row["pending_change_requests"] += pending
+    for row in result.values():
+        row["umg_portals"].sort()
+    return result
+
+
 def history_rows(db, campaign):
     rows = []
     codes = {item.id: item.technical_code for item in _items(db, campaign)}
@@ -540,6 +574,12 @@ def history_rows(db, campaign):
                      "video_url": f"/download/{j.job_id}/video" if j.video_url else None,
                      "open_path": f"/videos/{j.job_id}", "assignment": assignment,
                      "settings": receipt.get("settings", {}), "evidence": evidence, "compliance": outcome})
+    publications = portal_history([row["job_id"] for row in rows], campaign.tenant_id)
+    for row in rows:
+        publication = publications.get(row["job_id"], {})
+        row["umg_portals"] = publication.get("umg_portals", [])
+        row["is_in_umg_portal"] = bool(row["umg_portals"])
+        row["pending_change_requests"] = publication.get("pending_change_requests", 0)
     return rows
 
 
