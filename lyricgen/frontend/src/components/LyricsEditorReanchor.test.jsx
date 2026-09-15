@@ -201,8 +201,8 @@ describe("Pegar letra oficial y re-sincronizar", () => {
       .mockResolvedValueOnce({
         ok: false, status: 409, code: "reference_structure_unconfirmed",
         structure: {
-          supported: false, reasons: ["line_count_divergent"],
-          metrics: { reference_token_coverage: 0.41, longest_unmatched_content_run: 2 },
+          supported: false, reasons: ["line_count_divergent", "reference_contains_unmatched_passage"],
+          metrics: { reference_token_coverage: 0.79, longest_unmatched_content_run: 8 },
           pasted_line_count: 12, current_line_count: 3,
         },
       })
@@ -217,7 +217,12 @@ describe("Pegar letra oficial y re-sincronizar", () => {
     fireEvent.click(screen.getByTestId("paste-lyrics-submit"));
     const report = await screen.findByTestId("paste-lyrics-structure");
     expect(report).toHaveTextContent("12 líneas pegadas vs 3");
-    expect(report).toHaveTextContent("41%");
+    expect(report).toHaveTextContent("Hay diferencias con el texto del editor");
+    expect(report).toHaveTextContent("tramo de 8 palabras diferentes entre ambos textos");
+    expect(report).toHaveTextContent("Coincidencia de palabras con el texto del editor: 79%");
+    expect(report).toHaveTextContent("Este aviso no demuestra que tu letra esté mal");
+    expect(report).not.toHaveTextContent("se reconoce en el audio");
+    expect(report).not.toHaveTextContent("otra versión");
     // Nada se aplicó todavía: sigue abierto y sin toast.
     expect(toastSpy).not.toHaveBeenCalled();
     fireEvent.click(screen.getByTestId("paste-lyrics-confirm-anyway"));

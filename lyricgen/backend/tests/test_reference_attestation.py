@@ -145,3 +145,21 @@ def test_structure_guard_keeps_exact_repeated_occurrences_and_small_mishears():
     )
     assert result["allow_global_forced_alignment"] is True
     assert result["metrics"]["longest_unmatched_content_run"] == 1
+
+
+def test_normalized_text_match_ignores_wrapping_case_accents_and_punctuation():
+    report = assess_reference_attestation(
+        "Una CANCIÓN,\npara cantar\ny recordar",
+        _segments("Una cancion para\ncantar y recordar"),
+    )
+    assert report["metrics"]["normalized_text_matches"] is True
+
+
+def test_normalized_text_match_keeps_stop_words_and_repeated_occurrences():
+    for reference, transcript in (
+        ("Camino en la noche", "Camino por la noche"),
+        ("Cantamos juntos\nCantamos juntos", "Cantamos juntos"),
+        ("", ""),
+    ):
+        report = assess_reference_attestation(reference, _segments(transcript))
+        assert report["metrics"]["normalized_text_matches"] is False

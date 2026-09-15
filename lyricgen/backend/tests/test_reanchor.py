@@ -993,3 +993,27 @@ def test_reanchor_renews_quality_and_commits_outbox_before_dispatch(client, monk
     duplicate = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token), json={"base_revision": 0})
     assert duplicate.json()["idempotent"] is True
     assert len(dispatched) == 1
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_pasted_structure_accepts_identical_words_with_different_line_breaks(reverse):
+    from reference_attestation import assess_reference_attestation
+    short_lines = ["Una canción", "para cantar", "Bajo estrellas", "quiero soñar", "Seguimos juntos", "hasta despertar"]
+    long_lines = ["Una canción para cantar", "Bajo estrellas quiero soñar", "Seguimos juntos hasta despertar"]
+    pasted, current = (short_lines, long_lines) if reverse else (long_lines, short_lines)
+    attestation = assess_reference_attestation(
+        "\n".join(pasted), [{"text": line} for line in current],
+        reference_source="operator_pasted",
+    )
+    report = main_mod._pasted_structure_report(attestation, len(pasted), len(current))
+    assert report["supported"] is True
+    assert "line_count_divergent" not in report["reasons"]
+
+
+def test_pasted_structure_still_requires_confirmation_for_unmatched_passage():
+    report = main_mod._pasted_structure_report({
+        "metrics": {"reference_token_coverage": 0.79, "longest_unmatched_content_run": 8},
+        "reasons": ["reference_contains_unmatched_passage"],
+    }, 32, 48)
+    assert report["supported"] is False
+    assert "reference_contains_unmatched_passage" in report["reasons"]

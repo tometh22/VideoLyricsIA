@@ -15592,7 +15592,8 @@ def _pasted_structure_report(attestation, pasted_count: int, current_count: int)
     reasons = list((attestation or {}).get("reasons") or [])
     ratio = (pasted_count / current_count) if current_count else None
     line_count_divergent = bool(
-        current_count and (pasted_count > current_count * 1.5
+        metrics.get("normalized_text_matches") is not True
+        and current_count and (pasted_count > current_count * 1.5
                            or pasted_count * 1.5 < current_count)
     )
     if line_count_divergent:
