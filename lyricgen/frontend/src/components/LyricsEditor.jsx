@@ -2113,7 +2113,7 @@ export default function LyricsEditor({
   //   2. POST /jobs/{id}/reanchor vía el callback del padre.
   //   3. Éxito → reemplazar `edited` con los segments re-anclados (mismo
   //      seed que el mount; las líneas `locked` vuelven intactas del
-  //      backend) + toast "N re-sincronizadas, M para revisar".
+  //      backend) y refrescar la evaluación de calidad de esa revisión.
   //      Decline / error → toast de error, timings quedan como estaban.
   // El snapshot pre-reanchor va al edit history, así Cmd+Z lo revierte.
   const [reanchoring, setReanchoring] = useState(false);
@@ -2191,9 +2191,8 @@ export default function LyricsEditor({
         setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
         if (editorRequest) setQualityRefresh({ jobId: transcribeJobId, revision: res.revision ?? null });
         toast({
-          message: (t("editor.reanchor_done") || "{n} líneas re-sincronizadas, {m} para revisar")
-            .replace("{n}", String(res.count ?? res.segments.length))
-            .replace("{m}", String(res.review_count ?? 0)),
+          message: (t("editor.reanchor_done") || "{n} líneas re-sincronizadas")
+            .replace("{n}", String(res.count ?? res.segments.length)),
           tone: "success",
         });
       } else if (res && res.reason === "structural_mismatch") {
@@ -2286,10 +2285,9 @@ export default function LyricsEditor({
         setPasteText("");
         setPasteStructure(null);
         toast({
-          message: (t("editor.paste_lyrics_done") || "Letra aplicada: {r} líneas nuevas, {k} conservadas, {m} para revisar")
+          message: (t("editor.paste_lyrics_done") || "Letra aplicada: {r} líneas nuevas, {k} conservadas")
             .replace("{r}", String(res.lines_replaced ?? 0))
-            .replace("{k}", String(res.lines_kept ?? 0))
-            .replace("{m}", String(res.review_count ?? 0)),
+            .replace("{k}", String(res.lines_kept ?? 0)),
           tone: "success",
         });
       } else if (res && res.code === "reference_structure_unconfirmed" && res.structure) {

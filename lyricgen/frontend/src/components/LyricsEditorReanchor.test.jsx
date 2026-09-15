@@ -107,7 +107,7 @@ describe("Re-sincronizar con IA", () => {
     await waitFor(() => expect(toastSpy).toHaveBeenCalled());
     expect(toastSpy.mock.calls[0][0].tone).toBe("success");
     expect(toastSpy.mock.calls[0][0].message).toContain("3");
-    expect(toastSpy.mock.calls[0][0].message).toContain("1");
+    expect(toastSpy.mock.calls[0][0].message).toBe("3 líneas re-sincronizadas");
   });
 
   it("decline del backend (ok:false) → toast de error, sin romper el editor", async () => {
@@ -183,7 +183,7 @@ describe("Pegar letra oficial y re-sincronizar", () => {
     expect(onPersistSegments).toHaveBeenCalled();
     await waitFor(() => expect(toastSpy).toHaveBeenCalled());
     expect(toastSpy.mock.calls[0][0].tone).toBe("success");
-    expect(toastSpy.mock.calls[0][0].message).toContain("1");
+    expect(toastSpy.mock.calls[0][0].message).toBe("Letra aplicada: 1 líneas nuevas, 3 conservadas");
     expect(screen.queryByTestId("paste-lyrics-textarea")).toBeNull();
   });
 
