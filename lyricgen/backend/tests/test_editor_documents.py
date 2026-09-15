@@ -1730,3 +1730,64 @@ def test_postgres_two_simultaneous_locks_exactly_one_gets_lease():
     with ThreadPoolExecutor(max_workers=2) as pool:
         outcomes = list(pool.map(locker, [first.id, second.id]))
     assert sorted(outcomes) == [False, True]
+
+
+def test_campaign_human_history_requires_material_editor_work(db):
+    from campaign_review_history import saved_review_history
+    from editor import sync_legacy_snapshot
+
+    first, second, job_id = _users_and_job()
+    job = db.query(Job).filter_by(job_id=job_id).one()
+    doc = db.query(EditorDocument).filter_by(job_id=job_id).one()
+    # Initial migration attributed to a batch actor is still not human work.
+    doc.updated_by = second.id
+    db.commit()
+    assert saved_review_history(db, [job_id]) == {}
+    _, _, applied = save_document(db, job, doc, first.id, doc.revision,
+                                  list(doc.current_segments), "autosave")
+    assert not applied
+    assert saved_review_history(db, [job_id]) == {}
+    # A fast structural draft must count even when it has no version snapshot
+    # and the older per-line audit cannot associate added/deleted lines.
+    changed = [dict(doc.current_segments[0])]
+    _, version, applied = save_document(db, job, doc, first.id, doc.revision,
+                                       changed, "draft")
+    assert applied and version is None
+    history = saved_review_history(db, [job_id])
+    assert history[job_id]["user_id"] == first.id
+    saved_at = history[job_id]["at"]
+    # A later automatic migration must not impersonate the last reviewer.
+    changed = [dict(doc.current_segments[0], text="automatic update")]
+    save_document(db, job, doc, second.id, doc.revision, changed, "migration")
+    assert saved_review_history(db, [job_id])[job_id] == history[job_id]
+    # The legacy editor remains discoverable too.
+    changed = [dict(doc.current_segments[0], text="human correction")]
+    sync_legacy_snapshot(db, doc, second.id, changed, doc.revision + 1)
+    history = saved_review_history(db, [job_id])
+    assert history[job_id]["user_id"] == second.id
+    assert history[job_id]["at"] >= saved_at
+    assert saved_review_history(db, ["unrelated"]) == {}
+
+
+def test_campaign_legacy_history_needs_edit_checkpoint_and_excludes_machine(db):
+    from campaign_review_history import saved_review_history
+
+    first, _, job_id = _users_and_job()
+    doc = db.query(EditorDocument).filter_by(job_id=job_id).one()
+    for checkpoint in ("migration", "transcription", "reviewer_candidate", "quality_proposal"):
+        db.add(AuditLog(user_id=first.id, action="lyrics.segments_diff", detail={
+            "job_id": job_id, "checkpoint": checkpoint,
+        }))
+    db.add(AuditLog(user_id=first.id, action="lyrics.segments_diff", detail={
+        "job_id": job_id, "checkpoint": "autosave", "author_kind": "machine_candidate",
+    }))
+    db.flush()
+    assert saved_review_history(db, [job_id]) == {}
+    # A legacy diff without lineage alone is insufficient.
+    db.add(AuditLog(user_id=first.id, action="lyrics.segments_diff", detail={"job_id": job_id}))
+    db.flush()
+    assert saved_review_history(db, [job_id]) == {}
+    db.add(EditorVersion(id=str(uuid.uuid4()), job_id=job_id, tenant_id=doc.tenant_id, revision=1,
+        segments=doc.current_segments, created_by=first.id, reason="manual"))
+    db.flush()
+    assert saved_review_history(db, [job_id])[job_id]["user_id"] == first.id

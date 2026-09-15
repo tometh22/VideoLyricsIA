@@ -1070,12 +1070,21 @@ def test_review_queue_scope_keeps_pending_categories_and_approved_filter_aligned
             updated_at=datetime(2026, 9, 9, index, tzinfo=timezone.utc),
         ))
     db.commit()
+    # An automatic document update is not human work, even with an actor.
+    assert batch.review_queue(campaign.id, scope="drafts", **args)["items"] == []
+    db.add(AuditLog(user_id=user.id, action="editor.review_saved", detail={
+        "job_id": jobs[1].job_id, "checkpoint": "draft",
+    }, created_at=datetime(2026, 9, 9, 1, tzinfo=timezone.utc)))
+    db.commit()
     drafts = batch.review_queue(campaign.id, scope="drafts", **args)
     assert [row["job_id"] for row in drafts["items"]] == [jobs[1].job_id]
     assert drafts["items"][0]["is_draft"] is True
     assert drafts["campaign_totals"]["drafts"] == 1
     document = db.query(EditorDocument).filter_by(job_id=jobs[2].job_id).one()
     document.updated_by = user.id
+    db.add(AuditLog(user_id=user.id, action="editor.review_saved", detail={
+        "job_id": jobs[2].job_id, "checkpoint": "manual",
+    }, created_at=datetime(2026, 9, 9, 2, tzinfo=timezone.utc)))
     db.commit()
     drafts = batch.review_queue(campaign.id, scope="drafts", **{**args, "order": "learning"})
     assert drafts["order"] == "recent"

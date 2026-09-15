@@ -406,6 +406,8 @@ def _record_training_delta(
             detail={
                 "job_id": job.job_id,
                 "n_lines": len(current),
+                "checkpoint": checkpoint,
+                "author_kind": "machine_candidate" if checkpoint == "reviewer_candidate" else None,
                 "changed": changed,
                 "reorder": reordered,
                 "correction_summary": {
@@ -1846,6 +1848,12 @@ def save_document(
     document.revision += 1
     document.updated_by = user_id
     document.updated_at = now_utc()
+    from campaign_review_history import HUMAN_CHECKPOINTS
+    if reason in HUMAN_CHECKPOINTS and not segments_equivalent(previous_segments, normalized):
+        db.add(AuditLog(user_id=user_id, action="editor.review_saved", detail={
+            "job_id": job.job_id, "checkpoint": reason,
+            "from_revision": previous_revision, "to_revision": document.revision,
+        }))
     job.segments_json = normalized
     job.segments_revision = document.revision
     if getattr(job, "campaign_id", None) and job.status == "lyrics_approved":
@@ -1999,6 +2007,11 @@ def sync_legacy_snapshot(
     document.updated_by = user_id
     document.updated_at = now_utc()
     _ensure_version(db, document, revision, normalized, user_id, "autosave")
+    if not segments_equivalent(previous_segments, normalized):
+        db.add(AuditLog(user_id=user_id, action="editor.review_saved", detail={
+            "job_id": job.job_id, "checkpoint": "legacy_autosave",
+            "from_revision": previous_revision, "to_revision": revision,
+        }))
     _record_training_delta(
         db,
         job=job,

@@ -1856,10 +1856,13 @@ def review_queue(
     } if job_ids else {}
     from reviewer_campaign_product import campaign_payload
     reviewer_summary, reviewer_rows = campaign_payload(db, campaign.id, pairs, documents)
-    reviewer_ids = {
+    from campaign_review_history import saved_review_history
+    review_history = saved_review_history(db, job_ids) if stage == "lyrics" else {}
+    reviewer_ids = {entry["user_id"] for entry in review_history.values()}
+    reviewer_ids.update({
         int(row.lock_user_id) for row in documents.values()
         if row.lock_user_id is not None
-    }
+    })
     reviewer_ids.update(
         int(row.updated_by) for row in documents.values()
         if row.updated_by is not None
@@ -1883,7 +1886,7 @@ def review_queue(
     draft_ids = {
         job.job_id for _, job in pairs
         if job and (document := documents.get(job.job_id))
-        and document.updated_by is not None
+        and job.job_id in review_history
         and _queue_state("lyrics", job, document) in {"ready", "reviewing"}
     } if stage == "lyrics" else set()
     allowed_states = {state} if state in _ALL_REVIEW_STATES else (
@@ -1895,6 +1898,9 @@ def review_queue(
     rows: list[dict[str, Any]] = []
     for item, job in pairs:
         document = documents.get(job.job_id) if job else None
+        history = review_history.get(job.job_id) if job else None
+        if stage == "final" and document and document.updated_by is not None:
+            history = {"user_id": document.updated_by, "at": document.updated_at}
         queue_state = _queue_state(stage, job, document)
         if scope == "drafts" and (not job or job.job_id not in draft_ids):
             continue
@@ -1927,9 +1933,12 @@ def review_queue(
             if effective_scope == "approved":
                 if not job or job.approved_by != current_user.get("id"):
                     continue
-            elif not document or current_user.get("id") not in {
-                document.updated_by, document.lock_user_id,
-            }:
+            elif stage == "final":
+                if not document or current_user.get("id") not in {
+                    document.updated_by, document.lock_user_id,
+                }:
+                    continue
+            elif not history or history["user_id"] != current_user.get("id"):
                 continue
         verdict = verdicts.get(job.job_id, {}) if job else {}
         color = str(verdict.get("color") or "red").lower()
@@ -2003,12 +2012,12 @@ def review_queue(
                 document and document.lock_user_id is not None
                 and _aware(document.lock_expires_at) and _aware(document.lock_expires_at) > _now()
             ),
-            "last_reviewed_by": document.updated_by if document else None,
-            "last_reviewed_name": reviewers.get(document.updated_by) if document else None,
-            "last_reviewed_at": document.updated_at.isoformat() if document and document.updated_at else None,
+            "last_reviewed_by": history["user_id"] if history else None,
+            "last_reviewed_name": reviewers.get(history["user_id"]) if history else None,
+            "last_reviewed_at": history["at"].isoformat() if history and history["at"] else None,
             "resume_available": bool(
-                queue_state in _PENDING_REVIEW_STATES and document
-                and document.updated_by == current_user.get("id")
+                queue_state in _PENDING_REVIEW_STATES and history
+                and history["user_id"] == current_user.get("id")
             ),
             "approval": {
                 "user_id": job.approved_by if job else None,
