@@ -3,6 +3,17 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.35] - 2026-09-15
+
+### Fixed
+
+- Explain pasted-lyric differences as a comparison with editor text, without
+  presenting transcript overlap as proof of accuracy against the recording.
+- Accept identical normalized lyrics with different line breaks without an
+  unnecessary structure confirmation; retain guards for unmatched passages.
+- Show a blocking progress dialog throughout lyric re-synchronization and
+  delayed-response recovery, restoring editor interaction on completion or error.
+
 ## [1.1.34] - 2026-09-15
 
 ### Added
