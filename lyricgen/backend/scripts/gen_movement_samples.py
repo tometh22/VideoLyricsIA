@@ -2,7 +2,7 @@
 wizard's "Movimiento" step. These are the sales card, so they are generated
 with the real engine at its best:
 
-  - Veo STANDARD model (veo-3.1-generate-001), NOT the fast tier.
+  - Veo Lite model (veo-3.1-lite-generate-001), enforced for all samples.
   - No legibility blur (BG_BLUR_SIGMA=0) so the demos stay crisp.
   - "Foto + parallax" is produced via Imagen-4 Ultra (a premium still) + a
     clean LATERAL pan — the SAME engine path as the real foto-parallax render
@@ -40,7 +40,7 @@ if os.path.exists(_ENV):
 # time inside pipeline, so they don't touch the runtime defaults):
 #   - Veo STANDARD for fidelity + far better "static" adherence than fast.
 #   - No legibility blur → crisp, premium-looking demos.
-os.environ["VEO_MODEL"] = os.environ.get("VEO_MODEL_DEMO", "veo-3.1-generate-001")
+os.environ["VEO_MODEL"] = "veo-3.1-lite-generate-001"
 os.environ["VEO_MODEL_STATIC"] = os.environ["VEO_MODEL"]
 os.environ["BG_BLUR_SIGMA"] = "0"
 
