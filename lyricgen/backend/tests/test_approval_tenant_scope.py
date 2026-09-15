@@ -117,7 +117,7 @@ def test_admin_override_can_approve_campaign_qc_blocker_with_audit(
     _, owner = _register(client, "approval_override_owner")
     job_id = _seed_pending_review(db, owner)
     job = db.query(Job).filter(Job.job_id == job_id).one()
-    job.campaign_id = "camp_override"
+    job.campaign_id = "camp_over"
     job.workload_class = "batch"
     job.delivery_qc = {
         "status": "COMPLETE",
