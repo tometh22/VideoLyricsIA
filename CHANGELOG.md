@@ -3,6 +3,30 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.45] - 2026-09-15
+
+### Fixed
+
+- Give the operator a timing instead of "No se pudo re-sincronizar" when every
+  aligner declines a legitimately hard recording. Staging job `18dc85ecd8d6`
+  ("Navidad de Aimogasta", 2026-09-15): the pasted 40-line official lyric was
+  rejected by local CTC (median word score 0.29 < 0.30), by the hosted
+  aligner, and by Whisper-DP (23 of 40 lines guessed by interpolation), so
+  the operator got a generic failure and neither the text nor the timing was
+  saved. Replaying the declined CTC candidate against an independent aligner
+  confirmed the 0.30 floor was right — 23 of its 40 lines were off by more
+  than 0.5 s and one run landed 13-18 s late — so the cascade gained a fourth,
+  genuinely independent stage instead of a looser threshold: local Whisper
+  **forced** alignment (stable-ts), which constrains the decoder to the
+  operator's text, runs on CPU in ~5 s, costs nothing per call and
+  interpolates no line. On that job it timed all 40 lines with zero crammed
+  lines and flagged the 10 least confident for review. It runs only after the
+  three existing engines have declined, and every shared guard still applies:
+  the same `_safe_alignment` verdict, the same crammed-line guard, the same
+  fail-closed ending. Two negative controls over the same audio still decline
+  — another song's lyric (Color Esperanza) and the same lyric duplicated to
+  80 lines. Kill switch: `ANCHOR_LOCAL_ALIGN_ENABLED=0`.
+
 ## [1.1.44] - 2026-09-15
 
 ### Fixed
