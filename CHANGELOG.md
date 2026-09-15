@@ -3,6 +3,15 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.33] - 2026-09-15
+
+### Fixed
+
+- Require saved editor-change evidence before labeling campaign lyrics as human
+  drafts; automatic saves no longer impersonate reviewers or inflate that filter.
+- Show saved human changes inside pending songs and explain the campaign total
+  as pending plus approved plus discarded, preserving existing review links.
+
 ## [1.1.32] - 2026-09-15
 
 ### Fixed
