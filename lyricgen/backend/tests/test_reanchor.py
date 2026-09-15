@@ -933,3 +933,50 @@ def test_reanchor_task_registry_uses_redis_when_available(client, monkeypatch):
     assert key in fake.store
     assert fake.ttl[key] == 3600
     assert task_id not in main_mod._REANCHOR_TASK_LOCAL
+
+
+def test_reanchor_renews_quality_and_commits_outbox_before_dispatch(client, monkeypatch):
+    from database import Job, SessionLocal
+    from transcription_quality import segments_hash
+
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_job(user_id, tenant_id, segments=[dict(s) for s in SEGS])
+    _mock_align_ok(monkeypatch)
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        job.transcription_quality = {
+            "policy_version": "lyrics-quality-v5", "mode": "enforce",
+            "decision": "pass", "evaluated_revision": 0,
+            "segments_hash": segments_hash(SEGS),
+            "unsafe_windows": [], "analysis_status": "complete",
+        }
+        db.commit()
+    finally:
+        db.close()
+
+    dispatched = []
+    def dispatch(event_id):
+        from database import JobOutboxEvent
+        with SessionLocal() as check:
+            job = check.query(Job).filter(Job.job_id == job_id).one()
+            event = check.query(JobOutboxEvent).filter_by(id=event_id).one()
+            assert job.segments_revision == 1
+            assert event.payload["expected_revision"] == 1
+            assert event.payload["expected_segments_hash"] == segments_hash(job.segments_json)
+            dispatched.append(event_id)
+    monkeypatch.setattr(main_mod, "_dispatch_editor_quality_outbox", dispatch)
+    result = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token), json={"base_revision": 0})
+    assert result.status_code == 200, result.text
+    assert result.json()["ok"]
+    quality = client.get(f"/editor/{job_id}", headers=auth(token)).json()["transcription_quality"]
+    assert quality["evaluated_revision"] == result.json()["revision"] == 1
+    assert quality["segments_hash"] == segments_hash(result.json()["segments"])
+    assert quality["analysis_status"] == "superseded_by_edit"
+    assert quality["render_blocked"] is True
+    assert quality["unsafe_windows"]
+    assert len(dispatched) == 1
+    duplicate = client.post(f"/jobs/{job_id}/reanchor", headers=auth(token), json={"base_revision": 0})
+    assert duplicate.json()["idempotent"] is True
+    assert len(dispatched) == 1
