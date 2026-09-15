@@ -392,3 +392,44 @@ def test_a_failed_edit_is_not_advertised_as_in_flight():
     assert df.STALE_EDITING in df.STALE_IN_FLIGHT
     assert df.STALE_PRORES in df.STALE_IN_FLIGHT
     assert df.STALE_FAILED not in df.STALE_IN_FLIGHT
+
+
+def test_delivery_contract_outranks_a_job_row_that_forgot_it_owed_a_master():
+    """Entrega 289, encontrada EN VIVO el 15-sep-2026 (job f7752c6feed4).
+
+    La fila del job no tenía una sola señal de que debiera un master:
+    `delivery_profile="youtube"`, `umg_spec` en JSON `null` — que no es SQL
+    NULL, así que `umg_spec IS NOT NULL` da true y engaña a cualquier query —
+    y las dos keys .mov borradas por el edit. Y sin embargo el portal estaba
+    ofreciendo un master de 4,3 GB del corte anterior.
+
+    Lo que sí sabía que era una entrega ProRes era la fila del portal, en
+    `file_types`. Ese es el contrato con el cliente; el perfil del job es un
+    detalle interno que ya falló tres veces.
+    """
+    job = FakeJob(
+        delivery_profile="youtube", umg_spec=None,
+        previous_versions=EDITED,
+        s3_keys={
+            "video": "universal_music/f7752c6feed4/lyric_video.mp4",
+            "short": "universal_music/f7752c6feed4/short.mp4",
+            "thumbnail": "universal_music/f7752c6feed4/thumbnail.jpg",
+        },
+    )
+    # Con las columnas del job solo, es invisible.
+    assert df.has_prores_deliverable(job) is False
+    # Con el contrato de la entrega, no.
+    assert df.prores_pending(job, ["umg_master", "video", "umg_short", "short", "thumbnail"]) == [
+        "umg_master", "umg_short",
+    ]
+
+
+def test_a_delivery_that_publishes_no_prores_still_asks_nothing():
+    """El contrapeso: que `file_types` mande no significa inventar un master
+    donde la entrega nunca publicó uno."""
+    job = FakeJob(
+        delivery_profile="youtube", umg_spec=None,
+        previous_versions=EDITED,
+        s3_keys={"video": "t/j/lyric_video.mp4", "short": "t/j/short.mp4"},
+    )
+    assert df.prores_pending(job, ["video", "short", "thumbnail"]) == []

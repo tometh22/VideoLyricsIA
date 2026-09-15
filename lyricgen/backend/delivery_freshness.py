@@ -159,12 +159,27 @@ def prores_pending(job, file_types: Iterable[str] | None = None) -> list[str]:
     publishes — a job that never produced a vertical short must not be
     held back waiting for `umg_short`.
     """
-    if not has_prores_deliverable(job):
+    if job is None:
+        return []
+    wanted = tuple(file_types) if file_types is not None else PRORES_FILE_TYPES
+    # Cuando el llamador dice qué entregables publica ESTA entrega, eso pesa
+    # más que las columnas del job. Encontrado en vivo el 2026-09-15 con la
+    # entrega 289 (job f7752c6feed4): `delivery_profile="youtube"`, `umg_spec`
+    # en JSON `null` —que no es SQL NULL, así que `umg_spec IS NOT NULL` da
+    # true y engaña a cualquier query— y las dos keys .mov borradas por el
+    # edit. O sea: en la fila del job no quedaba UNA sola señal de que debía
+    # un master, y sin embargo el portal estaba ofreciendo uno de 4,3 GB del
+    # corte anterior. La evidencia vivía en `file_types` de la entrega, que
+    # es el contrato con el cliente; el perfil del job es un detalle interno
+    # que ya falló por tercera vez (ver has_prores_deliverable).
+    published_as_prores = file_types is not None and any(
+        ft in wanted for ft in PRORES_FILE_TYPES
+    )
+    if not published_as_prores and not has_prores_deliverable(job):
         return []
     previous = job.previous_versions if isinstance(job.previous_versions, list) else []
     if not previous:
         return []
-    wanted = tuple(file_types) if file_types is not None else PRORES_FILE_TYPES
     keys = job.s3_keys or {}
     return [
         ft for ft in PRORES_FILE_TYPES

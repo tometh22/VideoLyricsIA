@@ -1002,3 +1002,42 @@ def test_a_dead_re_render_stops_promising_the_client_work_in_progress(
     assert version["updating"] is False
     # El operador sí lo ve: el motivo viaja igual.
     assert version["updating_reason"] == "edit_failed"
+
+
+def test_stale_master_without_a_prores_spec_says_what_is_actually_wrong(
+    client, admin_token, approved_job, db,
+):
+    """Los dos casos frenan, pero no significan lo mismo.
+
+    Entrega 289 (2026-09-15): `delivery_profile="youtube"` y `umg_spec` en
+    JSON null sobre un job que YA se entregó como UMG y cuyo master de 4,3 GB
+    sigue descargable, del corte anterior. Decirle al operador "este video fue
+    generado sólo para YouTube" lo manda a buscar el problema al lugar
+    equivocado mientras el cliente se lleva el archivo viejo.
+    """
+    approved_job.umg_spec = None
+    approved_job.delivery_profile = "youtube"
+    approved_job.s3_keys = {
+        "video": "default/testjob12345/lyric_video.mp4",
+        "short": "default/testjob12345/short.mp4",
+        "thumbnail": "default/testjob12345/thumbnail.jpg",
+    }
+    _edit_the_render(db, approved_job)
+
+    with (
+        # El .mov viejo sigue en R2 y contesta el HEAD.
+        patch("main.storage.object_exists", return_value=True),
+        patch("main.enqueue_prores_prewarm") as enqueue,
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={},
+        )
+
+    assert res.status_code == 409, res.text
+    detail = res.json()["detail"]
+    assert detail["code"] == "prores_stale_without_spec"
+    assert detail["stale"] == ["umg_master", "umg_short"]
+    assert "ANTES de la edición" in detail["message"]
+    # No se encola nada: sin spec no hay con qué transcodificar.
+    enqueue.assert_not_called()
