@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from database import AuditLog, Job
+from database import AuditLog, BatchCampaign, Job
 
 
 def _auth(token: str) -> dict[str, str]:
@@ -65,6 +65,9 @@ def _cleanup(db):
         db.query(Job).filter(Job.job_id.in_(job_ids)).delete(
             synchronize_session=False,
         )
+    db.query(BatchCampaign).filter(BatchCampaign.id == "camp_over_001").delete(
+        synchronize_session=False,
+    )
     db.query(AuditLog).filter(AuditLog.action.in_([
         "job.approve",
         "job.reject",
@@ -116,8 +119,16 @@ def test_admin_override_can_approve_campaign_qc_blocker_with_audit(
 ):
     _, owner = _register(client, "approval_override_owner")
     job_id = _seed_pending_review(db, owner)
+    campaign_id = "camp_over_001"
+    db.add(BatchCampaign(
+        id=campaign_id,
+        tenant_id=owner["tenant_id"],
+        created_by=owner["id"],
+        name="Approval override fixture",
+    ))
+    db.flush()
     job = db.query(Job).filter(Job.job_id == job_id).one()
-    job.campaign_id = "camp_over"
+    job.campaign_id = campaign_id
     job.workload_class = "batch"
     job.delivery_qc = {
         "status": "COMPLETE",
