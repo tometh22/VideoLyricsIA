@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from database import AuditLog, Job
+from database import AuditLog, BatchCampaign, Job
 
 
 def _auth(token: str) -> dict[str, str]:
@@ -65,6 +65,9 @@ def _cleanup(db):
         db.query(Job).filter(Job.job_id.in_(job_ids)).delete(
             synchronize_session=False,
         )
+    db.query(BatchCampaign).filter(BatchCampaign.id == "camp_over_01").delete(
+        synchronize_session=False,
+    )
     db.query(AuditLog).filter(AuditLog.action.in_([
         "job.approve",
         "job.reject",
@@ -109,6 +112,58 @@ def test_admin_can_approve_cross_tenant_job(
     )
     assert access_log.detail["job_id"] == job_id
     assert access_log.detail["kind"] == "approve_job"
+
+
+def test_admin_override_can_approve_campaign_qc_blocker_with_audit(
+    client, admin_token, admin_user_id, db,
+):
+    _, owner = _register(client, "approval_override_owner")
+    job_id = _seed_pending_review(db, owner)
+    campaign_id = "camp_over_01"
+    db.add(BatchCampaign(
+        id=campaign_id,
+        tenant_id=owner["tenant_id"],
+        created_by=owner["id"],
+        name="Approval override fixture",
+    ))
+    db.flush()
+    job = db.query(Job).filter(Job.job_id == job_id).one()
+    job.campaign_id = campaign_id
+    job.workload_class = "batch"
+    job.delivery_qc = {
+        "status": "COMPLETE",
+        "issues": [{
+            "issue_id": "title-mismatch",
+            "code": "UMG_TITLE_METADATA",
+            "severity": "FAIL",
+            "status": "OPEN",
+            "blocking": True,
+        }],
+    }
+    db.commit()
+
+    response = client.post(
+        f"/approve/{job_id}",
+        headers=_auth(admin_token),
+        json={
+            "notes": "Urgencia de campaña Chile",
+            "admin_override": True,
+            "override_reason": "Autorizado por Tomi para liberar campaña Chile y enviar a UMG Chile",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    db.expire_all()
+    assert db.query(Job).filter(Job.job_id == job_id).one().status == "done"
+    log = (
+        db.query(AuditLog)
+        .filter(AuditLog.action == "job.approve")
+        .order_by(AuditLog.id.desc())
+        .first()
+    )
+    assert log.detail["admin_override"] is True
+    assert "campaña Chile" in log.detail["override_reason"]
+    assert log.detail["cross_tenant_admin"] is True
 
 
 def test_regular_user_cannot_approve_other_tenant_job(client, db):

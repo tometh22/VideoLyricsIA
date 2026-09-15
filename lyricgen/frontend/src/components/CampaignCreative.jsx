@@ -128,6 +128,27 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
   useEffect(() => { let alive = true; load(true).catch(e => { if (alive) setError(e.message); }); return () => { alive = false; }; }, [load]);
   useEffect(() => { if (view === "history") { const timer = setInterval(() => load().catch(e => setError(e.message)), 15000); return () => clearInterval(timer); } }, [load, view]);
   const run = async fn => { setBusy(true); setError(""); setMessage(""); try { await fn(); } catch (e) { setError(e.message); } finally { setBusy(false); } };
+  const approveAllHistory = () => run(async () => {
+    const pending = (report?.videos || []).filter(video => video.status === "pending_review");
+    const reason = `Autorización urgente de Tomi · campaña ${campaignId} · envío a UMG Chile`;
+    let approved = 0;
+    const failures = [];
+    for (const video of pending) {
+      try {
+        await post(`/approve/${video.job_id}`, {
+          notes: "Aprobación masiva autorizada para liberar entrega a UMG Chile",
+          admin_override: true,
+          override_reason: reason,
+        });
+        approved++;
+      } catch (approvalError) {
+        failures.push(`${video.artist} · ${video.title}: ${approvalError.message}`);
+      }
+    }
+    await load();
+    setMessage(`${approved} videos aprobados${failures.length ? ` · ${failures.length} no se pudieron aprobar` : ""}.`);
+    if (failures.length) throw new Error(failures.join(" | "));
+  });
   const submitGeneration = () => run(async () => {
     const batch = [...(generation || [])];
     let sent = 0;
@@ -267,7 +288,7 @@ export default function CampaignCreative({ campaignId, view = "creative" }) {
     {view === "history" && report && <div className="space-y-4">
       <div><h2 className="text-xl font-semibold">Videos de esta campaña ({report.videos.length})</h2><p className="mt-1 text-sm text-ink-secondary">Reproducí, aprobá o editá cada video sin recorrer tarjetas gigantes. Sólo se carga el video que abrís.</p></div>
       {!report.videos.length && <p className="rounded-xl bg-surface-2/40 p-8">Todavía no hay videos generados. Primero aprobá letras y tiempos, y luego iniciá la generación desde Estilo y fondos.</p>}
-      {data.can_manage && approvedVideos.length > 0 && <div className="flex flex-wrap items-center gap-2 rounded-xl bg-emerald-500/10 p-3 ring-1 ring-emerald-400/20"><button className={button} disabled={busy} onClick={() => setSelectedVideoIds(allApprovedSelected ? new Set() : new Set(approvedVideos.map(video => video.job_id)))}>{allApprovedSelected ? "Limpiar aprobados" : `Seleccionar todos los aprobados (${approvedVideos.length})`}</button><span className="text-sm" aria-label={`${selectedApprovedVideos.length} videos aprobados seleccionados`}><strong>{selectedApprovedVideos.length}</strong> seleccionados para enviar</span><button className={primaryButton + " ml-auto"} disabled={busy || !selectedApprovedVideos.length} onClick={() => { setBulkDelivery(selectedApprovedVideos); setDeliveryPortal(""); }}>Enviar seleccionados a un portal</button></div>}
+      {data.can_manage && (approvedVideos.length > 0 || (report?.videos || []).some(video => video.status === "pending_review")) && <div className="flex flex-wrap items-center gap-2 rounded-xl bg-emerald-500/10 p-3 ring-1 ring-emerald-400/20"><button className={button} disabled={busy} onClick={() => setSelectedVideoIds(allApprovedSelected ? new Set() : new Set(approvedVideos.map(video => video.job_id)))}>{allApprovedSelected ? "Limpiar aprobados" : `Seleccionar todos los aprobados (${approvedVideos.length})`}</button><span className="text-sm" aria-label={`${selectedApprovedVideos.length} videos aprobados seleccionados`}><strong>{selectedApprovedVideos.length}</strong> seleccionados para enviar</span><button className={primaryButton + " ml-auto"} disabled={busy || !selectedApprovedVideos.length} onClick={() => { setBulkDelivery(selectedApprovedVideos); setDeliveryPortal(""); }}>Enviar seleccionados a un portal</button>{(report?.videos || []).some(video => video.status === "pending_review") && <button className={button} disabled={busy} onClick={approveAllHistory}>Liberar pendientes autorizados</button>}</div>}
       {!!report.videos.length && <div className="overflow-hidden rounded-2xl bg-surface-2/30 ring-1 ring-white/10">
         <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-center">
           <input className={input + " lg:max-w-sm"} aria-label="Buscar videos de la campaña" placeholder="Buscar canción o artista" value={videoQuery} onChange={event => { setVideoQuery(event.target.value); setVideoPage(1); }} />

@@ -12416,6 +12416,12 @@ async def export_provenance(
 
 class ApproveJobRequest(BaseModel):
     notes: str = Field(default="", max_length=2048)
+    # Explicit emergency path for a platform administrator who has received
+    # an operator instruction to release a bounded campaign despite delivery
+    # or language review blockers. This is intentionally separate from the
+    # normal approval flow and always records the reason in the audit log.
+    admin_override: bool = False
+    override_reason: str = Field(default="", max_length=500)
 
 
 class DeliveryQCIssueDecisionRequest(BaseModel):
@@ -12678,15 +12684,31 @@ async def approve_job(
         job.delivery_qc,
         "enforce" if job.workload_class == "batch" else effective_delivery_qc_mode(),
     )
-    if _delivery_gate.get("blocked"):
+    override_requested = bool(body.admin_override)
+    override_allowed = (
+        override_requested
+        and current_user.get("role") == "admin"
+        and bool(body.override_reason.strip())
+        and bool(job.campaign_id)
+    )
+    if override_requested and not override_allowed:
         raise HTTPException(
-            status_code=409,
+            status_code=403,
             detail={
-                "code": "delivery_qc_blocked",
-                "message": "El preflight de entrega tiene hallazgos pendientes.",
-                "delivery_qc": _delivery_gate,
+                "code": "admin_override_required",
+                "message": "El override requiere un administrador, campaña y motivo.",
             },
         )
+    if _delivery_gate.get("blocked"):
+        if not override_allowed:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "delivery_qc_blocked",
+                    "message": "El preflight de entrega tiene hallazgos pendientes.",
+                    "delivery_qc": _delivery_gate,
+                },
+            )
 
     # Server-side language/discrepancy gate. Recomputed from persisted segments
     # + reference so an old or hand-rolled client cannot approve output that
@@ -12702,29 +12724,30 @@ async def approve_job(
         _language_review["needs_language_review"]
         and not _language_review["language_review_resolved"]
     ):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "language_review_unresolved",
-                "message": (
-                    "La letra no coincide con el idioma/contenido de la "
-                    "referencia. Revisá los versos marcados y confirmá el "
-                    "idioma antes de aprobar."
-                ),
-                "language_review": {
-                    "output_reference_divergence":
-                        _language_review["output_reference_divergence"],
-                    "output_reference_divergence_ratio":
-                        _language_review["output_reference_divergence_ratio"],
-                    "output_reference_unexplained_indices":
-                        _language_review["output_reference_unexplained_indices"],
-                    "language_conflict": _language_review["language_conflict"],
-                    "detected_languages": _language_review["detected_languages"],
-                    "reference_languages": _language_review["reference_languages"],
-                    "segments_revision": int(job.segments_revision or 0),
+        if not override_allowed:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "language_review_unresolved",
+                    "message": (
+                        "La letra no coincide con el idioma/contenido de la "
+                        "referencia. Revisá los versos marcados y confirmá el "
+                        "idioma antes de aprobar."
+                    ),
+                    "language_review": {
+                        "output_reference_divergence":
+                            _language_review["output_reference_divergence"],
+                        "output_reference_divergence_ratio":
+                            _language_review["output_reference_divergence_ratio"],
+                        "output_reference_unexplained_indices":
+                            _language_review["output_reference_unexplained_indices"],
+                        "language_conflict": _language_review["language_conflict"],
+                        "detected_languages": _language_review["detected_languages"],
+                        "reference_languages": _language_review["reference_languages"],
+                        "segments_revision": int(job.segments_revision or 0),
+                    },
                 },
-            },
-        )
+            )
 
     scene_plan = job.scene_plan if isinstance(job.scene_plan, dict) else {}
     approval_credits = (
@@ -12767,6 +12790,8 @@ async def approve_job(
         user_id=current_user["id"],
         action="job.approve",
         detail={"job_id": job_id, "notes": body.notes,
+                "admin_override": override_allowed,
+                "override_reason": body.override_reason.strip() if override_allowed else None,
                 "archived_failed_attempts": _archived_n,
                 "tenant_id": job.tenant_id,
                 "owner_user_id": job.user_id,
