@@ -16319,6 +16319,10 @@ async def _reanchor_execute(job_id: str, body: "ReanchorSegmentsRequest",
                     ),
                 },
             )
+        # The editor bridge canonicalizes line timing to four decimals. Bind
+        # the response, quality snapshot and outbox to that same payload;
+        # hashing raw CTC floats makes the queue reject the committed revision.
+        merged = normalize_segments(merged)
         row.segments_json = merged
         row.segments_revision = (
             current_revision + 1 if body.base_revision is not None else current_revision
