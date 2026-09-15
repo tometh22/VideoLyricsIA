@@ -674,6 +674,7 @@ export default function LyricsTimeline({
 
   return (
     <div
+      data-editor-task="timing"
       className="rounded-2xl bg-surface-2/40 ring-1 ring-white/[0.07] overflow-hidden animate-fade-in outline-none focus-visible:ring-2 focus-visible:ring-brand-light"
       tabIndex={0}
       onKeyDown={handleKeyDown}

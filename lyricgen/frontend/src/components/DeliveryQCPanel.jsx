@@ -13,10 +13,44 @@ const TONES = {
   STALE: "text-ink-secondary bg-white/[0.04] ring-white/10",
 };
 
+const CHECK_TONES = {
+  PASS: "text-emerald-300 bg-emerald-500/10 ring-emerald-500/25",
+  FAIL: "text-red-300 bg-red-500/10 ring-red-500/25",
+  REVIEW: "text-amber-200 bg-amber-500/10 ring-amber-500/25",
+  NOT_RUN: "text-ink-secondary bg-white/[0.04] ring-white/10",
+};
+
+const CHECK_LABELS = {
+  PASS: "Pasó",
+  FAIL: "Falló",
+  REVIEW: "Revisión",
+  NOT_RUN: "No ejecutado",
+};
+
 export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor }) {
   const report = job?.delivery_qc;
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const refresh = async () => {
+    setBusy("refresh");
+    setError("");
+    try {
+      const response = await fetch(`${API}/jobs/${job.job_id}/delivery-qc/recheck`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = data.detail;
+        throw new Error(typeof detail === "string" ? detail : detail?.message || detail?.code || "No se pudo actualizar el preflight");
+      }
+      onJobUpdate?.({ ...job, delivery_qc: data.delivery_qc });
+    } catch (requestError) {
+      setError(String(requestError.message || requestError));
+    } finally {
+      setBusy("");
+    }
+  };
   const safeActions = useMemo(
     () => (report?.repairs?.actions || []).filter((row) => row.status === "APPLIED"),
     [report],
@@ -24,6 +58,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
   if (!report) return null;
 
   const state = report.status === "STALE" ? "STALE" : (report.decision || "PASS");
+  const checks = report.checks || [];
   const updateDecision = async (issue, decision) => {
     setBusy(issue.issue_id);
     setError("");
@@ -93,19 +128,43 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
       </div>
 
       <div className="grid grid-cols-3 gap-2 mb-4 text-center">
-        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.summary?.fail_count || 0}</div><div className="text-[10px] text-ink-secondary">críticos</div></div>
-        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.summary?.warn_count || 0}</div><div className="text-[10px] text-ink-secondary">avisos</div></div>
-        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.summary?.open_count || 0}</div><div className="text-[10px] text-ink-secondary">abiertos</div></div>
+        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.check_summary?.fail ?? report.summary?.fail_count ?? 0}</div><div className="text-[10px] text-ink-secondary">fallos reales</div></div>
+        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.check_summary?.review ?? report.summary?.warn_count ?? 0}</div><div className="text-[10px] text-ink-secondary">revisiones</div></div>
+        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.check_summary?.not_run ?? 0}</div><div className="text-[10px] text-ink-secondary">no ejecutados</div></div>
       </div>
 
-      {report.status === "STALE" && <p className="text-xs text-amber-200 mb-3">Se está generando o falta analizar el render más reciente.</p>}
+      {checks.length > 0 && (
+        <div data-testid="delivery-qc-checks" className="mb-4 rounded-xl bg-white/[0.02] ring-1 ring-white/[0.06] p-3">
+          <div className="flex items-center justify-between gap-3 mb-2">
+            <p className="text-xs font-semibold">Checks automáticos y revisiones</p>
+            <p className="text-[10px] text-ink-secondary">
+              {report.check_summary?.pass ?? checks.filter((check) => check.status === "PASS").length} pasaron
+            </p>
+          </div>
+          <div className="grid gap-1.5 sm:grid-cols-2">
+            {checks.map((check) => {
+              const status = CHECK_LABELS[check.status] ? check.status : "NOT_RUN";
+              return (
+                <div key={check.check_id} className="flex items-center justify-between gap-2 rounded-lg bg-white/[0.03] px-2.5 py-2">
+                  <span className="min-w-0 truncate text-[11px] text-ink-secondary">{check.label}</span>
+                  <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${CHECK_TONES[status]}`}>
+                    {CHECK_LABELS[status]}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {report.status === "STALE" && <div className="mb-3 space-y-2"><p className="text-xs text-amber-200">El reporte corresponde a una versión anterior o todavía no fue generado.</p><button disabled={busy === "refresh"} onClick={refresh} className="btn-secondary h-9 px-3 text-xs">{busy === "refresh" ? "Actualizando preflight…" : "Actualizar preflight"}</button></div>}
       <div className="space-y-2">
         {(report.issues || []).map((issue) => (
           <div key={issue.issue_id} className="rounded-xl bg-white/[0.03] ring-1 ring-white/[0.06] p-3">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className={issue.severity === "FAIL" ? "text-red-300 text-[10px] font-bold" : "text-amber-200 text-[10px] font-bold"}>{issue.severity}</span>
+                  <span className={issue.result_status === "FAIL" || (!issue.result_status && issue.severity === "FAIL" && !issue.manual_verification_required) ? "text-red-300 text-[10px] font-bold" : "text-amber-200 text-[10px] font-bold"}>{issue.result_status || (issue.manual_verification_required ? "REVIEW" : issue.severity)}</span>
                   <p className="text-xs font-medium">{issue.summary}</p>
                 </div>
                 {issue.description && <p className="text-[11px] text-ink-secondary mt-1">{issue.description}</p>}
@@ -118,7 +177,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
                 </div>
               </div>
               {issue.status === "OPEN" ? (
-                <button disabled={busy === issue.issue_id} onClick={() => updateDecision(issue, "acknowledged")} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50">Revisado</button>
+                <button disabled={busy === issue.issue_id} onClick={() => updateDecision(issue, issue.manual_verification_required ? "resolved_manual" : "acknowledged")} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50">{issue.manual_verification_required ? "Firmar check" : "Revisado"}</button>
               ) : <span className="text-[10px] text-emerald-300">{issue.status}</span>}
             </div>
           </div>

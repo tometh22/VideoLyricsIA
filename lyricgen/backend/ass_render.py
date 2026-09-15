@@ -940,9 +940,14 @@ def build_ass(
                           f"\\t(0,{_enter_ms},\\clip(0,0,{width},{height}))")
         elif trans == "dissolve_blur":
             # Enter out of focus and resolve, then blur back out near the end.
+            # The style shadow is black at 50% alpha. Fade that shadow to
+            # transparent during the same exit window so the blur does not
+            # spread the dark halo and make it look heavier as the lyric
+            # disappears. This is visual-only: the dialogue end timestamp is
+            # unchanged, so approved lyric windows stay exact.
             _exit_ms = min(380, max(140, int(_dur_ms * 0.30)))
             overrides += (f"\\blur8\\t(0,{_enter_ms},\\blur0)"
-                          f"\\t({_dur_ms - _exit_ms},{_dur_ms},\\blur8)")
+                          f"\\t({_dur_ms - _exit_ms},{_dur_ms},\\blur8\\4a&HFF&)")
 
         if fade_in_ms > 0 or fade_out_ms > 0:
             overrides += f"\\fad({int(fade_in_ms)},{int(fade_out_ms)})"

@@ -65,3 +65,39 @@ Antes de una campaña real, correr 5–10 canciones y luego 30. Verificar:
 Rollback: pausar campañas, poner `BATCH_CAMPAIGN_ENABLED=0` y dejar drenar las
 colas batch. No hace falta revertir la migración; las columnas nuevas son
 compatibles y todos los jobs históricos tienen `workload_class=interactive`.
+
+## Campañas paralelas de Art Track
+
+Las campañas existentes conservan `kind=lyric_video` y su recorrido de
+transcripción/revisión de letras. Para el flujo paralelo crear una campaña
+con `kind=art_track` y `destination_portal=argentina|chile`. Desde su tarjeta
+se seleccionan los WAV/MP3 y JPG/PNG juntos (o se usa el cargador local con
+`--covers`). El backend registra assets deduplicados, asocia por ruta/código/
+nombre o cover de carpeta y deja los conflictos como `ambiguous`/`missing`.
+
+Después de confirmar las asociaciones, **Confirmar asociados y generar** crea
+jobs batch mediante outbox y llama al renderer Art Track existente: no ejecuta
+ASR, Demucs, letras ni fondos IA. La cola está limitada por
+`BATCH_RENDER_WINDOW` y `BATCH_FINAL_REVIEW_LIMIT`; cada resultado queda en
+revisión humana aunque `REQUIRE_REVIEW` esté apagado. Sólo las aprobaciones
+vigentes entran en la previsualización y operación durable de envío. El estado
+de la operación se consulta en `/batch/delivery-operations/{id}` y se reanuda
+desde el worker tras una caída.
+
+Las campañas `lyric_video` también pueden enviar en bloque desde **Historial de
+videos**: el operador marca **Seleccionar todos los aprobados** (o una parte),
+elige Argentina o Chile y confirma. La solicitud guarda una instantánea de los
+`job_ids` aprobados en `DeliveryBatch`; los trabajos pendientes, descartados o
+con una aprobación que cambió quedan fuera. Reenviar con otra idempotencia
+actualiza la entrega existente de ese portal sin duplicarla.
+
+El destino AR/CL se guarda por fila `Delivery.portal_id`, con filtros y tokens
+independientes para `umg.genly.pro` y `umgchile.genly.pro`.
+
+## Throughput — objetivo septiembre 2026
+
+La campaña UMG Agosto midió que el CTC ejecutado en CPU consume alrededor del
+35% del tiempo por canción. Con 8 réplicas y el proveedor estable no se escala
+más durante el lote actual. La mejora prioritaria de septiembre es mover CTC a
+GPU, conservando exactamente los mismos gates y comparando canciones/hora,
+latencia p50/p95 y paridad de alineación antes de cambiar el runtime.

@@ -480,6 +480,187 @@ def test_railway_no_imputa_minimo_account_wide_a_un_proyecto(monkeypatch):
                for row in result.breakdown)
 
 
+# ---------------------------------------------------------------------------
+# Railway "Agent Usage" — la sexta línea de la factura, que se reporta y NO
+# se suma. Los mocks de acá son la RESPUESTA LITERAL de la API real, tomada
+# el 1-sep-2026 contra el workspace de Genly: `totalUsedCents` es un Int en
+# CENTAVOS y `softLimitCents` puede venir null. Un mock con un campo en
+# dólares dejaría pasar el bug de las unidades sin que nadie se entere.
+# ---------------------------------------------------------------------------
+
+# Bill Breakdown real del ciclo 20-jul→20-ago-2026. Los importes de la
+# derecha son los que IMPRIME LA FACTURA, no algo derivado de las constantes
+# del módulo: si mañana alguien toca `RAILWAY_MINUTES_PER_BILLED_MONTH` o una
+# tarifa, la expectativa NO se mueve con el bug y el test lo caza.
+_FACTURA_RAILWAY_CICLO_JUL_AGO = {
+    "MEMORY_USAGE_GB": (440390.97, 101.9424),
+    "CPU_USAGE": (24435.87, 11.3129),
+    "DISK_USAGE_GB": (382099.00, 1.3267),
+    "BACKUP_USAGE_GB": (29545.52, 0.1026),
+}
+# 101,9424 + 11,3129 + 1,3267 + 0,1026 — sumado a mano desde la factura.
+_TOTAL_FACTURADO_SIN_AGENT = 114.6846
+# La línea "Agent" del mismo Bill Breakdown.
+_AGENT_USAGE_FACTURADO = 5.07
+
+
+def _railway_router(monkeypatch, *, agent_payload, registro=None):
+    """Enruta cada POST por el texto de la query, como hace el server real.
+
+    `fetch_railway` hace hasta tres llamadas distintas al mismo endpoint
+    (usage, project→workspaceId, agentUsage). Un mock que devuelve siempre
+    lo mismo haría pasar cualquier cosa.
+    """
+    usage = [{"measurement": m, "value": v}
+             for m, (v, _) in _FACTURA_RAILWAY_CICLO_JUL_AGO.items()]
+
+    class _Resp:
+        def __init__(self, body):
+            self.status_code = 200
+            self._body = body
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._body
+
+    def _post(*args, **kwargs):
+        query = (kwargs.get("json") or {}).get("query", "")
+        if registro is not None:
+            registro.append(query)
+        if "agentUsage" in query:
+            return _Resp(agent_payload)
+        # OJO: la query de `usage` TAMBIÉN menciona `workspaceId` (lo acepta
+        # como scope), así que enrutar por esa palabra devolvía el payload
+        # equivocado y la fuente entera daba error. Se enruta por `project(`.
+        if "project(" in query:
+            return _Resp({"data": {"project": {
+                "workspaceId": "f5d836a8-b9e7-427a-be77-bb7010c1d194"}}})
+        return _Resp({"data": {"usage": usage}})
+
+    monkeypatch.setenv("RAILWAY_API_TOKEN", "fake")
+    monkeypatch.setenv("RAILWAY_PROJECT_ID", "proj-genly")
+    monkeypatch.delenv("RAILWAY_WORKSPACE_ID", raising=False)
+    monkeypatch.setattr(billing_sources, "_RAILWAY_WORKSPACE_BY_PROJECT", {})
+    monkeypatch.setattr(billing_sources.requests, "post", _post)
+
+
+def test_railway_agent_usage_se_reporta_pero_no_entra_en_el_total(monkeypatch):
+    """`Agent Usage` se ve, pero no suma. Ese es todo el contrato.
+
+    La query `agentUsage` devuelve un CONTADOR ACUMULADO DEL CICLO ABIERTO:
+    no acepta rango de fechas, el ciclo va del 20 al 20 (pisa dos meses
+    calendario) y no desglosa por proyecto ni por servicio. Meterlo en
+    `amount_usd` contaría el mismo dinero en dos meses seguidos y rompería
+    la reconciliación del 0,3% contra la factura.
+    """
+    _railway_router(monkeypatch, agent_payload={"data": {"agentUsage": {
+        "totalUsedCents": 507, "hardLimitCents": 2000,
+        "softLimitCents": None,
+        "billingPeriodEnd": "2026-09-20T15:36:29.000Z"}}})
+
+    result = billing_sources.fetch_railway(billing_sources.current_period())
+
+    assert result.status == "ok"
+    # El total es el de la factura SIN la línea de agente. Si alguien la
+    # suma, esto da 119,75 y el test se cae.
+    assert result.amount_usd == pytest.approx(_TOTAL_FACTURADO_SIN_AGENT,
+                                              abs=0.02), result.amount_usd
+
+    filas = {row["measurement"]: row for row in result.breakdown}
+    agente = filas["AGENT_USAGE"]
+    assert agente["excluded_from_total"] is True
+    assert agente["cost"] == 0.0, "la fila no puede aportar dólares al total"
+    assert agente["observed_cycle_amount_usd"] == _AGENT_USAGE_FACTURADO
+    assert agente["hard_limit_usd"] == 20.00
+    assert agente["cycle_end"] == "2026-09-20T15:36:29.000Z"
+
+    # La invariante que sostiene el panel: el desglose sigue sumando el total.
+    assert sum(row["cost"] for row in result.breakdown) == pytest.approx(
+        result.amount_usd, abs=0.02)
+    # Y el número queda dicho donde un humano lo lee.
+    assert "5.07" in result.detail and "NO sumado" in result.detail
+    assert result.raw["agent_usage"]["used_usd"] == _AGENT_USAGE_FACTURADO
+
+
+def test_railway_no_pregunta_agent_usage_para_un_mes_cerrado(monkeypatch):
+    """Un mes cerrado no se puede contestar: el contador es del ciclo VIGENTE.
+
+    Preguntarlo igual estamparía el valor de HOY sobre un mes viejo, que es
+    peor que no tener el dato porque parece un dato.
+    """
+    registro = []
+    _railway_router(monkeypatch, registro=registro,
+                    agent_payload={"data": {"agentUsage": {
+                        "totalUsedCents": 507, "hardLimitCents": 2000,
+                        "softLimitCents": None,
+                        "billingPeriodEnd": "2026-09-20T15:36:29.000Z"}}})
+
+    result = billing_sources.fetch_railway("2026-06")
+
+    assert not any("agentUsage" in q for q in registro), registro
+    assert all(row["measurement"] != "AGENT_USAGE" for row in result.breakdown)
+    assert "Agent Usage" not in (result.detail or "")
+    assert result.raw["agent_usage"] is None
+
+
+def test_railway_agent_usage_devuelve_dolares_no_centavos(monkeypatch):
+    """`totalUsedCents` es un Int en centavos. Es la trampa obvia del campo.
+
+    Sin la división, los $5,07 de la factura se reportan como $507 — cien
+    veces la línea entera de Railway.
+    """
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {"data": {"agentUsage": {
+                "totalUsedCents": 507, "hardLimitCents": 2000,
+                "softLimitCents": None,
+                "billingPeriodEnd": "2026-09-20T15:36:29.000Z"}}}
+
+    monkeypatch.setattr(billing_sources.requests, "post",
+                        lambda *a, **k: _Resp())
+    leido = billing_sources.railway_agent_usage("fake", "ws-genly")
+    # Literales de la factura y del panel de límites de Railway, no
+    # aritmética sobre la misma constante que el bug tocaría.
+    assert leido["used_usd"] == 5.07
+    assert leido["hard_limit_usd"] == 20.00
+
+
+def test_railway_agent_usage_ilegible_no_se_reporta_como_cero(monkeypatch):
+    """"No lo pude leer" no es "salió cero".
+
+    El payload es el que devolvió de verdad la API con un token sin permiso
+    (`Not Authorized` sobre `me`, 1-sep-2026). Si esto se tradujera a $0,00,
+    un permiso faltante se leería como una línea que dejó de gastar.
+    """
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {"errors": [{"message": "Not Authorized"}], "data": None}
+
+    monkeypatch.setattr(billing_sources.requests, "post",
+                        lambda *a, **k: _Resp())
+    assert billing_sources.railway_agent_usage("fake", "ws-genly") is None
+
+
+def test_railway_agent_usage_ilegible_no_rompe_la_fuente(monkeypatch):
+    """Una consulta accesoria no puede tumbar la recolección del gasto real."""
+    _railway_router(monkeypatch, agent_payload={
+        "errors": [{"message": "Not Authorized"}], "data": None})
+
+    result = billing_sources.fetch_railway(billing_sources.current_period())
+
+    assert result.status == "ok"
+    assert result.amount_usd == pytest.approx(_TOTAL_FACTURADO_SIN_AGENT,
+                                              abs=0.02)
+    assert all(row["measurement"] != "AGENT_USAGE" for row in result.breakdown)
+    assert result.raw["agent_usage"] is None
+
+
 def test_fixed_no_suma_railway_y_acepta_config_legacy(monkeypatch):
     monkeypatch.setenv(
         "FIXED_SUBSCRIPTIONS_JSON",

@@ -33,6 +33,9 @@ elige entre este path async y el legacy sync. Default a env de staging primero.
 from __future__ import annotations
 
 import asyncio
+import copy
+from datetime import datetime, timezone
+import hashlib
 import logging
 import os
 import re
@@ -47,6 +50,314 @@ def _safe_exception_code(exc: BaseException) -> str:
     """Return a bounded class label; never serialize exception text/args."""
     name = getattr(type(exc), "__name__", "Exception")
     return name if isinstance(name, str) and _EXCEPTION_TYPE_RE.fullmatch(name) else "Exception"
+
+
+def _approved_reuse_enabled() -> bool:
+    return os.environ.get("APPROVED_TEXT_REUSE_ENABLED", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _approved_text_for_audio(
+    tenant_id: str, audio_sha256: str, *, exclude_job_id: str,
+) -> dict | None:
+    """Fase 3 (2026-09-13): texto ya APROBADO por un humano para este mismo
+    audio (jobs.input_audio_sha256) dentro del tenant.
+
+    Una canción que un revisor ya confirmó no debería volver a pasar por ASR
+    libre cuando llega de nuevo (re-subida, variante, otra campaña). El texto
+    aprobado entra como ancla (operator_reference) y el timing lo re-alinea
+    CTC — NO se copian segments: copiar exigiría fabricar evidencia máquina
+    (attempt_id, etc.) y esa es justo la clase de bug que dejó un canary en
+    0/30. Devuelve None si no hay versión aprobada de OTRO job del tenant.
+    Best-effort — nunca levanta.
+    """
+    if not tenant_id or not audio_sha256:
+        return None
+    from database import EditorVersion, Job, SessionLocal
+    db = SessionLocal()
+    try:
+        version = (
+            db.query(EditorVersion)
+            .join(Job, Job.job_id == EditorVersion.job_id)
+            .filter(EditorVersion.is_approved.is_(True))
+            .filter(EditorVersion.tenant_id == tenant_id)
+            .filter(Job.input_audio_sha256 == audio_sha256)
+            .filter(Job.job_id != exclude_job_id)
+            .order_by(EditorVersion.created_at.desc())
+            .first()
+        )
+        if version is None:
+            return None
+        lines = [
+            str(seg.get("text") or "").strip()
+            for seg in (version.segments or []) if isinstance(seg, dict)
+        ]
+        lines = [ln for ln in lines if ln]
+        if len(lines) < 3:
+            return None
+        return {
+            "text": "\n".join(lines),
+            "from_job_id": str(version.job_id),
+            "from_revision": int(version.revision or 0),
+            "line_count": len(lines),
+            "approved_at": version.created_at.isoformat() if version.created_at else None,
+        }
+    except Exception as exc:  # noqa: BLE001 — lookup opcional
+        logger.warning("[APPROVED-REUSE] lookup failed job=%s error_type=%s",
+                       exclude_job_id, _safe_exception_code(exc))
+        return None
+    finally:
+        db.close()
+
+
+async def _maybe_apply_approved_reuse(
+    result: dict, audio_path: str, job_id: str, reuse: dict | None, *, aligner,
+) -> dict:
+    """Anclar el texto aprobado por el MISMO camino que la letra pegada por
+    el operador (`_maybe_anchor_align`, fail-closed adentro). Diferencia
+    clave con el ancla del operador: si declina, NO falla el job — vuelve
+    al resultado ASR y deja provenance ``approved_text_reuse.used=False``.
+    """
+    if not isinstance(result, dict) or not isinstance(reuse, dict):
+        return result
+    provenance = {k: v for k, v in reuse.items() if k != "text"}
+    try:
+        aligned = await aligner(copy.deepcopy(result), audio_path, job_id, reuse["text"])
+    except Exception as exc:  # noqa: BLE001 — nunca rompe el pipeline
+        logger.warning("[APPROVED-REUSE] aligner failed job=%s error_type=%s",
+                       job_id, _safe_exception_code(exc))
+        aligned = None
+    status = ""
+    if isinstance(aligned, dict):
+        status = str((aligned.get("anchor_alignment") or {}).get("status") or "")
+    if status != "applied":
+        out = dict(result)
+        out["approved_text_reuse"] = {**provenance, "used": False,
+                                      "reason": status or "declined"}
+        logger.info("[APPROVED-REUSE] declined job=%s from=%s reason=%s",
+                    job_id, provenance.get("from_job_id"), status or "declined")
+        return out
+    aligned["approved_text_reuse"] = {**provenance, "used": True}
+    logger.info("[APPROVED-REUSE] applied job=%s from=%s lines=%s",
+                job_id, provenance.get("from_job_id"), provenance.get("line_count"))
+    return aligned
+
+
+def _catalog_reference_summary(
+    reference: dict,
+    *,
+    status: str,
+    used: bool,
+    reason: str = "",
+    attestation: dict | None = None,
+    timing_source: str = "",
+) -> dict:
+    """Persist provenance and decisions without duplicating raw lyric text."""
+    summary = {
+        "schema_version": "batch-catalog-reference-v1",
+        "status": status,
+        "used": bool(used),
+        "reason": str(reason or "")[:120],
+        "source_kind": str(reference.get("source_kind") or "none")[:40],
+        "source_document_id": str(reference.get("source_document_id") or "")[:200],
+        "sheet_name": str(reference.get("sheet_name") or "")[:200],
+        "row_numbers": [int(row) for row in (reference.get("row_numbers") or [])[:10]],
+        "association_basis": str(reference.get("association_basis") or "none")[:80],
+        "source_asset_id": str(reference.get("source_asset_id") or "")[:100],
+        "source_audio_sha256": str(reference.get("source_audio_sha256") or "")[:64],
+        "text_sha256": str(reference.get("text_sha256") or "")[:64],
+        "timing_source": str(timing_source or "")[:80],
+    }
+    if isinstance(attestation, dict):
+        summary["attestation"] = attestation
+    return summary
+
+
+def _lrclib_candidate_enabled() -> bool:
+    return os.environ.get("CAMPAIGN_LRCLIB_CANDIDATE_ENABLED", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+async def _maybe_lrclib_candidate(
+    artist: str,
+    title: str,
+    source_audio_sha256: str,
+    *,
+    audio_path: str,
+    live: bool,
+) -> dict | None:
+    """Fase 2 (2026-09-13): candidato de referencia desde lrclib cuando la
+    planilla no trae letra.
+
+    Medido en staging el 13-sep: 314 de 339 canciones de campaña no tenían
+    referencia alguna, y los caminos anclados a una referencia son los que
+    llegan al editor con el texto exacto. Devuelve un dict con el MISMO
+    contrato que la referencia de planilla (status candidate + binding
+    text_sha256 / source_audio_sha256) para que `_maybe_apply_catalog_reference`
+    lo someta a la MISMA atestación acústica. lrclib nunca es autor sin gate:
+    si la letra es de otra versión, la atestación la rechaza igual que a la
+    planilla. Vivos: se saltea (el gate sólo permitiría local_only).
+    Best-effort — nunca levanta.
+    """
+    if not _lrclib_candidate_enabled() or live or not artist or not title:
+        return None
+    try:
+        from pipeline import _fetch_lrclib, _audio_duration
+        from forced_align import lrc_to_plain_text
+        from database import SessionLocal
+        try:
+            duration = await asyncio.to_thread(_audio_duration, audio_path)
+        except Exception:  # noqa: BLE001 — la duración sólo afina la búsqueda
+            duration = None
+        db = SessionLocal()
+        try:
+            record = await asyncio.to_thread(_fetch_lrclib, artist, title, db, duration)
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("[LRCLIB-CANDIDATE] fetch failed artist=%r title=%r: %s",
+                       artist, title, exc)
+        return None
+    if not isinstance(record, dict):
+        return None
+    text = str(record.get("plain") or "").strip()
+    if not text and record.get("synced"):
+        text = lrc_to_plain_text(str(record.get("synced") or ""))
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 4:
+        return None
+    text = "\n".join(lines)
+    return {
+        "status": "candidate",
+        "source_kind": "lrclib",
+        "association_basis": "artist_title_lookup",
+        "artist": artist,
+        "track": title,
+        "text": text,
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "source_audio_sha256": str(source_audio_sha256 or "").lower(),
+        "lrclib_duration": record.get("duration"),
+        "row_numbers": [],
+    }
+
+
+async def _effective_catalog_reference(
+    catalog_reference: dict | None,
+    *,
+    artist: str,
+    title: str,
+    source_audio_sha256: str,
+    audio_path: str,
+    live: bool,
+    reference_required: bool,
+) -> tuple[dict | None, str]:
+    """Elegir qué referencia entra al gate: la planilla si trae letra; si no
+    (ausente o inexistente) y la campaña exige referencia, el candidato lrclib.
+    Devuelve (referencia, estado_de_planilla) para dejar provenance."""
+    sheet_status = str((catalog_reference or {}).get("status") or "none")
+    if sheet_status not in ("none", "absent") or not reference_required:
+        return catalog_reference, sheet_status
+    candidate = await _maybe_lrclib_candidate(
+        artist, title, source_audio_sha256, audio_path=audio_path, live=live,
+    )
+    return (candidate if candidate is not None else catalog_reference), sheet_status
+
+
+async def _maybe_apply_catalog_reference(
+    result: dict,
+    audio_path: str,
+    job_id: str,
+    reference: dict | None,
+    source_audio_sha256: str,
+    *,
+    live: bool,
+    aligner,
+) -> dict:
+    """Apply a sheet candidate only after audio-first attestation and alignment."""
+    if not isinstance(result, dict) or not isinstance(reference, dict):
+        return result
+    status = str(reference.get("status") or "")
+    if status == "absent":
+        result["catalog_reference"] = _catalog_reference_summary(
+            reference,
+            status="absent",
+            used=False,
+            reason=str(reference.get("absence_reason") or "external_reference_absent"),
+        )
+        return result
+    text = str(reference.get("text") or "").strip()
+    expected_text_hash = str(reference.get("text_sha256") or "").lower()
+    expected_audio_hash = str(reference.get("source_audio_sha256") or "").lower()
+    if (
+        status != "candidate"
+        or not text
+        or hashlib.sha256(text.encode("utf-8")).hexdigest() != expected_text_hash
+        or expected_audio_hash != str(source_audio_sha256 or "").lower()
+    ):
+        result["catalog_reference"] = _catalog_reference_summary(
+            reference,
+            status="invalidated",
+            used=False,
+            reason="source_binding_invalid",
+        )
+        return result
+
+    from pipeline import _audio_duration
+    from reference_attestation import assess_reference_attestation, reference_gate_action
+    try:
+        duration = await asyncio.to_thread(_audio_duration, audio_path)
+    except Exception:
+        duration = None
+    report = assess_reference_attestation(
+        text,
+        result.get("segments") or [],
+        reference_source="catalog_unverified",
+        audio_duration_s=duration,
+        is_live=live,
+    )
+    action = reference_gate_action(report, mode="enforce", is_live=live)
+    if action != "reference_allowed":
+        result["catalog_reference"] = _catalog_reference_summary(
+            reference,
+            status="rejected",
+            used=False,
+            reason=f"attestation_{action}",
+            attestation=report,
+        )
+        return result
+
+    original = copy.deepcopy(result)
+    try:
+        aligned = await aligner(
+            copy.deepcopy(result), audio_path, job_id, text,
+            content_source="catalog_reference", enabled=True,
+        )
+    except Exception as exc:
+        original["catalog_reference"] = _catalog_reference_summary(
+            reference, status="alignment_declined", used=False,
+            reason=f"alignment_{_safe_exception_code(exc)}", attestation=report,
+        )
+        return original
+    alignment = dict(aligned.get("anchor_alignment") or {}) if isinstance(aligned, dict) else {}
+    if alignment.get("status") != "applied":
+        original["catalog_reference"] = _catalog_reference_summary(
+            reference,
+            status="alignment_declined",
+            used=False,
+            reason=str(alignment.get("reason") or "alignment_declined"),
+            attestation=report,
+        )
+        return original
+    # Keep the independent acoustic reference separate from catalogue text.
+    aligned["reference_lyrics"] = original.get("reference_lyrics", "")
+    aligned["catalog_reference"] = _catalog_reference_summary(
+        reference,
+        status="audio_validated",
+        used=True,
+        attestation=report,
+        timing_source=str(alignment.get("timing_source") or ""),
+    )
+    return aligned
 
 
 def _drop_final_credit_hallucinations(result: dict, job_id: str) -> dict:
@@ -163,6 +474,34 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                     logger.info(
                         "[COVERAGE] sin stem para voiced_gaps error_type=%s",
                         _safe_exception_code(exc),
+                    )
+            # CTC/Whisper word clocks end at the last phoneme and omit a held
+            # vowel. Reuse the already-cached vocal stem to extend a line only
+            # through an attached, energy-backed pitch run (±2 semitones).
+            # This happens after word consistency, never trims, and skips
+            # operator-locked boundaries.
+            from timing_review_suggestions import automatic_tail_enabled
+            if _stem and automatic_tail_enabled():
+                try:
+                    from pathlib import Path
+                    from timing_review_suggestions import (
+                        extend_line_ends_to_stable_pitch,
+                        load_acoustic_track,
+                    )
+
+                    _track = load_acoustic_track(Path(_stem))
+                    _extended, _tail_report = extend_line_ends_to_stable_pitch(
+                        r.get("segments") or [], _track,
+                    )
+                    if _tail_report["extended_count"]:
+                        r["segments"] = _extended
+                    r.setdefault("postpass_stats", {})[
+                        "stable_pitch_tail"
+                    ] = _tail_report
+                except Exception as exc:
+                    logger.info(
+                        "[TIMING-TAIL] abstained error_type=%s job=%s",
+                        _safe_exception_code(exc), job_id,
                     )
             # Veredictos del sondeo con ASR: gap_rescue mide PALABRAS, la
             # única evidencia real de letra faltante. El breaker no puede
@@ -314,6 +653,7 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             r.pop("_pre_anchor_provider_segments", None)
             r.pop("_recognition_hypotheses", None)
             r.pop("_recognition_attempt_count", None)
+            r.pop("_reconcile_capture", None)
             r.pop("_primary_asr_family", None)
             r.pop("_independent_asr_family", None)
             r.pop("_lora_asr_words", None)
@@ -335,7 +675,9 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     from line_evidence import annotate_provider_evidence
 
     r = dict(r)
-    r["segments"] = annotate_provider_evidence(r.get("segments") or [])
+    r["segments"] = annotate_provider_evidence(
+        r.get("segments") or [], timing_source=r.get("timing_source"),
+    )
 
     calibrated = calibration_identity()["calibrated"]
     require_independent = bool(
@@ -427,11 +769,45 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     if live_hint:
         from lyric_content_policy import EDITORIAL_POLICY_ID
         final_metrics["editorial_policy_id"] = EDITORIAL_POLICY_ID
-    final_metrics["language"] = str(language or "unknown")[:16]
+    # Preserve why auto-LID abstained.  The old single ``unknown`` value
+    # collapsed valid bilingual/low-evidence abstentions together with a
+    # persistence failure, making the 10/30 campaign result impossible to
+    # autopsy.  A final-row singleton is safe to persist as the detected
+    # language; mixed and insufficient evidence remain explicit abstentions.
+    from transcription_language import diagnose_language_state
+    lid_diagnostic = diagnose_language_state(r, language)
+    detected_languages = list(lid_diagnostic["detected_languages"])
+    resolved_language = str(language or "").strip().lower()
+    if not resolved_language and len(detected_languages) == 1:
+        resolved_language = detected_languages[0]
+    final_metrics["language"] = str(resolved_language or "unknown")[:16]
+    final_metrics["detected_languages"] = detected_languages
+    final_metrics["mixed_language"] = bool(lid_diagnostic["mixed_language"])
+    final_metrics["lid_status"] = (
+        "known" if resolved_language else lid_diagnostic["classification"]
+    )
     # Persist the paired LoRA↔base disagreement as a song-level routing
     # feature. It is computed before internal witness streams are stripped,
     # uses no reference lyrics, and remains advisory until calibration signs
     # the router gate.
+    # Contador de llamadas reales al ASR vs cache hits. La procedencia ya
+    # distingue "replicate_raw" de "cache_hit_raw"; acá se agrega para que
+    # cualquier reporte pueda declarar si el ASR corrió, sin auditar a mano.
+    try:
+        asr_calls = {"whisperx_real_calls": 0, "whisperx_cache_hits": 0}
+        for hypothesis in (r.get("_recognition_hypotheses") or []):
+            if not isinstance(hypothesis, dict):
+                continue
+            transformation = str(hypothesis.get("transformation") or "")
+            if transformation == "cache_hit_raw":
+                asr_calls["whisperx_cache_hits"] += 1
+            elif transformation == "replicate_raw":
+                asr_calls["whisperx_real_calls"] += 1
+        asr_calls["asr_actually_ran"] = asr_calls["whisperx_real_calls"] > 0
+        final_metrics["asr_calls"] = asr_calls
+    except Exception:
+        pass
+
     try:
         from lora_family import song_disagreement_score
         router_signal = song_disagreement_score(
@@ -468,6 +844,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     r.pop("_pre_anchor_provider_segments", None)
     r.pop("_recognition_hypotheses", None)
     r.pop("_recognition_attempt_count", None)
+    r.pop("_reconcile_capture", None)
     r.pop("_primary_asr_family", None)
     r.pop("_independent_asr_family", None)
     r.pop("_lora_asr_words", None)
@@ -486,6 +863,11 @@ def run_transcription_job(
     filename: str = "",
     live: bool = False,
     anchor_lyrics: str = "",
+    reference_required: bool = False,
+    workload_class: str = "interactive",
+    pipeline_stage: str = "full",
+    parallel_audio_reference: bool = False,
+    catalog_reference: dict | None = None,
 ) -> dict:
     """RQ entry point — sync wrapper around `_run_transcription_for_job`.
 
@@ -499,6 +881,7 @@ def run_transcription_job(
     # Observability 2026-06-10: toda línea de log de este job lleva job_id.
     from observability import set_job_log_context
     set_job_log_context(job_id)
+    from reconcile_capture import record_result as _record_reconcile_result
     # Lazy import — main.py es pesado y el worker no debería pagarlo si
     # corre otros queues. asyncio.run abre/cierra su propio event loop por job,
     # que es lo que queremos (jobs independientes, sin event-loop leak).
@@ -516,12 +899,19 @@ def run_transcription_job(
     if not filename:
         filename = os.path.basename(audio_path)
 
-    # 1. Status flip a "transcribing" para que el polling lo vea ya en marcha.
+    if pipeline_stage not in {"full", "separation"}:
+        return _fail(job_id, "Etapa de transcripción inválida.")
+
+    # 1. Expose the durable stage before materialising the official audio.
     try:
         update_job(
             job_id,
-            status="transcribing",
-            current_step="transcribe.prepare",
+            status="separating" if pipeline_stage == "separation" else "transcribing",
+            current_step=(
+                "transcribe.isolate_vocals"
+                if pipeline_stage == "separation"
+                else "transcribe.prepare"
+            ),
             progress=2,
         )
     except Exception as exc:
@@ -580,6 +970,7 @@ def run_transcription_job(
     # the server does not see their bytes; the first worker materialization
     # promotes that object to its content-addressed destination.
     from database import Job as _IdentityJob, SessionLocal as _IdentitySession
+    _reuse_tenant_id = ""
     _identity_db = _IdentitySession()
     try:
         _identity_row = (
@@ -620,9 +1011,63 @@ def run_transcription_job(
                 1, int(_identity_row.audio_revision or 0),
             )
         source_audio_revision = int(_identity_row.audio_revision or 0)
+        _reuse_tenant_id = str(_identity_row.tenant_id or "")
         _identity_db.commit()
     finally:
         _identity_db.close()
+
+    if pipeline_stage == "separation":
+        # Phase A only computes and validates the content-addressed stem.  The
+        # campaign reconciler releases Phase B after every song is either
+        # separation_ready or terminal red.  No ASR/Gemini/background/render
+        # work is reachable from this branch.
+        import vocal_sep
+        if not vocal_sep.is_enabled():
+            return _fail(job_id, "Separación vocal requerida pero deshabilitada.")
+        stem_path = None
+        try:
+            stem_path = vocal_sep.separate_vocals(audio_path)
+            if not stem_path:
+                return _fail(job_id, "No se pudo preparar la separación vocal.")
+            update_job(
+                job_id,
+                status="separation_ready",
+                current_step="transcribe.separation_ready",
+                progress=20,
+            )
+            try:
+                from batch_campaigns import ensure_campaign_reconciler_scheduled
+                ensure_campaign_reconciler_scheduled()
+            except Exception as exc:
+                logger.warning(
+                    "[TRANSCRIBE-WORKER] separation ready but campaign wake-up "
+                    "failed job=%s error_type=%s",
+                    job_id, _safe_exception_code(exc),
+                )
+            return {
+                "job_id": job_id,
+                "status": "separation_ready",
+                "audio_sha256": source_audio_sha256,
+                "audio_revision": source_audio_revision,
+            }
+        finally:
+            if stem_path:
+                try:
+                    os.unlink(stem_path)
+                except OSError:
+                    pass
+
+    # Fase 3 (APPROVED_TEXT_REUSE_ENABLED, default off): si este mismo audio
+    # ya tiene una versión aprobada por un humano en el tenant, su texto entra
+    # como ancla. Nunca pisa una letra pegada por el operador.
+    approved_reuse = None
+    if _approved_reuse_enabled() and not (anchor_lyrics or "").strip():
+        approved_reuse = _approved_text_for_audio(
+            _reuse_tenant_id, source_audio_sha256, exclude_job_id=job_id,
+        )
+        if approved_reuse:
+            logger.info("[APPROVED-REUSE] candidate job=%s from=%s lines=%s",
+                        job_id, approved_reuse["from_job_id"], approved_reuse["line_count"])
 
     # 3. Llamar al pipeline async existente. `request` y `current_user` son
     #    ignorados dentro del cuerpo (verified) — passing None es seguro.
@@ -631,7 +1076,9 @@ def run_transcription_job(
             r = await _run_transcription_for_job(
                 None, None, job_id, audio_path,
                 language=language, artist=artist, title=title, filename=filename,
-                live=live,
+                live=live, reference_required=reference_required,
+                workload_class=workload_class,
+                parallel_audio_reference=parallel_audio_reference,
             )
             from recognition_provenance import resume_from_result
             resume_from_result(r)
@@ -639,6 +1086,31 @@ def run_transcription_job(
             # other timing/content post-pass can replace words and bounds.
             from line_evidence import freeze_result_provider_evidence
             r = freeze_result_provider_evidence(r)
+            _record_reconcile_result(r, "post:freeze_result_provider_evidence")
+            _effective_live = live or _looks_live(title, filename)
+            _effective_reference, _sheet_status = await _effective_catalog_reference(
+                catalog_reference,
+                artist=artist, title=title,
+                source_audio_sha256=source_audio_sha256,
+                audio_path=audio_path, live=_effective_live,
+                reference_required=reference_required,
+            )
+            r = await _maybe_apply_catalog_reference(
+                r,
+                audio_path,
+                job_id,
+                _effective_reference,
+                source_audio_sha256,
+                live=_effective_live,
+                aligner=_maybe_anchor_align,
+            )
+            if (_effective_reference is not catalog_reference
+                    and isinstance(r, dict)
+                    and isinstance(r.get("catalog_reference"), dict)):
+                # Provenance: la planilla no traía letra; lo que entró al gate
+                # fue el candidato lrclib. Queda en transcription_quality.
+                r["catalog_reference"]["sheet_reference_status"] = _sheet_status
+            _record_reconcile_result(r, "post:_maybe_apply_catalog_reference")
             # Post-pases gateados, en lockstep con los dos endpoints HTTP
             # (/transcribe y /transcribe-uploaded). ESTE es el camino que
             # usa el frontend real (enqueue → ShortWorker), así que si acá
@@ -657,15 +1129,22 @@ def run_transcription_job(
             if (anchor_lyrics or "").strip():
                 r = await _maybe_anchor_align(r, audio_path, job_id,
                                               anchor_lyrics)
+                _record_reconcile_result(r, "post:_maybe_anchor_align")
                 if (
                     isinstance(r, dict)
                     and (r.get("anchor_alignment") or {}).get("status")
                     == "declined"
                 ):
                     raise RuntimeError("operator_reference_alignment_declined")
+            elif approved_reuse is not None:
+                r = await _maybe_apply_approved_reuse(
+                    r, audio_path, job_id, approved_reuse, aligner=_maybe_anchor_align,
+                )
+                _record_reconcile_result(r, "post:_maybe_apply_approved_reuse")
             if not (isinstance(r, dict)
                     and r.get("timing_source") == "anchor_ctc"):
                 r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
+                _record_reconcile_result(r, "post:_maybe_ctc_retime")
             _post_lang = _resolve_postprocess_language(
                 language, r, job_id=job_id,
             )
@@ -674,29 +1153,49 @@ def run_transcription_job(
                 live_hint=live or _looks_live(title, filename),
                 language=_post_lang,
             )
+            _record_reconcile_result(r, "post:_maybe_adlib_filter")
             r = _maybe_repetition_reconcile(r, job_id)
+            _record_reconcile_result(r, "post:_maybe_repetition_reconcile")
             r = await _maybe_gap_rescue(r, audio_path, job_id, _post_lang)
+            _record_reconcile_result(r, "post:_maybe_gap_rescue")
             r = await _maybe_lora_family(r, audio_path, job_id, _post_lang)
+            _record_reconcile_result(r, "post:_maybe_lora_family")
             r = await _maybe_word_vote(
                 r, audio_path, job_id, _post_lang,
                 live_hint=live or _looks_live(title, filename),
             )
+            _record_reconcile_result(r, "post:_maybe_word_vote")
             r = _maybe_chorus_snap(r, job_id)
+            _record_reconcile_result(r, "post:_maybe_chorus_snap")
             r = _maybe_phrase_segment(r, job_id)
+            _record_reconcile_result(r, "post:_maybe_phrase_segment")
             from lyrics_format import format_lyrics_pass as _fmt
             _antes = _coverage_de(r)
             r = await _fmt(r, language=_post_lang)
+            _record_reconcile_result(r, "post:_fmt")
             r = _drop_final_credit_hallucinations(r, job_id)
+            _record_reconcile_result(r, "post:_drop_final_credit_hallucinations")
             # Último post-pase: re-encuadra cada cartel a sus propias palabras
             # (audit 2026-08-13). Va al final porque todas las etapas de
             # arriba pueden haber movido start/end o words de forma
             # independiente. Lockstep con los dos caminos HTTP de main.py.
             r = _maybe_timing_consistency(r, job_id)
+            _record_reconcile_result(r, "post:_maybe_timing_consistency")
             r = await _quality_gate_and_retry(
                 r, audio_path, job_id, _post_lang, _antes,
                 _maybe_timing_consistency,
                 live_hint=live or _looks_live(title, filename),
             )
+            if isinstance(r.get("catalog_reference"), dict):
+                quality = dict(r.get("transcription_quality") or {})
+                quality["catalog_reference"] = {
+                    **r["catalog_reference"], "source_audio_revision": source_audio_revision,
+                }
+                r["transcription_quality"] = quality
+            if isinstance(r.get("approved_text_reuse"), dict):
+                quality = dict(r.get("transcription_quality") or {})
+                quality["approved_text_reuse"] = dict(r["approved_text_reuse"])
+                r["transcription_quality"] = quality
             from delivery_repair_shadow import attach_delivery_repair_shadow
             return attach_delivery_repair_shadow(
                 r,
@@ -773,7 +1272,7 @@ def run_transcription_job(
         # frontend (main.py:2778), so the editor sees `transcribed` and
         # `/generate` sees `transcribed_pending`. Same observable
         # behaviour as the legacy path, no frontend change needed.
-        from database import Job, SessionLocal
+        from database import AuditLog, Job, SessionLocal
         _persist_db = SessionLocal()
         try:
             row = (
@@ -883,6 +1382,19 @@ def run_transcription_job(
                 )
                 quality["machine_evidence_required"] = True
                 quality["machine_evidence_schema"] = MACHINE_EVIDENCE_SCHEMA
+                if reference_required:
+                    candidate = result.get("reference_hypothesis_candidate") or {}
+                    from reference_hypothesis import build_from_candidate
+                    hypothesis, manual_review = build_from_candidate(
+                        candidate,
+                        fallback_text=reference_lyrics,
+                        audio_sha256=source_audio_sha256,
+                        audio_revision=int(row.audio_revision or 0),
+                    )
+                    if manual_review:
+                        quality["reference_hypothesis_unavailable"] = True
+                        quality["manual_full_review_required"] = True
+                    quality["reference_hypothesis"] = hypothesis
                 row.transcription_quality = quality
                 from machine_evidence import finalize_machine_evidence
                 durable_evidence = finalize_machine_evidence(
@@ -898,6 +1410,32 @@ def run_transcription_job(
                 require_machine_snapshot(row, document)
                 row.status = "transcribed_pending"
                 row.current_step = "editing"
+                if str(row.workload_class or workload_class) == "batch":
+                    # The review queue must be ordered before a human opens
+                    # it. Persist the blind v2 verdict atomically with the
+                    # transcription instead of relying on an operator script.
+                    from scripts.emit_song_semaforo import ACTION, song_verdict
+                    existing_verdict = next((
+                        log for log in _persist_db.query(AuditLog).filter(
+                            AuditLog.action == ACTION,
+                        ).order_by(AuditLog.id.desc()).limit(1000).all()
+                        if str((log.detail or {}).get("job_id") or "") == job_id
+                    ), None)
+                    if existing_verdict is None:
+                        verdict = song_verdict(quality, segments=segments)
+                        _persist_db.add(AuditLog(
+                            user_id=None,
+                            action=ACTION,
+                            detail={
+                                "job_id": job_id,
+                                "filename": row.filename,
+                                "tenant_id": row.tenant_id,
+                                "job_status": row.status,
+                                **verdict,
+                                "emitted_at": datetime.now(timezone.utc).isoformat(),
+                                "blind_review": True,
+                            },
+                        ))
             _persist_db.commit()
             persisted_revision = current_revision
             persisted_tenant_id = str(row.tenant_id or "")
@@ -932,9 +1470,9 @@ def run_transcription_job(
                     "[QUALITY-QUEUE] enqueue declined job=%s error_type=%s",
                     job_id, _safe_exception_code(enqueue_exc),
                 )
-        # reference_lyrics no tiene columna en el modelo Job (defer a otro PR
-        # si el editor lo necesita post-transcribe). Lo dejo en el log para
-        # diagnóstico mientras tanto.
+        # The batch reference is persisted inside transcription_quality and
+        # bound to audio SHA/revision above.  The legacy top-level text remains
+        # response-only for backwards compatibility.
         if reference_lyrics:
             logger.info("[TRANSCRIBE-WORKER] job=%s ref_lyrics=%d chars (no persistido aún)",
                         job_id, len(reference_lyrics))

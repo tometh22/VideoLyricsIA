@@ -624,7 +624,9 @@ export default function UploadZone({
   // el job id: corre UNA vez por job, no pisa ediciones en curso. NO llama
   // onEditFieldChange (r.* ya viene correcto de initialFields) → solo display.
   useEffect(() => {
-    if (!editMode || !editSeed) return;
+    // Campaign pre-render reviews also reopen persisted visual assignments.
+    // Seeding their display must not enable post-render editing restrictions.
+    if (!editSeed) return;
     setBatchDefaults((prev) => ({
       ...prev,
       genre: editSeed.genre || "",

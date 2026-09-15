@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from "react";
+import { classifyTask, isEditableTarget, readTaskAttr } from "../editorTaskClock";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import { EditorTour } from "./OnboardingTour";
@@ -6,12 +7,17 @@ import { useToast } from "./ToastProvider";
 import HelpTip from "./HelpCenter/HelpTip";
 import GuidedTimingReview from "./GuidedTimingReview";
 import LyricsTimeline from "./LyricsTimeline";
+import LocalDraftRecovery from "./LocalDraftRecovery";
+import ReanchorProgressDialog from "./ReanchorProgressDialog";
+import { reanchorFailureMessage, shouldRecoverReanchor } from "../lib/reanchorResult";
 import LyricVideoPreview from "./LyricVideoPreview";
+import { referenceSuggestionsById } from "../lib/referenceSuggestions";
 import { tierForLength } from "../lib/lyricTiers";
+import { approvalConflict } from "../lib/approvalSnapshot";
 import { resolveLegacyDraft } from "../lib/reviewRecovery";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
-import { reseedPreservingIds } from "../lib/segmentIds";
+import { reseedPreservingIds, mintSegmentId } from "../lib/segmentIds";
 import {
   clampBlockShiftDelta,
   shiftBlockWithinDuration,
@@ -29,6 +35,8 @@ import { createSaveQueue } from "../lib/saveQueue";
 import VersionHistory from "./VersionHistory";
 import WrapWarningDialog from "./WrapWarningDialog";
 import QualityProposalPanel from "./QualityProposalPanel";
+import CompleteReviewerCandidate from "./CompleteReviewerCandidate";
+import CatalogReference from "./CatalogReference";
 
 // Copy honesto del fallo de respaldo (autosave), por CAUSA real. El banner
 // + el confirm de "Aprobar" antes decían "problema de red" para cualquier
@@ -38,29 +46,28 @@ import QualityProposalPanel from "./QualityProposalPanel";
 // Decir siempre "red" es deshonesto y manda a la operadora por el camino
 // equivocado. `server` es el fallback = el copy original (comportamiento sin
 // cambios cuando el motivo es desconocido). El núcleo tranquilizador
-// («Aprobar y generar» usa lo de pantalla) se mantiene en TODAS las causas —
-// eso sigue siendo verdad porque el approve manda los segments en el body.
+// (la aprobación usa lo de pantalla) se mantiene en TODAS las causas.
 const _SAVE_ERROR_COPY = {
   network: {
     short: "No pudimos respaldar tu última edición (problema de red)",
     detail:
-      "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado».",
+      "Tus cambios siguen acá y la aprobación usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado».",
     confirm:
-      "Tu última edición no se pudo respaldar en el servidor (problema de red). Podés aprobar igual: el video se genera con lo que ves en pantalla. Solo el respaldo para reanudar la sesión queda desactualizado. ¿Continuar?",
+      "Tu última edición no se pudo respaldar en el servidor (problema de red). Esperá a ver «Guardado» antes de aprobar.",
   },
   session: {
     short: "No pudimos respaldar tu última edición (tu sesión venció)",
     detail:
-      "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. El reintento automático no alcanza si la sesión expiró: reingresá en otra pestaña para que el respaldo vuelva a guardarse.",
+      "Tus cambios siguen acá. El reintento automático no alcanza si la sesión expiró: reingresá en otra pestaña para que el respaldo vuelva a guardarse.",
     confirm:
-      "Tu última edición no se pudo respaldar (tu sesión venció). Podés aprobar igual: el video se genera con lo que ves en pantalla. Pero si vas a cerrar y reanudar después, reingresá primero para no perder el respaldo. ¿Continuar?",
+      "Tu última edición no se pudo respaldar (tu sesión venció). Reingresá antes de aprobar para no perder el respaldo.",
   },
   "job-gone": {
     short: "No pudimos respaldar: este trabajo ya no está en el servidor",
     detail:
-      "Puede haber expirado por inactividad. Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla, pero al generar el servidor podría rechazarlo. Si falla, volvé a subir la canción.",
+      "Puede haber expirado por inactividad. Tus cambios siguen acá, pero no se pueden aprobar hasta reconectar el trabajo del servidor.",
     confirm:
-      "Este trabajo ya no está en el servidor (pudo expirar por inactividad). Tus cambios siguen en pantalla, pero al generar podría fallar. ¿Intentar aprobar igual?",
+      "Este trabajo ya no está en el servidor. Reconectalo antes de aprobar.",
   },
   "draft-corrupt": {
     short: "Encontramos un borrador local que necesita revisión",
@@ -73,12 +80,19 @@ const _SAVE_ERROR_COPY = {
     detail: "Tus cambios siguen guardados localmente. Al volver la conexión compararemos primero la versión del equipo.",
     confirm: "Esperá a recuperar la conexión antes de aprobar.",
   },
+  velocity: {
+    short: "Frenamos el guardado: demasiadas canciones editadas en pocos minutos",
+    detail:
+      "Es un freno contra scripts automáticos. Tus cambios siguen acá; esperá unos minutos y el respaldo se reintenta solo. Si sos vos editando a mano, avisanos y subimos el tope.",
+    confirm:
+      "El respaldo está frenado por el tope de velocidad. Esperá a ver «Guardado» antes de aprobar.",
+  },
   server: {
     short: "No pudimos respaldar tu última edición en el servidor",
     detail:
-      "Tus cambios siguen acá y «Aprobar y generar» usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado».",
+      "Tus cambios siguen acá y la aprobación usa lo que ves en pantalla. Reintentamos automáticamente; evitá cerrar la pestaña hasta ver «Guardado».",
     confirm:
-      "Tu última edición no se pudo respaldar en el servidor. Podés aprobar igual: el video se genera con lo que ves en pantalla. Solo el respaldo para reanudar la sesión queda desactualizado. ¿Continuar?",
+      "Tu última edición no se pudo respaldar en el servidor. Esperá a ver «Guardado» antes de aprobar.",
   },
 };
 
@@ -91,6 +105,7 @@ function _saveErrorCategory(result) {
   if (reason === "network") return "network";
   if (status === 401 || status === 403) return "session";
   if (reason === "job-gone" || status === 404) return "job-gone";
+  if (reason === "velocity" || status === 429) return "velocity";
   // Revision drift is handled by the save queue's automatic rebase. If it
   // still cannot settle after bounded retries, show the generic retry copy;
   // never surface a collaboration/conflict banner to the operator.
@@ -299,7 +314,9 @@ function isQualityAnalysisPending(quality) {
   if (quality?.analysis_pending === true) return true;
   const explicitAnalysisStatus = quality?.analysis_status ?? quality?.status;
   const status = String(explicitAnalysisStatus ?? quality?.decision ?? "").toLowerCase();
-  return status === "analysis_pending" || status === "pending" || status === "analyzing";
+  // The transactional outbox may still be publishing this fresh snapshot.
+  return status === "analysis_pending" || status === "pending" || status === "analyzing"
+    || status === "superseded_by_edit";
 }
 
 function qualityFromEditorPayload(payload) {
@@ -444,43 +461,7 @@ function sanitizeSegmentsForPersistence(segments) {
   return sanitizeSegments(segments).map((segment) => ({ ...segment }));
 }
 
-function findSuggestion(whisperText, refLines, startIdx) {
-  if (!refLines.length) return null;
-  const wLower = whisperText.toLowerCase().trim();
-  let bestScore = 0;
-  let bestLine = null;
 
-  const searchStart = Math.max(0, startIdx - 3);
-  const searchEnd = Math.min(refLines.length, startIdx + 10);
-
-  for (let i = searchStart; i < searchEnd; i++) {
-    const rLower = refLines[i].toLowerCase().trim();
-    if (!rLower) continue;
-    const wWords = wLower.split(/\s+/);
-    const rWords = rLower.split(/\s+/);
-    let matches = 0;
-    for (const w of wWords) { if (rWords.includes(w)) matches++; }
-    const score = matches / Math.max(wWords.length, rWords.length);
-    if (score > bestScore) { bestScore = score; bestLine = refLines[i]; }
-
-    if (i < refLines.length - 1) {
-      const combined = rLower + " " + refLines[i + 1].toLowerCase().trim();
-      const cWords = combined.split(/\s+/);
-      let cMatches = 0;
-      for (const w of wWords) { if (cWords.includes(w)) cMatches++; }
-      const cScore = cMatches / Math.max(wWords.length, cWords.length);
-      if (cScore > bestScore) { bestScore = cScore; bestLine = refLines[i] + " " + refLines[i + 1]; }
-    }
-  }
-
-  if (bestScore > 0.3 && bestLine) {
-    const normalize = (s) => s.toLowerCase().replace(/[^a-záéíóúüñ\s]/g, "").replace(/\s+/g, " ").trim();
-    if (normalize(bestLine) !== normalize(whisperText)) {
-      return bestLine;
-    }
-  }
-  return null;
-}
 
 // Find two consecutive lines in `refLines` whose concatenation matches
 // `segText`. Used by the auto-split banner: when a Whisper segment
@@ -665,9 +646,14 @@ export default function LyricsEditor({
   // que preserva la identidad de filas (reseedPreservingIds) — hoy sin caller
   // de producción (reservado / lo ejercitan sólo los tests).
   segments, filename, audioFile, referenceLyrics,
+  referenceLinks = [], referenceUnavailable = false, sourceReference = null,
   coverageWarning = false, transcriptionQuality: transcriptionQualityProp = null, recoverySource = "",
   languageConflict = false, languageUncertain = false, mixedLanguage = false,
-  onApprove, onBack, isBatch = false, batchProgress = "",
+  outputReferenceDivergence = false, outputReferenceUnexplainedIndices = [],
+  needsLanguageReview = false, languageReviewResolved = false,
+  onResolveLanguageReview = null,
+  onApprove, onBack, onRegisterSafeExit = null,
+  isBatch = false, batchProgress = "",
   user = null,
   font = "",
   textCase = "upper",
@@ -699,6 +685,12 @@ export default function LyricsEditor({
   // El botón "Re-sincronizar con IA" solo se muestra si el padre lo pasa Y
   // features.anchor_lyrics está activo (flag ANCHOR_LYRICS_ENABLED).
   onReanchor = null,
+  onReanchorReconcile = null,
+  // Cuánto seguir sondeando al servidor tras perder la respuesta del
+  // re-anclado (ms). Tests lo bajan; default 8 min (CTC de 5 min de audio
+  // tarda ~5 min y un deploy del api en el medio corta la conexión).
+  reanchorWaitMs = 8 * 60 * 1000,
+  reanchorPollMs = 10 * 1000,
   // NOTE (PR E): el viejo `onEditedChange` (espejo sincrónico por keystroke
   // hacia App) fue eliminado — era la mitad del loop bidireccional del
   // reseed-storm. Los lectores externos (WizardLivePreview, snapshot de
@@ -731,6 +723,7 @@ export default function LyricsEditor({
   disableBeforeUnload = false,
   disableAutosave = false,
   submitLabel = null,
+  requireLineReview = false,
   // Optional audio peak envelope for the timeline waveform, fetched by the
   // parent (the post-render /edit modal has a job in R2; the wizard doesn't).
   // null → timeline renders without a waveform (graceful).
@@ -739,6 +732,11 @@ export default function LyricsEditor({
   // signed audio URL. Keep its loading state explicit so a slow enhancement
   // reads as progress, not as a broken/empty audio guide.
   waveformLoading = false,
+  // Guided timing review: per-second envelope (vocal stem when cached). The
+  // 1000-bucket overview is ~27 bars for a 7 s window of a 4-minute song;
+  // the guided cards need real detail to show where the voice starts.
+  waveformHires = null,
+  waveformHiresLoading = false,
   // Live preview: signed URL of the cached background video (post-render
   // modal). null → preview uses a style-tinted template gradient (wizard).
   previewBgUrl = null,
@@ -813,7 +811,9 @@ export default function LyricsEditor({
     });
   }, [transcribeJobId, transcriptionQualityProp]);
 
-  const qualityAnalysisPending = isQualityAnalysisPending(transcriptionQuality);
+  const [qualityRefresh, setQualityRefresh] = useState(null);
+  const qualityRefreshPending = qualityRefresh?.jobId === transcribeJobId;
+  const qualityAnalysisPending = qualityRefreshPending || isQualityAnalysisPending(transcriptionQuality);
   useEffect(() => {
     if (!qualityAnalysisPending || !transcribeJobId || !editorRequest) return undefined;
     let cancelled = false;
@@ -846,10 +846,14 @@ export default function LyricsEditor({
           } catch { /* a transient/non-JSON response is retried */ }
           nextQuality = qualityFromEditorPayload(body);
           if (!cancelled && nextQuality) {
-            accepted = shouldAcceptQualityUpdate(transcriptionQualityRef.current, nextQuality);
+            const refreshedRevision = Number(nextQuality.evaluated_revision);
+            const refreshCurrent = !qualityRefreshPending || qualityRefresh.revision == null
+              || (Number.isFinite(refreshedRevision) && refreshedRevision >= qualityRefresh.revision);
+            accepted = refreshCurrent && shouldAcceptQualityUpdate(transcriptionQualityRef.current, nextQuality);
             if (accepted) {
               transcriptionQualityRef.current = nextQuality;
               setTranscriptionQuality(nextQuality);
+              if (qualityRefreshPending) setQualityRefresh(null);
             }
           }
         }
@@ -865,7 +869,7 @@ export default function LyricsEditor({
       if (timer) window.clearTimeout(timer);
       controller?.abort();
     };
-  }, [editorRequest, qualityAnalysisPending, transcribeJobId]);
+  }, [editorRequest, qualityAnalysisPending, transcribeJobId, qualityRefresh, qualityRefreshPending]);
 
   // PR E (2026-07): `edited` vive en el segmentsStore (Map por jobId a
   // nivel módulo), NO en un useState local. El store SOBREVIVE al unmount:
@@ -980,12 +984,16 @@ export default function LyricsEditor({
   // changes. Ahora ambos autosaves actualizan saveStatus, y "error"
   // se muestra como chip rojo con botón Reintentar.
   const [saveStatus, setSaveStatus] = useState("idle"); // idle|local|saving|saved|offline|conflict|error
+  const [savedAt, setSavedAt] = useState(null);
   // Motivo del último fallo de respaldo, para que el banner + el confirm de
   // "Aprobar" digan la CAUSA REAL en vez de "problema de red" siempre (el
   // copy honesto de PR A quedó hardcodeado a "red"; la causa real puede ser
   // sesión vencida, job expirado, etc. — ver _SAVE_ERROR_COPY). null cuando
   // no hay error. Se deriva de result.reason/status de persistSegments.
   const [saveErrorReason, setSaveErrorReason] = useState(null);
+  const [draftRecovery, setDraftRecovery] = useState(null);
+  const draftRecoveryRef = useRef(null);
+  draftRecoveryRef.current = draftRecovery;
   const [flushCounter, setFlushCounter] = useState(0);
   const [durableHydrated, setDurableHydrated] = useState(false);
   const saveConflictRef = useRef(false);
@@ -1047,6 +1055,9 @@ export default function LyricsEditor({
   const activeClockStorageKey = transcribeJobId
     ? `genly_active_edit:${draftTenant}:${draftOwner || "anonymous"}:${transcribeJobId}`
     : null;
+  // Espejo de isPlaying para los listeners globales del reloj, que se montan
+  // antes de que exista el estado del reproductor.
+  const isPlayingRef = useRef(false);
   const editorActiveClockRef = useRef(null);
   if (!editorActiveClockRef.current) {
     let persistedMs = 0;
@@ -1064,6 +1075,7 @@ export default function LyricsEditor({
       lastTickMs: now,
       lastActivityMs: now,
       active: visible && focused,
+      task: "unknown",
     };
   }
   const persistActiveClock = useCallback(() => {
@@ -1088,10 +1100,17 @@ export default function LyricsEditor({
   }, [activeClockStorageKey]);
   useEffect(() => {
     if (typeof window === "undefined" || typeof document === "undefined") return undefined;
-    const activity = () => {
+    const activity = (event) => {
       readActiveEditMs();
       const now = Date.now();
       const clock = editorActiveClockRef.current;
+      const target = event?.target || null;
+      clock.task = classifyTask({
+        taskAttr: readTaskAttr(target),
+        editable: isEditableTarget(target),
+        isPlaying: isPlayingRef.current,
+        interactedRecently: true,
+      });
       clock.lastActivityMs = now;
       clock.lastTickMs = now;
       clock.active = document.visibilityState !== "hidden"
@@ -1198,6 +1217,11 @@ export default function LyricsEditor({
             body: JSON.stringify({
               session_id: editorSessionIdRef.current,
               activity_seq: nextSequence,
+              // Con interacción reciente vale la tarea que se estaba haciendo;
+              // sin ella, lo que está pasando es escuchar (o nada).
+              task: now - clock.lastActivityMs < 5000
+                ? clock.task
+                : classifyTask({ isPlaying: isPlayingRef.current }),
             }),
           },
         );
@@ -1243,13 +1267,6 @@ export default function LyricsEditor({
   // original real; fallback a `edited` para el path jobId-less/local (donde
   // el primer mount `original` === `edited` de todos modos).
   const originalSegmentsRef = useRef(segmentsStore.getOriginal(_storeKey) ?? edited);
-  // Operator feedback 2026-05-25 (UMG): "Debería hacerlo solo, no
-  // preguntarme" — the auto-trim banner ("Recortar N líneas con texto
-  // colgado · Aplicar") was friction. Detection is reliable enough to
-  // apply silently on initial load. The ref tracks per-segments-prop
-  // application so re-seeding a new job re-triggers; routine edits
-  // (typing in a line) do NOT, because they don't change the ref.
-  const autoTrimAppliedRef = useRef(false);
   // PR E (2026-07): acá vivía el effect de prop-sync/reseed (Bug B7 + los
   // guards de eco #724/live-edit + el detector [reseed-storm]). Se ELIMINÓ
   // entero: el estado vive en segmentsStore (sobrevive unmounts, el prop
@@ -1277,6 +1294,7 @@ export default function LyricsEditor({
     setSaveStatus(status);
     setSaveErrorReason(reason);
     if (status === "saved") {
+      setSavedAt(new Date());
       // Cuántos fallos hicieron falta antes de que este guardado saliera. Es
       // el dato que faltaba para distinguir "hipo transitorio que se recuperó
       // solo" de "el operador estuvo peleando con el editor".
@@ -1304,7 +1322,7 @@ export default function LyricsEditor({
         });
       }
     }
-    if (status === "saved" && draftKey) {
+    if (status === "saved" && draftKey && !draftRecoveryRef.current) {
       // El snapshot confirmado se capturó hasta 800 ms (draft) o 5 s
       // (checkpoint) ANTES de este OK. Borrar el borrador a ciegas tiraba todo
       // lo tipeado en esa ventana: el efecto que reescribe el draft está
@@ -1338,7 +1356,7 @@ export default function LyricsEditor({
     setIsDirty(true);
   }, []);
   const { flush: flushDurableSave } = useEditorAutosave({
-    enabled: editorV2Enabled && durableHydrated && !durableEditor.loading,
+    enabled: editorV2Enabled && durableHydrated && !durableEditor.loading && !draftRecovery,
     segments: durableSegments,
     dirty: isDirty,
     save: durableEditor.save,
@@ -1368,81 +1386,45 @@ export default function LyricsEditor({
       let next = remote;
       let markDirty = false;
       if (draftKey) {
+        let raw = null;
+        let phase = "read";
         try {
-          const raw = localStorage.getItem(draftKey);
+          raw = localStorage.getItem(draftKey);
           if (raw) {
+            phase = "parse";
             const draft = JSON.parse(raw);
-            if (!Array.isArray(draft?.segments) || !draft.segments.length) {
-              setSaveStatus("error");
-              setSaveErrorReason("draft-corrupt");
+            phase = "compare";
+            // Validate before normalization: clamps/defaults must not make an
+            // unreadable copy look equivalent and eligible for deletion.
+            const valid = Array.isArray(draft?.segments) && draft.segments.length > 0
+              && draft.segments.every((row) => row && typeof row.text === "string"
+                && Number.isFinite(row.start) && Number.isFinite(row.end) && row.end >= row.start);
+            if (!valid) throw new Error("invalid_segments");
+            const local = sanitizeSegments(draft.segments);
+            // Even finite, nonnegative durations may be clamped by the editor.
+            // A normalized match must never authorize deleting different bytes.
+            if (!segmentsEquivalent(draft.segments, local)) {
+              throw new Error("draft_normalization_changes_content");
+            }
+            const pending = draft.pending_changes || draft.pending_ops?.length;
+            if (pending) throw new Error("uncomparable_pending_operations");
+            const sameContent = segmentsEquivalent(local, remote);
+            if (sameContent) {
+              phase = "remove";
+              // Do not remove a different copy written by another tab meanwhile.
+              if (localStorage.getItem(draftKey) !== raw) throw new Error("draft_changed");
+              localStorage.removeItem(draftKey);
             } else {
-              const local = sanitizeSegments(draft.segments);
-              // A local draft can outlive a background/typography edit. Those
-              // operations may advance the document revision or refresh
-              // renderer metadata without changing any operator-owned lyric
-              // content. Comparing raw JSON here made that harmless case look
-              // like a stale draft as soon as the editor reopened.
-              const sameContent = segmentsEquivalent(local, remote);
-              if (sameContent) {
-                localStorage.removeItem(draftKey);
-              } else if (Number.isInteger(draft.base_revision)
-                && draft.base_revision === durableEditor.document.revision) {
-                next = local;
-                markDirty = true;
-                setSaveStatus("local");
-              } else {
-                let baseSegments = Array.isArray(draft.base_segments)
-                  ? sanitizeSegments(draft.base_segments)
-                  : null;
-
-                // Drafts created before base_segments was introduced still
-                // carry base_revision (and the oldest drafts carry neither).
-                // Prefer the immutable checkpoint, but fall back to the
-                // original transcription if history is unavailable. The
-                // original is a safe three-way base: edits made only by this
-                // browser merge cleanly, while same-line changes still use
-                // the local snapshot when it is rebased and saved below.
-                if (!baseSegments && Number.isInteger(draft.base_revision)
-                  && draft.base_revision === 0) {
-                  baseSegments = remoteOriginal;
-                }
-                if (!baseSegments && Number.isInteger(draft.base_revision) && editorRequest) {
-                  try {
-                    const summariesResponse = await editorRequest(
-                      `/editor/${transcribeJobId}/versions?limit=50`,
-                    );
-                    const summaries = summariesResponse.ok
-                      ? (await summariesResponse.clone().json())?.versions || []
-                      : [];
-                    const baseVersion = summaries.find(
-                      (version) => version.revision === draft.base_revision,
-                    );
-                    if (baseVersion?.id) {
-                      const versionResponse = await editorRequest(
-                        `/editor/${transcribeJobId}/versions/${encodeURIComponent(baseVersion.id)}`,
-                      );
-                      if (versionResponse.ok) {
-                        const version = await versionResponse.clone().json();
-                        if (Array.isArray(version?.segments)) {
-                          baseSegments = sanitizeSegments(version.segments);
-                        }
-                      }
-                    }
-                  } catch { /* use the original transcription fallback */ }
-                }
-                if (!baseSegments) baseSegments = remoteOriginal;
-                if (cancelled) return;
-                const merged = mergeThreeWay(baseSegments, local, remote);
-                next = merged.merged;
-                markDirty = !segmentsEquivalent(next, remote);
-                if (markDirty) setSaveStatus("local");
-                else localStorage.removeItem(draftKey);
-              }
+              setDraftRecovery({ kind: "different", raw, local,
+                baseRevision: draft.base_revision, updatedAt: draft.updated_at });
             }
           }
         } catch {
-          setSaveStatus("error");
-          setSaveErrorReason("draft-corrupt");
+          const message = phase === "read" ? "El navegador no permitió leer la copia local."
+            : phase === "parse" ? "No pudimos interpretar el archivo de la copia local."
+              : phase === "remove" ? "La copia coincide con la guardada, pero no pudimos retirar el aviso de forma segura. Puede haber cambiado en otra pestaña o el navegador impidió borrarla."
+                : "La copia local no tiene un formato de letra y tiempos que podamos comparar sin alterarlo.";
+          setDraftRecovery({ kind: "unreadable", raw, message });
         }
       }
       if (cancelled) return;
@@ -1498,7 +1480,8 @@ export default function LyricsEditor({
     const unsubscribe = queue.subscribe(transcribeJobId, ({ status, reason }) => {
       setSaveStatus(status);
       setSaveErrorReason(reason);
-      if (status === "saved" && draftKey) {
+      if (status === "saved") setSavedAt(new Date());
+      if (status === "saved" && draftKey && !draftRecoveryRef.current) {
         try { localStorage.removeItem(draftKey); } catch { /* storage blocked */ }
       }
     });
@@ -1534,7 +1517,7 @@ export default function LyricsEditor({
   }, [draftKey, editorV2Enabled, segmentsRevision, setEdited]);
 
   useEffect(() => {
-    if (!draftKey || !isDirty) return;
+    if (!draftKey || !isDirty || draftRecoveryRef.current) return;
     try {
       const cleaned = sanitizeSegmentsForPersistence(edited);
       localStorage.setItem(draftKey, JSON.stringify({
@@ -1752,12 +1735,18 @@ export default function LyricsEditor({
   const audioUrl = usingLocalAudio ? blobAudioUrl : audioUrlProp;
   const audioTemporarilyUnavailable = !audioUrl && audioUnavailableReason === "temporary";
 
+  const [playbackRate, setPlaybackRate] = useState(1);
   const audioRef = useRef(null);
   const lastMountedAudioRef = useRef(null);
   const setAudioElementRef = useCallback((element) => {
     audioRef.current = element;
-    if (element) lastMountedAudioRef.current = element;
-  }, []);
+    if (element) {
+      lastMountedAudioRef.current = element;
+      element.defaultPlaybackRate = playbackRate;
+      element.playbackRate = playbackRate;
+      element.preservesPitch = true;
+    }
+  }, [playbackRate]);
   const listRef = useRef(null);
   const rowRefs = useRef({});
   const rafRef = useRef(null);
@@ -1773,6 +1762,7 @@ export default function LyricsEditor({
   const lastPublishedActiveIdRef = useRef(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
+  useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [audioError, setAudioError] = useState(false);
@@ -1900,6 +1890,35 @@ export default function LyricsEditor({
   }, [isPlaying, sanitizedEdited, onPlaybackTick]);
   const [wrapWarning, setWrapWarning] = useState(null); // {ids: [...]} for 3+ line segs
   const [focusedSegId, setFocusedSegId] = useState(null); // for preview panel
+  const lineReviewKey = transcribeJobId ? `genly:line-review:${transcribeJobId}` : null;
+  const [reviewedLineIds, setReviewedLineIds] = useState(() => {
+    if (!lineReviewKey) return [];
+    try {
+      const value = JSON.parse(localStorage.getItem(lineReviewKey) || "[]");
+      return Array.isArray(value) ? value : [];
+    }
+    catch { return []; }
+  });
+  useEffect(() => {
+    if (!lineReviewKey) return;
+    try { localStorage.setItem(lineReviewKey, JSON.stringify(reviewedLineIds)); }
+    catch { /* autosave remains authoritative if browser storage is full */ }
+  }, [lineReviewKey, reviewedLineIds]);
+  // A deliberate text/timing edit is itself evidence that the operator
+  // reviewed that line.  Window confirmation is applied after React commits
+  // the new snapshot so it is bound to the new qualityReviewKey, never the
+  // stale pre-edit key.
+  const editedReviewLineIdsRef = useRef(new Set());
+  const markLinesReviewedByEdit = useCallback((ids) => {
+    const validIds = (Array.isArray(ids) ? ids : [ids]).filter((id) => id != null);
+    if (!validIds.length) return;
+    validIds.forEach((id) => editedReviewLineIdsRef.current.add(id));
+    setReviewedLineIds((current) => {
+      const next = new Set(current);
+      validIds.forEach((id) => next.add(id));
+      return next.size === current.length ? current : [...next];
+    });
+  }, []);
 
   // Inline timestamp edit state. Only one row can be in edit mode at a
   // time; clicking a different row's timestamp swaps the active editor.
@@ -2004,6 +2023,7 @@ export default function LyricsEditor({
   // timeline only captures history after a drag actually commits, so pointer
   // cancellation cannot create a phantom Undo entry.
   const handleTimelineTimingChange = useCallback((id, newStart, newEnd, interaction = {}) => {
+    markLinesReviewedByEdit(id);
     setIsDirty(true);
     setEdited((prev) => prev.map((s) =>
       s._id === id ? { ...s, start: newStart, end: newEnd, locked: true } : s
@@ -2023,10 +2043,11 @@ export default function LyricsEditor({
     // flush effect below reads the just-updated `edited` and persists.
     setFlushCounter((c) => c + 1);
     trackEditorEvent("editor_timing_changed", { count: 1, operation: interaction.operation || "resize_or_move" });
-  }, [trackEditorEvent]);
+  }, [markLinesReviewedByEdit, trackEditorEvent]);
 
   const handleTimelineTimingChangeBatch = useCallback((changes, interaction = {}) => {
     if (!changes?.length) return;
+    markLinesReviewedByEdit(changes.map(({ id }) => id));
     const firstOriginal = editedRef.current.find((segment) => segment._id === changes[0].id);
     const deltaMs = firstOriginal ? Math.round((changes[0].start - firstOriginal.start) * 1000) : 0;
     setIsDirty(true);
@@ -2057,7 +2078,7 @@ export default function LyricsEditor({
       delta_ms: deltaMs,
       duration_ms: Math.round(interaction.durationMs || 0),
     });
-  }, [trackEditorEvent]);
+  }, [markLinesReviewedByEdit, trackEditorEvent]);
 
   const handleGuidedTimingChange = useCallback((id, newStart, newEnd, interaction = {}) => {
     pushEditHistory();
@@ -2080,6 +2101,7 @@ export default function LyricsEditor({
   // flags, so the render goes back to auto hold-until-next.
   const resetTimings = useCallback(() => {
     pushEditHistory();
+    markLinesReviewedByEdit(editedRef.current.map((segment) => segment._id));
     const byId = new Map(sanitizeSegments(originalSegmentsRef.current || []).map((s) => [s._id, s]));
     setEdited((prev) => prev.map((s) => {
       const o = byId.get(s._id);
@@ -2090,7 +2112,7 @@ export default function LyricsEditor({
     }));
     setFlushCounter((c) => c + 1);
     toast({ message: "Timings restaurados al original", tone: "info" });
-  }, [pushEditHistory, toast]);
+  }, [markLinesReviewedByEdit, pushEditHistory, toast]);
 
   // Versión B, parte 2 — "Re-sincronizar con IA". Flujo:
   //   1. Flush del estado local a /save-segments (el backend re-ancla lo
@@ -2099,25 +2121,80 @@ export default function LyricsEditor({
   //   2. POST /jobs/{id}/reanchor vía el callback del padre.
   //   3. Éxito → reemplazar `edited` con los segments re-anclados (mismo
   //      seed que el mount; las líneas `locked` vuelven intactas del
-  //      backend) + toast "N re-sincronizadas, M para revisar".
+  //      backend) y refrescar la evaluación de calidad de esa revisión.
   //      Decline / error → toast de error, timings quedan como estaban.
   // El snapshot pre-reanchor va al edit history, así Cmd+Z lo revierte.
   const [reanchoring, setReanchoring] = useState(false);
+  const reanchorReturnFocusRef = useRef(null);
   const canReanchor = !!(onReanchor && transcribeJobId
     && user?.features?.anchor_lyrics === true);
+  // 2026-09-14: si la respuesta se pierde (alineación >60 s, proxy que
+  // re-envía, 409 del duplicado), consultar el estado real antes de declarar
+  // fallo: si la revisión avanzó, el servidor ya aplicó el re-anclado.
+  // 2026-09-14 (Agus, Los Prisioneros 244558ff99aa): el cliente perdió la
+  // conexión a los ~2 min (deploy del api en el medio) y el servidor persistió
+  // recién 3 min después. Mirar UNA vez no alcanza: seguir sondeando hasta
+  // reanchorWaitMs, mostrando que seguimos esperando.
+  const [reanchorWaiting, setReanchorWaiting] = useState(null); // { since } | null
+  const recoverReanchorFromServer = useCallback(async (baseRevision) => {
+    if (!onReanchorReconcile || !transcribeJobId) return null;
+    const started = Date.now();
+    setReanchorWaiting({ since: started });
+    try {
+      for (;;) {
+        try {
+          const r = await Promise.resolve(onReanchorReconcile(transcribeJobId, baseRevision));
+          if (r && r.ok && Array.isArray(r.segments) && r.segments.length
+              && Number.isInteger(r.revision) && r.revision > baseRevision) return r;
+        } catch { /* best effort */ }
+        if (Date.now() - started >= reanchorWaitMs) return null;
+        await new Promise((resolve) => setTimeout(resolve, reanchorPollMs));
+      }
+    } finally {
+      setReanchorWaiting(null);
+    }
+  }, [onReanchorReconcile, transcribeJobId, reanchorWaitMs, reanchorPollMs]);
+  const applyReanchorResult = useCallback((res, message) => {
+    if (Number.isInteger(res.revision)) {
+      saveQueueRef.current.prime(transcribeJobId, res.revision);
+    }
+    pushEditHistory();
+    setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
+    if (editorRequest) setQualityRefresh({ jobId: transcribeJobId, revision: res.revision ?? null });
+    toast({ message, tone: "success" });
+  }, [transcribeJobId, pushEditHistory, toast, editorRequest]);
+
   const handleReanchor = useCallback(async () => {
     if (!onReanchor || !transcribeJobId || reanchoring) return;
     setReanchoring(true);
+    let baseRevision = Number.isInteger(segmentsRevision) ? segmentsRevision : 0;
+    let requestStarted = false;
     try {
       let saved = null;
       if (onPersistSegments) {
         saved = await flushPendingSave(null, true);
-        if (saved?.ok === false) throw new Error(saved.reason || "save-failed");
+        if (saved?.ok === false) {
+          toast({ message: reanchorFailureMessage({ ...saved, phase: "save" }, t), tone: "error" });
+          return;
+        }
       }
-      const baseRevision = Number.isInteger(saved?.revision)
+      baseRevision = Number.isInteger(saved?.revision)
         ? saved.revision
         : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
-      const res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision));
+      requestStarted = true;
+      let res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision));
+      // Gate estructural del backend (2026-09-13): el texto editado tiene
+      // estrofas que la transcripción nunca oyó. Igual que en el modal de
+      // pegar, el operador puede confirmar que ES esta versión.
+      if (res && res.code === "reference_structure_unconfirmed" && res.structure) {
+        const confirmed = window.confirm(
+          (t("editor.reanchor_structure_confirm") || "Hay diferencias con la transcripción automática ({p} líneas contra {c} transcriptas). La transcripción puede tener errores. Si verificaste la letra con el audio, ¿re-sincronizar con esta letra?")
+            .replace("{p}", String(res.structure.pasted_line_count ?? "?"))
+            .replace("{c}", String(res.structure.current_line_count ?? "?")),
+        );
+        if (!confirmed) return;
+        res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision, { confirm_structure: true }));
+      }
       if (res && res.ok && Array.isArray(res.segments) && res.segments.length) {
         if (Number.isInteger(res.revision)) {
           saveQueueRef.current.prime(transcribeJobId, res.revision);
@@ -2126,28 +2203,139 @@ export default function LyricsEditor({
         // PR E: ids frescos vía el mismo helper que el seed inicial —
         // consistencia con la identidad estable del store (PR D).
         setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
+        if (editorRequest) setQualityRefresh({ jobId: transcribeJobId, revision: res.revision ?? null });
         toast({
-          message: (t("editor.reanchor_done") || "{n} líneas re-sincronizadas, {m} para revisar")
-            .replace("{n}", String(res.count ?? res.segments.length))
-            .replace("{m}", String(res.review_count ?? 0)),
+          message: (t("editor.reanchor_done") || "{n} líneas re-sincronizadas")
+            .replace("{n}", String(res.count ?? res.segments.length)),
           tone: "success",
         });
+      } else if (res && res.reason === "structural_mismatch") {
+        // Veredicto acústico: las líneas sobrantes salieron apretadas con
+        // score cero. El backend no persistió nada.
+        toast({
+          message: (t("editor.reanchor_structural_mismatch") || "No se re-sincronizó: {n} líneas no suenan en la grabación. El timing quedó como estaba.")
+            .replace("{n}", String(res.structural?.crammed_lines ?? "?")),
+          tone: "error",
+        });
+      } else {
+        const recovered = shouldRecoverReanchor(res) ? await recoverReanchorFromServer(baseRevision) : null;
+        if (recovered) {
+          applyReanchorResult(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
+        } else {
+          toast({
+            message: reanchorFailureMessage(res, t),
+            tone: "error",
+          });
+        }
+      }
+    } catch {
+      const recovered = requestStarted ? await recoverReanchorFromServer(baseRevision) : null;
+      if (recovered) {
+        applyReanchorResult(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
       } else {
         toast({
-          message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
+          message: reanchorFailureMessage(requestStarted ? null : { phase: "save" }, t),
           tone: "error",
         });
       }
-    } catch {
-      toast({
-        message: t("editor.reanchor_failed") || "No se pudo re-sincronizar — el timing quedó como estaba.",
-        tone: "error",
-      });
     } finally {
       setReanchoring(false);
     }
   }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, reanchoring, edited,
-      pushEditHistory, toast, t, flushPendingSave]);
+      pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult, editorRequest]);
+
+  // 2026-09-13: pegar la letra OFICIAL y re-sincronizar desde ese texto.
+  // Mismo endpoint que el re-anclado (POST /jobs/{id}/reanchor) con
+  // lyrics_text; el backend mergea por bloques y devuelve 409
+  // reference_structure_unconfirmed si la letra no parece de esta
+  // grabación — ahí se muestra el reporte y el operador confirma o no.
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const [pasteBusy, setPasteBusy] = useState(false);
+  const [pasteStructure, setPasteStructure] = useState(null);
+  const [pasteError, setPasteError] = useState("");
+  const pasteLineCount = pasteText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).length;
+  const openPasteLyrics = useCallback(() => {
+    setPasteStructure(null);
+    setPasteError("");
+    setPasteOpen(true);
+  }, []);
+  const submitPasteLyrics = useCallback(async (confirmStructure = false) => {
+    if (!onReanchor || !transcribeJobId || pasteBusy) return;
+    if (pasteLineCount < 3) {
+      setPasteError(t("editor.paste_lyrics_min_lines") || "Pegá al menos 3 líneas.");
+      return;
+    }
+    setPasteBusy(true);
+    setPasteError("");
+    let baseRevision = Number.isInteger(segmentsRevision) ? segmentsRevision : 0;
+    let requestStarted = false;
+    const finishPaste = (res, message) => {
+      applyReanchorResult(res, message);
+      setPasteOpen(false);
+      setPasteText("");
+      setPasteStructure(null);
+    };
+    try {
+      let saved = null;
+      if (onPersistSegments) {
+        saved = await flushPendingSave(null, true);
+        if (saved?.ok === false) {
+          setPasteError(reanchorFailureMessage({ ...saved, phase: "save" }, t));
+          return;
+        }
+      }
+      baseRevision = Number.isInteger(saved?.revision)
+        ? saved.revision
+        : (Number.isInteger(segmentsRevision) ? segmentsRevision : 0);
+      requestStarted = true;
+      const res = await Promise.resolve(onReanchor(transcribeJobId, baseRevision, {
+        lyrics_text: pasteText,
+        confirm_structure: confirmStructure,
+      }));
+      if (res && res.ok && Array.isArray(res.segments) && res.segments.length) {
+        if (Number.isInteger(res.revision)) {
+          saveQueueRef.current.prime(transcribeJobId, res.revision);
+        }
+        pushEditHistory();
+        setEdited(reseedPreservingIds([], sanitizeSegments(res.segments)));
+        if (editorRequest) setQualityRefresh({ jobId: transcribeJobId, revision: res.revision ?? null });
+        setPasteOpen(false);
+        setPasteText("");
+        setPasteStructure(null);
+        toast({
+          message: (t("editor.paste_lyrics_done") || "Letra aplicada: {r} líneas nuevas, {k} conservadas")
+            .replace("{r}", String(res.lines_replaced ?? 0))
+            .replace("{k}", String(res.lines_kept ?? 0)),
+          tone: "success",
+        });
+      } else if (res && res.code === "reference_structure_unconfirmed" && res.structure) {
+        setPasteStructure(res.structure);
+      } else if (res && res.reason === "structural_mismatch") {
+        setPasteError(
+          (t("editor.reanchor_structural_mismatch") || "No se re-sincronizó: {n} líneas no suenan en la grabación. El timing quedó como estaba.")
+            .replace("{n}", String(res.structural?.crammed_lines ?? "?")),
+        );
+      } else {
+        const recovered = shouldRecoverReanchor(res) ? await recoverReanchorFromServer(baseRevision) : null;
+        if (recovered) {
+          finishPaste(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
+        } else {
+          setPasteError(reanchorFailureMessage(res, t));
+        }
+      }
+    } catch {
+      const recovered = requestStarted ? await recoverReanchorFromServer(baseRevision) : null;
+      if (recovered) {
+        finishPaste(recovered, t("editor.reanchor_recovered") || "La re-sincronización se aplicó en el servidor (la respuesta tardó); cargamos el resultado.");
+      } else {
+        setPasteError(reanchorFailureMessage(requestStarted ? null : { phase: "save" }, t));
+      }
+    } finally {
+      setPasteBusy(false);
+    }
+  }, [onReanchor, onPersistSegments, transcribeJobId, segmentsRevision, pasteBusy, pasteText,
+      pasteLineCount, pushEditHistory, toast, t, flushPendingSave, recoverReanchorFromServer, applyReanchorResult, editorRequest]);
 
   const focusSegment = useCallback((id) => {
     setFocusedSegId(id);
@@ -2188,6 +2376,7 @@ export default function LyricsEditor({
     // the undo stack — the user's Ctrl+Z would feel broken otherwise.
     if (Math.abs(newStart - seg.start) >= 1e-3) {
       pushEditHistory();
+      markLinesReviewedByEdit(seg._id);
     }
     setEdited((prev) => prev.map((s) => {
       if (s._id !== seg._id) return s;
@@ -2319,6 +2508,11 @@ export default function LyricsEditor({
       );
       if (!ok) applyCascade = false;
     }
+    markLinesReviewedByEdit(
+      applyCascade
+        ? edited.slice(syncCursor).map((segment) => segment._id)
+        : target._id,
+    );
     const appliedDelta = applyCascade
       ? clampBlockShiftDelta(edited.slice(syncCursor), delta, duration)
       : delta;
@@ -2448,7 +2642,7 @@ export default function LyricsEditor({
         });
       });
     }
-  }, [syncMode, syncCursor, edited, currentTime, duration, syncCascade]);
+  }, [syncMode, syncCursor, edited, currentTime, duration, syncCascade, markLinesReviewedByEdit]);
 
   // Keep syncCursor inside the bounds of `edited` after split/delete
   // operations performed mid-sync. Without this, deleting line 8 while
@@ -2964,8 +3158,9 @@ export default function LyricsEditor({
   // in sync mode so the operator can recover from a mistap.
   useEffect(() => {
     const onKey = (e) => {
+      if (draftRecoveryRef.current) return;
       const tag = (document.activeElement?.tagName || "").toUpperCase();
-      const editing = tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable;
+      const editing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || document.activeElement?.isContentEditable;
       if (editing) return;
       if (e.code === "Space") {
         // Ignore keyboard autorepeat / sustained press so the operator
@@ -2976,6 +3171,21 @@ export default function LyricsEditor({
         e.preventDefault();
         if (syncMode) tapAnchor();
         else togglePlay();
+      } else if (requireLineReview && e.key === "ArrowLeft") {
+        e.preventDefault();
+        seekTo(Math.max(0, currentTime - 2), false);
+      } else if (requireLineReview && e.key === "ArrowRight") {
+        e.preventDefault();
+        seekTo(Math.min(duration || currentTime + 2, currentTime + 2), false);
+      } else if (requireLineReview && e.key === "Tab") {
+        e.preventDefault();
+        const currentIndex = Math.max(0, edited.findIndex((segment) => segment._id === focusedSegId));
+        const next = edited[(currentIndex + (e.shiftKey ? -1 : 1) + edited.length) % edited.length];
+        if (next) {
+          setFocusedSegId(next._id);
+          seekTo(Math.max(0, next.start), false);
+          rowRefs.current[next._id]?.querySelector('input[type="text"]')?.focus();
+        }
       } else if ((e.metaKey || e.ctrlKey) && (e.key === "z" || e.key === "Z")) {
         // Cmd/Ctrl+Z: undo. Sync Mode rolls back the last anchor (with
         // its propagated future); outside Sync Mode it pops the manual
@@ -3016,7 +3226,7 @@ export default function LyricsEditor({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit, audioUrl, enterSyncMode, exitSyncMode, toggleFocusMode, jumpToNextReview]);
+  }, [togglePlay, syncMode, tapAnchor, undoLastAnchor, undoEdit, audioUrl, enterSyncMode, exitSyncMode, toggleFocusMode, jumpToNextReview, requireLineReview, currentTime, duration, focusedSegId, activeId, edited, seekTo]);
 
   // ─── Reference lyrics suggestions (unchanged) ───────────────────────
   const refLines = useMemo(() => {
@@ -3024,21 +3234,10 @@ export default function LyricsEditor({
     return referenceLyrics.split("\n").filter((l) => l.trim());
   }, [referenceLyrics]);
 
-  const suggestionsById = useMemo(() => {
-    const map = {};
-    let refIdx = 0;
-    segments.forEach((seg, i) => {
-      const suggestion = findSuggestion(seg.text, refLines, refIdx);
-      map[i] = suggestion;
-      if (suggestion) {
-        const idx = refLines.findIndex(
-          (l, j) => j >= refIdx && l.toLowerCase().includes(seg.text.toLowerCase().split(" ")[0]?.toLowerCase())
-        );
-        if (idx >= 0) refIdx = idx + 1;
-      }
-    });
-    return map;
-  }, [segments, refLines]);
+  const suggestionsById = useMemo(
+    () => referenceSuggestionsById(edited, refLines),
+    [edited, refLines],
+  );
 
   // Detección de segments mergeados (2 lyric lines en 1 segment) usando
   // lrclib plain como oracle. Caso real motivador: Whisper agrupa
@@ -3090,12 +3289,14 @@ export default function LyricsEditor({
         result.push({
           ...seg,
           _id: nextId++,
+          segment_id: mintSegmentId(),
           text: lineA,
           end: Math.max(seg.start + 0.3, midTime - gap),
         });
         result.push({
           ...seg,
           _id: nextId++,
+          segment_id: mintSegmentId(),
           text: lineB,
           start: Math.min(seg.end - 0.3, midTime),
           end: seg.end,
@@ -3107,6 +3308,7 @@ export default function LyricsEditor({
 
   const updateText = (id, text) => {
     pushEditHistory();
+    markLinesReviewedByEdit(id);
     setEdited((prev) => prev.map((seg) => (seg._id === id ? { ...seg, text } : seg)));
   };
 
@@ -3137,6 +3339,7 @@ export default function LyricsEditor({
     if (!propagationPrompt) return;
     const { newText, matchIds } = propagationPrompt;
     pushEditHistory();
+    markLinesReviewedByEdit(matchIds);
     const idset = new Set(matchIds);
     setEdited((prev) => prev.map((s) => (idset.has(s._id) ? { ...s, text: newText } : s)));
     setPropagationPrompt(null);
@@ -3159,6 +3362,9 @@ export default function LyricsEditor({
 
   const applyAllSuggestions = () => {
     pushEditHistory();
+    markLinesReviewedByEdit(edited
+      .filter((segment) => suggestionsById[segment._id])
+      .map((segment) => segment._id));
     setEdited((prev) =>
       prev.map((seg) => {
         const suggestion = suggestionsById[seg._id];
@@ -3174,8 +3380,9 @@ export default function LyricsEditor({
   const shiftAllSegments = useCallback((delta) => {
     if (Math.abs(delta) < 0.05) return;
     pushEditHistory();
+    markLinesReviewedByEdit(editedRef.current.map((segment) => segment._id));
     setEdited((prev) => shiftBlockWithinDuration(prev, delta, duration));
-  }, [pushEditHistory, duration]);
+  }, [markLinesReviewedByEdit, pushEditHistory, duration]);
 
   const deleteSegments = useCallback((ids) => {
     const requested = new Set(Array.isArray(ids) ? ids : [ids]);
@@ -3211,8 +3418,13 @@ export default function LyricsEditor({
   /** Bulk: trim every segment whose duration exceeds the cap. Each
    * segment is trimmed independently — only its own `end` is modified
    * based on its own text length and start. No cross-segment effect. */
-  const trimAllLongSegs = () => {
+  const trimAllLongSegs = ({ confirmReview = true } = {}) => {
     pushEditHistory();
+    if (confirmReview) {
+      markLinesReviewedByEdit(edited
+        .filter((segment) => segment.end - segment.start > estimateVoiceEndDuration(segment.text))
+        .map((segment) => segment._id));
+    }
     setEdited((prev) =>
       prev.map((seg) => {
         const dur = seg.end - seg.start;
@@ -3228,21 +3440,8 @@ export default function LyricsEditor({
     return dur > estimateVoiceEndDuration(seg.text);
   }).length;
 
-  // Auto-trim on initial load: if the just-loaded segments have hanging
-  // text (lrclib/genius lines that ran into instrumental outros, or
-  // duplicated chorus blocks at the end), apply the same fix the
-  // operator would have applied manually via the autofix banner. The
-  // `autoTrimAppliedRef` (declared up by the segments re-seed effect)
-  // guards against re-running on every text-edit keystroke. Cmd-Z still
-  // works because trimAllLongSegs calls pushEditHistory.
-  useEffect(() => {
-    if (autoTrimAppliedRef.current) return;
-    if (!edited || edited.length === 0) return;
-    if (longSegCount > 0) {
-      trimAllLongSegs();
-    }
-    autoTrimAppliedRef.current = true;
-  }, [edited, longSegCount]);
+  // Opening or approving a song never invokes text-length-based trimming.
+  // The explicit trim action above remains available to the operator.
 
   // Compute how many visual lines a segment will occupy in the video.
   const linesForSeg = useCallback((text) => {
@@ -3278,12 +3477,14 @@ export default function LyricsEditor({
           const bStart = firstWordStart(r.wordsB);
           const bEnd = lastWordEnd(r.wordsB);
           const s1 = {
-            ...seg, _id: nextId1, text: r.textA, words: r.wordsA,
+            ...seg, _id: nextId1, segment_id: mintSegmentId(),
+            text: r.textA, words: r.wordsA,
             start: aStart != null ? aStart : seg.start,
             end: aEnd != null ? aEnd : seg.end,
           };
           const s2 = {
-            ...seg, _id: nextId2, text: r.textB, words: r.wordsB,
+            ...seg, _id: nextId2, segment_id: mintSegmentId(),
+            text: r.textB, words: r.wordsB,
             start: bStart != null ? bStart : s1.end + 0.05,
             end: bEnd != null ? bEnd : seg.end,
           };
@@ -3326,8 +3527,8 @@ export default function LyricsEditor({
       const midTime = seg.start + (seg.end - seg.start) * ratio;
       const gap = 0.05;
       const { words: _dropWords, ...segNoWords } = seg;
-      const s1 = { ...segNoWords, _id: nextId1, text: part1, end: Math.max(seg.start + 0.3, midTime - gap) };
-      const s2 = { ...segNoWords, _id: nextId2, text: part2, start: Math.min(seg.end - 0.3, midTime), end: seg.end };
+      const s1 = { ...segNoWords, _id: nextId1, segment_id: mintSegmentId(), text: part1, end: Math.max(seg.start + 0.3, midTime - gap) };
+      const s2 = { ...segNoWords, _id: nextId2, segment_id: mintSegmentId(), text: part2, start: Math.min(seg.end - 0.3, midTime), end: seg.end };
       return [...prev.slice(0, idx), s1, s2, ...prev.slice(idx + 1)];
     });
   };
@@ -3376,7 +3577,10 @@ export default function LyricsEditor({
       const newStart = Math.min(duration || orig.end + segDur, orig.end);
       const newEnd = Math.min(duration || newStart + segDur, newStart + segDur);
       const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
-      const dup = { ...orig, _id: nextId, start: newStart, end: newEnd };
+      const dup = {
+        ...orig, _id: nextId, segment_id: mintSegmentId(),
+        start: newStart, end: newEnd,
+      };
       return [...prev.slice(0, idx + 1), dup, ...prev.slice(idx + 1)];
     });
     setFlushCounter((c) => c + 1);
@@ -3419,7 +3623,10 @@ export default function LyricsEditor({
         baseStart + segDur,
       );
       const nextId = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
-      const inserted = { _id: nextId, start: baseStart, end: baseEnd, text: "" };
+      const inserted = {
+        _id: nextId, segment_id: mintSegmentId(),
+        start: baseStart, end: baseEnd, text: "",
+      };
       // Keep `edited` sorted by start so syncCursor / neighbour clamp /
       // /save-segments autosave all see a monotonic timeline. The
       // backend also sorts (#184) but doing it here keeps the UI's
@@ -3451,7 +3658,9 @@ export default function LyricsEditor({
         if (e <= s) e = s + 0.5;
       }
       const nextId = prev.reduce((m, x) => Math.max(m, x._id), -1) + 1;
-      const inserted = { _id: nextId, start: s, end: e, text: "" };
+      const inserted = {
+        _id: nextId, segment_id: mintSegmentId(), start: s, end: e, text: "",
+      };
       return [...prev, inserted].sort((a, b) => a.start - b.start);
     });
     setFlushCounter((c) => c + 1);
@@ -3487,27 +3696,14 @@ export default function LyricsEditor({
   const hasSuggestions = pendingSuggestions > 0;
   const blankCount = edited.filter((seg) => !(seg.text || "").trim()).length;
 
-  const approvalSegments = useMemo(() => {
-    const sorted = sanitizeSegments(edited)
-      .filter((seg) => (seg.text || "").trim())
-      .sort((a, b) => a.start - b.start);
-    return sorted.map((seg, i) => {
-      let end = seg.end;
-      if (i + 1 < sorted.length) {
-        const nextStart = sorted[i + 1].start;
-        if (end > nextStart - 0.05) {
-          end = Math.max(seg.start + 0.3, nextStart - 0.05);
-        }
-      }
-      return { ...seg, end };
-    });
-  }, [edited]);
+  const approvalSegments = useMemo(() => edited.map((seg) => ({ ...seg })), [edited]);
 
   const unsafeWindows = useMemo(
     () => normalizeUnsafeWindows(transcriptionQuality),
     [transcriptionQuality],
   );
-  const focusedQualityReview = transcriptionQuality?.decision === "review_required"
+  const focusedQualityReview = !requireLineReview
+    && transcriptionQuality?.decision === "review_required"
     && isTranscriptionQualityV5(transcriptionQuality)
     && transcriptionQuality?.mode === "enforce"
     && unsafeWindows.length > 0;
@@ -3521,6 +3717,13 @@ export default function LyricsEditor({
   const qualityGuidanceAvailable = isTranscriptionQualityV5(transcriptionQuality)
     && (transcriptionQuality?.decision === "review_required" || qualityAnalysisPending)
     && unsafeWindows.length > 0;
+  // Campaign review has one explicit approval per song. Machine windows are
+  // navigation/guidance only: requiring one acknowledgement per window would
+  // turn 25 flags/song into roughly 7,500 clicks for this 300-song batch.
+  // Keep the older per-window acknowledgement only for the non-campaign
+  // enforce workflow.
+  const campaignQualityReview = false;
+  const qualityConfirmationActive = focusedQualityReview;
   useEffect(() => {
     if (viewMode === "advanced" && !qualityGuidanceAvailable) {
       setTimingWorkspaceMode("timeline");
@@ -3548,30 +3751,63 @@ export default function LyricsEditor({
       text: segment.text,
     })),
   }), [approvalSegments, transcriptionQuality]);
-  const [qualityWindowReview, setQualityWindowReview] = useState({ key: null, ids: [] });
+  const qualityWindowReviewStorageKey = transcribeJobId
+    ? `genly:quality-window-review:${transcribeJobId}`
+    : null;
+  const [qualityWindowReview, setQualityWindowReview] = useState(() => {
+    if (!requireLineReview || !qualityWindowReviewStorageKey) return { key: null, ids: [] };
+    try {
+      const value = JSON.parse(localStorage.getItem(qualityWindowReviewStorageKey) || "null");
+      return value && Array.isArray(value.ids) ? value : { key: null, ids: [] };
+    } catch { return { key: null, ids: [] }; }
+  });
+  useEffect(() => {
+    if (!requireLineReview || !qualityWindowReviewStorageKey) return;
+    try { localStorage.setItem(qualityWindowReviewStorageKey, JSON.stringify(qualityWindowReview)); }
+    catch { /* the durable editor draft remains authoritative */ }
+  }, [qualityWindowReview, qualityWindowReviewStorageKey, requireLineReview]);
   const serverAcknowledgement = transcriptionQuality?.acknowledgement;
   const serverAcknowledgementCurrent = isServerQualityAcknowledgementCurrent({
     quality: transcriptionQuality,
     revision: segmentsRevision,
     dirty: isDirty,
-    focused: focusedQualityReview,
+    focused: qualityConfirmationActive,
   });
   const confirmedUnsafeWindowIds = useMemo(() => new Set(
     serverAcknowledgementCurrent
       ? (serverAcknowledgement?.confirmed_window_ids || [])
       : (qualityWindowReview.key === qualityReviewKey ? qualityWindowReview.ids : []),
   ), [qualityReviewKey, qualityWindowReview, serverAcknowledgement, serverAcknowledgementCurrent]);
-  const unconfirmedUnsafeWindows = focusedQualityReview
+  const unconfirmedUnsafeWindows = qualityConfirmationActive
     ? unsafeWindows.filter((window) => !confirmedUnsafeWindowIds.has(window.id))
     : [];
+  // Text/timing edits confirm both the affected line and every quality
+  // window that overlaps it.  Carry unrelated window confirmations forward;
+  // the edited window itself is re-confirmed against the new snapshot here.
+  useEffect(() => {
+    const editedIds = editedReviewLineIdsRef.current;
+    if (!requireLineReview || !editedIds.size || !unsafeWindows.length) return;
+    const changedSegments = sanitizedEdited.filter((segment) => editedIds.has(segment._id));
+    editedIds.clear();
+    const changedWindowIds = unsafeWindows
+      .filter((qualityWindow) => changedSegments.some((segment) => (
+        segmentOverlapsWindow(segment, qualityWindow)
+      )))
+      .map((qualityWindow) => qualityWindow.id);
+    if (!changedWindowIds.length) return;
+    setQualityWindowReview((current) => ({
+      key: qualityReviewKey,
+      ids: [...new Set([...(current.ids || []), ...changedWindowIds])],
+    }));
+  }, [qualityReviewKey, requireLineReview, sanitizedEdited, unsafeWindows]);
   const unsafeCandidateSegmentIds = useMemo(() => {
     if (!qualityGuidanceAvailable) return new Set();
-    const windowsForRows = focusedQualityReview ? unconfirmedUnsafeWindows : unsafeWindows;
+    const windowsForRows = qualityConfirmationActive ? unconfirmedUnsafeWindows : unsafeWindows;
     return new Set(sanitizedEdited.flatMap((segment) => {
       const coveringWindows = unsafeWindows.filter((qualityWindow) => (
         segmentOverlapsWindow(segment, qualityWindow)
       ));
-      const confirmedByWindow = focusedQualityReview
+      const confirmedByWindow = qualityConfirmationActive
         && coveringWindows.length > 0
         && coveringWindows.every((qualityWindow) => confirmedUnsafeWindowIds.has(qualityWindow.id));
       if (confirmedByWindow) return [];
@@ -3583,16 +3819,20 @@ export default function LyricsEditor({
         || segment?.review === true;
       return overlapsUnsafeWindow || explicitlyUnsafe ? [segment._id] : [];
     }));
-  }, [confirmedUnsafeWindowIds, focusedQualityReview, qualityGuidanceAvailable, sanitizedEdited, unsafeWindows, unconfirmedUnsafeWindows]);
+  }, [confirmedUnsafeWindowIds, qualityConfirmationActive, qualityGuidanceAvailable, sanitizedEdited, unsafeWindows, unconfirmedUnsafeWindows]);
   // One calm marker/navigation stop per unsafe *part*, not one warning per
   // lyric line. Long windows often cover several valid lines; painting and
   // navigating every one made a single diagnosis look like many failures.
   // In observe mode diagnostics remain available in the summary/timing view,
-  // but do not permanently decorate the lyric rows.
+  // but do not permanently decorate generic lyric rows. Campaign review is
+  // the exception: its flags are the operator's requested navigation guide.
   const unsafeWindowMarkerSegmentIds = useMemo(() => {
-    if (!qualityGuidanceAvailable || !focusedQualityReview) return new Set();
+    if (!qualityGuidanceAvailable || (!requireLineReview && !qualityConfirmationActive)) {
+      return new Set();
+    }
     const markerIds = new Set();
-    unconfirmedUnsafeWindows.forEach((qualityWindow) => {
+    const windowsToMark = qualityConfirmationActive ? unconfirmedUnsafeWindows : unsafeWindows;
+    windowsToMark.forEach((qualityWindow) => {
       const first = sanitizedEdited.find((segment) => (
         segmentOverlapsWindow(segment, qualityWindow)
       ));
@@ -3613,7 +3853,7 @@ export default function LyricsEditor({
       inExplicitRun = explicitlyUnsafe;
     });
     return markerIds;
-  }, [focusedQualityReview, qualityGuidanceAvailable, sanitizedEdited, unsafeWindows, unconfirmedUnsafeWindows]);
+  }, [qualityConfirmationActive, qualityGuidanceAvailable, requireLineReview, sanitizedEdited, unsafeWindows, unconfirmedUnsafeWindows]);
   unsafeNavigationIdsRef.current = unsafeWindowMarkerSegmentIds;
   // ENMASCARAR ≠ INFORMAR. Reemplazar la letra por "Letra sin confirmar" en el
   // preview es una consecuencia del modo `enforce`, donde el operador PUEDE
@@ -3688,9 +3928,11 @@ export default function LyricsEditor({
     });
     trackEditorEvent("editor_guided_window_confirmed", {
       window_id: qualityWindow.id,
-      required: focusedQualityReview,
+      required: campaignQualityReview,
     });
-  }, [focusedQualityReview, isQualityWindowConfirmable, qualityReviewKey, t, toast, trackEditorEvent]);
+  }, [campaignQualityReview, isQualityWindowConfirmable, qualityReviewKey, t, toast, trackEditorEvent]);
+
+  const campaignReviewIncomplete = false;
 
   // Single-flight del CTA completo, incluido el flush de autosave que ocurre
   // ANTES de onApprove. El lock de App sólo cubre el POST /edit; no alcanzaba
@@ -3701,12 +3943,55 @@ export default function LyricsEditor({
   const approveInFlightRef = useRef(false);
   const [isApproving, setIsApproving] = useState(false);
 
+  const [languageResolutionOpen, setLanguageResolutionOpen] = useState(false);
+  const [languageResolutionBusy, setLanguageResolutionBusy] = useState(false);
+  const [languageResolutionError, setLanguageResolutionError] = useState("");
+  const languageResolutionFlight = useRef(false);
+  const unresolvedLanguage = !languageReviewResolved
+    && (languageConflict || languageUncertain || needsLanguageReview);
+  const confirmLanguageReview = async () => {
+    if (languageResolutionFlight.current || !onResolveLanguageReview) return;
+    languageResolutionFlight.current = true;
+    setLanguageResolutionBusy(true);
+    setLanguageResolutionError("");
+    try {
+      const snapshot = JSON.stringify(sanitizeSegmentsForPersistence(editedRef.current));
+      const saved = await flushPendingSave(null, true);
+      if (!saved?.ok || !Number.isInteger(saved.revision)) {
+        throw new Error("No pudimos guardar esta versión. Tus cambios siguen en pantalla; reintentá el guardado.");
+      }
+      if (snapshot !== JSON.stringify(sanitizeSegmentsForPersistence(editedRef.current))) {
+        throw new Error("La letra cambió durante el guardado. Revisá la versión actual y volvé a confirmar.");
+      }
+      const result = await onResolveLanguageReview({ baseRevision: saved.revision });
+      if (!result?.ok) throw new Error(result?.reason === "stale_revision"
+        ? "La versión guardada cambió. Revisá la letra actual y volvé a confirmar."
+        : "No pudimos registrar tu confirmación. Tus cambios están guardados; reintentá.");
+      setLanguageResolutionOpen(false);
+      toast({ message: "Confirmación guardada. Ya podés aprobar letra y timing.", tone: "info" });
+    } catch (error) {
+      setLanguageResolutionError(error?.message || "No pudimos guardar la confirmación. Reintentá.");
+    } finally {
+      languageResolutionFlight.current = false;
+      setLanguageResolutionBusy(false);
+    }
+  };
+
   const runApprove = async ({ skipWrapWarning = false } = {}) => {
+    const conflict = approvalConflict(approvalSegments);
+    if (conflict) {
+      toast({ message: conflict, tone: "error" });
+      return;
+    }
+    if (unresolvedLanguage) {
+      setLanguageResolutionOpen(true);
+      return;
+    }
     if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
       toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
       return;
     }
-    if (saveErrorReason === "draft-corrupt") {
+    if (draftRecovery) {
       toast({ message: "Descartá o recuperá manualmente el borrador local antes de aprobar.", tone: "error" });
       return;
     }
@@ -3740,14 +4025,28 @@ export default function LyricsEditor({
     }
     setWrapWarning(null);
     const cleaned = approvalSegments;
+    // The campaign CTA is the one song-level attestation. Send every line
+    // identity from that exact persisted snapshot so the backend can still
+    // reject stale/partial documents without requiring per-line clicks.
+    const confirmedLineIdsForApproval = cleaned
+      .filter((segment) => requireLineReview || reviewedLineIds.includes(segment._id))
+      .map((segment, index) => {
+        const persistedIdentity = String(segment.segment_id || segment.id || "").trim();
+        // The August campaign was materialized before stable `segment_id`s
+        // existed. Its durable revision still binds the exact snapshot, so
+        // use the same ordered fallback as the API instead of submitting an
+        // empty list and making every legacy song impossible to approve.
+        return persistedIdentity || `index:${index}`;
+      })
+      .filter(Boolean);
     const correctionSummary = summarizeOperatorCorrections(
       originalSegmentsRef.current || [], cleaned || [],
     );
-    // Quality remains a diagnostic: it highlights uncertain passages but
-    // never turns the editor into a mandatory review workflow. The final
-    // render uses the operator's saved lyrics, regardless of whether the
-    // asynchronous quality analysis has finished.
-    const qualityAcknowledged = false;
+    // Campaign windows are guidance and never call the per-window quality
+    // acknowledgement endpoint. The approval endpoint records the one
+    // song-level human decision against the exact editor revision.
+    const qualityAcknowledged = campaignQualityReview
+      && unconfirmedUnsafeWindows.length === 0;
     const approvalTelemetry = {
       ...correctionSummary,
       duration_ms: Math.max(0, Date.now() - editorSessionStartedAtRef.current),
@@ -3768,8 +4067,8 @@ export default function LyricsEditor({
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               base_revision: revision,
-              confirmed_window_ids: focusedQualityReview
-                ? unsafeWindows.map((qualityWindow) => qualityWindow.id)
+              confirmed_window_ids: qualityAcknowledged
+                ? [...confirmedUnsafeWindowIds]
                 : [],
             }),
           },
@@ -3783,9 +4082,8 @@ export default function LyricsEditor({
       return false;
     };
     if (editorV2Enabled) {
-      // `_buildCleanedSegments` may tighten an overlap by 50 ms. Persist
-      // that exact final snapshot before sending its revision/version id;
-      // Editor 2.0 intentionally ignores browser JSON during approval.
+      // Flush the same editor snapshot, never tighten gaps during approval.
+      // The backend approves only the exact persisted revision.
       const cleanedForPersistence = sanitizeSegmentsForPersistence(cleaned);
       const saveResult = await flushDurableSave("manual", cleanedForPersistence);
       if (saveResult?.ok === false) {
@@ -3807,6 +4105,7 @@ export default function LyricsEditor({
           editorRevision: currentSave.revision,
           editorVersionId: currentSave.versionId,
           operatorMetrics,
+          confirmedLineIds: confirmedLineIdsForApproval,
         }));
         if (approvalResult?.ok !== false || approvalResult.reason !== "conflict") break;
 
@@ -3831,7 +4130,11 @@ export default function LyricsEditor({
       }
       if (approvalResult?.ok === false) {
         setIsDirty(true);
-        toast({ message: "No pudimos confirmar todavía. Tus cambios siguen en pantalla y se reintentarán al guardar.", tone: "info" });
+        toast({
+          message: approvalResult.message
+            || "No pudimos confirmar todavía. Tus cambios siguen en pantalla y se reintentarán al guardar.",
+          tone: approvalResult.message ? "error" : "info",
+        });
         return;
       }
       setIsDirty(false);
@@ -3848,6 +4151,7 @@ export default function LyricsEditor({
       await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
         baseRevision: revision,
         operatorMetrics,
+        confirmedLineIds: confirmedLineIdsForApproval,
       }));
       clearActiveClock();
       trackEditorEvent("editor_approved", {
@@ -3870,6 +4174,7 @@ export default function LyricsEditor({
     await Promise.resolve(onApprove(cleaned.map(({ _id, ...rest }) => rest), {
       baseRevision: approvedRevision,
       operatorMetrics,
+      confirmedLineIds: confirmedLineIdsForApproval,
     }));
     clearActiveClock();
     trackEditorEvent("editor_approved", {
@@ -3890,11 +4195,25 @@ export default function LyricsEditor({
     }
   };
 
-  const handleBackSafely = useCallback(async () => {
-    const result = await flushPendingSave();
+  const handleBackSafely = useCallback(async (afterSave) => {
+    const result = draftRecoveryRef.current ? { ok: true } : await flushPendingSave();
     if (result?.ok === false && result.reason === "stale-revision") return;
-    onBack?.();
+    if (typeof afterSave === "function") {
+      await afterSave();
+      return;
+    }
+    await Promise.resolve(onBack?.());
   }, [flushPendingSave, onBack]);
+
+  // The campaign header lives in App, outside this component. Register the
+  // same save-aware exit used by the editor's back arrow so its header action
+  // cannot bypass a pending autosave or leave this review mounted over the
+  // queue route.
+  useEffect(() => {
+    if (!onRegisterSafeExit) return undefined;
+    onRegisterSafeExit(handleBackSafely);
+    return () => onRegisterSafeExit(null);
+  }, [handleBackSafely, onRegisterSafeExit]);
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
 
@@ -3905,6 +4224,7 @@ export default function LyricsEditor({
   // y suprimimos los badges per-línea (el banner ya transmite la info).
   // Si <3 son review, el badge per-línea queda — es info útil sin saturar.
   const reviewSegCount = edited.reduce((n, s) => n + (s.review ? 1 : 0), 0);
+  const unvalidatedTimingCount = edited.filter((s) => s.timing_validation?.status === "unvalidated").length;
   // El chip anuncia cuántas líneas recorre el navegador, y el navegador
   // cicla `review` ∪ zonas dudosas. Contar sólo `review` dejaba el chip
   // desincronizado (o directamente oculto con 9 líneas navegables).
@@ -3958,7 +4278,9 @@ export default function LyricsEditor({
   // letra" (si hay líneas review del anclado) + estado del fondo. Si no
   // hay nada que avisar → "Todo listo".
   const confidenceParts = [];
-  if (reviewSegCount > 0) confidenceParts.push(t("editor.confidence_synced") || "Sincronizado con tu letra");
+  if (unvalidatedTimingCount > 0) {
+    confidenceParts.push(`Timing no validado · ${unvalidatedTimingCount} líneas a revisar`);
+  } else if (reviewSegCount > 0) confidenceParts.push(t("editor.confidence_synced") || "Sincronizado con tu letra");
   // Orientación al abrir (56 s medidos hasta la primera edición): cuántas zonas
   // marcó el análisis de calidad. Se AGREGA a la señal calma existente
   // ("señal review calma", 2026-07) en vez de reemplazarla — es un dato para
@@ -3987,7 +4309,7 @@ export default function LyricsEditor({
     idle: isDirty ? "Cambios locales" : "Guardado",
     local: "Cambios locales",
     saving: "Guardando…",
-    saved: "Guardado",
+    saved: `Guardado ✓${savedAt ? ` ${savedAt.toLocaleTimeString([], { hour12: false })}` : ""}`,
     offline: "Sin conexión",
     conflict: "Cambio en conflicto",
     error: "No se pudo guardar",
@@ -4014,12 +4336,41 @@ export default function LyricsEditor({
   // breathe: preview ~680 px wide (≈ 2× before), lines fit ≈ 60 chars per
   // row before scrolling. Timeline view stays at max-w-6xl (already wide
   // enough).
+  const resolveRecovery = (recover) => {
+    try {
+      if (localStorage.getItem(draftKey) !== draftRecovery.raw) {
+        setDraftRecovery({ ...draftRecovery, kind: "unreadable", message: "La copia cambió en otra pestaña. Recargá para compararla de nuevo; no borramos nada." });
+        return;
+      }
+      if (recover) {
+        // Only an explicit choice makes the local copy an editable draft.
+        // Keep its original bytes until the normal save path confirms them.
+        setEdited(reseedPreservingIds(editedRef.current, draftRecovery.local));
+        setIsDirty(true);
+        setSaveStatus("local");
+      } else {
+        localStorage.removeItem(draftKey);
+        setIsDirty(false);
+      }
+      draftRecoveryRef.current = null;
+      setDraftRecovery(null);
+    } catch {
+      setDraftRecovery({ ...draftRecovery, kind: "unreadable", message: "El navegador impidió resolver la copia local. La conservamos y no guardamos cambios en el servidor." });
+    }
+  };
+
   return (
     // UI F10 (2026-05-26): pb-28 (7 rem ≈ 112 px) garantiza safe-area
     // bajo el botón flotante "Aprobar y generar" (h-12 = 48 px + bottom-6
     // = 24 px + sombra). Sin esto la última card del timeline o de la
     // lista quedaba tapada cuando el operador scrolleaba hasta el final.
-    <div data-testid="lyrics-editor" aria-busy={editorInitializationBlocked} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+    <div ref={reanchorReturnFocusRef} tabIndex={-1} data-testid="lyrics-editor" inert={draftRecovery ? "" : undefined} aria-busy={editorInitializationBlocked || reanchoring || pasteBusy} className={`w-full mx-auto pb-28 ${viewMode === "advanced" ? "max-w-[1800px] px-2 sm:px-4" : "max-w-[1400px]"}`}>
+      {(reanchoring || pasteBusy) && <ReanchorProgressDialog
+        waiting={!!reanchorWaiting} returnFocusRef={reanchorReturnFocusRef} />}
+      {draftRecovery && createPortal(<LocalDraftRecovery recovery={draftRecovery}
+        revision={durableEditor.document?.revision} remote={durableEditor.document?.segments || []}
+        onRecover={() => resolveRecovery(true)} onDiscard={() => resolveRecovery(false)}
+        onBack={() => onBack?.()} />, document.body)}
       {editorInitializationBlocked && createPortal(
         <div
           className="fixed inset-0 z-[80] flex items-center justify-center bg-surface-0/70 px-5 backdrop-blur-sm"
@@ -4037,12 +4388,17 @@ export default function LyricsEditor({
                 </div>
                 <h3 className="mt-4 text-base font-semibold text-white">No pudimos abrir la versión editable</h3>
                 <p className="mt-2 text-sm leading-6 text-ink-secondary">
-                  Tus líneas siguen a salvo. Reconectá el editor antes de modificar o aprobar.
+                  {durableEditor.errorStatus === 401 ? "La sesión venció. Volvé a iniciar sesión para abrir esta canción."
+                    : [403, 404].includes(durableEditor.errorStatus) ? "No se pudo acceder a esta canción. Comprobá el enlace y los permisos de tu cuenta."
+                      : durableEditor.errorStatus === 429 || durableEditor.errorStatus >= 500 ? "El servidor no está disponible temporalmente. Esperá unos segundos y reintentá."
+                        : "No se pudo completar la conexión con el editor. Comprobá tu conexión y reintentá."}
                 </p>
+                <p className="mt-2 text-xs text-ink-secondary">La edición y la aprobación siguen bloqueadas hasta cargar la versión guardada.</p>
+                <p className="mt-3 break-all font-mono text-xs text-ink-secondary">Canción: {transcribeJobId}{durableEditor.errorStatus ? ` · HTTP ${durableEditor.errorStatus}` : " · Sin respuesta HTTP"}</p>
                 <button
                   type="button"
                   onClick={() => durableEditor.load()}
-                  className="mt-5 inline-flex h-11 items-center justify-center rounded-xl bg-white px-5 text-sm font-semibold text-surface-0 transition-colors hover:bg-gray-100"
+                  className="mt-5 inline-flex h-11 items-center justify-center rounded-xl bg-white px-5 text-sm font-semibold text-gray-950 transition-colors hover:bg-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand"
                 >
                   Reintentar
                 </button>
@@ -4072,6 +4428,7 @@ export default function LyricsEditor({
             }
           }}
           onLoadedMetadata={(e) => {
+            e.currentTarget.playbackRate = playbackRate;
             const mediaDuration = Number(e.currentTarget.duration);
             setAudioError(false);
             autoRecoveryAttemptedUrlRef.current = null;
@@ -4180,6 +4537,48 @@ export default function LyricsEditor({
           }}
         />
       )}
+      <CatalogReference reference={sourceReference} />
+      {(referenceLyrics || referenceUnavailable || referenceLinks.length > 0) && (
+        <details className="mb-3 rounded-xl bg-surface-2/45 p-4 ring-1 ring-white/[0.06]">
+          <summary className="cursor-pointer text-sm font-semibold text-white">
+            Referencia derivada del audio
+          </summary>
+          <p className="mt-2 text-xs font-medium text-amber-200">
+            Sugerencia: verificar cada línea contra el audio. Nunca se aplica sola.
+          </p>
+          {referenceUnavailable ? (
+            <p className="mt-3 rounded-lg bg-red-500/10 p-3 text-xs text-red-200 ring-1 ring-red-500/25">
+              No hubo hipótesis automática. Esta canción requiere revisión manual completa.
+            </p>
+          ) : referenceLyrics ? (
+            <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-lg bg-black/20 p-3 text-xs leading-5 text-ink-secondary">{referenceLyrics}</pre>
+          ) : null}
+          {referenceLinks.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {referenceLinks.map((link) => (
+                <a key={`${link.kind}:${link.url}`} href={link.url} target="_blank" rel="noreferrer noopener" className="rounded-lg bg-white/[0.06] px-3 py-2 text-xs text-brand-light hover:bg-white/[0.1]">
+                  {link.kind}
+                </a>
+              ))}
+            </div>
+          )}
+        </details>
+      )}
+      {requireLineReview && (
+        <div className="mb-3 rounded-xl bg-brand/[0.08] px-4 py-3 text-xs ring-1 ring-brand/25" data-testid="line-review-gate">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span className="font-semibold text-brand-light">Revisión por canción</span>
+            {unsafeWindows.length > 0 && (
+              <span className="font-semibold tabular-nums text-amber-100" data-testid="campaign-guidance-count">
+                {unsafeWindows.length} {unsafeWindows.length === 1 ? "parte sugerida" : "partes sugeridas"}
+              </span>
+            )}
+          </div>
+          <p className="mt-2 leading-relaxed text-ink-secondary">
+            Escuchá y corregí lo necesario. Las partes marcadas son una guía, no requieren clics. “Aprobar letra y timing” confirma una vez la canción completa. Tus cambios se guardan automáticamente aunque salgas sin aprobar.
+          </p>
+        </div>
+      )}
 
       {/* Header: back + title (non-sticky). The primary CTA is a FIXED
           floating button (below) so it can never be hidden behind the
@@ -4230,11 +4629,24 @@ export default function LyricsEditor({
         <div className="mx-auto flex w-full max-w-[1800px] items-center justify-between gap-4">
           <div className="hidden min-w-0 sm:block">
             <p className={`text-[11px] font-medium ${saveStatus === "error" || saveStatus === "offline" ? "text-red-300" : "text-white"}`}>{saveStatusLabel}</p>
-            <p className="mt-0.5 truncate text-[10px] text-ink-tertiary">{edited.length} líneas · {viewMode === "advanced" ? "timings revisados" : "texto revisado"}</p>
+            <p className="mt-0.5 truncate text-[10px] text-ink-tertiary">
+              {requireLineReview
+                ? `${edited.length} líneas · aprobación única por canción`
+                : `${edited.length} líneas · ${viewMode === "advanced" ? "timings revisados" : "texto revisado"}`}
+            </p>
           </div>
+          {unresolvedLanguage && (
+            <button type="button" onClick={() => setLanguageResolutionOpen(true)}
+              className="ml-auto rounded-lg bg-amber-400/15 px-3 py-2 text-xs text-amber-100 ring-1 ring-amber-400/30">
+              Resolver discrepancia
+            </button>
+          )}
           <button
             onClick={handleApprove}
-            disabled={isApproving || languageConflict || languageUncertain || (editorV2Enabled && (!durableHydrated || durableEditor.loading)) || saveErrorReason === "draft-corrupt"}
+            disabled={isApproving || (!requireLineReview && (
+              (editorV2Enabled && (!durableHydrated || durableEditor.loading))
+              || !!draftRecovery
+            ))}
             aria-busy={isApproving}
             aria-label={isApproving
               ? (t("editor.applying_changes") || "Aplicando cambios…")
@@ -4243,7 +4655,8 @@ export default function LyricsEditor({
                 : (t("editor.approve_generate") || "Aprobar y generar")))}
             aria-describedby={qualityGuidanceAvailable ? "transcription-quality-review" : undefined}
             data-quality-status={qualityAnalysisPending ? "analysis_pending" : (transcriptionQuality?.decision || undefined)}
-            data-quality-review-required="false"
+            data-quality-review-required={campaignQualityReview ? "true" : "false"}
+            data-review-incomplete={campaignReviewIncomplete ? "true" : "false"}
             data-tour="editor-approve-floating"
             className="editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-brand-light px-5 text-sm font-semibold text-white shadow-xl shadow-brand/25 transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
           >
@@ -4256,6 +4669,77 @@ export default function LyricsEditor({
           </button>
         </div>
       </div>
+
+      {pasteOpen && createPortal(
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4">
+          <section role="dialog" aria-modal="true" aria-labelledby="paste-lyrics-title"
+            className="w-full max-w-2xl rounded-2xl bg-surface-1 p-6 shadow-2xl ring-1 ring-white/15">
+            <h2 id="paste-lyrics-title" className="text-lg font-semibold text-white">{t("editor.paste_lyrics") || "Pegar letra oficial y re-sincronizar"}</h2>
+            <p className="mt-2 text-sm text-ink-secondary">{t("editor.paste_lyrics_hint") || "Pegá la letra correcta, una línea por renglón. Las líneas iguales conservan su ajuste manual; las distintas se reemplazan y quedan marcadas para revisar."}</p>
+            {sourceReference?.text && (
+              <button type="button" data-testid="paste-lyrics-use-sheet" onClick={() => { setPasteText(sourceReference.text); setPasteStructure(null); }}
+                className="mt-3 rounded-lg bg-white/[0.06] px-3 py-1.5 text-xs text-white ring-1 ring-white/10">{t("editor.paste_lyrics_use_sheet") || "Usar la letra de la planilla"}</button>
+            )}
+            <textarea data-testid="paste-lyrics-textarea" aria-label={t("editor.paste_lyrics") || "Letra oficial"} value={pasteText}
+              onChange={(e) => { setPasteText(e.target.value); setPasteStructure(null); }} rows={12}
+              placeholder={t("editor.paste_lyrics_placeholder") || "Pegá acá la letra oficial…"}
+              className="mt-3 w-full rounded-xl bg-black/30 p-3 font-mono text-sm text-white ring-1 ring-white/15" />
+            <p className="mt-2 text-xs text-ink-tertiary" data-testid="paste-lyrics-count">{pasteLineCount} líneas pegadas · {edited.length} en el editor</p>
+            {pasteStructure && (
+              <div role="alert" data-testid="paste-lyrics-structure" className="mt-3 rounded-xl bg-amber-400/[0.08] p-3 text-xs text-amber-200 ring-1 ring-amber-400/30">
+                <p className="font-medium">{t("editor.paste_lyrics_structure_title") || "Hay diferencias con el texto del editor"}</p>
+                <ul className="mt-1 list-disc pl-4">
+                  {pasteStructure.reasons?.includes("line_count_divergent") && <li>{(t("editor.paste_lyrics_structure_lines") || "{p} líneas pegadas vs {c} en el editor; los saltos de línea pueden ser distintos.").replace("{p}", String(pasteStructure.pasted_line_count)).replace("{c}", String(pasteStructure.current_line_count))}</li>}
+                  {pasteStructure.reasons?.includes("reference_contains_unmatched_passage") && <li>{(t("editor.paste_lyrics_structure_passage") || "La comparación encontró un tramo de {n} palabras diferentes entre ambos textos.").replace("{n}", String(pasteStructure.metrics?.longest_unmatched_content_run ?? "?"))}</li>}
+                  {Number.isFinite(pasteStructure.metrics?.reference_token_coverage) && <li>{(t("editor.paste_lyrics_structure_coverage") || "Coincidencia de palabras con el texto del editor: {p}% (no mide la exactitud de la letra en el audio).").replace("{p}", String(Math.round(pasteStructure.metrics.reference_token_coverage * 100)))}</li>}
+                </ul>
+                <p className="mt-1">{t("editor.paste_lyrics_structure_hint") || "La transcripción automática puede omitir o confundir palabras. Este aviso no demuestra que tu letra esté mal. Si verificaste que corresponde a este audio, podés continuar; después revisá la sincronización."}</p>
+              </div>
+            )}
+            {reanchorWaiting && (
+              <p role="status" data-testid="paste-lyrics-waiting" className="mt-3 text-sm text-amber-200">
+                {t("editor.reanchor_waiting") || "La respuesta se perdió pero el servidor sigue re-sincronizando. Seguimos esperando (puede tardar unos minutos)…"}
+              </p>
+            )}
+            {pasteError && <p role="alert" className="mt-3 text-sm text-red-300">{pasteError}</p>}
+            <div className="mt-5 flex justify-end gap-3">
+              <button type="button" disabled={pasteBusy} onClick={() => setPasteOpen(false)}
+                className="rounded-lg px-3 py-2 text-sm text-white">{t("editor.paste_lyrics_cancel") || "Cancelar"}</button>
+              {pasteStructure ? (
+                <button type="button" data-testid="paste-lyrics-confirm-anyway" disabled={pasteBusy} onClick={() => submitPasteLyrics(true)}
+                  className="rounded-lg bg-amber-500/80 px-4 py-2 text-sm font-medium text-black disabled:opacity-50">
+                  {pasteBusy ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.paste_lyrics_confirm_anyway") || "Confirmar letra y re-sincronizar")}
+                </button>
+              ) : (
+                <button type="button" data-testid="paste-lyrics-submit" disabled={pasteBusy || pasteLineCount < 3} onClick={() => submitPasteLyrics(false)}
+                  className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
+                  {pasteBusy ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.paste_lyrics_submit") || "Reemplazar letra y re-sincronizar")}
+                </button>
+              )}
+            </div>
+          </section>
+        </div>, document.body,
+      )}
+
+      {languageResolutionOpen && createPortal(
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4">
+          <section role="dialog" aria-modal="true" aria-labelledby="language-resolution-title"
+            className="w-full max-w-lg rounded-2xl bg-surface-1 p-6 shadow-2xl ring-1 ring-white/15">
+            <h2 id="language-resolution-title" className="text-lg font-semibold text-white">Confirmar la letra revisada</h2>
+            <p className="mt-3 text-sm text-ink-secondary">La referencia automática puede equivocarse. Si escuchaste el audio y verificaste que la letra que dejaste es correcta, podés confirmar esta versión para aprobarla.</p>
+            {languageResolutionError && <p role="alert" className="mt-3 text-sm text-red-300">{languageResolutionError}</p>}
+            {!onResolveLanguageReview && <p role="alert" className="mt-3 text-sm text-red-300">No está disponible la confirmación. Guardá tus cambios y volvé a abrir la canción.</p>}
+            <div className="mt-5 flex justify-end gap-3">
+              <button type="button" disabled={languageResolutionBusy} onClick={() => setLanguageResolutionOpen(false)}
+                className="rounded-lg px-3 py-2 text-sm text-white">Seguir revisando</button>
+              <button type="button" disabled={languageResolutionBusy || !onResolveLanguageReview}
+                onClick={confirmLanguageReview} className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
+                {languageResolutionBusy ? "Guardando confirmación…" : "Escuché el audio y confirmo esta letra"}
+              </button>
+            </div>
+          </section>
+        </div>, document.body,
+      )}
 
       {coverageWarning && (
         <div className="mb-4 rounded-2xl ring-1 ring-accent/25 bg-accent/[0.06] px-4 py-3 flex items-start gap-3">
@@ -4276,7 +4760,37 @@ export default function LyricsEditor({
           </p>
         </div>
       )}
-      {languageUncertain && !languageConflict && (
+      {outputReferenceDivergence && !languageConflict && (
+        <div className="mb-4 rounded-2xl bg-amber-400/[0.08] px-4 py-3 ring-1 ring-amber-400/30">
+          <p className="text-xs leading-relaxed text-amber-100">
+            {t("editor.language_reference_divergence")
+              || "Algunos versos no coinciden con la referencia del audio (posible idioma equivocado en la transcripción)."}
+            {Array.isArray(outputReferenceUnexplainedIndices)
+              && outputReferenceUnexplainedIndices.length > 0 && (
+              <span className="block mt-1 text-amber-200/80">
+                {"Revisá las líneas: "}
+                {outputReferenceUnexplainedIndices.map((i) => i + 1).join(", ")}
+                {". Corregilas o, si la letra es correcta, confirmalo para poder aprobar."}
+              </span>
+            )}
+          </p>
+          {languageReviewResolved ? (
+            <p className="mt-2 text-xs text-emerald-200">
+              {t("editor.language_review_resolved") || "Discrepancia revisada por un humano. Ya podés aprobar."}
+            </p>
+          ) : (onResolveLanguageReview && (
+            <button
+              type="button"
+              data-testid="resolve-language-review"
+              onClick={() => setLanguageResolutionOpen(true)}
+              className="mt-2 rounded-lg bg-amber-400/20 px-3 py-1 text-xs text-amber-100 ring-1 ring-amber-400/40 hover:bg-amber-400/30"
+            >
+              {t("editor.confirm_lyrics_correct") || "Ya lo revisé, la letra es correcta"}
+            </button>
+          ))}
+        </div>
+      )}
+      {languageUncertain && !languageConflict && !outputReferenceDivergence && (
         <div className="mb-4 rounded-2xl bg-amber-400/[0.08] px-4 py-3 ring-1 ring-amber-400/30">
           <p className="text-xs leading-relaxed text-amber-100">
             {t("editor.language_uncertain") || "No pudimos corroborar el idioma. Elegí el idioma de esta canción y reprocesá antes de aprobar."}
@@ -4311,6 +4825,10 @@ export default function LyricsEditor({
         </section>
       )}
 
+      <CompleteReviewerCandidate candidate={durableEditor.document?.reviewer_candidate}
+        currentRevision={durableEditor.document?.revision} currentSegments={edited}
+        onSeek={(start) => seekTo(start, true)} />
+
       {durableEditor.document?.quality_proposal && (
         <div className="mb-4">
           <QualityProposalPanel
@@ -4321,6 +4839,7 @@ export default function LyricsEditor({
             onDismiss={dismissQualityProposal}
             onObserve={observeQualityProposal}
             onRejectWindow={rejectQualityProposalWindow}
+            onReviewTelemetry={(properties) => trackEditorEvent("editor_reviewer_candidate", properties)}
             applying={qualityProposalBusy.applying}
             dismissing={qualityProposalBusy.dismissing}
             observing={qualityProposalBusy.observing}
@@ -4348,7 +4867,7 @@ export default function LyricsEditor({
               <p id="transcription-quality-title" className="text-xs font-semibold text-amber-100">
                 {t("editor.quality_title") || "Revisión focalizada de transcripción"}
               </p>
-              {focusedQualityReview && (
+              {qualityConfirmationActive && (
                 <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ring-1 ${
                   unconfirmedUnsafeWindows.length === 0
                     ? "bg-emerald-400/10 text-emerald-200 ring-emerald-300/25"
@@ -4409,7 +4928,7 @@ export default function LyricsEditor({
                         <span className="shrink-0 font-mono text-[11px] font-semibold tabular-nums text-white">{range}</span>
                         <span className="truncate text-[11px] text-ink-secondary">{unsafeWindowReasonLabel(qualityWindow, t)}</span>
                       </button>
-                      {focusedQualityReview && (
+                      {qualityConfirmationActive && (
                         <button
                           type="button"
                           onClick={() => confirmUnsafeWindow(qualityWindow)}
@@ -4437,9 +4956,11 @@ export default function LyricsEditor({
                 })}
               </ul>
             )}
-            {focusedQualityReview && (
+            {qualityConfirmationActive && (
               <p className="mt-2 text-[10px] leading-relaxed text-amber-100/60">
-                {t("editor.quality_reset_hint") || "Si cambiás la letra o los tiempos después de confirmar, deberás revisar estas zonas nuevamente."}
+                {campaignQualityReview
+                  ? "Editar el texto o timing de una línea confirma también las ventanas marcadas que toca."
+                  : (t("editor.quality_reset_hint") || "Si cambiás la letra o los tiempos después de confirmar, deberás revisar estas zonas nuevamente.")}
               </p>
             )}
           </div>
@@ -4572,6 +5093,17 @@ export default function LyricsEditor({
           <span className="text-xs text-gray-500 tabular-nums shrink-0 w-10">
             {formatTime(duration)}
           </span>
+          <select
+            aria-label={t("editor.playback_speed") || "Velocidad de reproducción"}
+            title={t("editor.playback_speed") || "Velocidad de reproducción"}
+            value={playbackRate}
+            onChange={(event) => setPlaybackRate(Number(event.target.value))}
+            className="h-9 shrink-0 rounded-lg border border-white/10 bg-surface-2 px-1.5 text-xs font-semibold tabular-nums text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light"
+          >
+            <option value={1}>1×</option>
+            <option value={1.5}>1.5×</option>
+            <option value={2}>2×</option>
+          </select>
           </>) : audioLoading ? (
             /* Cargando: el padre todavía está trayendo la URL del audio.
                NO mostrar "no disponible" acá — es un falso alarma mientras
@@ -5125,7 +5657,7 @@ export default function LyricsEditor({
              izquierda no renderiza — los controles ya están en el paso
              4 del stepper y el preview central del wizard refleja los
              cambios. El grid colapsa a 1 columna full-width. */}
-      <div className="relative mb-4 flex items-center gap-3 rounded-2xl bg-gradient-to-r from-surface-2/80 via-surface-2/45 to-brand/[0.055] p-2 ring-1 ring-white/[0.08] shadow-xl shadow-black/10" data-testid="editor-mode-explainer">
+      <div className="relative mb-4 flex flex-wrap items-center gap-3 rounded-2xl bg-gradient-to-r from-surface-2/80 via-surface-2/45 to-brand/[0.055] p-2 ring-1 ring-white/[0.08] shadow-xl shadow-black/10" data-testid="editor-mode-explainer">
         <div
           className="grid min-w-0 flex-1 grid-cols-2 gap-1 rounded-xl bg-black/20 p-1"
           role="tablist"
@@ -5177,6 +5709,23 @@ export default function LyricsEditor({
             </span>
           </button>
         </div>
+        {/* 2026-09-14: pegar la letra oficial es una acción de TEXTO, no de
+            timing: va visible en las dos pestañas, no escondida en el menú de
+            Herramientas (que sólo existe en "Ajustar tiempos" y se cortaba a
+            la derecha en ventanas angostas). El ítem del menú se conserva. */}
+        {canReanchor && !syncMode && (
+          <button
+            type="button"
+            data-testid="paste-lyrics-cta"
+            disabled={reanchoring || pasteBusy}
+            onClick={() => { openPasteLyrics(); setOverflowOpen(false); }}
+            title={t("editor.paste_lyrics_menu_hint") || "Reemplaza el texto y realinea con el audio"}
+            className="inline-flex h-10 shrink-0 items-center gap-2 rounded-xl bg-brand/15 px-3 text-[11px] font-semibold text-brand-light ring-1 ring-brand/30 transition-colors hover:bg-brand/25 hover:text-white disabled:opacity-50"
+          >
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24"><path d="M9 4h6a2 2 0 0 1 2 2v14H7V6a2 2 0 0 1 2-2zM9 4v2h6V4M10 11h4M10 15h4" strokeLinecap="round" strokeLinejoin="round" /></svg>
+            <span>{t("editor.paste_lyrics_short") || "Pegar letra oficial"}</span>
+          </button>
+        )}
         {viewMode === "advanced" && (
           <div className="relative shrink-0">
             <button
@@ -5202,6 +5751,11 @@ export default function LyricsEditor({
                   <button type="button" role="menuitem" onClick={() => { toggleFocusMode(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white">
                     <span className="block font-medium">{focusMode ? (t("editor.focus_exit") || "Salir de modo enfoque") : (t("editor.focus_enter") || "Trabajar a pantalla completa")}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Maximiza el espacio de edición</span>
                   </button>
+                  {canReanchor && !syncMode && (
+                    <button type="button" role="menuitem" data-testid="paste-lyrics-btn" disabled={reanchoring || pasteBusy} onClick={() => { openPasteLyrics(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white disabled:opacity-50">
+                      <span className="block font-medium">{t("editor.paste_lyrics") || "Pegar letra oficial y re-sincronizar"}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">{t("editor.paste_lyrics_menu_hint") || "Reemplaza el texto y realinea con el audio"}</span>
+                    </button>
+                  )}
                   {canReanchor && !syncMode && (
                     <button type="button" role="menuitem" data-testid="reanchor-btn" disabled={reanchoring} onClick={() => { handleReanchor(); setOverflowOpen(false); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[11px] text-ink-secondary hover:bg-white/[0.05] hover:text-white disabled:opacity-50">
                       <span className="block font-medium">{reanchoring ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.reanchor") || "Re-sincronizar con IA")}</span><span className="mt-0.5 block text-[10px] text-ink-tertiary">Conserva los ajustes manuales</span>
@@ -5449,8 +6003,8 @@ export default function LyricsEditor({
                         <GuidedTimingReview
                           windows={qualityGuidanceAvailable ? unsafeWindows : []}
                           segments={sanitizedEdited}
-                          waveform={waveform}
-                          waveformLoading={waveformLoading}
+                          waveform={waveformHires || waveform}
+                          waveformLoading={!waveformHires && !waveform && (waveformHiresLoading || waveformLoading)}
                           duration={duration}
                           audioAvailable={!!audioUrl && !audioError && audioMetadataReady}
                           audioLoading={audioLoading || (!!audioUrl && !audioError && !audioMetadataReady)}
@@ -5596,6 +6150,7 @@ export default function LyricsEditor({
                 ref={(el) => { rowRefs.current[seg._id] = el; }}
                 {...(idx === 0 ? { "data-tour": "editor-list-row" } : {})}
                 data-testid={`lyric-row-${idx + 1}`}
+                data-line-confirmed={reviewedLineIds.includes(seg._id) ? "true" : "false"}
                 data-unsafe-candidate={isUnsafeCandidate ? "true" : "false"}
                 data-unsafe-marker={isUnsafeMarker ? "true" : "false"}
                 aria-describedby={isUnsafeMarker ? unsafeCandidateHintId : undefined}
@@ -5688,6 +6243,11 @@ export default function LyricsEditor({
                     </div>
                   )}
                   <div className="flex-1 min-w-0 relative">
+                    {seg.timing_validation?.status === "unvalidated" && (
+                      <p data-testid={`timing-unvalidated-${idx + 1}`} className="px-3 pt-1 text-xs text-amber-300">
+                        Timing no validado · revisá este tramo contra el audio. No se cambiaron sus tiempos.
+                      </p>
+                    )}
                     <input
                       type="text"
                       aria-label={`Letra de la línea ${idx + 1}`}
@@ -5697,6 +6257,9 @@ export default function LyricsEditor({
                         const el = e.currentTarget;
                         if (e.key === "Enter") {
                           // Split THIS line at the cursor, word-aware (keeps timing).
+                          // Campaign review uses Enter for the same structural edit:
+                          // line confirmation is song-scoped, so it must not shadow
+                          // the editor's established split shortcut.
                           e.preventDefault();
                           const caret = el.selectionStart ?? el.value.length;
                           if (!el.value.slice(0, caret).trim() || !el.value.slice(caret).trim()) {

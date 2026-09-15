@@ -1,0 +1,62 @@
+import { describe, expect, it } from "vitest";
+import { reviewCounts, reviewStateLabel, reviewActionLabel, reviewDestination, safeReviewReturnPath, reviewStateFilter } from "./reviewerNavigation";
+
+describe("reviewer navigation contract", () => {
+  it("keeps drafts pending and resumes them without bypassing another editor's lock", () => {
+    expect(reviewCounts({ campaign_totals: { songs: 10, approved: 2, drafts: 3 } }).pending).toBe(8);
+    const draft = { job_id: "draft", state: "ready", is_draft: true };
+    expect(reviewStateLabel(draft)).toBe("Con cambios humanos guardados");
+    expect(reviewActionLabel(draft)).toBe("Continuar revisión");
+    expect(reviewActionLabel({ ...draft, reviewer_lock_active: true })).toBeNull();
+    expect(reviewActionLabel({ ...draft, state: "approved" })).toBe("Editar transcripción");
+  });
+  it("keeps campaign counts independent of the active scope", () => {
+    expect(reviewCounts({ scope: { total: 40 }, campaign_totals: { songs: 300, approved: 40 } }))
+      .toEqual({ all: 300, approved: 40, pending: 260, discarded: 0, drafts: 0 });
+    expect(reviewCounts(null).approved).toBeUndefined();
+  });
+  it.each([
+    ["pending", "Pendiente de procesamiento", null], ["processing", "Procesando", null],
+    ["ready", "Sin cambios humanos registrados", "Revisar"], ["reviewing", "En revisión", "Revisar"],
+    ["approved", "Aprobada", "Editar transcripción"], ["exported", "Exportada", "Editar transcripción"],
+    ["failed", "Fallida", null], ["unknown", "Estado no disponible", null],
+  ])("renders state %s honestly", (state, label, action) => {
+    const row = { job_id: "one", state };
+    expect(reviewStateLabel(row)).toBe(label);
+    expect(reviewActionLabel(row)).toBe(action);
+  });
+  it("respects foreign locks but never labels approvals as in-progress", () => {
+    const row = { job_id: "one", state: "reviewing", reviewer_lock_active: true, reviewer_name: "Agus" };
+    expect(reviewStateLabel(row)).toBe("En revisión por Agus");
+    expect(reviewActionLabel(row)).toBeNull();
+    expect(reviewActionLabel({ ...row, reviewer_is_current_user: true })).toBe("Continuar");
+    expect(reviewStateLabel({ ...row, state: "approved" })).toBe("Aprobada");
+    expect(reviewActionLabel({ ...row, state: "approved" })).toBeNull();
+    expect(reviewActionLabel({ ...row, state: "approved" }, "final")).toBe("Ver video");
+  });
+  it("does not assign the previous reviewer to an unreviewed row", () => {
+    expect(reviewStateLabel({ state: "ready", reviewer_name: "Agus" })).toBe("Sin cambios humanos registrados");
+  });
+  it("opens approved lyrics in the editor and preserves the return filter", () => {
+    expect(reviewDestination({ job_id: "a/b", state: "approved" }, "/admin/cola?scope=approved"))
+      .toBe("/review/a%2Fb?return_to=%2Fadmin%2Fcola%3Fscope%3Dapproved");
+  });
+  it.each(["approved", "exported"])("keeps %s final video navigation separate", (state) => {
+    const row = { job_id: "video", state };
+    expect(reviewDestination(row, "/campaigns/c1?stage=final", "final"))
+      .toBe("/videos/video?return_to=%2Fcampaigns%2Fc1%3Fstage%3Dfinal");
+    expect(reviewActionLabel(row, "final")).toBe("Ver video");
+    expect(reviewDestination(row, "/campaigns/c1", "lyrics")).toContain("/review/video?");
+  });
+  it("rejects status filters that would silently override an approvals tab", () => {
+    expect(reviewStateFilter("ready", "approved")).toBe("");
+    expect(reviewStateFilter("approved", "pending")).toBe("");
+    expect(reviewStateFilter("failed", "all")).toBe("failed");
+  });
+  it.each(["/admin/cola?scope=approved", "/campaigns/test?tab=approved&q=hola"])("allows reviewer return %s", (path) => {
+    expect(safeReviewReturnPath(path)).toBe(path);
+  });
+  it.each(["https://evil.test", "//evil.test", "/\\evil.test", "/admin/cola-evil", "/admin/settings", "javascript:alert(1)"])("rejects unrelated return %s", (path) => {
+    expect(safeReviewReturnPath(path)).toBeNull();
+  });
+});

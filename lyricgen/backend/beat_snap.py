@@ -162,10 +162,18 @@ def snap_segments(segs: list[dict], beats: list[float], *,
 
 
 def apply(audio_path: str, segs: list[dict], *,
-          window_ms: int | None = None) -> list[dict]:
+          window_ms: int | None = None, capture=None) -> list[dict]:
     """Detect beats and snap, behind BEAT_SNAP_ENABLED. One-shot helper for
     the pipeline; returns originals on any failure."""
+    def observe(value):
+        if capture is not None:
+            try:
+                capture(value)
+            except Exception:
+                pass
+
     if not is_enabled() or not segs or not audio_path:
+        observe({"status": "skipped"})
         return segs
     if window_ms is None:
         try:
@@ -174,8 +182,10 @@ def apply(audio_path: str, segs: list[dict], *,
             window_ms = _DEFAULT_WINDOW_MS
     result = detect_beats(audio_path)
     if result is None:
+        observe({"status": "unavailable"})
         return segs
     bpm, beats = result
+    observe({"status": "detected", "bpm": bpm, "beats": beats, "window_ms": window_ms})
     snapped = snap_segments(segs, beats, window_ms=window_ms)
     moved = sum(1 for a, b in zip(segs, snapped)
                 if float(a.get("start", 0)) != float(b.get("start", 0)))

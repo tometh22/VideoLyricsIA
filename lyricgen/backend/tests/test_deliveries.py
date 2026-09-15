@@ -292,6 +292,83 @@ def test_portal_items_lists_active_deliveries(client, admin_token, approved_job,
     assert len(v["files"]) == 5
 
 
+def test_chile_portal_does_not_expose_non_chile_delivery(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The Chile surface only exposes rows explicitly sent to Chile.
+
+    The fixture is published with the default Argentina destination, which
+    Chile must not inherit even when both portals use the same token.
+    """
+    client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    res = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    )
+    assert res.status_code == 200
+    assert not any(
+        song["artist"] == "Test Artist" for song in res.json()["songs"]
+    )
+
+
+def test_same_job_can_be_published_to_both_portals(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The destination is part of the delivery identity, not the job.
+
+    This is the regression test for the admin workflow: a video sent first to
+    Argentina must remain independently publishable to Chile.
+    """
+    argentina = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    chile = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert argentina.status_code == 200, argentina.text
+    assert chile.status_code == 200, chile.text
+    assert argentina.json()["portal_id"] == "argentina"
+    assert chile.json()["portal_id"] == "chile"
+    assert argentina.json()["delivery_id"] != chile.json()["delivery_id"]
+
+    argentina_items = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "argentina"},
+    ).json()
+    chile_items = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    ).json()
+    assert any(song["artist"] == "Test Artist" for song in argentina_items["songs"])
+    assert any(song["artist"] == "Test Artist" for song in chile_items["songs"])
+
+    status = client.get(
+        f"/status/{approved_job.job_id}", headers=auth(admin_token),
+    ).json()
+    assert set(status["umg_portals"]) == {"argentina", "chile"}
+
+
+def test_chile_publish_accepts_source_from_any_tenant(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The selected Chile destination, not the source tenant, controls visibility."""
+    res = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert res.status_code == 200, res.text
+    items = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    ).json()
+    assert any(song["artist"] == "Test Artist" for song in items["songs"])
+
+
 def test_portal_can_delete(client, admin_token, approved_job, all_r2_files_present):
     # Publish first
     res = client.post(
@@ -614,3 +691,436 @@ def test_media_token_404_cuando_el_entregable_no_existe(
     res = client.get(f"/media-token/{approved_job.job_id}/video",
                      headers=auth(admin_token))
     assert res.status_code == 200, res.text
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Ciclo de vida de una corrección: editar → publicar → el cliente revisa.
+#
+# El portal reconstruye la key de R2 y la firma, y el render escribe en esa
+# misma key. Así que una corrección llega al cliente sin link nuevo — lo que
+# queremos — y sin rastro en ninguna fila: mismo label, misma fecha, misma
+# pastilla verde de "aprobado" sobre un corte que nunca vio. Estos tests
+# fijan las dos consecuencias que se vieron en producción.
+# ───────────────────────────────────────────────────────────────────────────
+
+def _edit_the_render(db, job):
+    """Simula lo que deja un re-render de edición en la fila del job.
+
+    run_edit_pipeline archiva los entregables previos, re-sube el MP4 e
+    invalida las keys del ProRes; el prewarm las reescribe cuando el master
+    fresco está arriba. Reproducir esa forma es lo que hace verificable el
+    estado intermedio.
+    """
+    job.edit_count = (job.edit_count or 0) + 1
+    job.segments_revision = (job.segments_revision or 0) + 1
+    job.previous_versions = (job.previous_versions or []) + [{
+        "version": len(job.previous_versions or []) + 1,
+        "archived_at": datetime.now(timezone.utc).isoformat(),
+        "keys": {"video": "default/testjob12345/lyric_video.mp4.v1"},
+    }]
+    db.commit()
+
+
+def test_stale_prores_blocks_publication_instead_of_shipping_a_mismatched_pair(
+    client, admin_token, approved_job, db,
+):
+    """El .mov PRE-EDIT sigue en su key y contesta el HEAD.
+
+    Con la sola prueba de existencia el gate daba OK y el portal entregaba
+    el master viejo al lado del MP4 nuevo (incidente 2026-08-03). El oráculo
+    es la fila: el edit borró s3_keys["umg_master"] y el prewarm todavía no
+    la reescribió.
+    """
+    approved_job.s3_keys = {
+        "video": "default/testjob12345/lyric_video.mp4",
+        "short": "default/testjob12345/short.mp4",
+        "thumbnail": "default/testjob12345/thumbnail.jpg",
+        "umg_short": "default/testjob12345/umg_short.mov",
+    }
+    _edit_the_render(db, approved_job)
+
+    with (
+        # TODOS los objetos están en R2 — incluido el master viejo.
+        patch("main.storage.object_exists", return_value=True),
+        patch(
+            "main.enqueue_prores_prewarm",
+            side_effect=lambda _job_id, file_type, *, force=False: f"rq:{file_type}",
+        ) as enqueue,
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={},
+        )
+
+    assert res.status_code == 202, res.text
+    body = res.json()
+    assert body["status"] == "preparing_prores"
+    assert body["stale"] == ["umg_master"]
+    assert body["missing"] == ["umg_master"]
+    enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True)
+
+
+def test_publishing_a_corrected_cut_reopens_the_client_review(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Contenido nuevo = versión nueva, aprobación de baja, pedido cerrado.
+
+    Los tres eran manuales o no existían: el cliente veía su pedido
+    "pendiente" y su propia pastilla verde sobre una corrección que nunca
+    revisó, sin nada que lo invitara a volver a bajar el archivo.
+    """
+    from database import Delivery, DeliveryChangeRequest
+
+    first = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["revision"] == 1
+    delivery_id = first.json()["delivery_id"]
+
+    # El cliente aprueba y después pide un cambio sobre esa versión.
+    assert client.post(
+        f"/api/deliveries/{delivery_id}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+    ).status_code == 200
+    with patch("main.emails.send_umg_change_request_notification"):
+        cr_id = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": "falta una línea en el estribillo"},
+        ).json()["id"]
+
+    _edit_the_render(db, approved_job)
+
+    second = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert second.status_code == 200, second.text
+    body = second.json()
+    assert body["replaced"] is True
+    assert body["content_changed"] is True
+    assert body["revision"] == 2
+    assert body["resolved_change_requests"] == [cr_id]
+
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    db.refresh(row)
+    assert row.published_revision == 2
+    assert row.content_updated_at is not None
+    # La aprobación era sobre el corte anterior: el portal vuelve a ofrecer
+    # Aprobar / Rechazar sin tocar nada del lado del cliente.
+    assert row.approved_at is None
+    assert row.approved_by_label is None
+
+    cr = db.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
+    db.refresh(cr)
+    assert cr.resolved_at is not None
+    assert cr.resolved_by_revision == 2
+    assert cr.resolution_source == "publication"
+
+
+def test_resending_the_same_cut_keeps_the_approval_and_the_open_request(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """El contrapeso del test anterior.
+
+    Si un reenvío contara como versión nueva, cada doble clic anularía una
+    aprobación legítima de UMG y les pediría revisar de nuevo algo idéntico.
+    """
+    from database import Delivery, DeliveryChangeRequest
+
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    client.post(
+        f"/api/deliveries/{delivery_id}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+    )
+    with patch("main.emails.send_umg_change_request_notification"):
+        cr_id = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": "consulta, no cambio"},
+        ).json()["id"]
+
+    again = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["content_changed"] is False
+    assert again.json()["revision"] == 1
+    assert again.json()["resolved_change_requests"] == []
+
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    db.refresh(row)
+    assert row.published_revision == 1
+    assert row.approved_at is not None
+
+    cr = db.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
+    db.refresh(cr)
+    assert cr.resolved_at is None
+
+
+def test_a_row_published_before_fingerprints_existed_keeps_its_approval(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Migración: filas viejas no tienen con qué comparar.
+
+    Tratarlas como contenido nuevo habría dado de baja, de una sola vez,
+    todas las aprobaciones vigentes del portal.
+    """
+    from database import Delivery
+
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    client.post(
+        f"/api/deliveries/{delivery_id}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+    )
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    row.published_render_fingerprint = None
+    db.commit()
+
+    _edit_the_render(db, approved_job)
+    again = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert again.json()["content_changed"] is False
+    db.refresh(row)
+    assert row.approved_at is not None
+
+
+def test_portal_listing_tells_the_client_there_is_a_new_version(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Sin estos campos el cliente no tenía UN indicio de que el archivo
+    detrás de su descarga cambió: mismo label, misma fecha, mismo peso
+    (cacheado 30 días) y su propia aprobación intacta."""
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    client.post(
+        f"/api/deliveries/{delivery_id}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+    )
+
+    _edit_the_render(db, approved_job)
+    client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+
+    items = client.get(
+        "/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN},
+    ).json()
+    version = next(
+        v for song in items["songs"] for v in song["versions"]
+        if v["delivery_id"] == delivery_id
+    )
+    assert version["revision"] == 2
+    assert version["content_updated_at"] is not None
+    assert version["awaiting_review"] is True
+    assert version["approved_at"] is None
+    # Publicar cierra la ventana de "se están aplicando cambios".
+    assert version["updating"] is False
+
+
+def test_requesting_a_re_render_marks_the_publication_as_updating(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """La ventana honesta: desde que se pide el re-render, el portal deja de
+    presentar la descarga como final. El MP4 se reemplaza minutos antes que
+    el master, así que el aviso tiene que empezar antes, no después."""
+    from database import Delivery
+
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+
+    # Sin entregables trackeados no hay nada publicado que marcar; con
+    # s3_keys el /retry sabe que sí.
+    approved_job.s3_keys = {"video": "default/testjob12345/lyric_video.mp4"}
+    approved_job.input_r2_key = "inputs/default/testjob12345/song.mp3"
+    approved_job.status = "error"
+    db.commit()
+
+    with patch("main.enqueue_pipeline", return_value="rq:1"):
+        retry = client.post(
+            f"/retry/{approved_job.job_id}", headers=auth(admin_token),
+        )
+    assert retry.status_code in (200, 202), retry.text
+
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    db.refresh(row)
+    assert row.stale_since is not None
+    assert row.stale_reason == "editing"
+
+    items = client.get(
+        "/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN},
+    ).json()
+    version = next(
+        v for song in items["songs"] for v in song["versions"]
+        if v["delivery_id"] == delivery_id
+    )
+    assert version["updating"] is True
+    assert version["updating_reason"] == "editing"
+
+
+def test_a_dead_re_render_stops_promising_the_client_work_in_progress(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Si el edit muere, la fila sigue marcada para el operador pero el
+    portal deja de decir "estamos aplicando cambios": prometerle trabajo en
+    curso a un cliente cuando nadie está trabajando es peor que no decir
+    nada, y no tiene forma de destrabarse solo."""
+    from database import Delivery
+
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    row.stale_since = datetime.now(timezone.utc)
+    row.stale_reason = "edit_failed"
+    db.commit()
+
+    version = next(
+        v for song in client.get(
+            "/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN},
+        ).json()["songs"] for v in song["versions"]
+        if v["delivery_id"] == delivery_id
+    )
+    assert version["updating"] is False
+    # El operador sí lo ve: el motivo viaja igual.
+    assert version["updating_reason"] == "edit_failed"
+
+
+def test_stale_master_without_a_prores_spec_says_what_is_actually_wrong(
+    client, admin_token, approved_job, db,
+):
+    """Los dos casos frenan, pero no significan lo mismo.
+
+    Entrega 289 (2026-09-15): `delivery_profile="youtube"` y `umg_spec` en
+    JSON null sobre un job que YA se entregó como UMG y cuyo master de 4,3 GB
+    sigue descargable, del corte anterior. Decirle al operador "este video fue
+    generado sólo para YouTube" lo manda a buscar el problema al lugar
+    equivocado mientras el cliente se lleva el archivo viejo.
+    """
+    approved_job.umg_spec = None
+    approved_job.delivery_profile = "youtube"
+    approved_job.s3_keys = {
+        "video": "default/testjob12345/lyric_video.mp4",
+        "short": "default/testjob12345/short.mp4",
+        "thumbnail": "default/testjob12345/thumbnail.jpg",
+    }
+    _edit_the_render(db, approved_job)
+
+    with (
+        # El .mov viejo sigue en R2 y contesta el HEAD.
+        patch("main.storage.object_exists", return_value=True),
+        patch("main.enqueue_prores_prewarm") as enqueue,
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={},
+        )
+
+    assert res.status_code == 409, res.text
+    detail = res.json()["detail"]
+    assert detail["code"] == "prores_stale_without_spec"
+    assert detail["stale"] == ["umg_master", "umg_short"]
+    assert "ANTES de la edición" in detail["message"]
+    # No se encola nada: sin spec no hay con qué transcodificar.
+    enqueue.assert_not_called()
+
+
+def test_republishing_does_not_rename_the_delivery(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Visto en vivo al reparar la entrega 289 (2026-09-15).
+
+    `_compute_default_delivery_label` cuenta las entregas activas de esa
+    canción, y la fila que se está actualizando se cuenta a sí misma: publicar
+    de nuevo rebautizaba "Campaña" como "Opción 2" — una segunda opción que no
+    existe, en la pantalla del cliente. Con "Publicar actualización" como
+    botón, pasaría en cada corrección.
+    """
+    from database import Delivery
+
+    first = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"label": "Campaña"},
+    )
+    assert first.status_code == 200, first.text
+    delivery_id = first.json()["delivery_id"]
+    assert first.json()["label"] == "Campaña"
+
+    _edit_the_render(db, approved_job)
+    again = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["label"] == "Campaña"
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    db.refresh(row)
+    assert row.label == "Campaña"
+
+    # Un label explícito sigue mandando.
+    renamed = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"label": "Renderizado v3"},
+    )
+    assert renamed.json()["label"] == "Renderizado v3"
+
+
+def test_a_genuinely_new_delivery_still_gets_opcion_n(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """El contrapeso: la convención de "Opción N" es para una entrega nueva de
+    la misma canción, y esa sí tiene que numerarse."""
+    client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    # Otro job, misma canción y artista: es una segunda opción de verdad.
+    from database import Job
+    me = client.get("/auth/me", headers=auth(admin_token)).json()
+    sibling = Job(
+        job_id="testjob54321", user_id=me["id"], tenant_id="default",
+        artist=approved_job.artist, song_title=approved_job.song_title,
+        filename="test.mp3", status="done", delivery_profile="umg",
+        umg_spec={"frame_size": "HD", "fps": 24.0, "prores_profile": 3},
+        approved_by=me["id"], approved_at=datetime.now(timezone.utc),
+        video_url="/download/testjob54321/video",
+        short_url="/download/testjob54321/short",
+        thumbnail_url="/download/testjob54321/thumbnail",
+    )
+    db.add(sibling)
+    db.commit()
+    try:
+        res = client.post(
+            f"/admin/deliveries/from-job/{sibling.job_id}",
+            headers=auth(admin_token), json={},
+        )
+        assert res.status_code == 200, res.text
+        assert res.json()["label"] == "Opción 2"
+    finally:
+        from database import Delivery, DeliveryChangeRequest
+        ids = [d.id for d in db.query(Delivery).filter(Delivery.job_id == "testjob54321").all()]
+        if ids:
+            db.query(DeliveryChangeRequest).filter(
+                DeliveryChangeRequest.delivery_id.in_(ids)
+            ).delete(synchronize_session=False)
+        db.query(Delivery).filter(Delivery.job_id == "testjob54321").delete()
+        db.query(Job).filter(Job.job_id == "testjob54321").delete()
+        db.commit()

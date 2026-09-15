@@ -73,18 +73,18 @@ export async function installEditorHarness(page, options = {}) {
   let sourceAudioRequests = 0;
   const audioBytes = createSyntheticWav();
 
-  await page.addInitScript(({ token }) => {
-    localStorage.clear();
-    sessionStorage.clear();
+  await page.addInitScript(({ token, role, preserveStorage }) => {
+    if (!preserveStorage || !sessionStorage.getItem("e2e-initialized")) { localStorage.clear(); sessionStorage.clear(); }
+    sessionStorage.setItem("e2e-initialized", "1");
     localStorage.setItem("genly_token", token);
     localStorage.setItem("genly_lang", "es");
     localStorage.setItem("genly_user", JSON.stringify({
       id: "e2e-user",
       email: "e2e@example.test",
       name: "E2E Operator",
-      role: "user",
+      role,
     }));
-  }, { token: authToken() });
+  }, { token: authToken(), role: options.role || "user", preserveStorage: !!options.preserveStorage });
 
   await page.route("**/*", async (route) => {
     const request = route.request();

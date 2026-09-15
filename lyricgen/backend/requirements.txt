@@ -11,6 +11,12 @@ cryptography>=46.0.7,<51.0.0
 passlib[bcrypt]>=1.7.4,<2.0.0
 bcrypt<4.1
 openai-whisper
+# stable-ts: alineado forzado LOCAL sobre el mismo Whisper de arriba —
+# último testigo acústico de la cascada de `_maybe_anchor_align` cuando
+# CTC, el alineador hosted y Whisper-DP declinan (job 18dc85ecd8d6,
+# 15-sep). Ver lyrics_local_forced_align.py. Sin dependencias nuevas:
+# se apoya en openai-whisper y torch, que ya estaban.
+stable-ts>=2.19.0,<3.0.0
 openai>=1.50.0,<2.0.0
 # Forced alignment (Rotor-grade timing): aligns known lyrics to the user's
 # audio via a hosted model. See forced_align.py. Behind FORCED_ALIGNER_ENABLED.
@@ -51,7 +57,7 @@ rq==1.16.2
 # retry/failure-callback wiring without a real Redis instance.
 fakeredis==2.26.2
 boto3==1.35.0
-sentry-sdk[fastapi]==2.14.0
+sentry-sdk[fastapi]==2.69.1
 slowapi==0.1.9
 psutil>=5.9.0,<7.0.0
 # --- Genly CTC timing engine (ctc_align.py, gated CTC_ALIGN_ENABLED) ---

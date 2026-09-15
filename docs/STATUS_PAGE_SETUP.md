@@ -1,9 +1,96 @@
-# Status page público — setup en 10 min
+# Status page
 
 > Cuando hay outage, los clientes van a buscar dónde verificar si es
 > ellos o nosotros. Sin status page, asumen que es su problema y nos
-> escriben. Con status page público en `status.genly.pro`, ven la luz
-> roja directo y saben que estamos al tanto.
+> escriben. Con una status page pública ven la luz roja directo y saben
+> que estamos al tanto.
+
+## Estado actual: la página propia YA EXISTE
+
+Desde sep-2026 hay una página de status **propia**, en `/status` del
+frontend. No hace falta contratar nada para tenerla.
+
+| | Página propia (`/status`) | BetterStack (abajo) |
+|---|---|---|
+| Incidentes redactados a mano | ✅ desde Admin → Ahora → Estado público | ✅ |
+| Barra de aviso en la home del producto | ✅ | ❌ |
+| Detecta caídas sola | ✅ (sondas internas de `/health`) | ✅ |
+| Sirve si se cae **todo** (Vercel + Railway) | ❌ | ✅ |
+| Manda el mail cuando prod no contesta | ❌ | ✅ (y `uptime.yml` ya lo hace) |
+
+Las dos se complementan y no compiten: **una página propia no puede
+reportar su propia caída total.** El backstop para ese caso es la sonda
+externa —hoy `.github/workflows/uptime.yml`, que corre en infra de GitHub
+cada 5 min y manda mail— o BetterStack si algún día se quiere sub-minuto
+multi-región.
+
+### Cómo funciona la propia
+
+- **Frontend:** `src/components/StatusPage.jsx` (ruta pública `/status`,
+  sin JWT) + `src/components/ServiceStatusBanner.jsx` (la barra de la home
+  y de la landing) + `src/hooks/useServiceStatusSummary.js` (un solo poll
+  compartido, cada 60 s).
+- **Backend:** `backend/status_page.py`. Endpoints públicos bajo
+  `/service-status` (el prefijo NO es `/status` porque `/status/{job_id}`
+  ya existe para el polling de un job) y de admin bajo `/admin/status`.
+- **Dos fuentes independientes.** El relato humano (`status_incidents` +
+  `status_incident_updates`) y la sonda (`derive_components` sobre
+  `health_snapshot()`). El indicador general es el peor de los dos.
+- **Lo que la sonda NO publica:** el skew de release entre API y workers
+  (`mixed_worker_releases`, `worker_fleet_incoherent`) y `disk_low`. Pasan
+  en cada deploy y no cambian nada para el usuario; publicarlos dejaría la
+  página amarilla después de cada merge.
+- **Barras de 90 días.** Se calculan sobre tramos OBSERVADOS
+  (`status_component_events`). Un día sin observaciones sale **gris, no
+  verde**, y el `uptime_pct` viene siempre con su `coverage_pct`. Las
+  observaciones las genera cualquier visita a `/service-status/*` más el
+  latido de 5 min de `uptime.yml` (`_heartbeat_status_page`): si ese
+  workflow se apaga, las barras se vuelven grises — que es la respuesta
+  correcta, no un bug.
+
+### Publicar un incidente
+
+Admin → **Ahora** → **Estado público**. Se redacta título + primera
+actualización, se marcan los servicios afectados y el impacto, y hay
+preview del texto exacto que va a ver el cliente antes de publicar.
+
+Reglas que impone el backend, no la UI:
+- El timeline es **append-only**. No hay endpoint para editar una entrada
+  publicada; corregir = publicar otra.
+- Cambiar el estado (investigando → identificado → resuelto) **exige**
+  texto: no se puede dejar la página en "En observación" sin contar qué
+  se arregló.
+- `banner` es independiente de `status`: se puede tener un incidente
+  publicado en `/status` sin barra en la home (mantenimiento anunciado),
+  y `public=false` conserva el registro interno sin publicarlo.
+- Resolver apaga la barra. Re-resolver no mueve el `resolved_at`
+  original, que es la ventana que usa el historial de uptime.
+
+### Config
+
+| Env var | Default | Para qué |
+|---|---|---|
+| `STATUS_AUTO_BANNER_MIN` | `partial_outage` | Estado mínimo de la sonda para que la barra aparezca SOLA, sin incidente redactado. En `degraded` un backlog de cola pintaría la home de amarillo. |
+| `STATUS_TRANSCRIPTION_BACKLOG_DEGRADED` | `80` | Profundidad de cola de transcripción que se reporta como demoras. Arriba del lote típico de UMG (30-60) a propósito. |
+| `STATUS_RENDER_BACKLOG_DEGRADED` | `80` | Idem para las colas de render. |
+
+### Lo que NO tiene
+
+- **Suscripción por email a las novedades** ("Subscribe to updates" de las
+  páginas de OpenAI/Atlassian). Requiere tabla de suscriptores, doble
+  opt-in y baja — no está construido y la página no lo ofrece, en vez de
+  ofrecer un botón que no hace nada.
+- **Dominio propio** `status.genly.pro`. Hoy la URL es `<app>/status`. Un
+  CNAME a Vercel con la misma app la serviría, pero es una decisión de DNS
+  aparte.
+
+---
+
+## Opción externa: BetterStack
+
+Sigue siendo el camino recomendado para la sonda multi-región y el
+backstop de la caída total. Nada de lo de abajo choca con la página
+propia: son monitores externos.
 
 ## Provider elegido: BetterStack (free tier alcanza)
 
@@ -87,18 +174,13 @@ GoDaddy es donde están los nameservers (`ns71.domaincontrol.com`):
 
 ## Paso 5 — Linkear desde el frontend
 
-Agregar en el footer del frontend (`lyricgen/frontend/src/App.jsx`) o
-en el menú de usuario:
+YA HECHO para la página propia: el link vive en el footer de la landing y
+en el punto de estado del pie del sidebar (que además refleja el estado
+real — hasta sep-2026 estaba hardcodeado en verde y decía "Sistema
+operativo" incluso durante una caída total).
 
-```jsx
-<a href="https://status.genly.pro" target="_blank" rel="noopener"
-   className="text-xs text-ink-tertiary hover:text-white">
-  Estado del servicio
-</a>
-```
-
-Razón: cuando un usuario ve un error, el primer click natural es
-"¿el servicio anda?". Que la respuesta esté a un click visible.
+Si algún día se contrata BetterStack con dominio propio, apuntar esos dos
+links a `https://status.genly.pro` en vez de a la ruta interna.
 
 ## Verificación final
 

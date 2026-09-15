@@ -65,20 +65,21 @@ def persist_windows(plan: dict) -> None:
         db.close()
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("job_id")
-    parser.add_argument("--execute", action="store_true")
-    args = parser.parse_args()
-    plan = plan_job(args.job_id)
+def _text_operator_suggestions_enabled() -> bool:
+    return os.environ.get(
+        "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def run_plan(plan: dict, *, execute: bool) -> int:
     print(
         f"job={plan['job_id']} revision={plan['revision']} "
-        f"windows={len(plan['windows'])} mode={'execute' if args.execute else 'dry-run'}"
+        f"windows={len(plan['windows'])} mode={'execute' if execute else 'dry-run'}"
     )
-    if not plan["windows"]:
+    if not plan["windows"] and not _text_operator_suggestions_enabled():
         print("nothing_to_enqueue")
         return 2
-    if not args.execute:
+    if not execute:
         return 0
     import queue_jobs
     if not queue_jobs.transcription_quality_queue_enabled():
@@ -104,6 +105,23 @@ def main() -> int:
         print(f"enqueue_failed={str(rq_id).split(':', 1)[0]}")
         return 3
     return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("job_ids", nargs="+")
+    parser.add_argument("--execute", action="store_true")
+    args = parser.parse_args()
+    failures = 0
+    for job_id in args.job_ids:
+        try:
+            failures += int(run_plan(plan_job(job_id), execute=args.execute) != 0)
+        except Exception as exc:
+            # A stale/missing song must not prevent the remaining replay wave.
+            print(f"job={job_id} failed={type(exc).__name__}")
+            failures += 1
+    print(f"summary total={len(args.job_ids)} failed={failures}")
+    return 3 if failures else 0
 
 
 if __name__ == "__main__":

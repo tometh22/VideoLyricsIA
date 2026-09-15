@@ -3,12 +3,122 @@
 // El operador filtra pending/resolved/all (chips con badge), ve el contexto
 // del delivery (artista, canción, label, frame_size, tenant, owner), un
 // preview del video clickeable, el comentario, y resuelve / reabre.
+//
+// Y, desde 2026-09-15, ve el ciclo completo en la misma tarjeta. El portal
+// no guarda el archivo: reconstruye la key de R2 y la firma, así que un
+// re-render reemplaza la descarga del cliente EN SU LUGAR. Eso volvía
+// inverificable la única pregunta que importa después de corregir — "¿lo
+// que el cliente puede bajar ahora es lo que arreglé?" — y obligaba a ir a
+// la campaña, buscar la canción en Aprobadas, editar, y acordarse de volver
+// acá a tildar el pedido. Los tres pasos viven acá:
+//
+//   1. Editar letra    → abre el editor de esa canción.
+//   2. Publicar        → sube la versión al portal. El backend detecta que
+//                        el render cambió, baja la aprobación vieja (el
+//                        cliente vuelve a ver "Aprobar") y cierra este
+//                        pedido solo.
+//   3. Marcar resuelto → sigue estando, para lo que se contesta sin
+//                        re-renderizar (una aclaración, un pedido que se
+//                        descarta).
 import { useState } from "react";
 
-import { fmtDate } from "../../adminApi";
+import { fmtDate, fmtAgo } from "../../adminApi";
 import FilterBar from "../../primitives/FilterBar";
 import EmptyState from "../../primitives/EmptyState";
 import TableSkeleton from "../../primitives/TableSkeleton";
+
+const PORTAL_LABELS = { argentina: "UMG Argentina", chile: "UMG Chile" };
+
+// Estados en los que el job está re-renderizando: publicar ahora no tiene
+// sentido porque los archivos se están por reemplazar.
+const BUSY_JOB_STATUSES = new Set([
+  "queued", "processing", "rendering", "editing", "transcribed_pending",
+]);
+
+/**
+ * Traduce el bloque `publication` del backend a UNA frase y un tono.
+ *
+ * El orden importa: es el orden en que los problemas bloquean al operador.
+ * Primero lo que impide publicar (render en curso, master desfasado),
+ * después lo que falta hacer (publicar), y recién al final los estados de
+ * reposo (esperando al cliente / aprobado).
+ */
+export function publicationStatus(publication) {
+  if (!publication) {
+    return {
+      tone: "idle",
+      title: "Sin publicación activa en el portal",
+      detail: "Esta entrega no está publicada o fue dada de baja.",
+      canPublish: false,
+    };
+  }
+  const revision = publication.revision || 1;
+  const prores = publication.prores_pending || [];
+
+  if (BUSY_JOB_STATUSES.has(publication.job_status)) {
+    return {
+      tone: "busy",
+      title: "Re-renderizando",
+      detail:
+        "Mientras tanto el portal sigue entregando la versión anterior. " +
+        "Cuando termine, publicá la actualización desde acá.",
+      canPublish: false,
+    };
+  }
+  if (prores.length) {
+    return {
+      tone: "wait",
+      title: "El master ProRes todavía es el corte anterior",
+      detail:
+        "El MP4 ya está corregido. El master de broadcast se transcodifica " +
+        "aparte y todavía no terminó: publicar ahora entregaría un par " +
+        "desparejo. Tocá publicar para encolarlo y reintentá en un minuto.",
+      canPublish: true,
+      publishLabel: "Preparar master y publicar",
+    };
+  }
+  if (publication.needs_publish) {
+    return {
+      tone: "warn",
+      title: "El portal todavía entrega el corte anterior",
+      detail:
+        "El video se re-renderizó después de la última publicación. " +
+        "Publicá la actualización para que el cliente la vea como versión nueva.",
+      canPublish: true,
+      publishLabel: "Publicar actualización",
+    };
+  }
+  if (publication.awaiting_review) {
+    return {
+      tone: "ok",
+      title: `Versión ${revision} publicada · esperando al cliente`,
+      detail: "El cliente todavía no aprobó esta versión en el portal.",
+      canPublish: false,
+    };
+  }
+  if (publication.approved_at) {
+    return {
+      tone: "ok",
+      title: `Versión ${revision} aprobada por ${publication.approved_by_label || "el cliente"}`,
+      detail: `Aprobada el ${fmtDate(publication.approved_at)}.`,
+      canPublish: false,
+    };
+  }
+  return {
+    tone: "ok",
+    title: `Versión ${revision} publicada`,
+    detail: "El portal está entregando este mismo corte.",
+    canPublish: false,
+  };
+}
+
+const TONE_STYLES = {
+  warn: "bg-amber-500/10 ring-amber-400/30 text-amber-100",
+  wait: "bg-amber-500/10 ring-amber-400/25 text-amber-100",
+  busy: "bg-brand/10 ring-brand/25 text-brand-light",
+  ok: "bg-emerald-500/10 ring-emerald-400/20 text-emerald-100",
+  idle: "bg-surface-2/40 ring-white/[0.06] text-gray-300",
+};
 
 export default function ChangeRequestsPanel({
   changeRequests,
@@ -20,6 +130,10 @@ export default function ChangeRequestsPanel({
   crResolvingId,
   resolveChangeRequest,
   reopenChangeRequest,
+  crPublishingId,
+  crPublishNotice,
+  dismissPublishNotice,
+  publishDeliveryUpdate,
 }) {
   // Draft local del input de "respuesta" por CR. Clave = id del CR.
   const [drafts, setDrafts] = useState({});
@@ -41,6 +155,23 @@ export default function ChangeRequestsPanel({
           label="Estado"
         />
       </FilterBar>
+
+      {crPublishNotice && (
+        <div
+          role="status"
+          className={`rounded-card p-3 text-caption ring-1 flex items-start justify-between gap-3 ${
+            TONE_STYLES[crPublishNotice.tone === "ok" ? "ok" : "wait"]
+          }`}
+        >
+          <span>{crPublishNotice.text}</span>
+          <button
+            onClick={dismissPublishNotice}
+            className="text-label opacity-70 hover:opacity-100 shrink-0"
+          >
+            Cerrar
+          </button>
+        </div>
+      )}
 
       {crLoading && changeRequests.length === 0 ? (
         <div className="glass rounded-card p-2">
@@ -70,8 +201,16 @@ export default function ChangeRequestsPanel({
               draft={drafts[item.id] || ""}
               onDraftChange={(v) => setDraft(item.id, v)}
               resolving={crResolvingId === item.id}
+              publishing={crPublishingId === item.id}
               onResolve={() => resolveChangeRequest(item.id, drafts[item.id])}
               onReopen={() => reopenChangeRequest(item.id)}
+              onPublish={() =>
+                publishDeliveryUpdate(
+                  item.delivery?.job_id,
+                  item.delivery?.portal_id,
+                  item.id,
+                )
+              }
             />
           ))}
         </div>
@@ -80,9 +219,16 @@ export default function ChangeRequestsPanel({
   );
 }
 
-function ChangeRequestCard({ item, draft, onDraftChange, resolving, onResolve, onReopen }) {
+function ChangeRequestCard({
+  item, draft, onDraftChange, resolving, publishing,
+  onResolve, onReopen, onPublish,
+}) {
   const d = item.delivery || {};
   const isResolved = !!item.resolved_at;
+  const status = publicationStatus(item.publication);
+  // Un pedido resuelto AL PUBLICAR no necesita que nadie confirme nada: la
+  // corrección ya está en el portal. Uno cerrado a mano sí se explica.
+  const closedByPublication = item.resolution_source === "publication";
 
   return (
     <div
@@ -101,6 +247,7 @@ function ChangeRequestCard({ item, draft, onDraftChange, resolving, onResolve, o
           </h3>
           <div className="flex items-center gap-2 mt-1 flex-wrap text-label text-gray-500">
             {d.label && <span>{d.label}</span>}
+            {d.portal_id && (<><span>·</span><span>{PORTAL_LABELS[d.portal_id] || d.portal_id}</span></>)}
             {d.frame_size && (<><span>·</span><span className="text-brand-light">{d.frame_size}</span></>)}
             {d.job_id && (<><span>·</span><span className="font-mono">job {d.job_id}</span></>)}
             {d.tenant && (<><span>·</span><span>{d.tenant}</span></>)}
@@ -122,6 +269,17 @@ function ChangeRequestCard({ item, draft, onDraftChange, resolving, onResolve, o
         >
           {isResolved ? "Resuelto" : "Pendiente"}
         </span>
+      </div>
+
+      {/* Estado real de lo que el cliente puede descargar ahora mismo. */}
+      <div className={`rounded-button ring-1 p-3 mb-3 ${TONE_STYLES[status.tone]}`}>
+        <p className="text-caption font-semibold">{status.title}</p>
+        <p className="text-label opacity-80 mt-0.5 leading-relaxed">{status.detail}</p>
+        {item.publication?.stale_since && (
+          <p className="text-label opacity-70 mt-1">
+            Cambios en curso desde {fmtAgo(item.publication.stale_since)}.
+          </p>
+        )}
       </div>
 
       {/* Preview: thumbnail clickeable que abre el video en pestaña nueva. */}
@@ -164,8 +322,12 @@ function ChangeRequestCard({ item, draft, onDraftChange, resolving, onResolve, o
       {isResolved ? (
         <div className="mt-3 pt-3 border-t border-white/[0.06] flex items-start justify-between gap-3 flex-wrap">
           <div className="text-label text-gray-400 min-w-0">
-            <span className="text-emerald-300 font-medium">Resuelto</span>
-            {item.resolved_by && <> por <b>{item.resolved_by}</b></>}
+            <span className="text-emerald-300 font-medium">
+              {closedByPublication
+                ? `Resuelto al publicar la versión ${item.resolved_by_revision}`
+                : "Resuelto"}
+            </span>
+            {!closedByPublication && item.resolved_by && <> por <b>{item.resolved_by}</b></>}
             {" "}el {fmtDate(item.resolved_at)}
             {item.resolution_note && (
               <p className="mt-1 text-gray-300 whitespace-pre-wrap">
@@ -183,23 +345,56 @@ function ChangeRequestCard({ item, draft, onDraftChange, resolving, onResolve, o
           </button>
         </div>
       ) : (
-        <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-2">
-          <input
-            type="text"
-            placeholder="Respuesta opcional (ej: re-renderizado con la línea corregida)"
-            value={draft}
-            onChange={(e) => onDraftChange(e.target.value)}
-            maxLength={2000}
-            className="bg-surface-3/40 ring-1 ring-white/[0.06] focus:ring-brand/40 focus:outline-none rounded-button px-3 py-2 text-caption text-white placeholder:text-gray-600 w-full"
-          />
-          <div className="flex justify-end">
-            <button
-              onClick={onResolve}
-              disabled={resolving}
-              className="bg-brand hover:bg-brand-light text-white text-caption font-medium px-3 py-1.5 rounded-button disabled:opacity-50 transition-colors duration-brand"
-            >
-              {resolving ? "Guardando…" : "Marcar resuelto"}
-            </button>
+        <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-3">
+          {/* Los dos pasos que realmente atienden el pedido. */}
+          <div className="flex flex-wrap items-center gap-2">
+            {d.job_id && (
+              <a
+                href={`/videos/${d.job_id}/edit-lyrics`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="bg-white/[0.07] hover:bg-white/[0.12] text-white text-caption font-medium px-3 py-1.5 rounded-button transition-colors duration-brand"
+              >
+                Editar letra
+              </a>
+            )}
+            {d.job_id && (
+              <button
+                onClick={onPublish}
+                disabled={publishing || !status.canPublish}
+                title={
+                  status.canPublish
+                    ? "Sube el corte actual al portal y cierra este pedido"
+                    : "No hay nada nuevo para publicar en este momento"
+                }
+                className="bg-brand hover:bg-brand-light text-white text-caption font-medium px-3 py-1.5 rounded-button disabled:opacity-40 disabled:cursor-not-allowed transition-colors duration-brand"
+              >
+                {publishing
+                  ? "Publicando…"
+                  : status.publishLabel || "Publicar actualización"}
+              </button>
+            )}
+          </div>
+
+          {/* Cierre manual, para lo que se contesta sin re-renderizar. */}
+          <div className="space-y-2">
+            <input
+              type="text"
+              placeholder="Respuesta opcional (ej: re-renderizado con la línea corregida)"
+              value={draft}
+              onChange={(e) => onDraftChange(e.target.value)}
+              maxLength={2000}
+              className="bg-surface-3/40 ring-1 ring-white/[0.06] focus:ring-brand/40 focus:outline-none rounded-button px-3 py-2 text-caption text-white placeholder:text-gray-600 w-full"
+            />
+            <div className="flex justify-end">
+              <button
+                onClick={onResolve}
+                disabled={resolving}
+                className="bg-white/[0.07] hover:bg-white/[0.12] text-white text-caption font-medium px-3 py-1.5 rounded-button disabled:opacity-50 transition-colors duration-brand"
+              >
+                {resolving ? "Guardando…" : "Marcar resuelto sin publicar"}
+              </button>
+            </div>
           </div>
         </div>
       )}

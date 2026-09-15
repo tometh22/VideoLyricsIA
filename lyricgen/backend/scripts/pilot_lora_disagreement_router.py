@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import statistics
+import sys
 from pathlib import Path
 from typing import Any, Iterable
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 TOKEN_RE = re.compile(r"[\wÀ-ÿ]+(?:['’][\wÀ-ÿ]+)?", re.UNICODE)
@@ -205,6 +209,18 @@ def main() -> int:
             args.diagnostic_evaluation,
         ),
     ], difficult_wer_threshold=args.difficult_wer_threshold)
+    # El piloto original mezcló 13 canciones de entrenamiento del adaptador en la
+    # cohorte "reconstructed"; el desacuerdo sobre audio memorizado no es la
+    # señal de runtime. El registro de roles corta eso acá.
+    from song_roles import filter_evaluable, role_split
+    song_ids = [str(row.get("song_id")) for row in report.get("songs_detail") or []]
+    _evaluable, train_songs = filter_evaluable(song_ids)
+    if train_songs:
+        raise SystemExit(
+            "abortado: el piloto incluye canciones de entrenamiento: "
+            + ", ".join(sorted(set(train_songs)))
+        )
+    report["cohort_role_split"] = role_split(song_ids)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n",

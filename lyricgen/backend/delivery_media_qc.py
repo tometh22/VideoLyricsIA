@@ -119,7 +119,7 @@ def inspect_delivery_media(
         for key in ("width", "height", "codec", "pix_fmt"):
             if spec.get(key) is not None and str(actual.get(key)) != str(spec[key]):
                 issues.append({
-                    "code": f"MEDIA_{key.upper()}_MISMATCH", "severity": "WARN",
+                    "code": f"MEDIA_{key.upper()}_MISMATCH", "severity": "FAIL",
                     "category": "technical", "summary": f"Especificación {key} distinta",
                     "description": f"Render: {actual.get(key)}; esperado: {spec[key]}.",
                     "actual": actual.get(key), "expected": spec[key],
@@ -127,7 +127,7 @@ def inspect_delivery_media(
         if spec.get("fps") is not None and actual["fps"] is not None:
             if abs(float(actual["fps"]) - float(spec["fps"])) > .02:
                 issues.append({
-                    "code": "MEDIA_FPS_MISMATCH", "severity": "WARN",
+                    "code": "MEDIA_FPS_MISMATCH", "severity": "FAIL",
                     "category": "technical", "summary": "Frame rate distinto",
                     "description": f"Render: {actual['fps']:.3f}; esperado: {float(spec['fps']):.3f}.",
                     "actual": actual["fps"], "expected": spec["fps"],

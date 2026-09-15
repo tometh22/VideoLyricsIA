@@ -5,6 +5,8 @@ import BrandLockup from "./BrandLockup";
 import GenlyLogo from "./GenlyLogo";
 import { IS_PRODUCTION, APP_ENV } from "../env";
 import UsageBadge from "./UsageBadge";
+import { useServiceStatusSummary } from "../hooks/useServiceStatusSummary";
+import { statusLabelKey, statusStyle } from "../lib/serviceStatus";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -38,6 +40,38 @@ function _isPlainLeftClick(e) {
   return e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
 }
 
+// Punto de estado del sistema, abajo del sidebar.
+//
+// Hasta ago-2026 este punto estaba HARDCODEADO en verde con el texto
+// "Sistema operativo": decía lo mismo durante un outage total. Un
+// indicador que no puede mostrar malas noticias no es un indicador, es
+// decoración —y encima entrenaba a no mirarlo—. Ahora lee el mismo
+// `/service-status/summary` que la barra de incidente (poll compartido) y
+// linkea a la página pública.
+//
+// Si el endpoint no contesta, se cae al texto neutro en gris en vez de
+// afirmar verde: no saber no es estar bien.
+function SystemStatusDot({ open }) {
+  const { t } = useI18n();
+  const summary = useServiceStatusSummary();
+  const indicator = summary?.indicator || "unknown";
+  const style = statusStyle(indicator);
+  const label = indicator === "operational"
+    ? t("nav.system_ok")
+    : (t(statusLabelKey(indicator)) || t("nav.system_ok"));
+
+  return (
+    <Link
+      to="/status"
+      className="app-sidebar__health"
+      title={`${label} — ${t("service_status.nav_link")}`}
+    >
+      <div className={`w-2 h-2 rounded-full ${style.dot}`} />
+      {open && <span className={indicator === "operational" ? "" : style.text}>{label}</span>}
+    </Link>
+  );
+}
+
 export default function Sidebar({ onNav, activeView, open, onToggle, user, onLogout }) {
   const { t } = useI18n();
   const [campaignsEnabled, setCampaignsEnabled] = useState(false);
@@ -62,13 +96,17 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
     });
   }
   if (user?.role === "admin") {
+    items.splice(3, 0, {
+      id: "review_queue", label: "Cola de revisión", path: "/admin/cola",
+      icon: <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h9" strokeLinecap="round"/><path d="M18 16l2 2 3-4" strokeLinecap="round" strokeLinejoin="round"/></svg>,
+    });
     items.push({
       id: "admin", label: "Admin", path: "/admin",
       icon: <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" strokeLinecap="round" strokeLinejoin="round"/></svg>,
     });
   }
   const groups = [
-    { label: t("sidebar.production"), items: items.filter((item) => ["dashboard", "new", "campaigns", "history"].includes(item.id)) },
+    { label: t("sidebar.production"), items: items.filter((item) => ["dashboard", "new", "campaigns", "review_queue", "history"].includes(item.id)) },
     { label: t("sidebar.workspace"), items: items.filter((item) => ["settings", "admin"].includes(item.id)) },
   ];
 
@@ -172,10 +210,7 @@ export default function Sidebar({ onNav, activeView, open, onToggle, user, onLog
 
       {/* User & logout */}
       <div className={`app-sidebar__footer ${open ? "" : "is-compact"}`}>
-        <div className="app-sidebar__health" title={t("nav.system_ok")}>
-          <div className="w-2 h-2 rounded-full bg-accent" />
-          {open && <span>{t("nav.system_ok")}</span>}
-        </div>
+        <SystemStatusDot open={open} />
         {user && (
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 min-w-0">
