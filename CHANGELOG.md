@@ -3,6 +3,15 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.34] - 2026-09-15
+
+### Added
+
+- Add 1×, 1.5× and 2× playback speeds to the lyrics editor audio toolbar,
+  preserving pitch and lyric timestamps while reviewing the advanced timeline.
+- Keep the selected speed across pauses and audio-source renewals, with
+  keyboard-accessible controls in Spanish, English and Portuguese.
+
 ## [1.1.33] - 2026-09-15
 
 ### Fixed
