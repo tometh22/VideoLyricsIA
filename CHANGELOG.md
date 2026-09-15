@@ -3,6 +3,19 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.18-trial.7] - 2026-09-15
+
+### Fixed
+
+- Plan adapted operator stories jointly into at most six distinct, ordered shots
+  instead of independently rewriting the complete story for every clip. Preserve
+  shared visual direction and per-shot camera choices; reject incomplete or
+  duplicate storyboards before spending on Veo.
+- Keep narrative scenes moving forward across repeated musical sections and
+  preserve their sequence during cache-only lyric edits and targeted regenerations.
+- Literal mode remains literal. No model, content-policy, retry-budget, customer
+  credit or expiry changes. Trial-only deployment and real visual acceptance required.
+
 ## [1.1.18-trial.6] - 2026-09-15
 
 ### Fixed

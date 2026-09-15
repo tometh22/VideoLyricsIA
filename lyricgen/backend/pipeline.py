@@ -13775,6 +13775,50 @@ def _parse_json_object(text: str) -> dict | None:
         return None
 
 
+def _apply_operator_storyboard(plan, operator_prompt, *, allow_people=False,
+                               atmospherics_policy=None, job_id=None):
+    """One shared plan replaces independent prompt rewrites, before any Veo spend."""
+    from google import genai
+    from provenance import record_ai_call
+    from scene_storyboard import storyboard_request, validate_shots
+
+    duration = int(os.environ.get("VEO_CLIP_SECONDS", "8") or "8")
+    system, user = storyboard_request(plan, operator_prompt, allow_people, duration)
+    if policy_enforces(atmospherics_policy) and not atmospherics_policy.get("allow_atmospherics"):
+        system += " " + ATMOSPHERIC_NEGATIVE_RAIL
+    recorder = record_ai_call(
+        job_id=job_id, step="scene_storyboard", tool_name="gemini-2.5-flash",
+        tool_provider="google_vertex", prompt=f"system:{system}\nuser:{user}",
+        input_data_types=["operator_prompt", "visual_bible", "scene_order"],
+    ) if job_id else None
+    try:
+        client = _get_genai_client()
+        response = _call_with_timeout(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash", contents=user,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system, temperature=0.3, max_output_tokens=3500,
+                    response_mime_type="application/json",
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+                ),
+            ), timeout_s=45.0, label="SCENES-STORYBOARD",
+        )
+        prompts = validate_shots(_parse_json_object(response.text or ""),
+                                 [s["recurrence_key"] for s in plan["scenes"]])
+        for scene in plan["scenes"]:
+            scene["prompt"] = sanitize_generated_text(
+                prompts[scene["recurrence_key"]], atmospherics_policy)
+        plan["narrative_sequence"] = True
+        plan["storyboard_version"] = 1
+        if recorder:
+            recorder.finish(response_summary=f"validated {len(prompts)} ordered shots")
+        return plan
+    except Exception as exc:
+        if recorder:
+            recorder.finish(response_summary=f"storyboard failed: {type(exc).__name__}")
+        raise
+
+
 def _make_scene_prompt_fn(lyrics_text, artist, song_title, genre, concept,
                           style, custom_colors, job_id, allow_people,
                           *, match_lyrics=True, operator_prompt=None,
@@ -14364,6 +14408,10 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
         background_hint
     )
     secs = _scenes.detect_sections(segments, audio_duration)
+    _joint_story = creative_mode == "prompt_improved" and bool((background_hint or "").strip())
+    if _joint_story:
+        from scene_storyboard import sequence_sections
+        secs = sequence_sections(secs)
     n_unique = len({s.recurrence_key for s in secs})
     logger.info("[SCENES] %d secciones, %d escenas únicas (canción %.0fs)",
                 len(secs), n_unique, audio_duration or 0.0)
@@ -14381,10 +14429,19 @@ def _generate_scene_background(segments: list[dict], audio_duration: float,
                                       bg_verbatim=bg_verbatim,
                                       creative_mode=creative_mode,
                                       atmospherics_policy=atmospherics_policy)
+    # Do not pay for six independent rewrites or fall back to six copies of the
+    # full story. The joint planner must validate every shot before Veo starts.
+    if _joint_story:
+        prompt_fn = lambda **kwargs: {"prompt": ""}
     plan = _scenes.build_scene_plan(secs, bible, prompt_fn, artist=artist,
                                     song_title=song_title, style=style_hint,
                                     operator_movement=_normalize_movement_style(movement_style),
                                     creative_mode=creative_mode)
+    if _joint_story:
+        plan = _apply_operator_storyboard(
+            plan, background_hint, allow_people=allow_people,
+            atmospherics_policy=atmospherics_policy, job_id=job_id,
+        )
     plan["generation_policy"] = {
         "policy_version": BACKGROUND_POLICY_VERSION,
         "creative_mode": creative_mode,
@@ -14491,7 +14548,10 @@ def _regenerate_scene_background(scene_plan: dict, recurrence_key: str, job_dir:
                                           atmospherics_policy=_scene_atmospherics)
         bible_text = _scenes._bible_to_prompt_fragment(scene_plan.get("bible") or {})
         base_hint = ". ".join(x for x in (
-            bible_text, target.get("narrative_context"), hint.strip(),
+            bible_text, target.get("narrative_context"),
+            ("Preserve this shot's narrative role and visual identity: " + target.get("prompt", "")
+             if scene_plan.get("narrative_sequence") else ""),
+            hint.strip(),
         ) if x)
         try:
             res = prompt_fn(background_hint=base_hint,
@@ -14562,6 +14622,9 @@ def _restitch_scenes_for_edit(scene_plan: dict, segments: list[dict],
     """
     import scenes as _scenes
     new_secs = _scenes.detect_sections(segments, audio_duration)
+    if scene_plan.get("narrative_sequence"):
+        from scene_storyboard import sequence_sections
+        new_secs = sequence_sections(new_secs, count=len(scene_plan.get("scenes", [])))
     new_keys = {s.recurrence_key for s in new_secs}
     have_keys = {sc.get("recurrence_key") for sc in scene_plan.get("scenes", [])}
     if not new_keys or not new_keys.issubset(have_keys):
