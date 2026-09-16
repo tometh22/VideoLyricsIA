@@ -20,7 +20,7 @@
 //   3. Marcar resuelto → sigue estando, para lo que se contesta sin
 //                        re-renderizar (una aclaración, un pedido que se
 //                        descarta).
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { fmtDate, fmtAgo } from "../../adminApi";
 import FilterBar from "../../primitives/FilterBar";
@@ -134,6 +134,15 @@ export default function ChangeRequestsPanel({
   crPublishNotice,
   dismissPublishNotice,
   publishDeliveryUpdate,
+  proposalEnabled = false,
+  proposalApplyEnabled = false,
+  proposalBusyId = null,
+  proposalDetails = {},
+  generateProposal = () => {},
+  loadProposal = () => {},
+  adjustProposal = () => {},
+  applyProposal = () => {},
+  dismissProposal = () => {},
 }) {
   // Draft local del input de "respuesta" por CR. Clave = id del CR.
   const [drafts, setDrafts] = useState({});
@@ -211,6 +220,21 @@ export default function ChangeRequestsPanel({
                   item.id,
                 )
               }
+              proposalEnabled={proposalEnabled}
+              proposalApplyEnabled={proposalApplyEnabled}
+              proposalBusy={proposalBusyId === item.id}
+              proposal={proposalDetails[item.id] || null}
+              onGenerateProposal={() => generateProposal(item.id)}
+              onLoadProposal={() => loadProposal(item.id)}
+              onAdjustProposal={(proposalId, operationId, requestedText, baseRevision) =>
+                adjustProposal(
+                  item.id, proposalId, operationId, requestedText, baseRevision,
+                )
+              }
+              onApplyProposal={(proposalId, operationIds, baseRevision) =>
+                applyProposal(item.id, proposalId, operationIds, baseRevision)
+              }
+              onDismissProposal={(proposalId) => dismissProposal(item.id, proposalId)}
             />
           ))}
         </div>
@@ -222,6 +246,9 @@ export default function ChangeRequestsPanel({
 function ChangeRequestCard({
   item, draft, onDraftChange, resolving, publishing,
   onResolve, onReopen, onPublish,
+  proposalEnabled, proposalApplyEnabled, proposalBusy, proposal,
+  onGenerateProposal, onLoadProposal, onAdjustProposal, onApplyProposal,
+  onDismissProposal,
 }) {
   const d = item.delivery || {};
   const isResolved = !!item.resolved_at;
@@ -318,6 +345,21 @@ function ChangeRequestCard({
         UMG envió este pedido el {fmtDate(item.submitted_at)}
       </p>
 
+      {!isResolved && proposalEnabled && (
+        <ChangeRequestProposal
+          summary={item.proposal}
+          proposal={proposal}
+          busy={proposalBusy}
+          applyEnabled={proposalApplyEnabled}
+          jobId={d.job_id}
+          onGenerate={onGenerateProposal}
+          onLoad={onLoadProposal}
+          onAdjust={onAdjustProposal}
+          onApply={onApplyProposal}
+          onDismiss={onDismissProposal}
+        />
+      )}
+
       {/* Resolución */}
       {isResolved ? (
         <div className="mt-3 pt-3 border-t border-white/[0.06] flex items-start justify-between gap-3 flex-wrap">
@@ -398,6 +440,227 @@ function ChangeRequestCard({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+const PROPOSAL_LABELS = {
+  ready: "Lista para revisar",
+  partial: "Propuesta parcial",
+  needs_input: "Necesita intervención",
+  applied: "Aplicada",
+  partially_applied: "Aplicada parcialmente",
+  stale: "Desactualizada",
+  dismissed: "Descartada",
+};
+
+const MANUAL_LABELS = {
+  timing_review: "Revisar timing en el editor",
+  structure_review: "Revisar estructura de líneas",
+  background_review: "Cambio de fondo manual",
+  audio_review: "Verificar identidad del audio",
+  manual_review: "Interpretación manual requerida",
+};
+
+function ChangeRequestProposal({
+  summary, proposal, busy, applyEnabled, jobId,
+  onGenerate, onLoad, onAdjust, onApply, onDismiss,
+}) {
+  const operations = proposal?.operations || [];
+  const applicable = operations.filter(
+    (operation) => operation.applicable && operation.status === "pending",
+  );
+  const [selected, setSelected] = useState([]);
+  const [textDrafts, setTextDrafts] = useState({});
+
+  useEffect(() => {
+    setSelected(applicable.map((operation) => operation.id));
+    setTextDrafts(Object.fromEntries(applicable.map((operation) => [
+      operation.id,
+      operation.proposed_segments?.[0]?.text || "",
+    ])));
+  }, [proposal?.id, proposal?.updated_at]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const effective = proposal || summary;
+  const status = effective?.status;
+  const editorUrl = proposal?.editor_url
+    || (jobId ? `/videos/${jobId}/edit-lyrics` : null);
+
+  if (!effective) {
+    return (
+      <div className="mt-3 rounded-button bg-brand/5 ring-1 ring-brand/20 p-3">
+        <p className="text-label text-gray-300 mb-2">
+          El asistente puede convertir timestamps y reemplazos explícitos en un diff revisable.
+        </p>
+        <button
+          type="button"
+          onClick={onGenerate}
+          disabled={busy}
+          className="bg-brand hover:bg-brand-light text-white text-caption font-medium px-3 py-1.5 rounded-button disabled:opacity-50"
+        >
+          {busy ? "Analizando…" : "Analizar pedido"}
+        </button>
+      </div>
+    );
+  }
+
+  if (!proposal) {
+    return (
+      <div className="mt-3 rounded-button bg-brand/5 ring-1 ring-brand/20 p-3 flex items-center justify-between gap-3">
+        <div>
+          <p className="text-caption font-semibold text-brand-light">
+            {PROPOSAL_LABELS[status] || status}
+          </p>
+          <p className="text-label text-gray-400">
+            {summary.applicable_count || 0} cambio(s) aplicable(s)
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={status === "stale" || status === "dismissed" ? onGenerate : onLoad}
+          disabled={busy}
+          className="bg-white/[0.07] hover:bg-white/[0.12] text-white text-caption px-3 py-1.5 rounded-button disabled:opacity-50"
+        >
+          {busy
+            ? "Cargando…"
+            : status === "stale" || status === "dismissed"
+              ? "Recalcular"
+              : "Ver propuesta"}
+        </button>
+      </div>
+    );
+  }
+
+  const toggle = (id) => setSelected((current) => (
+    current.includes(id) ? current.filter((value) => value !== id) : [...current, id]
+  ));
+
+  return (
+    <div className="mt-3 rounded-button bg-brand/5 ring-1 ring-brand/20 p-3 space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="text-caption font-semibold text-brand-light">
+            {PROPOSAL_LABELS[status] || status}
+          </p>
+          <p className="text-label text-gray-400">
+            Basada en la revisión {proposal.base_revision}
+          </p>
+        </div>
+        {(status === "ready" || status === "partial" || status === "needs_input") && (
+          <button
+            type="button"
+            onClick={() => onDismiss(proposal.id)}
+            disabled={busy}
+            className="text-label text-gray-400 hover:text-gray-200 disabled:opacity-50"
+          >
+            Descartar
+          </button>
+        )}
+      </div>
+
+      {operations.map((operation) => {
+        const currentText = operation.current_segments?.[0]?.text || "";
+        const proposedText = textDrafts[operation.id]
+          ?? operation.proposed_segments?.[0]?.text ?? "";
+        if (!operation.applicable) {
+          return (
+            <div key={operation.id} className="rounded-button bg-amber-500/10 ring-1 ring-amber-400/20 p-2">
+              <p className="text-caption text-amber-200">
+                {MANUAL_LABELS[operation.kind] || "Revisión manual"}
+              </p>
+              {operation.timecode_seconds != null && (
+                <p className="text-label text-gray-400">Cerca de {Math.floor(operation.timecode_seconds / 60)}:{String(Math.round(operation.timecode_seconds % 60)).padStart(2, "0")}</p>
+              )}
+            </div>
+          );
+        }
+        return (
+          <div key={operation.id} className="block rounded-button bg-black/20 ring-1 ring-white/[0.06] p-2">
+            <div className="flex items-start gap-2">
+              {operation.status === "pending" && (
+                <input
+                  type="checkbox"
+                  aria-label={`Seleccionar cambio: ${currentText}`}
+                  checked={selected.includes(operation.id)}
+                  onChange={() => toggle(operation.id)}
+                  className="mt-1"
+                />
+              )}
+              <div className="min-w-0 flex-1">
+                <p className="text-label text-gray-500 line-through break-words">{currentText}</p>
+                {operation.status === "pending" ? (
+                  <div className="mt-1 flex gap-2">
+                    <input
+                      value={proposedText}
+                      onChange={(event) => setTextDrafts((current) => ({
+                        ...current, [operation.id]: event.target.value,
+                      }))}
+                      className="min-w-0 flex-1 bg-surface-3/60 ring-1 ring-white/[0.08] rounded-button px-2 py-1 text-caption text-emerald-200"
+                    />
+                    {proposedText !== (operation.proposed_segments?.[0]?.text || "") && (
+                      <button
+                        type="button"
+                        onClick={() => onAdjust(
+                          proposal.id, operation.id, proposedText, proposal.base_revision,
+                        )}
+                        disabled={busy || !proposedText.trim()}
+                        className="text-label text-brand-light disabled:opacity-50"
+                      >
+                        Guardar
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-caption text-emerald-200 break-words">{proposedText}</p>
+                )}
+                <p className="text-label text-gray-500 mt-1">
+                  {operation.operator_adjusted
+                    ? "Ajustado por operador"
+                    : operation.kind === "remove_terminal_period"
+                      ? "Formato determinístico"
+                      : "Pedido explícito del cliente"}
+                  {operation.scope === "all_matching" ? " · todas las apariciones" : ""}
+                  {operation.status === "applied" ? " · aplicado" : ""}
+                </p>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+
+      <div className="flex flex-wrap gap-2">
+        {(status === "ready" || status === "partial") && (
+          <button
+            type="button"
+            onClick={() => onApply(proposal.id, selected, proposal.base_revision)}
+            disabled={busy || !applyEnabled || selected.length === 0}
+            title={!applyEnabled ? "La aplicación está deshabilitada por configuración" : undefined}
+            className="bg-brand hover:bg-brand-light text-white text-caption font-medium px-3 py-1.5 rounded-button disabled:opacity-40"
+          >
+            {busy ? "Aplicando…" : `Aplicar seleccionadas (${selected.length})`}
+          </button>
+        )}
+        {(status === "applied" || status === "partially_applied") && editorUrl && (
+          <a
+            href={editorUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="bg-brand hover:bg-brand-light text-white text-caption font-medium px-3 py-1.5 rounded-button"
+          >
+            Revisar y re-renderizar
+          </a>
+        )}
+        {(status === "stale" || status === "dismissed" || status === "partially_applied") && (
+          <button
+            type="button"
+            onClick={onGenerate}
+            disabled={busy}
+            className="bg-white/[0.07] text-white text-caption px-3 py-1.5 rounded-button disabled:opacity-50"
+          >
+            {status === "partially_applied" ? "Recalcular pendientes" : "Recalcular"}
+          </button>
+        )}
+      </div>
     </div>
   );
 }

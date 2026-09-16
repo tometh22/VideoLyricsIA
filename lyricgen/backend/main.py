@@ -46,7 +46,9 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import func, text
-from sqlalchemy.exc import OperationalError, TimeoutError as SQLAlchemyTimeoutError
+from sqlalchemy.exc import (
+    IntegrityError, OperationalError, TimeoutError as SQLAlchemyTimeoutError,
+)
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import ObjectDeletedError
 
@@ -94,7 +96,7 @@ from database import (
     Job, User, UserSettings, AuditLog, APIKey, get_db, init_db,
     BackgroundAsset, AssetUsage, Delivery, DeliveryChangeRequest,
     SalesLead, UserSession, LoginSession, UiEvent, CreditGrant,
-    ProductEvent, EditorDocument, EditorVersion,
+    ProductEvent, EditorDocument, EditorVersion, ChangeRequestProposal,
     scoped_db, pool_stats,
     get_deliveries_db, deliveries_added_by, DELIVERIES_DATABASE_URL,
 )
@@ -20847,6 +20849,18 @@ async def admin_list_change_requests(
         u.id: u
         for u in (db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else [])
     }
+    proposals_by_request = {}
+    if _change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED") and crs:
+        proposal_rows = (
+            db.query(ChangeRequestProposal)
+            .filter(ChangeRequestProposal.change_request_id.in_([cr.id for cr in crs]))
+            .order_by(ChangeRequestProposal.created_at.desc())
+            .all()
+        )
+        for proposal in proposal_rows:
+            proposals_by_request.setdefault(
+                (proposal.portal_id, proposal.change_request_id), proposal,
+            )
 
     # Short-lived signed R2 URLs for the in-card preview. Generated here
     # (admin context) rather than via the per-tenant /media-token flow,
@@ -20872,6 +20886,8 @@ async def admin_list_change_requests(
         resolver = users_by_id.get(cr.resolved_by_user_id) if cr.resolved_by_user_id else None
         job = jobs_by_jobid.get(d.job_id) if d and d.job_id else None
         owner = owners_by_id.get(job.user_id) if job and job.user_id else None
+        portal_id = (d.portal_id or "argentina") if d else "argentina"
+        proposal = proposals_by_request.get((portal_id, cr.id))
         items.append({
             "id": cr.id,
             "comment": cr.comment,
@@ -20881,6 +20897,23 @@ async def admin_list_change_requests(
             "resolved_by": resolver.username if resolver else None,
             "resolved_by_revision": cr.resolved_by_revision,
             "resolution_source": cr.resolution_source,
+            "proposal": (
+                {
+                    "id": proposal.id,
+                    "status": proposal.status,
+                    "base_revision": proposal.base_revision,
+                    "applied_revision": proposal.applied_revision,
+                    "operation_count": len(proposal.operations or []),
+                    "applicable_count": sum(
+                        bool(item.get("applicable"))
+                        for item in (proposal.operations or [])
+                        if isinstance(item, dict)
+                    ),
+                    "updated_at": proposal.updated_at.isoformat()
+                    if proposal.updated_at else None,
+                }
+                if proposal else None
+            ),
             # Estado de la publicación frente al render actual del job.
             # Sin esto el operador no podía responder la única pregunta que
             # importa después de corregir: ¿lo que el cliente puede bajar
@@ -20930,7 +20963,512 @@ async def admin_list_change_requests(
         "items": items,
         "pending_count": pending_count,
         "resolved_count": resolved_count,
+        "proposal_enabled": _change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED"),
+        "proposal_apply_enabled": _change_request_flag("CHANGE_REQUEST_APPLY_ENABLED"),
     }
+
+
+def _change_request_flag(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _require_change_request_flag(name: str) -> None:
+    if not _change_request_flag(name):
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "change_request_assist_disabled", "flag": name},
+        )
+
+
+def _serialize_change_request_proposal(row: ChangeRequestProposal) -> dict:
+    return {
+        "id": row.id,
+        "portal_id": row.portal_id,
+        "change_request_id": row.change_request_id,
+        "delivery_id": row.delivery_id,
+        "job_id": row.job_id,
+        "request_sha256": row.request_sha256,
+        "base_revision": row.base_revision,
+        "segments_hash": row.segments_hash,
+        "segments_content_hash": row.segments_content_hash,
+        "audio_revision": row.audio_revision,
+        "parser_version": row.parser_version,
+        "schema_version": row.schema_version,
+        "status": row.status,
+        "operations": [
+            dict(item) for item in (row.operations or []) if isinstance(item, dict)
+        ],
+        "decision_history": [
+            dict(item) for item in (row.decision_history or []) if isinstance(item, dict)
+        ],
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "applied_at": row.applied_at.isoformat() if row.applied_at else None,
+        "applied_revision": row.applied_revision,
+    }
+
+
+def _change_request_context(ddb: Session, cr_id: int):
+    cr = (
+        ddb.query(DeliveryChangeRequest)
+        .filter(DeliveryChangeRequest.id == cr_id)
+        .first()
+    )
+    if cr is None:
+        raise HTTPException(status_code=404, detail="Change request not found")
+    delivery = ddb.query(Delivery).filter(Delivery.id == cr.delivery_id).first()
+    if delivery is None or delivery.removed_at is not None:
+        raise HTTPException(status_code=409, detail="Change request delivery is unavailable")
+    return cr, delivery
+
+
+class ChangeRequestProposalPatch(BaseModel):
+    operation_id: str = Field(min_length=1, max_length=80)
+    requested_text: str = Field(min_length=1, max_length=2000)
+    base_revision: int = Field(ge=0)
+
+
+class ChangeRequestProposalApply(BaseModel):
+    base_revision: int = Field(ge=0)
+    operation_ids: list[str] = Field(min_length=1, max_length=100)
+    idempotency_key: str = Field(min_length=16, max_length=160)
+
+
+class ChangeRequestProposalDismiss(BaseModel):
+    reason: str = Field(
+        default="operator_dismissed",
+        pattern=r"^(operator_dismissed|already_fixed|incorrect_parse|manual_workflow)$",
+    )
+
+
+@app.post("/admin/change-requests/{cr_id}/proposals")
+async def admin_generate_change_request_proposal(
+    cr_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """Generate or reuse a deterministic proposal for the current editor revision."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    _require_change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED")
+    cr, delivery = _change_request_context(ddb, cr_id)
+    if cr.resolved_at is not None:
+        raise HTTPException(status_code=409, detail="change_request_already_resolved")
+    job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    try:
+        document = get_or_create_document(
+            db, job.job_id, job.tenant_id, job.segments_json or [],
+        )
+    except (LookupError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+    from change_request_proposals import build_proposal, request_hash
+    portal_id = delivery.portal_id or "argentina"
+    comment_hash = request_hash(cr.comment)
+    cached = (
+        db.query(ChangeRequestProposal)
+        .filter(ChangeRequestProposal.portal_id == portal_id)
+        .filter(ChangeRequestProposal.change_request_id == cr_id)
+        .filter(ChangeRequestProposal.request_sha256 == comment_hash)
+        .filter(ChangeRequestProposal.base_revision == int(document.revision or 0))
+        .order_by(ChangeRequestProposal.created_at.desc())
+        .first()
+    )
+    if cached is not None and cached.status not in {"stale", "dismissed"}:
+        return {"ok": True, "cached": True, "proposal": _serialize_change_request_proposal(cached)}
+
+    built = build_proposal(
+        comment=cr.comment,
+        segments=list(document.current_segments or []),
+        base_revision=int(document.revision or 0),
+        audio_revision=int(job.audio_revision or 0),
+        audio_sha256=str(job.input_audio_sha256 or ""),
+    )
+    now = datetime.now(timezone.utc)
+    # Pending proposals for older snapshots remain as audit history but cannot
+    # be served as actionable after the document moves.
+    stale_rows = (
+        db.query(ChangeRequestProposal)
+        .filter(ChangeRequestProposal.portal_id == portal_id)
+        .filter(ChangeRequestProposal.change_request_id == cr_id)
+        .filter(ChangeRequestProposal.status.in_(("ready", "partial", "needs_input")))
+        .all()
+    )
+    for stale in stale_rows:
+        stale.status = "stale"
+        stale.updated_at = now
+
+    recalculated = cached is not None
+    if cached is not None:
+        row = cached
+        history = [
+            dict(item) for item in (row.decision_history or [])
+            if isinstance(item, dict)
+        ][-99:]
+        history.append({
+            "decision": "recalculated", "decided_at": now.isoformat(),
+        })
+        row.delivery_id = delivery.id
+        row.job_id = job.job_id
+        row.segments_hash = built["segments_hash"]
+        row.segments_content_hash = built["segments_content_hash"]
+        row.audio_revision = built["audio_revision"]
+        row.audio_sha256 = built["audio_sha256"]
+        row.parser_version = built["parser_version"]
+        row.schema_version = built["schema_version"]
+        row.status = built["status"]
+        row.operations = built["operations"]
+        row.decision_history = history
+        row.applied_by = None
+        row.applied_at = None
+        row.applied_revision = None
+        row.idempotency_hash = None
+        row.updated_at = now
+    else:
+        import uuid as _uuid
+        row = ChangeRequestProposal(
+            id=str(_uuid.uuid4()), portal_id=portal_id,
+            change_request_id=cr_id, delivery_id=delivery.id, job_id=job.job_id,
+            request_sha256=built["request_sha256"],
+            base_revision=built["base_revision"],
+            segments_hash=built["segments_hash"],
+            segments_content_hash=built["segments_content_hash"],
+            audio_revision=built["audio_revision"],
+            audio_sha256=built["audio_sha256"],
+            parser_version=built["parser_version"],
+            schema_version=built["schema_version"], status=built["status"],
+            operations=built["operations"], decision_history=[],
+            created_by=current_user["id"], created_at=now, updated_at=now,
+        )
+        db.add(row)
+    db.add(ProductEvent(
+        tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job.job_id,
+        name="change_request_proposal_generated",
+        properties={
+            "status": row.status,
+            "applicable_count": built["applicable_count"],
+            "unresolved_count": built["unresolved_count"],
+            "parser_version": row.parser_version,
+            "portal_id": portal_id,
+        },
+    ))
+    db.add(AuditLog(
+        user_id=current_user["id"], action="delivery.change_request.proposal_generated",
+        detail={
+            "change_request_id": cr_id, "delivery_id": delivery.id,
+            "job_id": job.job_id, "proposal_id": row.id,
+            "status": row.status, "operation_count": built["operation_count"],
+        },
+    ))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if recalculated:
+            raise
+        concurrent = (
+            db.query(ChangeRequestProposal)
+            .filter(ChangeRequestProposal.portal_id == portal_id)
+            .filter(ChangeRequestProposal.change_request_id == cr_id)
+            .filter(ChangeRequestProposal.request_sha256 == comment_hash)
+            .filter(ChangeRequestProposal.base_revision == int(document.revision or 0))
+            .first()
+        )
+        if concurrent is None:
+            raise
+        return {
+            "ok": True, "cached": True, "concurrent": True,
+            "proposal": _serialize_change_request_proposal(concurrent),
+        }
+    db.refresh(row)
+    return {
+        "ok": True, "cached": False, "recalculated": recalculated,
+        "proposal": _serialize_change_request_proposal(row),
+    }
+
+
+@app.get("/admin/change-requests/{cr_id}/proposals/current")
+async def admin_get_change_request_proposal(
+    cr_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    _require_change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED")
+    _cr, delivery = _change_request_context(ddb, cr_id)
+    row = (
+        db.query(ChangeRequestProposal)
+        .filter(ChangeRequestProposal.change_request_id == cr_id)
+        .filter(ChangeRequestProposal.portal_id == (delivery.portal_id or "argentina"))
+        .order_by(ChangeRequestProposal.created_at.desc())
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="change_request_proposal_not_found")
+    return {"ok": True, "proposal": _serialize_change_request_proposal(row)}
+
+
+@app.patch("/admin/change-requests/{cr_id}/proposals/{proposal_id}")
+async def admin_patch_change_request_proposal(
+    cr_id: int,
+    proposal_id: str,
+    body: ChangeRequestProposalPatch,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    _require_change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED")
+    row = (
+        db.query(ChangeRequestProposal)
+        .filter(ChangeRequestProposal.id == proposal_id)
+        .filter(ChangeRequestProposal.change_request_id == cr_id)
+        .with_for_update()
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="change_request_proposal_not_found")
+    if row.status not in {"ready", "partial", "needs_input"}:
+        raise HTTPException(status_code=409, detail="change_request_proposal_not_editable")
+    if row.base_revision != body.base_revision:
+        raise HTTPException(status_code=409, detail="editor_revision_conflict")
+    operations = [dict(item) for item in (row.operations or []) if isinstance(item, dict)]
+    operation = next((item for item in operations if item.get("id") == body.operation_id), None)
+    if operation is None or not operation.get("applicable"):
+        raise HTTPException(status_code=400, detail="change_request_operation_not_editable")
+    before = operation.get("current_segments") or []
+    if len(before) != 1:
+        raise HTTPException(status_code=400, detail="change_request_operation_not_editable")
+    proposed = {**dict(before[0]), "text": body.requested_text.strip()}
+    from editor import segments_content_hash
+    operation["proposed_segments"] = [proposed]
+    operation["proposed_segments_hash"] = segments_content_hash([proposed])
+    operation["operator_adjusted"] = True
+    operation["confidence"] = "operator"
+    row.operations = operations
+    row.updated_at = datetime.now(timezone.utc)
+    db.add(AuditLog(
+        user_id=current_user["id"], action="delivery.change_request.proposal_adjusted",
+        detail={
+            "change_request_id": cr_id, "proposal_id": proposal_id,
+            "operation_id": body.operation_id,
+        },
+    ))
+    db.commit()
+    db.refresh(row)
+    return {"ok": True, "proposal": _serialize_change_request_proposal(row)}
+
+
+@app.post("/admin/change-requests/{cr_id}/proposals/{proposal_id}/apply")
+async def admin_apply_change_request_proposal(
+    cr_id: int,
+    proposal_id: str,
+    body: ChangeRequestProposalApply,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    _require_change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED")
+    _require_change_request_flag("CHANGE_REQUEST_APPLY_ENABLED")
+    cr, delivery = _change_request_context(ddb, cr_id)
+    if cr.resolved_at is not None:
+        raise HTTPException(status_code=409, detail="change_request_already_resolved")
+    row = (
+        db.query(ChangeRequestProposal)
+        .filter(ChangeRequestProposal.id == proposal_id)
+        .filter(ChangeRequestProposal.change_request_id == cr_id)
+        .with_for_update()
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="change_request_proposal_not_found")
+    from change_request_proposals import apply_operations, request_hash
+    from editor import proposal_idempotency_hash
+    idem_hash = proposal_idempotency_hash(body.idempotency_key)
+    if row.status in {"applied", "partially_applied"} and row.idempotency_hash == idem_hash:
+        accepted = next((
+            item for item in reversed(row.decision_history or [])
+            if isinstance(item, dict)
+            and item.get("decision") == "accepted"
+            and item.get("idempotency_hash") == idem_hash
+        ), None)
+        if sorted(str(value) for value in body.operation_ids) != sorted(
+            str(value) for value in ((accepted or {}).get("operation_ids") or [])
+        ):
+            raise HTTPException(status_code=409, detail="idempotency_key_reused")
+        return {
+            "ok": True, "applied": False, "idempotent": True,
+            "revision": row.applied_revision,
+            "editor_url": (
+                f"/videos/{row.job_id}/edit-lyrics?change_request_id={cr_id}"
+                f"&proposal_id={row.id}"
+            ),
+            "proposal": _serialize_change_request_proposal(row),
+        }
+    if row.status not in {"ready", "partial"}:
+        raise HTTPException(status_code=409, detail="change_request_proposal_not_applicable")
+    if (
+        row.request_sha256 != request_hash(cr.comment)
+        or row.delivery_id != delivery.id
+        or row.job_id != delivery.job_id
+    ):
+        row.status = "stale"
+        row.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=409, detail="change_request_proposal_stale")
+    job = db.query(Job).filter(Job.job_id == row.job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    document = get_or_create_document(db, job.job_id, job.tenant_id, job.segments_json or [])
+    if (
+        int(document.revision or 0) != body.base_revision
+        or int(row.base_revision or 0) != body.base_revision
+        or int(job.audio_revision or 0) != int(row.audio_revision or 0)
+        or str(job.input_audio_sha256 or "") != str(row.audio_sha256 or "")
+    ):
+        row.status = "stale"
+        row.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=409, detail="change_request_proposal_stale")
+    previous = [dict(item) for item in (document.current_segments or [])]
+    try:
+        next_segments, selected = apply_operations(
+            previous,
+            {
+                "segments_content_hash": row.segments_content_hash,
+                "operations": row.operations,
+            },
+            body.operation_ids,
+        )
+        document, version, applied = save_document(
+            db, job, document, current_user["id"], body.base_revision,
+            next_segments, "change_request",
+        )
+    except RuntimeError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+    quality_outbox_id = None
+    if applied:
+        from correction_learning import invalidate_job_observations
+        invalidate_job_observations(db, job.job_id, "change_request_proposal_applied")
+        job.transcription_quality = _invalidate_quality_after_editor_save(
+            job, revision=document.revision,
+            segments=list(document.current_segments or []),
+            previous_segments=previous,
+        )
+        quality_outbox_id = _create_editor_quality_outbox(
+            db, job, revision=document.revision,
+            segments=list(document.current_segments or []),
+            quality=job.transcription_quality,
+            reason="change_request_proposal_applied",
+        )
+    selected_ids = {str(item.get("id")) for item in selected}
+    operations = []
+    pending_applicable = 0
+    for operation in row.operations or []:
+        item = dict(operation)
+        if str(item.get("id")) in selected_ids:
+            item["status"] = "applied"
+        elif item.get("applicable"):
+            item["status"] = "not_applied"
+            pending_applicable += 1
+        operations.append(item)
+    now = datetime.now(timezone.utc)
+    history = [
+        dict(item) for item in (row.decision_history or []) if isinstance(item, dict)
+    ][-99:]
+    history.append({
+        "decision": "accepted", "operation_ids": sorted(selected_ids),
+        "idempotency_hash": idem_hash, "decided_at": now.isoformat(),
+    })
+    row.operations = operations
+    row.decision_history = history
+    row.status = "partially_applied" if pending_applicable else "applied"
+    row.applied_by = current_user["id"]
+    row.applied_at = now
+    row.updated_at = now
+    row.applied_revision = int(document.revision or 0)
+    row.idempotency_hash = idem_hash
+    db.add(ProductEvent(
+        tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job.job_id,
+        name="change_request_proposal_applied",
+        properties={
+            "operation_count": len(selected_ids), "status": row.status,
+            "operation_kinds": sorted({str(item.get("kind")) for item in selected}),
+            "portal_id": row.portal_id,
+        },
+    ))
+    db.add(AuditLog(
+        user_id=current_user["id"], action="delivery.change_request.proposal_applied",
+        detail={
+            "change_request_id": cr_id, "delivery_id": row.delivery_id,
+            "job_id": row.job_id, "proposal_id": row.id,
+            "operation_ids": sorted(selected_ids),
+            "revision": int(document.revision or 0), "applied": applied,
+        },
+    ))
+    db.commit()
+    _dispatch_editor_quality_outbox(quality_outbox_id)
+    db.refresh(row)
+    return {
+        "ok": True, "applied": applied, "idempotent": not applied,
+        "revision": int(document.revision or 0),
+        "version_id": version.id if version else None,
+        "editor_url": f"/videos/{job.job_id}/edit-lyrics?change_request_id={cr_id}&proposal_id={row.id}",
+        "proposal": _serialize_change_request_proposal(row),
+    }
+
+
+@app.post("/admin/change-requests/{cr_id}/proposals/{proposal_id}/dismiss")
+async def admin_dismiss_change_request_proposal(
+    cr_id: int,
+    proposal_id: str,
+    body: ChangeRequestProposalDismiss,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    _require_change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED")
+    row = (
+        db.query(ChangeRequestProposal)
+        .filter(ChangeRequestProposal.id == proposal_id)
+        .filter(ChangeRequestProposal.change_request_id == cr_id)
+        .with_for_update()
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="change_request_proposal_not_found")
+    if row.status in {"applied", "partially_applied"}:
+        raise HTTPException(status_code=409, detail="applied_proposal_cannot_be_dismissed")
+    row.status = "dismissed"
+    row.updated_at = datetime.now(timezone.utc)
+    history = list(row.decision_history or [])[-99:]
+    history.append({
+        "decision": "dismissed", "reason": body.reason,
+        "decided_at": row.updated_at.isoformat(),
+    })
+    row.decision_history = history
+    db.add(AuditLog(
+        user_id=current_user["id"], action="delivery.change_request.proposal_dismissed",
+        detail={
+            "change_request_id": cr_id, "proposal_id": proposal_id,
+            "reason": body.reason,
+        },
+    ))
+    db.commit()
+    return {"ok": True, "proposal": _serialize_change_request_proposal(row)}
 
 
 class CreditGrantRequest(BaseModel):

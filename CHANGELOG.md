@@ -3,6 +3,31 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.50] - 2026-09-16
+
+### Added
+
+- Add a revision- and audio-bound assistant for Universal delivery change
+  requests. It understands the portal's real `timestamp + corrected lyric`
+  lists, explicit replacements, repeated occurrences and terminal-period
+  cleanup; operators can review, edit and selectively apply the diff from
+  Operación without requiring official lyrics.
+- Persist proposal lifecycle, decisions and idempotency in
+  `change_request_proposals`, keeping ambiguous timing, structure, background
+  and audio instructions review-only. Applying a proposal does not resolve the
+  customer request: the existing re-render and publish step remains the only
+  automatic closure point.
+- Surface reference-free Delivery QC review signals for fragmented lyric
+  cards, inconsistent near-repetitions and cards ending before their final
+  stored word timestamp.
+
+### Security
+
+- Bind every proposal to the external request hash, editor revision and
+  segment/audio identities; reject stale or conflicting writes and keep raw
+  lyric text out of product analytics. Both analysis and application remain
+  independently kill-switchable.
+
 ## [1.1.49] - 2026-09-16
 
 ### Fixed

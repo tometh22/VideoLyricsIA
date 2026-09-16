@@ -567,6 +567,137 @@ def _terminal_period_occurrences(
     return found
 
 
+def _fragmentation_occurrences(
+    segments: Sequence[Mapping[str, Any]],
+) -> list[tuple[int, _Occurrence]]:
+    """Flag dense runs of tiny lyric cards without pretending they are wrong."""
+    found: list[tuple[int, _Occurrence]] = []
+    run: list[int] = []
+
+    def flush() -> None:
+        if len(run) < 3:
+            return
+        first = run[0]
+        found.append((first, _Occurrence(
+            code="LYRIC_FRAGMENTATION",
+            severity="WARN",
+            category="Layout",
+            summary="Consecutive lyric fragments need layout review",
+            description=(
+                "Several one- or two-word cards occur consecutively. Confirm "
+                "whether they should be combined into complete display phrases."
+            ),
+            seconds=_segment_start(segments[first]),
+            detector="reference_free_fragmentation_v1",
+            confidence=0.82,
+            auto_fixable=False,
+            evidence={"segment_indices": list(run)},
+        )))
+
+    for index, row in enumerate(segments):
+        short = 0 < len(_tokens(_segment_text(row))) <= 2
+        close = not run or (
+            _segment_start(row) - _segment_end(segments[run[-1]]) <= 0.40
+        )
+        if short and close:
+            run.append(index)
+            continue
+        flush()
+        run = [index] if short else []
+    flush()
+    return found
+
+
+def _repeat_inconsistency_occurrences(
+    segments: Sequence[Mapping[str, Any]],
+) -> list[tuple[int, _Occurrence]]:
+    """Surface near-repeated lines with one lexical disagreement.
+
+    Without official lyrics neither variant is authoritative, so findings are
+    review-only and never carry an automatic replacement.
+    """
+    buckets: dict[tuple[str, int], list[tuple[int, str]]] = defaultdict(list)
+    found: list[tuple[int, _Occurrence]] = []
+    seen_indices: set[int] = set()
+    for index, row in enumerate(segments):
+        text = _segment_text(row)
+        tokens = _tokens(text)
+        if len(tokens) < 4 or len(tokens) > 18:
+            continue
+        key = (tokens[0], len(tokens) // 2)
+        candidates = buckets[key][-12:]
+        for prior_index, prior_text in candidates:
+            if index - prior_index < 2:
+                continue
+            similarity = _line_similarity(prior_text, text)
+            if not 0.80 <= similarity < 0.995:
+                continue
+            if index in seen_indices:
+                break
+            seen_indices.add(index)
+            found.append((index, _Occurrence(
+                code="LYRIC_REPEAT_INCONSISTENCY",
+                severity="WARN",
+                category="Lyrics",
+                summary="Near-repeated lyric has inconsistent wording",
+                description=(
+                    "Two likely repetitions differ in wording. Listen to both "
+                    "occurrences and confirm which transcription is correct."
+                ),
+                seconds=_segment_start(row),
+                actual=text,
+                expected=prior_text,
+                detector="reference_free_repeat_consistency_v1",
+                confidence=round(similarity, 3),
+                auto_fixable=False,
+                evidence={
+                    "segment_index": index,
+                    "compared_segment_index": prior_index,
+                    "similarity": round(similarity, 4),
+                },
+            )))
+            break
+        buckets[key].append((index, text))
+        if len(found) >= 20:
+            break
+    return found
+
+
+def _word_end_occurrences(
+    segments: Sequence[Mapping[str, Any]],
+) -> list[tuple[int, _Occurrence]]:
+    found: list[tuple[int, _Occurrence]] = []
+    for index, row in enumerate(segments):
+        words = [item for item in (row.get("words") or []) if isinstance(item, Mapping)]
+        if not words:
+            continue
+        word_end = _finite_number(words[-1].get("end"))
+        current_end = _segment_end(row)
+        if word_end is None or word_end <= current_end + 0.12:
+            continue
+        found.append((index, _Occurrence(
+            code="LYRIC_END_BEFORE_WORD_END",
+            severity="WARN",
+            category="Timing",
+            summary="Lyric card may disappear before its final word ends",
+            description=(
+                "The persisted word timestamp extends beyond the card. Confirm "
+                "the sung ending against the audio before adjusting timing."
+            ),
+            seconds=current_end,
+            actual=f"{current_end:.3f}",
+            expected=f"{word_end:.3f}",
+            detector="word_timestamp_end_review_v1",
+            confidence=0.75,
+            auto_fixable=False,
+            evidence={
+                "segment_index": index, "segment_end": current_end,
+                "last_word_end": word_end,
+            },
+        )))
+    return found
+
+
 def _reference_health_occurrences(
     health: Mapping[str, Any] | None,
     segments: Sequence[Mapping[str, Any]],
@@ -686,6 +817,9 @@ def build_delivery_preflight(
     occurrences: list[tuple[int, _Occurrence]] = []
     occurrences.extend(_metadata_occurrences(meta, asset_row))
     occurrences.extend(_terminal_period_occurrences(segment_rows))
+    occurrences.extend(_fragmentation_occurrences(segment_rows))
+    occurrences.extend(_repeat_inconsistency_occurrences(segment_rows))
+    occurrences.extend(_word_end_occurrences(segment_rows))
     occurrences.extend(_timeline_occurrences(segment_rows, duration))
     occurrences.extend(_reference_health_occurrences(reference_health, segment_rows))
     occurrences.extend(_acoustic_finding_occurrences(acoustic_findings, segment_rows))
