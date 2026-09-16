@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import ChangeRequestsPanel, { publicationStatus } from "./ChangeRequestsPanel";
 
@@ -158,5 +158,68 @@ describe("ChangeRequestsPanel", () => {
     });
     expect(screen.getByText(/Cambios en curso desde hace 20 min/))
       .toBeInTheDocument();
+  });
+
+  it("offers deterministic analysis when the assist flag is enabled", () => {
+    const generate = vi.fn();
+    renderPanel({}, { proposalEnabled: true, generateProposal: generate });
+    screen.getByRole("button", { name: "Analizar pedido" }).click();
+    expect(generate).toHaveBeenCalledWith(7);
+  });
+
+  it("loads a persisted proposal summary instead of regenerating it", () => {
+    const load = vi.fn();
+    renderPanel(
+      { proposal: { id: "proposal-1", status: "ready", applicable_count: 2 } },
+      { proposalEnabled: true, loadProposal: load },
+    );
+    screen.getByRole("button", { name: "Ver propuesta" }).click();
+    expect(load).toHaveBeenCalledWith(7);
+  });
+
+  it("applies only the selected revision-bound operations", async () => {
+    const apply = vi.fn();
+    const proposal = {
+      id: "proposal-1",
+      status: "ready",
+      base_revision: 4,
+      updated_at: "2026-09-16T00:00:00Z",
+      operations: [{
+        id: "op-1",
+        kind: "replace_text",
+        status: "pending",
+        applicable: true,
+        scope: "single",
+        current_segments: [{ start: 13, end: 15, text: "Texto viejo" }],
+        proposed_segments: [{ start: 13, end: 15, text: "Texto correcto" }],
+      }],
+    };
+    renderPanel({}, {
+      proposalEnabled: true,
+      proposalApplyEnabled: true,
+      proposalDetails: { 7: proposal },
+      applyProposal: apply,
+    });
+    const button = await screen.findByRole("button", { name: "Aplicar seleccionadas (1)" });
+    await waitFor(() => expect(button).toBeEnabled());
+    button.click();
+    expect(apply).toHaveBeenCalledWith(7, "proposal-1", ["op-1"], 4);
+  });
+
+  it("keeps timing instructions review-only", () => {
+    renderPanel({}, {
+      proposalEnabled: true,
+      proposalApplyEnabled: true,
+      proposalDetails: { 7: {
+        id: "proposal-2", status: "needs_input", base_revision: 4,
+        operations: [{
+          id: "manual-1", kind: "timing_review", status: "pending",
+          applicable: false, timecode_seconds: 83,
+        }],
+      } },
+    });
+    expect(screen.getByText("Revisar timing en el editor")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Aplicar seleccionadas/ }))
+      .not.toBeInTheDocument();
   });
 });

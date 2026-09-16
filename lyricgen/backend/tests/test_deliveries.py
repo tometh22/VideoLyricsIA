@@ -85,7 +85,10 @@ def approved_job(db, admin_token, client):
     # test DB silently ignores it, so deleting the CRs first is required or
     # this teardown 500s and leaves testjob12345 behind, breaking every
     # subsequent test that reuses this fixture's hardcoded job_id.
-    from database import Delivery, DeliveryChangeRequest
+    from database import (
+        ChangeRequestProposal, Delivery, DeliveryChangeRequest,
+        EditorDocument, EditorVersion, JobOutboxEvent,
+    )
     delivery_ids = [
         d.id for d in db.query(Delivery).filter(Delivery.job_id == "testjob12345").all()
     ]
@@ -93,6 +96,18 @@ def approved_job(db, admin_token, client):
         db.query(DeliveryChangeRequest).filter(
             DeliveryChangeRequest.delivery_id.in_(delivery_ids)
         ).delete(synchronize_session=False)
+    db.query(ChangeRequestProposal).filter(
+        ChangeRequestProposal.job_id == "testjob12345"
+    ).delete(synchronize_session=False)
+    db.query(JobOutboxEvent).filter(
+        JobOutboxEvent.job_id == "testjob12345"
+    ).delete(synchronize_session=False)
+    db.query(EditorVersion).filter(
+        EditorVersion.job_id == "testjob12345"
+    ).delete(synchronize_session=False)
+    db.query(EditorDocument).filter(
+        EditorDocument.job_id == "testjob12345"
+    ).delete(synchronize_session=False)
     db.query(Delivery).filter(Delivery.job_id == "testjob12345").delete()
     db.query(Job).filter(Job.id == job.id).delete()
     db.commit()
@@ -584,6 +599,158 @@ def test_change_request_submit_and_admin_lists_it(
     pending = client.get("/admin/change-requests?status=pending",
                           headers=auth(admin_token)).json()
     assert pending["pending_count"] == 1
+
+
+def test_change_request_proposal_applies_revisioned_text_but_stays_open_until_publish(
+    client, admin_token, approved_job, all_r2_files_present, db, monkeypatch,
+):
+    monkeypatch.setenv("CHANGE_REQUEST_ASSIST_ENABLED", "1")
+    monkeypatch.setenv("CHANGE_REQUEST_APPLY_ENABLED", "1")
+    approved_job.segments_json = [
+        {"start": 0.0, "end": 2.0, "text": "Texto equivocado"},
+        {"start": 2.2, "end": 4.0, "text": "Otra línea"},
+    ]
+    approved_job.segments_revision = 0
+    db.commit()
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    with patch("main.emails.send_umg_change_request_notification"):
+        cr_id = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": "0:01 Texto correcto"},
+        ).json()["id"]
+
+    generated = client.post(
+        f"/admin/change-requests/{cr_id}/proposals",
+        headers=auth(admin_token),
+    )
+    assert generated.status_code == 200, generated.text
+    proposal = generated.json()["proposal"]
+    operation_ids = [
+        row["id"] for row in proposal["operations"] if row["applicable"]
+    ]
+    assert len(operation_ids) == 1
+
+    with patch("main._dispatch_editor_quality_outbox"):
+        applied = client.post(
+            f"/admin/change-requests/{cr_id}/proposals/{proposal['id']}/apply",
+            headers=auth(admin_token),
+            json={
+                "base_revision": proposal["base_revision"],
+                "operation_ids": operation_ids,
+                "idempotency_key": "test-change-request-apply-0001",
+            },
+        )
+    assert applied.status_code == 200, applied.text
+    db.expire_all()
+    from database import DeliveryChangeRequest, Job
+    job = db.query(Job).filter(Job.job_id == approved_job.job_id).one()
+    request = db.query(DeliveryChangeRequest).filter(
+        DeliveryChangeRequest.id == cr_id
+    ).one()
+    assert job.segments_json[0]["text"] == "Texto correcto"
+    assert job.segments_revision == 1
+    assert request.resolved_at is None
+
+    # Network retries with the same key must not create another editor
+    # revision or lose the editor handoff URL.
+    with patch("main._dispatch_editor_quality_outbox"):
+        repeated = client.post(
+            f"/admin/change-requests/{cr_id}/proposals/{proposal['id']}/apply",
+            headers=auth(admin_token),
+            json={
+                "base_revision": proposal["base_revision"],
+                "operation_ids": operation_ids,
+                "idempotency_key": "test-change-request-apply-0001",
+            },
+        )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["idempotent"] is True
+    assert repeated.json()["revision"] == 1
+    assert repeated.json()["editor_url"].startswith(
+        f"/videos/{approved_job.job_id}/edit-lyrics"
+    )
+    db.expire_all()
+    assert db.query(Job).filter(Job.job_id == approved_job.job_id).one().segments_revision == 1
+
+
+def test_change_request_dismissed_proposal_can_be_recalculated(
+    client, admin_token, approved_job, all_r2_files_present, db, monkeypatch,
+):
+    monkeypatch.setenv("CHANGE_REQUEST_ASSIST_ENABLED", "1")
+    approved_job.segments_json = [{"start": 0.0, "end": 2.0, "text": "Viejo"}]
+    approved_job.segments_revision = 0
+    db.commit()
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    with patch("main.emails.send_umg_change_request_notification"):
+        cr_id = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": '0:01 debe decir "Nuevo"'},
+        ).json()["id"]
+    proposal = client.post(
+        f"/admin/change-requests/{cr_id}/proposals", headers=auth(admin_token),
+    ).json()["proposal"]
+    dismissed = client.post(
+        f"/admin/change-requests/{cr_id}/proposals/{proposal['id']}/dismiss",
+        headers=auth(admin_token), json={"reason": "incorrect_parse"},
+    )
+    assert dismissed.status_code == 200, dismissed.text
+
+    recalculated = client.post(
+        f"/admin/change-requests/{cr_id}/proposals", headers=auth(admin_token),
+    )
+    assert recalculated.status_code == 200, recalculated.text
+    payload = recalculated.json()
+    assert payload["recalculated"] is True
+    assert payload["proposal"]["id"] == proposal["id"]
+    assert payload["proposal"]["status"] == "ready"
+
+
+def test_change_request_apply_rejects_stale_editor_revision(
+    client, admin_token, approved_job, all_r2_files_present, db, monkeypatch,
+):
+    monkeypatch.setenv("CHANGE_REQUEST_ASSIST_ENABLED", "1")
+    monkeypatch.setenv("CHANGE_REQUEST_APPLY_ENABLED", "1")
+    approved_job.segments_json = [{"start": 0.0, "end": 2.0, "text": "Viejo"}]
+    approved_job.segments_revision = 0
+    db.commit()
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    with patch("main.emails.send_umg_change_request_notification"):
+        cr_id = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": '0:01 debe decir "Nuevo"'},
+        ).json()["id"]
+    proposal = client.post(
+        f"/admin/change-requests/{cr_id}/proposals", headers=auth(admin_token),
+    ).json()["proposal"]
+    operation_id = next(row["id"] for row in proposal["operations"] if row["applicable"])
+
+    # Simulate a concurrent editor save after proposal generation.
+    approved_job.segments_revision = 1
+    approved_job.segments_json = [{"start": 0.0, "end": 2.0, "text": "Edición humana"}]
+    db.commit()
+    response = client.post(
+        f"/admin/change-requests/{cr_id}/proposals/{proposal['id']}/apply",
+        headers=auth(admin_token),
+        json={
+            "base_revision": proposal["base_revision"],
+            "operation_ids": [operation_id],
+            "idempotency_key": "test-change-request-stale-0001",
+        },
+    )
+    assert response.status_code == 409
+    assert "stale" in str(response.json()["detail"])
 
 
 def test_change_request_notification_failure_does_not_break_submit(

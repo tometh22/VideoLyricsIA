@@ -19,7 +19,7 @@ from segment_timing import canonicalize_editor_segments
 
 EDITOR_REASONS = {
     "autosave", "manual", "restore", "approve", "conflict", "migration",
-    "transcription", "quality_proposal", "reviewer_candidate",
+    "transcription", "quality_proposal", "reviewer_candidate", "change_request",
 }
 EDITOR_CHECKPOINTS = EDITOR_REASONS | {"draft"}
 MAX_SEGMENTS = 5000

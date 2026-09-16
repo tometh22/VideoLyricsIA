@@ -80,6 +80,15 @@ export default function OperacionSection() {
             crPublishNotice={op.crPublishNotice}
             dismissPublishNotice={() => op.setCrPublishNotice(null)}
             publishDeliveryUpdate={op.publishDeliveryUpdate}
+            proposalEnabled={op.crProposalEnabled}
+            proposalApplyEnabled={op.crProposalApplyEnabled}
+            proposalBusyId={op.crProposalBusyId}
+            proposalDetails={op.crProposalDetails}
+            generateProposal={op.generateChangeRequestProposal}
+            loadProposal={op.loadChangeRequestProposal}
+            adjustProposal={op.adjustChangeRequestProposal}
+            applyProposal={op.applyChangeRequestProposal}
+            dismissProposal={op.dismissChangeRequestProposal}
           />
         </div>
         <div className="lg:col-span-3">
