@@ -3,6 +3,18 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.48] - 2026-09-16
+
+### Fixed
+
+- Bring the three portal commits production has been running into staging:
+  on-demand ProRes preparation from the portal, its cross-environment variant
+  for deliveries published from staging into the shared production portal,
+  and the per-portal listing cache separation. Staging was a regression
+  against production — promoting it would have removed features the client
+  uses today, and the portal's "descargar" button on a missing ProRes would
+  have started answering 404.
+
 ## [1.1.47] - 2026-09-16
 
 ### Fixed
