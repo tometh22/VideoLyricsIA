@@ -1,4 +1,4 @@
-// Sub-navegación del Admin Panel v2: 4 secciones, cada una con sub-vistas.
+// Sub-navegación del Admin Panel v2: 5 secciones, algunas con sub-vistas.
 // Reemplaza las 9 tabs horizontales del monolito — agrupadas por intención
 // (¿qué vengo a hacer?) y no por orden de aparición histórico.
 //
@@ -24,6 +24,22 @@ const NAV = [
       { id: "pipeline", label: "Pipeline en vivo" },
       { id: "estado-publico", label: "Estado público" },
     ],
+  },
+  {
+    // Trabajo editorial solicitado por los portales. Es sección principal y
+    // no una columna dentro de "Ahora": el operador necesita verla, abrir un
+    // pedido y comparar la letra completa sin competir con el pipeline.
+    id: "cambios",
+    label: "Cambios UMG",
+    description: "Pedidos de corrección del portal",
+    icon: (
+      <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+        <path d="M4 4h16v16H4z" />
+        <path d="M8 9h8M8 13h5" />
+        <path d="M15 17l4-4" />
+      </svg>
+    ),
+    subTabs: null,
   },
   {
     // ¿Mejor o peor que antes? — salud por cuenta, funnel, KPIs WoW.

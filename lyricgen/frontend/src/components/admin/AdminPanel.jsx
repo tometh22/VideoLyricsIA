@@ -1,17 +1,19 @@
 // Admin Panel v2 — shell.
 //
-// Layout: [sub-sidebar de 4 secciones] | [contenido de la sección activa]
+// Layout: [sub-sidebar de 5 secciones] | [contenido de la sección activa]
 // La navegación es estado local (una sola ruta /admin, sin query params —
 // herramienta interna de 2 operadores, no hace falta deep-linking).
 //
 // El estado transversal (banner de error, stats globales) vive en
 // AdminContext; todo lo demás es local de cada sección.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { AdminProvider, useAdmin } from "./AdminContext";
+import { API, fetchJson } from "./adminApi";
 import AdminSidebar, { defaultSubTab } from "./layout/AdminSidebar";
 import OperacionSection from "./sections/operacion/OperacionSection";
 import StatusIncidentsPanel from "./sections/operacion/StatusIncidentsPanel";
+import ChangeRequestsSection from "./sections/operacion/ChangeRequestsSection";
 import RendimientoSection from "./sections/rendimiento/RendimientoSection";
 import InsightsSection from "./sections/insights/InsightsSection";
 import GestionSection from "./sections/gestion/GestionSection";
@@ -20,6 +22,30 @@ function AdminShell({ onBack, isSuperAdmin }) {
   const { adminError, setAdminError, stats } = useAdmin();
   const [section, setSection] = useState("ahora");
   const [subTab, setSubTab] = useState(defaultSubTab("ahora"));
+  const [pendingChangeRequests, setPendingChangeRequests] = useState(0);
+
+  // El badge debe ser visible antes de entrar a la pantalla de Cambios.
+  // Es una consulta mínima y best-effort; la sección carga el detalle recién
+  // cuando el operador la abre.
+  useEffect(() => {
+    let active = true;
+    const loadPendingCount = () => {
+      fetchJson(`${API}/admin/change-requests?status=pending&limit=1`)
+        .then((data) => {
+          if (active) setPendingChangeRequests(data.pending_count || 0);
+        })
+        .catch(() => {});
+    };
+    loadPendingCount();
+    const iv = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      loadPendingCount();
+    }, 30000);
+    return () => {
+      active = false;
+      clearInterval(iv);
+    };
+  }, []);
 
   const navigate = (nextSection, nextSubTab) => {
     setSection(nextSection);
@@ -29,10 +55,14 @@ function AdminShell({ onBack, isSuperAdmin }) {
   // Badges vivos del sidebar: cosas que necesitan atención del operador.
   const badges = {
     ahora: stats?.jobs?.pending_review || 0,
+    cambios: pendingChangeRequests,
   };
 
   return (
-    <div className="w-full max-w-7xl animate-fade-in">
+    <div
+      data-testid="admin-shell"
+      className={`w-full animate-fade-in ${section === "cambios" ? "max-w-none" : "max-w-7xl"}`}
+    >
       {/* Header */}
       <div className="flex items-center gap-3 mb-6">
         <button
@@ -82,6 +112,12 @@ function AdminShell({ onBack, isSuperAdmin }) {
           {section === "ahora" && subTab === "estado-publico"
             ? <StatusIncidentsPanel />
             : section === "ahora" && <OperacionSection />}
+          {section === "cambios" && (
+            <ChangeRequestsSection
+              initialPendingCount={pendingChangeRequests}
+              onPendingCountChange={setPendingChangeRequests}
+            />
+          )}
           {section === "rendimiento" && <RendimientoSection />}
           {/* Doble guard: el sidebar ya oculta la entrada, pero si el flag
               quedó stale en localStorage el render también la niega. La
