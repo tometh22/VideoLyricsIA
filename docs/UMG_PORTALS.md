@@ -155,3 +155,36 @@ fingerprint ya no coincide). Eso es correcto —ese portal sigue entregando un
 corte que nadie aprobó— y se resuelve publicando también ahí. Si la decisión es
 no publicar en el otro portal, la fila queda visible en ese estado a propósito:
 no hay un camino en el que el aviso se limpie solo sin que alguien decida.
+
+## Auditoría diaria de integridad
+
+`delivery_integrity.audit_active_deliveries()` corre una vez por día dentro del
+ciclo del reaper, bajo el mismo lock de un solo runner que el barrido de
+retención. Reporta tres cosas y no arregla ninguna:
+
+| hallazgo | qué significa |
+|---|---|
+| `phantom` | la fila anuncia un `file_type` cuyo objeto no está en R2. El cliente ve un entregable que no se puede descargar |
+| `outdated` | el render del job cambió después de publicarse: el portal sirve algo que nadie aprobó |
+| `in_flight_too_long` | fila marcada "aplicando cambios" hace más de `DELIVERY_STALE_ALERT_HOURS` (24 por defecto). Sólo publicar limpia ese flag |
+
+Lo que deliberadamente **no** es un hallazgo: una fila sin
+`published_render_fingerprint` (no hay con qué comparar), un job que vive en
+otro entorno (las entregas de campaña viven en la DB del portal y sus jobs en
+la de staging), y un fallo de red de R2 (un falso positivo entrena a ignorar
+la alerta). Los dos primeros se cuentan en `unevaluable`.
+
+No arregla nada por diseño. El 2026-09-15 una fila decía "desactualizado"
+sobre bytes que ya estaban corregidos, y otra decía "todo en orden" sobre un
+master de un corte anterior: **medir el artefacto antes de tocarlo**.
+
+```bash
+# Verificar un entregable a mano: ffprobe sobre la URL firmada lee sólo los
+# headers y cuesta nada. Comparar SIEMPRE contra el MP4 fuente.
+ffprobe -v error -select_streams v:0 \
+  -show_entries stream=codec_tag_string,width,height,r_frame_rate,pix_fmt \
+  -show_entries format=duration -of default=noprint_wrappers=1 "<url firmada>"
+# master correcto de este catálogo: apch (ProRes 422 HQ), 1920x1080,
+# yuv422p10le, y fps + duración IGUALES a la fuente. Un fps distinto al de la
+# fuente es conversión de framerate, que el QC manual de UMG rechaza.
+```

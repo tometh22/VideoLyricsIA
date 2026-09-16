@@ -115,6 +115,17 @@ _DELIVERY_RETENTION_SWEEP_INTERVAL_S = int(os.environ.get(
 ))
 _last_delivery_retention_sweep_ts = 0.0
 
+# Auditoría de integridad de las entregas del portal, en el mismo ritmo
+# diario y bajo el mismo runner único. Pregunta dos cosas que nadie miraba:
+# si el archivo que la fila promete existe en R2, y si el render cambió
+# después de publicarse. Las dos veces que fallaron (2026-09-15: 28 masters
+# fantasma en el portal de Chile, y una entrega sirviendo un corte anterior)
+# nos enteramos de casualidad, preguntando por otra cosa.
+_DELIVERY_AUDIT_INTERVAL_S = int(os.environ.get(
+    "REAPER_DELIVERY_AUDIT_INTERVAL_S", str(24 * 3600),
+))
+_last_delivery_audit_ts = 0.0
+
 # Edit-request abandon threshold. The worst case is a background edit
 # which re-runs Veo (~3 min p99) plus the full video composite (~5-8 min
 # for a 4-min song). 30 min gives 2-3× headroom over the slowest healthy
@@ -1286,6 +1297,19 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
                     logger.info("[REAPER] delivery retention sweep: %s", _rep)
             except Exception as e:
                 logger.warning("[REAPER] delivery retention sweep failed: %s", e)
+
+        # Auditoría de integridad del portal. Sólo reporta: arreglar un
+        # entregable es siempre una decisión con un humano adentro, porque la
+        # fila puede mentir en las dos direcciones (el 2026-09-15 una decía
+        # "desactualizado" sobre bytes que ya estaban corregidos).
+        global _last_delivery_audit_ts
+        if time.time() - _last_delivery_audit_ts >= _DELIVERY_AUDIT_INTERVAL_S:
+            _last_delivery_audit_ts = time.time()
+            try:
+                from delivery_integrity import audit_active_deliveries, log_audit
+                log_audit(audit_active_deliveries())
+            except Exception as e:
+                logger.warning("[REAPER] delivery integrity audit failed: %s", e)
 
         _n_tr = _n_up = _n_ed = 0
         for job in abandoned:
