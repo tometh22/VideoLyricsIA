@@ -349,6 +349,7 @@ function ChangeRequestCard({
         <ChangeRequestProposal
           summary={item.proposal}
           proposal={proposal}
+          requestComment={item.comment}
           busy={proposalBusy}
           applyEnabled={proposalApplyEnabled}
           jobId={d.job_id}
@@ -462,8 +463,152 @@ const MANUAL_LABELS = {
   manual_review: "Interpretación manual requerida",
 };
 
+function samePreviewSegment(left, right) {
+  if (!left || !right) return false;
+  if (left._id != null && right._id != null) {
+    return String(left._id) === String(right._id);
+  }
+  return (
+    Math.abs(Number(left.start || 0) - Number(right.start || 0)) < 0.000001
+    && Math.abs(Number(left.end || 0) - Number(right.end || 0)) < 0.000001
+    && String(left.text || "") === String(right.text || "")
+  );
+}
+
+export function buildLyricsPreview(
+  segments = [], operations = [], selected = [], textDrafts = {},
+) {
+  const selectedIds = new Set(selected.map(String));
+  const replacements = operations.filter((operation) => (
+    operation?.applicable
+    && operation.status === "pending"
+    && selectedIds.has(String(operation.id))
+    && operation.current_segments?.length === 1
+    && operation.proposed_segments?.length === 1
+  ));
+  return segments.map((segment, index) => {
+    const operation = replacements.find((candidate) => (
+      samePreviewSegment(segment, candidate.current_segments[0])
+    ));
+    const currentText = String(segment?.text || "");
+    const resultText = operation
+      ? String(
+        textDrafts[operation.id]
+        ?? operation.proposed_segments?.[0]?.text
+        ?? currentText,
+      )
+      : currentText;
+    return {
+      key: segment?._id != null
+        ? `segment-${segment._id}`
+        : `segment-${index}-${segment?.start}-${segment?.end}`,
+      start: Number(segment?.start || 0),
+      currentText,
+      resultText,
+      changed: resultText !== currentText,
+      operationId: operation?.id || null,
+    };
+  });
+}
+
+function previewTimestamp(value) {
+  const seconds = Math.max(0, Math.round(Number(value) || 0));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function LyricsProposalPreview({
+  requestComment, lyricsContext, operations, selected, textDrafts,
+}) {
+  if (!lyricsContext?.segments?.length) {
+    return (
+      <div className="rounded-button bg-amber-500/10 ring-1 ring-amber-400/20 p-3">
+        <p className="text-caption text-amber-100 font-medium">
+          No pudimos cargar la letra completa para esta propuesta.
+        </p>
+        <p className="text-label text-amber-100/70 mt-1">
+          Recalculá antes de aplicar para revisar el resultado con contexto.
+        </p>
+      </div>
+    );
+  }
+  if (lyricsContext.matches_base === false) {
+    return (
+      <div className="rounded-button bg-amber-500/10 ring-1 ring-amber-400/20 p-3">
+        <p className="text-caption text-amber-100 font-medium">
+          La letra cambió después de generar esta propuesta.
+        </p>
+        <p className="text-label text-amber-100/70 mt-1">
+          Recalculá para comparar el pedido con la revisión actual.
+        </p>
+      </div>
+    );
+  }
+
+  const rows = buildLyricsPreview(
+    lyricsContext.segments, operations, selected, textDrafts,
+  );
+  const changedCount = rows.filter((row) => row.changed).length;
+  return (
+    <div
+      aria-label="Vista previa de la letra resultante"
+      className="rounded-button bg-black/20 ring-1 ring-white/[0.08] overflow-hidden"
+    >
+      <div className="p-3 border-b border-white/[0.08] space-y-2">
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div>
+            <p className="text-caption font-semibold text-white">
+              Así quedaría la letra completa
+            </p>
+            <p className="text-label text-gray-400">
+              Vista previa solamente · todavía no modifica el editor
+            </p>
+          </div>
+          <span className="text-label text-emerald-200 bg-emerald-500/10 ring-1 ring-emerald-400/20 px-2 py-1 rounded-button">
+            {changedCount} cambio(s) seleccionado(s)
+          </span>
+        </div>
+        <div className="rounded-button bg-surface-2/50 p-2 ring-1 ring-white/[0.05]">
+          <p className="text-label uppercase tracking-wider text-gray-500 mb-1">
+            Pedido original
+          </p>
+          <p className="text-label text-gray-200 whitespace-pre-wrap font-mono leading-relaxed">
+            {requestComment}
+          </p>
+        </div>
+      </div>
+      <div className="max-h-96 overflow-y-auto divide-y divide-white/[0.04]">
+        {rows.map((row) => (
+          <div
+            key={row.key}
+            data-testid={`lyrics-preview-${row.key}`}
+            className={`grid grid-cols-[3rem_minmax(0,1fr)] gap-2 px-3 py-2 ${
+              row.changed ? "bg-emerald-500/[0.08]" : ""
+            }`}
+          >
+            <span className="text-label font-mono text-gray-600 pt-0.5">
+              {previewTimestamp(row.start)}
+            </span>
+            <div className="min-w-0">
+              {row.changed && (
+                <p className="text-label text-gray-500 line-through break-words">
+                  {row.currentText}
+                </p>
+              )}
+              <p className={`text-caption break-words ${
+                row.changed ? "text-emerald-200 font-medium" : "text-gray-300"
+              }`}>
+                {row.resultText}
+              </p>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function ChangeRequestProposal({
-  summary, proposal, busy, applyEnabled, jobId,
+  summary, proposal, requestComment, busy, applyEnabled, jobId,
   onGenerate, onLoad, onAdjust, onApply, onDismiss,
 }) {
   const operations = proposal?.operations || [];
@@ -480,6 +625,11 @@ function ChangeRequestProposal({
       operation.proposed_segments?.[0]?.text || "",
     ])));
   }, [proposal?.id, proposal?.updated_at]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const hasUnsavedDrafts = applicable.some((operation) => (
+    (textDrafts[operation.id] ?? operation.proposed_segments?.[0]?.text ?? "")
+    !== (operation.proposed_segments?.[0]?.text ?? "")
+  ));
 
   const effective = proposal || summary;
   const status = effective?.status;
@@ -628,13 +778,37 @@ function ChangeRequestProposal({
         );
       })}
 
+      {(status === "ready" || status === "partial" || status === "needs_input") && (
+        <LyricsProposalPreview
+          requestComment={requestComment}
+          lyricsContext={proposal.lyrics_context}
+          operations={operations}
+          selected={selected}
+          textDrafts={textDrafts}
+        />
+      )}
+
+      {hasUnsavedDrafts && (
+        <p className="text-label text-amber-200">
+          Guardá los ajustes de texto antes de aplicar la propuesta.
+        </p>
+      )}
+
       <div className="flex flex-wrap gap-2">
         {(status === "ready" || status === "partial") && (
           <button
             type="button"
             onClick={() => onApply(proposal.id, selected, proposal.base_revision)}
-            disabled={busy || !applyEnabled || selected.length === 0}
-            title={!applyEnabled ? "La aplicación está deshabilitada por configuración" : undefined}
+            disabled={(
+              busy || !applyEnabled || selected.length === 0 || hasUnsavedDrafts
+            )}
+            title={
+              !applyEnabled
+                ? "La aplicación está deshabilitada por configuración"
+                : hasUnsavedDrafts
+                  ? "Guardá los ajustes de texto antes de aplicar"
+                  : undefined
+            }
             className="bg-brand hover:bg-brand-light text-white text-caption font-medium px-3 py-1.5 rounded-button disabled:opacity-40"
           >
             {busy ? "Aplicando…" : `Aplicar seleccionadas (${selected.length})`}

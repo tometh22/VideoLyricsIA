@@ -1,7 +1,11 @@
 import pytest
 
 from change_request_parser import parse_change_request
-from change_request_proposals import apply_operations, build_proposal
+from change_request_proposals import (
+    apply_operations,
+    build_proposal,
+    lyrics_preview_context,
+)
 
 
 def segment(start, end, text, **extra):
@@ -149,3 +153,42 @@ def test_ambiguous_request_never_becomes_applicable_patch():
     assert proposal["status"] == "needs_input"
     assert proposal["applicable_count"] == 0
     assert all(not row["applicable"] for row in proposal["operations"])
+
+
+def test_lyrics_preview_context_returns_full_revision_bound_lyric():
+    segments = [
+        segment(0, 2, "Primera línea", _id="a"),
+        segment(2, 4, "Segunda línea", _id="b"),
+    ]
+    proposal = build_proposal(
+        comment='0:03 debe decir "Segunda línea corregida"',
+        segments=segments,
+        base_revision=7,
+    )
+    context = lyrics_preview_context(
+        segments,
+        revision=7,
+        base_revision=proposal["base_revision"],
+        base_segments_content_hash=proposal["segments_content_hash"],
+    )
+    assert context["matches_base"] is True
+    assert [row["text"] for row in context["segments"]] == [
+        "Primera línea", "Segunda línea",
+    ]
+
+
+def test_lyrics_preview_context_marks_changed_editor_snapshot_stale():
+    original = [segment(0, 2, "Texto anterior")]
+    proposal = build_proposal(
+        comment='0:01 debe decir "Texto correcto"',
+        segments=original,
+        base_revision=2,
+    )
+    context = lyrics_preview_context(
+        [segment(0, 2, "Editado por otra persona")],
+        revision=3,
+        base_revision=proposal["base_revision"],
+        base_segments_content_hash=proposal["segments_content_hash"],
+    )
+    assert context["matches_base"] is False
+    assert context["revision"] == 3
