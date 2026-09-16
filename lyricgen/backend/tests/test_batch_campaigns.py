@@ -429,6 +429,29 @@ def test_render_capacity_fails_closed_before_human_approval(db):
     assert exc.value.detail["code"] == "reference_hypothesis_missing"
 
 
+def test_render_capacity_allows_batch_art_track_without_lyrics_approval(db):
+    """Art tracks use the shared capacity gate but never have lyric approval."""
+    campaign = _campaign(db, 1)
+    campaign.kind = "art_track"
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="queued", workload_class="batch", campaign_id=campaign.id,
+        campaign_item_id=item.id, render_params={"art_track": True},
+    )
+    db.add(job)
+    db.commit()
+
+    # No reference hypothesis, segments, or human lyric approval exists —
+    # capacity enforcement must still allow the art-track render to proceed.
+    batch.enforce_render_capacity(db, job)
+
+
 def test_render_capacity_reuses_the_current_final_review_slot(db, monkeypatch):
     monkeypatch.setattr(batch, "FINAL_REVIEW_LIMIT", 2)
     campaign = _campaign(db, 2)

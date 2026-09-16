@@ -327,6 +327,26 @@ def upload_art_asset(
     return entry["filename"], "uploaded"
 
 
+def source_for_art_asset(asset: dict, audio_entries: list[dict], cover_entries: list[dict]) -> dict | None:
+    """Resolve one registered asset to the local file with the same role.
+
+    Basenames are only a fallback: folder-relative paths are the canonical
+    identity, and a basename is accepted only when unique within its role.
+    This prevents ``cover.jpg`` from being selected for an unrelated
+    ``cover.mp3`` asset.
+    """
+    entries = cover_entries if asset.get("role") == "cover" else audio_entries if asset.get("role") == "audio" else []
+    by_path = {entry.get("relative_path"): entry for entry in entries if entry.get("relative_path")}
+    by_name: dict[str, list[dict]] = {}
+    for entry in entries:
+        by_name.setdefault(entry.get("filename"), []).append(entry)
+    source = by_path.get(asset.get("relative_path"))
+    if source is not None:
+        return source
+    matches = by_name.get(asset.get("filename"), [])
+    return matches[0] if len(matches) == 1 else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Upload a WAV/MP3 folder to a Genly campaign")
     parser.add_argument("--api", required=True, help="API base URL")
@@ -368,8 +388,9 @@ def main() -> int:
     if not paths:
         print("No WAV/MP3 files found.", file=sys.stderr)
         return 2
-    if len(paths) > 1000:
-        print("Campaigns accept at most 1,000 files.", file=sys.stderr)
+    if len(paths) > (500 if args.covers else 1000):
+        limit = 500 if args.covers else 1000
+        print(f"Campaigns accept at most {limit} files.", file=sys.stderr)
         return 2
 
     print(f"Inspecting {len(paths)} audio files…")
@@ -378,7 +399,13 @@ def main() -> int:
         futures = {pool.submit(inspect_file, path): path for path in paths}
         for future in as_completed(futures):
             try:
-                entries.append(future.result())
+                entry = future.result()
+                # Keep the folder-relative identity in the manifest.  Without
+                # it, two folders containing the same filename collapse to
+                # one mapping and a cover/audio with the same basename can be
+                # uploaded against the wrong asset.
+                entry["relative_path"] = str(entry["path"].relative_to(folder))
+                entries.append(entry)
             except Exception as exc:
                 print(f"ERROR inspecting {futures[future].name}: {exc}", file=sys.stderr)
     entries.sort(key=lambda item: item["filename"].casefold())
@@ -414,17 +441,18 @@ def main() -> int:
         assets = json_request(
             f"{base}/batch/art-track-campaigns/{args.campaign}/assets", auth=auth,
         )
-        by_path = {entry["relative_path"]: entry for entry in covers}
-        by_name = {entry["filename"]: entry for entry in covers}
-        by_audio = {entry["filename"]: entry for entry in entries}
         failures = []
         for asset in assets.get("items", []):
-            source = (
-                by_path.get(asset.get("relative_path"))
-                or by_name.get(asset.get("filename"))
-                or by_audio.get(asset.get("filename"))
-            )
-            if not source or asset.get("upload_state") == "uploaded":
+            source = source_for_art_asset(asset, entries, covers)
+            if asset.get("upload_state") == "uploaded":
+                continue
+            if not source:
+                failures.append(asset.get("filename") or asset.get("relative_path") or asset["id"])
+                print(
+                    f"ERROR {asset.get('filename')}: no local file matched "
+                    f"for role {asset.get('role')} ({asset.get('relative_path') or 'no relative path'})",
+                    file=sys.stderr,
+                )
                 continue
             try:
                 filename, state = upload_art_asset(base, auth, source, asset["id"])
