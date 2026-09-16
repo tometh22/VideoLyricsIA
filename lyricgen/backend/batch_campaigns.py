@@ -2621,7 +2621,13 @@ def enforce_render_capacity(db: Session, job: Job) -> None:
     """Keep campaign rendering bounded without consuming interactive quota."""
     if job.workload_class != "batch" or not job.campaign_id:
         return
-    require_prebackground_approval(job)
+    # Art-track campaigns intentionally have no lyrics, timing, reference
+    # hypothesis, or editor approval.  They still use this function for the
+    # shared render/review capacity gate, but applying the lyric approval gate
+    # here makes every queued batch art track fail with
+    # ``reference_hypothesis_missing`` before the renderer can start.
+    if not bool((job.render_params or {}).get("art_track")):
+        require_prebackground_approval(job)
     campaign = db.query(BatchCampaign).filter(
         BatchCampaign.id == job.campaign_id,
     ).with_for_update().first()

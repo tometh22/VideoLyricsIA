@@ -166,6 +166,7 @@ function CampaignDetail({ id }) {
   const [error, setError] = useState("");
   const [presetText, setPresetText] = useState("");
   const [assetBusy, setAssetBusy] = useState(false);
+  const [deliveryBusy, setDeliveryBusy] = useState(false);
   const [deliveryMessage, setDeliveryMessage] = useState("");
   const fileInput = useRef(null);
   const [queueStage, setQueueStage] = useState(() => searchParams.get("stage") || "lyrics");
@@ -233,6 +234,16 @@ function CampaignDetail({ id }) {
     setSearchParams(next, { replace: !push });
     try { sessionStorage.setItem(`campaign-review-context:${id}`, JSON.stringify(values)); } catch { /* best effort */ }
   }, [id, page, reviewPage, phase, queueStage, queueVersion, queueState, queueArtist, queueMine, queueOrder, queueScope, queueSearch, searchParams, setSearchParams]);
+
+  // Art tracks skip the lyrics editor and become reviewable only after the
+  // render.  Default their campaign queue to final review so an operator is
+  // not dropped into an empty "lyrics" queue after a successful 500-file
+  // import.
+  useEffect(() => {
+    if (campaign?.kind !== "art_track" || searchParams.get("stage") === "final" || queueStage === "final") return;
+    setQueueStage("final");
+    saveContext({ stage: "final" });
+  }, [campaign?.kind, queueStage, saveContext, searchParams]);
 
   const selectScope = (scope) => {
     if (scope === queueScope && !queueState) return;
@@ -419,29 +430,53 @@ function CampaignDetail({ id }) {
       const manifest = await api(`/batch/art-track-campaigns/${id}/manifest`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ audios, covers }) });
       const assets = await api(`/batch/art-track-campaigns/${id}/assets`);
       const local = new Map(files.map((file) => [file.webkitRelativePath || file.name, file]));
-      for (const asset of assets.items || []) {
-        const file = local.get(asset.relative_path) || local.get(asset.filename);
-        if (file && asset.upload_state !== "uploaded") await uploadAsset({ ...asset, file });
-      }
+      const pending = (assets.items || [])
+        .map((asset) => ({ ...asset, file: local.get(asset.relative_path) || local.get(asset.filename) }))
+        .filter((asset) => asset.file && asset.upload_state !== "uploaded");
+      // Keep browser memory and R2 pressure bounded while avoiding a 500-file
+      // serial upload. Each asset is independently resumable, so a failed
+      // worker can be retried with the same folder and skips completed files.
+      let cursor = 0;
+      const uploadWorker = async () => {
+        while (cursor < pending.length) {
+          const index = cursor++;
+          await uploadAsset(pending[index]);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(4, pending.length) }, uploadWorker));
       setDeliveryMessage(`${manifest.registered_count} audios registrados; ${manifest.matched_count} covers asociados. Confirmá las asociaciones antes de generar.`);
       await load();
     } catch (e) { setError(e.message); }
     finally { setAssetBusy(false); if (fileInput.current) fileInput.current.value = ""; }
   };
   const confirmAndRender = async () => {
+    if (assetBusy) return;
+    setAssetBusy(true); setError("");
     try {
       await api(`/batch/art-track-campaigns/${id}/associations/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm_all_matched: true }) });
       const result = await api(`/batch/art-track-campaigns/${id}/start-rendering`, { method: "POST" });
       setDeliveryMessage(`Generación iniciada: ${result.created_count} art tracks; ${result.blocked_item_ids?.length || 0} pendientes de asociación.`); await load();
     } catch (e) { setError(e.message); }
+    finally { setAssetBusy(false); }
   };
   const previewDeliveries = async () => {
+    if (deliveryBusy) return;
+    setDeliveryBusy(true); setError("");
     try { const result = await api(`/batch/art-track-campaigns/${id}/delivery-preview`, { method: "POST" }); setDeliveryMessage(`${result.eligible_count} art tracks aprobados para ${result.hostname}.`); }
     catch (e) { setError(e.message); }
+    finally { setDeliveryBusy(false); }
   };
   const createDeliveries = async () => {
-    try { const result = await api(`/batch/art-track-campaigns/${id}/deliveries`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: `ui-${id}-${Date.now()}` }) }); setDeliveryMessage(`Envío durable creado: ${result.total_count} canciones a ${result.hostname}.`); }
+    if (deliveryBusy) return;
+    setDeliveryBusy(true); setError("");
+    try {
+      const result = await api(`/batch/art-track-campaigns/${id}/deliveries`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idempotency_key: `ui-${id}-${Date.now()}` }) });
+      setDeliveryMessage(result.scheduled === false
+        ? `Envío guardado (${result.total_count} canciones), pendiente de worker en ${result.hostname}.`
+        : `Envío durable creado: ${result.total_count} canciones a ${result.hostname}.`);
+    }
     catch (e) { setError(e.message); }
+    finally { setDeliveryBusy(false); }
   };
 
   const labels = useMemo(() => Object.fromEntries(PHASES), []);
