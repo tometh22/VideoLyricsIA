@@ -70,6 +70,8 @@ CHECK_DEFINITIONS = (
         "UPSTREAM_QUALITY_REVIEW", "REFERENCE_TEXT_UNATTESTED",
         "REFERENCE_TIMELINE_INCOMPLETE", "LYRIC_ORTHOGRAPHY_MISMATCH",
         "LYRIC_TOKEN_TYPO", "LYRIC_TERMINAL_PERIOD",
+        "LYRIC_REPEAT_INCONSISTENCY", "LYRIC_FRAGMENTATION",
+        "LYRIC_END_BEFORE_WORD_END",
     }),
     ("ocr_title", "Texto visible del title card", "final_frame_ocr", {"OCR_TITLE_MISMATCH"}),
     ("ocr_lyrics", "Texto visible de las letras", "final_frame_ocr", {"OCR_LYRIC_MISMATCH"}),

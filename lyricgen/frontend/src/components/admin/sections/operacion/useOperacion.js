@@ -10,6 +10,26 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { API, fetchJson } from "../../adminApi";
+
+async function changeRequestIdempotencyKey(proposalId, baseRevision, operationIds) {
+  const signature = `${proposalId}:${baseRevision}:${[...operationIds].sort().join(",")}`;
+  if (globalThis.crypto?.subtle && typeof TextEncoder !== "undefined") {
+    const bytes = await globalThis.crypto.subtle.digest(
+      "SHA-256", new TextEncoder().encode(signature),
+    );
+    const hex = [...new Uint8Array(bytes)]
+      .map((value) => value.toString(16).padStart(2, "0")).join("");
+    return `change-request-${hex}`;
+  }
+  // Deterministic fallback for older admin browsers. The proposal UUID and
+  // revision remain in the input, so a reload still produces the same key.
+  let hash = 2166136261;
+  for (const char of signature) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `change-request-${proposalId}-${baseRevision}-${(hash >>> 0).toString(16)}`;
+}
 import { useAdmin } from "../../AdminContext";
 
 const STUCK_THRESHOLD_MIN = 100;
@@ -123,6 +143,10 @@ export default function useOperacion() {
   const [crResolvedCount, setCrResolvedCount] = useState(0);
   const [crLoading, setCrLoading] = useState(true);
   const [crResolvingId, setCrResolvingId] = useState(null);
+  const [crProposalEnabled, setCrProposalEnabled] = useState(false);
+  const [crProposalApplyEnabled, setCrProposalApplyEnabled] = useState(false);
+  const [crProposalBusyId, setCrProposalBusyId] = useState(null);
+  const [crProposalDetails, setCrProposalDetails] = useState({});
 
   const crStatusRef = useRef(crStatusFilter);
   crStatusRef.current = crStatusFilter;
@@ -136,12 +160,135 @@ export default function useOperacion() {
       setChangeRequests(data.items || []);
       setCrPendingCount(data.pending_count || 0);
       setCrResolvedCount(data.resolved_count || 0);
+      setCrProposalEnabled(data.proposal_enabled === true);
+      setCrProposalApplyEnabled(data.proposal_apply_enabled === true);
     } catch (err) {
       flashError(`No pude cargar los cambios: ${err.message || err}`);
     } finally {
       setCrLoading(false);
     }
   }, [flashError]);
+
+  const storeProposal = useCallback((requestId, proposal) => {
+    setCrProposalDetails((current) => ({ ...current, [requestId]: proposal }));
+  }, []);
+
+  const generateChangeRequestProposal = useCallback(async (requestId) => {
+    setCrProposalBusyId(requestId);
+    try {
+      const data = await fetchJson(`${API}/admin/change-requests/${requestId}/proposals`, {
+        method: "POST",
+      });
+      storeProposal(requestId, data.proposal);
+      await loadChangeRequests();
+      return data.proposal;
+    } catch (err) {
+      flashError(`No pude analizar el pedido: ${err.message || err}`);
+      return null;
+    } finally {
+      setCrProposalBusyId(null);
+    }
+  }, [flashError, loadChangeRequests, storeProposal]);
+
+  const loadChangeRequestProposal = useCallback(async (requestId) => {
+    setCrProposalBusyId(requestId);
+    try {
+      const data = await fetchJson(
+        `${API}/admin/change-requests/${requestId}/proposals/current`,
+      );
+      storeProposal(requestId, data.proposal);
+      return data.proposal;
+    } catch (err) {
+      flashError(`No pude cargar la propuesta: ${err.message || err}`);
+      return null;
+    } finally {
+      setCrProposalBusyId(null);
+    }
+  }, [flashError, storeProposal]);
+
+  const adjustChangeRequestProposal = useCallback(async (
+    requestId, proposalId, operationId, requestedText, baseRevision,
+  ) => {
+    setCrProposalBusyId(requestId);
+    try {
+      const data = await fetchJson(
+        `${API}/admin/change-requests/${requestId}/proposals/${proposalId}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            operation_id: operationId,
+            requested_text: requestedText,
+            base_revision: baseRevision,
+          }),
+        },
+      );
+      storeProposal(requestId, data.proposal);
+      return data.proposal;
+    } catch (err) {
+      flashError(`No pude ajustar la propuesta: ${err.message || err}`);
+      return null;
+    } finally {
+      setCrProposalBusyId(null);
+    }
+  }, [flashError, storeProposal]);
+
+  const applyChangeRequestProposal = useCallback(async (
+    requestId, proposalId, operationIds, baseRevision,
+  ) => {
+    setCrProposalBusyId(requestId);
+    try {
+      const idempotencyKey = await changeRequestIdempotencyKey(
+        proposalId, baseRevision, operationIds,
+      );
+      const data = await fetchJson(
+        `${API}/admin/change-requests/${requestId}/proposals/${proposalId}/apply`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            base_revision: baseRevision,
+            operation_ids: operationIds,
+            idempotency_key: idempotencyKey,
+          }),
+        },
+      );
+      storeProposal(requestId, { ...data.proposal, editor_url: data.editor_url });
+      setCrPublishNotice({
+        tone: "ok",
+        text: "La corrección quedó guardada. Abrí el editor para revisar y re-renderizar; el pedido seguirá pendiente hasta publicar.",
+      });
+      await loadChangeRequests();
+      return data;
+    } catch (err) {
+      flashError(`No pude aplicar la propuesta: ${err.message || err}`);
+      return null;
+    } finally {
+      setCrProposalBusyId(null);
+    }
+  }, [flashError, loadChangeRequests, storeProposal]);
+
+  const dismissChangeRequestProposal = useCallback(async (requestId, proposalId) => {
+    setCrProposalBusyId(requestId);
+    try {
+      const data = await fetchJson(
+        `${API}/admin/change-requests/${requestId}/proposals/${proposalId}/dismiss`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reason: "manual_workflow" }),
+        },
+      );
+      storeProposal(requestId, data.proposal);
+      await loadChangeRequests();
+      return data.proposal;
+    } catch (err) {
+      flashError(`No pude descartar la propuesta: ${err.message || err}`);
+      return null;
+    } finally {
+      setCrProposalBusyId(null);
+    }
+  }, [flashError, loadChangeRequests, storeProposal]);
 
   useEffect(() => {
     loadChangeRequests();
@@ -264,6 +411,15 @@ export default function useOperacion() {
     crResolvedCount,
     crLoading,
     crResolvingId,
+    crProposalEnabled,
+    crProposalApplyEnabled,
+    crProposalBusyId,
+    crProposalDetails,
+    generateChangeRequestProposal,
+    loadChangeRequestProposal,
+    adjustChangeRequestProposal,
+    applyChangeRequestProposal,
+    dismissChangeRequestProposal,
     resolveChangeRequest,
     reopenChangeRequest,
     crPublishingId,

@@ -1074,6 +1074,52 @@ class EditorDocument(Base):
     job = relationship("Job", back_populates="editor_document")
 
 
+class ChangeRequestProposal(Base):
+    """Revision-bound operator proposal for one external portal request.
+
+    Change requests may live in ``DELIVERIES_DATABASE_URL`` while jobs and
+    editor documents live in the local application database.  The external
+    identifiers therefore cannot be foreign keys; ``job_id`` is the local
+    integrity anchor and every apply revalidates the external request.
+    """
+    __tablename__ = "change_request_proposals"
+    __table_args__ = (
+        UniqueConstraint(
+            "portal_id", "change_request_id", "request_sha256",
+            "base_revision", name="uq_change_request_proposal_snapshot",
+        ),
+        Index("ix_crp_request_status", "portal_id", "change_request_id", "status"),
+        Index("ix_crp_job_created", "job_id", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    portal_id = Column(String(32), nullable=False, default="argentina")
+    change_request_id = Column(Integer, nullable=False)
+    delivery_id = Column(Integer, nullable=False)
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    request_sha256 = Column(String(64), nullable=False)
+    base_revision = Column(Integer, nullable=False)
+    segments_hash = Column(String(64), nullable=False)
+    segments_content_hash = Column(String(64), nullable=False)
+    audio_revision = Column(Integer, nullable=False, default=0, server_default="0")
+    audio_sha256 = Column(String(64), nullable=False, default="", server_default="")
+    parser_version = Column(String(64), nullable=False)
+    schema_version = Column(String(64), nullable=False)
+    status = Column(String(24), nullable=False)
+    operations = Column(JSONB, nullable=False)
+    decision_history = Column(JSONB, nullable=False, default=list)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    applied_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    applied_at = Column(DateTime(timezone=True), nullable=True)
+    applied_revision = Column(Integer, nullable=True)
+    idempotency_hash = Column(String(64), nullable=True)
+
+
 class JobOutboxEvent(Base):
     """Durable publication intent committed with the owning Job mutation."""
     __tablename__ = "job_outbox_events"

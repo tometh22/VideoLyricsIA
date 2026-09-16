@@ -6,7 +6,10 @@ from datetime import timedelta, timezone
 # The batch/shared account cannot establish personal review attribution, even
 # when its scripts use "manual" or "restore". Do not guess from name prefixes.
 KNOWN_AUTOMATION_ACCOUNTS = frozenset({"batch-universal-staging"})
-HUMAN_CHECKPOINTS = frozenset({"autosave", "manual", "draft", "restore", "conflict", "approve", "legacy_autosave"})
+HUMAN_CHECKPOINTS = frozenset({
+    "autosave", "manual", "draft", "restore", "conflict", "approve",
+    "legacy_autosave", "change_request",
+})
 ACTIVITY_WINDOW = timedelta(seconds=45)
 
 
