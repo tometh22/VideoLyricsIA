@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.52] - 2026-09-16
+
+### Changed
+
+- Promote UMG change requests to a dedicated, full-width Admin section with a
+  visible pending-count badge, so operators can review the original request,
+  current lyric and proposed result without competing with the live pipeline.
+- Keep the live pipeline focused in the `Ahora` section and isolate editorial
+  request data from the health and jobs polling lifecycle.
+
 ## [1.1.51] - 2026-09-16
 
 ### Added
