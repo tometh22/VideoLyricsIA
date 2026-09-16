@@ -10,18 +10,25 @@ un modelo para inventar cuál debería ser la letra.
 ## Flujo de operación
 
 1. En **Operación → Pedidos de cambio**, abrir `Analizar pedido`.
-2. Revisar el diff por línea. Las instrucciones de timing, estructura, fondo o
-   audio se muestran como revisión manual y no tienen botón de aplicación.
-3. Ajustar el texto propuesto si hace falta y aplicar únicamente las filas
-   seleccionadas.
-4. Abrir el editor, escuchar el tramo, re-renderizar y publicar la nueva
+2. Revisar juntos el pedido original, el diff por línea y la vista previa de
+   la letra completa resultante. La vista previa se actualiza al seleccionar o
+   deseleccionar cambios y no escribe en el editor.
+3. Las instrucciones de timing, estructura, fondo o audio se muestran como
+   revisión manual y no tienen botón de aplicación.
+4. Ajustar el texto propuesto si hace falta, guardar el ajuste y aplicar
+   únicamente las filas seleccionadas. Mientras haya un ajuste sin guardar,
+   la aplicación queda bloqueada para que el resultado aplicado no difiera de
+   la vista previa.
+5. Abrir el editor, escuchar el tramo, re-renderizar y publicar la nueva
    versión por el flujo existente.
-5. El pedido sigue pendiente hasta que la publicación lo cierre. Aplicar una
+6. El pedido sigue pendiente hasta que la publicación lo cierre. Aplicar una
    propuesta no equivale a entregarla al cliente.
 
 Cuando la revisión del editor o el audio cambia, la propuesta queda obsoleta y
-debe recalcularse. Una aplicación parcial también se recalcula sobre la nueva
-revisión para trabajar los pendientes.
+debe recalcularse. La API liga la vista previa a la misma revisión/hash que la
+aplicación, por lo que nunca muestra una letra vieja como si todavía pudiera
+aplicarse. Una aplicación parcial también se recalcula sobre la nueva revisión
+para trabajar los pendientes.
 
 ## Qué automatiza
 
