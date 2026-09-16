@@ -275,6 +275,8 @@ def test_portal_items_lists_active_deliveries(client, admin_token, approved_job,
     # Then list
     res = client.get("/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN})
     assert res.status_code == 200
+    assert res.headers["cache-control"] == "private, no-store, max-age=0"
+    assert res.headers["pragma"] == "no-cache"
     payload = res.json()
     assert "songs" in payload
     assert "file_type_labels" in payload
@@ -399,6 +401,104 @@ def test_admin_delete_via_jwt(client, admin_token, approved_job, all_r2_files_pr
 
     res = client.delete(f"/admin/deliveries/{delivery_id}", headers=auth(admin_token))
     assert res.status_code == 200
+
+
+def test_portal_can_prepare_missing_prores_for_its_delivery(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+
+    with patch("main.enqueue_prores_prewarm", return_value="prewarm:test") as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_master"},
+        )
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "queued"
+    enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True)
+
+
+def test_portal_can_prepare_staging_delivery_without_local_job(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    """The shared portal DB contains deliveries created by staging, while
+    production's jobs DB deliberately does not contain those Job rows."""
+    from database import Job
+
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+    db.query(Job).filter(Job.id == approved_job.id).delete()
+    db.commit()
+
+    with patch(
+        "main.enqueue_delivery_prores_prewarm", return_value="portal-prewarm:test",
+    ) as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_master"},
+        )
+
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "queued"
+    enqueue.assert_called_once_with(
+        approved_job.job_id, "umg_master", "default", frame_size="HD",
+    )
+
+
+def test_portal_can_prepare_legacy_mp4_only_delivery(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+    approved_job.umg_spec = None
+    db.commit()
+
+    with patch(
+        "main.enqueue_delivery_prores_prewarm", return_value="portal-prewarm:test",
+    ) as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_short"},
+        )
+
+    assert res.status_code == 202, res.text
+    enqueue.assert_called_once_with(
+        approved_job.job_id, "umg_short", "default", frame_size="HD",
+    )
+
+
+def test_portal_cannot_prepare_prores_from_the_other_portal(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    chile_delivery_id = published.json()["delivery_id"]
+    with patch("main.enqueue_prores_prewarm"):
+        res = client.post(
+            f"/api/deliveries/{chile_delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "argentina"},
+            json={"file_type": "umg_master"},
+        )
+    assert res.status_code == 404
 
 
 def test_status_endpoint_includes_is_in_umg_portal(

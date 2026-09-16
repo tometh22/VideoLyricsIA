@@ -130,7 +130,10 @@ from observability import init_sentry, init_logging, health_snapshot
 from pipeline import (run_pipeline, transcribe, _normalize_movement_style,
                       CANVAS_FILE_TYPES)
 from segment_timing import normalize_segments_timing, normalize_editor_segments, timing_anomalies
-from queue_jobs import enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm, enqueue_drive_delivery
+from queue_jobs import (
+    enqueue_pipeline, enqueue_edit, queue_depth, enqueue_prores_prewarm,
+    enqueue_delivery_prores_prewarm, enqueue_drive_delivery,
+)
 from render_spec import umg_catalog, validate_umg_config
 from transcription_language import (
     build_language_contract,
@@ -20187,6 +20190,97 @@ async def portal_delete_delivery(
     return _soft_delete_delivery(ddb, db, delivery_id, actor_user_id=None, portal_id=portal_id)
 
 
+@app.post("/api/deliveries/{delivery_id}/prepare-prores")
+async def portal_prepare_prores(
+    delivery_id: int,
+    body: dict,
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """Queue a missing ProRes derivative from the delivery portal.
+
+    ProRes is intentionally lazy because a master can take minutes and
+    several GB. The portal listing used to render a missing derivative as a
+    permanently disabled button, leaving UMG with no way to start it. Keep
+    the same portal row-level authorization as approve/delete. If this API
+    owns the source Job, reuse its exact persisted UMG spec; deliveries sent
+    from staging fall back to their immutable R2 snapshot so the shared
+    production portal can prepare them too.
+    """
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    file_type = body.get("file_type") if isinstance(body, dict) else None
+    if file_type not in ("umg_master", "umg_short"):
+        raise HTTPException(status_code=400, detail="Archivo ProRes inválido.")
+
+    delivery = _portal_delivery_query(
+        ddb.query(Delivery), portal_id,
+    ).filter(
+        Delivery.id == delivery_id,
+        Delivery.removed_at.is_(None),
+    ).first()
+    if delivery is None:
+        raise HTTPException(status_code=404, detail="Delivery no encontrada.")
+    if file_type not in (delivery.file_types or []):
+        raise HTTPException(status_code=404, detail="Archivo no disponible para esta entrega.")
+
+    job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
+    if job is not None and job.status != "done":
+        raise HTTPException(status_code=400, detail="El video todavía no terminó de procesarse.")
+
+    try:
+        if job is not None and job.umg_spec:
+            rq_id = enqueue_prores_prewarm(job.job_id, file_type, force=True)
+            prepare_source = "job"
+        else:
+            # Cross-environment/legacy campaign delivery. Its source MP4 is
+            # already validated by the portal listing and lives at the
+            # deterministic R2 key captured by the Delivery snapshot.
+            rq_id = enqueue_delivery_prores_prewarm(
+                delivery.job_id,
+                file_type,
+                delivery.tenant_snapshot,
+                frame_size=delivery.frame_size_snapshot,
+            )
+            prepare_source = "delivery_snapshot"
+    except Exception as exc:
+        logger.warning(
+            "[PORTAL-PRORES] enqueue failed delivery=%s job=%s type=%s: %s",
+            delivery_id, delivery.job_id, file_type, exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo iniciar la preparación ProRes. Probá de nuevo en un momento.",
+        ) from exc
+
+    db.add(AuditLog(
+        user_id=None,
+        action="delivery.prores.prepare",
+        detail={
+            "delivery_id": delivery_id,
+            "job_id": delivery.job_id,
+            "portal_id": portal_id,
+            "file_type": file_type,
+            "prepare_source": prepare_source,
+        },
+    ))
+    db.commit()
+    return JSONResponse(
+        status_code=202,
+        content={
+            "ok": True,
+            "status": "queued",
+            "delivery_id": delivery_id,
+            "job_id": delivery.job_id,
+            "file_type": file_type,
+            "rq_id": rq_id,
+            "retry_after": 60,
+        },
+        headers={"Retry-After": "60"},
+    )
+
+
 @app.post("/api/deliveries/{delivery_id}/change-request")
 async def portal_submit_change_request(
     delivery_id: int,
@@ -20396,6 +20490,7 @@ async def portal_get_meta(
 
 @app.get("/api/deliveries/items")
 async def portal_get_items(
+    response: Response,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_deliveries_db),
@@ -20406,6 +20501,11 @@ async def portal_get_items(
     under Railway's multi-worker setup — see the module-level note next
     to _DELIVERY_URL_EXPIRY_S."""
     portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    # The listing contains private, short-lived R2 URLs and is served through
+    # both UMG hostnames. Never let a CDN/proxy reuse one portal's response
+    # for the other portal (or expose signed URLs from a shared cache).
+    response.headers["Cache-Control"] = "private, no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     import time
     from concurrent.futures import ThreadPoolExecutor
 
