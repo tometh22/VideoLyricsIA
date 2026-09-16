@@ -3,6 +3,26 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.51] - 2026-09-16
+
+### Added
+
+- Show each change request beside the complete current lyric and a live preview
+  of the resulting lyric before applying it. Selected operations and edited
+  replacement text update the preview immediately, with changed lines shown
+  against their originals and timestamps for context.
+
+### Changed
+
+- Require proposal edits to be saved before application so the reviewed
+  preview is exactly the version that will be written.
+
+### Security
+
+- Mark a proposal stale in the read response when its bound lyric revision or
+  content hash no longer matches the editor document, preventing an outdated
+  contextual preview from being applied.
+
 ## [1.1.50] - 2026-09-16
 
 ### Added
