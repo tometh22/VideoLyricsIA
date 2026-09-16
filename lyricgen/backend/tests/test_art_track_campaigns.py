@@ -68,6 +68,22 @@ def test_art_manifest_deduplicates_shared_cover_and_blocks_ambiguous(client, adm
         db.close()
 
 
+def test_art_manifest_rejects_duplicate_technical_codes_without_server_error(client, admin_token, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign_id = _create(client, admin_token)
+    auth = {"Authorization": f"Bearer {admin_token}"}
+    response = client.post(
+        f"/batch/art-track-campaigns/{campaign_id}/manifest", headers=auth,
+        json={"covers": [], "audios": [
+            {"filename": "one.mp3", "technical_code": "ARF123", "size_bytes": 1000, "sha256": _digest("one")},
+            {"filename": "two.mp3", "technical_code": "arf123", "size_bytes": 1000, "sha256": _digest("two")},
+        ]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "duplicate_technical_code"
+
+
 def test_art_render_never_creates_transcription_and_is_idempotent(client, admin_token, monkeypatch):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
     campaign_id = _create(client, admin_token)

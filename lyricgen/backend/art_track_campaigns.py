@@ -43,6 +43,8 @@ router = APIRouter(prefix="/batch", tags=["art-track-campaigns"])
 ART_TRACK_LIMIT = min(int(os.environ.get("BATCH_ART_TRACK_ITEM_LIMIT", "500")), 500)
 ALLOWED_AUDIO = {".wav": "audio/wav", ".mp3": "audio/mpeg"}
 ALLOWED_COVERS = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+MAX_COVER_BYTES = int(os.environ.get("BATCH_MAX_COVER_BYTES", str(50 * 1024 * 1024)))
+MAX_COVER_PIXELS = int(os.environ.get("BATCH_MAX_COVER_PIXELS", "50000000"))
 DESTINATIONS = {"argentina": "umg.genly.pro", "chile": "umgchile.genly.pro"}
 DELIVERY_FILE_TYPES = ["umg_master", "video", "umg_short", "short", "thumbnail"]
 _SEP_RE = re.compile(r"[^a-z0-9]+")
@@ -229,6 +231,37 @@ def register_art_manifest(
     existing = db.query(BatchCampaignItem).filter(BatchCampaignItem.campaign_id == campaign.id).count()
     if existing + len(body.audios) > ART_TRACK_LIMIT:
         raise HTTPException(status_code=413, detail=f"Art-track campaigns accept at most {ART_TRACK_LIMIT} audios.")
+    # Surface duplicate technical codes as a deterministic association
+    # conflict instead of letting the database uniqueness constraint turn a
+    # 500-file manifest into an opaque 500 response. Repeating the exact same
+    # audio is still idempotent; reusing a code for different bytes is not.
+    incoming_codes: dict[str, str] = {}
+    for audio in body.audios:
+        code = str(audio.technical_code or "").strip().upper()
+        digest = audio.sha256.lower()
+        if not code:
+            continue
+        previous = incoming_codes.get(code)
+        if previous is not None and previous != digest:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "duplicate_technical_code", "technical_code": code},
+            )
+        incoming_codes[code] = digest
+    if incoming_codes:
+        existing_codes = {
+            row.technical_code: row.sha256
+            for row in db.query(BatchCampaignItem).filter(
+                BatchCampaignItem.campaign_id == campaign.id,
+                BatchCampaignItem.technical_code.in_(incoming_codes),
+            ).all()
+        }
+        for code, digest in incoming_codes.items():
+            if code in existing_codes and existing_codes[code] != digest:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "duplicate_technical_code", "technical_code": code},
+                )
     cover_rows: dict[tuple[str, str], BatchCampaignAsset] = {}
     for cover in body.covers:
         ext = os.path.splitext(cover.filename)[1].lower()
@@ -237,6 +270,10 @@ def register_art_manifest(
         digest = cover.sha256.lower()
         if not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise HTTPException(status_code=400, detail=f"Invalid SHA-256 for {cover.filename}.")
+        if cover.size_bytes > MAX_COVER_BYTES:
+            raise HTTPException(status_code=413, detail=f"Cover is too large: {cover.filename}")
+        if cover.width and cover.height and cover.width * cover.height > MAX_COVER_PIXELS:
+            raise HTTPException(status_code=413, detail=f"Cover has too many pixels: {cover.filename}")
         key = ("cover", digest)
         row = db.query(BatchCampaignAsset).filter(
             BatchCampaignAsset.campaign_id == campaign.id,
@@ -262,6 +299,14 @@ def register_art_manifest(
         digest = audio.sha256.lower()
         if not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise HTTPException(status_code=400, detail=f"Invalid SHA-256 for {audio.filename}.")
+        if audio.size_bytes > int(os.environ.get("BATCH_MAX_AUDIO_BYTES", str(500 * 1024 * 1024))):
+            raise HTTPException(status_code=413, detail=f"Audio is too large: {audio.filename}")
+        if audio.duration_seconds is not None and (
+            audio.duration_seconds <= 0 or audio.duration_seconds > float(
+                os.environ.get("BATCH_MAX_AUDIO_DURATION", "3600")
+            )
+        ):
+            raise HTTPException(status_code=422, detail=f"Invalid audio duration: {audio.filename}")
         row = db.query(BatchCampaignItem).filter(
             BatchCampaignItem.campaign_id == campaign.id,
             BatchCampaignItem.sha256 == digest,
@@ -401,6 +446,8 @@ def art_asset_complete(asset_id: str, body: AssetComplete, current_user: dict = 
 @router.post("/art-track-campaigns/{campaign_id}/associations/confirm")
 def confirm_associations(campaign_id: str, body: AssociationConfirmation, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     _require_scope(current_user); campaign = _campaign_art_or_409(db, campaign_id, current_user); _require_manager(campaign, current_user)
+    if campaign.status != "active":
+        raise HTTPException(status_code=409, detail="Campaign is not active.")
     query = db.query(BatchCampaignItem).filter(BatchCampaignItem.campaign_id == campaign.id)
     if body.item_ids is not None: query = query.filter(BatchCampaignItem.id.in_(body.item_ids))
     rows = query.with_for_update().all()
@@ -414,6 +461,8 @@ def confirm_associations(campaign_id: str, body: AssociationConfirmation, curren
 @router.patch("/art-track-campaigns/{campaign_id}/associations/{item_id}")
 def patch_association(campaign_id: str, item_id: str, body: AssociationPatch, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     _require_scope(current_user); campaign = _campaign_art_or_409(db, campaign_id, current_user); _require_manager(campaign, current_user)
+    if campaign.status != "active":
+        raise HTTPException(status_code=409, detail="Campaign is not active.")
     item = db.query(BatchCampaignItem).filter(BatchCampaignItem.id == item_id, BatchCampaignItem.campaign_id == campaign.id).with_for_update().first()
     if item is None:
         raise HTTPException(status_code=404, detail="Campaign item not found.")
@@ -454,6 +503,7 @@ def start_art_rendering(campaign_id: str, current_user: dict = Depends(get_curre
     eligible = [
         r for r in rows
         if r.association_confirmed and r.cover_asset_id and r.upload_state == "uploaded"
+        and r.metadata_error not in {"invalid_size", "invalid_duration"}
         and covers.get(r.cover_asset_id) is not None
         and covers[r.cover_asset_id].upload_state == "uploaded"
     ]
