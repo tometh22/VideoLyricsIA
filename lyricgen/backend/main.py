@@ -19708,6 +19708,14 @@ def _delivery_safe_filename(artist: str, song: str) -> str:
 
 _PORTAL_IDS = {"argentina", "chile"}
 
+# Profundidad de la cola `enterprise` a partir de la cual el portal deja de
+# aceptar preparaciones bajo demanda. Diez es holgado para un click humano y
+# angosto para una avalancha: si ya hay diez trabajos esperando, el próximo
+# transcode de varios GB se pone delante de renders de cliente.
+_PORTAL_PREPARE_MAX_QUEUE_DEPTH = int(
+    os.environ.get("PORTAL_PREPARE_MAX_QUEUE_DEPTH", "10")
+)
+
 
 def _portal_id(raw: str | None) -> str:
     portal_id = (raw or "argentina").strip().lower()
@@ -20228,6 +20236,41 @@ async def portal_prepare_prores(
     job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
     if job is not None and job.status != "done":
         raise HTTPException(status_code=400, detail="El video todavía no terminó de procesarse.")
+
+    # Freno. Este endpoint encola un ffmpeg de varios GB en la cola
+    # `enterprise`, la MISMA que sirve los renders de cliente, y lo hace con
+    # `force=True`, que saltea a propósito el guard de profundidad.
+    #
+    # Medido el 2026-09-16: entre los dos portales hay 178 archivos ausentes
+    # (Argentina 75 masters + 75 shorts, Chile 28 shorts), o sea 178 botones
+    # a un click de distancia, y el rate limiter de producción no estaba
+    # frenando nada. Alguien recorriendo el catálogo podía dejar los renders
+    # de UMG atrás de decenas de GB de transcodes.
+    #
+    # Saltear la backpressure para UN click humano que está esperando el
+    # archivo es razonable; para una avalancha no. El tope es por profundidad
+    # de cola: si ya hay trabajo esperando, este pedido no es urgente.
+    try:
+        _depth = queue_depth().get("enterprise", 0)
+    except Exception:
+        _depth = 0        # sin Redis no hay cola que proteger
+    if _depth >= _PORTAL_PREPARE_MAX_QUEUE_DEPTH:
+        logger.warning(
+            "[PORTAL-PRORES] rechazado por cola llena delivery=%s type=%s depth=%s",
+            delivery_id, file_type, _depth,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "prores_queue_busy",
+                "message": (
+                    "Hay varios archivos en preparación en este momento. "
+                    "Probá de nuevo en unos minutos."
+                ),
+                "retry_after": 300,
+            },
+            headers={"Retry-After": "300"},
+        )
 
     try:
         if job is not None and job.umg_spec:

@@ -1248,3 +1248,89 @@ def test_items_identifies_its_portal_scope(client, admin_token, approved_job, al
         assert res.json()["portal_id"] == portal, (
             f"el listado de {portal} no se identifica; el portal falla cerrado"
         )
+
+
+def test_el_portal_no_encola_transcodes_con_la_cola_llena(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Este endpoint saltea la backpressure a propósito (`force=True`), y eso
+    está bien para UN click humano que está esperando su archivo.
+
+    Lo que no está bien es una avalancha: medido el 2026-09-16, entre los dos
+    portales hay 178 archivos ausentes, o sea 178 botones a un click, en la
+    MISMA cola que sirve los renders de cliente. Si ya hay trabajo esperando,
+    este pedido no es urgente y se rechaza con 503 en vez de ponerse delante.
+    """
+    res = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    delivery_id = res.json()["delivery_id"]
+
+    with (
+        patch("main.queue_depth", return_value={"enterprise": 50}),
+        patch("main.enqueue_prores_prewarm") as enqueue,
+        patch("main.enqueue_delivery_prores_prewarm") as enqueue_snapshot,
+    ):
+        busy = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_short"},
+        )
+    assert busy.status_code == 503, busy.text
+    assert busy.json()["detail"]["code"] == "prores_queue_busy"
+    assert busy.headers.get("Retry-After") == "300"
+    # Y lo importante: no encoló nada por ninguno de los dos caminos.
+    enqueue.assert_not_called()
+    enqueue_snapshot.assert_not_called()
+
+
+def test_con_la_cola_libre_el_portal_sigue_preparando(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """El contrapeso: el freno no puede volver inútil al botón. Con la cola
+    tranquila, un click humano sigue saltando la backpressure — que es
+    exactamente para lo que está."""
+    res = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    delivery_id = res.json()["delivery_id"]
+
+    with (
+        patch("main.queue_depth", return_value={"enterprise": 0}),
+        patch("main.enqueue_prores_prewarm", return_value="rq:1") as enqueue,
+    ):
+        ok = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_short"},
+        )
+    assert ok.status_code == 202, ok.text
+    enqueue.assert_called_once()
+    assert enqueue.call_args.kwargs == {"force": True}
+
+
+def test_sin_redis_el_freno_no_bloquea_el_portal(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Si no se puede leer la cola, no hay cola que proteger: fallar cerrado
+    acá dejaría al cliente sin poder pedir su archivo por un problema nuestro
+    de observabilidad."""
+    res = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    delivery_id = res.json()["delivery_id"]
+
+    with (
+        patch("main.queue_depth", side_effect=RuntimeError("redis caído")),
+        patch("main.enqueue_prores_prewarm", return_value="rq:1") as enqueue,
+    ):
+        ok = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_short"},
+        )
+    assert ok.status_code == 202, ok.text
+    enqueue.assert_called_once()

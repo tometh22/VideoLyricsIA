@@ -3,6 +3,19 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.49] - 2026-09-16
+
+### Fixed
+
+- Refuse an on-demand ProRes preparation when the enterprise queue already
+  has work waiting. That endpoint enqueues a multi-GB ffmpeg onto the same
+  queue that serves client renders, and does it with the queue-depth guard
+  deliberately bypassed — right for one human click waiting on a file, wrong
+  for an avalanche. Measured on 2026-09-16 there are 178 missing files across
+  both portals, so 178 buttons one click away, with production's rate limiter
+  not throttling anything. Falls open when the queue cannot be read: a
+  monitoring problem must not stop a client from asking for their file.
+
 ## [1.1.48] - 2026-09-16
 
 ### Fixed
