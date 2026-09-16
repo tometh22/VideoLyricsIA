@@ -179,3 +179,30 @@ describe("límite de series", () => {
     expect(screen.queryByText("Otros")).toBeNull();
   });
 });
+
+describe("una fuente que contesta ok pero devuelve cero", () => {
+  it("avisa aunque la cobertura esté completa", () => {
+    // El caso real, medido en staging el 1-sep-2026: agosto con las 31
+    // celdas de GCP en `ok` y `complete: true`, y 30 de esos 31 días en
+    // $0,00 porque el export de facturación cortaba el 1-ago. En verde,
+    // eso se lee como un mes barato en vez de un mes sin datos.
+    montar({
+      stale_sources: [{
+        source: "gcp", last_nonzero_day: "2026-08-01", zero_days: 30,
+        reported_usd: 3.97,
+      }],
+    });
+    expect(screen.getByText(/contestó bien pero devolvió cero/i)).toBeTruthy();
+    // Dice QUÉ fuente y desde cuándo, no sólo que algo pasa.
+    expect(screen.getByText(/Google Vertex/)).toBeTruthy();
+    expect(screen.getByText("2026-08-01")).toBeTruthy();
+    expect(screen.getByText("30")).toBeTruthy();
+    // Y el banner de cobertura sigue callado: son dos preguntas distintas.
+    expect(screen.queryByText(/el total es un piso, no el total/i)).toBeNull();
+  });
+
+  it("no dice nada cuando ninguna fuente está sospechosa", () => {
+    montar({ stale_sources: [] });
+    expect(screen.queryByText(/contestó bien pero devolvió cero/i)).toBeNull();
+  });
+});

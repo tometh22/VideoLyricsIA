@@ -31,6 +31,34 @@ export const EDIT_TYPE_PRIORITY = [
   "typography",
 ];
 
+/** Build the explicit campaign re-approval that must precede a post-render
+ * edit. Returns null for ordinary jobs and a stable invalid result when the
+ * editor could not bind the current durable revision/line set. */
+export function buildCampaignEditApproval(review, saveMeta = {}) {
+  if (!review?.campaignId) return null;
+  const confirmedLineIds = Array.isArray(saveMeta.confirmedLineIds)
+    ? saveMeta.confirmedLineIds
+    : [];
+  const editorRevision = Number.isInteger(saveMeta.editorRevision)
+    ? saveMeta.editorRevision
+    : (Number.isInteger(saveMeta.baseRevision) ? saveMeta.baseRevision : null);
+  if (editorRevision == null || confirmedLineIds.length === 0) {
+    return { valid: false, campaignId: review.campaignId };
+  }
+  return {
+    valid: true,
+    campaignId: review.campaignId,
+    body: {
+      editor_revision: editorRevision,
+      editor_version_id: saveMeta.editorVersionId || null,
+      confirmed_line_ids: confirmedLineIds,
+      lyrics_confirmed: true,
+      timings_confirmed: true,
+      heard_against_audio: true,
+    },
+  };
+}
+
 // Tipos "de fondo": comparten el gate de status (exigen pending_review) y el
 // de multi-escena (se rechazan porque el fondo es un timeline). custom (fondo
 // subido en edición) entra acá: pisaría el timeline igual que un asset único.

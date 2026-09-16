@@ -75,6 +75,14 @@ def test_cache_key_namespace_prefix(tiny_audio):
     assert key.startswith("gem-clean:")
 
 
+def test_strict_audio_reference_never_reuses_regular_cleanup_cache(tiny_audio):
+    regular, _, _ = pipeline._gemini_cleanup_cache_key(tiny_audio, "hola")
+    strict, _, _ = pipeline._gemini_cleanup_cache_key(
+        tiny_audio, "hola", policy="strict-audio-v1",
+    )
+    assert regular != strict
+
+
 def test_cache_key_unreadable_audio_returns_none():
     """Hash failure shouldn't crash — cache is best-effort. Caller still
     proceeds to a live Gemini call without a cache key."""

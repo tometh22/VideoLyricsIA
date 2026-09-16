@@ -27,14 +27,14 @@ _STOP = {
 }
 
 
-def _tokens(value: Any) -> list[str]:
+def _tokens(value: Any, *, include_stop_words: bool = False) -> list[str]:
     normalized = unicodedata.normalize("NFKD", str(value or "").casefold())
     normalized = "".join(
         char for char in normalized if unicodedata.category(char) != "Mn"
     )
     return [
         token for token in re.findall(r"[^\W_]+", normalized, re.UNICODE)
-        if token not in _STOP
+        if include_stop_words or token not in _STOP
     ]
 
 
@@ -71,6 +71,22 @@ def assess_reference_attestation(
     asr_containment = overlap / len(asr_tokens) if asr_tokens else 0.0
     reference_coverage = overlap / len(reference_tokens) if reference_tokens else 0.0
     ordered_similarity = SequenceMatcher(None, reference_tokens, asr_tokens).ratio()
+    # A repeated chorus can dominate whole-song averages while a verse is
+    # missing or unrelated. Do not let that average authorize rebucketing all
+    # timed words into the reference's lines. Small ASR spelling/mishearing
+    # differences remain eligible; a run of four unsupported content words in
+    # either sequence requires audio-owned structure. This is a conservative
+    # routing guard, not a claim that the ASR is the correct lyric.
+    unmatched_runs = [
+        max(reference_end - reference_start, asr_end - asr_start)
+        for tag, reference_start, reference_end, asr_start, asr_end
+        in SequenceMatcher(
+            None, reference_tokens, asr_tokens, autojunk=False,
+        ).get_opcodes()
+        if tag != "equal"
+    ]
+    longest_unmatched_run = max(unmatched_runs, default=0)
+    structure_supported = longest_unmatched_run < 4
     attestation_score = (
         0.45 * ordered_similarity
         + 0.35 * asr_containment
@@ -115,6 +131,7 @@ def assess_reference_attestation(
         and timeline_observed
         and reference_coverage >= 0.60
         and ordered_similarity >= 0.52
+        and structure_supported
     )
     if trusted:
         status = "trusted"
@@ -131,6 +148,8 @@ def assess_reference_attestation(
         reasons.append("asr_timeline_incomplete")
     if is_live:
         reasons.append("live_structure_requires_local_alignment")
+    if not structure_supported:
+        reasons.append("reference_contains_unmatched_passage")
     if local_vocabulary_supported and not global_alignment_supported and not is_live:
         reasons.append("global_structure_not_attested")
 
@@ -143,12 +162,20 @@ def assess_reference_attestation(
         "require_local_alignment": not global_alignment_supported,
         "reasons": reasons,
         "metrics": {
+            # Line wrapping is editorial, not evidence of another recording.
+            # Keep all words here: the content-token score omits stop words.
+            "normalized_text_matches": bool(
+                _tokens(reference_text, include_stop_words=True)
+                and _tokens(reference_text, include_stop_words=True)
+                == _tokens(_segments_text(asr_segments), include_stop_words=True)
+            ),
             "reference_token_count": len(reference_tokens),
             "asr_token_count": len(asr_tokens),
             "ordered_similarity": round(ordered_similarity, 6),
             "asr_token_containment": round(asr_containment, 6),
             "reference_token_coverage": round(reference_coverage, 6),
             "attestation_score": round(attestation_score, 6),
+            "longest_unmatched_content_run": longest_unmatched_run,
             "timeline_observed": timeline_observed,
             "trailing_gap_s": round(trailing_gap, 6) if trailing_gap is not None else None,
         },

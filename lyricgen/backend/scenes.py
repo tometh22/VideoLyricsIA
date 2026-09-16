@@ -38,6 +38,11 @@ MIN_SCENE_DURATION = float(os.environ.get("SCENES_MIN_DURATION", "14.0"))
 # Tope de escenas ÚNICAS por canción (costo Veo + coherencia visual). Los
 # coros recurrentes comparten escena, así que esto acota los versos.
 MAX_UNIQUE_SCENES = int(os.environ.get("SCENES_MAX_UNIQUE", "6"))
+# A continuous vocal block has no repetition/gap signal, but it still must not
+# become a single background for a whole 3–5 minute song.  Keep the fallback
+# cuts infrequent and musical while guaranteeing that the multi-scene opt-in
+# actually produces more than one scene for long songs.
+MAX_SCENE_DURATION = float(os.environ.get("SCENES_MAX_DURATION", "45.0"))
 # Hueco sin letra (segundos) que cuenta como sección instrumental (intro/
 # puente/breakdown/outro) — buen punto de corte de escena.
 GAP_THRESHOLD = float(os.environ.get("SCENES_GAP_THRESHOLD", "4.0"))
@@ -117,6 +122,78 @@ def _norm_line(text: str) -> str:
     return t.strip()
 
 
+def _split_long_vocal_blocks(blocks: list) -> list:
+    """Split a long non-recurrent vocal block into scene-sized chunks.
+
+    Repetition and instrumental gaps are strong section signals, but they are
+    not present in every lyric (for example, an uninterrupted verse or a
+    transcription whose chorus lines differ slightly).  Such a block should
+    still produce a useful multi-scene timeline.  Cuts are selected from lyric
+    starts and balanced across the block; a synthetic timestamp is used only
+    when a single ASR row is longer than the target window.
+    """
+    if not blocks or MAX_SCENE_DURATION <= 0:
+        return blocks
+
+    out = []
+    for block in blocks:
+        duration = max(0.0, float(block.end) - float(block.start))
+        if block.recurrent or duration <= MAX_SCENE_DURATION:
+            out.append(block)
+            continue
+
+        # Equal-sized chunks keep the final chunk from becoming a tiny tail.
+        # The cap is applied later to unique scene keys, so this is bounded by
+        # the existing credit/coherence guardrail as well.
+        chunk_count = max(2, int((duration + MAX_SCENE_DURATION - 1e-9)
+                                 // MAX_SCENE_DURATION))
+        target_duration = duration / chunk_count
+        min_duration = max(1.0, min(MIN_SCENE_DURATION,
+                                    MIN_SCENE_DURATION * 4.0 / 7.0))
+        candidates = sorted({
+            float(start) for start in getattr(block, "line_starts", [])
+            if float(block.start) < float(start) < float(block.end)
+        })
+
+        boundaries = [float(block.start)]
+        for index in range(1, chunk_count):
+            target = float(block.start) + target_duration * index
+            lower = boundaries[-1] + min_duration
+            upper = float(block.end) - min_duration * (chunk_count - index)
+            eligible = [point for point in candidates if lower <= point <= upper]
+            if eligible:
+                cut = min(eligible, key=lambda point: abs(point - target))
+            else:
+                # A single unusually long ASR row may have no internal line
+                # start.  Preserve coverage rather than silently returning a
+                # one-scene plan; this is an exceptional, deterministic cut.
+                cut = min(max(target, lower), upper)
+            boundaries.append(cut)
+        boundaries.append(float(block.end))
+
+        for index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+            line_norms = [
+                text for line_start, text in zip(
+                    getattr(block, "line_starts", []),
+                    getattr(block, "line_norms", []),
+                ) if start <= float(line_start) < end
+            ]
+            out.append(type(block)(
+                start=start,
+                end=end,
+                recurrent=False,
+                norm_text=" | ".join(line_norms),
+                line_starts=[
+                    float(line_start) for line_start in getattr(block, "line_starts", [])
+                    if start <= float(line_start) < end
+                ],
+                line_norms=line_norms,
+            ))
+        logger.info("[SCENES] bloque vocal largo dividido: %.1fs → %d escenas",
+                    duration, chunk_count)
+    return out
+
+
 def detect_sections(segments: list[dict], audio_duration: float) -> list[Section]:
     """Detecta secciones (verso/coro/puente/intro/outro) de forma DETERMINISTA.
 
@@ -124,6 +201,8 @@ def detect_sections(segments: list[dict], audio_duration: float) -> list[Section
       - letra repetida  → coro (líneas cuyo texto normalizado aparece ≥2 veces)
       - hueco sin letra → intro/puente/breakdown/outro (gap > GAP_THRESHOLD)
       - timing de líneas → límites de corte (snap al inicio de línea)
+      - bloque vocal largo → cortes equilibrados aunque no haya repeticiones
+        exactas ni silencios largos (máximo MAX_SCENE_DURATION por escena)
 
     Devuelve secciones contiguas que cubren [0, audio_duration], ya fusionadas
     para respetar MIN_SCENE_DURATION y con recurrence_key asignada (coros
@@ -152,6 +231,11 @@ def detect_sections(segments: list[dict], audio_duration: float) -> list[Section
         end: float
         recurrent: bool
         norm_text: str  # texto normalizado concatenado (clave de recurrencia del coro)
+        # Candidate cut points retained from the original lyric rows.  The
+        # fallback splitter uses these instead of cutting in the middle of a
+        # line whenever possible.
+        line_starts: list[float] = field(default_factory=list)
+        line_norms: list[str] = field(default_factory=list)
 
     blocks: list[_Block] = []
     for s in segs:
@@ -161,8 +245,20 @@ def detect_sections(segments: list[dict], audio_duration: float) -> list[Section
         if blocks and blocks[-1].recurrent == is_rec and (st - blocks[-1].end) <= GAP_THRESHOLD:
             blocks[-1].end = en
             blocks[-1].norm_text += " | " + n
+            blocks[-1].line_starts.append(st)
+            blocks[-1].line_norms.append(n)
         else:
-            blocks.append(_Block(start=st, end=en, recurrent=is_rec, norm_text=n))
+            blocks.append(_Block(
+                start=st, end=en, recurrent=is_rec, norm_text=n,
+                line_starts=[st], line_norms=[n],
+            ))
+
+    # A song may have no exact repeated lyric rows and no long instrumental
+    # gaps.  In that case the block above spans the whole track and the old
+    # detector silently reduced "multi-scene" to one generated clip.  Split
+    # only long non-recurrent vocal blocks, snapping cuts to lyric starts and
+    # leaving recurring chorus blocks intact so chorus identity still wins.
+    blocks = _split_long_vocal_blocks(blocks)
 
     # 3) Materializar secciones cubriendo huecos:
     #    - hueco inicial → intro ; hueco final → outro ; hueco intermedio →
@@ -507,6 +603,7 @@ def build_scene_plan(
         "scenes": scenes,
         "params": {
             "min_scene_duration": MIN_SCENE_DURATION,
+            "max_scene_duration": MAX_SCENE_DURATION,
             "max_unique_scenes": MAX_UNIQUE_SCENES,
             "xfade": XFADE_DURATION,
         },

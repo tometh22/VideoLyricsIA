@@ -27,19 +27,27 @@
  * with /transcribe-uploaded (editor flow) or /generate (direct).
  */
 
+import { fetchWithTimeout } from "./fetchWithTimeout";
+
 const API = import.meta.env.VITE_API_URL || "";
+
+const API_POST_TIMEOUT_MS = 15_000;
+const R2_UPLOAD_STALL_TIMEOUT_MS = 60_000;
 
 function authHeaders() {
   const token = localStorage.getItem("genly_token");
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-async function apiPost(path, body) {
-  const res = await fetch(`${API}${path}`, {
+async function apiPost(path, body, { signal = null, idempotencyKey = null, timeoutMs = API_POST_TIMEOUT_MS } = {}) {
+  const headers = { "Content-Type": "application/json", ...authHeaders() };
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  const res = await fetchWithTimeout(`${API}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...authHeaders() },
+    headers,
     body: JSON.stringify(body),
-  });
+    signal,
+  }, timeoutMs);
   if (!res.ok) {
     let detail = "";
     try {
@@ -65,14 +73,37 @@ async function apiPost(path, body) {
 function putToR2WithProgress(url, blob, contentType, onProgress, signal) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    let settled = false;
+    let stallTimer = null;
+    const clearStallTimer = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = null;
+    };
+    const failForStall = () => {
+      if (settled) return;
+      settled = true;
+      try { xhr.abort(); } catch { /* noop */ }
+      clearStallTimer();
+      const error = new Error("R2 upload stalled");
+      error.code = "upload_stalled";
+      reject(error);
+    };
+    const armStallTimer = () => {
+      clearStallTimer();
+      stallTimer = setTimeout(failForStall, R2_UPLOAD_STALL_TIMEOUT_MS);
+    };
     xhr.open("PUT", url, true);
     if (contentType) xhr.setRequestHeader("Content-Type", contentType);
-    if (xhr.upload && onProgress) {
+    if (xhr.upload) {
       xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) onProgress(e.loaded, e.total);
+        armStallTimer();
+        if (onProgress && e.lengthComputable) onProgress(e.loaded, e.total);
       };
     }
     xhr.onload = () => {
+      if (settled) return;
+      settled = true;
+      clearStallTimer();
       if (xhr.status >= 200 && xhr.status < 300) {
         // ETag header is required for multipart_complete. R2's CORS
         // policy must expose it via ExposeHeaders: ["ETag"] (see
@@ -83,8 +114,18 @@ function putToR2WithProgress(url, blob, contentType, onProgress, signal) {
         reject(new Error(`R2 PUT failed: ${xhr.status} ${xhr.statusText}`));
       }
     };
-    xhr.onerror = () => reject(new Error("R2 PUT network error"));
-    xhr.onabort = () => reject(Object.assign(new Error("aborted"), { aborted: true }));
+    xhr.onerror = () => {
+      if (settled) return;
+      settled = true;
+      clearStallTimer();
+      reject(new Error("R2 PUT network error"));
+    };
+    xhr.onabort = () => {
+      if (settled) return;
+      settled = true;
+      clearStallTimer();
+      reject(Object.assign(new Error("aborted"), { aborted: true }));
+    };
     if (signal) {
       if (signal.aborted) {
         xhr.abort();
@@ -93,6 +134,7 @@ function putToR2WithProgress(url, blob, contentType, onProgress, signal) {
       signal.addEventListener("abort", () => xhr.abort(), { once: true });
     }
     xhr.send(blob);
+    armStallTimer();
   });
 }
 
@@ -103,7 +145,7 @@ async function withRetry(fn, { maxAttempts = 6, baseMs = 1000 } = {}) {
     try {
       return await fn(attempt);
     } catch (err) {
-      if (err.aborted) throw err;
+      if (err.aborted || err.name === "AbortError") throw err;
       // Fail-fast en errores no-reintentables de NUESTRA API (apiPost
       // adjunta .status): 401 = sesión muerta (reintentar 6 veces solo
       // demoraba ~46 s el logout), 404 = job reapeado/superseded, 403 =
@@ -193,7 +235,7 @@ async function multipartUpload({
           } else {
             const resp = await apiPost("/upload-multipart-part-url", {
               job_id: jobId, part_number: partNumber,
-            });
+            }, { signal });
             url = resp.url;
           }
           const res = await putToR2WithProgress(
@@ -260,7 +302,7 @@ async function multipartUpload({
   await apiPost("/upload-multipart-complete", {
     job_id: jobId,
     parts,
-  });
+  }, { signal });
   return { jobId, key };
 }
 
@@ -286,7 +328,7 @@ export async function uploadFileToR2(
     size_bytes: file.size,
     artist: meta.artist || "",
     title: meta.title || "",
-  });
+  }, { signal });
 
   const contentType = file.type || "application/octet-stream";
 
@@ -327,7 +369,7 @@ export async function uploadFileToR2(
     filename: file.name,
     content_type: contentType,
     expected_parts: expectedParts,
-  });
+  }, { signal });
 
   return multipartUpload({
     file,

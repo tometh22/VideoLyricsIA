@@ -147,12 +147,66 @@ def text_mismatches(segments, words, *, min_ratio: float = 0.4,
     return out
 
 
+def _merged(intervals, pad: float = 0.0) -> list[tuple[float, float]]:
+    """Une intervalos solapados, opcionalmente con padding."""
+    out: list[list[float]] = []
+    for a, b in sorted((min(x, y) - pad, max(x, y) + pad) for x, y in intervals):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+def voiced_coverage(segments, stem_path: str | None = None, *,
+                    regions=None, pad: float = 0.05) -> float | None:
+    """Fracción [0..1] de los SEGUNDOS CANTADOS que alguna línea reclama.
+
+    Es la contracara de ``audio_coverage``. Aquella mide contra las palabras
+    que el ASR entregó, así que un punto sordo del ASR le resulta invisible y
+    puede reportar 1,0 mientras falta letra: medido el 2026-09-02, "Sisters
+    (Live)" perdió 9 de 23 líneas aprobadas y reportó cobertura 1,000 con
+    62,6 s de hueco cantado.
+
+    Esta usa el VAD del stem, que no depende del ASR, y sale de las MISMAS
+    regiones que ``voiced_gaps``: por construcción, si ``voiced_gap_s`` sube,
+    ésta baja. Devuelve ``None`` cuando no hay stem ni VAD (no se puede
+    afirmar ni negar pérdida) — nunca 1,0 por falta de evidencia.
+    """
+    regs = regions
+    if regs is None:
+        if not stem_path:
+            return None
+        try:
+            from anchor_align import vocal_regions
+            regs = vocal_regions(stem_path)
+        except Exception:
+            return None
+    regs = [(_f(a), _f(b)) for a, b in (regs or []) if _f(b) > _f(a)]
+    if not regs:
+        return None
+    total = sum(b - a for a, b in regs)
+    if total <= 0:
+        return None
+    lines = _merged(_intervals(segments), pad=pad)
+    if not lines:
+        return 0.0
+    covered = 0.0
+    for a, b in regs:
+        for c, d in lines:
+            lo, hi = max(a, c), min(b, d)
+            if hi > lo:
+                covered += hi - lo
+    return max(0.0, min(1.0, covered / total))
+
+
 def voiced_gaps(segments, stem_path: str | None, *,
                 audio_duration: float | None = None,
                 min_gap_s: float = 8.0,
                 min_voiced_s: float = 3.0,
                 min_voiced_frac: float = 0.0,
                 rescue_skipped=None,
+                regions=None,
                 include_leading: bool = False) -> list[dict]:
     """Huecos entre carteles que contienen CANTO según el VAD del stem.
 
@@ -205,12 +259,14 @@ LA FRACCIÓN NO SIRVE PARA DISTINGUIRLOS — probado y descartado. Tentaba
 
     Devuelve [{"start", "end", "voiced_s"}] por hueco culpable. [] si no hay
     stem o librosa (nunca acusa sin evidencia). Never raises."""
-    if not stem_path:
+    if not stem_path and regions is None:
         return []
     try:
-        from anchor_align import vocal_regions
         from gap_rescue import find_gaps
-        regs = vocal_regions(stem_path)
+        regs = regions
+        if regs is None:
+            from anchor_align import vocal_regions
+            regs = vocal_regions(stem_path)
         if not regs:
             return []
         descartados = []
@@ -248,11 +304,34 @@ def summarize(segments, words, *, stem_path: str | None = None,
     spans = uncovered_spans(segments, words)
     duraciones = [b - a for a, b, _ in spans]
     mismatches = text_mismatches(segments, words)
+    # El VAD del stem carga audio: se calcula UNA vez y se comparte entre el
+    # detector de huecos y la cobertura cantada (que salen de lo mismo).
+    regions = None
+    if stem_path:
+        try:
+            from anchor_align import vocal_regions
+            regions = vocal_regions(stem_path)
+        except Exception:
+            regions = None
     vg = voiced_gaps(segments, stem_path, audio_duration=audio_duration,
-                     rescue_skipped=rescue_skipped,
+                     rescue_skipped=rescue_skipped, regions=regions,
                      include_leading=live_hint)
+    asr_cov = round(audio_coverage(segments, words), 4)
+    voiced_cov = voiced_coverage(segments, regions=regions)
+    voiced_total = (
+        round(sum(_f(b) - _f(a) for a, b in (regions or []) if _f(b) > _f(a)), 2)
+        if regions else 0.0
+    )
+    # `audio_coverage` es la clave que leen los gates. Se queda, pero pasa a
+    # ser la PEOR de las dos vistas: contra palabras del ASR y contra segundos
+    # cantados. Así una canción no puede reportar 1,000 mientras pierde
+    # secciones enteras sólo porque el ASR tampoco las oyó.
+    combined = asr_cov if voiced_cov is None else min(asr_cov, round(voiced_cov, 4))
     return {
-        "audio_coverage": round(audio_coverage(segments, words), 4),
+        "audio_coverage": combined,
+        "asr_word_coverage": asr_cov,
+        "voiced_coverage": None if voiced_cov is None else round(voiced_cov, 4),
+        "voiced_total_s": voiced_total,
         "uncovered_spans": len(spans),
         "uncovered_seconds": round(sum(duraciones), 2),
         "worst_span_s": round(max(duraciones), 2) if duraciones else 0.0,

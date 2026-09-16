@@ -195,10 +195,17 @@ class WarmOnlyWorker(_RQWorker):
         # este worker está vivo. Si la huella no se puede calcular, se manda
         # vacía y el gate cae a comparar el SHA — nunca se cae el heartbeat.
         try:
-            from observability import backend_code_fingerprint
+            from observability import backend_code_fingerprint, runtime_timing_config
             _fingerprint = backend_code_fingerprint()
+            _timing_config = runtime_timing_config()
         except Exception:
-            _fingerprint = ""
+            _fingerprint = "unknown"
+            _timing_config = None
+        try:
+            from queue_jobs import _transcription_quality_runtime_token
+            _runtime_token = _transcription_quality_runtime_token()
+        except Exception:
+            _runtime_token = None
 
         ttl = _release_heartbeat_ttl_seconds()
         queues = [getattr(q, "name", str(q)) for q in getattr(self, "queues", [])]
@@ -218,6 +225,16 @@ class WarmOnlyWorker(_RQWorker):
             # commits de sólo-frontend, lo que dejaba /health en `down` con todo
             # funcionando.
             "code_fingerprint": _fingerprint,
+            # Token de identidad de runtime (política + release + las 72 flags
+            # de configuración + calibración). Si difiere entre el servicio que
+            # encola y el quality-worker, cada replay se descarta con
+            # runtime_identity_mismatch sin dejar rastro; publicarlo acá es lo
+            # que permite verlo en /health en vez de descubrirlo 21 días tarde.
+            "runtime_token": _runtime_token,
+            # API and every worker capable of transcription must agree on the
+            # same timing constants. /health/ready compares this canonical
+            # payload and fails closed on mismatch or missing publication.
+            "timing_config": _timing_config,
             "rq_payload_version": RQ_PAYLOAD_VERSION,
             "rq_supported_payload_versions": sorted(RQ_SUPPORTED_PAYLOAD_VERSIONS),
             "environment": (
@@ -447,14 +464,19 @@ def main():
         VALID_POLICY_MODES as _bg_policy_modes,
         policy_mode as _bg_policy_mode,
     )
+    from lyric_anchors import (
+        ANCHORS_ENV as _lyric_anchors_env,
+        VALID_ANCHOR_MODES as _lyric_anchor_modes,
+        anchors_mode as _lyric_anchors_mode,
+    )
     from observability import _resolve_release as _resolve_runtime_release
     logger.info(
         "[BG_POLICY][STARTUP] process=rq-worker release=%s environment=%s "
-        "policy_version=%s policy_mode=%s cache_namespace=%s queues=%s "
-        "rq_payload_version=%s",
+        "policy_version=%s policy_mode=%s lyric_anchor_mode=%s "
+        "cache_namespace=%s queues=%s rq_payload_version=%s",
         _resolve_runtime_release(),
         os.environ.get("ENVIRONMENT", "production").lower().strip(),
-        _bg_policy_version, _bg_policy_mode(),
+        _bg_policy_version, _bg_policy_mode(), _lyric_anchors_mode(),
         _bg_policy_version,
         ",".join(_resolve_queue_names()),
         os.environ.get("RQ_PAYLOAD_VERSION", "2"),
@@ -464,6 +486,12 @@ def main():
         logger.warning(
             "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
             _bg_policy_env, _raw_bg_policy_mode,
+        )
+    _raw_lyric_anchor_mode = os.environ.get(_lyric_anchors_env, "off").strip().lower()
+    if _raw_lyric_anchor_mode not in _lyric_anchor_modes:
+        logger.warning(
+            "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
+            _lyric_anchors_env, _raw_lyric_anchor_mode,
         )
 
     _warn_if_shutdown_grace_too_short()

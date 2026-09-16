@@ -19,6 +19,30 @@
 
 const EPSILON_S = 1e-3;
 
+// Namespace aleatorio por carga de página: dos pestañas (o dos sesiones sobre
+// el mismo job) no pueden acuñar el mismo id, y el prefijo no numérico hace
+// imposible chocar con los ids derivados de índice/`_id` que `decorateSegments`
+// le pone a las filas que llegan del backend sin `segment_id`.
+const MINT_NAMESPACE = Math.random().toString(36).slice(2, 8);
+let mintCounter = 0;
+
+/**
+ * Id estable para una fila NUEVA del editor.
+ *
+ * `segment_id` es la clave con la que el merge a tres puntas identifica cada
+ * línea. Duplicar o dividir una fila con `{ ...seg }` le heredaba el id del
+ * padre, y dos filas con la misma clave hacían que el merge devolviera N veces
+ * la MISMA línea; el deduplicador de colisiones borraba después las copias
+ * sobrantes y el operador perdía letra que nunca tocó (job f866cbcf0e49, UMG
+ * Chile, 1-sep-2026: 44 líneas → 38, entre ellas 4 repeticiones del estribillo
+ * que había duplicado a mano). Toda fila creada en el editor tiene que pasar
+ * por acá.
+ */
+export function mintSegmentId() {
+  mintCounter += 1;
+  return `n${MINT_NAMESPACE}-${mintCounter}`;
+}
+
 function valueMatches(a, b) {
   if (Math.abs((Number(a.start) || 0) - (Number(b.start) || 0)) > EPSILON_S) return false;
   if (Math.abs((Number(a.end) || 0) - (Number(b.end) || 0)) > EPSILON_S) return false;

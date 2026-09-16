@@ -8,6 +8,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -19,6 +20,71 @@ ENV = (os.environ.get("ENVIRONMENT")
        or os.environ.get("ENV")
        or "dev").lower().strip()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+def _float_env(name: str, default: float = 0.0) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, str(default)) or default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _int_env(name: str, default: int = 0) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default)) or default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    fallback = "1" if default else "0"
+    return os.environ.get(name, fallback).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def runtime_timing_config() -> dict[str, float | int | bool]:
+    """Canonical timing knobs that must agree across transcription services."""
+    return {
+        "lyric_hold_s": _float_env("LYRIC_HOLD_S", 0.5),
+        "lyric_lead_in_s": _float_env("LYRIC_LEAD_IN_S"),
+        "lyric_lead_in_ms": _int_env("LYRIC_LEAD_IN_MS"),
+        "stable_pitch_tail_enabled": _bool_env("STABLE_PITCH_TAIL_ENABLED"),
+    }
+
+
+def timing_config_parity(
+    release_rows: list[dict], api_config: dict | None = None,
+) -> dict:
+    """Fail-closed parity view for API and every application worker.
+
+    Timing settings must not depend on which service happens to consume a
+    retry, edit or render payload. All worker heartbeat rows participate,
+    including render- and quality-only queues. A worker that does not publish
+    its timing config is unverifiable and therefore fails the operational gate.
+    """
+    configurations = {"api": dict(api_config or runtime_timing_config())}
+    missing: list[str] = []
+    for row in release_rows or []:
+        service = str(row.get("service") or "worker")
+        worker = str(row.get("worker") or "unknown")
+        label = f"{service}:{worker}"
+        config = row.get("timing_config")
+        if not isinstance(config, dict):
+            missing.append(label)
+            continue
+        configurations[label] = dict(config)
+    identities = {
+        json.dumps(config, sort_keys=True, separators=(",", ":"))
+        for config in configurations.values()
+    }
+    match = not missing and len(identities) == 1
+    return {
+        "match": match,
+        "api": configurations["api"],
+        "participants": len(configurations),
+        "missing": sorted(missing),
+        "configurations": configurations,
+    }
 
 
 def _resolve_release() -> str:
@@ -417,56 +483,48 @@ def _fleet_readiness_config(environment: str | None = None) -> tuple[bool, dict[
     return strict, expected
 
 
-def worker_fleet_coherence(
-    release_rows: list[dict],
-    api_release: str,
-    api_protocol: int,
+def _fleet_required_queues(
     expected_service_counts: dict[str, int] | None = None,
-    api_code_fingerprint: str = "",
+) -> set[str]:
+    required = {"transcription", "bg_preview", "enterprise", "default"}
+    normalized = {
+        _fleet_service_name(service): max(int(count), 0)
+        for service, count in (expected_service_counts or {}).items()
+    }
+    if normalized.get("quality_worker", 0) > 0:
+        required.add("transcription_quality")
+    if normalized.get("batch_short_worker", 0) > 0:
+        required.update({"transcription_batch", "campaign_control"})
+    if normalized.get("batch_worker", 0) > 0:
+        required.add("batch_render")
+    return required
+
+
+def _worker_release_matches_api(
+    row: dict,
+    api_release: str,
+    api_code_fingerprint: str,
+) -> bool:
+    """Fail closed when either side cannot prove code compatibility."""
+    row_fp = str(row.get("code_fingerprint") or "").strip()
+    api_fp = (api_code_fingerprint or "").strip()
+    if api_fp and row_fp:
+        return row_fp == api_fp
+    return (
+        not api_release
+        or api_release == "unknown"
+        or row.get("release") == api_release
+    )
+
+
+def _worker_release_shape(
+    release_rows: list[dict],
+    api_protocol: int,
+    expected_service_counts: dict[str, int] | None,
 ) -> dict:
-    """Pure deploy-gate contract shared by health and focused tests."""
-    expected = {"transcription", "bg_preview", "enterprise", "default"}
-    if any(
-        _fleet_service_name(service) == "quality_worker" and int(count) > 0
-        for service, count in (expected_service_counts or {}).items()
-    ):
-        expected.add("transcription_quality")
-    if any(
-        _fleet_service_name(service) == "batch_short_worker" and int(count) > 0
-        for service, count in (expected_service_counts or {}).items()
-    ):
-        expected.update({"transcription_batch", "campaign_control"})
-    if any(
-        _fleet_service_name(service) == "batch_worker" and int(count) > 0
-        for service, count in (expected_service_counts or {}).items()
-    ):
-        expected.add("batch_render")
     advertised = {
         queue for row in release_rows for queue in (row.get("queues") or [])
     }
-    # Compatibilidad API↔worker: se compara la HUELLA DEL CÓDIGO DE BACKEND, no
-    # el SHA de git. Los workers tienen filtros de path en Railway, así que un
-    # commit de sólo-frontend no los redeploya (correcto) pero sí mueve el SHA
-    # de la API — y con la comparación por SHA eso dejaba /health en `down`
-    # después de cada merge de frontend, con todo funcionando. Una alarma que
-    # grita en falso de rutina enseña a ignorarla.
-    #
-    # Sólo se usa la huella cuando LOS DOS lados la publican. Un worker viejo
-    # (mid-deploy, antes de que este código llegue) no la trae, y ahí se cae al
-    # SHA: el comportamiento de siempre, sin ventana ciega durante el rollout.
-    api_fingerprint = (api_code_fingerprint or "").strip()
-
-    def _row_matches(row: dict) -> bool:
-        row_fp = (row.get("code_fingerprint") or "").strip()
-        if api_fingerprint and row_fp:
-            return row_fp == api_fingerprint
-        return (
-            not api_release
-            or api_release == "unknown"
-            or row.get("release") == api_release
-        )
-
-    release_match = bool(release_rows) and all(_row_matches(row) for row in release_rows)
     protocol_match = bool(release_rows) and all(
         row.get("rq_payload_version") == api_protocol for row in release_rows
     )
@@ -487,19 +545,112 @@ def worker_fleet_coherence(
         for service, expected_count in normalized_expected.items()
         if service_counts.get(service, 0) < expected_count
     }
-    missing = sorted(expected - advertised)
+    missing = sorted(
+        _fleet_required_queues(expected_service_counts) - advertised
+    )
     return {
-        "coherent": bool(
-            release_match
-            and protocol_match
-            and not missing
-            and not under_replicated
-        ),
-        "missing_queues": missing,
-        "release_match": release_match,
         "protocol_match": protocol_match,
         "service_counts": service_counts,
         "under_replicated": under_replicated,
+        "missing_queues": missing,
+    }
+
+
+def _select_current_worker_release_rows(
+    release_rows: list[dict],
+    api_release: str,
+    api_protocol: int,
+    expected_service_counts: dict[str, int] | None = None,
+    api_code_fingerprint: str = "",
+) -> tuple[list[dict], list[dict]]:
+    """Ignore replaced-release heartbeats only after replacement is complete.
+
+    Redis keys intentionally live briefly after a worker is replaced. During a
+    rolling deploy that leaves both generations visible and used to make the
+    API report a mixed/incoherent fleet even after every required new replica
+    was ready. A row is considered superseded only when it does not match the
+    API's current backend code and the matching cohort independently satisfies
+    queue coverage, payload protocol and expected service cardinality.
+
+    Until that proof exists, every row remains active and the normal coherence
+    checks fail closed. This is important: an old worker cannot fill a missing
+    queue or replica slot for an incomplete new release.
+    """
+    current: list[dict] = []
+    replaced: list[dict] = []
+    for row in release_rows:
+        target = (
+            current
+            if _worker_release_matches_api(
+                row, api_release, api_code_fingerprint,
+            )
+            else replaced
+        )
+        target.append(row)
+    if not replaced:
+        return list(release_rows), []
+    current_shape = _worker_release_shape(
+        current, api_protocol, expected_service_counts,
+    )
+    current_complete = bool(
+        current
+        and current_shape["protocol_match"]
+        and not current_shape["missing_queues"]
+        and not current_shape["under_replicated"]
+    )
+    if current_complete:
+        return current, replaced
+    return list(release_rows), []
+
+
+def worker_fleet_coherence(
+    release_rows: list[dict],
+    api_release: str,
+    api_protocol: int,
+    expected_service_counts: dict[str, int] | None = None,
+    api_code_fingerprint: str = "",
+) -> dict:
+    """Pure deploy-gate contract shared by health and focused tests."""
+    # Compatibilidad API↔worker: se compara la HUELLA DEL CÓDIGO DE BACKEND, no
+    # el SHA de git. Los workers tienen filtros de path en Railway, así que un
+    # commit de sólo-frontend no los redeploya (correcto) pero sí mueve el SHA
+    # de la API — y con la comparación por SHA eso dejaba /health en `down`
+    # después de cada merge de frontend, con todo funcionando. Una alarma que
+    # grita en falso de rutina enseña a ignorarla.
+    #
+    # Sólo se usa la huella cuando LOS DOS lados la publican. Un worker viejo
+    # (mid-deploy, antes de que este código llegue) no la trae, y ahí se cae al
+    # SHA: el comportamiento de siempre, sin ventana ciega durante el rollout.
+    active_rows, superseded_rows = _select_current_worker_release_rows(
+        release_rows,
+        api_release,
+        api_protocol,
+        expected_service_counts,
+        api_code_fingerprint,
+    )
+    release_match = bool(active_rows) and all(
+        _worker_release_matches_api(
+            row, api_release, api_code_fingerprint,
+        )
+        for row in active_rows
+    )
+    shape = _worker_release_shape(
+        active_rows, api_protocol, expected_service_counts,
+    )
+    return {
+        "coherent": bool(
+            release_match
+            and shape["protocol_match"]
+            and not shape["missing_queues"]
+            and not shape["under_replicated"]
+        ),
+        "missing_queues": shape["missing_queues"],
+        "release_match": release_match,
+        "protocol_match": shape["protocol_match"],
+        "service_counts": shape["service_counts"],
+        "under_replicated": shape["under_replicated"],
+        "active_release_rows": active_rows,
+        "superseded_release_rows": superseded_rows,
     }
 
 
@@ -647,16 +798,6 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
                             if isinstance(raw, bytes):
                                 raw = raw.decode("utf-8", "replace")
                             release_rows.append(json.loads(raw))
-                    snap["worker_releases"] = release_rows
-                    releases = {row.get("release") for row in release_rows if row.get("release")}
-                    protocols = {
-                        row.get("rq_payload_version") for row in release_rows
-                        if row.get("rq_payload_version") is not None
-                    }
-                    if len(releases) > 1:
-                        _degrade("mixed_worker_releases")
-                    if len(protocols) > 1:
-                        _degrade("mixed_worker_protocols")
                     fleet = worker_fleet_coherence(
                         release_rows,
                         str(snap.get("release") or ""),
@@ -664,6 +805,25 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
                         expected_service_counts=expected_service_counts,
                         api_code_fingerprint=backend_code_fingerprint(),
                     )
+                    active_release_rows = fleet["active_release_rows"]
+                    superseded_release_rows = fleet["superseded_release_rows"]
+                    snap["worker_releases"] = active_release_rows
+                    snap["worker_releases_superseded"] = len(
+                        superseded_release_rows
+                    )
+                    releases = {
+                        row.get("release") for row in active_release_rows
+                        if row.get("release")
+                    }
+                    protocols = {
+                        row.get("rq_payload_version")
+                        for row in active_release_rows
+                        if row.get("rq_payload_version") is not None
+                    }
+                    if len(releases) > 1:
+                        _degrade("mixed_worker_releases")
+                    if len(protocols) > 1:
+                        _degrade("mixed_worker_protocols")
                     snap["fleet_coherent"] = fleet["coherent"]
                     snap["fleet_missing_queues"] = fleet["missing_queues"]
                     snap["fleet_release_match"] = fleet["release_match"]
@@ -675,6 +835,18 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
                             _down("worker_fleet_incoherent", allow_starting=False)
                         else:
                             _degrade("worker_fleet_incoherent")
+                    timing_parity = timing_config_parity(active_release_rows)
+                    snap["timing_config_parity"] = timing_parity
+                    if not timing_parity["match"]:
+                        reason = (
+                            "timing_config_unreported"
+                            if timing_parity["missing"]
+                            else "timing_config_mismatch"
+                        )
+                        if enforce_fleet_readiness:
+                            _down(reason, allow_starting=False)
+                        else:
+                            _degrade(reason)
                 except Exception:
                     snap["worker_releases"] = []
                     snap["fleet_coherent"] = False
@@ -826,4 +998,95 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
         snap["operational_metrics"] = ops_metrics_snapshot()
     except Exception:
         snap["operational_metrics"] = {}
+    snap["quality_gates"] = quality_gates_snapshot(snap)
+    if snap["quality_gates"].get("state") == "red":
+        snap.setdefault("degraded_reasons", [])
+        for reason in snap["quality_gates"].get("reasons") or []:
+            if reason not in snap["degraded_reasons"]:
+                snap["degraded_reasons"].append(reason)
     return snap
+
+
+def quality_gates_snapshot(snap: dict | None = None) -> dict:
+    """Estado ROJO/VERDE de las compuertas de calidad, visible en /health.
+
+    Existe porque el replay de calidad estuvo muerto 21 días en staging y desde
+    siempre en producción mientras /health decía ``ok``: sin calibración el
+    score queda en null y la decisión nunca puede ser ``pass``; sin artefactos
+    fijados las propuestas de las amarillas nunca se autorizan; y si el token de
+    runtime difiere entre el servicio que encola y el quality-worker, cada
+    replay se descarta en 4 segundos sin una sola línea de log.
+
+    Nunca cambia el ``status`` general: un deploy no se puede caer por esto
+    (Railway espera /health). Lo que hace es dejar de ser invisible.
+    """
+    reasons: list[str] = []
+    payload: dict = {"state": "green", "reasons": reasons}
+    try:
+        from transcription_quality import (
+            POLICY_VERSION, calibration_identity, runtime_identity,
+        )
+        calibration = calibration_identity()
+        identity = runtime_identity()
+        payload["policy_version"] = POLICY_VERSION
+        payload["calibrated"] = bool(calibration.get("calibrated"))
+        payload["calibration_id"] = calibration.get("calibration_id")
+        payload["pipeline_config_fingerprint"] = identity.get("pipeline_config_fingerprint")
+        if not calibration.get("calibrated"):
+            reasons.append("quality_calibration_unavailable")
+    except Exception:
+        payload["calibrated"] = None
+        reasons.append("quality_calibration_unreadable")
+    try:
+        from queue_jobs import _transcription_quality_runtime_token
+        payload["runtime_token"] = _transcription_quality_runtime_token()
+    except Exception:
+        payload["runtime_token"] = None
+        reasons.append("runtime_token_unavailable")
+    # Propuestas de las amarillas: mismo criterio que
+    # quality_v6_calibration (kill switch + artefactos fijados con su sha256).
+    # Se evalúa acá directo para no fabricar un objeto de certificación falso.
+    try:
+        blockers: list[str] = []
+        if os.environ.get("QUALITY_V6_PROPOSALS_ENABLED", "0").strip().lower() not in {
+            "1", "true", "yes", "on",
+        }:
+            blockers.append("proposal_kill_switch_off")
+        pinned = {
+            "QUALITY_V6_DATASET_MANIFEST_PATH": os.environ.get("QUALITY_V6_DATASET_MANIFEST_PATH", "").strip(),
+            "QUALITY_V6_DATASET_MANIFEST_SHA256": os.environ.get("QUALITY_V6_DATASET_MANIFEST_SHA256", "").strip().lower(),
+            "QUALITY_V6_CALIBRATION_PATH": os.environ.get("QUALITY_V6_CALIBRATION_PATH", "").strip(),
+            "QUALITY_V6_CALIBRATION_SHA256": os.environ.get("QUALITY_V6_CALIBRATION_SHA256", "").strip().lower(),
+        }
+        missing = [name for name, value in pinned.items() if not value]
+        if missing or not all(
+            re.fullmatch(r"[0-9a-f]{64}", pinned[name])
+            for name in ("QUALITY_V6_DATASET_MANIFEST_SHA256", "QUALITY_V6_CALIBRATION_SHA256")
+            if pinned[name]
+        ):
+            blockers.append("pinned_artifacts_missing")
+        payload["quality_v6_proposals"] = {
+            "authorized": not blockers, "blockers": blockers, "missing_env": missing,
+        }
+        if blockers:
+            reasons.append("quality_v6_proposals_blocked")
+    except Exception:
+        payload["quality_v6_proposals"] = {"authorized": None, "blockers": []}
+    # Paridad de flota: cada worker publica su token; si no coinciden, el
+    # replay se descarta silenciosamente (runtime_identity_mismatch).
+    try:
+        rows = (snap or {}).get("worker_releases") or []
+        tokens = {
+            str(row.get("runtime_token"))
+            for row in rows if isinstance(row, dict) and row.get("runtime_token")
+        }
+        if payload.get("runtime_token"):
+            tokens.add(str(payload["runtime_token"]))
+        payload["fleet_runtime_tokens"] = sorted(tokens)
+        payload["fleet_runtime_token_match"] = len(tokens) <= 1
+        if len(tokens) > 1:
+            reasons.append("fleet_runtime_token_mismatch")
+    except Exception:
+        payload["fleet_runtime_token_match"] = None
+    payload["state"] = "red" if reasons else "green"
+    return payload

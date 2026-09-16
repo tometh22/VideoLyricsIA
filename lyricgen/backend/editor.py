@@ -7,6 +7,7 @@ import json
 import uuid
 import hashlib
 import os
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -18,7 +19,7 @@ from segment_timing import canonicalize_editor_segments
 
 EDITOR_REASONS = {
     "autosave", "manual", "restore", "approve", "conflict", "migration",
-    "transcription", "quality_proposal",
+    "transcription", "quality_proposal", "reviewer_candidate",
 }
 EDITOR_CHECKPOINTS = EDITOR_REASONS | {"draft"}
 MAX_SEGMENTS = 5000
@@ -45,10 +46,38 @@ def quality_consensus_observations_enabled() -> bool:
 
 
 def operator_suggestions_enabled() -> bool:
-    """Human-click suggestions are independent from automatic correction."""
+    """Return whether any human-click suggestion family is enabled."""
+    return text_operator_suggestions_enabled() or timing_operator_suggestions_enabled()
+
+
+def reviewer_candidate_enabled(proposal: dict) -> bool:
+    if not isinstance(proposal, dict) or not proposal.get("reviewer_assist"):
+        return True
+    from reviewer_assist_scope import display_enabled
+    return display_enabled(proposal["reviewer_assist"].get("campaign_id"))
+
+
+def text_operator_suggestions_enabled() -> bool:
+    """Text proposals are independent from automatic correction."""
     return os.environ.get(
         "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
     ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def timing_operator_suggestions_enabled() -> bool:
+    """Timing proposals require their own explicit rollout switch."""
+    return os.environ.get(
+        "QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def operator_suggestion_type_enabled(suggestion_type: str) -> bool:
+    """Route persisted proposal families through independent switches."""
+    if suggestion_type == "timing":
+        return timing_operator_suggestions_enabled()
+    if suggestion_type in {"text", "vocalization"}:
+        return text_operator_suggestions_enabled()
+    return False
 
 
 def revoke_quality_proposal_if_disabled(document: EditorDocument) -> bool:
@@ -66,7 +95,7 @@ def revoke_quality_proposal_if_disabled(document: EditorDocument) -> bool:
     ) or (
         operator_only
         and status == "pending"
-        and not operator_suggestions_enabled()
+        and (not operator_suggestions_enabled() or not reviewer_candidate_enabled(proposal))
     ) or (
         not observation and not operator_only
         and status == "pending"
@@ -191,6 +220,39 @@ def _user_summary(db: Session, user_id: int | None) -> dict | None:
     if not user:
         return {"id": user_id}
     return {"id": user.id, "username": user.username}
+
+
+# Reviewer-pilot actor. A pilot copy is owned by a dedicated users row whose
+# role is "agent"; admin.py only ever writes "user"/"admin", so this value can
+# not be set through the product. Everything else in the codebase compares role
+# against "admin", so an agent behaves exactly like a regular non-admin user.
+PILOT_AGENT_ROLE = "agent"
+
+
+def actor_for(db: Session, user_id: int | None) -> dict:
+    """Server-derived authorship. Never trust a client-supplied actor flag."""
+    user = (
+        db.query(User).filter(User.id == user_id).first()
+        if user_id is not None else None
+    )
+    if user is not None and user.role == PILOT_AGENT_ROLE:
+        return {"actor_kind": "agent", "agent_id": user.username}
+    return {"actor_kind": "human" if user_id is not None else None, "agent_id": None}
+
+
+def assert_pilot_actor(db: Session, job: Job, user_id: int) -> None:
+    """Keep agents and humans on opposite sides of the pilot boundary.
+
+    Raised as ValueError so every existing editor write path (PATCH, proposal
+    apply, restore, conflict resolve) fails closed with 422 instead of writing.
+    """
+    actor = db.query(User).filter(User.id == user_id).first()
+    is_agent = actor is not None and actor.role == PILOT_AGENT_ROLE
+    if getattr(job, "pilot_id", None):
+        if not is_agent or user_id != job.user_id:
+            raise ValueError("pilot_copy_is_writable_only_by_its_agent")
+    elif is_agent:
+        raise ValueError("agent_may_only_edit_its_pilot_copy")
 
 
 def _version_summary(db: Session, version: EditorVersion) -> dict:
@@ -344,6 +406,7 @@ def _record_training_delta(
             detail={
                 "job_id": job.job_id,
                 "n_lines": len(current),
+                "checkpoint": checkpoint,
                 "changed": changed,
                 "reorder": reordered,
                 "correction_summary": {
@@ -370,6 +433,9 @@ def _record_training_delta(
     )
     if detail is None:
         return False
+    if checkpoint == "reviewer_candidate":
+        detail["author_kind"] = "machine_candidate"
+        detail["human_certified"] = False
     db.add(AuditLog(
         user_id=user_id,
         action="lyrics.segments_diff",
@@ -568,16 +634,33 @@ def require_machine_snapshot(job: Job, document: EditorDocument) -> None:
     validate_machine_evidence(document.machine_evidence, document.original_segments)
 
 
-def serialize_document(db: Session, document: EditorDocument) -> dict:
+def serialize_document(
+    db: Session, document: EditorDocument, job: Job | None = None,
+) -> dict:
     lock_expires = _aware(document.lock_expires_at)
     lock_active = bool(lock_expires and lock_expires > now_utc())
     proposal = _proposal_for_response(document)
+    # Authorship and isolation are read back from the stored rows, so a caller
+    # verifying a saved copy never has to take the client's word for them.
+    pilot = {
+        "pilot_id": getattr(job, "pilot_id", None) if job is not None else None,
+        "source_job_id": getattr(job, "parent_job_id", None) if job is not None else None,
+        "campaign_id": getattr(job, "campaign_id", None) if job is not None else None,
+        "approved": bool(getattr(job, "approved_at", None)) if job is not None else None,
+        "audio_sha256": getattr(job, "input_audio_sha256", None) if job is not None else None,
+        "learning_eligible": (
+            bool(getattr(job, "machine_snapshot_required", False))
+            if job is not None else None
+        ),
+    }
     return {
         "job_id": document.job_id,
         "revision": document.revision,
         "segments": document.current_segments,
         "original_segments": document.original_segments,
         "quality_proposal": proposal,
+        **pilot,
+        **actor_for(db, document.updated_by),
         "updated_at": _aware(document.updated_at).isoformat() if document.updated_at else None,
         "updated_by": _user_summary(db, document.updated_by),
         "lock": {
@@ -669,7 +752,7 @@ def segments_content_hash(value: list[dict]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _strict_timeline(value: Any, *, label: str) -> list[dict]:
+def _strict_timeline(value: Any, *, label: str, allow_overlaps: bool = False) -> list[dict]:
     """Validate without canonical repair so malformed proposals fail closed."""
     if not isinstance(value, list):
         raise ValueError(f"{label} must be an array")
@@ -703,7 +786,7 @@ def _strict_timeline(value: Any, *, label: str) -> list[dict]:
         if previous is not None:
             if abs(row["start"] - previous["start"]) <= _TIMELINE_EPSILON:
                 raise ValueError(f"{label} contains duplicate starts")
-            if row["start"] < previous["end"] - _TIMELINE_EPSILON:
+            if not allow_overlaps and row["start"] < previous["end"] - _TIMELINE_EPSILON:
                 raise ValueError(f"{label} contains overlapping segments")
         previous = row
     return rows
@@ -719,10 +802,42 @@ def _segments_overlapping_window(
     ]
 
 
+def _operator_text_preserves_timing(proposal: dict) -> bool:
+    """An existing overlap need not block a separate, time-preserving text edit.
+
+    This is inferred from server-stored rows, never a supplied exemption flag.
+    All source binding, ownership, window and approval checks still apply.
+    """
+    if (proposal.get("operator_suggestion_only") is not True
+            or proposal.get("automatic_apply_allowed") is not False):
+        return False
+    windows = proposal.get("windows")
+    if not isinstance(windows, list) or not windows:
+        return False
+    for window in windows:
+        if not isinstance(window, dict) or window.get("suggestion_type") != "text":
+            return False
+        before, after = window.get("current_segments"), window.get("proposed_segments")
+        if not isinstance(before, list) or not before or not isinstance(after, list) or len(before) != len(after):
+            return False
+        for left, right in zip(before, after):
+            if not isinstance(left, dict) or not isinstance(right, dict):
+                return False
+            try:
+                if any(not math.isfinite(float(left[key]))
+                       or float(left[key]) != float(right[key]) for key in ("start", "end")):
+                    return False
+            except (KeyError, TypeError, ValueError):
+                return False
+    return True
+
+
 def _validate_review_proposal_against_document(
     proposal: dict, current_segments: list[dict], *, require_hashes: bool = False,
 ) -> dict:
-    current = _strict_timeline(current_segments, label="current timeline")
+    preserves_timing = _operator_text_preserves_timing(proposal)
+    current = _strict_timeline(current_segments, label="current timeline",
+                               allow_overlaps=preserves_timing)
     windows = proposal.get("windows")
     if not isinstance(windows, list) or not windows:
         raise ValueError("quality proposal requires windows")
@@ -739,6 +854,7 @@ def _validate_review_proposal_against_document(
             raise ValueError("quality proposal window timing is invalid")
         supplied_current = _strict_timeline(
             window.get("current_segments"), label=f"window {index} current",
+            allow_overlaps=preserves_timing,
         )
         expected_current = _segments_overlapping_window(current, start, end)
         if supplied_current != expected_current:
@@ -751,6 +867,7 @@ def _validate_review_proposal_against_document(
             raise ValueError("quality proposal window cuts through a current segment")
         proposed = _strict_timeline(
             window.get("proposed_segments"), label=f"window {index} proposed",
+            allow_overlaps=preserves_timing,
         )
         if not proposed:
             raise ValueError("quality proposal window requires proposed segments")
@@ -938,7 +1055,7 @@ def persist_operator_review_proposal_if_current(
     """Persist auditable one-click suggestions without authorizing automation."""
     from transcription_quality import segments_hash
 
-    if not operator_suggestions_enabled():
+    if not operator_suggestions_enabled() or not reviewer_candidate_enabled(proposal):
         return False
     if not (
         isinstance(proposal, dict)
@@ -955,6 +1072,15 @@ def persist_operator_review_proposal_if_current(
     ).with_for_update().first()
     if job is None or document is None:
         return False
+    if proposal.get("reviewer_assist"):
+        from reviewer_assist_scope import publication_enabled
+        if not publication_enabled(getattr(job, "campaign_id", None)):
+            return False
+    if proposal.get("reviewer_assist") and document.quality_proposal:
+        previous_proposal = document.quality_proposal
+        if not (previous_proposal.get("reviewer_assist") and previous_proposal.get("status") == "stale"):
+            # Never replace another pending batch or a human acceptance ledger.
+            return False
     if (
         int(document.revision or 0) != int(expected_revision)
         or segments_hash(document.current_segments or []) != expected_segments_hash
@@ -969,6 +1095,17 @@ def persist_operator_review_proposal_if_current(
         _segment_key(dict(item))
         for item in (document.original_segments or []) if isinstance(item, dict)
     }
+    if proposal.get('reviewer_assist'):
+        from reviewer_edit_provenance import from_database
+        from shadow_reference_import import digest
+        current_rows = list(document.current_segments or [])
+        receipt = from_database(db, {'job_id':job_id, 'segments':current_rows,
+            'segments_revision':document.revision, 'segments_sha256':digest(current_rows),
+            'audio_sha256':job.input_audio_sha256, 'audio_revision':job.audio_revision,
+            'status':job.status, 'approved_at':job.approved_at})
+        denied = {_segment_key(current_rows[r['line_index']]) for r in receipt['lines'] if r['protected']}
+        original_keys = {_segment_key(current_rows[r['line_index']]) for r in receipt['lines']
+                         if not r['protected']} - denied
     eligible_windows = []
     for window in proposal.get("windows") or []:
         if not isinstance(window, dict):
@@ -978,6 +1115,8 @@ def persist_operator_review_proposal_if_current(
             if isinstance(item, dict)
         ]
         suggestion_type = str(window.get("suggestion_type") or "")
+        if not operator_suggestion_type_enabled(suggestion_type):
+            continue
         if (not current and suggestion_type == "timing") or any(
             item.get("locked") is True or item.get("operator_locked") is True
             or _segment_key(item) not in original_keys
@@ -1016,6 +1155,13 @@ def persist_operator_review_proposal_if_current(
         "created_at": created.isoformat(),
         "expires_at": (created + timedelta(days=7)).isoformat(),
     }
+    if proposal.get("reviewer_assist"):
+        from database import ProductEvent
+        for window in eligible_windows:
+            db.add(ProductEvent(tenant_id=str(job.tenant_id), user_id=None, job_id=job_id,
+                name="editor_reviewer_candidate", properties={"kind": "generated",
+                    "proposal_id": hashlib.sha256(window["id"].encode()).hexdigest()[:16],
+                    "candidate_id": document.quality_proposal["id"], "event_id": str(uuid.uuid4())}))
     db.flush()
     return True
 
@@ -1166,9 +1312,18 @@ def apply_quality_proposal(
         EditorDocument.job_id == document.job_id,
     ).populate_existing().with_for_update().one()
     proposal = dict(document.quality_proposal or {})
+    if proposal.get("reviewer_assist") and (
+        getattr(document, "approved_at", None) or getattr(job, "approved_at", None)
+        or getattr(job, "status", None) in {"lyrics_approved", "done"}
+    ):
+        raise RuntimeError("approved_song_preserved")
+    if proposal.get("reviewer_assist"):
+        from reviewer_assist_scope import display_enabled
+        if not display_enabled(getattr(job, "campaign_id", None)):
+            raise QualityProposalsDisabled("reviewer_campaign_out_of_scope")
     operator_only = proposal.get("operator_suggestion_only") is True
     if operator_only:
-        if not operator_suggestions_enabled():
+        if not operator_suggestions_enabled() or not reviewer_candidate_enabled(proposal):
             revoke_quality_proposal_if_disabled(document)
             db.flush()
             raise QualityProposalsDisabled("operator_suggestions_disabled")
@@ -1242,9 +1397,17 @@ def apply_quality_proposal(
         float(row.get("start") or 0), float(row.get("end") or 0),
         str(row.get("text") or ""),
     ))
-    segments = _strict_timeline(segments, label="quality proposal result")
+    preserves_timing = _operator_text_preserves_timing(validated_proposal)
+    segments = _strict_timeline(segments, label="quality proposal result",
+                               allow_overlaps=preserves_timing)
+    if preserves_timing and [
+        (float(row["start"]), float(row["end"])) for row in segments
+    ] != [(float(row["start"]), float(row["end"]))
+          for row in document.current_segments or []]:
+        raise ValueError("text proposal changed the existing timeline")
     document, version, applied = save_document(
-        db, job, document, user_id, base_revision, segments, "quality_proposal",
+        db, job, document, user_id, base_revision, segments,
+        "reviewer_candidate" if proposal.get("reviewer_assist") else "quality_proposal",
     )
     history = [
         dict(item) for item in (proposal.get("decision_history") or [])
@@ -1260,6 +1423,12 @@ def apply_quality_proposal(
         dict(item) for item in validated_proposal["windows"]
         if str(item.get("id")) not in selected
     ]
+    assist_receipt = None
+    if proposal.get("reviewer_assist"):
+        assist_receipt = {**proposal["reviewer_assist"], "accepted_windows": [
+            *proposal["reviewer_assist"].get("accepted_windows", []),
+            *[{"id": w["id"], "proposed_segments": w["proposed_segments"]} for w in windows],
+        ]}
     if operator_only and remaining:
         current = list(document.current_segments or [])
         document.quality_proposal = {
@@ -1272,6 +1441,9 @@ def apply_quality_proposal(
             "decision_history": history,
             "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
         }
+        if assist_receipt:
+            assist_receipt.pop("candidate", None)
+            document.quality_proposal = {**document.quality_proposal, "reviewer_assist": assist_receipt}
     else:
         document.quality_proposal = {
             "id": proposal_id, "status": "applied", "windows": [],
@@ -1281,6 +1453,9 @@ def apply_quality_proposal(
             "decision_history": history,
             "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
         }
+        if assist_receipt:
+            document.quality_proposal = {**document.quality_proposal,
+                "reviewer_assist": assist_receipt}
     db.flush()
     return document, version, applied
 
@@ -1312,7 +1487,7 @@ def reject_operator_suggestion(
         or proposal.get("operator_suggestion_only") is not True
     ):
         raise LookupError("operator_suggestion_not_found")
-    if not operator_suggestions_enabled():
+    if not operator_suggestions_enabled() or not reviewer_candidate_enabled(proposal):
         revoke_quality_proposal_if_disabled(document)
         db.flush()
         raise QualityProposalsDisabled("operator_suggestions_disabled")
@@ -1408,6 +1583,21 @@ def rebase_operator_suggestions_after_manual_edit(
     """
     proposal = dict(proposal or {})
     from transcription_quality import segments_hash
+    if proposal.get("reviewer_assist") and proposal.get("status") == "applied":
+        def row_identity(row):
+            return (str(row.get("text", "")), round(float(row.get("start", 0)), 4),
+                    round(float(row.get("end", 0)), 4))
+        before_keys = {row_identity(row) for row in previous_segments}
+        after_keys = {row_identity(row) for row in document.current_segments}
+        events = []
+        for window in proposal["reviewer_assist"].get("accepted_windows", []):
+            keys = {row_identity(row) for row in window["proposed_segments"]}
+            if keys <= before_keys and not keys <= after_keys:
+                events.append({"decision": "edited_after_accept",
+                    "window_id": hashlib.sha256(window["id"].encode()).hexdigest()[:16],
+                    "decided_at": now_utc().isoformat()})
+        document.quality_proposal = proposal
+        return events
     if (
         proposal.get("operator_suggestion_only") is not True
         or proposal.get("status") != "pending"
@@ -1544,7 +1734,14 @@ def rebase_operator_suggestions_after_manual_edit(
         decisions.append(evidence)
         history.append(evidence)
 
-    if remaining:
+    if proposal.get("reviewer_assist"):
+        # A complete version is not rebased piecemeal after a human revision.
+        assist = dict(proposal["reviewer_assist"])
+        assist.pop("candidate", None)
+        document.quality_proposal = {"id": proposal.get("id"), "status": "stale",
+            "windows": [], "base_revision": proposal.get("base_revision"),
+            "decision_history": history[-100:], "reviewer_assist": assist}
+    elif remaining:
         document.quality_proposal = {
             **proposal,
             "status": "pending",
@@ -1596,6 +1793,11 @@ def save_document(
         .with_for_update()
         .one()
     )
+    # Guard every editor write path at once (PATCH, proposal apply, restore,
+    # conflict resolve) instead of one endpoint at a time.
+    assert_pilot_actor(db, job, user_id)
+    if getattr(job, "pilot_id", None) and reason == "approve":
+        raise ValueError("pilot_copy_cannot_be_approved")
     normalized = normalize_segments(segments)
     if document.revision != base_revision:
         # A background/typography render can advance the durable revision
@@ -1631,12 +1833,44 @@ def save_document(
         return document, version, False
     previous_segments = [dict(item) for item in (document.current_segments or [])]
     previous_revision = int(document.revision or 0)
+    from reviewer_timing_capture import timing_capture
+    capture = timing_capture(previous_segments, segments, job=job, user_id=user_id,
+        checkpoint=reason, from_revision=previous_revision, to_revision=previous_revision + 1)
+    if capture:
+        # Same transaction as save; capture submitted timings before any
+        # normalization, without adding forms or asserting line-level intent.
+        capture['normalization_changed_timing'] = any(
+            any(round(float(a.get(k, 0)), 4) != round(float(b.get(k, 0)), 4) for k in ('start', 'end'))
+            for a, b in zip(segments, normalized))
+        db.add(AuditLog(user_id=user_id, action='lyrics.prospective_timing', detail=capture))
     document.current_segments = normalized
     document.revision += 1
     document.updated_by = user_id
     document.updated_at = now_utc()
+    from campaign_review_history import HUMAN_CHECKPOINTS
+    if reason in HUMAN_CHECKPOINTS and not segments_equivalent(previous_segments, normalized):
+        db.add(AuditLog(user_id=user_id, action="editor.review_saved", detail={
+            "job_id": job.job_id, "checkpoint": reason,
+            "from_revision": previous_revision, "to_revision": document.revision,
+        }))
     job.segments_json = normalized
     job.segments_revision = document.revision
+    if getattr(job, "campaign_id", None) and job.status == "lyrics_approved":
+        # Opening or saving an identical snapshot keeps its approval. A real
+        # edit before rendering must return to human review, otherwise the
+        # old revision blocks both generation and a subsequent approval.
+        quality = dict(job.transcription_quality or {})
+        approval = quality.pop("pre_background_approval", None)
+        db.add(AuditLog(user_id=user_id, action="batch.lyrics_approval_reopened", detail={
+            "job_id": job.job_id, "campaign_id": job.campaign_id,
+            "previous_approval": approval,
+            "from_revision": previous_revision, "to_revision": document.revision,
+            "reason": "editor_segments_changed",
+        }))
+        job.transcription_quality = quality
+        job.status = "transcribed_pending"
+        job.approved_at = None
+        job.approved_by = None
     # Any ordinary edit makes a raw proposal stale. Quality-proposal apply
     # writes a text-free tombstone after save_document returns.
     document.quality_proposal = None
@@ -1772,6 +2006,11 @@ def sync_legacy_snapshot(
     document.updated_by = user_id
     document.updated_at = now_utc()
     _ensure_version(db, document, revision, normalized, user_id, "autosave")
+    if not segments_equivalent(previous_segments, normalized):
+        db.add(AuditLog(user_id=user_id, action="editor.review_saved", detail={
+            "job_id": job.job_id, "checkpoint": "legacy_autosave",
+            "from_revision": previous_revision, "to_revision": revision,
+        }))
     _record_training_delta(
         db,
         job=job,
@@ -1829,6 +2068,23 @@ def resolve_conflict(
     )
 
 
+def validate_approval_snapshot(segments):
+    """No normalisation/repair here: the saved revision is the contract."""
+    if not segments:
+        raise ValueError("approval_requires_nonempty_lyrics")
+    ordered = []
+    for index, row in enumerate(segments):
+        start, end = row.get('start'), row.get('end')
+        if (not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (start, end))
+                or start < 0 or end <= start or not str(row.get('text') or '').strip()):
+            raise ValueError(f"approval_invalid_line:{index + 1}")
+        ordered.append((round(start, 4), round(end, 4), index))
+    ordered.sort()
+    for left, right in zip(ordered, ordered[1:]):
+        if left[1] > right[0]:
+            raise ValueError(f"approval_overlap_requires_explicit_edit:{left[2] + 1}:{right[2] + 1}")
+
+
 def approve_document(
     db: Session,
     job: Job,
@@ -1843,6 +2099,8 @@ def approve_document(
     else saved. Both selectors must still identify the document's current
     revision, otherwise approval fails closed with the standard conflict.
     """
+    if getattr(job, "pilot_id", None):
+        raise ValueError("pilot_copy_cannot_be_approved")
     job = (
         db.query(Job)
         .filter(Job.job_id == job.job_id)
@@ -1850,10 +2108,15 @@ def approve_document(
         .with_for_update()
         .one()
     )
-    document = get_or_create_document(
-        db, job.job_id, job.tenant_id, job.segments_json or [],
-    )
+    # Existing persisted documents must not pass through migration/healing on
+    # approval. Conflicts are explicit; opening/normalizing is not approval.
+    document = db.query(EditorDocument).filter(
+        EditorDocument.job_id == job.job_id, EditorDocument.tenant_id == job.tenant_id,
+    ).populate_existing().with_for_update().first()
+    if document is None:
+        document = get_or_create_document(db, job.job_id, job.tenant_id, job.segments_json or [])
     require_machine_snapshot(job, document)
+    validate_approval_snapshot(document.current_segments)
     selected = None
     selected_is_equivalent_current = False
     if editor_version_id:
@@ -1881,7 +2144,7 @@ def approve_document(
     if version.reason != "transcription":
         version.reason = "approve"
     freeze_approval_training_evidence(job, version)
-    job.segments_json = normalize_segments(document.current_segments)
+    job.segments_json = deepcopy(document.current_segments)
     job.segments_revision = document.revision
     db.flush()
     return document, version

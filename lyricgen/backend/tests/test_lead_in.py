@@ -75,10 +75,12 @@ def test_bad_segment_passthrough():
 
 # ── hold (LYRIC_HOLD_S) ──────────────────────────────────────────────────────
 
-def test_hold_default_off(monkeypatch):
+def test_hold_default_is_safe_half_second(monkeypatch):
     monkeypatch.delenv("LYRIC_HOLD_S", raising=False)
     segs = _segs()
-    assert lead_in.apply_hold(segs) is segs
+    out = lead_in.apply_hold(segs)
+    assert lead_in.hold_seconds() == 0.5
+    assert out[0]["end"] == 12.5
 
 
 def test_hold_extends_into_gap_with_cap():
@@ -114,7 +116,7 @@ def test_hold_env_parsing(monkeypatch):
     monkeypatch.setenv("LYRIC_HOLD_S", "0.25")
     assert lead_in.hold_seconds() == 0.25
     monkeypatch.setenv("LYRIC_HOLD_S", "nope")
-    assert lead_in.hold_seconds() == 0.0
+    assert lead_in.hold_seconds() == 0.5
 
 
 def test_lead_clampeado_al_tope(monkeypatch, caplog):

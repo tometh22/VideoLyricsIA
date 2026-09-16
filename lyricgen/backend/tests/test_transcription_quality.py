@@ -578,6 +578,28 @@ def test_human_revision_supersedes_and_invalidates_all_stale_evidence():
     assert pending["analysis_pending"] is True
 
 
+def test_human_edit_preserves_audio_reference_but_not_human_approval():
+    from reference_hypothesis import build_unavailable, validate_binding
+    reference = build_unavailable(audio_sha256="a" * 64, audio_revision=2)
+    reference.update(review_status="human_line_review_approved", reviewed_editor_revision=4)
+    quality = {"reference_hypothesis": reference, "reference_hypothesis_unavailable": True,
+               "reviewer_campaign_status": {"status": "complete", "source": {"segments_revision": 4}},
+               "pre_background_approval": {"editor_revision": 4}, "score": 99}
+    updated = tq.supersede_pending_analysis(quality, revision=5)
+    retained = updated["reference_hypothesis"]
+    assert validate_binding(retained, audio_sha256="a" * 64, audio_revision=2) == (True, "ok")
+    assert not validate_binding(retained, audio_sha256="b" * 64, audio_revision=2)[0]
+    assert retained["review_status"] == "manual_full_review_required"
+    assert "reviewed_editor_revision" not in retained
+    assert "pre_background_approval" not in updated and "score" not in updated
+    assert updated["reference_hypothesis_unavailable"] is True
+    assert reference["reviewed_editor_revision"] == 4
+    assert retained is not reference
+    assert updated["reviewer_campaign_status"] == quality["reviewer_campaign_status"]
+    assert updated["reviewer_campaign_status"] is not quality["reviewer_campaign_status"]
+    assert updated["reviewer_campaign_status"]["source"]["segments_revision"] == 4
+
+
 def test_eight_witness_words_cannot_certify_a_five_minute_song():
     quality = tq.evaluate(
         [_segment(1, 2)], {

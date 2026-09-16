@@ -174,6 +174,7 @@ def test_still_background_wired_from_both_pipelines():
             f"{fn.__name__} debe pasar still_background a generate_lyric_video"
         )
         idx = src.find("still_background=")
+        assert 'foto-parallax' in src[idx:idx + 200], "Foto fija debe mantener quieta también la foto subida"
         assert 'estatico' in src[idx:idx + 200], (
             f"{fn.__name__} debe derivar still_background del movimiento "
             "'estatico' elegido por el operador"

@@ -50,4 +50,28 @@ describe("useJobProgress terminal polling contract", () => {
     expect(global.fetch).toHaveBeenCalledTimes(1);
     unmount();
   });
+
+  it("does not overlap fallback status requests while one is still pending", async () => {
+    let resolveFetch;
+    global.fetch = vi.fn(() => new Promise((resolve) => { resolveFetch = resolve; }));
+    const { unmount } = renderHook(() => useJobProgress("job-1", {
+      api: "http://test",
+      token: "token",
+    }));
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+
+    resolveFetch({
+      ok: true,
+      status: 200,
+      json: async () => ({ status: "processing", progress: 10 }),
+    });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    unmount();
+  });
 });

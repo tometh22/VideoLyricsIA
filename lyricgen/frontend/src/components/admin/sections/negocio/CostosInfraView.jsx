@@ -82,6 +82,47 @@ function TooltipCosto({ active, payload, label, groupBy }) {
 
 /** Banner de cobertura. Deliberadamente imposible de confundir con un aviso
  *  menor: mientras falten celdas, el número grande es un piso. */
+// Aviso distinto del de cobertura, y por eso un componente aparte.
+//
+// `coverage` responde "¿el proveedor contestó?". Esto responde "¿lo que
+// contestó es creíble?". Medido en staging el 1-sep-2026: agosto tenía las
+// 31 celdas de GCP en `ok` y cobertura COMPLETA, con 30 de esos 31 días en
+// $0,00 exacto porque el export de facturación cortaba el 1-ago. El panel
+// mostraba GCP en $3,97 contra $138,90 de julio, en verde. Leído como
+// ahorro, es un 97% de gasto desaparecido.
+//
+// Va arriba del banner de cobertura a propósito: cuando los dos aparecen,
+// éste es el que explica un número que igual se ve completo.
+function BannerFuenteSospechosa({ fuentes }) {
+  if (!fuentes || !fuentes.length) return null;
+  return (
+    <div className="rounded-card bg-[#F5A524]/[0.07] ring-1 ring-[#F5A524]/25 px-5 py-4 mb-5">
+      <p className="text-caption font-semibold text-[#F5A524]">
+        Una fuente contestó bien pero devolvió cero
+      </p>
+      <p className="text-caption text-gray-400 mt-1">
+        La cobertura no marca esto —el proveedor respondió— pero el importe
+        no es creíble. Lo más probable es que el dato de origen esté
+        cortado, así que el total de esa fuente es un <b>piso</b>.
+      </p>
+      <ul className="mt-2 space-y-1">
+        {fuentes.map((f) => (
+          <li key={f.source} className="text-caption text-gray-300">
+            <span className="font-medium">
+              {ETIQUETA_FUENTE[f.source] || f.source}
+            </span>
+            : <span className="tabular-nums">{f.zero_days}</span> días
+            seguidos en $0,00 · último con gasto{" "}
+            <span className="tabular-nums">{f.last_nonzero_day}</span> ·
+            reporta{" "}
+            <span className="tabular-nums">{fmtMoney(f.reported_usd)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function BannerCobertura({ cobertura, onColectar, colectando }) {
   if (!cobertura || cobertura.complete) return null;
   const faltan = cobertura.missing_total ?? cobertura.missing?.length ?? 0;
@@ -190,6 +231,7 @@ export default function CostosInfraView({
       </FilterBar>
 
       <div className="mt-5">
+        <BannerFuenteSospechosa fuentes={data?.stale_sources} />
         <BannerCobertura cobertura={data?.coverage} onColectar={colectar}
                          colectando={colectando} />
 

@@ -442,6 +442,7 @@ const nearCollision = (left, right) => {
 export function canonicalizeEditorSegments(segments) {
   if (!Array.isArray(segments)) return [];
   const cleaned = [];
+  const dropped = [];
   segments.forEach((segment) => {
     if (!segment || typeof segment !== "object") return;
     const start = Number(segment.start);
@@ -451,10 +452,25 @@ export function canonicalizeEditorSegments(segments) {
     ));
     if (duplicate) {
       duplicate.end = Math.max(Number(duplicate.end) || 0, Number(segment.end) || 0);
+      dropped.push(String(segment.text || ""));
       return;
     }
     cleaned.push({ ...segment });
   });
+  // Este deduplicador borra filas del documento del operador. Está bien que lo
+  // haga (una copia pegada 0,1 s después no es un segundo evento cantado), pero
+  // hasta ahora lo hacía sin dejar rastro: fue el que EJECUTÓ la pérdida de las
+  // 6 líneas del job f866cbcf0e49 (1-sep-2026) después de que el merge le
+  // pasara N copias idénticas de la misma línea. `[segment-collision]` lo
+  // reenvía observability.js a Sentry (mismo mecanismo que `[reseed-storm]`).
+  if (dropped.length > 0) {
+    // eslint-disable-next-line no-console
+    console.warn("[segment-collision] editor rows dropped as duplicates", {
+      dropped: dropped.length,
+      of: segments.length,
+      texts: dropped.slice(0, 5),
+    });
+  }
 
   const decorated = cleaned.map((segment, index) => ({
     segment,

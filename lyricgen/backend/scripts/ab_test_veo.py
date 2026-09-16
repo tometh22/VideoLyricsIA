@@ -1,13 +1,7 @@
-"""A/B test: generate the same Veo prompt with veo-3.1-generate-001 and
-veo-3.1-fast-generate-001 to compare visual quality before swapping models
-in production.
+"""Legacy sample utility, restricted to Veo Lite by the mandatory model policy.
 
-Reads VERTEX_PROJECT, VERTEX_LOCATION, GOOGLE_APPLICATION_CREDENTIALS from
-.env in the backend dir. Costs roughly $4 (8s × $0.40 standard + 8s × $0.10
-fast = $4). Output MP4s land in lyricgen/outputs/ab_test_veo/.
-
-Run from repo root or from backend/:
-    cd lyricgen/backend && python3 scripts/ab_test_veo.py
+Reads Vertex credentials from the backend environment. Generated samples are
+billable and saved in lyricgen/outputs/ab_test_veo/.
 """
 
 import os
@@ -39,17 +33,14 @@ PROMPT = (
     "no CGI, no animation."
 )
 
-MODELS = [
-    ("veo-3.1-generate-001", "standard"),
-    ("veo-3.1-fast-generate-001", "fast"),
-]
+MODELS = [("veo-3.1-lite-generate-001", "lite")]
 
 # Allow retrying just one variant: `python3 scripts/ab_test_veo.py standard`
 if len(sys.argv) > 1:
     wanted = sys.argv[1]
     MODELS = [(m, l) for (m, l) in MODELS if l == wanted]
     if not MODELS:
-        sys.exit(f"unknown variant {wanted!r} (use: standard|fast)")
+        sys.exit(f"unknown variant {wanted!r} (use: lite)")
 
 
 def access_token() -> str:
@@ -65,6 +56,8 @@ def access_token() -> str:
 
 
 def generate(model: str, label: str) -> Path:
+    if model != "veo-3.1-lite-generate-001":
+        raise ValueError("Only Veo Lite is enabled for video generation")
     out_path = OUTPUT_DIR / f"{label}_{model}.mp4"
     base = (
         f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1"

@@ -104,6 +104,34 @@ def _probe(url: str) -> tuple[bool, str]:
     return True, f"200 status={status}"
 
 
+def _heartbeat_status_page(url: str) -> None:
+    """Latido de 5 min que alimenta el historial de la página de status.
+
+    `status_page.observe_components` escribe el tramo observado de cada
+    componente cuando alguien pega a `/service-status/*`. Sin este latido,
+    las únicas observaciones vendrían de visitas humanas — es decir, casi
+    ninguna de madrugada — y las barras de 90 días saldrían grises
+    ("sin datos") en vez de contar el uptime real. El diseño prefiere el
+    gris a un verde inventado, así que la forma de tener barras verdes de
+    verdad es observar de verdad, cada 5 minutos, desde afuera.
+
+    NUNCA cambia el resultado del ping. La historia del deadlock del
+    2026-07-28 (Railway "Wait for CI" espera este check, este check pega a
+    prod, prod está a medio deployar → auto-bloqueo) vale igual acá: si
+    este GET fallara el job, un bug en la página de status podría trabar
+    los deploys de producción. Es best-effort y punto.
+    """
+    try:
+        req = urllib.request.Request(f"{url}/service-status/summary", method="GET")
+        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read(_MAX_BODY_BYTES).decode("utf-8", "replace"))
+        print(f"[uptime] status-page heartbeat: indicator={payload.get('indicator')} "
+              f"banner={payload.get('banner')}")
+    except Exception as e:
+        # Incluye el 404 esperado mientras la feature no esté deployada.
+        print(f"[uptime] status-page heartbeat skipped: {type(e).__name__}: {e}")
+
+
 def main() -> int:
     url = (os.environ.get("PRODUCTION_API_URL") or "https://genly-ai.up.railway.app").rstrip("/")
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -114,6 +142,7 @@ def main() -> int:
         last_detail = detail
         print(f"[uptime] {ts} attempt {i}/{_ATTEMPTS}: {'OK' if ok else 'FAIL'} ({detail})")
         if ok:
+            _heartbeat_status_page(url)
             return 0  # any single success = up; no alert.
         if i < _ATTEMPTS:
             time.sleep(_GAP_S)

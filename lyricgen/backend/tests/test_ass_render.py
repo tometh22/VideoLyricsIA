@@ -636,7 +636,15 @@ def test_build_ass_dissolve_blur_emits_blur_in_and_out():
     segs = [{"text": "hola", "start": 1.0, "end": 5.0}]
     d = _dialogue(_ass([_line(segs, transition="dissolve_blur")]))
     assert "\\blur8" in d and "\\blur0" in d
-    assert d.count("\\t(") == 2          # focus-in + blur-out
+    assert "\\4a&HFF&" in d                       # shadow fades with exit blur
+    assert d.count("\\t(") == 2          # focus-in + blur/shadow-out
+
+
+def test_line_transition_preserves_approved_lyric_window():
+    segs = [{"text": "hola", "start": 3.2, "end": 6.7}]
+    line = _line(segs, transition="dissolve_blur")
+    assert line.start_s == pytest.approx(3.2)
+    assert line.end_s == pytest.approx(6.7)
 
 
 def test_word_reveal_adds_staggered_exit():
@@ -892,4 +900,3 @@ def test_title_card_lines_defaults_unchanged_no_regression():
     artist, song = lines
     assert artist.fontsize == 100 and song.fontsize == 62
     assert artist.alignment == 5 and artist.pos[0] == 0.5
-

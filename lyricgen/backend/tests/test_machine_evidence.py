@@ -460,3 +460,60 @@ def test_evidence_jobs_keep_every_durable_draft_checkpoint(db):
     assert len(audits) == 60
     assert all(item.detail["schema"] == "editor-line-delta-v2" for item in audits)
     assert all(item.detail["truncated"] is False for item in audits)
+
+
+def test_lora_witness_survives_finalize_and_validate():
+    """A LoRA word stream must not break the durable-evidence contract.
+
+    Regression: filing the LoRA family as a ``candidate`` without an
+    ``attempt_id`` made ``validate_machine_evidence`` raise
+    ``machine_recognition_attempt_id_invalid`` at final persistence, so every
+    song where the adapter attached words ended ``transcription_failed``.
+    """
+    from machine_evidence import (
+        build_machine_evidence, finalize_machine_evidence,
+        validate_machine_evidence,
+    )
+
+    segments = [{
+        "start": 1.0, "end": 2.5, "text": "hola mundo",
+        "words": [
+            {"word": "hola", "start": 1.0, "end": 1.4, "score": 0.9},
+            {"word": "mundo", "start": 1.5, "end": 2.5, "score": 0.8},
+        ],
+    }]
+    result = {
+        "segments": segments,
+        "_asr_words": [
+            {"word": "hola", "start": 1.0, "end": 1.4},
+            {"word": "mundo", "start": 1.5, "end": 2.5},
+        ],
+        "_primary_asr_family": "whisperx",
+        "_lora_asr_words": [
+            {"word": "hola", "start": 1.001, "end": 1.4},
+            {"word": "mundo", "start": 1.5, "end": 2.5},
+        ],
+        "_lora_asr_family": "openai_whisper_large_v3_turbo_lora_v1",
+        "_lora_family_role": "additional_consensus_family",
+    }
+    evidence = build_machine_evidence(result)
+    finalized = finalize_machine_evidence(
+        evidence, original_segments=segments,
+        quality={
+            "decision": "review_required", "policy_version": "lyrics-quality-v6",
+            "timing_source": "ctc", "score": None, "risk": 0.4,
+        },
+        audio_sha256="a" * 64, audio_revision=1,
+    )
+    validate_machine_evidence(finalized, segments)  # must not raise
+
+    lora = [
+        item for item in finalized["hypotheses_by_family"]
+        if item.get("family") == "openai_whisper_large_v3_turbo_lora_v1"
+        and item.get("kind") == "word_stream"
+    ]
+    assert len(lora) == 1
+    assert lora[0]["role"] not in {"primary", "candidate", "selected"}
+    assert lora[0]["view"] == "lora_v1"
+    assert lora[0]["event_count"] == 2
+    assert finalized["capture"]["recognition_attempt_count"] == 1

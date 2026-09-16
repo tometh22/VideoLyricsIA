@@ -19,6 +19,42 @@ def test_ci_runs_for_stacked_pull_requests():
     )
 
 
+def test_ci_is_merge_queue_ready_without_weakening_current_pr_gates():
+    """Queue rollout stays fail-closed until the explicit repository toggle.
+
+    GitHub applies one required-check set to both ``pull_request`` and
+    ``merge_group``.  The stable ``ci-gate`` context therefore has to switch
+    what it validates by event, while the legacy full PR suite remains the
+    default until queue activation has been proven end to end.
+    """
+    workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text()
+
+    trigger_block = workflow.split("on:", 1)[1].split("permissions:", 1)[0]
+    assert "pull_request:" in trigger_block
+    assert "merge_group:" in trigger_block
+    assert "types: [checks_requested]" in trigger_block
+    assert "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in workflow
+
+    assert "backend_fast:" in workflow
+    assert "name: backend-fast" in workflow
+    assert "timeout-minutes: 10" in workflow
+    assert "github.event_name == 'pull_request'" in workflow
+
+    fail_safe = "vars.STAGING_MERGE_QUEUE_ENABLED != 'true'"
+    # Backend, frontend, real editor collaboration, and Sentinel keep running
+    # on PRs when the opt-in variable is absent (the current repository state).
+    assert workflow.count(fail_safe) >= 5
+    # The staging-specific switch must never weaken PRs to main or stacked PRs.
+    assert workflow.count("github.base_ref != 'staging'") >= 5
+    assert "BASE_REF: ${{ github.base_ref }}" in workflow
+
+    assert "ci_gate:" in workflow
+    assert "name: ci-gate" in workflow
+    assert "if: always()" in workflow
+    assert 'if event == "pull_request":' in workflow
+    assert 'if result != "success"' in workflow
+
+
 def test_railway_uses_one_config_per_service():
     assert not (REPO / "railway.toml").exists()
     assert {p.name for p in (REPO / "railway").glob("*.toml")} == {
@@ -326,6 +362,104 @@ def test_el_protocolo_sigue_siendo_bloqueante_aunque_la_huella_coincida():
     out = worker_fleet_coherence(workers, "sha", 2, api_code_fingerprint="abc123")
     assert out["protocol_match"] is False
     assert out["coherent"] is False
+
+
+def test_readiness_ignora_release_reemplazado_solo_con_cohorte_actual_completa():
+    """El TTL del worker viejo no causa un 503 después del rollout completo."""
+    from observability import worker_fleet_coherence
+
+    def row(service, release, fingerprint, queues):
+        return {
+            "worker": f"{service}-{release}",
+            "service": service,
+            "release": release,
+            "code_fingerprint": fingerprint,
+            "rq_payload_version": 2,
+            "queues": queues,
+        }
+
+    old = [
+        row("Worker", "sha-old", "old-code", ["enterprise", "default"]),
+        row("ShortWorker", "sha-old", "old-code", ["transcription", "bg_preview"]),
+    ]
+    current = [
+        row("Worker", "sha-new", "new-code", ["enterprise", "default"]),
+        row("ShortWorker", "sha-new", "new-code", ["transcription", "bg_preview"]),
+    ]
+    out = worker_fleet_coherence(
+        old + current,
+        "sha-new",
+        2,
+        {"worker": 1, "short_worker": 1},
+        api_code_fingerprint="new-code",
+    )
+
+    assert out["coherent"] is True
+    assert out["release_match"] is True
+    assert out["service_counts"] == {"worker": 1, "short_worker": 1}
+    assert out["active_release_rows"] == current
+    assert out["superseded_release_rows"] == old
+
+
+def test_readiness_no_descarta_release_viejo_durante_rollout_incompleto():
+    """La generación vieja no puede completar colas/réplicas para la nueva."""
+    from observability import worker_fleet_coherence
+
+    old = [
+        {"service": "Worker", "release": "sha-old",
+         "code_fingerprint": "old-code", "rq_payload_version": 2,
+         "queues": ["enterprise", "default"]},
+        {"service": "ShortWorker", "release": "sha-old",
+         "code_fingerprint": "old-code", "rq_payload_version": 2,
+         "queues": ["transcription", "bg_preview"]},
+    ]
+    only_one_current_pool = [{
+        "service": "Worker", "release": "sha-new",
+        "code_fingerprint": "new-code", "rq_payload_version": 2,
+        "queues": ["enterprise", "default"],
+    }]
+    out = worker_fleet_coherence(
+        old + only_one_current_pool,
+        "sha-new",
+        2,
+        {"worker": 1, "short_worker": 1},
+        api_code_fingerprint="new-code",
+    )
+
+    assert out["coherent"] is False
+    assert out["release_match"] is False
+    assert out["superseded_release_rows"] == []
+    assert len(out["active_release_rows"]) == 3
+
+
+def test_readiness_no_oculta_protocolo_incompatible_del_release_actual():
+    """Un release nuevo completo en réplicas pero incompatible sigue rojo."""
+    from observability import worker_fleet_coherence
+
+    current = [
+        {"service": "Worker", "release": "sha-new",
+         "code_fingerprint": "new-code", "rq_payload_version": 1,
+         "queues": ["enterprise", "default"]},
+        {"service": "ShortWorker", "release": "sha-new",
+         "code_fingerprint": "new-code", "rq_payload_version": 1,
+         "queues": ["transcription", "bg_preview"]},
+    ]
+    old = [{
+        "service": "Worker", "release": "sha-old",
+        "code_fingerprint": "old-code", "rq_payload_version": 2,
+        "queues": ["enterprise", "default"],
+    }]
+    out = worker_fleet_coherence(
+        old + current,
+        "sha-new",
+        2,
+        {"worker": 1, "short_worker": 1},
+        api_code_fingerprint="new-code",
+    )
+
+    assert out["coherent"] is False
+    assert out["protocol_match"] is False
+    assert out["superseded_release_rows"] == []
 
 
 def test_la_huella_es_estable_y_no_incluye_los_tests():

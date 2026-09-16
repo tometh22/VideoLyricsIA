@@ -27,6 +27,7 @@
 //      never scrolls past card #20 never pays for the other 180.
 
 import { useEffect, useRef, useState } from "react";
+import { fetchWithTimeout } from "./fetchWithTimeout";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -85,9 +86,9 @@ function withSlot(runFetch) {
 }
 
 async function rawFetchMediaToken(jobId, fileType) {
-  const res = await fetch(`${API}/media-token/${jobId}/${fileType}`, {
+  const res = await fetchWithTimeout(`${API}/media-token/${jobId}/${fileType}`, {
     headers: authHeaders(),
-  });
+  }, 10_000);
   if (!res.ok) {
     throw new Error(`media-token failed: ${res.status}`);
   }

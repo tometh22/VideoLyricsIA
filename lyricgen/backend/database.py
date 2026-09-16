@@ -689,6 +689,14 @@ class Job(Base):
     # se borra, la variante sobrevive como job independiente. Indexado
     # para listar hijos en /jobs eficientemente.
     parent_job_id = Column(String(32), nullable=True, index=True)
+    # Piloto de revisor: identifica una COPIA DE PRUEBA y a qué corrida
+    # pertenece. NULL = job normal (todos los existentes). No nulo implica,
+    # por sí solo y verificado en el servidor: copia de prueba, fuera de
+    # campaña, escribible únicamente por su usuario de agente
+    # (editor.save_document) y no aprobable. Deliberadamente NO se agregó
+    # una columna de "learning_eligible": machine_snapshot_required=False
+    # ya excluye el job de training_corpus y de learning_triggers.
+    pilot_id = Column(String(64), nullable=True)
     # Set by /edit when the operator triggers an edit (typography/lyrics/
     # background). The reaper uses this to detect edits that died mid-render
     # (worker killed by deploy/OOM): if a job is status="editing" and
@@ -871,6 +879,15 @@ class BatchCampaign(Base):
     tenant_id = Column(String(100), nullable=False, index=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     name = Column(String(160), nullable=False)
+    # ``lyric_video`` is the legacy default.  The value is immutable once an
+    # item has been imported so a lyric campaign can never be turned into an
+    # art-track campaign (or vice versa) by a later PATCH.
+    kind = Column(String(24), nullable=False, default="lyric_video", server_default="lyric_video")
+    # Destination is a business contract, not a tenant id.  It is kept on
+    # the campaign so an AR/CL choice cannot drift with a filename or a
+    # worker environment variable.
+    destination_portal = Column(String(32), nullable=True)
+    preset_version = Column(String(40), nullable=False, default="art-track-v1", server_default="art-track-v1")
     status = Column(String(20), nullable=False, default="active", server_default="active")
     expected_count = Column(Integer, nullable=False, default=0, server_default="0")
     default_render_params = Column(JSONB, nullable=False, default=dict, server_default="{}")
@@ -911,6 +928,15 @@ class BatchCampaignItem(Base):
     upload_attempts = Column(Integer, nullable=False, default=0, server_default="0")
     uploaded_at = Column(DateTime(timezone=True), nullable=True)
     render_overrides = Column(JSONB, nullable=False, default=dict, server_default="{}")
+    # Art-track association.  A cover asset is a separate row so one album
+    # cover can be referenced by many songs without duplicating bytes.
+    cover_asset_id = Column(String(36), ForeignKey("batch_campaign_assets.id"), nullable=True, index=True)
+    cover_match_state = Column(String(20), nullable=False, default="pending", server_default="pending")
+    cover_match_method = Column(String(32), nullable=True)
+    cover_match_error = Column(String(255), nullable=True)
+    association_confirmed = Column(Boolean, nullable=False, default=False, server_default="false")
+    approved_render_fingerprint = Column(String(64), nullable=True)
+    discard_record = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
@@ -934,6 +960,90 @@ class BatchUploadSession(Base):
     claimed_at = Column(DateTime(timezone=True), nullable=True)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class BatchCampaignAsset(Base):
+    """Deduplicated audio/cover input owned by one campaign.
+
+    Audio rows created by the original uploader remain in
+    ``batch_campaign_items`` for backwards compatibility.  New art-track
+    manifests use this table for both roles and point items at the cover row.
+    """
+
+    __tablename__ = "batch_campaign_assets"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "role", "sha256", name="uq_batch_asset_campaign_role_sha"),
+        Index("ix_batch_assets_campaign_role_state", "campaign_id", "role", "upload_state"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    campaign_id = Column(String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    role = Column(String(12), nullable=False)  # audio | cover
+    filename = Column(String(500), nullable=False)
+    relative_path = Column(String(1000), nullable=True)
+    sha256 = Column(String(64), nullable=False)
+    size_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    mime_type = Column(String(120), nullable=False)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    upload_state = Column(String(20), nullable=False, default="registered", server_default="registered")
+    upload_key = Column(Text, nullable=True)
+    multipart_upload_id = Column(Text, nullable=True)
+    upload_error = Column(String(500), nullable=True)
+    upload_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    uploaded_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class DeliveryBatch(Base):
+    """Durable snapshot of one bulk publication operation."""
+
+    __tablename__ = "delivery_batches"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "idempotency_key", name="uq_delivery_batch_campaign_idempotency"),
+        Index("ix_delivery_batches_campaign_status", "campaign_id", "status"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    campaign_id = Column(String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    destination_portal = Column(String(32), nullable=False)
+    status = Column(String(24), nullable=False, default="queued", server_default="queued")
+    idempotency_key = Column(String(160), nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    total_count = Column(Integer, nullable=False, default=0, server_default="0")
+    sent_count = Column(Integer, nullable=False, default=0, server_default="0")
+    failed_count = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class DeliveryBatchItem(Base):
+    """Immutable item selection and per-song receipt for a delivery batch."""
+
+    __tablename__ = "delivery_batch_items"
+    __table_args__ = (
+        UniqueConstraint("delivery_batch_id", "job_id", name="uq_delivery_batch_item_job"),
+        Index("ix_delivery_batch_items_status", "delivery_batch_id", "status"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    delivery_batch_id = Column(String(36), ForeignKey("delivery_batches.id", ondelete="CASCADE"), nullable=False, index=True)
+    campaign_id = Column(String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    job_id = Column(String(12), nullable=False, index=True)
+    approved_render_fingerprint = Column(String(64), nullable=False)
+    status = Column(String(24), nullable=False, default="pending", server_default="pending")
+    delivery_id = Column(Integer, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    error_code = Column(String(120), nullable=True)
+    error_detail = Column(String(500), nullable=True)
+    receipt = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
 
 class EditorDocument(Base):
@@ -1166,7 +1276,7 @@ class QualityExperimentRun(Base):
 
 
 class Delivery(Base):
-    # Versions exposed on the UMG deliverables portal (umg.genly.pro).
+    # Versions exposed on the UMG deliverables portals (Argentina and Chile).
     # Replaces the previous static items.json workflow — admins click
     # "Enviar a UMG" on an approved job and a row lands here; the portal
     # fetches the list dynamically and signs R2 URLs on demand.
@@ -1202,6 +1312,13 @@ class Delivery(Base):
     artist_snapshot = Column(String(255), nullable=False)
     song_title_snapshot = Column(String(500), nullable=False)
     tenant_snapshot = Column(String(100), nullable=False)
+    # Destination surface for this published version. Legacy rows are
+    # Argentina by default; the row-level destination lets one job be
+    # published independently to both portals.
+    portal_id = Column(
+        String(20), nullable=False, default="argentina",
+        server_default="argentina", index=True,
+    )
     frame_size_snapshot = Column(String(20), nullable=True)  # HD | UHD-4K | DCI-4K
     added_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     added_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -1216,6 +1333,37 @@ class Delivery(Base):
     # leave room for per-user portal logins to write usernames here later.
     approved_at = Column(DateTime(timezone=True), nullable=True, index=True)
     approved_by_label = Column(String(120), nullable=True)
+    # ── Freshness of the published content ────────────────────────────
+    # The portal does not store a file or a frozen URL: it rebuilds the
+    # R2 key from (tenant, job_id, file_type) and signs it on demand, so
+    # a re-render silently replaces what the client downloads. That is
+    # the behaviour we want (a correction reaches them without a new
+    # link) and also the hazard: the row kept saying "approved by UMG,
+    # published on <old date>" about content they never saw.
+    #
+    # These four columns make the row describe the content it is
+    # actually serving, so both the portal and the operator can tell a
+    # re-send of the same cut from a genuinely new version.
+    #
+    # published_render_fingerprint: identity of the render that was in
+    # R2 at publish time (delivery_freshness.render_fingerprint). A
+    # publish whose fingerprint differs is new content, not a re-send.
+    published_render_fingerprint = Column(String(64), nullable=True)
+    # Human-facing version counter. Starts at 1 and only advances when
+    # the fingerprint changes, so "Versión 2" always means the client
+    # has something new to look at.
+    published_revision = Column(
+        Integer, nullable=False, default=1, server_default="1",
+    )
+    # When the served files last changed. Distinct from added_at, which
+    # also moves on a plain re-send.
+    content_updated_at = Column(DateTime(timezone=True), nullable=True)
+    # Set while a re-render is in flight for this job: the files in R2
+    # are about to be replaced (or already partially were — the MP4
+    # lands minutes before the ProRes master). Cleared on the next
+    # publish. Non-null means "do not treat this download as final".
+    stale_since = Column(DateTime(timezone=True), nullable=True)
+    stale_reason = Column(String(40), nullable=True)
 
     def to_dict(self):
         return {
@@ -1226,11 +1374,21 @@ class Delivery(Base):
             "artist": self.artist_snapshot,
             "song_title": self.song_title_snapshot,
             "tenant": self.tenant_snapshot,
+            "portal_id": self.portal_id or "argentina",
             "frame_size": self.frame_size_snapshot,
             "added_at": self.added_at.isoformat() if self.added_at else None,
             "removed_at": self.removed_at.isoformat() if self.removed_at else None,
             "approved_at": self.approved_at.isoformat() if self.approved_at else None,
             "approved_by_label": self.approved_by_label,
+            "published_revision": self.published_revision or 1,
+            "content_updated_at": (
+                self.content_updated_at.isoformat()
+                if self.content_updated_at else None
+            ),
+            "stale_since": (
+                self.stale_since.isoformat() if self.stale_since else None
+            ),
+            "stale_reason": self.stale_reason,
         }
 
 
@@ -1262,6 +1420,14 @@ class DeliveryChangeRequest(Base):
         Integer, ForeignKey("users.id"), nullable=True,
     )
     resolution_note = Column(Text, nullable=True)
+    # Which published revision answered this request, when it was closed
+    # by actually shipping a new cut rather than by hand. Lets the portal
+    # say "atendido en la versión 2" instead of a bare "resuelto", and
+    # lets the operator see that a request was auto-closed.
+    resolved_by_revision = Column(Integer, nullable=True)
+    # "manual" (operator ticked it off) | "publication" (a new revision
+    # was published). Null on rows predating this column.
+    resolution_source = Column(String(20), nullable=True)
 
     def to_dict(self):
         return {
@@ -1271,6 +1437,8 @@ class DeliveryChangeRequest(Base):
             "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "resolution_note": self.resolution_note,
+            "resolved_by_revision": self.resolved_by_revision,
+            "resolution_source": self.resolution_source,
         }
 
 
@@ -2119,6 +2287,135 @@ class CorpusAnnotation(Base):
 
 
 # ---------------------------------------------------------------------------
+# Status page (status_page.py) — comunicación de incidentes + historial de
+# disponibilidad. Ver docs/STATUS_PAGE_SETUP.md.
+#
+# Tres tablas porque responden tres preguntas distintas y una sola las
+# confundiría:
+#   - status_incidents        → qué le contamos al cliente (redactado a mano)
+#   - status_incident_updates → cómo evolucionó ese relato (append-only)
+#   - status_component_events → qué vio la máquina (sondas de /health)
+#
+# El relato humano NUNCA se deriva de la máquina ni al revés: un incidente
+# de un proveedor externo (Replicate en cola, Veo sin cuota) puede tener
+# todas las sondas verdes, y un deploy parcial puede poner una sonda roja
+# sin que el cliente note nada. Mezclarlas en una tabla obliga a elegir
+# cuál manda y las dos veces que eso se decide se elige mal.
+# ---------------------------------------------------------------------------
+
+class StatusIncident(Base):
+    """Un incidente redactado por un operador, público en /status.
+
+    Es la fuente de verdad de la barra horizontal de la home: mientras
+    haya una fila abierta con `banner=True`, todos los usuarios la ven.
+
+    `components` es la lista de ids de componente afectados (los ids
+    estables de status_page.COMPONENTS, no labels traducibles). Se guarda
+    como JSONB y no como tabla puente porque son <=6 valores de un enum
+    cerrado y jamás se consulta "dame los incidentes del componente X"
+    sin traer igual el incidente entero.
+    """
+    __tablename__ = "status_incidents"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(200), nullable=False)
+    # investigating | identified | monitoring | resolved
+    status = Column(String(20), nullable=False, default="investigating")
+    # none | minor | major | critical  — 'none' es mantenimiento/aviso.
+    impact = Column(String(16), nullable=False, default="minor")
+    components = Column(JSONB, nullable=True)
+
+    # started_at es EDITABLE a mano: casi siempre el operador se entera
+    # después de que el incidente empezó, y el historial de uptime lo usa
+    # como ventana real. Si fuera created_at, cada incidente reportado
+    # tarde acortaría su propio downtime en el gráfico.
+    started_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Si el banner de la home se muestra. Se separa de `status` porque hay
+    # dos casos legítimos de incidente abierto SIN banner: un aviso de
+    # mantenimiento programado que todavía no empezó, y un incidente que
+    # solo afecta a un proveedor interno y no cambia nada para el usuario.
+    banner = Column(Boolean, nullable=False, default=True, server_default="true")
+
+    # Un incidente no público existe para el historial interno sin
+    # aparecer en /status (ej. el postmortem de algo que nadie vio).
+    public = Column(Boolean, nullable=False, default=True, server_default="true")
+
+    created_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_status_incidents_started", "started_at"),
+        Index("ix_status_incidents_open", "resolved_at", "public"),
+    )
+
+
+class StatusIncidentUpdate(Base):
+    """Una entrada del timeline de un incidente. APPEND-ONLY.
+
+    Append-only a propósito: el timeline es el registro de qué se le dijo
+    al cliente y cuándo. Editar una entrada pasada convierte la página en
+    un documento que se puede reescribir, que es exactamente lo contrario
+    de para qué sirve. Corregir = publicar otra entrada.
+    """
+    __tablename__ = "status_incident_updates"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    incident_id = Column(
+        Integer,
+        ForeignKey("status_incidents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # El status del incidente en el momento de esta entrada — se copia y
+    # no se joinea con el incidente porque el timeline tiene que poder
+    # mostrar "Investigating → Identified → Resolved" tal como se publicó.
+    status = Column(String(20), nullable=False)
+    body = Column(Text, nullable=False)
+    created_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_status_updates_incident", "incident_id", "created_at"),
+    )
+
+
+class StatusComponentEvent(Base):
+    """Un tramo de tiempo durante el cual la máquina vio un componente en
+    un estado dado. Es la materia prima de las barras de 90 días.
+
+    POR QUÉ TRAMOS Y NO MUESTRAS: una muestra por sonda son ~8.600 filas
+    por día por componente y aun así deja huecos sin decir dónde. Un tramo
+    (`started_at`, `last_seen_at`) escribe UNA fila por transición y bumpea
+    `last_seen_at` en cada observación igual, así que la tabla crece con
+    los cambios de estado (unos pocos por mes) y no con el tráfico.
+
+    POR QUÉ `last_seen_at` Y NO SOLO `started_at`: sin él, no hay forma de
+    distinguir "estuvo verde 30 días" de "lo vimos verde una vez hace 30
+    días y nunca más". El gráfico tiene que poder dibujar un día como
+    "sin datos" en vez de inventarle un verde: la única razón para tener
+    una página de status es que se le pueda creer, y un 100% de uptime
+    fabricado por falta de observaciones la vuelve peor que no tenerla.
+    """
+    __tablename__ = "status_component_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    component = Column(String(32), nullable=False)
+    # operational | degraded | partial_outage | major_outage
+    status = Column(String(20), nullable=False)
+    # La razón cruda de /health (degraded_reason, down_reason, r2_slow_1800ms).
+    # Interna: /status la expone solo a admins.
+    reason = Column(String(120), nullable=True)
+    started_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_status_events_component_seen", "component", "last_seen_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------
 
@@ -2215,6 +2512,9 @@ def _migrate_user_columns():
         # delete del padre no rompa la variante. Indexado para que el
         # /jobs liste con `variant_count` eficientemente.
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS parent_job_id VARCHAR(32)",
+        # Reviewer pilot test copies. Nullable and unindexed: every existing
+        # row stays NULL and no read path filters on it.
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pilot_id VARCHAR(64)",
         "CREATE INDEX IF NOT EXISTS ix_jobs_parent_job_id ON jobs(parent_job_id)",
         # Archive of previous deliverable s3_keys overwritten by a partial
         # re-render (lyrics/typography/background edit). Populated by
@@ -2231,6 +2531,24 @@ def _migrate_user_columns():
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ",
         "CREATE INDEX IF NOT EXISTS ix_deliveries_approved_at ON deliveries(approved_at)",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_by_label VARCHAR(120)",
+        # Destination surface for published versions. Alembic is the
+        # canonical production migration; this startup mirror keeps older
+        # staging/dev databases self-healing when they boot without the
+        # release runner.
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS portal_id VARCHAR(20) DEFAULT 'argentina' NOT NULL",
+        "CREATE INDEX IF NOT EXISTS ix_deliveries_portal_id ON deliveries(portal_id)",
+        # Publication freshness. The portal serves whatever sits at the
+        # deterministic R2 key, so a re-render replaces the client's
+        # download in place; these columns let the row say which cut it
+        # is actually serving. Alembic (b4c6d8e0f2a4) is canonical — this
+        # mirror keeps older databases self-healing on boot.
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_render_fingerprint VARCHAR(64)",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_revision INTEGER DEFAULT 1 NOT NULL",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS content_updated_at TIMESTAMPTZ",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_reason VARCHAR(40)",
+        "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolved_by_revision INTEGER",
+        "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolution_source VARCHAR(20)",
         # Categoría del error para el dashboard de actividad (PR telemetría).
         # Se setea en los sinks de error del pipeline/reaper vía
         # error_taxonomy.classify_error(). Espejo de la migración Alembic
