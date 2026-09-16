@@ -124,7 +124,10 @@ _last_delivery_retention_sweep_ts = 0.0
 _DELIVERY_AUDIT_INTERVAL_S = int(os.environ.get(
     "REAPER_DELIVERY_AUDIT_INTERVAL_S", str(24 * 3600),
 ))
-_last_delivery_audit_ts = 0.0
+# Arranca "ya corrida": con 0.0 la auditoría salía en el primer ciclo de
+# CADA deploy, o sea ~1000 HEAD a R2 por cada release en vez de una vez al
+# día. El primer reporte llega al día siguiente, que es el ritmo que tiene.
+_last_delivery_audit_ts = time.time()
 
 # Edit-request abandon threshold. The worst case is a background edit
 # which re-runs Veo (~3 min p99) plus the full video composite (~5-8 min

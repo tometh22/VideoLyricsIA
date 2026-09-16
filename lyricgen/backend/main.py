@@ -19818,8 +19818,29 @@ async def admin_create_delivery_from_job(
     # invalidar y el prewarm la reescribe recién cuando el master fresco está
     # arriba. Publicar se bloquea en esa ventana en vez de entregar un par
     # desparejo.
+    # Segunda prueba de re-render para el caso /retry: esos caminos no
+    # archivan entregables previos, así que sin esto pasaban derecho y se
+    # podía publicar el master PRE-retry al lado del MP4 nuevo.
+    _active = (
+        ddb.query(Delivery)
+        .filter(Delivery.job_id == job_id)
+        .filter(Delivery.removed_at.is_(None))
+        .order_by(Delivery.added_at.desc())
+        .first()
+    )
+    _re_rendered = None
+    if _active is not None and job.completed_at is not None:
+        _published_at = _active.content_updated_at or _active.added_at
+        if _published_at is not None:
+            _prev = job.previous_versions if isinstance(job.previous_versions, list) else []
+            _re_rendered = bool(_prev) or (
+                delivery_freshness._aware(job.completed_at)
+                > delivery_freshness._aware(_published_at)
+            )
     stale_prores = [
-        ft for ft in delivery_freshness.prores_pending(job, delivery_file_types)
+        ft for ft in delivery_freshness.prores_pending(
+            job, delivery_file_types, re_rendered=_re_rendered,
+        )
         if ft not in missing
     ]
     if missing or stale_prores:

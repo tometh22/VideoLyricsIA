@@ -3,6 +3,41 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.47] - 2026-09-16
+
+### Fixed
+
+- Build the delivery fingerprint from evidence that a render finished, not
+  from its inputs. Touching `segments_revision`, `render_params` or
+  `umg_spec` without re-rendering moved it, and publishing then cleared the
+  client's approval and auto-closed their open change requests over a video
+  nobody touched — reproduced on 29 rows. Conversely `/retry` and
+  `edit_art_track` re-render from scratch and touch none of those, so a whole
+  correction was reported as "the same cut". `completed_at` separates them.
+- Catch a `/retry` in the ProRes gate. Those paths never archive the previous
+  deliverables, so the staleness rule saw nothing and the pre-retry broadcast
+  master could be published beside the new MP4 — the 2026-08-03 incident
+  through another door. The publish path and the admin panel now also prove a
+  re-render by comparing the render's completion against the publication.
+- Write the freshness columns when publishing in bulk. Every row published by
+  a campaign was born with no fingerprint, so drift detection was dead on
+  exactly the rows the campaign view lists, and a campaign re-publish never
+  cleared the "applying changes" flag.
+- Drop `force=True` from the bulk ProRes prewarm. It deliberately bypasses the
+  queue-depth guard, and this path can publish up to 500 songs at once — a
+  thousand multi-GB transcodes ahead of every client render on the same queue.
+  The portal's on-demand button, which is a human click, keeps it.
+
+### Improved
+
+- Tell a ProRes that is generated on demand from a file nothing will create.
+  The daily audit was about to report 28 "phantoms" for a state the product
+  chose on purpose, and an alert that cries without reason stops being read.
+- Stop the audit from reporting a green day when it failed entirely or
+  checked zero objects, always write its metrics so "clean" is
+  distinguishable from "never ran", order the rows it truncates, and stop
+  re-running the whole ~1000-object pass on every API deploy.
+
 ## [1.1.46] - 2026-09-16
 
 ### Fixed

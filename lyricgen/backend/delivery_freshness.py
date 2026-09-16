@@ -58,38 +58,52 @@ STALE_IN_FLIGHT = (STALE_EDITING, STALE_PRORES)
 
 
 def render_fingerprint(job) -> str:
-    """Identity of the render currently in R2 for `job`.
+    """Identidad del render que produjo los archivos que hoy están en R2.
 
-    Two publishes with the same fingerprint are the same cut: the
-    operator pressed the button twice, nothing to re-review. A different
-    fingerprint means the bytes behind the client's download changed.
+    Dos publicaciones con el mismo fingerprint son el mismo corte: el
+    operador apretó el botón dos veces y no hay nada que re-revisar. Uno
+    distinto significa que los bytes detrás de la descarga del cliente
+    cambiaron.
 
-    Deliberately built from the *inputs* that produce the render rather
-    than from `s3_keys` (the keys are deterministic and therefore
-    identical across renders — that is the whole problem) or from
-    `completed_at` (only written on the first terminal transition, so a
-    lyrics edit leaves it untouched).
+    **Sólo entran señales de que un render TERMINÓ.** La primera versión
+    de esta función mezclaba también los inputs —`segments_revision`,
+    `render_params`, `umg_spec`— y eso estaba mal en las dos direcciones:
 
-    `previous_versions` is the strongest of these: `run_edit_pipeline`
-    appends one entry per overwriting re-render, so its length counts how
-    many times the delivered files were actually replaced.
+    - **Falso positivo, con daño real.** Tocar cualquiera de esos campos
+      sin re-renderizar movía el fingerprint, y publicar entonces borraba
+      la aprobación del cliente y **cerraba sus pedidos de cambio
+      abiertos** con un "resuelto en la versión N" sobre un video que
+      nadie tocó. `/save-segments`, `/reanchor` y habilitar ProRes llegan
+      todos por ahí. Reproducido el 2026-09-16: escribir `umg_spec` en 29
+      jobs marcó las 29 entregas como desactualizadas sin que cambiara un
+      solo byte.
+    - **Falso negativo, peor.** `/retry` y `edit_art_track` re-renderizan
+      de cero y NO tocan ninguno de esos campos (`edit_count` vuelve a 0,
+      `previous_versions` no se toca, `render_params` se re-arma igual),
+      así que el fingerprint quedaba **idéntico** y una corrección
+      entera se informaba como "es el mismo corte que ya estaba
+      publicado".
+
+    `completed_at` cierra el caso de `/retry`: esos dos caminos lo ponen
+    en NULL y `jobs.update_job` escribe uno nuevo en la siguiente
+    transición terminal, mientras que una edición lo deja intacto. Junto
+    con `edit_count` y el archivo de entregables pisados cubre los tres
+    caminos que reemplazan archivos, y **nada más**.
+
+    `s3_keys` sigue afuera a propósito: las keys son determinísticas y
+    por lo tanto idénticas entre renders — ese es el problema original.
     """
     previous = job.previous_versions if isinstance(job.previous_versions, list) else []
     payload = {
         "job": job.job_id,
-        # Counts of overwriting re-renders, from both sides: the reviewer
-        # quota counter and the R2 archive of replaced deliverables.
+        # Cuántas veces se pisaron los entregables, por los dos lados: el
+        # contador de cuota del revisor y el archivo en R2 de lo pisado.
         "edits": job.edit_count or 0,
         "overwrites": len(previous),
         "last_overwrite": (previous[-1] or {}).get("archived_at") if previous else None,
-        # Lyrics and timing.
-        "segments": job.segments_revision or 0,
-        # Look: style, typography, background cache key, scenes.
-        "render": job.render_params or {},
-        # Broadcast spec: frame size / fps / ProRes profile.
-        "umg": job.umg_spec or {},
-        # Audio identity, so a re-upload of a different master is caught.
-        "audio": job.input_audio_sha256 or job.input_r2_key,
+        # Cuándo terminó el render vigente. Es lo único que distingue un
+        # /retry (que reinicia el resto de los contadores) de un reenvío.
+        "completed": getattr(job, "completed_at", None),
     }
     blob = json.dumps(payload, sort_keys=True, default=str).encode()
     return hashlib.sha256(blob).hexdigest()
@@ -113,13 +127,26 @@ def has_prores_deliverable(job) -> bool:
     return any(keys.get(ft) for ft in PRORES_FILE_TYPES)
 
 
+def _aware(value):
+    """SQLite devuelve datetimes sin tzinfo y Postgres con: compararlos
+    levanta TypeError, y acá lo comería el llamador dejando la frescura muda."""
+    if value is None or getattr(value, "tzinfo", None):
+        return value
+    return value.replace(tzinfo=timezone.utc)
+
+
 # Which rendered output each lazy derivative is transcoded FROM. The
 # pairing is what makes staleness decidable: an edit re-uploads the
 # source and drops the derivative's key in the same pipeline run.
 _PRORES_SOURCE = {"umg_master": "video", "umg_short": "short"}
 
 
-def prores_pending(job, file_types: Iterable[str] | None = None) -> list[str]:
+def prores_pending(
+    job,
+    file_types: Iterable[str] | None = None,
+    *,
+    re_rendered: bool | None = None,
+) -> list[str]:
     """ProRes derivatives that no longer match the video next to them.
 
     R2 cannot answer this: after an edit the pre-edit .mov is still at
@@ -177,8 +204,19 @@ def prores_pending(job, file_types: Iterable[str] | None = None) -> list[str]:
     )
     if not published_as_prores and not has_prores_deliverable(job):
         return []
-    previous = job.previous_versions if isinstance(job.previous_versions, list) else []
-    if not previous:
+    # Evidencia de que un render pisó los archivos. Por defecto sale del
+    # archivo de entregables previos, que sólo escribe `run_edit_pipeline`.
+    #
+    # `/retry` y `edit_art_track` NO lo escriben: limpian `s3_keys` y
+    # re-renderizan de cero, así que con la regla por defecto pasaban
+    # derecho y se podía publicar el master PRE-retry al lado del MP4
+    # nuevo — el incidente 2026-08-03 por otra puerta. El llamador que
+    # conoce la fila publicada puede probarlo de otra forma (el render
+    # terminó DESPUÉS de la última publicación) y pasarlo acá.
+    if re_rendered is None:
+        previous = job.previous_versions if isinstance(job.previous_versions, list) else []
+        re_rendered = bool(previous)
+    if not re_rendered:
         return []
     keys = job.s3_keys or {}
     return [
@@ -278,7 +316,22 @@ def publication_state(job, delivery) -> dict:
     """
     published_fingerprint = getattr(delivery, "published_render_fingerprint", None)
     current_fingerprint = render_fingerprint(job) if job is not None else None
-    pending = prores_pending(job, delivery.file_types or []) if job is not None else []
+    # La fila publicada permite una segunda prueba que el job solo no da:
+    # si el render terminó DESPUÉS de publicarse, los archivos que el
+    # cliente ve ya no son los que se publicaron.
+    re_rendered = None
+    completed = _aware(getattr(job, "completed_at", None)) if job is not None else None
+    published_at = _aware(
+        getattr(delivery, "content_updated_at", None) or delivery.added_at
+    )
+    if completed is not None and published_at is not None:
+        previous = (
+            job.previous_versions if isinstance(job.previous_versions, list) else []
+        )
+        re_rendered = bool(previous) or completed > published_at
+    pending = prores_pending(
+        job, delivery.file_types or [], re_rendered=re_rendered,
+    ) if job is not None else []
     # A row published before this column existed has no fingerprint to
     # compare against. Treat it as current: claiming "needs publish" on
     # every historical delivery would bury the rows that really do.

@@ -304,4 +304,60 @@ def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
     finally:
         db.close()
     assert sorted(c.args[1] for c in enqueue.call_args_list) == ["umg_master", "umg_short"]
-    assert all(c.kwargs == {"force": True} for c in enqueue.call_args_list)
+    # SIN force: esta ruta publica hasta 500 canciones de una, y `force=True`
+    # saltea a propósito el tope de profundidad de cola. Mil transcodes de
+    # varios GB encolados de un saque se ponen delante de TODOS los renders de
+    # cliente que vengan después, en la misma cola. Acá nadie está esperando
+    # el archivo; el click humano del portal sí justifica saltear el tope.
+    assert all(c.kwargs == {} for c in enqueue.call_args_list)
+
+    # Y la fila nace con su fingerprint: sin esto, TODA entrega publicada por
+    # campaña quedaba ciega a su primera corrección.
+    db = SessionLocal()
+    try:
+        row = db.query(Delivery).filter(Delivery.job_id == job_id).one()
+        assert row.published_render_fingerprint
+        assert row.content_updated_at is not None
+    finally:
+        db.close()
+
+
+def test_publicar_por_campana_no_sombrea_el_fingerprint_de_aprobacion(
+    client, admin_token, monkeypatch,
+):
+    """Regresión de un bug que me comí escribiendo esto.
+
+    `art_track_campaigns._fingerprint()` es la función que valida que la
+    aprobación siga siendo la misma. Bautizar una variable LOCAL con ese
+    nombre dentro de `process_delivery_batch` la sombrea en todo el scope, y
+    su uso anterior —el gate `stale_approval`— explota con UnboundLocalError.
+    O sea: el chequeo de que nadie re-renderizó desde que se aprobó deja de
+    correr, que es justo el que protege al cliente de recibir otra cosa.
+    """
+    from database import Delivery
+    import art_track_campaigns as atc
+
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign_for(client, admin_token, "Scope")
+    job_id = _seed_campaign_job(
+        campaign,
+        umg_spec={"frame_size": "HD", "fps": 24.0, "prores_profile": 3},
+        s3_keys={"video": "t/j/lyric_video.mp4", "short": "t/j/short.mp4",
+                 "thumbnail": "t/j/thumbnail.jpg"},
+    )
+    op = _run_bulk_delivery(client, admin_token, campaign.id, "scope-guard-000001")
+
+    with (
+        patch.object(atc.storage, "is_enabled", return_value=True),
+        patch.object(atc.storage, "object_exists", return_value=True),
+        patch.object(atc, "enqueue_prores_prewarm"),
+    ):
+        atc.process_delivery_batch(op)          # con el bug: UnboundLocalError
+        atc.process_delivery_batch(op)          # y de nuevo, ahora por la rama de update
+
+    db = SessionLocal()
+    try:
+        row = db.query(Delivery).filter(Delivery.job_id == job_id).one()
+        assert row.published_render_fingerprint
+    finally:
+        db.close()
