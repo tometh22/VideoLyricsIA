@@ -245,6 +245,30 @@ def build_proposal(
     }
 
 
+def lyrics_preview_context(
+    segments: Iterable[dict], *, revision: int, base_revision: int,
+    base_segments_content_hash: str,
+) -> dict:
+    """Return the live lyric snapshot used by the operator preview.
+
+    The snapshot is deliberately assembled at read time instead of being
+    persisted in the proposal/audit trail.  ``matches_base`` is the same
+    integrity condition enforced by apply, so the UI never presents an old
+    proposal as if it were a valid preview of the current editor document.
+    """
+    current = normalize_segments([dict(row) for row in segments])
+    current_hash = segments_content_hash(current)
+    return {
+        "revision": int(revision or 0),
+        "segments_content_hash": current_hash,
+        "matches_base": (
+            int(revision or 0) == int(base_revision or 0)
+            and current_hash == str(base_segments_content_hash or "")
+        ),
+        "segments": current,
+    }
+
+
 def apply_operations(
     current_segments: Iterable[dict], proposal: dict,
     operation_ids: Iterable[str],
@@ -295,4 +319,3 @@ def apply_operations(
     if before_timing != after_timing:
         raise ValueError("text change request changed timeline")
     return result, [deepcopy(row) for row in selected]
-
