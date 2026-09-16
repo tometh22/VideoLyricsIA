@@ -20980,8 +20980,10 @@ def _require_change_request_flag(name: str) -> None:
         )
 
 
-def _serialize_change_request_proposal(row: ChangeRequestProposal) -> dict:
-    return {
+def _serialize_change_request_proposal(
+    row: ChangeRequestProposal, *, document: EditorDocument | None = None,
+) -> dict:
+    payload = {
         "id": row.id,
         "portal_id": row.portal_id,
         "change_request_id": row.change_request_id,
@@ -21006,6 +21008,23 @@ def _serialize_change_request_proposal(row: ChangeRequestProposal) -> dict:
         "applied_at": row.applied_at.isoformat() if row.applied_at else None,
         "applied_revision": row.applied_revision,
     }
+    if document is not None:
+        from change_request_proposals import lyrics_preview_context
+        payload["lyrics_context"] = lyrics_preview_context(
+            list(document.current_segments or []),
+            revision=int(document.revision or 0),
+            base_revision=int(row.base_revision or 0),
+            base_segments_content_hash=str(row.segments_content_hash or ""),
+        )
+        if (
+            payload["status"] in {"ready", "partial", "needs_input"}
+            and not payload["lyrics_context"]["matches_base"]
+        ):
+            # Do not offer apply against a preview that no longer describes
+            # the live editor document. The persisted row remains audit
+            # history; recalculation creates/reuses the correct revision.
+            payload["status"] = "stale"
+    return payload
 
 
 def _change_request_context(ddb: Session, cr_id: int):
@@ -21078,7 +21097,12 @@ async def admin_generate_change_request_proposal(
         .first()
     )
     if cached is not None and cached.status not in {"stale", "dismissed"}:
-        return {"ok": True, "cached": True, "proposal": _serialize_change_request_proposal(cached)}
+        return {
+            "ok": True, "cached": True,
+            "proposal": _serialize_change_request_proposal(
+                cached, document=document,
+            ),
+        }
 
     built = build_proposal(
         comment=cr.comment,
@@ -21181,12 +21205,14 @@ async def admin_generate_change_request_proposal(
             raise
         return {
             "ok": True, "cached": True, "concurrent": True,
-            "proposal": _serialize_change_request_proposal(concurrent),
+            "proposal": _serialize_change_request_proposal(
+                concurrent, document=document,
+            ),
         }
     db.refresh(row)
     return {
         "ok": True, "cached": False, "recalculated": recalculated,
-        "proposal": _serialize_change_request_proposal(row),
+        "proposal": _serialize_change_request_proposal(row, document=document),
     }
 
 
@@ -21210,7 +21236,15 @@ async def admin_get_change_request_proposal(
     )
     if row is None:
         raise HTTPException(status_code=404, detail="change_request_proposal_not_found")
-    return {"ok": True, "proposal": _serialize_change_request_proposal(row)}
+    document = (
+        db.query(EditorDocument)
+        .filter(EditorDocument.job_id == row.job_id)
+        .first()
+    )
+    return {
+        "ok": True,
+        "proposal": _serialize_change_request_proposal(row, document=document),
+    }
 
 
 @app.patch("/admin/change-requests/{cr_id}/proposals/{proposal_id}")
@@ -21261,7 +21295,15 @@ async def admin_patch_change_request_proposal(
     ))
     db.commit()
     db.refresh(row)
-    return {"ok": True, "proposal": _serialize_change_request_proposal(row)}
+    document = (
+        db.query(EditorDocument)
+        .filter(EditorDocument.job_id == row.job_id)
+        .first()
+    )
+    return {
+        "ok": True,
+        "proposal": _serialize_change_request_proposal(row, document=document),
+    }
 
 
 @app.post("/admin/change-requests/{cr_id}/proposals/{proposal_id}/apply")
@@ -21426,7 +21468,7 @@ async def admin_apply_change_request_proposal(
         "revision": int(document.revision or 0),
         "version_id": version.id if version else None,
         "editor_url": f"/videos/{job.job_id}/edit-lyrics?change_request_id={cr_id}&proposal_id={row.id}",
-        "proposal": _serialize_change_request_proposal(row),
+        "proposal": _serialize_change_request_proposal(row, document=document),
     }
 
 

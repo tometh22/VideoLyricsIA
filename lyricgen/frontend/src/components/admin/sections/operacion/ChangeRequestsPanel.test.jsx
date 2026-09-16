@@ -1,6 +1,9 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import ChangeRequestsPanel, { publicationStatus } from "./ChangeRequestsPanel";
+import ChangeRequestsPanel, {
+  buildLyricsPreview,
+  publicationStatus,
+} from "./ChangeRequestsPanel";
 
 afterEach(cleanup);
 
@@ -106,6 +109,28 @@ describe("publicationStatus", () => {
   });
 });
 
+describe("buildLyricsPreview", () => {
+  it("applies only selected text operations to the full lyric snapshot", () => {
+    const segments = [
+      { _id: "a", start: 0, end: 2, text: "Primera línea" },
+      { _id: "b", start: 2, end: 4, text: "Padre Fahey" },
+      { _id: "c", start: 4, end: 6, text: "Última línea" },
+    ];
+    const operations = [{
+      id: "op-1", status: "pending", applicable: true,
+      current_segments: [segments[1]],
+      proposed_segments: [{ ...segments[1], text: "padre fhay" }],
+    }];
+    const preview = buildLyricsPreview(segments, operations, ["op-1"]);
+    expect(preview.map((row) => row.resultText)).toEqual([
+      "Primera línea", "padre fhay", "Última línea",
+    ]);
+    expect(preview.filter((row) => row.changed)).toHaveLength(1);
+    expect(buildLyricsPreview(segments, operations, [])[1].resultText)
+      .toBe("Padre Fahey");
+  });
+});
+
 describe("ChangeRequestsPanel", () => {
   it("offers the two steps that actually answer the request", () => {
     renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true } });
@@ -184,14 +209,23 @@ describe("ChangeRequestsPanel", () => {
       status: "ready",
       base_revision: 4,
       updated_at: "2026-09-16T00:00:00Z",
+      lyrics_context: {
+        revision: 4,
+        matches_base: true,
+        segments: [
+          { _id: "before", start: 10, end: 12, text: "Línea anterior" },
+          { _id: "target", start: 13, end: 15, text: "Texto viejo" },
+          { _id: "after", start: 16, end: 18, text: "Línea siguiente" },
+        ],
+      },
       operations: [{
         id: "op-1",
         kind: "replace_text",
         status: "pending",
         applicable: true,
         scope: "single",
-        current_segments: [{ start: 13, end: 15, text: "Texto viejo" }],
-        proposed_segments: [{ start: 13, end: 15, text: "Texto correcto" }],
+        current_segments: [{ _id: "target", start: 13, end: 15, text: "Texto viejo" }],
+        proposed_segments: [{ _id: "target", start: 13, end: 15, text: "Texto correcto" }],
       }],
     };
     renderPanel({}, {
@@ -202,6 +236,19 @@ describe("ChangeRequestsPanel", () => {
     });
     const button = await screen.findByRole("button", { name: "Aplicar seleccionadas (1)" });
     await waitFor(() => expect(button).toBeEnabled());
+    const preview = screen.getByLabelText("Vista previa de la letra resultante");
+    expect(preview).toHaveTextContent("Pedido original");
+    expect(preview).toHaveTextContent(REQUEST.comment);
+    expect(preview).toHaveTextContent("Línea anterior");
+    expect(preview).toHaveTextContent("Texto viejo");
+    expect(preview).toHaveTextContent("Texto correcto");
+    expect(preview).toHaveTextContent("Línea siguiente");
+
+    fireEvent.click(screen.getByLabelText("Seleccionar cambio: Texto viejo"));
+    expect(preview).toHaveTextContent("0 cambio(s) seleccionado(s)");
+    expect(screen.getByRole("button", { name: "Aplicar seleccionadas (0)" }))
+      .toBeDisabled();
+    fireEvent.click(screen.getByLabelText("Seleccionar cambio: Texto viejo"));
     button.click();
     expect(apply).toHaveBeenCalledWith(7, "proposal-1", ["op-1"], 4);
   });
@@ -221,5 +268,43 @@ describe("ChangeRequestsPanel", () => {
     expect(screen.getByText("Revisar timing en el editor")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Aplicar seleccionadas/ }))
       .not.toBeInTheDocument();
+  });
+
+  it("previews operator drafts in context and blocks apply until they are saved", () => {
+    const adjust = vi.fn();
+    const segment = { _id: "target", start: 13, end: 15, text: "Texto viejo" };
+    renderPanel({}, {
+      proposalEnabled: true,
+      proposalApplyEnabled: true,
+      proposalDetails: { 7: {
+        id: "proposal-3", status: "ready", base_revision: 4,
+        updated_at: "2026-09-16T00:00:00Z",
+        lyrics_context: {
+          revision: 4, matches_base: true,
+          segments: [segment],
+        },
+        operations: [{
+          id: "op-1", kind: "replace_text", status: "pending",
+          applicable: true, scope: "single",
+          current_segments: [segment],
+          proposed_segments: [{ ...segment, text: "Texto correcto" }],
+        }],
+      } },
+      adjustProposal: adjust,
+    });
+
+    fireEvent.change(screen.getByDisplayValue("Texto correcto"), {
+      target: { value: "Texto corregido por operador" },
+    });
+    const preview = screen.getByLabelText("Vista previa de la letra resultante");
+    expect(preview).toHaveTextContent("Texto corregido por operador");
+    expect(screen.getByText(/Guardá los ajustes de texto/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Aplicar seleccionadas (1)" }))
+      .toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Guardar" }));
+    expect(adjust).toHaveBeenCalledWith(
+      7, "proposal-3", "op-1", "Texto corregido por operador", 4,
+    );
   });
 });
