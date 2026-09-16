@@ -7,6 +7,7 @@ from firefly_client import (
     FIREFLY_IMS_TOKEN_URL,
     FireflyAmbiguousSubmission,
     FireflyClient,
+    FireflyError,
     FireflyJobFailed,
     FireflyRateLimited,
 )
@@ -202,6 +203,44 @@ def test_provider_job_urls_are_restricted_to_adobe_and_remain_ambiguous():
 
     with pytest.raises(FireflyAmbiguousSubmission, match="complete job metadata"):
         _client(session).submit_video("Landscape")
+
+
+def test_adobe_epo_job_hosts_are_allowed():
+    session = FakeSession()
+    _token(session)
+    response = _accepted()
+    response._payload["statusUrl"] = (
+        "https://firefly-epo852211.adobe.io/v3/status/urn:ff:jobs:test:123"
+    )
+    response._payload["cancelUrl"] = (
+        "https://firefly-epo852211.adobe.io/v3/cancel/urn:ff:jobs:test:123"
+    )
+    session.queue("post", response)
+
+    submission = _client(session).submit_video("Landscape")
+
+    assert submission["status_url"].startswith("https://firefly-epo852211.adobe.io/")
+
+
+def test_unsupported_dimensions_fail_before_auth_or_submission():
+    session = FakeSession()
+
+    with pytest.raises(ValueError, match="Unsupported Firefly video size"):
+        _client(session).submit_video("Landscape", width=1024, height=768)
+
+    assert session.calls == []
+
+
+def test_output_download_rejects_untrusted_hosts(tmp_path):
+    session = FakeSession()
+
+    with pytest.raises(FireflyError, match="invalid video output URL"):
+        _client(session).download_video(
+            "https://127.0.0.1/internal/video.mp4?token=secret",
+            str(tmp_path / "clip.mp4"),
+        )
+
+    assert session.calls == []
 
 
 @pytest.mark.parametrize("status_code", [408, 500, 503])

@@ -41,6 +41,36 @@ FIREFLY_SCOPES = (
 )
 FIREFLY_VIDEO_MODEL = "video1_standard"
 _FIREFLY_API_HOST = "firefly-api.adobe.io"
+_FIREFLY_JOB_HOST_SUFFIX = ".adobe.io"
+_FIREFLY_OUTPUT_HOST_SUFFIXES = (
+    ".amazonaws.com",
+    ".windows.net",
+    ".dropboxusercontent.com",
+    ".storage.googleapis.com",
+    ".adobe.io",
+)
+_FIREFLY_OUTPUT_HOSTS = {
+    "amazonaws.com",
+    "windows.net",
+    "dropboxusercontent.com",
+    "storage.googleapis.com",
+    "frontdoor.prod.azure.cxp.adobe.com",
+    "assets.frame.io",
+    "adobe.io",
+}
+FIREFLY_VIDEO_SIZES = frozenset(
+    {
+        (1920, 1080),
+        (1280, 720),
+        (960, 540),
+        (1080, 1920),
+        (720, 1280),
+        (540, 960),
+        (1080, 1080),
+        (720, 720),
+        (540, 540),
+    }
+)
 _TERMINAL_FAILURES = {"failed", "cancelled", "canceled", "timeout"}
 
 
@@ -208,9 +238,14 @@ class FireflyClient:
     @staticmethod
     def _trusted_job_url(url: str) -> str:
         parsed = urlparse(str(url or ""))
+        hostname = (parsed.hostname or "").lower()
+        trusted_host = hostname == _FIREFLY_API_HOST or (
+            hostname.startswith("firefly-")
+            and hostname.endswith(_FIREFLY_JOB_HOST_SUFFIX)
+        )
         if (
             parsed.scheme != "https"
-            or parsed.hostname != _FIREFLY_API_HOST
+            or not trusted_host
             or not parsed.path.startswith("/v3/")
             or parsed.username
             or parsed.password
@@ -221,7 +256,16 @@ class FireflyClient:
     @staticmethod
     def _trusted_output_url(url: str) -> str:
         parsed = urlparse(str(url or ""))
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        hostname = (parsed.hostname or "").lower()
+        trusted_host = hostname in _FIREFLY_OUTPUT_HOSTS or any(
+            hostname.endswith(suffix) for suffix in _FIREFLY_OUTPUT_HOST_SUFFIXES
+        )
+        if (
+            parsed.scheme != "https"
+            or not trusted_host
+            or parsed.username
+            or parsed.password
+        ):
             raise FireflyError("Adobe returned an invalid video output URL")
         return url
 
@@ -254,12 +298,17 @@ class FireflyClient:
         cleaned_prompt = str(prompt or "").strip()
         if not cleaned_prompt:
             raise ValueError("Firefly video prompt cannot be empty")
-        if width <= 0 or height <= 0:
-            raise ValueError("Firefly video dimensions must be positive")
+        dimensions = (int(width), int(height))
+        if dimensions not in FIREFLY_VIDEO_SIZES:
+            allowed = ", ".join(
+                f"{allowed_width}x{allowed_height}"
+                for allowed_width, allowed_height in sorted(FIREFLY_VIDEO_SIZES)
+            )
+            raise ValueError(f"Unsupported Firefly video size; allowed sizes: {allowed}")
 
         body: dict = {
             "prompt": cleaned_prompt,
-            "sizes": [{"width": int(width), "height": int(height)}],
+            "sizes": [{"width": dimensions[0], "height": dimensions[1]}],
         }
         if seed is not None:
             body["seeds"] = [int(seed)]
