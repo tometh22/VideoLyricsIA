@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 import logging
 
+import delivery_freshness
 import storage
 from auth import get_current_user, has_art_track_access
 from batch_campaigns import _campaign_or_404, _now, _require_manager, _require_scope
@@ -690,9 +691,18 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                         "nada los puede generar", job.job_id, sorted(prores_absent),
                     )
                 elif prores_absent:
+                    # SIN force: la ruta masiva puede publicar hasta 500
+                    # canciones de una, y `force=True` saltea a propósito el
+                    # tope de profundidad de cola. 1000 transcodes de varios
+                    # GB encolados de un saque se ponen delante de TODOS los
+                    # renders de cliente que vengan después, en la misma cola
+                    # `enterprise`. Acá no hay nadie esperando el archivo: si
+                    # la cola está llena, que la auditoría diaria lo reporte y
+                    # se pida bajo demanda desde el portal, que sí es un click
+                    # humano y sí justifica saltear el tope.
                     for ft in prores_absent:
                         try:
-                            enqueue_prores_prewarm(job.job_id, ft, force=True)
+                            enqueue_prores_prewarm(job.job_id, ft)
                         except Exception as exc:
                             logger.warning(
                                 "[DELIVERY] no se pudo encolar %s de job=%s: %s",
@@ -714,7 +724,12 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     delivery_query = delivery_query.filter(Delivery.portal_id == op.destination_portal)
                 active = delivery_query.first()
                 if active is None:
-                    delivery_kwargs = dict(job_id=job.job_id, label=delivery_label, file_types=delivery_file_types, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"))
+                    # Las columnas de frescura se escriben también acá. Sin
+                    # esto, TODA fila publicada por campaña nacía sin
+                    # fingerprint, así que la detección de deriva quedaba
+                    # muerta justo en las filas que lista la campaña — y la
+                    # primera corrección de cada una pasaba en silencio.
+                    delivery_kwargs = dict(job_id=job.job_id, label=delivery_label, file_types=delivery_file_types, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"), published_render_fingerprint=delivery_freshness.render_fingerprint(job), content_updated_at=_now())
                     if hasattr(Delivery, "portal_id"):
                         delivery_kwargs["portal_id"] = op.destination_portal
                     active = Delivery(**delivery_kwargs)
@@ -722,6 +737,23 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                 else:
                     active.label = delivery_label
                     active.file_types = delivery_file_types
+                    # Re-publicar por campaña: mismo criterio que el alta y que
+                    # el endpoint individual. Y limpiar la ventana de "en
+                    # vuelo": si no, una fila marcada al pedir el re-render se
+                    # queda diciéndole "actualizando" al cliente para siempre.
+                    # OJO con el nombre: `_fingerprint` ya es una función de
+                    # este módulo (la del snapshot de aprobación) y una local
+                    # con ese nombre la sombrea en TODO el scope, rompiendo su
+                    # uso de más arriba con UnboundLocalError.
+                    _render_fp = delivery_freshness.render_fingerprint(job)
+                    if active.published_render_fingerprint != _render_fp:
+                        active.published_revision = (active.published_revision or 1) + 1
+                        active.content_updated_at = _now()
+                        active.approved_at = None
+                        active.approved_by_label = None
+                    active.published_render_fingerprint = _render_fp
+                    active.stale_since = None
+                    active.stale_reason = None
                     active.artist_snapshot = job.artist
                     active.song_title_snapshot = job.song_title or ""
                     active.tenant_snapshot = job.tenant_id

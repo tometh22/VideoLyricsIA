@@ -58,14 +58,14 @@ def _solo(report, clave, ids):
 
 
 def test_ve_el_entregable_que_la_fila_promete_y_no_existe(db, limpio):
-    """El caso del 2026-09-15: 28 de 34 entregas del portal de Chile
-    ofrecían un "ProRes Master (broadcast)" que no estaba en R2. En la
-    pantalla del cliente se ve igual que cualquier otro archivo."""
+    """Un entregable del render que no está en R2 no lo genera nadie: es un
+    fantasma. (El MP4 y el thumbnail los escribe el pipeline; si faltan,
+    faltan.)"""
     row = _delivery(db, file_types=["umg_master", "video"])
     limpio.append(row)
 
     def existe(key):
-        return not key.endswith("umg_master.mov")
+        return not key.endswith("lyric_video.mp4")
 
     with (
         patch.object(di.storage, "is_enabled", return_value=True),
@@ -75,7 +75,7 @@ def test_ve_el_entregable_que_la_fila_promete_y_no_existe(db, limpio):
 
     fantasmas = _solo(rep, "phantom", {row.id})
     assert len(fantasmas) == 1
-    assert fantasmas[0]["file_type"] == "umg_master"
+    assert fantasmas[0]["file_type"] == "video"
     assert fantasmas[0]["portal_id"] == "chile"
 
 
@@ -240,3 +240,46 @@ def test_el_reaper_la_corre_una_vez_por_dia():
     assert src.index("_DELIVERY_RETENTION_SWEEP_INTERVAL_S") < src.index(
         "_DELIVERY_AUDIT_INTERVAL_S"
     )
+
+
+def test_un_prores_ausente_es_bajo_demanda_y_no_un_fantasma(db, limpio):
+    """Los dos se ven igual en R2 y significan cosas distintas.
+
+    El portal tiene un botón que genera el ProRes cuando el cliente lo pide, y
+    no pre-generarlos es una decisión de producto (29 shorts de ~600 MB que
+    quizá nadie baje). Reportarlos como fantasmas sería gritar todos los días
+    por un estado buscado, y una alerta que grita sin razón se deja de leer en
+    una semana.
+    """
+    row = _delivery(db, file_types=["umg_master", "umg_short", "video"])
+    limpio.append(row)
+    with (
+        patch.object(di.storage, "is_enabled", return_value=True),
+        patch.object(di.storage, "object_exists",
+                     side_effect=lambda k: not k.endswith(".mov")),
+    ):
+        rep = di.audit_active_deliveries()
+    assert _solo(rep, "phantom", {row.id}) == []
+    bajo_demanda = _solo(rep, "on_demand", {row.id})
+    assert sorted(x["file_type"] for x in bajo_demanda) == ["umg_master", "umg_short"]
+
+
+def test_una_auditoria_caida_no_se_informa_verde(caplog):
+    """Informaba "0 entregas activas OK" cuando se había caído entera. Verde
+    y mudo es peor que no tenerla: nadie vuelve a mirar."""
+    import logging
+    with caplog.at_level(logging.ERROR):
+        di.log_audit({"checked": 0, "objects_checked": 0, "phantom": [],
+                      "outdated": [], "in_flight_too_long": [], "on_demand": [],
+                      "error": "portal db caída"})
+    assert any("NO es un resultado" in r.getMessage() for r in caplog.records)
+
+
+def test_cero_objetos_chequeados_no_es_un_dia_limpio(caplog):
+    """Si R2 está deshabilitado, el chequeo de archivos ausentes —la razón de
+    ser del módulo— no corrió, y el reporte decía "todo OK"."""
+    import logging
+    with caplog.at_level(logging.ERROR):
+        di.log_audit({"checked": 215, "objects_checked": 0, "phantom": [],
+                      "outdated": [], "in_flight_too_long": [], "on_demand": []})
+    assert any("CERO objetos" in r.getMessage() for r in caplog.records)

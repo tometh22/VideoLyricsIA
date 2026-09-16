@@ -41,6 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import storage
+from delivery_freshness import PRORES_FILE_TYPES
 from delivery_retention import DELIVERY_FILENAMES
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,7 @@ def audit_active_deliveries(*, now: datetime | None = None) -> dict:
     """
     report: dict = {
         "checked": 0, "objects_checked": 0,
-        "phantom": [], "outdated": [], "in_flight_too_long": [],
+        "phantom": [], "outdated": [], "in_flight_too_long": [], "on_demand": [],
         "unevaluable": 0,
     }
     try:
@@ -96,6 +97,10 @@ def audit_active_deliveries(*, now: datetime | None = None) -> dict:
             rows = (
                 ddb.query(Delivery)
                 .filter(Delivery.removed_at.is_(None))
+                # Orden estable: el corte por MAX_OBJECT_CHECKS agarra un
+                # prefijo, y sin ORDER BY el orden de Postgres es arbitrario,
+                # así que "el prefijo" podía dejar filas sin auditar nunca.
+                .order_by(Delivery.added_at.desc())
                 .all()
             )
             snapshot = [
@@ -143,6 +148,19 @@ def audit_active_deliveries(*, now: datetime | None = None) -> dict:
                         continue
                     did, ft = result
                     row = by_id[did]
+                    # Un ProRes ausente NO es lo mismo que un MP4 ausente: el
+                    # portal tiene un botón que lo genera al pedirlo, y esa es
+                    # una decisión de producto (no pre-generar 29 shorts de
+                    # ~600 MB que quizá nadie baje). Reportarlos como fantasmas
+                    # sería gritar todos los días por un estado buscado — y una
+                    # alerta que grita sin razón se deja de leer en una semana.
+                    if ft in PRORES_FILE_TYPES:
+                        report["on_demand"].append({
+                            "delivery_id": did, "portal_id": row["portal_id"],
+                            "job_id": row["job_id"], "file_type": ft,
+                            "song": f"{row['artist']} — {row['song']}",
+                        })
+                        continue
                     report["phantom"].append({
                         "delivery_id": did, "portal_id": row["portal_id"],
                         "job_id": row["job_id"], "file_type": ft,
@@ -197,6 +215,24 @@ def audit_active_deliveries(*, now: datetime | None = None) -> dict:
     return report
 
 
+def _increment_audit_metrics(report: dict) -> None:
+    """Siempre, incluso en un día limpio.
+
+    Si sólo se escriben cuando hay hallazgos, una métrica en cero es
+    indistinguible de "la auditoría no corrió", que es justo lo que uno
+    quiere poder alertar."""
+    try:
+        from ops_metrics import increment
+        increment("delivery_audit_runs", 1)
+        increment("delivery_audit_error", 1 if report.get("error") else 0)
+        increment("delivery_audit_phantom", len(report.get("phantom", [])))
+        increment("delivery_audit_outdated", len(report.get("outdated", [])))
+        increment("delivery_audit_in_flight", len(report.get("in_flight_too_long", [])))
+        increment("delivery_audit_on_demand", len(report.get("on_demand", [])))
+    except Exception:
+        pass
+
+
 def log_audit(report: dict) -> None:
     """Escribe el resultado y cuenta las métricas.
 
@@ -208,6 +244,17 @@ def log_audit(report: dict) -> None:
         + len(report.get("outdated", []))
         + len(report.get("in_flight_too_long", []))
     )
+    if report.get("error"):
+        # Una auditoría que se cayó entera informaba "0 entregas activas OK".
+        # Verde y mudo es peor que no tenerla: nadie vuelve a mirar.
+        logger.error("[DELIVERY-AUDIT] incompleta, NO es un resultado: %s", report["error"])
+    elif report.get("checked") and not report.get("objects_checked"):
+        logger.error(
+            "[DELIVERY-AUDIT] %d entregas y CERO objetos chequeados "
+            "(¿R2 deshabilitado?): el chequeo de archivos ausentes no corrió",
+            report["checked"],
+        )
+    _increment_audit_metrics(report)
     if not total:
         logger.info(
             "[DELIVERY-AUDIT] %d entregas activas OK (%d objetos, %d no evaluables)",
@@ -230,10 +277,4 @@ def log_audit(report: dict) -> None:
             "[DELIVERY-AUDIT] EN VUELO hace mucho entrega=%s %s: %s desde %s",
             item["delivery_id"], item["song"], item["reason"], item["since"],
         )
-    try:
-        from ops_metrics import increment
-        increment("delivery_audit_phantom", len(report.get("phantom", [])))
-        increment("delivery_audit_outdated", len(report.get("outdated", [])))
-        increment("delivery_audit_in_flight", len(report.get("in_flight_too_long", [])))
-    except Exception:
-        pass
+

@@ -41,6 +41,7 @@ class FakeJob:
         self.s3_keys = kwargs.get("s3_keys")
         self.delivery_profile = kwargs.get("delivery_profile", "umg")
         self.status = kwargs.get("status", "done")
+        self.completed_at = kwargs.get("completed_at")
 
 
 # ---------------------------------------------------------------------------
@@ -64,15 +65,12 @@ def test_fingerprint_ignores_s3_keys():
 
 @pytest.mark.parametrize("mutation", [
     {"edit_count": 1},
-    {"segments_revision": 7},
-    {"render_params": {"style": "claro"}},
-    {"umg_spec": {"frame_size": "UHD-4K"}},
-    {"input_audio_sha256": "b" * 64},
     {"previous_versions": [{"version": 1, "archived_at": "2026-09-15T10:00:00Z"}]},
+    {"completed_at": datetime(2026, 9, 16, tzinfo=timezone.utc)},
 ])
 def test_fingerprint_moves_when_the_render_changes(mutation):
-    """Anything that changes the rendered bytes must change the identity,
-    otherwise a corrected cut is published as if it were a re-send."""
+    """Sólo entran señales de que un render TERMINÓ: si los bytes detrás de
+    la descarga cambiaron, la identidad tiene que cambiar."""
     base_kwargs = {"render_params": {"style": "oscuro"}}
     base = FakeJob(**base_kwargs)
     assert df.render_fingerprint(FakeJob(**{**base_kwargs, **mutation})) != (
@@ -191,6 +189,7 @@ class FakeDelivery:
         self.stale_since = kwargs.get("stale_since")
         self.stale_reason = kwargs.get("stale_reason")
         self.file_types = kwargs.get("file_types", ["umg_master", "video"])
+        self.added_at = kwargs.get("added_at", datetime(2026, 9, 1, tzinfo=timezone.utc))
 
 
 def test_publication_state_flags_a_render_published_before_the_edit():
@@ -433,3 +432,100 @@ def test_a_delivery_that_publishes_no_prores_still_asks_nothing():
         s3_keys={"video": "t/j/lyric_video.mp4", "short": "t/j/short.mp4"},
     )
     assert df.prores_pending(job, ["video", "short", "thumbnail"]) == []
+
+
+# ---------------------------------------------------------------------------
+# El fingerprint es identidad de RENDER, no de inputs (2026-09-16)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("mutation", [
+    {"segments_revision": 7},
+    {"render_params": {"style": "claro"}},
+    {"umg_spec": {"frame_size": "UHD-4K", "fps": 24.0, "prores_profile": 3}},
+    {"input_audio_sha256": "b" * 64},
+])
+def test_cambiar_un_input_sin_re_renderizar_no_mueve_la_identidad(mutation):
+    """Y el daño de que la moviera era real, no teórico.
+
+    `content_changed` borra la aprobación del cliente y **cierra sus pedidos
+    de cambio abiertos** con un "resuelto en la versión N". Con los inputs
+    adentro del hash, guardar la letra (`/save-segments`), re-anclar
+    (`/reanchor`) o habilitar ProRes bastaba para disparar eso sobre un video
+    que nadie tocó. Reproducido el 2026-09-16: escribir `umg_spec` en 29 jobs
+    marcó las 29 entregas como desactualizadas sin que cambiara un byte.
+    """
+    base = {"render_params": {"style": "oscuro"}, "edit_count": 2}
+    assert df.render_fingerprint(FakeJob(**{**base, **mutation})) == (
+        df.render_fingerprint(FakeJob(**base))
+    )
+
+
+def test_un_retry_completo_si_mueve_la_identidad():
+    """El agujero opuesto, y peor.
+
+    `/retry` y `edit_art_track` re-renderizan de cero y NO tocan
+    `previous_versions`; además `edit_count` vuelve a 0. Con la versión
+    anterior el fingerprint quedaba IDÉNTICO y una corrección entera se
+    informaba al operador como "es el mismo corte que ya estaba publicado".
+    Lo que los distingue es `completed_at`: los dos lo ponen en NULL y la
+    siguiente transición terminal escribe uno nuevo.
+    """
+    antes = FakeJob(edit_count=3, completed_at=datetime(2026, 9, 15, 10, tzinfo=timezone.utc))
+    despues_del_retry = FakeJob(  # edit_count reseteado, previous_versions intacto
+        edit_count=0, completed_at=datetime(2026, 9, 16, 2, tzinfo=timezone.utc),
+    )
+    assert df.render_fingerprint(antes) != df.render_fingerprint(despues_del_retry)
+
+
+def test_el_retry_no_pasa_por_el_gate_del_prores():
+    """Mismo agujero, del lado del gate: sin `previous_versions` la regla por
+    defecto no ve nada, y se podía publicar el master PRE-retry al lado del
+    MP4 nuevo. El llamador que conoce la fila publicada pasa la evidencia."""
+    job = FakeJob(previous_versions=None, s3_keys={
+        "video": "t/j/lyric_video.mp4", "short": "t/j/short.mp4",
+    })
+    assert df.prores_pending(job) == []                      # regla por defecto: ciega
+    assert df.prores_pending(job, re_rendered=True) == ["umg_master", "umg_short"]
+
+
+def test_publication_state_detecta_el_retry_por_la_fecha():
+    """La fila publicada da la prueba que el job solo no da: si el render
+    terminó DESPUÉS de publicarse, lo que el cliente ve ya no es lo que se
+    publicó."""
+    job = FakeJob(
+        previous_versions=None,
+        completed_at=datetime(2026, 9, 16, 3, tzinfo=timezone.utc),
+        s3_keys={"video": "t/j/lyric_video.mp4", "short": "t/j/short.mp4"},
+    )
+    delivery = FakeDelivery(
+        published_render_fingerprint="viejo",
+        added_at=datetime(2026, 9, 15, tzinfo=timezone.utc),
+        file_types=["umg_master", "umg_short", "video", "short"],
+    )
+    assert df.publication_state(job, delivery)["prores_pending"] == [
+        "umg_master", "umg_short",
+    ]
+
+
+def test_publicar_de_nuevo_sin_re_render_no_reporta_prores_pendiente():
+    """El contrapeso: si el render es anterior a la publicación, no hay nada
+    en vuelo y publicar de nuevo no debe encolar transcodes."""
+    job = FakeJob(
+        previous_versions=None,
+        completed_at=datetime(2026, 9, 14, tzinfo=timezone.utc),
+        s3_keys={"video": "t/j/lyric_video.mp4", "short": "t/j/short.mp4"},
+    )
+    delivery = FakeDelivery(added_at=datetime(2026, 9, 15, tzinfo=timezone.utc))
+    assert df.publication_state(job, delivery)["prores_pending"] == []
+
+
+def test_fechas_sin_zona_no_rompen_la_comparacion():
+    """SQLite devuelve datetimes naive y Postgres aware; compararlos levanta
+    TypeError y dejaría la frescura muda sin que nadie se entere."""
+    job = FakeJob(
+        previous_versions=None,
+        completed_at=datetime(2026, 9, 16, 3),          # naive
+        s3_keys={"video": "t/j/lyric_video.mp4"},
+    )
+    delivery = FakeDelivery(added_at=datetime(2026, 9, 15, tzinfo=timezone.utc))
+    assert df.publication_state(job, delivery)["prores_pending"] == ["umg_master"]
