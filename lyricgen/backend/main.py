@@ -20584,6 +20584,14 @@ async def portal_get_items(
     return {
         "songs": list(songs.values()),
         "file_type_labels": file_type_labels,
+        # El portal de Chile FALLA CERRADO si esto no viene: compara
+        # `data.portal_id !== "chile"` y tira "El backend Chile todavía no
+        # está actualizado", mostrando CERO entregas. Es deliberado — protege
+        # de que umgchile.genly.pro renderice el listado global de un backend
+        # viejo. Pero producción ya lo devuelve y staging no, así que promover
+        # staging dejaba el portal del cliente vacío el día del deploy.
+        # Verificado en vivo el 2026-09-15: prod sí, staging no.
+        "portal_id": portal_id,
         "expires_at_ts": now + _DELIVERY_URL_EXPIRY_S,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

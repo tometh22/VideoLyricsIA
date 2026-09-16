@@ -3,6 +3,17 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.46] - 2026-09-16
+
+### Fixed
+
+- Identify the portal scope in `GET /api/deliveries/items`. The Chile portal
+  fails closed when the listing does not say which portal it is for — by
+  design, so umgchile.genly.pro can never render a stale backend's global
+  listing — and production already returned the field while staging did not.
+  Promoting staging would therefore have shown the client zero deliveries and
+  an error. Verified live before and after.
+
 ## [1.1.45] - 2026-09-15
 
 ### Fixed

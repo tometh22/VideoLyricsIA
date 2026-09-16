@@ -1124,3 +1124,27 @@ def test_a_genuinely_new_delivery_still_gets_opcion_n(
         db.query(Delivery).filter(Delivery.job_id == "testjob54321").delete()
         db.query(Job).filter(Job.job_id == "testjob54321").delete()
         db.commit()
+
+
+def test_items_identifies_its_portal_scope(client, admin_token, approved_job, all_r2_files_present):
+    """El portal de Chile falla CERRADO si el listado no se identifica.
+
+    `index.template.html` compara `data.portal_id !== "chile"` y, si no
+    coincide, tira "El backend Chile todavía no está actualizado" y muestra
+    CERO entregas. Es a propósito: evita que umgchile.genly.pro renderice el
+    listado global de un backend viejo. Producción ya devolvía el campo y
+    staging no, así que promover staging vaciaba el portal del cliente el día
+    del deploy (verificado en vivo el 2026-09-15). Este test es la única cosa
+    que impide que se vuelva a caer en la promoción.
+    """
+    client.post(f"/admin/deliveries/from-job/{approved_job.job_id}",
+                headers=auth(admin_token), json={"portal_id": "chile"})
+    for portal in ("argentina", "chile"):
+        res = client.get(
+            "/api/deliveries/items",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": portal},
+        )
+        assert res.status_code == 200, res.text
+        assert res.json()["portal_id"] == portal, (
+            f"el listado de {portal} no se identifica; el portal falla cerrado"
+        )
