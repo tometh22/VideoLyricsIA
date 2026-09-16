@@ -18,6 +18,10 @@ delivered.
   accents, future endings (`-ás`/`-á`/`-án`) and audited near-exact dictionary
   typos such as `AVENTRUA`/`AVENTURA`;
 - invalid ranges, overlaps and lyrics outside the media duration;
+- reference-free review warnings for runs of fragmented one/two-word cards,
+  inconsistent near-repetitions and cards that end before their final stored
+  word timestamp;
+- blocking of sentence periods at the end of delivered lyric lines;
 - propagation of the upstream Quality v6 verdict;
 - blocking of unattested catalogue text and materially incomplete timelines
   from `reference_health`;
