@@ -17998,10 +17998,18 @@ async def enable_prores_for_job(
     job = job_query.first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != "done":
+    # ``pending_review`` is also a completed render: the pipeline deliberately
+    # leaves UMG/campaign jobs there until a human approves them.  Legacy UMG
+    # deliveries commonly need their missing ProRes spec restored while still
+    # in that state, so gating on the literal ``done`` value makes the recovery
+    # action impossible even though the MP4 source already exists.
+    if job.status not in {"done", "pending_review"}:
         raise HTTPException(
             status_code=400,
-            detail=f"Job must be done before enabling ProRes export (current: {job.status})",
+            detail=(
+                "El video debe haber terminado de renderizar antes de actualizar "
+                f"el archivo profesional (estado actual: {job.status})"
+            ),
         )
 
     # Reusa la validación canónica. delivery_profile="umg" fuerza el
