@@ -25,6 +25,7 @@ from editor import (
     operator_suggestion_type_enabled,
     rebase_operator_suggestions_after_manual_edit,
     save_document,
+    serialize_document,
 )
 from transcription_quality import segments_hash
 from quality_v6_contracts import PROPOSAL_WINDOW_SCHEMA, REVIEW_PROPOSAL_SCHEMA
@@ -1618,6 +1619,35 @@ def test_approval_requires_the_current_exact_snapshot():
         with pytest.raises(RuntimeError, match="editor_revision_conflict"):
             approve_document(db, job, first.id, editor_version_id=version.id)
         db.rollback()
+    finally:
+        db.close()
+
+
+def test_editor_payload_keeps_latest_approved_snapshot_when_a_newer_draft_exists():
+    first, _, job_id = _users_and_job("editor_latest_approved")
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        document = db.query(EditorDocument).filter(EditorDocument.job_id == job_id).one()
+        approved_rows = [{"start": 0, "end": 1, "text": "latest approved"}]
+        document, version, _ = save_document(
+            db, job, document, first.id, 0, approved_rows, "manual",
+        )
+        approve_document(
+            db, job, first.id,
+            editor_revision=version.revision, editor_version_id=version.id,
+        )
+        draft_rows = [{"start": 0, "end": 1, "text": "newer unapproved draft"}]
+        document, _, _ = save_document(
+            db, job, document, first.id, version.revision, draft_rows, "draft",
+        )
+        db.commit()
+
+        payload = serialize_document(db, document, job)
+        assert payload["segments"] == draft_rows
+        assert payload["revision"] == 2
+        assert payload["latest_approved_version"]["revision"] == 1
+        assert payload["latest_approved_version"]["segments"] == approved_rows
     finally:
         db.close()
 

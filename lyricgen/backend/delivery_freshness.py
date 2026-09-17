@@ -262,6 +262,34 @@ def clear_size_cache(r2_keys: Iterable[str]) -> int:
         return 0
 
 
+def needs_publish(job, delivery) -> bool:
+    """Whether ``delivery`` still points at the cut from before an edit.
+
+    Current rows have a render fingerprint and can be compared directly.
+    Rows created before fingerprints were introduced cannot.  For those
+    legacy rows, ``stale_since`` is the durable evidence written when a
+    re-render is requested.  A failed edit deliberately does not count: its
+    files were not replaced and the operator must retry the render first.
+
+    Keeping this decision here makes the admin status and the publish
+    endpoint agree.  Otherwise the UI can offer publishing while the backend
+    treats it as a no-op (or, as happened with legacy rows, hide the action
+    even after a successful correction).
+    """
+    if job is None or delivery is None:
+        return False
+    published_fingerprint = getattr(
+        delivery, "published_render_fingerprint", None,
+    )
+    current_fingerprint = render_fingerprint(job)
+    if published_fingerprint and current_fingerprint:
+        return published_fingerprint != current_fingerprint
+    return bool(
+        getattr(delivery, "stale_since", None)
+        and getattr(delivery, "stale_reason", None) in STALE_IN_FLIGHT
+    )
+
+
 def publication_state(job, delivery) -> dict:
     """What the operator needs to know about one published row.
 
@@ -276,17 +304,10 @@ def publication_state(job, delivery) -> dict:
     - `awaiting_review`: new content was published and the client has not
       approved it yet.
     """
-    published_fingerprint = getattr(delivery, "published_render_fingerprint", None)
-    current_fingerprint = render_fingerprint(job) if job is not None else None
     pending = prores_pending(job, delivery.file_types or []) if job is not None else []
-    # A row published before this column existed has no fingerprint to
-    # compare against. Treat it as current: claiming "needs publish" on
-    # every historical delivery would bury the rows that really do.
-    changed = bool(
-        published_fingerprint
-        and current_fingerprint
-        and published_fingerprint != current_fingerprint
-    )
+    # Fingerprinted rows compare exact render identity. Legacy rows stay
+    # quiet unless a real edit path marked them stale before re-rendering.
+    changed = needs_publish(job, delivery)
     return {
         "revision": delivery.published_revision or 1,
         "content_updated_at": (
