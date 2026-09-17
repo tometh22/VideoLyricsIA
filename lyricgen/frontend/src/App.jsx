@@ -83,6 +83,7 @@ import { buildEditReview, buildEditCurrent, resolveEditSubmission, backgroundEdi
 import {
   changeRequestAdminPath,
   parseChangeRequestEditContext,
+  recoverChangeRequestEditContext,
 } from "./lib/changeRequestEditFlow";
 import { normalizeMovementCode } from "./lib/catalogCodes";
 import { buildVariantPayload } from "./lib/variantPayload";
@@ -963,10 +964,12 @@ function EditLyricsRoute({
   const { id } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
-  const changeRequestContext = useMemo(
+  const explicitChangeRequestContext = useMemo(
     () => parseChangeRequestEditContext(location.search),
     [location.search],
   );
+  const [recoveredChangeRequestContext, setRecoveredChangeRequestContext] = useState(null);
+  const changeRequestContext = explicitChangeRequestContext || recoveredChangeRequestContext;
   const handleRenderingComplete = useCallback(() => {
     const requestPath = changeRequestAdminPath(changeRequestContext, "completed");
     if (requestPath) {
@@ -1048,6 +1051,19 @@ function EditLyricsRoute({
         return;
       }
 
+      let resolvedChangeRequestContext;
+      try {
+        resolvedChangeRequestContext = await recoverChangeRequestEditContext({
+          search: location.search, job,
+          request: (path) => authFetchCriticalRead(`${API}${path}`),
+        });
+      } catch {
+        if (alive) setState({ status: "request_error" });
+        return;
+      }
+      if (!alive) return;
+      setRecoveredChangeRequestContext(resolvedChangeRequestContext);
+
       // Solo pending_review/done/rejected son editables (mismo gating
       // que canEditLyrics en JobDetail). Editing/queued/processing →
       // bail-out: no tiene sentido abrir el editor sobre un render en curso.
@@ -1125,7 +1141,7 @@ function EditLyricsRoute({
         // Preserva el origen UMG a través del autosave y del render.  Es una
         // intención explícita y acotada: permite re-renderizar la revisión
         // que la propuesta ya guardó aunque no exista un diff local.
-        changeRequestContext,
+        changeRequestContext: resolvedChangeRequestContext,
         // editMode + baseline son la API del flow edit-wizard. App.jsx los
         // lee en handleApproveLyrics para emitir POSTs /edit con el diff
         // contra baseline. UploadZone los lee para mostrar UIs de edición
@@ -1357,7 +1373,7 @@ function EditLyricsRoute({
     };
     // setCurrentReview is stable via useState; only re-bootstrap on id change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, changeRequestContext]);
+  }, [id, location.search]);
 
   // Cleanup en unmount: si el operador navega lejos sin aprobar (back-button,
   // sidebar, etc.), borrar el editingJobId del currentReview para que un
@@ -1464,6 +1480,14 @@ function EditLyricsRoute({
         <button onClick={() => navigate(`/videos/${id}`)} className="btn-secondary">
           {t("detail.back") || "Volver al video"}
         </button>
+      </div>
+    );
+  }
+  if (state.status === "request_error") {
+    return (
+      <div className="text-center mt-16">
+        <p className="text-gray-500 mb-4">No pudimos recuperar los cambios de este pedido. Reintentá para revisar la versión guardada.</p>
+        <button onClick={() => window.location.reload()} className="btn-secondary">Reintentar</button>
       </div>
     );
   }
