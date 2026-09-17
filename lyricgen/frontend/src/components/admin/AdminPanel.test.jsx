@@ -54,7 +54,7 @@ describe("AdminPanel · navegación de cambios", () => {
       expect(screen.getByText("73 resueltos")).toBeInTheDocument();
     });
     expect(
-      screen.getByText(/Revisá el pedido, la letra vigente y el resultado propuesto/),
+      screen.getByText(/Revisá el pedido, la letra y los prompts sugeridos/),
     ).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Pipeline en vivo" })).toBe(null);
   });
