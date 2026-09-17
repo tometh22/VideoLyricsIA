@@ -1420,10 +1420,10 @@ export default function LyricsEditor({
             }
           }
         } catch {
-          const message = phase === "read" ? "El navegador no permitió leer la copia local."
-            : phase === "parse" ? "No pudimos interpretar el archivo de la copia local."
-              : phase === "remove" ? "La copia coincide con la guardada, pero no pudimos retirar el aviso de forma segura. Puede haber cambiado en otra pestaña o el navegador impidió borrarla."
-                : "La copia local no tiene un formato de letra y tiempos que podamos comparar sin alterarlo.";
+          const message = phase === "read" ? "El navegador no nos permitió acceder a ese borrador."
+            : phase === "parse" ? "Ese borrador quedó incompleto y no se puede leer."
+              : phase === "remove" ? "El borrador coincide con la versión guardada, pero cambió en otra pestaña o el navegador no permitió retirarlo."
+                : "El borrador no es compatible con la versión actual del editor.";
           setDraftRecovery({ kind: "unreadable", raw, message });
         }
       }
