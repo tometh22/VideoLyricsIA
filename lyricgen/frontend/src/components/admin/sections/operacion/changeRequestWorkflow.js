@@ -44,6 +44,15 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
       tone: "busy",
     };
   }
+  // A missing/old master says nothing about whether this client's request was
+  // interpreted. Do not paint those stages complete or hide the analyze action.
+  if (proposalEnabled && !proposalForRequest(item, loadedProposal)) {
+    return {
+      key: "analyze", activeStep: 0, label: "Pendiente de interpretar",
+      detail: "Analizá el pedido primero. El estado del archivo profesional no confirma estas correcciones.",
+      tone: "action",
+    };
+  }
   if ((publication.prores_pending || []).length) {
     return {
       key: "publish", activeStep: 4, label: "Archivo profesional pendiente",

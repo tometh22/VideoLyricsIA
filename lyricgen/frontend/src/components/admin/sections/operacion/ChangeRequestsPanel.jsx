@@ -63,7 +63,7 @@ export function publicationStatus(publication) {
         title: "Hay que elegir el formato del archivo profesional",
         detail:
           "Esta entrega vieja perdió la configuración de resolución, cuadros por segundo y perfil. " +
-          "Elegilos una vez para regenerar el .mov con la corrección.",
+          "Elegilos una vez para generar el .mov del último render. Esto no aplica cambios de letra pendientes.",
         canPublish: true,
         publishLabel: "Elegir formato y actualizar .mov",
         needsProResSetup: true,
@@ -442,6 +442,8 @@ function ChangeRequestCard({
   let primaryAction;
   if (isResolved) {
     primaryAction = { label: resolving ? "Reabriendo…" : "Reabrir pedido", onClick: onReopen, disabled: resolving };
+  } else if (workflow.key === "analyze" && !effectiveProposal) {
+    primaryAction = { label: proposalBusy ? "Analizando…" : "Analizar pedido", onClick: onGenerateProposal, disabled: proposalBusy };
   } else if (status.canPublish) {
     primaryAction = {
       label: publishing
@@ -966,8 +968,12 @@ function ChangeRequestProposal({
       <div className="rounded-2xl bg-brand/[0.06] ring-1 ring-brand/20 p-4">
         <p className="text-caption font-semibold text-white">Convertir el pedido en cambios revisables</p>
         <p className="text-label text-gray-400 mt-1">
-          El asistente puede convertir timestamps y reemplazos explícitos en un diff revisable.
+          Revisá una propuesta de cambios basada en los tiempos y las frases del cliente antes de aplicarla.
         </p>
+        <button type="button" onClick={onGenerate} disabled={busy}
+          className="mt-3 rounded-lg bg-brand px-3 py-2 text-caption text-white disabled:opacity-50">
+          {busy ? "Analizando este pedido…" : "Analizar este pedido"}
+        </button>
       </div>
     );
   }
