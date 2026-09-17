@@ -12,6 +12,7 @@ import TableSkeleton from "../../primitives/TableSkeleton";
 import EnableProResModal from "../../../EnableProResModal";
 import ChangeRequestQueue from "./ChangeRequestQueue";
 import RequestWorkflowStepper from "./RequestWorkflowStepper";
+import RequestVideo from "./RequestVideo";
 import {
   PORTAL_LABELS,
   requestSearchText,
@@ -72,9 +73,8 @@ export function publicationStatus(publication) {
       tone: "wait",
       title: "Falta actualizar el archivo profesional (.mov)",
       detail:
-        "El video de arriba ya tiene la corrección, pero el archivo de máxima " +
-        "calidad que descarga Universal todavía es la versión anterior. " +
-        "Actualizalo primero; cuando termine aparecerá Publicar actualización.",
+        "El archivo profesional está pendiente respecto del último render. " +
+        "Actualizar el .mov no renderiza cambios de letra pendientes ni publica en el portal.",
       canPublish: true,
       publishLabel: "Actualizar archivo profesional",
     };
@@ -153,6 +153,7 @@ export default function ChangeRequestsPanel({
   crPublishNotice,
   dismissPublishNotice,
   publishDeliveryUpdate,
+  prepareProRes = () => {},
   proposalEnabled = false,
   proposalApplyEnabled = false,
   proposalBusyId = null,
@@ -262,8 +263,12 @@ export default function ChangeRequestsPanel({
       });
       return;
     }
+    if (item.publication?.prores_pending?.length) {
+      prepareProRes(item.delivery?.job_id, item.id);
+      return;
+    }
     publishDeliveryUpdate(item.delivery?.job_id, item.delivery?.portal_id, item.id);
-  }, [publishDeliveryUpdate]);
+  }, [prepareProRes, publishDeliveryUpdate]);
 
   useEffect(() => {
     if (!returnNotice || typeof window === "undefined") return;
@@ -292,7 +297,7 @@ export default function ChangeRequestsPanel({
         </div>
       )}
 
-      {crPublishNotice && (
+      {crPublishNotice && crPublishNotice.requestId == null && (
         <div
           role="status"
           className={`rounded-card p-3 text-caption ring-1 flex items-start justify-between gap-3 ${
@@ -351,6 +356,7 @@ export default function ChangeRequestsPanel({
               onDraftChange={(value) => setDraft(selectedItem.id, value)}
               resolving={crResolvingId === selectedItem.id}
               publishing={crPublishingId === selectedItem.id}
+              actionNotice={crPublishNotice?.requestId === selectedItem.id ? crPublishNotice : null}
               onResolve={() => resolveChangeRequest(selectedItem.id, drafts[selectedItem.id])}
               onReopen={() => reopenChangeRequest(selectedItem.id)}
               onPublish={() => publishItem(selectedItem)}
@@ -405,7 +411,7 @@ export default function ChangeRequestsPanel({
 }
 
 function ChangeRequestCard({
-  item, draft, onDraftChange, resolving, publishing,
+  item, draft, onDraftChange, resolving, publishing, actionNotice,
   onResolve, onReopen, onPublish,
   proposalEnabled, proposalApplyEnabled, proposalBusy, proposal,
   onGenerateProposal, onLoadProposal, onAdjustProposal, onApplyProposal,
@@ -438,7 +444,9 @@ function ChangeRequestCard({
     primaryAction = { label: resolving ? "Reabriendo…" : "Reabrir pedido", onClick: onReopen, disabled: resolving };
   } else if (status.canPublish) {
     primaryAction = {
-      label: publishing ? "Publicando…" : status.publishLabel || "Publicar actualización",
+      label: publishing
+        ? (item.publication?.prores_pending?.length ? "Solicitando actualización…" : "Publicando…")
+        : status.publishLabel || "Publicar actualización",
       onClick: onPublish,
       disabled: publishing,
     };
@@ -520,14 +528,15 @@ function ChangeRequestCard({
 
           <div className="overflow-hidden rounded-2xl bg-black/30 ring-1 ring-white/[0.08]">
             {d.video_url ? (
-              <video
-                ref={videoRef}
-                src={d.video_url}
-                poster={d.thumbnail_url || undefined}
-                controls
-                preload="metadata"
-                className="aspect-video max-h-[25rem] w-full bg-black object-contain"
-                aria-label={`Video de ${d.artist || "artista"} — ${d.song || "canción"}`}
+              <RequestVideo
+                videoRef={videoRef}
+                url={d.video_url}
+                poster={d.thumbnail_url}
+                renderIdentity={JSON.stringify([
+                  d.job_id, item.publication?.job_status, item.publication?.revision,
+                  item.publication?.content_updated_at, item.publication?.needs_publish,
+                ])}
+                label={`Video de ${d.artist || "artista"} — ${d.song || "canción"}`}
               />
             ) : d.thumbnail_url ? (
               <img
@@ -649,6 +658,11 @@ function ChangeRequestCard({
       </div>
 
       <footer className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 rounded-b-2xl border-t border-white/[0.08] bg-surface-2/95 px-4 py-3 shadow-[0_-18px_40px_rgba(0,0,0,0.24)] backdrop-blur sm:px-5">
+        {actionNotice && <div role={actionNotice.tone === "error" ? "alert" : "status"}
+          aria-label="Estado de la acción"
+          className={`w-full rounded-lg p-3 text-caption ${actionNotice.tone === "error" ? "bg-red-500/10 text-red-200" : "bg-sky-500/10 text-sky-100"}`}>
+          {actionNotice.text}
+        </div>}
         <div className="min-w-0">
           <p className="text-caption font-semibold text-white">{workflow.label}</p>
           <p className="truncate text-label text-gray-500">
@@ -695,8 +709,8 @@ const PROPOSAL_LABELS = {
   ready: "Lista para revisar",
   partial: "Propuesta parcial",
   needs_input: "Necesita intervención",
-  applied: "Aplicada",
-  partially_applied: "Aplicada parcialmente",
+  applied: "Guardada en la letra",
+  partially_applied: "Guardada parcialmente en la letra",
   stale: "Desactualizada",
   dismissed: "Descartada",
 };
@@ -941,6 +955,8 @@ function ChangeRequestProposal({
 
   const effective = proposal || summary;
   const status = effective?.status;
+  const savedChecks = appliedTextChecks(proposal);
+  const savedMatches = savedChecks.length > 0 && savedChecks.every(check => check.matches);
   const editorUrl = editorUrlWithRequest(
     jobId, requestId, effective?.id, proposal?.editor_url,
   );
@@ -969,6 +985,13 @@ function ChangeRequestProposal({
               : `${summary.applicable_count || 0} cambio(s) aplicable(s)`}
           </p>
         </div>
+        <button type="button" onClick={onLoad} disabled={busy}
+          className="mt-3 rounded-lg bg-white/[0.07] px-3 py-2 text-caption text-white disabled:opacity-50">
+          {busy ? "Cargando comparación…" : "Ver propuesta y letra guardada"}
+        </button>
+        {["applied", "partially_applied"].includes(status) && <p className="mt-2 text-label text-gray-400">
+          Este estado registra el guardado, no confirma que el video esté actualizado. Abrí la comparación para verificarlo.
+        </p>}
       </div>
     );
   }
@@ -1184,6 +1207,15 @@ function ChangeRequestProposal({
         </p>
       )}
 
+      {["applied", "partially_applied"].includes(status) && (
+        <>
+          <AppliedLyricsVerification proposal={proposal} onSeek={onSeek} />
+          <button type="button" onClick={onLoad} disabled={busy} className="text-caption text-brand-light underline">
+            Actualizar comparación
+          </button>
+        </>
+      )}
+
       <div className="flex flex-wrap gap-2">
         {(status === "ready" || status === "partial") && applicable.length > 0 && (
           <button
@@ -1212,17 +1244,62 @@ function ChangeRequestProposal({
             Revisar y re-renderizar
           </a>
         )}
-        {(status === "stale" || status === "dismissed" || status === "partially_applied") && (
+        {(["stale", "dismissed", "applied", "partially_applied"].includes(status)) && (
           <button
             type="button"
             onClick={onGenerate}
-            disabled={busy}
+            disabled={busy || (status === "applied" && savedMatches)}
+            title={status === "applied" && savedMatches ? "La letra ya coincide. Generá el corte para actualizar el video." : undefined}
             className="bg-white/[0.07] text-white text-caption px-3 py-1.5 rounded-button disabled:opacity-50"
           >
-            {status === "partially_applied" ? "Recalcular pendientes" : "Recalcular"}
+            {["applied", "partially_applied"].includes(status) ? "Volver a analizar con la letra actual" : "Recalcular"}
           </button>
         )}
       </div>
     </section>
   );
+}
+
+export function appliedTextChecks(proposal) {
+  const current = proposal?.lyrics_context?.segments || [];
+  return (proposal?.operations || [])
+    .filter(op => op.status === "applied" && op.proposed_segments?.length)
+    .map(operation => {
+      const actual = operation.proposed_segments.map(expected => current.find(row => (
+        expected._id != null && row._id != null
+          ? String(row._id) === String(expected._id)
+          : Math.abs(Number(row.start) - Number(expected.start)) < 0.05
+            && Math.abs(Number(row.end) - Number(expected.end)) < 0.05
+      )));
+      const located = actual.every(Boolean);
+      const matches = located && actual.every((row, index) => row.text === operation.proposed_segments[index].text);
+      return { operation, actual, located, matches };
+    });
+}
+
+function AppliedLyricsVerification({ proposal, onSeek }) {
+  const current = proposal.lyrics_context?.segments;
+  if (!Array.isArray(current)) return <p role="alert" className="text-amber-200 text-caption">
+    No se pudo verificar la letra guardada. Volvé a cargar la propuesta antes de aprobar.
+  </p>;
+  const checks = appliedTextChecks(proposal);
+  return <section aria-label="Verificación de la letra guardada" className="space-y-3 rounded-xl bg-black/20 p-3">
+    <p className="text-caption font-semibold text-white">Letra guardada ahora · revisión {proposal.lyrics_context.revision}</p>
+    <p className="text-label text-gray-400">Comparación contra la letra actual del servidor. El video sólo cambia después de renderizar.</p>
+    {checks.map(({ operation, actual, located, matches }) => {
+      return <div key={operation.id} className="text-caption">
+        <p className={matches ? "text-emerald-200" : "text-amber-200"}>
+          {matches ? "Coincide con el pedido" : located ? "No coincide con el pedido: volvé a analizar" : "No se pudo localizar la línea: volvé a analizar"}
+        </p>
+        <p className="text-gray-300">Guardado: {actual.filter(Boolean).map(row => row.text).join(" / ") || "Sin coincidencia"}</p>
+      </div>;
+    })}
+    <details className="text-label text-gray-300">
+      <summary className="cursor-pointer">Ver letra completa guardada ({current.length} líneas)</summary>
+      {current.map((row, index) => <p key={row._id || index} className="mt-2">
+        <button type="button" onClick={() => onSeek?.(row.start)} className="mr-2 text-brand-light">{previewTimestamp(row.start)}</button>
+        {row.text}
+      </p>)}
+    </details>
+  </section>;
 }
