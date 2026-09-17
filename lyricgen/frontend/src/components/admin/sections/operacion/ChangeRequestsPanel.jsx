@@ -483,32 +483,45 @@ export function buildLyricsPreview(
     operation?.applicable
     && operation.status === "pending"
     && selectedIds.has(String(operation.id))
-    && operation.current_segments?.length === 1
+    && operation.current_segments?.length >= 1
     && operation.proposed_segments?.length === 1
   ));
-  return segments.map((segment, index) => {
-    const operation = replacements.find((candidate) => (
-      samePreviewSegment(segment, candidate.current_segments[0])
-    ));
+  const rows = [];
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    const operation = replacements.find((candidate) => {
+      const currentRows = candidate.current_segments || [];
+      if (!samePreviewSegment(segment, currentRows[0])) return false;
+      return currentRows.every((row, offset) => (
+        samePreviewSegment(segments[index + offset], row)
+      ));
+    });
+    const currentRows = operation?.current_segments || [segment];
     const currentText = String(segment?.text || "");
     const resultText = operation
       ? String(
         textDrafts[operation.id]
         ?? operation.proposed_segments?.[0]?.text
-        ?? currentText,
+        ?? currentRows.map((row) => row?.text || "").join(" "),
       )
       : currentText;
-    return {
+    rows.push({
       key: segment?._id != null
         ? `segment-${segment._id}`
         : `segment-${index}-${segment?.start}-${segment?.end}`,
       start: Number(segment?.start || 0),
-      currentText,
+      currentText: operation
+        ? currentRows.map((row) => String(row?.text || "")).join(" / ")
+        : currentText,
       resultText,
-      changed: resultText !== currentText,
+      changed: Boolean(operation) && (
+        currentRows.length > 1 || resultText !== currentText
+      ),
       operationId: operation?.id || null,
-    };
-  });
+    });
+    if (operation) index += currentRows.length - 1;
+  }
+  return rows;
 }
 
 function previewTimestamp(value) {
@@ -627,8 +640,10 @@ function ChangeRequestProposal({
   }, [proposal?.id, proposal?.updated_at]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const hasUnsavedDrafts = applicable.some((operation) => (
-    (textDrafts[operation.id] ?? operation.proposed_segments?.[0]?.text ?? "")
-    !== (operation.proposed_segments?.[0]?.text ?? "")
+    operation.current_segments?.length === 1
+    && operation.proposed_segments?.length === 1
+    && (textDrafts[operation.id] ?? operation.proposed_segments?.[0]?.text ?? "")
+      !== (operation.proposed_segments?.[0]?.text ?? "")
   ));
 
   const effective = proposal || summary;
@@ -709,7 +724,9 @@ function ChangeRequestProposal({
       </div>
 
       {operations.map((operation) => {
-        const currentText = operation.current_segments?.[0]?.text || "";
+        const currentText = (operation.current_segments || [])
+          .map((row) => row?.text || "")
+          .join(" / ");
         const proposedText = textDrafts[operation.id]
           ?? operation.proposed_segments?.[0]?.text ?? "";
         if (!operation.applicable) {
@@ -721,9 +738,23 @@ function ChangeRequestProposal({
               {operation.timecode_seconds != null && (
                 <p className="text-label text-gray-400">Cerca de {Math.floor(operation.timecode_seconds / 60)}:{String(Math.round(operation.timecode_seconds % 60)).padStart(2, "0")}</p>
               )}
+              {operation.kind === "background_review" && editorUrl && (
+                <a
+                  href={editorUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex mt-2 bg-white/[0.08] hover:bg-white/[0.14] text-white text-label font-medium px-2.5 py-1.5 rounded-button"
+                >
+                  Abrir editor de fondo
+                </a>
+              )}
             </div>
           );
         }
+        const textEditable = (
+          operation.current_segments?.length === 1
+          && operation.proposed_segments?.length === 1
+        );
         return (
           <div key={operation.id} className="block rounded-button bg-black/20 ring-1 ring-white/[0.06] p-2">
             <div className="flex items-start gap-2">
@@ -738,7 +769,7 @@ function ChangeRequestProposal({
               )}
               <div className="min-w-0 flex-1">
                 <p className="text-label text-gray-500 line-through break-words">{currentText}</p>
-                {operation.status === "pending" ? (
+                {operation.status === "pending" && textEditable ? (
                   <div className="mt-1 flex gap-2">
                     <input
                       value={proposedText}
@@ -768,6 +799,8 @@ function ChangeRequestProposal({
                     ? "Ajustado por operador"
                     : operation.kind === "remove_terminal_period"
                       ? "Formato determinístico"
+                      : operation.kind === "merge_phrase"
+                        ? "Frase completa en una sola pantalla"
                       : "Pedido explícito del cliente"}
                   {operation.scope === "all_matching" ? " · todas las apariciones" : ""}
                   {operation.status === "applied" ? " · aplicado" : ""}

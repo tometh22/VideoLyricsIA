@@ -20985,6 +20985,7 @@ async def admin_generate_change_request_proposal(
     except (LookupError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
 
+    from change_request_parser import SCHEMA_VERSION as current_parser_version
     from change_request_proposals import build_proposal, request_hash
     portal_id = delivery.portal_id or "argentina"
     comment_hash = request_hash(cr.comment)
@@ -20997,7 +20998,14 @@ async def admin_generate_change_request_proposal(
         .order_by(ChangeRequestProposal.created_at.desc())
         .first()
     )
-    if cached is not None and cached.status not in {"stale", "dismissed"}:
+    if (
+        cached is not None
+        and cached.status not in {"stale", "dismissed"}
+        and (
+            cached.status not in {"ready", "partial", "needs_input"}
+            or cached.parser_version == current_parser_version
+        )
+    ):
         return {
             "ok": True, "cached": True,
             "proposal": _serialize_change_request_proposal(
