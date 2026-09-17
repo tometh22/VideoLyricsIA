@@ -20758,7 +20758,10 @@ async def admin_list_change_requests(
         for u in (db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else [])
     }
     proposals_by_request = {}
+    current_change_request_parser_version = None
     if _change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED") and crs:
+        from change_request_parser import SCHEMA_VERSION
+        current_change_request_parser_version = SCHEMA_VERSION
         proposal_rows = (
             db.query(ChangeRequestProposal)
             .filter(ChangeRequestProposal.change_request_id.in_([cr.id for cr in crs]))
@@ -20796,6 +20799,12 @@ async def admin_list_change_requests(
         owner = owners_by_id.get(job.user_id) if job and job.user_id else None
         portal_id = (d.portal_id or "argentina") if d else "argentina"
         proposal = proposals_by_request.get((portal_id, cr.id))
+        proposal_status = proposal.status if proposal else None
+        if (
+            proposal_status in {"ready", "partial", "needs_input"}
+            and proposal.parser_version != current_change_request_parser_version
+        ):
+            proposal_status = "stale"
         items.append({
             "id": cr.id,
             "comment": cr.comment,
@@ -20808,7 +20817,7 @@ async def admin_list_change_requests(
             "proposal": (
                 {
                     "id": proposal.id,
-                    "status": proposal.status,
+                    "status": proposal_status,
                     "base_revision": proposal.base_revision,
                     "applied_revision": proposal.applied_revision,
                     "operation_count": len(proposal.operations or []),
@@ -20921,6 +20930,10 @@ def _serialize_change_request_proposal(
         "applied_at": row.applied_at.isoformat() if row.applied_at else None,
         "applied_revision": row.applied_revision,
     }
+    if payload["status"] in {"ready", "partial", "needs_input"}:
+        from change_request_parser import SCHEMA_VERSION as current_parser_version
+        if row.parser_version != current_parser_version:
+            payload["status"] = "stale"
     if document is not None:
         from change_request_proposals import lyrics_preview_context
         payload["lyrics_context"] = lyrics_preview_context(

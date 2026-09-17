@@ -75,10 +75,10 @@ describe("publicationStatus", () => {
     const status = publicationStatus({
       ...BASE_PUBLICATION, needs_publish: true, prores_pending: ["umg_master"],
     });
-    expect(status.title).toMatch(/ProRes todavía es el corte anterior/);
+    expect(status.title).toMatch(/archivo profesional/);
     // Publicar SÍ se ofrece: encola el master y el backend contesta 202.
     expect(status.canPublish).toBe(true);
-    expect(status.publishLabel).toMatch(/Preparar master/);
+    expect(status.publishLabel).toMatch(/Actualizar archivo profesional/);
   });
 
   it("surfaces a corrected render that was never published", () => {

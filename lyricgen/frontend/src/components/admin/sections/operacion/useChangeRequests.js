@@ -290,8 +290,8 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         setCrPublishNotice({
           tone: "wait",
           text: data.stale?.length
-            ? "El master ProRes todavía es el corte anterior. Se está regenerando con la corrección: reintentá en un minuto."
-            : "Falta preparar el master ProRes. Ya se encoló: reintentá en un minuto.",
+            ? "Se está actualizando el archivo profesional (.mov) con la corrección. Esperá un minuto; después vas a poder publicar."
+            : "Se está preparando el archivo profesional (.mov). Esperá un minuto; después vas a poder publicar.",
         });
       } else if (data.content_changed) {
         setCrPublishNotice({
