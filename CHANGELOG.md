@@ -3,6 +3,17 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.56] - 2026-09-17
+
+### Fixed
+
+- Preserve the exact applied UMG proposal when opening the lyric editor after
+  reloading the change-request queue, so reviewing an already-saved correction
+  triggers the intended re-render instead of reporting "No cambiaste nada".
+- Let legacy UMG deliveries configure and regenerate their professional ProRes
+  master while the completed video is in `pending_review`, while continuing to
+  reject jobs that are still rendering.
+
 ## [1.1.55] - 2026-09-17
 
 ### Added
