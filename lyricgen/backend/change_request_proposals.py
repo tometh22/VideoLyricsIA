@@ -136,6 +136,82 @@ def _text_operation(
     }
 
 
+def _merge_phrase_target(
+    segments: list[dict], instruction: dict,
+) -> tuple[int, list[dict]] | None:
+    """Find an exact contiguous fragment sequence around the client timestamp."""
+    requested = fold_text(str(instruction.get("requested_text") or ""))
+    timecode = instruction.get("timecode_seconds")
+    if not requested or timecode is None:
+        return None
+    primary = _at_time(segments, float(timecode))
+    if primary is None:
+        return None
+    primary_index = primary[0]
+    candidates: list[tuple[int, list[dict]]] = []
+    for size in range(2, min(6, len(segments)) + 1):
+        first = max(0, primary_index - size + 1)
+        last = min(primary_index, len(segments) - size)
+        for start in range(first, last + 1):
+            window = segments[start:start + size]
+            joined = fold_text(" ".join(str(row.get("text") or "") for row in window))
+            if joined == requested:
+                candidates.append((start, window))
+    if not candidates:
+        return None
+    # Prefer the least invasive exact window, then the one whose midpoint is
+    # closest to the timestamp supplied by UMG.
+    return min(candidates, key=lambda item: (
+        len(item[1]),
+        abs(
+            (float(item[1][0].get("start") or 0)
+             + float(item[1][-1].get("end") or 0)) / 2
+            - float(timecode)
+        ),
+    ))
+
+
+def _merge_phrase_operation(
+    *, instruction: dict, index: int, current_rows: list[dict],
+) -> dict:
+    requested = str(instruction.get("requested_text") or "").strip()
+    current = [deepcopy(row) for row in current_rows]
+    proposed = deepcopy(current[0])
+    proposed.update({
+        "start": float(current[0].get("start") or 0),
+        "end": float(current[-1].get("end") or 0),
+        "text": requested,
+    })
+    # Word-level metadata belongs to the old fragments and must be recomputed
+    # later; retaining it would make the merged line internally inconsistent.
+    for key in ("words", "word_timestamps", "tokens"):
+        proposed.pop(key, None)
+    proposed_rows = [proposed]
+    return {
+        "id": _operation_id(
+            instruction.get("id"), index,
+            *(row.get("_id") or row.get("id") or row.get("start") for row in current),
+            requested,
+        ),
+        "group_key": instruction.get("id"),
+        "kind": "merge_phrase",
+        "status": "pending",
+        "applicable": True,
+        "automatic_apply_allowed": False,
+        "confidence": instruction.get("confidence") or "high",
+        "scope": "single",
+        "source_excerpt": instruction.get("source_excerpt"),
+        "timecode_seconds": instruction.get("timecode_seconds"),
+        "start": proposed["start"],
+        "end": proposed["end"],
+        "current_segments": current,
+        "proposed_segments": proposed_rows,
+        "current_segments_hash": segments_content_hash(current),
+        "proposed_segments_hash": segments_content_hash(proposed_rows),
+        "warnings": ["structural_merge_requires_confirmation"],
+    }
+
+
 def _period_operations(segments: list[dict], instruction: dict) -> list[dict]:
     rows: list[dict] = []
     for index, current in enumerate(segments):
@@ -190,6 +266,7 @@ def build_proposal(
     parsed = parse_change_request(comment)
     operations: list[dict] = []
     unresolved: list[dict] = []
+    structural_targets: set[str] = set()
     for instruction in parsed["instructions"]:
         kind = instruction.get("kind")
         if kind == "replace_text":
@@ -207,6 +284,22 @@ def build_proposal(
                     **_manual_operation(instruction),
                     "reason": "lyric_target_not_found",
                     "warnings": ["lyric_target_not_found"],
+                })
+        elif kind == "merge_phrase":
+            target = _merge_phrase_target(current, instruction)
+            if target is not None:
+                index, rows = target
+                target_hash = segments_content_hash(rows)
+                if target_hash not in structural_targets:
+                    operations.append(_merge_phrase_operation(
+                        instruction=instruction, index=index, current_rows=rows,
+                    ))
+                    structural_targets.add(target_hash)
+            else:
+                unresolved.append({
+                    **_manual_operation(instruction),
+                    "reason": "complete_phrase_fragments_not_found",
+                    "warnings": ["complete_phrase_fragments_not_found"],
                 })
         elif kind == "remove_terminal_period":
             matches = _period_operations(current, instruction)
@@ -296,26 +389,40 @@ def apply_operations(
     for operation in selected:
         before = operation.get("current_segments") or []
         after = operation.get("proposed_segments") or []
-        if len(before) != 1 or len(after) != 1:
-            raise ValueError("change request operations must replace one segment")
+        kind = operation.get("kind")
+        if not before or len(after) != 1:
+            raise ValueError("change request operations need source segments and one result")
+        if kind != "merge_phrase" and len(before) != 1:
+            raise ValueError("text change request operations must replace one segment")
         before_hash = segments_content_hash(before)
         after_hash = segments_content_hash(after)
+        before_row_hashes = [segments_content_hash([row]) for row in before]
         if (
             before_hash != operation.get("current_segments_hash")
             or after_hash != operation.get("proposed_segments_hash")
-            or before_hash not in current_by_hash
-            or before_hash in claimed
+            or any(value not in current_by_hash for value in before_row_hashes)
+            or any(value in claimed for value in before_row_hashes)
         ):
             raise RuntimeError("change_request_proposal_stale")
-        claimed.add(before_hash)
+        if kind == "merge_phrase":
+            ordered = sorted(before, key=lambda row: float(row.get("start") or 0))
+            proposed = after[0]
+            if (
+                float(proposed.get("start") or 0) != float(ordered[0].get("start") or 0)
+                or float(proposed.get("end") or 0) != float(ordered[-1].get("end") or 0)
+            ):
+                raise ValueError("structural merge changed phrase boundaries")
+        claimed.update(before_row_hashes)
 
     result = [row for row in current if segments_content_hash([row]) not in claimed]
     for operation in selected:
         result.extend(deepcopy(operation["proposed_segments"]))
     result = normalize_segments(result)
-    # Text-only operations must never move the timeline.
-    before_timing = [(row["start"], row["end"]) for row in current]
-    after_timing = [(row["start"], row["end"]) for row in result]
-    if before_timing != after_timing:
-        raise ValueError("text change request changed timeline")
+    # Plain text operations must never move the timeline. Structural merges
+    # deliberately replace adjacent fragments by their exact outer span.
+    if not any(row.get("kind") == "merge_phrase" for row in selected):
+        before_timing = [(row["start"], row["end"]) for row in current]
+        after_timing = [(row["start"], row["end"]) for row in result]
+        if before_timing != after_timing:
+            raise ValueError("text change request changed timeline")
     return result, [deepcopy(row) for row in selected]
