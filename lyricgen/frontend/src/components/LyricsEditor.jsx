@@ -724,6 +724,7 @@ export default function LyricsEditor({
   disableAutosave = false,
   submitLabel = null,
   requireLineReview = false,
+  preferApprovedVersion = false,
   // Optional audio peak envelope for the timeline waveform, fetched by the
   // parent (the post-render /edit modal has a job in R2; the wizard doesn't).
   // null → timeline renders without a waveform (graceful).
@@ -1380,7 +1381,17 @@ export default function LyricsEditor({
     durableHydratedJobRef.current = transcribeJobId;
     let cancelled = false;
     const hydrate = async () => {
-      const remote = sanitizeSegments(durableEditor.document.segments || []);
+      const latestApproved = preferApprovedVersion
+        && Array.isArray(durableEditor.document.latest_approved_version?.segments)
+        && durableEditor.document.latest_approved_version.segments.length > 0
+        ? durableEditor.document.latest_approved_version
+        : null;
+      const remote = sanitizeSegments(
+        latestApproved?.segments || durableEditor.document.segments || [],
+      );
+      const remoteRevision = Number.isInteger(latestApproved?.revision)
+        ? latestApproved.revision
+        : durableEditor.document.revision;
       const remoteOriginal = sanitizeSegments(durableEditor.document.original_segments || remote);
       originalSegmentsRef.current = remoteOriginal;
       let next = remote;
@@ -1416,7 +1427,8 @@ export default function LyricsEditor({
               localStorage.removeItem(draftKey);
             } else {
               setDraftRecovery({ kind: "different", raw, local,
-                baseRevision: draft.base_revision, updatedAt: draft.updated_at });
+                baseRevision: draft.base_revision, updatedAt: draft.updated_at,
+                serverRevision: remoteRevision });
             }
           }
         } catch {
@@ -1442,7 +1454,7 @@ export default function LyricsEditor({
     hydrate();
     return () => { cancelled = true; };
   }, [draftKey, durableEditor.document, durableEditor.loading,
-    editorRequest, editorV2Enabled, setEdited, transcribeJobId]);
+    editorRequest, editorV2Enabled, preferApprovedVersion, setEdited, transcribeJobId]);
 
   // Debounced autosave to backend: every 3s after the last edit, persist
   // the current segments to /jobs/{id}/save-segments. This bumps the
@@ -4375,7 +4387,11 @@ export default function LyricsEditor({
       {(reanchoring || pasteBusy) && <ReanchorProgressDialog
         waiting={!!reanchorWaiting} returnFocusRef={reanchorReturnFocusRef} />}
       {draftRecovery && createPortal(<LocalDraftRecovery recovery={draftRecovery}
-        revision={durableEditor.document?.revision} remote={durableEditor.document?.segments || []}
+        revision={draftRecovery.serverRevision ?? durableEditor.document?.revision}
+        remote={preferApprovedVersion
+          ? (durableEditor.document?.latest_approved_version?.segments
+            || durableEditor.document?.segments || [])
+          : (durableEditor.document?.segments || [])}
         onRecover={() => resolveRecovery(true)} onDiscard={() => resolveRecovery(false)}
         onBack={() => onBack?.()} />, document.body)}
       {editorInitializationBlocked && createPortal(

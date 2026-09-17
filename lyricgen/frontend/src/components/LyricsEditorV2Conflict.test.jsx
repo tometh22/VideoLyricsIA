@@ -106,6 +106,7 @@ function renderEditor(editorRequest, props = {}) {
     onPersistSegments={vi.fn()}
     onApprove={props.onApprove || vi.fn()}
     onBack={vi.fn()}
+    preferApprovedVersion={props.preferApprovedVersion || false}
   />);
 }
 
@@ -429,6 +430,35 @@ describe("local recovery is separate from server save status", () => {
     expect(await screen.findByDisplayValue("versión equipo")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Encontramos un borrador anterior" })).not.toBeInTheDocument();
     expect(screen.queryByText("No se pudo guardar")).not.toBeInTheDocument();
+    expect(localStorage.getItem(key)).toBeNull();
+    expect(localStorage.getItem(`${key}:incompatible`)).toBe(raw);
+    expect(mutations(request)).toHaveLength(0);
+  });
+
+  it("opens the latest approved version after quarantining an incompatible edit draft", async () => {
+    const raw = '{"segments":';
+    localStorage.setItem(key, raw);
+    const currentDraft = [{ ...SERVER[0], text: "borrador más nuevo sin aprobar" }];
+    const fallback = makeRequest();
+    const request = vi.fn(async (path, options = {}) => {
+      if (path === `/editor/${JOB}` && !options.method) {
+        return reply({
+          job_id: JOB,
+          revision: 6,
+          segments: currentDraft,
+          original_segments: SERVER,
+          latest_approved_version: { revision: 5, segments: SERVER },
+          lock: { active: false },
+        });
+      }
+      return fallback(path, options);
+    });
+
+    renderEditor(request, { preferApprovedVersion: true });
+
+    expect(await screen.findByDisplayValue("versión equipo")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("borrador más nuevo sin aprobar")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Encontramos un borrador anterior" })).not.toBeInTheDocument();
     expect(localStorage.getItem(key)).toBeNull();
     expect(localStorage.getItem(`${key}:incompatible`)).toBe(raw);
     expect(mutations(request)).toHaveLength(0);
