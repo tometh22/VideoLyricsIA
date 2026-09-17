@@ -3,6 +3,17 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.57] - 2026-09-17
+
+### Fixed
+
+- Recover applied UMG proposals from existing request-only editor links, so
+  saved corrections can be approved without changing their text again.
+  Validate the request, job and saved revision before enabling that render.
+- Open the latest saved lyric correction instead of an older approved version.
+  Reloading and approving now preserves the corrected phrase in the render
+  payload; browser regressions cover both legacy and durable editors.
+
 ## [1.1.56] - 2026-09-17
 
 ### Fixed
