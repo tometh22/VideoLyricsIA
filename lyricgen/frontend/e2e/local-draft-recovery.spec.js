@@ -24,12 +24,11 @@ test("local recovery preserves server state across reload, return, and explicit 
   await expect(dialog).toHaveCount(0);
   await expect(page.locator('input[aria-label="Letra de la línea 1"]')).toHaveValue("Primera línea");
   expect(harness.saves).toHaveLength(0); expect(harness.approvals).toHaveLength(0);
-  await seedAndOpen(page, '{"segments":');
-  await expect(dialog).toContainText("quedó incompleto");
-  await page.screenshot({ path: "test-results/local-draft-unreadable.png", fullPage: true });
-  await dialog.getByRole("button", { name: "Usar versión de Genly" }).click();
+  const incompatible = '{"segments":';
+  await seedAndOpen(page, incompatible);
   await expect(dialog).toHaveCount(0);
   await expect(page.locator('input[aria-label="Letra de la línea 1"]')).toHaveValue("Primera línea");
   expect(await page.evaluate(key => localStorage.getItem(key), key)).toBeNull();
+  expect(await page.evaluate(key => localStorage.getItem(`${key}:incompatible`), key)).toBe(incompatible);
   expect(harness.saves).toHaveLength(0); expect(harness.approvals).toHaveLength(0);
 });
