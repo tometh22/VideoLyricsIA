@@ -65,7 +65,7 @@ export async function installEditorHarness(page, options = {}) {
   const transcriptionQuality = options.transcriptionQuality || null;
   const saves = [];
   const approvals = [];
-  let durableRevision = 0;
+  let durableRevision = options.initialRevision || 0;
   let durableSegments = JSON.parse(JSON.stringify(empty ? [] : segments));
   const durableOriginal = JSON.parse(JSON.stringify(durableSegments));
   const versions = [];
@@ -115,7 +115,7 @@ export async function installEditorHarness(page, options = {}) {
     }
 
     if (request.method() === "GET" && path === "/auth/me") {
-      await route.fulfill(jsonResponse({ id: "e2e-user", email: "e2e@example.test", role: "user", tenant_id: "e2e-team", features: { editor_v2: editorV2 } }));
+      await route.fulfill(jsonResponse({ id: "e2e-user", email: "e2e@example.test", role: options.role || "user", tenant_id: "e2e-team", features: { editor_v2: editorV2 } }));
       return;
     }
 
@@ -125,6 +125,7 @@ export async function installEditorHarness(page, options = {}) {
         revision: durableRevision,
         segments: durableSegments,
         original_segments: durableOriginal,
+        latest_approved_version: options.latestApprovedVersion || null,
         updated_by: null,
         updated_at: new Date().toISOString(),
         lock: { active: false, user: null, expires_at: null },
@@ -187,7 +188,7 @@ export async function installEditorHarness(page, options = {}) {
         artist: "E2E Artist",
         song_title: "E2E Song",
         segments_json: empty ? [] : segments,
-        segments_revision: 0,
+        segments_revision: options.initialRevision || 0,
         transcription_quality: transcriptionQuality,
         render_params: {},
       }));
