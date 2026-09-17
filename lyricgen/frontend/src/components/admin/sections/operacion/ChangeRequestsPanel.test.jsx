@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import ChangeRequestsPanel, {
+  appliedTextChecks,
   buildLyricsPreview,
   editorUrlWithRequest,
   publicationStatus,
@@ -74,6 +75,23 @@ function renderPanelItems(items, props = {}) {
 
 // El orden de prioridad es el orden en que los estados bloquean al operador.
 describe("publicationStatus", () => {
+  it("verifies saved corrections when editor snapshots regenerate local row ids", () => {
+    const expected = { _id: "old-local-id", start: 70.12, end: 74.2, text: "Soy quien ayer cantó sé vos" };
+    const proposal = { operations: [{ status: "applied", proposed_segments: [expected] }],
+      lyrics_context: { segments: [{ ...expected, _id: "new-local-id" }] } };
+    expect(appliedTextChecks(proposal)[0]).toMatchObject({ located: true, matches: true });
+    proposal.lyrics_context.segments[0].text = "Texto anterior";
+    expect(appliedTextChecks(proposal)[0]).toMatchObject({ located: true, matches: false });
+  });
+
+  it("does not verify a different occurrence or ambiguous timing just because text matches", () => {
+    const expected = { _id: "old", start: 70, end: 74, text: "Frase repetida" };
+    const proposal = { operations: [{ status: "applied", proposed_segments: [expected] }],
+      lyrics_context: { segments: [{ ...expected, _id: "other", start: 170, end: 174 }] } };
+    expect(appliedTextChecks(proposal)[0].located).toBe(false);
+    proposal.lyrics_context.segments = [{ ...expected, _id: "new1" }, { ...expected, _id: "new2" }];
+    expect(appliedTextChecks(proposal)[0].located).toBe(false);
+  });
   it("keeps analysis accessible beside the original request when a master is pending", () => {
     const generate = vi.fn();
     const publish = vi.fn();
