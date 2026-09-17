@@ -5,6 +5,10 @@ import ChangeRequestsPanel, {
   publicationStatus,
 } from "./ChangeRequestsPanel";
 
+vi.mock("../../../../i18n", () => ({
+  useI18n: () => ({ t: (key) => key }),
+}));
+
 afterEach(cleanup);
 
 const BASE_PUBLICATION = {
@@ -16,6 +20,7 @@ const BASE_PUBLICATION = {
   stale_reason: null,
   needs_publish: false,
   prores_pending: [],
+  prores_configured: true,
   awaiting_review: false,
   job_status: "done",
 };
@@ -79,6 +84,17 @@ describe("publicationStatus", () => {
     // Publicar SÍ se ofrece: encola el master y el backend contesta 202.
     expect(status.canPublish).toBe(true);
     expect(status.publishLabel).toMatch(/Actualizar archivo profesional/);
+  });
+
+  it("asks for the missing ProRes format on a legacy delivery", () => {
+    const status = publicationStatus({
+      ...BASE_PUBLICATION,
+      needs_publish: true,
+      prores_pending: ["umg_master"],
+      prores_configured: false,
+    });
+    expect(status.needsProResSetup).toBe(true);
+    expect(status.publishLabel).toMatch(/Elegir formato/);
   });
 
   it("surfaces a corrected render that was never published", () => {
@@ -170,6 +186,26 @@ describe("ChangeRequestsPanel", () => {
     );
     screen.getByRole("button", { name: "Publicar actualización" }).click();
     expect(publish).toHaveBeenCalledWith("f7752c6feed4", "chile", 7);
+  });
+
+  it("opens the format selector instead of attempting an impossible legacy publish", async () => {
+    const publish = vi.fn();
+    renderPanel(
+      {
+        publication: {
+          ...BASE_PUBLICATION,
+          needs_publish: true,
+          prores_pending: ["umg_master"],
+          prores_configured: false,
+        },
+      },
+      { publishDeliveryUpdate: publish },
+    );
+    screen.getByRole("button", { name: "Elegir formato y actualizar .mov" }).click();
+    expect(await screen.findByRole("dialog", {
+      name: "Configurar y actualizar el archivo profesional",
+    })).toBeInTheDocument();
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it("keeps manual resolution available but names it for what it is", () => {

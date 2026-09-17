@@ -17971,17 +17971,28 @@ async def enable_prores_for_job(
     ))
     db.commit()
 
-    # Encola ambos masters. enqueue_prores_prewarm es best-effort: si el
-    # tenant tiene la cola enterprise saturada hace skip (el lazy path
-    # del /download los va a generar bajo demanda igual).
+    # Encola ambos masters como acción explícita. A diferencia del prewarm
+    # automático del pipeline, no se permite un "ok" sin trabajo encolado:
+    # la pantalla depende de esta respuesta para empezar a esperar el .mov.
     enqueued = []
     try:
         for file_type in ("umg_master", "umg_short"):
-            rq_id = enqueue_prores_prewarm(job_id, file_type)
+            # Este endpoint nace de una acción explícita del operador. Debe
+            # atravesar el flag/backpressure de prewarm opcional igual que el
+            # botón de publicar; de otro modo puede responder "queued" sin
+            # haber encolado nada y dejar la pantalla esperando para siempre.
+            rq_id = enqueue_prores_prewarm(job_id, file_type, force=True)
             if rq_id:
                 enqueued.append(file_type)
     except Exception as e:  # pragma: no cover
         logger.warning("[PRORES] enable-prores prewarm enqueue failed: %s", e)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No se pudo iniciar la actualización del archivo profesional. "
+                "Probá de nuevo en un momento."
+            ),
+        ) from e
 
     return {
         "ok": True,
@@ -20805,6 +20816,17 @@ async def admin_list_change_requests(
             and proposal.parser_version != current_change_request_parser_version
         ):
             proposal_status = "stale"
+        publication = (
+            delivery_freshness.publication_state(job, d) if d else None
+        )
+        if publication is not None:
+            # Algunas entregas legacy conservan el .mov publicado pero
+            # perdieron ``umg_spec`` en el job. En ese caso sabemos que el
+            # master quedó viejo, pero no podemos regenerarlo sin que el
+            # operador vuelva a elegir resolución/FPS/perfil. Exponerlo evita
+            # ofrecer un botón que inevitablemente termina en 409 y permite
+            # abrir la configuración ProRes en esta misma tarjeta.
+            publication["prores_configured"] = bool(job and job.umg_spec)
         items.append({
             "id": cr.id,
             "comment": cr.comment,
@@ -20840,9 +20862,7 @@ async def admin_list_change_requests(
             # Sin esto el operador no podía responder la única pregunta que
             # importa después de corregir: ¿lo que el cliente puede bajar
             # AHORA es lo que acabo de arreglar?
-            "publication": (
-                delivery_freshness.publication_state(job, d) if d else None
-            ),
+            "publication": publication,
             "delivery": (
                 {
                     "id": d.id,

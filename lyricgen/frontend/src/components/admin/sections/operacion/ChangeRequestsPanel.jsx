@@ -26,6 +26,7 @@ import { fmtDate, fmtAgo } from "../../adminApi";
 import FilterBar from "../../primitives/FilterBar";
 import EmptyState from "../../primitives/EmptyState";
 import TableSkeleton from "../../primitives/TableSkeleton";
+import EnableProResModal from "../../../EnableProResModal";
 
 const PORTAL_LABELS = { argentina: "UMG Argentina", chile: "UMG Chile" };
 
@@ -66,6 +67,18 @@ export function publicationStatus(publication) {
     };
   }
   if (prores.length) {
+    if (publication.prores_configured === false) {
+      return {
+        tone: "wait",
+        title: "Hay que elegir el formato del archivo profesional",
+        detail:
+          "Esta entrega vieja perdió la configuración de resolución, cuadros por segundo y perfil. " +
+          "Elegilos una vez para regenerar el .mov con la corrección.",
+        canPublish: true,
+        publishLabel: "Elegir formato y actualizar .mov",
+        needsProResSetup: true,
+      };
+    }
     return {
       tone: "wait",
       title: "Falta actualizar el archivo profesional (.mov)",
@@ -144,9 +157,11 @@ export default function ChangeRequestsPanel({
   applyProposal = () => {},
   dismissProposal = () => {},
   regenerateBackground = () => {},
+  onProResConfigured = () => {},
 }) {
   // Draft local del input de "respuesta" por CR. Clave = id del CR.
   const [drafts, setDrafts] = useState({});
+  const [proResSetup, setProResSetup] = useState(null);
   const setDraft = (id, val) => setDrafts((d) => ({ ...d, [id]: val }));
 
   const filterOptions = [
@@ -214,13 +229,22 @@ export default function ChangeRequestsPanel({
               publishing={crPublishingId === item.id}
               onResolve={() => resolveChangeRequest(item.id, drafts[item.id])}
               onReopen={() => reopenChangeRequest(item.id)}
-              onPublish={() =>
+              onPublish={() => {
+                const status = publicationStatus(item.publication);
+                if (status.needsProResSetup) {
+                  setProResSetup({
+                    jobId: item.delivery?.job_id,
+                    requestId: item.id,
+                    frameSize: item.delivery?.frame_size,
+                  });
+                  return;
+                }
                 publishDeliveryUpdate(
                   item.delivery?.job_id,
                   item.delivery?.portal_id,
                   item.id,
-                )
-              }
+                );
+              }}
               proposalEnabled={proposalEnabled}
               proposalApplyEnabled={proposalApplyEnabled}
               proposalBusy={proposalBusyId === item.id}
@@ -245,6 +269,22 @@ export default function ChangeRequestsPanel({
             />
           ))}
         </div>
+      )}
+
+      {proResSetup && (
+        <EnableProResModal
+          jobId={proResSetup.jobId}
+          initialFrameSize={proResSetup.frameSize}
+          title="Configurar y actualizar el archivo profesional"
+          description="Elegí el formato que requiere Universal. Vamos a regenerar el .mov con el video corregido; todavía no se publicará en el portal."
+          submitLabel="Guardar formato y actualizar .mov"
+          onClose={() => setProResSetup(null)}
+          onSuccess={(data) => {
+            const setup = proResSetup;
+            setProResSetup(null);
+            onProResConfigured(setup.requestId, data);
+          }}
+        />
       )}
     </div>
   );
