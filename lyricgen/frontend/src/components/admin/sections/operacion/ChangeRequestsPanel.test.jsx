@@ -83,7 +83,8 @@ describe("publicationStatus", () => {
 
   it("surfaces a corrected render that was never published", () => {
     const status = publicationStatus({ ...BASE_PUBLICATION, needs_publish: true });
-    expect(status.title).toMatch(/todavía entrega el corte anterior/);
+    expect(status.title).toMatch(/render nuevo está listo para revisar/i);
+    expect(status.detail).toMatch(/Abrí el video/);
     expect(status.canPublish).toBe(true);
   });
 
@@ -303,6 +304,47 @@ describe("ChangeRequestsPanel", () => {
     });
     expect(screen.getByRole("link", { name: "Abrir editor de fondo" }))
       .toHaveAttribute("href", "/videos/f7752c6feed4/edit-lyrics");
+  });
+
+  it("shows an editable visual prompt and regenerates without publishing", () => {
+    const regenerate = vi.fn();
+    renderPanel({}, {
+      proposalEnabled: true,
+      proposalDetails: { 7: {
+        id: "proposal-bg", status: "ready", base_revision: 4,
+        operations: [{
+          id: "visual-bg", kind: "background_review", status: "pending",
+          applicable: false,
+          visual_action: "regenerate_background",
+          regeneration_supported: true,
+          current_prompt: "Calle nocturna con autos",
+          suggested_prompt: "Nueva calle nocturna, sin armas, sin texto ni logos.",
+          background_mode: "veo",
+        }],
+      } },
+      regenerateBackground: regenerate,
+    });
+
+    expect(screen.getByText("Prompt usado hasta ahora")).toBeInTheDocument();
+    const prompt = screen.getByLabelText("Prompt sugerido para el fondo");
+    expect(prompt).toHaveValue("Nueva calle nocturna, sin armas, sin texto ni logos.");
+    fireEvent.change(prompt, {
+      target: { value: "Barrio al amanecer, sin armas, sin texto ni logos." },
+    });
+    fireEvent.click(screen.getByRole("button", {
+      name: "Regenerar fondo con este prompt",
+    }));
+
+    expect(regenerate).toHaveBeenCalledWith(
+      7,
+      "proposal-bg",
+      "visual-bg",
+      "f7752c6feed4",
+      "Barrio al amanecer, sin armas, sin texto ni logos.",
+      "veo",
+    );
+    expect(screen.queryByRole("button", { name: /Aplicar seleccionadas/ }))
+      .not.toBeInTheDocument();
   });
 
   it("previews operator drafts in context and blocks apply until they are saved", () => {

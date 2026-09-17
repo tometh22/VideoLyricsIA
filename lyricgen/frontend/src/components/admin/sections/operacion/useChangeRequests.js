@@ -41,15 +41,33 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   const [crPublishNotice, setCrPublishNotice] = useState(null);
 
   const crStatusRef = useRef(crStatusFilter);
+  const activeRenderIdsRef = useRef(new Set());
   crStatusRef.current = crStatusFilter;
 
-  const loadChangeRequests = useCallback(async () => {
-    setCrLoading(true);
+  const loadChangeRequests = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) setCrLoading(true);
     try {
       const data = await fetchJson(
         `${API}/admin/change-requests?status=${crStatusRef.current}&limit=200`,
       );
-      setChangeRequests(data.items || []);
+      const items = data.items || [];
+      const nextActive = new Set(items
+        .filter((item) => [
+          "queued", "processing", "rendering", "editing", "transcribed_pending",
+        ].includes(item.publication?.job_status))
+        .map((item) => item.id));
+      const completed = [...activeRenderIdsRef.current].filter((id) => (
+        !nextActive.has(id)
+        && items.some((item) => item.id === id && item.publication?.needs_publish)
+      ));
+      activeRenderIdsRef.current = nextActive;
+      setChangeRequests(items);
+      if (completed.length) {
+        setCrPublishNotice({
+          tone: "ok",
+          text: "El render nuevo terminó. Abrí el video de la tarjeta y comprobá el fondo; Publicar actualización sigue siendo un paso manual.",
+        });
+      }
       setCrPendingCount(data.pending_count || 0);
       setCrResolvedCount(data.resolved_count || 0);
       setCrProposalEnabled(data.proposal_enabled === true);
@@ -57,7 +75,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     } catch (err) {
       flashError(`No pude cargar los cambios: ${err.message || err}`);
     } finally {
-      setCrLoading(false);
+      if (!silent) setCrLoading(false);
     }
   }, [flashError]);
 
@@ -182,6 +200,41 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     }
   }, [flashError, loadChangeRequests, storeProposal]);
 
+  const regenerateBackgroundFromProposal = useCallback(async (
+    requestId, proposalId, operationId, jobId, prompt, backgroundMode,
+  ) => {
+    setCrProposalBusyId(requestId);
+    setCrPublishNotice(null);
+    try {
+      const nonce = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+      const data = await fetchJson(`${API}/edit/${jobId}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": `cr-background-${proposalId}-${operationId}-${nonce}`,
+        },
+        body: JSON.stringify({
+          edit_type: "background",
+          background_hint: prompt.trim(),
+          background_mode: backgroundMode === "imagen" ? "imagen" : "veo",
+          bg_verbatim: true,
+          force_content_validation: true,
+        }),
+      });
+      setCrPublishNotice({
+        tone: "wait",
+        text: "La regeneración empezó. El portal conserva el corte anterior: esperá a que termine, abrí el video nuevo y publicalo sólo si quedó bien.",
+      });
+      await loadChangeRequests({ silent: true });
+      return data;
+    } catch (err) {
+      flashError(`No pude regenerar el fondo: ${err.message || err}`);
+      return null;
+    } finally {
+      setCrProposalBusyId(null);
+    }
+  }, [flashError, loadChangeRequests]);
+
   useEffect(() => {
     loadChangeRequests();
   }, [crStatusFilter, loadChangeRequests]);
@@ -195,6 +248,18 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     }, 30000);
     return () => clearInterval(iv);
   }, []);
+
+  const hasActiveRender = changeRequests.some((item) => [
+    "queued", "processing", "rendering", "editing", "transcribed_pending",
+  ].includes(item.publication?.job_status));
+  useEffect(() => {
+    if (!hasActiveRender) return undefined;
+    const iv = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      loadChangeRequests({ silent: true });
+    }, 5000);
+    return () => clearInterval(iv);
+  }, [hasActiveRender, loadChangeRequests]);
 
   const resolveChangeRequest = useCallback(async (id, note) => {
     setCrResolvingId(id);
@@ -280,6 +345,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     adjustChangeRequestProposal,
     applyChangeRequestProposal,
     dismissChangeRequestProposal,
+    regenerateBackgroundFromProposal,
     resolveChangeRequest,
     reopenChangeRequest,
     crPublishingId,

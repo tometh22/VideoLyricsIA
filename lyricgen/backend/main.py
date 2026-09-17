@@ -16915,13 +16915,21 @@ async def request_edit(
                 ),
             )
 
+    _is_admin = current_user.get("role") == "admin"
     # Status gate. Lyrics and metadata edits accept a wider set of
     # terminal-ish states so users can fix typos/timing on videos that
     # already finished rendering (done, in approval queue, or even
-    # rejected) without having to re-upload the MP3. typography/background
-    # stay strict — they're billed as "edits in the review loop" and only
-    # make sense while the reviewer is still deciding.
-    if body.edit_type in ("lyrics", "metadata"):
+    # rejected) without having to re-upload the MP3. Typography and regular
+    # users' background edits stay strict; platform admins can regenerate a
+    # shipped UMG background as part of a reviewed change request.
+    # Platform admins may also regenerate a background on an already shipped
+    # UMG job from the change-request screen. It remains an explicit paid
+    # action and still passes every storage, scene, content-validation and
+    # publication-freshness guard in this handler.
+    _terminal_edit = body.edit_type in ("lyrics", "metadata") or (
+        _is_admin and body.edit_type == "background"
+    )
+    if _terminal_edit:
         allowed = ("done", "pending_review", "rejected")
         if job.status not in allowed:
             raise HTTPException(
@@ -16989,7 +16997,6 @@ async def request_edit(
     # for "fix the tilde" would frustrate operators who already spent
     # their slots on typography/background/lyrics. AuditLog still records
     # the metadata edit for traceability (`metadata_only=True`).
-    _is_admin = current_user.get("role") == "admin"
     _metadata_only = body.edit_type == "metadata"
     # background_library tampoco consume slot (mismo mecanismo que metadata):
     # el cap de 3 existe para acotar gasto Veo (~$0.90/regen); el swap a un
@@ -20906,6 +20913,11 @@ async def admin_list_change_requests(
                         for item in (proposal.operations or [])
                         if isinstance(item, dict)
                     ),
+                    "visual_action_count": sum(
+                        item.get("visual_action") == "regenerate_background"
+                        for item in (proposal.operations or [])
+                        if isinstance(item, dict)
+                    ),
                     "updated_at": proposal.updated_at.isoformat()
                     if proposal.updated_at else None,
                 }
@@ -21115,6 +21127,15 @@ async def admin_generate_change_request_proposal(
         base_revision=int(document.revision or 0),
         audio_revision=int(job.audio_revision or 0),
         audio_sha256=str(job.input_audio_sha256 or ""),
+        background_context={
+            "background_hint": (job.render_params or {}).get("background_hint"),
+            "background_mode": (job.render_params or {}).get("background_mode"),
+            "concept": (job.render_params or {}).get("concept"),
+            "genre": (job.render_params or {}).get("genre"),
+            "artist": job.artist,
+            "song_title": job.song_title,
+            "scene_plan": job.scene_plan,
+        },
     )
     now = datetime.now(timezone.utc)
     # Pending proposals for older snapshots remain as audit history but cannot
@@ -21180,6 +21201,7 @@ async def admin_generate_change_request_proposal(
             "status": row.status,
             "applicable_count": built["applicable_count"],
             "unresolved_count": built["unresolved_count"],
+            "visual_action_count": built["visual_action_count"],
             "parser_version": row.parser_version,
             "portal_id": portal_id,
         },
