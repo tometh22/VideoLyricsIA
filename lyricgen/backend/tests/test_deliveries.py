@@ -1063,6 +1063,45 @@ def test_a_row_published_before_fingerprints_existed_keeps_its_approval(
     assert row.approved_at is not None
 
 
+def test_a_legacy_row_marked_stale_publishes_the_corrected_cut(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """A real edit marker disambiguates legacy rows without fingerprints.
+
+    This is the historical-delivery case where the admin used to show only
+    "Marcar resuelto sin publicar" even though a corrected render existed.
+    """
+    from database import Delivery
+
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    client.post(
+        f"/api/deliveries/{delivery_id}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+    )
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    row.published_render_fingerprint = None
+    row.stale_since = datetime.now(timezone.utc)
+    row.stale_reason = "editing"
+    db.commit()
+
+    _edit_the_render(db, approved_job)
+    again = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+
+    assert again.status_code == 200, again.text
+    assert again.json()["content_changed"] is True
+    assert again.json()["revision"] == 2
+    db.refresh(row)
+    assert row.approved_at is None
+    assert row.stale_since is None
+    assert row.stale_reason is None
+
+
 def test_portal_listing_tells_the_client_there_is_a_new_version(
     client, admin_token, approved_job, db, all_r2_files_present,
 ):
