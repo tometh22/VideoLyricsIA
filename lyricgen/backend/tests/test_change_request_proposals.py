@@ -218,6 +218,47 @@ def test_ambiguous_request_never_becomes_applicable_patch():
     assert all(not row["applicable"] for row in proposal["operations"])
 
 
+def test_background_request_suggests_editable_prompt_from_request_and_current_context():
+    comment = "Cambiar el fondo porfa. Que no aparezcan armas."
+    proposal = build_proposal(
+        comment=comment,
+        segments=[segment(0, 2, "Letra")],
+        base_revision=2,
+        background_context={
+            "background_hint": "Barrio urbano nocturno, cámara lenta",
+            "background_mode": "veo",
+            "artist": "2 Minutos",
+            "song_title": "Tema",
+        },
+    )
+    operation = proposal["operations"][0]
+
+    assert proposal["status"] == "ready"
+    assert proposal["applicable_count"] == 0
+    assert proposal["visual_action_count"] == 1
+    assert operation["visual_action"] == "regenerate_background"
+    assert operation["regeneration_supported"] is True
+    assert operation["current_prompt"] == "Barrio urbano nocturno, cámara lenta"
+    assert comment in operation["suggested_prompt"]
+    assert "Cumplir literalmente" in operation["suggested_prompt"]
+    assert operation["force_content_validation"] is True
+
+
+def test_multi_scene_background_request_stays_in_scene_editor():
+    proposal = build_proposal(
+        comment="Cambiar el fondo, sin personas",
+        segments=[segment(0, 2, "Letra")],
+        base_revision=1,
+        background_context={
+            "scene_plan": {"scenes": [{"index": 0}, {"index": 1}]},
+        },
+    )
+    operation = proposal["operations"][0]
+    assert proposal["status"] == "needs_input"
+    assert operation["regeneration_supported"] is False
+    assert "multi_scene_background_requires_scene_editor" in operation["warnings"]
+
+
 def test_lyrics_preview_context_returns_full_revision_bound_lyric():
     segments = [
         segment(0, 2, "Primera línea", _id="a"),

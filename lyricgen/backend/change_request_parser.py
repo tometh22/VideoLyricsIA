@@ -13,7 +13,7 @@ import unicodedata
 from typing import Iterable
 
 
-SCHEMA_VERSION = "change-request-parser-v2"
+SCHEMA_VERSION = "change-request-parser-v3"
 
 _TIMECODE_RE = re.compile(
     r"(?<!\d)(?:(?P<hours>\d{1,2}):)?(?P<minutes>\d{1,2}):(?P<seconds>\d{2})(?!\d)"
