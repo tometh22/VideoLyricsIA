@@ -3,6 +3,23 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.53] - 2026-09-16
+
+### Added
+
+- Turn UMG requests for a complete phrase on one screen into reviewable
+  structural proposals when consecutive lyric fragments exactly match the
+  client-supplied phrase and timestamps.
+- Add a direct background-editor action to visual change requests, keeping
+  image regeneration behind an explicit operator preview.
+
+### Security
+
+- Require human selection for structural merges, preserve the phrase's outer
+  timing boundaries, and leave ambiguous or non-exact matches manual.
+- Recalculate pending proposals created by an older parser without rewriting
+  already applied proposal history.
+
 ## [1.1.52] - 2026-09-16
 
 ### Changed
