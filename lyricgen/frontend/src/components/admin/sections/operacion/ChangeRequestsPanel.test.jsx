@@ -74,6 +74,19 @@ function renderPanelItems(items, props = {}) {
 
 // El orden de prioridad es el orden en que los estados bloquean al operador.
 describe("publicationStatus", () => {
+  it("keeps analysis accessible beside the original request when a master is pending", () => {
+    const generate = vi.fn();
+    const publish = vi.fn();
+    renderPanel({ publication: { ...BASE_PUBLICATION, prores_pending: ["umg_master"] } }, {
+      proposalEnabled: true, generateProposal: generate, publishDeliveryUpdate: publish,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Analizar este pedido" }));
+    expect(generate).toHaveBeenCalledWith(7);
+    fireEvent.click(screen.getByRole("button", { name: "Analizar pedido" }));
+    expect(generate).toHaveBeenCalledTimes(2);
+    expect(publish).not.toHaveBeenCalled();
+    expect(screen.queryByText("El video de arriba ya tiene la corrección", { exact: false })).toBeNull();
+  });
   it("blocks publishing while the job is still re-rendering", () => {
     const status = publicationStatus({
       ...BASE_PUBLICATION, job_status: "editing", needs_publish: true,
@@ -263,15 +276,45 @@ describe("ChangeRequestsPanel", () => {
   });
 
   it("keeps the applied proposal context after reloading the request queue", () => {
+    const load = vi.fn();
     renderPanel(
       { proposal: { id: "proposal-1", status: "applied", applied_revision: 5 } },
-      { proposalEnabled: true },
+      { proposalEnabled: true, loadProposal: load },
     );
     expect(screen.getByRole("link", { name: "Revisar y generar corte" }))
       .toHaveAttribute(
         "href",
         "/videos/f7752c6feed4/edit-lyrics?change_request_id=7&proposal_id=proposal-1",
       );
+    fireEvent.click(screen.getByRole("button", { name: "Ver propuesta y letra guardada" }));
+    expect(load).toHaveBeenCalledWith(7);
+  });
+
+  it("updates a configured master without invoking publication", () => {
+    const prepare = vi.fn();
+    const publish = vi.fn();
+    renderPanel({ publication: { ...BASE_PUBLICATION, job_status: "pending_review", prores_pending: ["umg_master"] } },
+      { prepareProRes: prepare, publishDeliveryUpdate: publish,
+        crPublishNotice: { requestId: 7, tone: "error", text: "La cola no está disponible" } });
+    fireEvent.click(screen.getByRole("button", { name: "Actualizar archivo profesional" }));
+    expect(prepare).toHaveBeenCalledWith("f7752c6feed4", 7);
+    expect(publish).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert").closest("footer")).not.toBeNull();
+  });
+
+  it.each([true, false])("checks the actual stored text for an applied proposal (matches=%s)", matches => {
+    const proposed = { _id: "line-1", start: 72, end: 77, text: "Soy quien ayer cantó sé vos" };
+    const proposal = { id: "proposal-1", status: "applied", base_revision: 2, applied_revision: 3,
+      operations: [{ id: "op-1", kind: "replace_text", applicable: true, status: "applied",
+        current_segments: [{ ...proposed, text: "Texto anterior" }], proposed_segments: [proposed] }],
+      lyrics_context: { revision: 4, segments: [{ ...proposed, text: matches ? proposed.text : "Texto anterior" }] } };
+    const generate = vi.fn();
+    renderPanel({ proposal }, { proposalEnabled: true, proposalDetails: { 7: proposal }, generateProposal: generate });
+    expect(screen.getByRole("region", { name: "Verificación de la letra guardada" }))
+      .toHaveTextContent(matches ? "Coincide con el pedido" : "No coincide con el pedido");
+    const recalculate = screen.getByRole("button", { name: "Volver a analizar con la letra actual" });
+    if (matches) expect(recalculate).toBeDisabled();
+    else { fireEvent.click(recalculate); expect(generate).toHaveBeenCalledWith(7); }
   });
 
   it("publishes to the portal the delivery belongs to", () => {

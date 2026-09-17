@@ -44,6 +44,15 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
       tone: "busy",
     };
   }
+  // A missing/old master says nothing about whether this client's request was
+  // interpreted. Do not paint those stages complete or hide the analyze action.
+  if (proposalEnabled && !proposalForRequest(item, loadedProposal)) {
+    return {
+      key: "analyze", activeStep: 0, label: "Pendiente de interpretar",
+      detail: "Analizá el pedido primero. El estado del archivo profesional no confirma estas correcciones.",
+      tone: "action",
+    };
+  }
   if ((publication.prores_pending || []).length) {
     return {
       key: "publish", activeStep: 4, label: "Archivo profesional pendiente",
@@ -64,8 +73,8 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
   const proposalStatus = proposal?.status;
   if (PROPOSAL_APPLIED_STATUSES.has(proposalStatus)) {
     return {
-      key: "render", activeStep: 2, label: "Cambios aplicados",
-      detail: "Generá el corte corregido para poder revisarlo.", tone: "action",
+      key: "render", activeStep: 2, label: "Letra guardada · falta renderizar",
+      detail: "Verificá la letra guardada y generá el corte. El video todavía puede ser el anterior.", tone: "action",
     };
   }
   if (PROPOSAL_REVIEW_STATUSES.has(proposalStatus)) {

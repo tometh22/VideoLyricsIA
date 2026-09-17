@@ -3,6 +3,23 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.58] - 2026-09-17
+
+### Fixed
+
+- Isolate the remaining processing-job reaper contract test from the advisory
+  lock held by lifespan daemons in the full suite; retain row-state assertions.
+- Keep request analysis accessible beside the original comment even when a
+  professional master is pending; do not mark unanalysed request steps complete.
+- Keep UMG preview playback running when polling renews signed media URLs;
+  reload only for a new object/render and expose an explicit media retry.
+- Prepare configured ProRes masters with their saved format without invoking
+  publication or requiring a pending-review render to be approved first.
+  Show persistent acknowledgement and errors beside the action button.
+- Keep saved-proposal details available and compare them against the current
+  server lyric. Distinguish saved text from rendered video, and allow a fresh
+  analysis when the saved text no longer matches the requested correction.
+
 ## [1.1.57] - 2026-09-17
 
 ### Fixed
