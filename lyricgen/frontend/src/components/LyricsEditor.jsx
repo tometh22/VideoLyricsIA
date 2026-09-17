@@ -724,6 +724,7 @@ export default function LyricsEditor({
   disableAutosave = false,
   submitLabel = null,
   requireLineReview = false,
+  preferApprovedVersion = false,
   // Optional audio peak envelope for the timeline waveform, fetched by the
   // parent (the post-render /edit modal has a job in R2; the wizard doesn't).
   // null → timeline renders without a waveform (graceful).
@@ -1380,7 +1381,17 @@ export default function LyricsEditor({
     durableHydratedJobRef.current = transcribeJobId;
     let cancelled = false;
     const hydrate = async () => {
-      const remote = sanitizeSegments(durableEditor.document.segments || []);
+      const latestApproved = preferApprovedVersion
+        && Array.isArray(durableEditor.document.latest_approved_version?.segments)
+        && durableEditor.document.latest_approved_version.segments.length > 0
+        ? durableEditor.document.latest_approved_version
+        : null;
+      const remote = sanitizeSegments(
+        latestApproved?.segments || durableEditor.document.segments || [],
+      );
+      const remoteRevision = Number.isInteger(latestApproved?.revision)
+        ? latestApproved.revision
+        : durableEditor.document.revision;
       const remoteOriginal = sanitizeSegments(durableEditor.document.original_segments || remote);
       originalSegmentsRef.current = remoteOriginal;
       let next = remote;
@@ -1416,15 +1427,23 @@ export default function LyricsEditor({
               localStorage.removeItem(draftKey);
             } else {
               setDraftRecovery({ kind: "different", raw, local,
-                baseRevision: draft.base_revision, updatedAt: draft.updated_at });
+                baseRevision: draft.base_revision, updatedAt: draft.updated_at,
+                serverRevision: remoteRevision });
             }
           }
         } catch {
-          const message = phase === "read" ? "El navegador no permitió leer la copia local."
-            : phase === "parse" ? "No pudimos interpretar el archivo de la copia local."
-              : phase === "remove" ? "La copia coincide con la guardada, pero no pudimos retirar el aviso de forma segura. Puede haber cambiado en otra pestaña o el navegador impidió borrarla."
-                : "La copia local no tiene un formato de letra y tiempos que podamos comparar sin alterarlo.";
-          setDraftRecovery({ kind: "unreadable", raw, message });
+          // An unreadable/obsolete browser draft is not a choice the operator
+          // can meaningfully resolve: there is nothing safe to preview or
+          // recover. Quarantine its exact bytes for support/recovery and open
+          // the intact Genly revision. Only two valid, different versions are
+          // allowed to interrupt the editor with the recovery dialog.
+          if (typeof raw === "string") {
+            try {
+              localStorage.setItem(`${draftKey}:incompatible`, raw);
+              // Do not remove a newer value written by another tab.
+              if (localStorage.getItem(draftKey) === raw) localStorage.removeItem(draftKey);
+            } catch { /* best effort; never block the server version */ }
+          }
         }
       }
       if (cancelled) return;
@@ -1435,7 +1454,7 @@ export default function LyricsEditor({
     hydrate();
     return () => { cancelled = true; };
   }, [draftKey, durableEditor.document, durableEditor.loading,
-    editorRequest, editorV2Enabled, setEdited, transcribeJobId]);
+    editorRequest, editorV2Enabled, preferApprovedVersion, setEdited, transcribeJobId]);
 
   // Debounced autosave to backend: every 3s after the last edit, persist
   // the current segments to /jobs/{id}/save-segments. This bumps the
@@ -4368,7 +4387,11 @@ export default function LyricsEditor({
       {(reanchoring || pasteBusy) && <ReanchorProgressDialog
         waiting={!!reanchorWaiting} returnFocusRef={reanchorReturnFocusRef} />}
       {draftRecovery && createPortal(<LocalDraftRecovery recovery={draftRecovery}
-        revision={durableEditor.document?.revision} remote={durableEditor.document?.segments || []}
+        revision={draftRecovery.serverRevision ?? durableEditor.document?.revision}
+        remote={preferApprovedVersion
+          ? (durableEditor.document?.latest_approved_version?.segments
+            || durableEditor.document?.segments || [])
+          : (durableEditor.document?.segments || [])}
         onRecover={() => resolveRecovery(true)} onDiscard={() => resolveRecovery(false)}
         onBack={() => onBack?.()} />, document.body)}
       {editorInitializationBlocked && createPortal(

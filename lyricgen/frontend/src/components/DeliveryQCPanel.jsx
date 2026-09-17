@@ -27,6 +27,29 @@ const CHECK_LABELS = {
   NOT_RUN: "No ejecutado",
 };
 
+const GENERIC_REVIEW_DETECTOR = "mandatory_signed_reviewer_checklist";
+
+function identityKey(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+function isSwappedMetadataIssue(issue, job) {
+  const actual = identityKey(issue.actual);
+  const expected = identityKey(issue.expected);
+  const artist = identityKey(job?.artist);
+  const title = identityKey(job?.song_title);
+  return Boolean(
+    actual && expected && artist && title
+    && ((actual === artist && expected === title)
+      || (actual === title && expected === artist))
+  );
+}
+
 export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor }) {
   const report = job?.delivery_qc;
   const [busy, setBusy] = useState("");
@@ -55,10 +78,57 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
     () => (report?.repairs?.actions || []).filter((row) => row.status === "APPLIED"),
     [report],
   );
+  const rawState = report?.status === "STALE" ? "STALE" : (report?.decision || "PASS");
+  // Delivery QC is currently an observation layer for interactive editing.
+  // A stale/legacy report may still say BLOCK, but that must not make the
+  // editor look unavailable unless the report explicitly runs in enforce mode.
+  const isNonBlocking = report?.mode !== "enforce";
+  const state = isNonBlocking && rawState === "BLOCK" ? "REVIEW" : rawState;
+  const hiddenSwappedIssueIds = useMemo(() => new Set(
+    (report?.issues || [])
+      .filter((issue) => isSwappedMetadataIssue(issue, job))
+      .map((issue) => String(issue.issue_id)),
+  ), [job, report]);
+  const checkStatus = (check) => {
+    if (
+      check.check_id === "metadata_title" || check.check_id === "metadata_artist"
+    ) {
+      const issueIds = (check.issue_ids || []).map(String);
+      if (issueIds.length > 0 && issueIds.every((id) => hiddenSwappedIssueIds.has(id))) {
+        return "PASS";
+      }
+    }
+    return check.status;
+  };
+  const checks = useMemo(() => {
+    const seenLabels = new Set();
+    return (report?.checks || []).filter((check) => {
+      if (check.detector === GENERIC_REVIEW_DETECTOR) return false;
+      const label = String(check.label || check.check_id || "");
+      if (seenLabels.has(label)) return false;
+      seenLabels.add(label);
+      return true;
+    });
+  }, [report]);
+  const issues = useMemo(
+    () => (report?.issues || []).filter((issue) => (
+      issue.detector !== GENERIC_REVIEW_DETECTOR
+      && issue.status === "OPEN"
+      && !isSwappedMetadataIssue(issue, job)
+    )),
+    [job, report],
+  );
+  const visibleCheckSummary = useMemo(() => ({
+    fail: checks.filter((check) => checkStatus(check) === "FAIL").length,
+    review: checks.filter((check) => checkStatus(check) === "REVIEW").length,
+    notRun: checks.filter((check) => checkStatus(check) === "NOT_RUN").length,
+    pass: checks.filter((check) => checkStatus(check) === "PASS").length,
+  }), [checks, hiddenSwappedIssueIds]);
+  const hasCheckData = Array.isArray(report?.checks);
+  const displayedFailCount = hasCheckData
+    ? visibleCheckSummary.fail
+    : (report?.summary?.fail_count ?? 0);
   if (!report) return null;
-
-  const state = report.status === "STALE" ? "STALE" : (report.decision || "PASS");
-  const checks = report.checks || [];
   const updateDecision = async (issue, decision) => {
     setBusy(issue.issue_id);
     setError("");
@@ -120,17 +190,30 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
       <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
         <div>
           <h3 className="text-sm font-semibold">Preflight de entrega</h3>
-          <p className="text-xs text-ink-secondary mt-1">Control final tipo sello sobre el video renderizado.</p>
+          <p className="text-xs text-ink-secondary mt-1">Resumen del render actual. No modifica la letra ni tus cambios.</p>
         </div>
-        <span className={`px-2.5 py-1 rounded-full text-[11px] font-semibold ring-1 ${TONES[state] || TONES.STALE}`}>
-          {state === "PASS" ? "Sin hallazgos" : state === "REVIEW" ? "Revisar" : state === "BLOCK" ? "Bloqueado" : "Desactualizado"}
-        </span>
+        <div className="flex items-center gap-2">
+          {onOpenEditor && (
+            <button type="button" onClick={onOpenEditor} className="btn-primary h-9 px-3 text-xs">
+              Editar cambios
+            </button>
+          )}
+          <span className={`px-2.5 py-1 rounded-full text-[11px] font-semibold ring-1 ${TONES[state] || TONES.STALE}`}>
+            {state === "PASS" ? "Sin hallazgos" : state === "REVIEW" ? (isNonBlocking ? "Revisión informativa" : "Revisar") : state === "BLOCK" ? "Bloqueado" : "Desactualizado"}
+          </span>
+        </div>
       </div>
 
+      {isNonBlocking && (
+        <div className="mb-4 rounded-xl bg-brand/10 px-3 py-2 text-xs text-brand-light ring-1 ring-brand/20">
+          Estos checks son informativos por ahora y no bloquean la edición ni el avance del video.
+        </div>
+      )}
+
       <div className="grid grid-cols-3 gap-2 mb-4 text-center">
-        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.check_summary?.fail ?? report.summary?.fail_count ?? 0}</div><div className="text-[10px] text-ink-secondary">fallos reales</div></div>
-        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.check_summary?.review ?? report.summary?.warn_count ?? 0}</div><div className="text-[10px] text-ink-secondary">revisiones</div></div>
-        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{report.check_summary?.not_run ?? 0}</div><div className="text-[10px] text-ink-secondary">no ejecutados</div></div>
+        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{displayedFailCount}</div><div className="text-[10px] text-ink-secondary">fallos objetivos</div></div>
+        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{visibleCheckSummary.review}</div><div className="text-[10px] text-ink-secondary">revisiones</div></div>
+        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{visibleCheckSummary.notRun}</div><div className="text-[10px] text-ink-secondary">no ejecutados</div></div>
       </div>
 
       {checks.length > 0 && (
@@ -138,12 +221,12 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
           <div className="flex items-center justify-between gap-3 mb-2">
             <p className="text-xs font-semibold">Checks automáticos y revisiones</p>
             <p className="text-[10px] text-ink-secondary">
-              {report.check_summary?.pass ?? checks.filter((check) => check.status === "PASS").length} pasaron
+              {visibleCheckSummary.pass} pasaron
             </p>
           </div>
           <div className="grid gap-1.5 sm:grid-cols-2">
             {checks.map((check) => {
-              const status = CHECK_LABELS[check.status] ? check.status : "NOT_RUN";
+              const status = CHECK_LABELS[checkStatus(check)] ? checkStatus(check) : "NOT_RUN";
               return (
                 <div key={check.check_id} className="flex items-center justify-between gap-2 rounded-lg bg-white/[0.03] px-2.5 py-2">
                   <span className="min-w-0 truncate text-[11px] text-ink-secondary">{check.label}</span>
@@ -159,7 +242,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
 
       {report.status === "STALE" && <div className="mb-3 space-y-2"><p className="text-xs text-amber-200">El reporte corresponde a una versión anterior o todavía no fue generado.</p><button disabled={busy === "refresh"} onClick={refresh} className="btn-secondary h-9 px-3 text-xs">{busy === "refresh" ? "Actualizando preflight…" : "Actualizar preflight"}</button></div>}
       <div className="space-y-2">
-        {(report.issues || []).map((issue) => (
+        {issues.map((issue) => (
           <div key={issue.issue_id} className="rounded-xl bg-white/[0.03] ring-1 ring-white/[0.06] p-3">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
@@ -183,6 +266,10 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
           </div>
         ))}
       </div>
+
+      {!issues.length && (
+        <p className="text-xs text-ink-secondary mt-3">No hay observaciones accionables para mostrar.</p>
+      )}
 
       <div className="flex flex-wrap gap-2 mt-4">
         {safeActions.some((row) => ["text", "timing"].includes(row.domain)) && (

@@ -640,6 +640,22 @@ def serialize_document(
     lock_expires = _aware(document.lock_expires_at)
     lock_active = bool(lock_expires and lock_expires > now_utc())
     proposal = _proposal_for_response(document)
+    latest_approved = (
+        db.query(EditorVersion)
+        .filter(
+            EditorVersion.job_id == document.job_id,
+            EditorVersion.tenant_id == document.tenant_id,
+            EditorVersion.is_approved.is_(True),
+        )
+        .order_by(EditorVersion.revision.desc())
+        .first()
+    )
+    latest_approved_payload = None
+    if latest_approved is not None:
+        latest_approved_payload = {
+            **_version_summary(db, latest_approved),
+            "segments": latest_approved.segments,
+        }
     # Authorship and isolation are read back from the stored rows, so a caller
     # verifying a saved copy never has to take the client's word for them.
     pilot = {
@@ -658,6 +674,7 @@ def serialize_document(
         "revision": document.revision,
         "segments": document.current_segments,
         "original_segments": document.original_segments,
+        "latest_approved_version": latest_approved_payload,
         "quality_proposal": proposal,
         **pilot,
         **actor_for(db, document.updated_by),

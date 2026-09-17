@@ -41,6 +41,39 @@ def _title_card_matches(metadata: Mapping[str, Any], actual: Any) -> bool:
     return tuple(rendered) in allowed
 
 
+def select_identity_observation(
+    observations: Sequence[Mapping[str, Any]],
+    *,
+    metadata: Mapping[str, Any],
+    field: str,
+) -> Mapping[str, Any] | None:
+    """Pick an OCR row by its visible value before trusting its claimed kind.
+
+    OCR providers occasionally swap the ``title`` and ``artist`` labels on a
+    two-line title card.  The pixels are still useful evidence, so prefer an
+    exact value match for the requested metadata field and only then fall back
+    to the provider's classification.
+    """
+    expected = _fold(metadata.get(field))
+    if not expected:
+        return None
+    identity_rows = [
+        row for row in observations
+        if str(row.get("kind") or "") in {"title", "artist"}
+        and str(row.get("text") or "").strip()
+    ]
+    exact = next(
+        (row for row in identity_rows if _fold(row.get("text")) == expected),
+        None,
+    )
+    if exact is not None:
+        return exact
+    return next(
+        (row for row in identity_rows if str(row.get("kind") or "") == field),
+        None,
+    )
+
+
 def compare_ocr_observations(
     observations: Sequence[Mapping[str, Any]],
     *,
@@ -50,6 +83,21 @@ def compare_ocr_observations(
 ) -> list[dict[str, Any]]:
     """Compare independently transcribed frames to expected rendered content."""
     issues: list[dict[str, Any]] = []
+    identity_rows = [
+        row for row in observations
+        if str(row.get("kind") or "") in {"title", "artist"}
+        and str(row.get("text") or "").strip()
+    ]
+    expected_title = _fold(metadata.get("title"))
+    expected_artist = _fold(metadata.get("artist"))
+    # If both expected lines are present, a provider label swap is a
+    # classification error, not a metadata mismatch. Keep the evidence but do
+    # not report two contradictory failures for the same title card.
+    identity_pair_matches = bool(
+        expected_title and expected_artist
+        and any(_fold(row.get("text")) == expected_title for row in identity_rows)
+        and any(_fold(row.get("text")) == expected_artist for row in identity_rows)
+    )
     for row in observations:
         try:
             confidence = float(row.get("confidence") or 0)
@@ -76,7 +124,13 @@ def compare_ocr_observations(
             except (TypeError, ValueError, IndexError):
                 continue
             expected = str(segment.get("text", segment.get("t", ""))).strip()
-        title_card_match = kind == "title" and _title_card_matches(metadata, actual)
+        title_card_match = kind in {"title", "artist"} and _title_card_matches(metadata, actual)
+        if (
+            kind in {"title", "artist"}
+            and identity_pair_matches
+            and _fold(actual) in {expected_title, expected_artist}
+        ):
+            continue
         if expected and actual and _fold(actual) != _fold(expected) and not title_card_match:
             digest = hashlib.sha256(f"{code}|{seconds:.3f}|{actual}|{expected}".encode()).hexdigest()[:16]
             issues.append({

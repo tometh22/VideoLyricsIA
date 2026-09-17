@@ -6127,6 +6127,7 @@ export default function App() {
             sourceReference={currentReview.sourceReference || null}
             referenceUnavailable={!!currentReview.referenceUnavailable}
             requireLineReview={!!currentReview.campaignId}
+            preferApprovedVersion={!!currentReview.editingJobId}
             coverageWarning={currentReview.coverageWarning}
             transcriptionQuality={currentReview.transcriptionQuality}
             recoverySource={currentReview.recoverySource}

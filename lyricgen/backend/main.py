@@ -19992,14 +19992,11 @@ async def admin_create_delivery_from_job(
     now = datetime.now(timezone.utc)
 
     if existing:
-        # Contenido nuevo salvo que el fingerprint diga lo contrario. Una
-        # fila publicada antes de que existiera la columna no tiene con qué
-        # comparar: se la trata como reenvío para no anular una aprobación
-        # legítima de UMG por una migración.
-        content_changed = bool(
-            existing.published_render_fingerprint
-            and existing.published_render_fingerprint != fingerprint
-        )
+        # Filas actuales comparan el fingerprint. Las legacy sólo cuentan
+        # como contenido nuevo cuando el flujo real de edición dejó su marca
+        # stale: así no anulamos aprobaciones antiguas por la migración, pero
+        # tampoco escondemos Publicar después de corregirlas.
+        content_changed = delivery_freshness.needs_publish(job, existing)
         existing.label = label
         existing.file_types = delivery_file_types
         existing.added_by_user_id = added_by

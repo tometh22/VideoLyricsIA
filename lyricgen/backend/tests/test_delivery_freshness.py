@@ -219,6 +219,27 @@ def test_row_predating_the_column_is_not_reported_as_outdated():
     assert df.publication_state(job, delivery)["needs_publish"] is False
 
 
+def test_legacy_row_marked_by_a_real_edit_needs_publish():
+    """The stale marker is the only before/after evidence legacy rows have."""
+    job = FakeJob(edit_count=3)
+    delivery = FakeDelivery(
+        published_render_fingerprint=None,
+        stale_since=datetime.now(timezone.utc),
+        stale_reason=df.STALE_EDITING,
+    )
+    assert df.publication_state(job, delivery)["needs_publish"] is True
+
+
+def test_failed_legacy_edit_does_not_offer_publish():
+    job = FakeJob(edit_count=3)
+    delivery = FakeDelivery(
+        published_render_fingerprint=None,
+        stale_since=datetime.now(timezone.utc),
+        stale_reason=df.STALE_FAILED,
+    )
+    assert df.publication_state(job, delivery)["needs_publish"] is False
+
+
 def test_publication_state_reports_new_content_awaiting_the_client():
     job = FakeJob(s3_keys={"video": "t/j/lyric_video.mp4", "umg_master": "t/j/m.mov"})
     delivery = FakeDelivery(
