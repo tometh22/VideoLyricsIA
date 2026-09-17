@@ -5,7 +5,7 @@ import useChangeRequests from "./useChangeRequests";
 const mocks = vi.hoisted(() => ({ fetchJson: vi.fn(), flashError: vi.fn() }));
 vi.mock("../../AdminContext", () => ({ useAdmin: () => ({ flashError: mocks.flashError }) }));
 vi.mock("../../adminApi", () => ({ API: "", fetchJson: mocks.fetchJson }));
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); });
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.fetchJson.mockImplementation(async url => {
@@ -42,4 +42,21 @@ it("does not announce work when the server confirms no enqueued files", async ()
   const { result } = renderHook(() => useChangeRequests());
   await act(() => result.current.prepareProRes("job-85", 85));
   expect(result.current.crPublishNotice.tone).toBe("error");
+});
+it("announces a prepared master even when lyrics still await review and publication is not ready", async () => {
+  vi.useFakeTimers();
+  let pending = ["umg_master"];
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => url.startsWith("/admin/change-requests?")
+    ? Promise.resolve({ items: [{ id: 85, publication: {
+      job_status: "pending_review", prores_pending: pending, needs_publish: false,
+    } }] }) : previous(url, opts));
+  const { result } = renderHook(() => useChangeRequests());
+  await act(async () => {});
+  await act(() => result.current.prepareProRes("job-85", 85));
+  pending = [];
+  await act(() => vi.advanceTimersByTimeAsync(5000));
+  expect(result.current.crPublishNotice).toMatchObject({ requestId: 85, tone: "ok",
+    text: expect.stringContaining("Terminó la preparación") });
+  expect(result.current.crPublishNotice.text).toContain("no confirma que el pedido esté corregido");
 });
