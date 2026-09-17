@@ -7,6 +7,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useAdmin } from "../../AdminContext";
 import { API, fetchJson } from "../../adminApi";
 
+const ACTIVE_RENDER_STATUSES = new Set([
+  "queued", "processing", "rendering", "editing", "transcribed_pending",
+]);
+
+function publicationHasPendingWork(publication) {
+  return ACTIVE_RENDER_STATUSES.has(publication?.job_status)
+    || (publication?.prores_pending?.length || 0) > 0;
+}
+
 async function changeRequestIdempotencyKey(proposalId, baseRevision, operationIds) {
   const signature = `${proposalId}:${baseRevision}:${[...operationIds].sort().join(",")}`;
   if (globalThis.crypto?.subtle && typeof TextEncoder !== "undefined") {
@@ -52,9 +61,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       );
       const items = data.items || [];
       const nextActive = new Set(items
-        .filter((item) => [
-          "queued", "processing", "rendering", "editing", "transcribed_pending",
-        ].includes(item.publication?.job_status))
+        .filter((item) => publicationHasPendingWork(item.publication))
         .map((item) => item.id));
       const completed = [...activeRenderIdsRef.current].filter((id) => (
         !nextActive.has(id)
@@ -65,7 +72,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       if (completed.length) {
         setCrPublishNotice({
           tone: "ok",
-          text: "El render nuevo terminó. Abrí el video de la tarjeta y comprobá el fondo; Publicar actualización sigue siendo un paso manual.",
+          text: "Los archivos nuevos están listos. Revisá el video de la tarjeta; Publicar actualización sigue siendo un paso manual.",
         });
       }
       setCrPendingCount(data.pending_count || 0);
@@ -249,17 +256,17 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     return () => clearInterval(iv);
   }, []);
 
-  const hasActiveRender = changeRequests.some((item) => [
-    "queued", "processing", "rendering", "editing", "transcribed_pending",
-  ].includes(item.publication?.job_status));
+  const hasActiveWork = changeRequests.some((item) => (
+    publicationHasPendingWork(item.publication)
+  ));
   useEffect(() => {
-    if (!hasActiveRender) return undefined;
+    if (!hasActiveWork) return undefined;
     const iv = setInterval(() => {
       if (typeof document !== "undefined" && document.hidden) return;
       loadChangeRequests({ silent: true });
     }, 5000);
     return () => clearInterval(iv);
-  }, [hasActiveRender, loadChangeRequests]);
+  }, [hasActiveWork, loadChangeRequests]);
 
   const resolveChangeRequest = useCallback(async (id, note) => {
     setCrResolvingId(id);
