@@ -68,13 +68,13 @@ export function publicationStatus(publication) {
   if (prores.length) {
     return {
       tone: "wait",
-      title: "El master ProRes todavía es el corte anterior",
+      title: "Falta actualizar el archivo profesional (.mov)",
       detail:
-        "El MP4 ya está corregido. El master de broadcast se transcodifica " +
-        "aparte y todavía no terminó: publicar ahora entregaría un par " +
-        "desparejo. Tocá publicar para encolarlo y reintentá en un minuto.",
+        "El video de arriba ya tiene la corrección, pero el archivo de máxima " +
+        "calidad que descarga Universal todavía es la versión anterior. " +
+        "Actualizalo primero; cuando termine aparecerá Publicar actualización.",
       canPublish: true,
-      publishLabel: "Preparar master y publicar",
+      publishLabel: "Actualizar archivo profesional",
     };
   }
   if (publication.needs_publish) {
