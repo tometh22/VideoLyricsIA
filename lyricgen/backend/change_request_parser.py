@@ -13,7 +13,7 @@ import unicodedata
 from typing import Iterable
 
 
-SCHEMA_VERSION = "change-request-parser-v1"
+SCHEMA_VERSION = "change-request-parser-v2"
 
 _TIMECODE_RE = re.compile(
     r"(?<!\d)(?:(?P<hours>\d{1,2}):)?(?P<minutes>\d{1,2}):(?P<seconds>\d{2})(?!\d)"
@@ -33,6 +33,11 @@ _STRUCTURE_RE = re.compile(
     r"\b(unir|separar|dividir|juntar|frase\s+completa|misma\s+pantalla|"
     r"una\s+sola\s+(?:línea|linea)|dos\s+(?:líneas|lineas))\b",
     re.IGNORECASE,
+)
+_FULL_PHRASE_SCREEN_RE = re.compile(
+    r"\bfrases?\s+completas?\b.{0,60}\b(?:en\s+)?(?:una|1)\s+sola\s+pantalla\b|"
+    r"\bfrases?\s+completas?\b.{0,60}\bmisma\s+pantalla\b",
+    re.IGNORECASE | re.DOTALL,
 )
 _BACKGROUND_RE = re.compile(
     r"\b(fondo|background|prompt|escena|imagen|animaci[oó]n|personas?|logo)\b",
@@ -151,6 +156,33 @@ def _timecoded_chunks(comment: str) -> Iterable[tuple[float, str]]:
         yield parse_timecode(match), comment[match.start():end].strip()
 
 
+def _full_phrase_rows(comment: str) -> list[tuple[float, str, str]]:
+    """Extract ``timestamps + full phrase`` rows from UMG layout requests.
+
+    A line such as ``0:01 y 0:04: \"borracho y agresivo\"`` applies the same
+    exact phrase to both moments.  We only enable this shape when the comment
+    explicitly asks for complete phrases on one screen, so ordinary timestamp
+    corrections keep their existing text-replacement semantics.
+    """
+    if not _FULL_PHRASE_SCREEN_RE.search(comment):
+        return []
+    rows: list[tuple[float, str, str]] = []
+    for raw_line in comment.splitlines():
+        matches = list(_TIMECODE_RE.finditer(raw_line))
+        if not matches:
+            continue
+        payload = raw_line[matches[-1].end():].strip(" \t:;,_-–—")
+        quoted = [_clean_candidate(value) for value in _QUOTED_RE.findall(payload)]
+        payload = quoted[-1] if quoted else _clean_candidate(payload)
+        if not payload or _INSTRUCTION_PREFIX_RE.search(payload):
+            continue
+        if len(fold_text(payload).split()) > 40:
+            continue
+        for match in matches:
+            rows.append((parse_timecode(match), payload, raw_line[:600]))
+    return rows
+
+
 def parse_change_request(comment: str) -> dict:
     """Return conservative structured instructions from one free-text request."""
     comment = (comment or "").strip()
@@ -171,8 +203,21 @@ def parse_change_request(comment: str) -> dict:
         ))
 
     scope = "all_matching" if _REPEAT_RE.search(comment) else "single"
+    full_phrase_rows = _full_phrase_rows(comment)
+    for timecode, requested, excerpt in full_phrase_rows:
+        add(
+            kind="merge_phrase", source_excerpt=excerpt,
+            timecode_seconds=timecode, requested_text=requested,
+            scope="single", confidence="high",
+            reason="complete_phrase_on_one_screen",
+        )
+
     chunks = list(_timecoded_chunks(comment))
-    for timecode, chunk in chunks:
+    # A complete-phrase request is structural, not a request to overwrite one
+    # lyric segment with the whole phrase.  Parsing it a second time as a text
+    # replacement would create a misleading duplicate operation.
+    parse_regular_chunks = not full_phrase_rows
+    for timecode, chunk in chunks if parse_regular_chunks else []:
         quotes = [_clean_candidate(value) for value in _QUOTED_RE.findall(chunk)]
         quotes = [value for value in quotes if value]
         current, requested = _explicit_pair(chunk, quotes)
@@ -251,7 +296,7 @@ def parse_change_request(comment: str) -> dict:
             confidence="medium", reason="timing_requires_audio_review",
         )
     if _STRUCTURE_RE.search(comment) and not any(
-        row.kind == "structure_review" for row in instructions
+        row.kind in {"structure_review", "merge_phrase"} for row in instructions
     ):
         add(
             kind="structure_review", source_excerpt=comment[:600],
@@ -268,7 +313,7 @@ def parse_change_request(comment: str) -> dict:
         "instructions": [row.to_dict() for row in instructions],
         "instruction_count": len(instructions),
         "has_actionable_text": any(
-            row.kind in {"replace_text", "remove_terminal_period"}
+            row.kind in {"replace_text", "remove_terminal_period", "merge_phrase"}
             for row in instructions
         ),
     }

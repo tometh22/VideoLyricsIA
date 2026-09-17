@@ -129,6 +129,26 @@ describe("buildLyricsPreview", () => {
     expect(buildLyricsPreview(segments, operations, [])[1].resultText)
       .toBe("Padre Fahey");
   });
+
+  it("collapses an exact multi-segment phrase into one preview row", () => {
+    const segments = [
+      { _id: "a", start: 1, end: 2, text: "Borracho" },
+      { _id: "b", start: 2, end: 4, text: "y agresivo" },
+      { _id: "c", start: 4, end: 6, text: "Después" },
+    ];
+    const operations = [{
+      id: "merge-1", kind: "merge_phrase", status: "pending", applicable: true,
+      current_segments: segments.slice(0, 2),
+      proposed_segments: [{ _id: "a", start: 1, end: 4, text: "Borracho y agresivo" }],
+    }];
+    const preview = buildLyricsPreview(segments, operations, ["merge-1"]);
+    expect(preview).toHaveLength(2);
+    expect(preview[0]).toMatchObject({
+      currentText: "Borracho / y agresivo",
+      resultText: "Borracho y agresivo",
+      changed: true,
+    });
+  });
 });
 
 describe("ChangeRequestsPanel", () => {
@@ -268,6 +288,21 @@ describe("ChangeRequestsPanel", () => {
     expect(screen.getByText("Revisar timing en el editor")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Aplicar seleccionadas/ }))
       .not.toBeInTheDocument();
+  });
+
+  it("offers a direct background-editor action for visual requests", () => {
+    renderPanel({}, {
+      proposalEnabled: true,
+      proposalDetails: { 7: {
+        id: "proposal-bg", status: "needs_input", base_revision: 4,
+        operations: [{
+          id: "manual-bg", kind: "background_review", status: "pending",
+          applicable: false,
+        }],
+      } },
+    });
+    expect(screen.getByRole("link", { name: "Abrir editor de fondo" }))
+      .toHaveAttribute("href", "/videos/f7752c6feed4/edit-lyrics");
   });
 
   it("previews operator drafts in context and blocks apply until they are saved", () => {

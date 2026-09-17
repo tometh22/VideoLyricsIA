@@ -81,6 +81,69 @@ def test_parser_keeps_timing_and_structure_review_only():
     }
 
 
+def test_parser_extracts_complete_phrase_for_every_listed_timestamp():
+    parsed = parse_change_request(
+        '0:01 y 0:04: "borracho y agresivo"\n'
+        '0:42: Y en la damajuana no hay nada que beber\n\n'
+        'Revisar que las frases completas esten en 1 sola pantalla'
+    )
+    rows = [row for row in parsed["instructions"] if row["kind"] == "merge_phrase"]
+    assert [(row["timecode_seconds"], row["requested_text"]) for row in rows] == [
+        (1.0, "borracho y agresivo"),
+        (4.0, "borracho y agresivo"),
+        (42.0, "Y en la damajuana no hay nada que beber"),
+    ]
+    assert not any(row["kind"] == "replace_text" for row in parsed["instructions"])
+
+
+def test_complete_phrase_builds_exact_structural_merge_and_applies_it():
+    segments = [
+        segment(0.8, 1.8, "borracho"),
+        segment(1.8, 3.2, "y agresivo"),
+        segment(41.8, 43.0, "Y en la damajuana"),
+        segment(43.0, 45.2, "no hay nada que beber"),
+    ]
+    proposal = build_proposal(
+        comment=(
+            '0:01: "borracho y agresivo"\n'
+            '0:42: Y en la damajuana no hay nada que beber\n'
+            'Revisar que las frases completas esten en 1 sola pantalla'
+        ),
+        segments=segments,
+        base_revision=3,
+    )
+    applicable = [row for row in proposal["operations"] if row["applicable"]]
+    assert proposal["status"] == "ready"
+    assert [row["kind"] for row in applicable] == ["merge_phrase", "merge_phrase"]
+    assert [len(row["current_segments"]) for row in applicable] == [2, 2]
+
+    result, selected = apply_operations(
+        segments, proposal, [row["id"] for row in applicable],
+    )
+    assert [row["text"] for row in result] == [
+        "borracho y agresivo",
+        "Y en la damajuana no hay nada que beber",
+    ]
+    assert [(row["start"], row["end"]) for row in result] == [
+        (0.8, 3.2), (41.8, 45.2),
+    ]
+    assert all(row["automatic_apply_allowed"] is False for row in selected)
+
+
+def test_complete_phrase_stays_manual_when_fragments_do_not_match_exactly():
+    proposal = build_proposal(
+        comment=(
+            '0:42: Y en la damajuana no hay nada que beber\n'
+            'Revisar que las frases completas esten en 1 sola pantalla'
+        ),
+        segments=[segment(41.8, 44, "Otra frase")],
+        base_revision=1,
+    )
+    assert proposal["status"] == "needs_input"
+    assert proposal["applicable_count"] == 0
+    assert proposal["operations"][0]["reason"] == "complete_phrase_fragments_not_found"
+
+
 def test_build_and_apply_timestamped_text_proposal_preserves_timing_and_metadata():
     segments = [
         segment(10, 12, "Antes"),
