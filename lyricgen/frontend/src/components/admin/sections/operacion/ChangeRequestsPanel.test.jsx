@@ -74,6 +74,19 @@ function renderPanelItems(items, props = {}) {
 
 // El orden de prioridad es el orden en que los estados bloquean al operador.
 describe("publicationStatus", () => {
+  it("keeps analysis accessible beside the original request when a master is pending", () => {
+    const generate = vi.fn();
+    const publish = vi.fn();
+    renderPanel({ publication: { ...BASE_PUBLICATION, prores_pending: ["umg_master"] } }, {
+      proposalEnabled: true, generateProposal: generate, publishDeliveryUpdate: publish,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Analizar este pedido" }));
+    expect(generate).toHaveBeenCalledWith(7);
+    fireEvent.click(screen.getByRole("button", { name: "Analizar pedido" }));
+    expect(generate).toHaveBeenCalledTimes(2);
+    expect(publish).not.toHaveBeenCalled();
+    expect(screen.queryByText("El video de arriba ya tiene la corrección", { exact: false })).toBeNull();
+  });
   it("blocks publishing while the job is still re-rendering", () => {
     const status = publicationStatus({
       ...BASE_PUBLICATION, job_status: "editing", needs_publish: true,

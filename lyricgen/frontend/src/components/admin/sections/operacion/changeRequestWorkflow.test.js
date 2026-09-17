@@ -30,7 +30,7 @@ describe("change request workflow", () => {
     const items = [
       { id: 1, publication: {} },
       { id: 2, publication: { job_status: "processing" } },
-      { id: 3, publication: { needs_publish: true } },
+      { id: 3, proposal: { status: "applied" }, publication: { needs_publish: true } },
       { id: 4, resolved_at: "2026-09-17T00:00:00Z", publication: {} },
     ];
     expect(workflowCounts(items, {}, true)).toEqual({
@@ -41,6 +41,12 @@ describe("change request workflow", () => {
     });
     expect(workflowMatchesFilter(requestWorkflow(items[0]), "action")).toBe(true);
     expect(workflowMatchesFilter(requestWorkflow(items[3]), "action")).toBe(false);
+  });
+
+  it("does not mistake a pending master for a handled request without a proposal", () => {
+    expect(requestWorkflow({ publication: {
+      job_status: "done", prores_pending: ["umg_master"], needs_publish: true,
+    } }, null, true)).toMatchObject({ key: "analyze", activeStep: 0 });
   });
 
   it("classifies requests and searches delivery metadata plus comments", () => {
