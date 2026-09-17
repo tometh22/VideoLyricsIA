@@ -61,6 +61,52 @@ def test_ocr_accepts_artist_plus_title_title_card():
     assert issues == []
 
 
+def test_ocr_ignores_swapped_title_and_artist_labels():
+    observations = [
+        {"kind": "title", "seconds": 1.0, "text": "Catupecu Machu", "confidence": .99},
+        {"kind": "artist", "seconds": 1.0, "text": "Magia Veneno", "confidence": .99},
+    ]
+    assert compare_ocr_observations(
+        observations,
+        metadata={"artist": "Catupecu Machu", "title": "Magia Veneno"},
+        segments=[],
+    ) == []
+
+
+def test_runtime_uses_visible_value_when_ocr_swaps_identity_kinds(tmp_path, monkeypatch):
+    asset = tmp_path / "video.mp4"
+    asset.write_bytes(b"encoded")
+    monkeypatch.setenv("DELIVERY_QC_MODE", "observe")
+    monkeypatch.setattr(
+        "delivery_qc_runtime.inspect_delivery_media",
+        lambda *_args, **_kwargs: {
+            "probe": {"duration": 2.0, "video": {"fps": 30}, "audio_streams": 1},
+            "issues": [], "abstentions": [],
+        },
+    )
+    observations = [
+        {"kind": "title", "seconds": 1.0, "text": "Catupecu Machu", "confidence": .99},
+        {"kind": "artist", "seconds": 1.0, "text": "Magia Veneno", "confidence": .99},
+    ]
+    monkeypatch.setattr(
+        "delivery_qc_runtime.inspect_rendered_text",
+        lambda *_args, **_kwargs: {
+            "observations": observations,
+            "issues": [], "abstentions": [],
+        },
+    )
+    job = SimpleNamespace(
+        artist="Catupecu Machu", song_title="Magia Veneno", filename="tema.wav",
+        umg_spec=None, segments_revision=1, edit_count=0,
+        transcription_quality={},
+    )
+    report = build_runtime_report(job=job, video_path=str(asset), segments=[])
+    assert not any(
+        row["code"] in {"METADATA_TITLE_MISMATCH", "METADATA_ARTIST_MISMATCH"}
+        for row in report["issues"]
+    )
+
+
 def test_enforce_blocks_open_findings_but_observe_never_blocks():
     report = {"status": "COMPLETE", "issues": [{"issue_id": "x", "severity": "FAIL", "status": "OPEN"}]}
     assert approval_gate(report, "observe")["can_approve"] is True
@@ -224,6 +270,26 @@ def test_runtime_report_exposes_passed_checks_and_manual_review_state(tmp_path, 
     assert report["decision"] == "REVIEW"
     assert report["summary"]["fail_count"] == 0
     assert report["approval"]["reason"] == "review_recommended"
+
+
+def test_runtime_report_does_not_duplicate_title_metadata_check(tmp_path, monkeypatch):
+    asset = tmp_path / "video.mp4"
+    asset.write_bytes(b"encoded")
+    monkeypatch.setenv("DELIVERY_QC_MODE", "observe")
+    monkeypatch.setattr(
+        "delivery_qc_runtime.inspect_delivery_media",
+        lambda *_args, **_kwargs: {"probe": {}, "issues": [], "abstentions": []},
+    )
+    monkeypatch.setattr(
+        "delivery_qc_runtime.inspect_rendered_text",
+        lambda *_args, **_kwargs: {"observations": [], "issues": [], "abstentions": []},
+    )
+    job = SimpleNamespace(
+        artist="Artist", song_title="Title", filename="tema.wav", umg_spec=None,
+        segments_revision=1, edit_count=0, transcription_quality={},
+    )
+    report = build_runtime_report(job=job, video_path=str(asset), segments=[])
+    assert [row["label"] for row in report["checks"]].count("Título coincide con metadata") == 1
 
 
 def test_runtime_report_blocks_only_an_objective_detector_failure(tmp_path, monkeypatch):

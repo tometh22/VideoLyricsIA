@@ -29,6 +29,7 @@ describe("DeliveryQCPanel", () => {
           { check_id: "media_container", label: "Archivo de video válido", status: "PASS" },
           { check_id: "umg_black_bars", label: "Sin franjas negras", status: "REVIEW" },
           { check_id: "ocr_title", label: "Texto visible del title card", status: "NOT_RUN" },
+          { check_id: "umg_title_metadata", label: "Título coincide con metadata", status: "REVIEW", detector: "mandatory_signed_reviewer_checklist" },
         ],
         check_summary: { pass: 1 },
       },
@@ -38,6 +39,21 @@ describe("DeliveryQCPanel", () => {
     expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("Pasó");
     expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("Revisión");
     expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("No ejecutado");
+    expect(screen.getByTestId("delivery-qc-checks")).not.toHaveTextContent("Título coincide con metadata");
+  });
+
+  it("mantiene la revisión informativa y deja editar aunque un reporte legacy diga BLOCK", () => {
+    const onOpenEditor = vi.fn();
+    const legacyBlockedJob = {
+      ...job,
+      delivery_qc: { ...job.delivery_qc, decision: "BLOCK", mode: "observe" },
+    };
+    render(<DeliveryQCPanel job={legacyBlockedJob} onSeek={vi.fn()} onJobUpdate={vi.fn()} onOpenEditor={onOpenEditor} />);
+    expect(screen.getByText("Revisión informativa")).toBeTruthy();
+    expect(screen.getByText("Estos checks son informativos por ahora y no bloquean la edición ni el avance del video.")).toBeTruthy();
+    fireEvent.click(screen.getByText("Editar cambios"));
+    expect(onOpenEditor).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Bloqueado")).toBeNull();
   });
 
   it("permite actualizar un reporte desactualizado desde el video renderizado", async () => {

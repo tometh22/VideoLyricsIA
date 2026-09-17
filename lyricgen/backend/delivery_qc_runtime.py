@@ -14,7 +14,7 @@ import os
 from typing import Any, Mapping, Sequence
 
 from delivery_media_qc import inspect_delivery_media
-from delivery_ocr import inspect_rendered_text
+from delivery_ocr import inspect_rendered_text, select_identity_observation
 from delivery_preflight import build_delivery_preflight, frame_timecode
 
 
@@ -257,6 +257,12 @@ def _build_check_results(
         })
 
     for code, summary, description in MANDATORY_REVIEW_CHECKS:
+        # The title metadata check is already represented by the evidence-based
+        # ``metadata_title`` result above. Keeping the generic UMG reminder in
+        # this checklist produced two rows with the same label and confused
+        # reviewers about which one was authoritative.
+        if code == "UMG_TITLE_METADATA":
+            continue
         matched = [row for row in rows if row.get("code") == code]
         # These are always present for batch reports.  Their REVIEW status is
         # intentional: they are awaiting an operator's visual attestation,
@@ -362,8 +368,13 @@ def build_runtime_report(
         video_path, metadata={"artist": job.artist, "title": job.song_title},
         segments=segments, ocr_callback=ocr_callback,
     )
-    title_ocr = next((row for row in ocr.get("observations") or [] if row.get("kind") == "title" and row.get("text")), None)
-    artist_ocr = next((row for row in ocr.get("observations") or [] if row.get("kind") == "artist" and row.get("text")), None)
+    ocr_observations = ocr.get("observations") or []
+    title_ocr = select_identity_observation(
+        ocr_observations, metadata={"title": job.song_title, "artist": job.artist}, field="title",
+    )
+    artist_ocr = select_identity_observation(
+        ocr_observations, metadata={"title": job.song_title, "artist": job.artist}, field="artist",
+    )
     fps = float((media.get("probe") or {}).get("video", {}).get("fps") or spec.get("fps") or 30)
     base = build_delivery_preflight(
         metadata={"artist": job.artist, "title": job.song_title},

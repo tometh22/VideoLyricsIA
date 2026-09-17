@@ -237,6 +237,22 @@ def test_reference_free_preflight_flags_card_ending_before_last_word_timestamp()
     assert issue["expected"] == "2.400"
 
 
+def test_repeated_card_endings_are_one_issue_with_many_timecodes():
+    report = build_delivery_preflight(
+        metadata={"artist": "A", "title": "T"},
+        segments=[
+            {"start": 0, "end": 1, "text": "Una", "words": [{"start": 0, "end": 1.4, "word": "Una"}]},
+            {"start": 2, "end": 3, "text": "Dos", "words": [{"start": 2, "end": 3.5, "word": "Dos"}]},
+            {"start": 4, "end": 5, "text": "Tres", "words": [{"start": 4, "end": 5.7, "word": "Tres"}]},
+        ],
+        asset={"rendered_title": "T", "rendered_artist": "A", "duration": 6},
+    )
+    issues = [row for row in report["issues"] if row["code"] == "LYRIC_END_BEFORE_WORD_END"]
+    assert len(issues) == 1
+    assert issues[0]["occurrence_count"] == 3
+    assert len(issues[0]["timecodes"]) == 3
+
+
 def test_reference_health_blocks_wrong_or_incomplete_catalogue_text():
     report = build_delivery_preflight(
         metadata={"title": "Wrong catalogue"},

@@ -2327,7 +2327,13 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           <div className="flex flex-wrap gap-3">
             <button
               onClick={handleApprove}
-              disabled={approving || job.delivery_qc?.approval?.blocked === true}
+              // Delivery QC is informational until a report explicitly opts
+              // into enforce mode. Legacy persisted reports can carry a stale
+              // approval.blocked flag, which must not trap the editor.
+              disabled={approving || (
+                job.delivery_qc?.mode === "enforce"
+                && job.delivery_qc?.approval?.blocked === true
+              )}
               className="inline-flex items-center justify-center h-12 px-6 rounded-button text-sm font-semibold text-white bg-accent hover:bg-accent/90 disabled:opacity-50 transition-colors"
             >
               {approving ? (
