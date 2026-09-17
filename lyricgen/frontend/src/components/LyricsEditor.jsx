@@ -1382,6 +1382,9 @@ export default function LyricsEditor({
     let cancelled = false;
     const hydrate = async () => {
       const latestApproved = preferApprovedVersion
+        // Approval history is not the editable source of truth. A newer
+        // saved correction must survive reopening, even before approval.
+        && durableEditor.document.latest_approved_version?.revision === durableEditor.document.revision
         && Array.isArray(durableEditor.document.latest_approved_version?.segments)
         && durableEditor.document.latest_approved_version.segments.length > 0
         ? durableEditor.document.latest_approved_version
@@ -4389,6 +4392,7 @@ export default function LyricsEditor({
       {draftRecovery && createPortal(<LocalDraftRecovery recovery={draftRecovery}
         revision={draftRecovery.serverRevision ?? durableEditor.document?.revision}
         remote={preferApprovedVersion
+          && durableEditor.document?.latest_approved_version?.revision === durableEditor.document?.revision
           ? (durableEditor.document?.latest_approved_version?.segments
             || durableEditor.document?.segments || [])
           : (durableEditor.document?.segments || [])}
