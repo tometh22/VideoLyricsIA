@@ -1420,11 +1420,18 @@ export default function LyricsEditor({
             }
           }
         } catch {
-          const message = phase === "read" ? "El navegador no nos permitió acceder a ese borrador."
-            : phase === "parse" ? "Ese borrador quedó incompleto y no se puede leer."
-              : phase === "remove" ? "El borrador coincide con la versión guardada, pero cambió en otra pestaña o el navegador no permitió retirarlo."
-                : "El borrador no es compatible con la versión actual del editor.";
-          setDraftRecovery({ kind: "unreadable", raw, message });
+          // An unreadable/obsolete browser draft is not a choice the operator
+          // can meaningfully resolve: there is nothing safe to preview or
+          // recover. Quarantine its exact bytes for support/recovery and open
+          // the intact Genly revision. Only two valid, different versions are
+          // allowed to interrupt the editor with the recovery dialog.
+          if (typeof raw === "string") {
+            try {
+              localStorage.setItem(`${draftKey}:incompatible`, raw);
+              // Do not remove a newer value written by another tab.
+              if (localStorage.getItem(draftKey) === raw) localStorage.removeItem(draftKey);
+            } catch { /* best effort; never block the server version */ }
+          }
         }
       }
       if (cancelled) return;

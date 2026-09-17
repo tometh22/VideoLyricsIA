@@ -421,24 +421,16 @@ describe("local recovery is separate from server save status", () => {
   const key = `genly_editor_draft:team-a:42:${JOB}`;
   const mutations = (request) => request.mock.calls.filter(([, options]) => options?.method === "PATCH");
 
-  it("explains an unreadable browser draft and lets the operator use the saved version", async () => {
+  it("quarantines an unreadable browser draft and opens the saved version without blocking", async () => {
     const raw = '{"segments":';
     localStorage.setItem(key, raw);
     const request = makeRequest();
     renderEditor(request);
-    const dialog = await screen.findByRole("dialog", { name: "Encontramos un borrador anterior" });
-    expect(dialog).toHaveTextContent("revisión 5");
-    expect(dialog).toHaveTextContent("está intacta");
-    expect(dialog).toHaveTextContent("borrador automático de una edición anterior");
-    expect(dialog).toHaveTextContent("quedó incompleto");
-    expect(screen.queryByText("No se pudo guardar")).not.toBeInTheDocument();
-    expect(localStorage.getItem(key)).toBe(raw);
-    expect(mutations(request)).toHaveLength(0);
-
-    fireEvent.click(screen.getByRole("button", { name: "Usar versión de Genly" }));
-    await waitFor(() => expect(dialog).not.toBeInTheDocument());
-    expect(localStorage.getItem(key)).toBeNull();
     expect(await screen.findByDisplayValue("versión equipo")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Encontramos un borrador anterior" })).not.toBeInTheDocument();
+    expect(screen.queryByText("No se pudo guardar")).not.toBeInTheDocument();
+    expect(localStorage.getItem(key)).toBeNull();
+    expect(localStorage.getItem(`${key}:incompatible`)).toBe(raw);
     expect(mutations(request)).toHaveLength(0);
   });
 
@@ -481,7 +473,7 @@ describe("local recovery is separate from server save status", () => {
     expect(mutations(request)).toHaveLength(0);
   });
 
-  it.each([0, 0.005])("preserves a %s-second copy when normalization would make it equal to the server", async (end) => {
+  it.each([0, 0.005])("quarantines a %s-second incompatible copy and opens the server version", async (end) => {
     const raw = JSON.stringify({ segments: [{ ...SERVER[0], end }], base_revision: 4 });
     localStorage.setItem(key, raw);
     const fallback = makeRequest();
@@ -494,18 +486,20 @@ describe("local recovery is separate from server save status", () => {
       return fallback(path, options);
     });
     renderEditor(request);
-    expect(await screen.findByText(/no es compatible con la versión actual/)).toBeInTheDocument();
-    expect(localStorage.getItem(key)).toBe(raw);
-    expect(screen.getByRole("button", { name: "Usar versión de Genly" })).toBeInTheDocument();
+    await waitFor(() => expect(localStorage.getItem(key)).toBeNull());
+    expect(screen.queryByRole("dialog", { name: "Encontramos un borrador anterior" })).not.toBeInTheDocument();
+    expect(localStorage.getItem(`${key}:incompatible`)).toBe(raw);
     expect(mutations(request)).toHaveLength(0);
   });
 
-  it("does not clamp invalid timing and then delete a seemingly equivalent copy", async () => {
+  it("does not clamp invalid timing into the document before quarantining it", async () => {
     const raw = JSON.stringify({ segments: [{ ...SERVER[0], start: null }] });
     localStorage.setItem(key, raw);
     const request = makeRequest(); renderEditor(request);
-    expect(await screen.findByText(/no es compatible con la versión actual/)).toBeInTheDocument();
-    expect(localStorage.getItem(key)).toBe(raw);
+    expect(await screen.findByDisplayValue("versión equipo")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Encontramos un borrador anterior" })).not.toBeInTheDocument();
+    expect(localStorage.getItem(key)).toBeNull();
+    expect(localStorage.getItem(`${key}:incompatible`)).toBe(raw);
     expect(mutations(request)).toHaveLength(0);
   });
 });
