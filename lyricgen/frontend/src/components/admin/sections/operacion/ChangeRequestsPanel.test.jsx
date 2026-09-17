@@ -9,7 +9,10 @@ vi.mock("../../../../i18n", () => ({
   useI18n: () => ({ t: (key) => key }),
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  window.history.replaceState({}, "", "/admin");
+});
 
 const BASE_PUBLICATION = {
   revision: 1,
@@ -43,12 +46,17 @@ const REQUEST = {
 
 function renderPanel(overrides = {}, props = {}) {
   const item = { ...REQUEST, ...overrides };
+  renderPanelItems([item], props);
+  return item;
+}
+
+function renderPanelItems(items, props = {}) {
   render(
     <ChangeRequestsPanel
-      changeRequests={[item]}
+      changeRequests={items}
       crStatusFilter="pending"
       setCrStatusFilter={() => {}}
-      crPendingCount={1}
+      crPendingCount={items.filter((item) => !item.resolved_at).length}
       crResolvedCount={0}
       crLoading={false}
       crResolvingId={null}
@@ -61,7 +69,6 @@ function renderPanel(overrides = {}, props = {}) {
       {...props}
     />,
   );
-  return item;
 }
 
 // El orden de prioridad es el orden en que los estados bloquean al operador.
@@ -169,13 +176,69 @@ describe("buildLyricsPreview", () => {
 });
 
 describe("ChangeRequestsPanel", () => {
-  it("offers the two steps that actually answer the request", () => {
+  it("uses a compact queue and preserves the selected request in the URL", () => {
+    const second = {
+      ...REQUEST,
+      id: 8,
+      comment: "Cambiar el fondo a una calle al amanecer",
+      delivery: { ...REQUEST.delivery, song: "Otra canción", artist: "Otra banda" },
+    };
+    renderPanelItems([REQUEST, second]);
+
+    expect(screen.getByRole("heading", { name: REQUEST.delivery.song })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: /Otra canción/ }));
+    expect(screen.getByRole("heading", { name: "Otra canción" })).toBeInTheDocument();
+    expect(window.location.search).toContain("change_request_id=8");
+    expect(screen.getByRole("option", { name: /Otra canción/ })).toHaveAttribute(
+      "aria-selected", "true",
+    );
+  });
+
+  it("deep-links a request and confirms a render submitted from the editor", () => {
+    const second = {
+      ...REQUEST,
+      id: 8,
+      delivery: { ...REQUEST.delivery, song: "Pedido retornado" },
+    };
+    window.history.replaceState({}, "", "/admin?section=cambios&change_request_id=8&render_submitted=1");
+    renderPanelItems([REQUEST, second]);
+
+    expect(screen.getByRole("heading", { name: "Pedido retornado" })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(/render corregido fue enviado/i);
+    expect(window.location.search).not.toContain("render_submitted");
+  });
+
+  it("searches the queue and supports J/K navigation", () => {
+    const second = {
+      ...REQUEST,
+      id: 8,
+      comment: "Cambiar fondo",
+      delivery: { ...REQUEST.delivery, song: "Tema nocturno", artist: "Los Test" },
+    };
+    renderPanelItems([REQUEST, second]);
+    fireEvent.keyDown(window, { key: "j" });
+    expect(screen.getByRole("heading", { name: "Tema nocturno" })).toBeInTheDocument();
+
+    const search = screen.getByRole("searchbox", { name: "Buscar pedidos" });
+    fireEvent.change(search, { target: { value: "San Rosendo" } });
+    expect(screen.queryByRole("option", { name: /Tema nocturno/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: REQUEST.delivery.song })).toBeInTheDocument();
+  });
+
+  it("keeps the editor available while publishing is the primary action", () => {
     renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true } });
     expect(screen.getByText("Editar letra")).toHaveAttribute(
-      "href", "/videos/f7752c6feed4/edit-lyrics",
+      "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
     );
     expect(screen.getByRole("button", { name: "Publicar actualización" }))
       .toBeEnabled();
+  });
+
+  it("keeps the request context when the editor is the primary action", () => {
+    renderPanel();
+    expect(screen.getByRole("link", { name: "Editar letra" })).toHaveAttribute(
+      "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
+    );
   });
 
   it("publishes to the portal the delivery belongs to", () => {
@@ -339,7 +402,9 @@ describe("ChangeRequestsPanel", () => {
       } },
     });
     expect(screen.getByRole("link", { name: "Abrir editor de fondo" }))
-      .toHaveAttribute("href", "/videos/f7752c6feed4/edit-lyrics");
+      .toHaveAttribute(
+        "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
+      );
   });
 
   it("shows an editable visual prompt and regenerates without publishing", () => {
@@ -383,7 +448,7 @@ describe("ChangeRequestsPanel", () => {
       .not.toBeInTheDocument();
   });
 
-  it("previews operator drafts in context and blocks apply until they are saved", () => {
+  it("previews operator drafts, autosaves them and blocks apply until confirmed", async () => {
     const adjust = vi.fn();
     const segment = { _id: "target", start: 13, end: 15, text: "Texto viejo" };
     renderPanel({}, {
@@ -406,18 +471,21 @@ describe("ChangeRequestsPanel", () => {
       adjustProposal: adjust,
     });
 
-    fireEvent.change(screen.getByDisplayValue("Texto correcto"), {
+    const input = screen.getByDisplayValue("Texto correcto");
+    fireEvent.change(input, {
       target: { value: "Texto corregido por operador" },
     });
     const preview = screen.getByLabelText("Vista previa de la letra resultante");
     expect(preview).toHaveTextContent("Texto corregido por operador");
-    expect(screen.getByText(/Guardá los ajustes de texto/)).toBeInTheDocument();
+    expect(screen.getByText(/Estamos guardando tus ajustes/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Aplicar seleccionadas (1)" }))
       .toBeDisabled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Guardar" }));
-    expect(adjust).toHaveBeenCalledWith(
-      7, "proposal-3", "op-1", "Texto corregido por operador", 4,
-    );
+    fireEvent.blur(input);
+    await waitFor(() => {
+      expect(adjust).toHaveBeenCalledWith(
+        7, "proposal-3", "op-1", "Texto corregido por operador", 4,
+      );
+    });
   });
 });

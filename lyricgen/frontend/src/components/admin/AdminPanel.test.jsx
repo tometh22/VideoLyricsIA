@@ -36,12 +36,15 @@ describe("AdminPanel · navegación de cambios", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    window.history.replaceState({}, "", "/admin");
   });
 
   it("abre Cambios UMG como pestaña dedicada y de ancho completo", async () => {
     render(<AdminPanel onBack={() => {}} />);
 
-    await waitFor(() => expect(screen.getByText("11")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Cambios UMG/ })).toHaveTextContent("11"),
+    );
     fireEvent.click(screen.getByRole("button", { name: /Cambios UMG/ }));
 
     await waitFor(() => {
@@ -50,12 +53,25 @@ describe("AdminPanel · navegación de cambios", () => {
       ).toBeInTheDocument();
       expect(screen.getByTestId("change-requests-fullscreen")).toBeInTheDocument();
       expect(screen.getByTestId("admin-shell")).toHaveClass("max-w-none");
-      expect(screen.getByText("11 pendientes")).toBeInTheDocument();
-      expect(screen.getByText("73 resueltos")).toBeInTheDocument();
+      expect(screen.getByText("pendientes").parentElement).toHaveTextContent("11");
+      expect(screen.getByText("resueltos").parentElement).toHaveTextContent("73");
     });
     expect(
-      screen.getByText(/Revisá el pedido, la letra y los prompts sugeridos/),
+      screen.getByText(/Atendé cada pedido de punta a punta/),
     ).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Pipeline en vivo" })).toBe(null);
+  });
+
+  it("abre Cambios UMG directamente desde el retorno del editor", async () => {
+    window.history.replaceState(
+      {}, "", "/admin?section=cambios&change_request_id=77&render_submitted=1",
+    );
+    render(<AdminPanel onBack={() => {}} />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Cambios UMG" })).toBeInTheDocument();
+      expect(screen.getByTestId("admin-shell")).toHaveClass("max-w-none");
+    });
     expect(screen.queryByRole("heading", { name: "Pipeline en vivo" })).toBe(null);
   });
 });

@@ -1,8 +1,9 @@
 // Admin Panel v2 — shell.
 //
 // Layout: [sub-sidebar de 5 secciones] | [contenido de la sección activa]
-// La navegación es estado local (una sola ruta /admin, sin query params —
-// herramienta interna de 2 operadores, no hace falta deep-linking).
+// La navegación vive en una sola ruta /admin. El estado visual sigue siendo
+// local, pero la sección activa se refleja en el query string para permitir
+// retornos directos desde el editor y enlaces a un pedido puntual.
 //
 // El estado transversal (banner de error, stats globales) vive en
 // AdminContext; todo lo demás es local de cada sección.
@@ -20,8 +21,16 @@ import GestionSection from "./sections/gestion/GestionSection";
 
 function AdminShell({ onBack, isSuperAdmin }) {
   const { adminError, setAdminError, stats } = useAdmin();
-  const [section, setSection] = useState("ahora");
-  const [subTab, setSubTab] = useState(defaultSubTab("ahora"));
+  const initialSection = (() => {
+    if (typeof window === "undefined") return "ahora";
+    const requested = new URLSearchParams(window.location.search).get("section");
+    if (requested === "insights" && !isSuperAdmin) return "ahora";
+    return ["ahora", "cambios", "rendimiento", "insights", "gestion"].includes(requested)
+      ? requested
+      : "ahora";
+  })();
+  const [section, setSection] = useState(initialSection);
+  const [subTab, setSubTab] = useState(defaultSubTab(initialSection));
   const [pendingChangeRequests, setPendingChangeRequests] = useState(0);
 
   // El badge debe ser visible antes de entrar a la pantalla de Cambios.
@@ -50,6 +59,15 @@ function AdminShell({ onBack, isSuperAdmin }) {
   const navigate = (nextSection, nextSubTab) => {
     setSection(nextSection);
     setSubTab(nextSubTab);
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.set("section", nextSection);
+      if (nextSection !== "cambios") {
+        url.searchParams.delete("change_request_id");
+        url.searchParams.delete("render_submitted");
+      }
+      window.history.replaceState(window.history.state, "", url);
+    }
   };
 
   // Badges vivos del sidebar: cosas que necesitan atención del operador.

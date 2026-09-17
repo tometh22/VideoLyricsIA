@@ -1,7 +1,5 @@
 import { useEffect } from "react";
 
-import SectionHeader from "../../layout/SectionHeader";
-
 import ChangeRequestsPanel from "./ChangeRequestsPanel";
 import useChangeRequests from "./useChangeRequests";
 
@@ -18,38 +16,38 @@ export default function ChangeRequestsSection({ initialPendingCount, onPendingCo
       aria-labelledby="change-requests-title"
       data-testid="change-requests-fullscreen"
     >
-      <div className="flex items-start justify-between gap-4 flex-wrap">
+      <div className="flex items-start justify-between gap-4 flex-wrap border-b border-white/[0.06] pb-5">
         <div>
-          <h2 id="change-requests-title" className="text-2xl font-bold text-white">
+          <div className="flex items-center gap-2">
+            <span className="h-2.5 w-2.5 rounded-full bg-brand shadow-[0_0_18px_rgba(124,58,237,0.75)]" />
+            <p className="text-label font-semibold uppercase tracking-[0.18em] text-brand-light">
+              Operación
+            </p>
+          </div>
+          <h2 id="change-requests-title" className="mt-2 text-3xl font-bold tracking-tight text-white">
             Cambios UMG
           </h2>
-          <p className="text-ui text-gray-400 mt-1">
-            Revisá el pedido, la letra y los prompts sugeridos; mirá cada render antes de publicarlo.
+          <p className="text-ui text-gray-400 mt-1 max-w-2xl">
+            Atendé cada pedido de punta a punta: interpretar, corregir, revisar el corte y publicar.
           </p>
         </div>
-        <div className="flex items-center gap-2 text-caption">
-          <span className="rounded-full bg-amber-500/15 text-amber-200 ring-1 ring-amber-400/25 px-3 py-1.5 font-semibold">
-            {changes.crPendingCount} pendientes
-          </span>
-          <span className="rounded-full bg-emerald-500/10 text-emerald-200 ring-1 ring-emerald-400/20 px-3 py-1.5">
-            {changes.crResolvedCount} resueltos
-          </span>
+        <div className="flex items-stretch gap-2 text-caption">
+          <div className="min-w-[6.5rem] rounded-xl bg-amber-500/[0.08] px-3 py-2 ring-1 ring-amber-400/15">
+            <p className="text-xl font-bold text-amber-200">{changes.crPendingCount}</p>
+            <p className="text-label text-amber-100/60">pendientes</p>
+          </div>
+          <div className="min-w-[6.5rem] rounded-xl bg-emerald-500/[0.06] px-3 py-2 ring-1 ring-emerald-400/15">
+            <p className="text-xl font-bold text-emerald-200">{changes.crResolvedCount}</p>
+            <p className="text-label text-emerald-100/60">resueltos</p>
+          </div>
         </div>
       </div>
 
-      <div className="rounded-card bg-brand/[0.06] ring-1 ring-brand/20 px-4 py-3">
-        <p className="text-caption text-gray-200">
-          Cada pedido se revisa completo en esta pantalla. Aplicar una propuesta modifica la
-          letra del editor; regenerar un fondo crea un corte nuevo. Ninguna acción publica ni
-          cierra el pedido hasta que revises el video y uses Publicar actualización.
-        </p>
-      </div>
-
-      <div className="w-full min-w-0">
-        <SectionHeader
-          title="Pedidos del portal"
-          subtitle="UMG Argentina y UMG Chile · ordenados por fecha de envío"
-        />
+      <div className="w-full min-w-0 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-label text-gray-500">
+          <span>UMG Argentina y UMG Chile · más recientes primero</span>
+          <span className="hidden sm:inline">J/K navega · / busca · ⌘↵ ejecuta la acción recomendada</span>
+        </div>
         <ChangeRequestsPanel
           changeRequests={changes.changeRequests}
           crStatusFilter={changes.crStatusFilter}
