@@ -7,6 +7,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Keep request analysis accessible beside the original comment even when a
+  professional master is pending; do not mark unanalysed request steps complete.
 - Keep UMG preview playback running when polling renews signed media URLs;
   reload only for a new object/render and expose an explicit media retry.
 - Prepare configured ProRes masters with their saved format without invoking
