@@ -80,6 +80,10 @@ import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { backgroundRegenExtras } from "./lib/editWizardDiff";
 import { buildEditReview, buildEditCurrent, resolveEditSubmission, backgroundEditBlockedReason, buildCampaignEditApproval } from "./lib/editSubmission";
+import {
+  changeRequestAdminPath,
+  parseChangeRequestEditContext,
+} from "./lib/changeRequestEditFlow";
 import { normalizeMovementCode } from "./lib/catalogCodes";
 import { buildVariantPayload } from "./lib/variantPayload";
 import { prefetchKey } from "./lib/prefetchKey";
@@ -809,7 +813,15 @@ function JobDetailRoute({ fetchHistory }) {
 // recarga la ruta para que el editor monte solo. Para otros estados
 // no-editable (queued, processing, error), muestra el mensaje estático
 // de antes con un botón "Volver al video".
-function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
+function EditingNotEditablePanel({
+  jobId,
+  jobStatus,
+  isRendering,
+  onBack,
+  onComplete,
+  returnsToChangeRequest = false,
+  t,
+}) {
   const [polledStatus, setPolledStatus] = useState(jobStatus);
   const [polledProgress, setPolledProgress] = useState(null);
   const [polledStep, setPolledStep] = useState(null);
@@ -827,8 +839,10 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
         setPolledStatus(newStatus);
         if (typeof data.progress === "number") setPolledProgress(data.progress);
         if (typeof data.current_step === "string") setPolledStep(data.current_step);
-        // Transition a un estado editable → recargá la página para que
-        // EditLyricsRoute corra su bootstrap de nuevo y monte el editor.
+        // Transition a un estado editable.  En una corrección UMG el trabajo
+        // ya terminó: volver a montar el editor hace parecer que el render no
+        // se aplicó.  Ese flujo vuelve al pedido; una edición común conserva
+        // el reload histórico.
         const editable = ["done", "pending_review", "rejected", "lyrics_approved"].includes(newStatus);
         if (editable) {
           // [editor-reload-loop] capture (P0 UMG Chile 2026-06-16). This reload
@@ -850,7 +864,8 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
               });
             }
           } catch { /* sessionStorage unavailable — proceed with the reload */ }
-          window.location.reload();
+          if (onComplete) onComplete(data);
+          else window.location.reload();
         }
       } catch {
         // Silent — siguiente tick reintenta.
@@ -859,7 +874,7 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
     const iv = setInterval(tick, 5000);
     tick(); // primero tick inmediato
     return () => { cancelled = true; clearInterval(iv); };
-  }, [jobId, isRendering]);
+  }, [jobId, isRendering, jobStatus, onComplete]);
 
   if (isRendering) {
     const pct = Math.max(3, Math.min(100, polledProgress || 0));
@@ -872,8 +887,10 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
           {t("edit.editing_in_progress_title") || "El video se está re-renderizando"}
         </h2>
         <p className="text-sm text-gray-500 mb-4">
-          {t("edit.editing_in_progress_subtitle") ||
-            "Estamos aplicando los cambios del edit anterior. Volveremos a abrir el editor automáticamente cuando termine."}
+          {returnsToChangeRequest
+            ? "Estamos aplicando la corrección. Cuando termine volverás al pedido para verificar el resultado y publicarlo."
+            : (t("edit.editing_in_progress_subtitle") ||
+              "Estamos aplicando los cambios del edit anterior. Volveremos a abrir el editor automáticamente cuando termine.")}
         </p>
         <div className="mt-3 h-1.5 rounded-full bg-surface-3/60 overflow-hidden max-w-xs mx-auto">
           <div
@@ -885,7 +902,7 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
           {polledStep || "video"} · {polledProgress || 0}%
         </p>
         <button onClick={onBack} className="btn-secondary mt-6">
-          {t("detail.back") || "Volver al video"}
+          {returnsToChangeRequest ? "Volver al pedido" : (t("detail.back") || "Volver al video")}
         </button>
       </div>
     );
@@ -945,6 +962,19 @@ function EditLyricsRoute({
 }) {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const changeRequestContext = useMemo(
+    () => parseChangeRequestEditContext(location.search),
+    [location.search],
+  );
+  const handleRenderingComplete = useCallback(() => {
+    const requestPath = changeRequestAdminPath(changeRequestContext, "completed");
+    if (requestPath) {
+      navigate(requestPath, { replace: true });
+      return;
+    }
+    window.location.reload();
+  }, [changeRequestContext, navigate]);
   // status: "loading" | "ready" | "no_segments" | "not_editable" |
   //         "not_found" | "error". Loading hasta que tanto el job como
   // las URLs firmadas aterricen; ready hace montar el wizardScreen.
@@ -1092,6 +1122,10 @@ function EditLyricsRoute({
       // preview without bg image. Operator can edit text/timing immediately.
       setCurrentReview({
         editingJobId: id,
+        // Preserva el origen UMG a través del autosave y del render.  Es una
+        // intención explícita y acotada: permite re-renderizar la revisión
+        // que la propuesta ya guardó aunque no exista un diff local.
+        changeRequestContext,
         // editMode + baseline son la API del flow edit-wizard. App.jsx los
         // lee en handleApproveLyrics para emitir POSTs /edit con el diff
         // contra baseline. UploadZone los lee para mostrar UIs de edición
@@ -1323,7 +1357,7 @@ function EditLyricsRoute({
     };
     // setCurrentReview is stable via useState; only re-bootstrap on id change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
+  }, [id, changeRequestContext]);
 
   // Cleanup en unmount: si el operador navega lejos sin aprobar (back-button,
   // sidebar, etc.), borrar el editingJobId del currentReview para que un
@@ -1402,7 +1436,11 @@ function EditLyricsRoute({
         jobId={id}
         jobStatus={state.jobStatus}
         isRendering={isRendering}
-        onBack={() => navigate(`/videos/${id}`)}
+        onBack={() => navigate(
+          changeRequestAdminPath(changeRequestContext) || `/videos/${id}`,
+        )}
+        onComplete={handleRenderingComplete}
+        returnsToChangeRequest={!!changeRequestContext}
         t={t}
       />
     );
@@ -3963,6 +4001,7 @@ export default function App() {
           current,
           jobStatus: r.jobStatus,
           scenePlan: r.scenePlan,
+          forceLyricsRerender: !!r.changeRequestContext,
         });
 
         if (submission.presentBuckets.length === 0) {
@@ -4021,6 +4060,10 @@ export default function App() {
           dropped: submission.willDrop,
         });
         const payload = submission.payload;
+        if (r.changeRequestContext) {
+          payload.change_request_id = r.changeRequestContext.changeRequestId;
+          payload.change_request_proposal_id = r.changeRequestContext.proposalId;
+        }
         // Regen de fondo IA (Veo/Imagen + validación): paridad con la tarjeta
         // "Regenerar fondo" que se plegó al wizard (unificación #973). Motor y
         // política de validación son MODIFICADORES de un regen, no campos del
@@ -4134,9 +4177,18 @@ export default function App() {
         }
 
         const doPost = async (body) => {
+          const requestRevision = Number.isInteger(body.editor_revision)
+            ? body.editor_revision
+            : (Number.isInteger(body.base_revision) ? body.base_revision : r.segmentsRevision);
+          const umgIdempotencyKey = r.changeRequestContext
+            ? `umg-change:${r.changeRequestContext.changeRequestId}:${r.changeRequestContext.proposalId}:${requestRevision}`
+            : null;
           const res = await authFetch(`${API}/edit/${editedJobId}`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              ...(umgIdempotencyKey ? { "Idempotency-Key": umgIdempotencyKey } : {}),
+            },
             body: JSON.stringify(body),
           });
           let data = {};
@@ -4168,7 +4220,11 @@ export default function App() {
             wizardPersistence.clear();
             segmentsStore.evict(reviewStoreKey(r));
             segmentsStore.evict(r.transcribeJobId);
-            navigate(`/videos/${editedJobId}`, { replace: true });
+            navigate(
+              changeRequestAdminPath(r.changeRequestContext, "submitted")
+                || `/videos/${editedJobId}`,
+              { replace: true },
+            );
             return { ok: true, duplicate: true };
           }
           const conflict = isEditorRevisionConflict(res, data);
@@ -4197,7 +4253,11 @@ export default function App() {
         // la entrada leakea. Se evicta también transcribeJobId por las dudas.
         segmentsStore.evict(reviewStoreKey(r));
         segmentsStore.evict(r.transcribeJobId);
-        navigate(`/videos/${editedJobId}`, { replace: true });
+        navigate(
+          changeRequestAdminPath(r.changeRequestContext, "submitted")
+            || `/videos/${editedJobId}`,
+          { replace: true },
+        );
         return { ok: true, approvedEditorVersionId: data?.approved_editor_version_id || null };
       } finally {
         editSubmitLockRef.current = false;
@@ -5395,6 +5455,7 @@ export default function App() {
         }),
         jobStatus: r.jobStatus,
         scenePlan: r.scenePlan,
+        forceLyricsRerender: !!r.changeRequestContext,
       });
     } catch {
       // El resumen es informativo: si algo falla, el wizard sigue usable y el
