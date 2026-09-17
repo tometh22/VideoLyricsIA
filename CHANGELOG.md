@@ -7,6 +7,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Isolate the remaining processing-job reaper contract test from the advisory
+  lock held by lifespan daemons in the full suite; retain row-state assertions.
 - Keep request analysis accessible beside the original comment even when a
   professional master is pending; do not mark unanalysed request steps complete.
 - Keep UMG preview playback running when polling renews signed media URLs;
