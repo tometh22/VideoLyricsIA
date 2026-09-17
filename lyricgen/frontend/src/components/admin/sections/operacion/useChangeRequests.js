@@ -323,6 +323,14 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     }
   }, [flashError, loadChangeRequests]);
 
+  const handleProResConfigured = useCallback(async () => {
+    setCrPublishNotice({
+      tone: "wait",
+      text: "Formato guardado. Se está regenerando el archivo profesional (.mov) con la corrección; el portal sigue mostrando la versión anterior.",
+    });
+    await loadChangeRequests({ silent: true });
+  }, [loadChangeRequests]);
+
   const reopenChangeRequest = useCallback(async (id) => {
     setCrResolvingId(id);
     try {
@@ -359,5 +367,6 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     crPublishNotice,
     setCrPublishNotice,
     publishDeliveryUpdate,
+    handleProResConfigured,
   };
 }

@@ -676,6 +676,7 @@ def test_change_request_submit_and_admin_lists_it(
     assert item["delivery"]["artist"] == "Test Artist"
     assert item["delivery"]["job_id"] == approved_job.job_id
     assert item["resolved_at"] is None
+    assert item["publication"]["prores_configured"] is True
 
     # Resolver lo saca de "pending" y lo pasa a "resolved".
     res = client.post(f"/admin/change-requests/{cr_id}/resolve",
