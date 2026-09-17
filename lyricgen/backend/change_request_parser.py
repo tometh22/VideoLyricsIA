@@ -13,7 +13,7 @@ import unicodedata
 from typing import Iterable
 
 
-SCHEMA_VERSION = "change-request-parser-v2"
+SCHEMA_VERSION = "change-request-parser-v4"
 
 _TIMECODE_RE = re.compile(
     r"(?<!\d)(?:(?P<hours>\d{1,2}):)?(?P<minutes>\d{1,2}):(?P<seconds>\d{2})(?!\d)"
@@ -100,10 +100,29 @@ def _clean_candidate(value: str | None) -> str | None:
 def _bare_timecoded_requested_text(chunk: str) -> str | None:
     """Extract the portal's common ``timestamp + corrected line`` format."""
     payload = _TIMECODE_RE.sub("", chunk, count=1).strip(" \t\r\n:;,_-–—")
-    payload = payload.splitlines()[0].strip() if payload else ""
-    if not payload or _INSTRUCTION_PREFIX_RE.search(payload):
+    if not payload:
         return None
-    payload = _TRAILING_REVIEW_NOTE_RE.sub("", payload).strip()
+    # UMG often writes one requested on-screen phrase over two or three
+    # physical lines, with a timestamp only on the first line. `_timecoded_
+    # chunks` already bounded this payload at the next timestamp; keeping only
+    # splitlines()[0] silently dropped the rest of the client's correction.
+    # Join continuation lines as spaces (segment text is single-line) and stop
+    # at a blank paragraph or an unmistakable standalone instruction.
+    lines: list[str] = []
+    for raw_line in payload.splitlines():
+        line = raw_line.strip(" \t\r:;,_-–—")
+        if not line:
+            if lines:
+                break
+            continue
+        if _INSTRUCTION_PREFIX_RE.search(line):
+            if not lines:
+                return None
+            break
+        line = _TRAILING_REVIEW_NOTE_RE.sub("", line).strip()
+        if line:
+            lines.append(line)
+    payload = " ".join(lines).strip()
     if not payload or len(fold_text(payload).split()) > 40:
         return None
     return _clean_candidate(payload)

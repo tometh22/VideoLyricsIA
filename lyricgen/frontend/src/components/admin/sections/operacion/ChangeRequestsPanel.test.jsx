@@ -5,6 +5,10 @@ import ChangeRequestsPanel, {
   publicationStatus,
 } from "./ChangeRequestsPanel";
 
+vi.mock("../../../../i18n", () => ({
+  useI18n: () => ({ t: (key) => key }),
+}));
+
 afterEach(cleanup);
 
 const BASE_PUBLICATION = {
@@ -16,6 +20,7 @@ const BASE_PUBLICATION = {
   stale_reason: null,
   needs_publish: false,
   prores_pending: [],
+  prores_configured: true,
   awaiting_review: false,
   job_status: "done",
 };
@@ -75,15 +80,27 @@ describe("publicationStatus", () => {
     const status = publicationStatus({
       ...BASE_PUBLICATION, needs_publish: true, prores_pending: ["umg_master"],
     });
-    expect(status.title).toMatch(/ProRes todavía es el corte anterior/);
+    expect(status.title).toMatch(/archivo profesional/);
     // Publicar SÍ se ofrece: encola el master y el backend contesta 202.
     expect(status.canPublish).toBe(true);
-    expect(status.publishLabel).toMatch(/Preparar master/);
+    expect(status.publishLabel).toMatch(/Actualizar archivo profesional/);
+  });
+
+  it("asks for the missing ProRes format on a legacy delivery", () => {
+    const status = publicationStatus({
+      ...BASE_PUBLICATION,
+      needs_publish: true,
+      prores_pending: ["umg_master"],
+      prores_configured: false,
+    });
+    expect(status.needsProResSetup).toBe(true);
+    expect(status.publishLabel).toMatch(/Elegir formato/);
   });
 
   it("surfaces a corrected render that was never published", () => {
     const status = publicationStatus({ ...BASE_PUBLICATION, needs_publish: true });
-    expect(status.title).toMatch(/todavía entrega el corte anterior/);
+    expect(status.title).toMatch(/render nuevo está listo para revisar/i);
+    expect(status.detail).toMatch(/Abrí el video/);
     expect(status.canPublish).toBe(true);
   });
 
@@ -169,6 +186,26 @@ describe("ChangeRequestsPanel", () => {
     );
     screen.getByRole("button", { name: "Publicar actualización" }).click();
     expect(publish).toHaveBeenCalledWith("f7752c6feed4", "chile", 7);
+  });
+
+  it("opens the format selector instead of attempting an impossible legacy publish", async () => {
+    const publish = vi.fn();
+    renderPanel(
+      {
+        publication: {
+          ...BASE_PUBLICATION,
+          needs_publish: true,
+          prores_pending: ["umg_master"],
+          prores_configured: false,
+        },
+      },
+      { publishDeliveryUpdate: publish },
+    );
+    screen.getByRole("button", { name: "Elegir formato y actualizar .mov" }).click();
+    expect(await screen.findByRole("dialog", {
+      name: "Configurar y actualizar el archivo profesional",
+    })).toBeInTheDocument();
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it("keeps manual resolution available but names it for what it is", () => {
@@ -303,6 +340,47 @@ describe("ChangeRequestsPanel", () => {
     });
     expect(screen.getByRole("link", { name: "Abrir editor de fondo" }))
       .toHaveAttribute("href", "/videos/f7752c6feed4/edit-lyrics");
+  });
+
+  it("shows an editable visual prompt and regenerates without publishing", () => {
+    const regenerate = vi.fn();
+    renderPanel({}, {
+      proposalEnabled: true,
+      proposalDetails: { 7: {
+        id: "proposal-bg", status: "ready", base_revision: 4,
+        operations: [{
+          id: "visual-bg", kind: "background_review", status: "pending",
+          applicable: false,
+          visual_action: "regenerate_background",
+          regeneration_supported: true,
+          current_prompt: "Calle nocturna con autos",
+          suggested_prompt: "Nueva calle nocturna, sin armas, sin texto ni logos.",
+          background_mode: "veo",
+        }],
+      } },
+      regenerateBackground: regenerate,
+    });
+
+    expect(screen.getByText("Prompt usado hasta ahora")).toBeInTheDocument();
+    const prompt = screen.getByLabelText("Prompt sugerido para el fondo");
+    expect(prompt).toHaveValue("Nueva calle nocturna, sin armas, sin texto ni logos.");
+    fireEvent.change(prompt, {
+      target: { value: "Barrio al amanecer, sin armas, sin texto ni logos." },
+    });
+    fireEvent.click(screen.getByRole("button", {
+      name: "Regenerar fondo con este prompt",
+    }));
+
+    expect(regenerate).toHaveBeenCalledWith(
+      7,
+      "proposal-bg",
+      "visual-bg",
+      "f7752c6feed4",
+      "Barrio al amanecer, sin armas, sin texto ni logos.",
+      "veo",
+    );
+    expect(screen.queryByRole("button", { name: /Aplicar seleccionadas/ }))
+      .not.toBeInTheDocument();
   });
 
   it("previews operator drafts in context and blocks apply until they are saved", () => {

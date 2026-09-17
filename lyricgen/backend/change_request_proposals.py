@@ -12,7 +12,7 @@ from editor import normalize_segments, segments_content_hash
 from transcription_quality import segments_hash
 
 
-SCHEMA_VERSION = "change-request-proposal-v1"
+SCHEMA_VERSION = "change-request-proposal-v2"
 MANUAL_KINDS = {
     "manual_review", "timing_review", "structure_review",
     "background_review", "audio_review",
@@ -258,14 +258,92 @@ def _manual_operation(instruction: dict) -> dict:
     }
 
 
+def _background_prompt_operation(
+    instruction: dict, *, comment: str, background_context: dict | None,
+) -> dict:
+    """Build an editable visual brief without spending a model call.
+
+    The existing prompt/concept is useful context, but the client's request is
+    repeated verbatim as an explicit requirement so exclusions such as "sin
+    armas" cannot get lost in a generic creative rewrite.  The operator still
+    reviews and can edit this prompt before starting the paid regeneration.
+    """
+    context = dict(background_context or {})
+    current_prompt = str(context.get("background_hint") or "").strip()
+    concept = str(context.get("concept") or "").strip()
+    artist = str(context.get("artist") or "").strip()
+    song_title = str(context.get("song_title") or "").strip()
+    genre = str(context.get("genre") or "").strip()
+    client_request = " ".join(str(comment or "").strip().split())
+
+    parts: list[str] = []
+    if current_prompt:
+        parts.append(
+            "Crear una composición diferente. Usar sólo como referencia de "
+            f"tono y estilo, no de objetos: {current_prompt}."
+        )
+    elif concept:
+        parts.append(f"Conservar la dirección visual general: {concept}.")
+    elif artist or song_title or genre:
+        identity = " — ".join(value for value in (artist, song_title) if value)
+        if genre:
+            identity = f"{identity} ({genre})" if identity else genre
+        parts.append(f"Crear una nueva composición visual para {identity}.")
+    else:
+        parts.append("Crear una composición visual completamente nueva para el lyric video.")
+    if client_request:
+        parts.append(f"Requisito obligatorio del cliente: {client_request}.")
+    parts.append(
+        "No incluir texto, subtítulos, logos ni marcas de agua en el fondo. "
+        "Cumplir literalmente todas las exclusiones indicadas por el cliente."
+    )
+    suggested_prompt = " ".join(parts)[:4000]
+    scene_plan = context.get("scene_plan")
+    multi_scene = bool(
+        isinstance(scene_plan, dict) and scene_plan.get("scenes")
+    )
+    mode = str(context.get("background_mode") or "").strip()
+    if mode not in {"veo", "imagen"}:
+        mode = "veo"
+    warnings = ["human_video_review_required_before_publish"]
+    if multi_scene:
+        warnings.append("multi_scene_background_requires_scene_editor")
+    return {
+        "id": _operation_id(
+            instruction.get("id"), "background_regeneration", client_request,
+            current_prompt, concept,
+        ),
+        "group_key": instruction.get("id"),
+        "kind": "background_review",
+        "status": "pending",
+        "applicable": False,
+        "visual_action": "regenerate_background",
+        "regeneration_supported": not multi_scene,
+        "automatic_apply_allowed": False,
+        "confidence": instruction.get("confidence") or "medium",
+        "scope": "single",
+        "source_excerpt": instruction.get("source_excerpt"),
+        "reason": "background_prompt_requires_operator_confirmation",
+        "current_prompt": current_prompt,
+        "suggested_prompt": suggested_prompt,
+        "background_mode": mode,
+        "force_content_validation": True,
+        "current_segments": [],
+        "proposed_segments": [],
+        "warnings": warnings,
+    }
+
+
 def build_proposal(
     *, comment: str, segments: Iterable[dict], base_revision: int,
     audio_revision: int = 0, audio_sha256: str = "",
+    background_context: dict | None = None,
 ) -> dict:
     current = normalize_segments([dict(row) for row in segments])
     parsed = parse_change_request(comment)
     operations: list[dict] = []
     unresolved: list[dict] = []
+    visual_operations: list[dict] = []
     structural_targets: set[str] = set()
     for instruction in parsed["instructions"]:
         kind = instruction.get("kind")
@@ -311,13 +389,23 @@ def build_proposal(
                     "reason": "no_terminal_period_found",
                     "warnings": ["no_terminal_period_found"],
                 })
+        elif kind == "background_review":
+            visual_operations.append(_background_prompt_operation(
+                instruction,
+                comment=comment,
+                background_context=background_context,
+            ))
         else:
             unresolved.append(_manual_operation(instruction))
 
     applicable_count = len(operations)
-    if applicable_count and unresolved:
+    visual_count = len(visual_operations)
+    actionable_count = applicable_count + sum(
+        bool(row.get("regeneration_supported")) for row in visual_operations
+    )
+    if actionable_count and unresolved:
         status = "partial"
-    elif applicable_count:
+    elif actionable_count:
         status = "ready"
     else:
         status = "needs_input"
@@ -331,9 +419,10 @@ def build_proposal(
         "segments_content_hash": segments_content_hash(current),
         "audio_revision": int(audio_revision or 0),
         "audio_sha256": str(audio_sha256 or ""),
-        "operations": [*operations, *unresolved],
-        "operation_count": len(operations) + len(unresolved),
+        "operations": [*operations, *visual_operations, *unresolved],
+        "operation_count": len(operations) + visual_count + len(unresolved),
         "applicable_count": applicable_count,
+        "visual_action_count": visual_count,
         "unresolved_count": len(unresolved),
     }
 

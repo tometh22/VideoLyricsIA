@@ -26,6 +26,7 @@ import { fmtDate, fmtAgo } from "../../adminApi";
 import FilterBar from "../../primitives/FilterBar";
 import EmptyState from "../../primitives/EmptyState";
 import TableSkeleton from "../../primitives/TableSkeleton";
+import EnableProResModal from "../../../EnableProResModal";
 
 const PORTAL_LABELS = { argentina: "UMG Argentina", chile: "UMG Chile" };
 
@@ -66,24 +67,36 @@ export function publicationStatus(publication) {
     };
   }
   if (prores.length) {
+    if (publication.prores_configured === false) {
+      return {
+        tone: "wait",
+        title: "Hay que elegir el formato del archivo profesional",
+        detail:
+          "Esta entrega vieja perdió la configuración de resolución, cuadros por segundo y perfil. " +
+          "Elegilos una vez para regenerar el .mov con la corrección.",
+        canPublish: true,
+        publishLabel: "Elegir formato y actualizar .mov",
+        needsProResSetup: true,
+      };
+    }
     return {
       tone: "wait",
-      title: "El master ProRes todavía es el corte anterior",
+      title: "Falta actualizar el archivo profesional (.mov)",
       detail:
-        "El MP4 ya está corregido. El master de broadcast se transcodifica " +
-        "aparte y todavía no terminó: publicar ahora entregaría un par " +
-        "desparejo. Tocá publicar para encolarlo y reintentá en un minuto.",
+        "El video de arriba ya tiene la corrección, pero el archivo de máxima " +
+        "calidad que descarga Universal todavía es la versión anterior. " +
+        "Actualizalo primero; cuando termine aparecerá Publicar actualización.",
       canPublish: true,
-      publishLabel: "Preparar master y publicar",
+      publishLabel: "Actualizar archivo profesional",
     };
   }
   if (publication.needs_publish) {
     return {
       tone: "warn",
-      title: "El portal todavía entrega el corte anterior",
+      title: "El render nuevo está listo para revisar",
       detail:
-        "El video se re-renderizó después de la última publicación. " +
-        "Publicá la actualización para que el cliente la vea como versión nueva.",
+        "Abrí el video de esta tarjeta y comprobá el cambio. El portal sigue " +
+        "entregando el corte anterior hasta que publiques la actualización.",
       canPublish: true,
       publishLabel: "Publicar actualización",
     };
@@ -143,9 +156,12 @@ export default function ChangeRequestsPanel({
   adjustProposal = () => {},
   applyProposal = () => {},
   dismissProposal = () => {},
+  regenerateBackground = () => {},
+  onProResConfigured = () => {},
 }) {
   // Draft local del input de "respuesta" por CR. Clave = id del CR.
   const [drafts, setDrafts] = useState({});
+  const [proResSetup, setProResSetup] = useState(null);
   const setDraft = (id, val) => setDrafts((d) => ({ ...d, [id]: val }));
 
   const filterOptions = [
@@ -213,13 +229,22 @@ export default function ChangeRequestsPanel({
               publishing={crPublishingId === item.id}
               onResolve={() => resolveChangeRequest(item.id, drafts[item.id])}
               onReopen={() => reopenChangeRequest(item.id)}
-              onPublish={() =>
+              onPublish={() => {
+                const status = publicationStatus(item.publication);
+                if (status.needsProResSetup) {
+                  setProResSetup({
+                    jobId: item.delivery?.job_id,
+                    requestId: item.id,
+                    frameSize: item.delivery?.frame_size,
+                  });
+                  return;
+                }
                 publishDeliveryUpdate(
                   item.delivery?.job_id,
                   item.delivery?.portal_id,
                   item.id,
-                )
-              }
+                );
+              }}
               proposalEnabled={proposalEnabled}
               proposalApplyEnabled={proposalApplyEnabled}
               proposalBusy={proposalBusyId === item.id}
@@ -235,9 +260,31 @@ export default function ChangeRequestsPanel({
                 applyProposal(item.id, proposalId, operationIds, baseRevision)
               }
               onDismissProposal={(proposalId) => dismissProposal(item.id, proposalId)}
+              onRegenerateBackground={(proposalId, operationId, prompt, backgroundMode) =>
+                regenerateBackground(
+                  item.id, proposalId, operationId, item.delivery?.job_id,
+                  prompt, backgroundMode,
+                )
+              }
             />
           ))}
         </div>
+      )}
+
+      {proResSetup && (
+        <EnableProResModal
+          jobId={proResSetup.jobId}
+          initialFrameSize={proResSetup.frameSize}
+          title="Configurar y actualizar el archivo profesional"
+          description="Elegí el formato que requiere Universal. Vamos a regenerar el .mov con el video corregido; todavía no se publicará en el portal."
+          submitLabel="Guardar formato y actualizar .mov"
+          onClose={() => setProResSetup(null)}
+          onSuccess={(data) => {
+            const setup = proResSetup;
+            setProResSetup(null);
+            onProResConfigured(setup.requestId, data);
+          }}
+        />
       )}
     </div>
   );
@@ -248,7 +295,7 @@ function ChangeRequestCard({
   onResolve, onReopen, onPublish,
   proposalEnabled, proposalApplyEnabled, proposalBusy, proposal,
   onGenerateProposal, onLoadProposal, onAdjustProposal, onApplyProposal,
-  onDismissProposal,
+  onDismissProposal, onRegenerateBackground,
 }) {
   const d = item.delivery || {};
   const isResolved = !!item.resolved_at;
@@ -358,6 +405,7 @@ function ChangeRequestCard({
           onAdjust={onAdjustProposal}
           onApply={onApplyProposal}
           onDismiss={onDismissProposal}
+          onRegenerateBackground={onRegenerateBackground}
         />
       )}
 
@@ -622,7 +670,7 @@ function LyricsProposalPreview({
 
 function ChangeRequestProposal({
   summary, proposal, requestComment, busy, applyEnabled, jobId,
-  onGenerate, onLoad, onAdjust, onApply, onDismiss,
+  onGenerate, onLoad, onAdjust, onApply, onDismiss, onRegenerateBackground,
 }) {
   const operations = proposal?.operations || [];
   const applicable = operations.filter(
@@ -630,6 +678,7 @@ function ChangeRequestProposal({
   );
   const [selected, setSelected] = useState([]);
   const [textDrafts, setTextDrafts] = useState({});
+  const [backgroundDrafts, setBackgroundDrafts] = useState({});
 
   useEffect(() => {
     setSelected(applicable.map((operation) => operation.id));
@@ -637,6 +686,9 @@ function ChangeRequestProposal({
       operation.id,
       operation.proposed_segments?.[0]?.text || "",
     ])));
+    setBackgroundDrafts(Object.fromEntries(operations
+      .filter((operation) => operation.visual_action === "regenerate_background")
+      .map((operation) => [operation.id, operation.suggested_prompt || ""])));
   }, [proposal?.id, proposal?.updated_at]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const hasUnsavedDrafts = applicable.some((operation) => (
@@ -677,7 +729,9 @@ function ChangeRequestProposal({
             {PROPOSAL_LABELS[status] || status}
           </p>
           <p className="text-label text-gray-400">
-            {summary.applicable_count || 0} cambio(s) aplicable(s)
+            {summary.visual_action_count
+              ? `${summary.visual_action_count} fondo(s) listo(s) para regenerar`
+              : `${summary.applicable_count || 0} cambio(s) aplicable(s)`}
           </p>
         </div>
         <button
@@ -730,6 +784,88 @@ function ChangeRequestProposal({
         const proposedText = textDrafts[operation.id]
           ?? operation.proposed_segments?.[0]?.text ?? "";
         if (!operation.applicable) {
+          if (operation.visual_action === "regenerate_background") {
+            const backgroundPrompt = backgroundDrafts[operation.id]
+              ?? operation.suggested_prompt ?? "";
+            const supported = operation.regeneration_supported !== false;
+            return (
+              <div
+                key={operation.id}
+                className="rounded-button bg-sky-500/10 ring-1 ring-sky-400/25 p-3 space-y-3"
+              >
+                <div>
+                  <p className="text-caption text-sky-100 font-semibold">
+                    Fondo nuevo sugerido
+                  </p>
+                  <p className="text-label text-sky-100/70 mt-1">
+                    Revisá y ajustá el prompt. Regenerar inicia un render, pero no publica ni cierra el pedido.
+                  </p>
+                </div>
+                {operation.current_prompt && (
+                  <div className="rounded-button bg-black/20 p-2 ring-1 ring-white/[0.05]">
+                    <p className="text-label uppercase tracking-wider text-gray-500 mb-1">
+                      Prompt usado hasta ahora
+                    </p>
+                    <p className="text-label text-gray-300 whitespace-pre-wrap">
+                      {operation.current_prompt}
+                    </p>
+                  </div>
+                )}
+                <label className="block">
+                  <span className="text-label text-gray-300">Prompt para rehacer el fondo</span>
+                  <textarea
+                    aria-label="Prompt sugerido para el fondo"
+                    value={backgroundPrompt}
+                    onChange={(event) => setBackgroundDrafts((current) => ({
+                      ...current, [operation.id]: event.target.value,
+                    }))}
+                    maxLength={4000}
+                    rows={6}
+                    className="mt-1 w-full bg-surface-3/60 ring-1 ring-white/[0.08] focus:ring-sky-400/40 focus:outline-none rounded-button px-3 py-2 text-caption text-white leading-relaxed"
+                  />
+                </label>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <p className="text-label text-gray-400">
+                    {operation.background_mode === "imagen"
+                      ? "Modo actual: Imagen animada"
+                      : "Modo actual: Video IA"}
+                    {" · validación de contenido obligatoria"}
+                  </p>
+                  {supported ? (
+                    <button
+                      type="button"
+                      onClick={() => onRegenerateBackground(
+                        proposal.id,
+                        operation.id,
+                        backgroundPrompt,
+                        operation.background_mode,
+                      )}
+                      disabled={busy || !backgroundPrompt.trim()}
+                      className="bg-sky-500 hover:bg-sky-400 text-white text-caption font-semibold px-3 py-2 rounded-button disabled:opacity-40"
+                    >
+                      {busy ? "Iniciando…" : "Regenerar fondo con este prompt"}
+                    </button>
+                  ) : (
+                    <div>
+                      <p className="text-label text-amber-200">
+                        Este video usa varias escenas; el cambio debe hacerse escena por escena.
+                      </p>
+                      {editorUrl && (
+                        <a
+                          href={editorUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex mt-2 bg-white/[0.08] hover:bg-white/[0.14] text-white text-label font-medium px-2.5 py-1.5 rounded-button"
+                        >
+                          Abrir editor de escenas
+                        </a>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          }
           return (
             <div key={operation.id} className="rounded-button bg-amber-500/10 ring-1 ring-amber-400/20 p-2">
               <p className="text-caption text-amber-200">
@@ -828,7 +964,7 @@ function ChangeRequestProposal({
       )}
 
       <div className="flex flex-wrap gap-2">
-        {(status === "ready" || status === "partial") && (
+        {(status === "ready" || status === "partial") && applicable.length > 0 && (
           <button
             type="button"
             onClick={() => onApply(proposal.id, selected, proposal.base_revision)}

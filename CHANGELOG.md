@@ -3,6 +3,34 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.54] - 2026-09-16
+
+### Added
+
+- Let operators regenerate visual backgrounds directly from a UMG change
+  request, with an editable prompt and explicit preview before starting the
+  existing re-render flow.
+- Let legacy UMG deliveries restore their missing ProRes configuration from
+  the change-request card, then prepare the professional master and refresh
+  publication status automatically.
+
+### Changed
+
+- Parse multi-line UMG instructions as one reviewable request and preserve
+  continuation text instead of dropping it after the first timestamp.
+- Make delivery preflight findings concise and non-blocking unless an actual
+  enforced approval gate fails.
+
+### Fixed
+
+- Always open post-render lyric edits from the latest approved revision, even
+  when a newer unapproved autosave exists on the server.
+- Archive incompatible browser drafts without blocking the editor behind a
+  technical recovery dialog.
+- Enable publishing corrected legacy deliveries after a real re-render; the
+  new publication advances the revision, clears the old client approval and
+  resolves the associated request. Failed renders remain blocked.
+
 ## [1.1.53] - 2026-09-16
 
 ### Added

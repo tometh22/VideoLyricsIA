@@ -16915,13 +16915,21 @@ async def request_edit(
                 ),
             )
 
+    _is_admin = current_user.get("role") == "admin"
     # Status gate. Lyrics and metadata edits accept a wider set of
     # terminal-ish states so users can fix typos/timing on videos that
     # already finished rendering (done, in approval queue, or even
-    # rejected) without having to re-upload the MP3. typography/background
-    # stay strict — they're billed as "edits in the review loop" and only
-    # make sense while the reviewer is still deciding.
-    if body.edit_type in ("lyrics", "metadata"):
+    # rejected) without having to re-upload the MP3. Typography and regular
+    # users' background edits stay strict; platform admins can regenerate a
+    # shipped UMG background as part of a reviewed change request.
+    # Platform admins may also regenerate a background on an already shipped
+    # UMG job from the change-request screen. It remains an explicit paid
+    # action and still passes every storage, scene, content-validation and
+    # publication-freshness guard in this handler.
+    _terminal_edit = body.edit_type in ("lyrics", "metadata") or (
+        _is_admin and body.edit_type == "background"
+    )
+    if _terminal_edit:
         allowed = ("done", "pending_review", "rejected")
         if job.status not in allowed:
             raise HTTPException(
@@ -16989,7 +16997,6 @@ async def request_edit(
     # for "fix the tilde" would frustrate operators who already spent
     # their slots on typography/background/lyrics. AuditLog still records
     # the metadata edit for traceability (`metadata_only=True`).
-    _is_admin = current_user.get("role") == "admin"
     _metadata_only = body.edit_type == "metadata"
     # background_library tampoco consume slot (mismo mecanismo que metadata):
     # el cap de 3 existe para acotar gasto Veo (~$0.90/regen); el swap a un
@@ -17894,17 +17901,28 @@ async def enable_prores_for_job(
     ))
     db.commit()
 
-    # Encola ambos masters. enqueue_prores_prewarm es best-effort: si el
-    # tenant tiene la cola enterprise saturada hace skip (el lazy path
-    # del /download los va a generar bajo demanda igual).
+    # Encola ambos masters como acción explícita. A diferencia del prewarm
+    # automático del pipeline, no se permite un "ok" sin trabajo encolado:
+    # la pantalla depende de esta respuesta para empezar a esperar el .mov.
     enqueued = []
     try:
         for file_type in ("umg_master", "umg_short"):
-            rq_id = enqueue_prores_prewarm(job_id, file_type)
+            # Este endpoint nace de una acción explícita del operador. Debe
+            # atravesar el flag/backpressure de prewarm opcional igual que el
+            # botón de publicar; de otro modo puede responder "queued" sin
+            # haber encolado nada y dejar la pantalla esperando para siempre.
+            rq_id = enqueue_prores_prewarm(job_id, file_type, force=True)
             if rq_id:
                 enqueued.append(file_type)
     except Exception as e:  # pragma: no cover
         logger.warning("[PRORES] enable-prores prewarm enqueue failed: %s", e)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No se pudo iniciar la actualización del archivo profesional. "
+                "Probá de nuevo en un momento."
+            ),
+        ) from e
 
     return {
         "ok": True,
@@ -20847,7 +20865,10 @@ async def admin_list_change_requests(
         for u in (db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else [])
     }
     proposals_by_request = {}
+    current_change_request_parser_version = None
     if _change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED") and crs:
+        from change_request_parser import SCHEMA_VERSION
+        current_change_request_parser_version = SCHEMA_VERSION
         proposal_rows = (
             db.query(ChangeRequestProposal)
             .filter(ChangeRequestProposal.change_request_id.in_([cr.id for cr in crs]))
@@ -20885,6 +20906,23 @@ async def admin_list_change_requests(
         owner = owners_by_id.get(job.user_id) if job and job.user_id else None
         portal_id = (d.portal_id or "argentina") if d else "argentina"
         proposal = proposals_by_request.get((portal_id, cr.id))
+        proposal_status = proposal.status if proposal else None
+        if (
+            proposal_status in {"ready", "partial", "needs_input"}
+            and proposal.parser_version != current_change_request_parser_version
+        ):
+            proposal_status = "stale"
+        publication = (
+            delivery_freshness.publication_state(job, d) if d else None
+        )
+        if publication is not None:
+            # Algunas entregas legacy conservan el .mov publicado pero
+            # perdieron ``umg_spec`` en el job. En ese caso sabemos que el
+            # master quedó viejo, pero no podemos regenerarlo sin que el
+            # operador vuelva a elegir resolución/FPS/perfil. Exponerlo evita
+            # ofrecer un botón que inevitablemente termina en 409 y permite
+            # abrir la configuración ProRes en esta misma tarjeta.
+            publication["prores_configured"] = bool(job and job.umg_spec)
         items.append({
             "id": cr.id,
             "comment": cr.comment,
@@ -20897,12 +20935,17 @@ async def admin_list_change_requests(
             "proposal": (
                 {
                     "id": proposal.id,
-                    "status": proposal.status,
+                    "status": proposal_status,
                     "base_revision": proposal.base_revision,
                     "applied_revision": proposal.applied_revision,
                     "operation_count": len(proposal.operations or []),
                     "applicable_count": sum(
                         bool(item.get("applicable"))
+                        for item in (proposal.operations or [])
+                        if isinstance(item, dict)
+                    ),
+                    "visual_action_count": sum(
+                        item.get("visual_action") == "regenerate_background"
                         for item in (proposal.operations or [])
                         if isinstance(item, dict)
                     ),
@@ -20915,9 +20958,7 @@ async def admin_list_change_requests(
             # Sin esto el operador no podía responder la única pregunta que
             # importa después de corregir: ¿lo que el cliente puede bajar
             # AHORA es lo que acabo de arreglar?
-            "publication": (
-                delivery_freshness.publication_state(job, d) if d else None
-            ),
+            "publication": publication,
             "delivery": (
                 {
                     "id": d.id,
@@ -21005,6 +21046,10 @@ def _serialize_change_request_proposal(
         "applied_at": row.applied_at.isoformat() if row.applied_at else None,
         "applied_revision": row.applied_revision,
     }
+    if payload["status"] in {"ready", "partial", "needs_input"}:
+        from change_request_parser import SCHEMA_VERSION as current_parser_version
+        if row.parser_version != current_parser_version:
+            payload["status"] = "stale"
     if document is not None:
         from change_request_proposals import lyrics_preview_context
         payload["lyrics_context"] = lyrics_preview_context(
@@ -21115,6 +21160,15 @@ async def admin_generate_change_request_proposal(
         base_revision=int(document.revision or 0),
         audio_revision=int(job.audio_revision or 0),
         audio_sha256=str(job.input_audio_sha256 or ""),
+        background_context={
+            "background_hint": (job.render_params or {}).get("background_hint"),
+            "background_mode": (job.render_params or {}).get("background_mode"),
+            "concept": (job.render_params or {}).get("concept"),
+            "genre": (job.render_params or {}).get("genre"),
+            "artist": job.artist,
+            "song_title": job.song_title,
+            "scene_plan": job.scene_plan,
+        },
     )
     now = datetime.now(timezone.utc)
     # Pending proposals for older snapshots remain as audit history but cannot
@@ -21180,6 +21234,7 @@ async def admin_generate_change_request_proposal(
             "status": row.status,
             "applicable_count": built["applicable_count"],
             "unresolved_count": built["unresolved_count"],
+            "visual_action_count": built["visual_action_count"],
             "parser_version": row.parser_version,
             "portal_id": portal_id,
         },
