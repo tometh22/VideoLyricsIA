@@ -65,7 +65,8 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         .map((item) => item.id));
       const completed = [...activeRenderIdsRef.current].filter((id) => (
         !nextActive.has(id)
-        && items.some((item) => item.id === id && item.publication?.needs_publish)
+        && items.some((item) => item.id === id
+          && ["done", "pending_review"].includes(item.publication?.job_status))
       ));
       activeRenderIdsRef.current = nextActive;
       setChangeRequests(items);
@@ -77,7 +78,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
           return {
             requestId: current?.requestId ?? completed[0],
             tone: "ok",
-            text: "Los archivos nuevos están listos. Revisá el video de la tarjeta; Publicar actualización sigue siendo un paso manual.",
+            text: "Terminó la preparación de los archivos. Revisá el video: esto no confirma que el pedido esté corregido ni publica en el portal.",
           };
         });
       }
@@ -376,7 +377,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     setCrPublishNotice({
       requestId,
       tone: "wait",
-      text: "Formato guardado. Se está regenerando el archivo profesional (.mov) con la corrección; el portal sigue mostrando la versión anterior.",
+      text: "Formato guardado. Se está generando el .mov del último render; esto no aplica cambios de letra pendientes ni publica en el portal.",
     });
     await loadChangeRequests({ silent: true });
   }, [loadChangeRequests]);
