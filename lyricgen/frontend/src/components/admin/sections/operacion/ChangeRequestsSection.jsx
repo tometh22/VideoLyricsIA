@@ -24,7 +24,7 @@ export default function ChangeRequestsSection({ initialPendingCount, onPendingCo
             Cambios UMG
           </h2>
           <p className="text-ui text-gray-400 mt-1">
-            Revisá el pedido, la letra vigente y el resultado propuesto antes de aplicarlo.
+            Revisá el pedido, la letra y los prompts sugeridos; mirá cada render antes de publicarlo.
           </p>
         </div>
         <div className="flex items-center gap-2 text-caption">
@@ -40,7 +40,8 @@ export default function ChangeRequestsSection({ initialPendingCount, onPendingCo
       <div className="rounded-card bg-brand/[0.06] ring-1 ring-brand/20 px-4 py-3">
         <p className="text-caption text-gray-200">
           Cada pedido se revisa completo en esta pantalla. Aplicar una propuesta modifica la
-          letra del editor, pero el pedido permanece pendiente hasta re-renderizar y publicar.
+          letra del editor; regenerar un fondo crea un corte nuevo. Ninguna acción publica ni
+          cierra el pedido hasta que revises el video y uses Publicar actualización.
         </p>
       </div>
 
@@ -63,6 +64,7 @@ export default function ChangeRequestsSection({ initialPendingCount, onPendingCo
           crPublishNotice={changes.crPublishNotice}
           dismissPublishNotice={() => changes.setCrPublishNotice(null)}
           publishDeliveryUpdate={changes.publishDeliveryUpdate}
+          onProResConfigured={changes.handleProResConfigured}
           proposalEnabled={changes.crProposalEnabled}
           proposalApplyEnabled={changes.crProposalApplyEnabled}
           proposalBusyId={changes.crProposalBusyId}
@@ -72,6 +74,7 @@ export default function ChangeRequestsSection({ initialPendingCount, onPendingCo
           adjustProposal={changes.adjustChangeRequestProposal}
           applyProposal={changes.applyChangeRequestProposal}
           dismissProposal={changes.dismissChangeRequestProposal}
+          regenerateBackground={changes.regenerateBackgroundFromProposal}
         />
       </div>
     </section>

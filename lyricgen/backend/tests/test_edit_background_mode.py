@@ -18,7 +18,7 @@ import uuid
 from database import Job as JobModel, User as UserModel
 
 
-def _create_pending_review_job(db, tenant_id, user_id):
+def _create_pending_review_job(db, tenant_id, user_id, *, status="pending_review"):
     """Insert a Job in pending_review status that satisfies request_edit's
     pre-checks: bg_r2_key_cached + segments_json + edit_count=0."""
     job_id = uuid.uuid4().hex[:12]
@@ -29,7 +29,7 @@ def _create_pending_review_job(db, tenant_id, user_id):
         artist="Test",
         song_title="BG Mode Test",
         filename="test.mp3",
-        status="pending_review",
+        status=status,
         delivery_profile="youtube",
         progress=100,
         bg_r2_key_cached="fake/bg.mp4",
@@ -99,6 +99,35 @@ def test_bg_mode_veo_explicit_also_forwarded(client, admin_token, db, monkeypatc
     )
     assert res.status_code == 202, res.text
     assert captured[0]["edit_params"].get("background_mode") == "veo"
+
+
+def test_admin_can_regenerate_background_for_already_delivered_job(
+    client, admin_token, db, monkeypatch,
+):
+    """Cambios UMG starts from a shipped/done job, not pending_review."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _create_pending_review_job(
+        db, tenant_id, user_id, status="done",
+    )
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "edit_type": "background",
+            "background_hint": "Nueva escena urbana, sin armas ni texto",
+            "background_mode": "veo",
+            "bg_verbatim": True,
+            "force_content_validation": True,
+        },
+    )
+
+    assert res.status_code == 202, res.text
+    assert captured[0]["edit_params"]["background_hint"] == (
+        "Nueva escena urbana, sin armas ni texto"
+    )
+    assert captured[0]["edit_params"]["force_content_validation"] is True
 
 
 def test_bg_mode_absent_leaves_edit_params_clean(client, admin_token, db, monkeypatch):
