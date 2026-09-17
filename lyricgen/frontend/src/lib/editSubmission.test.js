@@ -112,6 +112,23 @@ describe("invariante: un job sin tocar no produce diff", () => {
     expect(out.payload).toBeNull();
     expect(out.editType).toBeNull();
   });
+
+  it("renderiza la revisión ya guardada cuando viene de un pedido UMG", () => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const current = currentFrom(JOB_FULL);
+    const out = resolveEditSubmission({
+      baseline,
+      current,
+      jobStatus: "done",
+      forceLyricsRerender: true,
+    });
+    expect(out.presentBuckets).toEqual(["lyrics"]);
+    expect(out.editType).toBe("lyrics");
+    expect(out.payload).toMatchObject({
+      edit_type: "lyrics",
+      segments: current.segments,
+    });
+  });
 });
 
 describe("invariante estructural: baseline y current cubren las mismas claves", () => {
