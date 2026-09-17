@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 import ChangeRequestsPanel, {
   buildLyricsPreview,
+  editorUrlWithRequest,
   publicationStatus,
 } from "./ChangeRequestsPanel";
 
@@ -133,6 +134,26 @@ describe("publicationStatus", () => {
   });
 });
 
+describe("editorUrlWithRequest", () => {
+  it("restores the proposal id after the queue is reloaded", () => {
+    expect(editorUrlWithRequest(
+      "f7752c6feed4", 7, "proposal-1",
+      "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
+    )).toBe(
+      "/videos/f7752c6feed4/edit-lyrics?change_request_id=7&proposal_id=proposal-1",
+    );
+  });
+
+  it("preserves unrelated query parameters and anchors", () => {
+    expect(editorUrlWithRequest(
+      "f7752c6feed4", 7, "proposal-1",
+      "/videos/f7752c6feed4/edit-lyrics?source=admin#lyrics",
+    )).toBe(
+      "/videos/f7752c6feed4/edit-lyrics?source=admin&change_request_id=7&proposal_id=proposal-1#lyrics",
+    );
+  });
+});
+
 describe("buildLyricsPreview", () => {
   it("applies only selected text operations to the full lyric snapshot", () => {
     const segments = [
@@ -239,6 +260,18 @@ describe("ChangeRequestsPanel", () => {
     expect(screen.getByRole("link", { name: "Editar letra" })).toHaveAttribute(
       "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
     );
+  });
+
+  it("keeps the applied proposal context after reloading the request queue", () => {
+    renderPanel(
+      { proposal: { id: "proposal-1", status: "applied", applied_revision: 5 } },
+      { proposalEnabled: true },
+    );
+    expect(screen.getByRole("link", { name: "Revisar y generar corte" }))
+      .toHaveAttribute(
+        "href",
+        "/videos/f7752c6feed4/edit-lyrics?change_request_id=7&proposal_id=proposal-1",
+      );
   });
 
   it("publishes to the portal the delivery belongs to", () => {
@@ -403,7 +436,7 @@ describe("ChangeRequestsPanel", () => {
     });
     expect(screen.getByRole("link", { name: "Abrir editor de fondo" }))
       .toHaveAttribute(
-        "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
+        "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7&proposal_id=proposal-bg",
       );
   });
 

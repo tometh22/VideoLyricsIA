@@ -122,14 +122,21 @@ const TONE_STYLES = {
   idle: "bg-surface-2/40 ring-white/[0.06] text-gray-300",
 };
 
-function editorUrlWithRequest(jobId, requestId, suppliedUrl) {
+export function editorUrlWithRequest(jobId, requestId, proposalId, suppliedUrl) {
   const rawUrl = suppliedUrl || (jobId ? `/videos/${jobId}/edit-lyrics` : null);
-  if (!rawUrl || requestId == null || /[?&]change_request_id=/.test(rawUrl)) return rawUrl;
+  if (!rawUrl || requestId == null) return rawUrl;
   const hashIndex = rawUrl.indexOf("#");
-  const path = hashIndex >= 0 ? rawUrl.slice(0, hashIndex) : rawUrl;
+  const pathAndQuery = hashIndex >= 0 ? rawUrl.slice(0, hashIndex) : rawUrl;
   const hash = hashIndex >= 0 ? rawUrl.slice(hashIndex) : "";
-  const separator = path.includes("?") ? "&" : "?";
-  return `${path}${separator}change_request_id=${encodeURIComponent(requestId)}${hash}`;
+  const queryIndex = pathAndQuery.indexOf("?");
+  const path = queryIndex >= 0 ? pathAndQuery.slice(0, queryIndex) : pathAndQuery;
+  const params = new URLSearchParams(
+    queryIndex >= 0 ? pathAndQuery.slice(queryIndex + 1) : "",
+  );
+  params.set("change_request_id", String(requestId));
+  if (proposalId) params.set("proposal_id", String(proposalId));
+  const query = params.toString();
+  return `${path}${query ? `?${query}` : ""}${hash}`;
 }
 
 export default function ChangeRequestsPanel({
@@ -423,7 +430,9 @@ function ChangeRequestCard({
   }, []);
 
   const effectiveProposal = proposal || item.proposal;
-  const editorUrl = editorUrlWithRequest(d.job_id, item.id, effectiveProposal?.editor_url);
+  const editorUrl = editorUrlWithRequest(
+    d.job_id, item.id, effectiveProposal?.id, effectiveProposal?.editor_url,
+  );
   let primaryAction;
   if (isResolved) {
     primaryAction = { label: resolving ? "Reabriendo…" : "Reabrir pedido", onClick: onReopen, disabled: resolving };
@@ -437,6 +446,12 @@ function ChangeRequestCard({
     primaryAction = { label: "Generando corte nuevo…", disabled: true };
   } else if (proposalEnabled && !effectiveProposal) {
     primaryAction = { label: proposalBusy ? "Analizando…" : "Analizar pedido", onClick: onGenerateProposal, disabled: proposalBusy };
+  } else if (["applied", "partially_applied"].includes(effectiveProposal?.status) && d.job_id) {
+    // The compact queue already carries the applied proposal id.  Do not make
+    // the operator reload the full diff just to enter the render step: that
+    // extra round-trip used to fall back to a request-only URL and lose the
+    // explicit render intent after a page refresh.
+    primaryAction = { label: "Revisar y generar corte", href: editorUrl };
   } else if (proposalEnabled && item.proposal && !proposal) {
     primaryAction = { label: proposalBusy ? "Cargando…" : "Ver propuesta", onClick: onLoadProposal, disabled: proposalBusy };
   } else if (["ready", "partial", "needs_input"].includes(proposal?.status)) {
@@ -444,8 +459,6 @@ function ChangeRequestCard({
       label: "Revisar propuesta",
       onClick: () => proposalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
     };
-  } else if (["applied", "partially_applied"].includes(proposal?.status) && d.job_id) {
-    primaryAction = { label: "Revisar y generar corte", href: editorUrl };
   } else if (d.job_id) {
     primaryAction = { label: "Editar letra", href: editorUrl };
   } else {
@@ -645,7 +658,9 @@ function ChangeRequestCard({
         <div className="flex items-center gap-2">
           {!isResolved && d.job_id && primaryAction.label !== "Editar letra" && (
             <a
-              href={editorUrlWithRequest(d.job_id, item.id)}
+              href={editorUrlWithRequest(
+                d.job_id, item.id, effectiveProposal?.id, effectiveProposal?.editor_url,
+              )}
               className="rounded-xl px-3 py-2 text-caption font-medium text-gray-300 hover:bg-white/[0.06] hover:text-white"
             >
               Editar letra
@@ -926,7 +941,9 @@ function ChangeRequestProposal({
 
   const effective = proposal || summary;
   const status = effective?.status;
-  const editorUrl = editorUrlWithRequest(jobId, requestId, proposal?.editor_url);
+  const editorUrl = editorUrlWithRequest(
+    jobId, requestId, effective?.id, proposal?.editor_url,
+  );
 
   if (!effective) {
     return (
