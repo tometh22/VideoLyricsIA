@@ -12588,6 +12588,13 @@ class EditJobRequest(BaseModel):
     base_revision: int | None = Field(default=None, ge=0)
     editor_revision: int | None = Field(default=None, ge=0)
     editor_version_id: str | None = Field(default=None, max_length=36)
+    # Optional UMG workflow provenance.  A proposal is applied to the durable
+    # editor before the operator opens it, so the browser may legitimately
+    # request a lyrics re-render with no local diff.  The /edit handler binds
+    # this pair back to an applied proposal for the same job; arbitrary query
+    # parameters never become render authority.
+    change_request_id: int | None = Field(default=None, ge=1)
+    change_request_proposal_id: str | None = Field(default=None, max_length=36)
     force_conflict_overwrite: bool = False
     # Optional free-form hint for edit_type=="background". The operator
     # types what they want the new background to convey ("paisaje cálido
@@ -16599,7 +16606,7 @@ async def request_edit(
     Limited to 3 edits per job. After the 3rd edit the reviewer must
     approve or reject — no further edits are allowed.
     """
-    from database import Job as JobModel, AuditLog
+    from database import Job as JobModel, AuditLog, ChangeRequestProposal
     from pipeline import _MAX_EDITS
 
     _edit_request_fingerprint = _request_fingerprint(
@@ -16798,6 +16805,49 @@ async def request_edit(
     job = _edit_q.with_for_update().first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # A UMG proposal saves its revision before review, which makes a correct
+    # editor screen look unchanged against job.segments_json.  Accept that
+    # explicit render intent only when both identifiers resolve to an applied
+    # proposal for this exact job and the actor is an admin.  A newer manual
+    # editor revision is allowed (the operator may refine the suggestion), but
+    # the proposal can never claim a future/stale revision.
+    _change_request_proposal = None
+    _has_change_request_context = (
+        body.change_request_id is not None
+        or body.change_request_proposal_id is not None
+    )
+    if _has_change_request_context:
+        if (
+            body.change_request_id is None
+            or not body.change_request_proposal_id
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "change_request_context_incomplete"},
+            )
+        if current_user.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        _change_request_proposal = (
+            db.query(ChangeRequestProposal)
+            .filter(
+                ChangeRequestProposal.id == body.change_request_proposal_id,
+                ChangeRequestProposal.change_request_id == body.change_request_id,
+                ChangeRequestProposal.job_id == job_id,
+                ChangeRequestProposal.status.in_(("applied", "partially_applied")),
+            )
+            .first()
+        )
+        if (
+            _change_request_proposal is None
+            or _change_request_proposal.applied_revision is None
+            or int(_change_request_proposal.applied_revision)
+            > int(getattr(job, "segments_revision", 0) or 0)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "change_request_proposal_not_renderable"},
+            )
     if getattr(job, "workload_class", "interactive") == "batch":
         from batch_campaigns import enforce_render_capacity
         enforce_render_capacity(db, job)
@@ -17531,6 +17581,8 @@ async def request_edit(
             "base_revision": body.base_revision,
             "segments_revision": int(getattr(job, "segments_revision", 0) or 0),
             "force_conflict_overwrite": body.force_conflict_overwrite,
+            "change_request_id": body.change_request_id,
+            "change_request_proposal_id": body.change_request_proposal_id,
         },
     ))
     # Commit the publication intent in the same transaction as the Job and
@@ -17553,6 +17605,8 @@ async def request_edit(
             "workload_class": getattr(job, "workload_class", "interactive") or "interactive",
             "request_fingerprint": _edit_request_fingerprint,
             "idempotency_key_hash": _edit_idempotency_hash,
+            "change_request_id": body.change_request_id,
+            "change_request_proposal_id": body.change_request_proposal_id,
         },
     )
     for _qc_action in _delivery_qc_actions:

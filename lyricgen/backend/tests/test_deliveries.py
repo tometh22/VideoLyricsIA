@@ -712,6 +712,7 @@ def test_change_request_proposal_applies_revisioned_text_but_stays_open_until_pu
         {"start": 2.2, "end": 4.0, "text": "Otra línea"},
     ]
     approved_job.segments_revision = 0
+    approved_job.bg_r2_key_cached = "backgrounds/testjob12345.mp4"
     db.commit()
     delivery_id = client.post(
         f"/admin/deliveries/from-job/{approved_job.job_id}",
@@ -776,6 +777,52 @@ def test_change_request_proposal_applies_revisioned_text_but_stays_open_until_pu
     )
     db.expire_all()
     assert db.query(Job).filter(Job.job_id == approved_job.job_id).one().segments_revision == 1
+
+    # The proposal already persisted revision 1, so the editor has no local
+    # diff.  Its explicit UMG context must still enqueue that exact saved
+    # revision for rendering instead of producing "No cambiaste nada".
+    current_segments = db.query(Job).filter(
+        Job.job_id == approved_job.job_id
+    ).one().segments_json
+    invalid_context = client.post(
+        f"/edit/{approved_job.job_id}",
+        headers=auth(admin_token),
+        json={
+            "edit_type": "lyrics",
+            "segments": current_segments,
+            "base_revision": 1,
+            "change_request_id": cr_id,
+            "change_request_proposal_id": "not-the-applied-proposal",
+        },
+    )
+    assert invalid_context.status_code == 409
+    assert invalid_context.json()["detail"]["code"] == "change_request_proposal_not_renderable"
+
+    with patch("main.enqueue_edit", return_value="edit:test"):
+        render = client.post(
+            f"/edit/{approved_job.job_id}",
+            headers={
+                **auth(admin_token),
+                "Idempotency-Key": f"umg-change:{cr_id}:{proposal['id']}:1",
+            },
+            json={
+                "edit_type": "lyrics",
+                "segments": current_segments,
+                "base_revision": 1,
+                "change_request_id": cr_id,
+                "change_request_proposal_id": proposal["id"],
+            },
+        )
+    assert render.status_code == 202, render.text
+    db.expire_all()
+    from database import JobOutboxEvent
+    event = db.query(JobOutboxEvent).filter(
+        JobOutboxEvent.job_id == approved_job.job_id,
+        JobOutboxEvent.event_type == "edit.enqueue",
+    ).order_by(JobOutboxEvent.created_at.desc()).first()
+    assert event is not None
+    assert event.payload["change_request_id"] == cr_id
+    assert event.payload["change_request_proposal_id"] == proposal["id"]
 
 
 def test_change_request_dismissed_proposal_can_be_recalculated(

@@ -1,34 +1,23 @@
-// Pedidos de cambio de UMG (delivery_change_requests).
-//
-// El operador filtra pending/resolved/all (chips con badge), ve el contexto
-// del delivery (artista, canción, label, frame_size, tenant, owner), un
-// preview del video clickeable, el comentario, y resuelve / reabre.
-//
-// Y, desde 2026-09-15, ve el ciclo completo en la misma tarjeta. El portal
-// no guarda el archivo: reconstruye la key de R2 y la firma, así que un
-// re-render reemplaza la descarga del cliente EN SU LUGAR. Eso volvía
-// inverificable la única pregunta que importa después de corregir — "¿lo
-// que el cliente puede bajar ahora es lo que arreglé?" — y obligaba a ir a
-// la campaña, buscar la canción en Aprobadas, editar, y acordarse de volver
-// acá a tildar el pedido. Los tres pasos viven acá:
-//
-//   1. Editar letra    → abre el editor de esa canción.
-//   2. Publicar        → sube la versión al portal. El backend detecta que
-//                        el render cambió, baja la aprobación vieja (el
-//                        cliente vuelve a ver "Aprobar") y cierra este
-//                        pedido solo.
-//   3. Marcar resuelto → sigue estando, para lo que se contesta sin
-//                        re-renderizar (una aclaración, un pedido que se
-//                        descarta).
-import { useEffect, useState } from "react";
+// Workspace operativo de pedidos de cambio de UMG
+// (delivery_change_requests). Una cola compacta mantiene el contexto y el
+// panel de detalle guía el caso por cinco etapas: interpretar, aplicar,
+// renderizar, revisar y publicar. El pedido seleccionado queda en la URL
+// para que el editor pueda devolver al operador al mismo punto del flujo.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { fmtDate, fmtAgo } from "../../adminApi";
 import FilterBar from "../../primitives/FilterBar";
 import EmptyState from "../../primitives/EmptyState";
 import TableSkeleton from "../../primitives/TableSkeleton";
 import EnableProResModal from "../../../EnableProResModal";
-
-const PORTAL_LABELS = { argentina: "UMG Argentina", chile: "UMG Chile" };
+import ChangeRequestQueue from "./ChangeRequestQueue";
+import RequestWorkflowStepper from "./RequestWorkflowStepper";
+import {
+  PORTAL_LABELS,
+  requestSearchText,
+  requestWorkflow,
+  workflowMatchesFilter,
+} from "./changeRequestWorkflow";
 
 // Estados en los que el job está re-renderizando: publicar ahora no tiene
 // sentido porque los archivos se están por reemplazar.
@@ -133,6 +122,16 @@ const TONE_STYLES = {
   idle: "bg-surface-2/40 ring-white/[0.06] text-gray-300",
 };
 
+function editorUrlWithRequest(jobId, requestId, suppliedUrl) {
+  const rawUrl = suppliedUrl || (jobId ? `/videos/${jobId}/edit-lyrics` : null);
+  if (!rawUrl || requestId == null || /[?&]change_request_id=/.test(rawUrl)) return rawUrl;
+  const hashIndex = rawUrl.indexOf("#");
+  const path = hashIndex >= 0 ? rawUrl.slice(0, hashIndex) : rawUrl;
+  const hash = hashIndex >= 0 ? rawUrl.slice(hashIndex) : "";
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}change_request_id=${encodeURIComponent(requestId)}${hash}`;
+}
+
 export default function ChangeRequestsPanel({
   changeRequests,
   crStatusFilter,
@@ -162,6 +161,21 @@ export default function ChangeRequestsPanel({
   // Draft local del input de "respuesta" por CR. Clave = id del CR.
   const [drafts, setDrafts] = useState({});
   const [proResSetup, setProResSetup] = useState(null);
+  const [search, setSearch] = useState("");
+  const [stageFilter, setStageFilter] = useState("all");
+  const searchInputRef = useRef(null);
+  const initialRequestId = useMemo(() => {
+    if (typeof window === "undefined") return null;
+    const params = new URLSearchParams(window.location.search);
+    return params.get("change_request_id") || params.get("request");
+  }, []);
+  const [selectedId, setSelectedId] = useState(initialRequestId);
+  const [returnNotice, setReturnNotice] = useState(() => {
+    if (typeof window === "undefined") return null;
+    return new URLSearchParams(window.location.search).get("render_submitted") === "1"
+      ? "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el portal conserva el corte anterior hasta que lo publiques."
+      : null;
+  });
   const setDraft = (id, val) => setDrafts((d) => ({ ...d, [id]: val }));
 
   const filterOptions = [
@@ -169,6 +183,87 @@ export default function ChangeRequestsPanel({
     { id: "resolved", label: "Resueltos", badge: crResolvedCount },
     { id: "all", label: "Todos" },
   ];
+
+  const filteredRequests = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase("es");
+    return changeRequests.filter((item) => {
+      if (query && !requestSearchText(item).includes(query)) return false;
+      const workflow = requestWorkflow(item, proposalDetails[item.id], proposalEnabled);
+      return workflowMatchesFilter(workflow, stageFilter);
+    });
+  }, [changeRequests, proposalDetails, proposalEnabled, search, stageFilter]);
+
+  const selectedItem = useMemo(() => (
+    filteredRequests.find((item) => String(item.id) === String(selectedId))
+    || filteredRequests[0]
+    || null
+  ), [filteredRequests, selectedId]);
+
+  const selectRequest = useCallback((id) => {
+    setSelectedId(id);
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.set("change_request_id", id);
+      url.searchParams.delete("request");
+      window.history.replaceState(window.history.state, "", url);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (selectedItem && String(selectedItem.id) !== String(selectedId)) {
+      selectRequest(selectedItem.id);
+    }
+  }, [selectRequest, selectedId, selectedItem]);
+
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (event.defaultPrevented) return;
+      const target = event.target;
+      const typing = target instanceof HTMLInputElement
+        || target instanceof HTMLTextAreaElement
+        || target instanceof HTMLSelectElement
+        || target?.isContentEditable;
+      if (event.key === "/" && !typing) {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+        return;
+      }
+      if (typing || !["j", "k", "ArrowDown", "ArrowUp"].includes(event.key)) return;
+      if (!filteredRequests.length) return;
+      event.preventDefault();
+      const currentIndex = Math.max(0, filteredRequests.findIndex(
+        (item) => String(item.id) === String(selectedItem?.id),
+      ));
+      const direction = event.key === "j" || event.key === "ArrowDown" ? 1 : -1;
+      const nextIndex = Math.min(
+        filteredRequests.length - 1,
+        Math.max(0, currentIndex + direction),
+      );
+      selectRequest(filteredRequests[nextIndex].id);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [filteredRequests, selectRequest, selectedItem?.id]);
+
+  const publishItem = useCallback((item) => {
+    const status = publicationStatus(item.publication);
+    if (status.needsProResSetup) {
+      setProResSetup({
+        jobId: item.delivery?.job_id,
+        requestId: item.id,
+        frameSize: item.delivery?.frame_size,
+      });
+      return;
+    }
+    publishDeliveryUpdate(item.delivery?.job_id, item.delivery?.portal_id, item.id);
+  }, [publishDeliveryUpdate]);
+
+  useEffect(() => {
+    if (!returnNotice || typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    url.searchParams.delete("render_submitted");
+    window.history.replaceState(window.history.state, "", url);
+  }, [returnNotice]);
 
   return (
     <div className="space-y-4">
@@ -180,6 +275,15 @@ export default function ChangeRequestsPanel({
           label="Estado"
         />
       </FilterBar>
+
+      {returnNotice && (
+        <div role="status" className="flex items-start justify-between gap-3 rounded-xl bg-sky-500/[0.08] p-3 text-caption text-sky-100 ring-1 ring-sky-400/20">
+          <span>{returnNotice}</span>
+          <button type="button" onClick={() => setReturnNotice(null)} className="shrink-0 text-label opacity-70 hover:opacity-100">
+            Cerrar
+          </button>
+        </div>
+      )}
 
       {crPublishNotice && (
         <div
@@ -218,56 +322,59 @@ export default function ChangeRequestsPanel({
           }
         />
       ) : (
-        <div className="space-y-3">
-          {changeRequests.map((item) => (
+        <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(17rem,0.72fr)_minmax(0,2.28fr)]">
+          <ChangeRequestQueue
+            items={filteredRequests}
+            allItems={changeRequests}
+            selectedId={selectedItem?.id}
+            onSelect={selectRequest}
+            proposals={proposalDetails}
+            proposalEnabled={proposalEnabled}
+            search={search}
+            onSearchChange={setSearch}
+            stageFilter={stageFilter}
+            onStageFilterChange={setStageFilter}
+            searchInputRef={searchInputRef}
+          />
+          {selectedItem ? (
             <ChangeRequestCard
-              key={item.id}
-              item={item}
-              draft={drafts[item.id] || ""}
-              onDraftChange={(v) => setDraft(item.id, v)}
-              resolving={crResolvingId === item.id}
-              publishing={crPublishingId === item.id}
-              onResolve={() => resolveChangeRequest(item.id, drafts[item.id])}
-              onReopen={() => reopenChangeRequest(item.id)}
-              onPublish={() => {
-                const status = publicationStatus(item.publication);
-                if (status.needsProResSetup) {
-                  setProResSetup({
-                    jobId: item.delivery?.job_id,
-                    requestId: item.id,
-                    frameSize: item.delivery?.frame_size,
-                  });
-                  return;
-                }
-                publishDeliveryUpdate(
-                  item.delivery?.job_id,
-                  item.delivery?.portal_id,
-                  item.id,
-                );
-              }}
+              key={selectedItem.id}
+              item={selectedItem}
+              draft={drafts[selectedItem.id] || ""}
+              onDraftChange={(value) => setDraft(selectedItem.id, value)}
+              resolving={crResolvingId === selectedItem.id}
+              publishing={crPublishingId === selectedItem.id}
+              onResolve={() => resolveChangeRequest(selectedItem.id, drafts[selectedItem.id])}
+              onReopen={() => reopenChangeRequest(selectedItem.id)}
+              onPublish={() => publishItem(selectedItem)}
               proposalEnabled={proposalEnabled}
               proposalApplyEnabled={proposalApplyEnabled}
-              proposalBusy={proposalBusyId === item.id}
-              proposal={proposalDetails[item.id] || null}
-              onGenerateProposal={() => generateProposal(item.id)}
-              onLoadProposal={() => loadProposal(item.id)}
+              proposalBusy={proposalBusyId === selectedItem.id}
+              proposal={proposalDetails[selectedItem.id] || null}
+              onGenerateProposal={() => generateProposal(selectedItem.id)}
+              onLoadProposal={() => loadProposal(selectedItem.id)}
               onAdjustProposal={(proposalId, operationId, requestedText, baseRevision) =>
                 adjustProposal(
-                  item.id, proposalId, operationId, requestedText, baseRevision,
+                  selectedItem.id, proposalId, operationId, requestedText, baseRevision,
                 )
               }
               onApplyProposal={(proposalId, operationIds, baseRevision) =>
-                applyProposal(item.id, proposalId, operationIds, baseRevision)
+                applyProposal(selectedItem.id, proposalId, operationIds, baseRevision)
               }
-              onDismissProposal={(proposalId) => dismissProposal(item.id, proposalId)}
+              onDismissProposal={(proposalId) => dismissProposal(selectedItem.id, proposalId)}
               onRegenerateBackground={(proposalId, operationId, prompt, backgroundMode) =>
                 regenerateBackground(
-                  item.id, proposalId, operationId, item.delivery?.job_id,
+                  selectedItem.id, proposalId, operationId, selectedItem.delivery?.job_id,
                   prompt, backgroundMode,
                 )
               }
             />
-          ))}
+          ) : (
+            <div className="rounded-2xl bg-surface-2/30 p-8 text-center ring-1 ring-white/[0.06]">
+              <p className="text-ui font-semibold text-white">No hay pedidos con estos filtros</p>
+              <p className="mt-1 text-caption text-gray-500">Limpiá la búsqueda o elegí otra etapa.</p>
+            </div>
+          )}
         </div>
       )}
 
@@ -300,26 +407,75 @@ function ChangeRequestCard({
   const d = item.delivery || {};
   const isResolved = !!item.resolved_at;
   const status = publicationStatus(item.publication);
+  const workflow = requestWorkflow(item, proposal, proposalEnabled);
+  const videoRef = useRef(null);
+  const proposalRef = useRef(null);
   // Un pedido resuelto AL PUBLICAR no necesita que nadie confirme nada: la
   // corrección ya está en el portal. Uno cerrado a mano sí se explica.
   const closedByPublication = item.resolution_source === "publication";
 
+  const seekVideo = useCallback((seconds) => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = Math.max(0, Number(seconds) || 0);
+    video.play?.().catch?.(() => {});
+    video.scrollIntoView?.({ behavior: "smooth", block: "center" });
+  }, []);
+
+  const effectiveProposal = proposal || item.proposal;
+  const editorUrl = editorUrlWithRequest(d.job_id, item.id, effectiveProposal?.editor_url);
+  let primaryAction;
+  if (isResolved) {
+    primaryAction = { label: resolving ? "Reabriendo…" : "Reabrir pedido", onClick: onReopen, disabled: resolving };
+  } else if (status.canPublish) {
+    primaryAction = {
+      label: publishing ? "Publicando…" : status.publishLabel || "Publicar actualización",
+      onClick: onPublish,
+      disabled: publishing,
+    };
+  } else if (workflow.key === "rendering") {
+    primaryAction = { label: "Generando corte nuevo…", disabled: true };
+  } else if (proposalEnabled && !effectiveProposal) {
+    primaryAction = { label: proposalBusy ? "Analizando…" : "Analizar pedido", onClick: onGenerateProposal, disabled: proposalBusy };
+  } else if (proposalEnabled && item.proposal && !proposal) {
+    primaryAction = { label: proposalBusy ? "Cargando…" : "Ver propuesta", onClick: onLoadProposal, disabled: proposalBusy };
+  } else if (["ready", "partial", "needs_input"].includes(proposal?.status)) {
+    primaryAction = {
+      label: "Revisar propuesta",
+      onClick: () => proposalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
+    };
+  } else if (["applied", "partially_applied"].includes(proposal?.status) && d.job_id) {
+    primaryAction = { label: "Revisar y generar corte", href: editorUrl };
+  } else if (d.job_id) {
+    primaryAction = { label: "Editar letra", href: editorUrl };
+  } else {
+    primaryAction = { label: "Sin acción disponible", disabled: true };
+  }
+
+  useEffect(() => {
+    const handleShortcut = (event) => {
+      if (!(event.metaKey || event.ctrlKey) || event.key !== "Enter") return;
+      if (primaryAction.disabled) return;
+      event.preventDefault();
+      if (primaryAction.onClick) primaryAction.onClick();
+      else if (primaryAction.href) window.location.assign(primaryAction.href);
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [primaryAction.disabled, primaryAction.href, primaryAction.onClick]);
+
   return (
-    <div
-      className={`glass rounded-card p-5 border-l-4 ${
-        isResolved ? "border-emerald-500/60 opacity-75" : "border-amber-400"
-      }`}
-    >
+    <article className="min-w-0 rounded-2xl bg-surface-2/25 ring-1 ring-white/[0.07]">
       {/* Contexto del delivery */}
-      <div className="flex items-start justify-between gap-3 mb-3 flex-wrap">
+      <header className="flex flex-wrap items-start justify-between gap-4 border-b border-white/[0.06] px-4 py-4 sm:px-5">
         <div className="min-w-0">
-          <p className="text-section uppercase tracking-wider text-brand-light font-bold mb-0.5">
+          <p className="text-label uppercase tracking-[0.18em] text-brand-light font-bold mb-1">
             {d.artist || "(sin artista)"}
           </p>
-          <h3 className="text-ui font-bold leading-snug text-white">
+          <h3 className="text-xl font-bold leading-tight text-white">
             {d.song || "(canción eliminada)"}
           </h3>
-          <div className="flex items-center gap-2 mt-1 flex-wrap text-label text-gray-500">
+          <div className="flex items-center gap-2 mt-2 flex-wrap text-label text-gray-500">
             {d.label && <span>{d.label}</span>}
             {d.portal_id && (<><span>·</span><span>{PORTAL_LABELS[d.portal_id] || d.portal_id}</span></>)}
             {d.frame_size && (<><span>·</span><span className="text-brand-light">{d.frame_size}</span></>)}
@@ -337,159 +493,186 @@ function ChangeRequestCard({
           </div>
         </div>
         <span
-          className={`text-section font-bold uppercase px-2 py-1 rounded-button shrink-0 ${
+          className={`text-label font-semibold px-2.5 py-1 rounded-full shrink-0 ring-1 ${
             isResolved ? "bg-emerald-500/15 text-emerald-300" : "bg-amber-500/15 text-amber-300"
           }`}
         >
           {isResolved ? "Resuelto" : "Pendiente"}
         </span>
-      </div>
+      </header>
 
-      {/* Estado real de lo que el cliente puede descargar ahora mismo. */}
-      <div className={`rounded-button ring-1 p-3 mb-3 ${TONE_STYLES[status.tone]}`}>
-        <p className="text-caption font-semibold">{status.title}</p>
-        <p className="text-label opacity-80 mt-0.5 leading-relaxed">{status.detail}</p>
-        {item.publication?.stale_since && (
-          <p className="text-label opacity-70 mt-1">
-            Cambios en curso desde {fmtAgo(item.publication.stale_since)}.
-          </p>
-        )}
-      </div>
+      <div className="grid min-w-0 gap-5 p-4 sm:p-5 lg:grid-cols-[minmax(18rem,0.9fr)_minmax(0,1.1fr)]">
+        <div className="min-w-0 space-y-4 lg:sticky lg:top-4 lg:self-start">
+          <RequestWorkflowStepper workflow={workflow} />
 
-      {/* Preview: thumbnail clickeable que abre el video en pestaña nueva. */}
-      {d.thumbnail_url && (
-        <a
-          href={d.video_url || d.thumbnail_url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="block relative mb-3 rounded-button overflow-hidden ring-1 ring-white/[0.06] group"
-          title={d.video_url ? "Abrir video en pestaña nueva" : "Abrir imagen"}
-        >
-          <img
-            src={d.thumbnail_url}
-            alt="Preview del video"
-            loading="lazy"
-            className="w-full max-h-[220px] object-contain bg-black/40"
-          />
-          {d.video_url && (
-            <span className="absolute inset-0 flex items-center justify-center">
-              <span className="w-12 h-12 rounded-full bg-black/50 ring-1 ring-white/30 flex items-center justify-center group-hover:bg-black/70 transition-colors duration-brand">
-                <svg className="w-5 h-5 text-white ml-0.5" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M8 5v14l11-7z" />
-                </svg>
-              </span>
-            </span>
-          )}
-        </a>
-      )}
+          <div className="overflow-hidden rounded-2xl bg-black/30 ring-1 ring-white/[0.08]">
+            {d.video_url ? (
+              <video
+                ref={videoRef}
+                src={d.video_url}
+                poster={d.thumbnail_url || undefined}
+                controls
+                preload="metadata"
+                className="aspect-video max-h-[25rem] w-full bg-black object-contain"
+                aria-label={`Video de ${d.artist || "artista"} — ${d.song || "canción"}`}
+              />
+            ) : d.thumbnail_url ? (
+              <img
+                src={d.thumbnail_url}
+                alt="Preview del video"
+                loading="lazy"
+                className="aspect-video max-h-[25rem] w-full bg-black object-contain"
+              />
+            ) : (
+              <div className="flex aspect-video items-center justify-center text-caption text-gray-600">
+                Sin preview disponible
+              </div>
+            )}
+            {(d.video_url || d.thumbnail_url) && (
+              <div className="flex items-center justify-between gap-3 border-t border-white/[0.06] px-3 py-2">
+                <span className="text-label text-gray-500">Corte actual del operador</span>
+                <a
+                  href={d.video_url || d.thumbnail_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-label text-brand-light hover:text-white"
+                >
+                  Abrir original ↗
+                </a>
+              </div>
+            )}
+          </div>
 
-      {/* Comentario del pedido */}
-      <div className="rounded-button bg-surface-2/40 ring-1 ring-white/[0.04] p-3 text-caption leading-relaxed whitespace-pre-wrap font-mono text-gray-200">
-        {item.comment}
-      </div>
-
-      <p className="text-label text-gray-500 mt-2">
-        UMG envió este pedido el {fmtDate(item.submitted_at)}
-      </p>
-
-      {!isResolved && proposalEnabled && (
-        <ChangeRequestProposal
-          summary={item.proposal}
-          proposal={proposal}
-          requestComment={item.comment}
-          busy={proposalBusy}
-          applyEnabled={proposalApplyEnabled}
-          jobId={d.job_id}
-          onGenerate={onGenerateProposal}
-          onLoad={onLoadProposal}
-          onAdjust={onAdjustProposal}
-          onApply={onApplyProposal}
-          onDismiss={onDismissProposal}
-          onRegenerateBackground={onRegenerateBackground}
-        />
-      )}
-
-      {/* Resolución */}
-      {isResolved ? (
-        <div className="mt-3 pt-3 border-t border-white/[0.06] flex items-start justify-between gap-3 flex-wrap">
-          <div className="text-label text-gray-400 min-w-0">
-            <span className="text-emerald-300 font-medium">
-              {closedByPublication
-                ? `Resuelto al publicar la versión ${item.resolved_by_revision}`
-                : "Resuelto"}
-            </span>
-            {!closedByPublication && item.resolved_by && <> por <b>{item.resolved_by}</b></>}
-            {" "}el {fmtDate(item.resolved_at)}
-            {item.resolution_note && (
-              <p className="mt-1 text-gray-300 whitespace-pre-wrap">
-                <span className="text-gray-500">Respuesta: </span>
-                {item.resolution_note}
+          <div className={`rounded-xl ring-1 p-3 ${TONE_STYLES[status.tone]}`}>
+            <p className="text-caption font-semibold">{status.title}</p>
+            <p className="text-label opacity-80 mt-0.5 leading-relaxed">{status.detail}</p>
+            {item.publication?.stale_since && (
+              <p className="text-label opacity-70 mt-1">
+                Cambios en curso desde {fmtAgo(item.publication.stale_since)}.
               </p>
             )}
           </div>
-          <button
-            onClick={onReopen}
-            disabled={resolving}
-            className="text-label text-amber-300 hover:text-amber-200 disabled:opacity-50"
-          >
-            Reabrir
-          </button>
         </div>
-      ) : (
-        <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-3">
-          {/* Los dos pasos que realmente atienden el pedido. */}
-          <div className="flex flex-wrap items-center gap-2">
-            {d.job_id && (
-              <a
-                href={`/videos/${d.job_id}/edit-lyrics`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="bg-white/[0.07] hover:bg-white/[0.12] text-white text-caption font-medium px-3 py-1.5 rounded-button transition-colors duration-brand"
-              >
-                Editar letra
-              </a>
-            )}
-            {d.job_id && (
-              <button
-                onClick={onPublish}
-                disabled={publishing || !status.canPublish}
-                title={
-                  status.canPublish
-                    ? "Sube el corte actual al portal y cierra este pedido"
-                    : "No hay nada nuevo para publicar en este momento"
-                }
-                className="bg-brand hover:bg-brand-light text-white text-caption font-medium px-3 py-1.5 rounded-button disabled:opacity-40 disabled:cursor-not-allowed transition-colors duration-brand"
-              >
-                {publishing
-                  ? "Publicando…"
-                  : status.publishLabel || "Publicar actualización"}
-              </button>
-            )}
-          </div>
 
-          {/* Cierre manual, para lo que se contesta sin re-renderizar. */}
-          <div className="space-y-2">
-            <input
-              type="text"
-              placeholder="Respuesta opcional (ej: re-renderizado con la línea corregida)"
-              value={draft}
-              onChange={(e) => onDraftChange(e.target.value)}
-              maxLength={2000}
-              className="bg-surface-3/40 ring-1 ring-white/[0.06] focus:ring-brand/40 focus:outline-none rounded-button px-3 py-2 text-caption text-white placeholder:text-gray-600 w-full"
-            />
-            <div className="flex justify-end">
-              <button
-                onClick={onResolve}
-                disabled={resolving}
-                className="bg-white/[0.07] hover:bg-white/[0.12] text-white text-caption font-medium px-3 py-1.5 rounded-button disabled:opacity-50 transition-colors duration-brand"
-              >
-                {resolving ? "Guardando…" : "Marcar resuelto sin publicar"}
-              </button>
+        <div className="min-w-0 space-y-4">
+          <section className="rounded-2xl bg-white/[0.025] p-4 ring-1 ring-white/[0.07]">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-label font-semibold uppercase tracking-[0.16em] text-gray-500">Pedido original</p>
+              <span className="text-[10px] text-gray-600">{fmtAgo(item.submitted_at)}</span>
             </div>
-          </div>
+            <p className="mt-3 whitespace-pre-wrap text-ui leading-relaxed text-gray-100">
+              {item.comment}
+            </p>
+            <p className="mt-3 text-label text-gray-600">Enviado el {fmtDate(item.submitted_at)}</p>
+          </section>
+
+          {!isResolved && proposalEnabled && (
+            <div ref={proposalRef} className="scroll-mt-4">
+              <ChangeRequestProposal
+                summary={item.proposal}
+                proposal={proposal}
+                requestComment={item.comment}
+                busy={proposalBusy}
+                applyEnabled={proposalApplyEnabled}
+                jobId={d.job_id}
+                onGenerate={onGenerateProposal}
+                onLoad={onLoadProposal}
+                onAdjust={onAdjustProposal}
+                onApply={onApplyProposal}
+                onDismiss={onDismissProposal}
+                onRegenerateBackground={onRegenerateBackground}
+                onSeek={seekVideo}
+                requestId={item.id}
+              />
+            </div>
+          )}
+
+          {isResolved ? (
+            <div className="rounded-2xl bg-emerald-500/[0.06] p-4 text-label text-gray-400 ring-1 ring-emerald-400/15">
+              <span className="text-emerald-300 font-medium">
+                {closedByPublication
+                  ? `Resuelto al publicar la versión ${item.resolved_by_revision}`
+                  : "Resuelto"}
+              </span>
+              {!closedByPublication && item.resolved_by && <> por <b>{item.resolved_by}</b></>}
+              {" "}el {fmtDate(item.resolved_at)}
+              {item.resolution_note && (
+                <p className="mt-2 whitespace-pre-wrap text-gray-300">
+                  <span className="text-gray-500">Respuesta: </span>{item.resolution_note}
+                </p>
+              )}
+            </div>
+          ) : (
+            <details className="group rounded-xl bg-white/[0.02] ring-1 ring-white/[0.06]">
+              <summary className="cursor-pointer list-none px-4 py-3 text-label text-gray-500 hover:text-gray-300">
+                Cerrar manualmente o dejar una respuesta
+                <span className="float-right transition-transform group-open:rotate-180">⌄</span>
+              </summary>
+              <div className="space-y-2 border-t border-white/[0.06] p-4">
+                <p className="text-label text-gray-500">
+                  Usalo sólo cuando el pedido no requiera publicar un corte nuevo.
+                </p>
+                <input
+                  type="text"
+                  placeholder="Respuesta opcional"
+                  value={draft}
+                  onChange={(event) => onDraftChange(event.target.value)}
+                  maxLength={2000}
+                  className="w-full rounded-xl bg-surface-3/40 px-3 py-2 text-caption text-white ring-1 ring-white/[0.06] placeholder:text-gray-600 focus:outline-none focus:ring-brand/40"
+                />
+                <div className="flex justify-end">
+                  <button
+                    onClick={onResolve}
+                    disabled={resolving}
+                    className="rounded-lg bg-white/[0.07] px-3 py-1.5 text-caption font-medium text-white hover:bg-white/[0.12] disabled:opacity-50"
+                  >
+                    {resolving ? "Guardando…" : "Marcar resuelto sin publicar"}
+                  </button>
+                </div>
+              </div>
+            </details>
+          )}
         </div>
-      )}
-    </div>
+      </div>
+
+      <footer className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 rounded-b-2xl border-t border-white/[0.08] bg-surface-2/95 px-4 py-3 shadow-[0_-18px_40px_rgba(0,0,0,0.24)] backdrop-blur sm:px-5">
+        <div className="min-w-0">
+          <p className="text-caption font-semibold text-white">{workflow.label}</p>
+          <p className="truncate text-label text-gray-500">
+            {isResolved ? "Podés reabrirlo si el cliente necesita otra corrección." : "Acción recomendada para este pedido"}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {!isResolved && d.job_id && primaryAction.label !== "Editar letra" && (
+            <a
+              href={editorUrlWithRequest(d.job_id, item.id)}
+              className="rounded-xl px-3 py-2 text-caption font-medium text-gray-300 hover:bg-white/[0.06] hover:text-white"
+            >
+              Editar letra
+            </a>
+          )}
+          {primaryAction.href ? (
+            <a
+              href={primaryAction.href}
+              className="rounded-xl bg-brand px-4 py-2.5 text-caption font-semibold text-white shadow-lg shadow-brand/15 hover:bg-brand-light"
+            >
+              {primaryAction.label}
+            </a>
+          ) : (
+            <button
+              type="button"
+              aria-label={primaryAction.label}
+              onClick={primaryAction.onClick}
+              disabled={primaryAction.disabled}
+              className="rounded-xl bg-brand px-4 py-2.5 text-caption font-semibold text-white shadow-lg shadow-brand/15 hover:bg-brand-light disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              {primaryAction.label}
+              {!primaryAction.disabled && <span className="ml-2 hidden text-[10px] opacity-60 sm:inline">⌘↵</span>}
+            </button>
+          )}
+        </div>
+      </footer>
+    </article>
   );
 }
 
@@ -578,7 +761,7 @@ function previewTimestamp(value) {
 }
 
 function LyricsProposalPreview({
-  requestComment, lyricsContext, operations, selected, textDrafts,
+  requestComment, lyricsContext, operations, selected, textDrafts, onSeek,
 }) {
   if (!lyricsContext?.segments?.length) {
     return (
@@ -646,9 +829,15 @@ function LyricsProposalPreview({
               row.changed ? "bg-emerald-500/[0.08]" : ""
             }`}
           >
-            <span className="text-label font-mono text-gray-600 pt-0.5">
+            <button
+              type="button"
+              onClick={() => onSeek?.(row.start)}
+              disabled={!onSeek}
+              className="pt-0.5 text-left text-label font-mono text-gray-500 hover:text-brand-light disabled:cursor-default disabled:hover:text-gray-500"
+              title={onSeek ? "Reproducir desde este momento" : undefined}
+            >
               {previewTimestamp(row.start)}
-            </span>
+            </button>
             <div className="min-w-0">
               {row.changed && (
                 <p className="text-label text-gray-500 line-through break-words">
@@ -669,8 +858,8 @@ function LyricsProposalPreview({
 }
 
 function ChangeRequestProposal({
-  summary, proposal, requestComment, busy, applyEnabled, jobId,
-  onGenerate, onLoad, onAdjust, onApply, onDismiss, onRegenerateBackground,
+  summary, proposal, requestComment, busy, applyEnabled, jobId, requestId,
+  onGenerate, onLoad, onAdjust, onApply, onDismiss, onRegenerateBackground, onSeek,
 }) {
   const operations = proposal?.operations || [];
   const applicable = operations.filter(
@@ -679,6 +868,8 @@ function ChangeRequestProposal({
   const [selected, setSelected] = useState([]);
   const [textDrafts, setTextDrafts] = useState({});
   const [backgroundDrafts, setBackgroundDrafts] = useState({});
+  const [saveStates, setSaveStates] = useState({});
+  const saveTimersRef = useRef(new Map());
 
   useEffect(() => {
     setSelected(applicable.map((operation) => operation.id));
@@ -689,7 +880,42 @@ function ChangeRequestProposal({
     setBackgroundDrafts(Object.fromEntries(operations
       .filter((operation) => operation.visual_action === "regenerate_background")
       .map((operation) => [operation.id, operation.suggested_prompt || ""])));
+    setSaveStates({});
   }, [proposal?.id, proposal?.updated_at]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => () => {
+    saveTimersRef.current.forEach((timer) => clearTimeout(timer));
+    saveTimersRef.current.clear();
+  }, []);
+
+  const saveTextDraft = useCallback(async (operation, value) => {
+    if (!proposal || !operation || !value.trim()) return;
+    const original = operation.proposed_segments?.[0]?.text || "";
+    if (value === original) {
+      setSaveStates((current) => ({ ...current, [operation.id]: null }));
+      return;
+    }
+    const timer = saveTimersRef.current.get(operation.id);
+    if (timer) clearTimeout(timer);
+    saveTimersRef.current.delete(operation.id);
+    setSaveStates((current) => ({ ...current, [operation.id]: "saving" }));
+    const result = await onAdjust(
+      proposal.id, operation.id, value, proposal.base_revision,
+    );
+    setSaveStates((current) => ({
+      ...current,
+      [operation.id]: result ? "saved" : "error",
+    }));
+  }, [onAdjust, proposal]);
+
+  const updateTextDraft = useCallback((operation, value) => {
+    setTextDrafts((current) => ({ ...current, [operation.id]: value }));
+    setSaveStates((current) => ({ ...current, [operation.id]: "pending" }));
+    const existing = saveTimersRef.current.get(operation.id);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => saveTextDraft(operation, value), 700);
+    saveTimersRef.current.set(operation.id, timer);
+  }, [saveTextDraft]);
 
   const hasUnsavedDrafts = applicable.some((operation) => (
     operation.current_segments?.length === 1
@@ -700,30 +926,22 @@ function ChangeRequestProposal({
 
   const effective = proposal || summary;
   const status = effective?.status;
-  const editorUrl = proposal?.editor_url
-    || (jobId ? `/videos/${jobId}/edit-lyrics` : null);
+  const editorUrl = editorUrlWithRequest(jobId, requestId, proposal?.editor_url);
 
   if (!effective) {
     return (
-      <div className="mt-3 rounded-button bg-brand/5 ring-1 ring-brand/20 p-3">
-        <p className="text-label text-gray-300 mb-2">
+      <div className="rounded-2xl bg-brand/[0.06] ring-1 ring-brand/20 p-4">
+        <p className="text-caption font-semibold text-white">Convertir el pedido en cambios revisables</p>
+        <p className="text-label text-gray-400 mt-1">
           El asistente puede convertir timestamps y reemplazos explícitos en un diff revisable.
         </p>
-        <button
-          type="button"
-          onClick={onGenerate}
-          disabled={busy}
-          className="bg-brand hover:bg-brand-light text-white text-caption font-medium px-3 py-1.5 rounded-button disabled:opacity-50"
-        >
-          {busy ? "Analizando…" : "Analizar pedido"}
-        </button>
       </div>
     );
   }
 
   if (!proposal) {
     return (
-      <div className="mt-3 rounded-button bg-brand/5 ring-1 ring-brand/20 p-3 flex items-center justify-between gap-3">
+      <div className="rounded-2xl bg-brand/[0.06] ring-1 ring-brand/20 p-4">
         <div>
           <p className="text-caption font-semibold text-brand-light">
             {PROPOSAL_LABELS[status] || status}
@@ -734,18 +952,6 @@ function ChangeRequestProposal({
               : `${summary.applicable_count || 0} cambio(s) aplicable(s)`}
           </p>
         </div>
-        <button
-          type="button"
-          onClick={status === "stale" || status === "dismissed" ? onGenerate : onLoad}
-          disabled={busy}
-          className="bg-white/[0.07] hover:bg-white/[0.12] text-white text-caption px-3 py-1.5 rounded-button disabled:opacity-50"
-        >
-          {busy
-            ? "Cargando…"
-            : status === "stale" || status === "dismissed"
-              ? "Recalcular"
-              : "Ver propuesta"}
-        </button>
       </div>
     );
   }
@@ -755,7 +961,7 @@ function ChangeRequestProposal({
   ));
 
   return (
-    <div className="mt-3 rounded-button bg-brand/5 ring-1 ring-brand/20 p-3 space-y-3">
+    <section className="rounded-2xl bg-brand/[0.045] ring-1 ring-brand/20 p-4 space-y-4" aria-label="Propuesta de cambios">
       <div className="flex items-center justify-between gap-3">
         <div>
           <p className="text-caption font-semibold text-brand-light">
@@ -909,23 +1115,20 @@ function ChangeRequestProposal({
                   <div className="mt-1 flex gap-2">
                     <input
                       value={proposedText}
-                      onChange={(event) => setTextDrafts((current) => ({
-                        ...current, [operation.id]: event.target.value,
-                      }))}
-                      className="min-w-0 flex-1 bg-surface-3/60 ring-1 ring-white/[0.08] rounded-button px-2 py-1 text-caption text-emerald-200"
+                      onChange={(event) => updateTextDraft(operation, event.target.value)}
+                      onBlur={() => saveTextDraft(operation, proposedText)}
+                      className="min-w-0 flex-1 rounded-lg bg-surface-3/60 px-2.5 py-1.5 text-caption text-emerald-200 ring-1 ring-white/[0.08] focus:outline-none focus:ring-emerald-400/35"
                     />
-                    {proposedText !== (operation.proposed_segments?.[0]?.text || "") && (
-                      <button
-                        type="button"
-                        onClick={() => onAdjust(
-                          proposal.id, operation.id, proposedText, proposal.base_revision,
-                        )}
-                        disabled={busy || !proposedText.trim()}
-                        className="text-label text-brand-light disabled:opacity-50"
-                      >
-                        Guardar
-                      </button>
-                    )}
+                    <span className={`shrink-0 self-center text-[10px] ${
+                      saveStates[operation.id] === "error" ? "text-red-300"
+                        : saveStates[operation.id] === "saved" ? "text-emerald-300"
+                          : "text-gray-500"
+                    }`}>
+                      {saveStates[operation.id] === "saving" ? "Guardando…"
+                        : saveStates[operation.id] === "saved" ? "Guardado"
+                          : saveStates[operation.id] === "error" ? "Reintentar al salir"
+                            : saveStates[operation.id] === "pending" ? "Autoguardado pendiente" : ""}
+                    </span>
                   </div>
                 ) : (
                   <p className="text-caption text-emerald-200 break-words">{proposedText}</p>
@@ -954,12 +1157,13 @@ function ChangeRequestProposal({
           operations={operations}
           selected={selected}
           textDrafts={textDrafts}
+          onSeek={onSeek}
         />
       )}
 
       {hasUnsavedDrafts && (
         <p className="text-label text-amber-200">
-          Guardá los ajustes de texto antes de aplicar la propuesta.
+          Estamos guardando tus ajustes antes de habilitar la aplicación.
         </p>
       )}
 
@@ -978,7 +1182,7 @@ function ChangeRequestProposal({
                   ? "Guardá los ajustes de texto antes de aplicar"
                   : undefined
             }
-            className="bg-brand hover:bg-brand-light text-white text-caption font-medium px-3 py-1.5 rounded-button disabled:opacity-40"
+            className="rounded-xl bg-brand px-4 py-2.5 text-caption font-semibold text-white hover:bg-brand-light disabled:opacity-40"
           >
             {busy ? "Aplicando…" : `Aplicar seleccionadas (${selected.length})`}
           </button>
@@ -986,9 +1190,7 @@ function ChangeRequestProposal({
         {(status === "applied" || status === "partially_applied") && editorUrl && (
           <a
             href={editorUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="bg-brand hover:bg-brand-light text-white text-caption font-medium px-3 py-1.5 rounded-button"
+            className="rounded-xl bg-brand px-4 py-2.5 text-caption font-semibold text-white hover:bg-brand-light"
           >
             Revisar y re-renderizar
           </a>
@@ -1004,6 +1206,6 @@ function ChangeRequestProposal({
           </button>
         )}
       </div>
-    </div>
+    </section>
   );
 }

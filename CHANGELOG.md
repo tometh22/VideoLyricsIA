@@ -3,6 +3,23 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.55] - 2026-09-17
+
+### Added
+
+- Turn Cambios UMG into a dedicated full-width review workspace with a
+  persistent request queue, video and timestamp context, editable diff,
+  autosave status, workflow progress and a fixed primary action.
+
+### Fixed
+
+- Render a UMG lyric proposal that was already saved before opening the
+  editor, even when there is no additional browser-side diff.
+- Validate the exact request and applied proposal used to enqueue a render,
+  make retries idempotent, and preserve that provenance in the render outbox.
+- Return operators to the exact UMG request after submitting or completing a
+  render instead of reopening the lyric editor without context.
+
 ## [1.1.54] - 2026-09-16
 
 ### Added

@@ -290,9 +290,25 @@ export function resolveEditSubmission({
   current,
   jobStatus,
   scenePlan,
+  forceLyricsRerender = false,
 } = {}) {
   const diff = computeFieldDiff(baseline || {}, current || {});
-  const presentBuckets = Object.keys(diff);
+  let presentBuckets = Object.keys(diff);
+
+  // Applying a UMG proposal intentionally saves the corrected editor
+  // revision *before* the operator reviews it.  In that flow baseline and
+  // current are therefore byte-identical even though the rendered video is
+  // still the previous revision.  Treat the explicit, proposal-bound review
+  // as a lyrics render intent instead of showing the misleading "No cambiaste
+  // nada" guard.  Callers must only set this flag for a validated
+  // change_request_id + proposal_id deep-link; ordinary editor visits keep the
+  // strict no-op behaviour below.
+  if (presentBuckets.length === 0 && forceLyricsRerender) {
+    diff.lyrics = {
+      segments: normalizeSegmentsForEdit((current && current.segments) || []),
+    };
+    presentBuckets = ["lyrics"];
+  }
 
   const empty = {
     editType: null,
