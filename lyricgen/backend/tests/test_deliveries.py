@@ -120,6 +120,35 @@ def test_admin_can_create_delivery(client, admin_token, approved_job, all_r2_fil
     assert body["replaced"] is False
 
 
+@pytest.mark.parametrize('portal', ['argentina', 'chile'])
+@pytest.mark.parametrize('keys', [None, {}, {'video': 'immutable/published-cut.mp4'}])
+def test_portal_reads_only_explicit_published_keys(client, admin_token, approved_job, all_r2_files_present, db, portal, keys):
+    from database import Delivery
+    created = client.post(f'/admin/deliveries/from-job/{approved_job.job_id}',
+                          headers=auth(admin_token), json={'portal_id': portal})
+    assert created.status_code == 200, created.text
+    row = db.get(Delivery, created.json()['delivery_id'])
+    row.published_file_keys = keys
+    db.commit()
+    with patch('main.storage._get_client') as storage_client, patch(
+        'main.storage.generate_signed_url', side_effect=lambda key, **kwargs: 'https://files.test/' + key,
+    ) as sign:
+        storage_client.return_value.head_object.return_value = {'ContentLength': 12345}
+        response = client.get('/api/deliveries/items', headers={
+            'X-Portal-Token': PORTAL_TOKEN, 'X-Portal-Id': portal})
+    assert response.status_code == 200, response.text
+    version = response.json()['songs'][0]['versions'][0]
+    signed = [call.args[0] for call in sign.call_args_list]
+    if keys is None:
+        assert version['preview_url'].endswith('/lyric_video.mp4')
+    elif not keys:
+        assert signed == []
+        assert version['preview_url'] is None
+    else:
+        assert set(signed) == {'immutable/published-cut.mp4'}
+        assert version['preview_url'] == 'https://files.test/immutable/published-cut.mp4'
+
+
 def test_missing_prores_is_prepared_instead_of_returning_dead_end(
     client, admin_token, approved_job,
 ):

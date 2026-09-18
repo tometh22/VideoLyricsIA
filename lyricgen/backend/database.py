@@ -1224,6 +1224,11 @@ class Delivery(Base):
     approved_at = Column(DateTime(timezone=True), nullable=True, index=True)
     approved_by_label = Column(String(120), nullable=True)
 
+    # Staging publications can pin immutable files in this shared database.
+    # NULL retains legacy URLs; an empty/partial map must never fall through
+    # to newer unreviewed working files.
+    published_file_keys = Column(JSONB, nullable=True)
+
     def to_dict(self):
         return {
             "id": self.id,
@@ -2236,6 +2241,7 @@ def _migrate_user_columns():
         # Found"). Two columns: approved_at (timestamp) and
         # approved_by_label (free-form, defaults to "UMG").
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS file_sizes JSONB",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_file_keys JSONB",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ",
         "CREATE INDEX IF NOT EXISTS ix_deliveries_approved_at ON deliveries(approved_at)",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_by_label VARCHAR(120)",

@@ -3,6 +3,18 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.2] - 2026-09-18
+
+### Fixed
+
+- Read immutable published-file pointers for Argentina and Chile deliveries
+  created by the staging correction workflow. Never fall through to a new
+  unreviewed render when a pinned file is absent. Legacy rows are unchanged.
+- This is a portal-reader compatibility patch on the exact 1.0.1 production
+  source, not a promotion of staging application features.
+- Recognize official aliases of already-reviewed dependency advisories, retaining
+  package scope and expiry (backport of the staging audit fix).
+
 ## [1.0.1] - 2026-09-15
 
 ### Fixed

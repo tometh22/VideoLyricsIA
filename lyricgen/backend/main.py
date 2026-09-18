@@ -18705,6 +18705,13 @@ async def portal_get_meta(
     }
 
 
+def _published_delivery_key(delivery, file_type):
+    keys = delivery.published_file_keys
+    if keys is not None:
+        return keys.get(file_type)
+    return _r2_key_for_delivery(delivery.tenant_snapshot, delivery.job_id, file_type)
+
+
 @app.get("/api/deliveries/items")
 async def portal_get_items(
     response: Response,
@@ -18748,7 +18755,9 @@ async def portal_get_items(
         for ft in (d.file_types or []):
             if ft not in _DELIVERY_FILE_TYPES:
                 continue
-            r2_key = _r2_key_for_delivery(d.tenant_snapshot, d.job_id, ft)
+            r2_key = _published_delivery_key(d, ft)
+            if not r2_key:
+                continue
             head_jobs.append((di, ft, r2_key))
 
     size_map: dict[tuple[int, str], int | None] = {}
@@ -18839,7 +18848,9 @@ async def portal_get_items(
         for ft in (d.file_types or []):
             if ft not in _DELIVERY_FILE_TYPES:
                 continue
-            r2_key = _r2_key_for_delivery(d.tenant_snapshot, d.job_id, ft)
+            r2_key = _published_delivery_key(d, ft)
+            if not r2_key:
+                continue
             dl_name = f"{_delivery_safe_filename(d.artist_snapshot, d.song_title_snapshot)}.{_DELIVERY_FILE_TYPES[ft]['ext']}"
             try:
                 url = storage.generate_signed_url(
