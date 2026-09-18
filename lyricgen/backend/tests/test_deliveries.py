@@ -138,6 +138,8 @@ def test_portal_reads_only_explicit_published_keys(client, admin_token, approved
             'X-Portal-Token': PORTAL_TOKEN, 'X-Portal-Id': portal})
     assert response.status_code == 200, response.text
     version = response.json()['songs'][0]['versions'][0]
+    assert version['revision'] == 1
+    assert version['content_updated_at'] is None
     signed = [call.args[0] for call in sign.call_args_list]
     if keys is None:
         assert version['preview_url'].endswith('/lyric_video.mp4')
@@ -147,6 +149,44 @@ def test_portal_reads_only_explicit_published_keys(client, admin_token, approved
     else:
         assert set(signed) == {'immutable/published-cut.mp4'}
         assert version['preview_url'] == 'https://files.test/immutable/published-cut.mp4'
+
+
+@pytest.mark.parametrize('portal', ['argentina', 'chile'])
+def test_portal_exposes_corrected_version_without_rewriting_original_date(
+    client, admin_token, approved_job, all_r2_files_present, db, portal,
+):
+    from database import Delivery, DeliveryChangeRequest
+    created = client.post(f'/admin/deliveries/from-job/{approved_job.job_id}',
+                          headers=auth(admin_token), json={'portal_id': portal})
+    assert created.status_code == 200, created.text
+    row = db.get(Delivery, created.json()['delivery_id'])
+    row.added_at = datetime(2026, 9, 4, 12, tzinfo=timezone.utc)
+    row.content_updated_at = datetime(2026, 9, 18, 3, tzinfo=timezone.utc)
+    row.published_revision = 3
+    row.published_file_keys = {'video': 'immutable/corrected-version.mp4'}
+    db.add(DeliveryChangeRequest(delivery_id=row.id, comment='Cambiar el fondo',
+                                resolved_at=row.content_updated_at,
+                                resolved_by_revision=3, resolution_source='publication'))
+    db.commit()
+    with patch('main.storage._get_portal_client') as r2, patch(
+        'main.storage.generate_signed_url', side_effect=lambda key, **kwargs: 'https://files.test/' + key,
+    ):
+        r2.return_value.head_object.return_value = {'ContentLength': 12345}
+        response = client.get('/api/deliveries/items', headers={
+            'X-Portal-Token': PORTAL_TOKEN, 'X-Portal-Id': portal})
+    assert response.status_code == 200, response.text
+    version = response.json()['songs'][0]['versions'][0]
+    assert version['revision'] == 3
+    def utc(value):
+        parsed = datetime.fromisoformat(value)
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    assert utc(version['content_updated_at']) == datetime(2026, 9, 18, 3, tzinfo=timezone.utc)
+    assert utc(version['added_at']) == datetime(2026, 9, 4, 12, tzinfo=timezone.utc)
+    assert version['preview_url'] == 'https://files.test/immutable/corrected-version.mp4'
+    assert version['approved_at'] is None  # never forge the client's approval
+    assert version['pending_change_requests'] == 0
+    assert version['change_requests'][0]['resolved_by_revision'] == 3
+    assert version['change_requests'][0]['resolution_source'] == 'publication'
 
 
 @pytest.mark.parametrize('head_fails', [False, True])

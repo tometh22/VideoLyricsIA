@@ -1228,6 +1228,10 @@ class Delivery(Base):
     # NULL retains legacy URLs; an empty/partial map must never fall through
     # to newer unreviewed working files.
     published_file_keys = Column(JSONB, nullable=True)
+    # Read the existing shared publication metadata written by staging.
+    # added_at is the delivery's original date, not the corrected cut's date.
+    published_revision = Column(Integer, nullable=False, default=1, server_default="1")
+    content_updated_at = Column(DateTime(timezone=True), nullable=True)
 
     def to_dict(self):
         return {
@@ -1275,6 +1279,8 @@ class DeliveryChangeRequest(Base):
         Integer, ForeignKey("users.id"), nullable=True,
     )
     resolution_note = Column(Text, nullable=True)
+    resolved_by_revision = Column(Integer, nullable=True)
+    resolution_source = Column(String(20), nullable=True)
 
     def to_dict(self):
         return {
@@ -2242,6 +2248,10 @@ def _migrate_user_columns():
         # approved_by_label (free-form, defaults to "UMG").
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS file_sizes JSONB",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_file_keys JSONB",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_revision INTEGER DEFAULT 1 NOT NULL",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS content_updated_at TIMESTAMPTZ",
+        "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolved_by_revision INTEGER",
+        "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolution_source VARCHAR(20)",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ",
         "CREATE INDEX IF NOT EXISTS ix_deliveries_approved_at ON deliveries(approved_at)",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_by_label VARCHAR(120)",

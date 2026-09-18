@@ -18758,6 +18758,8 @@ def portal_get_items(
                 "submitted_at": cr.submitted_at.isoformat() if cr.submitted_at else None,
                 "resolved_at": cr.resolved_at.isoformat() if cr.resolved_at else None,
                 "resolution_note": cr.resolution_note,
+                "resolved_by_revision": cr.resolved_by_revision,
+                "resolution_source": cr.resolution_source,
             })
     # Detach before rollback so scalar fields remain usable without a reload.
     db.expunge_all()
@@ -18903,6 +18905,8 @@ def portal_get_items(
             "frame_size": d.frame_size_snapshot,
             "added_at": d.added_at.isoformat() if d.added_at else None,
             "files": files,
+            "revision": d.published_revision or 1,
+            "content_updated_at": d.content_updated_at.isoformat() if d.content_updated_at else None,
             "preview_url": preview_url,
             "short_preview_url": short_preview_url,
             "change_requests": change_requests,
