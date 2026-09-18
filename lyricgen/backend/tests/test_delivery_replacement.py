@@ -30,12 +30,13 @@ def test_correction_variant_replaces_requested_delivery(client, admin_token, app
         assert response.status_code == 200, response.text
         assert response.json()['delivery_id'] == original_id
         assert response.json()['replaced_job_id'] == parent_id
-        assert response.json()['resolved_change_requests'] == [request_id]
+        # A matching variant is not evidence that every request was reviewed.
+        assert response.json()['resolved_change_requests'] == []
         assert response.json()['revision'] == 2
         db.expire_all()
         original = db.get(Delivery, original_id)
         assert original.job_id == child_id and original.approved_at is None
-        assert db.get(DeliveryChangeRequest, request_id).resolved_at
+        assert db.get(DeliveryChangeRequest, request_id).resolved_at is None
         if duplicate_id:
             assert db.get(Delivery, duplicate_id).removed_at is not None
         # A second click is idempotent and does not create another option.

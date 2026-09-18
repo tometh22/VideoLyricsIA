@@ -38,12 +38,12 @@ export function publicationStatus(publication) {
   if (!publication) {
     return {
       tone: "idle",
-      title: "Sin publicación activa en el portal",
-      detail: "Esta entrega no está publicada o fue dada de baja.",
+      title: "Publicación por verificar",
+      detail: "No tenemos datos suficientes para confirmar la versión del portal. Actualizá el pedido.",
       canPublish: false,
     };
   }
-  const revision = publication.revision || 1;
+  const revision = publication.revision;
   const prores = publication.prores_pending || [];
 
   if (BUSY_JOB_STATUSES.has(publication.job_status)) {
@@ -94,6 +94,10 @@ export function publicationStatus(publication) {
       publishLabel: "Publicar actualización",
     };
   }
+  if (!Number.isInteger(revision) || revision < 1) {
+    return { tone: "idle", title: "Publicación por verificar",
+      detail: "El servidor no confirmó una revisión publicada. No significa que el portal esté actualizado.", canPublish: false };
+  }
   if (publication.awaiting_review) {
     return {
       tone: "ok",
@@ -113,7 +117,9 @@ export function publicationStatus(publication) {
   return {
     tone: "ok",
     title: `Versión ${revision} publicada`,
-    detail: "El portal está entregando este mismo corte.",
+    detail: publication.render_matches_editor === true
+      ? "La revisión publicada coincide con el corte según el registro de entrega."
+      : "Existe una publicación registrada; falta confirmar si coincide con el corte actual.",
     canPublish: false,
   };
 }
@@ -170,6 +176,7 @@ export default function ChangeRequestsPanel({
   regenerateBackground = () => {},
   onProResConfigured = () => {},
   reviewForRender = () => {},
+  refreshChangeRequests = () => {},
 }) {
   // Draft local del input de "respuesta" por CR. Clave = id del CR.
   const [drafts, setDrafts] = useState({});
@@ -377,25 +384,26 @@ export default function ChangeRequestsPanel({
               onReopen={() => reopenChangeRequest(selectedItem.id)}
               onPublish={() => publishItem(selectedItem)}
               onReviewRender={() => reviewForRender(selectedItem.id)}
+              onRefresh={() => refreshChangeRequests()}
               proposalEnabled={proposalEnabled}
               proposalApplyEnabled={proposalApplyEnabled}
               proposalBusy={proposalBusyId === selectedItem.id}
               proposal={proposalDetails[selectedItem.id] || null}
               onGenerateProposal={() => generateProposal(selectedItem.id)}
               onLoadProposal={() => loadProposal(selectedItem.id)}
-              onAdjustProposal={(proposalId, operationId, requestedText, baseRevision) =>
+              onAdjustProposal={(proposalId, operationId, requestedText, baseRevision, contentHash) =>
                 adjustProposal(
-                  selectedItem.id, proposalId, operationId, requestedText, baseRevision,
+                  selectedItem.id, proposalId, operationId, requestedText, baseRevision, contentHash,
                 )
               }
-              onApplyProposal={(proposalId, operationIds, baseRevision) =>
-                applyProposal(selectedItem.id, proposalId, operationIds, baseRevision)
+              onApplyProposal={(proposalId, operationIds, baseRevision, contentHash) =>
+                applyProposal(selectedItem.id, proposalId, operationIds, baseRevision, contentHash)
               }
               onDismissProposal={(proposalId) => dismissProposal(selectedItem.id, proposalId)}
-              onRegenerateBackground={(proposalId, operationId, prompt, backgroundMode) =>
+              onRegenerateBackground={(proposalId, operationId, prompt, backgroundMode, contentHash) =>
                 regenerateBackground(
                   selectedItem.id, proposalId, operationId, selectedItem.delivery?.job_id,
-                  prompt, backgroundMode,
+                  prompt, backgroundMode, contentHash,
                 )
               }
             />
@@ -432,7 +440,7 @@ function ChangeRequestCard({
   onResolve, onReopen, onPublish, onReviewRender,
   proposalEnabled, proposalApplyEnabled, proposalBusy, proposal,
   onGenerateProposal, onLoadProposal, onAdjustProposal, onApplyProposal,
-  onDismissProposal, onRegenerateBackground,
+  onDismissProposal, onRegenerateBackground, onRefresh,
 }) {
   const d = item.delivery || {};
   const isResolved = !!item.resolved_at;
@@ -457,7 +465,38 @@ function ChangeRequestCard({
     d.job_id, item.id, ["applied", "partially_applied"].includes(effectiveProposal?.status) ? effectiveProposal?.id : null,
   );
   let primaryAction;
-  if (isResolved) {
+  const serverActions = workflow.allowed_actions;
+  const allows = (action) => !Array.isArray(serverActions) || serverActions.includes(action);
+  if (Array.isArray(serverActions)) {
+    if (isResolved && allows("reopen")) {
+      primaryAction = { label: resolving ? "Reabriendo…" : "Reabrir pedido", onClick: onReopen, disabled: resolving };
+    } else if (["refresh", "unknown"].includes(workflow.key) && allows("refresh")) {
+      primaryAction = { label: "Actualizar estado", onClick: onRefresh, disabled: false };
+    } else if (workflow.key === "blocked" && allows("edit") && d.job_id) {
+      primaryAction = { label: "Revisar trabajo", href: editorUrl };
+    } else if (workflow.key === "analyze" && allows("analyze")) {
+      primaryAction = { label: proposalBusy ? "Analizando…" : "Analizar pedido", onClick: onGenerateProposal, disabled: proposalBusy };
+    } else if (allows("prepare_master") && item.publication?.prores_pending?.length) {
+      primaryAction = { label: publishing ? "Solicitando actualización…" : status.publishLabel || "Actualizar archivo profesional", onClick: onPublish, disabled: publishing };
+    } else if (allows("publish") && status.canPublish) {
+      primaryAction = { label: publishing ? "Publicando…" : "Publicar actualización", onClick: onPublish, disabled: publishing };
+    } else if (workflow.key === "rendering") {
+      primaryAction = { label: "Generando corte nuevo…", disabled: true };
+    } else if (allows("review_proposal") && ["apply", "analyze"].includes(workflow.key)) {
+      primaryAction = { label: proposalBusy ? "Cargando…" : "Revisar propuesta", disabled: proposalBusy,
+        onClick: proposal ? () => proposalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }) : onLoadProposal };
+    } else if (allows("review_render")) {
+      primaryAction = { label: "Revisar y confirmar render", onClick: onReviewRender, disabled: proposalBusy || publishing };
+    } else if (allows("resolve")) {
+      primaryAction = { label: "Marcar como resuelto", onClick: onResolve, disabled: resolving || !draft.trim() };
+    } else if (allows("refresh")) {
+      primaryAction = { label: "Actualizar estado", onClick: onRefresh, disabled: false };
+    } else if (allows("edit") && d.job_id) {
+      primaryAction = { label: "Editar letra", href: editorUrl };
+    } else {
+      primaryAction = { label: "Revisá el motivo del bloqueo", disabled: true };
+    }
+  } else if (isResolved) {
     primaryAction = { label: resolving ? "Reabriendo…" : "Reabrir pedido", onClick: onReopen, disabled: resolving };
   } else if (workflow.key === "analyze" && !effectiveProposal) {
     primaryAction = { label: proposalBusy ? "Analizando…" : "Analizar pedido", onClick: onGenerateProposal, disabled: proposalBusy };
@@ -472,7 +511,7 @@ function ChangeRequestCard({
   } else if (workflow.key === "rendering") {
     primaryAction = { label: "Generando corte nuevo…", disabled: true };
   } else if (item.publication?.render_matches_editor && !item.publication?.needs_publish) {
-    primaryAction = { label: "Marcar como resuelto", onClick: onResolve, disabled: resolving };
+    primaryAction = { label: "Marcar como resuelto", onClick: onResolve, disabled: resolving || !draft.trim() };
   } else if (proposalEnabled && !effectiveProposal) {
     primaryAction = { label: proposalBusy ? "Analizando…" : "Analizar pedido", onClick: onGenerateProposal, disabled: proposalBusy };
   } else if (["applied", "partially_applied"].includes(effectiveProposal?.status) && d.job_id) {
@@ -497,6 +536,8 @@ function ChangeRequestCard({
   useEffect(() => {
     const handleShortcut = (event) => {
       if (!(event.metaKey || event.ctrlKey) || event.key !== "Enter") return;
+      if (event.defaultPrevented || event.target?.closest?.("input, textarea, select, [contenteditable='true'], [role='dialog']")
+        || document.querySelector("[role='dialog'][aria-modal='true']")) return;
       if (primaryAction.disabled) return;
       event.preventDefault();
       if (primaryAction.onClick) primaryAction.onClick();
@@ -586,6 +627,15 @@ function ChangeRequestCard({
             )}
           </div>
 
+          {d.published_video_url && (
+            <a href={d.published_video_url} target="_blank" rel="noopener noreferrer"
+              className="block rounded-xl bg-white/[0.03] p-3 text-caption text-brand-light ring-1 ring-white/[0.08]"
+              aria-label="Ver versión publicada">
+              Ver versión publicada{Number.isInteger(d.published_revision) ? ` ${d.published_revision}` : ""} ↗
+              <span className="mt-1 block text-label text-gray-400">Archivo de la publicación registrada, separado del corte candidato de arriba.</span>
+            </a>
+          )}
+
           <div className={`rounded-xl ring-1 p-3 ${TONE_STYLES[status.tone]}`}>
             <p className="text-caption font-semibold">{status.title}</p>
             <p className="text-label opacity-80 mt-0.5 leading-relaxed">{status.detail}</p>
@@ -635,7 +685,7 @@ function ChangeRequestCard({
               <span className="text-emerald-300 font-medium">
                 {closedByPublication
                   ? `Resuelto al publicar la versión ${item.resolved_by_revision}`
-                  : "Resuelto"}
+                  : "Cerrado manualmente · no acredita una nueva publicación"}
               </span>
               {!closedByPublication && item.resolved_by && <> por <b>{item.resolved_by}</b></>}
               {" "}el {fmtDate(item.resolved_at)}
@@ -654,7 +704,9 @@ function ChangeRequestCard({
                 </p>
                 <input
                   type="text"
-                  placeholder="Respuesta opcional"
+                  placeholder="Motivo del cierre sin publicar (obligatorio)"
+                  aria-label="Motivo del cierre sin publicar"
+                  required
                   value={draft}
                   onChange={(event) => onDraftChange(event.target.value)}
                   maxLength={2000}
@@ -663,7 +715,7 @@ function ChangeRequestCard({
                 <div className="flex justify-end">
                   <button
                     onClick={onResolve}
-                    disabled={resolving}
+                    disabled={resolving || !draft.trim() || !allows("resolve")}
                     className="rounded-lg bg-white/[0.07] px-3 py-1.5 text-caption font-medium text-white hover:bg-white/[0.12] disabled:opacity-50"
                   >
                     {resolving ? "Guardando…" : "Marcar como resuelto"}
@@ -676,7 +728,7 @@ function ChangeRequestCard({
       </div>
 
       <footer className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 rounded-b-2xl border-t border-white/[0.08] bg-surface-2/95 px-4 py-3 shadow-[0_-18px_40px_rgba(0,0,0,0.24)] backdrop-blur sm:px-5">
-        {!isResolved && item.publication?.can_render && workflow.key !== "rendering" && primaryAction.onClick !== onReviewRender && (
+        {!isResolved && allows("review_render") && item.publication?.can_render && workflow.key !== "rendering" && primaryAction.onClick !== onReviewRender && (
           <button type="button" onClick={onReviewRender} disabled={proposalBusy || publishing}
             className="rounded-lg bg-white/10 px-3 py-2 text-caption text-white disabled:opacity-40">
             Revisar letra y re-renderizar
@@ -743,6 +795,13 @@ const MANUAL_LABELS = {
   background_review: "Cambio de fondo manual",
   audio_review: "Verificar identidad del audio",
   manual_review: "Interpretación manual requerida",
+};
+
+const BACKGROUND_BLOCK_REASONS = {
+  multi_scene_background_requires_scene_editor: "Este video usa varias escenas; el cambio debe hacerse escena por escena.",
+  background_constraints_exceed_prompt_limit: "Las condiciones obligatorias superan el límite del prompt. Revisá el alcance a mano; no vamos a recortar ni omitir restricciones del cliente.",
+  unresolved_visual_constraint: "Hay una restricción visual que necesita aclaración. Revisá el pedido completo y definí qué se debe conservar o excluir antes de regenerar.",
+  unresolved_request_requires_review: "Hay partes del pedido que no se pudieron interpretar con seguridad. Revisalas a mano antes de regenerar el fondo.",
 };
 
 function samePreviewSegment(left, right) {
@@ -921,18 +980,36 @@ function ChangeRequestProposal({
   const [backgroundDrafts, setBackgroundDrafts] = useState({});
   const [saveStates, setSaveStates] = useState({});
   const saveTimersRef = useRef(new Map());
+  const draftBaselineRef = useRef({ id: null, values: {} });
 
   useEffect(() => {
-    setSelected(applicable.map((operation) => operation.id));
-    setTextDrafts(Object.fromEntries(applicable.map((operation) => [
+    if (!proposal) {
+      saveTimersRef.current.forEach(timer => clearTimeout(timer));
+      saveTimersRef.current.clear();
+      return;
+    }
+    const previous = draftBaselineRef.current;
+    const values = Object.fromEntries(applicable.map((operation) => [
       operation.id,
       operation.proposed_segments?.[0]?.text || "",
+    ]));
+    setSelected(current => previous.id === proposal?.id
+      ? current.filter(id => applicable.some(operation => operation.id === id))
+      : applicable.map(operation => operation.id));
+    setTextDrafts(current => Object.fromEntries(Object.entries(values).map(([id, value]) => [id,
+      previous.id === proposal?.id && current[id] != null && current[id] !== previous.values[id]
+        ? current[id] : value,
     ])));
+    draftBaselineRef.current = { id: proposal?.id, values };
+    // A timer captured the previous preview hash. Do not dispatch an old
+    // patch after a remote update; retain drafts for explicit review/blur.
+    saveTimersRef.current.forEach(timer => clearTimeout(timer));
+    saveTimersRef.current.clear();
     setBackgroundDrafts(Object.fromEntries(operations
       .filter((operation) => operation.visual_action === "regenerate_background")
       .map((operation) => [operation.id, operation.suggested_prompt || ""])));
     setSaveStates({});
-  }, [proposal?.id, proposal?.updated_at]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [proposal?.id, proposal?.updated_at, proposal?.content_hash]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => () => {
     saveTimersRef.current.forEach((timer) => clearTimeout(timer));
@@ -951,7 +1028,7 @@ function ChangeRequestProposal({
     saveTimersRef.current.delete(operation.id);
     setSaveStates((current) => ({ ...current, [operation.id]: "saving" }));
     const result = await onAdjust(
-      proposal.id, operation.id, value, proposal.base_revision,
+      proposal.id, operation.id, value, proposal.base_revision, proposal.content_hash,
     );
     setSaveStates((current) => ({
       ...current,
@@ -977,6 +1054,9 @@ function ChangeRequestProposal({
 
   const effective = proposal || summary;
   const status = effective?.status;
+  const previewCurrent = ["ready", "partial"].includes(status)
+    && !!proposal?.content_hash && proposal?.lyrics_context?.matches_base === true
+    && (!summary?.content_hash || summary.content_hash === proposal.content_hash);
   const savedChecks = appliedTextChecks(proposal);
   const savedMatches = savedChecks.length > 0 && savedChecks.every(check => check.matches);
   const editorUrl = editorUrlWithRequest(
@@ -1056,10 +1136,24 @@ function ChangeRequestProposal({
         const proposedText = textDrafts[operation.id]
           ?? operation.proposed_segments?.[0]?.text ?? "";
         if (!operation.applicable) {
+          if (operation.status === "already_satisfied") {
+            return (
+              <div key={operation.id} className="rounded-button bg-white/[0.04] ring-1 ring-white/[0.1] p-3">
+                <p className="text-caption font-semibold text-gray-200">Ya coincide en la letra guardada</p>
+                {(operation.verified_segments || []).map((segment, index) => (
+                  <p key={segment._id || index} className="mt-2 text-caption text-gray-300 whitespace-pre-wrap">{segment.text}</p>
+                ))}
+                <p className="mt-2 text-label text-gray-400">Verificación textual de la revisión {proposal.lyrics_context?.revision ?? proposal.base_revision}. No confirma el render ni la publicación.</p>
+              </div>
+            );
+          }
           if (operation.visual_action === "regenerate_background") {
             const backgroundPrompt = backgroundDrafts[operation.id]
               ?? operation.suggested_prompt ?? "";
             const supported = operation.regeneration_supported !== false;
+            const blockedReasons = [...new Set(operation.warnings || [])]
+              .filter(reason => BACKGROUND_BLOCK_REASONS[reason]);
+            const multiScene = blockedReasons.includes("multi_scene_background_requires_scene_editor");
             return (
               <div
                 key={operation.id}
@@ -1111,17 +1205,21 @@ function ChangeRequestProposal({
                         operation.id,
                         backgroundPrompt,
                         operation.background_mode,
+                        proposal.content_hash,
                       )}
-                      disabled={busy || !backgroundPrompt.trim()}
+                      disabled={busy || !backgroundPrompt.trim() || !previewCurrent}
+                      title={!previewCurrent ? "Actualizá y revisá la comparación antes de generar" : undefined}
                       className="bg-sky-500 hover:bg-sky-400 text-white text-caption font-semibold px-3 py-2 rounded-button disabled:opacity-40"
                     >
                       {busy ? "Iniciando…" : "Regenerar fondo con este prompt"}
                     </button>
                   ) : (
                     <div>
-                      <p className="text-label text-amber-200">
-                        Este video usa varias escenas; el cambio debe hacerse escena por escena.
-                      </p>
+                      {(blockedReasons.length ? blockedReasons : ["unknown"]).map(reason => (
+                        <p key={reason} className="text-label text-amber-200 mt-1">
+                          {BACKGROUND_BLOCK_REASONS[reason] || "Este pedido requiere revisión manual antes de regenerar. Abrí el editor de fondo y contrastalo con el pedido original."}
+                        </p>
+                      ))}
                       {editorUrl && (
                         <a
                           href={editorUrl}
@@ -1129,7 +1227,7 @@ function ChangeRequestProposal({
                           rel="noopener noreferrer"
                           className="inline-flex mt-2 bg-white/[0.08] hover:bg-white/[0.14] text-white text-label font-medium px-2.5 py-1.5 rounded-button"
                         >
-                          Abrir editor de escenas
+                          {multiScene ? "Abrir editor de escenas" : "Abrir editor de fondo"}
                         </a>
                       )}
                     </div>
@@ -1143,6 +1241,10 @@ function ChangeRequestProposal({
               <p className="text-caption text-amber-200">
                 {MANUAL_LABELS[operation.kind] || "Revisión manual"}
               </p>
+              {operation.source_excerpt && <p className="mt-1 text-label text-gray-300 whitespace-pre-wrap">{operation.source_excerpt}</p>}
+              {operation.reason === "instruction_requires_manual_interpretation" && (
+                <p className="mt-1 text-label text-amber-100">No podemos distinguir con certeza la letra de las indicaciones. Conservamos el pedido completo: revisá esta parte en el editor.</p>
+              )}
               {operation.timecode_seconds != null && (
                 <p className="text-label text-gray-400">Cerca de {Math.floor(operation.timecode_seconds / 60)}:{String(Math.round(operation.timecode_seconds % 60)).padStart(2, "0")}</p>
               )}
@@ -1181,6 +1283,7 @@ function ChangeRequestProposal({
                   <div className="mt-1 flex gap-2">
                     <input
                       value={proposedText}
+                      disabled={busy || !previewCurrent}
                       onChange={(event) => updateTextDraft(operation, event.target.value)}
                       onBlur={() => saveTextDraft(operation, proposedText)}
                       className="min-w-0 flex-1 rounded-lg bg-surface-3/60 px-2.5 py-1.5 text-caption text-emerald-200 ring-1 ring-white/[0.08] focus:outline-none focus:ring-emerald-400/35"
@@ -1229,7 +1332,7 @@ function ChangeRequestProposal({
 
       {hasUnsavedDrafts && (
         <p className="text-label text-amber-200">
-          Estamos guardando tus ajustes antes de habilitar la aplicación.
+          Tenés ajustes sin guardar. Salí del campo para guardarlos y revisá la comparación antes de aplicar.
         </p>
       )}
 
@@ -1246,13 +1349,15 @@ function ChangeRequestProposal({
         {(status === "ready" || status === "partial") && applicable.length > 0 && (
           <button
             type="button"
-            onClick={() => onApply(proposal.id, selected, proposal.base_revision)}
+            onClick={() => onApply(proposal.id, selected, proposal.base_revision, proposal.content_hash)}
             disabled={(
-              busy || !applyEnabled || selected.length === 0 || hasUnsavedDrafts
+              busy || !applyEnabled || !previewCurrent || selected.length === 0 || hasUnsavedDrafts
             )}
             title={
               !applyEnabled
                 ? "La aplicación está deshabilitada por configuración"
+                : !proposal.content_hash
+                  ? "Actualizá la comparación para verificar su versión"
                 : hasUnsavedDrafts
                   ? "Guardá los ajustes de texto antes de aplicar"
                   : undefined
@@ -1282,6 +1387,11 @@ function ChangeRequestProposal({
           </button>
         )}
       </div>
+      {!proposal.content_hash && ["ready", "partial", "needs_input"].includes(status) && (
+        <button type="button" onClick={onLoad} disabled={busy} className="text-caption text-brand-light underline">
+          Actualizar comparación antes de aplicar
+        </button>
+      )}
     </section>
   );
 }

@@ -19,6 +19,8 @@ const PROPOSAL_REVIEW_STATUSES = new Set(["ready", "partial", "needs_input"]);
 const PROPOSAL_APPLIED_STATUSES = new Set(["applied", "partially_applied"]);
 
 export function proposalForRequest(item, loadedProposal) {
+  if (loadedProposal && item?.proposal?.content_hash
+    && loadedProposal.content_hash !== item.proposal.content_hash) return item.proposal;
   return loadedProposal || item?.proposal || null;
 }
 
@@ -29,10 +31,21 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
       detail: "Elegí un pedido de la cola.", tone: "idle",
     };
   }
+  if (item.workflow && Array.isArray(item.workflow.allowed_actions)) {
+    if (!loadedProposal?.content_hash || loadedProposal.content_hash === item.proposal?.content_hash) {
+      return item.workflow;
+    }
+    return { key: "refresh", activeStep: 0, label: "Comparación desactualizada",
+      detail: "La propuesta cambió. Actualizá el estado y revisá la nueva comparación antes de continuar.",
+      tone: "attention", allowed_actions: ["refresh"] };
+  }
   if (item.resolved_at) {
+    const published = item.resolution_source === "publication";
     return {
-      key: "resolved", activeStep: WORKFLOW_STEPS.length,
-      label: "Pedido resuelto", detail: "La corrección ya fue cerrada.", tone: "done",
+      key: "resolved", activeStep: published ? WORKFLOW_STEPS.length : -1,
+      label: published ? "Resuelto al publicar" : "Cerrado manualmente",
+      detail: published ? "El pedido se cerró al registrar su publicación."
+        : "Este cierre no confirma que se haya publicado un video nuevo.", tone: "done",
     };
   }
 
@@ -82,7 +95,7 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
   }
   if (publication.render_matches_editor) {
     return { key: "review", activeStep: 3, label: "Corte generado",
-      detail: "El portal ya tiene este corte. Si el pedido está atendido, marcalo como resuelto.", tone: "done" };
+      detail: "Revisá la publicación registrada y el pedido. Cerrarlo manualmente requiere indicar el motivo.", tone: "attention" };
   }
 
   const proposal = proposalForRequest(item, loadedProposal);
@@ -157,7 +170,7 @@ export function workflowMatchesFilter(workflow, filter) {
   if (filter === "action") {
     return ["analyze", "apply", "manual", "render"].includes(workflow.key);
   }
-  if (filter === "review") return workflow.key === "publish";
+  if (filter === "review") return ["publish", "review"].includes(workflow.key);
   return workflow.key === filter;
 }
 
@@ -167,7 +180,7 @@ export function workflowCounts(items, proposals, proposalEnabled) {
     const workflow = requestWorkflow(item, proposals?.[item.id], proposalEnabled);
     if (["analyze", "apply", "manual", "render"].includes(workflow.key)) counts.action += 1;
     if (workflow.key === "rendering") counts.rendering += 1;
-    if (workflow.key === "publish") counts.review += 1;
+    if (["publish", "review"].includes(workflow.key)) counts.review += 1;
   });
   return counts;
 }

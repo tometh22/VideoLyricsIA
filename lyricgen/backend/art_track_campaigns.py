@@ -854,22 +854,10 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     active.approved_at = None; active.approved_by_label = None
                 if changed or active.content_updated_at is None:
                     active.content_updated_at = _now()
-                if changed:
-                    from database import DeliveryChangeRequest
-                    from change_request_workflow import latest_overwrite, timestamp
-                    rendered_at = latest_overwrite(job) or timestamp(job.completed_at)
-                    pending = ddb.query(DeliveryChangeRequest).filter(
-                        DeliveryChangeRequest.delivery_id == active.id,
-                        DeliveryChangeRequest.resolved_at.is_(None)).all()
-                    for change in pending:
-                        # Requests arriving after this render are NOT answered
-                        # by resending an older already-approved cut.
-                        if rendered_at and timestamp(change.submitted_at) <= rendered_at:
-                            change.resolved_at = _now()
-                            change.resolved_by_user_id = deliveries_added_by(op.created_by)
-                            change.resolved_by_revision = active.published_revision
-                            change.resolution_source = 'publication'
-                            change.resolution_note = f'Resuelto al publicar la versión {active.published_revision} desde la campaña.'
+                # A campaign send attests the selected cut, not every client
+                # request predating it. Until the batch intent carries explicit
+                # reviewed request/revision evidence, keep requests open; the
+                # Corrections workflow can verify and close the intended case.
                 row.error_code = None; row.error_detail = None
                 ddb.commit()
                 db.commit()

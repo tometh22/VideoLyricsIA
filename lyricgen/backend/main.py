@@ -12508,6 +12508,7 @@ class ApproveJobRequest(BaseModel):
 class DeliveryQCIssueDecisionRequest(BaseModel):
     decision: str = Field(pattern="^(acknowledged|rejected|resolved_manual)$")
     reason: str = Field(default="", max_length=300)
+    expected_report_id: str | None = Field(default=None, max_length=160)
 
 
 class DeliveryQCExternalFindingRequest(BaseModel):
@@ -12524,6 +12525,7 @@ class DeliveryQCExternalFindingRequest(BaseModel):
 
 
 class DeliveryQCExternalResultRequest(BaseModel):
+    expected_report_id: str | None = Field(default=None, max_length=160)
     finding_count: int = Field(ge=0, le=10000)
     report_id: str = Field(default="", max_length=160)
     source: str = Field(default="umg", pattern="^[a-zA-Z0-9_-]{1,32}$")
@@ -12586,6 +12588,7 @@ class EditJobRequest(BaseModel):
     # Optional one-click Delivery QC repairs. IDs are server-issued and bound
     # to the fresh report; arbitrary browser patches are never accepted.
     delivery_qc_action_ids: list[str] = Field(default_factory=list, max_length=64)
+    expected_delivery_qc_report_id: str | None = Field(default=None, max_length=160)
     base_revision: int | None = Field(default=None, ge=0)
     editor_revision: int | None = Field(default=None, ge=0)
     editor_version_id: str | None = Field(default=None, max_length=36)
@@ -12596,6 +12599,8 @@ class EditJobRequest(BaseModel):
     # parameters never become render authority.
     change_request_id: int | None = Field(default=None, ge=1)
     change_request_proposal_id: str | None = Field(default=None, max_length=36)
+    change_request_operation_id: str | None = Field(default=None, max_length=100)
+    expected_proposal_hash: str | None = Field(default=None, min_length=64, max_length=64)
     force_conflict_overwrite: bool = False
     # Optional free-form hint for edit_type=="background". The operator
     # types what they want the new background to convey ("paisaje cálido
@@ -12942,8 +12947,17 @@ async def approve_job(
     return {"ok": True, "status": "done", "job_id": job_id}
 
 
+def _validate_qc_report_preview(report, expected_report_id):
+    actual = report.get("report_id") or report.get("generated_at")
+    if report.get("status") != "COMPLETE" or not actual or expected_report_id != actual:
+        raise HTTPException(status_code=409, detail={
+            "code": "delivery_qc_preview_changed",
+            "message": "El reporte cambió o no tiene identidad verificable. Actualizá el preflight y revisá el video antes de confirmar.",
+        })
+
+
 @app.post("/jobs/{job_id}/delivery-qc/issues/{issue_id}/decision")
-async def decide_delivery_qc_issue(
+def decide_delivery_qc_issue(
     job_id: str,
     issue_id: str,
     body: DeliveryQCIssueDecisionRequest,
@@ -12960,6 +12974,7 @@ async def decide_delivery_qc_issue(
     report = dict(job.delivery_qc or {})
     if report.get("status") != "COMPLETE":
         raise HTTPException(status_code=409, detail="delivery_qc_report_stale")
+    _validate_qc_report_preview(report, body.expected_report_id)
     found = None
     issues = []
     status_map = {
@@ -13019,6 +13034,10 @@ async def decide_delivery_qc_issue(
         report,
         "enforce" if job.workload_class == "batch" else effective_delivery_qc_mode(),
     )
+    # Decisions also advance the viewed report token: another tab cannot
+    # silently overwrite a review recorded since its last refresh.
+    from uuid import uuid4
+    report['report_id'] = uuid4().hex
     job.delivery_qc = report
     db.add(ProductEvent(
         tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job_id,
@@ -13061,12 +13080,25 @@ async def recheck_delivery_qc(
 
     video_key = (job.s3_keys or {}).get("video") if isinstance(job.s3_keys, dict) else None
     local_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP["video"])
+    from delivery_qc_runtime import qc_input_identity
+    expected_input = qc_input_identity(job)
+    # No connection/transaction is retained during a download or while the
+    # worker opens its own session. The identity is checked before and after QC.
+    db.rollback()
 
     async def _run(video_path: str):
         from delivery_qc_runtime import run_delivery_qc_for_job
-        return await asyncio.to_thread(
-            run_delivery_qc_for_job, job_id, video_path,
-        )
+        try:
+            return await asyncio.to_thread(
+                run_delivery_qc_for_job, job_id, video_path,
+                expected_input=expected_input,
+            )
+        except RuntimeError as exc:
+            if str(exc).startswith('delivery_qc_'):
+                raise HTTPException(status_code=409, detail={
+                    'code': str(exc), 'message': 'El video o su revisión cambió durante el control. Actualizá y volvé a revisar.',
+                }) from None
+            raise
 
     if video_key and storage.is_enabled():
         import tempfile
@@ -13086,7 +13118,7 @@ async def recheck_delivery_qc(
 
 
 @app.post("/jobs/{job_id}/delivery-qc/external-result")
-async def record_delivery_qc_external_result(
+def record_delivery_qc_external_result(
     job_id: str,
     body: DeliveryQCExternalResultRequest,
     current_user: dict = Depends(get_current_user),
@@ -13112,6 +13144,7 @@ async def record_delivery_qc_external_result(
         findings=raw_findings,
     )
     report = dict(job.delivery_qc or {})
+    _validate_qc_report_preview(report, body.expected_report_id)
     history = list(report.get("external_results") or [])
     result = {
         "source": body.source, "report_id": body.report_id,
@@ -13126,6 +13159,8 @@ async def record_delivery_qc_external_result(
     }
     history.append(result)
     report["external_results"] = history[-20:]
+    from uuid import uuid4
+    report['report_id'] = uuid4().hex
     job.delivery_qc = report
     db.add(ProductEvent(
         tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job_id,
@@ -16592,7 +16627,7 @@ async def upload_edit_custom_background(
 
 
 @app.post("/edit/{job_id}")
-async def request_edit(
+def request_edit(
     job_id: str,
     body: EditJobRequest,
     background_tasks: BackgroundTasks,
@@ -16609,9 +16644,25 @@ async def request_edit(
 
     Limited to 3 edits per job. After the 3rd edit the reviewer must
     approve or reject — no further edits are allowed.
+
+    This synchronous handler runs in FastAPI's worker pool: SQLAlchemy pool
+    and row-lock waits must never block the event loop needed to complete
+    competing requests. Only the bounded storage coroutine returns to it.
     """
     from database import Job as JobModel, AuditLog, ChangeRequestProposal
     from pipeline import _MAX_EDITS
+
+    background_case = None
+    if body.edit_type == 'background' and (
+            body.change_request_id is not None or body.change_request_proposal_id is not None):
+        if current_user.get('role') != 'admin':
+            raise HTTPException(status_code=403, detail='Admin only')
+        if not all((body.change_request_id, body.change_request_proposal_id,
+                    body.change_request_operation_id, body.expected_proposal_hash)):
+            raise HTTPException(status_code=409, detail='change_request_context_incomplete')
+        from database import scoped_deliveries_db
+        with scoped_deliveries_db() as request_db:
+            background_case = _read_change_request_context(db, request_db, body.change_request_id)
 
     _edit_request_fingerprint = _request_fingerprint(
         "edit.v1", {"job_id": job_id, "body": _model_payload(body)},
@@ -16667,7 +16718,7 @@ async def request_edit(
                 # Never replay a failed render as an accepted 202. The
                 # normal status gate directs recovery to the retry flow.
                 break
-            return _accepted_job_response(
+            response = _accepted_job_response(
                 job_id=job_id,
                 status=str(_probe.status or "pending_review"),
                 status_url=f"/status/{job_id}",
@@ -16679,6 +16730,8 @@ async def request_edit(
                     "progress": _probe.progress,
                 },
             )
+            db.rollback()
+            return response
     if _probe.status == "editing":
         from database import JobOutboxEvent
 
@@ -16704,7 +16757,7 @@ async def request_edit(
             _active_edit_payload.get("idempotency_key_hash") or ""
         )
         if _active_edit_fingerprint == _edit_request_fingerprint:
-            return _accepted_job_response(
+            response = _accepted_job_response(
                 job_id=job_id,
                 status="editing",
                 status_url=f"/status/{job_id}",
@@ -16716,6 +16769,8 @@ async def request_edit(
                     "progress": _probe.progress,
                 },
             )
+            db.rollback()
+            return response
         if (
             _edit_idempotency_hash
             and _edit_idempotency_hash == _active_edit_idem
@@ -16738,19 +16793,37 @@ async def request_edit(
             },
         )
 
+    # Capture read-only probe data before returning its connection. Nothing
+    # below may lazy-load this ORM snapshot during remote I/O; authority comes
+    # from the refreshed locked Job read after preflight.
+    _probe_s3 = dict(_probe.s3_keys) if isinstance(_probe.s3_keys, dict) else {}
+    _probe_input_r2_key = _probe.input_r2_key
+    manual_case = None
+    if (body.edit_type != 'background' and body.change_request_id is not None
+            and not body.change_request_proposal_id):
+        if current_user.get('role') != 'admin':
+            raise HTTPException(status_code=403, detail='Admin only')
+        # Read external context before acquiring Job. Acquiring a second
+        # pooled connection while holding Job can starve all manual renders.
+        # This stays after the durable replay fast-path: a committed render's
+        # retry must not be invalidated by later case lifecycle changes.
+        from database import scoped_deliveries_db
+        with scoped_deliveries_db() as request_db:
+            manual_case = _read_change_request_context(db, request_db, body.change_request_id)
+    db.rollback()
+
     # Preflight storage before taking the mutation row-lock. Probe all usable
     # sources in parallel and cap the whole dependency wait: a slow R2 HEAD
     # must not keep Postgres locked or turn an accepted edit into a browser
     # timeout. `None` is an inconclusive dependency failure, so the worker's
     # existing two-tier recovery remains authoritative in that case.
     if storage.is_enabled():
-        _probe_s3 = _probe.s3_keys if isinstance(_probe.s3_keys, dict) else {}
         _deliverable_keys = [
             _probe_s3.get(kind) for kind in ("video", "short")
         ]
         _audio_source_items = [
             (kind, key) for kind, key in [
-                ("input", _probe.input_r2_key),
+                ("input", _probe_input_r2_key),
                 *zip(("video", "short"), _deliverable_keys),
             ] if key
         ]
@@ -16763,12 +16836,17 @@ async def request_edit(
                     "para regenerar el video."
                 ),
             )
-        _source_results = await asyncio.gather(*(
-            _bounded_storage_probe(
-                storage.object_exists, key, timeout_seconds=2.0,
-            )
-            for _kind, key in _audio_source_items
-        ))
+        async def _probe_sources():
+            # No ORM objects or DB operations cross back onto the event loop.
+            return await asyncio.gather(*(
+                _bounded_storage_probe(
+                    storage.object_exists, key, timeout_seconds=2.0,
+                )
+                for _kind, key in _audio_source_items
+            ))
+
+        from anyio import from_thread
+        _source_results = from_thread.run(_probe_sources)
         _source_by_kind = {
             kind: result
             for (kind, _key), result in zip(_audio_source_items, _source_results)
@@ -16792,7 +16870,7 @@ async def request_edit(
         if not _has_input and _has_deliverable:
             logger.info(
                 "[EDIT] job %s: input %r ausente en R2 — el worker recuperará "
-                "el audio del deliverable (tier-2)", job_id, _probe.input_r2_key,
+                "el audio del deliverable (tier-2)", job_id, _probe_input_r2_key,
             )
 
     # with_for_update() toma row-level lock en Postgres para serializar
@@ -16810,7 +16888,7 @@ async def request_edit(
     _edit_q = db.query(JobModel).filter(JobModel.job_id == job_id)
     if current_user.get("role") != "admin":
         _edit_q = _edit_q.filter(JobModel.tenant_id == current_user["tenant_id"])
-    job = _edit_q.with_for_update().first()
+    job = _edit_q.populate_existing().with_for_update().first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -16825,7 +16903,35 @@ async def request_edit(
         body.change_request_id is not None
         or body.change_request_proposal_id is not None
     )
-    if _has_change_request_context:
+    if background_case is not None:
+        background_request, background_delivery = background_case
+        if background_delivery.job_id != job_id or background_request.resolved_at:
+            raise HTTPException(status_code=409, detail='change_request_job_mismatch')
+        from change_request_proposals import request_hash
+        background_proposal = (db.query(ChangeRequestProposal).filter(
+            ChangeRequestProposal.id == body.change_request_proposal_id,
+            ChangeRequestProposal.change_request_id == body.change_request_id,
+            ChangeRequestProposal.job_id == job_id,
+        ).populate_existing().with_for_update().first())
+        document = db.query(EditorDocument).filter(EditorDocument.job_id == job_id).first()
+        preview = _serialize_change_request_proposal(background_proposal, document=document) if background_proposal else {}
+        operation = next((op for op in preview.get('operations', [])
+                          if op.get('id') == body.change_request_operation_id), {})
+        if (preview.get('status') not in {'ready', 'partial'}
+                or preview.get('content_hash') != body.expected_proposal_hash
+                or preview.get('request_sha256') != request_hash(background_request.comment)
+                or document is None or document.revision != body.editor_revision
+                or document.revision != preview.get('base_revision')
+                or background_proposal.delivery_id != background_delivery.id
+                or int(background_proposal.audio_revision or 0) != int(job.audio_revision or 0)
+                or str(background_proposal.audio_sha256 or '') != str(job.input_audio_sha256 or '')
+                or operation.get('visual_action') != 'regenerate_background'
+                or not operation.get('regeneration_supported')):
+            raise HTTPException(status_code=409, detail={
+                'code': 'proposal_preview_changed',
+                'message': 'La propuesta de fondo cambió o necesita revisión. Recalculá el pedido antes de generar.',
+            })
+    elif _has_change_request_context:
         if body.change_request_id is None:
             raise HTTPException(
                 status_code=400,
@@ -16834,11 +16940,11 @@ async def request_edit(
         if current_user.get("role") != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
         if not body.change_request_proposal_id:
-            from database import scoped_deliveries_db
-            with scoped_deliveries_db() as request_db:
-                manual_request, manual_delivery = _change_request_context(request_db, body.change_request_id)
-                if manual_delivery.job_id != job_id or manual_request.resolved_at:
-                    raise HTTPException(status_code=409, detail='change_request_job_mismatch')
+            if manual_case is None:
+                raise HTTPException(status_code=409, detail='change_request_context_incomplete')
+            manual_request, manual_delivery = manual_case
+            if manual_delivery.job_id != job_id or manual_request.resolved_at:
+                raise HTTPException(status_code=409, detail='change_request_job_mismatch')
         _change_request_proposal = (
             db.query(ChangeRequestProposal)
             .filter(
@@ -16866,6 +16972,7 @@ async def request_edit(
     _delivery_qc_actions: list[dict] = []
     if body.delivery_qc_action_ids:
         report = job.delivery_qc if isinstance(job.delivery_qc, dict) else {}
+        _validate_qc_report_preview(report, body.expected_delivery_qc_report_id)
         if report.get("status") != "COMPLETE" or int(report.get("segments_revision") or -1) != int(job.segments_revision or 0):
             raise HTTPException(status_code=409, detail="delivery_qc_report_stale")
         indexed = {
@@ -16902,7 +17009,7 @@ async def request_edit(
             dict(_raced_edit.payload or {}) if _raced_edit is not None else {}
         )
         if str(_raced_payload.get("request_fingerprint") or "") == _edit_request_fingerprint:
-            return _accepted_job_response(
+            response = _accepted_job_response(
                 job_id=job_id,
                 status="editing",
                 status_url=f"/status/{job_id}",
@@ -16914,6 +17021,10 @@ async def request_edit(
                     "progress": job.progress,
                 },
             )
+            # Release Job immediately; do not rely on dependency teardown
+            # being scheduled before another request waits for this lock.
+            db.rollback()
+            return response
         if (
             _edit_idempotency_hash
             and _edit_idempotency_hash
@@ -19862,7 +19973,7 @@ class SendToUMGRequest(BaseModel):
 
 
 @app.post("/admin/deliveries/from-job/{job_id}")
-async def admin_create_delivery_from_job(
+def admin_create_delivery_from_job(
     job_id: str,
     body: SendToUMGRequest | None = None,
     current_user: dict = Depends(get_current_user),
@@ -19880,9 +19991,26 @@ async def admin_create_delivery_from_job(
     DB de deliveries (`ddb`), que puede ser externa (portal de prod) cuando
     DELIVERIES_DATABASE_URL está seteada — así staging publica en el mismo
     portal que prod. Sin esa env, ddb == db y el comportamiento es idéntico.
+
+    SQLAlchemy pool/row-lock waits run in FastAPI's worker pool, never on
+    the application event loop needed to finish competing requests.
     """
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
+
+    if ddb is not db and ddb.get_bind() is db.get_bind():
+        # Local fallback: both dependencies otherwise compete for two slots
+        # in the SAME pool. A Job lock holder can starve waiting for ddb while
+        # every remaining slot waits for that Job. Alias only this endpoint,
+        # only an identical Engine, before loading context or doing writes.
+        # Approval still commits first; publication commits next; the local
+        # audit is still committed afterwards in its own transaction. Actual
+        # external portal databases keep their independent sessions/commits.
+        if any(session.new or session.dirty or session.deleted for session in (db, ddb)):
+            raise HTTPException(status_code=409, detail='publication_context_has_pending_writes')
+        db.rollback()
+        ddb.rollback()
+        ddb = db
 
     portal_id = _portal_id(body.portal_id if body else None)
 
@@ -19907,7 +20035,10 @@ async def admin_create_delivery_from_job(
         if job.status == 'pending_review':
             # The Publish confirmation is the final video review. Keep the
             # normal QC, billing and audit gates; never mark done directly.
-            await approve_job(job_id, ApproveJobRequest(notes='Corte revisado desde Cambios UMG'), current_user, db)
+            # The existing approval coroutine contains synchronous DB work.
+            # Run it on this worker's private loop, not the application loop;
+            # all normal quota, QC, tenant and audit gates remain authoritative.
+            asyncio.run(approve_job(job_id, ApproveJobRequest(notes='Corte revisado desde Cambios UMG'), current_user, db))
             db.expire_all()
             job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
             validate_reviewed_cut()
@@ -19924,11 +20055,32 @@ async def admin_create_delivery_from_job(
     # requirements. ProRes is different: it is a lazy derivative and its
     # post-render prewarm is deliberately best-effort, so an explicit
     # "Enviar a UMG" must recover by force-enqueueing missing masters.
-    missing = []
-    for ft in _DEFAULT_DELIVERY_FILE_TYPES:
-        key = _r2_key_for_delivery(job.tenant_id, job.job_id, ft)
-        if not storage.object_exists(key):
-            missing.append(ft)
+    # Even HEAD calls can stall. Never hold either database transaction or
+    # the event loop while contacting storage; an outage is not a missing
+    # master and must not trigger a paid/redundant transcode.
+    expected_preflight = (delivery_freshness.render_fingerprint(job),
+                          job.segments_revision, job.status, job.approved_at,
+                          json.dumps(job.umg_spec, sort_keys=True))
+    preflight_keys = {ft: _r2_key_for_delivery(job.tenant_id, job.job_id, ft)
+                      for ft in _DEFAULT_DELIVERY_FILE_TYPES}
+    db.rollback()
+    if ddb is not db:
+        ddb.rollback()
+    statuses = {ft: storage.object_status_bounded(key) for ft, key in preflight_keys.items()}
+    if any(value not in {'exists', 'missing'} for value in statuses.values()):
+        raise HTTPException(status_code=503, detail={
+            'code': 'publication_storage_unavailable',
+            'message': 'No pudimos verificar los archivos. No se inició otra generación; reintentá la verificación.',
+        })
+    job = (db.query(Job).filter(Job.job_id == job_id)
+           .populate_existing().with_for_update().first())
+    if job is None or expected_preflight != (
+            delivery_freshness.render_fingerprint(job), job.segments_revision,
+            job.status, job.approved_at, json.dumps(job.umg_spec, sort_keys=True)):
+        raise HTTPException(status_code=409, detail='El corte cambió durante la verificación. Revisá la versión actual.')
+    if body and body.change_request_id:
+        validate_reviewed_cut()
+    missing = [ft for ft, value in statuses.items() if value == 'missing']
     # Un entregable que el job NUNCA produjo no es un "esperá al render":
     # es una entrega parcial legítima. Se saca de los requisitos y de la
     # fila Delivery, así el operador puede mandar a UMG el master que sí
@@ -20030,6 +20182,12 @@ async def admin_create_delivery_from_job(
                     "missing": missing_prores,
                 },
             )
+        # This branch publishes no pointer and mutates no local Job. Release
+        # both read transactions/Job lock before queue I/O or helper sessions;
+        # even an early 202 must not wait for response cleanup to unlock Job.
+        db.rollback()
+        if ddb is not db:
+            ddb.rollback()
         enqueued = []
         try:
             for file_type in missing_prores:
@@ -20105,9 +20263,7 @@ async def admin_create_delivery_from_job(
         if ddb is not db:
             ddb.rollback()
         try:
-            from starlette.concurrency import run_in_threadpool
-            prepared_snapshot = await run_in_threadpool(
-                copy_snapshot, snapshot_tenant, job_id, delivery_file_types)
+            prepared_snapshot = copy_snapshot(snapshot_tenant, job_id, delivery_file_types)
         except Exception as exc:
             raise HTTPException(status_code=503, detail='No se pudo preparar la publicación. El portal conserva la versión anterior.') from exc
         job = (db.query(Job).filter(Job.job_id == job_id)
@@ -20210,27 +20366,25 @@ async def admin_create_delivery_from_job(
     delivery.published_file_keys = prepared_snapshot
     archive_duplicate(duplicate, now)
 
-    # Publicar la corrección ES la respuesta al pedido de cambios. Cerrarlos
-    # a mano después era un paso que se olvidaba, y el cliente veía su pedido
-    # "pendiente" indefinidamente sobre una versión que ya lo contemplaba.
-    # Sólo se cierran los de ESTA fila y sólo cuando hubo contenido nuevo.
+    # Explicit final review binds exactly one case to this cut. Publishing
+    # from campaign/history alone cannot attest every pending instruction.
     resolved_requests = []
-    if content_changed:
+    if content_changed and body and body.change_request_id:
         pending_requests = (
             ddb.query(DeliveryChangeRequest)
             .filter(DeliveryChangeRequest.delivery_id == delivery.id)
             .filter(DeliveryChangeRequest.resolved_at.is_(None))
+            .filter(DeliveryChangeRequest.id == body.change_request_id)
+            .populate_existing().with_for_update()
             .all()
         )
         for request in pending_requests:
             # Reviewing one correction is not approval of unrelated requests.
-            if body and body.change_request_id and request.id != body.change_request_id:
+            if request.id != body.change_request_id:
                 continue
-            if replaced_job_id:
-                from change_request_workflow import latest_overwrite, timestamp
-                rendered_at = latest_overwrite(job) or timestamp(job.completed_at)
-                if not rendered_at or timestamp(request.submitted_at) > rendered_at:
-                    continue
+            # Recheck after copying/locking: a newly submitted request or a
+            # different case was never reviewed by this publication intent.
+            validate_reviewed_cut()
             request.resolved_at = now
             request.resolved_by_user_id = added_by
             request.resolved_by_revision = delivery.published_revision
@@ -21064,6 +21218,16 @@ async def admin_list_change_requests(
         except Exception:
             return None
 
+    def _published_signed(delivery, file_type: str) -> str | None:
+        from delivery_snapshots import portal_key
+        if delivery is None or not _storage.is_enabled():
+            return None
+        try:
+            key = portal_key(delivery, file_type)
+            return _storage.generate_signed_url(key, expiry_seconds=3600) if key else None
+        except Exception:
+            return None
+
     items = []
     for cr in crs:
         d = deliveries_by_id.get(cr.delivery_id)
@@ -21105,6 +21269,7 @@ async def admin_list_change_requests(
                 {
                     "id": proposal.id,
                     "status": proposal_status,
+                    "content_hash": _serialize_change_request_proposal(proposal)["content_hash"],
                     "base_revision": proposal.base_revision,
                     "applied_revision": proposal.applied_revision,
                     "operation_count": len(proposal.operations or []),
@@ -21148,11 +21313,23 @@ async def admin_list_change_requests(
                     # video = click-to-play.
                     "thumbnail_url": _signed(job, "thumbnail"),
                     "video_url": _signed(job, "video"),
+                    "published_video_url": _published_signed(d, "video"),
+                    "published_thumbnail_url": _published_signed(d, "thumbnail"),
+                    "published_revision": d.published_revision,
                 }
                 if d
                 else None
             ),
         })
+
+        from change_request_workflow import case_state
+        items[-1]['workflow'] = case_state(
+            publication=publication, proposal_status=proposal_status,
+            resolved_at=cr.resolved_at, resolution_source=cr.resolution_source,
+            proposal_enabled=_change_request_flag('CHANGE_REQUEST_ASSIST_ENABLED'),
+            available=bool(job and d and d.removed_at is None),
+            pending_manual=sum(not op.get('applicable') and op.get('status') not in {'already_satisfied', 'applied'}
+                               for op in (proposal.operations or []) if isinstance(op, dict)) if proposal else 0)
 
     # Totals are cheap and the admin UI shows them as headline counters.
     pending_count = (
@@ -21201,6 +21378,7 @@ def _serialize_change_request_proposal(
         "segments_hash": row.segments_hash,
         "segments_content_hash": row.segments_content_hash,
         "audio_revision": row.audio_revision,
+        "audio_sha256": row.audio_sha256,
         "parser_version": row.parser_version,
         "schema_version": row.schema_version,
         "status": row.status,
@@ -21215,6 +21393,11 @@ def _serialize_change_request_proposal(
         "applied_at": row.applied_at.isoformat() if row.applied_at else None,
         "applied_revision": row.applied_revision,
     }
+    from change_request_proposals import proposal_content_hash
+    payload["content_hash"] = proposal_content_hash(payload)
+    payload["pending_manual"] = sum(not op.get('applicable') and op.get('status') not in {'already_satisfied', 'applied'}
+                                    for op in payload['operations'])
+    payload["satisfied_count"] = sum(op.get('status') == 'already_satisfied' for op in payload['operations'])
     if payload["status"] in {"ready", "partial", "needs_input"}:
         from change_request_parser import SCHEMA_VERSION as current_parser_version
         if row.parser_version != current_parser_version:
@@ -21252,12 +21435,27 @@ def _change_request_context(ddb: Session, cr_id: int):
     return cr, delivery
 
 
+def _read_change_request_context(db: Session, ddb: Session, cr_id: int):
+    """Read-only entry snapshot without holding two pooled connections.
+
+    Call only before endpoint writes. Auth's optional heartbeat is already
+    committed. Separate portal/local transactions must remain separate; sharing
+    their Session would silently change publication commit semantics.
+    """
+    db.rollback()
+    cr, delivery = _change_request_context(ddb, cr_id)
+    ddb.expunge(cr)
+    ddb.expunge(delivery)
+    ddb.rollback()
+    return cr, delivery
+
+
 @app.get('/admin/change-requests/{cr_id}/review')
-async def admin_review_change_request(cr_id: int, current_user: dict = Depends(get_current_user),
+def admin_review_change_request(cr_id: int, current_user: dict = Depends(get_current_user),
                                       db: Session = Depends(get_db), ddb: Session = Depends(get_deliveries_db)):
     if current_user.get('role') != 'admin':
         raise HTTPException(status_code=403, detail='Admin only')
-    cr, delivery = _change_request_context(ddb, cr_id)
+    cr, delivery = _read_change_request_context(db, ddb, cr_id)
     job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
     if job is None:
         raise HTTPException(status_code=404, detail='Job not found')
@@ -21280,12 +21478,13 @@ async def admin_render_change_request(cr_id: int, body: RenderChangeRequest,
                                       db: Session = Depends(get_db), ddb: Session = Depends(get_deliveries_db)):
     if current_user.get('role') != 'admin':
         raise HTTPException(status_code=403, detail='Admin only')
-    cr, delivery = _change_request_context(ddb, cr_id)
+    from starlette.concurrency import run_in_threadpool
+    cr, delivery = await run_in_threadpool(_read_change_request_context, db, ddb, cr_id)
     if cr.resolved_at:
         raise HTTPException(status_code=409, detail='Reabrí el pedido antes de generar otro corte.')
     # Identical durable approval path, QC gates and transactional outbox as
     # the editor; never invent a second renderer or trust client-side lyrics.
-    return await request_edit(delivery.job_id, EditJobRequest(
+    return await run_in_threadpool(request_edit, delivery.job_id, EditJobRequest(
         edit_type='lyrics', editor_revision=body.editor_revision,
         change_request_id=cr_id,
     ), background_tasks,
@@ -21297,12 +21496,14 @@ class ChangeRequestProposalPatch(BaseModel):
     operation_id: str = Field(min_length=1, max_length=80)
     requested_text: str = Field(min_length=1, max_length=2000)
     base_revision: int = Field(ge=0)
+    expected_proposal_hash: str | None = Field(default=None, min_length=64, max_length=64)
 
 
 class ChangeRequestProposalApply(BaseModel):
     base_revision: int = Field(ge=0)
     operation_ids: list[str] = Field(min_length=1, max_length=100)
     idempotency_key: str = Field(min_length=16, max_length=160)
+    expected_proposal_hash: str | None = Field(default=None, min_length=64, max_length=64)
 
 
 class ChangeRequestProposalDismiss(BaseModel):
@@ -21313,7 +21514,7 @@ class ChangeRequestProposalDismiss(BaseModel):
 
 
 @app.post("/admin/change-requests/{cr_id}/proposals")
-async def admin_generate_change_request_proposal(
+def admin_generate_change_request_proposal(
     cr_id: int,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -21323,7 +21524,7 @@ async def admin_generate_change_request_proposal(
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
     _require_change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED")
-    cr, delivery = _change_request_context(ddb, cr_id)
+    cr, delivery = _read_change_request_context(db, ddb, cr_id)
     if cr.resolved_at is not None:
         raise HTTPException(status_code=409, detail="change_request_already_resolved")
     job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
@@ -21364,22 +21565,26 @@ async def admin_generate_change_request_proposal(
             ),
         }
 
-    built = build_proposal(
-        comment=cr.comment,
-        segments=list(document.current_segments or []),
-        base_revision=int(document.revision or 0),
-        audio_revision=int(job.audio_revision or 0),
-        audio_sha256=str(job.input_audio_sha256 or ""),
-        background_context={
-            "background_hint": (job.render_params or {}).get("background_hint"),
-            "background_mode": (job.render_params or {}).get("background_mode"),
-            "concept": (job.render_params or {}).get("concept"),
-            "genre": (job.render_params or {}).get("genre"),
-            "artist": job.artist,
-            "song_title": job.song_title,
-            "scene_plan": job.scene_plan,
-        },
-    )
+    try:
+        built = build_proposal(
+            comment=cr.comment,
+            segments=list(document.current_segments or []),
+            base_revision=int(document.revision or 0),
+            audio_revision=int(job.audio_revision or 0),
+            audio_sha256=str(job.input_audio_sha256 or ""),
+            background_context={
+                "background_hint": (job.render_params or {}).get("background_hint"),
+                "background_mode": (job.render_params or {}).get("background_mode"),
+                "concept": (job.render_params or {}).get("concept"),
+                "genre": (job.render_params or {}).get("genre"),
+                "artist": job.artist,
+                "song_title": job.song_title,
+                "scene_plan": job.scene_plan,
+            },
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
     now = datetime.now(timezone.utc)
     # Pending proposals for older snapshots remain as audit history but cannot
     # be served as actionable after the document moves.
@@ -21487,7 +21692,7 @@ async def admin_generate_change_request_proposal(
 
 
 @app.get("/admin/change-requests/{cr_id}/proposals/current")
-async def admin_get_change_request_proposal(
+def admin_get_change_request_proposal(
     cr_id: int,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -21496,7 +21701,7 @@ async def admin_get_change_request_proposal(
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
     _require_change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED")
-    _cr, delivery = _change_request_context(ddb, cr_id)
+    _cr, delivery = _read_change_request_context(db, ddb, cr_id)
     row = (
         db.query(ChangeRequestProposal)
         .filter(ChangeRequestProposal.change_request_id == cr_id)
@@ -21518,7 +21723,7 @@ async def admin_get_change_request_proposal(
 
 
 @app.patch("/admin/change-requests/{cr_id}/proposals/{proposal_id}")
-async def admin_patch_change_request_proposal(
+def admin_patch_change_request_proposal(
     cr_id: int,
     proposal_id: str,
     body: ChangeRequestProposalPatch,
@@ -21541,6 +21746,16 @@ async def admin_patch_change_request_proposal(
         raise HTTPException(status_code=409, detail="change_request_proposal_not_editable")
     if row.base_revision != body.base_revision:
         raise HTTPException(status_code=409, detail="editor_revision_conflict")
+    preview = _serialize_change_request_proposal(row)
+    if (preview["status"] == "stale" or not body.expected_proposal_hash
+            or preview["content_hash"] != body.expected_proposal_hash):
+        raise HTTPException(status_code=409, detail={
+            "code": "proposal_preview_changed",
+            "message": "La propuesta cambió. Volvé a cargarla y revisar el texto antes de confirmar.",
+        })
+    document = db.query(EditorDocument).filter(EditorDocument.job_id == row.job_id).first()
+    if document is None or document.revision != body.base_revision:
+        raise HTTPException(status_code=409, detail="editor_revision_conflict")
     operations = [dict(item) for item in (row.operations or []) if isinstance(item, dict)]
     operation = next((item for item in operations if item.get("id") == body.operation_id), None)
     if operation is None or not operation.get("applicable"):
@@ -21549,6 +21764,10 @@ async def admin_patch_change_request_proposal(
     if len(before) != 1:
         raise HTTPException(status_code=400, detail="change_request_operation_not_editable")
     proposed = {**dict(before[0]), "text": body.requested_text.strip()}
+    if not proposed["text"]:
+        raise HTTPException(status_code=422, detail="requested_text must not be blank")
+    for key in ("words", "word_timestamps", "tokens"):
+        proposed.pop(key, None)
     from editor import segments_content_hash
     operation["proposed_segments"] = [proposed]
     operation["proposed_segments_hash"] = segments_content_hash([proposed])
@@ -21577,7 +21796,7 @@ async def admin_patch_change_request_proposal(
 
 
 @app.post("/admin/change-requests/{cr_id}/proposals/{proposal_id}/apply")
-async def admin_apply_change_request_proposal(
+def admin_apply_change_request_proposal(
     cr_id: int,
     proposal_id: str,
     body: ChangeRequestProposalApply,
@@ -21589,13 +21808,19 @@ async def admin_apply_change_request_proposal(
         raise HTTPException(status_code=403, detail="Admin only")
     _require_change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED")
     _require_change_request_flag("CHANGE_REQUEST_APPLY_ENABLED")
-    cr, delivery = _change_request_context(ddb, cr_id)
+    cr, delivery = _read_change_request_context(db, ddb, cr_id)
     if cr.resolved_at is not None:
         raise HTTPException(status_code=409, detail="change_request_already_resolved")
+    # All editor writers acquire Job first. CREATE already uses this order;
+    # taking Proposal first here deadlocks against concurrent re-analysis.
+    job = db.query(Job).filter(Job.job_id == delivery.job_id).with_for_update().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     row = (
         db.query(ChangeRequestProposal)
         .filter(ChangeRequestProposal.id == proposal_id)
         .filter(ChangeRequestProposal.change_request_id == cr_id)
+        .populate_existing()
         .with_for_update()
         .first()
     )
@@ -21613,7 +21838,7 @@ async def admin_apply_change_request_proposal(
         ), None)
         if sorted(str(value) for value in body.operation_ids) != sorted(
             str(value) for value in ((accepted or {}).get("operation_ids") or [])
-        ):
+        ) or body.expected_proposal_hash != (accepted or {}).get("proposal_content_hash"):
             raise HTTPException(status_code=409, detail="idempotency_key_reused")
         return {
             "ok": True, "applied": False, "idempotent": True,
@@ -21626,6 +21851,13 @@ async def admin_apply_change_request_proposal(
         }
     if row.status not in {"ready", "partial"}:
         raise HTTPException(status_code=409, detail="change_request_proposal_not_applicable")
+    preview = _serialize_change_request_proposal(row)
+    if (preview["status"] == "stale" or not body.expected_proposal_hash
+            or body.expected_proposal_hash != preview["content_hash"]):
+        raise HTTPException(status_code=409, detail={
+            "code": "proposal_preview_changed",
+            "message": "La propuesta cambió. Volvé a cargarla y revisar el texto antes de aplicar.",
+        })
     if (
         row.request_sha256 != request_hash(cr.comment)
         or row.delivery_id != delivery.id
@@ -21688,6 +21920,7 @@ async def admin_apply_change_request_proposal(
     selected_ids = {str(item.get("id")) for item in selected}
     operations = []
     pending_applicable = 0
+    pending_manual = 0
     for operation in row.operations or []:
         item = dict(operation)
         if str(item.get("id")) in selected_ids:
@@ -21695,6 +21928,8 @@ async def admin_apply_change_request_proposal(
         elif item.get("applicable"):
             item["status"] = "not_applied"
             pending_applicable += 1
+        elif item.get("status") not in {"already_satisfied", "applied"}:
+            pending_manual += 1
         operations.append(item)
     now = datetime.now(timezone.utc)
     history = [
@@ -21703,10 +21938,11 @@ async def admin_apply_change_request_proposal(
     history.append({
         "decision": "accepted", "operation_ids": sorted(selected_ids),
         "idempotency_hash": idem_hash, "decided_at": now.isoformat(),
+        "proposal_content_hash": body.expected_proposal_hash,
     })
     row.operations = operations
     row.decision_history = history
-    row.status = "partially_applied" if pending_applicable else "applied"
+    row.status = "partially_applied" if pending_applicable or pending_manual else "applied"
     row.applied_by = current_user["id"]
     row.applied_at = now
     row.updated_at = now
@@ -22065,6 +22301,11 @@ async def admin_resolve_change_request(
     note = ((body or {}).get("resolution_note") or "").strip() if isinstance(body, dict) else ""
     if len(note) > 2000:
         raise HTTPException(status_code=400, detail="resolution_note too long (max 2000)")
+    if not note:
+        raise HTTPException(status_code=422, detail={
+            "code": "resolution_reason_required",
+            "message": "Explicá por qué el pedido está atendido. Cerrar manualmente no publica otro video.",
+        })
     cr.resolved_at = datetime.now(timezone.utc)
     # resolved_by_user_id es FK a users de la DB de deliveries → mapear.
     cr.resolved_by_user_id = deliveries_added_by(current_user["id"])
