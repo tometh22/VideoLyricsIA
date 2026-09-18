@@ -12,7 +12,7 @@ def test_correction_variant_replaces_requested_delivery(client, admin_token, app
     parent_id = approved_job.job_id
     published = client.post('/admin/deliveries/from-job/' + parent_id, headers=headers, json={'portal_id': portal}).json()
     original_id = published['delivery_id']
-    child = Job(job_id='variant-correction-test', parent_job_id=parent_id,
+    child = Job(job_id='variant00001', parent_job_id=parent_id,
                 tenant_id=approved_job.tenant_id, user_id=approved_job.user_id,
                 artist=approved_job.artist, song_title=approved_job.song_title,
                 filename='variant.mp3', status='done', approved_at=datetime.now(timezone.utc), completed_at=datetime.now(timezone.utc),
@@ -56,7 +56,7 @@ def test_replacement_does_not_cross_portals_or_match_title_only(client, admin_to
     from delivery_replacement import target
     published = client.post('/admin/deliveries/from-job/' + approved_job.job_id, headers=auth(admin_token), json={'portal_id': 'argentina'}).json()
     db.add(DeliveryChangeRequest(delivery_id=published['delivery_id'], comment='Cambiar fondo', submitted_at=datetime.now(timezone.utc) - timedelta(minutes=1))); db.commit()
-    child = Job(job_id='transient-child', tenant_id=approved_job.tenant_id,
+    child = Job(job_id='variant00002', tenant_id=approved_job.tenant_id,
                 artist=approved_job.artist, song_title=approved_job.song_title, completed_at=datetime.now(timezone.utc))
     assert target(db, db, child, 'argentina') == (None, None)
     child.parent_job_id = approved_job.job_id
