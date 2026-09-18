@@ -48,11 +48,16 @@ describe("legacy request-only links", () => {
   it.each(["partially_applied"])("recovers %s proposals", async status => {
     await expect(recover({ ...proposal, status }).result).resolves.toEqual({ changeRequestId: 85, proposalId: "proposal-85" });
   });
-  it.each(["pending", "stale", "rejected"])("does not force a rerender for a %s proposal", async status => {
-    await expect(recover({ ...proposal, status }).result).resolves.toBeNull();
+  it.each(["pending", "stale", "rejected"])("keeps a manual review context for a %s proposal", async status => {
+    await expect(recover({ ...proposal, status }).result).resolves.toEqual({ changeRequestId: 85, proposalId: null });
   });
   it("allows manual requests with no proposal", async () => {
-    await expect(recover(null, 404).result).resolves.toBeNull();
+    const request = vi.fn().mockResolvedValueOnce({ status: 404 })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: job.job_id, resolved: false }) });
+    await expect(recoverChangeRequestEditContext({ search: "?change_request_id=85", job, request }))
+      .resolves.toEqual({ changeRequestId: 85, proposalId: null });
+    expect(changeRequestAdminPath({ changeRequestId: 85, proposalId: null }, "submitted"))
+      .toContain("render_submitted=1");
   });
   it.each([{ job_id: "other-job" }, { change_request_id: 86 }])("rejects a mismatched request/job (%j)", async mismatch => {
     await expect(recover({ ...proposal, ...mismatch }).result).rejects.toThrow("change_request_job_mismatch");

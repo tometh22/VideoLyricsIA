@@ -1,6 +1,56 @@
 import { expect, test } from "@playwright/test";
 import { createSyntheticWav, installEditorHarness } from "./editor-harness.js";
 
+test('reviews saved lyrics, confirms one render, then publishes to Chile without visiting the editor', async ({ page }) => {
+  await installEditorHarness(page, { jobId: 'job-85', role: 'admin' });
+  let stage = 'saved';
+  let polls = 0;
+  const writes = [];
+  const text = 'Respirarse, emborrachar, morir y seguir viviendo';
+  await page.route('**/*', async route => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    const json = body => route.fulfill({ json: body });
+    if (path === '/service-status/summary') return json({ status: 'operational', incidents: [] });
+    if (path === '/admin/stats') return json({});
+    if (path === '/admin/change-requests/85/review') return json({ change_request_id: 85, editor_revision: 58,
+      comment: 'Usar frase completa', segments: [{ start: 144.26, end: 149.58, text }] });
+    if (path === '/admin/change-requests') {
+      if (stage === 'rendering' && ++polls >= 2) stage = 'rendered';
+      return json({ pending_count: stage === 'published' ? 0 : 1, proposal_enabled: true,
+        items: stage === 'published' ? [] : [{ id: 85, comment: 'Usar frase completa',
+          proposal: { id: 'p85', status: 'applied' }, delivery: { job_id: 'job-85', portal_id: 'chile', song: 'Prueba', artist: 'Test' },
+          publication: { job_status: stage === 'rendering' ? 'editing' : 'pending_review',
+            can_render: stage !== 'rendering', render_matches_editor: stage === 'rendered',
+            needs_publish: stage === 'rendered', editor_revision: 58, render_fingerprint: 'render58', prores_pending: [] } }] });
+    }
+    if (request.method() === 'POST' && (path.endsWith('/85/render') || path.includes('/deliveries/from-job/'))) {
+      writes.push({ path, body: request.postDataJSON() });
+      stage = path.endsWith('/85/render') ? 'rendering' : 'published';
+      return json(stage === 'rendering' ? { status: 'editing' } : { content_changed: true, revision: 2, resolved_change_requests: [85] });
+    }
+    return route.fallback();
+  });
+  await page.goto('/admin?section=cambios&change_request_id=85');
+  const announcement = page.getByRole('button', { name: /Entendido|Entendí|Cancelar|Cerrar novedades/ }).first();
+  if (await announcement.isVisible()) await announcement.click();
+  await page.getByRole('button', { name: 'Revisar y confirmar render', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Revisar letra y confirmar render' });
+  await expect(dialog).toContainText(text);
+  const approve = dialog.getByRole('button', { name: 'Aprobar y re-renderizar' });
+  await expect(approve).toBeDisabled();
+  await dialog.getByRole('checkbox').check();
+  await approve.click();
+  await expect(page.getByRole('button', { name: 'Publicar actualización' })).toBeVisible({ timeout: 12000 });
+  expect(writes).toEqual([{ path: '/admin/change-requests/85/render', body: { editor_revision: 58 } }]);
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Publicar actualización' }).click();
+  await expect(page.getByRole('status', { name: 'Resultado del pedido' })).toContainText('Publicada la versión 2');
+  expect(writes[1].body).toEqual({ portal_id: 'chile', change_request_id: 85,
+    reviewed_render_fingerprint: 'render58', reviewed_editor_revision: 58 });
+  expect(page.url()).toContain('/admin?');
+});
+
 test("keeps the player running through polling, prepares without publishing, and opens saved-change verification", async ({ page }) => {
   await installEditorHarness(page, { jobId: "job-85", role: "admin" });
   let polls = 0;

@@ -60,3 +60,21 @@ it("announces a prepared master even when lyrics still await review and publicat
     text: expect.stringContaining("Terminó la preparación") });
   expect(result.current.crPublishNotice.text).toContain("no confirma que el pedido esté corregido");
 });
+
+it("reviews then renders exactly the saved revision once without publishing", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => {
+    if (url.endsWith('/85/review')) return Promise.resolve({ change_request_id: 85, editor_revision: 58, segments: [{ text: 'Completa' }] });
+    if (url.endsWith('/85/render')) return Promise.resolve({ status: 'editing' });
+    return previous(url, opts);
+  });
+  const { result } = renderHook(() => useChangeRequests());
+  await act(() => result.current.reviewForRender(85));
+  expect(result.current.crRenderReview.editor_revision).toBe(58);
+  await act(async () => { await Promise.all([result.current.confirmRender(), result.current.confirmRender()]); });
+  const renders = mocks.fetchJson.mock.calls.filter(([url]) => url.endsWith('/render'));
+  expect(renders).toHaveLength(1);
+  expect(JSON.parse(renders[0][1].body)).toEqual({ editor_revision: 58 });
+  expect(mocks.fetchJson.mock.calls.some(([url]) => url.includes('from-job'))).toBe(false);
+  expect(result.current.crPublishNotice.text).toContain('todavía no se publicó');
+});

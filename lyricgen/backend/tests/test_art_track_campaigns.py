@@ -18,6 +18,11 @@ def _digest(value: str) -> str:
 
 
 @pytest.fixture(autouse=True)
+def publication_storage(monkeypatch):
+    monkeypatch.setattr('storage.copy_object', lambda *_: True)
+
+
+@pytest.fixture(autouse=True)
 def clean_art_rows():
     yield
     db = SessionLocal()
@@ -265,6 +270,16 @@ def test_bulk_publish_does_not_promise_a_prores_nothing_will_create(
         assert "umg_master" not in row.file_types
         assert "umg_short" not in row.file_types
         assert row.file_types == ["video", "short", "thumbnail"]
+        assert row.published_file_keys['video']
+        operation = db.get(DeliveryBatch, op)
+        assert operation.status == 'completed'
+        assert operation.sent_count == 1
+        # Recover the already-existing bad summary without resending bytes.
+        operation.status = 'partial'
+        db.commit()
+        response = client.get(f'/batch/delivery-operations/{op}', headers={'Authorization': f'Bearer {admin_token}'})
+        assert response.json()['status'] == 'completed'
+        assert response.json()['sent_count'] == 1
     finally:
         db.close()
     # Sin spec no hay con qué transcodificar: encolar sería girar en falso.
@@ -299,8 +314,9 @@ def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
 
     db = SessionLocal()
     try:
-        row = db.query(Delivery).filter(Delivery.job_id == job_id).one()
-        assert "umg_master" in row.file_types and "umg_short" in row.file_types
+        assert db.query(Delivery).filter(Delivery.job_id == job_id).first() is None
+        item = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.delivery_batch_id == op).one()
+        assert item.error_code == 'deliverables_not_ready'
     finally:
         db.close()
     assert sorted(c.args[1] for c in enqueue.call_args_list) == ["umg_master", "umg_short"]

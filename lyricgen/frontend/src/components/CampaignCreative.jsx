@@ -289,7 +289,7 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
     {message && <p role="status" className="rounded-xl bg-emerald-500/15 p-3 text-emerald-200">{message}</p>}
     {generationNotice && <p role="status" className="rounded-xl bg-amber-500/15 p-3 text-amber-200">{generationNotice}</p>}
     <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-sm text-ink-secondary">Estilo guardado de la campaña</p><button className={button} disabled={busy} onClick={() => run(() => load())}>Actualizar estado</button></div>
-    {searchParams.get("delivery_op") && <CampaignDeliveryProgress operationId={searchParams.get("delivery_op")} request={request} onSelectFailed={ids => { setSelectedVideoIds(new Set(ids)); writeParams({ q: null, video_state: "approved", vpage: null }); }} />}
+    {searchParams.get("delivery_op") && <CampaignDeliveryProgress operationId={searchParams.get("delivery_op")} request={request} onSettled={() => load().catch(e => setError(e.message))} onSelectFailed={ids => { setSelectedVideoIds(new Set(ids)); writeParams({ q: null, video_state: "approved", vpage: null }); }} />}
     {view === "creative" && <>
       <div className="overflow-hidden rounded-2xl bg-surface-2/40 ring-1 ring-white/10">
         <div className="space-y-4 p-5">
