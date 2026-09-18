@@ -1951,7 +1951,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                         : sendingUmg
                           ? (t("detail.sending_umg") || "Enviando…")
                           : umgPortals.length
-                            ? `${t("detail.in_umg_portal") || "✓ En UMG"} (${umgPortals.map((id) => UMG_PORTALS.find((portal) => portal.id === id)?.label).join(" + ")})`
+                            ? `${t("detail.update_umg") || "Publicar actualización"} (${umgPortals.map((id) => UMG_PORTALS.find((portal) => portal.id === id)?.label).join(" + ")})`
                             : (t("detail.send_umg") || "Enviar a UMG")}
                     </button>
                     {showUmgPortalPicker && (
