@@ -3,6 +3,13 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.62] - 2026-09-18
+
+### Fixed
+- Corrected background variants replace the unique ancestor delivery with an open request in the chosen portal, retaining the delivery/request identity and archiving duplicate portal rows without deleting videos or files.
+- Campaign publication releases transactions during large media copies and rechecks approval/publication identity before committing, matching the individual publisher; publication revisions increment only once.
+- Clarify variant replacement in the publication picker and retain the current portal as the default destination when updating.
+
 ## [1.1.61] - 2026-09-18
 
 ### Fixed

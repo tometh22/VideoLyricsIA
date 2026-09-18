@@ -11366,6 +11366,7 @@ def status(
             campaign_context = context_for_job(db, job_model)
     return {
         "job_id": job["job_id"],
+        "parent_job_id": job.get("parent_job_id"),
         "workload_class": job.get("workload_class", "interactive"),
         "campaign_id": job.get("campaign_id"),
         "campaign_item_id": job.get("campaign_item_id"),
@@ -19890,7 +19891,9 @@ async def admin_create_delivery_from_job(
         raise HTTPException(status_code=404, detail="Job not found")
     if body and body.change_request_id:
         cr, destination = _change_request_context(ddb, body.change_request_id)
-        if destination.job_id != job_id or destination.portal_id != portal_id:
+        from delivery_replacement import target as correction_target
+        target_delivery, _ = correction_target(db, ddb, job, portal_id)
+        if target_delivery is None or destination.id != target_delivery.id or (destination.portal_id or 'argentina') != portal_id:
             raise HTTPException(status_code=409, detail='change_request_job_mismatch')
         def validate_reviewed_cut():
             from change_request_workflow import render_state
@@ -20079,31 +20082,24 @@ async def admin_create_delivery_from_job(
     # this job_id, update it in place. Operator clicks "Enviar a UMG"
     # again after a re-render → we refresh the timestamp, the R2 files
     # stay the same (worker overwrites on edit).
-    existing = (
-        ddb.query(Delivery)
-        .filter(Delivery.job_id == job_id)
-        .filter(Delivery.portal_id == portal_id)
-        .filter(Delivery.removed_at.is_(None))
-        .first()
-    )
+    from delivery_replacement import target as publication_target, identity as publication_identity, archive_duplicate
+    existing, duplicate = publication_target(db, ddb, job, portal_id)
+    replaced_job_id = existing.job_id if existing and existing.job_id != job_id else None
+    previous_publication = ({'job_id': existing.job_id, 'delivery_id': existing.id,
+                             'revision': existing.published_revision,
+                             'file_keys': existing.published_file_keys} if replaced_job_id else None)
 
     # A broadcast copy can take minutes. Both databases terminate idle
     # transactions after 60 s, so never hold the job lock/DB connections
     # while copying. Revalidate both identities under locks afterwards.
     from delivery_snapshots import copy_snapshot
-    def publication_identity(row):
-        if row is None:
-            return None
-        return (row.id, row.published_revision, row.published_render_fingerprint,
-                row.published_file_keys, row.file_types, row.added_at,
-                row.content_updated_at, row.removed_at)
-
     prepared_snapshot = existing.published_file_keys if existing else None
-    if (not prepared_snapshot or existing.file_types != delivery_file_types
+    if (replaced_job_id or not prepared_snapshot or existing.file_types != delivery_file_types
             or delivery_freshness.needs_publish(job, existing)):
         expected_job = (delivery_freshness.render_fingerprint(job),
                         job.segments_revision, job.status, job.approved_at)
         expected_delivery = publication_identity(existing)
+        expected_duplicate = publication_identity(duplicate)
         snapshot_tenant = job.tenant_id
         db.rollback()
         if ddb is not db:
@@ -20120,14 +20116,15 @@ async def admin_create_delivery_from_job(
                 delivery_freshness.render_fingerprint(job),
                 job.segments_revision, job.status, job.approved_at)):
             raise HTTPException(status_code=409, detail='El corte cambió durante la publicación. Revisá la versión actual.')
-        existing = (ddb.query(Delivery).filter(Delivery.job_id == job_id,
-                    Delivery.portal_id == portal_id, Delivery.removed_at.is_(None))
-                    .populate_existing().with_for_update().first())
-        if publication_identity(existing) != expected_delivery:
+        existing, duplicate = publication_target(db, ddb, job, portal_id)
+        for row in sorted([r for r in (existing, duplicate) if r is not None], key=lambda r: r.id):
+            ddb.refresh(row, with_for_update=True)
+        if (publication_identity(existing) != expected_delivery
+                or publication_identity(duplicate) != expected_duplicate):
             raise HTTPException(status_code=409, detail='La entrega cambió durante la publicación. Actualizá su estado.')
         if body and body.change_request_id:
             cr, destination = _change_request_context(ddb, body.change_request_id)
-            if destination.job_id != job_id or destination.portal_id != portal_id:
+            if existing is None or destination.id != existing.id or (destination.portal_id or 'argentina') != portal_id:
                 raise HTTPException(status_code=409, detail='change_request_job_mismatch')
             validate_reviewed_cut()
 
@@ -20158,7 +20155,8 @@ async def admin_create_delivery_from_job(
         # como contenido nuevo cuando el flujo real de edición dejó su marca
         # stale: así no anulamos aprobaciones antiguas por la migración, pero
         # tampoco escondemos Publicar después de corregirlas.
-        content_changed = delivery_freshness.needs_publish(job, existing)
+        content_changed = bool(replaced_job_id) or delivery_freshness.needs_publish(job, existing)
+        existing.job_id = job_id
         existing.label = label
         existing.file_types = delivery_file_types
         existing.added_by_user_id = added_by
@@ -20210,6 +20208,7 @@ async def admin_create_delivery_from_job(
     # Files were copied without transactions; only the guarded pointer switch
     # and request resolution share this short transaction.
     delivery.published_file_keys = prepared_snapshot
+    archive_duplicate(duplicate, now)
 
     # Publicar la corrección ES la respuesta al pedido de cambios. Cerrarlos
     # a mano después era un paso que se olvidaba, y el cliente veía su pedido
@@ -20227,6 +20226,11 @@ async def admin_create_delivery_from_job(
             # Reviewing one correction is not approval of unrelated requests.
             if body and body.change_request_id and request.id != body.change_request_id:
                 continue
+            if replaced_job_id:
+                from change_request_workflow import latest_overwrite, timestamp
+                rendered_at = latest_overwrite(job) or timestamp(job.completed_at)
+                if not rendered_at or timestamp(request.submitted_at) > rendered_at:
+                    continue
             request.resolved_at = now
             request.resolved_by_user_id = added_by
             request.resolved_by_revision = delivery.published_revision
@@ -20262,6 +20266,8 @@ async def admin_create_delivery_from_job(
             "revision": delivery.published_revision,
             "content_changed": content_changed,
             "resolved_change_requests": resolved_requests,
+            "replaced_job_id": replaced_job_id,
+            "previous_publication": previous_publication,
         },
     ))
     db.commit()
@@ -20278,6 +20284,7 @@ async def admin_create_delivery_from_job(
         "revision": delivery.published_revision,
         "content_changed": content_changed,
         "resolved_change_requests": resolved_requests,
+        "replaced_job_id": replaced_job_id,
     }
 
 

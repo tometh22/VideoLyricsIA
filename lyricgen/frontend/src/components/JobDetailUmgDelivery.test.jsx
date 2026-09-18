@@ -124,6 +124,7 @@ describe("JobDetail UMG delivery recovery", () => {
     );
 
     fireEvent.click(screen.getByText("detail.send_umg"));
+    expect(screen.getByText(/esta variante lo reemplaza en la misma entrega/)).toBeTruthy();
     fireEvent.click(screen.getByText("umg.portal_argentina"));
     expect(screen.getByText("prores.enable_title")).toBeTruthy();
 
@@ -146,7 +147,7 @@ describe("JobDetail UMG delivery recovery", () => {
     });
 
     expect(await screen.findByText("Video publicado en umg.genly.pro")).toBeTruthy();
-    expect(screen.getByText(/detail\.in_umg_portal/)).toBeTruthy();
+    expect(screen.getByText(/detail\.update_umg/)).toBeTruthy();
     expect(onJobUpdate).toHaveBeenCalledWith(expect.objectContaining({
       prores_ready: true,
     }));

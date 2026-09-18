@@ -11,8 +11,18 @@ respeta el opt-out explícito.
 import uuid as _uuid
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from database import Job, User, UserSettings, AuditLog
 from reaper import remind_stale_pending_review
+
+
+@pytest.fixture(autouse=True)
+def isolate_reminder_sweep(monkeypatch):
+    # Other TestClient lifespans leave a periodic daemon running. Exercise
+    # the real imported function directly, without a concurrent daemon also
+    # sending reminders for the same fixtures. Keep every dedupe assertion.
+    monkeypatch.setattr("reaper.remind_stale_pending_review", lambda *a, **kw: 0)
 
 
 def _mkuser(db, *, email="op@umusic.com", notif_jobs=None):
