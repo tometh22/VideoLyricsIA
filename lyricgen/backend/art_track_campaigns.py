@@ -775,19 +775,37 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                 # retried after the shared Delivery contract is integrated.
                 if not hasattr(Delivery, "portal_id"):
                     row.status = "failed"; row.error_code = "portal_contract_unavailable"; row.error_detail = "Delivery.portal_id is required for art-track portal isolation."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
-                delivery_query = ddb.query(Delivery).filter(Delivery.job_id == job.job_id, Delivery.removed_at.is_(None))
-                # Nagoya's portal contract adds portal_id to Delivery. Keep
-                # this code compatible with the legacy single-portal schema
-                # until that migration is integrated; once present, AR and
-                # CL are correctly independent rows.
-                if hasattr(Delivery, "portal_id"):
-                    delivery_query = delivery_query.filter(Delivery.portal_id == op.destination_portal)
-                active = delivery_query.first()
-                changed = delivery_freshness.needs_publish(job, active) if active else False
+                from delivery_replacement import target, identity, archive_duplicate
+                active, duplicate = target(db, ddb, job, op.destination_portal)
+                replaced_job_id = active.job_id if active and active.job_id != job.job_id else None
+                previous_publication = {'job_id': active.job_id, 'revision': active.published_revision,
+                                        'file_keys': active.published_file_keys} if replaced_job_id else None
+                changed = bool(replaced_job_id) or (delivery_freshness.needs_publish(job, active) if active else False)
                 from delivery_snapshots import copy_snapshot
+                pinned = active.published_file_keys if active and not changed and active.file_types == delivery_file_types else None
                 try:
-                    pinned = (active.published_file_keys if active and not changed else None) or copy_snapshot(
-                        job.tenant_id, job.job_id, delivery_file_types)
+                    if not pinned:
+                        expected = (identity(active), identity(duplicate))
+                        expected_job = (_fingerprint(job), job.segments_revision, job.approved_at)
+                        tenant, jid, item_id, portal = job.tenant_id, job.job_id, row.id, op.destination_portal
+                        # Persist prior item results before releasing both
+                        # transactions. Multi-GB copies exceed DB idle limits.
+                        ddb.commit()
+                        db.commit()
+                        pinned = copy_snapshot(tenant, jid, delivery_file_types)
+                        row = db.query(DeliveryBatchItem).filter_by(id=item_id).populate_existing().with_for_update().one()
+                        if row.status == 'sent':
+                            continue
+                        job = db.query(Job).filter_by(job_id=jid).populate_existing().with_for_update().one()
+                        active, duplicate = target(db, ddb, job, portal)
+                        for delivery in sorted([d for d in (active, duplicate) if d is not None], key=lambda d: d.id):
+                            ddb.refresh(delivery, with_for_update=True)
+                        if (job.status != 'done' or expected_job != (_fingerprint(job), job.segments_revision, job.approved_at)
+                                or expected != (identity(active), identity(duplicate))):
+                            row.status = 'failed'; row.error_code = 'stale_approval'
+                            row.error_detail = 'El corte o la publicación cambiaron durante el envío. Revisá y reintentá.'
+                            row.attempts = int(row.attempts or 0) + 1; failed += 1
+                            continue
                 except Exception:
                     row.status = 'failed'; row.error_code = 'deliverables_not_ready'
                     row.error_detail = 'No se pudo preparar la publicación; el portal no se modificó.'
@@ -805,6 +823,7 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     active = Delivery(**delivery_kwargs)
                     ddb.add(active); ddb.flush()
                 else:
+                    active.job_id = job.job_id
                     active.label = delivery_label
                     active.file_types = delivery_file_types
                     # Re-publicar por campaña: mismo criterio que el alta y que
@@ -816,11 +835,6 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     # con ese nombre la sombrea en TODO el scope, rompiendo su
                     # uso de más arriba con UnboundLocalError.
                     _render_fp = delivery_freshness.render_fingerprint(job)
-                    if active.published_render_fingerprint != _render_fp:
-                        active.published_revision = (active.published_revision or 1) + 1
-                        active.content_updated_at = _now()
-                        active.approved_at = None
-                        active.approved_by_label = None
                     active.published_render_fingerprint = _render_fp
                     active.stale_since = None
                     active.stale_reason = None
@@ -830,7 +844,8 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     active.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
                     active.added_by_user_id = deliveries_added_by(op.created_by)
                     active.added_at = _now()
-                row.delivery_id = active.id; row.status = "sent"; row.receipt = {"delivery_id": active.id, "portal": op.destination_portal}; row.attempts = int(row.attempts or 0) + 1; sent += 1
+                row.delivery_id = active.id; row.status = "sent"; row.receipt = {"delivery_id": active.id, "portal": op.destination_portal, "replaced_job_id": replaced_job_id, "previous_publication": previous_publication}; row.attempts = int(row.attempts or 0) + 1; sent += 1
+                archive_duplicate(duplicate, _now())
                 active.published_file_keys = pinned
                 active.published_render_fingerprint = delivery_freshness.render_fingerprint(job)
                 active.stale_since = None; active.stale_reason = None
@@ -856,6 +871,8 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                             change.resolution_source = 'publication'
                             change.resolution_note = f'Resuelto al publicar la versión {active.published_revision} desde la campaña.'
                 row.error_code = None; row.error_detail = None
+                ddb.commit()
+                db.commit()
             ddb.commit()
         finally: ddb.close()
         db.flush()

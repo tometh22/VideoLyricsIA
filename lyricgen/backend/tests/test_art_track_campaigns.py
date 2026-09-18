@@ -247,6 +247,44 @@ def _campaign_for(client, admin_token, name):
         db.close()
 
 
+@pytest.mark.parametrize('edit_during_copy', [False, True])
+def test_bulk_copy_releases_transactions_and_rechecks_revision(client, admin_token, monkeypatch, edit_during_copy):
+    import art_track_campaigns as atc
+    import database
+    from database import Delivery
+    monkeypatch.setenv('BATCH_CAMPAIGN_ENABLED', '1')
+    campaign = _campaign_for(client, admin_token, 'Bounded publication')
+    jid = _seed_campaign_job(campaign, umg_spec=None, s3_keys={
+        'video': 't/j/lyric_video.mp4', 'short': 't/j/short.mp4', 'thumbnail': 't/j/thumbnail.jpg'})
+    op = _run_bulk_delivery(client, admin_token, campaign.id, 'transaction-test-' + str(edit_during_copy))
+    sessions = []
+    original = database.SessionLocal
+    def session():
+        value = original()
+        sessions.append(value)
+        return value
+    def copy(tenant, job_id, kinds):
+        assert len(sessions) == 2 and all(not s.in_transaction() for s in sessions)
+        if edit_during_copy:
+            with original() as other:
+                job = other.query(Job).filter_by(job_id=job_id).one()
+                job.segments_revision = int(job.segments_revision or 0) + 1
+                other.commit()
+        return {kind: 'pinned/' + kind for kind in kinds}
+    monkeypatch.setattr(atc, 'SessionLocal', session)
+    monkeypatch.setattr(database, 'DeliveriesSessionLocal', session)
+    monkeypatch.setattr('delivery_snapshots.copy_snapshot', copy)
+    monkeypatch.setattr(atc.storage, 'is_enabled', lambda: True)
+    monkeypatch.setattr(atc.storage, 'object_exists', lambda key: not key.endswith('.mov'))
+    atc.process_delivery_batch(op)
+    with original() as check:
+        row = check.query(DeliveryBatchItem).filter_by(delivery_batch_id=op).one()
+        assert row.status == ('failed' if edit_during_copy else 'sent')
+        if edit_during_copy:
+            assert row.error_code == 'stale_approval'
+            assert check.query(Delivery).filter_by(job_id=jid).first() is None
+
+
 def test_bulk_publish_does_not_promise_a_prores_nothing_will_create(
     client, admin_token, monkeypatch,
 ):

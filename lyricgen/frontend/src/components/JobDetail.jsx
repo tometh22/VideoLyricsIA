@@ -571,6 +571,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       // baja y tiene que volver a revisar.
       const resolved = result.resolved_change_requests?.length || 0;
       const parts = [label ? `Aparece como "${label}".` : null];
+      if (result.replaced_job_id) {
+        parts.push("Esta variante reemplazó el video anterior en la misma entrega. El pedido de cambios queda asociado a la versión corregida.");
+      }
       if (result.content_changed) {
         parts.push(
           `Es la versión ${result.revision}: el cliente la ve como pendiente de aprobar.`,
@@ -616,8 +619,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   };
 
   const handleSendToUMG = () => {
-    const nextPortal = UMG_PORTALS.find(({ id }) => !umgPortals.includes(id));
-    setSelectedUmgPortal(nextPortal?.id || "argentina");
+    // Updating an existing cut should default to its current destination,
+    // not silently highlight the OTHER country's portal.
+    setSelectedUmgPortal(umgPortals[0] || "argentina");
     setShowUmgPortalPicker(true);
   };
   // Dropdown for HD/2K/4K selection on retry. Only shown when the job
@@ -1958,6 +1962,13 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                         <p className="mb-3 text-xs text-ink-secondary">
                           {t("umg.destination_hint") || "Elegí dónde querés publicar este video."}
                         </p>
+                        {job.parent_job_id && (
+                          <p className="mb-3 text-xs text-ink-primary">
+                            Si el video original tiene un pedido de cambios pendiente en ese portal,
+                            esta variante lo reemplaza en la misma entrega y cierra el pedido.
+                            No necesitás enviarlo otra vez desde la campaña.
+                          </p>
+                        )}
                         <div className="space-y-2">
                           {UMG_PORTALS.map((portal) => {
                             const published = umgPortals.includes(portal.id);
