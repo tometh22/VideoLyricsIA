@@ -343,6 +343,23 @@ def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
     # el archivo; el click humano del portal sí justifica saltear el tope.
     assert all(c.kwargs == {} for c in enqueue.call_args_list)
 
+    # Publication waits for the generated masters. Retry only after their
+    # durable keys exist, never inventing a delivery before completion.
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        job.s3_keys = {**job.s3_keys, "umg_master": "t/j/umg_master.mov",
+                       "umg_short": "t/j/umg_short.mov"}
+        db.commit()
+    finally:
+        db.close()
+    ready_op = _run_bulk_delivery(client, admin_token, campaign.id, "bulk-con-spec-ready-0001")
+    with (
+        patch.object(atc.storage, "is_enabled", return_value=True),
+        patch.object(atc.storage, "object_exists", return_value=True),
+    ):
+        atc.process_delivery_batch(ready_op)
+
     # Y la fila nace con su fingerprint: sin esto, TODA entrega publicada por
     # campaña quedaba ciega a su primera corrección.
     db = SessionLocal()
@@ -375,7 +392,9 @@ def test_publicar_por_campana_no_sombrea_el_fingerprint_de_aprobacion(
         campaign,
         umg_spec={"frame_size": "HD", "fps": 24.0, "prores_profile": 3},
         s3_keys={"video": "t/j/lyric_video.mp4", "short": "t/j/short.mp4",
-                 "thumbnail": "t/j/thumbnail.jpg"},
+                 "thumbnail": "t/j/thumbnail.jpg",
+                 "umg_master": "t/j/umg_master.mov",
+                 "umg_short": "t/j/umg_short.mov"},
     )
     op = _run_bulk_delivery(client, admin_token, campaign.id, "scope-guard-000001")
 
