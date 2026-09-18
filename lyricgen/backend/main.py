@@ -18713,7 +18713,7 @@ def _published_delivery_key(delivery, file_type):
 
 
 @app.get("/api/deliveries/items")
-async def portal_get_items(
+def portal_get_items(
     response: Response,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
@@ -18731,7 +18731,7 @@ async def portal_get_items(
     response.headers["Cache-Control"] = "private, no-store, max-age=0"
     response.headers["Pragma"] = "no-cache"
     import time
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, wait
 
     now = time.time()
     deliveries = _portal_delivery_query(
@@ -18741,6 +18741,27 @@ async def portal_get_items(
     ).order_by(
         Delivery.artist_snapshot, Delivery.song_title_snapshot, Delivery.added_at,
     ).all()
+
+    # Materialize ALL database state before Redis/R2 I/O. PostgreSQL closes
+    # idle transactions after one minute; a cold listing must not retain one.
+    cr_map: dict[int, list[dict]] = {}
+    if deliveries:
+        crs = (
+            db.query(DeliveryChangeRequest)
+            .filter(DeliveryChangeRequest.delivery_id.in_([d.id for d in deliveries]))
+            .order_by(DeliveryChangeRequest.submitted_at.desc())
+            .all()
+        )
+        for cr in crs:
+            cr_map.setdefault(cr.delivery_id, []).append({
+                "id": cr.id, "comment": cr.comment,
+                "submitted_at": cr.submitted_at.isoformat() if cr.submitted_at else None,
+                "resolved_at": cr.resolved_at.isoformat() if cr.resolved_at else None,
+                "resolution_note": cr.resolution_note,
+            })
+    # Detach before rollback so scalar fields remain usable without a reload.
+    db.expunge_all()
+    db.rollback()
 
     # Resolve every (delivery, file) pair's R2 size in parallel BEFORE
     # building the response. Sequential head_object calls were the root
@@ -18775,12 +18796,18 @@ async def portal_get_items(
     except Exception:
         _rcache = None
 
+    cached_values = []
+    if _rcache is not None and head_jobs:
+        try:
+            cached_values = _rcache.mget(["dlsize:" + key for _, _, key in head_jobs])
+        except Exception:
+            cached_values = []
     uncached: list[tuple[int, str, str]] = []
-    for di, ft, r2_key in head_jobs:
+    for index, (di, ft, r2_key) in enumerate(head_jobs):
         cached = None
-        if _rcache is not None:
+        if index < len(cached_values):
             try:
-                raw = _rcache.get("dlsize:" + r2_key)
+                raw = cached_values[index]
                 if raw is not None:
                     cached = int(raw)
             except Exception:
@@ -18793,7 +18820,7 @@ async def portal_get_items(
     def _head_size(job: tuple[int, str, str]) -> tuple[tuple[int, str], str, int | None]:
         di, ft, r2_key = job
         try:
-            client = storage._get_client()
+            client = storage._get_portal_client()
             if client is None:
                 return (di, ft), r2_key, None
             head = client.head_object(Bucket=storage.R2_BUCKET, Key=r2_key)
@@ -18804,35 +18831,28 @@ async def portal_get_items(
     if uncached:
         # Only HEAD the files we haven't cached yet. 16-way concurrency cap
         # so we don't open hundreds of R2 sockets at once.
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            for k, r2_key, v in pool.map(_head_size, uncached):
+        pool = ThreadPoolExecutor(max_workers=16)
+        futures = [pool.submit(_head_size, job) for job in uncached]
+        try:
+            done, _ = wait(futures, timeout=12)
+            cache_updates = {}
+            for future in done:
+                k, r2_key, v = future.result()
                 size_map[k] = v
                 if v is not None and _rcache is not None:
-                    try:
-                        _rcache.setex("dlsize:" + r2_key, 2592000, int(v))
-                    except Exception:
-                        pass
-
-    # Bulk-fetch change requests for all visible deliveries in one query
-    # (avoid N+1). Group into {delivery_id: [requests]} so the per-version
-    # loop below can attach them without another DB round-trip.
-    cr_map: dict[int, list[dict]] = {}
-    if deliveries:
-        delivery_ids = [d.id for d in deliveries]
-        crs = (
-            db.query(DeliveryChangeRequest)
-            .filter(DeliveryChangeRequest.delivery_id.in_(delivery_ids))
-            .order_by(DeliveryChangeRequest.submitted_at.desc())
-            .all()
-        )
-        for cr in crs:
-            cr_map.setdefault(cr.delivery_id, []).append({
-                "id": cr.id,
-                "comment": cr.comment,
-                "submitted_at": cr.submitted_at.isoformat() if cr.submitted_at else None,
-                "resolved_at": cr.resolved_at.isoformat() if cr.resolved_at else None,
-                "resolution_note": cr.resolution_note,
-            })
+                    cache_updates["dlsize:" + r2_key] = int(v)
+            if cache_updates:
+                try:
+                    pipe = _rcache.pipeline(transaction=False)
+                    for key, value in cache_updates.items():
+                        pipe.setex(key, 2592000, value)
+                    pipe.execute()
+                except Exception:
+                    pass
+        finally:
+            # Do not wait for all queued HEADs after the listing deadline.
+            # At most 16 in-flight requests finish under the client's timeout.
+            pool.shutdown(wait=False, cancel_futures=True)
 
     # Group by (artist, song). Within each group, versions stay in
     # added_at order (oldest first), matching how items.json reads.
