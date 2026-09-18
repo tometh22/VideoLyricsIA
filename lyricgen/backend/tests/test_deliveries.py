@@ -43,6 +43,13 @@ def _portal_token_env():
         os.environ["DELIVERY_PORTAL_TOKEN"] = old
 
 
+@pytest.fixture(autouse=True)
+def _publication_copy_succeeds(monkeypatch):
+    # This suite mocks R2 existence; copying that same fake storage is also
+    # an I/O boundary. Failure/byte isolation is tested separately.
+    monkeypatch.setattr('storage.copy_object', lambda *_: True)
+
+
 @pytest.fixture
 def approved_job(db, admin_token, client):
     """Create an approved job in the DB that the delivery endpoints can use.
@@ -1179,7 +1186,7 @@ def test_resending_the_same_cut_keeps_the_approval_and_the_open_request(
     assert cr.resolved_at is None
 
 
-def test_a_row_published_before_fingerprints_existed_keeps_its_approval(
+def test_legacy_row_with_proven_later_overwrite_requires_new_approval(
     client, admin_token, approved_job, db, all_r2_files_present,
 ):
     """Migración: filas viejas no tienen con qué comparar.
@@ -1206,9 +1213,9 @@ def test_a_row_published_before_fingerprints_existed_keeps_its_approval(
         f"/admin/deliveries/from-job/{approved_job.job_id}",
         headers=auth(admin_token), json={},
     )
-    assert again.json()["content_changed"] is False
+    assert again.json()["content_changed"] is True
     db.refresh(row)
-    assert row.approved_at is not None
+    assert row.approved_at is None
 
 
 def test_a_legacy_row_marked_stale_publishes_the_corrected_cut(

@@ -322,6 +322,11 @@ def needs_publish(job, delivery) -> bool:
     current_fingerprint = render_fingerprint(job)
     if published_fingerprint and current_fingerprint:
         return published_fingerprint != current_fingerprint
+    from change_request_workflow import latest_overwrite, timestamp
+    overwritten = latest_overwrite(job)
+    published = timestamp(getattr(delivery, 'content_updated_at', None) or delivery.added_at)
+    if job.status in {'done', 'pending_review'} and overwritten and published and overwritten > published:
+        return True
     return bool(
         getattr(delivery, "stale_since", None)
         and getattr(delivery, "stale_reason", None) in STALE_IN_FLIGHT
@@ -386,4 +391,5 @@ def publication_state(job, delivery) -> dict:
             delivery.content_updated_at and delivery.approved_at is None
         ),
         "job_status": getattr(job, "status", None),
+        "render_fingerprint": current_fingerprint,
     }

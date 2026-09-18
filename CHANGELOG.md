@@ -3,6 +3,19 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.60] - 2026-09-18
+
+### Fixed
+
+- Unify UMG correction review, exact-revision render approval and explicit
+  publication from the editor and Changes. Expose manual resolution clearly.
+- Pin published portal files independently from new renders, with an additive
+  deliveries schema update and fail-closed publication copies.
+- Reconcile campaign publication progress, refresh history after completion,
+  and resolve older requests when a corrected cut is published.
+- Allow platform administrators to regenerate approved backgrounds from the
+  editor, retaining scene, permission and publication safeguards.
+
 ## [1.1.59] - 2026-09-17
 
 ### Fixed

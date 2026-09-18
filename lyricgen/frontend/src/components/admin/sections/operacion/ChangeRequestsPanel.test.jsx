@@ -299,7 +299,8 @@ describe("ChangeRequestsPanel", () => {
       { proposal: { id: "proposal-1", status: "applied", applied_revision: 5 } },
       { proposalEnabled: true, loadProposal: load },
     );
-    expect(screen.getByRole("link", { name: "Revisar y generar corte" }))
+    expect(screen.getByRole("button", { name: "Revisar y confirmar render" })).toBeEnabled();
+    expect(screen.getByRole("link", { name: "Editar letra" }))
       .toHaveAttribute(
         "href",
         "/videos/f7752c6feed4/edit-lyrics?change_request_id=7&proposal_id=proposal-1",
@@ -342,7 +343,7 @@ describe("ChangeRequestsPanel", () => {
       { publishDeliveryUpdate: publish },
     );
     screen.getByRole("button", { name: "Publicar actualización" }).click();
-    expect(publish).toHaveBeenCalledWith("f7752c6feed4", "chile", 7);
+    expect(publish).toHaveBeenCalledWith("f7752c6feed4", "chile", 7, expect.objectContaining({ needs_publish: true }));
   });
 
   it("opens the format selector instead of attempting an impossible legacy publish", async () => {
@@ -370,7 +371,7 @@ describe("ChangeRequestsPanel", () => {
     // Marcar resuelto sin publicar no cambia el archivo del cliente: la
     // etiqueta lo dice, para que no se use como si lo hiciera.
     expect(
-      screen.getByRole("button", { name: "Marcar resuelto sin publicar" }),
+      screen.getByRole("button", { name: "Marcar como resuelto" }),
     ).toBeInTheDocument();
   });
 
@@ -497,7 +498,7 @@ describe("ChangeRequestsPanel", () => {
     });
     expect(screen.getByRole("link", { name: "Abrir editor de fondo" }))
       .toHaveAttribute(
-        "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7&proposal_id=proposal-bg",
+        "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
       );
   });
 

@@ -44,6 +44,18 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
       tone: "busy",
     };
   }
+  if (publication.render_matches_editor === false && publication.can_render) {
+    const proposal = proposalForRequest(item, loadedProposal);
+    if (["applied", "partially_applied"].includes(proposal?.status) || !proposal) {
+      return { key: proposal ? "render" : "analyze", activeStep: proposal ? 2 : 0,
+        label: proposal ? "Revisar y confirmar el render" : "Pendiente de interpretar",
+        detail: "Aplicá la propuesta o editá a mano. Después revisá la letra y confirmá el render.", tone: "action" };
+    }
+  }
+  if (publication.render_matches_editor && publication.needs_publish && !(publication.prores_pending || []).length) {
+    return { key: "publish", activeStep: 3, label: "Corte listo · revisar y publicar",
+      detail: "Reproducí el video y confirmá Publicar actualización para actualizar el portal.", tone: "attention" };
+  }
   // A missing/old master says nothing about whether this client's request was
   // interpreted. Do not paint those stages complete or hide the analyze action.
   if (proposalEnabled && !proposalForRequest(item, loadedProposal)) {
@@ -67,6 +79,10 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
       key: "publish", activeStep: 4, label: "Listo para publicar",
       detail: "Revisá el corte nuevo y publicalo cuando esté correcto.", tone: "attention",
     };
+  }
+  if (publication.render_matches_editor) {
+    return { key: "review", activeStep: 3, label: "Corte generado",
+      detail: "El portal ya tiene este corte. Si el pedido está atendido, marcalo como resuelto.", tone: "done" };
   }
 
   const proposal = proposalForRequest(item, loadedProposal);

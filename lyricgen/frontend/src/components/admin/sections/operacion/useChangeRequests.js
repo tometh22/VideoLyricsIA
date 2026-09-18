@@ -48,6 +48,8 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   const [crProposalDetails, setCrProposalDetails] = useState({});
   const [crPublishingId, setCrPublishingId] = useState(null);
   const [crPublishNotice, setCrPublishNotice] = useState(null);
+  const [crRenderReview, setCrRenderReview] = useState(null);
+  const renderLockRef = useRef(false);
 
   const crStatusRef = useRef(crStatusFilter);
   const activeRenderIdsRef = useRef(new Set());
@@ -289,6 +291,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ resolution_note: (note || "").trim() }),
       });
+      setCrPublishNotice({ requestId: id, tone: "ok", text: "Pedido marcado como resuelto en el portal. No se generó ni publicó otro video." });
       await loadChangeRequests();
     } catch (err) {
       flashError(`No pude marcar como resuelto: ${err.message || err}`);
@@ -297,14 +300,49 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     }
   }, [flashError, loadChangeRequests]);
 
-  const publishDeliveryUpdate = useCallback(async (jobId, portalId, crId) => {
+  const reviewForRender = useCallback(async (requestId) => {
+    setCrProposalBusyId(requestId);
+    try {
+      const review = await fetchJson(`${API}/admin/change-requests/${requestId}/review`);
+      setCrRenderReview(review);
+    } catch (err) {
+      setCrPublishNotice({ requestId, tone: "error", text: `No pude abrir la revisión: ${err.message || err}` });
+    } finally { setCrProposalBusyId(null); }
+  }, []);
+
+  const confirmRender = useCallback(async () => {
+    if (!crRenderReview || renderLockRef.current) return;
+    const requestId = crRenderReview.change_request_id;
+    renderLockRef.current = true;
+    setCrProposalBusyId(requestId);
+    try {
+      const data = await fetchJson(`${API}/admin/change-requests/${requestId}/render`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ editor_revision: crRenderReview.editor_revision }),
+      });
+      setCrRenderReview(null);
+      setCrPublishNotice({ requestId, tone: "ok", text: ["done", "pending_review"].includes(data.status)
+        ? "Esta revisión ya tiene un corte generado. Revisalo antes de publicar."
+        : "Letra aprobada. Generando el corte nuevo; todavía no se publicó en el portal." });
+      await loadChangeRequests();
+    } catch (err) {
+      setCrRenderReview(null);
+      setCrPublishNotice({ requestId, tone: "error", text: `No se inició el render: ${err.message || err}. Volvé a revisar la letra guardada.` });
+    } finally { renderLockRef.current = false; setCrProposalBusyId(null); }
+  }, [crRenderReview, loadChangeRequests]);
+
+  const publishDeliveryUpdate = useCallback(async (jobId, portalId, crId, publication) => {
     setCrPublishingId(crId ?? jobId);
     setCrPublishNotice(null);
     try {
       const data = await fetchJson(`${API}/admin/deliveries/from-job/${jobId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ portal_id: portalId || "argentina" }),
+        body: JSON.stringify({ portal_id: portalId || "argentina",
+          ...(publication ? { change_request_id: crId,
+            reviewed_render_fingerprint: publication.render_fingerprint,
+            reviewed_editor_revision: publication.editor_revision } : {}),
+        }),
       });
       if (data.ok === false && data.status === "preparing_prores") {
         setCrPublishNotice({
@@ -418,6 +456,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     crPublishNotice,
     setCrPublishNotice,
     publishDeliveryUpdate,
+    reviewForRender, confirmRender, crRenderReview, setCrRenderReview,
     prepareProRes,
     handleProResConfigured,
   };

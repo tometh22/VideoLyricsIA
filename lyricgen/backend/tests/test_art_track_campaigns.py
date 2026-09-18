@@ -18,6 +18,11 @@ def _digest(value: str) -> str:
 
 
 @pytest.fixture(autouse=True)
+def publication_storage(monkeypatch):
+    monkeypatch.setattr('storage.copy_object', lambda *_: True)
+
+
+@pytest.fixture(autouse=True)
 def clean_art_rows():
     yield
     db = SessionLocal()
@@ -281,6 +286,16 @@ def test_bulk_publish_does_not_promise_a_prores_nothing_will_create(
         assert "umg_master" not in row.file_types
         assert "umg_short" not in row.file_types
         assert row.file_types == ["video", "short", "thumbnail"]
+        assert row.published_file_keys['video']
+        operation = db.get(DeliveryBatch, op)
+        assert operation.status == 'completed'
+        assert operation.sent_count == 1
+        # Recover the already-existing bad summary without resending bytes.
+        operation.status = 'partial'
+        db.commit()
+        response = client.get(f'/batch/delivery-operations/{op}', headers={'Authorization': f'Bearer {admin_token}'})
+        assert response.json()['status'] == 'completed'
+        assert response.json()['sent_count'] == 1
     finally:
         db.close()
     # Sin spec no hay con qué transcodificar: encolar sería girar en falso.
@@ -315,8 +330,9 @@ def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
 
     db = SessionLocal()
     try:
-        row = db.query(Delivery).filter(Delivery.job_id == job_id).one()
-        assert "umg_master" in row.file_types and "umg_short" in row.file_types
+        assert db.query(Delivery).filter(Delivery.job_id == job_id).first() is None
+        item = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.delivery_batch_id == op).one()
+        assert item.error_code == 'deliverables_not_ready'
     finally:
         db.close()
     assert sorted(c.args[1] for c in enqueue.call_args_list) == ["umg_master", "umg_short"]
@@ -326,6 +342,23 @@ def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
     # cliente que vengan después, en la misma cola. Acá nadie está esperando
     # el archivo; el click humano del portal sí justifica saltear el tope.
     assert all(c.kwargs == {} for c in enqueue.call_args_list)
+
+    # Publication waits for the generated masters. Retry only after their
+    # durable keys exist, never inventing a delivery before completion.
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        job.s3_keys = {**job.s3_keys, "umg_master": "t/j/umg_master.mov",
+                       "umg_short": "t/j/umg_short.mov"}
+        db.commit()
+    finally:
+        db.close()
+    ready_op = _run_bulk_delivery(client, admin_token, campaign.id, "bulk-con-spec-ready-0001")
+    with (
+        patch.object(atc.storage, "is_enabled", return_value=True),
+        patch.object(atc.storage, "object_exists", return_value=True),
+    ):
+        atc.process_delivery_batch(ready_op)
 
     # Y la fila nace con su fingerprint: sin esto, TODA entrega publicada por
     # campaña quedaba ciega a su primera corrección.
@@ -359,7 +392,9 @@ def test_publicar_por_campana_no_sombrea_el_fingerprint_de_aprobacion(
         campaign,
         umg_spec={"frame_size": "HD", "fps": 24.0, "prores_profile": 3},
         s3_keys={"video": "t/j/lyric_video.mp4", "short": "t/j/short.mp4",
-                 "thumbnail": "t/j/thumbnail.jpg"},
+                 "thumbnail": "t/j/thumbnail.jpg",
+                 "umg_master": "t/j/umg_master.mov",
+                 "umg_short": "t/j/umg_short.mov"},
     )
     op = _run_bulk_delivery(client, admin_token, campaign.id, "scope-guard-000001")
 
