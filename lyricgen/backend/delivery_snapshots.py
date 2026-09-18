@@ -51,9 +51,25 @@ def pin_legacy_deliveries(job_id):
     from database import Delivery, scoped_deliveries_db
     with scoped_deliveries_db() as db:
         rows = (db.query(Delivery).filter(Delivery.job_id == job_id,
-                Delivery.removed_at.is_(None)).with_for_update().all())
-        for row in rows:
-            if row.published_file_keys is None:
-                row.published_file_keys = copy_snapshot(
-                    row.tenant_snapshot, job_id, row.file_types or [], allow_missing=True)
-        db.commit()
+                Delivery.removed_at.is_(None)).all())
+        def identity(row):
+            return (row.tenant_snapshot, tuple(row.file_types or []),
+                    row.published_revision, row.published_render_fingerprint,
+                    row.added_at, row.content_updated_at)
+        pending = [(row.id, identity(row)) for row in rows
+                   if row.published_file_keys is None]
+        db.rollback()
+        for row_id, expected in pending:
+            # Keep no transaction/lock alive during large R2 copies. Another
+            # publisher may win; never overwrite its pinned pointer.
+            keys = copy_snapshot(expected[0], job_id, list(expected[1]), allow_missing=True)
+            row = (db.query(Delivery).filter(Delivery.id == row_id)
+                   .populate_existing().with_for_update().first())
+            if row is None or row.removed_at is not None or row.published_file_keys is not None:
+                db.rollback()
+                continue
+            if identity(row) != expected:
+                db.rollback()
+                raise RuntimeError('La entrega cambió mientras se conservaba la versión publicada.')
+            row.published_file_keys = keys
+            db.commit()
