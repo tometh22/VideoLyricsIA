@@ -21,22 +21,45 @@ def portal_key(delivery, file_type):
 
 
 def copy_snapshot(tenant, job_id, file_types, *, allow_missing=False):
+    """Copy a stable observed source set; never return a partial verified set.
+
+    This detects source changes during publication. It cannot establish that
+    sources already present before preflight came from the same render: that
+    requires a writer-owned immutable generation manifest. Multipart ETags are
+    used as preconditions only, never compared to destination content hashes.
+    """
     snapshot = uuid4().hex
     result = {}
-    for file_type in file_types:
+    sources = {}
+    absent_sources = []
+    # Capture ALL identities before any copy, so a late missing/unknown source
+    # does not start an expensive partially usable publication.
+    for file_type in dict.fromkeys(file_types):
         if file_type not in FILENAMES:
             continue
         source = working_key(tenant, job_id, file_type)
-        if allow_missing:
-            status = storage.object_status(source)
-            if status == 'missing':
-                continue
-            if status != 'exists':
-                raise RuntimeError('No se pudo verificar la versión publicada.')
+        identity = storage.object_identity(source)
+        if identity.get('status') == 'missing' and allow_missing:
+            absent_sources.append(source)
+            continue
+        if identity.get('status') != 'exists':
+            raise RuntimeError('No se pudo verificar la versión publicada.')
+        sources[file_type] = (source, identity)
+    for file_type, (source, identity) in sources.items():
         target = f'{source}.published-{snapshot}'
-        if not storage.copy_object(source, target):
+        if not storage.copy_object(source, target, expected_etag=identity['etag']):
             raise RuntimeError('No se pudo conservar la versión publicada. No se actualizaron los entregables.')
+        destination = storage.object_identity(target)
+        if destination.get('status') != 'exists' or destination.get('size') != identity['size']:
+            raise RuntimeError('No se pudo verificar la copia publicada. No se actualizaron los entregables.')
         result[file_type] = target
+    # A source may change after its own copy while another large master copies.
+    # Recheck the full set after all copies, before returning publishable keys.
+    for source, identity in sources.values():
+        if storage.object_identity(source) != identity:
+            raise RuntimeError('Los archivos cambiaron mientras se preparaba la publicación. Volvé a revisar el corte.')
+    if any(storage.object_identity(source).get('status') != 'missing' for source in absent_sources):
+        raise RuntimeError('Los archivos cambiaron mientras se preparaba la publicación. Volvé a revisar el corte.')
     if not result and not allow_missing:
         raise RuntimeError('La publicación no contiene archivos.')
     return result

@@ -19,7 +19,11 @@ def _digest(value: str) -> str:
 
 @pytest.fixture(autouse=True)
 def publication_storage(monkeypatch):
-    monkeypatch.setattr('storage.copy_object', lambda *_: True)
+    import storage
+    monkeypatch.setattr(storage, 'copy_object', lambda *_, **kwargs: True)
+    monkeypatch.setattr(storage, 'object_identity', lambda key: (
+        {'status': 'exists', 'etag': 'synthetic-version', 'size': 100}
+        if storage.object_exists(key.split('.published-', 1)[0]) else {'status': 'missing'}))
 
 
 @pytest.fixture(autouse=True)

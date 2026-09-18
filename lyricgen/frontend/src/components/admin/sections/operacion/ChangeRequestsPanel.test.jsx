@@ -75,6 +75,10 @@ function renderPanelItems(items, props = {}) {
 
 // El orden de prioridad es el orden en que los estados bloquean al operador.
 describe("publicationStatus", () => {
+  it.each([null, {}, { job_status: "done" }])("does not invent a published revision from %j", publication => {
+    expect(publicationStatus(publication)).toMatchObject({ canPublish: false, title: "Publicación por verificar" });
+    expect(publicationStatus(publication).detail).not.toContain("mismo corte");
+  });
   it("verifies saved corrections when editor snapshots regenerate local row ids", () => {
     const expected = { _id: "old-local-id", start: 70.12, end: 74.2, text: "Soy quien ayer cantó sé vos" };
     const proposal = { operations: [{ status: "applied", proposed_segments: [expected] }],
@@ -342,7 +346,7 @@ describe("ChangeRequestsPanel", () => {
       { publication: { ...BASE_PUBLICATION, needs_publish: true } },
       { publishDeliveryUpdate: publish },
     );
-    screen.getByRole("button", { name: "Publicar actualización" }).click();
+    fireEvent.click(screen.getByRole("button", { name: "Publicar actualización" }));
     expect(publish).toHaveBeenCalledWith("f7752c6feed4", "chile", 7, expect.objectContaining({ needs_publish: true }));
   });
 
@@ -359,7 +363,7 @@ describe("ChangeRequestsPanel", () => {
       },
       { publishDeliveryUpdate: publish },
     );
-    screen.getByRole("button", { name: "Elegir formato y actualizar .mov" }).click();
+    fireEvent.click(screen.getByRole("button", { name: "Elegir formato y actualizar .mov" }));
     expect(await screen.findByRole("dialog", {
       name: "Configurar y actualizar el archivo profesional",
     })).toBeInTheDocument();
@@ -373,6 +377,38 @@ describe("ChangeRequestsPanel", () => {
     expect(
       screen.getByRole("button", { name: "Marcar como resuelto" }),
     ).toBeInTheDocument();
+  });
+
+  it("requires a manual-close motive and ignores the global shortcut inside that field", () => {
+    const resolve = vi.fn();
+    const generate = vi.fn();
+    renderPanel({}, { resolveChangeRequest: resolve, proposalEnabled: true, generateProposal: generate });
+    const close = screen.getByRole("button", { name: "Marcar como resuelto" });
+    expect(close).toBeDisabled();
+    const reason = screen.getByLabelText("Motivo del cierre sin publicar");
+    fireEvent.change(reason, { target: { value: "Cliente confirmó que no requiere otro video" } });
+    fireEvent.keyDown(reason, { key: "Enter", ctrlKey: true });
+    expect(generate).not.toHaveBeenCalled();
+    expect(resolve).not.toHaveBeenCalled();
+    expect(close).toBeEnabled();
+    fireEvent.click(close);
+    expect(resolve).toHaveBeenCalledWith(7, "Cliente confirmó que no requiere otro video");
+  });
+
+  it("does not override server action restrictions with a legacy publication flag", () => {
+    const refresh = vi.fn();
+    renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true },
+      workflow: { key: "unknown", activeStep: 0, label: "Falta verificar", detail: "Actualizá", tone: "attention", allowed_actions: ["refresh"] },
+    }, { refreshChangeRequests: refresh });
+    expect(screen.queryByRole("button", { name: "Publicar actualización" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Actualizar estado" }));
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("links the published snapshot separately from the candidate video", () => {
+    renderPanel({ delivery: { ...REQUEST.delivery, video_url: "/candidate.mp4", published_video_url: "/published/v2.mp4", published_revision: 2 } });
+    expect(screen.getByRole("link", { name: "Ver versión publicada" })).toHaveAttribute("href", "/published/v2.mp4");
+    expect(screen.getByLabelText(`Video de ${REQUEST.delivery.artist} — ${REQUEST.delivery.song}`)).toHaveAttribute("src", "/candidate.mp4");
   });
 
   it("explains an auto-closed request instead of crediting an operator", () => {
@@ -403,7 +439,7 @@ describe("ChangeRequestsPanel", () => {
   it("offers deterministic analysis when the assist flag is enabled", () => {
     const generate = vi.fn();
     renderPanel({}, { proposalEnabled: true, generateProposal: generate });
-    screen.getByRole("button", { name: "Analizar pedido" }).click();
+    fireEvent.click(screen.getByRole("button", { name: "Analizar pedido" }));
     expect(generate).toHaveBeenCalledWith(7);
   });
 
@@ -413,7 +449,7 @@ describe("ChangeRequestsPanel", () => {
       { proposal: { id: "proposal-1", status: "ready", applicable_count: 2 } },
       { proposalEnabled: true, loadProposal: load },
     );
-    screen.getByRole("button", { name: "Ver propuesta" }).click();
+    fireEvent.click(screen.getByRole("button", { name: "Ver propuesta" }));
     expect(load).toHaveBeenCalledWith(7);
   });
 
@@ -421,6 +457,7 @@ describe("ChangeRequestsPanel", () => {
     const apply = vi.fn();
     const proposal = {
       id: "proposal-1",
+      content_hash: "hash-preview-1",
       status: "ready",
       base_revision: 4,
       updated_at: "2026-09-16T00:00:00Z",
@@ -464,8 +501,8 @@ describe("ChangeRequestsPanel", () => {
     expect(screen.getByRole("button", { name: "Aplicar seleccionadas (0)" }))
       .toBeDisabled();
     fireEvent.click(screen.getByLabelText("Seleccionar cambio: Texto viejo"));
-    button.click();
-    expect(apply).toHaveBeenCalledWith(7, "proposal-1", ["op-1"], 4);
+    fireEvent.click(button);
+    expect(apply).toHaveBeenCalledWith(7, "proposal-1", ["op-1"], 4, "hash-preview-1");
   });
 
   it("keeps timing instructions review-only", () => {
@@ -502,12 +539,74 @@ describe("ChangeRequestsPanel", () => {
       );
   });
 
+  it.each([
+    ["unresolved_visual_constraint", /restricción visual que necesita aclaración/],
+    ["background_constraints_exceed_prompt_limit", /condiciones obligatorias superan el límite/],
+    ["unresolved_request_requires_review", /partes del pedido que no se pudieron interpretar/],
+    ["future_unknown_reason", /requiere revisión manual antes de regenerar/],
+  ])("explains a disabled background action for %s without inventing multiple scenes", (reason, message) => {
+    renderPanel({}, { proposalEnabled: true, proposalDetails: { 7: {
+      id: "p-background", status: "needs_input", base_revision: 4,
+      operations: [{ id: "bg", kind: "background_review", applicable: false,
+        visual_action: "regenerate_background", regeneration_supported: false,
+        suggested_prompt: "Pedido completo", warnings: [reason] }],
+    } } });
+    expect(screen.getByText(message)).toBeInTheDocument();
+    expect(screen.queryByText(/Este video usa varias escenas/)).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Abrir editor de fondo" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Regenerar fondo con este prompt" })).not.toBeInTheDocument();
+  });
+
+  it("shows every blocking visual reason and reserves the scene editor for real multiscene work", () => {
+    renderPanel({}, { proposalEnabled: true, proposalDetails: { 7: {
+      id: "p-background", status: "needs_input", base_revision: 4,
+      operations: [{ id: "bg", kind: "background_review", applicable: false,
+        visual_action: "regenerate_background", regeneration_supported: false,
+        warnings: ["multi_scene_background_requires_scene_editor", "unresolved_visual_constraint"] }],
+    } } });
+    expect(screen.getByText(/Este video usa varias escenas/)).toBeInTheDocument();
+    expect(screen.getByText(/restricción visual que necesita aclaración/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Abrir editor de escenas" })).toBeInTheDocument();
+  });
+
+  it("presents already satisfied text as a textual check, not a failed manual action or published video", () => {
+    renderPanel({}, { proposalEnabled: true, proposalDetails: { 7: {
+      id: "p-satisfied", status: "ready", base_revision: 4,
+      operations: [{ id: "text-ok", kind: "manual_review", status: "already_satisfied", applicable: false,
+        verified_segments: [{ _id: "s1", text: "Texto exacto solicitado", start: 3, end: 5 }] }],
+    } } });
+    expect(screen.getByText("Ya coincide en la letra guardada")).toBeInTheDocument();
+    expect(screen.getByText("Texto exacto solicitado")).toBeInTheDocument();
+    expect(screen.getByText(/No confirma el render ni la publicación/)).toBeInTheDocument();
+    expect(screen.queryByText("Interpretación manual requerida")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['stale', true], ['ready', false], ['ready', undefined], ['applied', true],
+  ])('blocks background generation for status %s and preview match %s', (status, matches) => {
+    const regenerate = vi.fn();
+    renderPanel({}, { proposalEnabled: true, regenerateBackground: regenerate,
+      proposalDetails: { 7: { id: 'obsolete-bg', status, base_revision: 4,
+        content_hash: 'a'.repeat(64),
+        lyrics_context: { revision: 4, matches_base: matches, segments: [] },
+        operations: [{ id: 'bg', applicable: false, status: 'pending',
+          kind: 'background_review', visual_action: 'regenerate_background',
+          regeneration_supported: true, suggested_prompt: 'Paisaje sin texto' }],
+      } } });
+    const button = screen.getByRole('button', { name: 'Regenerar fondo con este prompt' });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(regenerate).not.toHaveBeenCalled();
+  });
+
   it("shows an editable visual prompt and regenerates without publishing", () => {
     const regenerate = vi.fn();
     renderPanel({}, {
       proposalEnabled: true,
       proposalDetails: { 7: {
         id: "proposal-bg", status: "ready", base_revision: 4,
+        content_hash: "a".repeat(64),
+        lyrics_context: { revision: 4, matches_base: true, segments: [] },
         operations: [{
           id: "visual-bg", kind: "background_review", status: "pending",
           applicable: false,
@@ -538,6 +637,7 @@ describe("ChangeRequestsPanel", () => {
       "f7752c6feed4",
       "Barrio al amanecer, sin armas, sin texto ni logos.",
       "veo",
+      "a".repeat(64),
     );
     expect(screen.queryByRole("button", { name: /Aplicar seleccionadas/ }))
       .not.toBeInTheDocument();
@@ -551,6 +651,7 @@ describe("ChangeRequestsPanel", () => {
       proposalApplyEnabled: true,
       proposalDetails: { 7: {
         id: "proposal-3", status: "ready", base_revision: 4,
+        content_hash: "hash-preview-3",
         updated_at: "2026-09-16T00:00:00Z",
         lyrics_context: {
           revision: 4, matches_base: true,
@@ -572,14 +673,14 @@ describe("ChangeRequestsPanel", () => {
     });
     const preview = screen.getByLabelText("Vista previa de la letra resultante");
     expect(preview).toHaveTextContent("Texto corregido por operador");
-    expect(screen.getByText(/Estamos guardando tus ajustes/)).toBeInTheDocument();
+    expect(screen.getByText(/Tenés ajustes sin guardar/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Aplicar seleccionadas (1)" }))
       .toBeDisabled();
 
     fireEvent.blur(input);
     await waitFor(() => {
       expect(adjust).toHaveBeenCalledWith(
-        7, "proposal-3", "op-1", "Texto corregido por operador", 4,
+        7, "proposal-3", "op-1", "Texto corregido por operador", 4, "hash-preview-3",
       );
     });
   });

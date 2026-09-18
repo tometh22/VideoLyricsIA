@@ -1,280 +1,261 @@
-"""¿Lo que el portal promete existe, y es lo que dijimos que era?
+"""Read-only audit of the exact objects promised by portal publications.
 
-Esto existe porque las dos veces que falló nos enteramos de casualidad.
-
-El 2026-09-15 el portal de Chile ofrecía, de 34 entregas activas, **28
-"ProRes Master (broadcast)" que no existían en R2** — la publicación masiva
-los anunciaba creyendo que el portal los transcodifica al primer download, y
-el portal no hace eso: firma la key determinística y listo. Nadie tenía forma
-de saberlo: en la pantalla del cliente el archivo se ve como cualquier otro
-hasta que lo aprieta. Lo encontramos porque alguien preguntó por otra cosa.
-
-Y el mismo día, una entrega servía un master de un corte anterior con el
-pedido de cambios marcado como resuelto al lado, porque la fila del job había
-perdido su key y ningún chequeo mira eso.
-
-Las dos clases son detectables en una pasada barata, y las dos son invisibles
-sin ella:
-
-- **fantasma**: la fila anuncia un `file_type` cuyo objeto no está en R2. El
-  cliente ve un entregable que no se puede descargar.
-- **desactualizada**: el render del job cambió después de publicarse, así que
-  el portal está sirviendo (o está a punto de servir) algo que nadie aprobó.
-  Sólo se puede evaluar cuando este entorno es dueño del Job: las entregas
-  de campaña viven en la DB del portal mientras sus jobs viven en la de
-  staging, así que en producción muchas quedan "no evaluables" y eso NO es un
-  hallazgo.
-- **en vuelo hace mucho**: una fila marcada como "aplicando cambios" que
-  quedó así. Se cura publicando, y si nadie publica hay que verlo.
-
-No arregla nada por sí solo: reporta. Arreglar un entregable es siempre una
-decisión con un humano adentro — la lección del 2026-09-15 fue que la fila
-puede mentir en las dos direcciones, y que hay que medir el artefacto antes
-de tocarlo.
+A newer working candidate is not a broken immutable publication. Missing,
+unknown, malformed and unchecked artifacts must never be reported as healthy.
 """
-
 from __future__ import annotations
 
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 
 import storage
-from delivery_freshness import PRORES_FILE_TYPES
 from delivery_retention import DELIVERY_FILENAMES
 
 logger = logging.getLogger(__name__)
-
-# Horas que una fila puede estar marcada como "en vuelo" antes de que sea
-# raro. Un re-render más el transcode del master tarda minutos; un día
-# significa que el edit murió o que nadie publicó el resultado.
 STALE_IN_FLIGHT_HOURS = int(os.environ.get("DELIVERY_STALE_ALERT_HOURS", "24"))
-
-# Tope de objetos a chequear por pasada. Con ~215 entregas activas × 5
-# archivos son ~1000 HEAD una vez por día, que a R2 no le mueve la aguja;
-# el tope es para que un crecimiento de 10x no convierta la auditoría en el
-# trabajo más caro del reaper.
 MAX_OBJECT_CHECKS = int(os.environ.get("DELIVERY_AUDIT_MAX_CHECKS", "2000"))
+AUDIT_TIMEOUT_SECONDS = max(0.0, float(os.environ.get("DELIVERY_AUDIT_TIMEOUT_SECONDS", "12")))
+# One bounded pool across passes: an unfinished timed-out HEAD must not create
+# four more threads on every subsequent audit. No ORM objects enter this pool.
+_OBJECT_AUDIT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="delivery-audit")
+
+
+def _inspect_budgeted(checks, *, deadline):
+    """Return completed outcomes without waiting for stragglers at deadline.
+
+    Running network calls cannot be killed safely. Their client has short
+    connect/read timeouts; the shared executor bounds outstanding concurrency.
+    Results that arrive after the deadline are not retroactively called green.
+    """
+    remaining = iter(checks)
+    pending = {}
+    results = []
+    attempted = 0
+
+    def inspect(check):
+        try:
+            return storage.object_status_bounded(check[2])
+        except Exception:
+            return "unavailable"
+
+    def fill():
+        nonlocal attempted
+        while len(pending) < 4 and time.monotonic() < deadline:
+            try:
+                check = next(remaining)
+            except StopIteration:
+                break
+            pending[_OBJECT_AUDIT_POOL.submit(inspect, check)] = check
+            attempted += 1
+
+    fill()
+    while pending:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        done, _ = wait(pending, timeout=left, return_when=FIRST_COMPLETED)
+        if not done or time.monotonic() >= deadline:
+            break
+        for future in done:
+            check = pending.pop(future)
+            try:
+                status = future.result()
+            except Exception:
+                status = "unavailable"
+            results.append((check, status))
+        fill()
+    cancelled = 0
+    for future, check in pending.items():
+        if future.cancel():
+            cancelled += 1
+        else:
+            results.append((check, "deadline_exceeded"))
+    unchecked = len(checks) - attempted + cancelled
+    return results, attempted - cancelled, unchecked
 
 
 def _key(tenant: str, job_id: str, file_type: str) -> str | None:
-    """Key determinística de R2, con el mismo saneado que usa el escritor.
-
-    Deliberadamente sale de `DELIVERY_FILENAMES` en vez de una copia local:
-    si mañana se agrega un entregable, la auditoría lo incluye sin que nadie
-    se acuerde de tocar este archivo.
-    """
     filename = DELIVERY_FILENAMES.get(file_type)
     if not filename:
         return None
-    return (
-        f"{storage._safe_filename(tenant)}"
-        f"/{storage._safe_filename(job_id)}"
-        f"/{storage._safe_filename(filename)}"
-    )
+    return (f"{storage._safe_filename(tenant)}/{storage._safe_filename(job_id)}"
+            f"/{storage._safe_filename(filename)}")
 
 
-def audit_active_deliveries(*, now: datetime | None = None) -> dict:
-    """Recorre las entregas activas del portal y devuelve lo que no cierra.
+def _published_key(row: dict, file_type: str) -> tuple[str | None, str | None]:
+    """Match the portal's fail-closed snapshot semantics; never fall back."""
+    keys = row.get("published_file_keys")
+    if keys is not None:
+        if not isinstance(keys, dict):
+            return None, "invalid_snapshot_manifest"
+        key = keys.get(file_type)
+        if not isinstance(key, str) or not key.strip():
+            return None, "missing_snapshot_key"
+        return key, None
+    key = _key(row["tenant"], row["job_id"], file_type)
+    return (key, None) if key else (None, "unsupported_file_type")
 
-    Nunca levanta: esto corre dentro del ciclo del reaper y una auditoría que
-    tira abajo el reaper cuesta más que la auditoría.
+
+def _budgeted_checks(checks: list, *, now: datetime, cursor: int | None = None):
+    """Fair contiguous windows over a stable catalogue, even after restart.
+
+    The default rotates each UTC day; ceil(N/budget) consecutive daily runs
+    cover a stable catalogue. Explicit cursor/next_cursor permit additional
+    passes in the same day. Unselected objects remain explicitly unchecked.
     """
-    report: dict = {
-        "checked": 0, "objects_checked": 0,
-        "phantom": [], "outdated": [], "in_flight_too_long": [], "on_demand": [],
-        "unevaluable": 0,
+    count, budget = len(checks), max(0, MAX_OBJECT_CHECKS)
+    if not count or not budget:
+        return [], 0
+    day = int(now.timestamp() // 86400)
+    start = (cursor if cursor is not None else day * budget) % count
+    selected = [checks[(start + i) % count] for i in range(min(budget, count))]
+    return selected, (start + len(selected)) % count
+
+
+def _finding(row, file_type=None, reason=None):
+    result = {"delivery_id": row["id"], "portal_id": row["portal_id"],
+              "job_id": row["job_id"], "song": f"{row['artist']} — {row['song']}"}
+    if file_type is not None:
+        result["file_type"] = file_type
+    if reason is not None:
+        result["reason"] = reason
+    return result
+
+
+def audit_active_deliveries(*, now: datetime | None = None, cursor: int | None = None) -> dict:
+    """Report only. A failure must not kill the reaper or become a green run."""
+    report = {
+        "checked": 0, "objects_checked": 0, "objects_verified": 0,
+        "objects_total": 0, "objects_unchecked": 0, "next_cursor": 0,
+        "phantom": [], "outdated": [], "candidate_available": [],
+        "in_flight_too_long": [], "on_demand": [], "unknown": [],
+        "manifest_failures": [], "unevaluable": 0, "complete": False,
     }
+    started_at = time.monotonic()
+    deadline = started_at + AUDIT_TIMEOUT_SECONDS
     try:
         from database import Delivery, Job, SessionLocal, scoped_deliveries_db
-        import delivery_freshness
+        from delivery_freshness import _aware, render_fingerprint
 
-        now = now or datetime.now(timezone.utc)
+        now = _aware(now or datetime.now(timezone.utc))
         cutoff = now - timedelta(hours=STALE_IN_FLIGHT_HOURS)
-
         with scoped_deliveries_db() as ddb:
-            rows = (
-                ddb.query(Delivery)
-                .filter(Delivery.removed_at.is_(None))
-                # Orden estable: el corte por MAX_OBJECT_CHECKS agarra un
-                # prefijo, y sin ORDER BY el orden de Postgres es arbitrario,
-                # así que "el prefijo" podía dejar filas sin auditar nunca.
-                .order_by(Delivery.added_at.desc())
-                .all()
-            )
-            snapshot = [
-                {
-                    "id": d.id, "job_id": d.job_id, "portal_id": d.portal_id or "argentina",
-                    "tenant": d.tenant_snapshot, "artist": d.artist_snapshot,
-                    "song": d.song_title_snapshot,
-                    "file_types": list(d.file_types or []),
-                    "fingerprint": d.published_render_fingerprint,
-                    "stale_since": d.stale_since, "stale_reason": d.stale_reason,
-                }
-                for d in rows
-            ]
+            rows = (ddb.query(Delivery).filter(Delivery.removed_at.is_(None))
+                    .order_by(Delivery.id.asc()).all())
+            snapshot = [{
+                "id": d.id, "job_id": d.job_id, "portal_id": d.portal_id or "argentina",
+                "tenant": d.tenant_snapshot, "artist": d.artist_snapshot,
+                "song": d.song_title_snapshot, "file_types": list(d.file_types or []),
+                "fingerprint": d.published_render_fingerprint,
+                "published_file_keys": d.published_file_keys,
+                "stale_since": d.stale_since, "stale_reason": d.stale_reason,
+            } for d in rows]
         report["checked"] = len(snapshot)
+        by_id = {row["id"]: row for row in snapshot}
+        checks = []
+        for row in snapshot:
+            if not row["file_types"]:
+                report["manifest_failures"].append(_finding(row, reason="empty_file_types"))
+            for ft in sorted(set(row["file_types"])):
+                report["objects_total"] += 1
+                key, problem = _published_key(row, ft)
+                if problem:
+                    report["manifest_failures"].append(_finding(row, ft, problem))
+                else:
+                    checks.append((row["id"], ft, key))
+        selected, report["next_cursor"] = _budgeted_checks(checks, now=now, cursor=cursor)
+        report["cursor_mode"] = "explicit" if cursor is not None else "utc_day_rotation"
+        if not storage.is_enabled():
+            selected = []
+            report["storage_status"] = "unavailable"
+        else:
+            report["storage_status"] = "enabled"
+        report["objects_unchecked"] = len(checks) - len(selected)
+        # Our deliveries session AND the reaper caller's work/lock sessions
+        # are closed before this remote I/O (see reaper's deferred audit).
+        results, attempted, unchecked = _inspect_budgeted(selected, deadline=deadline)
+        report["objects_attempted"] = attempted
+        report["objects_unchecked"] += unchecked
+        report["objects_checked"] = sum(status != "deadline_exceeded" for _, status in results)
+        report["deadline_exceeded"] = bool(unchecked or any(status == "deadline_exceeded" for _, status in results))
+        for (did, ft, _key), status in results:
+            row = by_id[did]
+            if status == "exists":
+                report["objects_verified"] += 1
+            elif status == "missing":
+                report["phantom"].append(_finding(row, ft, "object_missing"))
+            else:
+                report["unknown"].append(_finding(row, ft,
+                    "deadline_exceeded" if status == "deadline_exceeded" else "storage_unavailable"))
 
-        # ── fantasmas: el objeto que la fila promete no está en R2 ──
-        if storage.is_enabled():
-            checks: list[tuple[int, str, str]] = []
-            for row in snapshot:
-                for ft in row["file_types"]:
-                    key = _key(row["tenant"], row["job_id"], ft)
-                    if key:
-                        checks.append((row["id"], ft, key))
-            if len(checks) > MAX_OBJECT_CHECKS:
-                logger.warning(
-                    "[DELIVERY-AUDIT] %d objetos a chequear supera el tope %d; "
-                    "se audita un prefijo", len(checks), MAX_OBJECT_CHECKS,
-                )
-                checks = checks[:MAX_OBJECT_CHECKS]
-            report["objects_checked"] = len(checks)
-
-            def _missing(check):
-                did, ft, key = check
-                try:
-                    return None if storage.object_exists(key) else (did, ft)
-                except Exception:
-                    # Un fallo de red no es un archivo faltante. Callar acá es
-                    # lo correcto: un falso positivo entrena a ignorar la alerta.
-                    return None
-
-            by_id = {row["id"]: row for row in snapshot}
-            with ThreadPoolExecutor(max_workers=16) as pool:
-                for result in pool.map(_missing, checks):
-                    if not result:
-                        continue
-                    did, ft = result
-                    row = by_id[did]
-                    # Un ProRes ausente NO es lo mismo que un MP4 ausente: el
-                    # portal tiene un botón que lo genera al pedirlo, y esa es
-                    # una decisión de producto (no pre-generar 29 shorts de
-                    # ~600 MB que quizá nadie baje). Reportarlos como fantasmas
-                    # sería gritar todos los días por un estado buscado — y una
-                    # alerta que grita sin razón se deja de leer en una semana.
-                    if ft in PRORES_FILE_TYPES:
-                        report["on_demand"].append({
-                            "delivery_id": did, "portal_id": row["portal_id"],
-                            "job_id": row["job_id"], "file_type": ft,
-                            "song": f"{row['artist']} — {row['song']}",
-                        })
-                        continue
-                    report["phantom"].append({
-                        "delivery_id": did, "portal_id": row["portal_id"],
-                        "job_id": row["job_id"], "file_type": ft,
-                        "song": f"{row['artist']} — {row['song']}",
-                    })
-
-        # ── desactualizadas: el render cambió después de publicar ──
         job_ids = [row["job_id"] for row in snapshot if row["fingerprint"]]
-        jobs: dict = {}
+        jobs = {}
         if job_ids:
-            db = SessionLocal()
-            try:
+            with SessionLocal() as db:
                 for job in db.query(Job).filter(Job.job_id.in_(job_ids)).all():
-                    jobs[job.job_id] = delivery_freshness.render_fingerprint(job)
-            finally:
-                db.close()
+                    jobs[(job.tenant_id, job.job_id)] = render_fingerprint(job)
         for row in snapshot:
-            if not row["fingerprint"]:
-                # Publicada antes de que existiera el fingerprint: no hay con
-                # qué comparar. Se cuenta, no se alerta.
+            current = jobs.get((row["tenant"], row["job_id"]))
+            if not row["fingerprint"] or current is None:
                 report["unevaluable"] += 1
-                continue
-            current = jobs.get(row["job_id"])
-            if current is None:
-                # El Job es de otro entorno. Tampoco es un hallazgo.
-                report["unevaluable"] += 1
-                continue
-            if current != row["fingerprint"]:
-                report["outdated"].append({
-                    "delivery_id": row["id"], "portal_id": row["portal_id"],
-                    "job_id": row["job_id"],
-                    "song": f"{row['artist']} — {row['song']}",
-                })
-
-        # ── en vuelo hace demasiado ──
-        # `_aware` porque SQLite devuelve datetimes sin tzinfo y Postgres con:
-        # comparar los dos mundos levanta TypeError, y acá lo comería el
-        # except de arriba dejando una auditoría muda que parece verde.
-        from batch_campaigns import _aware
-        for row in snapshot:
-            desde = _aware(row["stale_since"])
-            if desde and desde < cutoff:
-                report["in_flight_too_long"].append({
-                    "delivery_id": row["id"], "portal_id": row["portal_id"],
-                    "job_id": row["job_id"], "reason": row["stale_reason"],
-                    "since": row["stale_since"].isoformat(),
-                    "song": f"{row['artist']} — {row['song']}",
-                })
+            elif current != row["fingerprint"]:
+                # Only a legacy mutable pointer drifts when working bytes change.
+                category = "candidate_available" if row["published_file_keys"] is not None else "outdated"
+                report[category].append(_finding(row))
+            since = _aware(row["stale_since"])
+            if since and since < cutoff:
+                item = _finding(row, reason=row["stale_reason"])
+                item["since"] = since.isoformat()
+                report["in_flight_too_long"].append(item)
+        report["complete"] = not (report["objects_unchecked"] or report["unknown"])
     except Exception as exc:
-        logger.warning("[DELIVERY-AUDIT] auditoría incompleta: %s", exc)
-        report["error"] = str(exc)[:200]
+        logger.warning("[DELIVERY-AUDIT] auditoría incompleta: %s", type(exc).__name__)
+        report["error"] = type(exc).__name__
+    report["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
     return report
 
 
 def _increment_audit_metrics(report: dict) -> None:
-    """Siempre, incluso en un día limpio.
-
-    Si sólo se escriben cuando hay hallazgos, una métrica en cero es
-    indistinguible de "la auditoría no corrió", que es justo lo que uno
-    quiere poder alertar."""
     try:
         from ops_metrics import increment
         increment("delivery_audit_runs", 1)
         increment("delivery_audit_error", 1 if report.get("error") else 0)
-        increment("delivery_audit_phantom", len(report.get("phantom", [])))
-        increment("delivery_audit_outdated", len(report.get("outdated", [])))
-        increment("delivery_audit_in_flight", len(report.get("in_flight_too_long", [])))
-        increment("delivery_audit_on_demand", len(report.get("on_demand", [])))
+        for metric, field in (("phantom", "phantom"), ("outdated", "outdated"),
+                              ("in_flight", "in_flight_too_long"), ("on_demand", "on_demand"),
+                              ("unknown", "unknown"), ("manifest", "manifest_failures"),
+                              ("candidate", "candidate_available")):
+            increment("delivery_audit_" + metric, len(report.get(field, [])))
+        increment("delivery_audit_unchecked", report.get("objects_unchecked", 0))
     except Exception:
         pass
 
 
 def log_audit(report: dict) -> None:
-    """Escribe el resultado y cuenta las métricas.
-
-    En silencio si todo cierra: una auditoría que habla todos los días sin
-    tener nada deja de leerse en una semana.
-    """
-    total = (
-        len(report.get("phantom", []))
-        + len(report.get("outdated", []))
-        + len(report.get("in_flight_too_long", []))
-    )
-    if report.get("error"):
-        # Una auditoría que se cayó entera informaba "0 entregas activas OK".
-        # Verde y mudo es peor que no tenerla: nadie vuelve a mirar.
-        logger.error("[DELIVERY-AUDIT] incompleta, NO es un resultado: %s", report["error"])
-    elif report.get("checked") and not report.get("objects_checked"):
-        logger.error(
-            "[DELIVERY-AUDIT] %d entregas y CERO objetos chequeados "
-            "(¿R2 deshabilitado?): el chequeo de archivos ausentes no corrió",
-            report["checked"],
-        )
     _increment_audit_metrics(report)
-    if not total:
-        logger.info(
-            "[DELIVERY-AUDIT] %d entregas activas OK (%d objetos, %d no evaluables)",
-            report.get("checked", 0), report.get("objects_checked", 0),
-            report.get("unevaluable", 0),
-        )
+    if report.get("error"):
+        logger.error("[DELIVERY-AUDIT] incompleta, NO es un resultado: %s", report["error"])
         return
-    for item in report.get("phantom", []):
-        logger.error(
-            "[DELIVERY-AUDIT] FANTASMA entrega=%s portal=%s %s: promete %s y no está en R2",
-            item["delivery_id"], item["portal_id"], item["song"], item["file_type"],
-        )
-    for item in report.get("outdated", []):
-        logger.error(
-            "[DELIVERY-AUDIT] DESACTUALIZADA entrega=%s portal=%s %s: el render cambió "
-            "después de publicarse", item["delivery_id"], item["portal_id"], item["song"],
-        )
+    if report.get("checked") and not report.get("objects_checked"):
+        logger.error("[DELIVERY-AUDIT] %d entregas y CERO objetos chequeados; no es una auditoría sana",
+                     report["checked"])
+    if report.get("unknown") or report.get("objects_unchecked"):
+        logger.warning("[DELIVERY-AUDIT] incompleta: %d desconocidos, %d sin comprobar",
+                       len(report.get("unknown", [])), report.get("objects_unchecked", 0))
+    for category in ("phantom", "outdated", "manifest_failures"):
+        for item in report.get(category, []):
+            logger.error("[DELIVERY-AUDIT] %s entrega=%s portal=%s tipo=%s motivo=%s",
+                         category, item["delivery_id"], item["portal_id"],
+                         item.get("file_type"), item.get("reason"))
     for item in report.get("in_flight_too_long", []):
-        logger.warning(
-            "[DELIVERY-AUDIT] EN VUELO hace mucho entrega=%s %s: %s desde %s",
-            item["delivery_id"], item["song"], item["reason"], item["since"],
-        )
-
+        logger.warning("[DELIVERY-AUDIT] EN VUELO entrega=%s motivo=%s desde=%s",
+                       item["delivery_id"], item.get("reason"), item["since"])
+    problems = any(report.get(field) for field in
+                   ("phantom", "outdated", "manifest_failures", "in_flight_too_long"))
+    if report.get("complete") and not problems:
+        logger.info("[DELIVERY-AUDIT] archivos comprobados sin fallos: %d; "
+                    "candidatos posteriores=%d, frescura no evaluable=%d",
+                    report.get("objects_verified", 0), len(report.get("candidate_available", [])),
+                    report.get("unevaluable", 0))

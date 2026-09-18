@@ -76,6 +76,7 @@ export default function ChangeRequestsSection({ initialPendingCount, onPendingCo
           dismissProposal={changes.dismissChangeRequestProposal}
           regenerateBackground={changes.regenerateBackgroundFromProposal}
           reviewForRender={changes.reviewForRender}
+          refreshChangeRequests={changes.refreshChangeRequests}
         />
         {changes.crRenderReview && <ChangeRequestRenderReview review={changes.crRenderReview}
           busy={changes.crProposalBusyId === changes.crRenderReview.change_request_id}

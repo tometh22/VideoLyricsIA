@@ -27,6 +27,11 @@ def test_apagado_devuelve_skipped_sin_encolar(client, admin_token, monkeypatch):
     """Contrato clave: se reusa el `skipped` que el frontend YA maneja, así
     que apagarlo no rompe la UI ni deja el wizard esperando."""
     monkeypatch.setenv("BG_PREVIEW_ENABLED", "0")
+    # Isolate the switch contract from a cache artifact created by another
+    # test using the same synthetic song/params. Cached paid work is correctly
+    # served even while the switch is off; this case specifically exercises a
+    # cache miss and must not depend on test ordering.
+    monkeypatch.setattr("bg_preview.cache_check", lambda _key: False)
     res = client.post("/generate-preview", headers=auth(admin_token),
                       json=_body())
     assert res.status_code == 200
@@ -42,6 +47,7 @@ def test_el_mensaje_le_dice_al_operador_que_igual_va_a_salir(client, admin_token
     """Si el mensaje sugiriera que algo falló, el operador reintentaría — y
     cada reintento cuesta."""
     monkeypatch.setenv("BG_PREVIEW_ENABLED", "0")
+    monkeypatch.setattr("bg_preview.cache_check", lambda _key: False)
     msg = client.post("/generate-preview", headers=auth(admin_token),
                       json=_body()).json()["message"]
     assert "genera igual" in msg
@@ -66,6 +72,7 @@ def test_sin_la_variable_queda_prendido(client, admin_token, monkeypatch):
 def test_acepta_las_variantes_de_apagado(client, admin_token, monkeypatch):
     for valor in ("0", "false", "off", "no", "FALSE", " Off "):
         monkeypatch.setenv("BG_PREVIEW_ENABLED", valor)
+        monkeypatch.setattr("bg_preview.cache_check", lambda _key: False)
         body = client.post("/generate-preview", headers=auth(admin_token),
                            json=_body()).json()
         assert body.get("reason") == "disabled", valor

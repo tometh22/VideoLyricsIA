@@ -47,7 +47,21 @@ def _portal_token_env():
 def _publication_copy_succeeds(monkeypatch):
     # This suite mocks R2 existence; copying that same fake storage is also
     # an I/O boundary. Failure/byte isolation is tested separately.
-    monkeypatch.setattr('storage.copy_object', lambda *_: True)
+    monkeypatch.setattr('storage.copy_object', lambda *_, **kwargs: True)
+    # Legacy test scenarios customize the bool stub; adapt that fake at the
+    # boundary while production now distinguishes missing from unavailable.
+    import storage
+    original_exists, original_status = storage.object_exists, storage.object_status
+    monkeypatch.setattr(storage, 'object_status', lambda key: (
+        original_status(key) if storage.object_exists is original_exists
+        else 'exists' if storage.object_exists(key) else 'missing'))
+    def identity(key):
+        source = key.split('.published-', 1)[0]
+        status = storage.object_status(source)
+        return {'status': status, **({'etag': 'synthetic-version', 'size': 100}
+                                    if status == 'exists' else {})}
+    monkeypatch.setattr(storage, 'object_identity', identity)
+    monkeypatch.setattr(storage, 'object_status_bounded', lambda key: storage.object_status(key))
 
 
 @pytest.fixture
@@ -729,7 +743,7 @@ def test_change_request_proposal_applies_revisioned_text_but_stays_open_until_pu
         cr_id = client.post(
             f"/api/deliveries/{delivery_id}/change-request",
             headers={"X-Portal-Token": PORTAL_TOKEN},
-            json={"comment": "0:01 Texto correcto"},
+            json={"comment": '0:01 "Texto correcto"'},
         ).json()["id"]
 
     generated = client.post(
@@ -749,6 +763,7 @@ def test_change_request_proposal_applies_revisioned_text_but_stays_open_until_pu
             headers=auth(admin_token),
             json={
                 "base_revision": proposal["base_revision"],
+                "expected_proposal_hash": proposal["content_hash"],
                 "operation_ids": operation_ids,
                 "idempotency_key": "test-change-request-apply-0001",
             },
@@ -772,6 +787,7 @@ def test_change_request_proposal_applies_revisioned_text_but_stays_open_until_pu
             headers=auth(admin_token),
             json={
                 "base_revision": proposal["base_revision"],
+                "expected_proposal_hash": proposal["content_hash"],
                 "operation_ids": operation_ids,
                 "idempotency_key": "test-change-request-apply-0001",
             },
@@ -900,6 +916,7 @@ def test_change_request_apply_rejects_stale_editor_revision(
         headers=auth(admin_token),
         json={
             "base_revision": proposal["base_revision"],
+            "expected_proposal_hash": proposal["content_hash"],
             "operation_ids": [operation_id],
             "idempotency_key": "test-change-request-stale-0001",
         },
@@ -1085,12 +1102,7 @@ def test_stale_prores_blocks_publication_instead_of_shipping_a_mismatched_pair(
 def test_publishing_a_corrected_cut_reopens_the_client_review(
     client, admin_token, approved_job, db, all_r2_files_present,
 ):
-    """Contenido nuevo = versión nueva, aprobación de baja, pedido cerrado.
-
-    Los tres eran manuales o no existían: el cliente veía su pedido
-    "pendiente" y su propia pastilla verde sobre una corrección que nunca
-    revisó, sin nada que lo invitara a volver a bajar el archivo.
-    """
+    """New content resets client approval, but is not proof a case was reviewed."""
     from database import Delivery, DeliveryChangeRequest
 
     first = client.post(
@@ -1124,7 +1136,7 @@ def test_publishing_a_corrected_cut_reopens_the_client_review(
     assert body["replaced"] is True
     assert body["content_changed"] is True
     assert body["revision"] == 2
-    assert body["resolved_change_requests"] == [cr_id]
+    assert body["resolved_change_requests"] == []
 
     row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
     db.refresh(row)
@@ -1137,9 +1149,9 @@ def test_publishing_a_corrected_cut_reopens_the_client_review(
 
     cr = db.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
     db.refresh(cr)
-    assert cr.resolved_at is not None
-    assert cr.resolved_by_revision == 2
-    assert cr.resolution_source == "publication"
+    assert cr.resolved_at is None
+    assert cr.resolved_by_revision is None
+    assert cr.resolution_source is None
 
 
 def test_resending_the_same_cut_keeps_the_approval_and_the_open_request(
@@ -1266,7 +1278,7 @@ def test_a_legacy_row_marked_stale_publishes_the_corrected_cut(
     assert again.status_code == 200, again.text
     assert again.json()["content_changed"] is True
     assert again.json()["revision"] == 2
-    assert again.json()["resolved_change_requests"] == [request_id]
+    assert again.json()["resolved_change_requests"] == []
     db.refresh(row)
     assert row.approved_at is None
     assert row.stale_since is None
@@ -1276,8 +1288,8 @@ def test_a_legacy_row_marked_stale_publishes_the_corrected_cut(
         .filter(DeliveryChangeRequest.id == request_id)
         .one()
     )
-    assert request.resolution_source == "publication"
-    assert request.resolved_by_revision == 2
+    assert request.resolution_source is None
+    assert request.resolved_by_revision is None
 
 
 def test_portal_listing_tells_the_client_there_is_a_new_version(

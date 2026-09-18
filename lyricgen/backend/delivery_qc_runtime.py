@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+from uuid import uuid4
 from typing import Any, Mapping, Sequence
 
 from delivery_media_qc import inspect_delivery_media
@@ -147,22 +148,43 @@ def _normalise_issue(issue: Mapping[str, Any], *, fps: float) -> dict[str, Any]:
     return row
 
 
-def _merge_prior_decisions(issues: list[dict[str, Any]], previous: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+def _merge_prior_decisions(
+    issues: list[dict[str, Any]], previous: Mapping[str, Any] | None,
+    *, artifact_sha256: str | None = None, input_identity: dict | None = None,
+) -> list[dict[str, Any]]:
     prior = {
         str(row.get("issue_id")): row
         for row in ((previous or {}).get("issues") or []) if isinstance(row, Mapping)
     }
+    # Preserve decisions when rechecking exactly the same artifact and inputs,
+    # never merely because the detector's issue ID stayed the same. Legacy
+    # reports without this evidence cannot attest a new/rebuilt render.
+    same_artifact = bool(artifact_sha256 and input_identity
+        and (previous or {}).get("artifact_sha256") == artifact_sha256
+        and (previous or {}).get("input_identity") == input_identity)
     for issue in issues:
-        # A human visual/timing attestation is for one concrete render. Never
-        # inherit it into a rebuilt report, even when the stable check id is
-        # unchanged after a re-render.
-        if issue.get("manual_verification_required"):
+        if not same_artifact:
             continue
         old = prior.get(str(issue.get("issue_id")))
-        if old and old.get("status") in {"ACKNOWLEDGED", "REJECTED", "RESOLVED_MANUAL"}:
+        ignored = {'status', 'operator_decision'}
+        same_finding = old and {k: v for k, v in old.items() if k not in ignored} == {
+            k: v for k, v in issue.items() if k not in ignored}
+        if same_finding and old.get("status") in {"ACKNOWLEDGED", "REJECTED", "RESOLVED_MANUAL"}:
             issue["status"] = old["status"]
             issue["operator_decision"] = deepcopy(old.get("operator_decision") or {})
     return issues
+
+
+def _artifact_sha256(video_path: str) -> str | None:
+    """Stream the local QC input; missing evidence never preserves a waiver."""
+    try:
+        digest = hashlib.sha256()
+        with open(video_path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
 
 
 def _issue_result_status(issue: Mapping[str, Any]) -> str:
@@ -350,6 +372,7 @@ def build_runtime_report(
     previous: Mapping[str, Any] | None = None,
     ocr_callback=None,
 ) -> dict[str, Any]:
+    artifact_before = _artifact_sha256(video_path)
     mode = (
         "enforce" if getattr(job, "workload_class", "interactive") == "batch"
         else effective_delivery_qc_mode()
@@ -381,8 +404,6 @@ def build_runtime_report(
         segments=segments, approved_lyrics=None, reference_trusted=False,
         asset={
             "filename": job.filename, "duration": (media.get("probe") or {}).get("duration") or duration,
-            "rendered_title": (title_ocr or {}).get("text"),
-            "rendered_artist": (artist_ocr or {}).get("text"),
         },
         quality=quality, fps=fps,
     )
@@ -426,12 +447,26 @@ def build_runtime_report(
     for item in all_rows:
         row = _normalise_issue(item, fps=fps)
         deduped[row["issue_id"]] = row
-    issues = _merge_prior_decisions(list(deduped.values()), previous)
+    artifact_sha256 = _artifact_sha256(video_path)
+    if artifact_sha256 != artifact_before:
+        raise RuntimeError('delivery_qc_artifact_changed')
+    input_identity = {
+        "segments_hash": current_hash,
+        "segments_revision": int(job.segments_revision or 0),
+        "audio_revision": int(getattr(job, "audio_revision", 0) or 0),
+        "audio_sha256": str(getattr(job, "input_audio_sha256", "") or ""),
+        "artist": job.artist, "title": job.song_title, "spec": spec,
+        "quality": deepcopy(quality), "filename": getattr(job, 'filename', None),
+        "mode": mode, "qc_schema": SCHEMA_VERSION,
+    }
+    issues = _merge_prior_decisions(list(deduped.values()), previous,
+        artifact_sha256=artifact_sha256, input_identity=input_identity)
     issues.sort(key=lambda row: ({"FAIL": 0, "WARN": 1}.get(row.get("severity"), 2), (row.get("seconds") or [0])[0]))
     checks = _build_check_results(
         issues=issues, media=media, ocr=ocr, quality=quality, spec=spec,
-        rendered={"rendered_title": (title_ocr or {}).get("text"),
-                  "rendered_artist": (artist_ocr or {}).get("text")},
+        # OCR is pixel evidence, not a deterministic render manifest. The OCR
+        # checks above remain visible; absent manifest metadata is NOT_RUN.
+        rendered={},
     )
     check_summary = {
         "total": len(checks),
@@ -453,9 +488,12 @@ def build_runtime_report(
     blocking_checks = [row for row in checks if row.get("blocking") and row.get("status") in {"FAIL", "REVIEW"}]
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION, "mode": mode, "status": "COMPLETE",
+        "report_id": uuid4().hex,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "segments_revision": int(job.segments_revision or 0),
         "segments_hash": current_hash,
+        "artifact_sha256": artifact_sha256,
+        "input_identity": input_identity,
         "render_identity": {"path_basename": os.path.basename(video_path), "edit_count": int(job.edit_count or 0)},
         "decision": "BLOCK" if blocking_checks else "REVIEW" if check_summary["review"] or check_summary["not_run"] else "PASS",
         "summary": summary, "check_summary": check_summary,
@@ -480,14 +518,28 @@ def build_runtime_report(
     return report
 
 
-def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None) -> dict[str, Any] | None:
+def qc_input_identity(job):
+    from delivery_freshness import render_fingerprint
+    return (render_fingerprint(job), job.segments_revision,
+            segments_hash(job.segments_json or []), job.audio_revision,
+            job.input_audio_sha256, deepcopy(job.umg_spec), job.artist, job.song_title,
+            deepcopy(job.transcription_quality), job.filename, job.workload_class,
+            (job.s3_keys or {}).get('video') if isinstance(job.s3_keys, dict) else None,
+            effective_delivery_qc_mode())
+
+
+def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None,
+                            expected_input=None) -> dict[str, Any] | None:
     """Run and persist QC from a render worker. Never raises in observe mode."""
     from database import Job, SessionLocal
+    from types import SimpleNamespace
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
         if job is None:
             return None
+        if expected_input is not None and qc_input_identity(job) != expected_input:
+            raise RuntimeError('delivery_qc_input_changed')
         # Contractual batch QC cannot be disabled by the global interactive
         # rollout flag. Interactive jobs retain the existing off switch.
         if (
@@ -496,8 +548,20 @@ def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None) -> d
         ):
             return None
         rows = list(segments if segments is not None else (job.segments_json or []))
-        previous = job.delivery_qc if isinstance(job.delivery_qc, Mapping) else None
-        report = build_runtime_report(job=job, video_path=video_path, segments=rows, previous=previous)
+        previous = deepcopy(job.delivery_qc) if isinstance(job.delivery_qc, Mapping) else None
+        expected = qc_input_identity(job)
+        snapshot = SimpleNamespace(**{name: deepcopy(getattr(job, name, None)) for name in (
+            'artist', 'song_title', 'filename', 'umg_spec', 'segments_revision',
+            'edit_count', 'transcription_quality', 'workload_class',
+            'audio_revision', 'input_audio_sha256')})
+        db.rollback()
+        report = build_runtime_report(job=snapshot, video_path=video_path, segments=rows, previous=previous)
+        job = db.query(Job).filter(Job.job_id == job_id).populate_existing().with_for_update().first()
+        if job is None or expected != qc_input_identity(job):
+            raise RuntimeError('delivery_qc_input_changed')
+        if job.delivery_qc != previous:
+            # A concurrent human decision/recheck wins over this stale run.
+            raise RuntimeError('delivery_qc_review_changed')
         job.delivery_qc = report
         db.commit()
         return report

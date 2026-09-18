@@ -121,6 +121,19 @@ def db():
     session.close()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def isolate_used_prompt_history(tmp_path_factory):
+    """Prompt-generation tests must not append to the tracked asset history."""
+    import pipeline
+
+    original = pipeline._USED_PROMPTS_FILE
+    pipeline._USED_PROMPTS_FILE = str(tmp_path_factory.mktemp("prompt-history") / "used.json")
+    try:
+        yield
+    finally:
+        pipeline._USED_PROMPTS_FILE = original
+
+
 # Exit status REAL de la sesión. Lo captura pytest_sessionfinish (que lo recibe
 # como argumento) y lo consume pytest_unconfigure para el hard-exit con el código
 # correcto, sin caer en la leaky teardown de las libs nativas.

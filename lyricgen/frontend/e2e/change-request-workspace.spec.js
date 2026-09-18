@@ -1,6 +1,43 @@
 import { expect, test } from "@playwright/test";
 import { createSyntheticWav, installEditorHarness } from "./editor-harness.js";
 
+// Browser-boundary fault regression only. This deliberately does not claim
+// real publication or database coverage; the isolated real-stack gate is separate.
+test("a response lost after publication never tells the operator it definitely did not publish", async ({ page }) => {
+  await installEditorHarness(page, { jobId: "e2ecrfault01", role: "admin" });
+  let committed = false;
+  let writes = 0;
+  await page.route("**/*", async route => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    const json = body => route.fulfill({ json: body });
+    if (path === "/service-status/summary") return json({ status: "operational", incidents: [] });
+    if (path === "/admin/stats") return json({});
+    if (path === "/admin/change-requests") return json({ proposal_enabled: true,
+      pending_count: committed ? 0 : 1, items: committed ? [] : [{ id: 85, comment: "Texto de prueba",
+        proposal: { id: "p85", status: "applied" },
+        delivery: { job_id: "e2ecrfault01", portal_id: "chile", song: "Sintética", artist: "QA" },
+        publication: { job_status: "done", editor_revision: 4, render_fingerprint: "render4", render_matches_editor: true, needs_publish: true, prores_pending: [] },
+        workflow: { key: "publish", activeStep: 3, label: "Revisar y publicar", detail: "Prueba", tone: "attention", allowed_actions: ["publish", "resolve"] },
+      }] });
+    if (path.includes("/deliveries/from-job/") && request.method() === "POST") {
+      committed = true;
+      writes += 1;
+      return route.fulfill({ status: 502, json: { detail: "Proxy response lost" } });
+    }
+    return route.fallback();
+  });
+  await page.goto("/admin?section=cambios&change_request_id=85");
+  const announcement = page.getByRole("button", { name: /Entendido|Entendí|Cancelar|Cerrar novedades/ }).first();
+  if (await announcement.isVisible()) await announcement.click();
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button", { name: "Publicar actualización", exact: true }).click();
+  const notice = page.getByRole("status", { name: "Resultado del pedido" });
+  await expect(notice).toContainText("podría haberse publicado");
+  await expect(notice).not.toContainText("No se publicó");
+  expect(writes).toBe(1);
+});
+
 test('reviews saved lyrics, confirms one render, then publishes to Chile without visiting the editor', async ({ page }) => {
   await installEditorHarness(page, { jobId: 'job-85', role: 'admin' });
   let stage = 'saved';
@@ -20,6 +57,11 @@ test('reviews saved lyrics, confirms one render, then publishes to Chile without
       return json({ pending_count: stage === 'published' ? 0 : 1, proposal_enabled: true,
         items: stage === 'published' ? [] : [{ id: 85, comment: 'Usar frase completa',
           proposal: { id: 'p85', status: 'applied' }, delivery: { job_id: 'job-85', portal_id: 'chile', song: 'Prueba', artist: 'Test' },
+          workflow: stage === 'rendering'
+            ? { key: 'rendering', activeStep: 2, label: 'Generando corte nuevo', detail: 'Todavía no publicado.', tone: 'busy', allowed_actions: ['refresh'] }
+            : stage === 'rendered'
+              ? { key: 'publish', activeStep: 3, label: 'Revisar video y publicar actualización', detail: 'Revisá el corte.', tone: 'attention', allowed_actions: ['publish', 'edit', 'resolve'] }
+              : { key: 'render', activeStep: 2, label: 'Revisar cambios guardados y generar video', detail: 'Revisá la letra guardada.', tone: 'action', allowed_actions: ['review_render', 'edit', 'resolve'] },
           publication: { job_status: stage === 'rendering' ? 'editing' : 'pending_review',
             can_render: stage !== 'rendering', render_matches_editor: stage === 'rendered',
             needs_publish: stage === 'rendered', editor_revision: 58, render_fingerprint: 'render58', prores_pending: [] } }] });
@@ -27,7 +69,7 @@ test('reviews saved lyrics, confirms one render, then publishes to Chile without
     if (request.method() === 'POST' && (path.endsWith('/85/render') || path.includes('/deliveries/from-job/'))) {
       writes.push({ path, body: request.postDataJSON() });
       stage = path.endsWith('/85/render') ? 'rendering' : 'published';
-      return json(stage === 'rendering' ? { status: 'editing' } : { content_changed: true, revision: 2, resolved_change_requests: [85] });
+      return json(stage === 'rendering' ? { status: 'editing' } : { ok: true, content_changed: true, revision: 2, resolved_change_requests: [85] });
     }
     return route.fallback();
   });
@@ -49,6 +91,50 @@ test('reviews saved lyrics, confirms one render, then publishes to Chile without
   expect(writes[1].body).toEqual({ portal_id: 'chile', change_request_id: 85,
     reviewed_render_fingerprint: 'render58', reviewed_editor_revision: 58 });
   expect(page.url()).toContain('/admin?');
+});
+
+test('publishes a manually corrected current cut without forcing an advisory proposal to be reapplied', async ({ page }) => {
+  await installEditorHarness(page, { jobId: 'job-85', role: 'admin' });
+  let published = false;
+  const writes = [];
+  await page.route('**/*', async route => {
+    const req = route.request();
+    const path = new URL(req.url()).pathname;
+    const json = body => route.fulfill({ json: body });
+    if (path === '/service-status/summary') return json({ status: 'operational', incidents: [] });
+    if (path === '/admin/stats') return json({});
+    if (path === '/admin/change-requests') return json({ pending_count: published ? 0 : 1,
+      proposal_enabled: true, proposal_apply_enabled: true, items: published ? [] : [{
+        id: 85, comment: 'Usar frase completa y revisar el fondo',
+        proposal: { id: 'p85', status: 'needs_input', content_hash: 'advisory-hash' },
+        delivery: { job_id: 'job-85', portal_id: 'chile', song: 'Prueba manual', artist: 'QA' },
+        publication: { job_status: 'done', editor_revision: 59, render_fingerprint: 'manual-render59',
+          render_matches_editor: true, can_render: true, needs_publish: true, prores_pending: [] },
+        workflow: { key: 'publish', activeStep: 3, label: 'Revisar video y publicar actualización',
+          detail: 'La propuesta sigue pendiente: revisá el pedido completo en el video antes de publicar.',
+          pending_manual: 1, tone: 'attention', allowed_actions: ['edit', 'resolve', 'analyze', 'review_proposal', 'publish'] },
+      }] });
+    if (req.method() === 'POST' && (path.startsWith('/admin/change-requests/') || path.includes('/deliveries/from-job/'))) {
+      writes.push({ path, body: req.postDataJSON() });
+      if (path === '/admin/deliveries/from-job/job-85') {
+        published = true;
+        return json({ ok: true, content_changed: true, revision: 3, job_id: 'job-85', portal_id: 'chile', resolved_change_requests: [85] });
+      }
+      return route.fulfill({ status: 409, json: { detail: 'Unexpected mutation: this cut was corrected manually' } });
+    }
+    return route.fallback();
+  });
+  await page.goto('/admin?section=cambios&change_request_id=85');
+  const announcement = page.getByRole('button', { name: /Entendido|Entendí|Cancelar|Cerrar novedades/ }).first();
+  if (await announcement.isVisible()) await announcement.click();
+  await expect(page.getByText(/La propuesta sigue pendiente:/)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Publicar actualización', exact: true })).toBeVisible();
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Publicar actualización', exact: true }).click();
+  await expect(page.getByRole('status', { name: 'Resultado del pedido' })).toContainText('Publicada la versión 3');
+  expect(writes).toEqual([{ path: '/admin/deliveries/from-job/job-85', body: {
+    portal_id: 'chile', change_request_id: 85, reviewed_render_fingerprint: 'manual-render59', reviewed_editor_revision: 59,
+  } }]);
 });
 
 test("keeps the player running through polling, prepares without publishing, and opens saved-change verification", async ({ page }) => {

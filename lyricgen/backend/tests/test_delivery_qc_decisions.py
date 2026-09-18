@@ -23,6 +23,7 @@ def _job(db, owner, *, status="COMPLETE"):
         progress=100,
         delivery_qc={
             "schema_version": "genly-delivery-qc-runtime-v1",
+            "report_id": "synthetic-viewed-report",
             "status": status,
             "mode": "observe",
             "decision": "REVIEW",
@@ -48,7 +49,7 @@ def test_reviewer_decision_persists_and_closes_issue(client, user_token, db):
     response = client.post(
         f"/jobs/{job.job_id}/delivery-qc/issues/issue-1/decision",
         headers={"Authorization": f"Bearer {user_token}"},
-        json={"decision": "acknowledged", "reason": "audio_preview_checked"},
+        json={"decision": "acknowledged", "reason": "audio_preview_checked", "expected_report_id": "synthetic-viewed-report"},
     )
 
     assert response.status_code == 200, response.text
@@ -111,7 +112,7 @@ def test_mandatory_check_requires_signed_manual_resolution(client, user_token, d
     rejected = client.post(
         f"/jobs/{job.job_id}/delivery-qc/issues/issue-1/decision",
         headers={"Authorization": f"Bearer {user_token}"},
-        json={"decision": "acknowledged"},
+        json={"decision": "acknowledged", "expected_report_id": "synthetic-viewed-report"},
     )
     assert rejected.status_code == 422
     assert rejected.json()["detail"] == (
@@ -121,7 +122,7 @@ def test_mandatory_check_requires_signed_manual_resolution(client, user_token, d
     signed = client.post(
         f"/jobs/{job.job_id}/delivery-qc/issues/issue-1/decision",
         headers={"Authorization": f"Bearer {user_token}"},
-        json={"decision": "resolved_manual", "reason": "full_video_reviewed"},
+        json={"decision": "resolved_manual", "reason": "full_video_reviewed", "expected_report_id": "synthetic-viewed-report"},
     )
     assert signed.status_code == 200, signed.text
     issue = signed.json()["delivery_qc"]["issues"][0]
@@ -136,7 +137,8 @@ def test_external_qc_result_is_admin_only_and_persists(
     owner = _me(client, user_token)
     job = _job(db, owner)
     path = f"/jobs/{job.job_id}/delivery-qc/external-result"
-    payload = {"source": "umg", "report_id": "umg-2026-08-28", "finding_count": 0}
+    payload = {"source": "umg", "report_id": "umg-2026-08-28", "finding_count": 0,
+               "expected_report_id": "synthetic-viewed-report"}
 
     forbidden = client.post(
         path,
@@ -176,6 +178,7 @@ def test_external_qc_findings_are_normalized_and_become_a_regression_case(
         headers={"Authorization": f"Bearer {admin_token}"},
         json={
             "source": "umg", "report_id": "umg-regression-1",
+            "expected_report_id": "synthetic-viewed-report",
             "finding_count": 1,
             "findings": [{
                 "description": 'Misspelled in lyrics, "JAMAS" should be "JAMÁS"',

@@ -232,7 +232,14 @@ def test_runtime_report_turns_missing_detectors_into_signed_manual_failures(tmp_
         row for row in rebuilt["issues"]
         if row["detector"] == "mandatory_signed_reviewer_checklist"
     ]
-    assert all(row["status"] == "OPEN" for row in rebuilt_manual)
+    assert all(row["status"] == "RESOLVED_MANUAL" for row in rebuilt_manual)
+    # A recheck of identical bytes/inputs preserves the attestation. A new
+    # artifact with the same filename and unchanged detector IDs does not.
+    asset.write_bytes(b"different-render")
+    changed = build_runtime_report(job=job, video_path=str(asset),
+        segments=[{"start": 0, "end": 2, "text": "Hola"}], previous=signed_previous)
+    assert all(row['status'] == 'OPEN' for row in changed['issues']
+               if row['manual_verification_required'])
 
 
 def test_runtime_report_exposes_passed_checks_and_manual_review_state(tmp_path, monkeypatch):
