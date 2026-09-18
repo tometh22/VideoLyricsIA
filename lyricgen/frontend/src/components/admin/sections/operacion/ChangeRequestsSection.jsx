@@ -2,6 +2,7 @@ import { useEffect } from "react";
 
 import ChangeRequestsPanel from "./ChangeRequestsPanel";
 import useChangeRequests from "./useChangeRequests";
+import ChangeRequestRenderReview from "./ChangeRequestRenderReview";
 
 export default function ChangeRequestsSection({ initialPendingCount, onPendingCountChange }) {
   const changes = useChangeRequests({ initialPendingCount });
@@ -74,7 +75,11 @@ export default function ChangeRequestsSection({ initialPendingCount, onPendingCo
           applyProposal={changes.applyChangeRequestProposal}
           dismissProposal={changes.dismissChangeRequestProposal}
           regenerateBackground={changes.regenerateBackgroundFromProposal}
+          reviewForRender={changes.reviewForRender}
         />
+        {changes.crRenderReview && <ChangeRequestRenderReview review={changes.crRenderReview}
+          busy={changes.crProposalBusyId === changes.crRenderReview.change_request_id}
+          onConfirm={changes.confirmRender} onClose={() => changes.setCrRenderReview(null)} />}
       </div>
     </section>
   );

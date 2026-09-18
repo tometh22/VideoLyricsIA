@@ -4033,6 +4033,7 @@ export default function App() {
           jobStatus: r.jobStatus,
           scenePlan: r.scenePlan,
           forceLyricsRerender: !!r.changeRequestContext,
+          allowApprovedBackground: user?.role === "admin",
         });
 
         if (submission.presentBuckets.length === 0) {
@@ -4060,7 +4061,7 @@ export default function App() {
               ? (t("edit.bg_locked_scenes_desc") ||
                  "El fondo es un timeline multi-escena. Regenerá la escena que quieras cambiar desde el filmstrip del video — no consume cupo de edición.")
               : (t("edit.bg_locked_done_desc") ||
-                 "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo."),
+                 "Pedile a un administrador que regenere el fondo desde Cambios o desde el editor. No hace falta crear otro video."),
             tone: "warning",
           });
           return;
@@ -5487,13 +5488,14 @@ export default function App() {
         jobStatus: r.jobStatus,
         scenePlan: r.scenePlan,
         forceLyricsRerender: !!r.changeRequestContext,
+        allowApprovedBackground: user?.role === "admin",
       });
     } catch {
       // El resumen es informativo: si algo falla, el wizard sigue usable y el
       // submit real vuelve a calcularlo. Nunca romper la pantalla por un chip.
       return null;
     }
-  }, [currentReview, liveReviewSegments, bgSelectMode, backgroundId]);
+  }, [currentReview, liveReviewSegments, bgSelectMode, backgroundId, user?.role]);
 
   // Resume banner shown on /new and /review when sessionStorage has a
   // pending batch from a prior visit. Lets the operator restore their
@@ -5874,6 +5876,7 @@ export default function App() {
           ? backgroundEditBlockedReason({
               jobStatus: currentReview.jobStatus,
               scenePlan: currentReview.scenePlan,
+              allowApprovedBackground: user?.role === "admin",
             })
           : null}
         editsRemaining={_wizardOnExistingJob ? currentReview.editsRemaining : null}
@@ -6232,7 +6235,7 @@ export default function App() {
             languageReviewResolved={!!currentReview.languageReviewResolved}
             onResolveLanguageReview={handleResolveLanguageReview}
             onApprove={handleApproveLyrics}
-            submitLabel={currentReview.campaignId ? "Aprobar letra y timing" : null}
+            submitLabel={currentReview.changeRequestContext ? "Aprobar y re-renderizar" : (currentReview.campaignId ? "Aprobar letra y timing" : null)}
             onRegisterSafeExit={currentReview.campaignId
               ? registerCampaignReviewSafeExit
               : null}

@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 import logging
 
 import storage
+import delivery_freshness
 from auth import get_current_user, has_art_track_access
 from batch_campaigns import _campaign_or_404, _now, _require_manager, _require_scope
 from database import (
@@ -608,12 +609,17 @@ def get_delivery_batch(operation_id: str, current_user: dict = Depends(get_curre
     rows = db.query(DeliveryBatchItem).filter(
         DeliveryBatchItem.delivery_batch_id == operation.id,
     ).order_by(DeliveryBatchItem.created_at.asc()).all()
+    # Old workers counted before flushing item transitions (autoflush=False),
+    # leaving a one-item successful operation permanently "partial".
+    sent_count = sum(row.status == 'sent' for row in rows)
+    failed_count = sum(row.status == 'failed' for row in rows)
+    status = 'completed' if rows and sent_count == len(rows) else operation.status
     return {
-        "operation_id": operation.id, "status": operation.status,
+        "operation_id": operation.id, "status": status,
         "destination_portal": operation.destination_portal,
         "hostname": DESTINATIONS.get(operation.destination_portal),
-        "total_count": operation.total_count, "sent_count": operation.sent_count,
-        "failed_count": operation.failed_count,
+        "total_count": operation.total_count, "sent_count": sent_count,
+        "failed_count": failed_count,
         "items": [{"job_id": row.job_id, "status": row.status,
                     "delivery_id": row.delivery_id, "attempts": row.attempts,
                     "error_code": row.error_code, "receipt": row.receipt} for row in rows],
@@ -653,7 +659,7 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
         ddb = DeliveriesSessionLocal()
         try:
             for row in items:
-                job = db.query(Job).filter(Job.job_id == row.job_id, Job.tenant_id == op.tenant_id).one_or_none()
+                job = db.query(Job).filter(Job.job_id == row.job_id, Job.tenant_id == op.tenant_id).with_for_update().one_or_none()
                 if not job or job.status != "done" or not job.approved_at or _fingerprint(job) != row.approved_render_fingerprint:
                     row.status = "failed"; row.error_code = "stale_approval"; row.error_detail = "Approval or render version changed."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
                 if storage.is_enabled():
@@ -698,6 +704,10 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                                 "[DELIVERY] no se pudo encolar %s de job=%s: %s",
                                 ft, job.job_id, exc,
                             )
+                    row.status = 'failed'; row.error_code = 'deliverables_not_ready'
+                    row.error_detail = 'Esperando el archivo profesional. Reintentá cuando termine.'
+                    row.attempts = int(row.attempts or 0) + 1; failed += 1
+                    continue
                 # Never write an AR/CL operation through the legacy
                 # single-portal schema. Without the portal_id migration,
                 # doing so would make a Chile delivery visible in Argentina
@@ -713,6 +723,16 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                 if hasattr(Delivery, "portal_id"):
                     delivery_query = delivery_query.filter(Delivery.portal_id == op.destination_portal)
                 active = delivery_query.first()
+                changed = delivery_freshness.needs_publish(job, active) if active else False
+                from delivery_snapshots import copy_snapshot
+                try:
+                    pinned = (active.published_file_keys if active and not changed else None) or copy_snapshot(
+                        job.tenant_id, job.job_id, delivery_file_types)
+                except Exception:
+                    row.status = 'failed'; row.error_code = 'deliverables_not_ready'
+                    row.error_detail = 'No se pudo preparar la publicación; el portal no se modificó.'
+                    row.attempts = int(row.attempts or 0) + 1; failed += 1
+                    continue
                 if active is None:
                     delivery_kwargs = dict(job_id=job.job_id, label=delivery_label, file_types=delivery_file_types, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"))
                     if hasattr(Delivery, "portal_id"):
@@ -729,9 +749,36 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     active.added_by_user_id = deliveries_added_by(op.created_by)
                     active.added_at = _now()
                 row.delivery_id = active.id; row.status = "sent"; row.receipt = {"delivery_id": active.id, "portal": op.destination_portal}; row.attempts = int(row.attempts or 0) + 1; sent += 1
+                active.published_file_keys = pinned
+                active.published_render_fingerprint = delivery_freshness.render_fingerprint(job)
+                active.stale_since = None; active.stale_reason = None
+                if changed:
+                    active.published_revision = (active.published_revision or 1) + 1
+                    active.approved_at = None; active.approved_by_label = None
+                if changed or active.content_updated_at is None:
+                    active.content_updated_at = _now()
+                if changed:
+                    from database import DeliveryChangeRequest
+                    from change_request_workflow import latest_overwrite, timestamp
+                    rendered_at = latest_overwrite(job) or timestamp(job.completed_at)
+                    pending = ddb.query(DeliveryChangeRequest).filter(
+                        DeliveryChangeRequest.delivery_id == active.id,
+                        DeliveryChangeRequest.resolved_at.is_(None)).all()
+                    for change in pending:
+                        # Requests arriving after this render are NOT answered
+                        # by resending an older already-approved cut.
+                        if rendered_at and timestamp(change.submitted_at) <= rendered_at:
+                            change.resolved_at = _now()
+                            change.resolved_by_user_id = deliveries_added_by(op.created_by)
+                            change.resolved_by_revision = active.published_revision
+                            change.resolution_source = 'publication'
+                            change.resolution_note = f'Resuelto al publicar la versión {active.published_revision} desde la campaña.'
+                row.error_code = None; row.error_detail = None
             ddb.commit()
         finally: ddb.close()
-        op.sent_count = (op.sent_count or 0) + sent; op.failed_count = (op.failed_count or 0) + failed
+        db.flush()
+        op.sent_count = db.query(func.count(DeliveryBatchItem.id)).filter(DeliveryBatchItem.delivery_batch_id == op.id, DeliveryBatchItem.status == 'sent').scalar() or 0
+        op.failed_count = db.query(func.count(DeliveryBatchItem.id)).filter(DeliveryBatchItem.delivery_batch_id == op.id, DeliveryBatchItem.status == 'failed').scalar() or 0
         remaining = db.query(func.count(DeliveryBatchItem.id)).filter(DeliveryBatchItem.delivery_batch_id == op.id, DeliveryBatchItem.status.in_(("pending", "failed"))).scalar() or 0
         op.status = "completed" if remaining == 0 else "partial"; op.completed_at = _now() if remaining == 0 else None; op.updated_at = _now(); db.commit()
         return {"sent": sent, "failed": failed}

@@ -183,7 +183,7 @@ export async function installEditorHarness(page, options = {}) {
     if (request.method() === "GET" && path === `/status/${jobId}`) {
       await route.fulfill(jsonResponse({
         job_id: jobId,
-        status: "pending_review",
+        status: options.jobStatus || "pending_review",
         filename: "e2e-song.mp3",
         artist: "E2E Artist",
         song_title: "E2E Song",
