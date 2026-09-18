@@ -67,3 +67,11 @@ describe("change request workflow", () => {
     expect(searchText).toContain("operador@example.com");
   });
 });
+// A finished legacy cut must not enter the editor/render loop again.
+it('offers publication after an exact reviewed render, even for an applied proposal', () => {
+  const state = requestWorkflow({ proposal: { status: 'applied' }, publication: {
+    job_status: 'pending_review', render_matches_editor: true, needs_publish: true,
+  } });
+  expect(state.key).toBe('publish');
+  expect(state.activeStep).toBe(3);
+});

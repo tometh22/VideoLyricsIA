@@ -56,6 +56,10 @@ export function publicationStatus(publication) {
       canPublish: false,
     };
   }
+  if (publication.render_matches_editor === false) {
+    return { tone: "wait", title: "Letra pendiente de generar",
+      detail: "Revisá la letra guardada y confirmá Aprobar y re-renderizar. Todavía no se puede publicar esta revisión.", canPublish: false };
+  }
   if (prores.length) {
     if (publication.prores_configured === false) {
       return {
@@ -165,6 +169,7 @@ export default function ChangeRequestsPanel({
   dismissProposal = () => {},
   regenerateBackground = () => {},
   onProResConfigured = () => {},
+  reviewForRender = () => {},
 }) {
   // Draft local del input de "respuesta" por CR. Clave = id del CR.
   const [drafts, setDrafts] = useState({});
@@ -267,7 +272,10 @@ export default function ChangeRequestsPanel({
       prepareProRes(item.delivery?.job_id, item.id);
       return;
     }
-    publishDeliveryUpdate(item.delivery?.job_id, item.delivery?.portal_id, item.id);
+    if (item.publication?.render_fingerprint && !window.confirm(
+      `¿Revisaste el video y confirmás publicar esta actualización en UMG ${item.delivery?.portal_id === "chile" ? "Chile" : "Argentina"}? El pedido quedará resuelto en ese portal.`,
+    )) return;
+    publishDeliveryUpdate(item.delivery?.job_id, item.delivery?.portal_id, item.id, item.publication);
   }, [prepareProRes, publishDeliveryUpdate]);
 
   useEffect(() => {
@@ -287,6 +295,14 @@ export default function ChangeRequestsPanel({
           label="Estado"
         />
       </FilterBar>
+
+      {crPublishNotice && crPublishNotice.requestId !== selectedItem?.id && (
+        <div role={crPublishNotice.tone === "error" ? "alert" : "status"} aria-label="Resultado del pedido"
+          className="rounded-xl bg-sky-500/10 p-3 text-caption text-sky-100">
+          Pedido #{crPublishNotice.requestId}: {crPublishNotice.text}
+          <button type="button" onClick={dismissPublishNotice} className="ml-3 underline">Cerrar</button>
+        </div>
+      )}
 
       {returnNotice && (
         <div role="status" className="flex items-start justify-between gap-3 rounded-xl bg-sky-500/[0.08] p-3 text-caption text-sky-100 ring-1 ring-sky-400/20">
@@ -360,6 +376,7 @@ export default function ChangeRequestsPanel({
               onResolve={() => resolveChangeRequest(selectedItem.id, drafts[selectedItem.id])}
               onReopen={() => reopenChangeRequest(selectedItem.id)}
               onPublish={() => publishItem(selectedItem)}
+              onReviewRender={() => reviewForRender(selectedItem.id)}
               proposalEnabled={proposalEnabled}
               proposalApplyEnabled={proposalApplyEnabled}
               proposalBusy={proposalBusyId === selectedItem.id}
@@ -412,7 +429,7 @@ export default function ChangeRequestsPanel({
 
 function ChangeRequestCard({
   item, draft, onDraftChange, resolving, publishing, actionNotice,
-  onResolve, onReopen, onPublish,
+  onResolve, onReopen, onPublish, onReviewRender,
   proposalEnabled, proposalApplyEnabled, proposalBusy, proposal,
   onGenerateProposal, onLoadProposal, onAdjustProposal, onApplyProposal,
   onDismissProposal, onRegenerateBackground,
@@ -437,7 +454,7 @@ function ChangeRequestCard({
 
   const effectiveProposal = proposal || item.proposal;
   const editorUrl = editorUrlWithRequest(
-    d.job_id, item.id, effectiveProposal?.id, effectiveProposal?.editor_url,
+    d.job_id, item.id, ["applied", "partially_applied"].includes(effectiveProposal?.status) ? effectiveProposal?.id : null,
   );
   let primaryAction;
   if (isResolved) {
@@ -454,6 +471,8 @@ function ChangeRequestCard({
     };
   } else if (workflow.key === "rendering") {
     primaryAction = { label: "Generando corte nuevo…", disabled: true };
+  } else if (item.publication?.render_matches_editor && !item.publication?.needs_publish) {
+    primaryAction = { label: "Marcar como resuelto", onClick: onResolve, disabled: resolving };
   } else if (proposalEnabled && !effectiveProposal) {
     primaryAction = { label: proposalBusy ? "Analizando…" : "Analizar pedido", onClick: onGenerateProposal, disabled: proposalBusy };
   } else if (["applied", "partially_applied"].includes(effectiveProposal?.status) && d.job_id) {
@@ -461,7 +480,7 @@ function ChangeRequestCard({
     // the operator reload the full diff just to enter the render step: that
     // extra round-trip used to fall back to a request-only URL and lose the
     // explicit render intent after a page refresh.
-    primaryAction = { label: "Revisar y generar corte", href: editorUrl };
+    primaryAction = { label: "Revisar y confirmar render", onClick: onReviewRender, disabled: proposalBusy };
   } else if (proposalEnabled && item.proposal && !proposal) {
     primaryAction = { label: proposalBusy ? "Cargando…" : "Ver propuesta", onClick: onLoadProposal, disabled: proposalBusy };
   } else if (["ready", "partial", "needs_input"].includes(proposal?.status)) {
@@ -627,14 +646,11 @@ function ChangeRequestCard({
               )}
             </div>
           ) : (
-            <details className="group rounded-xl bg-white/[0.02] ring-1 ring-white/[0.06]">
-              <summary className="cursor-pointer list-none px-4 py-3 text-label text-gray-500 hover:text-gray-300">
-                Cerrar manualmente o dejar una respuesta
-                <span className="float-right transition-transform group-open:rotate-180">⌄</span>
-              </summary>
+            <section aria-label="Resolver pedido" className="rounded-xl bg-white/[0.02] ring-1 ring-white/[0.06]">
+              <h3 className="px-4 py-3 text-label text-gray-300">Marcar como resuelto en el portal</h3>
               <div className="space-y-2 border-t border-white/[0.06] p-4">
                 <p className="text-label text-gray-500">
-                  Usalo sólo cuando el pedido no requiera publicar un corte nuevo.
+                  Cierra el pedido en el portal correspondiente, sin generar ni publicar otro video.
                 </p>
                 <input
                   type="text"
@@ -650,16 +666,22 @@ function ChangeRequestCard({
                     disabled={resolving}
                     className="rounded-lg bg-white/[0.07] px-3 py-1.5 text-caption font-medium text-white hover:bg-white/[0.12] disabled:opacity-50"
                   >
-                    {resolving ? "Guardando…" : "Marcar resuelto sin publicar"}
+                    {resolving ? "Guardando…" : "Marcar como resuelto"}
                   </button>
                 </div>
               </div>
-            </details>
+            </section>
           )}
         </div>
       </div>
 
       <footer className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 rounded-b-2xl border-t border-white/[0.08] bg-surface-2/95 px-4 py-3 shadow-[0_-18px_40px_rgba(0,0,0,0.24)] backdrop-blur sm:px-5">
+        {!isResolved && item.publication?.can_render && workflow.key !== "rendering" && primaryAction.onClick !== onReviewRender && (
+          <button type="button" onClick={onReviewRender} disabled={proposalBusy || publishing}
+            className="rounded-lg bg-white/10 px-3 py-2 text-caption text-white disabled:opacity-40">
+            Revisar letra y re-renderizar
+          </button>
+        )}
         {actionNotice && <div role={actionNotice.tone === "error" ? "alert" : "status"}
           aria-label="Estado de la acción"
           className={`w-full rounded-lg p-3 text-caption ${actionNotice.tone === "error" ? "bg-red-500/10 text-red-200" : "bg-sky-500/10 text-sky-100"}`}>
@@ -674,9 +696,7 @@ function ChangeRequestCard({
         <div className="flex items-center gap-2">
           {!isResolved && d.job_id && primaryAction.label !== "Editar letra" && (
             <a
-              href={editorUrlWithRequest(
-                d.job_id, item.id, effectiveProposal?.id, effectiveProposal?.editor_url,
-              )}
+              href={editorUrl}
               className="rounded-xl px-3 py-2 text-caption font-medium text-gray-300 hover:bg-white/[0.06] hover:text-white"
             >
               Editar letra
@@ -960,7 +980,7 @@ function ChangeRequestProposal({
   const savedChecks = appliedTextChecks(proposal);
   const savedMatches = savedChecks.length > 0 && savedChecks.every(check => check.matches);
   const editorUrl = editorUrlWithRequest(
-    jobId, requestId, effective?.id, proposal?.editor_url,
+    jobId, requestId, ["applied", "partially_applied"].includes(status) ? effective?.id : null,
   );
 
   if (!effective) {

@@ -16538,7 +16538,10 @@ async def upload_edit_custom_background(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     _audit_cross_tenant_access(db, current_user, job, "edit")
-    if job.status != "pending_review":
+    _can_upload_background = job.status == "pending_review" or (
+        current_user.get("role") == "admin" and job.status in ("done", "rejected")
+    )
+    if not _can_upload_background:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -16659,6 +16662,10 @@ async def request_edit(
                         "job_id": job_id,
                     },
                 )
+            if _probe.status == 'error':
+                # Never replay a failed render as an accepted 202. The
+                # normal status gate directs recovery to the retry flow.
+                break
             return _accepted_job_response(
                 job_id=job_id,
                 status=str(_probe.status or "pending_review"),
@@ -16818,16 +16825,19 @@ async def request_edit(
         or body.change_request_proposal_id is not None
     )
     if _has_change_request_context:
-        if (
-            body.change_request_id is None
-            or not body.change_request_proposal_id
-        ):
+        if body.change_request_id is None:
             raise HTTPException(
                 status_code=400,
                 detail={"code": "change_request_context_incomplete"},
             )
         if current_user.get("role") != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
+        if not body.change_request_proposal_id:
+            from database import scoped_deliveries_db
+            with scoped_deliveries_db() as request_db:
+                manual_request, manual_delivery = _change_request_context(request_db, body.change_request_id)
+                if manual_delivery.job_id != job_id or manual_request.resolved_at:
+                    raise HTTPException(status_code=409, detail='change_request_job_mismatch')
         _change_request_proposal = (
             db.query(ChangeRequestProposal)
             .filter(
@@ -16838,7 +16848,7 @@ async def request_edit(
             )
             .first()
         )
-        if (
+        if body.change_request_proposal_id and (
             _change_request_proposal is None
             or _change_request_proposal.applied_revision is None
             or int(_change_request_proposal.applied_revision)
@@ -16977,7 +16987,7 @@ async def request_edit(
     # action and still passes every storage, scene, content-validation and
     # publication-freshness guard in this handler.
     _terminal_edit = body.edit_type in ("lyrics", "metadata") or (
-        _is_admin and body.edit_type == "background"
+        _is_admin and body.edit_type in ("background", "background_library", "custom")
     )
     if _terminal_edit:
         allowed = ("done", "pending_review", "rejected")
@@ -17106,7 +17116,7 @@ async def request_edit(
     # present, and a remote save between autosave and approval fails closed.
     _approved_editor_version = None
     if body.editor_revision is not None or body.editor_version_id:
-        if not current_user.get("features", {}).get("editor_v2"):
+        if not current_user.get("features", {}).get("editor_v2") and not _has_change_request_context:
             raise HTTPException(status_code=404, detail="Job not found.")
         try:
             _editor_document, _approved_editor_version = approve_document(
@@ -17270,7 +17280,9 @@ async def request_edit(
                     },
                 )
 
-    edit_params: dict = {}
+    edit_params: dict = {
+        '_confirmed_segments_revision': int(job.segments_revision or 0),
+    }
     if body.font is not None:
         edit_params["font"] = body.font
     if body.font_scale is not None:
@@ -19843,6 +19855,9 @@ class SendToUMGRequest(BaseModel):
     """Optional overrides when publishing a job to the portal."""
     label: str | None = None  # default: "Renderizado" or "Opción N"
     portal_id: str = "argentina"
+    change_request_id: int | None = Field(default=None, ge=1)
+    reviewed_render_fingerprint: str | None = Field(default=None, max_length=64)
+    reviewed_editor_revision: int | None = Field(default=None, ge=0)
 
 
 @app.post("/admin/deliveries/from-job/{job_id}")
@@ -19873,6 +19888,29 @@ async def admin_create_delivery_from_job(
     job = db.query(Job).filter(Job.job_id == job_id).first()
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    if body and body.change_request_id:
+        cr, destination = _change_request_context(ddb, body.change_request_id)
+        if destination.job_id != job_id or destination.portal_id != portal_id:
+            raise HTTPException(status_code=409, detail='change_request_job_mismatch')
+        def validate_reviewed_cut():
+            from change_request_workflow import render_state
+            document = db.query(EditorDocument).filter(EditorDocument.job_id == job_id).first()
+            state = render_state(job, document, cr)
+            if (not state['render_matches_editor']
+                    or body.reviewed_editor_revision != state['editor_revision']
+                    or body.reviewed_render_fingerprint != delivery_freshness.render_fingerprint(job)):
+                raise HTTPException(status_code=409, detail='El corte cambió. Revisá el video actualizado antes de publicar.')
+        validate_reviewed_cut()
+        if job.status == 'pending_review':
+            # The Publish confirmation is the final video review. Keep the
+            # normal QC, billing and audit gates; never mark done directly.
+            await approve_job(job_id, ApproveJobRequest(notes='Corte revisado desde Cambios UMG'), current_user, db)
+            db.expire_all()
+            job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+            validate_reviewed_cut()
+    job = db.query(Job).filter(Job.job_id == job_id).populate_existing().with_for_update().first()
+    if body and body.change_request_id:
+        validate_reviewed_cut()
     if job.status != "done" or job.approved_at is None:
         raise HTTPException(
             status_code=400,
@@ -20125,6 +20163,17 @@ async def admin_create_delivery_from_job(
         ddb.add(delivery)
         action = "delivery.create"
 
+    # Copy all files before atomically switching the portal's pointer. A
+    # failed copy leaves the old cut and request status untouched.
+    from delivery_snapshots import copy_snapshot
+    try:
+        if content_changed or not delivery.published_file_keys:
+            delivery.published_file_keys = copy_snapshot(
+                job.tenant_id, job_id, delivery.file_types or [])
+    except Exception as exc:
+        ddb.rollback()
+        raise HTTPException(status_code=503, detail='No se pudo preparar la publicación. El portal conserva la versión anterior.') from exc
+
     # Publicar la corrección ES la respuesta al pedido de cambios. Cerrarlos
     # a mano después era un paso que se olvidaba, y el cliente veía su pedido
     # "pendiente" indefinidamente sobre una versión que ya lo contemplaba.
@@ -20138,6 +20187,9 @@ async def admin_create_delivery_from_job(
             .all()
         )
         for request in pending_requests:
+            # Reviewing one correction is not approval of unrelated requests.
+            if body and body.change_request_id and request.id != body.change_request_id:
+                continue
             request.resolved_at = now
             request.resolved_by_user_id = added_by
             request.resolved_by_revision = delivery.published_revision
@@ -20652,7 +20704,10 @@ async def portal_get_items(
         for ft in (d.file_types or []):
             if ft not in _DELIVERY_FILE_TYPES:
                 continue
-            r2_key = _r2_key_for_delivery(d.tenant_snapshot, d.job_id, ft)
+            from delivery_snapshots import portal_key
+            r2_key = portal_key(d, ft)
+            if not r2_key:
+                continue
             head_jobs.append((di, ft, r2_key))
 
     size_map: dict[tuple[int, str], int | None] = {}
@@ -20748,7 +20803,10 @@ async def portal_get_items(
         for ft in (d.file_types or []):
             if ft not in _DELIVERY_FILE_TYPES:
                 continue
-            r2_key = _r2_key_for_delivery(d.tenant_snapshot, d.job_id, ft)
+            from delivery_snapshots import portal_key
+            r2_key = portal_key(d, ft)
+            if not r2_key:
+                continue
             dl_name = f"{_delivery_safe_filename(d.artist_snapshot, d.song_title_snapshot)}.{_DELIVERY_FILE_TYPES[ft]['ext']}"
             try:
                 url = storage.generate_signed_url(
@@ -20922,6 +20980,8 @@ async def admin_list_change_requests(
         for j in (db.query(_JobModel).filter(_JobModel.job_id.in_(job_ids)).all() if job_ids else [])
     }
     owner_ids = list({j.user_id for j in jobs_by_jobid.values() if j and j.user_id})
+    documents_by_jobid = {document.job_id: document for document in (
+        db.query(EditorDocument).filter(EditorDocument.job_id.in_(job_ids)).all() if job_ids else [])}
     owners_by_id = {
         u.id: u
         for u in (db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else [])
@@ -20985,6 +21045,9 @@ async def admin_list_change_requests(
             # ofrecer un botón que inevitablemente termina en 409 y permite
             # abrir la configuración ProRes en esta misma tarjeta.
             publication["prores_configured"] = bool(job and job.umg_spec)
+            if job:
+                from change_request_workflow import render_state
+                publication.update(render_state(job, documents_by_jobid.get(job.job_id), cr))
         items.append({
             "id": cr.id,
             "comment": cr.comment,
@@ -21143,6 +21206,47 @@ def _change_request_context(ddb: Session, cr_id: int):
     if delivery is None or delivery.removed_at is not None:
         raise HTTPException(status_code=409, detail="Change request delivery is unavailable")
     return cr, delivery
+
+
+@app.get('/admin/change-requests/{cr_id}/review')
+async def admin_review_change_request(cr_id: int, current_user: dict = Depends(get_current_user),
+                                      db: Session = Depends(get_db), ddb: Session = Depends(get_deliveries_db)):
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail='Admin only')
+    cr, delivery = _change_request_context(ddb, cr_id)
+    job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail='Job not found')
+    document = db.query(EditorDocument).filter(EditorDocument.job_id == job.job_id).first()
+    from change_request_workflow import render_state
+    return {'job_id': job.job_id, 'change_request_id': cr.id, 'comment': cr.comment,
+            'resolved': bool(cr.resolved_at), 'portal_id': delivery.portal_id,
+            'segments': document.current_segments if document is not None else (job.segments_json or []),
+            **render_state(job, document, cr)}
+
+
+class RenderChangeRequest(BaseModel):
+    editor_revision: int = Field(ge=0)
+
+
+@app.post('/admin/change-requests/{cr_id}/render')
+async def admin_render_change_request(cr_id: int, body: RenderChangeRequest,
+                                      background_tasks: BackgroundTasks,
+                                      current_user: dict = Depends(get_current_user),
+                                      db: Session = Depends(get_db), ddb: Session = Depends(get_deliveries_db)):
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail='Admin only')
+    cr, delivery = _change_request_context(ddb, cr_id)
+    if cr.resolved_at:
+        raise HTTPException(status_code=409, detail='Reabrí el pedido antes de generar otro corte.')
+    # Identical durable approval path, QC gates and transactional outbox as
+    # the editor; never invent a second renderer or trust client-side lyrics.
+    return await request_edit(delivery.job_id, EditJobRequest(
+        edit_type='lyrics', editor_revision=body.editor_revision,
+        change_request_id=cr_id,
+    ), background_tasks,
+        idempotency_key=f'change-request:{cr_id}:render:{body.editor_revision}',
+        current_user=current_user, db=db)
 
 
 class ChangeRequestProposalPatch(BaseModel):

@@ -1,12 +1,15 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const portals = { argentina: ["Argentina", "https://umg.genly.pro"], chile: ["Chile", "https://umgchile.genly.pro"] };
 const errors = { stale_approval: "La aprobación o el video cambió. Revisá y aprobá la versión actual.", deliverables_not_ready: "Faltan archivos de entrega. Revisá el detalle del video.", portal_contract_unavailable: "El portal no está disponible para este envío." };
 
-export default function CampaignDeliveryProgress({ operationId, request, onSelectFailed }) {
+export default function CampaignDeliveryProgress({ operationId, request, onSelectFailed, onSettled }) {
   const [operation, setOperation] = useState(null);
   const [error, setError] = useState("");
   const [refresh, setRefresh] = useState(0);
+  const settledRef = useRef(null);
+  const onSettledRef = useRef(onSettled);
+  onSettledRef.current = onSettled;
   useEffect(() => {
     const controller = new AbortController();
     let timer;
@@ -16,6 +19,13 @@ export default function CampaignDeliveryProgress({ operationId, request, onSelec
         const result = await request(`/batch/delivery-operations/${encodeURIComponent(operationId)}`, { signal: controller.signal });
         if (controller.signal.aborted) return;
         setOperation(result); setError("");
+        if (["completed", "partial", "failed"].includes(result.status)) {
+          const signature = `${operationId}:${result.status}:${result.sent_count}:${result.failed_count}`;
+          if (settledRef.current !== signature) {
+            settledRef.current = signature;
+            onSettledRef.current?.();
+          }
+        }
         if (!["completed", "partial", "failed"].includes(result.status)) timer = setTimeout(poll, 4000);
       } catch (e) { if (!controller.signal.aborted) setError(e.message); }
     };

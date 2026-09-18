@@ -1395,6 +1395,9 @@ class Delivery(Base):
     # R2 at publish time (delivery_freshness.render_fingerprint). A
     # publish whose fingerprint differs is new content, not a re-send.
     published_render_fingerprint = Column(String(64), nullable=True)
+    # Immutable objects served by the portal. Working render keys must never
+    # replace a client's approved cut before an explicit publication.
+    published_file_keys = Column(JSONB, nullable=True)
     # Human-facing version counter. Starts at 1 and only advances when
     # the fingerprint changes, so "Versión 2" always means the client
     # has something new to look at.
@@ -2589,6 +2592,7 @@ def _migrate_user_columns():
         # is actually serving. Alembic (b4c6d8e0f2a4) is canonical — this
         # mirror keeps older databases self-healing on boot.
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_render_fingerprint VARCHAR(64)",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_file_keys JSONB",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_revision INTEGER DEFAULT 1 NOT NULL",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS content_updated_at TIMESTAMPTZ",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ",

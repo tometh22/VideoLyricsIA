@@ -21,13 +21,19 @@ export async function recoverChangeRequestEditContext({ search, job, request }) 
     throw new Error("invalid_change_request_context");
   }
   const response = await request(`/admin/change-requests/${changeRequestId}/proposals/current`);
-  if (response.status === 404) return null; // manual request without a proposal
+  if (response.status === 404) {
+    const review = await request(`/admin/change-requests/${changeRequestId}/review`);
+    if (!review.ok) throw new Error("change_request_context_unavailable");
+    const context = await review.json();
+    if (context.job_id !== job.job_id || context.resolved) throw new Error("change_request_job_mismatch");
+    return { changeRequestId, proposalId: null };
+  }
   if (!response.ok) throw new Error("change_request_context_unavailable");
   const { proposal } = await response.json();
   if (proposal?.job_id !== job.job_id || proposal?.change_request_id !== changeRequestId) {
     throw new Error("change_request_job_mismatch");
   }
-  if (!["applied", "partially_applied"].includes(proposal.status)) return null;
+  if (!["applied", "partially_applied"].includes(proposal.status)) return { changeRequestId, proposalId: null };
   if (!PROPOSAL_ID.test(proposal.id || "")
     || !Number.isInteger(proposal.applied_revision)
     || proposal.applied_revision < 0
@@ -48,7 +54,7 @@ export function parseChangeRequestEditContext(search = "") {
 }
 
 export function changeRequestAdminPath(context, state = null) {
-  if (!context?.changeRequestId || !context?.proposalId) return null;
+  if (!context?.changeRequestId) return null;
   const params = new URLSearchParams({
     section: "cambios",
     change_request_id: String(context.changeRequestId),
