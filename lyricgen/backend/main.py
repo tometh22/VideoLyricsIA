@@ -20087,6 +20087,50 @@ async def admin_create_delivery_from_job(
         .first()
     )
 
+    # A broadcast copy can take minutes. Both databases terminate idle
+    # transactions after 60 s, so never hold the job lock/DB connections
+    # while copying. Revalidate both identities under locks afterwards.
+    from delivery_snapshots import copy_snapshot
+    def publication_identity(row):
+        if row is None:
+            return None
+        return (row.id, row.published_revision, row.published_render_fingerprint,
+                row.published_file_keys, row.file_types, row.added_at,
+                row.content_updated_at, row.removed_at)
+
+    prepared_snapshot = existing.published_file_keys if existing else None
+    if (not prepared_snapshot or existing.file_types != delivery_file_types
+            or delivery_freshness.needs_publish(job, existing)):
+        expected_job = (delivery_freshness.render_fingerprint(job),
+                        job.segments_revision, job.status, job.approved_at)
+        expected_delivery = publication_identity(existing)
+        snapshot_tenant = job.tenant_id
+        db.rollback()
+        if ddb is not db:
+            ddb.rollback()
+        try:
+            from starlette.concurrency import run_in_threadpool
+            prepared_snapshot = await run_in_threadpool(
+                copy_snapshot, snapshot_tenant, job_id, delivery_file_types)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail='No se pudo preparar la publicación. El portal conserva la versión anterior.') from exc
+        job = (db.query(Job).filter(Job.job_id == job_id)
+               .populate_existing().with_for_update().first())
+        if (job is None or expected_job != (
+                delivery_freshness.render_fingerprint(job),
+                job.segments_revision, job.status, job.approved_at)):
+            raise HTTPException(status_code=409, detail='El corte cambió durante la publicación. Revisá la versión actual.')
+        existing = (ddb.query(Delivery).filter(Delivery.job_id == job_id,
+                    Delivery.portal_id == portal_id, Delivery.removed_at.is_(None))
+                    .populate_existing().with_for_update().first())
+        if publication_identity(existing) != expected_delivery:
+            raise HTTPException(status_code=409, detail='La entrega cambió durante la publicación. Actualizá su estado.')
+        if body and body.change_request_id:
+            cr, destination = _change_request_context(ddb, body.change_request_id)
+            if destination.job_id != job_id or destination.portal_id != portal_id:
+                raise HTTPException(status_code=409, detail='change_request_job_mismatch')
+            validate_reviewed_cut()
+
     # El label por defecto es para una entrega NUEVA: primera de esa canción
     # = "Renderizado", siguientes = "Opción N" (convención heredada del
     # items.json manual). Re-publicar NO renombra: _compute_default_delivery_
@@ -20163,16 +20207,9 @@ async def admin_create_delivery_from_job(
         ddb.add(delivery)
         action = "delivery.create"
 
-    # Copy all files before atomically switching the portal's pointer. A
-    # failed copy leaves the old cut and request status untouched.
-    from delivery_snapshots import copy_snapshot
-    try:
-        if content_changed or not delivery.published_file_keys:
-            delivery.published_file_keys = copy_snapshot(
-                job.tenant_id, job_id, delivery.file_types or [])
-    except Exception as exc:
-        ddb.rollback()
-        raise HTTPException(status_code=503, detail='No se pudo preparar la publicación. El portal conserva la versión anterior.') from exc
+    # Files were copied without transactions; only the guarded pointer switch
+    # and request resolution share this short transaction.
+    delivery.published_file_keys = prepared_snapshot
 
     # Publicar la corrección ES la respuesta al pedido de cambios. Cerrarlos
     # a mano después era un paso que se olvidaba, y el cliente veía su pedido

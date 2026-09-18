@@ -3,6 +3,15 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.61] - 2026-09-18
+
+### Fixed
+
+- Release database transactions while copying large portal files, then
+  revalidate the approved cut and destination before publishing atomically.
+- Preserve legacy portal files without holding idle database locks, and
+  never replace a publication completed concurrently by another operator.
+
 ## [1.1.60] - 2026-09-18
 
 ### Fixed
