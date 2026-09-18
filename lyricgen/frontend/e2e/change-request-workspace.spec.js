@@ -27,7 +27,9 @@ test("keeps the player running through polling, prepares without publishing, and
       id: "proposal-85", status: "applied", applied_revision: 3, base_revision: 2,
       operations: [{ id: "op-1", kind: "replace_text", status: "applied", applicable: true,
         current_segments: [{ ...segment, text: "Respirarse emborrachar" }], proposed_segments: [segment] }],
-      lyrics_context: { revision: 3, segments: [segment] },
+      // The editor can regenerate local ids on a later save. The comparison
+      // must still verify the actual row, rather than demanding reapplication.
+      lyrics_context: { revision: 4, segments: [{ ...segment, _id: "new-editor-local-id" }] },
     } });
     if (url.pathname === "/status/job-85") return json({ job_id: "job-85", status: "pending_review",
       umg_spec: { frame_size: "HD", fps: 29.97, prores_profile: 3 } });

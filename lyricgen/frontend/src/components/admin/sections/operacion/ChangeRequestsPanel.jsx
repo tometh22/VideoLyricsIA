@@ -1271,12 +1271,23 @@ export function appliedTextChecks(proposal) {
   return (proposal?.operations || [])
     .filter(op => op.status === "applied" && op.proposed_segments?.length)
     .map(operation => {
-      const actual = operation.proposed_segments.map(expected => current.find(row => (
-        expected._id != null && row._id != null
-          ? String(row._id) === String(expected._id)
-          : Math.abs(Number(row.start) - Number(expected.start)) < 0.05
-            && Math.abs(Number(row.end) - Number(expected.end)) < 0.05
-      )));
+      const actual = operation.proposed_segments.map(expected => {
+        const byId = expected._id == null ? [] : current.filter(row => (
+          row._id != null && String(row._id) === String(expected._id)
+        ));
+        if (byId.length) return byId.length === 1 ? byId[0] : undefined;
+        // Local editor ids may be regenerated on save/render. Like the
+        // backend's segments_equivalent contract, use unchanged timing when
+        // that id no longer exists. Never infer identity from matching text:
+        // another chorus occurrence must not hide an unapplied correction.
+        const byTiming = current.filter(row => (
+          [row.start, row.end, expected.start, expected.end]
+            .every(value => value != null && Number.isFinite(Number(value)))
+          && Math.abs(Number(row.start) - Number(expected.start)) < 0.05
+          && Math.abs(Number(row.end) - Number(expected.end)) < 0.05
+        ));
+        return byTiming.length === 1 ? byTiming[0] : undefined;
+      });
       const located = actual.every(Boolean);
       const matches = located && actual.every((row, index) => row.text === operation.proposed_segments[index].text);
       return { operation, actual, located, matches };

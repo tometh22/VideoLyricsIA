@@ -3,6 +3,14 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.59] - 2026-09-17
+
+### Fixed
+
+- Verify saved UMG corrections across regenerated editor-local line IDs by
+  falling back to unique unchanged timing. Do not match another chorus by text
+  alone or accept ambiguous line timings as proof of an applied correction.
+
 ## [1.1.58] - 2026-09-17
 
 ### Fixed
