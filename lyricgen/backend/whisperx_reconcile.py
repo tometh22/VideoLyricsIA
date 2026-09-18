@@ -294,25 +294,16 @@ def reconcile(wx_segs: list[dict],
         )
         return None
 
-    # Re-attach per-word stamps to each reconciled line so the editor can
-    # still do word-level karaoke. We just bucket the same `words` again by
-    # position so the words inside line N align with line N's text.
-    line_word_counts = [len(ln.split()) for ln in lines if ln]
-    cur = 0
-    for i, seg in enumerate(out):
-        # `out` may have fewer entries than lines (drop on monotonic clamp);
-        # we can't reliably re-attach in that case, so leave words off.
-        try:
-            wc = line_word_counts[i]
-        except IndexError:
-            break
-        span = words[cur:cur + wc]
-        cur += wc
-        if span and all(isinstance(w, dict) and "start" in w for w in span):
+    # The helper already attached the span it actually matched. Re-bucketing
+    # by reference word counts loses re-anchoring after an extra/missing token
+    # or a skipped line. Cleanup would then trim a correctly aligned phrase
+    # using another phrase's words. Preserve ownership and the existing
+    # word/start/end schema (do not change downstream confidence policy).
+    for seg in out:
+        span = seg.get("words")
+        if span:
             seg["words"] = [
-                {"word": w.get("word", "").strip(),
-                 "start": float(w.get("start", seg["start"])),
-                 "end": float(w.get("end", seg["end"]))}
+                {"word": w["word"], "start": w["start"], "end": w["end"]}
                 for w in span
             ]
 
