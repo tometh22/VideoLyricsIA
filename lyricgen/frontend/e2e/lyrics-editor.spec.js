@@ -11,6 +11,34 @@ import {
 } from "./editor-harness.js";
 
 test.describe("lyrics editor browser contract", () => {
+
+  test("plays the context before a line without changing its text or timing", async ({ page }) => {
+    const harness = await installEditorHarness(page);
+    const analytics = [];
+    page.on("request", (request) => {
+      if (request.method() === "POST" && new URL(request.url()).pathname === "/analytics/events") {
+        analytics.push(...request.postDataJSON().events);
+      }
+    });
+    await harness.open();
+    const savesBefore = harness.saves.length;
+    const button = page.getByRole("button", { name: "Escuchar 2 s antes de la línea 4" });
+    await expect(button).toBeVisible();
+    await button.click();
+    await expect.poll(() => page.locator("audio").evaluate((audio) => audio.paused)).toBe(false);
+    await expect.poll(() => analytics.filter((event) => event.name === "editor_line_context_played").length).toBe(1);
+    const event = analytics.find((item) => item.name === "editor_line_context_played");
+    expect(event.properties).toMatchObject({ position_ms: 800, line_start_ms: 2800,
+      requested_lead_in_ms: 2000, effective_lead_in_ms: 2000, line_context: "target" });
+    await expect(page.getByRole("textbox", { name: "Letra de la línea 4", exact: true })).toHaveValue("Cuarta línea");
+    expect(harness.saves).toHaveLength(savesBefore);
+    // The same labelled action remains reachable on a narrow review screen.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(button).toBeVisible();
+    await button.click();
+    await expect.poll(() => analytics.filter((event) => event.name === "editor_line_context_played").length).toBe(2);
+  });
+
   test("switches basic and advanced views over the same lines", async ({ page }) => {
     const harness = await installEditorHarness(page);
     await harness.open();

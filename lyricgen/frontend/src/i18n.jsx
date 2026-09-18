@@ -5,6 +5,8 @@ import { createContext, useContext, useState, useCallback } from "react";
 // dictionary via I18nProvider below — exporting is read-only.
 export const translations = {
   es: {
+    "editor.listen_context": "Escuchar 2 s antes",
+    "editor.listen_context_line": "Escuchar 2 s antes de la línea {n}",
     // Login
     "login.title": "Iniciar sesión",
     "login.subtitle": "Ingresá tus credenciales para continuar",
@@ -2374,6 +2376,8 @@ export const translations = {
   },
 
   en: {
+    "editor.listen_context": "Listen 2 s before",
+    "editor.listen_context_line": "Listen 2 s before line {n}",
     "login.title": "Sign in",
     "login.subtitle": "Enter your credentials to continue",
     "upload.mode_scenes": "Scenes",
@@ -4655,6 +4659,8 @@ export const translations = {
   },
 
   pt: {
+    "editor.listen_context": "Ouvir 2 s antes",
+    "editor.listen_context_line": "Ouvir 2 s antes da linha {n}",
     "login.title": "Entrar",
     "login.subtitle": "Insira suas credenciais para continuar",
     "upload.mode_scenes": "Cenas",

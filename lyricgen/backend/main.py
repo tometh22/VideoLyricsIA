@@ -14666,7 +14666,7 @@ async def resolve_editor_conflict(
 
 
 _PRODUCT_EVENT_NAMES = {
-    "editor_opened", "editor_view_changed", "editor_seek",
+    "editor_opened", "editor_view_changed", "editor_seek", "editor_line_context_played",
     "editor_selection_created", "editor_group_moved", "editor_timing_changed",
     "editor_undo", "editor_autosave_success", "editor_autosave_failed",
     "editor_conflict", "editor_version_restored", "editor_approved",
@@ -14682,11 +14682,19 @@ PRODUCT_METRICS_WINDOW_DAYS = int(
     os.environ.get("PRODUCT_METRICS_WINDOW_DAYS", "28")
 )
 
+_EDITOR_SEEK_PROPERTIES = {
+    "position_ms", "source", "from_position_ms", "line_id", "revision",
+    "line_start_ms", "line_context", "review_marker", "unsaved_changes",
+    "segment_id", "line_index",
+}
 _PRODUCT_EVENT_PROPERTIES = {
     "editor_reviewer_candidate": {"kind", "proposal_id", "candidate_id", "event_id", "seconds"},
     "editor_opened": {"line_count", "view", "source"},
     "editor_view_changed": {"from", "to"},
-    "editor_seek": {"position_ms", "source"},
+    "editor_seek": _EDITOR_SEEK_PROPERTIES,
+    "editor_line_context_played": _EDITOR_SEEK_PROPERTIES | {
+        "requested_lead_in_ms", "effective_lead_in_ms",
+    },
     "editor_selection_created": {"count", "method", "duration_ms"},
     "editor_group_moved": {"count", "delta_ms", "duration_ms"},
     "editor_timing_changed": {"count", "operation", "delta_ms", "duration_ms"},
@@ -14744,10 +14752,15 @@ async def record_product_events(
         if item.name not in _PRODUCT_EVENT_NAMES:
             rejected += 1
             continue
-        event_job = (
-            get_job_for_tenant(db, item.job_id, current_user["tenant_id"])
-            if item.job_id else None
-        )
+        # Match the editor's existing admin access without creating a document,
+        # acquiring a lock, or touching job activity just to record telemetry.
+        event_job = None
+        if item.job_id:
+            event_job = (
+                db.query(Job).filter(Job.job_id == item.job_id).first()
+                if current_user.get("role") == "admin"
+                else get_job_for_tenant(db, item.job_id, current_user["tenant_id"])
+            )
         if item.job_id and not event_job:
             rejected += 1
             continue
