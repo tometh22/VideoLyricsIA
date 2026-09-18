@@ -3,6 +3,12 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.3] - 2026-09-18
+
+### Fixed
+- Release portal-listing database transactions before external storage/cache I/O, preserving resolved requests and immutable published versions.
+- Isolate portal HEAD requests from long-running upload clients with short timeouts and no retries; run the synchronous listing off the API event loop.
+
 ## [1.0.2] - 2026-09-18
 
 ### Fixed

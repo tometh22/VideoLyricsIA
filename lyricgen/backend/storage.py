@@ -48,6 +48,28 @@ except (TypeError, ValueError):
     R2_CLEANUP_SPIKE_THRESHOLD = 100
 
 _client = None
+_portal_client = None
+_portal_client_lock = threading.Lock()
+
+
+def _get_portal_client():
+    """Isolated, bounded HEAD client; never inherit multipart-upload retries."""
+    global _portal_client
+    if not is_enabled():
+        return None
+    with _portal_client_lock:
+        if _portal_client is None:
+            import boto3
+            from botocore.config import Config
+            _portal_client = boto3.client(
+                "s3", endpoint_url=R2_ENDPOINT_URL,
+                aws_access_key_id=R2_ACCESS_KEY_ID,
+                aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                config=Config(signature_version="s3v4", connect_timeout=2,
+                              read_timeout=3, retries={"max_attempts": 0},
+                              max_pool_connections=16),
+            )
+        return _portal_client
 
 
 def is_enabled() -> bool:
