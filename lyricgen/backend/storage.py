@@ -1285,6 +1285,14 @@ def copy_object(src_key: str, dst_key: str) -> bool:
     if not object_exists(src_key):
         return False
     src = {"Bucket": R2_BUCKET, "Key": src_key}
+    if src_key.lower().endswith('.mov'):
+        # Broadcast masters are frequently multi-GB. A single CopyObject
+        # can consume all read-timeout retries before reaching the multipart
+        # fallback below, leaving publication/render progress frozen for
+        # minutes. The managed transfer selects multipart by size up front.
+        client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key)
+        logger.info("[R2] Copied master %s -> %s", src_key, dst_key)
+        return True
     try:
         client.copy_object(Bucket=R2_BUCKET, Key=dst_key, CopySource=src)
     except ClientError as e:
