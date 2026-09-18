@@ -3,6 +3,12 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.4] - 2026-09-18
+
+### Fixed
+- Expose the published revision, correction date and resolution revision already stored by staging to both real UMG portals. Corrected files now display their new version instead of only the original delivery date.
+- Preserve immutable download pointers and original delivery history; no customer content or approval changes.
+
 ## [1.0.3] - 2026-09-18
 
 ### Fixed
