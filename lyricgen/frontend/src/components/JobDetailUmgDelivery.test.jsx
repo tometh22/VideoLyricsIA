@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -46,6 +47,20 @@ function response(status, body, headers = {}) {
   };
 }
 
+function StatefulJobDetail({ initialJob, onJobUpdate = vi.fn() }) {
+  const [currentJob, setCurrentJob] = useState(initialJob);
+  return (
+    <JobDetail
+      job={currentJob}
+      onBack={vi.fn()}
+      onJobUpdate={(nextJob) => {
+        setCurrentJob(nextJob);
+        onJobUpdate(nextJob);
+      }}
+    />
+  );
+}
+
 describe("JobDetail UMG delivery recovery", () => {
   beforeEach(() => {
     localStorage.setItem("genly_token", "admin-token");
@@ -62,8 +77,22 @@ describe("JobDetail UMG delivery recovery", () => {
 
   it("configures ProRes, waits for both masters and then publishes", async () => {
     const onJobUpdate = vi.fn();
+    const currentReport = {
+      status: "COMPLETE", mode: "enforce", decision: "PASS", report_id: "qc-ready",
+      source_fingerprint: "source-current", visual_fingerprint: "visual-current",
+      delivery_spec: {}, issues: [], approval: { blocked: false, can_approve: true },
+    };
+    const preflightedJob = {
+      ...job,
+      delivery_qc: {
+        status: "COMPLETE", mode: "enforce", decision: "PASS",
+        source_fingerprint: "source-current", visual_fingerprint: "visual-current",
+        delivery_spec: {}, issues: [], approval: { blocked: false, can_approve: true },
+      },
+    };
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
       async (url) => {
+        if (url.includes("/delivery-qc/recheck")) return response(200, { ok: true, delivery_qc: currentReport });
         if (url.includes("/enable-prores/")) {
           return response(200, {
             ok: true,
@@ -115,7 +144,7 @@ describe("JobDetail UMG delivery recovery", () => {
       <MemoryRouter>
         <AlertProvider>
           <JobDetail
-            job={job}
+            job={preflightedJob}
             onBack={vi.fn()}
             onJobUpdate={onJobUpdate}
           />
@@ -126,7 +155,7 @@ describe("JobDetail UMG delivery recovery", () => {
     fireEvent.click(screen.getByText("detail.send_umg"));
     expect(screen.getByText(/esta variante lo reemplaza en la misma entrega/)).toBeTruthy();
     fireEvent.click(screen.getByText("umg.portal_argentina"));
-    expect(screen.getByText("prores.enable_title")).toBeTruthy();
+    expect(await screen.findByText("prores.enable_title")).toBeTruthy();
 
     fireEvent.click(screen.getByText("prores.submit"));
 
@@ -153,7 +182,57 @@ describe("JobDetail UMG delivery recovery", () => {
     }));
   });
 
+  it("runs and shows QC before configuring or preparing ProRes on the first UMG send", async () => {
+    const pendingReport = {
+      status: "COMPLETE", mode: "enforce", decision: "REVIEW",
+      source_fingerprint: "source-current", visual_fingerprint: "visual-current",
+      delivery_spec: {}, approval: { blocked: true, reason: "manual_review_required" },
+      issues: [{
+        issue_id: "manual-black-bars", code: "UMG_BLACK_BARS",
+        status: "OPEN", result_status: "REVIEW", severity: "FAIL",
+        manual_verification_required: true, detector: "mandatory_signed_reviewer_checklist",
+        summary: "Revisar franjas negras", description: "Mirar el video completo.",
+      }],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      if (url.includes("/admin/deliveries/from-job/")) {
+        return response(409, {
+          detail: {
+            code: "delivery_qc_blocked",
+            delivery_qc: { blocked: true, reason: "fresh_preflight_required" },
+          },
+        });
+      }
+      if (url.includes("/delivery-qc/recheck")) {
+        return response(200, { ok: true, delivery_qc: pendingReport });
+      }
+      if (url.includes("/status/")) return response(200, { ...job, delivery_qc: pendingReport });
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+
+    render(
+      <MemoryRouter>
+        <AlertProvider>
+          <StatefulJobDetail initialJob={job} />
+        </AlertProvider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByText("detail.send_umg"));
+    fireEvent.click(screen.getByText("umg.portal_argentina"));
+
+    expect(await screen.findByText("Preflight de entrega")).toBeInTheDocument();
+    expect(screen.getByText("Revisar franjas negras")).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => url.includes("/enable-prores/"))).toBe(false);
+    expect(screen.getByRole("button", { name: "Firmar: Revisar franjas negras" })).toBeInTheDocument();
+  });
+
   it("publishes an already prepared job to Chile", async () => {
+    const currentReport = {
+      status: "COMPLETE", mode: "enforce", decision: "PASS", report_id: "qc-ready-chile",
+      source_fingerprint: "source-current", visual_fingerprint: "visual-current",
+      delivery_spec: {}, issues: [], approval: { blocked: false, can_approve: true },
+    };
     const preparedJob = {
       ...job,
       umg_spec: { frame_size: "HD", fps: 29.97, prores_profile: 3 },
@@ -164,6 +243,7 @@ describe("JobDetail UMG delivery recovery", () => {
       },
     };
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, options) => {
+      if (url.includes("/delivery-qc/recheck")) return response(200, { ok: true, delivery_qc: currentReport });
       if (url.includes("/admin/deliveries/from-job/")) {
         return response(200, { ok: true, label: "Renderizado", replaced: false, portal_id: "chile" });
       }

@@ -12511,6 +12511,10 @@ class DeliveryQCIssueDecisionRequest(BaseModel):
     expected_report_id: str | None = Field(default=None, max_length=160)
 
 
+class DeliveryQCRecheckRequest(BaseModel):
+    for_umg_delivery: bool = False
+
+
 class DeliveryQCExternalFindingRequest(BaseModel):
     finding_id: str = Field(default="", max_length=160)
     code: str = Field(default="", max_length=100)
@@ -12772,11 +12776,8 @@ async def approve_job(
             detail="Una copia de piloto no se aprueba ni se entrega.",
         )
 
-    from delivery_qc_runtime import approval_gate, effective_delivery_qc_mode
-    _delivery_gate = approval_gate(
-        job.delivery_qc,
-        "enforce" if job.workload_class == "batch" else effective_delivery_qc_mode(),
-    )
+    from delivery_qc_runtime import delivery_readiness_gate
+    _delivery_gate = delivery_readiness_gate(job, job.delivery_qc)
     override_requested = bool(body.admin_override)
     override_allowed = (
         override_requested
@@ -12974,6 +12975,9 @@ def decide_delivery_qc_issue(
     report = dict(job.delivery_qc or {})
     if report.get("status") != "COMPLETE":
         raise HTTPException(status_code=409, detail="delivery_qc_report_stale")
+    from delivery_qc_runtime import qc_input_fingerprint
+    if report.get("job_input_fingerprint") != qc_input_fingerprint(job):
+        raise HTTPException(status_code=409, detail="delivery_qc_report_stale")
     _validate_qc_report_preview(report, body.expected_report_id)
     found = None
     issues = []
@@ -12982,6 +12986,7 @@ def decide_delivery_qc_issue(
         "rejected": "REJECTED",
         "resolved_manual": "RESOLVED_MANUAL",
     }
+    from delivery_qc_runtime import _issue_result_status
     for raw in report.get("issues") or []:
         row = dict(raw)
         if str(row.get("issue_id")) == issue_id:
@@ -12991,11 +12996,13 @@ def decide_delivery_qc_issue(
                     status_code=422,
                     detail="mandatory_reviewer_check_requires_signed_manual_resolution",
                 )
-            if row.get("severity") == "FAIL" and body.decision == "acknowledged":
+            if _issue_result_status(row) == "FAIL" and row.get("blocking", True):
                 raise HTTPException(
                     status_code=422,
-                    detail="fail_finding_cannot_be_acknowledged",
+                    detail="blocking_fail_requires_correction_and_new_preflight",
                 )
+            if body.decision == "resolved_manual" and not row.get("manual_verification_required"):
+                raise HTTPException(status_code=422, detail="manual_resolution_requires_mandatory_reviewer_check")
             row["status"] = status_map[body.decision]
             row["operator_decision"] = {
                 "decision": body.decision, "reason": body.reason,
@@ -13013,10 +13020,7 @@ def decide_delivery_qc_issue(
         raise HTTPException(status_code=404, detail="delivery_qc_issue_not_found")
     report["issues"] = issues
     open_rows = [row for row in issues if row.get("status") == "OPEN"]
-    from delivery_qc_runtime import (
-        _issue_result_status, approval_gate, effective_delivery_qc_mode,
-        refresh_check_results,
-    )
+    from delivery_qc_runtime import (_issue_result_status, delivery_readiness_gate, refresh_check_results)
     report["summary"] = {
         **dict(report.get("summary") or {}),
         "open_count": len(open_rows),
@@ -13030,10 +13034,7 @@ def decide_delivery_qc_issue(
         ),
     }
     report = refresh_check_results(report)
-    report["approval"] = approval_gate(
-        report,
-        "enforce" if job.workload_class == "batch" else effective_delivery_qc_mode(),
-    )
+    report["approval"] = delivery_readiness_gate(job, report)
     # Decisions also advance the viewed report token: another tab cannot
     # silently overwrite a review recorded since its last refresh.
     from uuid import uuid4
@@ -13060,6 +13061,7 @@ def decide_delivery_qc_issue(
 @app.post("/jobs/{job_id}/delivery-qc/recheck")
 async def recheck_delivery_qc(
     job_id: str,
+    body: DeliveryQCRecheckRequest | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -13082,6 +13084,7 @@ async def recheck_delivery_qc(
     local_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP["video"])
     from delivery_qc_runtime import qc_input_identity
     expected_input = qc_input_identity(job)
+    mode_override = "enforce" if body and body.for_umg_delivery else None
     # No connection/transaction is retained during a download or while the
     # worker opens its own session. The identity is checked before and after QC.
     db.rollback()
@@ -13091,7 +13094,7 @@ async def recheck_delivery_qc(
         try:
             return await asyncio.to_thread(
                 run_delivery_qc_for_job, job_id, video_path,
-                expected_input=expected_input,
+                expected_input=expected_input, mode_override=mode_override,
             )
         except RuntimeError as exc:
             if str(exc).startswith('delivery_qc_'):
@@ -20050,6 +20053,17 @@ def admin_create_delivery_from_job(
             status_code=400,
             detail="Job must be approved (status=done) before it can be published",
         )
+
+    # UMG has its own contractual preflight even when the general QC rollout
+    # is observe/off. Check before storage calls or ProRes queue work.
+    from delivery_qc_runtime import delivery_readiness_gate
+    _umg_gate = delivery_readiness_gate(job, job.delivery_qc, for_umg_delivery=True)
+    if _umg_gate.get("blocked"):
+        raise HTTPException(status_code=409, detail={
+            "code": "delivery_qc_blocked",
+            "message": "Completá la revisión del video antes de preparar o enviar los masters.",
+            "delivery_qc": _umg_gate,
+        })
 
     # Validate all 5 files exist in R2. The three render outputs are hard
     # requirements. ProRes is different: it is a lazy derivative and its

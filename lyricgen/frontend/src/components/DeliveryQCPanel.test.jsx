@@ -21,6 +21,19 @@ const job = {
 };
 
 describe("DeliveryQCPanel", () => {
+  it("permite iniciar el preflight UMG aunque todavía no haya reporte", async () => {
+    const onJobUpdate = vi.fn();
+    const report = { status: "COMPLETE", mode: "enforce", issues: [] };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ delivery_qc: report }) }));
+    render(<DeliveryQCPanel job={{ job_id: "abc123", delivery_qc: null }} forUmgDelivery onJobUpdate={onJobUpdate} />);
+    fireEvent.click(screen.getByRole("button", { name: "Analizar corte" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining("/delivery-qc/recheck"),
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ for_umg_delivery: true }) }),
+    ));
+    expect(onJobUpdate).toHaveBeenCalledWith(expect.objectContaining({ delivery_qc: report }));
+  });
+
   it("muestra los checks que pasaron y distingue una revisión de un fallo", () => {
     const checkedJob = {
       ...job,
@@ -67,6 +80,26 @@ describe("DeliveryQCPanel", () => {
     expect(screen.getByText("Título no coincide")).toBeInTheDocument();
     expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("Falló");
     expect(screen.getByTestId("delivery-qc-checks")).not.toHaveTextContent("Pasó");
+  });
+
+  it("does not offer acknowledgement for an objective FAIL", () => {
+    render(<DeliveryQCPanel job={{ ...job, delivery_qc: {
+      ...job.delivery_qc, decision: "BLOCK", mode: "enforce",
+      issues: [{ issue_id: "black-frame", severity: "FAIL", result_status: "FAIL", status: "OPEN", summary: "Cuadro negro detectado" }],
+    } }} onJobUpdate={vi.fn()} onOpenEditor={vi.fn()} />);
+    expect(screen.queryByText("Revisado")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Corregir video" })).toBeInTheDocument();
+  });
+
+  it("focuses the first manual signoff after publication is blocked", async () => {
+    const pendingJob = { ...job, delivery_qc: {
+      ...job.delivery_qc, issues: [
+        { issue_id: "manual-1", status: "OPEN", manual_verification_required: true, summary: "Revisar encuadre" },
+        { issue_id: "manual-2", status: "OPEN", manual_verification_required: true, summary: "Revisar sincronía" },
+      ],
+    } };
+    render(<DeliveryQCPanel job={pendingJob} focusRequest={1} onJobUpdate={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Firmar: Revisar encuadre" })).toHaveFocus());
   });
 
   it("keeps different checks with the same label and required human issues visible", () => {

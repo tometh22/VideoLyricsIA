@@ -27,10 +27,11 @@ const CHECK_LABELS = {
   NOT_RUN: "No ejecutado",
 };
 
-export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor }) {
+export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor, forUmgDelivery = false, focusRequest = 0, onContinueToPublish }) {
   const report = job?.delivery_qc;
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const firstActionRef = useRef(null);
   const latestJob = useRef(job);
   latestJob.current = job;
   const requestRef = useRef(null);
@@ -43,6 +44,10 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
     setBusy(""); setError("");
     return () => { requestRef.current = null; };
   }, [identity]);
+  useEffect(() => {
+    if (!focusRequest) return;
+    requestAnimationFrame(() => firstActionRef.current?.focus?.());
+  }, [focusRequest]);
   const beginRequest = (label) => {
     if (requestRef.current?.identity === identity) return null;
     const request = { identity };
@@ -64,7 +69,8 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
     try {
       const response = await fetch(`${API}/jobs/${job.job_id}/delivery-qc/recheck`, {
         method: "POST",
-        headers: authHeaders(),
+        headers: forUmgDelivery ? { ...authHeaders(), "Content-Type": "application/json" } : authHeaders(),
+        ...(forUmgDelivery ? { body: JSON.stringify({ for_umg_delivery: true }) } : {}),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -111,7 +117,21 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
   const effectiveBlockers = report?.approval?.blocked ? (report.approval.issue_ids || []) : [];
   const reportToken = report?.report_id || report?.generated_at;
   const reportReviewable = Boolean(reportToken) && report?.status === "COMPLETE";
-  if (!report) return null;
+  const pendingManualCount = issues.filter((issue) => issue.manual_verification_required).length;
+  const firstManualIssueId = issues.find((issue) => issue.manual_verification_required)?.issue_id;
+  if (!report) {
+    if (!forUmgDelivery) return null;
+    return (
+      <section data-testid="delivery-qc-panel" className="rounded-card p-4 mb-6 bg-surface/80 ring-1 ring-white/10">
+        <h3 className="text-sm font-semibold">Revisión antes de publicar</h3>
+        <p className="text-xs text-ink-secondary mt-1">Analizá este corte y resolvé solo los puntos que necesiten atención.</p>
+        <button ref={firstActionRef} type="button" onClick={refresh} disabled={Boolean(busy)} className="btn-primary h-10 px-4 mt-3 text-xs">
+          {busy === "refresh" ? "Analizando corte…" : "Analizar corte"}
+        </button>
+        {error && <p role="alert" className="text-xs text-red-300 mt-3">{error}</p>}
+      </section>
+    );
+  }
   const updateDecision = async (issue, decision) => {
     if (!reportReviewable) {
       setError("Actualizá el preflight antes de firmar: hace falta un informe completo con identidad verificable.");
@@ -225,7 +245,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
         </div>
       )}
 
-      <div className="grid grid-cols-3 gap-2 mb-4 text-center">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-4 text-center">
         <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{displayedFailCount}</div><div className="text-[10px] text-ink-secondary">checks con fallo</div></div>
         <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{visibleCheckSummary.review}</div><div className="text-[10px] text-ink-secondary">revisiones</div></div>
         <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{visibleCheckSummary.notRun}</div><div className="text-[10px] text-ink-secondary">no ejecutados</div></div>
@@ -254,6 +274,11 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
           </div>
         </div>
       )}
+      {forUmgDelivery && pendingManualCount > 0 && (
+        <p className="text-xs text-amber-200 mb-3" role="status">
+          {pendingManualCount} {pendingManualCount === 1 ? "control visual pendiente" : "controles visuales pendientes"} para este corte.
+        </p>
+      )}
 
       {report.status !== "COMPLETE" && <div className="mb-3 space-y-2"><p className="text-xs text-amber-200">El informe no está vigente o completo. Actualizá el preflight y esperá a que termine antes de firmar o aplicar sugerencias.</p><button disabled={Boolean(busy)} onClick={refresh} className="btn-secondary h-9 px-3 text-xs">{busy === "refresh" ? "Actualizando preflight…" : "Actualizar preflight"}</button></div>}
       <div className="space-y-2">
@@ -270,14 +295,18 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
                 {issue.description && <p className="text-[11px] text-ink-secondary mt-1">{issue.description}</p>}
                 <div className="flex flex-wrap gap-1.5 mt-2">
                   {(issue.seconds || []).slice(0, 8).map((seconds, index) => (
-                    <button key={`${seconds}-${index}`} onClick={() => onSeek?.(Number(seconds))} className="text-[10px] px-2 py-1 rounded-lg bg-brand/10 text-brand-light hover:bg-brand/20">
+                    <button key={`${seconds}-${index}`} aria-label={`Ir a ${issue.summary}, ${issue.timecodes?.[index] || `${Number(seconds).toFixed(2)} segundos`}`} onClick={() => onSeek?.(Number(seconds))} className="text-[10px] px-2 py-1 rounded-lg bg-brand/10 text-brand-light hover:bg-brand/20">
                       {issue.timecodes?.[index] || `${Number(seconds).toFixed(2)}s`}
                     </button>
                   ))}
                 </div>
               </div>
-              {issue.status === "OPEN" ? (
-                <button disabled={Boolean(busy) || !reportReviewable} onClick={() => updateDecision(issue, issue.manual_verification_required ? "resolved_manual" : "acknowledged")} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50">{issue.manual_verification_required ? "Firmar check" : "Revisado"}</button>
+              {issue.status === "OPEN" && issue.manual_verification_required ? (
+                <button ref={issue.issue_id === firstManualIssueId ? firstActionRef : undefined} aria-label={`Firmar: ${issue.summary}`} disabled={Boolean(busy) || !reportReviewable} onClick={() => updateDecision(issue, "resolved_manual")} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50">Firmar</button>
+              ) : issue.status === "OPEN" && (issue.result_status === "FAIL" || issue.severity === "FAIL") ? (
+                <button type="button" onClick={onOpenEditor} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-red-500/10 text-red-200 hover:bg-red-500/20">Corregir video</button>
+              ) : issue.status === "OPEN" ? (
+                <button disabled={Boolean(busy) || !reportReviewable} onClick={() => updateDecision(issue, "acknowledged")} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50">Revisado</button>
               ) : <span className="text-[10px] text-emerald-300">{issue.status}</span>}
             </div>
           </div>
@@ -289,6 +318,9 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
       )}
 
       <div className="flex flex-wrap gap-2 mt-4">
+        {forUmgDelivery && reportReviewable && report.approval?.can_approve && onContinueToPublish && (
+          <button type="button" onClick={onContinueToPublish} className="btn-primary h-10 px-4 text-xs">Continuar a publicar</button>
+        )}
         {safeActions.some((row) => ["text", "timing"].includes(row.domain)) && (
           <button disabled={Boolean(busy) || !reportReviewable} onClick={() => applySafeActions("lyrics")} className="btn-primary h-10 px-4 text-xs">Corregir texto/timing seguro</button>
         )}
@@ -297,7 +329,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
         )}
         <button onClick={onOpenEditor} className="btn-secondary h-10 px-4 text-xs">Abrir editor</button>
       </div>
-      {error && <p className="text-xs text-red-300 mt-3">{String(error)}</p>}
+      {error && <p role="alert" className="text-xs text-red-300 mt-3">{String(error)}</p>}
       {report.mode === "observe" && <p className="text-[10px] text-ink-secondary mt-3">Modo observar: no bloquea ni modifica una entrega automáticamente.</p>}
     </section>
   );

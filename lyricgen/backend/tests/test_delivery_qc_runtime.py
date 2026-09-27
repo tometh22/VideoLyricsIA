@@ -1,10 +1,14 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from delivery_media_qc import inspect_delivery_media
 from delivery_ocr import compare_ocr_observations
 from delivery_qc_runtime import (
-    approval_gate, build_runtime_report, mark_delivery_qc_stale,
+    MANDATORY_REVIEW_CHECKS, approval_gate, build_runtime_report,
+    delivery_qc_source_fingerprint, delivery_qc_visual_fingerprint,
+    delivery_readiness_gate, mark_delivery_qc_stale, segments_hash,
     refresh_check_results,
 )
 
@@ -112,7 +116,8 @@ def test_enforce_blocks_open_findings_but_observe_never_blocks():
     assert approval_gate(report, "observe")["can_approve"] is True
     assert approval_gate(report, "enforce")["can_approve"] is False
     report["issues"][0]["status"] = "RESOLVED_MANUAL"
-    assert approval_gate(report, "enforce")["can_approve"] is True
+    assert approval_gate(report, "enforce")["can_approve"] is False
+    assert approval_gate(report, "enforce")["reason"] == "open_fail"
 
 
 def test_enforce_does_not_block_a_non_deterministic_review():
@@ -144,6 +149,159 @@ def test_legacy_manual_reviewer_checks_do_not_block_approval():
     assert gate["blocked"] is False
     assert gate["can_approve"] is True
     assert gate["reason"] == "review_recommended"
+
+
+def _current_umg_report(job, *, pending_codes=()):
+    pending_codes = set(pending_codes)
+    now = "2026-09-27T12:00:00+00:00"
+    issues = []
+    for code, summary, description in MANDATORY_REVIEW_CHECKS:
+        pending = code in pending_codes
+        issues.append({
+            "issue_id": f"manual-{code}", "code": code,
+            "summary": summary, "description": description,
+            "status": "OPEN" if pending else "RESOLVED_MANUAL",
+            "result_status": "REVIEW", "severity": "FAIL",
+            "manual_verification_required": True,
+            "operator_decision": None if pending else {
+                "decision": "resolved_manual", "user_id": 12,
+                "decided_at": now,
+            },
+        })
+    return {
+        "status": "COMPLETE", "generated_at": now,
+        "segments_revision": job.segments_revision,
+        "segments_hash": segments_hash(job.segments_json),
+        "delivery_spec": dict(job.umg_spec),
+        "source_fingerprint": delivery_qc_source_fingerprint(job),
+        "visual_fingerprint": delivery_qc_visual_fingerprint(job),
+        "job_input_fingerprint": delivery_qc_source_fingerprint(job),
+        "artifact_sha256": "test-artifact",
+        "input_identity": {"test": "stable"},
+        "source_fingerprint": delivery_qc_source_fingerprint(job),
+        "visual_fingerprint": delivery_qc_visual_fingerprint(job),
+        "render_identity": {"edit_count": job.edit_count},
+        "issues": issues,
+    }
+
+
+def test_umg_readiness_requires_current_report_and_signed_manual_checks():
+    job = SimpleNamespace(
+        delivery_profile="umg", workload_class="interactive",
+        status="done", job_id="qc-test", editing_started_at=None,
+        input_audio_sha256="a" * 64, input_r2_key="input/test.mp3",
+        artist="Test", song_title="Song", style="oscuro",
+        render_params={}, scene_plan={}, bg_r2_key_cached=None,
+        umg_spec={"frame_size": "HD", "fps": 29.97},
+        segments_revision=3,
+        segments_json=[{"start": 0, "end": 2, "text": "Hola"}],
+        edit_count=2,
+    )
+    assert delivery_readiness_gate(job, None, for_umg_delivery=True)["reason"] == "fresh_preflight_required"
+
+    report = _current_umg_report(job, pending_codes={"UMG_BLACK_BARS"})
+    gate = delivery_readiness_gate(job, report, for_umg_delivery=True)
+    assert gate["blocked"] is True
+    assert gate["reason"] == "manual_review_required"
+    assert gate["issue_ids"] == ["manual-UMG_BLACK_BARS"]
+
+    report = _current_umg_report(job)
+    assert delivery_readiness_gate(job, report, for_umg_delivery=True)["can_approve"] is True
+
+    job.edit_count += 1
+    assert delivery_readiness_gate(job, report, for_umg_delivery=True)["reason"] == "fresh_preflight_required"
+
+    job.edit_count -= 1
+    job.scene_plan = {"scenes": [{"recurrence_key": "chorus", "prompt": "nuevo"}]}
+    assert delivery_readiness_gate(job, report, for_umg_delivery=True)["reason"] == "fresh_preflight_required"
+
+
+def test_blocking_automatic_fail_cannot_be_dismissed_by_closed_status():
+    report = {
+        "status": "COMPLETE",
+        "issues": [{
+            "issue_id": "objective-black-frame", "code": "MEDIA_BLACK_FRAME",
+            "severity": "FAIL", "result_status": "FAIL", "blocking": True,
+            "status": "RESOLVED_MANUAL",
+        }],
+    }
+    gate = approval_gate(report, "enforce")
+    assert gate["blocked"] is True
+    assert gate["reason"] == "open_fail"
+    assert gate["issue_ids"] == ["objective-black-frame"]
+
+
+def test_manual_signoff_survives_prores_spec_change_but_not_new_visual_cut():
+    from delivery_qc_runtime import _merge_prior_decisions
+
+    job = SimpleNamespace(
+        delivery_profile="umg", job_id="qc-test", status="done",
+        editing_started_at=None, input_audio_sha256="a" * 64,
+        input_r2_key="input/test.mp3", artist="Test", song_title="Song",
+        style="oscuro", render_params={}, scene_plan={},
+        bg_r2_key_cached=None, umg_spec={"frame_size": "HD"},
+        segments_revision=1, segments_json=[{"start": 0, "end": 1, "text": "Hola"}],
+        edit_count=1,
+    )
+    prior = _current_umg_report(job)
+    prior_issue = prior["issues"][0]
+
+    job.umg_spec = {"frame_size": "UHD-4K"}
+    same_visual_issue = {**prior_issue}
+    _merge_prior_decisions([same_visual_issue], prior, artifact_sha256="test-artifact", input_identity={"test": "stable"}, same_source=False, same_visual=True)
+    assert same_visual_issue.get("status") == "RESOLVED_MANUAL"
+
+    job.edit_count += 1
+    next_cut_issue = {**prior_issue}
+    next_cut_issue["status"] = "OPEN"
+    next_cut_issue["operator_decision"] = None
+    _merge_prior_decisions([next_cut_issue], prior, artifact_sha256="test-artifact", input_identity={"test": "stable"}, same_source=False, same_visual=False)
+    assert next_cut_issue.get("status") == "OPEN"
+
+
+def test_nonmanual_resolution_does_not_carry_to_a_different_source_snapshot():
+    from delivery_qc_runtime import _merge_prior_decisions
+
+    prior = {"issues": [{
+        "issue_id": "ocr-title", "status": "ACKNOWLEDGED",
+        "operator_decision": {"decision": "acknowledged", "user_id": 12},
+    }]}
+    current = [{"issue_id": "ocr-title", "status": "OPEN"}]
+    _merge_prior_decisions(current, prior, same_source=False, same_visual=False)
+    assert current[0]["status"] == "OPEN"
+
+
+def test_recheck_does_not_scan_or_persist_if_source_changed_before_lock(monkeypatch):
+    import database
+    from delivery_qc_runtime import delivery_qc_source_fingerprint, run_delivery_qc_for_job
+
+    job = SimpleNamespace(
+        job_id="qc-race", status="done", delivery_profile="umg", workload_class="interactive",
+        input_audio_sha256="a" * 64, input_r2_key="input/race.mp3",
+        segments_revision=2, segments_json=[{"start": 0, "end": 1, "text": "Hola"}],
+        edit_count=3, editing_started_at=None, artist="Artista", song_title="Tema",
+        style="oscuro", render_params={}, scene_plan={}, bg_r2_key_cached=None,
+        umg_spec={"frame_size": "HD"},
+    )
+    class Query:
+        def filter(self, *_args): return self
+        def with_for_update(self): return self
+        def first(self): return job
+    class Session:
+        def query(self, *_args): return Query()
+        def rollback(self): pass
+        def close(self): pass
+    monkeypatch.setattr(database, "SessionLocal", Session)
+    monkeypatch.setattr(
+        "delivery_qc_runtime.build_runtime_report",
+        lambda **_kwargs: pytest.fail("must not scan a report against a changed source"),
+    )
+
+    result = run_delivery_qc_for_job(
+        job.job_id, "/tmp/old-render.mp4", force=True,
+        mode_override="enforce", expected_source_fingerprint="old-source",
+    )
+    assert result is None
 
 
 def test_refresh_check_results_marks_signed_manual_check_as_passed():
@@ -218,7 +376,7 @@ def test_runtime_report_turns_missing_detectors_into_signed_manual_failures(tmp_
             {
                 **row,
                 "status": "RESOLVED_MANUAL",
-                "operator_decision": {"reviewer_name": "Reviewer"},
+                    "operator_decision": {"decision": "resolved_manual", "user_id": 12, "reviewer_name": "Reviewer"},
             }
             for row in report["issues"]
         ],
@@ -261,9 +419,12 @@ def test_runtime_report_exposes_passed_checks_and_manual_review_state(tmp_path, 
         },
     )
     job = SimpleNamespace(
-        workload_class="batch", artist="Artista", song_title="Tema", filename="tema.wav",
+        job_id="batch-qc", status="done", workload_class="batch", artist="Artista", song_title="Tema", filename="tema.wav",
         umg_spec=None, segments_revision=2, edit_count=0,
         transcription_quality={"decision": "safe"},
+        segments_json=[{"start": 0, "end": 2, "text": "Hola"}],
+        audio_revision=0, input_audio_sha256=None, s3_keys={}, delivery_profile="umg",
+        previous_versions=[], completed_at=None,
     )
     report = build_runtime_report(
         job=job, video_path=str(asset), segments=[{"start": 0, "end": 2, "text": "Hola"}],
@@ -276,7 +437,8 @@ def test_runtime_report_exposes_passed_checks_and_manual_review_state(tmp_path, 
     assert checks["umg_black_bars"]["blocking"] is False
     assert report["decision"] == "REVIEW"
     assert report["summary"]["fail_count"] == 0
-    assert report["approval"]["reason"] == "review_recommended"
+    assert report["approval"]["reason"] == "manual_review_required"
+    assert report["approval"]["blocked"] is True
 
 
 def test_runtime_report_does_not_duplicate_title_metadata_check(tmp_path, monkeypatch):
@@ -318,9 +480,12 @@ def test_runtime_report_blocks_only_an_objective_detector_failure(tmp_path, monk
         lambda *_args, **_kwargs: {"observations": [], "issues": [], "abstentions": []},
     )
     job = SimpleNamespace(
-        workload_class="batch", artist="Artista", song_title="Tema", filename="tema.wav",
+        job_id="batch-fail", status="done", workload_class="batch", artist="Artista", song_title="Tema", filename="tema.wav",
         umg_spec=None, segments_revision=1, edit_count=0,
         transcription_quality={"decision": "safe"},
+        segments_json=[{"start": 0, "end": 2, "text": "Hola"}],
+        audio_revision=0, input_audio_sha256=None, s3_keys={}, delivery_profile="umg",
+        previous_versions=[], completed_at=None,
     )
     report = build_runtime_report(
         job=job, video_path=str(asset), segments=[{"start": 0, "end": 2, "text": "Hola"}],
