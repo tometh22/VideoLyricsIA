@@ -20,6 +20,12 @@ def proposal_case(client, admin_token, approved_job, db, all_r2_files_present, m
     monkeypatch.setattr('main._dispatch_editor_quality_outbox', lambda *_: None)
     approved_job.segments_json = [{'start': 0, 'end': 3, 'text': 'Viejo'}]
     approved_job.segments_revision = 0
+    db.flush()
+    db.refresh(approved_job)
+    from tests.test_deliveries import _signed_umg_qc_report
+    approved_job.delivery_qc = _signed_umg_qc_report(
+        approved_job, approved_job.approved_by,
+    )
     db.commit()
     response = client.post('/admin/deliveries/from-job/' + approved_job.job_id,
                            headers=auth(admin_token), json={})

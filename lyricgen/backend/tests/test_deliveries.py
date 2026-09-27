@@ -30,6 +30,41 @@ from tests.conftest import auth
 PORTAL_TOKEN = os.environ.get("DELIVERY_PORTAL_TOKEN", "test-portal-token")
 
 
+def _signed_umg_qc_report(job, reviewer_id):
+    from delivery_qc_runtime import (
+        MANDATORY_REVIEW_CHECKS, delivery_qc_source_fingerprint,
+        delivery_qc_visual_fingerprint, segments_hash,
+    )
+
+    now = datetime.now(timezone.utc).isoformat()
+    issues = [{
+        "issue_id": f"manual-{code}", "code": code, "severity": "FAIL",
+        "result_status": "REVIEW", "status": "RESOLVED_MANUAL",
+        "manual_verification_required": True,
+        "operator_decision": {
+            "decision": "resolved_manual", "user_id": reviewer_id,
+            "decided_at": now,
+        },
+    } for code, _summary, _description in MANDATORY_REVIEW_CHECKS]
+    return {
+        "status": "COMPLETE", "mode": "enforce", "generated_at": now,
+        "report_id": "current-test-report",
+        "segments_revision": int(job.segments_revision or 0),
+        "segments_hash": segments_hash(job.segments_json or []),
+        "delivery_spec": dict(job.umg_spec or {}),
+        "source_fingerprint": delivery_qc_source_fingerprint(job),
+        "visual_fingerprint": delivery_qc_visual_fingerprint(job),
+        "job_input_fingerprint": delivery_qc_source_fingerprint(job),
+        "render_identity": {"edit_count": int(job.edit_count or 0)},
+        "issues": issues,
+    }
+
+
+def _refresh_umg_qc(job):
+    """Model an operator reviewing the exact current render before delivery."""
+    job.delivery_qc = _signed_umg_qc_report(job, job.user_id)
+
+
 @pytest.fixture(autouse=True)
 def _portal_token_env():
     """Make sure DELIVERY_PORTAL_TOKEN is set during this module's tests
@@ -99,6 +134,8 @@ def approved_job(db, admin_token, client):
     db.add(job)
     db.commit()
     db.refresh(job)
+    job.delivery_qc = _signed_umg_qc_report(job, me["id"])
+    db.commit()
     yield job
     # Cleanup: remove the job + any deliveries we created against it.
     # Change requests reference deliveries via a FK (delivery_change_requests
@@ -156,6 +193,105 @@ def test_admin_can_create_delivery(client, admin_token, approved_job, all_r2_fil
     assert body["replaced"] is False
 
 
+def test_publication_blocks_when_qc_report_is_missing(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    approved_job.delivery_qc = None
+    db.commit()
+
+    response = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "delivery_qc_blocked"
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "fresh_preflight_required"
+
+
+def test_publication_blocks_until_required_manual_checks_are_signed(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    report = dict(approved_job.delivery_qc)
+    report["issues"] = [dict(row) for row in report["issues"]]
+    report["issues"][0].update({"status": "OPEN", "operator_decision": None})
+    approved_job.delivery_qc = report
+    db.commit()
+
+    response = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "argentina"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "manual_review_required"
+
+
+def test_publication_does_not_start_prores_when_qc_needs_correction(
+    client, admin_token, approved_job, db,
+):
+    report = dict(approved_job.delivery_qc)
+    report["issues"] = [dict(row) for row in report["issues"]]
+    report["issues"].append({
+        "issue_id": "objective-black-frame", "code": "MEDIA_BLACK_FRAME",
+        "status": "OPEN", "severity": "FAIL", "result_status": "FAIL",
+        "blocking": True,
+    })
+    approved_job.delivery_qc = report
+    db.commit()
+
+    with patch("main.enqueue_prores_prewarm") as enqueue:
+        response = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={"portal_id": "chile"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "open_fail"
+    enqueue.assert_not_called()
+
+
+def test_objective_fail_cannot_be_manually_cleared_through_api(
+    client, admin_token, approved_job, db,
+):
+    report = dict(approved_job.delivery_qc)
+    report["issues"] = [dict(row) for row in report["issues"]]
+    report["issues"].append({
+        "issue_id": "objective-black-frame", "code": "MEDIA_BLACK_FRAME",
+        "status": "OPEN", "severity": "FAIL", "result_status": "FAIL",
+        "blocking": True,
+    })
+    approved_job.delivery_qc = report
+    db.commit()
+
+    response = client.post(
+        f"/jobs/{approved_job.job_id}/delivery-qc/issues/objective-black-frame/decision",
+        headers=auth(admin_token),
+        json={"decision": "resolved_manual", "reason": "try to bypass", "expected_report_id": report["report_id"]},
+    )
+
+    assert response.status_code == 422, response.json()
+    assert response.json()["detail"] == "blocking_fail_requires_correction_and_new_preflight"
+
+
+def test_umg_publish_rejects_qc_from_a_different_scene_render(
+    client, admin_token, approved_job, db, monkeypatch,
+):
+    approved_job.scene_plan = {"scenes": [{"prompt": "new scene"}]}
+    db.commit()
+    monkeypatch.setattr(
+        "main.storage.object_status_bounded",
+        lambda *_args, **_kwargs: pytest.fail("QC must block before storage verification"),
+    )
+
+    response = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "delivery_qc_blocked"
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "fresh_preflight_required"
+
+
 def test_missing_prores_is_prepared_instead_of_returning_dead_end(
     client, admin_token, approved_job,
 ):
@@ -194,6 +330,7 @@ def test_youtube_only_job_requests_prores_configuration(
 ):
     approved_job.umg_spec = None
     approved_job.delivery_profile = "youtube"
+    _refresh_umg_qc(approved_job)
     db.commit()
 
     def object_exists(key):
@@ -734,6 +871,7 @@ def test_change_request_proposal_applies_revisioned_text_but_stays_open_until_pu
     ]
     approved_job.segments_revision = 0
     approved_job.bg_r2_key_cached = "backgrounds/testjob12345.mp4"
+    _refresh_umg_qc(approved_job)
     db.commit()
     delivery_id = client.post(
         f"/admin/deliveries/from-job/{approved_job.job_id}",
@@ -854,6 +992,7 @@ def test_change_request_dismissed_proposal_can_be_recalculated(
     monkeypatch.setenv("CHANGE_REQUEST_ASSIST_ENABLED", "1")
     approved_job.segments_json = [{"start": 0.0, "end": 2.0, "text": "Viejo"}]
     approved_job.segments_revision = 0
+    _refresh_umg_qc(approved_job)
     db.commit()
     delivery_id = client.post(
         f"/admin/deliveries/from-job/{approved_job.job_id}",
@@ -891,6 +1030,7 @@ def test_change_request_apply_rejects_stale_editor_revision(
     monkeypatch.setenv("CHANGE_REQUEST_APPLY_ENABLED", "1")
     approved_job.segments_json = [{"start": 0.0, "end": 2.0, "text": "Viejo"}]
     approved_job.segments_revision = 0
+    _refresh_umg_qc(approved_job)
     db.commit()
     delivery_id = client.post(
         f"/admin/deliveries/from-job/{approved_job.job_id}",
@@ -1057,6 +1197,7 @@ def _edit_the_render(db, job):
         "archived_at": datetime.now(timezone.utc).isoformat(),
         "keys": {"video": "default/testjob12345/lyric_video.mp4.v1"},
     }]
+    _refresh_umg_qc(job)
     db.commit()
 
 
@@ -1502,6 +1643,8 @@ def test_a_genuinely_new_delivery_still_gets_opcion_n(
         thumbnail_url="/download/testjob54321/thumbnail",
     )
     db.add(sibling)
+    db.commit()
+    _refresh_umg_qc(sibling)
     db.commit()
     try:
         res = client.post(

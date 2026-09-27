@@ -20,10 +20,13 @@ def _headers(token):
     return {"Authorization": f"Bearer {token}"}
 
 
-def _report(report_id="report-A"):
+def _report(report_id="report-A", *, source_fingerprint=""):
     return {
         "schema_version": "genly-delivery-qc-runtime-v1",
         "report_id": report_id, "status": "COMPLETE", "mode": "observe",
+        "segments_revision": 1,
+        "source_fingerprint": source_fingerprint,
+        "job_input_fingerprint": source_fingerprint,
         "decision": "REVIEW",
         "summary": {"open_count": 1, "fail_count": 0, "warn_count": 1},
         "issues": [{"issue_id": "same-issue", "status": "OPEN",
@@ -35,15 +38,21 @@ def _report(report_id="report-A"):
 def _job(client, token, db):
     owner = client.get("/auth/me", headers=_headers(token)).json()
     job_id = uuid.uuid4().hex[:12]
-    db.add(Job(
+    job = Job(
         job_id=job_id, user_id=owner["id"], tenant_id=owner["tenant_id"],
         artist="QC Fence Artist", song_title="QC Fence Song", filename="qc.wav",
         status="pending_review", progress=100, workload_class="interactive",
         segments_json=[{"start": 0, "end": 2, "text": "Hola"}],
         segments_revision=1, audio_revision=1, input_audio_sha256="a" * 64,
-        transcription_quality={}, delivery_qc=_report(),
+        transcription_quality={},
         s3_keys={"video": f"synthetic/{job_id}/video.mp4"},
-    ))
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    job.delivery_qc = _report(
+        source_fingerprint=runtime.delivery_qc_source_fingerprint(job),
+    )
     db.commit()
     return job_id
 
@@ -61,7 +70,9 @@ def test_same_issue_id_does_not_authorize_replacement_report(
 ):
     job_id = _job(client, user_token, db)
     job = db.query(Job).filter(Job.job_id == job_id).one()
-    job.delivery_qc = _report("report-B")
+    job.delivery_qc = _report(
+        "report-B", source_fingerprint=runtime.delivery_qc_source_fingerprint(job),
+    )
     db.commit()
 
     response = client.post(
@@ -72,7 +83,7 @@ def test_same_issue_id_does_not_authorize_replacement_report(
 
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "delivery_qc_preview_changed"
-    assert _stored(db, job_id) == _report("report-B")
+    assert _stored(db, job_id) == job.delivery_qc
     assert db.query(ProductEvent).filter(
         ProductEvent.job_id == job_id,
         ProductEvent.name == "delivery_qc_issue_decision",
@@ -98,7 +109,9 @@ def test_same_issue_id_does_not_authorize_replacement_report(
 def test_external_result_cannot_be_attached_to_unseen_report(client, admin_token, db):
     job_id = _job(client, admin_token, db)
     job = db.query(Job).filter(Job.job_id == job_id).one()
-    job.delivery_qc = _report("report-B")
+    job.delivery_qc = _report(
+        "report-B", source_fingerprint=runtime.delivery_qc_source_fingerprint(job),
+    )
     db.commit()
     response = client.post(
         f"/jobs/{job_id}/delivery-qc/external-result",
@@ -108,12 +121,13 @@ def test_external_result_cannot_be_attached_to_unseen_report(client, admin_token
     )
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "delivery_qc_preview_changed"
-    assert _stored(db, job_id) == _report("report-B")
+    assert _stored(db, job_id) == job.delivery_qc
 
 
 def test_qc_releases_transaction_before_detectors(client, user_token, db, monkeypatch):
     monkeypatch.setenv("DELIVERY_QC_MODE", "observe")
     job_id = _job(client, user_token, db)
+    initial_report = _stored(db, job_id)
     real_factory = database.SessionLocal
     sessions = []
 
@@ -125,12 +139,15 @@ def test_qc_releases_transaction_before_detectors(client, user_token, db, monkey
     def build(**kwargs):
         assert sessions and all(not s.in_transaction() for s in sessions)
         assert kwargs["job"].song_title == "QC Fence Song"
-        return _report("report-B")
+        return _report(
+            "report-B", source_fingerprint=runtime.delivery_qc_source_fingerprint(kwargs["job"]),
+        )
 
     monkeypatch.setattr(database, "SessionLocal", tracked_factory)
     monkeypatch.setattr(runtime, "build_runtime_report", build)
-    assert runtime.run_delivery_qc_for_job(job_id, "unused.mp4") == _report("report-B")
-    assert _stored(db, job_id) == _report("report-B")
+    result = runtime.run_delivery_qc_for_job(job_id, "unused.mp4")
+    assert result["report_id"] == "report-B"
+    assert _stored(db, job_id)["report_id"] == "report-B"
     assert all(not s.in_transaction() for s in sessions)
 
 
@@ -146,6 +163,7 @@ def test_detector_input_change_discards_result(
 ):
     monkeypatch.setenv("DELIVERY_QC_MODE", "observe")
     job_id = _job(client, user_token, db)
+    initial_report = _stored(db, job_id)
 
     def build(**_kwargs):
         with database.SessionLocal() as concurrent:
@@ -157,7 +175,7 @@ def test_detector_input_change_discards_result(
     monkeypatch.setattr(runtime, "build_runtime_report", build)
     with pytest.raises(RuntimeError, match="^delivery_qc_input_changed$"):
         runtime.run_delivery_qc_for_job(job_id, "unused.mp4")
-    assert _stored(db, job_id) == _report()
+    assert _stored(db, job_id) == initial_report
 
 
 def test_concurrent_human_review_wins_over_detector_result(
@@ -165,6 +183,7 @@ def test_concurrent_human_review_wins_over_detector_result(
 ):
     monkeypatch.setenv("DELIVERY_QC_MODE", "observe")
     job_id = _job(client, user_token, db)
+    initial_report = _stored(db, job_id)
     reviewed = _report()
     reviewed["issues"][0].update(
         status="ACKNOWLEDGED", operator_decision={"reason": "reviewed-current-video"},
@@ -191,6 +210,7 @@ def test_render_advancing_during_download_returns_409_without_running_detectors(
 
     monkeypatch.setenv("DELIVERY_QC_MODE", "observe")
     job_id = _job(client, user_token, db)
+    initial_report = _stored(db, job_id)
     monkeypatch.setattr(main.storage, "is_enabled", lambda: True)
 
     def download(_key, path):
@@ -213,7 +233,7 @@ def test_render_advancing_during_download_returns_409_without_running_detectors(
     )
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "delivery_qc_input_changed"
-    assert _stored(db, job_id) == _report()
+    assert _stored(db, job_id) == initial_report
 
 
 def test_artifact_mutated_mid_analysis_is_not_a_valid_report(tmp_path, monkeypatch):

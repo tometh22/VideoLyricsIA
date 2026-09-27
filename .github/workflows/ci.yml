@@ -149,19 +149,19 @@ jobs:
 
       - name: Apply migrations on real PostgreSQL
         env:
-          DATABASE_URL: "postgresql://genly:genly@localhost:5432/genly_test"
+          DATABASE_URL: "postgresql+psycopg2://genly:genly@localhost:5432/genly_test"
         run: python -m alembic upgrade head
 
       - name: Run tests
         env:
-          DATABASE_URL: "postgresql://genly:genly@localhost:5432/genly_test"
+          DATABASE_URL: "postgresql+psycopg2://genly:genly@localhost:5432/genly_test"
           JWT_SECRET: "ci-test-secret-key"
           ADMIN_PASSWORD: "testadmin123"
         run: python -m pytest tests/ -v --tb=short
 
       - name: Real MoviePy + libass render gates
         env:
-          DATABASE_URL: "postgresql://genly:genly@localhost:5432/genly_test"
+          DATABASE_URL: "postgresql+psycopg2://genly:genly@localhost:5432/genly_test"
           JWT_SECRET: "ci-test-secret-key"
           ADMIN_PASSWORD: "testadmin123"
           GENLY_TEST_REAL_MOVIEPY: "1"
@@ -239,7 +239,7 @@ jobs:
       vars.STAGING_MERGE_QUEUE_ENABLED != 'true'
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: postgresql://genly:genly@127.0.0.1:5432/genly_editor_e2e
+      DATABASE_URL: postgresql+psycopg2://genly:genly@127.0.0.1:5432/genly_editor_e2e
       JWT_SECRET: editor-e2e-ci-secret
       ADMIN_PASSWORD: testadmin123
       ENVIRONMENT: test

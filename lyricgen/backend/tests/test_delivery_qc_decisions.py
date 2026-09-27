@@ -26,6 +26,7 @@ def _job(db, owner, *, status="COMPLETE"):
             "report_id": "synthetic-viewed-report",
             "status": status,
             "mode": "observe",
+            "segments_revision": 0,
             "decision": "REVIEW",
             "summary": {"open_count": 1, "fail_count": 0, "warn_count": 1},
             "issues": [{
@@ -38,6 +39,15 @@ def _job(db, owner, *, status="COMPLETE"):
         },
     )
     db.add(job)
+    db.commit()
+    db.refresh(job)
+    from delivery_qc_runtime import delivery_qc_source_fingerprint
+    input_fingerprint = delivery_qc_source_fingerprint(job)
+    job.delivery_qc = {
+        **job.delivery_qc,
+        "source_fingerprint": input_fingerprint,
+        "job_input_fingerprint": input_fingerprint,
+    }
     db.commit()
     return job
 

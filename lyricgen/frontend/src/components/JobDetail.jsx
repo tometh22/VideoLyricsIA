@@ -466,6 +466,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const isUmgAdmin = currentUser?.role === "admin";
   const [sendingUmg, setSendingUmg] = useState(false);
   const [umgSendStage, setUmgSendStage] = useState(null);
+  const [umgPreflightRequested, setUmgPreflightRequested] = useState(false);
+  const [qcFocusRequest, setQcFocusRequest] = useState(0);
   const [sendUmgAfterProres, setSendUmgAfterProres] = useState(false);
   const [umgPortals, setUmgPortals] = useState(() => getUmgPortals(job));
   const [showUmgPortalPicker, setShowUmgPortalPicker] = useState(false);
@@ -606,16 +608,59 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     }
   };
 
-  const beginUmgPublish = (portalId) => {
+  const refreshUmgPreflight = async (portalId, publishWhenReady = false, jobSnapshot = job) => {
+    if (sendingUmg) return false;
+    setSendingUmg(true);
+    setUmgSendStage("preflight");
+    setUmgPreflightRequested(true);
+    let ready = false;
+    try {
+      const response = await fetch(`${API}/jobs/${job.job_id}/delivery-qc/recheck`, {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ for_umg_delivery: true }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.delivery_qc) {
+        const detail = data.detail;
+        throw new Error((typeof detail === "string" ? detail : detail?.message) || "No se pudo analizar este corte.");
+      }
+      onJobUpdate?.({ ...jobSnapshot, delivery_qc: data.delivery_qc });
+      ready = data.delivery_qc.approval?.can_approve === true;
+      if (!ready) setQcFocusRequest((value) => value + 1);
+    } catch (error) {
+      alert({ title: "No se pudo revisar el video", description: error?.message || "Revisá tu conexión y probá otra vez.", tone: "error" });
+    } finally {
+      setSendingUmg(false);
+      setUmgSendStage(null);
+    }
+    if (ready && publishWhenReady) publishToUMG(portalId);
+    return ready;
+  };
+
+  const beginUmgPublish = async (portalId) => {
     setSelectedUmgPortal(portalId);
     setSendUmgPortal(portalId);
     setShowUmgPortalPicker(false);
+    setUmgPreflightRequested(true);
+    if (sendingUmg) return;
+    const isReady = await refreshUmgPreflight(portalId);
+    if (!isReady) return;
     if (!job.umg_spec) {
       setSendUmgAfterProres(true);
       setShowProResModal(true);
       return;
     }
     publishToUMG(portalId);
+  };
+
+  const continueUmgPublish = () => {
+    if (!job.umg_spec) {
+      setSendUmgAfterProres(true);
+      setShowProResModal(true);
+      return;
+    }
+    publishToUMG(sendUmgPortal);
   };
 
   const handleSendToUMG = () => {
@@ -1946,7 +1991,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                         ? "Actualizar este video en un portal UMG"
                         : "Publicar este video en un portal UMG"}
                     >
-                      {umgSendStage === "preparing"
+                      {umgSendStage === "preflight"
+                        ? "Analizando corte…"
+                        : umgSendStage === "preparing"
                         ? "Preparando masters…"
                         : sendingUmg
                           ? (t("detail.sending_umg") || "Enviando…")
@@ -2303,6 +2350,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           onJobUpdate={onJobUpdate}
           onSeek={seekVideo}
           onOpenEditor={() => navigate(withReturn(`/videos/${job.job_id}/edit-lyrics`))}
+          forUmgDelivery={umgPreflightRequested || isUmgJob || isInUmgPortal}
+          focusRequest={qcFocusRequest}
+          onContinueToPublish={umgPreflightRequested ? continueUmgPublish : undefined}
         />
       )}
 
@@ -2425,9 +2475,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             // Trigger un refresh del job en el próximo tick para que
             // isUmgJob flipee a true (gracias al umg_spec recién
             // persistido) y aparezca el tab de Máster ProRes.
-            onJobUpdate?.({ ...job, umg_spec: data.umg_spec });
+            const configuredJob = { ...job, umg_spec: data.umg_spec };
+            onJobUpdate?.(configuredJob);
             if (shouldContinueToUmg) {
-              publishToUMG(sendUmgPortal);
+              refreshUmgPreflight(sendUmgPortal, true, configuredJob);
             }
           }}
         />

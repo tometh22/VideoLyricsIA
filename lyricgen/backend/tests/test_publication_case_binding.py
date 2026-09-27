@@ -67,6 +67,10 @@ def _publish(client, token, job_id, **body):
 
 def _prepare(client, token, db, job, fake_r2):
     job_id = job.job_id
+    from tests.test_deliveries import _signed_umg_qc_report
+    db.refresh(job)
+    job.delivery_qc = _signed_umg_qc_report(job, job.approved_by)
+    db.commit()
     initial = _publish(client, token, job_id)
     assert initial.status_code == 200, initial.text
     delivery_id = initial.json()["delivery_id"]
@@ -86,6 +90,9 @@ def _prepare(client, token, db, job, fake_r2):
         "_rendered_at": datetime.now(timezone.utc).isoformat(),
     }
     current.s3_keys = {ft: working_key(current.tenant_id, job_id, ft) for ft in FILENAMES}
+    db.flush()
+    db.refresh(current)
+    current.delivery_qc = _signed_umg_qc_report(current, current.approved_by)
     body = {"change_request_id": ids[0],
             "reviewed_editor_revision": current.segments_revision,
             "reviewed_render_fingerprint": render_fingerprint(current)}
