@@ -15,6 +15,10 @@ def manual_request(client, admin_token, approved_job, db, all_r2_files_present):
     job = approved_job
     job.segments_json = [{'start': 0, 'end': 3, 'text': 'Letra completa corregida a mano'}]
     job.bg_r2_key_cached = 'backgrounds/test.mp4'
+    db.flush()
+    db.refresh(job)
+    from tests.test_deliveries import _signed_umg_qc_report
+    job.delivery_qc = _signed_umg_qc_report(job, job.approved_by)
     db.commit()
     document = get_or_create_document(db, job.job_id, job.tenant_id, job.segments_json)
     db.commit()
@@ -68,6 +72,10 @@ def test_publish_confirms_finished_cut_and_resolves_only_selected_request(client
     job.previous_versions = [{'archived_at': datetime.now(timezone.utc).isoformat()}]
     job.render_params = {'_rendered_segments_revision': document.revision,
                          '_rendered_at': datetime.now(timezone.utc).isoformat()}
+    from tests.test_deliveries import _signed_umg_qc_report
+    db.flush()
+    db.refresh(job)
+    job.delivery_qc = _signed_umg_qc_report(job, job.approved_by)
     db.commit()
     body = dict(portal_id='argentina', change_request_id=cr.id,
                 reviewed_render_fingerprint=render_fingerprint(job), reviewed_editor_revision=document.revision)

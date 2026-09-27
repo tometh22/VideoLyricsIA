@@ -95,9 +95,16 @@ DATABASE_URL = os.environ.get(
     "postgresql://genly:genly@localhost:5432/genly",
 )
 
-# Handle Heroku-style postgres:// URLs
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+def _normalize_postgres_driver(url: str) -> str:
+    """Pin generic Postgres URLs to the installed psycopg2 DBAPI."""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+psycopg2://", 1)
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return url
+
+
+DATABASE_URL = _normalize_postgres_driver(DATABASE_URL)
 
 # Pool sizing is *per-process*. The formula that has to hold under
 # burst is:
@@ -202,10 +209,7 @@ def get_db():
 # get_db → prod y dev quedan byte-a-byte iguales que hoy. NO se corre
 # create_all contra este engine: la DB externa (prod) es dueña de su schema.
 DELIVERIES_DATABASE_URL = os.environ.get("DELIVERIES_DATABASE_URL", "").strip()
-if DELIVERIES_DATABASE_URL.startswith("postgres://"):
-    DELIVERIES_DATABASE_URL = DELIVERIES_DATABASE_URL.replace(
-        "postgres://", "postgresql://", 1
-    )
+DELIVERIES_DATABASE_URL = _normalize_postgres_driver(DELIVERIES_DATABASE_URL)
 
 # El added_by_user_id de deliveries es FK NOT NULL a users.id de la DB
 # destino. Un user id de staging no existe en prod → al escribir en la DB
@@ -271,8 +275,7 @@ def deliveries_added_by(default_user_id):
 # SOLO LECTURA por convención: no se corre create_all contra este engine y
 # ningún camino de escritura lo usa.
 PEER_DATABASE_URL = os.environ.get("PEER_DATABASE_URL", "").strip() or DELIVERIES_DATABASE_URL
-if PEER_DATABASE_URL.startswith("postgres://"):
-    PEER_DATABASE_URL = PEER_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+PEER_DATABASE_URL = _normalize_postgres_driver(PEER_DATABASE_URL)
 
 if (
     PEER_DATABASE_URL

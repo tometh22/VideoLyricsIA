@@ -16,8 +16,14 @@ def test_correction_variant_replaces_requested_delivery(client, admin_token, app
                 tenant_id=approved_job.tenant_id, user_id=approved_job.user_id,
                 artist=approved_job.artist, song_title=approved_job.song_title,
                 filename='variant.mp3', status='done', approved_at=datetime.now(timezone.utc), completed_at=datetime.now(timezone.utc),
-                approved_by=approved_job.approved_by, video_url='/video', short_url='/short', thumbnail_url='/thumb')
-    db.add(child); db.commit()
+                approved_by=approved_job.approved_by, video_url='/video', short_url='/short', thumbnail_url='/thumb',
+                delivery_profile='umg', umg_spec=dict(approved_job.umg_spec or {}))
+    db.add(child)
+    db.flush()
+    db.refresh(child)
+    from tests.test_deliveries import _signed_umg_qc_report
+    child.delivery_qc = _signed_umg_qc_report(child, child.approved_by)
+    db.commit()
     child_id = child.job_id
     duplicate_id = None
     try:
