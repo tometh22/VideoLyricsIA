@@ -147,6 +147,22 @@ describe("publicationStatus", () => {
     expect(status.canPublish).toBe(true);
   });
 
+  it("links a QC-blocked publication to the review checklist", () => {
+    renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true } }, {
+      crPublishNotice: {
+        requestId: 7,
+        tone: "wait",
+        text: "Falta firmar la revisión del video para este corte.",
+        actionLabel: "Completar revisión del video",
+        actionHref: "/videos/f7752c6feed4?qc_focus=manual&return_to=%2Fadmin%3Fsection%3Dcambios%26change_request_id%3D7",
+      },
+    });
+
+    expect(screen.getByText(/Falta firmar la revisión del video/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Completar revisión del video" }))
+      .toHaveAttribute("href", expect.stringContaining("qc_focus=manual"));
+  });
+
   it("does not offer publishing when the portal already has this cut", () => {
     expect(publicationStatus(BASE_PUBLICATION).canPublish).toBe(false);
   });
@@ -348,6 +364,23 @@ describe("ChangeRequestsPanel", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Publicar actualización" }));
     expect(publish).toHaveBeenCalledWith("f7752c6feed4", "chile", 7, expect.objectContaining({ needs_publish: true }));
+  });
+
+  it("links a blocked publication to the pending QC review", async () => {
+    renderPanel(
+      { publication: { ...BASE_PUBLICATION, needs_publish: true } },
+      { crPublishNotice: {
+        requestId: 7,
+        tone: "wait",
+        text: "Falta firmar la revisión del video para este corte.",
+        actionLabel: "Completar revisión del video",
+        actionHref: "/videos/f7752c6feed4?qc_focus=manual&return_to=%2Fadmin%3Fsection%3Dcambios%26change_request_id%3D7",
+      } },
+    );
+
+    expect(screen.getByText(/Falta firmar la revisión del video/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Completar revisión del video" }))
+      .toHaveAttribute("href", expect.stringContaining("qc_focus=manual"));
   });
 
   it("opens the format selector instead of attempting an impossible legacy publish", async () => {

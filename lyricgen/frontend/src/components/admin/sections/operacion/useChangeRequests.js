@@ -562,10 +562,27 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       }
       await loadChangeRequests();
     } catch (err) {
-      setCrPublishNotice({ requestId: crId, outcomeUnknown: mutationOutcomeUnknown(err), tone: mutationOutcomeUnknown(err) ? "wait" : "error",
-        text: mutationOutcomeUnknown(err)
-          ? "No pudimos confirmar el resultado de la publicación. Actualizando el estado: podría haberse publicado. Verificá la versión antes de reintentar."
-          : `El servidor no aceptó la publicación: ${err.message || err}` });
+      const gate = err?.detail?.delivery_qc;
+      if (err?.detail?.code === "delivery_qc_blocked" && jobId) {
+        const returnPath = `/admin?section=cambios&change_request_id=${encodeURIComponent(crId)}`;
+        const reviewUrl = `/videos/${encodeURIComponent(jobId)}?qc_focus=${gate?.reason === "manual_review_required" ? "manual" : "findings"}&return_to=${encodeURIComponent(returnPath)}`;
+        setCrPublishNotice({
+          requestId: crId,
+          tone: "wait",
+          text: gate?.reason === "manual_review_required"
+            ? "Falta firmar la revisión del video para este corte. Abrí los controles, completalos y después volvé a publicar."
+            : gate?.reason === "fresh_preflight_required"
+              ? "Este corte todavía no tiene un preflight vigente. Analizalo antes de publicar."
+              : "El preflight encontró puntos que requieren atención antes de publicar.",
+          actionLabel: "Completar revisión del video",
+          actionHref: reviewUrl,
+        });
+      } else {
+        setCrPublishNotice({ requestId: crId, outcomeUnknown: mutationOutcomeUnknown(err), tone: mutationOutcomeUnknown(err) ? "wait" : "error",
+          text: mutationOutcomeUnknown(err)
+            ? "No pudimos confirmar el resultado de la publicación. Actualizando el estado: podría haberse publicado. Verificá la versión antes de reintentar."
+            : `El servidor no aceptó la publicación: ${err.message || err}` });
+      }
       await loadChangeRequests({ silent: true });
     } finally {
       mutationLocksRef.current.delete(lock);
