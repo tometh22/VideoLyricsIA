@@ -738,6 +738,14 @@ function ChangeRequestCard({
           aria-label="Estado de la acción"
           className={`w-full rounded-lg p-3 text-caption ${actionNotice.tone === "error" ? "bg-red-500/10 text-red-200" : "bg-sky-500/10 text-sky-100"}`}>
           {actionNotice.text}
+          {actionNotice.actionHref && (
+            <a
+              href={actionNotice.actionHref}
+              className="mt-2 inline-flex min-h-9 items-center rounded-lg bg-white/10 px-3 py-1.5 font-semibold text-white hover:bg-white/15"
+            >
+              {actionNotice.actionLabel || "Revisar controles"}
+            </a>
+          )}
         </div>}
         <div className="min-w-0">
           <p className="text-caption font-semibold text-white">{workflow.label}</p>

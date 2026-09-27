@@ -3,6 +3,11 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.63] - 2026-09-27
+
+### Fixed
+- Route UMG publication QC blocks to the current video's review checklist and return to the same change request afterward.
+
 ## [1.1.62] - 2026-09-18
 
 ### Fixed

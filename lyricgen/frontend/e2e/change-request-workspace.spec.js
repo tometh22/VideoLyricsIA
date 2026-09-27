@@ -1,6 +1,75 @@
 import { expect, test } from "@playwright/test";
 import { createSyntheticWav, installEditorHarness } from "./editor-harness.js";
 
+test("routes a QC-blocked publish to the video checklist and back to the same UMG request", async ({ page }) => {
+  const jobId = "umg-qc-review-109";
+  await installEditorHarness(page, { jobId, role: "admin" });
+  let publishAttempts = 0;
+  await page.route("**/*", async route => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    const json = body => route.fulfill({ json: body });
+    if (path === "/service-status/summary") return json({ status: "operational", incidents: [] });
+    if (path === "/admin/stats") return json({ jobs: { pending_review: 0 } });
+    if (path === "/admin/change-requests") return json({ proposal_enabled: true,
+      pending_count: 1, resolved_count: 0, items: [{ id: 109, comment: "Corregir letra",
+        delivery: { job_id: jobId, portal_id: "chile", song: "Volarás", artist: "Illapu" },
+        publication: { revision: 1, job_status: "done", render_fingerprint: "render-2",
+          editor_revision: 12, needs_publish: true, prores_pending: [] },
+        workflow: { key: "publish", activeStep: 3, label: "Revisar video y publicar actualización",
+          detail: "El render está listo.", tone: "attention", allowed_actions: ["publish"] },
+      }] });
+    if (path === `/admin/deliveries/from-job/${jobId}` && request.method() === "POST") {
+      publishAttempts += 1;
+      return route.fulfill({ status: 409, json: { detail: {
+        code: "delivery_qc_blocked",
+        message: "Completá la revisión del video antes de preparar o enviar los masters.",
+        delivery_qc: { blocked: true, can_approve: false, reason: "manual_review_required",
+          issue_ids: ["manual-black-bars"], missing_checks: [] },
+      } } });
+    }
+    if (path === `/status/${jobId}`) return json({
+      job_id: jobId, status: "done", song_title: "Volarás", artist: "Illapu",
+      delivery_profile: "umg", is_in_umg_portal: true,
+      umg_spec: { frame_size: "HD", fps: 29.97, prores_profile: 3 },
+      files: { video_url: "/e2e/audio.wav", thumbnail_url: "/e2e/thumbnail.png" },
+      s3_keys: { video: "tenant/job/video.mp4" },
+      delivery_qc: { report_id: "qc-current", status: "COMPLETE", mode: "enforce",
+        decision: "REVIEW", approval: { blocked: true, can_approve: false,
+          reason: "manual_review_required", issue_ids: ["manual-black-bars"] },
+        issues: [{ issue_id: "manual-black-bars", code: "UMG_BLACK_BARS",
+          summary: "Sin franjas negras", description: "Confirmar 16:9 full screen sin bandas negras.",
+          status: "OPEN", severity: "FAIL", result_status: "REVIEW",
+          manual_verification_required: true, detector: "mandatory_signed_reviewer_checklist" }],
+        checks: [], check_summary: { total: 0, pass: 0, fail: 0, review: 0, not_run: 0 },
+      },
+    });
+    return route.fallback();
+  });
+
+  await page.goto("/admin?section=cambios&change_request_id=109");
+  const announcement = page.getByRole("button", { name: /Entendido|Entendí|Cancelar|Cerrar novedades/ }).first();
+  if (await announcement.isVisible()) await announcement.click();
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button", { name: "Publicar actualización", exact: true }).click();
+  await expect(page.getByRole("status", { name: "Estado de la acción" }))
+    .toContainText("Falta firmar la revisión del video");
+  await page.getByRole("link", { name: "Completar revisión del video" }).click();
+
+  await expect(page).toHaveURL(new RegExp(`/videos/${jobId}\\?qc_focus=manual&return_to=`));
+  const manualSignoff = page.getByRole("button", { name: "Firmar: Sin franjas negras" });
+  await expect(manualSignoff).toBeVisible();
+  await expect.poll(() => manualSignoff.evaluate(element => element === document.activeElement))
+    .toBe(true);
+  expect(publishAttempts).toBe(1);
+
+  await page.keyboard.press("Escape");
+  await page.locator(".job-detail-command button").first().click();
+  await expect(page).toHaveURL(/\/admin\?section=cambios&change_request_id=109$/);
+  await expect(page.getByRole("heading", { name: "Cambios UMG" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Volarás", exact: true })).toBeVisible();
+});
+
 // Browser-boundary fault regression only. This deliberately does not claim
 // real publication or database coverage; the isolated real-stack gate is separate.
 test("a response lost after publication never tells the operator it definitely did not publish", async ({ page }) => {

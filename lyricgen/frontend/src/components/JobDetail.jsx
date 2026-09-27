@@ -467,7 +467,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [sendingUmg, setSendingUmg] = useState(false);
   const [umgSendStage, setUmgSendStage] = useState(null);
   const [umgPreflightRequested, setUmgPreflightRequested] = useState(false);
-  const [qcFocusRequest, setQcFocusRequest] = useState(0);
+  const [qcFocusRequest, setQcFocusRequest] = useState(() => (
+    new URLSearchParams(location.search).has("qc_focus") ? 1 : 0
+  ));
   const [sendUmgAfterProres, setSendUmgAfterProres] = useState(false);
   const [umgPortals, setUmgPortals] = useState(() => getUmgPortals(job));
   const [showUmgPortalPicker, setShowUmgPortalPicker] = useState(false);
