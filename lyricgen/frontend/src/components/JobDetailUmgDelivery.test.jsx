@@ -184,7 +184,7 @@ describe("JobDetail UMG delivery recovery", () => {
 
   it("runs and shows QC before configuring or preparing ProRes on the first UMG send", async () => {
     const pendingReport = {
-      status: "COMPLETE", mode: "enforce", decision: "REVIEW",
+      report_id: "qc-current", status: "COMPLETE", mode: "enforce", decision: "REVIEW",
       source_fingerprint: "source-current", visual_fingerprint: "visual-current",
       delivery_spec: {}, approval: { blocked: true, reason: "manual_review_required" },
       issues: [{
@@ -206,6 +206,13 @@ describe("JobDetail UMG delivery recovery", () => {
       if (url.includes("/delivery-qc/recheck")) {
         return response(200, { ok: true, delivery_qc: pendingReport });
       }
+      if (url.includes("/delivery-qc/review-attestation")) {
+        return response(200, { ok: true, delivery_qc: {
+          ...pendingReport, report_id: "qc-reviewed",
+          approval: { blocked: false, can_approve: true },
+          issues: pendingReport.issues.map(issue => ({ ...issue, status: "RESOLVED_MANUAL" })),
+        } });
+      }
       if (url.includes("/status/")) return response(200, { ...job, delivery_qc: pendingReport });
       throw new Error(`Unexpected fetch: ${url}`);
     });
@@ -224,7 +231,16 @@ describe("JobDetail UMG delivery recovery", () => {
     expect(await screen.findByText("Preflight de entrega")).toBeInTheDocument();
     expect(screen.getByText("Revisar franjas negras")).toBeInTheDocument();
     expect(fetchMock.mock.calls.some(([url]) => url.includes("/enable-prores/"))).toBe(false);
-    expect(screen.getByRole("button", { name: "Firmar: Revisar franjas negras" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Firmar/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Confirmar revisión del video" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar revisión del video" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/delivery-qc/review-attestation"),
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ confirmed: true, expected_report_id: "qc-current" }) }),
+    ));
+    expect(screen.getByRole("button", { name: "Continuar a publicar" })).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => url.includes("/enable-prores/"))).toBe(false);
   });
 
   it("publishes an already prepared job to Chile", async () => {

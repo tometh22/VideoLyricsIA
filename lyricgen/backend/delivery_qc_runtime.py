@@ -262,14 +262,23 @@ def _build_check_results(
             status, reason = "NOT_RUN", "No hubo texto de title card para comparar."
         elif check_id == "metadata_artist" and not matched and not rendered.get("rendered_artist"):
             status, reason = "NOT_RUN", "No hubo texto de artista para comparar."
+        elif check_id == "metadata_version" and not matched and not spec.get("version"):
+            status, reason = "NOT_APPLICABLE", "La especificación de entrega no exige una versión visible."
         elif check_id == "metadata_version" and not matched and not rendered.get("rendered_version"):
-            status, reason = "NOT_RUN", "El render no informa una versión visible para comparar."
+            status, reason = "NOT_RUN", "La especificación exige versión, pero no hay evidencia visible para compararla."
         elif check_id in {"ocr_title", "ocr_lyrics"}:
             kinds = {"title"} if check_id == "ocr_title" else {"lyric"}
-            has_kind = any(str(row.get("kind")) in kinds for row in ocr_observations)
-            if not has_kind and not matched:
+            qualified = []
+            for row in ocr_observations:
+                try:
+                    confidence = float(row.get("confidence") or 0)
+                except (TypeError, ValueError):
+                    confidence = 0
+                if str(row.get("kind")) in kinds and str(row.get("text") or "").strip() and confidence >= .92:
+                    qualified.append(row)
+            if not qualified and not matched:
                 status = "NOT_RUN"
-                reason = (ocr_abstentions[0].get("reason") if ocr_abstentions else "Sin observación OCR aplicable")
+                reason = (ocr_abstentions[0].get("reason") if ocr_abstentions else "OCR sin texto legible con confianza suficiente")
         elif check_id == "lyrics_quality" and not quality_verdict and not matched:
             # Deterministic timeline/text checks still ran, but the upstream
             # quality verdict itself was not supplied by the transcription
@@ -333,7 +342,7 @@ def refresh_check_results(report: Mapping[str, Any]) -> dict[str, Any]:
         "total": len(checks),
         **{
             status.lower(): sum(item.get("status") == status for item in checks)
-            for status in ("PASS", "FAIL", "REVIEW", "NOT_RUN")
+            for status in ("PASS", "FAIL", "REVIEW", "NOT_RUN", "NOT_APPLICABLE")
         },
     }
     row["check_summary"] = check_summary
@@ -472,12 +481,15 @@ def build_runtime_report(
     except (TypeError, ValueError):
         pass
     spec = dict(job.umg_spec or {}) if isinstance(job.umg_spec, Mapping) else {}
+    umg_ocr_enabled = None
+    if is_umg_delivery_job(job):
+        umg_ocr_enabled = os.environ.get("DELIVERY_QC_UMG_OCR_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
     media = inspect_delivery_media(video_path, expected_duration=duration, expected={
         key: spec.get(key) for key in ("width", "height", "fps", "codec", "pix_fmt") if spec.get(key) is not None
     })
     ocr = inspect_rendered_text(
         video_path, metadata={"artist": job.artist, "title": job.song_title},
-        segments=segments, ocr_callback=ocr_callback,
+        segments=segments, ocr_callback=ocr_callback, enabled=umg_ocr_enabled,
     )
     ocr_observations = ocr.get("observations") or []
     title_ocr = select_identity_observation(
@@ -486,6 +498,14 @@ def build_runtime_report(
     artist_ocr = select_identity_observation(
         ocr_observations, metadata={"title": job.song_title, "artist": job.artist}, field="artist",
     )
+    def trusted_ocr_text(observation):
+        if not isinstance(observation, Mapping) or not str(observation.get("text") or "").strip():
+            return None
+        try:
+            confidence = float(observation.get("confidence") or 0)
+        except (TypeError, ValueError):
+            return None
+        return str(observation["text"]).strip() if confidence >= .92 else None
     fps = float((media.get("probe") or {}).get("video", {}).get("fps") or spec.get("fps") or 30)
     base = build_delivery_preflight(
         metadata={"artist": job.artist, "title": job.song_title},
@@ -559,13 +579,16 @@ def build_runtime_report(
         issues=issues, media=media, ocr=ocr, quality=quality, spec=spec,
         # OCR is pixel evidence, not a deterministic render manifest. The OCR
         # checks above remain visible; absent manifest metadata is NOT_RUN.
-        rendered={},
+        rendered={
+            "rendered_title": trusted_ocr_text(title_ocr),
+            "rendered_artist": trusted_ocr_text(artist_ocr),
+        },
     )
     check_summary = {
         "total": len(checks),
         **{
             status.lower(): sum(row.get("status") == status for row in checks)
-            for status in ("PASS", "FAIL", "REVIEW", "NOT_RUN")
+            for status in ("PASS", "FAIL", "REVIEW", "NOT_RUN", "NOT_APPLICABLE")
         },
     }
     open_rows = [row for row in issues if row.get("status") == "OPEN"]

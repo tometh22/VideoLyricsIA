@@ -5,6 +5,7 @@ test("routes a QC-blocked publish to the video checklist and back to the same UM
   const jobId = "umg-qc-review-109";
   await installEditorHarness(page, { jobId, role: "admin" });
   let publishAttempts = 0;
+  let attestationRequests = 0;
   await page.route("**/*", async route => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
@@ -44,6 +45,18 @@ test("routes a QC-blocked publish to the video checklist and back to the same UM
         checks: [], check_summary: { total: 0, pass: 0, fail: 0, review: 0, not_run: 0 },
       },
     });
+    if (path === `/jobs/${jobId}/delivery-qc/review-attestation` && request.method() === "POST") {
+      attestationRequests += 1;
+      return json({ ok: true, delivery_qc: {
+        report_id: "qc-attested", status: "COMPLETE", mode: "enforce",
+        approval: { blocked: false, can_approve: true, reason: "all_findings_resolved" },
+        issues: [{ issue_id: "manual-black-bars", code: "UMG_BLACK_BARS",
+          summary: "Sin franjas negras", status: "RESOLVED_MANUAL", severity: "FAIL",
+          result_status: "REVIEW", manual_verification_required: true,
+          operator_decision: { decision: "resolved_manual", reviewer_name: "QA operator" } }],
+        checks: [], check_summary: { total: 0, pass: 0, fail: 0, review: 0, not_run: 0 },
+      } });
+    }
     return route.fallback();
   });
 
@@ -57,14 +70,17 @@ test("routes a QC-blocked publish to the video checklist and back to the same UM
   await page.getByRole("link", { name: "Completar revisión del video" }).click();
 
   await expect(page).toHaveURL(new RegExp(`/videos/${jobId}\\?qc_focus=manual&return_to=`));
-  const manualSignoff = page.getByRole("button", { name: "Firmar: Sin franjas negras" });
-  await expect(manualSignoff).toBeVisible();
-  await expect.poll(() => manualSignoff.evaluate(element => element === document.activeElement))
-    .toBe(true);
-  expect(publishAttempts).toBe(1);
-
+  await expect(page.getByTestId("delivery-qc-human-review")).toContainText("Sin franjas negras");
+  await expect(page.getByRole("button", { name: /Firmar/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Confirmar revisión del video" })).toBeDisabled();
   await page.keyboard.press("Escape");
-  await page.locator(".job-detail-command button").first().click();
+  await page.getByRole("checkbox", { name: /Revisé el corte actual completo/ }).check();
+  await page.getByRole("button", { name: "Confirmar revisión del video" }).click();
+  await expect.poll(() => attestationRequests).toBe(1);
+  await expect(page.getByText("Revisión guardada para este render.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Volver al pedido para publicar" })).toBeVisible();
+  expect(publishAttempts).toBe(1);
+  await page.getByRole("button", { name: "Volver al pedido para publicar" }).click();
   await expect(page).toHaveURL(/\/admin\?section=cambios&change_request_id=109$/);
   await expect(page.getByRole("heading", { name: "Cambios UMG" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Volarás", exact: true })).toBeVisible();

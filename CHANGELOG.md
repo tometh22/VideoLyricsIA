@@ -3,6 +3,11 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.64] - 2026-09-27
+
+### Fixed
+- Replace eight individual UMG checklist signatures with one audited review of the exact current render; explain publication blockers and distinguish unverified OCR from a pass.
+
 ## [1.1.63] - 2026-09-27
 
 ### Fixed

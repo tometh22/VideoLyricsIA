@@ -109,6 +109,92 @@ def test_runtime_uses_visible_value_when_ocr_swaps_identity_kinds(tmp_path, monk
         row["code"] in {"METADATA_TITLE_MISMATCH", "METADATA_ARTIST_MISMATCH"}
         for row in report["issues"]
     )
+    checks = {row["check_id"]: row for row in report["checks"]}
+    assert checks["metadata_title"]["status"] == "PASS"
+    assert checks["metadata_artist"]["status"] == "PASS"
+
+
+@pytest.mark.parametrize("observation", [
+    {"kind": "title", "seconds": 1.0, "text": "", "confidence": .99},
+    {"kind": "title", "seconds": 1.0, "text": "Maybe title", "confidence": .61},
+])
+def test_empty_or_low_confidence_ocr_is_not_presented_as_pass(tmp_path, monkeypatch, observation):
+    asset = tmp_path / "video.mp4"
+    asset.write_bytes(b"encoded")
+    monkeypatch.setenv("DELIVERY_QC_MODE", "observe")
+    monkeypatch.setattr(
+        "delivery_qc_runtime.inspect_delivery_media",
+        lambda *_args, **_kwargs: {
+            "probe": {"duration": 2.0, "video": {"fps": 30}, "audio_streams": 1},
+            "issues": [], "abstentions": [],
+        },
+    )
+    monkeypatch.setattr(
+        "delivery_qc_runtime.inspect_rendered_text",
+        lambda *_args, **_kwargs: {"observations": [observation], "issues": [], "abstentions": []},
+    )
+    job = SimpleNamespace(
+        artist="Artist", song_title="Title", filename="song.wav", umg_spec={},
+        segments_revision=1, edit_count=0, transcription_quality={},
+    )
+    report = build_runtime_report(job=job, video_path=str(asset), segments=[])
+    checks = {row["check_id"]: row for row in report["checks"]}
+    assert checks["ocr_title"]["status"] == "NOT_RUN"
+    assert checks["metadata_title"]["status"] == "NOT_RUN"
+    assert "confianza" in checks["ocr_title"]["reason"]
+
+
+def test_delivery_version_is_not_applicable_when_spec_does_not_require_one(tmp_path, monkeypatch):
+    asset = tmp_path / "video.mp4"
+    asset.write_bytes(b"encoded")
+    monkeypatch.setenv("DELIVERY_QC_MODE", "observe")
+    monkeypatch.setattr(
+        "delivery_qc_runtime.inspect_delivery_media",
+        lambda *_args, **_kwargs: {
+            "probe": {"duration": 2.0, "video": {"fps": 30}, "audio_streams": 1},
+            "issues": [], "abstentions": [],
+        },
+    )
+    monkeypatch.setattr(
+        "delivery_qc_runtime.inspect_rendered_text",
+        lambda *_args, **_kwargs: {"observations": [], "issues": [], "abstentions": [{"reason": "disabled"}]},
+    )
+    job = SimpleNamespace(
+        artist="Artist", song_title="Title", filename="song.wav", umg_spec={"width": 1920},
+        segments_revision=1, edit_count=0, transcription_quality={},
+    )
+    report = build_runtime_report(job=job, video_path=str(asset), segments=[])
+    check = next(row for row in report["checks"] if row["check_id"] == "metadata_version")
+    assert check["status"] == "NOT_APPLICABLE"
+    assert "no exige" in check["reason"]
+
+
+def test_umg_preflight_enables_ocr_by_default_and_can_be_disabled(tmp_path, monkeypatch):
+    asset = tmp_path / "video.mp4"
+    asset.write_bytes(b"encoded")
+    monkeypatch.delenv("DELIVERY_QC_UMG_OCR_ENABLED", raising=False)
+    monkeypatch.setattr(
+        "delivery_qc_runtime.inspect_delivery_media",
+        lambda *_args, **_kwargs: {
+            "probe": {"duration": 2.0, "video": {"fps": 30}, "audio_streams": 1},
+            "issues": [], "abstentions": [],
+        },
+    )
+    enabled_values = []
+    monkeypatch.setattr(
+        "delivery_qc_runtime.inspect_rendered_text",
+        lambda *_args, **kwargs: enabled_values.append(kwargs["enabled"]) or {
+            "observations": [], "issues": [], "abstentions": [{"reason": "disabled"}],
+        },
+    )
+    job = SimpleNamespace(
+        delivery_profile="umg", artist="Artist", song_title="Title", filename="song.wav",
+        umg_spec={}, segments_revision=1, edit_count=0, transcription_quality={},
+    )
+    build_runtime_report(job=job, video_path=str(asset), segments=[])
+    monkeypatch.setenv("DELIVERY_QC_UMG_OCR_ENABLED", "0")
+    build_runtime_report(job=job, video_path=str(asset), segments=[])
+    assert enabled_values == [True, False]
 
 
 def test_enforce_blocks_open_findings_but_observe_never_blocks():
@@ -320,7 +406,10 @@ def test_refresh_check_results_marks_signed_manual_check_as_passed():
     refreshed = refresh_check_results(report)
     assert refreshed["checks"][0]["status"] == "PASS"
     assert refreshed["checks"][0]["blocking"] is False
-    assert refreshed["check_summary"] == {"total": 1, "pass": 1, "fail": 0, "review": 0, "not_run": 0}
+    assert refreshed["check_summary"] == {
+        "total": 1, "pass": 1, "fail": 0, "review": 0,
+        "not_run": 0, "not_applicable": 0,
+    }
     assert refreshed["decision"] == "PASS"
 
 

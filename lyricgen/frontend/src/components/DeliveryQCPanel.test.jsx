@@ -41,6 +41,7 @@ describe("DeliveryQCPanel", () => {
         ...job.delivery_qc,
         checks: [
           { check_id: "media_container", label: "Archivo de video válido", status: "PASS" },
+          { check_id: "timing_review", label: "Calidad del timing", status: "REVIEW" },
           { check_id: "umg_black_bars", label: "Sin franjas negras", status: "REVIEW" },
           { check_id: "ocr_title", label: "Texto visible del title card", status: "NOT_RUN" },
           { check_id: "umg_title_metadata", label: "Título coincide con metadata", status: "REVIEW", detector: "mandatory_signed_reviewer_checklist" },
@@ -50,10 +51,11 @@ describe("DeliveryQCPanel", () => {
     };
     render(<DeliveryQCPanel job={checkedJob} onSeek={vi.fn()} onJobUpdate={vi.fn()} onOpenEditor={vi.fn()} />);
     expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("Archivo de video válido");
+    expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("Calidad del timing");
     expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("Pasó");
     expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("Revisión");
-    expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("No ejecutado");
-    expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("Título coincide con metadata");
+    expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("No verificado");
+    expect(screen.getByTestId("delivery-qc-checks")).not.toHaveTextContent("Título coincide con metadata");
   });
 
   it("mantiene la revisión informativa y deja editar aunque un reporte legacy diga BLOCK", () => {
@@ -75,7 +77,7 @@ describe("DeliveryQCPanel", () => {
       mode: "enforce", decision: "BLOCK", approval: { blocked: true },
       checks: [{ check_id: "metadata_title", label: "Título detectado", status: "FAIL", issue_ids: ["swap"] }],
       issues: [{ issue_id: "swap", status: "OPEN", severity: "FAIL", actual: "Artista", expected: "Título", summary: "Título no coincide" }],
-    } }} />);
+    } }} forUmgDelivery />);
     expect(screen.getByText("Bloqueado")).toBeInTheDocument();
     expect(screen.getByText("Título no coincide")).toBeInTheDocument();
     expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("Falló");
@@ -91,26 +93,40 @@ describe("DeliveryQCPanel", () => {
     expect(screen.getByRole("button", { name: "Corregir video" })).toBeInTheDocument();
   });
 
-  it("focuses the first manual signoff after publication is blocked", async () => {
+  it("offers one full-video attestation instead of individual manual signatures", async () => {
     const pendingJob = { ...job, delivery_qc: {
-      ...job.delivery_qc, issues: [
+      ...job.delivery_qc, report_id: "report-A", approval: { blocked: true, reason: "manual_review_required" }, issues: [
         { issue_id: "manual-1", status: "OPEN", manual_verification_required: true, summary: "Revisar encuadre" },
         { issue_id: "manual-2", status: "OPEN", manual_verification_required: true, summary: "Revisar sincronía" },
       ],
     } };
-    render(<DeliveryQCPanel job={pendingJob} focusRequest={1} onJobUpdate={vi.fn()} />);
-    await waitFor(() => expect(screen.getByRole("button", { name: "Firmar: Revisar encuadre" })).toHaveFocus());
+    const onJobUpdate = vi.fn();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ delivery_qc: { ...pendingJob.delivery_qc, approval: { blocked: false, can_approve: true } } }) }));
+    render(<DeliveryQCPanel job={pendingJob} forUmgDelivery onJobUpdate={onJobUpdate} />);
+    expect(screen.getByTestId("delivery-qc-human-review")).toHaveTextContent("Revisé el corte actual completo");
+    expect(screen.getByTestId("delivery-qc-human-review")).toHaveTextContent("Revisar encuadre");
+    expect(screen.getByTestId("delivery-qc-human-review")).toHaveTextContent("Revisar sincronía");
+    expect(screen.queryByRole("button", { name: /Firmar/ })).not.toBeInTheDocument();
+    const confirm = screen.getByRole("button", { name: "Confirmar revisión del video" });
+    expect(confirm).toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(confirm);
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining("/delivery-qc/review-attestation"),
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ confirmed: true, expected_report_id: "report-A" }) }),
+    ));
+    expect(onJobUpdate).toHaveBeenCalled();
   });
 
-  it("keeps different checks with the same label and required human issues visible", () => {
+  it("groups generic manual reminders separately from automatic checks", () => {
     render(<DeliveryQCPanel job={{ ...job, delivery_qc: {
       decision: "BLOCK", mode: "observe", approval: { blocked: true },
       checks: [{ check_id: "a", label: "Título", status: "PASS" },
-        { check_id: "b", label: "Título", status: "REVIEW", detector: "mandatory_signed_reviewer_checklist" }],
-      issues: [{ issue_id: "human", status: "OPEN", detector: "mandatory_signed_reviewer_checklist", summary: "Confirmar título", manual_verification_required: true }],
-    } }} />);
-    expect(screen.getAllByText("Título")).toHaveLength(2);
-    expect(screen.getByText("Confirmar título")).toBeInTheDocument();
+        { check_id: "umg_black_bars", label: "Sin franjas negras", status: "REVIEW" }],
+      issues: [{ issue_id: "human", code: "UMG_BLACK_BARS", status: "OPEN", severity: "FAIL", summary: "Confirmar franjas negras" }],
+    } }} forUmgDelivery />);
+    expect(screen.getByTestId("delivery-qc-checks").querySelectorAll(".grid > div")).toHaveLength(1);
+    expect(screen.getByTestId("delivery-qc-human-review")).toHaveTextContent("Confirmar franjas negras");
     expect(screen.getByText("Bloqueado")).toBeInTheDocument();
     expect(screen.queryByText(/Este informe es informativo/)).not.toBeInTheDocument();
   });
@@ -119,6 +135,16 @@ describe("DeliveryQCPanel", () => {
     render(<DeliveryQCPanel job={{ ...job, delivery_qc: { checks: [], issues: [] } }} />);
     expect(screen.getByText("Verificación pendiente")).toBeInTheDocument();
     expect(screen.queryByText("Sin hallazgos")).not.toBeInTheDocument();
+  });
+
+  it("uses plain-language labels for unknown and non-applicable checks", () => {
+    render(<DeliveryQCPanel job={{ ...job, delivery_qc: { ...job.delivery_qc, checks: [
+      { check_id: "version", label: "Versión", status: "NOT_APPLICABLE" },
+      { check_id: "ocr", label: "Texto visible", status: "NOT_RUN", reason: "OCR sin confianza suficiente" },
+    ] } }} />);
+    expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("No aplica");
+    expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("No verificado");
+    expect(screen.getByTestId("delivery-qc-checks")).toHaveTextContent("OCR sin confianza suficiente");
   });
 
   it("permite actualizar un reporte desactualizado desde el video renderizado", async () => {

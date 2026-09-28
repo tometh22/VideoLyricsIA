@@ -12511,6 +12511,11 @@ class DeliveryQCIssueDecisionRequest(BaseModel):
     expected_report_id: str | None = Field(default=None, max_length=160)
 
 
+class DeliveryQCReviewAttestationRequest(BaseModel):
+    confirmed: bool
+    expected_report_id: str = Field(min_length=1, max_length=160)
+
+
 class DeliveryQCRecheckRequest(BaseModel):
     for_umg_delivery: bool = False
 
@@ -13053,6 +13058,92 @@ def decide_delivery_qc_issue(
     db.add(AuditLog(
         user_id=current_user["id"], action="delivery_qc.issue_decision",
         detail={"job_id": job_id, "issue_id": issue_id, "decision": body.decision},
+    ))
+    db.commit()
+    return {"ok": True, "delivery_qc": report}
+
+
+@app.post("/jobs/{job_id}/delivery-qc/review-attestation")
+def attest_delivery_qc_review(
+    job_id: str,
+    body: DeliveryQCReviewAttestationRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Record one explicit full-video review for the exact current render."""
+    if not body.confirmed:
+        raise HTTPException(status_code=422, detail="review_attestation_confirmation_required")
+    query = db.query(Job).filter(Job.job_id == job_id)
+    if current_user.get("role") != "admin":
+        query = query.filter(Job.tenant_id == current_user["tenant_id"])
+    job = query.with_for_update().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    report = dict(job.delivery_qc or {})
+    if report.get("status") != "COMPLETE":
+        raise HTTPException(status_code=409, detail="delivery_qc_report_stale")
+    from delivery_qc_runtime import (
+        LEGACY_MANUAL_CHECK_CODES, MANDATORY_REVIEW_CHECKS,
+        _issue_result_status, delivery_readiness_gate, qc_input_fingerprint,
+        refresh_check_results,
+    )
+    if report.get("job_input_fingerprint") != qc_input_fingerprint(job):
+        raise HTTPException(status_code=409, detail="delivery_qc_report_stale")
+    _validate_qc_report_preview(report, body.expected_report_id)
+
+    issues = [dict(row) for row in report.get("issues") or []]
+    manual = [row for row in issues if row.get("manual_verification_required")
+              or str(row.get("code") or "") in LEGACY_MANUAL_CHECK_CODES]
+    present_codes = {str(row.get("code") or "") for row in manual}
+    required_codes = {code for code, _label, _description in MANDATORY_REVIEW_CHECKS}
+    if not required_codes.issubset(present_codes):
+        raise HTTPException(status_code=409, detail={
+            "code": "review_checklist_incomplete",
+            "message": "El informe no contiene la lista completa de revisión. Actualizá el preflight.",
+        })
+    if any(_issue_result_status(row) == "FAIL" and row.get("blocking", True)
+           for row in issues if row.get("status") == "OPEN"):
+        raise HTTPException(status_code=422, detail="blocking_fail_requires_correction_and_new_preflight")
+    pending = [row for row in manual if row.get("status") != "RESOLVED_MANUAL"]
+    if not pending:
+        raise HTTPException(status_code=409, detail="review_attestation_already_complete")
+
+    now = datetime.now(timezone.utc).isoformat()
+    reviewer_name = str(
+        current_user.get("full_name") or current_user.get("username")
+        or current_user.get("email") or f"user-{current_user['id']}"
+    )[:160]
+    resolved_codes = []
+    for row in issues:
+        if row in pending:
+            row["status"] = "RESOLVED_MANUAL"
+            row["operator_decision"] = {
+                "decision": "resolved_manual", "reason": "full_video_review_attested",
+                "user_id": current_user["id"], "reviewer_name": reviewer_name,
+                "decided_at": now,
+            }
+            resolved_codes.append(str(row.get("code") or "unknown"))
+    report["issues"] = issues
+    open_rows = [row for row in issues if row.get("status") == "OPEN"]
+    report["summary"] = {
+        **dict(report.get("summary") or {}), "open_count": len(open_rows),
+        "fail_count": sum(_issue_result_status(row) == "FAIL" for row in open_rows),
+        "warn_count": sum(_issue_result_status(row) == "REVIEW" for row in open_rows),
+    }
+    report = refresh_check_results(report)
+    report["approval"] = delivery_readiness_gate(job, report)
+    from uuid import uuid4
+    report["report_id"] = uuid4().hex
+    job.delivery_qc = report
+    db.add(ProductEvent(
+        tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job_id,
+        name="delivery_qc_review_attestation",
+        properties={"issue_count": len(resolved_codes), "check_codes": sorted(resolved_codes)},
+    ))
+    db.add(AuditLog(
+        user_id=current_user["id"], action="delivery_qc.review_attestation",
+        detail={"job_id": job_id, "issue_count": len(resolved_codes),
+                "report_id": body.expected_report_id},
     ))
     db.commit()
     return {"ok": True, "delivery_qc": report}
