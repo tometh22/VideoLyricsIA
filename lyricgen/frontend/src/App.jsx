@@ -6147,6 +6147,37 @@ export default function App() {
             {campaignCreativeSave.error ? <span className="text-red-300">Ajustes sin guardar: {campaignCreativeSave.error} <button className="underline" onClick={() => campaignCreativeSave.save().catch(() => {})}>Reintentar guardado</button></span>
               : campaignCreativeSave.status === "saved" ? "Ajustes de campaña guardados" : "Guardando ajustes de esta canción…"}
           </div>}
+          {currentReview.transcriptionQuality?.auto_repair?.status === "applied" && (
+            <section
+              role="status"
+              aria-live="polite"
+              className="mb-3 rounded-xl bg-emerald-400/[0.08] px-4 py-3 ring-1 ring-emerald-300/25"
+              data-testid="auto-repair-summary"
+            >
+              <p className="text-sm font-semibold text-emerald-100">
+                {t("editor.auto_repair_done") === "editor.auto_repair_done"
+                  ? "Aplicamos mejoras automáticas antes de abrir el editor."
+                  : t("editor.auto_repair_done")}
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-emerald-100/75">
+                {t("editor.auto_repair_detail") === "editor.auto_repair_detail"
+                  ? "Ya podés seguir con la canción; revisá los cambios en el editor si querés."
+                  : t("editor.auto_repair_detail")}
+              </p>
+              <p className="mt-1 text-xs text-emerald-100/60">
+                {["timing_reversible", "content_reversible"].map((action) => {
+                  const count = Number(
+                    currentReview.transcriptionQuality.auto_repair.applied_actions?.[action] || 0,
+                  );
+                  if (!count) return null;
+                  const label = action === "timing_reversible"
+                    ? (count === 1 ? "ajuste de timing" : "ajustes de timing")
+                    : (count === 1 ? "corrección de letra" : "correcciones de letra");
+                  return `${count} ${label}`;
+                }).filter(Boolean).join(" · ")}
+              </p>
+            </section>
+          )}
           <Suspense fallback={<EditorSuspenseFallback />}>
           <LyricsEditor
             // 2026-07-16: cuando el wizard pasa un slot (bajo el video), el
