@@ -75,18 +75,21 @@ def test_queue_has_changed_windows_and_controls_without_lyric_text():
     assert "texto escuchado" not in serialized
 
 
-def test_stale_audio_and_unverified_occurrence_are_excluded():
+def test_stale_audio_is_excluded_and_unverified_occurrence_is_diagnostic_only():
     stale = _record()
     stale["audio_sha256"] = "b" * 64
     unbound = _record(job_id="job00000002", audio_hash="c" * 64)
     unbound["edited_segments"][1]["id"] = "other"
     unbound["edited_version"]["segments"] = unbound["edited_segments"]
     result = build_triage([stale, unbound], secret=SECRET)
-    assert result["queue"] == []
     assert result["summary"]["jobs_excluded"] == {
         "audio_snapshot_unverified": 1,
-        "structure_or_occurrence_unverified": 1,
     }
+    assert result["summary"]["jobs_eligible"] == 1
+    assert len(result["queue"]) == len(unbound["edited_segments"])
+    assert all(row["task_type"] == "structure_diagnosis" for row in result["queue"])
+    assert all(row["occurrence_binding"] == "unpaired_edited" for row in result["queue"])
+    assert all(row["automatic_apply_allowed"] is False for row in result["queue"])
 
 
 def test_superseded_operator_revision_cannot_seed_review_queue():
