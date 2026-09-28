@@ -817,10 +817,28 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
             and initial.get("decision") != "pass" and windows and is_enabled()
         ):
             auto_trace["attempted"] = bool(auto_content_enabled)
-            candidate_result, retry_stats = await asyncio.to_thread(
-                reprocess, r, audio_path, windows,
-                language=language, job_id=job_id,
-            )
+            try:
+                candidate_result, retry_stats = await asyncio.to_thread(
+                    reprocess, r, audio_path, windows,
+                    language=language, job_id=job_id,
+                )
+            except Exception as exc:
+                # Content auto-repair may invoke an optional provider even
+                # when inline quality retry is disabled. A provider outage in
+                # that advisory path must abstain and retain the original
+                # quality verdict; only a required inline retry failure is a
+                # quality-gate failure.
+                if inline_retry_enabled or not auto_content_enabled:
+                    raise
+                candidate_result = None
+                retry_stats = {
+                    "attempted": True,
+                    "failed": False,
+                    "declined": ["optional_auto_repair_unavailable"],
+                    "failure_code": type(exc).__name__,
+                }
+                auto_trace["status"] = "candidate_generation_failed"
+                auto_trace["abstained_count"] += len(windows)
             if POLICY_VERSION == "lyrics-quality-v6":
                 changed = (
                     isinstance(candidate_result, dict)
@@ -921,7 +939,10 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
                     else:
                         auto_trace["status"] = "candidate_not_improved"
                         auto_trace["abstained_count"] += candidate_count
-                elif auto_policy["status"] == "authorized":
+                elif (
+                    auto_policy["status"] == "authorized"
+                    and auto_trace["status"] != "candidate_generation_failed"
+                ):
                     auto_trace["status"] = "no_safe_candidate"
     except Exception as exc:
         logger.warning(

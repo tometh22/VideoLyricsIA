@@ -140,8 +140,14 @@ def candidate_has_independent_evidence(candidate: Any, action: str) -> bool:
             families = evidence.get("source_families")
     if not isinstance(families, (list, tuple, set)):
         return False
+    # A provider can expose several names or views for the same underlying
+    # model (for example WhisperX and openai_whisper). Do not let those aliases
+    # satisfy the independence gate. Keep the same family rules used by the
+    # signed consensus-review calibration contract.
+    from consensus_review_certificate import canonical_source_family
+
     distinct = {
-        str(value).strip().lower() for value in families
+        canonical_source_family(value) for value in families
         if isinstance(value, str) and value.strip()
     }
     # Varying stems/mixes, slowed views, or multiple calls to the same model

@@ -3,6 +3,21 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.69] - 2026-09-28
+
+### Fixed
+
+- Treat aliases of one recognition provider as one evidence family for lyric
+  auto-repair. Optional candidate-provider errors now abstain without changing
+  the original transcription verdict.
+
+### Added
+
+- Add a private, read-only Agus calibration queue with audio/checkpoint
+  verification, blind clip review, controls and separate diagnostic handling
+  for inserted or deleted lines. Operator edits remain hints, never gold labels
+  or permission for automatic changes.
+
 ## [1.1.68] - 2026-09-28
 
 ### Fixed

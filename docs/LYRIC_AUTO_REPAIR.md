@@ -7,6 +7,12 @@ acción autorizada y una reevaluación de calidad que mejora el resultado. Si
 cualquier filtro falla, conserva la versión original y registra solo el motivo
 acotado y el conteo en `transcription_quality.auto_repair`.
 
+La independencia se evalúa por familia canónica del modelo: nombres alternativos,
+variantes de interfaz y vistas del mismo proveedor no cuentan como dos fuentes.
+Si falla el proveedor usado solo para proponer una reparación, el motor se
+abstiene y conserva la evaluación y los segmentos originales; el fallo de esa
+propuesta no se registra como fallo de la evaluación de calidad.
+
 ## Acciones que admite la primera versión
 
 - `timing_reversible`: mover límites o tiempos de palabras sin alterar la
@@ -36,8 +42,8 @@ firmada y los switches por acción:
 - `LYRIC_AUTO_REPAIR_AUTHORIZATION_SHA256=<sha256 del archivo exacto>`
 - `LYRIC_AUTO_REPAIR_PUBLIC_KEYS={"key-id":"<clave pública Ed25519 base64>"}`
 
-No se debe generar ni habilitar una autorización con las ocho canciones
-revisadas hoy: esas ediciones sirven como casos de reproducción, no como
+No se debe generar ni habilitar una autorización con las revisiones operativas
+de Agus: esas ediciones sirven como casos de reproducción, no como
 verdad de referencia independiente. La autorización debe cubrir corpus
 etiquetado a ciegas, negativos que el motor dejó intactos, cero errores
 catastróficos y al menos 539 acciones revisadas por acción con límite inferior
