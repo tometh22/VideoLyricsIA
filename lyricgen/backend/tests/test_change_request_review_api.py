@@ -30,6 +30,21 @@ def manual_request(client, admin_token, approved_job, db, all_r2_files_present):
     return job, document, cr
 
 
+def test_change_request_list_can_reconcile_one_exact_request(client, admin_token, manual_request, db):
+    _, _, request = manual_request
+    sibling = DeliveryChangeRequest(delivery_id=request.delivery_id, comment='Otro pedido')
+    db.add(sibling)
+    db.commit()
+
+    response = client.get(
+        f'/admin/change-requests?status=all&change_request_id={request.id}&limit=1',
+        headers=auth(admin_token),
+    )
+
+    assert response.status_code == 200, response.text
+    assert [item['id'] for item in response.json()['items']] == [request.id]
+
+
 def test_manual_review_render_uses_exact_saved_revision_and_deduplicates(client, admin_token, manual_request, db):
     job, document, cr = manual_request
     review = client.get(f'/admin/change-requests/{cr.id}/review', headers=auth(admin_token)).json()

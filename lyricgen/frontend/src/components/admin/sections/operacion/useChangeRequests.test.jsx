@@ -221,9 +221,45 @@ it.each([undefined, 502])("reports uncertain publication after lost response/sta
   const { result } = renderHook(() => useChangeRequests());
   await act(() => result.current.publishDeliveryUpdate("job-85", "chile", 85, { editor_revision: 4, render_fingerprint: "render4" }));
   expect(result.current.crPublishNotice).toMatchObject({ requestId: 85, tone: "wait" });
-  expect(result.current.crPublishNotice.text).toContain("podría haberse publicado");
+  expect(result.current.crPublishNotice.text).toContain("podría haberse completado");
   expect(result.current.crPublishNotice.text).not.toContain("No se publicó");
   expect(mocks.fetchJson.mock.calls.filter(([, options]) => options?.method === "POST")).toHaveLength(1);
+});
+
+it("confirms a lost publication response from the request's publication resolution", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => url.includes("/deliveries/from-job/")
+    ? Promise.reject(new TypeError("connection lost"))
+    : url.includes("status=all")
+      ? Promise.resolve({ items: [{ id: 85, resolved_at: "2026-09-28T20:00:00Z",
+        resolved_by_revision: 3, resolution_source: "publication" }] })
+      : previous(url, opts));
+  const { result } = renderHook(() => useChangeRequests());
+  await act(() => result.current.publishDeliveryUpdate("job-85", "chile", 85,
+    { editor_revision: 4, render_fingerprint: "render4" }));
+  expect(result.current.crPublishNotice.outcomeUnknown).toBe(true);
+  await act(() => result.current.reconcilePublication(85));
+  expect(mocks.fetchJson).toHaveBeenCalledWith(expect.stringContaining("change_request_id=85"));
+  expect(result.current.crPublishNotice).toMatchObject({ tone: "ok", text: expect.stringContaining("versión 3") });
+});
+
+it("keeps publication success when the follow-up list refresh fails", async () => {
+  let failList = false;
+  mocks.fetchJson.mockImplementation((url) => {
+    if (url.startsWith("/admin/change-requests?")) {
+      if (failList) throw new Error("list unavailable");
+      return Promise.resolve({ items: [] });
+    }
+    if (url.includes("/deliveries/from-job/")) return Promise.resolve({ ok: true, content_changed: true,
+      revision: 3, portal_id: "chile", job_id: "job-85", resolved_change_requests: [85] });
+    throw new Error(`Unexpected URL ${url}`);
+  });
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  failList = true;
+  await act(() => result.current.publishDeliveryUpdate("job-85", "chile", 85,
+    { editor_revision: 4, render_fingerprint: "render4" }));
+  expect(result.current.crPublishNotice).toMatchObject({ tone: "ok", text: expect.stringContaining("Publicada la versión 3") });
 });
 
 it("does not default a missing publication destination to Argentina", async () => {

@@ -3,6 +3,14 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.70] - 2026-09-28
+
+### Fixed
+
+- Keep the UMG publish confirmation visible when a follow-up request-list
+  refresh fails, show live publish progress, and allow operators to reconcile
+  an uncertain response against the exact change request before retrying.
+
 ## [1.1.69] - 2026-09-28
 
 ### Fixed

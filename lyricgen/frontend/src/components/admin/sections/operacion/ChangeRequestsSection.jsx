@@ -63,6 +63,7 @@ export default function ChangeRequestsSection({ initialPendingCount, onPendingCo
           crPublishNotice={changes.crPublishNotice}
           dismissPublishNotice={() => changes.setCrPublishNotice(null)}
           publishDeliveryUpdate={changes.publishDeliveryUpdate}
+          reconcilePublication={changes.reconcilePublication}
           prepareProRes={changes.prepareProRes}
           onProResConfigured={changes.handleProResConfigured}
           proposalEnabled={changes.crProposalEnabled}
