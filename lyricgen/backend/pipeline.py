@@ -4575,7 +4575,7 @@ def _fetch_lrclib(artist: str, song: str, db=None,
                 cached = _json.loads(row.lyrics)
                 if cached.get("plain") or cached.get("synced"):
                     cached_title = cached.get("source_track_name")
-                    if cached_title and not _lrclib_title_matches(song, cached_title):
+                    if not _lrclib_title_matches(song, cached_title or ""):
                         logger.warning(
                             "[LYRICS] lrclib cache title mismatch key=%s requested=%r "
                             "matched=%r record=%s; ignoring cached lyrics",
@@ -4626,10 +4626,9 @@ def _fetch_lrclib(artist: str, song: str, db=None,
     else:
         try:
             result = _parse_lrclib_record(r.json())
-            if (result and result.get("source_track_name")
-                    and not _lrclib_title_matches(
-                        song, result["source_track_name"]
-                    )):
+            if (result and not _lrclib_title_matches(
+                song, result.get("source_track_name") or ""
+            )):
                 logger.warning(
                     "[LYRICS] lrclib /get title mismatch requested=%r "
                     "matched=%r record=%s; searching for another candidate",
