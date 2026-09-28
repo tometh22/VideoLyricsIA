@@ -156,6 +156,7 @@ def test_title_guard_allows_editions_but_keeps_distinct_title_words():
     )
     assert _lrclib_title_matches("Hoy", "Hoy (feat. Otra Artista)")
     assert not _lrclib_title_matches("Hoy", "Hoy - Es Adios")
+    assert not _lrclib_title_matches("Cerca de ti", "Cerca de mi")
 
 
 def test_get_response_with_different_title_is_rejected():

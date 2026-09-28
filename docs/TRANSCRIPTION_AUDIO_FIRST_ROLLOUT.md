@@ -33,6 +33,10 @@ collapsed Whisper while the generic pass nearly matched ROTOR.
 - External lyrics must pass independent ASR attestation before they can replace
   words or determine the whole-song structure. An unsafe candidate falls back
   to the audio transcript even if the diagnostic setting is `observe` or `off`.
+- A live `local_only` verdict emits the audio transcript before any global
+  catalogue reconciliation, regardless of the other live policy switches.
+- A later Genius/Gemini gap refetch must pass the same audio attestation before
+  it can replace an already accepted lyric.
 - Catalogue text cannot prime first-pass ASR or choose its language before the
   audio has been heard.
 

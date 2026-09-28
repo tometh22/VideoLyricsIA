@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from reference_attestation import (
     assess_reference_attestation,
     effective_reference_gate_mode,
@@ -118,6 +120,15 @@ def test_live_reference_can_only_be_used_as_local_vocabulary():
     assert reference_gate_action(
         result, mode="observe", is_live=True,
     ) == "observe"
+
+
+def test_live_local_only_exits_before_global_catalogue_reconcile():
+    """The live gate must not depend on separate live-policy flags."""
+    source = (Path(__file__).parents[1] / "main.py").read_text()
+    gate = source.index('if _reference_action in {"audio_first", "local_only"}:')
+    emit = source.index("return _emit_segments(", gate)
+    reconcile = source.index("_captured_reconcile(", gate)
+    assert gate < emit < reconcile
 
 
 def test_attestation_never_emits_plain_sha256_identities(monkeypatch):

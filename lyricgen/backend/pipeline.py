@@ -4493,11 +4493,10 @@ def _lrclib_cache_key(artist: str, song: str) -> str:
 def _lrclib_title_matches(requested: str, candidate: str) -> bool:
     """Reject a different song hidden behind a partial catalogue title.
 
-    Variant suffixes and small spelling differences are acceptable for a
-    multi-word title. A one-word title must identify the whole song: ``Hoy``
-    must never select ``Hoy Es Adios`` just because the artist matches.
+    Known edition suffixes and accent/punctuation differences are acceptable.
+    The complete normalized title must still match: ``Hoy`` must never select
+    ``Hoy Es Adios`` just because the artist matches.
     """
-    import difflib as _difflib
     import re as _re
 
     def _normalized(value: str) -> list[str]:
@@ -4523,11 +4522,7 @@ def _lrclib_title_matches(requested: str, candidate: str) -> bool:
     found = _normalized(candidate)
     if not wanted or not found:
         return False
-    if len(wanted) == 1 or len(found) == 1:
-        return wanted == found
-    return _difflib.SequenceMatcher(
-        None, " ".join(wanted), " ".join(found), autojunk=False,
-    ).ratio() >= 0.85
+    return wanted == found
 
 
 def _fetch_lrclib(artist: str, song: str, db=None,
@@ -5144,7 +5139,7 @@ def _pick_best_lrclib_candidate(candidates: list, artist: str,
 
     Scoring:
       - Artist match exacto: +0.5; substring: +0.3; else 0.
-      - Song match exacto: +0.3; variante/ortografía cercana: +0.2.
+      - Song match exacto: +0.3; edición ya validada: +0.2.
       - Bonus +0.2 si el candidate tiene syncedLyrics (preferimos
         synced sobre plain para output con timestamps exactos).
       - Duration guard (cuando `audio_duration` está disponible): +0.25 si
