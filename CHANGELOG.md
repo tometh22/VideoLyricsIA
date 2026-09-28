@@ -10,7 +10,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Reject LRCLIB results and cached lyrics whose title does not match the
   requested song, including the incident where "Hoy" selected "Hoy Es Adios".
 - Require independent audio evidence before external lyrics can replace
-  transcription, including the legacy fallback path.
+  transcription, including the legacy fallback and gap-driven re-fetch paths.
 - Log the selected catalogue record and audio/catalogue durations for future
   incident diagnosis.
 
