@@ -268,6 +268,10 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
   const pages = Math.max(1, Math.ceil(filtered.length / 20));
   const currentPage = Math.min(page, pages);
   const visible = filtered.slice((currentPage - 1) * 20, currentPage * 20);
+  const trim = n => (Number.isInteger(n) ? n : Number(n.toFixed(2)));
+  const weightSum = groups.reduce((total, g) => total + (Number(g.weight) || 0), 0);
+  const distributionTarget = mode === "percent" ? 100 : selected.size;
+  const distributionBalanced = groups.length > 0 && Math.abs(weightSum - distributionTarget) < 1e-6;
   const activeVideoFilter = videoFilters.find(filter => filter.id === videoFilter) || videoFilters[0];
   const searchedVideos = (report?.videos || []).filter(video => matchesCampaignSong(videoQuery, video));
   const stateVideos = searchedVideos.filter(activeVideoFilter.matches);
