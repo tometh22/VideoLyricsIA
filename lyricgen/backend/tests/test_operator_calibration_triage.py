@@ -89,9 +89,20 @@ def test_stale_audio_and_unverified_occurrence_are_excluded():
     }
 
 
+def test_superseded_operator_revision_cannot_seed_review_queue():
+    stale = _record()
+    stale["current_revision"] = 2
+    result = build_triage([stale], secret=SECRET)
+    assert result["queue"] == []
+    assert result["summary"]["jobs_excluded"] == {
+        "operator_checkpoint_unverified": 1,
+    }
+
+
 def test_artist_and_recording_groups_do_not_cross_splits():
     first = _record()
     second = _record(job_id="job00000002", audio_hash="b" * 64)
+    second["artist"] = "ÁRTISTA REPETIDO"
     result = build_triage([first, second], secret=SECRET)
     assert len({row["split"] for row in result["queue"]}) == 1
     assert len(result["summary"]["songs_by_split"]) == 1

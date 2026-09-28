@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Genly · Escucha ciega</title>
+<style>
+  :root{color-scheme:dark;font:16px system-ui;background:#101721;color:#edf3fa}
+  body{max-width:760px;margin:24px auto;padding:0 18px}
+  h1{font-size:1.65rem}h2{font-size:1.1rem;margin-bottom:8px}
+  .muted{color:#b3c1d0}.card{background:#1b2938;border:1px solid #394d61;border-radius:12px;padding:18px;margin:16px 0}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button,input,select,textarea{font:inherit;border:1px solid #647b92;border-radius:8px;background:#26394d;color:white;padding:10px}
+  button{cursor:pointer}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid #89b8fa}
+  button.primary{background:#2f6baf;border-color:#75aff3}audio{width:100%;margin:12px 0}
+  label{display:block;margin:12px 0}input[type=number]{width:110px}textarea{width:95%;min-height:64px}
+  #status{min-height:24px;color:#8fe1b0}.warning{color:#ffd38b}
+</style>
+<main>
+  <h1>Escucha ciega de tramos</h1>
+  <p class="muted">Escuchá el audio y marcá lo que oís. Esta página no cambia canciones ni aprueba correcciones.</p>
+  <div class="card">
+    <label>Revisor <input id="reviewer" autocomplete="off" placeholder="Tu identificador"></label>
+    <div class="row"><button id="previous">← Anterior</button><strong id="position"></strong><button id="next">Siguiente →</button></div>
+    <p id="task"></p><p class="muted" id="clip"></p>
+    <audio id="audio" controls preload="metadata"></audio>
+    <div class="row"><button class="primary" id="replay">▶ Repetir tramo</button><span id="clock"></span></div>
+    <p id="audioError" class="warning" role="alert"></p>
+  </div>
+  <div class="card">
+    <h2>Lo que escuchaste</h2>
+    <label>Resultado
+      <select id="verdict">
+        <option value="unreviewed">Pendiente</option>
+        <option value="clear">Puedo marcarlo</option>
+        <option value="ambiguous">Ambiguo o voces superpuestas</option>
+        <option value="unavailable">Audio no disponible</option>
+      </select>
+    </label>
+    <label>Letra o vocalización escuchada <textarea id="heard" placeholder="Solo si corresponde; escribí lo que oís"></textarea></label>
+    <div class="row">
+      <label>Inicio (s) <input id="start" type="number" min="0" step="0.01"></label>
+      <button id="markStart">Marcar inicio ahora</button>
+      <label>Fin (s) <input id="end" type="number" min="0" step="0.01"></label>
+      <button id="markEnd">Marcar fin ahora</button>
+    </div>
+    <label>Nota breve <textarea id="note" placeholder="Ej.: coro, repetición, reverb, duda"></textarea></label>
+    <p id="status" role="status"></p>
+    <div class="row"><button class="primary" id="saveNext">Guardar y seguir →</button><button id="download">Descargar mis respuestas</button></div>
+  </div>
+  <p class="muted">Se guarda en este navegador. El archivo descargado contiene tu transcripción y debe permanecer en un lugar privado. Un segundo revisor escuchará sin ver esta respuesta.</p>
+</main>
+<script id="data" type="application/json">__CALIBRATION_DATA__</script>
+<script>
+const data=JSON.parse(document.getElementById('data').textContent),rows=data.tasks,$=id=>document.getElementById(id);
+const audio=$('audio'),fields=['verdict','heard','start','end','note'];let index=0,answers={};
+const reviewerKey=()=>`genly-calibration:${data.queue_sha256}:${$('reviewer').value.trim()}`;
+function loadAnswers(){try{answers=JSON.parse(localStorage.getItem(reviewerKey())||'{}')}catch(_){answers={}}}
+function save(){const reviewer=$('reviewer').value.trim();if(!reviewer){$('status').textContent='Escribí tu identificador para guardar.';return false}
+  const answer={schema:'blind-operator-audio-observation-draft-v1',task_id:rows[index].task_id,reviewer_id:reviewer,
+    verdict:$('verdict').value,heard_text:$('heard').value,start_s:$('start').value,end_s:$('end').value,note:$('note').value,
+    source_audio_sha256_bound:false,annotation_mode:'blind',candidate_seen:false,updated_at:new Date().toISOString(),gold:false};
+  answers[answer.task_id]=answer;try{localStorage.setItem(reviewerKey(),JSON.stringify(answers));$('status').textContent='Guardado ✓';return true}
+  catch(_){$('status').textContent='No se pudo guardar. Descargá tus respuestas.';return false}}
+function show(){const row=rows[index],stored=answers[row.task_id]||{};audio.pause();audio.src=row.audio_url;
+  $('position').textContent=`${index+1} / ${rows.length}`;$('task').textContent={timing_review:'Marcá el inicio y el fin de la frase cantada.',content_review:'Escribí lo que escuchás.',joint_diagnosis:'Escribí lo que escuchás y marcá sus límites.',unchanged_control:'Control: escuchá y marcá lo que escuchás.'}[row.task_type]||'Escuchá este tramo.';
+  $('clip').textContent=`Tramo ${row.clip_start_s.toFixed(2)}–${row.clip_end_s.toFixed(2)} s · ${row.repeated_phrase?'frase repetida':'frase única'}`;
+  fields.forEach(field=>$(field).value=stored[field==='heard'?'heard_text':field==='start'?'start_s':field==='end'?'end_s':field]|| (field==='verdict'?'unreviewed':''));
+  $('audioError').textContent='';$('status').textContent='';audio.onloadedmetadata=()=>{audio.currentTime=row.clip_start_s};}
+function move(next){if($('reviewer').value.trim())save();index=Math.max(0,Math.min(rows.length-1,next));show()}
+$('reviewer').addEventListener('change',()=>{loadAnswers();show()});$('previous').onclick=()=>move(index-1);$('next').onclick=()=>move(index+1);$('saveNext').onclick=()=>{if(save())move(index+1)};
+$('replay').onclick=()=>{audio.currentTime=rows[index].clip_start_s;audio.play().catch(()=>{})};
+audio.ontimeupdate=()=>{const row=rows[index];$('clock').textContent=`${audio.currentTime.toFixed(2)} s`;if(audio.currentTime>=row.clip_end_s)audio.pause()};
+audio.onerror=()=>{$('audioError').textContent='No se pudo abrir el audio. Puede haber vencido el enlace privado.'};
+$('markStart').onclick=()=>{$('start').value=audio.currentTime.toFixed(2);save()};$('markEnd').onclick=()=>{$('end').value=audio.currentTime.toFixed(2);save()};
+fields.forEach(field=>$(field).addEventListener('change',save));
+$('download').onclick=()=>{if(!save())return;const blob=new Blob([JSON.stringify({schema:'blind-operator-audio-review-draft-v1',queue_sha256:data.queue_sha256,reviewer_id:$('reviewer').value.trim(),annotations:Object.values(answers),gold:false},null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='escucha-ciega.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+show();
+</script>
+</html>

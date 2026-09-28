@@ -26,6 +26,28 @@ son exclusivos, con permisos `0600`, dentro de `.context`:
   del audio y tiempos comparados, para cotejar después de la escucha.
 - `summary.jsonl`: cantidades y motivos de exclusión, sin IDs de canciones.
 
+Para preparar una sesión de escucha, el comando siguiente vuelve a verificar
+la identidad del audio en una transacción de lectura y firma enlaces GET que
+vencen en cuatro horas. El archivo y la página contienen enlaces privados:
+
+```sh
+python3.11 lyricgen/backend/scripts/sign_operator_calibration_audio.py \
+  --queue .context/agus-calibration/blind_queue.jsonl \
+  --provenance .context/agus-calibration/sealed_provenance.jsonl \
+  --output .context/agus-calibration/audio_urls.json
+python3.11 lyricgen/backend/scripts/build_operator_calibration_preview.py \
+  --queue .context/agus-calibration/blind_queue.jsonl \
+  --audio-urls .context/agus-calibration/audio_urls.json \
+  --output .context/agus-calibration/reviewer/index.html
+python3.11 lyricgen/backend/scripts/serve_reviewer_shadow_preview.py \
+  --directory .context/agus-calibration/reviewer --port 8767
+```
+
+El servidor escucha solo en `127.0.0.1` y expone únicamente la carpeta del
+revisor, sin el archivo de procedencia. La página guarda las respuestas en el
+navegador y permite descargarlas. Estas respuestas son borradores privados:
+todavía no equivalen a etiquetas adjudicadas ni a una aprobación del motor.
+
 Un cambio estructural, una identidad de línea dudosa, un audio reemplazado, un
 checkpoint de máquina sin validar o una versión de Agus ya superada quedan
 fuera de la cola. Se agregan hasta cuatro líneas intactas por canción como

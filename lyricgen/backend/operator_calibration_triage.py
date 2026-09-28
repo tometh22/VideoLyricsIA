@@ -12,6 +12,7 @@ import json
 import math
 import re
 from typing import Any, Iterable
+import unicodedata
 
 from evidence_contracts import strong_hmac_secret_bytes
 from machine_evidence import snapshot_hash, validate_machine_evidence
@@ -103,7 +104,11 @@ def _case(record: dict[str, Any], key: bytes) -> tuple[dict | None, str | None]:
         return None, "timing_invalid"
 
     job_id = str(record["job_id"])
-    artist = " ".join(str(record.get("artist") or "").casefold().split())
+    artist = "".join(
+        char for char in unicodedata.normalize(
+            "NFKD", str(record.get("artist") or "").casefold(),
+        ) if unicodedata.category(char)[0] in {"L", "N"}
+    )
     artist_group = _token(key, "artist", artist or job_id)
     audio_group = _token(key, "audio", audio_hash)
     original_hash = snapshot_hash(original)
