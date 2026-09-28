@@ -168,6 +168,17 @@ describe("DeliveryQCPanel", () => {
     }));
   });
 
+  it("ofrece volver a analizar un preflight UMG completo cuando el gate pide uno vigente", () => {
+    render(<DeliveryQCPanel job={{
+      ...job,
+      delivery_qc: {
+        ...job.delivery_qc,
+        approval: { blocked: false, reason: "fresh_preflight_required" },
+      },
+    }} forUmgDelivery />);
+    expect(screen.getByRole("button", { name: "Actualizar preflight" })).toBeInTheDocument();
+  });
+
   it("seeks to findings and persists a reviewer decision", async () => {
     const onSeek = vi.fn();
     const onJobUpdate = vi.fn();

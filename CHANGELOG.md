@@ -3,6 +3,12 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.66] - 2026-09-28
+
+### Fixed
+- Preserve job state in UMG preflight refreshes so a completed analysis can satisfy the current-render readiness gate.
+- Keep the refresh action available whenever the UMG gate requires a fresh preflight.
+
 ## [1.1.65] - 2026-09-28
 
 ### Fixed

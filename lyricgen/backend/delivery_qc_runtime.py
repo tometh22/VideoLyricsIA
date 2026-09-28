@@ -676,7 +676,7 @@ def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None,
         previous = deepcopy(job.delivery_qc) if isinstance(job.delivery_qc, Mapping) else None
         expected = qc_input_identity(job)
         snapshot = SimpleNamespace(**{name: deepcopy(getattr(job, name, None)) for name in (
-            'artist', 'song_title', 'filename', 'umg_spec', 'segments_revision',
+            'artist', 'song_title', 'filename', 'status', 'umg_spec', 'segments_revision',
             'edit_count', 'transcription_quality', 'workload_class',
             'audio_revision', 'input_audio_sha256', 'delivery_profile', 'prores_ready',
             's3_keys', 'segments_json', 'render_params', 'scene_plan', 'background_key',

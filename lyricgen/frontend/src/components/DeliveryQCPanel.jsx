@@ -270,7 +270,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
         </div>
       )}
 
-      {forUmgDelivery && report.approval?.blocked && (
+      {forUmgDelivery && (report.approval?.blocked || report.approval?.reason === "fresh_preflight_required") && (
         <div role="alert" aria-label="Motivo del bloqueo de aprobación"
           className={`mb-4 rounded-xl p-3 text-xs ring-1 ${objectiveFailures.length ? "bg-red-500/10 text-red-200 ring-red-400/20" : "bg-amber-500/10 text-amber-100 ring-amber-400/20"}`}>
           <p className="font-semibold">{report.approval.reason === "fresh_preflight_required"

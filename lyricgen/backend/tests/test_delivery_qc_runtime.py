@@ -390,6 +390,54 @@ def test_recheck_does_not_scan_or_persist_if_source_changed_before_lock(monkeypa
     assert result is None
 
 
+def test_recheck_snapshot_preserves_job_status_for_umg_readiness_gate(monkeypatch):
+    import database
+    from delivery_qc_runtime import (
+        delivery_qc_source_fingerprint, delivery_readiness_gate,
+        run_delivery_qc_for_job, segments_hash,
+    )
+
+    job = SimpleNamespace(
+        job_id="qc-status", status="pending_review", delivery_profile="umg",
+        workload_class="interactive", delivery_qc=None, segments_json=[],
+        segments_revision=1, edit_count=0, artist="Artista", song_title="Tema",
+        previous_versions=[], completed_at=None, filename="tema.wav",
+        umg_spec=None, s3_keys={}, transcription_quality={}, audio_revision=0,
+    )
+
+    class Query:
+        def filter(self, *_args): return self
+        def with_for_update(self): return self
+        def populate_existing(self): return self
+        def first(self): return job
+
+    class Session:
+        def query(self, *_args): return Query()
+        def rollback(self): pass
+        def commit(self): pass
+        def close(self): pass
+
+    captured = {}
+    monkeypatch.setattr(database, "SessionLocal", Session)
+    def build_report(**kwargs):
+        snapshot = kwargs["job"]
+        report = {
+            "status": "COMPLETE", "generated_at": "now",
+            "segments_revision": snapshot.segments_revision,
+            "segments_hash": segments_hash(snapshot.segments_json),
+            "render_identity": {"edit_count": snapshot.edit_count},
+            "delivery_spec": {},
+            "source_fingerprint": delivery_qc_source_fingerprint(snapshot),
+            "issues": [],
+        }
+        captured["gate"] = delivery_readiness_gate(snapshot, report, for_umg_delivery=True)
+        return report
+    monkeypatch.setattr("delivery_qc_runtime.build_runtime_report", build_report)
+
+    run_delivery_qc_for_job(job.job_id, "/tmp/current-render.mp4", force=True, mode_override="enforce")
+    assert captured["gate"]["reason"] != "fresh_preflight_required"
+
+
 def test_refresh_check_results_marks_signed_manual_check_as_passed():
     report = {
         "decision": "BLOCK",
