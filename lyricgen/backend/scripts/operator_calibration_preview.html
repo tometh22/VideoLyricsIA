@@ -55,6 +55,8 @@
 <script>
 const data=JSON.parse(document.getElementById('data').textContent),rows=data.tasks,$=id=>document.getElementById(id);
 const audio=$('audio'),fields=['verdict','heard','start','end','note'];let index=0,answers={};
+const reviewerPrefKey=`genly-calibration:reviewer:${data.queue_sha256}`;
+try{$('reviewer').value=localStorage.getItem(reviewerPrefKey)||''}catch(_){}
 const reviewerKey=()=>`genly-calibration:${data.queue_sha256}:${$('reviewer').value.trim()}`;
 function loadAnswers(){try{answers=JSON.parse(localStorage.getItem(reviewerKey())||'{}')}catch(_){answers={}}}
 function isDone(row){const answer=answers[row.task_id];return !!answer&&answer.verdict!=='unreviewed'}
@@ -67,21 +69,22 @@ function save(){const reviewer=$('reviewer').value.trim();if(!reviewer){$('statu
     source_audio_sha256_bound:false,annotation_mode:'blind',candidate_seen:false,updated_at:new Date().toISOString(),gold:false};
   answers[answer.task_id]=answer;try{localStorage.setItem(reviewerKey(),JSON.stringify(answers));$('status').textContent='Guardado ✓';return true}
   catch(_){$('status').textContent='No se pudo guardar. Descargá tus respuestas.';return false}}
+function absoluteTime(){return audio.currentTime+(rows[index].local_clip?rows[index].clip_start_s:0)}
 function show(){const row=rows[index],stored=answers[row.task_id]||{};audio.pause();audio.src=row.audio_url;
   $('position').textContent=`${index+1} / ${rows.length}`;updateProgress();$('task').textContent='Escribí lo que escuchás y marcá el inicio y el final de la frase. Si no hay una frase clara, elegí «Ambiguo».';
   $('clip').textContent=`Recorte ${row.clip_start_s.toFixed(2)}–${row.clip_end_s.toFixed(2)} s`;
   fields.forEach(field=>$(field).value=stored[field==='heard'?'heard_text':field==='start'?'start_s':field==='end'?'end_s':field]|| (field==='verdict'?'unreviewed':''));
-  $('audioError').textContent='';$('status').textContent='';audio.onloadedmetadata=()=>{audio.currentTime=row.clip_start_s};}
+  $('audioError').textContent='';$('status').textContent='';$('clock').textContent=`${row.clip_start_s.toFixed(2)} s`;audio.onloadedmetadata=()=>{audio.currentTime=row.local_clip?0:row.clip_start_s};}
 function changeFilter(){const visible=visibleIndices();if(visible.length&&!visible.includes(index))index=visible[0];show()}
-$('reviewer').addEventListener('change',()=>{loadAnswers();changeFilter()});$('reviewFilter').onchange=changeFilter;
+$('reviewer').addEventListener('change',()=>{try{localStorage.setItem(reviewerPrefKey,$('reviewer').value.trim())}catch(_){}loadAnswers();changeFilter()});$('reviewFilter').onchange=changeFilter;
 $('jump').onclick=()=>{const target=Number($('jumpTo').value)-1;if(Number.isInteger(target)&&target>=0&&target<rows.length){if($('reviewer').value.trim())save();index=target;show()}else $('status').textContent='Ingresá un número de tramo válido.'};
 $('previous').onclick=()=>{if($('reviewer').value.trim())save();moveFiltered(-1)};$('next').onclick=()=>{if($('reviewer').value.trim())save();moveFiltered(1)};$('saveNext').onclick=()=>{if(save())moveFiltered(1)};
-$('replay').onclick=()=>{audio.currentTime=rows[index].clip_start_s;audio.play().catch(()=>{})};
-audio.ontimeupdate=()=>{const row=rows[index];$('clock').textContent=`${audio.currentTime.toFixed(2)} s`;if(audio.currentTime>=row.clip_end_s)audio.pause()};
-audio.onerror=()=>{$('audioError').textContent='No se pudo abrir el audio. Puede haber vencido el enlace privado.'};
-$('markStart').onclick=()=>{$('start').value=audio.currentTime.toFixed(2);save()};$('markEnd').onclick=()=>{$('end').value=audio.currentTime.toFixed(2);save()};
+$('replay').onclick=()=>{audio.currentTime=rows[index].local_clip?0:rows[index].clip_start_s;audio.play().catch(()=>{$('audioError').textContent='No se pudo reproducir este recorte.'})};
+audio.ontimeupdate=()=>{const row=rows[index];$('clock').textContent=`${absoluteTime().toFixed(2)} s`;if(!row.local_clip&&audio.currentTime>=row.clip_end_s)audio.pause()};
+audio.onerror=()=>{$('audioError').textContent=rows[index].local_clip?'No se pudo abrir el recorte local.':'No se pudo abrir el audio. Puede haber vencido el enlace privado.'};
+$('markStart').onclick=()=>{$('start').value=absoluteTime().toFixed(2);save()};$('markEnd').onclick=()=>{$('end').value=absoluteTime().toFixed(2);save()};
 fields.forEach(field=>$(field).addEventListener('change',save));
 $('download').onclick=()=>{if(!save())return;const blob=new Blob([JSON.stringify({schema:'blind-operator-audio-review-draft-v1',queue_sha256:data.queue_sha256,reviewer_id:$('reviewer').value.trim(),annotations:Object.values(answers),gold:false},null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='escucha-ciega.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
-show();
+loadAnswers();show();
 </script>
 </html>

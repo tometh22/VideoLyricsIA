@@ -27,8 +27,10 @@ son exclusivos, con permisos `0600`, dentro de `.context`:
 - `summary.jsonl`: cantidades y motivos de exclusión, sin IDs de canciones.
 
 Para preparar una sesión de escucha, el comando siguiente vuelve a verificar
-la identidad del audio en una transacción de lectura y firma enlaces GET que
-vencen en cuatro horas. El archivo y la página contienen enlaces privados:
+la identidad del audio en una transacción de lectura y firma enlaces GET de
+duración limitada. Los enlaces quedan en un manifiesto privado; el visor usa
+recortes MP3 locales para que el navegador pueda reproducir y buscar cada tramo.
+El servidor genera cada recorte al abrirlo por primera vez:
 
 ```sh
 python3.11 lyricgen/backend/scripts/sign_operator_calibration_audio.py \
@@ -38,13 +40,25 @@ python3.11 lyricgen/backend/scripts/sign_operator_calibration_audio.py \
 python3.11 lyricgen/backend/scripts/build_operator_calibration_preview.py \
   --queue .context/agus-calibration/blind_queue.jsonl \
   --audio-urls .context/agus-calibration/audio_urls.json \
+  --clip-dir .context/agus-calibration/reviewer/clips \
+  --lazy-clips \
   --output .context/agus-calibration/reviewer/index.html
-python3.11 lyricgen/backend/scripts/serve_reviewer_shadow_preview.py \
-  --directory .context/agus-calibration/reviewer --port 8767
+python3.11 lyricgen/backend/scripts/serve_operator_calibration_preview.py \
+  --directory .context/agus-calibration/reviewer \
+  --queue .context/agus-calibration/blind_queue.jsonl \
+  --audio-urls .context/agus-calibration/audio_urls.json --port 8767
 ```
 
+Para una primera ronda pequeña, se puede pre-generar todos sus recortes con
+`render_operator_calibration_clips.py --queue ... --audio-urls ... --output-dir
+.context/agus-calibration/reviewer/clips`; así la escucha no depende del enlace
+firmado durante esa ronda. Para recortes todavía no generados, renovar el
+manifiesto y reiniciar el servidor cuando venzan los enlaces.
+
 El servidor escucha solo en `127.0.0.1` y expone únicamente la carpeta del
-revisor, sin el archivo de procedencia. La página tampoco expone el tipo de
+revisor, sin los enlaces firmados ni el archivo de procedencia. Los MP3
+locales siguen funcionando después de vencer los enlaces y conservan el
+inicio absoluto de cada recorte en los campos de anotación. La página tampoco expone el tipo de
 cambio, si un recorte es control, el modelo, el artista o la partición. Guarda
 las respuestas en el navegador y permite descargarlas. Estas respuestas son
 borradores privados:
