@@ -1,5 +1,6 @@
 from reference_attestation import (
     assess_reference_attestation,
+    effective_reference_gate_mode,
     reference_gate_action,
 )
 
@@ -33,6 +34,23 @@ def test_wrong_song_reference_is_fail_closed():
     assert result["text_status"] == "unsafe_without_witness"
     assert result["allow_vocabulary_reconciliation"] is False
     assert result["allow_global_forced_alignment"] is False
+
+
+def test_external_lyrics_enforce_audio_gate_even_when_configured_to_observe():
+    wrong = assess_reference_attestation(
+        "Bailando bajo la lluvia con un corazón enamorado",
+        _segments("Todos estos años de gente historias en la ciudad"),
+        audio_duration_s=100,
+    )
+    for source in ("lrclib", "genius", "gemini"):
+        for configured in ("off", "observe"):
+            mode = effective_reference_gate_mode(
+                configured, reference_source=source, reference_required=False,
+            )
+            assert mode == "enforce"
+            assert reference_gate_action(
+                wrong, mode=mode, is_live=False,
+            ) == "audio_first"
 
 
 def test_partial_or_live_reference_never_authorizes_global_alignment():

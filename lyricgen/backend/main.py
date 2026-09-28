@@ -7837,6 +7837,14 @@ async def _run_transcription_for_job(
                     "artist_used": artist_hint,
                     "song_used": song_hint,
                 }
+        if lrc:
+            logger.info(
+                "[LYRICS] job=%s source=lrclib record=%s requested=%r - %r "
+                "matched=%r - %r audio_duration=%s catalog_duration=%s",
+                job_id, lrc.get("source_record_id"), artist_hint, song_hint,
+                lrc.get("source_artist_name"), lrc.get("source_track_name"),
+                _audio_dur_for_lrc, lrc.get("duration"),
+            )
         # Auto-correct inverted metadata: when the swap-retry hit, the upload
         # had artist/title swapped (incident 2026-05-24 Viejas Locas /
         # Legalícenla in staging — frontend parser assumes Title_Artist for
@@ -8126,11 +8134,11 @@ async def _run_transcription_for_job(
             _batch_reference_task = None
             await _resolve_audio_reference(_language_reference)
 
-        # The upload wizard defaults to Auto.  Resolve that choice from the
-        # canonical lyrics before the primary ASR runs, so English references
-        # are transcribed as English while Spanish references retain the
-        # explicit hint that historically made Whisper more reliable.
-        if lrc:
+        # The upload wizard defaults to Auto. Only a reference derived from
+        # this recording may choose the ASR language before the audio is
+        # heard. A wrong catalogue hit could otherwise bias the very witness
+        # that is supposed to reject it.
+        if lrc and lyrics_source == "gemini_audio":
             _reference_for_language = (
                 (lrc.get("plain") or "").strip()
                 or (lrc.get("synced") or "").strip()
@@ -8169,6 +8177,12 @@ async def _run_transcription_for_job(
                     sorted(_reference_languages),
                     job_id,
                 )
+        elif lrc and lyrics_source in {"lrclib", "genius", "gemini"}:
+            logger.info(
+                "[LANGUAGE] catalogue cannot choose ASR language before "
+                "audio attestation job=%s",
+                job_id,
+            )
 
         # ─────────────────────────────────────────────────────────────────
         # WORLD-CLASS audio-as-truth pipeline (default 2026-05-25).
@@ -8320,8 +8334,14 @@ async def _run_transcription_for_job(
                     and os.environ.get("LIVE_AUDIO_AS_TRUTH_ENABLED", "1")
                     .strip().lower() in ("1", "true", "yes", "on")
                 )
+                # The ASR witness must be independent of the catalogue text
+                # that it will attest. A title-based lyric must never prime
+                # WhisperX into repeating the same possibly wrong song.
+                _catalogue_candidate = lyrics_source in {
+                    "lrclib", "genius", "gemini",
+                }
                 _drop_hint = (_live_no_hint or _live_audio_truth or _no_hint_always
-                              or _batch_audio_only_reference)
+                              or _batch_audio_only_reference or _catalogue_candidate)
                 if _no_hint_always and not _live_no_hint:
                     logger.info("[WC] WHISPERX_NO_HINT_ALWAYS — clean whisperX, reconcile restores canonical text")
                 elif _live_audio_truth and not _live_no_hint:
@@ -8378,13 +8398,14 @@ async def _run_transcription_for_job(
 
                 # Catalogue text is a candidate, never truth by declaration.
                 # Compare it with clean audio-first WhisperX before it can own
-                # vocabulary or whole-song structure.  Default mode is OFF;
-                # `observe` exports metrics only, while `enforce` fails closed
-                # to raw WhisperX when the candidate lacks ASR support.
-                _reference_gate_mode = (
-                    "enforce" if reference_required else os.environ.get(
-                        "REFERENCE_ATTESTATION_MODE", "off"
-                    ).strip().lower()
+                # vocabulary or whole-song structure. Catalogue candidates
+                # always enforce this gate, even when the diagnostic rollout
+                # setting is observe or off.
+                from reference_attestation import effective_reference_gate_mode
+                _reference_gate_mode = effective_reference_gate_mode(
+                    os.environ.get("REFERENCE_ATTESTATION_MODE", "off"),
+                    reference_source=lyrics_source,
+                    reference_required=reference_required,
                 )
                 if _wx_segs and _canonical and _reference_gate_mode in {
                     "observe", "enforce",
@@ -8397,21 +8418,27 @@ async def _run_transcription_for_job(
                     _reference_is_live = bool(
                         live or _looks_live(title, filename)
                     )
+                    _reference_source = str(
+                        _reference_candidate_state.get("source_kind") or ""
+                    )
+                    if _reference_source in {"", "none"}:
+                        _reference_source = (
+                            f"catalog_{lyrics_source}" if lyrics_source
+                            else "catalog_unverified"
+                        )
                     _reference_report = assess_reference_attestation(
                         _canonical,
                         _wx_segs,
-                        reference_source=str(
-                            _reference_candidate_state.get("source_kind")
-                            or "catalog_unverified"
-                        ),
+                        reference_source=_reference_source,
                         audio_duration_s=_audio_dur_for_lrc,
                         is_live=_reference_is_live,
                     )
                     _reference_attestation_state["report"] = _reference_report
                     logger.info(
-                        "[REFERENCE-ATTEST] mode=%s status=%s score=%.3f "
+                        "[REFERENCE-ATTEST] mode=%s source=%s status=%s score=%.3f "
                         "vocabulary=%s global=%s job=%s",
                         _reference_gate_mode,
+                        _reference_source,
                         _reference_report["text_status"],
                         _reference_report["metrics"]["attestation_score"],
                         _reference_report["allow_vocabulary_reconciliation"],
@@ -9088,6 +9115,18 @@ async def _run_transcription_for_job(
             )
             _batch_reference_task = None
             await _resolve_audio_reference(_reference_outcome)
+
+        # Without independent WhisperX words there is no witness for external
+        # catalogue text. The legacy path must transcribe the audio without
+        # seeding it with an unverified song found by artist/title.
+        if lrc and lyrics_source in {"lrclib", "genius", "gemini"}:
+            logger.warning(
+                "[REFERENCE-ATTEST] no independent ASR; discarding %s "
+                "catalogue candidate before audio-only fallback job=%s",
+                lyrics_source, job_id,
+            )
+            lrc = None
+            lyrics_source = None
 
         # ─────────────────────────────────────────────────────────────────
         # LEGACY FA-primary pipeline (below). Kept as a safety net during
@@ -9949,9 +9988,13 @@ async def _run_transcription_for_job(
             finally:
                 s.close()
 
-        gemini_task = asyncio.create_task(asyncio.to_thread(
-            _bg_fetch_lyrics, artist_hint, song_hint,
-        ))
+        gemini_task = (
+            asyncio.create_task(asyncio.sleep(0, result=None))
+            if _batch_audio_only_reference
+            else asyncio.create_task(asyncio.to_thread(
+                _bg_fetch_lyrics, artist_hint, song_hint,
+            ))
+        )
 
         # Post-ASR alignment is default-on with a kill-switch. Word timestamps
         # are requested regardless so raw lines can end on their last word.
@@ -9961,44 +10004,24 @@ async def _run_transcription_for_job(
         # The reference remains valuable after recognition for spelling and
         # human line grouping. Feeding it into Whisper first caused reference
         # parroting in the measured corpus and on the ROTOR regression track.
-        # `_initial_asr_lyrics_hint` retains an explicit rollback mode.
         #
-        # In audio-first mode Whisper starts immediately while Gemini continues
-        # in parallel. Only explicit short/full rollback modes wait for Gemini
-        # before ASR, because those modes intentionally need a prompt.
+        # Whisper starts immediately while Gemini continues in parallel. Its
+        # transcript is the independent witness used below to vet any text
+        # returned by that metadata-based lookup.
         _gemini_pre = ""
         _prompt_mode = os.environ.get(
             "WHISPER_REFERENCE_PROMPT_MODE", "off",
         ).strip().lower()
         if _prompt_mode not in ("", "off", "0", "false", "no"):
-            try:
-                _gemini_pre = (
-                    await asyncio.wait_for(
-                        asyncio.shield(gemini_task), timeout=10.0,
-                    )
-                    or ""
-                )
-                if _gemini_pre:
-                    logger.info(
-                        "[LYRICS] Gemini returned %d chars before Whisper — "
-                        "reference-prompt rollback mode=%s",
-                        len(_gemini_pre), _prompt_mode,
-                    )
-            except asyncio.TimeoutError:
-                logger.info(
-                    "[LYRICS] Gemini prompt not ready in 10s — Whisper runs "
-                    "audio-first",
-                )
-            except Exception as _e_gem:
-                logger.info(
-                    "[LYRICS] Gemini pre-fetch error (%s) — Whisper runs "
-                    "audio-first", _e_gem,
-                )
-        else:
-            logger.info(
-                "[LYRICS] audio-first mode — Whisper and reference lookup "
-                "running concurrently",
+            logger.warning(
+                "[REFERENCE-ATTEST] ignoring Whisper reference prompt "
+                "rollback; the ASR witness must be independent job=%s",
+                job_id,
             )
+        logger.info(
+            "[LYRICS] audio-first mode — Whisper and reference lookup "
+            "running concurrently",
+        )
 
         # Pre-fetch vocal stem so the chunked Whisper-1 transcription uses
         # clean audio (no backing music). The full mix causes timing compression
@@ -10057,7 +10080,8 @@ async def _run_transcription_for_job(
 
         # Final fallback: lyrics.ovh (free, no auth, thin catalogue but
         # covers some mainstream songs Gemini might miss or block).
-        if not reference and artist_hint and song_hint:
+        if (not reference and artist_hint and song_hint
+                and not _batch_audio_only_reference):
             try:
                 import requests as _req
                 res = _req.get(
@@ -10075,7 +10099,7 @@ async def _run_transcription_for_job(
         # exclusively when title + duration + heard words agree. This is
         # deliberately after ASR; doing it before listening recreated the old
         # "right duration, wrong song" incident.
-        if not reference and song_hint:
+        if not reference and song_hint and not _batch_audio_only_reference:
             try:
                 _evidence_dur = await asyncio.to_thread(
                     _audio_duration, tmp_path,
@@ -10118,6 +10142,37 @@ async def _run_transcription_for_job(
         # the song body), Karol G "Si Antes Te Hubiera Conocido"
         # (similar dialogue prefix), and any future song with the
         # same "good prefix + bad body" pattern.
+        if reference:
+            from reference_attestation import (
+                assess_reference_attestation,
+                reference_gate_action,
+            )
+            _legacy_duration = await asyncio.to_thread(_audio_duration, tmp_path)
+            _legacy_report = assess_reference_attestation(
+                reference, segments,
+                reference_source="catalog_unverified",
+                audio_duration_s=_legacy_duration,
+                is_live=bool(live or _looks_live(title, filename)),
+            )
+            _reference_attestation_state["report"] = _legacy_report
+            _legacy_action = reference_gate_action(
+                _legacy_report, mode="enforce",
+                is_live=bool(live or _looks_live(title, filename)),
+            )
+            logger.info(
+                "[REFERENCE-ATTEST] legacy status=%s score=%s action=%s job=%s",
+                _legacy_report["text_status"],
+                _legacy_report["metrics"]["attestation_score"],
+                _legacy_action, job_id,
+            )
+            if _legacy_action != "reference_allowed":
+                logger.warning(
+                    "[REFERENCE-ATTEST] legacy external lyrics rejected "
+                    "before alignment job=%s",
+                    job_id,
+                )
+                reference = ""
+
         if reference:
             user_dur = await asyncio.to_thread(_audio_duration, tmp_path)
 
