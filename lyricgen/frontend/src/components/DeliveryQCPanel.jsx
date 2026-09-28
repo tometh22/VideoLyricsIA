@@ -24,13 +24,21 @@ const CHECK_LABELS = {
   PASS: "Pasó",
   FAIL: "Falló",
   REVIEW: "Revisión",
-  NOT_RUN: "No ejecutado",
+  NOT_RUN: "No verificado",
+  NOT_APPLICABLE: "No aplica",
 };
 
-export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor, forUmgDelivery = false, focusRequest = 0, onContinueToPublish }) {
+const MANUAL_REVIEW_CODES = new Set([
+  "UMG_BLACK_BARS", "UMG_BACKGROUND_TEXT", "UMG_SCENE_CHANGE",
+  "UMG_LUMINANCE_STABLE", "UMG_MOBILE_CONTRAST", "UMG_LYRIC_NOT_LATE",
+  "UMG_TITLE_METADATA", "UMG_IMAGE_NOT_STRETCHED",
+]);
+
+export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor, forUmgDelivery = false, focusRequest = 0, onContinueToPublish, onReturnToPublish }) {
   const report = job?.delivery_qc;
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const [reviewConfirmed, setReviewConfirmed] = useState(false);
   const firstActionRef = useRef(null);
   const latestJob = useRef(job);
   latestJob.current = job;
@@ -41,7 +49,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
   identityRef.current = identity;
   useEffect(() => {
     requestRef.current = null;
-    setBusy(""); setError("");
+    setBusy(""); setError(""); setReviewConfirmed(false);
     return () => { requestRef.current = null; };
   }, [identity]);
   useEffect(() => {
@@ -117,8 +125,15 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
   const effectiveBlockers = report?.approval?.blocked ? (report.approval.issue_ids || []) : [];
   const reportToken = report?.report_id || report?.generated_at;
   const reportReviewable = Boolean(reportToken) && report?.status === "COMPLETE";
-  const pendingManualCount = issues.filter((issue) => issue.manual_verification_required).length;
-  const firstManualIssueId = issues.find((issue) => issue.manual_verification_required)?.issue_id;
+  const isManualIssue = issue => issue.manual_verification_required ||
+    issue.detector === "mandatory_signed_reviewer_checklist" || MANUAL_REVIEW_CODES.has(String(issue.code || "").toUpperCase());
+  const allManualIssues = (report?.issues || []).filter(issue => isManualIssue(issue));
+  const pendingManualIssues = allManualIssues.filter(issue => issue.status !== "RESOLVED_MANUAL");
+  const pendingManualCount = pendingManualIssues.length;
+  const manualIssues = pendingManualIssues;
+  const reviewedManualCount = allManualIssues.filter(issue => issue.status === "RESOLVED_MANUAL").length;
+  const objectiveFailures = issues.filter((issue) => issue.status === "OPEN" &&
+    (issue.result_status === "FAIL" || (issue.severity === "FAIL" && !isManualIssue(issue))));
   if (!report) {
     if (!forUmgDelivery) return null;
     return (
@@ -155,6 +170,29 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
       updateReport(request, data);
     } catch (requestError) {
       if (currentRequest(request)) setError(requestError.message);
+    } finally {
+      finishRequest(request);
+    }
+  };
+
+  const attestFullReview = async () => {
+    if (!reviewConfirmed || !reportReviewable) return;
+    const request = beginRequest("attest-review");
+    if (!request) return;
+    try {
+      const response = await fetch(`${API}/jobs/${job.job_id}/delivery-qc/review-attestation`, {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmed: true, expected_report_id: reportToken }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(response.status === 409
+        ? "El corte cambió mientras lo revisabas. Actualizá el preflight y revisá el nuevo render."
+        : data.detail?.message || data.detail || "No se pudo guardar la revisión");
+      updateReport(request, data);
+      setReviewConfirmed(false);
+    } catch (requestError) {
+      if (currentRequest(request)) setError(String(requestError.message || requestError));
     } finally {
       finishRequest(request);
     }
@@ -232,57 +270,90 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
         </div>
       )}
 
-      {report.approval?.blocked && (
+      {forUmgDelivery && report.approval?.blocked && (
         <div role="alert" aria-label="Motivo del bloqueo de aprobación"
-          className="mb-4 rounded-xl bg-red-500/10 p-3 text-xs text-red-200 ring-1 ring-red-400/20">
-          <p>{report.approval.reason === "fresh_preflight_required"
-            ? "Falta una verificación vigente del corte. Actualizá el preflight antes de aprobar."
-            : "La aprobación requiere resolver los hallazgos indicados por el servidor."}</p>
-          <p className="mt-1">Motivo: {report.approval.reason || "No informado; actualizá el preflight"}</p>
-          {effectiveBlockers.length > 0 && <p className="mt-1">Hallazgos: {effectiveBlockers.join(", ")}</p>}
+          className={`mb-4 rounded-xl p-3 text-xs ring-1 ${objectiveFailures.length ? "bg-red-500/10 text-red-200 ring-red-400/20" : "bg-amber-500/10 text-amber-100 ring-amber-400/20"}`}>
+          <p className="font-semibold">{report.approval.reason === "fresh_preflight_required"
+            ? "Este corte todavía no tiene una verificación vigente."
+            : objectiveFailures.length
+              ? `${objectiveFailures.length} ${objectiveFailures.length === 1 ? "falla detectada" : "fallas detectadas"}: corregilas y generá un nuevo render.`
+              : report.approval.reason === "manual_review_required"
+                ? "No hay fallas automáticas abiertas. Falta confirmar la revisión del video completo."
+                : "La publicación sigue bloqueada por una validación pendiente."}</p>
+          {effectiveBlockers.length > 0 && objectiveFailures.length > 0 && <p className="mt-1">Puntos a corregir: {objectiveFailures.map(row => row.summary).join(" · ")}</p>}
           {report.status === "COMPLETE" && <button type="button" onClick={refresh} disabled={Boolean(busy)}
             className="mt-2 underline">Actualizar preflight</button>}
         </div>
       )}
 
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-4 text-center">
-        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{displayedFailCount}</div><div className="text-[10px] text-ink-secondary">checks con fallo</div></div>
-        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{visibleCheckSummary.review}</div><div className="text-[10px] text-ink-secondary">revisiones</div></div>
-        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{visibleCheckSummary.notRun}</div><div className="text-[10px] text-ink-secondary">no ejecutados</div></div>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4 text-center">
+        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{displayedFailCount}</div><div className="text-[10px] text-ink-secondary">fallas detectadas</div></div>
+        <div className="rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{pendingManualCount}</div><div className="text-[10px] text-ink-secondary">controles para revisar</div></div>
+        <div className="col-span-2 sm:col-span-1 rounded-xl bg-white/[0.03] p-2"><div className="text-lg font-semibold">{visibleCheckSummary.notRun}</div><div className="text-[10px] text-ink-secondary">sin verificación automática</div></div>
       </div>
 
       {checks.length > 0 && (
-        <div data-testid="delivery-qc-checks" className="mb-4 rounded-xl bg-white/[0.02] ring-1 ring-white/[0.06] p-3">
-          <div className="flex items-center justify-between gap-3 mb-2">
-            <p className="text-xs font-semibold">Checks automáticos y revisiones</p>
-            <p className="text-[10px] text-ink-secondary">
-              {visibleCheckSummary.pass} pasaron
-            </p>
-          </div>
+        <details data-testid="delivery-qc-checks" open={visibleCheckSummary.fail > 0} className="mb-4 rounded-xl bg-white/[0.02] ring-1 ring-white/[0.06] p-3">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-xs font-semibold">
+            <span>Verificaciones automáticas</span>
+            <span className="text-[10px] font-normal text-ink-secondary">
+              {visibleCheckSummary.fail > 0
+                ? `${visibleCheckSummary.fail} ${visibleCheckSummary.fail === 1 ? "falla" : "fallas"}`
+                : `${visibleCheckSummary.pass} pasaron · ${visibleCheckSummary.notRun} sin verificar`}
+            </span>
+          </summary>
           <div className="grid gap-1.5 sm:grid-cols-2">
             {checks.map((check) => {
               const status = CHECK_LABELS[checkStatus(check)] ? checkStatus(check) : "NOT_RUN";
+              if (check.detector === "mandatory_signed_reviewer_checklist" || MANUAL_REVIEW_CODES.has(String(check.check_id || "").toUpperCase())) return null;
               return (
-                <div key={check.check_id} className="flex items-center justify-between gap-2 rounded-lg bg-white/[0.03] px-2.5 py-2">
-                  <span className="min-w-0 truncate text-[11px] text-ink-secondary">{check.label}</span>
-                  <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${CHECK_TONES[status]}`}>
+                <div key={check.check_id} title={check.reason || undefined} className="flex items-center justify-between gap-2 rounded-lg bg-white/[0.03] px-2.5 py-2">
+                  <span className="min-w-0 text-[11px] text-ink-secondary">{check.label}{check.reason && <span className="block text-[10px] opacity-70">{check.reason}</span>}</span>
+                  <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${CHECK_TONES[status] || CHECK_TONES.NOT_RUN}`}>
                     {CHECK_LABELS[status]}
                   </span>
                 </div>
               );
             })}
           </div>
-        </div>
+        </details>
       )}
       {forUmgDelivery && pendingManualCount > 0 && (
-        <p className="text-xs text-amber-200 mb-3" role="status">
-          {pendingManualCount} {pendingManualCount === 1 ? "control visual pendiente" : "controles visuales pendientes"} para este corte.
-        </p>
+        <div className="mb-4 rounded-xl bg-amber-500/[0.07] p-4 ring-1 ring-amber-400/20" data-testid="delivery-qc-human-review">
+          <div className="flex items-start gap-3">
+            <span aria-hidden="true" className="mt-0.5 text-amber-200">◉</span>
+            <div className="min-w-0 flex-1">
+              <h4 className="text-sm font-semibold text-amber-100">Revisión final del video</h4>
+              <p className="mt-1 text-xs text-ink-secondary">Mirá el render completo. Los controles de abajo requieren criterio humano; el sistema no puede confirmarlos con seguridad.</p>
+              <ul className="mt-3 grid gap-2 sm:grid-cols-2">
+                {manualIssues.map(issue => (
+                  <li key={issue.issue_id} className="rounded-lg bg-black/10 px-3 py-2 text-[11px] text-ink-secondary">{issue.summary}</li>
+                ))}
+              </ul>
+              <label className="mt-4 flex cursor-pointer items-start gap-2 text-xs text-ink-primary">
+                <input type="checkbox" checked={reviewConfirmed} onChange={event => setReviewConfirmed(event.target.checked)} disabled={!reportReviewable || Boolean(busy)} className="mt-0.5 accent-amber-400" />
+                <span>Revisé el corte actual completo y confirmé estos controles.</span>
+              </label>
+              <button ref={firstActionRef} type="button" disabled={!reviewConfirmed || !reportReviewable || Boolean(busy)} onClick={attestFullReview} className="btn-primary mt-3 h-10 px-4 text-xs disabled:opacity-50">
+                {busy === "attest-review" ? "Guardando revisión…" : "Confirmar revisión del video"}
+              </button>
+              <p className="mt-2 text-[10px] text-ink-secondary">La confirmación queda asociada a este render y a tu usuario.</p>
+            </div>
+          </div>
+        </div>
+      )}
+      {forUmgDelivery && pendingManualCount === 0 && reviewedManualCount > 0 && (
+        <div role="status" className="mb-4 rounded-xl bg-emerald-500/[0.08] p-3 text-xs text-emerald-100 ring-1 ring-emerald-400/20">
+          <p className="font-semibold">Revisión guardada para este render.</p>
+          <p className="mt-1 text-emerald-100/80">{objectiveFailures.length
+            ? "Todavía hay fallas automáticas que corregir antes de publicar."
+            : "La confirmación quedó asociada a tu usuario y a este corte."}</p>
+        </div>
       )}
 
       {report.status !== "COMPLETE" && <div className="mb-3 space-y-2"><p className="text-xs text-amber-200">El informe no está vigente o completo. Actualizá el preflight y esperá a que termine antes de firmar o aplicar sugerencias.</p><button disabled={Boolean(busy)} onClick={refresh} className="btn-secondary h-9 px-3 text-xs">{busy === "refresh" ? "Actualizando preflight…" : "Actualizar preflight"}</button></div>}
       <div className="space-y-2">
-        {issues.map((issue) => (
+        {issues.filter(issue => !isManualIssue(issue)).map((issue) => (
           <div key={issue.issue_id} data-issue-id={issue.issue_id}
             data-effective-blocker={effectiveBlockers.includes(issue.issue_id) ? "true" : undefined}
             className="rounded-xl bg-white/[0.03] ring-1 ring-white/[0.06] p-3">
@@ -301,9 +372,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
                   ))}
                 </div>
               </div>
-              {issue.status === "OPEN" && issue.manual_verification_required ? (
-                <button ref={issue.issue_id === firstManualIssueId ? firstActionRef : undefined} aria-label={`Firmar: ${issue.summary}`} disabled={Boolean(busy) || !reportReviewable} onClick={() => updateDecision(issue, "resolved_manual")} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50">Firmar</button>
-              ) : issue.status === "OPEN" && (issue.result_status === "FAIL" || issue.severity === "FAIL") ? (
+              {issue.status === "OPEN" && (issue.result_status === "FAIL" || issue.severity === "FAIL") ? (
                 <button type="button" onClick={onOpenEditor} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-red-500/10 text-red-200 hover:bg-red-500/20">Corregir video</button>
               ) : issue.status === "OPEN" ? (
                 <button disabled={Boolean(busy) || !reportReviewable} onClick={() => updateDecision(issue, "acknowledged")} className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50">Revisado</button>
@@ -320,6 +389,9 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
       <div className="flex flex-wrap gap-2 mt-4">
         {forUmgDelivery && reportReviewable && report.approval?.can_approve && onContinueToPublish && (
           <button type="button" onClick={onContinueToPublish} className="btn-primary h-10 px-4 text-xs">Continuar a publicar</button>
+        )}
+        {forUmgDelivery && reportReviewable && report.approval?.can_approve && onReturnToPublish && (
+          <button type="button" onClick={onReturnToPublish} className="btn-primary h-10 px-4 text-xs">Volver al pedido para publicar</button>
         )}
         {safeActions.some((row) => ["text", "timing"].includes(row.domain)) && (
           <button disabled={Boolean(busy) || !reportReviewable} onClick={() => applySafeActions("lyrics")} className="btn-primary h-10 px-4 text-xs">Corregir texto/timing seguro</button>

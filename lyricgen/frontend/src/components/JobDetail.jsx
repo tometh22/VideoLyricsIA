@@ -2355,6 +2355,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           forUmgDelivery={umgPreflightRequested || isUmgJob || isInUmgPortal}
           focusRequest={qcFocusRequest}
           onContinueToPublish={umgPreflightRequested ? continueUmgPublish : undefined}
+          onReturnToPublish={campaignReturn ? () => navigate(campaignReturn) : undefined}
         />
       )}
 

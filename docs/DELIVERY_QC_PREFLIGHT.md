@@ -38,9 +38,11 @@ line automatically.  This is especially important for live songs.
 
 - The exact final MP4 is inspected before R2 upload on initial and edited renders.
 - `ffprobe` validates streams, duration, codec, pixel format, dimensions and FPS.
-- High-confidence Gemini OCR samples the title card and lyric frames. The model
-  never receives expected text; comparison happens locally and OCR remains a
-  review signal, never an automatic correction.
+- For UMG deliveries, Gemini OCR samples the title card and lyric frames by
+  default (`DELIVERY_QC_UMG_OCR_ENABLED=0` disables it). Other deliveries retain
+  the opt-in `DELIVERY_QC_OCR_ENABLED` flag. The model never receives expected
+  text; comparison happens locally and OCR never changes the video. Empty or
+  low-confidence OCR is `NOT_RUN`, never `PASS`.
 - Reports persist on `Job.delivery_qc`, are bound to segment revision/hash and
   become `STALE` on every editor mutation.
 - Every check exposes an explicit result: `PASS`, `FAIL`, `REVIEW` or
@@ -52,10 +54,15 @@ line automatically.  This is especially important for live songs.
 - Reviewer decisions, accepted repair types, approval outcome and later label QC
   finding counts are structured product events. Existing editor `active_edit_ms`
   supplies minutes-per-song before/after.
-- `DELIVERY_QC_MODE=observe` never blocks approval. `enforce` requires a fresh
-  report and blocks only objective open `FAIL` findings. Open `REVIEW`
-  findings, including unsigned generic reviewer reminders, remain visible as
-  recommendations and do not become automatic failures.
+- `DELIVERY_QC_MODE=observe` never blocks ordinary approval. UMG publication
+  always requires a fresh report, correction of objective open `FAIL`
+  findings, and one audited human attestation for the complete current render.
+  The attestation resolves the grouped visual/listening checklist in one
+  operation; generic reminders are not displayed or signed as individual
+  issues. Other open `REVIEW` findings remain recommendations and never become
+  automatic failures.
+- A delivery version is `NOT_APPLICABLE` when the selected UMG specification
+  does not require one; when it does, missing visible evidence is `NOT_RUN`.
 
 ## Deliberately not automatic yet
 
@@ -127,7 +134,8 @@ also proposal-only unless an independent verifier confirms them.
 1. Motor produces segments and independently attested suggestions.
 2. Render produces the exact customer-facing asset.
 3. Preflight audits the encoded asset and persists an actionable report.
-4. The reviewer seeks, acknowledges or accepts safe suggestions with one click.
+4. The reviewer resolves objective failures, accepts safe suggestions, and
+   confirms the complete visual/audio review once for the current render.
 5. A correction creates a normal edit render; the old report becomes stale and
    a new preflight is mandatory.
 6. Approval records internal QC counts. Later label feedback is recorded through

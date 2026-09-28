@@ -153,14 +153,15 @@ def inspect_rendered_text(
     metadata: Mapping[str, Any],
     segments: Sequence[Mapping[str, Any]],
     ocr_callback: Callable[[list[dict[str, Any]]], Sequence[Mapping[str, Any]]] | None = None,
+    enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Sample title/lyric frames and optionally run an injected OCR provider.
 
     Production provider wiring is deliberately injectable: when unavailable the
     report records an abstention instead of silently declaring PASS.
     """
-    enabled = os.environ.get("DELIVERY_QC_OCR_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
-    if not enabled:
+    should_run = enabled if enabled is not None else os.environ.get("DELIVERY_QC_OCR_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if not should_run:
         return {"observations": [], "issues": [], "abstentions": [{"detector": "final_frame_ocr", "reason": "disabled"}]}
     if not os.path.isfile(video_path):
         return {"observations": [], "issues": [], "abstentions": [{"detector": "final_frame_ocr", "reason": "asset_missing"}]}
