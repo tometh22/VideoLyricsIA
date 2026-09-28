@@ -446,6 +446,23 @@ function ChangeRequestCard({
   const isResolved = !!item.resolved_at;
   const status = publicationStatus(item.publication);
   const workflow = requestWorkflow(item, proposal, proposalEnabled);
+  const qcGate = item.delivery_qc_gate;
+  const qcNeedsReview = !isResolved && qcGate?.blocked === true && (
+    Array.isArray(workflow.allowed_actions)
+      ? workflow.allowed_actions.some((action) => ["publish", "prepare_master"].includes(action))
+      : status.canPublish
+  );
+  const qcReviewHref = d.job_id
+    ? `/videos/${encodeURIComponent(d.job_id)}?qc_focus=${qcGate?.reason === "manual_review_required" ? "manual" : "findings"}&return_to=${encodeURIComponent(`/admin?section=cambios&change_request_id=${item.id}`)}`
+    : null;
+  const qcReviewLabel = qcGate?.reason === "fresh_preflight_required"
+    ? "Analizar y revisar este corte"
+    : "Completar revisión del video";
+  const qcReviewMessage = qcGate?.reason === "fresh_preflight_required"
+    ? "Este corte todavía no tiene un preflight vigente. Analizalo y revisá el resultado antes de publicar."
+    : qcGate?.reason === "manual_review_required"
+      ? "El preflight está actualizado, pero falta completar la revisión del video."
+      : "El preflight encontró puntos pendientes que hay que resolver antes de publicar.";
   const videoRef = useRef(null);
   const proposalRef = useRef(null);
   // Un pedido resuelto AL PUBLICAR no necesita que nadie confirme nada: la
@@ -467,7 +484,9 @@ function ChangeRequestCard({
   let primaryAction;
   const serverActions = workflow.allowed_actions;
   const allows = (action) => !Array.isArray(serverActions) || serverActions.includes(action);
-  if (Array.isArray(serverActions)) {
+  if (qcNeedsReview && qcReviewHref) {
+    primaryAction = { label: qcReviewLabel, href: qcReviewHref };
+  } else if (Array.isArray(serverActions)) {
     if (isResolved && allows("reopen")) {
       primaryAction = { label: resolving ? "Reabriendo…" : "Reabrir pedido", onClick: onReopen, disabled: resolving };
     } else if (["refresh", "unknown"].includes(workflow.key) && allows("refresh")) {
@@ -747,10 +766,19 @@ function ChangeRequestCard({
             </a>
           )}
         </div>}
+        {qcNeedsReview && !actionNotice && (
+          <div role="status" aria-label="Preflight pendiente"
+            className="w-full rounded-lg bg-amber-400/[0.08] p-3 text-caption text-amber-100 ring-1 ring-amber-300/20">
+            <p className="font-semibold">La publicación está pausada</p>
+            <p className="mt-0.5 text-label text-amber-50/80">{qcReviewMessage}</p>
+          </div>
+        )}
         <div className="min-w-0">
-          <p className="text-caption font-semibold text-white">{workflow.label}</p>
+          <p className="text-caption font-semibold text-white">
+            {qcNeedsReview ? "Revisión del video pendiente" : workflow.label}
+          </p>
           <p className="truncate text-label text-gray-500">
-            {isResolved ? "Podés reabrirlo si el cliente necesita otra corrección." : "Acción recomendada para este pedido"}
+            {isResolved ? "Podés reabrirlo si el cliente necesita otra corrección." : qcNeedsReview ? qcReviewMessage : "Acción recomendada para este pedido"}
           </p>
         </div>
         <div className="flex items-center gap-2">

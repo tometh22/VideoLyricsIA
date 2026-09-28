@@ -3,6 +3,11 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.65] - 2026-09-28
+
+### Fixed
+- Keep UMG publication unavailable until the current render has a valid preflight, and send the operator directly to the required review.
+
 ## [1.1.64] - 2026-09-27
 
 ### Fixed

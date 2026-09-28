@@ -574,7 +574,9 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
             : gate?.reason === "fresh_preflight_required"
               ? "Este corte todavía no tiene un preflight vigente. Analizalo antes de publicar."
               : "El preflight encontró puntos que requieren atención antes de publicar.",
-          actionLabel: "Completar revisión del video",
+          actionLabel: gate?.reason === "fresh_preflight_required"
+            ? "Analizar y revisar este corte"
+            : "Completar revisión del video",
           actionHref: reviewUrl,
         });
       } else {

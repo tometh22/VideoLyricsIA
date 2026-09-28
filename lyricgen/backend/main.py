@@ -21333,6 +21333,8 @@ async def admin_list_change_requests(
         except Exception:
             return None
 
+    from delivery_qc_runtime import delivery_readiness_gate
+
     items = []
     for cr in crs:
         d = deliveries_by_id.get(cr.delivery_id)
@@ -21398,6 +21400,13 @@ async def admin_list_change_requests(
             # importa después de corregir: ¿lo que el cliente puede bajar
             # AHORA es lo que acabo de arreglar?
             "publication": publication,
+            "delivery_qc_gate": (
+                delivery_readiness_gate(
+                    job, job.delivery_qc, for_umg_delivery=True,
+                )
+                if job is not None and d is not None and cr.resolved_at is None
+                else None
+            ),
             "delivery": (
                 {
                     "id": d.id,

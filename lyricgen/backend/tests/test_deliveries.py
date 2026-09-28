@@ -835,6 +835,7 @@ def test_change_request_submit_and_admin_lists_it(
     assert item["delivery"]["job_id"] == approved_job.job_id
     assert item["resolved_at"] is None
     assert item["publication"]["prores_configured"] is True
+    assert item["delivery_qc_gate"]["can_approve"] is True
 
     # Resolver lo saca de "pending" y lo pasa a "resolved".
     res = client.post(f"/admin/change-requests/{cr_id}/resolve",
@@ -858,6 +859,36 @@ def test_change_request_submit_and_admin_lists_it(
     pending = client.get("/admin/change-requests?status=pending",
                           headers=auth(admin_token)).json()
     assert pending["pending_count"] == 1
+
+
+def test_change_request_list_surfaces_missing_current_preflight(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    delivery = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert delivery.status_code == 200, delivery.text
+    delivery_id = delivery.json()["delivery_id"]
+    with patch("main.emails.send_umg_change_request_notification"):
+        request = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": "revisar el corte corregido"},
+        )
+    assert request.status_code == 200, request.text
+
+    approved_job.delivery_qc = None
+    db.commit()
+    listed = client.get(
+        "/admin/change-requests?status=pending", headers=auth(admin_token),
+    )
+    assert listed.status_code == 200, listed.text
+    item = next(
+        row for row in listed.json()["items"] if row["id"] == request.json()["id"]
+    )
+    assert item["delivery_qc_gate"]["blocked"] is True
+    assert item["delivery_qc_gate"]["reason"] == "fresh_preflight_required"
 
 
 def test_change_request_proposal_applies_revisioned_text_but_stays_open_until_publish(

@@ -366,6 +366,29 @@ describe("ChangeRequestsPanel", () => {
     expect(publish).toHaveBeenCalledWith("f7752c6feed4", "chile", 7, expect.objectContaining({ needs_publish: true }));
   });
 
+  it.each([
+    ["fresh_preflight_required", "Analizar y revisar este corte", "qc_focus=findings"],
+    ["manual_review_required", "Completar revisión del video", "qc_focus=manual"],
+  ])("routes a blocked publication to the required video review (%s)", (reason, label, focus) => {
+    const publish = vi.fn();
+    renderPanel({
+      publication: { ...BASE_PUBLICATION, needs_publish: true },
+      delivery_qc_gate: { blocked: true, reason },
+      workflow: {
+        key: "publish", activeStep: 3, label: "Revisar video y publicar actualización",
+        detail: "", tone: "attention", allowed_actions: ["edit", "publish", "resolve"],
+      },
+    }, { publishDeliveryUpdate: publish });
+
+    const review = screen.getByRole("link", { name: label });
+    expect(review).toHaveAttribute("href", expect.stringContaining(focus));
+    expect(review).toHaveAttribute("href", expect.stringContaining("change_request_id%3D7"));
+    expect(screen.queryByRole("button", { name: "Publicar actualización" })).not.toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Preflight pendiente" }))
+      .toHaveTextContent(/publicación está pausada/i);
+    expect(publish).not.toHaveBeenCalled();
+  });
+
   it("links a blocked publication to the pending QC review", async () => {
     renderPanel(
       { publication: { ...BASE_PUBLICATION, needs_publish: true } },
