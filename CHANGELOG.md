@@ -3,6 +3,15 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.67] - 2026-09-28
+
+### Added
+
+- Add a pre-editor lyric and timing auto-repair path with local-only candidate
+  contracts, per-action signed calibration authorization, stale audio/segment
+  guards, and a concise editor summary. Automatic changes remain disabled
+  until an independently calibrated authorization is configured.
+
 ## [1.1.66] - 2026-09-28
 
 ### Fixed
