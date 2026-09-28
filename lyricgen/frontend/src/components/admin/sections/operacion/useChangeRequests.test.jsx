@@ -221,7 +221,7 @@ it.each([undefined, 502])("reports uncertain publication after lost response/sta
   const { result } = renderHook(() => useChangeRequests());
   await act(() => result.current.publishDeliveryUpdate("job-85", "chile", 85, { editor_revision: 4, render_fingerprint: "render4" }));
   expect(result.current.crPublishNotice).toMatchObject({ requestId: 85, tone: "wait" });
-  expect(result.current.crPublishNotice.text).toContain("podría haberse completado");
+  expect(result.current.crPublishNotice.text).toContain("podría haberse publicado");
   expect(result.current.crPublishNotice.text).not.toContain("No se publicó");
   expect(mocks.fetchJson.mock.calls.filter(([, options]) => options?.method === "POST")).toHaveLength(1);
 });

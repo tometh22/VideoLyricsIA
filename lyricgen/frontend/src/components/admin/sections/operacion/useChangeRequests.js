@@ -555,7 +555,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         }
         if (mutationOutcomeUnknown(err)) {
           setCrPublishNotice({ requestId: crId, outcomeUnknown: true, tone: "wait",
-            text: "Se perdió la respuesta. La publicación podría haberse completado; consultá el estado antes de reintentar." });
+            text: "Se perdió la respuesta. La publicación podría haberse publicado; consultá el estado antes de reintentar." });
         } else {
           setCrPublishNotice({ requestId: crId, tone: "error",
             text: `El servidor no aceptó la publicación: ${err.message || err}` });
