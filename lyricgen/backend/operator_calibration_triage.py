@@ -47,6 +47,25 @@ def _identity_sequence(rows: list[dict]) -> list[tuple[str, str]] | None:
     return values
 
 
+def _line_bindings(original: list[dict], edited: list[dict]) -> tuple[list[tuple[str, str]] | None, str]:
+    """Bind only equal-length snapshots; positional matches remain diagnostic."""
+    old_ids = _identity_sequence(original)
+    new_ids = _identity_sequence(edited)
+    if old_ids is not None and old_ids == new_ids:
+        return old_ids, "stable_id"
+    # Legacy machine rows have no IDs. The editor adds them during the first
+    # save, so requiring identical IDs would discard every such song. An
+    # equal-length, index-bound pair can locate audio to review, but it must
+    # never be interpreted as a verified occurrence or calibration label.
+    if (
+        len(original) == len(edited)
+        and all(identity(row) is None for row in original)
+        and new_ids is not None
+    ):
+        return [("index_diagnostic", str(i)) for i in range(len(original))], "index_diagnostic"
+    return None, "unverified"
+
+
 def _clip(before: tuple[float, float], after: tuple[float, float]) -> tuple[float, float] | None:
     start = max(0.0, min(before[0], after[0]) - 2.0)
     end = max(before[1], after[1]) + 2.0
@@ -96,10 +115,8 @@ def _case(record: dict[str, Any], key: bytes) -> tuple[dict | None, str | None]:
         or not record.get("input_r2_key")
     ):
         return None, "audio_snapshot_unverified"
-    old_ids = _identity_sequence(original)
-    new_ids = _identity_sequence(edited)
-    if old_ids is None or old_ids != new_ids:
-        return None, "structure_or_occurrence_unverified"
+    line_ids, occurrence_binding = _line_bindings(original, edited)
+    structural_diagnosis = line_ids is None
     if any(_interval(row) is None for row in original + edited):
         return None, "timing_invalid"
 
@@ -117,16 +134,68 @@ def _case(record: dict[str, Any], key: bytes) -> tuple[dict | None, str | None]:
     tasks = []
     controls = []
     skipped_lines = Counter()
-    for index, (before, after, segment_id) in enumerate(zip(original, edited, old_ids)):
+    if structural_diagnosis:
+        # Inserts/deletes/reorders cannot be paired to a machine line. Audio
+        # can still be reviewed blind one edited window at a time; no delta
+        # or automatic-action accuracy may be inferred from this queue.
+        for index, after in enumerate(edited):
+            after_time = _interval(after)
+            clip = _clip(after_time, after_time)
+            if clip is None:
+                skipped_lines["long_window"] += 1
+                continue
+            edited_id = ("index_unpaired", str(index))
+            task_id = _token(
+                key, "task", f"{job_id}\x1f{audio_hash}\x1f{edited_hash}\x1f"
+                f"{edited_id[0]}:{edited_id[1]}\x1fstructure_diagnosis",
+            )
+            tasks.append(({
+                "schema": SCHEMA, "task_id": task_id, "job_id": job_id,
+                "line_index": index, "task_type": "structure_diagnosis",
+                "sample_role": "unpaired", "clip_start_s": clip[0],
+                "clip_end_s": clip[1], "repeated_phrase": False,
+                "occurrence_binding": "unpaired_edited", "human_protected": bool(
+                    after.get("locked") or after.get("operator_locked")
+                ),
+                "timing_source": str(record.get("timing_source") or "unknown")[:64],
+                "is_live": record.get("is_live") if isinstance(record.get("is_live"), bool) else None,
+                "blind_review_required": True, "gold": False,
+                "automatic_apply_allowed": False,
+            }, {
+                "task_id": task_id, "job_id": job_id,
+                "line_identity": list(edited_id),
+                "occurrence_binding": "unpaired_edited",
+                "original_version_id": first.get("id"),
+                "edited_version_id": target.get("id"),
+                "original_segments_sha256": original_hash,
+                "edited_segments_sha256": edited_hash,
+                "audio_sha256": audio_hash,
+                "audio_revision": int(record.get("audio_revision") or 0),
+                "original_start_s": None, "original_end_s": None,
+                "edited_start_s": after_time[0],
+                "edited_end_s": after_time[1],
+                "original_text_hmac": None,
+                "edited_text_hmac": _token(key, "lyric", str(after.get("text") or "")),
+                "operator_revision_is_gold": False,
+            }))
+        return {
+            "job_id": job_id, "artist_group": artist_group,
+            "audio_group": audio_group, "tasks": tasks,
+            "skipped_lines": skipped_lines,
+        }, None
+    for index, (before, after, segment_id) in enumerate(zip(original, edited, line_ids)):
         before_time, after_time = _interval(before), _interval(after)
         delta_start = round(after_time[0] - before_time[0], 4)
         delta_end = round(after_time[1] - before_time[1], 4)
         text_changed = before.get("text") != after.get("text")
         timing_changed = max(abs(delta_start), abs(delta_end)) > MIN_TIMING_CHANGE_S
         micro_timing = bool(delta_start or delta_end) and not timing_changed
-        if before.get("locked") or before.get("operator_locked") or after.get("locked") or after.get("operator_locked"):
-            skipped_lines["protected"] += 1
-            continue
+        human_protected = bool(
+            before.get("locked") or before.get("operator_locked")
+            or after.get("locked") or after.get("operator_locked")
+        )
+        if human_protected:
+            skipped_lines["human_protected_review_lines"] += 1
         if micro_timing and not text_changed:
             skipped_lines["micro_timing"] += 1
             continue
@@ -154,6 +223,8 @@ def _case(record: dict[str, Any], key: bytes) -> tuple[dict | None, str | None]:
             "clip_start_s": clip[0],
             "clip_end_s": clip[1],
             "repeated_phrase": repeated,
+            "occurrence_binding": occurrence_binding,
+            "human_protected": human_protected,
             "timing_source": str(record.get("timing_source") or "unknown")[:64],
             "is_live": record.get("is_live") if isinstance(record.get("is_live"), bool) else None,
             "blind_review_required": True,
@@ -164,6 +235,7 @@ def _case(record: dict[str, Any], key: bytes) -> tuple[dict | None, str | None]:
             "task_id": task_id,
             "job_id": job_id,
             "line_identity": list(segment_id),
+            "occurrence_binding": occurrence_binding,
             "original_version_id": first.get("id"),
             "edited_version_id": target.get("id"),
             "original_segments_sha256": original_hash,

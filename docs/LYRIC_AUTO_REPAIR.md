@@ -42,8 +42,8 @@ firmada y los switches por acción:
 - `LYRIC_AUTO_REPAIR_AUTHORIZATION_SHA256=<sha256 del archivo exacto>`
 - `LYRIC_AUTO_REPAIR_PUBLIC_KEYS={"key-id":"<clave pública Ed25519 base64>"}`
 
-No se debe generar ni habilitar una autorización con las ocho canciones
-revisadas hoy: esas ediciones sirven como casos de reproducción, no como
+No se debe generar ni habilitar una autorización con las revisiones operativas
+de Agus: esas ediciones sirven como casos de reproducción, no como
 verdad de referencia independiente. La autorización debe cubrir corpus
 etiquetado a ciegas, negativos que el motor dejó intactos, cero errores
 catastróficos y al menos 539 acciones revisadas por acción con límite inferior

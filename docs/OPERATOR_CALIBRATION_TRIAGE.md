@@ -48,11 +48,19 @@ revisor, sin el archivo de procedencia. La página guarda las respuestas en el
 navegador y permite descargarlas. Estas respuestas son borradores privados:
 todavía no equivalen a etiquetas adjudicadas ni a una aprobación del motor.
 
-Un cambio estructural, una identidad de línea dudosa, un audio reemplazado, un
-checkpoint de máquina sin validar o una versión de Agus ya superada quedan
-fuera de la cola. Se agregan hasta cuatro líneas intactas por canción como
+Un audio reemplazado, un checkpoint de máquina sin validar o una versión de
+Agus ya superada quedan fuera de la cola. Los cambios estructurales se
+convierten en recortes ciegos `structure_diagnosis` tomados de la versión
+editada: no se emparejan con una línea de máquina ni se usan para medir deltas
+o autorizar acciones. Cuando la máquina no guardó IDs de línea y el editor los
+agregó después, solo se admiten pares con igual cantidad de líneas. Se marcan
+`index_diagnostic`: el índice sirve para localizar el recorte, pero no prueba
+que sea la misma ocurrencia ni autoriza una etiqueta automática. Se agregan
+hasta cuatro líneas intactas por canción como
 controles. Las frases repetidas se señalan para muestreo difícil; todas las
-canciones del mismo artista o grabación quedan en la misma partición.
+canciones del mismo artista o grabación quedan en la misma partición. Las líneas
+que el operador bloqueó siguen disponibles para escuchar y se marcan
+`human_protected`; el motor no puede modificarlas automáticamente.
 
 ## Escucha y etiquetas
 
