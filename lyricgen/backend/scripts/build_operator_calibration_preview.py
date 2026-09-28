@@ -43,7 +43,15 @@ def build(queue_path: Path, urls_path: Path, output: Path) -> int:
     payload = {
         "queue_sha256": queue_sha,
         "expires_at": audio.get("expires_at"),
-        "tasks": [{**task, "audio_url": urls[task["job_id"]]} for task in tasks],
+        # Only the clip and an opaque task ID reach the reviewer. In
+        # particular, controls, change types, source models and split labels
+        # stay sealed; showing them would bias the blind observation.
+        "tasks": [{
+            "task_id": task["task_id"],
+            "clip_start_s": task["clip_start_s"],
+            "clip_end_s": task["clip_end_s"],
+            "audio_url": urls[task["job_id"]],
+        } for task in tasks],
     }
     safe_json = json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c")
     content = template.replace("__CALIBRATION_DATA__", safe_json)

@@ -44,8 +44,10 @@ python3.11 lyricgen/backend/scripts/serve_reviewer_shadow_preview.py \
 ```
 
 El servidor escucha solo en `127.0.0.1` y expone únicamente la carpeta del
-revisor, sin el archivo de procedencia. La página guarda las respuestas en el
-navegador y permite descargarlas. Estas respuestas son borradores privados:
+revisor, sin el archivo de procedencia. La página tampoco expone el tipo de
+cambio, si un recorte es control, el modelo, el artista o la partición. Guarda
+las respuestas en el navegador y permite descargarlas. Estas respuestas son
+borradores privados:
 todavía no equivalen a etiquetas adjudicadas ni a una aprobación del motor.
 
 Un audio reemplazado, un checkpoint de máquina sin validar o una versión de

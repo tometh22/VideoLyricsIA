@@ -20,7 +20,7 @@
   <p class="muted">Escuchá el audio y marcá lo que oís. Esta página no cambia canciones ni aprueba correcciones.</p>
   <div class="card">
     <label>Revisor <input id="reviewer" autocomplete="off" placeholder="Tu identificador"></label>
-    <div class="row"><label>Tipo <select id="taskFilter"><option value="all">Todos</option><option value="timing_review">Timing</option><option value="content_review">Letra</option><option value="joint_diagnosis">Letra y timing</option><option value="structure_diagnosis">Estructura</option><option value="unchanged_control">Controles</option></select></label><label>Estado <select id="reviewFilter"><option value="pending">Pendientes</option><option value="all">Todos</option><option value="done">Guardados</option></select></label></div>
+    <div class="row"><label>Estado <select id="reviewFilter"><option value="pending">Pendientes</option><option value="all">Todos</option><option value="done">Guardados</option></select></label><label>Ir al tramo <input id="jumpTo" type="number" min="1" step="1" placeholder="Número"></label><button id="jump">Ir</button></div>
     <div class="row"><button id="previous">← Anterior</button><strong id="position"></strong><button id="next">Siguiente →</button></div>
     <p class="muted" id="progress"></p>
     <p id="task"></p><p class="muted" id="clip"></p>
@@ -58,7 +58,7 @@ const audio=$('audio'),fields=['verdict','heard','start','end','note'];let index
 const reviewerKey=()=>`genly-calibration:${data.queue_sha256}:${$('reviewer').value.trim()}`;
 function loadAnswers(){try{answers=JSON.parse(localStorage.getItem(reviewerKey())||'{}')}catch(_){answers={}}}
 function isDone(row){const answer=answers[row.task_id];return !!answer&&answer.verdict!=='unreviewed'}
-function visibleIndices(){const kind=$('taskFilter').value,state=$('reviewFilter').value;return rows.map((row,i)=>({row,i})).filter(({row})=>(kind==='all'||row.task_type===kind)&&(state==='all'||(state==='done'&&isDone(row))||(state==='pending'&&!isDone(row)))).map(({i})=>i)}
+function visibleIndices(){const state=$('reviewFilter').value;return rows.map((row,i)=>({row,i})).filter(({row})=>state==='all'||(state==='done'&&isDone(row))||(state==='pending'&&!isDone(row))).map(({i})=>i)}
 function moveFiltered(direction){const visible=visibleIndices(),target=direction>0?visible.find(i=>i>index):visible.slice().reverse().find(i=>i<index);if(target!==undefined){index=target;show()}else{$('status').textContent='No quedan más tramos con este filtro.';updateProgress()}}
 function updateProgress(){const done=rows.filter(isDone).length,visible=visibleIndices();$('progress').textContent=`${done} de ${rows.length} guardados · ${visible.length} con el filtro actual`}
 function save(){const reviewer=$('reviewer').value.trim();if(!reviewer){$('status').textContent='Escribí tu identificador para guardar.';return false}
@@ -68,12 +68,13 @@ function save(){const reviewer=$('reviewer').value.trim();if(!reviewer){$('statu
   answers[answer.task_id]=answer;try{localStorage.setItem(reviewerKey(),JSON.stringify(answers));$('status').textContent='Guardado ✓';return true}
   catch(_){$('status').textContent='No se pudo guardar. Descargá tus respuestas.';return false}}
 function show(){const row=rows[index],stored=answers[row.task_id]||{};audio.pause();audio.src=row.audio_url;
-  $('position').textContent=`${index+1} / ${rows.length}`;updateProgress();$('task').textContent={timing_review:'Marcá el inicio y el fin de la frase cantada.',content_review:'Escribí lo que escuchás.',joint_diagnosis:'Escribí lo que escuchás y marcá sus límites.',structure_diagnosis:'Este tramo viene de una canción con líneas agregadas o quitadas. Escribí lo que escuchás y marcá sus límites.',unchanged_control:'Control: escuchá y marcá lo que escuchás.'}[row.task_type]||'Escuchá este tramo.';
-  $('clip').textContent=`Tramo ${row.clip_start_s.toFixed(2)}–${row.clip_end_s.toFixed(2)} s · ${row.repeated_phrase?'frase repetida':'frase única'}`;
+  $('position').textContent=`${index+1} / ${rows.length}`;updateProgress();$('task').textContent='Escribí lo que escuchás y marcá el inicio y el final de la frase. Si no hay una frase clara, elegí «Ambiguo».';
+  $('clip').textContent=`Recorte ${row.clip_start_s.toFixed(2)}–${row.clip_end_s.toFixed(2)} s`;
   fields.forEach(field=>$(field).value=stored[field==='heard'?'heard_text':field==='start'?'start_s':field==='end'?'end_s':field]|| (field==='verdict'?'unreviewed':''));
   $('audioError').textContent='';$('status').textContent='';audio.onloadedmetadata=()=>{audio.currentTime=row.clip_start_s};}
 function changeFilter(){const visible=visibleIndices();if(visible.length&&!visible.includes(index))index=visible[0];show()}
-$('reviewer').addEventListener('change',()=>{loadAnswers();changeFilter()});$('taskFilter').onchange=changeFilter;$('reviewFilter').onchange=changeFilter;
+$('reviewer').addEventListener('change',()=>{loadAnswers();changeFilter()});$('reviewFilter').onchange=changeFilter;
+$('jump').onclick=()=>{const target=Number($('jumpTo').value)-1;if(Number.isInteger(target)&&target>=0&&target<rows.length){if($('reviewer').value.trim())save();index=target;show()}else $('status').textContent='Ingresá un número de tramo válido.'};
 $('previous').onclick=()=>{if($('reviewer').value.trim())save();moveFiltered(-1)};$('next').onclick=()=>{if($('reviewer').value.trim())save();moveFiltered(1)};$('saveNext').onclick=()=>{if(save())moveFiltered(1)};
 $('replay').onclick=()=>{audio.currentTime=rows[index].clip_start_s;audio.play().catch(()=>{})};
 audio.ontimeupdate=()=>{const row=rows[index];$('clock').textContent=`${audio.currentTime.toFixed(2)} s`;if(audio.currentTime>=row.clip_end_s)audio.pause()};
