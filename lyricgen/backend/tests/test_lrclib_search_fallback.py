@@ -250,6 +250,8 @@ def test_get_success_skips_search_entirely():
                 "plainLyrics": "Línea uno\nLínea dos",
                 "syncedLyrics": "[00:10.00] Línea uno\n[00:14.00] Línea dos",
                 "duration": 120.0,
+                "trackName": "Song",
+                "artistName": "Test",
             }
             return resp
         if "/api/search" in url:
