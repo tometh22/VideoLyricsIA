@@ -8447,10 +8447,13 @@ async def _run_transcription_for_job(
                         mode=_reference_gate_mode,
                         is_live=_reference_is_live,
                     )
-                    if _reference_action == "audio_first":
+                    # local_only is the live verdict: it can never authorize
+                    # the global catalogue reconcile below, even when the
+                    # independent live policy switches are disabled.
+                    if _reference_action in {"audio_first", "local_only"}:
                         logger.warning(
-                            "[REFERENCE-ATTEST] catalogue candidate lacks "
-                            "safe text/structure attestation; "
+                            "[REFERENCE-ATTEST] catalogue candidate cannot "
+                            "own whole-song structure; "
                             "emitting audio-first WhisperX without reference "
                             "reconciliation job=%s",
                             job_id,
