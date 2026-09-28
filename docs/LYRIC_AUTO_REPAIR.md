@@ -7,6 +7,12 @@ acción autorizada y una reevaluación de calidad que mejora el resultado. Si
 cualquier filtro falla, conserva la versión original y registra solo el motivo
 acotado y el conteo en `transcription_quality.auto_repair`.
 
+La independencia se evalúa por familia canónica del modelo: nombres alternativos,
+variantes de interfaz y vistas del mismo proveedor no cuentan como dos fuentes.
+Si falla el proveedor usado solo para proponer una reparación, el motor se
+abstiene y conserva la evaluación y los segmentos originales; el fallo de esa
+propuesta no se registra como fallo de la evaluación de calidad.
+
 ## Acciones que admite la primera versión
 
 - `timing_reversible`: mover límites o tiempos de palabras sin alterar la
