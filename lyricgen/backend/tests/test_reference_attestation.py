@@ -1,5 +1,8 @@
+from pathlib import Path
+
 from reference_attestation import (
     assess_reference_attestation,
+    effective_reference_gate_mode,
     reference_gate_action,
 )
 
@@ -33,6 +36,23 @@ def test_wrong_song_reference_is_fail_closed():
     assert result["text_status"] == "unsafe_without_witness"
     assert result["allow_vocabulary_reconciliation"] is False
     assert result["allow_global_forced_alignment"] is False
+
+
+def test_external_lyrics_enforce_audio_gate_even_when_configured_to_observe():
+    wrong = assess_reference_attestation(
+        "Bailando bajo la lluvia con un corazón enamorado",
+        _segments("Todos estos años de gente historias en la ciudad"),
+        audio_duration_s=100,
+    )
+    for source in ("lrclib", "genius", "gemini"):
+        for configured in ("off", "observe"):
+            mode = effective_reference_gate_mode(
+                configured, reference_source=source, reference_required=False,
+            )
+            assert mode == "enforce"
+            assert reference_gate_action(
+                wrong, mode=mode, is_live=False,
+            ) == "audio_first"
 
 
 def test_partial_or_live_reference_never_authorizes_global_alignment():
@@ -100,6 +120,15 @@ def test_live_reference_can_only_be_used_as_local_vocabulary():
     assert reference_gate_action(
         result, mode="observe", is_live=True,
     ) == "observe"
+
+
+def test_live_local_only_exits_before_global_catalogue_reconcile():
+    """The live gate must not depend on separate live-policy flags."""
+    source = (Path(__file__).parents[1] / "main.py").read_text()
+    gate = source.index('if _reference_action in {"audio_first", "local_only"}:')
+    emit = source.index("return _emit_segments(", gate)
+    reconcile = source.index("_captured_reconcile(", gate)
+    assert gate < emit < reconcile
 
 
 def test_attestation_never_emits_plain_sha256_identities(monkeypatch):

@@ -79,4 +79,4 @@ def test_batch_auto_joins_reference_before_language_resolution_and_never_prompts
     resolve = source.index('_reference_for_language =', join)
     primary = source.index('if _wc_enabled:', resolve)
     assert join < resolve < primary
-    assert 'or _batch_audio_only_reference)' in source
+    assert 'or _batch_audio_only_reference or _catalogue_candidate)' in source

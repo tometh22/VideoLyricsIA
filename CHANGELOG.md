@@ -3,6 +3,19 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.68] - 2026-09-28
+
+### Fixed
+
+- Reject LRCLIB results and cached lyrics whose title does not match the
+  requested song, including the incident where "Hoy" selected "Hoy Es Adios".
+- Require independent audio evidence before external lyrics can replace
+  transcription, including the legacy fallback and gap-driven re-fetch paths.
+- Keep live recordings on audio-owned structure when catalogue attestation is
+  local-only, regardless of live policy switch settings.
+- Log the selected catalogue record and audio/catalogue durations for future
+  incident diagnosis.
+
 ## [1.1.67] - 2026-09-28
 
 ### Added
