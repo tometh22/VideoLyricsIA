@@ -6155,14 +6155,10 @@ export default function App() {
               data-testid="auto-repair-summary"
             >
               <p className="text-sm font-semibold text-emerald-100">
-                {t("editor.auto_repair_done") === "editor.auto_repair_done"
-                  ? "Aplicamos mejoras automáticas antes de abrir el editor."
-                  : t("editor.auto_repair_done")}
+                Aplicamos mejoras automáticas antes de abrir el editor.
               </p>
               <p className="mt-1 text-xs leading-relaxed text-emerald-100/75">
-                {t("editor.auto_repair_detail") === "editor.auto_repair_detail"
-                  ? "Ya podés seguir con la canción; revisá los cambios en el editor si querés."
-                  : t("editor.auto_repair_detail")}
+                Ya podés seguir con la canción; revisá los cambios en el editor si querés.
               </p>
               <p className="mt-1 text-xs text-emerald-100/60">
                 {["timing_reversible", "content_reversible"].map((action) => {
