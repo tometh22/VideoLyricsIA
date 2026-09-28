@@ -9353,6 +9353,37 @@ async def _run_transcription_for_job(
                             # measured against gap reduction, not raw line
                             # count.
                             if better_text:
+                                # A smaller alignment gap cannot prove the
+                                # replacement lyric belongs to this audio.
+                                # Re-attest every external text before it can
+                                # replace the already accepted reference.
+                                from reference_attestation import (
+                                    assess_reference_attestation,
+                                    reference_gate_action,
+                                )
+                                _refetch_report = assess_reference_attestation(
+                                    better_text,
+                                    _wx_segs,
+                                    reference_source=f"catalog_{better_source}",
+                                    audio_duration_s=_audio_dur_for_lrc,
+                                    is_live=_reference_is_live,
+                                )
+                                _refetch_action = reference_gate_action(
+                                    _refetch_report,
+                                    mode="enforce",
+                                    is_live=_reference_is_live,
+                                )
+                                if _refetch_action != "reference_allowed":
+                                    logger.warning(
+                                        "[REFERENCE-ATTEST] rejected gap refetch "
+                                        "source=%s status=%s score=%.3f job=%s",
+                                        better_source,
+                                        _refetch_report["text_status"],
+                                        _refetch_report["metrics"]["attestation_score"],
+                                        job_id,
+                                    )
+                                    better_text = None
+                            if better_text:
                                 orig_lines = len([l for l in (fa_text or "").splitlines() if l.strip()])
                                 new_lines = _lines(better_text)
                                 if new_lines > orig_lines * 1.05:
