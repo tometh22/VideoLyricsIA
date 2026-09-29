@@ -302,6 +302,47 @@ def test_umg_readiness_requires_current_report_and_signed_manual_checks():
     assert delivery_readiness_gate(job, report, for_umg_delivery=True)["reason"] == "fresh_preflight_required"
 
 
+def test_staging_campaign_bypass_skips_only_manual_review_requirements(monkeypatch):
+    job = SimpleNamespace(
+        delivery_profile="umg", workload_class="interactive", campaign_id="campaign-1",
+        status="done", job_id="qc-test", editing_started_at=None,
+        input_audio_sha256="a" * 64, input_r2_key="input/test.mp3",
+        artist="Test", song_title="Song", style="oscuro",
+        render_params={}, scene_plan={}, bg_r2_key_cached=None,
+        umg_spec={"frame_size": "HD", "fps": 29.97},
+        segments_revision=3,
+        segments_json=[{"start": 0, "end": 2, "text": "Hola"}],
+        edit_count=2,
+    )
+    report = _current_umg_report(job, pending_codes={"UMG_BLACK_BARS"})
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "1")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS", "other-campaign")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_UNTIL_UTC", "2099-01-01T00:00:00Z")
+    assert delivery_readiness_gate(job, report, for_umg_delivery=True)["reason"] == "manual_review_required"
+
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS", "campaign-1")
+    gate = delivery_readiness_gate(job, report, for_umg_delivery=True)
+    assert gate["blocked"] is False
+    assert gate["staging_manual_review_bypass"] is True
+    assert gate["reason"] == "staging_manual_review_bypass"
+
+    report["issues"].append({
+        "issue_id": "objective-black-frame", "code": "MEDIA_BLACK_FRAME",
+        "status": "OPEN", "severity": "FAIL", "result_status": "FAIL",
+        "blocking": True,
+    })
+    assert delivery_readiness_gate(job, report, for_umg_delivery=True)["reason"] == "open_fail"
+    assert delivery_readiness_gate(job, None, for_umg_delivery=True)["reason"] == "fresh_preflight_required"
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    assert delivery_readiness_gate(job, _current_umg_report(job, pending_codes={"UMG_BLACK_BARS"}), for_umg_delivery=True)["reason"] == "manual_review_required"
+
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_UNTIL_UTC", "2020-01-01T00:00:00Z")
+    assert delivery_readiness_gate(job, _current_umg_report(job, pending_codes={"UMG_BLACK_BARS"}), for_umg_delivery=True)["reason"] == "manual_review_required"
+
+
 def test_blocking_automatic_fail_cannot_be_dismissed_by_closed_status():
     report = {
         "status": "COMPLETE",
