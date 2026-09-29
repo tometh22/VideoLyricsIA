@@ -202,3 +202,21 @@ def test_approval_gate(monkeypatch):
     assert exc.value.review["required_count"] == 1
     monkeypatch.setenv("LYRIC_REVIEW_MODE", "observe")
     require_resolved(db, document, job)
+
+
+def test_chorus_fixed_in_one_repetition_suggests_the_others():
+    # Como Caramelo De Limón (#76): se corrigió una repetición del coro y las
+    # otras quedaron con la versión de la máquina.
+    original = [_line("Y con él mi corazón", t, t + 2, f"c{t}") for t in (10, 40, 70)]
+    screen = [dict(original[0], text="Y con él tu corazón"), original[1], original[2]]
+    [item] = [i for i in build_review(screen, original_segments=original, title="")["items"]
+              if i["kind"] == "chorus_propagate"]
+    assert item["required"] is False
+    assert [o["after"] for o in item["occurrences"]] == ["Y con él tu corazón"] * 2
+
+
+def test_merged_lines_are_not_a_chorus_correction():
+    original = [_line("Justo a tiempo ya", t, t + 2, f"c{t}") for t in (10, 40)]
+    screen = [dict(original[0], text="Ehy, quiebro razón justo a tiempo ya ahora"), original[1]]
+    review = build_review(screen, original_segments=original, title="")
+    assert [i for i in review["items"] if i["kind"] == "chorus_propagate"] == []

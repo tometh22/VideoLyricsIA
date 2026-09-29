@@ -13,7 +13,8 @@ guardada y nadie la miraba:
 - Gemini sobre el audio completo SIN referencia (misma evidencia);
 - la letra oficial de catálogo, cuando existe (lrclib la tenía en 17 de 20
   canciones y contenía la corrección del cliente en 74 de 97 ítems);
-- las correcciones que ya se hicieron en otras canciones del mismo artista.
+- las correcciones que ya se hicieron en otras canciones del mismo artista;
+- las repeticiones de un coro que la persona corrigió sólo en parte.
 
 Medido sobre esos pedidos: la unión de estos oídos y de cinco reglas
 deterministas cubre ~110 de los 136 ítems. Lo que queda es criterio
@@ -574,6 +575,70 @@ def _rule_memory(segments: list[dict], pairs: dict[str, str],
     return out
 
 
+def _map_to_current(segments: list[dict], orig: dict) -> int | None:
+    """Línea actual que corresponde a una línea de la máquina: por identidad
+    si se conservó, si no por solapamiento en el tiempo."""
+    sid = orig.get("segment_id")
+    if sid:
+        for i, seg in enumerate(segments):
+            if seg.get("segment_id") == sid:
+                return i
+    a, b = _f(orig.get("start")), _f(orig.get("end"))
+    best, best_overlap = None, 0.0
+    for i, seg in enumerate(segments):
+        overlap = min(b, _f(seg.get("end"))) - max(a, _f(seg.get("start")))
+        if overlap > best_overlap:
+            best, best_overlap = i, overlap
+    if best is None or best_overlap < 0.5 * max(0.1, b - a):
+        return None
+    return best
+
+
+def _rule_chorus(segments: list[dict], original_segments: Any) -> list[dict]:
+    """Un coro corregido sólo en algunas repeticiones: lo que más veces pide
+    UMG ("corregir en todos los coros"). Se detecta cuando la máquina había
+    escrito varias líneas iguales y una persona corrigió sólo algunas."""
+    originals = [s for s in (original_segments or []) if isinstance(s, dict)]
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for orig in originals:
+        key = _key_text(orig.get("text"))
+        if len(key.split()) >= 3:
+            groups[key].append(orig)
+    out = []
+    for key, members in groups.items():
+        if len(members) < 2:
+            continue
+        mapped = [(m, _map_to_current(segments, m)) for m in members]
+        current = [(i, str(segments[i].get("text") or "")) for _, i in mapped if i is not None]
+        if len({i for i, _ in current}) < 2:
+            continue
+        # Sólo correcciones del mismo coro, no líneas unidas o reordenadas:
+        # misma cantidad de palabras (±2) y mayormente las mismas.
+        def is_correction(text: str) -> bool:
+            a, b = key.split(), _key_text(text).split()
+            return abs(len(a) - len(b)) <= 2 and difflib.SequenceMatcher(a=a, b=b).ratio() >= 0.6
+        edited = [(i, t) for i, t in current if _key_text(t) != key and is_correction(t)]
+        untouched = [i for i, t in current if _key_text(t) == key]
+        if not edited or not untouched:
+            continue
+        variants = Counter(_key_text(t) for _, t in edited)
+        best_key, votes = variants.most_common(1)[0]
+        best_text = next(t for _, t in edited if _key_text(t) == best_key)
+        for i in sorted(set(untouched)):
+            out.append({
+                # Sugerencia: a veces la corrección de una repetición trae un
+                # error de tipeo, y propagarla lo multiplicaría.
+                "kind": "chorus_propagate", "line": i, "required": False,
+                "title": "Coro corregido en parte",
+                "why": f"Esta frase se repite {len(current)} veces y la corregiste en {len(edited)}",
+                "fix": {"type": "replace", "find": str(segments[i].get("text") or ""),
+                        "replace": best_text},
+                "action": "Igualar",
+                "dismiss": "Esta repetición es distinta",
+            })
+    return out
+
+
 # --------------------------------------------------------------------------
 # Armado final.
 # --------------------------------------------------------------------------
@@ -728,6 +793,7 @@ def build_review(
     items.extend(_rule_joined(segments, _bigrams(witness_text, gemini, official_text or ""), vocabulary))
     items.extend(_rule_orphans(segments))
     items.extend(_rule_memory(segments, memory_pairs or {}, witness))
+    items.extend(_rule_chorus(segments, original_segments))
 
     items = _finalize(segments, items)
     dismissed = dismissed_keys(segments)

@@ -24,7 +24,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - corrections already made in other songs of the same artist;
   - UMG style rules: question marks on non-questions and exclamations,
     title spelling, inconsistent accents, joined words and missing spaces,
-    a lonely word on screen.
+    a lonely word on screen;
+  - a chorus corrected in only some of its repetitions (suggestion, since
+    the corrected copy may itself carry a typo).
   Identical fixes are grouped ("se corrigen juntas" across every chorus).
   Only points with two agreeing sources or an objective rule block
   approval (409 `lyric_review_pending` on /generate, /edit and campaign
