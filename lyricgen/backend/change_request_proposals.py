@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import difflib
 import hashlib
 import json
 import re
@@ -72,13 +73,60 @@ def _at_time(segments: list[dict], value: float) -> tuple[int, dict] | None:
     return nearby[0] if len(nearby) == 1 else None
 
 
+_ELLIPSIS = re.compile(r"^(?:\.{2,}|…)\s*|\s*(?:\.{2,}|…)$")
+
+
+def _fold_word(word: str) -> str:
+    folded = unicodedata.normalize("NFKD", word.lower())
+    return "".join(ch for ch in folded if ch.isalnum() and not unicodedata.combining(ch))
+
+
+def _replace_quoted_fragment(current: str, requested: str) -> str:
+    """Aplica la cita del cliente sólo sobre el tramo que cita.
+
+    UMG escribe "0:44 Tu garantía de reloco se fundió" o
+    "...HACE UN AÑO ATRÁS...": citan el pedazo que corrigen, no la línea
+    entera. Reemplazar la línea completa borraba lo que quedaba fuera de la
+    cita ("dormite ya", el "Que" inicial; pedidos 112/113 del 29-09-2026).
+    Si la cita es más corta que la línea, se reemplaza la ventana de la
+    línea que más se le parece y el resto queda intacto.
+    """
+    literal = requested
+    requested = _ELLIPSIS.sub("", _ELLIPSIS.sub("", requested)).strip()
+    cur_words, req_words = current.split(), requested.split()
+    if not cur_words or not req_words or len(req_words) >= len(cur_words):
+        return literal
+    target = "".join(_fold_word(w) for w in req_words)
+    best = None
+    for size in range(max(1, len(req_words) - 1), min(len(cur_words), len(req_words) + 2) + 1):
+        for start in range(0, len(cur_words) - size + 1):
+            window = "".join(_fold_word(w) for w in cur_words[start:start + size])
+            ratio = difflib.SequenceMatcher(a=window, b=target, autojunk=False).ratio()
+            if best is None or ratio > best[0]:
+                best = (ratio, start, size)
+    if best is None or best[0] < 0.6 or best[2] == len(cur_words):
+        return literal
+    _, start, size = best
+    replacement = requested
+    letters = [c for c in requested if c.isalpha()]
+    if letters and all(c.isupper() for c in letters) and not current.isupper():
+        replacement = requested.lower()
+        if start == 0 and cur_words[0][:1].isupper():
+            replacement = replacement[:1].upper() + replacement[1:]
+    last = cur_words[start + size - 1]
+    trailing = re.search(r"[,;:.!?]+$", last)
+    if trailing and not re.search(r"[,;:.!?]$", replacement):
+        replacement += trailing.group(0)
+    return " ".join(cur_words[:start] + [replacement] + cur_words[start + size:])
+
+
 def _replace_text(current: str, expected: str | None, requested: str) -> str | None:
     current = str(current or "")
     requested = str(requested or "").strip()
     if not requested:
         return None
     if not expected:
-        return requested
+        return _replace_quoted_fragment(current, requested)
     expected = str(expected).strip()
     if _identity(current) == _identity(expected):
         return requested

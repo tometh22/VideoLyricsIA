@@ -1,10 +1,5 @@
-// Palabras que se escuchan en el audio y no están en la letra.
-//
-// El backend (heard_words.py) compara la letra guardada contra el testigo
-// independiente y la transcripción original de la máquina, y devuelve cada
-// tramo faltante con dónde va. Acá sólo se aplica la decisión del revisor
-// sobre la letra en pantalla: "Agregar" o "No se canta". La decisión "No se
-// canta" se guarda en la línea (`heard_dismissed`) y viaja con cada versión.
+// Ubicar e insertar palabras en la letra en pantalla. Lo usa la revisión
+// rápida (lyricReview.js) para "Agregar" lo que se escucha y no está.
 
 export function normToken(token) {
   return String(token || "")
@@ -83,49 +78,4 @@ export function lineWithAlertInserted(segments, lineIndex, alert) {
   }
   const inserted = at === 0 ? capitalize(words) : words;
   return [...tokens.slice(0, at), inserted, ...tokens.slice(at)].join(" ");
-}
-
-// Aplica "Agregar". `mint` crea la identidad de una línea nueva.
-export function applyHeardWordsAlert(segments, alert, mint) {
-  if (!Array.isArray(segments) || !alert) return segments;
-  if (alert.action === "new_line" && alert.new_line) {
-    const line = {
-      ...mint(),
-      start: Number(alert.new_line.start),
-      end: Number(alert.new_line.end),
-      text: capitalize(String(alert.text || "").trim()),
-    };
-    return [...segments, line].sort((a, b) => a.start - b.start);
-  }
-  const index = findAlertLineIndex(segments, alert);
-  if (index === -1) return segments;
-  const text = lineWithAlertInserted(segments, index, alert);
-  return segments.map((segment, i) => (i === index ? { ...segment, text } : segment));
-}
-
-// Aplica "No se canta": la clave queda en la línea más cercana.
-export function dismissHeardWordsAlert(segments, alert) {
-  const index = findAlertLineIndex(segments, alert);
-  if (index === -1 || !alert?.key) return segments;
-  return segments.map((segment, i) => {
-    if (i !== index) return segment;
-    const keys = Array.isArray(segment.heard_dismissed) ? segment.heard_dismissed : [];
-    return keys.includes(alert.key)
-      ? segment
-      : { ...segment, heard_dismissed: [...keys, alert.key] };
-  });
-}
-
-// Vista previa de "Agregar" para decidir sin tocar nada.
-export function previewHeardWordsAlert(segments, alert) {
-  if (alert?.action === "new_line") {
-    return { kind: "new_line", after: capitalize(String(alert.text || "").trim()) };
-  }
-  const index = findAlertLineIndex(segments, alert);
-  if (index === -1) return { kind: "insert", before: "", after: String(alert?.text || "") };
-  return {
-    kind: "insert",
-    before: String(segments[index].text || ""),
-    after: lineWithAlertInserted(segments, index, alert),
-  };
 }

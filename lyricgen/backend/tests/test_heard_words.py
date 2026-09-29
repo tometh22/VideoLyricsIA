@@ -1,15 +1,8 @@
 """Palabras que se escuchan y no están en la letra (reclamos UMG 29-09-2026)."""
-from types import SimpleNamespace
-
-import pytest
-
 from heard_words import (
-    HeardWordsPending,
     alert_key,
-    document_alerts,
     find_missing_heard_words,
     machine_words,
-    require_resolved,
     witness_words,
 )
 
@@ -110,7 +103,7 @@ def test_dismissed_alert_stays_dismissed():
     [alert] = find_missing_heard_words(final, witness=PAJARO_WITNESS, machine=machine)
     assert alert["key"] == alert_key("dormíte ya", 45.4)
     # El editor guarda la decisión "No se canta" en la línea.
-    final[1]["heard_dismissed"] = [alert["key"]]
+    final[1]["qa_dismissed"] = [alert["key"]]
     assert find_missing_heard_words(final, witness=PAJARO_WITNESS, machine=machine) == []
 
 
@@ -154,38 +147,3 @@ def test_only_whole_song_witness_streams_are_used():
         "events": [{"word": "relativo", "start": 0.1, "end": 0.4}],
     })
     assert [w["word"] for w in witness_words(evidence)] == ["hola", "mundo"]
-
-
-def _document(final):
-    return SimpleNamespace(
-        current_segments=final,
-        original_segments=PAJARO_MACHINE,
-        machine_evidence=_witness_evidence(PAJARO_WITNESS),
-    )
-
-
-def test_approval_requires_a_decision(monkeypatch):
-    monkeypatch.delenv("HEARD_WORDS_MODE", raising=False)
-    final = [
-        _line("Tu garantía de reloco se fundió", 43.5, 47.8),
-        _line("Te lo pido, por favor", 48.7, 51.1),
-    ]
-    with pytest.raises(HeardWordsPending) as exc:
-        require_resolved(_document(final))
-    assert exc.value.alerts[0]["text"] == "dormite ya"
-
-
-def test_observe_mode_shows_but_does_not_block(monkeypatch):
-    monkeypatch.setenv("HEARD_WORDS_MODE", "observe")
-    final = [
-        _line("Tu garantía de reloco se fundió", 43.5, 47.8),
-        _line("Te lo pido, por favor", 48.7, 51.1),
-    ]
-    require_resolved(_document(final))
-    assert len(document_alerts(_document(final))) == 1
-
-
-def test_off_mode_disables_everything(monkeypatch):
-    monkeypatch.setenv("HEARD_WORDS_MODE", "off")
-    final = [_line("Tu garantía de reloco se fundió", 43.5, 47.8)]
-    assert document_alerts(_document(final)) == []

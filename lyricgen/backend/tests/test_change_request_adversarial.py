@@ -352,3 +352,19 @@ def test_parenthetical_review_scope_does_not_expand_a_local_replacement():
     result, _ = apply_operations(segments, built, [applicable[0]["id"]])
     assert [row["text"] for row in result] == ["luna", "sol"]
     assert built["unresolved_count"] == 1
+
+
+def test_partial_client_quote_replaces_only_the_quoted_span():
+    # Pedidos UMG 81/99: la cita pegada sobre la línea entera borró "dormite
+    # ya" y el "Que" inicial (reclamos 112/113 del 29-09-2026).
+    assert _replace_text(
+        "Tu garantía de reloj se fundió, dormite ya", None, "Tu garantía de reloco se fundió",
+    ) == "Tu garantía de reloco se fundió, dormite ya"
+    assert _replace_text(
+        "Que hace un año te eras y siempre tú, mi mundo, tú", None, "...HACE UN AÑO ATRÁS...",
+    ) == "Que hace un año atrás y siempre tú, mi mundo, tú"
+
+
+def test_full_line_quote_still_replaces_the_line():
+    assert _replace_text("Pásalo en la radio", None, "Pásenlo en la radio") == "Pásenlo en la radio"
+    assert _replace_text("Hola", None, "Hola mundo") == "Hola mundo"

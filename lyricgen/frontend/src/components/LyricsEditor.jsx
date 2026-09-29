@@ -35,8 +35,8 @@ import { createSaveQueue } from "../lib/saveQueue";
 import VersionHistory from "./VersionHistory";
 import WrapWarningDialog from "./WrapWarningDialog";
 import QualityProposalPanel from "./QualityProposalPanel";
-import HeardWordsPanel from "./HeardWordsPanel";
-import { applyHeardWordsAlert, dismissHeardWordsAlert } from "../lib/heardWords";
+import LyricReviewPanel from "./LyricReviewPanel";
+import { applyReviewItem, dismissReviewItem } from "../lib/lyricReview";
 import CompleteReviewerCandidate from "./CompleteReviewerCandidate";
 import CatalogReference from "./CatalogReference";
 
@@ -2871,54 +2871,88 @@ export default function LyricsEditor({
     });
   }, [duration, guidedPlayingWindowId, stopGuidedPlayback, trackEditorEvent, waveform?.duration]);
 
-  // Palabras que el testigo y la máquina oyeron y no están en la letra
-  // guardada (heard_words.py). El servidor las recalcula en cada autosave;
-  // acá se ocultan al instante las que el revisor ya resolvió, hasta que el
-  // próximo guardado confirme la letra nueva.
-  const heardWordsMode = durableEditor.document?.heard_words_mode || "enforce";
-  const serverHeardWords = durableEditor.document?.heard_words;
-  const [heardResolvedIds, setHeardResolvedIds] = useState(() => new Set());
-  const heardPanelRef = useRef(null);
+  // Revisión rápida (lyric_review.py): lo que falta, lo que se escucha
+  // distinto y el estilo UMG. El servidor la recalcula en cada guardado; acá
+  // se ocultan al instante los puntos que el revisor ya resolvió, hasta que
+  // el próximo guardado confirme la letra nueva.
+  const lyricReview = durableEditor.document?.lyric_review || null;
+  const lyricReviewMode = lyricReview?.mode || "enforce";
+  const [reviewResolvedIds, setReviewResolvedIds] = useState(() => new Set());
+  const reviewPanelRef = useRef(null);
   const isDirtyRef = useRef(isDirty);
   isDirtyRef.current = isDirty;
   useEffect(() => {
-    const present = new Set((serverHeardWords || []).map((alert) => alert.id));
-    setHeardResolvedIds((previous) => {
+    const present = new Set((lyricReview?.items || []).map((item) => item.id));
+    setReviewResolvedIds((previous) => {
       if (!previous.size) return previous;
       return new Set([...previous].filter((id) => present.has(id) && isDirtyRef.current));
     });
-  }, [serverHeardWords]);
-  const pendingHeardWords = useMemo(() => (
-    heardWordsMode === "off" ? []
-      : (serverHeardWords || []).filter((alert) => !heardResolvedIds.has(alert.id))
-  ), [heardResolvedIds, heardWordsMode, serverHeardWords]);
-  const focusHeardWords = useCallback(() => {
-    const panel = heardPanelRef.current;
+  }, [lyricReview]);
+  const pendingReviewItems = useMemo(() => (
+    lyricReviewMode === "off" ? []
+      : (lyricReview?.items || []).filter((item) => !reviewResolvedIds.has(item.id))
+  ), [lyricReview, lyricReviewMode, reviewResolvedIds]);
+  const pendingRequiredReview = pendingReviewItems.filter((item) => item.required).length;
+  const focusLyricReview = useCallback(() => {
+    const panel = reviewPanelRef.current;
     if (!panel) return;
     panel.scrollIntoView({ block: "center", behavior: "smooth" });
     panel.focus({ preventScroll: true });
   }, []);
-  const resolveHeardWords = useCallback((alert, decision, apply) => {
+  const resolveReviewItem = useCallback((item, decision, apply) => {
     pushEditHistory();
     setEdited(apply);
-    setHeardResolvedIds((previous) => new Set(previous).add(alert.id));
+    setReviewResolvedIds((previous) => new Set(previous).add(item.id));
     setFlushCounter((count) => count + 1);
-    trackEditorEvent("editor_heard_words_decision", {
-      decision, sources: alert.sources, action: alert.action,
-      words: String(alert.text || "").split(/\s+/).filter(Boolean).length,
+    trackEditorEvent("editor_lyric_review_decision", {
+      decision, kind: item.kind, required: Boolean(item.required),
+      sources: item.sources, occurrences: (item.occurrences || []).length,
     });
-    window.requestAnimationFrame(() => heardPanelRef.current?.focus({ preventScroll: true }));
+    window.requestAnimationFrame(() => reviewPanelRef.current?.focus({ preventScroll: true }));
   }, [pushEditHistory, setEdited, trackEditorEvent]);
-  const addHeardWords = useCallback((alert) => resolveHeardWords(alert, "add", (previous) => {
-    const nextId = previous.reduce((max, segment) => Math.max(max, segment._id), -1) + 1;
-    return applyHeardWordsAlert(previous, alert, () => ({ _id: nextId, segment_id: mintSegmentId() }));
-  }), [resolveHeardWords]);
-  const dismissHeardWords = useCallback((alert) => resolveHeardWords(
-    alert, "not_sung", (previous) => dismissHeardWordsAlert(previous, alert),
-  ), [resolveHeardWords]);
-  const playHeardWords = useCallback((alert) => playGuidedWindow({
-    id: alert.id, start: alert.start, end: alert.end,
+  const applyLyricReview = useCallback((item, alternative = null) => {
+    let applied = 0;
+    resolveReviewItem(item, alternative ? "apply_alternative" : "apply", (previous) => {
+      const result = applyReviewItem(previous, item, {
+        alternative,
+        mint: () => ({
+          _id: previous.reduce((max, segment) => Math.max(max, segment._id), -1) + 1,
+          segment_id: mintSegmentId(),
+        }),
+      });
+      applied = result.applied;
+      return result.segments;
+    });
+    window.setTimeout(() => {
+      if (!applied) {
+        toast({ message: "Esa línea ya cambió: revisala a mano en la lista.", tone: "info" });
+      }
+    }, 0);
+  }, [resolveReviewItem, toast]);
+  const dismissLyricReview = useCallback((item) => resolveReviewItem(
+    item, "dismiss", (previous) => dismissReviewItem(previous, item),
+  ), [resolveReviewItem]);
+  const playLyricReview = useCallback((item) => playGuidedWindow({
+    id: item.id, start: item.start, end: item.end,
   }), [playGuidedWindow]);
+  const pasteOfficialLyrics = useCallback(async (text) => {
+    if (!editorRequest || !transcribeJobId) return false;
+    try {
+      const response = await editorRequest(`/editor/${transcribeJobId}/official-lyrics`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!response.ok) throw new Error(`http-${response.status}`);
+      const body = await response.json();
+      durableEditor.updateDocument({ lyric_review: body.lyric_review });
+      toast({ message: "Listo: la letra oficial se usa para comparar. Tu letra no cambió.", tone: "info" });
+      return true;
+    } catch {
+      toast({ message: "No pudimos guardar la letra oficial. Reintentá.", tone: "error" });
+      return false;
+    }
+  }, [durableEditor, editorRequest, toast, transcribeJobId]);
 
   useEffect(() => () => {
     // Removing the media element stops playback. Do not call pause() on every
@@ -4062,10 +4096,10 @@ export default function LyricsEditor({
       setLanguageResolutionOpen(true);
       return;
     }
-    if (heardWordsMode === "enforce" && pendingHeardWords.length > 0) {
-      focusHeardWords();
+    if (lyricReviewMode === "enforce" && pendingRequiredReview > 0) {
+      focusLyricReview();
       toast({
-        message: "Antes de aprobar, decidí las palabras que se escuchan y no están en la letra.",
+        message: `Antes de aprobar, resolvé ${pendingRequiredReview === 1 ? "el punto" : `los ${pendingRequiredReview} puntos`} de la revisión rápida.`,
         tone: "info",
       });
       return;
@@ -4177,12 +4211,12 @@ export default function LyricsEditor({
         return;
       }
       // El guardado recién hecho es la verdad: si la letra que se va a
-      // aprobar todavía pierde palabras oídas, se decide antes de aprobar.
-      if (heardWordsMode === "enforce" && saveResult?.heardWords?.length) {
-        setHeardResolvedIds(new Set());
-        focusHeardWords();
+      // aprobar todavía tiene puntos obligatorios, se deciden antes.
+      if (lyricReviewMode === "enforce" && saveResult?.lyricReview?.required_count > 0) {
+        setReviewResolvedIds(new Set());
+        focusLyricReview();
         toast({
-          message: "Antes de aprobar, decidí las palabras que se escuchan y no están en la letra.",
+          message: "Antes de aprobar, resolvé los puntos de la revisión rápida.",
           tone: "info",
         });
         return;
@@ -4928,15 +4962,18 @@ export default function LyricsEditor({
         currentRevision={durableEditor.document?.revision} currentSegments={edited}
         onSeek={(start) => seekTo(start, true)} />
 
-      <HeardWordsPanel
-        ref={heardPanelRef}
-        alerts={pendingHeardWords}
-        segments={edited}
-        playingId={guidedPlayingWindowId}
-        onPlay={playHeardWords}
-        onAdd={addHeardWords}
-        onDismiss={dismissHeardWords}
-      />
+      {editorV2Enabled && lyricReview && (
+        <LyricReviewPanel
+          ref={reviewPanelRef}
+          review={lyricReview}
+          items={pendingReviewItems}
+          playingId={guidedPlayingWindowId}
+          onPlay={playLyricReview}
+          onApply={applyLyricReview}
+          onDismiss={dismissLyricReview}
+          onPasteOfficial={editorRequest ? pasteOfficialLyrics : null}
+        />
+      )}
 
       {durableEditor.document?.quality_proposal && (
         <div className="mb-4">

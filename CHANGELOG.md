@@ -7,21 +7,48 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- Flag words that the independent witness and the original machine
-  transcription heard but the approved lyrics no longer contain (UMG
-  change requests 112/113: a leading "Que" and "dormite ya" twice were
-  deleted while pasting a partial client quote over the whole line).
-  The editor shows each one with its audio, a one-click "Agregar" that
-  inserts it where it was sung and a "No se canta" decision stored on the
-  line. Approval (editor, re-render and campaign lyric approval) returns
-  409 `heard_words_pending` until every alert is decided. Backtest on 313
-  approved staging songs: 56 alerts, 88 % of songs with none, 4 of 5 UMG
-  omission complaints caught with the exact alert.
+- **Revisión rápida** in the lyrics editor: one panel lists everything that
+  should be decided before approving, each with a one-click fix, the audio
+  of that moment and a preview of how the line will read. Built from the 20
+  UMG change requests of 2026-09-29 (136 items, Argentina and Chile), where
+  the dominant error was a machine mishearing that passed review untouched.
+  Sources, all already stored or cached (no new paid calls):
+  - words heard by the machine and the whole-song witness that the lyrics
+    lost ("Falta texto", e.g. "dormite ya", the leading "Que");
+  - where two independent ears (Gemini without reference, the witness,
+    official lyrics) agree against the screen ("Se escucha distinto"),
+    with alternatives when they disagree;
+  - official lyrics from the campaign sheet, the lrclib cache (fetched in
+    the background when missing) or pasted by the operator, used only for
+    comparison;
+  - corrections already made in other songs of the same artist;
+  - UMG style rules: question marks on non-questions and exclamations,
+    title spelling, inconsistent accents, joined words and missing spaces,
+    a lonely word on screen.
+  Identical fixes are grouped ("se corrigen juntas" across every chorus).
+  Only points with two agreeing sources or an objective rule block
+  approval (409 `lyric_review_pending` on /generate, /edit and campaign
+  lyric approval); single-source points are non-blocking suggestions.
+  Keyboard: A apply, N keep, E listen, J/K move. Decisions are stored on
+  the line (`qa_dismissed`). Songs where the ears fail are flagged as
+  difficult. Backtest: 102 of the 136 requested changes had a point in the
+  panel; over 313 approved staging songs 77 % would have no blocking point
+  (p90 2, max 5).
+- `docs/UMG_GUIA_ESTILO_LETRAS.md`: UMG lyric style guide derived from the
+  131 portal change requests, also reachable from the panel.
+
+### Fixed
+
+- Applying a change request whose quote is only part of the line no longer
+  overwrites the whole line; only the quoted span is replaced ("…se fundió,
+  dormite ya", "Que hace un año atrás").
 
 ### Configuration
 
-- `HEARD_WORDS_MODE`: `enforce` (default), `observe` (show without
+- `LYRIC_REVIEW_MODE`: `enforce` (default), `observe` (show without
   blocking) or `off`.
+- `LYRIC_REVIEW_FETCH_OFFICIAL`: `1` (default) fetches missing official
+  lyrics from lrclib in the background; `0` disables it.
 
 ## [1.1.73] - 2026-09-29
 

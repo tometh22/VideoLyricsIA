@@ -68,6 +68,7 @@ export async function installEditorHarness(page, options = {}) {
   let durableRevision = options.initialRevision || 0;
   let durableSegments = JSON.parse(JSON.stringify(empty ? [] : segments));
   const durableOriginal = JSON.parse(JSON.stringify(durableSegments));
+  let officialText = "";
   const versions = [];
   const heartbeats = [];
   let sourceAudioRequests = 0;
@@ -126,7 +127,7 @@ export async function installEditorHarness(page, options = {}) {
         segments: durableSegments,
         original_segments: durableOriginal,
         latest_approved_version: options.latestApprovedVersion || null,
-        ...(options.heardWords ? { heard_words: options.heardWords(durableSegments), heard_words_mode: "enforce" } : {}),
+        ...(options.lyricReview ? { lyric_review: options.lyricReview(durableSegments, officialText) } : {}),
         updated_by: null,
         updated_at: new Date().toISOString(),
         lock: { active: false, user: null, expires_at: null },
@@ -156,8 +157,14 @@ export async function installEditorHarness(page, options = {}) {
       saves.push(body);
       await route.fulfill(jsonResponse({
         applied: changed, revision: durableRevision, version_id: versionId, saved_at: new Date().toISOString(),
-        ...(options.heardWords ? { heard_words: options.heardWords(durableSegments), heard_words_mode: "enforce" } : {}),
+        ...(options.lyricReview ? { lyric_review: options.lyricReview(durableSegments, officialText) } : {}),
       }));
+      return;
+    }
+
+    if (editorV2 && options.lyricReview && request.method() === "POST" && path === `/editor/${jobId}/official-lyrics`) {
+      officialText = request.postDataJSON().text;
+      await route.fulfill(jsonResponse({ job_id: jobId, lyric_review: options.lyricReview(durableSegments, officialText) }));
       return;
     }
 

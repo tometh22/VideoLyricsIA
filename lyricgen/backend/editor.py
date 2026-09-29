@@ -739,8 +739,7 @@ def serialize_document(
         ),
         "latest_approved_version": latest_approved_payload,
         "quality_proposal": proposal,
-        "heard_words": _heard_words(document),
-        "heard_words_mode": _heard_words_mode(),
+        "lyric_review": _lyric_review(db, document, job),
         **pilot,
         **actor_for(db, document.updated_by),
         "updated_at": _aware(document.updated_at).isoformat() if document.updated_at else None,
@@ -753,16 +752,10 @@ def serialize_document(
     }
 
 
-def _heard_words(document: EditorDocument) -> list[dict]:
-    from heard_words import document_alerts
+def _lyric_review(db: Session, document: EditorDocument, job: Job | None) -> dict:
+    from lyric_review_sources import review_for_document
 
-    return document_alerts(document)
-
-
-def _heard_words_mode() -> str:
-    from heard_words import mode
-
-    return mode()
+    return review_for_document(db, document, job)
 
 
 def _proposal_for_response(document: EditorDocument) -> dict | None:
@@ -2219,10 +2212,11 @@ def approve_document(
         document = get_or_create_document(db, job.job_id, job.tenant_id, job.segments_json or [])
     require_machine_snapshot(job, document)
     validate_approval_snapshot(document.current_segments)
-    # Palabras que el testigo y la máquina oyeron y no están en la letra:
-    # cada una se agrega o se marca "no se canta" antes de aprobar.
-    from heard_words import require_resolved
-    require_resolved(document)
+    # Revisión rápida: lo que falta, lo que se escucha distinto y las reglas
+    # de estilo UMG. Cada punto obligatorio se aplica o se descarta antes de
+    # aprobar (lyric_review.py).
+    from lyric_review_sources import require_resolved
+    require_resolved(db, document, job)
     selected = None
     selected_is_equivalent_current = False
     if editor_version_id:

@@ -21,9 +21,9 @@ testigo y las de la transcripción original de la máquina (con su score).
 Alinea en orden lo oído contra la letra y se queda con lo que SOBRA en lo
 oído (borrado), no con lo reemplazado (una corrección de texto es trabajo
 del revisor, no un faltante). Cada tramo faltante vuelve como alerta con su
-instante y dónde insertarlo, para que el revisor decida en el editor:
-"Agregar" o "No se canta". La decisión "No se canta" se guarda en la línea
-(``heard_dismissed``), así viaja con cada versión sin migración.
+instante y dónde insertarlo. ``lyric_review`` lo muestra en el editor junto
+con los demás puntos ("Agregar" / "No se canta"); la decisión se guarda en
+la línea (``qa_dismissed``).
 
 Medido el 29-09-2026 sobre 313 canciones aprobadas en staging: 56 alertas
 (el 88 % de las canciones no tiene ninguna) y 4 de 5 reclamos de omisión de
@@ -239,7 +239,7 @@ def dismissed_keys(segments: Iterable[dict]) -> set[str]:
     keys: set[str] = set()
     for seg in segments or []:
         if isinstance(seg, dict):
-            for key in seg.get("heard_dismissed") or []:
+            for key in seg.get("qa_dismissed") or []:
                 if isinstance(key, str):
                     keys.add(key)
     return keys
@@ -477,66 +477,4 @@ def _insert(segments, idx, word_index, anchor_before, anchor_after) -> dict:
         "anchor_after": anchor_after,
         "placement": ("before" if word_index == 0 and words
                       else "after" if word_index >= words else "inside"),
-    }
-
-
-class HeardWordsPending(Exception):
-    """La letra no puede aprobarse con palabras oídas sin decidir."""
-
-    def __init__(self, alerts: list[dict]):
-        super().__init__("heard_words_pending")
-        self.alerts = alerts
-
-
-def mode() -> str:
-    """``enforce`` (default): aprobar exige decidir cada alerta.
-    ``observe``: se muestran sin bloquear. ``off``: ni se calculan."""
-    import os
-
-    value = os.environ.get("HEARD_WORDS_MODE", "enforce").strip().lower()
-    return value if value in {"enforce", "observe", "off"} else "enforce"
-
-
-def heard_word_alerts(document_segments: list[dict], *, original_segments: Any,
-                      machine_evidence: Any) -> list[dict]:
-    if mode() == "off":
-        return []
-    return find_missing_heard_words(
-        document_segments or [],
-        witness=witness_words(machine_evidence),
-        machine=machine_words(original_segments),
-    )
-
-
-def document_alerts(document: Any) -> list[dict]:
-    """Alertas pendientes de un ``EditorDocument``. Nunca rompe la lectura."""
-    try:
-        return heard_word_alerts(
-            list(getattr(document, "current_segments", None) or []),
-            original_segments=getattr(document, "original_segments", None),
-            machine_evidence=getattr(document, "machine_evidence", None),
-        )
-    except Exception:  # pragma: no cover - un detector nunca tumba el editor
-        import logging
-
-        logging.getLogger(__name__).exception("heard_words_failed")
-        return []
-
-
-def require_resolved(document: Any) -> None:
-    if mode() != "enforce":
-        return
-    pending = document_alerts(document)
-    if pending:
-        raise HeardWordsPending(pending)
-
-
-def conflict_detail(exc: HeardWordsPending) -> dict:
-    return {
-        "code": "heard_words_pending",
-        "message": (
-            "Hay palabras que se escuchan en el audio y no están en la letra. "
-            "Agregalas o marcá que no se cantan antes de aprobar."
-        ),
-        "heard_words": exc.alerts,
     }

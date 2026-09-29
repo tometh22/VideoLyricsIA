@@ -90,7 +90,7 @@ from auth import (
 import storage
 import delivery_freshness
 from machine_evidence import MachineSnapshotMissing, SCHEMA as MACHINE_EVIDENCE_SCHEMA
-from heard_words import HeardWordsPending, conflict_detail as heard_words_conflict
+from lyric_review import LyricReviewPending, conflict_detail as lyric_review_conflict
 from datetime import datetime, timedelta, timezone
 
 from database import (
@@ -10723,8 +10723,8 @@ async def generate_with_segments(
                 )
             except LookupError:
                 raise HTTPException(status_code=409, detail="editor_version_not_found") from None
-            except HeardWordsPending as exc:
-                raise HTTPException(status_code=409, detail=heard_words_conflict(exc)) from None
+            except LyricReviewPending as exc:
+                raise HTTPException(status_code=409, detail=lyric_review_conflict(exc)) from None
             except MachineSnapshotMissing as exc:
                 raise HTTPException(
                     status_code=409,
@@ -14394,16 +14394,39 @@ async def patch_editor_document(
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
     _dispatch_editor_quality_outbox(quality_outbox_id)
-    from heard_words import document_alerts, mode as heard_words_mode
+    from lyric_review_sources import review_for_document
     return {
         "job_id": job_id,
         "revision": document.revision,
         "version_id": version.id if version else None,
         "saved_at": document.updated_at.isoformat(),
         "applied": applied,
-        "heard_words": document_alerts(document),
-        "heard_words_mode": heard_words_mode(),
+        "lyric_review": review_for_document(db, document, job),
     }
+
+
+class OfficialLyricsRequest(BaseModel):
+    text: str = Field(..., max_length=20000)
+
+
+@app.post("/editor/{job_id}/official-lyrics")
+async def save_editor_official_lyrics(
+    job_id: str,
+    body: OfficialLyricsRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Letra oficial pegada por el operador (Google, planilla, UMG).
+
+    Sólo sirve de referencia para la revisión rápida: no toca la letra ni el
+    timing. Devuelve la revisión recalculada para mostrarla al instante.
+    """
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    _audit_cross_tenant_access(db, current_user, job, "editor_official_lyrics", commit=False)
+    from lyric_review_sources import review_for_document, save_operator_reference
+    save_operator_reference(db, job, body.text)
+    db.commit()
+    return {"job_id": job_id, "lyric_review": review_for_document(db, document, job)}
 
 
 @app.post("/editor/{job_id}/quality-proposals/{proposal_id}/apply")
@@ -17506,8 +17529,8 @@ def request_edit(
             )
         except LookupError:
             raise HTTPException(status_code=409, detail="editor_version_not_found") from None
-        except HeardWordsPending as exc:
-            raise HTTPException(status_code=409, detail=heard_words_conflict(exc)) from None
+        except LyricReviewPending as exc:
+            raise HTTPException(status_code=409, detail=lyric_review_conflict(exc)) from None
         except RuntimeError:
             _current_document = get_or_create_document(
                 db, job_id, job.tenant_id, job.segments_json or [],
