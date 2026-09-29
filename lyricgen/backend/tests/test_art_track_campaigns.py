@@ -132,6 +132,10 @@ def test_art_render_never_creates_transcription_and_is_idempotent(client, admin_
         assert db.query(JobOutboxEvent).filter(JobOutboxEvent.job_id == job.job_id, JobOutboxEvent.event_type == "transcription.enqueue").count() == 0
         event = db.query(JobOutboxEvent).filter(JobOutboxEvent.job_id == job.job_id, JobOutboxEvent.event_type == "pipeline.enqueue").one()
         assert event.payload["pipeline_kwargs"]["art_track_preset"] == "colombia_static"
+        # The outbox must not include kwargs that the worker pipeline rejects.
+        from inspect import signature
+        from pipeline import run_pipeline
+        signature(run_pipeline).bind_partial(**event.payload["pipeline_kwargs"])
     finally:
         db.close()
     again = client.post(f"/batch/art-track-campaigns/{campaign_id}/start-rendering", headers=auth)
