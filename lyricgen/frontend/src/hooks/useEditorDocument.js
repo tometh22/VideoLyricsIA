@@ -303,9 +303,24 @@ export function useEditorDocument({ jobId, enabled, request }) {
     return { ok: true, document: body };
   }, [applyDocument, document, jobId, request]);
 
+  const undoAutoRepair = useCallback(async () => {
+    const response = await request(`/editor/${jobId}/auto-repair/undo`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base_revision: revisionRef.current }),
+    });
+    const body = await responseBody(response);
+    if (response.status === 409) {
+      return { ok: false, reason: "stale-revision" };
+    }
+    if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+    applyDocument({ ...documentRef.current, ...body });
+    return { ok: true, document: body };
+  }, [applyDocument, jobId, request]);
+
   return {
     document, loading, error, errorStatus, lock,
     revisionRef, load, save, reconcile,
-    listVersions, restoreVersion,
+    listVersions, restoreVersion, undoAutoRepair,
   };
 }

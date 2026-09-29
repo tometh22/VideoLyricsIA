@@ -103,6 +103,7 @@ from database import (
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from editor import (
     apply_quality_proposal,
+    auto_repair_undo_segments,
     QualityProposalsDisabled,
     approve_document,
     acquire_lock,
@@ -14003,6 +14004,10 @@ class EditorRestoreRequest(BaseModel):
     base_revision: int
 
 
+class EditorAutoRepairUndoRequest(BaseModel):
+    base_revision: int = Field(ge=0)
+
+
 class EditorQualityProposalApplyRequest(BaseModel):
     base_revision: int = Field(ge=0)
     window_ids: list[str] = Field(min_length=1, max_length=50)
@@ -14833,6 +14838,69 @@ async def restore_editor_version(
         "revision": document.revision,
         "version_id": version.id,
         "segments": document.current_segments,
+    }
+
+
+@app.post("/editor/{job_id}/auto-repair/undo")
+async def undo_editor_auto_repair(
+    job_id: str,
+    body: EditorAutoRepairUndoRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    quality_outbox_id = None
+    try:
+        _audit_cross_tenant_access(db, current_user, job, "editor_auto_repair_undo", commit=False)
+        # save_document rechecks the source under row locks. This first read
+        # only provides a candidate; it cannot authorize a stale undo.
+        source = auto_repair_undo_segments(job, document)
+        if source is None or body.base_revision != 0:
+            raise RuntimeError("auto_repair_undo_unavailable")
+        previous = [dict(item) for item in (document.current_segments or [])]
+        document, version, applied = save_document(
+            db, job, document, current_user["id"], body.base_revision,
+            source, "auto_repair_undo",
+        )
+        if not applied:
+            raise RuntimeError("auto_repair_undo_unavailable")
+        db.add(AuditLog(
+            user_id=current_user["id"], action="editor.auto_repair_undone",
+            detail={
+                "job_id": job_id,
+                "from_revision": body.base_revision,
+                "to_revision": document.revision,
+                "version_id": version.id if version is not None else None,
+            },
+        ))
+        from correction_learning import invalidate_job_observations
+        invalidate_job_observations(db, job_id, "auto_repair_undone")
+        job.transcription_quality = _invalidate_quality_after_editor_save(
+            job, revision=document.revision,
+            segments=list(document.current_segments or []),
+            previous_segments=previous,
+        )
+        quality_outbox_id = _create_editor_quality_outbox(
+            db, job, revision=document.revision,
+            segments=list(document.current_segments or []),
+            quality=job.transcription_quality, reason="auto_repair_undone",
+        )
+        db.commit()
+    except RuntimeError as exc:
+        db.rollback()
+        if str(exc) == "auto_repair_undo_unavailable":
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        _, current = _editor_document_or_404(db, job_id, current_user)
+        raise HTTPException(
+            status_code=409, detail=_editor_conflict_payload(db, current),
+        ) from None
+    _dispatch_editor_quality_outbox(quality_outbox_id)
+    return {
+        "job_id": job_id,
+        "revision": document.revision,
+        "version_id": version.id if version is not None else None,
+        "segments": document.current_segments,
+        "auto_repair_undo_available": False,
     }
 
 
