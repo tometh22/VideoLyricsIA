@@ -17351,7 +17351,14 @@ def _build_art_track_colombia_base(cover_path: str, out_path: str, *,
                  artist_font, (232, 232, 236, 255))
 
     if (label_line or "").strip():
-        legal_font = font(max(14, int(H * 0.018)))
+        # Montserrat lacks U+2117 (the phonogram ℗ mark), which is required
+        # in label credits. The bundled Roboto face includes that glyph.
+        legal_size = max(14, int(H * 0.018))
+        try:
+            legal_font = ImageFont.truetype(
+                os.path.join(_FONTS_DIR, "Roboto-Bold.ttf"), legal_size)
+        except Exception:
+            legal_font = font(legal_size)
         legal_x = W // 2 if portrait else text_x
         legal_anchor = "ma" if portrait else "la"
         draw.text((legal_x, int(H * 0.94)), label_line.strip(),
