@@ -18218,6 +18218,15 @@ def _probe_dims_fps(path: str) -> tuple[int, int, str] | None:
         return None
 
 
+def _same_frame_rate(source: str, target: str) -> bool:
+    """Compare ffprobe and RenderSpec rates by value, not text formatting."""
+    from fractions import Fraction
+    try:
+        return Fraction(source) == Fraction(target)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return False
+
+
 def _transcode_to_prores(input_path: str, mov_path: str,
                           spec: "RenderSpec",
                           timeout_sec: int = 600) -> None:
@@ -18271,7 +18280,7 @@ def _transcode_to_prores(input_path: str, mov_path: str,
         src is not None
         and src[0] == spec.width
         and src[1] == spec.height
-        and src[2] == spec.fps_str
+        and _same_frame_rate(src[2], spec.fps_str)
     )
 
     vf_chain = (
