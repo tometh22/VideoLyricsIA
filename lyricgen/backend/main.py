@@ -14894,6 +14894,9 @@ async def undo_editor_auto_repair(
         raise HTTPException(
             status_code=409, detail=_editor_conflict_payload(db, current),
         ) from None
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
     _dispatch_editor_quality_outbox(quality_outbox_id)
     return {
         "job_id": job_id,

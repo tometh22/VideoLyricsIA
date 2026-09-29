@@ -211,3 +211,18 @@ def test_undo_is_tenant_scoped(client):
     assert _undo(client, job_id, outsider_token).status_code == 404
     with SessionLocal() as db:
         assert db.query(EditorDocument).filter_by(job_id=job_id).one().revision == 0
+
+
+def test_undo_rejects_invalid_actor_without_server_error(client, monkeypatch):
+    import main
+
+    job_id, token, _tenant = _prepared_job()
+    monkeypatch.setattr(
+        main, "save_document",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("invalid_actor")),
+    )
+    response = _undo(client, job_id, token)
+    assert response.status_code == 422
+    assert response.json()["detail"] == "invalid_actor"
+    with SessionLocal() as db:
+        assert db.query(EditorDocument).filter_by(job_id=job_id).one().revision == 0
