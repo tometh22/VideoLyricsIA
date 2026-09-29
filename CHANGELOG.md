@@ -3,6 +3,20 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.72] - 2026-09-29
+
+### Added
+
+- Preserve the private transcription snapshot before any automatic lyric or
+  timing repair and let an operator undo the repair while the song remains
+  untouched. The undo is versioned, reanalyzed, and excluded from human
+  correction training data.
+
+### Safety
+
+- Automatic repair still requires its existing signed acoustic calibration
+  authorization and remains disabled until that evidence is available.
+
 ## [1.1.71] - 2026-09-29
 
 ### Fixed
