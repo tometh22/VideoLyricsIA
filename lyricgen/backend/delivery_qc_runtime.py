@@ -484,8 +484,9 @@ def delivery_readiness_gate(job: Any, report: Mapping[str, Any] | None, *, for_u
         require_manual_review=required and not bypass_manual_review,
     )
     if bypass_manual_review:
-        gate["staging_manual_review_bypass"] = True
-        if not gate.get("blocked") and gate.get("reason") == "review_recommended":
+        normal_gate = approval_gate(report, "enforce", require_manual_review=True)
+        if normal_gate.get("blocked") and not gate.get("blocked"):
+            gate["staging_manual_review_bypass"] = True
             gate["reason"] = "staging_manual_review_bypass"
     return gate
 
