@@ -382,12 +382,13 @@ def test_align_skips_hallucinated_segments():
 # auto-recover commits.
 
 
-def _mock_lrclib_response(synced=None, plain=None, duration=180):
+def _mock_lrclib_response(synced=None, plain=None, duration=180, track_name="Y"):
     """Build a fake requests.Response for the lrclib endpoint."""
     payload = {
         "syncedLyrics": synced,
         "plainLyrics": plain,
         "duration": duration,
+        "trackName": track_name,
     }
     res = MagicMock()
     res.status_code = 200
@@ -402,7 +403,9 @@ def test_fetch_lrclib_derives_plain_from_synced_when_missing():
         "[00:10.00]Que cruce, que me anime a ver\n"
     )
     with patch("pipeline._req_get", create=True) if False else patch(
-        "requests.get", return_value=_mock_lrclib_response(synced=synced, plain=None),
+        "requests.get", return_value=_mock_lrclib_response(
+            synced=synced, plain=None, track_name="El Riesgo",
+        ),
     ):
         result = _fetch_lrclib("El Plan de la Mariposa", "El Riesgo")
     assert result is not None

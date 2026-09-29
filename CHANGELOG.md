@@ -3,6 +3,12 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.5] - 2026-09-29
+
+### Fixed
+- Require an independent audio transcription before catalogue lyrics can replace heard words or dictate whole-song timing. Reject unrelated lyrics in the normal and fallback paths.
+- Reject LRCLIB records and cached entries whose full title does not match the requested song, including the `Hoy` / `Hoy Es Adiós` incident.
+
 ## [1.0.4] - 2026-09-18
 
 ### Fixed

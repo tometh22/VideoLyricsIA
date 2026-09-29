@@ -4460,6 +4460,41 @@ def _lrclib_cache_key(artist: str, song: str) -> str:
     return f"lrclib:{h.hexdigest()[:16]}"
 
 
+def _lrclib_title_matches(requested: str, candidate: str) -> bool:
+    """Reject a different song hidden behind a partial catalogue title.
+
+    Known edition suffixes and accent/punctuation differences are acceptable.
+    The complete normalized title must still match: ``Hoy`` must never select
+    ``Hoy Es Adios`` just because the artist matches.
+    """
+    import re as _re
+
+    def _normalized(value: str) -> list[str]:
+        # Remove only known edition/credit suffixes. Stripping an arbitrary
+        # parenthetical or dash clause could turn a different song into the
+        # requested one and recreate this incident.
+        base = value or ""
+        variants = r"live|en vivo|remix|acoustic|demo|edit|version|mix|remaster(?:ed)?"
+        base = _re.sub(
+            rf"\s*[\(\[]\s*(?:{variants})\b[^\)\]]*[\)\]]",
+            " ", base, flags=_re.I,
+        )
+        base = _re.sub(
+            r"\s*[\(\[]\s*(?:feat\.?|ft\.?|with)\s+[^\)\]]*[\)\]]",
+            " ", base, flags=_re.I,
+        )
+        base = _re.sub(rf"\s+-\s+(?:{variants})\b.*$", "", base, flags=_re.I)
+        base = _re.sub(r"\s+(?:feat\.?|ft\.?|with)\s+.+$", "", base, flags=_re.I)
+        base = _strip_accents(base.casefold())
+        return _re.findall(r"[^\W_]+", base, _re.UNICODE)
+
+    wanted = _normalized(requested)
+    found = _normalized(candidate)
+    if not wanted or not found:
+        return False
+    return wanted == found
+
+
 def _fetch_lrclib(artist: str, song: str, db=None,
                   audio_duration: float | None = None) -> dict | None:
     """Look up a song on lrclib.net's public API. Returns:
@@ -4504,11 +4539,20 @@ def _fetch_lrclib(artist: str, song: str, db=None,
             if row and row.lyrics:
                 cached = _json.loads(row.lyrics)
                 if cached.get("plain") or cached.get("synced"):
-                    logger.info("[LYRICS] lrclib cache hit %s (%s plain chars, synced=%s)",
-                                cache_key,
-                                len((cached.get('plain') or '')),
-                                'yes' if cached.get('synced') else 'no')
-                    return cached
+                    cached_title = cached.get("source_track_name")
+                    if not _lrclib_title_matches(song, cached_title or ""):
+                        logger.warning(
+                            "[LYRICS] lrclib cache title mismatch key=%s requested=%r "
+                            "matched=%r record=%s; ignoring cached lyrics",
+                            cache_key, song, cached_title,
+                            cached.get("source_record_id"),
+                        )
+                    else:
+                        logger.info("[LYRICS] lrclib cache hit %s (%s plain chars, synced=%s)",
+                                    cache_key,
+                                    len((cached.get('plain') or '')),
+                                    'yes' if cached.get('synced') else 'no')
+                        return cached
         except Exception as e:
             logger.error("[LYRICS] lrclib cache read failed: %s", e)
     # Two attempts: lrclib reads can spike >10s under load. Total budget
@@ -4547,6 +4591,16 @@ def _fetch_lrclib(artist: str, song: str, db=None,
     else:
         try:
             result = _parse_lrclib_record(r.json())
+            if (result and not _lrclib_title_matches(
+                song, result.get("source_track_name") or ""
+            )):
+                logger.warning(
+                    "[LYRICS] lrclib /get title mismatch requested=%r "
+                    "matched=%r record=%s; searching for another candidate",
+                    song, result["source_track_name"],
+                    result.get("source_record_id"),
+                )
+                result = None
         except Exception as e:
             logger.error("[LYRICS] lrclib /get parse failed: %s", e)
             result = None
@@ -4695,6 +4749,10 @@ def _parse_lrclib_record(data: dict) -> dict | None:
         "plain": plain,
         "synced": synced,
         "duration": data.get("duration"),
+        "source_record_id": data.get("id"),
+        "source_track_name": data.get("trackName"),
+        "source_artist_name": data.get("artistName"),
+        "source_album_name": data.get("albumName"),
     }
 
 
@@ -5044,12 +5102,12 @@ def _pick_best_lrclib_candidate(candidates: list, artist: str,
                                  song: str,
                                  audio_duration: float | None = None) -> dict | None:
     """Scorea cada candidate de /api/search contra el (artist, song)
-    pedido. Devuelve el de mayor score si supera el threshold 0.5,
-    sino None.
+    pedido. Primero exige identidad de título completo; luego devuelve el
+    de mayor score si supera el threshold 0.5, sino None.
 
     Scoring:
       - Artist match exacto: +0.5; substring: +0.3; else 0.
-      - Song match exacto: +0.3; substring: +0.2; else 0.
+      - Song match exacto: +0.3; edición ya validada: +0.2.
       - Bonus +0.2 si el candidate tiene syncedLyrics (preferimos
         synced sobre plain para output con timestamps exactos).
       - Duration guard (cuando `audio_duration` está disponible): +0.25 si
@@ -5062,9 +5120,9 @@ def _pick_best_lrclib_candidate(candidates: list, artist: str,
         match de otra duración igual pasa el threshold si es lo único que
         hay (mejor tener el texto correcto — reconcile usa los wordstamps
         propios, no los timestamps de lrclib).
-      - Threshold 0.5: requiere mínimo artist+song match O synced+song
-        match razonable. Evita aceptar matches débiles que generarían
-        output peor que el Gemini fallback existente.
+      - Threshold 0.5 applies only after the title identity guard. A one-word
+        query like "Hoy" cannot select "Hoy Es Adios" despite an exact artist,
+        synced lyrics, and a score above 0.5.
 
     `audio_duration` es opcional y default None → scoring idéntico al
     original (back-compat con callers/tests que no lo pasan).
@@ -5089,6 +5147,8 @@ def _pick_best_lrclib_candidate(candidates: list, artist: str,
     best_score = 0.0
     for c in candidates:
         if not isinstance(c, dict):
+            continue
+        if not _lrclib_title_matches(song, c.get("trackName") or ""):
             continue
         c_artist = _norm(c.get("artistName"))
         c_song = _norm(c.get("trackName"))

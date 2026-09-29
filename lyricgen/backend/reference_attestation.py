@@ -191,3 +191,21 @@ def reference_gate_action(
     if not bool(report.get("allow_global_forced_alignment")):
         return "audio_first"
     return "reference_allowed"
+
+
+def effective_reference_gate_mode(
+    configured_mode: str,
+    *,
+    reference_source: str | None,
+    reference_required: bool,
+) -> str:
+    """Never let a catalogue lyric bypass independent audio attestation.
+
+    ``observe`` remains available for non-catalogue diagnostics. External
+    lyrics can replace heard words only after the ASR witness supports both
+    their vocabulary and whole-song structure.
+    """
+    source = str(reference_source or "").strip().lower()
+    if reference_required or source in {"lrclib", "genius", "gemini"}:
+        return "enforce"
+    return str(configured_mode or "off").strip().lower()
