@@ -739,6 +739,8 @@ def serialize_document(
         ),
         "latest_approved_version": latest_approved_payload,
         "quality_proposal": proposal,
+        "heard_words": _heard_words(document),
+        "heard_words_mode": _heard_words_mode(),
         **pilot,
         **actor_for(db, document.updated_by),
         "updated_at": _aware(document.updated_at).isoformat() if document.updated_at else None,
@@ -749,6 +751,18 @@ def serialize_document(
             "expires_at": lock_expires.isoformat() if lock_active else None,
         },
     }
+
+
+def _heard_words(document: EditorDocument) -> list[dict]:
+    from heard_words import document_alerts
+
+    return document_alerts(document)
+
+
+def _heard_words_mode() -> str:
+    from heard_words import mode
+
+    return mode()
 
 
 def _proposal_for_response(document: EditorDocument) -> dict | None:
@@ -2205,6 +2219,10 @@ def approve_document(
         document = get_or_create_document(db, job.job_id, job.tenant_id, job.segments_json or [])
     require_machine_snapshot(job, document)
     validate_approval_snapshot(document.current_segments)
+    # Palabras que el testigo y la máquina oyeron y no están en la letra:
+    # cada una se agrega o se marca "no se canta" antes de aprobar.
+    from heard_words import require_resolved
+    require_resolved(document)
     selected = None
     selected_is_equivalent_current = False
     if editor_version_id:

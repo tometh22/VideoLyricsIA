@@ -203,6 +203,10 @@ export function useEditorDocument({ jobId, enabled, request }) {
             revision: body.revision,
             segments,
             updated_at: body.saved_at,
+            ...(Array.isArray(body.heard_words) ? {
+              heard_words: body.heard_words,
+              heard_words_mode: body.heard_words_mode,
+            } : {}),
           };
           documentRef.current = next;
           return next;
@@ -218,6 +222,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
         versionId: body.version_id,
         applied: body.applied !== false,
         segments,
+        heardWords: Array.isArray(body.heard_words) ? body.heard_words : null,
       };
     } catch (err) {
       return { ok: false, reason: navigator.onLine === false ? "offline" : "network", error: String(err) };

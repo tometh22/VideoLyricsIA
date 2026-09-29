@@ -126,6 +126,7 @@ export async function installEditorHarness(page, options = {}) {
         segments: durableSegments,
         original_segments: durableOriginal,
         latest_approved_version: options.latestApprovedVersion || null,
+        ...(options.heardWords ? { heard_words: options.heardWords(durableSegments), heard_words_mode: "enforce" } : {}),
         updated_by: null,
         updated_at: new Date().toISOString(),
         lock: { active: false, user: null, expires_at: null },
@@ -153,7 +154,10 @@ export async function installEditorHarness(page, options = {}) {
         versions.unshift({ id: versionId, revision: durableRevision, reason: body.checkpoint, is_approved: false, created_at: new Date().toISOString() });
       }
       saves.push(body);
-      await route.fulfill(jsonResponse({ applied: changed, revision: durableRevision, version_id: versionId, saved_at: new Date().toISOString() }));
+      await route.fulfill(jsonResponse({
+        applied: changed, revision: durableRevision, version_id: versionId, saved_at: new Date().toISOString(),
+        ...(options.heardWords ? { heard_words: options.heardWords(durableSegments), heard_words_mode: "enforce" } : {}),
+      }));
       return;
     }
 

@@ -1380,6 +1380,7 @@ def approve_campaign_lyrics(
     if not reference_ok:
         raise HTTPException(status_code=409, detail={"code": reference_reason})
     from editor import approve_document
+    from heard_words import HeardWordsPending, conflict_detail as heard_words_conflict
     try:
         document, version = approve_document(
             db,
@@ -1390,6 +1391,8 @@ def approve_campaign_lyrics(
         )
     except LookupError:
         raise HTTPException(status_code=409, detail="editor_version_not_found") from None
+    except HeardWordsPending as exc:
+        raise HTTPException(status_code=409, detail=heard_words_conflict(exc)) from None
     except MachineSnapshotMissing:
         raise HTTPException(
             status_code=409,

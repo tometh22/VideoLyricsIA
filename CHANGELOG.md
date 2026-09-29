@@ -3,6 +3,26 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Flag words that the independent witness and the original machine
+  transcription heard but the approved lyrics no longer contain (UMG
+  change requests 112/113: a leading "Que" and "dormite ya" twice were
+  deleted while pasting a partial client quote over the whole line).
+  The editor shows each one with its audio, a one-click "Agregar" that
+  inserts it where it was sung and a "No se canta" decision stored on the
+  line. Approval (editor, re-render and campaign lyric approval) returns
+  409 `heard_words_pending` until every alert is decided. Backtest on 313
+  approved staging songs: 56 alerts, 88 % of songs with none, 4 of 5 UMG
+  omission complaints caught with the exact alert.
+
+### Configuration
+
+- `HEARD_WORDS_MODE`: `enforce` (default), `observe` (show without
+  blocking) or `off`.
+
 ## [1.1.73] - 2026-09-29
 
 ### Added

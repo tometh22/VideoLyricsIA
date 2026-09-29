@@ -94,6 +94,9 @@ export function translateBackendError(raw, t) {
   ) {
     return "La referencia de audio de esta canción no coincide con la versión que estás revisando. Tus cambios quedaron guardados; recargá antes de volver a aprobar.";
   }
+  if (raw && typeof raw === "object" && raw.code === "heard_words_pending") {
+    return "Hay palabras que se escuchan en el audio y no están en la letra. Abrí el editor, agregalas o marcá que no se cantan, y volvé a aprobar.";
+  }
   if (raw && typeof raw === "object" && raw.code === "edit_in_progress") {
     return tr("edit.error_already_editing") ||
       "Este video se está re-renderizando ahora. Esperá a que termine (revisalo en la página del video) y volvé a aplicar tus cambios.";

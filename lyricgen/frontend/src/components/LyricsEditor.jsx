@@ -35,6 +35,8 @@ import { createSaveQueue } from "../lib/saveQueue";
 import VersionHistory from "./VersionHistory";
 import WrapWarningDialog from "./WrapWarningDialog";
 import QualityProposalPanel from "./QualityProposalPanel";
+import HeardWordsPanel from "./HeardWordsPanel";
+import { applyHeardWordsAlert, dismissHeardWordsAlert } from "../lib/heardWords";
 import CompleteReviewerCandidate from "./CompleteReviewerCandidate";
 import CatalogReference from "./CatalogReference";
 
@@ -2869,6 +2871,55 @@ export default function LyricsEditor({
     });
   }, [duration, guidedPlayingWindowId, stopGuidedPlayback, trackEditorEvent, waveform?.duration]);
 
+  // Palabras que el testigo y la máquina oyeron y no están en la letra
+  // guardada (heard_words.py). El servidor las recalcula en cada autosave;
+  // acá se ocultan al instante las que el revisor ya resolvió, hasta que el
+  // próximo guardado confirme la letra nueva.
+  const heardWordsMode = durableEditor.document?.heard_words_mode || "enforce";
+  const serverHeardWords = durableEditor.document?.heard_words;
+  const [heardResolvedIds, setHeardResolvedIds] = useState(() => new Set());
+  const heardPanelRef = useRef(null);
+  const isDirtyRef = useRef(isDirty);
+  isDirtyRef.current = isDirty;
+  useEffect(() => {
+    const present = new Set((serverHeardWords || []).map((alert) => alert.id));
+    setHeardResolvedIds((previous) => {
+      if (!previous.size) return previous;
+      return new Set([...previous].filter((id) => present.has(id) && isDirtyRef.current));
+    });
+  }, [serverHeardWords]);
+  const pendingHeardWords = useMemo(() => (
+    heardWordsMode === "off" ? []
+      : (serverHeardWords || []).filter((alert) => !heardResolvedIds.has(alert.id))
+  ), [heardResolvedIds, heardWordsMode, serverHeardWords]);
+  const focusHeardWords = useCallback(() => {
+    const panel = heardPanelRef.current;
+    if (!panel) return;
+    panel.scrollIntoView({ block: "center", behavior: "smooth" });
+    panel.focus({ preventScroll: true });
+  }, []);
+  const resolveHeardWords = useCallback((alert, decision, apply) => {
+    pushEditHistory();
+    setEdited(apply);
+    setHeardResolvedIds((previous) => new Set(previous).add(alert.id));
+    setFlushCounter((count) => count + 1);
+    trackEditorEvent("editor_heard_words_decision", {
+      decision, sources: alert.sources, action: alert.action,
+      words: String(alert.text || "").split(/\s+/).filter(Boolean).length,
+    });
+    window.requestAnimationFrame(() => heardPanelRef.current?.focus({ preventScroll: true }));
+  }, [pushEditHistory, setEdited, trackEditorEvent]);
+  const addHeardWords = useCallback((alert) => resolveHeardWords(alert, "add", (previous) => {
+    const nextId = previous.reduce((max, segment) => Math.max(max, segment._id), -1) + 1;
+    return applyHeardWordsAlert(previous, alert, () => ({ _id: nextId, segment_id: mintSegmentId() }));
+  }), [resolveHeardWords]);
+  const dismissHeardWords = useCallback((alert) => resolveHeardWords(
+    alert, "not_sung", (previous) => dismissHeardWordsAlert(previous, alert),
+  ), [resolveHeardWords]);
+  const playHeardWords = useCallback((alert) => playGuidedWindow({
+    id: alert.id, start: alert.start, end: alert.end,
+  }), [playGuidedWindow]);
+
   useEffect(() => () => {
     // Removing the media element stops playback. Do not call pause() on every
     // src change: React reuses the element, so that cleanup could pause the
@@ -4011,6 +4062,14 @@ export default function LyricsEditor({
       setLanguageResolutionOpen(true);
       return;
     }
+    if (heardWordsMode === "enforce" && pendingHeardWords.length > 0) {
+      focusHeardWords();
+      toast({
+        message: "Antes de aprobar, decidí las palabras que se escuchan y no están en la letra.",
+        tone: "info",
+      });
+      return;
+    }
     if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
       toast({ message: "Estamos cargando la última versión. Esperá un instante para aprobar.", tone: "info" });
       return;
@@ -4113,6 +4172,17 @@ export default function LyricsEditor({
       if (saveResult?.ok === false) {
         toast({
           message: "Tus cambios siguen en pantalla. Reintentamos el guardado automáticamente.",
+          tone: "info",
+        });
+        return;
+      }
+      // El guardado recién hecho es la verdad: si la letra que se va a
+      // aprobar todavía pierde palabras oídas, se decide antes de aprobar.
+      if (heardWordsMode === "enforce" && saveResult?.heardWords?.length) {
+        setHeardResolvedIds(new Set());
+        focusHeardWords();
+        toast({
+          message: "Antes de aprobar, decidí las palabras que se escuchan y no están en la letra.",
           tone: "info",
         });
         return;
@@ -4857,6 +4927,16 @@ export default function LyricsEditor({
       <CompleteReviewerCandidate candidate={durableEditor.document?.reviewer_candidate}
         currentRevision={durableEditor.document?.revision} currentSegments={edited}
         onSeek={(start) => seekTo(start, true)} />
+
+      <HeardWordsPanel
+        ref={heardPanelRef}
+        alerts={pendingHeardWords}
+        segments={edited}
+        playingId={guidedPlayingWindowId}
+        onPlay={playHeardWords}
+        onAdd={addHeardWords}
+        onDismiss={dismissHeardWords}
+      />
 
       {durableEditor.document?.quality_proposal && (
         <div className="mb-4">
