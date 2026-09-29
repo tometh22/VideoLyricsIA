@@ -3,6 +3,21 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.74] - 2026-09-29
+
+### Added
+
+- Add a static Art Track preset for catalog deliveries: cover on the left,
+  title and artist on the right, a blurred cover background, and no waveform.
+  Keep the animated waveform preset available as a separate option.
+- Expose the preset in single-song uploads, campaigns, and the Art Track editor,
+  with high-quality ProRes export and individual campaign master downloads.
+
+### Fixed
+
+- Preserve the legal `℗` mark when a selected font lacks the glyph, and keep
+  compatible frame rates on the fast ProRes conversion path.
+
 ## [1.1.73] - 2026-09-29
 
 ### Added
