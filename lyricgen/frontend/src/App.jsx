@@ -6273,6 +6273,22 @@ export default function App() {
             segmentsRevision={currentReview.segmentsRevision || 0}
             storeKey={reviewStoreKey(currentReview)}
             onPersistSegments={persistSegmentsToBackend}
+            onAutoRepairUndone={(document) => {
+              setCurrentReview((previous) => previous && (
+                previous.editingJobId || previous.transcribeJobId
+              ) === document.job_id ? {
+                ...previous,
+                segments: document.segments,
+                segmentsRevision: document.revision,
+                transcriptionQuality: {
+                  ...(previous.transcriptionQuality || {}),
+                  auto_repair: {
+                    ...(previous.transcriptionQuality?.auto_repair || {}),
+                    status: "undone",
+                  },
+                },
+              } : previous);
+            }}
             editorRequest={editorRequest}
             saveQueue={segmentsSaveQueueRef.current}
             onReanchor={reanchorSegmentsOnBackend}

@@ -103,6 +103,7 @@ from database import (
 from jobs import bulk_delete_jobs, create_job, delete_job, get_job, get_all_jobs, update_job
 from editor import (
     apply_quality_proposal,
+    auto_repair_undo_segments,
     QualityProposalsDisabled,
     approve_document,
     acquire_lock,
@@ -12986,6 +12987,9 @@ async def approve_job(
         detail={"job_id": job_id, "notes": body.notes,
                 "admin_override": override_allowed,
                 "override_reason": body.override_reason.strip() if override_allowed else None,
+                "staging_manual_review_bypass": bool(
+                    _delivery_gate.get("staging_manual_review_bypass")
+                ),
                 "archived_failed_attempts": _archived_n,
                 "tenant_id": job.tenant_id,
                 "owner_user_id": job.user_id,
@@ -13011,6 +13015,9 @@ async def approve_job(
             "open_count": int(_qc_summary.get("open_count") or 0),
             "fail_count": int(_qc_summary.get("fail_count") or 0),
             "warn_count": int(_qc_summary.get("warn_count") or 0),
+            "staging_manual_review_bypass": bool(
+                _delivery_gate.get("staging_manual_review_bypass")
+            ),
         },
     ))
     db.commit()
@@ -14009,6 +14016,10 @@ class EditorRestoreRequest(BaseModel):
     base_revision: int
 
 
+class EditorAutoRepairUndoRequest(BaseModel):
+    base_revision: int = Field(ge=0)
+
+
 class EditorQualityProposalApplyRequest(BaseModel):
     base_revision: int = Field(ge=0)
     window_ids: list[str] = Field(min_length=1, max_length=50)
@@ -14842,6 +14853,73 @@ async def restore_editor_version(
     }
 
 
+@app.post("/editor/{job_id}/auto-repair/undo")
+async def undo_editor_auto_repair(
+    job_id: str,
+    body: EditorAutoRepairUndoRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    quality_outbox_id = None
+    try:
+        _audit_cross_tenant_access(db, current_user, job, "editor_auto_repair_undo", commit=False)
+        # save_document rechecks the source under row locks. This first read
+        # only provides a candidate; it cannot authorize a stale undo.
+        source = auto_repair_undo_segments(job, document)
+        if source is None or body.base_revision != 0:
+            raise RuntimeError("auto_repair_undo_unavailable")
+        previous = [dict(item) for item in (document.current_segments or [])]
+        document, version, applied = save_document(
+            db, job, document, current_user["id"], body.base_revision,
+            source, "auto_repair_undo",
+        )
+        if not applied:
+            raise RuntimeError("auto_repair_undo_unavailable")
+        db.add(AuditLog(
+            user_id=current_user["id"], action="editor.auto_repair_undone",
+            detail={
+                "job_id": job_id,
+                "from_revision": body.base_revision,
+                "to_revision": document.revision,
+                "version_id": version.id if version is not None else None,
+            },
+        ))
+        from correction_learning import invalidate_job_observations
+        invalidate_job_observations(db, job_id, "auto_repair_undone")
+        job.transcription_quality = _invalidate_quality_after_editor_save(
+            job, revision=document.revision,
+            segments=list(document.current_segments or []),
+            previous_segments=previous,
+        )
+        quality_outbox_id = _create_editor_quality_outbox(
+            db, job, revision=document.revision,
+            segments=list(document.current_segments or []),
+            quality=job.transcription_quality, reason="auto_repair_undone",
+        )
+        db.commit()
+    except RuntimeError as exc:
+        db.rollback()
+        if str(exc) == "auto_repair_undo_unavailable":
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        _, current = _editor_document_or_404(db, job_id, current_user)
+        raise HTTPException(
+            status_code=409, detail=_editor_conflict_payload(db, current),
+        ) from None
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    _dispatch_editor_quality_outbox(quality_outbox_id)
+    return {
+        "job_id": job_id,
+        "revision": document.revision,
+        "version_id": version.id if version is not None else None,
+        "segments": document.current_segments,
+        "transcription_quality": job.transcription_quality,
+        "auto_repair_undo_available": False,
+    }
+
+
 @app.post("/editor/{job_id}/conflicts/resolve")
 async def resolve_editor_conflict(
     job_id: str,
@@ -14897,7 +14975,7 @@ _PRODUCT_EVENT_NAMES = {
     "editor_conflict", "editor_version_restored", "editor_approved",
     "editor_help_opened", "editor_operator_suggestions_shown",
     "editor_operator_suggestion_decision", "editor_audio_playback_failed",
-    "editor_reviewer_candidate",
+    "editor_reviewer_candidate", "editor_auto_repair_undone",
 }
 
 # Ventana de /admin/product-metrics. Sin esto la única acotación era
@@ -14909,6 +14987,7 @@ PRODUCT_METRICS_WINDOW_DAYS = int(
 
 _PRODUCT_EVENT_PROPERTIES = {
     "editor_reviewer_candidate": {"kind", "proposal_id", "candidate_id", "event_id", "seconds"},
+    "editor_auto_repair_undone": {"to_revision"},
     "editor_opened": {"line_count", "view", "source"},
     "editor_view_changed": {"from", "to"},
     "editor_seek": {"position_ms", "source"},
@@ -20626,6 +20705,9 @@ def admin_create_delivery_from_job(
             "revision": delivery.published_revision,
             "content_changed": content_changed,
             "resolved_change_requests": resolved_requests,
+            "staging_manual_review_bypass": bool(
+                _umg_gate.get("staging_manual_review_bypass")
+            ),
             "replaced_job_id": replaced_job_id,
             "previous_publication": previous_publication,
         },

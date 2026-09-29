@@ -225,6 +225,47 @@ def test_publication_blocks_until_required_manual_checks_are_signed(
     assert response.json()["detail"]["delivery_qc"]["reason"] == "manual_review_required"
 
 
+def test_staging_campaign_bypass_allows_publication_but_keeps_audit(
+    client, admin_token, approved_job, db, all_r2_files_present, monkeypatch,
+):
+    from database import AuditLog, BatchCampaign
+
+    report = dict(approved_job.delivery_qc)
+    report["issues"] = [dict(row) for row in report["issues"]]
+    report["issues"][0].update({"status": "OPEN", "operator_decision": None})
+    approved_job.delivery_qc = report
+    campaign_id = "umg-stg-01"
+    db.add(BatchCampaign(
+        id=campaign_id,
+        tenant_id=approved_job.tenant_id,
+        created_by=approved_job.user_id,
+        name="Staging UMG bypass fixture",
+    ))
+    db.flush()
+    approved_job.campaign_id = campaign_id
+    db.commit()
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "1")
+    monkeypatch.setenv(
+        "DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS",
+        "umg-stg-01",
+    )
+    monkeypatch.setenv(
+        "DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_UNTIL_UTC",
+        "2099-01-01T00:00:00Z",
+    )
+
+    response = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "argentina"},
+    )
+    assert response.status_code == 200
+    audit = db.query(AuditLog).filter(
+        AuditLog.action == "delivery.create",
+    ).order_by(AuditLog.id.desc()).first()
+    assert audit.detail["staging_manual_review_bypass"] is True
+
+
 def test_publication_does_not_start_prores_when_qc_needs_correction(
     client, admin_token, approved_job, db,
 ):

@@ -141,6 +141,23 @@ also proposal-only unless an independent verifier confirms them.
 6. Approval records internal QC counts. Later label feedback is recorded through
    `/jobs/{job_id}/delivery-qc/external-result`, making zero findings measurable.
 
+### Temporary staging review-gate exception
+
+For an explicitly named staging campaign only, operators can temporarily skip
+the generic signed-review checklist when a **fresh** QC report exists. Objective
+blocking `FAIL`s, stale/missing reports, the independent language-discrepancy
+gate, required render files and ProRes freshness remain enforced. This is not a
+QC pass and does not alter production behavior. Each approval and portal publish
+records `staging_manual_review_bypass=true` in its audit event.
+
+The exception is disabled unless all three staging environment variables are
+set: `DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS=1`,
+`DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS` containing the exact
+campaign IDs, and `DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_UNTIL_UTC` containing a
+timezone-aware UTC expiry. It fails closed outside `ENVIRONMENT=staging`, for
+unlisted campaigns, or after expiry. Remove the flag, IDs and expiry once the
+local review flow is ready; never add these variables to production.
+
 The first rollout must measure precision per repair type and minutes of human
 correction saved.  Enforcement is enabled per repair type, never as one global
 switch.
