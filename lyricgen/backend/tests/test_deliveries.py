@@ -234,13 +234,13 @@ def test_staging_campaign_bypass_allows_publication_but_keeps_audit(
     report["issues"] = [dict(row) for row in report["issues"]]
     report["issues"][0].update({"status": "OPEN", "operator_decision": None})
     approved_job.delivery_qc = report
-    approved_job.campaign_id = "campaign-allowlisted"
+    approved_job.campaign_id = "umg-stg-01"
     db.commit()
     monkeypatch.setenv("ENVIRONMENT", "staging")
     monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "1")
     monkeypatch.setenv(
         "DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS",
-        "campaign-allowlisted",
+        "umg-stg-01",
     )
     monkeypatch.setenv(
         "DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_UNTIL_UTC",
