@@ -12980,6 +12980,9 @@ async def approve_job(
         detail={"job_id": job_id, "notes": body.notes,
                 "admin_override": override_allowed,
                 "override_reason": body.override_reason.strip() if override_allowed else None,
+                "staging_manual_review_bypass": bool(
+                    _delivery_gate.get("staging_manual_review_bypass")
+                ),
                 "archived_failed_attempts": _archived_n,
                 "tenant_id": job.tenant_id,
                 "owner_user_id": job.user_id,
@@ -13005,6 +13008,9 @@ async def approve_job(
             "open_count": int(_qc_summary.get("open_count") or 0),
             "fail_count": int(_qc_summary.get("fail_count") or 0),
             "warn_count": int(_qc_summary.get("warn_count") or 0),
+            "staging_manual_review_bypass": bool(
+                _delivery_gate.get("staging_manual_review_bypass")
+            ),
         },
     ))
     db.commit()
@@ -20614,6 +20620,9 @@ def admin_create_delivery_from_job(
             "revision": delivery.published_revision,
             "content_changed": content_changed,
             "resolved_change_requests": resolved_requests,
+            "staging_manual_review_bypass": bool(
+                _umg_gate.get("staging_manual_review_bypass")
+            ),
             "replaced_job_id": replaced_job_id,
             "previous_publication": previous_publication,
         },

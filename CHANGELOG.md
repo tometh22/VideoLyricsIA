@@ -3,6 +3,15 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.73] - 2026-09-29
+
+### Changed
+
+- Add a temporary, campaign-allowlisted staging exception for generic UMG
+  REVIEW/NOT_RUN signoffs. Fresh QC, objective blocking failures, language
+  review, render assets and ProRes freshness remain enforced; each bypass is
+  recorded in approval and delivery audit events.
+
 ## [1.1.71] - 2026-09-29
 
 ### Fixed
