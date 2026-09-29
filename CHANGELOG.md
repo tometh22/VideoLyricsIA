@@ -3,6 +3,15 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.71] - 2026-09-29
+
+### Fixed
+
+- Refresh UMG delivery QC automatically when ProRes configuration changes its
+  input fingerprint, then continue publication when the same reviewed render
+  still passes. A changed or failing render returns the operator to the exact
+  check that needs attention.
+
 ## [1.1.70] - 2026-09-28
 
 ### Fixed

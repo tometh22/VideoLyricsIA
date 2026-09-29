@@ -528,6 +528,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       let resp;
       let result;
       let preparationRounds = 0;
+      let qcRefreshRounds = 0;
       do {
         resp = await fetch(`${API}/admin/deliveries/from-job/${job.job_id}`, {
           method: "POST",
@@ -535,6 +536,55 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           body: JSON.stringify({ portal_id: targetPortal }),
         });
         result = await resp.json().catch(() => ({}));
+        // Enabling ProRes changes the QC input fingerprint (delivery spec),
+        // even though the MP4 the operator reviewed is unchanged. Refresh the
+        // current report and retry automatically; the backend carries the
+        // signed visual attestation forward only when that exact artifact still
+        // matches. This avoids leaving the operator with a dead-end 409 after
+        // waiting for the masters.
+        if (!resp.ok && resp.status === 409
+            && result.detail?.code === "delivery_qc_blocked"
+            && qcRefreshRounds < 1) {
+          const gate = result.detail.delivery_qc || {};
+          if (["fresh_preflight_required", "manual_review_required", "review_required"].includes(gate.reason)) {
+            qcRefreshRounds += 1;
+            setUmgSendStage("preflight");
+            const qcResponse = await fetch(`${API}/jobs/${job.job_id}/delivery-qc/recheck`, {
+              method: "POST",
+              headers: { ...authHeaders(), "Content-Type": "application/json" },
+              body: JSON.stringify({ for_umg_delivery: true }),
+            });
+            const qcResult = await qcResponse.json().catch(() => ({}));
+            const refreshedReport = qcResult.delivery_qc;
+            if (qcResponse.ok && refreshedReport) {
+              onJobUpdate?.({ ...job, delivery_qc: refreshedReport });
+              setUmgPreflightRequested(true);
+              if (refreshedReport.approval?.can_approve === true) {
+                setUmgSendStage("publishing");
+                continue;
+              }
+              const failures = (refreshedReport.issues || []).filter(issue => (
+                issue.status === "OPEN" && !issue.manual_verification_required
+                && (issue.result_status === "FAIL" || issue.severity === "FAIL")
+              ));
+              setQcFocusRequest(value => value + 1);
+              alert({
+                title: failures.length ? "Hay puntos que corregir" : "Revisión pendiente",
+                description: failures.length
+                  ? `Encontramos ${failures.length} ${failures.length === 1 ? "fallo" : "fallos"} que deben corregirse antes de publicar.`
+                  : "Revisá el corte actual y confirmá la revisión para continuar.",
+                tone: "warning",
+              });
+              return;
+            }
+            alert({
+              title: "No se pudo actualizar el preflight",
+              description: qcResult.detail?.message || qcResult.detail || "Revisá la conexión y volvé a intentar publicar.",
+              tone: "error",
+            });
+            return;
+          }
+        }
         if (resp.status !== 202 || result.status !== "preparing_prores") break;
         preparationRounds += 1;
         if (preparationRounds > 2) {
