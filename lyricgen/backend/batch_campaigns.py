@@ -361,14 +361,14 @@ class CampaignCreate(BaseModel):
     expected_count: int = Field(default=0, ge=0, le=ITEM_LIMIT)
     default_render_params: dict[str, Any] = Field(default_factory=dict)
     kind: str = Field(default="lyric_video", pattern="^(lyric_video|art_track)$")
-    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile)$")
+    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile|files)$")
 
 
 class CampaignPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
     status: str | None = None
     default_render_params: dict[str, Any] | None = None
-    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile)$")
+    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile|files)$")
 
 
 class SourceReferenceInput(BaseModel):
