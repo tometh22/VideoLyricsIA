@@ -275,3 +275,65 @@ def test_render_art_track_half_rate_wave_at_high_fps(monkeypatch, tmp_path):
     # Base at 60, wave strip at half rate (overlay holds frames).
     assert frates == [spec60.fps_str, "30"]
     assert calls["compute"]["n_frames"] == math.ceil(10.0 * 30)
+
+
+def test_colombia_static_renders_fixed_frame_without_waveform(monkeypatch, tmp_path):
+    from PIL import Image
+
+    cover = tmp_path / "cover.png"
+    Image.new("RGB", (400, 400), (20, 100, 180)).save(cover)
+    calls = {}
+
+    def fake_run(cmd, **kwargs):
+        calls["cmd"] = cmd
+        (tmp_path / "master.mp4").write_bytes(b"fake")
+
+    monkeypatch.setattr(pipeline, "run_checked", fake_run)
+    monkeypatch.setattr(pipeline, "_validate_rendered_mp4", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_art_track_waveform_bars", lambda *a, **k: pytest.fail("waveform rendered"))
+
+    output = pipeline._render_art_track(
+        str(cover), str(tmp_path / "song.wav"), str(tmp_path),
+        spec=rs.RenderSpec.youtube_default(), artist="Artista",
+        song_title="Canción", duration=3, out_name="master.mp4",
+        art_track_preset="colombia_static",
+    )
+
+    assert output == str(tmp_path / "master.mp4")
+    with Image.open(tmp_path / "master_colombia_base.png") as frame:
+        assert frame.size == (1920, 1080)
+        # The clear cover occupies the left side; the blurred background fills right.
+        assert frame.getpixel((500, 500))[:3] == (20, 100, 180)
+        assert frame.getpixel((1700, 500))[:3] != (20, 100, 180)
+    cmd = calls["cmd"]
+    assert cmd.count("-i") == 2
+    assert "-loop" in cmd and "-shortest" in cmd
+    assert "-filter_complex" not in cmd
+    assert "-ss" in cmd and cmd[cmd.index("-ss") + 1] == "0.0"
+    assert "-t" in cmd and cmd[cmd.index("-t") + 1] == "3.0"
+
+
+def test_colombia_static_short_uses_same_window_as_audio(monkeypatch, tmp_path):
+    from PIL import Image
+
+    cover = tmp_path / "cover.png"
+    Image.new("RGB", (200, 200), (110, 30, 70)).save(cover)
+    calls = {}
+
+    def fake_run(cmd, **kwargs):
+        calls["cmd"] = cmd
+        (tmp_path / "short.mp4").write_bytes(b"fake")
+
+    monkeypatch.setattr(pipeline, "run_checked", fake_run)
+    monkeypatch.setattr(pipeline, "_validate_rendered_mp4", lambda *a, **k: None)
+    pipeline._render_art_track(
+        str(cover), str(tmp_path / "song.wav"), str(tmp_path),
+        spec=rs.RenderSpec.youtube_short(), artist="Artista",
+        song_title="Canción", duration=180, out_name="short.mp4",
+        win_start=45, win_dur=30, art_track_preset="colombia_static",
+    )
+    with Image.open(tmp_path / "short_colombia_base.png") as frame:
+        assert frame.size == (1080, 1920)
+    cmd = calls["cmd"]
+    assert cmd[cmd.index("-ss") + 1] == "45"
+    assert cmd[cmd.index("-t") + 1] == "30.0"
