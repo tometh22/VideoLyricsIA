@@ -99,6 +99,8 @@ def test_undo_survives_quality_replay_and_preserves_training_provenance(
     assert undone.status_code == 200, undone.text
     assert undone.json()["revision"] == 1
     assert undone.json()["segments"] == SOURCE
+    assert undone.json()["transcription_quality"]["analysis_status"] == "superseded_by_edit"
+    assert undone.json()["transcription_quality"]["evaluated_revision"] == 1
     assert undone.json()["auto_repair_undo_available"] is False
     assert client.get(f"/editor/{job_id}", headers=auth(token)).json()[
         "auto_repair_undo_available"

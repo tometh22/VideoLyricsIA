@@ -10,7 +10,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Preserve the private transcription snapshot before any automatic lyric or
   timing repair and let an operator undo the repair while the song remains
   untouched. The undo is versioned, reanalyzed, and excluded from human
-  correction training data.
+  correction training data. The editor refreshes quality after undo instead
+  of showing windows from the replaced version, and records undo usage.
 
 ### Safety
 

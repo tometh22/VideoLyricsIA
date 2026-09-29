@@ -3723,8 +3723,8 @@ export default function LyricsEditor({
   const approvalSegments = useMemo(() => edited.map((seg) => ({ ...seg })), [edited]);
 
   const unsafeWindows = useMemo(
-    () => normalizeUnsafeWindows(transcriptionQuality),
-    [transcriptionQuality],
+    () => normalizeUnsafeWindows(qualityRefreshPending ? null : transcriptionQuality),
+    [qualityRefreshPending, transcriptionQuality],
   );
   const focusedQualityReview = !requireLineReview
     && transcriptionQuality?.decision === "review_required"
@@ -5828,6 +5828,12 @@ export default function LyricsEditor({
                 setEdited(reseedPreservingIds(editedRef.current, sanitizeSegments(result.document.segments || [])));
                 setIsDirty(false);
                 setSaveStatus("saved");
+                const nextQuality = qualityFromEditorPayload(result.document);
+                if (nextQuality) {
+                  transcriptionQualityRef.current = nextQuality;
+                  setTranscriptionQuality(nextQuality);
+                }
+                setQualityRefresh({ jobId: transcribeJobId, revision: result.document.revision });
                 onAutoRepairUndone?.(result.document);
                 toast({ message: "Mejora automática deshecha. La versión corregida quedó en el historial.", tone: "success" });
                 trackEditorEvent("editor_auto_repair_undone", { to_revision: result.document.revision });

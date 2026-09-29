@@ -28,20 +28,22 @@ function reply(body, status = 200) {
   };
 }
 
-function makeRequest() {
+function makeRequest({ beforeQuality = null, pendingQuality = null } = {}) {
   let current = {
     job_id: JOB, revision: 0, segments: REPAIRED,
     original_segments: REPAIRED,
+    transcription_quality: beforeQuality,
     auto_repair_undo_available: true,
     lock: { active: false },
   };
   return vi.fn(async (path, options = {}) => {
-    if (path === `/editor/${JOB}` && !options.method) return reply(current);
+    if (path === `/editor/${JOB}` && (!options.method || options.method === "GET")) return reply(current);
     if (path.endsWith("/lock/heartbeat")) return reply({ acquired: true, user: USER });
     if (path.endsWith("/lock") && options.method === "DELETE") return reply({ released: true });
     if (path === `/editor/${JOB}/auto-repair/undo`) {
       current = {
         ...current, revision: 1, segments: SOURCE,
+        transcription_quality: pendingQuality,
         auto_repair_undo_available: false,
       };
       return reply(current);
@@ -85,6 +87,49 @@ describe("automatic repair undo in the editor", () => {
     expect(await screen.findByDisplayValue("versión anterior")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Deshacer mejora automática" })).toBeNull();
     expect(editorRequest.mock.calls.filter(([path]) => path.endsWith("/auto-repair/undo"))).toHaveLength(1);
+  });
+
+  it("refreshes quality after undo without showing old unsafe windows", async () => {
+    const oldQuality = {
+      schema_version: 5, decision: "review_required", mode: "enforce",
+      evaluated_revision: 0, segments_hash: "repaired-hash", analysis_status: "complete",
+      unsafe_windows: [{ id: "repaired-window", start: 0, end: 1, reasons: ["text_audio_mismatch"] }],
+    };
+    const pendingQuality = {
+      ...oldQuality, evaluated_revision: 1, segments_hash: "source-hash",
+      analysis_status: "superseded_by_edit",
+    };
+    const finalQuality = {
+      ...pendingQuality, decision: "pass", analysis_status: "complete", unsafe_windows: [],
+    };
+    const baseRequest = makeRequest({ beforeQuality: oldQuality, pendingQuality });
+    let undoComplete = false;
+    let finishQualityPoll;
+    const editorRequest = vi.fn(async (path, options = {}) => {
+      if (path === `/editor/${JOB}/auto-repair/undo`) {
+        const result = await baseRequest(path, options);
+        undoComplete = true;
+        return result;
+      }
+      if (path === `/editor/${JOB}` && (!options.method || options.method === "GET") && undoComplete) {
+        return new Promise((resolve) => { finishQualityPoll = () => resolve(reply({
+          transcription_quality: finalQuality,
+        })); });
+      }
+      return baseRequest(path, options);
+    });
+    renderEditor(editorRequest, { transcriptionQuality: oldQuality });
+    fireEvent.click(await screen.findByRole("button", { name: "Deshacer mejora automática" }));
+
+    await screen.findByTestId("quality-analysis-pending");
+    expect(screen.queryByTestId("quality-review-panel")).toBeNull();
+    await waitFor(() => expect(finishQualityPoll).toBeTypeOf("function"));
+    finishQualityPoll();
+    await waitFor(() => expect(screen.queryByTestId("quality-analysis-pending")).toBeNull());
+    expect(screen.getByRole("button", { name: /Aprobar y generar/i }))
+      .toHaveAttribute("data-quality-status", "pass");
+    expect(editorRequest.mock.calls.filter(([path, options]) =>
+      path === `/editor/${JOB}` && (!options?.method || options.method === "GET")).length).toBeGreaterThan(1);
   });
 
   it("does not overwrite unsaved local edits", async () => {
