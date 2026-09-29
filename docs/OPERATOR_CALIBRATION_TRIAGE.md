@@ -64,6 +64,15 @@ las respuestas en el navegador y permite descargarlas. Estas respuestas son
 borradores privados:
 todavía no equivalen a etiquetas adjudicadas ni a una aprobación del motor.
 
+El servidor debe permanecer activo durante la revisión. Si se ejecuta desde
+una sesión temporal de un agente, esa sesión puede cerrarlo al terminar:
+instalarlo como servicio de usuario de macOS (`LaunchAgent`) o abrirlo desde
+una Terminal que permanezca abierta. Los recortes ya guardados en
+`reviewer/clips/` sobreviven; al volver a iniciar el servidor, el botón
+«Repetir tramo» reintenta la carga. El visor ofrece «Revisar tramos con audio
+no disponible» para repetir anotaciones hechas durante una caída del servidor
+sin borrar automáticamente las respuestas del revisor.
+
 Un audio reemplazado, un checkpoint de máquina sin validar o una versión de
 Agus ya superada quedan fuera de la cola. Los cambios estructurales se
 convierten en recortes ciegos `structure_diagnosis` tomados de la versión

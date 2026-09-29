@@ -20,9 +20,10 @@
   <p class="muted">Escuchá el audio y marcá lo que oís. Esta página no cambia canciones ni aprueba correcciones.</p>
   <div class="card">
     <label>Revisor <input id="reviewer" autocomplete="off" placeholder="Tu identificador"></label>
-    <div class="row"><label>Estado <select id="reviewFilter"><option value="pending">Pendientes</option><option value="all">Todos</option><option value="done">Guardados</option></select></label><label>Ir al tramo <input id="jumpTo" type="number" min="1" step="1" placeholder="Número"></label><button id="jump">Ir</button></div>
+    <div class="row"><label>Estado <select id="reviewFilter"><option value="pending">Pendientes</option><option value="unavailable">Audio no disponible</option><option value="all">Todos</option><option value="done">Guardados</option></select></label><label>Ir al tramo <input id="jumpTo" type="number" min="1" step="1" placeholder="Número"></label><button id="jump">Ir</button></div>
     <div class="row"><button id="previous">← Anterior</button><strong id="position"></strong><button id="next">Siguiente →</button></div>
     <p class="muted" id="progress"></p>
+    <button id="retryUnavailable" hidden></button>
     <p id="task"></p><p class="muted" id="clip"></p>
     <audio id="audio" controls preload="metadata"></audio>
     <div class="row"><button class="primary" id="replay">▶ Repetir tramo</button><span id="clock"></span></div>
@@ -60,9 +61,9 @@ try{$('reviewer').value=localStorage.getItem(reviewerPrefKey)||''}catch(_){}
 const reviewerKey=()=>`genly-calibration:${data.queue_sha256}:${$('reviewer').value.trim()}`;
 function loadAnswers(){try{answers=JSON.parse(localStorage.getItem(reviewerKey())||'{}')}catch(_){answers={}}}
 function isDone(row){const answer=answers[row.task_id];return !!answer&&answer.verdict!=='unreviewed'}
-function visibleIndices(){const state=$('reviewFilter').value;return rows.map((row,i)=>({row,i})).filter(({row})=>state==='all'||(state==='done'&&isDone(row))||(state==='pending'&&!isDone(row))).map(({i})=>i)}
+function visibleIndices(){const state=$('reviewFilter').value;return rows.map((row,i)=>({row,i})).filter(({row})=>state==='all'||(state==='done'&&isDone(row))||(state==='pending'&&!isDone(row))||(state==='unavailable'&&answers[row.task_id]?.verdict==='unavailable')).map(({i})=>i)}
 function moveFiltered(direction){const visible=visibleIndices(),target=direction>0?visible.find(i=>i>index):visible.slice().reverse().find(i=>i<index);if(target!==undefined){index=target;show()}else{$('status').textContent='No quedan más tramos con este filtro.';updateProgress()}}
-function updateProgress(){const done=rows.filter(isDone).length,visible=visibleIndices();$('progress').textContent=`${done} de ${rows.length} guardados · ${visible.length} con el filtro actual`}
+function updateProgress(){const done=rows.filter(isDone).length,visible=visibleIndices(),unavailable=rows.filter(row=>answers[row.task_id]?.verdict==='unavailable').length;$('progress').textContent=`${done} de ${rows.length} guardados · ${visible.length} con el filtro actual`;const retry=$('retryUnavailable');retry.hidden=!unavailable;retry.textContent=`Revisar ${unavailable} tramo${unavailable===1?'':'s'} con audio no disponible`}
 function save(){const reviewer=$('reviewer').value.trim();if(!reviewer){$('status').textContent='Escribí tu identificador para guardar.';return false}
   const answer={schema:'blind-operator-audio-observation-draft-v1',task_id:rows[index].task_id,reviewer_id:reviewer,
     verdict:$('verdict').value,heard_text:$('heard').value,start_s:$('start').value,end_s:$('end').value,note:$('note').value,
@@ -77,11 +78,12 @@ function show(){const row=rows[index],stored=answers[row.task_id]||{};audio.paus
   $('audioError').textContent='';$('status').textContent='';$('clock').textContent=`${row.clip_start_s.toFixed(2)} s`;audio.onloadedmetadata=()=>{audio.currentTime=row.local_clip?0:row.clip_start_s};}
 function changeFilter(){const visible=visibleIndices();if(visible.length&&!visible.includes(index))index=visible[0];show()}
 $('reviewer').addEventListener('change',()=>{try{localStorage.setItem(reviewerPrefKey,$('reviewer').value.trim())}catch(_){}loadAnswers();changeFilter()});$('reviewFilter').onchange=changeFilter;
+$('retryUnavailable').onclick=()=>{$('reviewFilter').value='unavailable';changeFilter()};
 $('jump').onclick=()=>{const target=Number($('jumpTo').value)-1;if(Number.isInteger(target)&&target>=0&&target<rows.length){if($('reviewer').value.trim())save();index=target;show()}else $('status').textContent='Ingresá un número de tramo válido.'};
 $('previous').onclick=()=>{if($('reviewer').value.trim())save();moveFiltered(-1)};$('next').onclick=()=>{if($('reviewer').value.trim())save();moveFiltered(1)};$('saveNext').onclick=()=>{if(save())moveFiltered(1)};
-$('replay').onclick=()=>{audio.currentTime=rows[index].local_clip?0:rows[index].clip_start_s;audio.play().catch(()=>{$('audioError').textContent='No se pudo reproducir este recorte.'})};
+$('replay').onclick=()=>{const row=rows[index];$('audioError').textContent='';if(audio.error){audio.src=row.audio_url;audio.load()}audio.currentTime=row.local_clip?0:row.clip_start_s;audio.play().catch(()=>{$('audioError').textContent='No se pudo reproducir este recorte. Probá otra vez en unos segundos.'})};
 audio.ontimeupdate=()=>{const row=rows[index];$('clock').textContent=`${absoluteTime().toFixed(2)} s`;if(!row.local_clip&&audio.currentTime>=row.clip_end_s)audio.pause()};
-audio.onerror=()=>{$('audioError').textContent=rows[index].local_clip?'No se pudo abrir el recorte local.':'No se pudo abrir el audio. Puede haber vencido el enlace privado.'};
+audio.onerror=()=>{$('audioError').textContent=rows[index].local_clip?'No se pudo abrir el recorte local. Tocá «Repetir tramo» para volver a intentar.':'No se pudo abrir el audio. Puede haber vencido el enlace privado.'};
 $('markStart').onclick=()=>{$('start').value=absoluteTime().toFixed(2);save()};$('markEnd').onclick=()=>{$('end').value=absoluteTime().toFixed(2);save()};
 fields.forEach(field=>$(field).addEventListener('change',save));
 $('download').onclick=()=>{if(!save())return;const blob=new Blob([JSON.stringify({schema:'blind-operator-audio-review-draft-v1',queue_sha256:data.queue_sha256,reviewer_id:$('reviewer').value.trim(),annotations:Object.values(answers),gold:false},null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='escucha-ciega.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
