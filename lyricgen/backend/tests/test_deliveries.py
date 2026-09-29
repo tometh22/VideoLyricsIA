@@ -228,13 +228,21 @@ def test_publication_blocks_until_required_manual_checks_are_signed(
 def test_staging_campaign_bypass_allows_publication_but_keeps_audit(
     client, admin_token, approved_job, db, all_r2_files_present, monkeypatch,
 ):
-    from database import AuditLog
+    from database import AuditLog, BatchCampaign
 
     report = dict(approved_job.delivery_qc)
     report["issues"] = [dict(row) for row in report["issues"]]
     report["issues"][0].update({"status": "OPEN", "operator_decision": None})
     approved_job.delivery_qc = report
-    approved_job.campaign_id = "umg-stg-01"
+    campaign_id = "umg-stg-01"
+    db.add(BatchCampaign(
+        id=campaign_id,
+        tenant_id=approved_job.tenant_id,
+        created_by=approved_job.user_id,
+        name="Staging UMG bypass fixture",
+    ))
+    db.flush()
+    approved_job.campaign_id = campaign_id
     db.commit()
     monkeypatch.setenv("ENVIRONMENT", "staging")
     monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "1")
