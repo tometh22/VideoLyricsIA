@@ -675,6 +675,7 @@ export default function LyricsEditor({
   // transcribeJobId sigan keyando el store correctamente.
   storeKey = null,
   onPersistSegments = null,
+  onAutoRepairUndone = null,
   editorRequest = null,
   saveQueue = null,
   // Descarta caches/draft locales y vuelve a hidratar la versión canónica
@@ -1003,6 +1004,7 @@ export default function LyricsEditor({
   // another write merely advanced the revision.
   saveConflictRef.current = false;
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [autoRepairUndoBusy, setAutoRepairUndoBusy] = useState(false);
   const editedRef = useRef(edited);
   editedRef.current = edited;
   const unsafeNavigationIdsRef = useRef(new Set());
@@ -3721,8 +3723,8 @@ export default function LyricsEditor({
   const approvalSegments = useMemo(() => edited.map((seg) => ({ ...seg })), [edited]);
 
   const unsafeWindows = useMemo(
-    () => normalizeUnsafeWindows(transcriptionQuality),
-    [transcriptionQuality],
+    () => normalizeUnsafeWindows(qualityRefreshPending ? null : transcriptionQuality),
+    [qualityRefreshPending, transcriptionQuality],
   );
   const focusedQualityReview = !requireLineReview
     && transcriptionQuality?.decision === "review_required"
@@ -5804,6 +5806,50 @@ export default function LyricsEditor({
           </div>
         )}
       </div>
+      {editorV2Enabled && durableEditor.document?.auto_repair_undo_available && (
+        <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-sky-400/20 bg-sky-400/5 px-3 py-2 text-xs text-gray-200">
+          <span>Esta canción recibió una mejora automática. Podés volver a la versión anterior.</span>
+          <button
+            type="button"
+            disabled={autoRepairUndoBusy || isDirty || Boolean(draftRecovery)}
+            onClick={async () => {
+              setAutoRepairUndoBusy(true);
+              try {
+                const result = await durableEditor.undoAutoRepair();
+                if (!result?.ok) {
+                  if (result?.reason === "stale-revision") {
+                    await durableEditor.load();
+                    toast({ message: "La canción cambió mientras la tenías abierta. Recargamos la versión actual.", tone: "warning" });
+                  } else {
+                    toast({ message: "No se pudo deshacer la mejora automática. Intentá de nuevo.", tone: "error" });
+                  }
+                  return;
+                }
+                setEdited(reseedPreservingIds(editedRef.current, sanitizeSegments(result.document.segments || [])));
+                setIsDirty(false);
+                setSaveStatus("saved");
+                const nextQuality = qualityFromEditorPayload(result.document);
+                if (nextQuality) {
+                  transcriptionQualityRef.current = nextQuality;
+                  setTranscriptionQuality(nextQuality);
+                }
+                setQualityRefresh({ jobId: transcribeJobId, revision: result.document.revision });
+                onAutoRepairUndone?.(result.document);
+                toast({ message: "Mejora automática deshecha. La versión corregida quedó en el historial.", tone: "success" });
+                trackEditorEvent("editor_auto_repair_undone", { to_revision: result.document.revision });
+              } catch {
+                toast({ message: "No se pudo deshacer la mejora automática. Intentá de nuevo.", tone: "error" });
+              } finally {
+                setAutoRepairUndoBusy(false);
+              }
+            }}
+            className="rounded-lg bg-sky-400/15 px-3 py-1.5 font-semibold text-sky-200 hover:bg-sky-400/25 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {autoRepairUndoBusy ? "Deshaciendo…" : "Deshacer mejora automática"}
+          </button>
+          {(isDirty || draftRecovery) && <span className="text-amber-300">Guardá o descartá tus cambios actuales primero.</span>}
+        </div>
+      )}
       <div className={`grid gap-4 mb-4 items-start ${viewMode === "advanced" ? (previewDockOpen && !hideTypographyControls && !hideInternalPreview ? "grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]" : "grid-cols-1") : (hideTypographyControls || hideInternalPreview ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}`}>
           {/* COLUMNA IZQUIERDA — sticky en desktop. Controles tipográficos
               + LyricVideoPreview (editable) + scope toggle.

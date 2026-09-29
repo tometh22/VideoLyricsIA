@@ -1160,6 +1160,12 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         )
     final["auto_repair"] = auto_trace
     r["transcription_quality"] = final
+    if auto_trace["applied_count"] > 0:
+        # Keep the exact machine output before automatic changes in the
+        # tenant-private evidence, so an untouched result can be restored.
+        from machine_evidence import snapshot_hash
+        r["_pre_auto_repair_segments"] = original_segments
+        auto_trace["source_snapshot_sha256"] = snapshot_hash(original_segments)
     if final["decision"] == "pass":
         logger.info("[QUALITY-GATE] PASS score=%s job=%s", final["score"], job_id)
     else:
@@ -1181,6 +1187,7 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     r.pop("_asr_words", None)
     r.pop("_independent_asr_words", None)
     r.pop("_pre_anchor_provider_segments", None)
+    r.pop("_pre_auto_repair_segments", None)
     r.pop("_recognition_hypotheses", None)
     r.pop("_recognition_attempt_count", None)
     r.pop("_reconcile_capture", None)

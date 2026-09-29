@@ -20,6 +20,7 @@ from segment_timing import canonicalize_editor_segments
 EDITOR_REASONS = {
     "autosave", "manual", "restore", "approve", "conflict", "migration",
     "transcription", "quality_proposal", "reviewer_candidate", "change_request",
+    "auto_repair_undo",
 }
 EDITOR_CHECKPOINTS = EDITOR_REASONS | {"draft"}
 MAX_SEGMENTS = 5000
@@ -634,6 +635,65 @@ def require_machine_snapshot(job: Job, document: EditorDocument) -> None:
     validate_machine_evidence(document.machine_evidence, document.original_segments)
 
 
+def auto_repair_undo_segments(job: Job, document: EditorDocument) -> list[dict] | None:
+    """Return the private pre-repair snapshot only for an untouched job."""
+    if (
+        int(document.revision or 0) != 0
+        or int(job.segments_revision or 0) != 0
+        or getattr(job, "approved_at", None) is not None
+        or job.status != "transcribed_pending"
+        or document.current_segments != job.segments_json
+        or document.current_segments != document.original_segments
+    ):
+        return None
+    evidence = document.machine_evidence
+    if not isinstance(evidence, dict):
+        return None
+    # The asynchronous quality replay can replace Job.transcription_quality
+    # after the machine snapshot is frozen. Read the repair trace from that
+    # immutable evidence so the undo does not disappear during reanalysis.
+    decisions = evidence.get("decisions") or {}
+    frozen_quality = decisions.get("quality") if isinstance(decisions, dict) else None
+    trace = frozen_quality.get("auto_repair") if isinstance(frozen_quality, dict) else None
+    if not isinstance(trace, dict):
+        return None
+    if type(trace.get("applied_count")) is not int or trace["applied_count"] <= 0:
+        return None
+    from machine_evidence import MachineSnapshotMissing, snapshot_hash, validate_machine_evidence
+    from transcription_quality import segments_hash
+    try:
+        validate_machine_evidence(evidence, document.original_segments)
+    except MachineSnapshotMissing:
+        return None
+    pre_human = evidence.get("pre_human") or {}
+    if (
+        not job.input_audio_sha256
+        or pre_human.get("audio_sha256") != job.input_audio_sha256
+        or pre_human.get("audio_revision") != int(job.audio_revision or 0)
+        or trace.get("source_segments_revision") != 0
+    ):
+        return None
+    source = [
+        item for item in evidence.get("hypotheses_by_family") or []
+        if isinstance(item, dict) and item.get("role") == "pre_auto_repair"
+    ]
+    if len(source) != 1 or not isinstance(source[0].get("events"), list):
+        return None
+    segments = source[0]["events"]
+    if (
+        snapshot_hash(segments) != trace.get("source_snapshot_sha256")
+        or segments_hash(segments) != trace.get("source_segments_hash")
+        or segments_hash(segments) == segments_hash(document.current_segments)
+    ):
+        return None
+    try:
+        if normalize_segments(segments) == document.current_segments:
+            return None
+    except ValueError:
+        return None
+    return deepcopy(segments)
+
+
 def serialize_document(
     db: Session, document: EditorDocument, job: Job | None = None,
 ) -> dict:
@@ -674,6 +734,9 @@ def serialize_document(
         "revision": document.revision,
         "segments": document.current_segments,
         "original_segments": document.original_segments,
+        "auto_repair_undo_available": bool(
+            job is not None and auto_repair_undo_segments(job, document) is not None
+        ),
         "latest_approved_version": latest_approved_payload,
         "quality_proposal": proposal,
         **pilot,
@@ -1813,6 +1876,10 @@ def save_document(
     # Guard every editor write path at once (PATCH, proposal apply, restore,
     # conflict resolve) instead of one endpoint at a time.
     assert_pilot_actor(db, job, user_id)
+    if reason == "auto_repair_undo":
+        source = auto_repair_undo_segments(job, document)
+        if base_revision != 0 or source is None or segments != source:
+            raise RuntimeError("auto_repair_undo_unavailable")
     if getattr(job, "pilot_id", None) and reason == "approve":
         raise ValueError("pilot_copy_cannot_be_approved")
     normalized = normalize_segments(segments)
@@ -1851,8 +1918,11 @@ def save_document(
     previous_segments = [dict(item) for item in (document.current_segments or [])]
     previous_revision = int(document.revision or 0)
     from reviewer_timing_capture import timing_capture
-    capture = timing_capture(previous_segments, segments, job=job, user_id=user_id,
-        checkpoint=reason, from_revision=previous_revision, to_revision=previous_revision + 1)
+    capture = None if reason == "auto_repair_undo" else timing_capture(
+        previous_segments, segments, job=job, user_id=user_id,
+        checkpoint=reason, from_revision=previous_revision,
+        to_revision=previous_revision + 1,
+    )
     if capture:
         # Same transaction as save; capture submitted timings before any
         # normalization, without adding forms or asserting line-level intent.
@@ -1891,16 +1961,17 @@ def save_document(
     # Any ordinary edit makes a raw proposal stale. Quality-proposal apply
     # writes a text-free tombstone after save_document returns.
     document.quality_proposal = None
-    _record_training_delta(
-        db,
-        job=job,
-        user_id=user_id,
-        previous=previous_segments,
-        current=normalized,
-        from_revision=previous_revision,
-        to_revision=int(document.revision),
-        checkpoint=reason,
-    )
+    if reason != "auto_repair_undo":
+        _record_training_delta(
+            db,
+            job=job,
+            user_id=user_id,
+            previous=previous_segments,
+            current=normalized,
+            from_revision=previous_revision,
+            to_revision=int(document.revision),
+            checkpoint=reason,
+        )
     version = None
     # For evidence-enrolled jobs even the fast 800 ms draft is part of the
     # recoverable operator path.  Store it as an autosave checkpoint so the

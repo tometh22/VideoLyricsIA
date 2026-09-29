@@ -97,3 +97,11 @@ def test_audio_playback_failure_acepta_lo_que_emite_el_cliente():
     assert {
         "position_ms", "media_error_code", "automatic_recovery_available",
     } <= main._PRODUCT_EVENT_PROPERTIES[event]
+
+
+def test_auto_repair_undo_telemetry_acepta_la_revision_restaurada():
+    import main
+    event = "editor_auto_repair_undone"
+    assert event in main._PRODUCT_EVENT_NAMES
+    assert {"to_revision"} <= main._PRODUCT_EVENT_PROPERTIES[event]
+    assert valid_property("to_revision", 1)

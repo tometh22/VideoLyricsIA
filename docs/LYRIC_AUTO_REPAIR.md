@@ -100,7 +100,11 @@ propuestas: guarda estado, cantidad y acciones aplicadas, hashes del snapshot
 y revisiones de audio/segmentos. Una propuesta no mejora el puntaje y reduce
 al menos una ventana insegura, se revierte en memoria.
 
-Por ahora el panel del editor no muestra un control de deshacer específico para
-esta corrección. La mutación permanece desactivada hasta que exista la
-autorización calibrada y la UX de deshacer pueda integrarse en el editor con su
-responsable actual.
+Cuando se aplica una corrección, la evidencia privada conserva la versión
+previa exacta. El editor ofrece **Deshacer mejora automática** mientras la
+canción siga sin editar ni aprobar y el audio, la revisión y los hashes sigan
+coincidiendo. La reversión queda en el historial, invalida el análisis de
+calidad anterior y no se toma como una corrección humana para entrenar.
+
+La mutación permanece desactivada hasta que exista la autorización calibrada.
+Encender solo los switches sin el artefacto firmado no activa la corrección.

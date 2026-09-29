@@ -239,3 +239,72 @@ describe("useEditorDocument save ordering", () => {
     expect(patchBodies.at(-1).base_revision).toBe(2);
   });
 });
+
+describe("useEditorDocument automatic repair undo", () => {
+  it("sends the durable revision and replaces the document after a successful undo", async () => {
+    const request = vi.fn(async (path, options = {}) => {
+      if (path === "/editor/undo-job" && !options.method) {
+        return reply({
+          job_id: "undo-job", revision: 0,
+          segments: [{ start: 0, end: 1, text: "automatic" }],
+          auto_repair_undo_available: true,
+          lock: { active: false },
+        });
+      }
+      if (path.endsWith("/lock/heartbeat")) return reply({ acquired: true });
+      if (path.endsWith("/lock") && options.method === "DELETE") return reply({ released: true });
+      if (path === "/editor/undo-job/auto-repair/undo") {
+        expect(JSON.parse(options.body)).toEqual({ base_revision: 0 });
+        return reply({
+          job_id: "undo-job", revision: 1,
+          segments: [{ start: 0, end: 1, text: "original" }],
+          auto_repair_undo_available: false,
+        });
+      }
+      return reply({}, 404);
+    });
+    const { result, unmount } = renderHook(() => useEditorDocument({
+      jobId: "undo-job", enabled: true, request,
+    }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    let undone;
+    await act(async () => { undone = await result.current.undoAutoRepair(); });
+    expect(undone.ok).toBe(true);
+    expect(result.current.revisionRef.current).toBe(1);
+    expect(result.current.document.segments[0].text).toBe("original");
+    expect(result.current.document.auto_repair_undo_available).toBe(false);
+    unmount();
+  });
+
+  it.each([
+    [409, "stale-revision"],
+    [500, "http-500"],
+  ])("preserves the current document after HTTP %s", async (status, reason) => {
+    const request = vi.fn(async (path, options = {}) => {
+      if (path === "/editor/undo-failure" && !options.method) {
+        return reply({
+          job_id: "undo-failure", revision: 0,
+          segments: [{ start: 0, end: 1, text: "automatic" }],
+          auto_repair_undo_available: true,
+          lock: { active: false },
+        });
+      }
+      if (path.endsWith("/lock/heartbeat")) return reply({ acquired: true });
+      if (path.endsWith("/lock") && options.method === "DELETE") return reply({ released: true });
+      if (path === "/editor/undo-failure/auto-repair/undo") {
+        return reply({ detail: "unavailable" }, status);
+      }
+      return reply({}, 404);
+    });
+    const { result, unmount } = renderHook(() => useEditorDocument({
+      jobId: "undo-failure", enabled: true, request,
+    }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    let undone;
+    await act(async () => { undone = await result.current.undoAutoRepair(); });
+    expect(undone).toMatchObject({ ok: false, reason });
+    expect(result.current.revisionRef.current).toBe(0);
+    expect(result.current.document.segments[0].text).toBe("automatic");
+    unmount();
+  });
+});
