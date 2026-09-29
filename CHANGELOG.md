@@ -3,7 +3,7 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [1.1.73] - 2026-09-29
+## [1.1.72] - 2026-09-29
 
 ### Changed
 
