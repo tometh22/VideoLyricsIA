@@ -337,3 +337,21 @@ def test_colombia_static_short_uses_same_window_as_audio(monkeypatch, tmp_path):
     cmd = calls["cmd"]
     assert cmd[cmd.index("-ss") + 1] == "45"
     assert cmd[cmd.index("-t") + 1] == "30.0"
+
+
+def test_colombia_static_legal_credit_renders_phonogram_glyph(tmp_path):
+    import dataclasses
+    from PIL import Image
+
+    cover = tmp_path / "cover.png"
+    Image.new("RGB", (100, 100), (40, 70, 110)).save(cover)
+    spec = dataclasses.replace(rs.RenderSpec.youtube_default(), width=640, height=360)
+    correct = tmp_path / "correct.png"
+    missing = tmp_path / "missing.png"
+    for destination, mark in ((correct, "℗"), (missing, "\U000e0001")):
+        pipeline._build_art_track_colombia_base(
+            str(cover), str(destination), spec=spec, artist="A",
+            song_title="T", label_line=f"{mark} 2026",
+        )
+    with Image.open(correct) as a, Image.open(missing) as b:
+        assert a.crop((330, 325, 640, 360)).tobytes() != b.crop((330, 325, 640, 360)).tobytes()
