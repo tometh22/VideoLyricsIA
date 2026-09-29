@@ -8923,12 +8923,12 @@ async def _run_transcription_for_job(
                                     _wx_segs,
                                     reference_source=f"catalog_{better_source}",
                                     audio_duration_s=_audio_dur_for_lrc,
-                                    is_live=_reference_is_live,
+                                    is_live=bool(live or _looks_live(title, filename)),
                                 )
                                 _refetch_action = reference_gate_action(
                                     _refetch_report,
                                     mode="enforce",
-                                    is_live=_reference_is_live,
+                                    is_live=bool(live or _looks_live(title, filename)),
                                 )
                                 if _refetch_action != "reference_allowed":
                                     logger.warning(
