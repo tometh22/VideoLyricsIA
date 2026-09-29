@@ -110,6 +110,39 @@ def effective_delivery_qc_mode() -> str:
     return mode if mode in {"off", "observe", "enforce"} else "off"
 
 
+def staging_umg_manual_review_bypass_enabled(job: Any) -> bool:
+    """Opt into skipping only non-objective UMG review reminders in staging.
+
+    A fresh report is still mandatory, objective blocking FAILs still block,
+    and the campaign must be explicitly allowlisted. This is a temporary
+    operational escape hatch for a named staging campaign, never production.
+    """
+    if os.environ.get("ENVIRONMENT", "").strip().lower() != "staging":
+        return False
+    if os.environ.get("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        return False
+    campaign_id = str(getattr(job, "campaign_id", "") or "").strip()
+    allowed_campaigns = {
+        value.strip()
+        for value in os.environ.get(
+            "DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS", "",
+        ).split(",")
+        if value.strip()
+    }
+    expires_at_raw = os.environ.get(
+        "DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_UNTIL_UTC", "",
+    ).strip()
+    try:
+        expires_at = datetime.fromisoformat(expires_at_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expires_at.tzinfo is None or datetime.now(timezone.utc) >= expires_at:
+        return False
+    return bool(campaign_id and campaign_id in allowed_campaigns)
+
+
 def segments_hash(segments: Sequence[Mapping[str, Any]]) -> str:
     from transcription_quality import segments_hash as quality_segments_hash
     return quality_segments_hash([dict(row) for row in segments if isinstance(row, Mapping)])
@@ -445,7 +478,17 @@ def delivery_readiness_gate(job: Any, report: Mapping[str, Any] | None, *, for_u
             return {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"}
         if report.get("source_fingerprint") != delivery_qc_source_fingerprint(job):
             return {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"}
-    return approval_gate(report, "enforce" if required else None, require_manual_review=required)
+    bypass_manual_review = required and staging_umg_manual_review_bypass_enabled(job)
+    gate = approval_gate(
+        report, "enforce" if required else None,
+        require_manual_review=required and not bypass_manual_review,
+    )
+    if bypass_manual_review:
+        normal_gate = approval_gate(report, "enforce", require_manual_review=True)
+        if normal_gate.get("blocked") and not gate.get("blocked"):
+            gate["staging_manual_review_bypass"] = True
+            gate["reason"] = "staging_manual_review_bypass"
+    return gate
 
 
 def mark_delivery_qc_stale(report: Mapping[str, Any] | None, *, revision: int, reason: str) -> dict[str, Any]:
