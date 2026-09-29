@@ -647,9 +647,15 @@ def auto_repair_undo_segments(job: Job, document: EditorDocument) -> list[dict] 
     ):
         return None
     evidence = document.machine_evidence
-    quality = job.transcription_quality
-    trace = quality.get("auto_repair") if isinstance(quality, dict) else None
-    if not isinstance(evidence, dict) or not isinstance(trace, dict):
+    if not isinstance(evidence, dict):
+        return None
+    # The asynchronous quality replay can replace Job.transcription_quality
+    # after the machine snapshot is frozen. Read the repair trace from that
+    # immutable evidence so the undo does not disappear during reanalysis.
+    decisions = evidence.get("decisions") or {}
+    frozen_quality = decisions.get("quality") if isinstance(decisions, dict) else None
+    trace = frozen_quality.get("auto_repair") if isinstance(frozen_quality, dict) else None
+    if not isinstance(trace, dict):
         return None
     if type(trace.get("applied_count")) is not int or trace["applied_count"] <= 0:
         return None
