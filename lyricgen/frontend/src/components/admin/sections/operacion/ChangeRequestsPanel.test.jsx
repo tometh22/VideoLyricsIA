@@ -117,6 +117,19 @@ describe("publicationStatus", () => {
     expect(status.title).toMatch(/Re-renderizando/);
   });
 
+  it("offers a safe status check after an uncertain publish", () => {
+    const reconcile = vi.fn();
+    renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true,
+      render_fingerprint: "render-1", editor_revision: 4 } }, {
+      crPublishNotice: { requestId: 999, tone: "wait", outcomeUnknown: true,
+        text: "La publicación podría haberse publicado." },
+      reconcilePublication: reconcile,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Consultar estado" }));
+    expect(reconcile).toHaveBeenCalledWith(999);
+    expect(screen.getByRole("status", { name: "Resultado del pedido" })).toHaveTextContent("podría haberse publicado");
+  });
+
   it("warns that the broadcast master is still the previous cut", () => {
     // El caso de producción del 2026-09-15: el MP4 ya está corregido y el
     // .mov PRE-EDIT sigue descargable en la misma key.

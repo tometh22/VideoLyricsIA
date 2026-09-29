@@ -161,6 +161,7 @@ export default function ChangeRequestsPanel({
   reopenChangeRequest,
   crPublishingId,
   crPublishNotice,
+  reconcilePublication,
   dismissPublishNotice,
   publishDeliveryUpdate,
   prepareProRes = () => {},
@@ -307,6 +308,11 @@ export default function ChangeRequestsPanel({
         <div role={crPublishNotice.tone === "error" ? "alert" : "status"} aria-label="Resultado del pedido"
           className="rounded-xl bg-sky-500/10 p-3 text-caption text-sky-100">
           Pedido #{crPublishNotice.requestId}: {crPublishNotice.text}
+          {crPublishNotice.outcomeUnknown && (
+            <button type="button" onClick={() => reconcilePublication?.(crPublishNotice.requestId)} className="ml-3 underline">
+              Consultar estado
+            </button>
+          )}
           <button type="button" onClick={dismissPublishNotice} className="ml-3 underline">Cerrar</button>
         </div>
       )}
@@ -757,6 +763,12 @@ function ChangeRequestCard({
           aria-label="Estado de la acción"
           className={`w-full rounded-lg p-3 text-caption ${actionNotice.tone === "error" ? "bg-red-500/10 text-red-200" : "bg-sky-500/10 text-sky-100"}`}>
           {actionNotice.text}
+          {actionNotice.outcomeUnknown && (
+            <button type="button" onClick={() => reconcilePublication?.(item.id)}
+              className="mt-2 inline-flex min-h-9 items-center rounded-lg bg-white/10 px-3 py-1.5 font-semibold text-white hover:bg-white/15">
+              Consultar estado
+            </button>
+          )}
           {actionNotice.actionHref && (
             <a
               href={actionNotice.actionHref}

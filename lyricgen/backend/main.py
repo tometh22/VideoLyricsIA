@@ -21313,13 +21313,16 @@ def _fmt_size_mb(size_bytes: int | None) -> str:
 async def admin_list_change_requests(
     status: str = "pending",
     limit: int = 200,
+    change_request_id: int | None = Query(None, ge=1),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
     """List change requests for the operator UI. Admin only.
 
-    status: "pending" (default), "resolved", or "all".
+    status: "pending" (default), "resolved", or "all". An optional
+    change_request_id narrows the result to that exact case for publication
+    outcome reconciliation after a lost client response.
     Returns request + delivery context (artist/song/label/frame/job_id)
     plus resolved_by username so the admin sees who acted on each one.
 
@@ -21335,6 +21338,8 @@ async def admin_list_change_requests(
         limit = 200
 
     q = ddb.query(DeliveryChangeRequest)
+    if change_request_id is not None:
+        q = q.filter(DeliveryChangeRequest.id == change_request_id)
     if status == "pending":
         q = q.filter(DeliveryChangeRequest.resolved_at.is_(None))
     elif status == "resolved":

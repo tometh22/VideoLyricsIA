@@ -519,17 +519,50 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     if (mutationLocksRef.current.has(lock)) return;
     mutationLocksRef.current.add(lock);
     setCrPublishingId(crId ?? jobId);
-    setCrPublishNotice(null);
+    setCrPublishNotice({ requestId: crId, tone: "wait",
+      text: "Publicando en UMG… Estamos verificando y copiando los archivos. No vuelvas a publicar mientras termina." });
     try {
-      const data = await fetchJson(`${API}/admin/deliveries/from-job/${jobId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ portal_id: portalId,
-          ...(publication ? { change_request_id: crId,
-            reviewed_render_fingerprint: publication.render_fingerprint,
-            reviewed_editor_revision: publication.editor_revision } : {}),
-        }),
-      });
+      let data;
+      try {
+        data = await fetchJson(`${API}/admin/deliveries/from-job/${jobId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ portal_id: portalId,
+            ...(publication ? { change_request_id: crId,
+              reviewed_render_fingerprint: publication.render_fingerprint,
+              reviewed_editor_revision: publication.editor_revision } : {}),
+          }),
+        });
+      } catch (err) {
+        const gate = err?.detail?.delivery_qc;
+        if (err?.detail?.code === "delivery_qc_blocked" && jobId) {
+          const returnPath = `/admin?section=cambios&change_request_id=${encodeURIComponent(crId)}`;
+          const reviewUrl = `/videos/${encodeURIComponent(jobId)}?qc_focus=${gate?.reason === "manual_review_required" ? "manual" : "findings"}&return_to=${encodeURIComponent(returnPath)}`;
+          setCrPublishNotice({
+            requestId: crId,
+            tone: "wait",
+            text: gate?.reason === "manual_review_required"
+              ? "Falta firmar la revisión del video para este corte. Abrí los controles, completalos y después volvé a publicar."
+              : gate?.reason === "fresh_preflight_required"
+                ? "Este corte todavía no tiene un preflight vigente. Analizalo antes de publicar."
+                : "El preflight encontró puntos que requieren atención antes de publicar.",
+            actionLabel: gate?.reason === "fresh_preflight_required"
+              ? "Analizar y revisar este corte"
+              : "Completar revisión del video",
+            actionHref: reviewUrl,
+          });
+          return;
+        }
+        if (mutationOutcomeUnknown(err)) {
+          setCrPublishNotice({ requestId: crId, outcomeUnknown: true, tone: "wait",
+            text: "Se perdió la respuesta. La publicación podría haberse publicado; consultá el estado antes de reintentar." });
+        } else {
+          setCrPublishNotice({ requestId: crId, tone: "error",
+            text: `El servidor no aceptó la publicación: ${err.message || err}` });
+        }
+        await loadChangeRequests({ silent: true });
+        return;
+      }
       if (data.ok === false && data.status === "preparing_prores") {
         setCrPublishNotice({
           requestId: crId,
@@ -560,35 +593,41 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
           text: "Reenviado. El render es el mismo que ya estaba publicado, así que la versión y la aprobación no cambian.",
         });
       }
-      await loadChangeRequests();
-    } catch (err) {
-      const gate = err?.detail?.delivery_qc;
-      if (err?.detail?.code === "delivery_qc_blocked" && jobId) {
-        const returnPath = `/admin?section=cambios&change_request_id=${encodeURIComponent(crId)}`;
-        const reviewUrl = `/videos/${encodeURIComponent(jobId)}?qc_focus=${gate?.reason === "manual_review_required" ? "manual" : "findings"}&return_to=${encodeURIComponent(returnPath)}`;
-        setCrPublishNotice({
-          requestId: crId,
-          tone: "wait",
-          text: gate?.reason === "manual_review_required"
-            ? "Falta firmar la revisión del video para este corte. Abrí los controles, completalos y después volvé a publicar."
-            : gate?.reason === "fresh_preflight_required"
-              ? "Este corte todavía no tiene un preflight vigente. Analizalo antes de publicar."
-              : "El preflight encontró puntos que requieren atención antes de publicar.",
-          actionLabel: gate?.reason === "fresh_preflight_required"
-            ? "Analizar y revisar este corte"
-            : "Completar revisión del video",
-          actionHref: reviewUrl,
-        });
-      } else {
-        setCrPublishNotice({ requestId: crId, outcomeUnknown: mutationOutcomeUnknown(err), tone: mutationOutcomeUnknown(err) ? "wait" : "error",
-          text: mutationOutcomeUnknown(err)
-            ? "No pudimos confirmar el resultado de la publicación. Actualizando el estado: podría haberse publicado. Verificá la versión antes de reintentar."
-            : `El servidor no aceptó la publicación: ${err.message || err}` });
+      // A committed publication stays confirmed even if the follow-up list read
+      // fails. Never turn a successful write into an apparent failed publish.
+      try {
+        await loadChangeRequests({ silent: true });
+      } catch {
+        // loadChangeRequests owns its own user-facing read error.
       }
-      await loadChangeRequests({ silent: true });
+    } catch (err) {
+      // Invalid or incomplete success receipts are ambiguous: the server may
+      // have committed before a proxy or response serialization failed.
+      setCrPublishNotice({ requestId: crId, outcomeUnknown: true, tone: "wait",
+        text: "No pudimos validar el recibo de publicación. Consultá el estado antes de reintentar." });
     } finally {
       mutationLocksRef.current.delete(lock);
       setCrPublishingId(current => current === (crId ?? jobId) ? null : current);
+    }
+  }, [loadChangeRequests]);
+
+  const reconcilePublication = useCallback(async (requestId) => {
+    if (requestId == null) return;
+    setCrPublishNotice({ requestId, outcomeUnknown: true, tone: "wait", text: "Consultando el portal…" });
+    try {
+      const data = await fetchJson(`${API}/admin/change-requests?status=all&change_request_id=${encodeURIComponent(requestId)}&limit=1`);
+      const item = (data.items || []).find((row) => String(row.id) === String(requestId));
+      if (item?.resolution_source === "publication" && item.resolved_at) {
+        setCrPublishNotice({ requestId, tone: "ok",
+          text: `Publicación confirmada. El pedido quedó resuelto en la versión ${item.resolved_by_revision || item.publication?.revision || "actual"}.` });
+        await loadChangeRequests({ silent: true });
+      } else {
+        setCrPublishNotice({ requestId, outcomeUnknown: true, tone: "wait",
+          text: "El pedido todavía figura pendiente. La publicación no está confirmada; esperá unos segundos y consultá de nuevo." });
+      }
+    } catch (err) {
+      setCrPublishNotice({ requestId, outcomeUnknown: true, tone: "wait",
+        text: `No se pudo consultar el estado: ${err.message || err}. No publiques otra versión todavía.` });
     }
   }, [loadChangeRequests]);
 
@@ -687,6 +726,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     crPublishNotice,
     setCrPublishNotice,
     publishDeliveryUpdate,
+    reconcilePublication,
     reviewForRender, confirmRender, crRenderReview, setCrRenderReview: closeRenderReview,
     prepareProRes,
     handleProResConfigured,
