@@ -90,9 +90,13 @@ describe("JobDetail UMG delivery recovery", () => {
         delivery_spec: {}, issues: [], approval: { blocked: false, can_approve: true },
       },
     };
+    let preflightCalls = 0;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
       async (url) => {
-        if (url.includes("/delivery-qc/recheck")) return response(200, { ok: true, delivery_qc: currentReport });
+        if (url.includes("/delivery-qc/recheck")) {
+          preflightCalls += 1;
+          return response(200, { ok: true, delivery_qc: currentReport });
+        }
         if (url.includes("/enable-prores/")) {
           return response(200, {
             ok: true,
@@ -108,6 +112,14 @@ describe("JobDetail UMG delivery recovery", () => {
             ([calledUrl]) => calledUrl.includes("/admin/deliveries/from-job/"),
           ).length;
           if (publishCalls === 1) {
+            return response(409, {
+              detail: {
+                code: "delivery_qc_blocked",
+                delivery_qc: { blocked: true, reason: "fresh_preflight_required" },
+              },
+            });
+          }
+          if (publishCalls === 2) {
             return response(202, {
               status: "preparing_prores",
               retry_after: 1,
@@ -171,9 +183,10 @@ describe("JobDetail UMG delivery recovery", () => {
       const publishCalls = fetchMock.mock.calls.filter(
         ([url]) => url.includes("/admin/deliveries/from-job/83f95d0e2679"),
       );
-      expect(publishCalls).toHaveLength(2);
+      expect(publishCalls).toHaveLength(3);
       expect(JSON.parse(publishCalls.at(-1)[1].body)).toEqual({ portal_id: "argentina" });
     });
+    expect(preflightCalls).toBeGreaterThan(1);
 
     expect(await screen.findByText("Video publicado en umg.genly.pro")).toBeTruthy();
     expect(screen.getByText(/detail\.update_umg/)).toBeTruthy();
