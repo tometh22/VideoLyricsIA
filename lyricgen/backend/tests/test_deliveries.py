@@ -292,6 +292,26 @@ def test_umg_publish_rejects_qc_from_a_different_scene_render(
     assert response.json()["detail"]["delivery_qc"]["reason"] == "fresh_preflight_required"
 
 
+def test_umg_publish_rejects_qc_after_prores_spec_changes_until_rechecked(
+    client, admin_token, approved_job, db, monkeypatch,
+):
+    approved_job.umg_spec = {"frame_size": "UHD-4K", "fps": 29.97}
+    db.commit()
+    monkeypatch.setattr(
+        "main.storage.object_status_bounded",
+        lambda *_args, **_kwargs: pytest.fail("QC must block before storage verification"),
+    )
+
+    response = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "delivery_qc_blocked"
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "fresh_preflight_required"
+
+
 def test_missing_prores_is_prepared_instead_of_returning_dead_end(
     client, admin_token, approved_job,
 ):
