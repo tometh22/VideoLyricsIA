@@ -6565,8 +6565,12 @@ export default function LyricsEditor({
               try {
                 const result = await durableEditor.undoAutoRepair();
                 if (!result?.ok) {
-                  await durableEditor.load();
-                  toast({ message: "No se pudo deshacer: la canción cambió o ya no está disponible. Recargamos la versión actual.", tone: "warning" });
+                  if (result?.reason === "stale-revision") {
+                    await durableEditor.load();
+                    toast({ message: "La canción cambió mientras la tenías abierta. Recargamos la versión actual.", tone: "warning" });
+                  } else {
+                    toast({ message: "No se pudo deshacer la mejora automática. Intentá de nuevo.", tone: "error" });
+                  }
                   return;
                 }
                 setEdited(reseedPreservingIds(editedRef.current, sanitizeSegments(result.document.segments || [])));
