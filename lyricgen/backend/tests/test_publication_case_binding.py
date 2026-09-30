@@ -525,27 +525,22 @@ def test_pointer_mode_does_not_freeze_working_files_before_a_rerender(monkeypatc
     assert calls == []   # default mode would copy every unpinned delivery first
 
 
-def test_pointer_mode_hides_a_stale_broadcast_master_but_not_the_mp4():
+def test_a_stale_broadcast_master_is_hidden_whatever_the_mode_and_the_reason(monkeypatch):
     from types import SimpleNamespace
     from delivery_snapshots import portal_key
-    import os
-    os.environ['PUBLISH_LATEST_POINTER'] = '1'
-    try:
-        in_flight = SimpleNamespace(published_file_keys=None, tenant_snapshot='t', job_id='j',
-                                    stale_since=datetime.now(timezone.utc), stale_reason='editing')
-        assert portal_key(in_flight, 'umg_master') is None
-        assert portal_key(in_flight, 'umg_short') is None
-        assert portal_key(in_flight, 'video') == working_key('t', 'j', 'video')
+    for mode in ('', '1'):
+        monkeypatch.setenv('PUBLISH_LATEST_POINTER', mode)
+        for reason in ('editing', 'prores_pending', 'edit_failed', None):
+            stale = SimpleNamespace(published_file_keys=None, tenant_snapshot='t', job_id='j',
+                                    stale_since=datetime.now(timezone.utc), stale_reason=reason)
+            assert portal_key(stale, 'umg_master') is None, (mode, reason)
+            assert portal_key(stale, 'umg_short') is None
+            assert portal_key(stale, 'video') == working_key('t', 'j', 'video')   # the MP4 still follows the newest render
         ready = SimpleNamespace(published_file_keys=None, tenant_snapshot='t', job_id='j', stale_since=None, stale_reason=None)
         assert portal_key(ready, 'umg_master') == working_key('t', 'j', 'umg_master')
         pinned = SimpleNamespace(published_file_keys={'umg_master': 'frozen'}, tenant_snapshot='t', job_id='j',
                                  stale_since=datetime.now(timezone.utc), stale_reason='editing')
         assert portal_key(pinned, 'umg_master') == 'frozen'      # an existing snapshot is untouched
-    finally:
-        del os.environ['PUBLISH_LATEST_POINTER']
-    failed = SimpleNamespace(published_file_keys=None, tenant_snapshot='t', job_id='j',
-                             stale_since=datetime.now(timezone.utc), stale_reason='editing')
-    assert portal_key(failed, 'umg_master') == working_key('t', 'j', 'umg_master')   # default mode unchanged
 
 
 def test_admin_list_reports_the_publication_mode(client, admin_token, monkeypatch):

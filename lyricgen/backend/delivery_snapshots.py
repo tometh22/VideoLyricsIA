@@ -35,13 +35,15 @@ def portal_key(delivery, file_type):
     if keys is not None:
         # A partial snapshot must not leak through to a newer working cut.
         return keys.get(file_type)
-    if latest_pointer_enabled() and file_type in PRORES_TYPES:
-        # A re-render leaves the PREVIOUS broadcast master in R2 until the new
-        # one is transcoded. While the delivery is marked in flight, serving
-        # that key would hand the client the old cut next to a new MP4.
-        from delivery_freshness import STALE_IN_FLIGHT
-        if getattr(delivery, 'stale_since', None) and getattr(delivery, 'stale_reason', None) in STALE_IN_FLIGHT:
-            return None
+    if file_type in PRORES_TYPES and getattr(delivery, 'stale_since', None):
+        # A re-render leaves the PREVIOUS broadcast master in R2 until the new one is
+        # transcoded, and nothing is frozen for a row without a snapshot. While the
+        # delivery is marked stale (whatever the reason: editing, prores_pending or
+        # a failed edit whose MP4 may already have been replaced) serving that key
+        # could hand the client the old cut next to a new MP4. This depends only on
+        # the row, never on this process's env flag, because staging and production
+        # share the deliveries database.
+        return None
     return working_key(delivery.tenant_snapshot, delivery.job_id, file_type)
 
 

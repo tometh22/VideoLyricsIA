@@ -3,6 +3,32 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.85] - 2026-09-30
+
+### Fixed
+
+- Campaign portal sends: a song that raises no longer stops the songs after it
+  (each song is isolated, processed in a stable order, and a failure marked
+  earlier is no longer rolled back by a later crash); `stale_approval` is not
+  offered a retry that can never succeed; an unreachable Redis is no longer read
+  as "no job" (no re-queue on a guess); the stalled-send sweeper skips locked
+  operations and moves on from ones it cannot re-queue; the list of requests a
+  send may close is capped.
+- A client request can only be closed by a publication if it was submitted
+  before the editor save that holds the fix and before the render finished, and
+  the job has an editor document; the inbox uses the same rule.
+- The change-request notification subject can no longer be broken by a newline
+  in the artist or song.
+- An accepted `/edit` now marks the job's deliveries as changing immediately, so
+  the old broadcast master and the client's approval do not look current while a
+  re-render is in flight. The portal hides a stale ProRes master for any row
+  marked stale (any reason), independent of the publication mode, because
+  staging and production share the deliveries database.
+- A job whose R2 files an active portal delivery without a snapshot still
+  serves can no longer be deleted (single and bulk); a clear 409 explains why.
+- `portal_serves_latest` is decided per delivery (a frozen snapshot keeps
+  serving the old cut) instead of by the global publication flag.
+
 ## [1.1.84] - 2026-09-30
 
 ### Added

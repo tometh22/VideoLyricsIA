@@ -56,9 +56,9 @@ def closable_on_publish(request, job, delivery, document=None) -> tuple[bool, st
 
     One rule shared by the inbox (what to offer), the send endpoint (what to
     accept) and the worker (what to apply), so they cannot disagree. Evidence
-    only: the request is still open, was submitted BEFORE the corrected render
-    finished, that render matches what the editor saved, and the portal still
-    shows an older cut.
+    only: the request is still open, was submitted BEFORE the editor save that
+    holds the fix and before the corrected render finished, that render matches
+    what the editor saved, and the portal still shows an older cut.
     """
     if request.resolved_at is not None:
         return False, "not_open"
@@ -70,7 +70,16 @@ def closable_on_publish(request, job, delivery, document=None) -> tuple[bool, st
     submitted_at = timestamp(request.submitted_at)
     if rendered_at is None or submitted_at is None or submitted_at > rendered_at:
         return False, "newer_than_cut"
-    if document is not None and not render_state(job, document, request)["render_matches_editor"]:
+    # The correction lives in the editor document. Without it there is no
+    # evidence the render reflects any saved fix, and a request that arrived
+    # AFTER the last save (for example while the render was running) cannot be
+    # answered by this cut even though it predates the render's completion.
+    if document is None:
+        return False, "render_not_current"
+    saved_at = timestamp(document.updated_at)
+    if saved_at is None or submitted_at > saved_at:
+        return False, "newer_than_cut"
+    if not render_state(job, document, request)["render_matches_editor"]:
         return False, "render_not_current"
     return True, "ok"
 
@@ -180,8 +189,10 @@ def campaign_change_requests(
             current_ids = set()
             for _request, _delivery in page:
                 _song = song_of(jobs_by_id.get(_delivery.job_id))
-                if _song is not None and _song.id in current_by_song:
-                    current_ids.add(current_by_song[_song.id].job_id)
+                _current = current_by_song.get(_song.id) if _song is not None else None
+                _current = _current or jobs_by_id.get(_delivery.job_id)
+                if _current is not None:
+                    current_ids.add(_current.job_id)
             documents = {doc.job_id: doc for doc in db.query(EditorDocument).filter(
                 EditorDocument.job_id.in_(current_ids or {""})).all()}
             payload = []

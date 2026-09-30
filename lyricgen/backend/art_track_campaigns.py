@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 import logging
@@ -618,6 +618,8 @@ def _validated_close_intents(db, ddb, campaign, candidates, destination, body) -
     """
     if not body.resolve_requests or not any(body.resolve_requests.values()):
         return {}
+    if len(body.resolve_requests) > 200 or sum(len(ids) for ids in body.resolve_requests.values()) > 500:
+        raise HTTPException(status_code=422, detail={"code": "too_many_change_requests"})
     from campaign_change_requests import actions_enabled, closable_on_publish
     if campaign.kind == "art_track" or not actions_enabled():
         raise HTTPException(status_code=409, detail={"code": "feature_disabled"})
@@ -735,7 +737,7 @@ def get_delivery_batch(operation_id: str, current_user: dict = Depends(get_curre
 
 # A retry cannot fix these: they need a person (pick the delivery to correct,
 # integrate the portal contract) or a new approval, not another attempt.
-NON_RETRYABLE_ITEM_ERRORS = {"ambiguous_replacement", "portal_contract_unavailable"}
+NON_RETRYABLE_ITEM_ERRORS = {"ambiguous_replacement", "portal_contract_unavailable", "stale_approval"}
 STALL_AFTER_SECONDS = 600
 
 
@@ -762,15 +764,19 @@ def _delivery_batch_rq_state(operation_id: str) -> str | None:
     try:
         from queue_jobs import _init_redis
         from rq.job import Job as RqJob
+        from rq.exceptions import NoSuchJobError
         redis, _, _ = _init_redis()
         if redis is None:
-            return None
+            return "unknown"
         try:
             return RqJob.fetch(f"delivery-batch:{operation_id}", connection=redis).get_status(refresh=True)
-        except Exception:
+        except NoSuchJobError:
             return None
+        except Exception:
+            # Redis unreachable is NOT "no job": never enqueue on a guess.
+            return "unknown"
     except Exception:
-        return None
+        return "unknown"
 
 
 def requeue_delivery_batch(operation_id: str) -> str:
@@ -780,8 +786,11 @@ def requeue_delivery_batch(operation_id: str) -> str:
     hazard is running two workers on the same operation: never enqueue while an
     RQ job for it is still queued or running.
     """
-    if _delivery_batch_rq_state(operation_id) in ("queued", "started", "scheduled", "deferred"):
+    state = _delivery_batch_rq_state(operation_id)
+    if state in ("queued", "started", "scheduled", "deferred"):
         return "already_running"
+    if state == "unknown":
+        return "unavailable"
     try:
         from queue_jobs import _init_redis
         from rq.job import Job as RqJob
@@ -807,7 +816,7 @@ def reconcile_stalled_delivery_batches(db: Session, limit: int = 20) -> int:
     cutoff = _now() - timedelta(seconds=STALL_AFTER_SECONDS)
     candidates = db.query(DeliveryBatch).filter(
         DeliveryBatch.status.in_(("queued", "sending")), DeliveryBatch.updated_at < cutoff,
-    ).order_by(DeliveryBatch.updated_at.asc()).limit(limit).all()
+    ).order_by(DeliveryBatch.updated_at.asc()).limit(limit).with_for_update(skip_locked=True).all()
     requeued = 0
     for operation in candidates:
         unfinished = db.query(func.count(DeliveryBatchItem.id)).filter(
@@ -821,6 +830,10 @@ def reconcile_stalled_delivery_batches(db: Session, limit: int = 20) -> int:
             operation.status = "queued"; operation.updated_at = _now()
             db.add(AuditLog(user_id=None, action="delivery.batch_requeued", detail={"delivery_batch_id": operation.id, "campaign_id": operation.campaign_id, "source": "reconciler", "unfinished_items": int(unfinished)}))
             db.commit(); requeued += 1
+        else:
+            # Still running, or Redis unreachable: look again later, and do not let
+            # operations that cannot be re-queued starve the ones behind them.
+            operation.updated_at = _now(); db.commit()
     return requeued
 
 
@@ -841,7 +854,9 @@ def retry_delivery_batch(operation_id: str, current_user: dict = Depends(get_cur
     _require_manager(campaign, current_user)
     retryable = db.query(func.count(DeliveryBatchItem.id)).filter(
         DeliveryBatchItem.delivery_batch_id == operation.id,
-        DeliveryBatchItem.status.in_(("pending", "failed")),
+        or_(DeliveryBatchItem.status == "pending",
+            and_(DeliveryBatchItem.status == "failed",
+                 or_(DeliveryBatchItem.error_code.is_(None), ~DeliveryBatchItem.error_code.in_(tuple(NON_RETRYABLE_ITEM_ERRORS))))),
     ).scalar() or 0
     if not retryable:
         raise HTTPException(status_code=409, detail={"code": "nothing_to_retry"})
@@ -914,203 +929,212 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
         campaign = db.query(BatchCampaign).filter(BatchCampaign.id == op.campaign_id).first()
         delivery_label = "Art Track" if campaign and campaign.kind == "art_track" else "Campaña"
         op.status = "sending"; db.commit()
-        items = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.delivery_batch_id == op.id, DeliveryBatchItem.status.in_(("pending", "failed"))).with_for_update(skip_locked=True).all()
+        items = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.delivery_batch_id == op.id, DeliveryBatchItem.status.in_(("pending", "failed"))).order_by(DeliveryBatchItem.created_at.asc(), DeliveryBatchItem.id.asc()).with_for_update(skip_locked=True).all()
         from database import DeliveriesSessionLocal, deliveries_added_by
         ddb = DeliveriesSessionLocal()
         try:
-            for row in items:
-                current_row_id = row.id
-                job = db.query(Job).filter(Job.job_id == row.job_id, Job.tenant_id == op.tenant_id).with_for_update().one_or_none()
-                if not job or job.status != "done" or not job.approved_at or _fingerprint(job) != row.approved_render_fingerprint:
-                    row.status = "failed"; row.error_code = "stale_approval"; row.error_detail = "Approval or render version changed."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
-                if storage.is_enabled():
-                    # The MP4/short/thumbnail are produced by the render.
-                    missing = [ft for ft in ("video", "short", "thumbnail") if not (job.s3_keys or {}).get(ft) or not storage.object_exists((job.s3_keys or {}).get(ft))]
-                    if missing:
-                        row.status = "failed"; row.error_code = "deliverables_not_ready"; row.error_detail = ", ".join(missing); row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
-                # ProRes NO se materializa solo. Esto publicaba los dos .mov en
-                # `file_types` sin verificarlos, apoyado en que el portal los
-                # transcodifica al primer download — y no lo hace: el portal
-                # firma la key determinística de R2 y nunca pasa por
-                # `ensure_prores_exists` (documentado desde el incidente
-                # 2026-08-03). Resultado medido el 2026-09-15 en el portal de
-                # Chile: 28 de 34 entregas activas ofrecían un "ProRes Master
-                # (broadcast)" que no existe en R2 y que nada iba a crear.
-                #
-                # Un job sin `umg_spec` no puede producirlos (no hay frame
-                # size, fps ni perfil), así que se publica como entrega
-                # PARCIAL —igual que un job sin short vertical— en vez de
-                # prometer un archivo inexistente. Uno con spec sí puede: se
-                # encola el prewarm y se publica; el archivo aparece cuando el
-                # transcode termina.
-                delivery_file_types = list(DELIVERY_FILE_TYPES)
-                prores_absent = [
-                    ft for ft in ("umg_master", "umg_short")
-                    if not storage.is_enabled()
-                    or not (job.s3_keys or {}).get(ft)
-                    or not storage.object_exists((job.s3_keys or {}).get(ft))
-                ]
-                if prores_absent and not job.umg_spec:
-                    delivery_file_types = [ft for ft in delivery_file_types if ft not in prores_absent]
-                    logger.warning(
-                        "[DELIVERY] job=%s se publica SIN %s: no tiene umg_spec, "
-                        "nada los puede generar", job.job_id, sorted(prores_absent),
-                    )
-                elif prores_absent:
-                    # SIN force: la ruta masiva puede publicar hasta 500
-                    # canciones de una, y `force=True` saltea a propósito el
-                    # tope de profundidad de cola. 1000 transcodes de varios
-                    # GB encolados de un saque se ponen delante de TODOS los
-                    # renders de cliente que vengan después, en la misma cola
-                    # `enterprise`. Acá no hay nadie esperando el archivo: si
-                    # la cola está llena, que la auditoría diaria lo reporte y
-                    # se pida bajo demanda desde el portal, que sí es un click
-                    # humano y sí justifica saltear el tope.
-                    for ft in prores_absent:
-                        try:
-                            enqueue_prores_prewarm(job.job_id, ft)
-                        except Exception as exc:
-                            logger.warning(
-                                "[DELIVERY] no se pudo encolar %s de job=%s: %s",
-                                ft, job.job_id, exc,
-                            )
-                    row.status = 'failed'; row.error_code = 'deliverables_not_ready'
-                    row.error_detail = 'Esperando el archivo profesional. Reintentá cuando termine.'
-                    row.attempts = int(row.attempts or 0) + 1; failed += 1
-                    continue
-                # Never write an AR/CL operation through the legacy
-                # single-portal schema. Without the portal_id migration,
-                # doing so would make a Chile delivery visible in Argentina
-                # (or vice versa). The durable item stays failed and can be
-                # retried after the shared Delivery contract is integrated.
-                if not hasattr(Delivery, "portal_id"):
-                    row.status = "failed"; row.error_code = "portal_contract_unavailable"; row.error_detail = "Delivery.portal_id is required for art-track portal isolation."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
-                from delivery_replacement import target, identity, archive_duplicate
+            for item in items:
+                # Persist what the previous song left pending (a failure mark set
+                # on a `continue` path) before this song can roll anything back.
+                db.commit(); ddb.commit()
+                row = item
+                current_row_id = item.id
                 try:
-                    active, duplicate = target(db, ddb, job, op.destination_portal)
-                except HTTPException as exc:
-                    # Ambiguous same-song replacement: one song must not abort
-                    # the whole operation. It needs a human decision, not a retry.
-                    row.status = "failed"; row.error_code = "ambiguous_replacement"
-                    row.error_detail = str(exc.detail)[:500]
-                    row.attempts = int(row.attempts or 0) + 1; failed += 1
-                    db.commit()
-                    continue
-                replaced_job_id = active.job_id if active and active.job_id != job.job_id else None
-                previous_publication = {'job_id': active.job_id, 'revision': active.published_revision,
-                                        'file_keys': active.published_file_keys} if replaced_job_id else None
-                changed = bool(replaced_job_id) or (delivery_freshness.needs_publish(job, active) if active else False)
-                from delivery_snapshots import copy_snapshot, latest_pointer_enabled
-                pinned = active.published_file_keys if active and not changed and active.file_types == delivery_file_types else None
-                try:
-                    if not pinned:
-                        expected = (identity(active), identity(duplicate))
-                        expected_job = (_fingerprint(job), job.segments_revision, job.approved_at)
-                        tenant, jid, item_id, portal = job.tenant_id, job.job_id, row.id, op.destination_portal
-                        # Persist prior item results before releasing both
-                        # transactions. Multi-GB copies exceed DB idle limits.
-                        ddb.commit()
+                    current_row_id = row.id
+                    job = db.query(Job).filter(Job.job_id == row.job_id, Job.tenant_id == op.tenant_id).with_for_update().one_or_none()
+                    if not job or job.status != "done" or not job.approved_at or _fingerprint(job) != row.approved_render_fingerprint:
+                        row.status = "failed"; row.error_code = "stale_approval"; row.error_detail = "Approval or render version changed."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
+                    if storage.is_enabled():
+                        # The MP4/short/thumbnail are produced by the render.
+                        missing = [ft for ft in ("video", "short", "thumbnail") if not (job.s3_keys or {}).get(ft) or not storage.object_exists((job.s3_keys or {}).get(ft))]
+                        if missing:
+                            row.status = "failed"; row.error_code = "deliverables_not_ready"; row.error_detail = ", ".join(missing); row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
+                    # ProRes NO se materializa solo. Esto publicaba los dos .mov en
+                    # `file_types` sin verificarlos, apoyado en que el portal los
+                    # transcodifica al primer download — y no lo hace: el portal
+                    # firma la key determinística de R2 y nunca pasa por
+                    # `ensure_prores_exists` (documentado desde el incidente
+                    # 2026-08-03). Resultado medido el 2026-09-15 en el portal de
+                    # Chile: 28 de 34 entregas activas ofrecían un "ProRes Master
+                    # (broadcast)" que no existe en R2 y que nada iba a crear.
+                    #
+                    # Un job sin `umg_spec` no puede producirlos (no hay frame
+                    # size, fps ni perfil), así que se publica como entrega
+                    # PARCIAL —igual que un job sin short vertical— en vez de
+                    # prometer un archivo inexistente. Uno con spec sí puede: se
+                    # encola el prewarm y se publica; el archivo aparece cuando el
+                    # transcode termina.
+                    delivery_file_types = list(DELIVERY_FILE_TYPES)
+                    prores_absent = [
+                        ft for ft in ("umg_master", "umg_short")
+                        if not storage.is_enabled()
+                        or not (job.s3_keys or {}).get(ft)
+                        or not storage.object_exists((job.s3_keys or {}).get(ft))
+                    ]
+                    if prores_absent and not job.umg_spec:
+                        delivery_file_types = [ft for ft in delivery_file_types if ft not in prores_absent]
+                        logger.warning(
+                            "[DELIVERY] job=%s se publica SIN %s: no tiene umg_spec, "
+                            "nada los puede generar", job.job_id, sorted(prores_absent),
+                        )
+                    elif prores_absent:
+                        # SIN force: la ruta masiva puede publicar hasta 500
+                        # canciones de una, y `force=True` saltea a propósito el
+                        # tope de profundidad de cola. 1000 transcodes de varios
+                        # GB encolados de un saque se ponen delante de TODOS los
+                        # renders de cliente que vengan después, en la misma cola
+                        # `enterprise`. Acá no hay nadie esperando el archivo: si
+                        # la cola está llena, que la auditoría diaria lo reporte y
+                        # se pida bajo demanda desde el portal, que sí es un click
+                        # humano y sí justifica saltear el tope.
+                        for ft in prores_absent:
+                            try:
+                                enqueue_prores_prewarm(job.job_id, ft)
+                            except Exception as exc:
+                                logger.warning(
+                                    "[DELIVERY] no se pudo encolar %s de job=%s: %s",
+                                    ft, job.job_id, exc,
+                                )
+                        row.status = 'failed'; row.error_code = 'deliverables_not_ready'
+                        row.error_detail = 'Esperando el archivo profesional. Reintentá cuando termine.'
+                        row.attempts = int(row.attempts or 0) + 1; failed += 1
+                        continue
+                    # Never write an AR/CL operation through the legacy
+                    # single-portal schema. Without the portal_id migration,
+                    # doing so would make a Chile delivery visible in Argentina
+                    # (or vice versa). The durable item stays failed and can be
+                    # retried after the shared Delivery contract is integrated.
+                    if not hasattr(Delivery, "portal_id"):
+                        row.status = "failed"; row.error_code = "portal_contract_unavailable"; row.error_detail = "Delivery.portal_id is required for art-track portal isolation."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
+                    from delivery_replacement import target, identity, archive_duplicate
+                    try:
+                        active, duplicate = target(db, ddb, job, op.destination_portal)
+                    except HTTPException as exc:
+                        # Ambiguous same-song replacement: one song must not abort
+                        # the whole operation. It needs a human decision, not a retry.
+                        row.status = "failed"; row.error_code = "ambiguous_replacement"
+                        row.error_detail = str(exc.detail)[:500]
+                        row.attempts = int(row.attempts or 0) + 1; failed += 1
                         db.commit()
-                        pinned = None if latest_pointer_enabled() else copy_snapshot(tenant, jid, delivery_file_types)
-                        row = db.query(DeliveryBatchItem).filter_by(id=item_id).populate_existing().with_for_update().one()
-                        if row.status == 'sent':
-                            continue
-                        job = db.query(Job).filter_by(job_id=jid).populate_existing().with_for_update().one()
-                        active, duplicate = target(db, ddb, job, portal)
-                        for delivery in sorted([d for d in (active, duplicate) if d is not None], key=lambda d: d.id):
-                            ddb.refresh(delivery, with_for_update=True)
-                        if (job.status != 'done' or expected_job != (_fingerprint(job), job.segments_revision, job.approved_at)
-                                or expected != (identity(active), identity(duplicate))):
-                            row.status = 'failed'; row.error_code = 'stale_approval'
-                            row.error_detail = 'El corte o la publicación cambiaron durante el envío. Revisá y reintentá.'
-                            row.attempts = int(row.attempts or 0) + 1; failed += 1
-                            continue
+                        continue
+                    replaced_job_id = active.job_id if active and active.job_id != job.job_id else None
+                    previous_publication = {'job_id': active.job_id, 'revision': active.published_revision,
+                                            'file_keys': active.published_file_keys} if replaced_job_id else None
+                    changed = bool(replaced_job_id) or (delivery_freshness.needs_publish(job, active) if active else False)
+                    from delivery_snapshots import copy_snapshot, latest_pointer_enabled
+                    pinned = active.published_file_keys if active and not changed and active.file_types == delivery_file_types else None
+                    try:
+                        if not pinned:
+                            expected = (identity(active), identity(duplicate))
+                            expected_job = (_fingerprint(job), job.segments_revision, job.approved_at)
+                            tenant, jid, item_id, portal = job.tenant_id, job.job_id, row.id, op.destination_portal
+                            # Persist prior item results before releasing both
+                            # transactions. Multi-GB copies exceed DB idle limits.
+                            ddb.commit()
+                            db.commit()
+                            pinned = None if latest_pointer_enabled() else copy_snapshot(tenant, jid, delivery_file_types)
+                            row = db.query(DeliveryBatchItem).filter_by(id=item_id).populate_existing().with_for_update().one()
+                            if row.status == 'sent':
+                                continue
+                            job = db.query(Job).filter_by(job_id=jid).populate_existing().with_for_update().one()
+                            active, duplicate = target(db, ddb, job, portal)
+                            for delivery in sorted([d for d in (active, duplicate) if d is not None], key=lambda d: d.id):
+                                ddb.refresh(delivery, with_for_update=True)
+                            if (job.status != 'done' or expected_job != (_fingerprint(job), job.segments_revision, job.approved_at)
+                                    or expected != (identity(active), identity(duplicate))):
+                                row.status = 'failed'; row.error_code = 'stale_approval'
+                                row.error_detail = 'El corte o la publicación cambiaron durante el envío. Revisá y reintentá.'
+                                row.attempts = int(row.attempts or 0) + 1; failed += 1
+                                continue
+                    except Exception:
+                        row.status = 'failed'; row.error_code = 'deliverables_not_ready'
+                        row.error_detail = 'No se pudo preparar la publicación; el portal no se modificó.'
+                        row.attempts = int(row.attempts or 0) + 1; failed += 1
+                        continue
+                    is_new_delivery = active is None
+                    # Decide BEFORE touching the delivery: once its fingerprint is
+                    # updated the corrected cut no longer reads as "needs publish".
+                    resolvable, skipped_requests = _evaluate_close_intent(db, ddb, row, job, active, changed)
+                    if active is None:
+                        # Las columnas de frescura se escriben también acá. Sin
+                        # esto, TODA fila publicada por campaña nacía sin
+                        # fingerprint, así que la detección de deriva quedaba
+                        # muerta justo en las filas que lista la campaña — y la
+                        # primera corrección de cada una pasaba en silencio.
+                        delivery_kwargs = dict(job_id=job.job_id, label=delivery_label, file_types=delivery_file_types, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"), published_render_fingerprint=delivery_freshness.render_fingerprint(job), content_updated_at=_now())
+                        if hasattr(Delivery, "portal_id"):
+                            delivery_kwargs["portal_id"] = op.destination_portal
+                        active = Delivery(**delivery_kwargs)
+                        ddb.add(active); ddb.flush()
+                    else:
+                        active.job_id = job.job_id
+                        active.label = delivery_label
+                        active.file_types = delivery_file_types
+                        # Re-publicar por campaña: mismo criterio que el alta y que
+                        # el endpoint individual. Y limpiar la ventana de "en
+                        # vuelo": si no, una fila marcada al pedir el re-render se
+                        # queda diciéndole "actualizando" al cliente para siempre.
+                        # OJO con el nombre: `_fingerprint` ya es una función de
+                        # este módulo (la del snapshot de aprobación) y una local
+                        # con ese nombre la sombrea en TODO el scope, rompiendo su
+                        # uso de más arriba con UnboundLocalError.
+                        _render_fp = delivery_freshness.render_fingerprint(job)
+                        active.published_render_fingerprint = _render_fp
+                        active.stale_since = None
+                        active.stale_reason = None
+                        active.artist_snapshot = job.artist
+                        active.song_title_snapshot = job.song_title or ""
+                        active.tenant_snapshot = job.tenant_id
+                        active.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
+                        active.added_by_user_id = deliveries_added_by(op.created_by)
+                        active.added_at = _now()
+                    row.delivery_id = active.id; row.status = "sent"; row.receipt = {"delivery_id": active.id, "portal": op.destination_portal, "replaced_job_id": replaced_job_id, "previous_publication": previous_publication, **({"change_requests": {"resolved": [r.id for r in resolvable], "skipped": skipped_requests}} if row.change_request_intent else {})}; row.attempts = int(row.attempts or 0) + 1; sent += 1
+                    archive_duplicate(duplicate, _now())
+                    active.published_file_keys = pinned
+                    active.published_render_fingerprint = delivery_freshness.render_fingerprint(job)
+                    active.stale_since = None; active.stale_reason = None
+                    if changed:
+                        active.published_revision = (active.published_revision or 1) + 1
+                        active.approved_at = None; active.approved_by_label = None
+                    if changed or active.content_updated_at is None:
+                        active.content_updated_at = _now()
+                    # A campaign send attests the selected cut, not every client
+                    # request predating it. Only the requests the operator ticked in
+                    # the send (and that still pass the same rule the worker just
+                    # re-checked) are closed; everything else stays open.
+                    _now_closed = _now()
+                    for closed in resolvable:
+                        closed.resolved_at = _now_closed; closed.updated_at = _now_closed
+                        closed.resolved_by_user_id = deliveries_added_by(op.created_by)
+                        closed.resolved_by_revision = active.published_revision
+                        closed.resolution_source = "publication"
+                        closed.resolution_note = (row.change_request_intent or {}).get("note") or f"Resuelto al publicar la versión {active.published_revision}."
+                    row.error_code = None; row.error_detail = None
+                    db.add(AuditLog(user_id=op.created_by, action="delivery.create" if is_new_delivery else "delivery.update", detail={
+                        "job_id": job.job_id, "label": delivery_label, "portal_id": op.destination_portal,
+                        "artist": job.artist, "song": job.song_title, "revision": active.published_revision,
+                        "content_changed": changed, "source": "campaign_bulk", "delivery_batch_id": op.id,
+                        "replaced_job_id": replaced_job_id, "previous_publication": previous_publication,
+                        "resolved_change_requests": [r.id for r in resolvable],
+                    }))
+                    ddb.commit()
+                    db.commit()
                 except Exception:
-                    row.status = 'failed'; row.error_code = 'deliverables_not_ready'
-                    row.error_detail = 'No se pudo preparar la publicación; el portal no se modificó.'
-                    row.attempts = int(row.attempts or 0) + 1; failed += 1
-                    continue
-                is_new_delivery = active is None
-                # Decide BEFORE touching the delivery: once its fingerprint is
-                # updated the corrected cut no longer reads as "needs publish".
-                resolvable, skipped_requests = _evaluate_close_intent(db, ddb, row, job, active, changed)
-                if active is None:
-                    # Las columnas de frescura se escriben también acá. Sin
-                    # esto, TODA fila publicada por campaña nacía sin
-                    # fingerprint, así que la detección de deriva quedaba
-                    # muerta justo en las filas que lista la campaña — y la
-                    # primera corrección de cada una pasaba en silencio.
-                    delivery_kwargs = dict(job_id=job.job_id, label=delivery_label, file_types=delivery_file_types, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"), published_render_fingerprint=delivery_freshness.render_fingerprint(job), content_updated_at=_now())
-                    if hasattr(Delivery, "portal_id"):
-                        delivery_kwargs["portal_id"] = op.destination_portal
-                    active = Delivery(**delivery_kwargs)
-                    ddb.add(active); ddb.flush()
-                else:
-                    active.job_id = job.job_id
-                    active.label = delivery_label
-                    active.file_types = delivery_file_types
-                    # Re-publicar por campaña: mismo criterio que el alta y que
-                    # el endpoint individual. Y limpiar la ventana de "en
-                    # vuelo": si no, una fila marcada al pedir el re-render se
-                    # queda diciéndole "actualizando" al cliente para siempre.
-                    # OJO con el nombre: `_fingerprint` ya es una función de
-                    # este módulo (la del snapshot de aprobación) y una local
-                    # con ese nombre la sombrea en TODO el scope, rompiendo su
-                    # uso de más arriba con UnboundLocalError.
-                    _render_fp = delivery_freshness.render_fingerprint(job)
-                    active.published_render_fingerprint = _render_fp
-                    active.stale_since = None
-                    active.stale_reason = None
-                    active.artist_snapshot = job.artist
-                    active.song_title_snapshot = job.song_title or ""
-                    active.tenant_snapshot = job.tenant_id
-                    active.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
-                    active.added_by_user_id = deliveries_added_by(op.created_by)
-                    active.added_at = _now()
-                row.delivery_id = active.id; row.status = "sent"; row.receipt = {"delivery_id": active.id, "portal": op.destination_portal, "replaced_job_id": replaced_job_id, "previous_publication": previous_publication, **({"change_requests": {"resolved": [r.id for r in resolvable], "skipped": skipped_requests}} if row.change_request_intent else {})}; row.attempts = int(row.attempts or 0) + 1; sent += 1
-                archive_duplicate(duplicate, _now())
-                active.published_file_keys = pinned
-                active.published_render_fingerprint = delivery_freshness.render_fingerprint(job)
-                active.stale_since = None; active.stale_reason = None
-                if changed:
-                    active.published_revision = (active.published_revision or 1) + 1
-                    active.approved_at = None; active.approved_by_label = None
-                if changed or active.content_updated_at is None:
-                    active.content_updated_at = _now()
-                # A campaign send attests the selected cut, not every client
-                # request predating it. Only the requests the operator ticked in
-                # the send (and that still pass the same rule the worker just
-                # re-checked) are closed; everything else stays open.
-                _now_closed = _now()
-                for closed in resolvable:
-                    closed.resolved_at = _now_closed; closed.updated_at = _now_closed
-                    closed.resolved_by_user_id = deliveries_added_by(op.created_by)
-                    closed.resolved_by_revision = active.published_revision
-                    closed.resolution_source = "publication"
-                    closed.resolution_note = (row.change_request_intent or {}).get("note") or f"Resuelto al publicar la versión {active.published_revision}."
-                row.error_code = None; row.error_detail = None
-                db.add(AuditLog(user_id=op.created_by, action="delivery.create" if is_new_delivery else "delivery.update", detail={
-                    "job_id": job.job_id, "label": delivery_label, "portal_id": op.destination_portal,
-                    "artist": job.artist, "song": job.song_title, "revision": active.published_revision,
-                    "content_changed": changed, "source": "campaign_bulk", "delivery_batch_id": op.id,
-                    "replaced_job_id": replaced_job_id, "previous_publication": previous_publication,
-                    "resolved_change_requests": [r.id for r in resolvable],
-                }))
-                ddb.commit()
-                db.commit()
+                    # One song must never stop the ones after it.
+                    logger.exception("[DELIVERY] batch %s: song item %s failed", operation_id, current_row_id)
+                    db.rollback(); ddb.rollback()
+                    stuck = db.query(DeliveryBatchItem).filter_by(id=current_row_id).populate_existing().first()
+                    if stuck is not None and stuck.status != "sent":
+                        stuck.status = "failed"; stuck.error_code = "unexpected_error"
+                        stuck.error_detail = "Error inesperado al publicar; reintentá."
+                        stuck.attempts = int(stuck.attempts or 0) + 1; failed += 1
+                        db.commit()
             ddb.commit()
         except Exception:
             # One unexpected error (DB blip, storage hiccup) must not leave the
             # whole operation "sending" forever with the browser polling it.
-            logger.exception("[DELIVERY] batch %s aborted while processing %s", operation_id, current_row_id)
+            logger.exception("[DELIVERY] batch %s aborted outside a song (last item %s)", operation_id, current_row_id)
             db.rollback(); ddb.rollback()
-            if current_row_id:
-                stuck = db.query(DeliveryBatchItem).filter_by(id=current_row_id).populate_existing().first()
-                if stuck is not None and stuck.status != "sent":
-                    stuck.status = "failed"; stuck.error_code = "unexpected_error"
-                    stuck.error_detail = "Error inesperado al publicar; reintentá."
-                    stuck.attempts = int(stuck.attempts or 0) + 1; failed += 1
-                    db.commit()
         finally: ddb.close()
         db.flush()
         op.sent_count = db.query(func.count(DeliveryBatchItem.id)).filter(DeliveryBatchItem.delivery_batch_id == op.id, DeliveryBatchItem.status == 'sent').scalar() or 0

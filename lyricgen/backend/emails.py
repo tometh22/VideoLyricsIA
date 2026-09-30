@@ -203,9 +203,14 @@ def send_umg_change_request_notification(
       También en Admin → Cambios de UMG.
     </p>
     """
-    subject = f"UMG{f' {portal}' if portal else ''} pidió un cambio — {artist or 'sin artista'}"
-    if song:
-        subject += f" · {song}"
+    def one_line(value):
+        # A newline in client-facing metadata would make the header unparseable and
+        # the mail would vanish silently.
+        return " ".join(str(value or "").split())
+
+    subject = f"UMG{f' {portal}' if portal else ''} pidió un cambio — {one_line(artist) or 'sin artista'}"
+    if one_line(song):
+        subject += f" · {one_line(song)}"
     body = _wrap_template(content)
     _send_email(to, subject, body)
     if owner_email and owner_email.strip().lower() != to.strip().lower():
