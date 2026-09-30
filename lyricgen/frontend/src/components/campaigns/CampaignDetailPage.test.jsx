@@ -82,7 +82,7 @@ describe("campaign workspace", () => {
     expect(screen.getByText(/Las alertas orientan/)).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: /Con cambios guardados/ }));
     await waitFor(() => expect(screen.queryByText("Canción 1")).not.toBeInTheDocument());
-    expect(location()).toContain("drafts=1");
+    await waitFor(() => expect(location()).toContain("drafts=1"));
     fireEvent.click(screen.getByRole("button", { name: "Continuar revisión · Canción 2" }));
     await screen.findByText("Editor de letra");
     expect(location()).toContain("drafts=1");
@@ -164,7 +164,7 @@ describe("campaign workspace", () => {
     expect(sends).toHaveLength(2);
     expect(sends[0].body.idempotency_key).toBe(sends[1].body.idempotency_key);
     expect(sends[1].body).toMatchObject({ job_ids: ["j1", "j2"], destination_portal: "chile" });
-    expect(location()).toContain("delivery_op=op1");
+    await waitFor(() => expect(location()).toContain("delivery_op=op1"));
     await screen.findByText(/1 de 1 enviados/, {}, { timeout: 4000 });
   });
 
@@ -211,7 +211,7 @@ describe("campaign workspace", () => {
     mount(api, "/campaigns/c1?tab=all&discard=i1");
     const dialog = await screen.findByRole("dialog", { name: "Descartar canción" });
     expect(within(dialog).getByRole("heading")).toHaveTextContent("Canción 1");
-    expect(location()).not.toContain("discard=");
+    await waitFor(() => expect(location()).not.toContain("discard="));
     cleanup(); clearCampaignResourceCache();
     mount(createCampaignApi({ songs: [makeSong(2, "qc")] }), "/campaigns/c1?discard=i2");
     await screen.findByText("La canción cambió de estado y no se puede descartar desde esta revisión.");
@@ -225,7 +225,7 @@ describe("campaign workspace", () => {
     expect(within(drawer).getByText("Video por revisar", { selector: "span" })).toBeInTheDocument();
     fireEvent.keyDown(drawer, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    expect(location()).not.toContain("song=");
+    await waitFor(() => expect(location()).not.toContain("song="));
   });
 
   it("sends art tracks by item to the campaign's fixed portal", async () => {
