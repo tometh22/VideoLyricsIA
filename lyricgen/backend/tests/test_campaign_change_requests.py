@@ -135,3 +135,92 @@ def test_another_tenant_cannot_open_the_campaign_inbox(db, setup, enabled):
     with pytest.raises(HTTPException) as denied:
         inbox.campaign_change_requests(campaign.id, "open", 50, None, {**actor, "role": "user", "tenant_id": "other"}, db)
     assert denied.value.status_code == 404
+
+
+@pytest.fixture
+def actions(monkeypatch):
+    monkeypatch.setenv("CAMPAIGN_CHANGE_REQUEST_ACTIONS", "1")
+
+
+def resolve(campaign, request_id, actor, db, note="Corregido y republicado"):
+    return inbox.resolve_campaign_change_request(
+        campaign.id, request_id, inbox.ResolveBody(resolution_note=note), actor, db, db)
+
+
+def open_request(db, cleanup, campaign, items, actor):
+    job = add_job(db, campaign, actor, item=items[0], status="done")
+    db.commit()
+    delivery = publish(db, cleanup, job)
+    row = request(db, delivery, "Cambiar la palabra final")
+    db.commit()
+    return row
+
+
+def test_closing_is_hidden_behind_its_own_flag(db, setup, enabled, cleanup):
+    campaign, items, actor = setup
+    row = open_request(db, cleanup, campaign, items, actor)
+    with pytest.raises(HTTPException) as denied:
+        resolve(campaign, row.id, actor, db)
+    assert denied.value.status_code == 404 and denied.value.detail == {"code": "feature_disabled"}
+
+
+def test_close_with_a_reason_the_client_can_read(db, setup, enabled, actions, cleanup):
+    campaign, items, actor = setup
+    row = open_request(db, cleanup, campaign, items, actor)
+    result = resolve(campaign, row.id, actor, db, "  Corregido y republicado  ")
+    assert result["ok"] is True and "already_resolved" not in result
+    db.expire_all()
+    stored = db.get(DeliveryChangeRequest, row.id)
+    assert stored.resolved_at is not None and stored.updated_at >= stored.submitted_at
+    assert stored.resolution_note == "Corregido y republicado" and stored.resolution_source == "manual"
+    from database import AuditLog
+    audit = db.query(AuditLog).filter_by(action="delivery.change_request.resolve").all()
+    assert any((a.detail or {}).get("campaign_id") == campaign.id and a.detail["source"] == "campaign" for a in audit)
+    # A double click is not an error and changes nothing.
+    again = resolve(campaign, row.id, actor, db, "otra nota")
+    assert again["already_resolved"] is True
+    db.expire_all()
+    assert db.get(DeliveryChangeRequest, row.id).resolution_note == "Corregido y republicado"
+    assert inbox.campaign_change_requests(campaign.id, "open", 50, None, actor, db)["counts"]["open"] == 0
+
+
+@pytest.mark.parametrize("note", ["", "   "])
+def test_closing_without_a_reason_is_refused(db, setup, enabled, actions, cleanup, note):
+    campaign, items, actor = setup
+    row = open_request(db, cleanup, campaign, items, actor)
+    with pytest.raises(HTTPException) as refused:
+        resolve(campaign, row.id, actor, db, note)
+    assert refused.value.status_code == 422 and refused.value.detail["code"] == "resolution_reason_required"
+    db.expire_all()
+    assert db.get(DeliveryChangeRequest, row.id).resolved_at is None
+
+
+def test_only_the_owner_or_an_admin_can_close(db, setup, enabled, actions, cleanup, monkeypatch):
+    campaign, items, actor = setup
+    row = open_request(db, cleanup, campaign, items, actor)
+    monkeypatch.setenv("BATCH_CAMPAIGN_SCOPES", campaign.tenant_id)
+    stranger = {"id": actor["id"] + 999, "role": "user", "tenant_id": campaign.tenant_id}
+    with pytest.raises(HTTPException) as denied:
+        resolve(campaign, row.id, stranger, db)
+    assert denied.value.status_code == 403
+    owner = {"id": campaign.created_by, "role": "user", "tenant_id": campaign.tenant_id}
+    assert resolve(campaign, row.id, owner, db)["ok"] is True
+
+
+def test_a_request_from_another_campaign_or_tenant_cannot_be_closed_here(db, setup, enabled, actions, cleanup):
+    campaign, items, actor = setup
+    mine = open_request(db, cleanup, campaign, items, actor)
+    unrelated = add_job(db, campaign, actor, status="done")
+    stranger_job = add_job(db, campaign, actor, item=items[1], status="done")
+    db.commit()
+    other_campaign_request = request(db, publish(db, cleanup, unrelated), "De otra campaña")
+    other_tenant_request = request(db, publish(db, cleanup, stranger_job, tenant="someone-else"), "De otro tenant")
+    db.commit()
+    for row in (other_campaign_request, other_tenant_request):
+        with pytest.raises(HTTPException) as missing:
+            resolve(campaign, row.id, actor, db)
+        assert missing.value.status_code == 404
+    db.expire_all()
+    assert db.get(DeliveryChangeRequest, other_campaign_request.id).resolved_at is None
+    assert db.get(DeliveryChangeRequest, other_tenant_request.id).resolved_at is None
+    assert db.get(DeliveryChangeRequest, mine.id).resolved_at is None

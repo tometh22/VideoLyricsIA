@@ -389,5 +389,9 @@ def campaign_pipeline(
     snapshot["can_manage"] = current_user.get("role") == "admin" or campaign.created_by == current_user.get("id")
     from campaign_change_requests import feature_enabled as change_requests_inbox_enabled
     snapshot["is_admin"] = current_user.get("role") == "admin"
-    snapshot["features"] = {"change_requests_inbox": change_requests_inbox_enabled()}
+    from campaign_change_requests import actions_enabled as change_request_actions_enabled
+    snapshot["features"] = {
+        "change_requests_inbox": change_requests_inbox_enabled(),
+        "change_request_actions": change_request_actions_enabled(),
+    }
     return snapshot

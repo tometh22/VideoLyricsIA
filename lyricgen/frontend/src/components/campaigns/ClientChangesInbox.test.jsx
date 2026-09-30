@@ -76,4 +76,41 @@ describe("client changes inbox", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reintentar" }));
     expect(await screen.findByText("No hay pedidos del cliente")).toBeInTheDocument();
   });
+
+  it("closes a request only with a reason, then refreshes the list and the campaign", async () => {
+    const onChanged = vi.fn();
+    const request = vi.fn(async (path, options = {}) => {
+      if (options.method === "POST") return { ok: true };
+      return request.mock.calls.some(([, o]) => o?.method === "POST") ? page([]) : page([item(5)]);
+    });
+    render(<ClientChangesInbox campaignId="c1" canResolve onChanged={onChanged} request={request} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Cerrar con nota" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar cierre" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Escribí por qué");
+    expect(request.mock.calls.some(([, o]) => o?.method === "POST")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Corregido y republicado en el portal." }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar cierre" }));
+    expect(await screen.findByText(/Pedido cerrado/)).toBeInTheDocument();
+    const post = request.mock.calls.find(([, o]) => o?.method === "POST");
+    expect(post[0]).toBe("/batch/campaigns/c1/change-requests/5/resolve");
+    expect(post[1].json).toEqual({ resolution_note: "Corregido y republicado en el portal." });
+    expect(onChanged).toHaveBeenCalledOnce();
+    expect(await screen.findByText("No hay pedidos del cliente")).toBeInTheDocument();
+  });
+
+  it("does not offer to close when the backend has not enabled it", async () => {
+    render(<ClientChangesInbox campaignId="c1" request={vi.fn().mockResolvedValue(page([item(1)]))} />);
+    await screen.findByText("Pedido 1");
+    expect(screen.queryByRole("button", { name: "Cerrar con nota" })).toBeNull();
+  });
+
+  it("keeps the note and shows the error when closing fails", async () => {
+    const request = vi.fn(async (path, options = {}) => { if (options.method === "POST") throw new Error("Solo el dueño de la campaña puede cambiarla."); return page([item(1)]); });
+    render(<ClientChangesInbox campaignId="c1" canResolve request={request} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Cerrar con nota" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Nota para el cliente" }), { target: { value: "Hecho" } });
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar cierre" }));
+    expect(await screen.findByText("Solo el dueño de la campaña puede cambiarla.")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Nota para el cliente" })).toHaveValue("Hecho");
+  });
 });

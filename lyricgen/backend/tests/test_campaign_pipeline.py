@@ -273,5 +273,5 @@ def test_pipeline_reports_admin_and_inbox_flag(db, setup, monkeypatch):
         monkeypatch.setenv("BATCH_CAMPAIGN_SCOPES", campaign.tenant_id)
         owner = pipeline.campaign_pipeline(campaign.id, {**actor, "role": "user"}, db)
         on = pipeline.campaign_pipeline(campaign.id, actor, db)
-    assert off["features"] == {"change_requests_inbox": False} and off["is_admin"] is True
-    assert on["features"] == {"change_requests_inbox": True} and owner["is_admin"] is False
+    assert off["features"] == {"change_requests_inbox": False, "change_request_actions": False} and off["is_admin"] is True
+    assert on["features"] == {"change_requests_inbox": True, "change_request_actions": False} and owner["is_admin"] is False

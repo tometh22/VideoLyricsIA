@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
@@ -24,7 +25,10 @@ import delivery_freshness
 from auth import get_current_user
 from batch_campaigns import _aware, _campaign_or_404, _require_scope
 from campaign_pipeline import _load_items, _load_lineage
-from database import Delivery, DeliveryChangeRequest, Job, get_db, scoped_deliveries_db
+from batch_campaigns import _require_manager
+from database import (
+    AuditLog, Delivery, DeliveryChangeRequest, Job, deliveries_added_by, get_db, get_deliveries_db, scoped_deliveries_db,
+)
 
 router = APIRouter(prefix="/batch/campaigns", tags=["campaign-change-requests"])
 
@@ -35,6 +39,10 @@ MAX_PAGE = 200
 
 def feature_enabled() -> bool:
     return os.environ.get("CAMPAIGN_CHANGE_REQUESTS_ENABLED", "0") == "1"
+
+
+def actions_enabled() -> bool:
+    return os.environ.get("CAMPAIGN_CHANGE_REQUEST_ACTIONS", "0") == "1"
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -166,3 +174,62 @@ def campaign_change_requests(
         "counts": {"open": int(open_count or 0), "resolved": int(resolved_count or 0), "oldest_open_at": _iso(oldest_open)},
         "items": payload, "next_cursor": next_cursor,
     }
+
+
+class ResolveBody(BaseModel):
+    resolution_note: str = Field(default="", max_length=2000)
+
+
+@router.post("/{campaign_id}/change-requests/{request_id}/resolve")
+def resolve_campaign_change_request(
+    campaign_id: str,
+    request_id: int,
+    body: ResolveBody,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """Close ONE request of this campaign by hand, with a reason the client sees.
+
+    Same effect as Admin > Cambios "Marcar como resuelto", for the campaign's
+    owner or any admin. It states that the request is attended; it does not
+    render or publish anything. The request must belong to this campaign's
+    songs AND tenant, otherwise it is reported as not found.
+    """
+    _require_scope(current_user)
+    campaign = _campaign_or_404(db, campaign_id, current_user)
+    if not actions_enabled():
+        raise HTTPException(status_code=404, detail={"code": "feature_disabled"})
+    _require_manager(campaign, current_user)
+    note = body.resolution_note.strip()
+    if not note:
+        raise HTTPException(status_code=422, detail={
+            "code": "resolution_reason_required",
+            "message": "Explicá por qué el pedido está atendido. Cerrar manualmente no publica otro video.",
+        })
+    lineage = {job.job_id for job in _load_lineage(db, [campaign], full=False)[campaign.id]}
+    row = ddb.query(DeliveryChangeRequest, Delivery).join(
+        Delivery, Delivery.id == DeliveryChangeRequest.delivery_id,
+    ).filter(
+        DeliveryChangeRequest.id == request_id, Delivery.tenant_snapshot == campaign.tenant_id,
+        Delivery.job_id.in_(lineage or {""}),
+    ).with_for_update(of=DeliveryChangeRequest).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail={"code": "change_request_not_found"})
+    request, delivery = row
+    if request.resolved_at is not None:
+        # Idempotent: a double click must not read as an error.
+        return {"ok": True, "already_resolved": True, "resolved_at": _iso(request.resolved_at), "updated_at": _iso(request.updated_at)}
+    now = datetime.now(timezone.utc)
+    request.resolved_at = now
+    request.updated_at = now
+    request.resolved_by_user_id = deliveries_added_by(current_user["id"])
+    request.resolution_note = note
+    request.resolution_source = "manual"
+    ddb.commit()
+    db.add(AuditLog(user_id=current_user["id"], action="delivery.change_request.resolve", detail={
+        "change_request_id": request_id, "delivery_id": delivery.id, "campaign_id": campaign.id,
+        "source": "campaign", "note_preview": note[:200],
+    }))
+    db.commit()
+    return {"ok": True, "resolved_at": _iso(now), "updated_at": _iso(now)}

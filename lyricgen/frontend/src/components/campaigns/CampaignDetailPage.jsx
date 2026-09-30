@@ -386,7 +386,7 @@ export default function CampaignDetailPage({ id }) {
     {flash && <Banner tone={flash.tone} role={flash.tone === "danger" ? "alert" : "status"} action={<Button size="sm" variant="ghost" onClick={() => setFlash(null)}>Cerrar</Button>}>{flash.text}</Banner>}
 
     {view === "changes"
-      ? <ClientChangesInbox campaignId={id} isAdmin={Boolean(pipe.data?.is_admin)} onOpenSong={(songId) => updateParams({ song: songId }, { push: true })} />
+      ? <ClientChangesInbox campaignId={id} isAdmin={Boolean(pipe.data?.is_admin)} canResolve={Boolean(pipe.data?.features?.change_request_actions && canManage)} onChanged={refresh} onOpenSong={(songId) => updateParams({ song: songId }, { push: true })} />
       : view === "config" && campaign
       ? <CampaignSettings campaign={campaign} section={section} onSection={(value) => updateParams({ section: value })} canManage={canManage} isAdmin={canManage}
         creative={creative.data} report={report.data} lyrics={lyrics.data} onChanged={refresh} remaining={Math.max(0, 1000 - (pipe.data?.total || 0))}
