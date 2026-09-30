@@ -441,3 +441,27 @@ def test_publication_final_review_preserves_normal_approval_qc_gate(
     assert db.get(Delivery, delivery_id).published_revision == 1
     assert db.query(Job).filter_by(job_id=job_id).one().status == 'pending_review'
     assert fake_r2['copies'] == []
+
+
+def test_staging_switch_lets_a_failed_qc_report_publish(
+    client, admin_token, approved_job, db, fake_r2, monkeypatch,
+):
+    """Same blocked cut as above, with the staging-only switch on: QC no longer gates."""
+    monkeypatch.setenv('DELIVERY_QC_MODE', 'enforce')
+    monkeypatch.setenv('ENVIRONMENT', 'staging')
+    monkeypatch.setenv('DELIVERY_QC_STAGING_GATES_OFF', '1')
+    job_id, delivery_id, ids, body = _prepare(client, admin_token, db, approved_job, fake_r2)
+    job = db.query(Job).filter_by(job_id=job_id).one()
+    job.status = 'pending_review'
+    job.approved_at = None
+    job.delivery_qc = {
+        'status': 'COMPLETE', 'report_id': 'blocked-publication', 'issues': [{
+            'issue_id': 'objective-failure', 'status': 'OPEN', 'severity': 'FAIL',
+            'code': 'MEDIA_AUDIO_STREAM_MISSING', 'result_status': 'FAIL', 'blocking': True,
+        }],
+    }
+    db.commit()
+    response = _publish(client, admin_token, job_id, **body)
+    detail = response.json().get('detail') if response.status_code >= 400 else None
+    assert not (isinstance(detail, dict) and detail.get('code') == 'delivery_qc_blocked'), response.text
+    assert response.status_code < 400, response.text

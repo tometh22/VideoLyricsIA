@@ -31,7 +31,7 @@ import delivery_freshness
 from auth import get_current_user, has_art_track_access
 from batch_campaigns import _campaign_or_404, _now, _require_manager, _require_scope
 from database import (
-    BatchCampaign, BatchCampaignAsset, BatchCampaignItem, DeliveryBatch,
+    AuditLog, BatchCampaign, BatchCampaignAsset, BatchCampaignItem, DeliveryBatch,
     DeliveryBatchItem, Job, JobOutboxEvent, SessionLocal, get_db, get_deliveries_db,
 )
 from jobs import create_job
@@ -613,6 +613,11 @@ def create_delivery_batch(campaign_id: str, body: DeliveryCreate, current_user: 
         raise HTTPException(status_code=400, detail="Elegí item_ids o job_ids, no ambos.")
     destination = (body.destination_portal or campaign.destination_portal or "argentina").lower()
     if destination not in DESTINATIONS: raise HTTPException(status_code=400, detail="destination_portal must be argentina or chile")
+    # The UI locks the portal of a campaign that has one; the API must too, or a
+    # stale tab / script can publish a Chile campaign into the Argentina portal.
+    locked_portal = (campaign.destination_portal or "").lower()
+    if locked_portal in DESTINATIONS and body.destination_portal and body.destination_portal.lower() != locked_portal:
+        raise HTTPException(status_code=409, detail={"code": "portal_locked", "portal": locked_portal})
     existing = db.query(DeliveryBatch).filter(DeliveryBatch.campaign_id == campaign.id, DeliveryBatch.idempotency_key == body.idempotency_key).first()
     if existing:
         return {"operation_id": existing.id, "status": existing.status, "deduplicated": True}
@@ -677,8 +682,133 @@ def get_delivery_batch(operation_id: str, current_user: dict = Depends(get_curre
         "failed_count": failed_count,
         "items": [{"job_id": row.job_id, "status": row.status,
                     "delivery_id": row.delivery_id, "attempts": row.attempts,
-                    "error_code": row.error_code, "receipt": row.receipt} for row in rows],
+                    "error_code": row.error_code, "error_detail": row.error_detail,
+                    "retryable": row.status == "failed" and row.error_code not in NON_RETRYABLE_ITEM_ERRORS,
+                    "receipt": row.receipt} for row in rows],
+        "stalled": _operation_stalled(operation, rows),
     }
+
+
+# A retry cannot fix these: they need a person (pick the delivery to correct,
+# integrate the portal contract) or a new approval, not another attempt.
+NON_RETRYABLE_ITEM_ERRORS = {"ambiguous_replacement", "portal_contract_unavailable"}
+STALL_AFTER_SECONDS = 600
+
+
+def _operation_stalled(operation: DeliveryBatch, rows) -> bool:
+    """Queued/sending with unfinished items and no progress for a while.
+
+    Redis down at enqueue time, or a worker killed mid-operation, leaves the
+    operation in flight forever; the UI uses this to offer a real retry.
+    """
+    if operation.status not in ("queued", "sending"):
+        return False
+    if not any(row.status in ("pending", "failed") for row in rows):
+        return False
+    updated = operation.updated_at
+    if updated is None:
+        return False
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    return (_now() - updated).total_seconds() > STALL_AFTER_SECONDS
+
+
+def _delivery_batch_rq_state(operation_id: str) -> str | None:
+    """RQ status of the operation's job, None when it does not exist / no Redis."""
+    try:
+        from queue_jobs import _init_redis
+        from rq.job import Job as RqJob
+        redis, _, _ = _init_redis()
+        if redis is None:
+            return None
+        try:
+            return RqJob.fetch(f"delivery-batch:{operation_id}", connection=redis).get_status(refresh=True)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def requeue_delivery_batch(operation_id: str) -> str:
+    """Re-schedule an operation. Returns queued | already_running | unavailable.
+
+    process_delivery_batch is idempotent (sent items are skipped), so the only
+    hazard is running two workers on the same operation: never enqueue while an
+    RQ job for it is still queued or running.
+    """
+    if _delivery_batch_rq_state(operation_id) in ("queued", "started", "scheduled", "deferred"):
+        return "already_running"
+    try:
+        from queue_jobs import _init_redis
+        from rq.job import Job as RqJob
+        redis, _, _ = _init_redis()
+        if redis is not None:
+            try:
+                RqJob.fetch(f"delivery-batch:{operation_id}", connection=redis).delete()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return "queued" if enqueue_delivery_batch(operation_id) else "unavailable"
+
+
+def reconcile_stalled_delivery_batches(db: Session, limit: int = 20) -> int:
+    """Re-schedule operations left queued/sending by a lost enqueue or a dead worker.
+
+    Called from the campaign reconciler. Safe to run every tick: an operation is
+    only touched when it has unfinished items, has not moved for
+    STALL_AFTER_SECONDS and has no live RQ job.
+    """
+    from datetime import timedelta
+    cutoff = _now() - timedelta(seconds=STALL_AFTER_SECONDS)
+    candidates = db.query(DeliveryBatch).filter(
+        DeliveryBatch.status.in_(("queued", "sending")), DeliveryBatch.updated_at < cutoff,
+    ).order_by(DeliveryBatch.updated_at.asc()).limit(limit).all()
+    requeued = 0
+    for operation in candidates:
+        unfinished = db.query(func.count(DeliveryBatchItem.id)).filter(
+            DeliveryBatchItem.delivery_batch_id == operation.id,
+            DeliveryBatchItem.status.in_(("pending", "failed")),
+        ).scalar() or 0
+        if not unfinished:
+            continue
+        outcome = requeue_delivery_batch(operation.id)
+        if outcome == "queued":
+            operation.status = "queued"; operation.updated_at = _now()
+            db.add(AuditLog(user_id=None, action="delivery.batch_requeued", detail={"delivery_batch_id": operation.id, "campaign_id": operation.campaign_id, "source": "reconciler", "unfinished_items": int(unfinished)}))
+            db.commit(); requeued += 1
+    return requeued
+
+
+@router.post("/art-track-delivery-operations/{operation_id}/retry")
+@router.post("/delivery-operations/{operation_id}/retry")
+def retry_delivery_batch(operation_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Retry the failed or never-processed items of an operation."""
+    _require_scope(current_user)
+    query = db.query(DeliveryBatch).filter(DeliveryBatch.id == operation_id)
+    if current_user.get("role") != "admin":
+        query = query.filter(DeliveryBatch.tenant_id == current_user["tenant_id"])
+    operation = query.with_for_update().first()
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Delivery operation not found.")
+    campaign = _campaign_for_delivery(db, operation.campaign_id, current_user)
+    if campaign.tenant_id != operation.tenant_id:
+        raise HTTPException(status_code=404, detail="Delivery operation not found.")
+    _require_manager(campaign, current_user)
+    retryable = db.query(func.count(DeliveryBatchItem.id)).filter(
+        DeliveryBatchItem.delivery_batch_id == operation.id,
+        DeliveryBatchItem.status.in_(("pending", "failed")),
+    ).scalar() or 0
+    if not retryable:
+        raise HTTPException(status_code=409, detail={"code": "nothing_to_retry"})
+    if operation.status == "sending" and (_now() - (operation.updated_at if operation.updated_at.tzinfo else operation.updated_at.replace(tzinfo=timezone.utc))).total_seconds() <= STALL_AFTER_SECONDS:
+        raise HTTPException(status_code=409, detail={"code": "operation_in_progress"})
+    outcome = requeue_delivery_batch(operation.id)
+    if outcome == "queued":
+        operation.status = "queued"; operation.updated_at = _now(); db.commit()
+    db.add(AuditLog(user_id=current_user["id"], action="delivery.batch_retry", detail={"delivery_batch_id": operation.id, "campaign_id": campaign.id, "outcome": outcome, "retryable_items": int(retryable)}))
+    db.commit()
+    return JSONResponse(status_code=202, content={"operation_id": operation.id, "status": operation.status, "scheduled": outcome == "queued", "outcome": outcome})
 
 
 def enqueue_delivery_batch(operation_id: str) -> bool:
@@ -702,7 +832,7 @@ def enqueue_delivery_batch(operation_id: str) -> bool:
 def process_delivery_batch(operation_id: str) -> dict[str, int]:
     """Worker entry point; safe to call repeatedly after a crash."""
     from database import Delivery
-    db = SessionLocal(); sent = failed = 0
+    db = SessionLocal(); sent = failed = 0; current_row_id = None
     try:
         op = db.query(DeliveryBatch).filter(DeliveryBatch.id == operation_id).with_for_update().first()
         if not op: return {"sent": 0, "failed": 0}
@@ -714,6 +844,7 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
         ddb = DeliveriesSessionLocal()
         try:
             for row in items:
+                current_row_id = row.id
                 job = db.query(Job).filter(Job.job_id == row.job_id, Job.tenant_id == op.tenant_id).with_for_update().one_or_none()
                 if not job or job.status != "done" or not job.approved_at or _fingerprint(job) != row.approved_render_fingerprint:
                     row.status = "failed"; row.error_code = "stale_approval"; row.error_detail = "Approval or render version changed."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
@@ -780,7 +911,16 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                 if not hasattr(Delivery, "portal_id"):
                     row.status = "failed"; row.error_code = "portal_contract_unavailable"; row.error_detail = "Delivery.portal_id is required for art-track portal isolation."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
                 from delivery_replacement import target, identity, archive_duplicate
-                active, duplicate = target(db, ddb, job, op.destination_portal)
+                try:
+                    active, duplicate = target(db, ddb, job, op.destination_portal)
+                except HTTPException as exc:
+                    # Ambiguous same-song replacement: one song must not abort
+                    # the whole operation. It needs a human decision, not a retry.
+                    row.status = "failed"; row.error_code = "ambiguous_replacement"
+                    row.error_detail = str(exc.detail)[:500]
+                    row.attempts = int(row.attempts or 0) + 1; failed += 1
+                    db.commit()
+                    continue
                 replaced_job_id = active.job_id if active and active.job_id != job.job_id else None
                 previous_publication = {'job_id': active.job_id, 'revision': active.published_revision,
                                         'file_keys': active.published_file_keys} if replaced_job_id else None
@@ -815,6 +955,7 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     row.error_detail = 'No se pudo preparar la publicación; el portal no se modificó.'
                     row.attempts = int(row.attempts or 0) + 1; failed += 1
                     continue
+                is_new_delivery = active is None
                 if active is None:
                     # Las columnas de frescura se escriben también acá. Sin
                     # esto, TODA fila publicada por campaña nacía sin
@@ -863,9 +1004,27 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                 # reviewed request/revision evidence, keep requests open; the
                 # Corrections workflow can verify and close the intended case.
                 row.error_code = None; row.error_detail = None
+                db.add(AuditLog(user_id=op.created_by, action="delivery.create" if is_new_delivery else "delivery.update", detail={
+                    "job_id": job.job_id, "label": delivery_label, "portal_id": op.destination_portal,
+                    "artist": job.artist, "song": job.song_title, "revision": active.published_revision,
+                    "content_changed": changed, "source": "campaign_bulk", "delivery_batch_id": op.id,
+                    "replaced_job_id": replaced_job_id, "previous_publication": previous_publication,
+                }))
                 ddb.commit()
                 db.commit()
             ddb.commit()
+        except Exception:
+            # One unexpected error (DB blip, storage hiccup) must not leave the
+            # whole operation "sending" forever with the browser polling it.
+            logger.exception("[DELIVERY] batch %s aborted while processing %s", operation_id, current_row_id)
+            db.rollback(); ddb.rollback()
+            if current_row_id:
+                stuck = db.query(DeliveryBatchItem).filter_by(id=current_row_id).populate_existing().first()
+                if stuck is not None and stuck.status != "sent":
+                    stuck.status = "failed"; stuck.error_code = "unexpected_error"
+                    stuck.error_detail = "Error inesperado al publicar; reintentá."
+                    stuck.attempts = int(stuck.attempts or 0) + 1; failed += 1
+                    db.commit()
         finally: ddb.close()
         db.flush()
         op.sent_count = db.query(func.count(DeliveryBatchItem.id)).filter(DeliveryBatchItem.delivery_batch_id == op.id, DeliveryBatchItem.status == 'sent').scalar() or 0

@@ -149,6 +149,7 @@ from transcription_language import (
 from language_review import (
     reference_text_of as _job_reference_text,
     review_payload as _language_review_payload,
+    staging_advisory as _language_staging_advisory,
 )
 from provenance import job_was_delivered
 from batch_profiles import (
@@ -12959,6 +12960,7 @@ async def approve_job(
     if (
         _language_review["needs_language_review"]
         and not _language_review["language_review_resolved"]
+        and not _language_staging_advisory()
     ):
         if not override_allowed:
             raise HTTPException(
@@ -17013,8 +17015,16 @@ def request_edit(
     from pipeline import _MAX_EDITS
 
     background_case = None
-    if body.edit_type == 'background' and (
-            body.change_request_id is not None or body.change_request_proposal_id is not None):
+    # A paid background regeneration is fenced to the exact proposal preview only
+    # when the caller says it is proposal-driven (proposal id, operation id or
+    # preview hash). An operator who opened the editor from "Editar letra" carries
+    # just the change_request_id and is a manual case, like any other edit type.
+    _proposal_driven_background = body.edit_type == 'background' and (
+        body.change_request_proposal_id is not None
+        or body.change_request_operation_id is not None
+        or body.expected_proposal_hash is not None
+    )
+    if _proposal_driven_background:
         if current_user.get('role') != 'admin':
             raise HTTPException(status_code=403, detail='Admin only')
         if not all((body.change_request_id, body.change_request_proposal_id,
@@ -17159,7 +17169,7 @@ def request_edit(
     _probe_s3 = dict(_probe.s3_keys) if isinstance(_probe.s3_keys, dict) else {}
     _probe_input_r2_key = _probe.input_r2_key
     manual_case = None
-    if (body.edit_type != 'background' and body.change_request_id is not None
+    if (not _proposal_driven_background and body.change_request_id is not None
             and not body.change_request_proposal_id):
         if current_user.get('role') != 'admin':
             raise HTTPException(status_code=403, detail='Admin only')
@@ -21124,11 +21134,30 @@ async def portal_submit_change_request(
     # envuelve acá (mismo criterio que billing._send_email_async) para que
     # NINGÚN error de este código best-effort — ni siquiera uno futuro por
     # fuera de emails.py — se filtre como excepción no manejada del thread.
+    # The campaign owner also gets the mail, behind a flag: ops keeps the shared
+    # inbox and the person who runs the campaign learns of the request first.
+    _cr_campaign_name = _cr_owner_email = None
+    try:
+        if os.environ.get("CHANGE_REQUEST_NOTIFY_OWNER", "0") == "1":
+            from database import BatchCampaign as _BatchCampaign, User as _User
+            _cr_job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
+            _cr_campaign = (db.query(_BatchCampaign).filter(_BatchCampaign.id == _cr_job.campaign_id).first()
+                            if _cr_job is not None and _cr_job.campaign_id else None)
+            if _cr_campaign is not None:
+                _cr_campaign_name = _cr_campaign.name
+                _cr_owner = db.query(_User).filter(_User.id == _cr_campaign.created_by).first()
+                _cr_owner_email = _cr_owner.email if _cr_owner is not None else None
+    except Exception:
+        logger.warning("[CR] no se pudo resolver el dueño de la campaña", exc_info=True)
+    _cr_id, _cr_portal = cr.id, portal_id
+
     def _notify_umg_change_request():
         try:
             emails.send_umg_change_request_notification(
                 delivery.artist_snapshot, delivery.song_title_snapshot,
                 comment, delivery_id, delivery.job_id,
+                request_id=_cr_id, portal_id=_cr_portal,
+                campaign_name=_cr_campaign_name, owner_email=_cr_owner_email,
             )
         except Exception:
             logger.warning("[CR] notificación de cambio UMG falló", exc_info=True)
@@ -21548,8 +21577,14 @@ async def admin_list_change_requests(
         q = q.filter(DeliveryChangeRequest.resolved_at.is_(None))
     elif status == "resolved":
         q = q.filter(DeliveryChangeRequest.resolved_at.isnot(None))
+    # Latest lifecycle change first: a request the client REOPENED keeps its old
+    # submitted_at and used to sink below the 200-row cut, unseen. updated_at
+    # (set on submit, resolve and reopen) brings it back to the top.
     crs = (
-        q.order_by(DeliveryChangeRequest.submitted_at.desc())
+        q.order_by(
+            func.coalesce(DeliveryChangeRequest.updated_at, DeliveryChangeRequest.submitted_at).desc(),
+            DeliveryChangeRequest.id.desc(),
+        )
         .limit(limit)
         .all()
     )

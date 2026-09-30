@@ -4205,12 +4205,19 @@ export default function App() {
           }
         }
 
+        // The key must identify ONE submit: the same editor revision can carry a
+        // lyrics render and later a background regeneration for the same request,
+        // and a key shared across them made the backend answer 409 (same key,
+        // different body). Retries inside this submit reuse the nonce.
+        const submitNonce = (typeof crypto !== "undefined" && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
         const doPost = async (body) => {
           const requestRevision = Number.isInteger(body.editor_revision)
             ? body.editor_revision
             : (Number.isInteger(body.base_revision) ? body.base_revision : r.segmentsRevision);
           const umgIdempotencyKey = r.changeRequestContext
-            ? `umg-change:${r.changeRequestContext.changeRequestId}:${r.changeRequestContext.proposalId}:${requestRevision}`
+            ? `umg-change:${r.changeRequestContext.changeRequestId}:${r.changeRequestContext.proposalId ?? "manual"}:${submission.editType}:${requestRevision}:${submitNonce}`
             : null;
           const res = await authFetch(`${API}/edit/${editedJobId}`, {
             method: "POST",

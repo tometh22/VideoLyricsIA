@@ -27,6 +27,9 @@ function CampaignCard({ campaign, onOpen }) {
   const done = doneCount(counts);
   const next = campaignNextStep(counts, kind, { portalSends: campaign.destination_portal !== "files" });
   const percent = total ? Math.round((100 * done) / total) : 0;
+  const flags = campaign.pipeline?.flags || {};
+  const openRequests = Number(flags.change_requests_open) || 0;
+  const oldestRequest = relativeDate(flags.oldest_change_request_at);
   return <button type="button" onClick={onOpen} aria-label={`${campaign.name} · ${STATUS_LABEL[campaign.status] || campaign.status}`}
     className="group flex flex-col gap-4 rounded-card bg-surface-2/50 p-5 text-left ring-1 ring-white/[0.07] transition duration-brand hover:-translate-y-0.5 hover:bg-surface-2/80 hover:ring-brand/40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand">
     <div className="flex items-start justify-between gap-3">
@@ -37,6 +40,7 @@ function CampaignCard({ campaign, onOpen }) {
       <Chip tone={STATUS_TONE[campaign.status] || "neutral"}>{STATUS_LABEL[campaign.status] || "Estado no disponible"}</Chip>
     </div>
     <MiniPipeline counts={counts} kind={kind} />
+    {openRequests > 0 && <div><Chip tone="warning">{openRequests} {openRequests === 1 ? "cambio pedido" : "cambios pedidos"} por el cliente{oldestRequest ? ` · el más antiguo: ${oldestRequest}` : ""}</Chip></div>}
     <div className="flex flex-wrap items-end justify-between gap-3">
       <div>
         <p className="text-2xl font-semibold tabular-nums text-white">{percent}%<span className="ml-1.5 text-xs font-normal text-ink-secondary">{done} de {total} terminadas</span></p>

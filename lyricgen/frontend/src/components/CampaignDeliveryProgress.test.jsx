@@ -45,3 +45,37 @@ it("names the songs of this delivery so a past operation is not read as the whol
   expect(screen.getByText("Influencia · Charly García")).toBeInTheDocument();
   expect(screen.getByText(/no de toda la campaña/)).toBeInTheDocument();
 });
+
+it("retries the failed songs of the operation and keeps polling after it is re-queued", async () => {
+  const partial = { status: "partial", sent_count: 1, total_count: 2, items: [
+    { job_id: "ok", status: "sent" }, { job_id: "bad", status: "failed", error_code: "deliverables_not_ready", retryable: true },
+  ] };
+  const request = vi.fn(async (path, options = {}) => {
+    if (options.method === "POST") return { operation_id: "op-r", status: "queued", scheduled: true, outcome: "queued" };
+    return request.mock.calls.filter(([, o]) => o?.method === "POST").length ? { status: "completed", sent_count: 2, total_count: 2, items: [] } : partial;
+  });
+  render(<CampaignDeliveryProgress operationId="op-r" request={request} onSelectFailed={vi.fn()} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Reintentar 1 fallido" }));
+  await screen.findByText(/Envío completado/);
+  const post = request.mock.calls.find(([, options]) => options?.method === "POST");
+  expect(post[0]).toBe("/batch/delivery-operations/op-r/retry");
+  expect(screen.queryByRole("button", { name: /Reintentar \d/ })).toBeNull();
+});
+
+it("does not offer a retry for failures that need a person and explains them", async () => {
+  const request = vi.fn().mockResolvedValue({ status: "partial", sent_count: 0, total_count: 1, items: [
+    { job_id: "amb", status: "failed", error_code: "ambiguous_replacement", error_detail: "varios pedidos", retryable: false },
+  ] });
+  render(<CampaignDeliveryProgress operationId="op-a" request={request} onSelectFailed={vi.fn()} />);
+  expect(await screen.findByText(/varios pedidos del cliente vinculados/)).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /Reintentar/ })).toBeNull();
+});
+
+it("flags a stalled operation and offers a retry even without failed songs", async () => {
+  const request = vi.fn().mockResolvedValue({ status: "sending", stalled: true, sent_count: 0, total_count: 3, items: [
+    { job_id: "p1", status: "pending" },
+  ] });
+  render(<CampaignDeliveryProgress operationId="op-s" request={request} onSelectFailed={vi.fn()} />);
+  expect(await screen.findByText(/parece detenido/)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Reintentar envío" })).toBeInTheDocument();
+});

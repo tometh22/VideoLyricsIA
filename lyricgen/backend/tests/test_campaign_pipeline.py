@@ -60,13 +60,14 @@ def portal(rows):
             " removed_at TEXT, published_render_fingerprint TEXT, published_revision INTEGER,"
             " stale_since TEXT, stale_reason TEXT, approved_at TEXT, content_updated_at TEXT)"
         ))
-        conn.execute(text("CREATE TABLE delivery_change_requests (id INTEGER, delivery_id INTEGER, resolved_at TEXT)"))
+        conn.execute(text("CREATE TABLE delivery_change_requests (id INTEGER, delivery_id INTEGER, resolved_at TEXT, submitted_at TEXT)"))
         for n, (job_id, portal_id, tenant, pending) in enumerate(rows, start=1):
             conn.execute(text("INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,NULL,NULL,1,NULL,NULL,NULL,NULL)"),
                          dict(n=n, job=job_id, portal=portal_id, tenant=tenant))
             for request in range(pending):
-                conn.execute(text("INSERT INTO delivery_change_requests VALUES (:id,:delivery,NULL)"),
-                             dict(id=n * 100 + request, delivery=n))
+                conn.execute(text("INSERT INTO delivery_change_requests VALUES (:id,:delivery,NULL,:submitted)"),
+                             dict(id=n * 100 + request, delivery=n,
+                                  submitted=f"2026-09-{20 - request:02d} 10:00:00.000000"))
 
     @contextmanager
     def session():
@@ -145,6 +146,9 @@ def test_variants_never_add_songs_and_the_current_version_decides_delivery(db, s
     assert second["portals"] == ["argentina"]
     assert second["pending_change_requests"] == 2
     assert result["flags"]["change_requests"] == 1
+    # Open REQUESTS (2 on one song) and the age of the oldest one.
+    assert result["flags"]["change_requests_open"] == 2
+    assert result["flags"]["oldest_change_request_at"].startswith("2026-09-19T10:00:00")
 
 
 def test_published_song_back_in_edit_stays_in_work_with_its_change_requests(db, setup, monkeypatch):

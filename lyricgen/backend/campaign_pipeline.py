@@ -191,7 +191,13 @@ def _snapshot(
             lineage_by_item[item_id].append(job)
 
     counts = {stage: 0 for stage in ALL_STAGES}
-    flags = {"portal_outdated": 0, "change_requests": 0, "metadata_missing": 0, "upload_errors": 0}
+    flags: dict[str, Any] = {
+        "portal_outdated": 0, "change_requests": 0, "metadata_missing": 0, "upload_errors": 0,
+        # Open client requests (not songs) and how long the oldest has waited:
+        # what the campaign list needs to say "3 cambios · el más antiguo hace 2 días".
+        "change_requests_open": 0, "oldest_change_request_at": None,
+    }
+    oldest_request: datetime | None = None
     rows: list[dict[str, Any]] = []
     epoch = datetime.min.replace(tzinfo=timezone.utc)
     for item in items:
@@ -225,6 +231,9 @@ def _snapshot(
                 if portal not in portals:
                     portals.append(portal)
             change_requests += int(publication.get("pending_change_requests") or 0)
+            published_oldest = _aware(publication.get("oldest_change_request_at"))
+            if published_oldest is not None and (oldest_request is None or published_oldest < oldest_request):
+                oldest_request = published_oldest
             updating = updating or bool(publication.get("portal_updating"))
             if current is not None and job.job_id != current.job_id:
                 published_other = True
@@ -236,6 +245,7 @@ def _snapshot(
         portals.sort()
         flags["portal_outdated"] += int(outdated)
         flags["change_requests"] += int(bool(change_requests))
+        flags["change_requests_open"] += change_requests
         flags["metadata_missing"] += int(item.metadata_error == "missing_metadata")
         flags["upload_errors"] += int(item.upload_state == "error")
         if not include_items:
@@ -302,6 +312,7 @@ def _snapshot(
             "pending_change_requests": change_requests,
         })
 
+    flags["oldest_change_request_at"] = _iso(oldest_request)
     total = len(items)
     snapshot: dict[str, Any] = {
         "campaign_id": campaign.id,

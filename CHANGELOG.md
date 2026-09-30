@@ -3,6 +3,42 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.82] - 2026-09-30
+
+### Added
+
+- Staging-only kill switches so corrections can be published while delivery
+  QC is being redesigned: `DELIVERY_QC_STAGING_GATES_OFF=1` stops the delivery
+  QC/preflight gate from blocking approval and publication, and
+  `LANGUAGE_REVIEW_STAGING_ADVISORY=1` stops the language review from returning
+  `language_review_unresolved` on approve and approve-lyrics. Both are inert
+  unless `ENVIRONMENT` is exactly `staging` and default to off; reports are still
+  generated and shown.
+
+## [1.1.81] - 2026-09-30
+
+### Fixed
+
+- Regenerating a background from the editor opened with "Editar letra" in
+  Cambios no longer answers 409: the proposal fence only applies when the
+  request carries a proposal, operation or preview hash. The edit idempotency
+  key now includes the edit type and a per-submit nonce.
+- A campaign send to a client portal fails per song instead of aborting: an
+  ambiguous replacement or an unexpected error marks only that song, the
+  operation ends as partial, can be retried (`POST /delivery-operations/{id}/retry`)
+  and the reconciler re-queues one that lost its worker. The backend now
+  enforces the campaign's fixed portal and audits each published song.
+- The client change-request notification names the portal (Argentina/Chile),
+  links straight to the request and can also reach the campaign owner
+  (`CHANGE_REQUEST_NOTIFY_OWNER`, off by default).
+- Admin > Cambios orders by the latest lifecycle change so a reopened request
+  is no longer pushed below the list cut.
+
+### Added
+
+- Campaign cards show how many client change requests are open and how long
+  the oldest has waited.
+
 ## [1.1.80] - 2026-09-30
 
 ### Fixed

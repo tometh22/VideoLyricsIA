@@ -530,6 +530,7 @@ def portal_history(job_ids, tenant_id):
         publications = ddb.query(
             Delivery.job_id, Delivery.portal_id,
             func.count(DeliveryChangeRequest.id),
+            func.min(DeliveryChangeRequest.submitted_at),
             Delivery.published_render_fingerprint, Delivery.published_revision,
             Delivery.stale_since, Delivery.stale_reason,
             Delivery.approved_at, Delivery.content_updated_at,
@@ -546,7 +547,7 @@ def portal_history(job_ids, tenant_id):
             Delivery.approved_at, Delivery.content_updated_at,
         ).all()
     result = {}
-    for (job_id, portal_id, pending, fingerprint, revision,
+    for (job_id, portal_id, pending, oldest_pending, fingerprint, revision,
          stale_since, stale_reason, approved_at, content_updated_at) in publications:
         row = result.setdefault(job_id, {
             "umg_portals": [], "pending_change_requests": 0,
@@ -554,11 +555,15 @@ def portal_history(job_ids, tenant_id):
             # render actual sin volver a la DB del portal.
             "published_fingerprints": [], "published_revision": 1,
             "portal_updating": False, "portal_awaiting_review": False,
+            "oldest_change_request_at": None,
         })
         portal = portal_id or "argentina"
         if portal not in row["umg_portals"]:
             row["umg_portals"].append(portal)
         row["pending_change_requests"] += pending
+        if pending and oldest_pending is not None and (
+                row["oldest_change_request_at"] is None or oldest_pending < row["oldest_change_request_at"]):
+            row["oldest_change_request_at"] = oldest_pending
         if fingerprint:
             row["published_fingerprints"].append(fingerprint)
         row["published_revision"] = max(row["published_revision"], revision or 1)
