@@ -36,3 +36,12 @@ it("retries a failed status lookup without creating another delivery", async () 
   expect(request.mock.calls.map(([path]) => path)).toEqual(["/batch/delivery-operations/operation-2", "/batch/delivery-operations/operation-2"]);
   expect(request.mock.calls.every(([, options]) => !options.method)).toBe(true);
 });
+
+it("names the songs of this delivery so a past operation is not read as the whole campaign", async () => {
+  const request = vi.fn().mockResolvedValue({ status: "completed", sent_count: 1, total_count: 1, items: [{ job_id: "j9", status: "sent" }] });
+  render(<CampaignDeliveryProgress operationId="op-9" request={request} describe={(jobId) => (jobId === "j9" ? "Influencia · Charly García" : "")} />);
+  await screen.findByText(/Envío completado/);
+  expect(screen.getByText("Canciones de este envío (1)")).toBeInTheDocument();
+  expect(screen.getByText("Influencia · Charly García")).toBeInTheDocument();
+  expect(screen.getByText(/no de toda la campaña/)).toBeInTheDocument();
+});

@@ -365,6 +365,7 @@ export default function CampaignDetailPage({ id }) {
       <strong>{movedSong.title}</strong> ahora está en «{stageMeta(movedSong.stage).title}».
     </Banner>}
     {params.get("delivery_op") && <CampaignDeliveryProgress operationId={params.get("delivery_op")} request={campaignRequest} onSettled={refresh}
+      describe={(jobId) => { const song = songs.find((item) => item.current_job_id === jobId || item.job_id === jobId || item.versions?.some((version) => version.job_id === jobId)); return song ? `${song.title} · ${song.artist}` : ""; }}
       onSelectFailed={(jobIds) => {
         const ids = songs.filter((song) => jobIds.includes(song.current_job_id)).map((song) => song.id);
         setView("approved"); setSelected(new Set(ids));
