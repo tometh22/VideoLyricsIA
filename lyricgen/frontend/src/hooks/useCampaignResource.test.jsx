@@ -44,6 +44,17 @@ describe("useCampaignResource", () => {
     await waitFor(() => expect(screen.getByTestId("probe")).toHaveTextContent("error:caído"));
   });
 
+  it("drops cached data when access is lost", async () => {
+    let status = 0;
+    const fetcher = vi.fn(async () => { if (status) throw Object.assign(new Error("sin acceso"), { status }); return "privado"; });
+    render(<Probe resourceKey="k5" fetcher={fetcher} />);
+    await screen.findByText("privado");
+    status = 404;
+    await act(async () => { await invalidateCampaignResources("k5"); });
+    expect(screen.getByTestId("probe")).toHaveTextContent("error:sin acceso");
+    expect(screen.queryByText("privado")).not.toBeInTheDocument();
+  });
+
   it("does not fetch while disabled", () => {
     const fetcher = vi.fn(async () => "x");
     function Disabled() { useCampaignResource("k4", fetcher, { enabled: false }); return null; }

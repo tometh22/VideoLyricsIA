@@ -29,7 +29,8 @@ export function canGenerate(song) {
 }
 
 export function canSend(song) {
-  return ["approved", "delivered"].includes(song.stage) && song.current_status === "done" && Boolean(song.approved_at) && song.has_video;
+  return ["approved", "delivered"].includes(song.stage) && song.current_status === "done" && Boolean(song.approved_at) && song.has_video
+    && song.current_sendable !== false;
 }
 
 export function canDiscard(song) {

@@ -199,3 +199,61 @@ def test_campaign_list_cards_carry_the_same_counts(db, setup, monkeypatch):
     assert listed["pipeline"]["counts"]["lyrics"] == 1
     assert listed["pipeline"]["counts"]["qc"] == 1
     assert listed["pipeline"]["counts"]["audio"] == 10
+
+
+def test_list_counts_use_bulk_queries_and_ignore_pilot_copies(db, setup, monkeypatch):
+    from batch_campaigns import list_campaigns
+    from sqlalchemy import event
+    campaign, items, actor = setup
+    root = add_job(db, campaign, actor, item=items[0], status="done")
+    pilot = add_job(db, campaign, actor, parent=root, status="transcribed_pending", minutes=5, video=False)
+    pilot.pilot_id = "pilot-1"
+    db.commit()
+    statements = []
+    engine = db.get_bind()
+
+    def count(*_args, **_kwargs):
+        statements.append(1)
+
+    with portal([]) as session:
+        monkeypatch.setattr(creative, "scoped_deliveries_db", session)
+        event.listen(engine, "before_cursor_execute", count)
+        try:
+            from campaign_pipeline import pipeline_counts_bulk
+            bulk = pipeline_counts_bulk(db, [campaign])
+        finally:
+            event.remove(engine, "before_cursor_execute", count)
+        listed = next(row for row in list_campaigns(actor, db)["items"] if row["id"] == campaign.id)
+        detail = pipeline.campaign_pipeline(campaign.id, actor, db)
+    # items + lineage ids + lineage rows: a constant, independent of songs.
+    assert len(statements) <= 4
+    assert bulk[campaign.id]["counts"] == detail["counts"] == listed["pipeline"]["counts"]
+    first = next(row for row in detail["items"] if row["title"] == "Tema 0")
+    assert first["stage"] == "approved" and first["current_job_id"] == root.job_id
+    assert first["current_sendable"] is True
+
+
+def test_list_survives_a_pipeline_failure(db, setup, monkeypatch):
+    from batch_campaigns import list_campaigns
+    import campaign_pipeline
+    campaign, _items, actor = setup
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(campaign_pipeline, "_load_lineage", broken)
+    listed = next(row for row in list_campaigns(actor, db)["items"] if row["id"] == campaign.id)
+    assert listed["pipeline"] is None
+    assert listed["counters"]["waiting_processing"] == 12
+
+
+def test_variants_outside_the_campaign_are_not_sendable(db, setup, monkeypatch):
+    campaign, items, actor = setup
+    root = add_job(db, campaign, actor, item=items[0], status="done")
+    add_job(db, campaign, actor, parent=root, status="done", minutes=5)
+    db.commit()
+    with portal([]) as session:
+        monkeypatch.setattr(creative, "scoped_deliveries_db", session)
+        row = pipeline.campaign_pipeline(campaign.id, actor, db)["items"][0]
+    assert row["current_is_variant"] is True
+    assert row["current_sendable"] is False

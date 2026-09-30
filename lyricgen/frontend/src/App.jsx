@@ -4,6 +4,7 @@ import { resolveSavedLanguageReview } from "./lib/languageResolution";
 import { reanchorHttpFailure } from "./lib/reanchorResult";
 import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
 import { safeReviewReturnPath } from "./lib/reviewerNavigation";
+import { clearCampaignResourceCache } from "./hooks/useCampaignResource";
 import {
   Routes, Route, Navigate, Outlet,
   useNavigate, useLocation, useParams,
@@ -2753,6 +2754,9 @@ export default function App() {
     // PR E: User B no debe heredar los segments editados de User A en la
     // misma máquina — el store es a nivel módulo, no muere con el unmount.
     try { segmentsStore.evictAll(); } catch { /* */ }
+    // Campaign snapshots (pipeline, review queue, videos) live in a module
+    // cache for instant tab switches; the next user must never see them.
+    try { clearCampaignResourceCache(); } catch { /* */ }
 
     // Short-lived media tokens (preview/download URLs scoped to
     // job+filetype). Without this, User B sees /preview URLs that

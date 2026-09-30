@@ -32,7 +32,7 @@ export default function VideoReviewPlayer({ queue, startId, onClose, onApproved,
   }, [queue.length]);
 
   const approve = useCallback(async () => {
-    if (!reviewable || busy) return;
+    if (!reviewable || busy || !url) return;
     setBusy(true); setError(""); setNotice("");
     try {
       await campaignPost(`/approve/${encodeURIComponent(jobId)}`, { notes: "Revisión final desde el reproductor de campaña" });
@@ -48,7 +48,7 @@ export default function VideoReviewPlayer({ queue, startId, onClose, onApproved,
     } finally {
       setBusy(false);
     }
-  }, [approvedIds, busy, index, jobId, onApproved, onClose, queue, reviewable, song]);
+  }, [approvedIds, busy, index, jobId, onApproved, onClose, queue, reviewable, song, url]);
 
   useEffect(() => {
     const onKey = (event) => {

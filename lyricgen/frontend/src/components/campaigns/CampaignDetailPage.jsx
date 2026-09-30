@@ -119,7 +119,11 @@ export default function CampaignDetailPage({ id }) {
   const lyricSongs = useMemo(() => songs.filter((song) => song.stage === "lyrics"), [songs]);
 
   const [selected, setSelected] = useState(() => new Set());
-  const [cursor, setCursor] = useState(null);
+  // The keyboard cursor follows a song, not a row index: a background
+  // refresh that reorders the list must never retarget Enter or X.
+  const [cursorId, setCursorId] = useState(null);
+  const deliveryKeys = useRef(new Map());
+  const cursor = cursorId ? visible.findIndex((song) => song.id === cursorId) : -1;
   const [focusRequest, setFocusRequest] = useState(null);
   const [dialog, setDialog] = useState(null);
   const [flash, setFlash] = useState(null);
@@ -131,7 +135,6 @@ export default function CampaignDetailPage({ id }) {
   const focusId = params.get("focus");
   const approvedJob = params.get("approved");
 
-  useEffect(() => { setSelected(new Set()); setCursor(null); }, [view]);
   useEffect(() => { try { localStorage.setItem("genly:last-campaign", id); } catch { /* best effort */ } }, [id]);
 
   const refresh = useCallback(() => invalidateCampaignResources(prefix), [prefix]);
@@ -144,6 +147,8 @@ export default function CampaignDetailPage({ id }) {
   }, [setParams]);
   const setParam = useCallback((key, value) => updateParams({ [key]: value, focus: null }), [updateParams]);
   const setView = useCallback((next) => {
+    setSelected(new Set());
+    setCursorId(null);
     const patch = { view: next === "all" ? null : next, tab: null, stage: null, song: null, focus: null, scroll: null };
     if (next !== "lyrics") Object.assign(patch, { drafts: null, mine: null, cls: null, version: null, order: null });
     if (!["all", "qc", "approved", "delivered"].includes(next)) patch.portal = null;
@@ -161,6 +166,9 @@ export default function CampaignDetailPage({ id }) {
     const timer = setTimeout(() => updateParams({ focus: null, scroll: null }), 6000);
     return () => { cancelAnimationFrame(frame); clearTimeout(timer); };
   }, [focusId, songs.length, updateParams]);
+
+  // Back from approving in the editor: the cached snapshot predates it.
+  useEffect(() => { if (approvedJob) void invalidateCampaignResources(prefix); }, [approvedJob, prefix]);
 
   // The editor's "Descartar canción" returns here with ?discard=<item>.
   const discardId = params.get("discard");
@@ -190,7 +198,7 @@ export default function CampaignDetailPage({ id }) {
       : `/review/${encodeURIComponent(song.job_id)}?return_to=${encodeURIComponent(returnPath(song))}`);
   }, [navigate, returnPath]);
 
-  const videosFor = (list) => list.map((song) => ({ job_id: song.current_job_id, title: song.title, artist: song.artist }));
+  const videosFor = (list) => list.map((song) => ({ item_id: song.id, job_id: song.current_job_id, title: song.title, artist: song.artist }));
   const runRetry = async (list) => {
     setBusyIds(new Set(list.map((song) => song.id)));
     const failed = [];
@@ -269,17 +277,17 @@ export default function CampaignDetailPage({ id }) {
       if (!visible.length) return;
       if (key === "j" || key === "arrowdown") {
         event.preventDefault();
-        const index = cursor == null ? 0 : Math.min(visible.length - 1, cursor + 1);
-        setCursor(index); setFocusRequest({ index, at: Date.now() });
+        const index = cursor < 0 ? 0 : Math.min(visible.length - 1, cursor + 1);
+        setCursorId(visible[index].id); setFocusRequest({ index, at: Date.now() });
       } else if (key === "k" || key === "arrowup") {
         event.preventDefault();
-        const index = cursor == null ? 0 : Math.max(0, cursor - 1);
-        setCursor(index); setFocusRequest({ index, at: Date.now() });
-      } else if (key === "x" && cursor != null && visible[cursor]) {
+        const index = cursor < 0 ? 0 : Math.max(0, cursor - 1);
+        setCursorId(visible[index].id); setFocusRequest({ index, at: Date.now() });
+      } else if (key === "x" && cursor >= 0) {
         event.preventDefault();
         const songId = visible[cursor].id;
         setSelected((old) => { const copy = new Set(old); if (copy.has(songId)) copy.delete(songId); else copy.add(songId); return copy; });
-      } else if (key === "enter" && cursor != null && event.target?.tagName === "TR" && visible[cursor]) {
+      } else if (key === "enter" && cursor >= 0 && event.target?.tagName === "TR" && event.target.dataset.song === visible[cursor].id) {
         event.preventDefault();
         const song = visible[cursor];
         const chosen = primaryAction(song, { kind, canManage });
@@ -304,7 +312,9 @@ export default function CampaignDetailPage({ id }) {
   // Back from the editor, the song may have moved on (approved, discarded…).
   const movedSong = focusId && !approvedSong && visible.length && !visible.some((song) => song.job_id === focusId || song.id === focusId)
     ? songs.find((song) => song.job_id === focusId || song.id === focusId) : null;
-  const nextAfterApproval = approvedSong ? nextLyricSong(sortSongs(lyricSongs, "lyrics")) : null;
+  // The cached snapshot may still list the song just approved as "Letra"
+  // until the refresh lands; never offer it again as the next one.
+  const nextAfterApproval = approvedSong ? nextLyricSong(sortSongs(lyricSongs.filter((song) => song.job_id !== approvedJob), "lyrics")) : null;
 
   if (!known && (head.error || pipe.error)) {
     return <div className="mx-auto max-w-3xl space-y-4 py-10">
@@ -357,7 +367,7 @@ export default function CampaignDetailPage({ id }) {
     {params.get("delivery_op") && <CampaignDeliveryProgress operationId={params.get("delivery_op")} request={campaignRequest} onSettled={refresh}
       onSelectFailed={(jobIds) => {
         const ids = songs.filter((song) => jobIds.includes(song.current_job_id)).map((song) => song.id);
-        setSelected(new Set(ids)); setView("approved");
+        setView("approved"); setSelected(new Set(ids));
       }} />}
     {pipe.data && pipe.data.portal_status_available === false && <Banner tone="warning">No pudimos consultar el portal del cliente: por ahora las entregas figuran como aprobadas.</Banner>}
     {pipe.error && known && <Banner tone="danger" action={<Button size="sm" onClick={refresh}>Reintentar</Button>}>No se pudo actualizar el estado: {pipe.error.message}</Banner>}
@@ -378,7 +388,7 @@ export default function CampaignDetailPage({ id }) {
           onToggle={(songId) => setSelected((old) => { const copy = new Set(old); if (copy.has(songId)) copy.delete(songId); else copy.add(songId); return copy; })}
           onToggleAll={(ids) => setSelected(new Set(ids))}
           onAction={onAction} onOpen={(song) => updateParams({ song: song.id }, { push: true })}
-          highlightedId={focusId || approvedJob} cursor={cursor} onCursor={setCursor} focusRequest={focusRequest} busyIds={busyIds}
+          highlightedId={focusId || approvedJob} cursor={cursor} onCursor={(index) => setCursorId(visible[index]?.id || null)} focusRequest={focusRequest} busyIds={busyIds}
           emptyState={<EmptyState title={filtered ? "No hay coincidencias con los filtros" : emptyCopy[0]} description={filtered ? "Probá con otra búsqueda o limpiá los filtros." : emptyCopy[1]}
             action={filtered ? <Button size="sm" onClick={() => updateParams(Object.fromEntries(FILTER_KEYS.map((key) => [key, null])))}>Limpiar filtros</Button>
               : view === "all" && canManage && lyric ? <Button size="sm" variant="primary" onClick={() => updateParams({ view: "config", section: "upload" }, { push: true })}>Subir audios</Button> : null} />} />
@@ -410,7 +420,8 @@ export default function CampaignDetailPage({ id }) {
       setFlash({ tone: summary.error ? "danger" : summary.notice ? "warning" : "success", text: [summary.message, summary.notice, summary.error].filter(Boolean).join(" ") });
       void refresh();
     }} />}
-    {dialog?.type === "send" && <SendToPortalDialog campaignId={id} videos={videosFor(dialog.songs)} defaultPortal={campaign?.destination_portal || dialog.songs[0]?.portals?.[0] || ""}
+    {dialog?.type === "send" && <SendToPortalDialog campaignId={id} kind={kind} videos={videosFor(dialog.songs)} idempotencyKeys={deliveryKeys.current}
+      lockedPortal={campaign?.destination_portal || ""} defaultPortal={dialog.songs[0]?.portals?.[0] || ""}
       onClose={() => setDialog(null)} onStarted={(operation, portal, total) => {
         setDialog(null); setSelected(new Set());
         updateParams({ delivery_op: operation.operation_id }, { push: true });

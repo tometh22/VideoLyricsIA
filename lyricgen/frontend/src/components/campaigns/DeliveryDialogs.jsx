@@ -12,22 +12,28 @@ function newKey(campaignId) {
  * response reuses the same idempotency key, so the backend never creates a
  * second batch for the same selection and portal.
  */
-export function SendToPortalDialog({ campaignId, videos, defaultPortal = "", onClose, onStarted }) {
-  const [portal, setPortal] = useState(defaultPortal);
+export function SendToPortalDialog({ campaignId, kind = "lyric_video", videos, defaultPortal = "", lockedPortal = "", idempotencyKeys, onClose, onStarted }) {
+  const [portal, setPortal] = useState(lockedPortal || defaultPortal);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const keyRef = useRef(null);
+  const localKeys = useRef(new Map());
+  const keys = idempotencyKeys || localKeys.current;
   const send = async () => {
     if (busy || !portal) return;
     setBusy(true); setError("");
-    const jobIds = videos.map((video) => video.job_id);
-    const signature = JSON.stringify([portal, [...jobIds].sort()]);
-    if (keyRef.current?.signature !== signature) keyRef.current = { signature, key: newKey(campaignId) };
+    // Art-track sends select campaign items; lyric sends select jobs. Either
+    // way the backend only publishes exactly this list.
+    const selection = kind === "art_track"
+      ? { item_ids: videos.map((video) => video.item_id) }
+      : { job_ids: videos.map((video) => video.job_id) };
+    const ids = Object.values(selection)[0];
+    const signature = JSON.stringify([kind, portal, [...ids].sort()]);
+    if (!keys.has(signature)) keys.set(signature, newKey(campaignId));
     try {
       const operation = await campaignPost(`/batch/campaigns/${encodeURIComponent(campaignId)}/deliveries`, {
-        job_ids: jobIds, destination_portal: portal, idempotency_key: keyRef.current.key,
+        ...selection, destination_portal: portal, idempotency_key: keys.get(signature),
       });
-      onStarted?.(operation, portal, jobIds.length);
+      onStarted?.(operation, portal, ids.length);
     } catch (sendError) {
       setError(sendError.message || "No se pudo iniciar el envío.");
     } finally {
@@ -42,11 +48,12 @@ export function SendToPortalDialog({ campaignId, videos, defaultPortal = "", onC
         <p className="mt-2 text-sm text-ink-secondary">Se publican sólo los videos de esta lista. El envío sigue en segundo plano y podés ver su avance en la campaña.</p>
       </div>
       <Field label="Portal de destino">
-        <select aria-label="Portal de destino" className={inputClass} value={portal} onChange={(event) => setPortal(event.target.value)}>
+        <select aria-label="Portal de destino" className={inputClass} value={portal} disabled={Boolean(lockedPortal)} onChange={(event) => setPortal(event.target.value)}>
           <option value="">Elegí un portal</option>
           {Object.entries(PORTALS).map(([id, value]) => <option key={id} value={id}>{value.label} · {value.host}</option>)}
         </select>
       </Field>
+      {lockedPortal && <p className="-mt-2 text-xs text-ink-secondary">Portal fijo de esta campaña.</p>}
       <ul className="max-h-44 space-y-1 overflow-auto rounded-xl bg-black/20 p-3 text-sm text-ink-secondary">
         {videos.map((video) => <li key={video.job_id} className="truncate"><span className="text-white">{video.title}</span> · {video.artist}</li>)}
       </ul>

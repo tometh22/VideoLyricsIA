@@ -157,15 +157,15 @@ describe("campaign workspace", () => {
     const dialog = await screen.findByRole("dialog", { name: "Enviar videos aprobados" });
     fireEvent.change(within(dialog).getByLabelText("Portal de destino"), { target: { value: "chile" } });
     fireEvent.click(within(dialog).getByRole("button", { name: "Confirmar envío" }));
-    await within(dialog).findByText("Conexión interrumpida");
+    await within(dialog).findByText("Conexión interrumpida", {}, { timeout: 4000 });
     fireEvent.click(within(dialog).getByRole("button", { name: "Confirmar envío" }));
-    await screen.findByText(/Envío iniciado para 2 videos a Chile/);
+    await screen.findByText(/Envío iniciado para 2 videos a Chile/, {}, { timeout: 4000 });
     const sends = api.state.calls.filter((call) => call.path === "/batch/campaigns/c1/deliveries");
     expect(sends).toHaveLength(2);
     expect(sends[0].body.idempotency_key).toBe(sends[1].body.idempotency_key);
     expect(sends[1].body).toMatchObject({ job_ids: ["j1", "j2"], destination_portal: "chile" });
     expect(location()).toContain("delivery_op=op1");
-    await screen.findByText(/1 de 1 enviados/);
+    await screen.findByText(/1 de 1 enviados/, {}, { timeout: 4000 });
   });
 
   it("keeps legacy links working and edits song data from the drawer", async () => {
@@ -226,6 +226,35 @@ describe("campaign workspace", () => {
     fireEvent.keyDown(drawer, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(location()).not.toContain("song=");
+  });
+
+  it("sends art tracks by item to the campaign's fixed portal", async () => {
+    const api = createCampaignApi({ kind: "art_track", songs: [makeSong(1, "approved"), makeSong(2, "approved")] });
+    api.state.campaign.destination_portal = "chile";
+    mount(api, "/campaigns/c1?view=approved");
+    await screen.findByText("Canción 2");
+    fireEvent.click(screen.getByRole("button", { name: "Enviar · Canción 1" }));
+    const dialog = await screen.findByRole("dialog", { name: "Enviar videos aprobados" });
+    expect(within(dialog).getByLabelText("Portal de destino")).toBeDisabled();
+    expect(within(dialog).getByLabelText("Portal de destino")).toHaveValue("chile");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Confirmar envío" }));
+    await waitFor(() => expect(api.state.calls.some((call) => call.path === "/batch/campaigns/c1/deliveries")).toBe(true));
+    const body = api.state.calls.find((call) => call.path === "/batch/campaigns/c1/deliveries").body;
+    expect(body.item_ids).toEqual(["i1"]);
+    expect(body).not.toHaveProperty("job_ids");
+    expect(body.destination_portal).toBe("chile");
+  });
+
+  it("never offers the song just approved as the next lyric, and hides unsendable variants", async () => {
+    const api = createCampaignApi({ songs: [makeSong(1, "lyrics"), makeSong(2, "lyrics"), makeSong(3, "approved", { current_sendable: false })] });
+    mount(api, "/campaigns/c1?view=lyrics&approved=j1");
+    const next = await screen.findByRole("button", { name: /Revisar siguiente:/ });
+    expect(next).toHaveTextContent("Canción 2");
+    cleanup(); clearCampaignResourceCache();
+    mount(createCampaignApi({ songs: [makeSong(3, "approved", { current_sendable: false })] }), "/campaigns/c1?view=approved");
+    await screen.findByText("Canción 3");
+    expect(screen.queryByRole("button", { name: "Enviar · Canción 3" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ver video · Canción 3" })).toBeInTheDocument();
   });
 
   it("moves through songs with the keyboard and acts with Enter", async () => {

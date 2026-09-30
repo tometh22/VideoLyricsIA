@@ -43,7 +43,10 @@ function revalidate(key) {
     }, (error) => {
       if (entry.seq !== seq || error?.name === "AbortError") return entry.snapshot.data;
       entry.controller = null;
-      publish(entry, { error, inflight: false, at: Date.now() });
+      // Lost access (logout, another account, removed scope): never keep
+      // showing data the current user may not be allowed to see.
+      const denied = [401, 403, 404].includes(error?.status);
+      publish(entry, { error, inflight: false, at: Date.now(), ...(denied ? { data: undefined } : {}) });
       return entry.snapshot.data;
     });
 }
