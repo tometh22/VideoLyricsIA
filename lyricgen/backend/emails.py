@@ -164,31 +164,52 @@ def send_lead_notification(name: str, company: str, email: str, volume: str, mes
     _send_email(to, "Nuevo lead de ventas — GenLy AI", _wrap_template(content))
 
 
+_PORTAL_LABELS = {"argentina": "Argentina", "chile": "Chile"}
+
+
 def send_umg_change_request_notification(
     artist: str, song: str, comment: str, delivery_id: int, job_id: str,
+    *, request_id: int | None = None, portal_id: str | None = None,
+    campaign_name: str | None = None, owner_email: str | None = None,
 ):
     """Notify ops the instant UMG submits a change request on the deliveries
     portal. Real-time counterpart to the "Cambios de UMG" admin panel — the
     panel requires opening the admin, this lands in the inbox so a pending
     request never sits unseen (incident 2026-07-24: the panel had been
     removed from the admin and requests piled up silently).
+
+    With ``request_id`` the mail links straight to that request; the portal
+    (AR/CL) leads the subject so the two queues are told apart at a glance.
+    ``owner_email`` (the campaign owner) gets the same mail when provided.
     """
     to = (os.environ.get("ALERT_EMAIL")
           or os.environ.get("OWNER_EMAIL")
           or "tomas@epical.digital")
     esc = html.escape
+    portal = _PORTAL_LABELS.get((portal_id or "").lower())
     comment_html = esc(comment or "—").replace(chr(10), "<br>")
+    link = (f"{FRONTEND_URL}/admin?section=cambios&change_request_id={int(request_id)}"
+            if request_id is not None else f"{FRONTEND_URL}/admin?section=cambios")
+    campaign_line = (f'<p><strong>Campaña:</strong> {esc(campaign_name)}</p>' if campaign_name else "")
     content = f"""
-    <h2 style="color:#fff;margin:0 0 16px;">UMG pidió un cambio</h2>
+    <h2 style="color:#fff;margin:0 0 16px;">UMG{f" {esc(portal)}" if portal else ""} pidió un cambio</h2>
     <p><strong>Artista:</strong> {esc(artist or "—")}</p>
     <p><strong>Canción:</strong> {esc(song or "—")}</p>
+    {campaign_line}
     <p><strong>Job:</strong> {esc(job_id or "—")} · <strong>Delivery:</strong> #{delivery_id}</p>
     <p style="margin-top:16px;"><strong>Pedido:</strong><br>{comment_html}</p>
+    {_button(link, "Abrir el pedido")}
     <p style="margin-top:16px;color:#888;font-size:13px;">
-      Resolvelo desde Admin → Operación → Cambios de UMG.
+      También en Admin → Cambios de UMG.
     </p>
     """
-    _send_email(to, f"UMG pidió un cambio — {artist or 'sin artista'}", _wrap_template(content))
+    subject = f"UMG{f' {portal}' if portal else ''} pidió un cambio — {artist or 'sin artista'}"
+    if song:
+        subject += f" · {song}"
+    body = _wrap_template(content)
+    _send_email(to, subject, body)
+    if owner_email and owner_email.strip().lower() != to.strip().lower():
+        _send_email(owner_email.strip(), subject, body)
 
 
 def send_welcome(email: str, username: str):

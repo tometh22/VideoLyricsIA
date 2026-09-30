@@ -21132,11 +21132,30 @@ async def portal_submit_change_request(
     # envuelve acá (mismo criterio que billing._send_email_async) para que
     # NINGÚN error de este código best-effort — ni siquiera uno futuro por
     # fuera de emails.py — se filtre como excepción no manejada del thread.
+    # The campaign owner also gets the mail, behind a flag: ops keeps the shared
+    # inbox and the person who runs the campaign learns of the request first.
+    _cr_campaign_name = _cr_owner_email = None
+    try:
+        if os.environ.get("CHANGE_REQUEST_NOTIFY_OWNER", "0") == "1":
+            from database import BatchCampaign as _BatchCampaign, User as _User
+            _cr_job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
+            _cr_campaign = (db.query(_BatchCampaign).filter(_BatchCampaign.id == _cr_job.campaign_id).first()
+                            if _cr_job is not None and _cr_job.campaign_id else None)
+            if _cr_campaign is not None:
+                _cr_campaign_name = _cr_campaign.name
+                _cr_owner = db.query(_User).filter(_User.id == _cr_campaign.created_by).first()
+                _cr_owner_email = _cr_owner.email if _cr_owner is not None else None
+    except Exception:
+        logger.warning("[CR] no se pudo resolver el dueño de la campaña", exc_info=True)
+    _cr_id, _cr_portal = cr.id, portal_id
+
     def _notify_umg_change_request():
         try:
             emails.send_umg_change_request_notification(
                 delivery.artist_snapshot, delivery.song_title_snapshot,
                 comment, delivery_id, delivery.job_id,
+                request_id=_cr_id, portal_id=_cr_portal,
+                campaign_name=_cr_campaign_name, owner_email=_cr_owner_email,
             )
         except Exception:
             logger.warning("[CR] notificación de cambio UMG falló", exc_info=True)

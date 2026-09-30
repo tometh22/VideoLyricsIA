@@ -883,6 +883,9 @@ def test_change_request_submit_and_admin_lists_it(
     assert call_args[0] == "Test Artist"        # artist
     assert call_args[2] == "poner la tipografía más grande"  # comment
     assert call_args[3] == delivery_id          # delivery_id
+    # El mail linkea al pedido exacto y dice a qué portal pertenece.
+    assert mock_notify.call_args.kwargs["request_id"] == cr_id
+    assert mock_notify.call_args.kwargs["portal_id"]
     assert call_args[4] == approved_job.job_id  # job_id
 
     # El admin lo ve como pendiente.
