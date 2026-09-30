@@ -435,7 +435,7 @@ export default function CampaignDetailPage({ id }) {
       void refresh();
     }} />}
     {dialog?.type === "send" && <SendToPortalDialog campaignId={id} kind={kind} videos={videosFor(dialog.songs)} idempotencyKeys={deliveryKeys.current}
-      lockedPortal={campaign?.destination_portal || ""} defaultPortal={dialog.songs[0]?.portals?.[0] || ""}
+      canClose={Boolean(pipe.data?.features?.change_request_actions && canManage)} lockedPortal={campaign?.destination_portal || ""} defaultPortal={dialog.songs[0]?.portals?.[0] || ""}
       onClose={() => setDialog(null)} onStarted={(operation, portal, total) => {
         setDialog(null); setSelected(new Set());
         updateParams({ delivery_op: operation.operation_id }, { push: true });
