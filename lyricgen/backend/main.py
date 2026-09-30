@@ -17013,8 +17013,16 @@ def request_edit(
     from pipeline import _MAX_EDITS
 
     background_case = None
-    if body.edit_type == 'background' and (
-            body.change_request_id is not None or body.change_request_proposal_id is not None):
+    # A paid background regeneration is fenced to the exact proposal preview only
+    # when the caller says it is proposal-driven (proposal id, operation id or
+    # preview hash). An operator who opened the editor from "Editar letra" carries
+    # just the change_request_id and is a manual case, like any other edit type.
+    _proposal_driven_background = body.edit_type == 'background' and (
+        body.change_request_proposal_id is not None
+        or body.change_request_operation_id is not None
+        or body.expected_proposal_hash is not None
+    )
+    if _proposal_driven_background:
         if current_user.get('role') != 'admin':
             raise HTTPException(status_code=403, detail='Admin only')
         if not all((body.change_request_id, body.change_request_proposal_id,
@@ -17159,7 +17167,7 @@ def request_edit(
     _probe_s3 = dict(_probe.s3_keys) if isinstance(_probe.s3_keys, dict) else {}
     _probe_input_r2_key = _probe.input_r2_key
     manual_case = None
-    if (body.edit_type != 'background' and body.change_request_id is not None
+    if (not _proposal_driven_background and body.change_request_id is not None
             and not body.change_request_proposal_id):
         if current_user.get('role') != 'admin':
             raise HTTPException(status_code=403, detail='Admin only')

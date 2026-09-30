@@ -69,6 +69,26 @@ def test_current_background_intent_is_accepted_once_and_replayed(client, admin_t
     assert len(calls) == 1
 
 
+def test_manual_background_from_change_request_link_is_not_proposal_fenced(client, admin_token, background_case):
+    """The editor opened via "Editar letra" only knows the request id: that is a
+    manual case (validated against the same job), not an incomplete proposal."""
+    job_id, _, body, calls = background_case
+    manual = {k: v for k, v in body.items() if k in {
+        'edit_type', 'background_mode', 'background_hint', 'change_request_id'}}
+    response = client.post('/edit/' + job_id, headers=auth(admin_token), json=manual)
+    assert response.status_code == 202, response.text
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('missing', ['change_request_operation_id', 'expected_proposal_hash', 'change_request_proposal_id'])
+def test_partial_proposal_background_context_is_still_rejected(client, admin_token, background_case, missing):
+    job_id, _, body, calls = background_case
+    body.pop(missing)
+    response = client.post('/edit/' + job_id, headers=auth(admin_token), json=body)
+    assert response.status_code == 409, response.text
+    assert calls == []
+
+
 @pytest.mark.parametrize('mutation', ['audio', 'report'])
 def test_edit_locked_reread_rejects_state_changed_during_storage_probe(
     client, admin_token, db, background_case, monkeypatch, mutation,
