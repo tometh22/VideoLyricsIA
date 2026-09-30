@@ -75,6 +75,25 @@ def test_a_single_ear_is_only_a_suggestion():
     [item] = [i for i in review["items"] if i["kind"] == "heard_different"]
     assert item["required"] is False
     assert review["required_count"] == 0
+    # Un solo oído acierta el lugar, casi nunca el texto: se escucha, no se
+    # corrige con su versión.
+    assert item["listen"] is True
+    assert item["title"] == "Escuchá este tramo"
+    assert "estilo" in item["why"]
+
+
+def test_a_single_ear_never_rewrites_chilean_slang():
+    # El Cigarrito (Víctor Jara): "que no pito" es "fumo"; el testigo oyó
+    # "pido" y "de habara" donde se canta "de a vara" (pedido #122).
+    lines = [("Lo más cierto es que no pito", 30.0), ("Prendo un cigarro de a vara", 90.0),
+             ("Y me voy a trabajar", 95.0)]
+    segs = [_line(t, s, s + 3, f"s{k}") for k, (t, s) in enumerate(lines)]
+    witness = _words("Lo más cierto es que no pido", 30.0) + _words("Prendo un cigarro de habara", 90.0) \
+        + _words("Y me voy a trabajar", 95.0)
+    review = build_review(segs, original_segments=segs, machine_evidence=_evidence(witness), title="El Cigarrito")
+    items = [i for i in review["items"] if i["kind"] == "heard_different"]
+    assert [i["occurrences"][0]["before"] for i in items] == ["Lo más cierto es que no pito"]
+    assert items[0]["listen"] is True and items[0]["required"] is False
 
 
 def test_a_word_a_person_already_changed_is_not_forced_back():

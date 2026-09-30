@@ -59,6 +59,25 @@ function Diff({ occurrence }) {
   );
 }
 
+// Un solo oído automático: la línea tal cual, con las palabras dudosas
+// subrayadas. Su versión va en el "por qué", nunca como arreglo.
+function Doubt({ occurrence }) {
+  const base = "text-[17px] leading-relaxed text-white";
+  if (!occurrence.before) return <p className={base}>{occurrence.after}</p>;
+  return (
+    <p className={base}>
+      {diffTokens(occurrence.before, occurrence.after).filter((part) => part.op !== "ins").map((part, i) => (
+        <span key={`${part.op}-${i}`}>
+          {i > 0 && " "}
+          {part.op === "same"
+            ? part.text
+            : <span className="underline decoration-amber-200/70 decoration-dotted decoration-2 underline-offset-4">{part.before || part.text}</span>}
+        </span>
+      ))}
+    </p>
+  );
+}
+
 function Kbd({ children, dark = false }) {
   return (
     <kbd className={`ml-2 hidden rounded px-1 font-sans text-[10px] font-semibold sm:inline ${dark
@@ -101,7 +120,7 @@ function ActiveCard({ item, failed, playing, onPlay, onApply, onDismiss, onEdit 
           <Icon path={playing ? STOP : PLAY} className="h-3 w-3" />{formatTime(item.start)}
         </button>
       </div>
-      <div className="mt-2.5"><Diff occurrence={occurrence} /></div>
+      <div className="mt-2.5">{item.listen ? <Doubt occurrence={occurrence} /> : <Diff occurrence={occurrence} />}</div>
       {item.why && <p className="mt-1 text-xs text-white/50">{item.why}</p>}
       {failed && (
         <p role="alert" className="mt-2 text-xs text-rose-200">
@@ -109,9 +128,10 @@ function ActiveCard({ item, failed, playing, onPlay, onApply, onDismiss, onEdit 
         </p>
       )}
       <div className="mt-4 flex flex-wrap items-center gap-2">
-        <button type="button" onClick={() => onApply(item)}
+        <button type="button" onClick={() => (item.listen ? onPlay(item) : onApply(item))}
           className="inline-flex h-10 items-center rounded-button bg-brand px-4 text-sm font-semibold text-white shadow-lg shadow-brand/20 transition-colors hover:bg-brand-light focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70 sm:h-9">
-          {item.action || "Corregir"}<Kbd dark>Enter</Kbd>
+          {item.listen && <Icon path={playing ? STOP : PLAY} className="mr-1.5 h-3 w-3" />}
+          {item.listen ? (playing ? "Detener" : "Escuchar") : (item.action || "Corregir")}<Kbd dark>Enter</Kbd>
         </button>
         <button type="button" onClick={() => onDismiss(item)} className={ghost}>
           {item.dismiss || "Está bien así"}<Kbd>⌫</Kbd>
@@ -138,7 +158,7 @@ function QueueRow({ item, onSelect }) {
         className="flex w-full items-center gap-3 rounded-lg px-2 py-1.5 text-left text-xs transition-colors hover:bg-white/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-light">
         <span className="w-9 shrink-0 tabular-nums text-white/50">{formatTime(item.start)}</span>
         <span className="shrink-0 text-white/80">{item.title}</span>
-        <span className="min-w-0 flex-1 truncate text-white/50">{occurrence.after || occurrence.before}</span>
+        <span className="min-w-0 flex-1 truncate text-white/50">{item.listen ? occurrence.before : occurrence.after || occurrence.before}</span>
         {item.occurrences.length > 1 && <span className="shrink-0 tabular-nums text-white/50">×{item.occurrences.length}</span>}
         {!item.required && <span className="shrink-0 text-[10px] text-white/50">sugerencia</span>}
       </button>
@@ -189,7 +209,7 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
   const lastAction = useRef(0);
 
   const visible = useMemo(
-    () => (showSuggestions || !required.length ? [...required, ...suggested] : required),
+    () => (showSuggestions ? [...required, ...suggested] : required),
     [required, suggested, showSuggestions],
   );
   const active = visible.find((item) => item.id === activeId) || visible[0] || null;
@@ -242,7 +262,10 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
     if (key === "?") setShowHelp((v) => !v);
     else if (key === "z" && canUndo) decide(onUndo);
     else if (!active) handled = false;
-    else if ((key === "enter" && !onButton) || key === "a") decide(() => onApply(active));
+    else if ((key === "enter" && !onButton) || key === "a") {
+      if (active.listen) onPlay(active);
+      else decide(() => onApply(active));
+    }
     else if (key === "backspace" || key === "n") decide(() => onDismiss(active));
     else if (["1", "2", "3"].includes(key) && active.alternatives?.[Number(key) - 1]) {
       decide(() => onApply(active, active.alternatives[Number(key) - 1]));
@@ -345,16 +368,16 @@ const LyricReviewPanel = forwardRef(function LyricReviewPanel({
       <footer className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-white/[0.06] px-4 py-2.5 text-xs">
         {status
           ? <p data-testid="lyric-review-status" className="min-w-0 truncate text-ink-secondary">{status}</p>
-          : !active && <p className="text-white/50">Sin puntos para revisar en esta letra.</p>}
+          : !active && !suggested.length && <p className="text-white/50">Sin puntos para revisar en esta letra.</p>}
         <div className="ml-auto flex flex-wrap items-center gap-x-3 gap-y-1">
           {canUndo && (
             <button type="button" onClick={() => decide(onUndo)} className={`inline-flex items-center gap-1 ${link}`}>
               <Icon path={UNDO} className="h-3 w-3" />Deshacer<Kbd>Z</Kbd>
             </button>
           )}
-          {suggested.length > 0 && required.length > 0 && (
+          {suggested.length > 0 && (
             <button type="button" onClick={() => setShowSuggestions((v) => !v)} className={link}>
-              {showSuggestions ? "Ocultar sugerencias" : `Ver ${suggested.length} ${suggested.length === 1 ? "sugerencia" : "sugerencias"} (no bloquean)`}
+              {showSuggestions ? "Ocultar sugerencias" : `Ver ${suggested.length} ${suggested.length === 1 ? "sugerencia" : "sugerencias"} (${required.length ? "no bloquean" : "opcional"})`}
             </button>
           )}
           {onOpenOfficial && (

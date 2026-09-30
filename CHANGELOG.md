@@ -3,6 +3,25 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- Revisión rápida no longer proposes a single automatic ear's text as a fix.
+  On staging "El Cigarrito" it offered "pito → pido" (Chilean slang) and
+  "de a vara → de habara". Measured over 298 approved songs, single-ear
+  points were ~1 false alarm per song and, on the 136 UMG change requests,
+  found the right place 48 times but the right text only 6. They now read
+  "Escuchá este tramo": the line stays as is, the doubtful words are
+  underlined, the ear's version goes in the reason, and Enter plays the
+  audio instead of applying anything.
+- Differences that are the same sound cut differently ("a vara"/"habara")
+  are no longer raised unless the official lyrics say so.
+- Timing suggestions left the panel (52 alerts, 1 real request); timing is
+  reviewed in "Ajustar tiempos".
+- When nothing blocks approval, suggestions stay behind "Ver N sugerencias
+  (opcional)" instead of taking the main card.
+
 ## [1.1.76] - 2026-09-30
 
 ### Added

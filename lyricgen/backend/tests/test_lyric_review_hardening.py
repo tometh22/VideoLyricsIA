@@ -160,15 +160,15 @@ def test_layout_follows_the_official_line_breaks():
     assert item["occurrences"][0]["fix"]["lines"][1]["text"] == "Quiero verte a solas otra vez"
 
 
-def test_line_that_leaves_before_the_last_word_suggests_a_longer_end():
+def test_timing_is_not_part_of_the_quick_review():
+    # 298 canciones aprobadas: 52 avisos de timing, 1 pedido real. El timing
+    # se revisa en "Ajustar tiempos".
     words = _words("Debo cuidarme de caer en el brasero", 60.0, step=0.4)
     screen = [_line("Debo cuidarme de caer en el brasero", 60.0, 61.8, "a"),
               _line("Otra línea", 66.0, 68.0, "b")]
     machine = [dict(screen[0], words=words), screen[1]]
     review = build_review(screen, original_segments=machine, machine_evidence=_ev(words))
-    [item] = [i for i in review["items"] if i["kind"] == "timing"]
-    assert item["required"] is False
-    assert item["occurrences"][0]["fix"]["end"] > 62.5
+    assert not [i for i in review["items"] if i["kind"] == "timing"]
 
 
 def test_chorus_propagation_keeps_the_corrected_punctuation():

@@ -173,6 +173,17 @@ def _seg_id(segments: list[dict], index: int | None) -> str | None:
     return str(value) if value else None
 
 
+def _same_sound(a: str, b: str) -> bool:
+    """«a vara» y «habara», «recójala» y «recójalá»: mismo sonido cortado o
+    escrito distinto. Un oído no puede distinguirlos."""
+    return sound("".join(_words(a))) == sound("".join(_words(b)))
+
+
+def _listen_hint(sources: Iterable[str], heard: str) -> str:
+    name = SOURCE_LABELS.get(next(iter(sources), ""), "otra transcripción")
+    return f"Sólo {name} oyó «{heard.strip()}»; con modismos y nombres suele equivocarse."
+
+
 def _why(sources: Iterable[str]) -> str:
     names = [SOURCE_LABELS[s] for s in ("official", "gemini", "witness", "machine", "memory")
              if s in set(sources)]
@@ -1104,6 +1115,9 @@ def build_review(
             continue
         if block["spelling_only"] and "official" not in sources:
             continue  # "urgo"/"hurgo" sólo lo decide la letra oficial
+        if block["fix"]["type"] == "replace" and "official" not in sources and \
+                _same_sound(block["fix"]["find"], block["fix"]["replace"]):
+            continue  # "de a vara" / "de habara": el mismo sonido, otro corte
         only_function = all(t in _FUNCTION for t in block["diff_heard"] + block["diff_screen"])
         if len(sources) < 2 and only_function and not (only_official and same_version):
             continue
@@ -1112,6 +1126,18 @@ def build_review(
         # pedido del cliente), no se la obliga a volver a decidir: sugerencia.
         edited = block["fix"]["type"] == "replace" and \
             _key_text(block["fix"]["find"]) in human_edited.get(block["line"], set())
+        if len(sources) < 2 and not only_official:
+            # Un solo oído automático acierta el lugar pero casi nunca el texto
+            # (pedidos #112-#131: 48 puntos, texto correcto en 6; y ~1 falsa
+            # alarma por canción aprobada). Se ofrece escuchar, no corregir.
+            heard = block["fix"].get("replace") if kind == "heard_different" else block["fix"].get("text")
+            items.append({
+                "kind": kind, "line": block["line"], "required": False, "listen": True,
+                "title": "Escuchá este tramo", "why": _listen_hint(sources, heard or ""),
+                "sources": sources, "fix": block["fix"], "alternatives": [],
+                "action": "Escuchar", "dismiss": "Está bien así",
+            })
+            continue
         items.append({
             "kind": kind, "line": block["line"], "required": len(sources) >= 2 and not edited,
             "title": "Se escucha distinto" if kind == "heard_different" else "Falta texto",
@@ -1130,7 +1156,8 @@ def build_review(
     items.extend(_rule_orphans(segments))
     items.extend(_rule_memory(segments, memory_pairs or {}, witness))
     items.extend(_rule_chorus(segments, original_segments))
-    items.extend(_rule_timing(segments, witness, machine))
+    # _rule_timing no entra: sobre 298 canciones aprobadas dio 52 avisos y
+    # acertó 1 pedido; el timing se revisa en "Ajustar tiempos".
     if same_version and official_ops:
         items.extend(_rule_layout_official(segments, screen, official_tokens, official_ops))
 
@@ -1197,6 +1224,9 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
             per_line[sig] = item
         else:
             prev["sources"] |= set(item.get("sources") or ())
+            if prev.get("listen") and not item.get("listen"):
+                for field in ("listen", "title", "action", "dismiss", "alternatives"):
+                    prev[field] = item.get(field)
             prev["required"] = prev["required"] or item["required"] or (
                 prev["kind"] in {"missing", "heard_different"} and len(prev["sources"]) >= 2)
             if prev["kind"] in {"missing", "heard_different"} and prev["sources"]:
@@ -1225,12 +1255,14 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
                 "dismiss": item.get("dismiss", "Está bien así"),
                 "keys": [key], "occurrences": [occ],
                 "alternatives": item.get("alternatives") or [],
+                "listen": bool(item.get("listen")),
             }
         else:
             g["occurrences"].append(occ)
             g["keys"].append(key)
             g["required"] = g["required"] or bool(item["required"])
             g["sources"] = sorted(set(g["sources"]) | item["sources"])
+            g["listen"] = g["listen"] and bool(item.get("listen"))
     out = []
     for g in grouped.values():
         g["occurrences"].sort(key=lambda o: o["start"])

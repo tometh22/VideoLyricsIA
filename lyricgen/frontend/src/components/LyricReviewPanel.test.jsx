@@ -71,6 +71,9 @@ describe("LyricReviewPanel", () => {
 
   it("picks another option with its number", () => {
     const props = renderPanel([suggestion]);
+    expect(screen.getByTestId("lyric-review-heading").textContent).toBe("Todo listo para aprobar");
+    expect(screen.queryByTestId("lyric-review-active")).toBeNull();
+    fireEvent.click(screen.getByText("Ver 1 sugerencia (opcional)"));
     fireEvent.keyDown(screen.getByTestId("lyric-review-panel"), { key: "1" });
     expect(props.onApply).toHaveBeenCalledWith(suggestion, suggestion.alternatives[0]);
   });
@@ -81,6 +84,26 @@ describe("LyricReviewPanel", () => {
     renderPanel([question]);
     const removed = [...document.querySelectorAll("del")].map((node) => node.textContent);
     expect(removed).toEqual(["¿", "?"]);
+  });
+
+  it("asks to listen when only one ear disagrees, never applying its text", () => {
+    const listen = { ...suggestion, id: "l", listen: true, title: "Escuchá este tramo", alternatives: [],
+      why: "Sólo el testigo oyó «pido»", occurrences: [occurrence("Lo más cierto es que no pito",
+        "Lo más cierto es que no pido", { type: "replace", find: "pito", replace: "pido" })] };
+    const props = renderPanel([missing, listen]);
+    const panel = screen.getByTestId("lyric-review-panel");
+    fireEvent.click(screen.getByText("Ver 1 sugerencia (no bloquean)"));
+    fireEvent.click(screen.getByText("Lo más cierto es que no pito"));
+    expect(screen.getByTestId("lyric-review-active").textContent).not.toMatch(/pido\s*$/);
+    expect(screen.queryByText("pido")).toBeNull();
+    let now = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => (now += 1000));
+    fireEvent.keyDown(panel, { key: "Enter" });
+    expect(props.onPlay).toHaveBeenCalledWith(expect.objectContaining({ id: "l" }));
+    expect(props.onApply).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /^Escuchar\s*Enter$/ }));
+    expect(props.onApply).not.toHaveBeenCalled();
+    clock.mockRestore();
   });
 
   it("keeps a failed fix on screen with a way out", () => {
