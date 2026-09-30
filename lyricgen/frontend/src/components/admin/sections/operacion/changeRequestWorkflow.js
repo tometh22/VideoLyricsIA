@@ -454,8 +454,8 @@ export function describePublishError(error) {
   }
   if (has("publication_storage_unavailable")) {
     return byPublicationMode({
-      snapshot: "No se pudieron copiar los archivos al portal. El portal conserva la versión anterior; reintentá en un minuto.",
-      pointer: "No se pudo preparar la publicación. Reintentá en un minuto.",
+      snapshot: "No pudimos verificar los archivos del video antes de publicar. El portal conserva la versión anterior; reintentá en un minuto.",
+      pointer: "No pudimos verificar los archivos del video antes de publicar. Reintentá en un minuto.",
     });
   }
   if (has("prores_required", "prores_stale_without_spec")) {
@@ -464,7 +464,8 @@ export function describePublishError(error) {
   if (status === 403) return "Tu usuario no tiene permiso para publicar. Pedile a un administrador que lo haga.";
   if (status === 404) return "No encontramos el video o el pedido. Actualizá la pantalla.";
   if (status === 409) return "El video cambió mientras se publicaba. Actualizá y reintentá.";
-  const reason = typeof detail === "string" && detail.includes(" ") ? detail : (error?.message || code);
+  const rawReason = typeof detail === "string" && detail.includes(" ") ? detail : (error?.message || code);
+  const reason = String(rawReason || "").replace(/[.\s]+$/, "");
   const tag = [status ? `HTTP ${status}` : "", code && !code.includes(" ") ? code : ""].filter(Boolean).join(" · ");
   return `No se pudo publicar${tag ? ` (${tag})` : ""}${reason && reason !== code ? `: ${reason}` : ""}. Actualizá la pantalla y reintentá; si se repite, avisá al equipo con el número del pedido.`;
 }

@@ -6,6 +6,7 @@ import ChangeRequestsPanel, {
   editorUrlWithRequest,
   publicationStatus,
 } from "./ChangeRequestsPanel";
+import { setPublicationMode } from "./publicationMode";
 
 vi.mock("../../../../i18n", () => ({
   useI18n: () => ({ t: (key) => key }),
@@ -492,6 +493,39 @@ describe("ChangeRequestsPanel", () => {
     expect(close).toBeEnabled();
     fireEvent.click(close);
     expect(resolve).toHaveBeenCalledWith(7, "Cliente confirmó que no requiere otro video");
+  });
+
+  it("never runs the PRIMARY action (publishing) from Ctrl+Enter on a focused secondary button", () => {
+    const publish = vi.fn();
+    renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true } }, { publishDeliveryUpdate: publish });
+    fireEvent.click(screen.getByRole("button", { name: "Cerrar sin publicar" }));
+    fireEvent.change(screen.getByLabelText("Motivo del cierre sin publicar"), { target: { value: "No requiere otro video" } });
+    fireEvent.keyDown(screen.getByRole("button", { name: "Confirmar cierre" }), { key: "Enter", ctrlKey: true });
+    fireEvent.keyDown(screen.getByRole("button", { name: "Cerrar sin publicar" }), { key: "Enter", metaKey: true });
+    expect(publish).not.toHaveBeenCalled();
+    fireEvent.keyDown(document.body, { key: "Enter", ctrlKey: true });   // the shortcut still works from the page
+    expect(publish).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not carry an open close-form over to another request", () => {
+    const other = { ...REQUEST, id: 9, delivery: { ...REQUEST.delivery, song: "Otra canción distinta" } };
+    renderPanelItems([REQUEST, other]);
+    fireEvent.click(screen.getByRole("button", { name: "Cerrar sin publicar" }));
+    expect(screen.getByLabelText("Motivo del cierre sin publicar")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Otra canción distinta"));
+    expect(screen.queryByLabelText("Motivo del cierre sin publicar")).not.toBeInTheDocument();
+  });
+
+  it("words the render-submitted notice by the publication mode known AFTER the first render", () => {
+    window.history.replaceState({}, "", "/admin?section=cambios&change_request_id=7&render_submitted=1");
+    setPublicationMode("pointer");
+    try {
+      renderPanel();
+      expect(screen.getByRole("status")).toHaveTextContent(/el cliente verá el video nuevo apenas termine/);
+      expect(screen.getByRole("status")).not.toHaveTextContent(/conserva el corte anterior/);
+    } finally {
+      setPublicationMode("snapshot");
+    }
   });
 
   it("does not override server action restrictions with a legacy publication flag", () => {

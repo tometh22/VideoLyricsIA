@@ -57,6 +57,10 @@ export function SendToPortalDialog({ campaignId, kind = "lyric_video", videos, d
         ...selection, destination_portal: portal, idempotency_key: keys.get(signature),
         ...(closing ? { resolve_requests: resolve, ...(note.trim() ? { resolution_note: note.trim() } : {}) } : {}),
       });
+      // The key exists to make a LOST response safe to retry. Once the operation
+      // is confirmed, forget it: sending the same selection later (after a partial
+      // failure, or a re-render of the same job) is a new send, not a replay.
+      keys.delete(signature);
       onStarted?.(operation, portal, ids.length);
     } catch (sendError) {
       setError(sendError.code === "change_request_not_closable"

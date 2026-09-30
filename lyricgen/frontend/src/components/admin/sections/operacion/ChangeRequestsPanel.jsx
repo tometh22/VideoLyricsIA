@@ -205,15 +205,12 @@ export default function ChangeRequestsPanel({
     return params.get("change_request_id") || params.get("request");
   }, []);
   const [selectedId, setSelectedId] = useState(initialRequestId);
-  const [returnNotice, setReturnNotice] = useState(() => {
-    if (typeof window === "undefined") return null;
-    return new URLSearchParams(window.location.search).get("render_submitted") === "1"
-      ? byPublicationMode({
-        snapshot: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el portal conserva el corte anterior hasta que lo publiques.",
-        pointer: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el cliente verá el video nuevo apenas termine.",
-      })
-      : null;
-  });
+  // Only the FACT is stored; the wording depends on the publication mode, which
+  // the list load sets after this first render, so it is chosen when rendering.
+  const [returnNotice, setReturnNotice] = useState(() => (
+    typeof window !== "undefined"
+    && new URLSearchParams(window.location.search).get("render_submitted") === "1"
+  ));
   const setDraft = (id, val) => setDrafts((d) => ({ ...d, [id]: val }));
 
   const filterOptions = [
@@ -336,8 +333,11 @@ export default function ChangeRequestsPanel({
 
       {returnNotice && (
         <div role="status" className="flex items-start justify-between gap-3 rounded-xl bg-sky-500/[0.08] p-3 text-caption text-sky-100 ring-1 ring-sky-400/20">
-          <span>{returnNotice}</span>
-          <button type="button" onClick={() => setReturnNotice(null)} className="shrink-0 text-label opacity-70 hover:opacity-100">
+          <span>{byPublicationMode({
+            snapshot: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el portal conserva el corte anterior hasta que lo publiques.",
+            pointer: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el cliente verá el video nuevo apenas termine.",
+          })}</span>
+          <button type="button" onClick={() => setReturnNotice(false)} className="shrink-0 text-label opacity-70 hover:opacity-100">
             Cerrar
           </button>
         </div>
@@ -510,6 +510,8 @@ function ChangeRequestCard({
   // acción con su handler o su enlace.
   const [closeOpen, setCloseOpen] = useState(false);
   const closeRef = useRef(null);
+  // A different request, or this one resolved/reopened, never inherits an open form.
+  useEffect(() => { setCloseOpen(false); }, [item.id, isResolved]);
   const view = correctionSteps(workflow, {
     isResolved,
     hasJob: Boolean(d.job_id),
@@ -546,7 +548,9 @@ function ChangeRequestCard({
   useEffect(() => {
     const handleShortcut = (event) => {
       if (!(event.metaKey || event.ctrlKey) || event.key !== "Enter") return;
-      if (event.defaultPrevented || event.target?.closest?.("input, textarea, select, [contenteditable='true'], [role='dialog']")
+      // A focused button/link owns the keypress (for example "Confirmar cierre"):
+      // the shortcut must never run the PRIMARY action, which may be publishing.
+      if (event.defaultPrevented || event.target?.closest?.("input, textarea, select, button, a, summary, [contenteditable='true'], [role='dialog']")
         || document.querySelector("[role='dialog'][aria-modal='true']")) return;
       if (primaryAction.disabled) return;
       event.preventDefault();

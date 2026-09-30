@@ -552,7 +552,10 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     mutationLocksRef.current.add(lock);
     setCrPublishingId(crId ?? jobId);
     setCrPublishNotice({ requestId: crId, tone: "wait",
-      text: "Publicando en UMG… Estamos verificando y copiando los archivos. No vuelvas a publicar mientras termina." });
+      text: byPublicationMode({
+        snapshot: "Publicando en UMG… Estamos verificando y copiando los archivos. No vuelvas a publicar mientras termina.",
+        pointer: "Publicando en UMG… Estamos registrando la nueva versión. No vuelvas a publicar mientras termina.",
+      }) });
     try {
       let data;
       try {

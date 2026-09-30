@@ -62,4 +62,19 @@ describe("send to portal: closing client requests", () => {
     expect(await screen.findByText(/ya no se puede cerrar con este envío/)).toBeInTheDocument();
     expect(onStarted).not.toHaveBeenCalled();
   });
+
+  it("forgets the idempotency key once the send is confirmed, but keeps it after a failure", async () => {
+    const keys = new Map();
+    let fail = true;
+    vi.stubGlobal("fetch", vi.fn(async () => (fail ? json({ detail: "boom" }, 500) : json({ operation_id: "op-1", total_count: 2, scheduled: true }, 202))));
+    const onStarted = vi.fn();
+    render(<SendToPortalDialog campaignId="c1" videos={videos} lockedPortal="chile" idempotencyKeys={keys} onClose={vi.fn()} onStarted={onStarted} />);
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar envío" }));
+    await screen.findByText(/boom|Error 500/);
+    expect(keys.size).toBe(1);             // a lost/failed response can be replayed with the same key
+    fail = false;
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar envío" }));
+    await waitFor(() => expect(onStarted).toHaveBeenCalled());
+    expect(keys.size).toBe(0);             // a confirmed send is over: the next one is a new operation
+  });
 });

@@ -39,6 +39,19 @@ const EMPTY = {
   discarded: ["No hay canciones descartadas", ""],
 };
 
+/**
+ * What the client actually sees for songs whose current cut is newer than the
+ * published one. Decided PER SONG: a delivery that still has a frozen copy keeps
+ * serving the old cut even while others follow the newest render.
+ */
+export function outdatedWording(songs) {
+  const outdated = songs.filter((song) => song.portal_outdated);
+  const latest = outdated.filter((song) => song.portal_serves_latest).length;
+  if (!outdated.length || latest === 0) return "el portal del cliente sigue mostrando el anterior.";
+  if (latest === outdated.length) return "el cliente ya descarga el archivo nuevo, pero falta registrar la versión y reiniciar su aprobación.";
+  return `${latest} ya ${latest === 1 ? "descarga" : "descargan"} el archivo nuevo (falta registrar la versión) y ${outdated.length - latest} ${outdated.length - latest === 1 ? "sigue mostrando" : "siguen mostrando"} la versión anterior.`;
+}
+
 function isTyping(target) {
   return Boolean(target?.closest?.("input, textarea, select, [contenteditable=true]"));
 }
@@ -379,9 +392,7 @@ export default function CampaignDetailPage({ id }) {
         setView("approved"); setSelected(new Set(ids));
       }} />}
     {outdatedCount > 0 && view !== "config" && view !== "changes" && <Banner tone="warning" action={<Button size="sm" onClick={() => updateParams({ view: null, portal: "outdated", song: null, focus: null }, { push: true })}>Ver {outdatedCount === 1 ? "la canción" : "las canciones"}</Button>}>
-      <strong>{outdatedCount}</strong> {outdatedCount === 1 ? "canción tiene" : "canciones tienen"} un corte nuevo que todavía no se envió: {pipe.data?.publication_mode === "pointer"
-        ? "el cliente ya descarga el archivo nuevo, pero falta registrar la versión y reiniciar su aprobación."
-        : "el portal del cliente sigue mostrando el anterior."}
+      <strong>{outdatedCount}</strong> {outdatedCount === 1 ? "canción tiene" : "canciones tienen"} un corte nuevo que todavía no se envió: {outdatedWording(songs)}
     </Banner>}
     {pipe.data && pipe.data.portal_status_available === false && <Banner tone="warning">No pudimos consultar el portal del cliente: por ahora las entregas figuran como aprobadas.</Banner>}
     {pipe.error && known && <Banner tone="danger" action={<Button size="sm" onClick={refresh}>Reintentar</Button>}>No se pudo actualizar el estado: {pipe.error.message}</Banner>}
@@ -441,6 +452,10 @@ export default function CampaignDetailPage({ id }) {
       onClose={() => setDialog(null)} onStarted={(operation, portal, total) => {
         setDialog(null); setSelected(new Set());
         updateParams({ delivery_op: operation.operation_id }, { push: true });
+        if (operation.deduplicated) {
+          setFlash({ tone: "info", text: "Ese envío ya estaba en curso: lo retomamos, no se creó otro." });
+          return;
+        }
         const target = `${operation.total_count || total} ${total === 1 ? "video" : "videos"} a ${portal === "chile" ? "Chile" : portal === "argentina" ? "Argentina" : portal}`;
         setFlash(operation.scheduled === false
           ? { tone: "warning", text: `El envío de ${target} quedó guardado, pero no pudimos ponerlo en cola. Usá «Reintentar» en el seguimiento del envío.` }

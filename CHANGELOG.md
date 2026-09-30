@@ -3,6 +3,29 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.86] - 2026-09-30
+
+### Changed
+
+- Admin > Cambios UMG shows a three-step correction flow (Corregir, Generar el
+  video nuevo, Publicar) with ONE primary button per state named after what it
+  does ("Corregir en el editor", "Generar el video corregido", "Publicar en el
+  portal y dar por resuelto"). AI suggestions become an optional helper,
+  closing without publishing is a small collapsed link that still requires a
+  reason, and publication errors explain what happened and what to do instead
+  of the generic "El servidor no aceptó la publicación". QC/preflight wording
+  only appears when the gate is actually blocking.
+- The client change inbox in campaigns shows the same three steps per request.
+- Wording about what the client sees follows `publication_mode`: it no longer
+  says "the portal keeps the previous cut" when the portal serves the newest
+  render, and the campaign banner and chips are decided per song.
+- Review fixes: Ctrl/Cmd+Enter on a focused secondary button no longer runs the
+  primary action (publishing); the "render submitted" notice picks its wording
+  after the publication mode is known; a confirmed portal send forgets its
+  idempotency key and a deduplicated one says so; a retry the server refuses is
+  explained in words and only offered once the send stopped or stalled; an open
+  close-form is not inherited by another request.
+
 ## [1.1.85] - 2026-09-30
 
 ### Fixed
