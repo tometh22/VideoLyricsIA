@@ -1000,7 +1000,7 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                 previous_publication = {'job_id': active.job_id, 'revision': active.published_revision,
                                         'file_keys': active.published_file_keys} if replaced_job_id else None
                 changed = bool(replaced_job_id) or (delivery_freshness.needs_publish(job, active) if active else False)
-                from delivery_snapshots import copy_snapshot
+                from delivery_snapshots import copy_snapshot, latest_pointer_enabled
                 pinned = active.published_file_keys if active and not changed and active.file_types == delivery_file_types else None
                 try:
                     if not pinned:
@@ -1011,7 +1011,7 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                         # transactions. Multi-GB copies exceed DB idle limits.
                         ddb.commit()
                         db.commit()
-                        pinned = copy_snapshot(tenant, jid, delivery_file_types)
+                        pinned = None if latest_pointer_enabled() else copy_snapshot(tenant, jid, delivery_file_types)
                         row = db.query(DeliveryBatchItem).filter_by(id=item_id).populate_existing().with_for_update().one()
                         if row.status == 'sent':
                             continue

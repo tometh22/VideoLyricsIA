@@ -190,6 +190,8 @@ def _snapshot(
         if item_id:
             lineage_by_item[item_id].append(job)
 
+    from delivery_snapshots import latest_pointer_enabled
+    serves_latest = latest_pointer_enabled()
     counts = {stage: 0 for stage in ALL_STAGES}
     flags: dict[str, Any] = {
         "portal_outdated": 0, "change_requests": 0, "metadata_missing": 0, "upload_errors": 0,
@@ -307,6 +309,9 @@ def _snapshot(
             ],
             "portals": portals,
             "portal_outdated": outdated,
+            # In pointer mode the portal already serves the newest render, so an
+            # 'outdated' song means "registration pending", not "client sees old".
+            "portal_serves_latest": serves_latest,
             "portal_updating": updating,
             "published_other_version": published_other and not published_current,
             "pending_change_requests": change_requests,
@@ -314,6 +319,7 @@ def _snapshot(
 
     flags["oldest_change_request_at"] = _iso(oldest_request)
     total = len(items)
+    publication_mode = "pointer" if serves_latest else "snapshot"
     snapshot: dict[str, Any] = {
         "campaign_id": campaign.id,
         "kind": kind,
@@ -322,6 +328,7 @@ def _snapshot(
         "counts": counts,
         "flags": flags,
         "portal_status_available": portal_available,
+        "publication_mode": publication_mode,
         "stages": list(STAGES),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

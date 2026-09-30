@@ -113,7 +113,9 @@ export default function SongDrawer({ song, kind, campaignId, canManage, portalSe
           <h3 className="text-xs font-semibold uppercase tracking-wider text-ink-secondary">Portal del cliente</h3>
           <div className="flex flex-wrap gap-1.5">
             {song.portals?.map((portal) => <Chip key={portal} tone="brand">En {portalLabel(portal)}</Chip>)}
-            {song.portal_outdated && <Chip tone="danger">Portal desactualizado: entrega un corte anterior</Chip>}
+            {song.portal_outdated && (song.portal_serves_latest
+              ? <Chip tone="warning">Corte nuevo sin registrar: el cliente ya descarga el archivo nuevo</Chip>
+              : <Chip tone="danger">Portal desactualizado: entrega un corte anterior</Chip>)}
             {song.pending_change_requests > 0 && <Chip tone="warning">{song.pending_change_requests} {song.pending_change_requests === 1 ? "cambio pedido" : "cambios pedidos"}</Chip>}
           </div>
         </section>}

@@ -1,7 +1,20 @@
-"""Fail-closed publication snapshots, with an atomic DB pointer switch."""
+"""Publication of deliverables: frozen snapshots, or a pointer to the latest render.
+
+Two modes, chosen by ``PUBLISH_LATEST_POINTER``:
+
+* off (default): every publication COPIES the files into immutable
+  ``.published-<uuid>`` objects (minutes and several GB per portal) and the
+  portal serves that frozen copy. Fail-closed, but slow and duplicated.
+* on: publishing copies nothing. ``published_file_keys`` stays NULL and the
+  portal serves the job's current render directly, so the newest cut is always
+  what the client downloads and a publication is a few database writes.
+"""
+import os
 from uuid import uuid4
 
 import storage
+
+PRORES_TYPES = frozenset({'umg_master', 'umg_short'})
 
 FILENAMES = {'video': 'lyric_video.mp4', 'short': 'short.mp4',
              'thumbnail': 'thumbnail.jpg', 'umg_master': 'umg_master.mov',
@@ -12,11 +25,23 @@ def working_key(tenant, job_id, file_type):
     return storage._object_key(tenant, job_id, FILENAMES[file_type])
 
 
+def latest_pointer_enabled() -> bool:
+    """Publish without copying; serve the job's newest render (see module doc)."""
+    return os.environ.get('PUBLISH_LATEST_POINTER', '').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
 def portal_key(delivery, file_type):
     keys = getattr(delivery, 'published_file_keys', None)
     if keys is not None:
         # A partial snapshot must not leak through to a newer working cut.
         return keys.get(file_type)
+    if latest_pointer_enabled() and file_type in PRORES_TYPES:
+        # A re-render leaves the PREVIOUS broadcast master in R2 until the new
+        # one is transcoded. While the delivery is marked in flight, serving
+        # that key would hand the client the old cut next to a new MP4.
+        from delivery_freshness import STALE_IN_FLIGHT
+        if getattr(delivery, 'stale_since', None) and getattr(delivery, 'stale_reason', None) in STALE_IN_FLIGHT:
+            return None
     return working_key(delivery.tenant_snapshot, delivery.job_id, file_type)
 
 
@@ -70,7 +95,13 @@ def pin_legacy_deliveries(job_id):
 
     Never replace a pinned pointer: Argentina and Chile may have approved
     different cuts. Partial copies are harmless unreferenced objects.
+
+    Pointer mode never freezes anything: the portal is meant to follow the
+    newest render, so there is nothing to conserve (and no multi-GB copy to
+    run before every re-render).
     """
+    if latest_pointer_enabled():
+        return
     from database import Delivery, scoped_deliveries_db
     with scoped_deliveries_db() as db:
         rows = (db.query(Delivery).filter(Delivery.job_id == job_id,

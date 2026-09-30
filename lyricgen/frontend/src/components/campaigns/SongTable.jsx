@@ -33,7 +33,8 @@ function StageDetail({ song }) {
     chips.push(<Chip key="g" tone="info">{song.creative.assignment?.group_name || "Estilo base"}</Chip>);
   }
   if (song.portals?.length) chips.push(<Chip key="portal" tone="brand">En {song.portals.map(portalLabel).join(" y ")}</Chip>);
-  if (song.portal_outdated) chips.push(<Chip key="old" tone="danger" title="Se volvió a renderizar después de publicarla: el portal sigue entregando el corte anterior.">Portal desactualizado</Chip>);
+  if (song.portal_outdated && song.portal_serves_latest) chips.push(<Chip key="old" tone="warning" title="Se volvió a renderizar después de la última publicación. El cliente ya descarga el archivo nuevo, pero falta registrar la versión y reiniciar su aprobación.">Corte nuevo sin registrar</Chip>);
+  else if (song.portal_outdated) chips.push(<Chip key="old" tone="danger" title="Se volvió a renderizar después de publicarla: el portal sigue entregando el corte anterior.">Portal desactualizado</Chip>);
   if (song.published_other_version) chips.push(<Chip key="other" tone="info">Otra versión publicada</Chip>);
   if (song.pending_change_requests) chips.push(<Chip key="cr" tone="warning">{song.pending_change_requests} {song.pending_change_requests === 1 ? "cambio pedido" : "cambios pedidos"}</Chip>);
   if (song.current_is_variant) chips.push(<Chip key="var">Variante</Chip>);
