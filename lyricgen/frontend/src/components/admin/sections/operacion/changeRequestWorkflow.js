@@ -334,7 +334,8 @@ export function correctionPrimary(workflow, ctx = {}) {
 /** Enlaces chicos bajo el botón principal. Nunca repiten lo que ya hace el principal. */
 export function correctionSecondary(workflow, primary, ctx = {}) {
   const {
-    isResolved = false, hasJob = true, effectiveProposal = null, proposalEnabled = false, busy = {},
+    isResolved = false, hasJob = true, effectiveProposal = null, proposalEnabled = false,
+    publication = null, busy = {},
   } = ctx;
   if (isResolved) return [];
   const links = [];
@@ -345,10 +346,18 @@ export function correctionSecondary(workflow, primary, ctx = {}) {
     links.push({ key: "suggest", label: busy.proposal ? SECONDARY_LABELS.suggesting : SECONDARY_LABELS.suggest,
       disabled: Boolean(busy.proposal) });
   }
+  // Camino directo al render cuando el principal es otro (p. ej. revisar
+  // cambios sugeridos pero la letra ya se corrigió a mano).
+  if (workflowAllows(workflow, "review_render") && publication?.can_render
+    && workflow?.key !== "rendering" && primary.key !== "render") {
+    links.push({ key: "render", label: PRIMARY_LABELS.render, disabled: Boolean(busy.proposal || busy.publishing) });
+  }
   if (hasJob && !["edit", "see_error"].includes(primary.key)) {
     links.push({ key: "edit", label: SECONDARY_LABELS.edit });
   }
-  if (primary.key !== "close") links.push({ key: "close", label: SECONDARY_LABELS.close });
+  if (primary.key !== "close" && workflowAllows(workflow, "resolve")) {
+    links.push({ key: "close", label: SECONDARY_LABELS.close });
+  }
   return links;
 }
 

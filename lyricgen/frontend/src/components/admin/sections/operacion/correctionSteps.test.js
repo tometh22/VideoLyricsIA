@@ -34,7 +34,7 @@ describe("correctionSteps: mapeo de las 5 etapas del servidor a 3 pasos", () => 
       { proposalEnabled: true, effectiveProposal: { status: "applied" } },
       ["done", "active", "todo"], "Generar el video corregido", ["edit", "close"]],
     ["rendering", ["refresh"], { activeStep: 2, tone: "busy" }, {},
-      ["done", "active", "todo"], "Generando el video nuevo…", ["edit", "close"]],
+      ["done", "active", "todo"], "Generando el video nuevo…", ["edit"]],
     ["publish", ["edit", "resolve", "analyze", "publish"], { activeStep: 3 },
       { status: { canPublish: true }, publication: { needs_publish: true } },
       ["done", "done", "active"], "Publicar en el portal y dar por resuelto", ["edit", "close"]],
@@ -48,9 +48,9 @@ describe("correctionSteps: mapeo de las 5 etapas del servidor a 3 pasos", () => 
     ["resolved", ["reopen"], { activeStep: 0, tone: "idle" }, { isResolved: true },
       ["todo", "todo", "todo"], "Reabrir pedido", []],
     ["blocked", ["edit", "refresh"], { activeStep: 2 }, {},
-      ["done", "active", "todo"], "Ver el error", ["close"]],
+      ["done", "active", "todo"], "Ver el error", []],
     ["unknown", ["refresh"], {}, {},
-      ["active", "todo", "todo"], "Actualizar estado", ["edit", "close"]],
+      ["active", "todo", "todo"], "Actualizar estado", ["edit"]],
   ];
 
   it.each(TABLE)("%s (%j)", (key, allowed, extra, ctx, expectedStates, label, secondary) => {
@@ -160,6 +160,17 @@ describe("correctionSteps: una única acción principal", () => {
       .not.toContain("suggest");
     expect(correctionSecondary(flow, primary, { proposalEnabled: true, busy: { proposal: true } })
       .find((l) => l.key === "suggest")).toMatchObject({ label: "Analizando…", disabled: true });
+  });
+
+  it("conserva el camino directo al render y sólo ofrece cerrar si el servidor lo permite", () => {
+    const flow = workflow("apply", ["edit", "resolve", "review_proposal", "review_render"]);
+    const ctx = { publication: { can_render: true } };
+    const primary = correctionPrimary(flow, ctx);
+    expect(primary.key).toBe("review_proposal");
+    expect(correctionSecondary(flow, primary, ctx).map((link) => link.key)).toEqual(["render", "edit", "close"]);
+    expect(correctionSecondary(flow, { key: "render" }, ctx).map((link) => link.key)).not.toContain("render");
+    expect(correctionSecondary(workflow("apply", ["edit", "review_proposal"]), primary, ctx).map((l) => l.key))
+      .not.toContain("close");
   });
 
   it("deshabilita el principal mientras trabaja y conserva el nombre", () => {

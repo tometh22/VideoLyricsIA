@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import ChangeRequestsPanel, {
   appliedTextChecks,
@@ -102,10 +102,11 @@ describe("publicationStatus", () => {
     renderPanel({ publication: { ...BASE_PUBLICATION, prores_pending: ["umg_master"] } }, {
       proposalEnabled: true, generateProposal: generate, publishDeliveryUpdate: publish,
     });
-    fireEvent.click(screen.getByRole("button", { name: "Analizar este pedido" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pedir sugerencia a la IA" }));
+    expect(generate).toHaveBeenCalledTimes(1);
     expect(generate).toHaveBeenCalledWith(7);
-    fireEvent.click(screen.getByRole("button", { name: "Analizar pedido" }));
-    expect(generate).toHaveBeenCalledTimes(2);
+    // La ayuda de la IA es opcional: lo principal es corregir.
+    expect(screen.getByRole("link", { name: "Corregir en el editor" })).toBeInTheDocument();
     expect(publish).not.toHaveBeenCalled();
     expect(screen.queryByText("El video de arriba ya tiene la corrección", { exact: false })).toBeNull();
   });
@@ -139,7 +140,7 @@ describe("publicationStatus", () => {
     expect(status.title).toMatch(/archivo profesional/);
     // Publicar SÍ se ofrece: encola el master y el backend contesta 202.
     expect(status.canPublish).toBe(true);
-    expect(status.publishLabel).toMatch(/Actualizar archivo profesional/);
+    expect(status.publishLabel).toMatch(/Preparar el archivo profesional/);
   });
 
   it("asks for the missing ProRes format on a legacy delivery", () => {
@@ -312,18 +313,20 @@ describe("ChangeRequestsPanel", () => {
 
   it("keeps the editor available while publishing is the primary action", () => {
     renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true } });
-    expect(screen.getByText("Editar letra")).toHaveAttribute(
+    expect(screen.getByText("Editar letra a mano")).toHaveAttribute(
       "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
     );
-    expect(screen.getByRole("button", { name: "Publicar actualización" }))
+    expect(screen.getByRole("button", { name: "Publicar en el portal y dar por resuelto" }))
       .toBeEnabled();
   });
 
   it("keeps the request context when the editor is the primary action", () => {
     renderPanel();
-    expect(screen.getByRole("link", { name: "Editar letra" })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: "Corregir en el editor" })).toHaveAttribute(
       "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
     );
+    // No repite el mismo destino como enlace secundario.
+    expect(screen.queryByText("Editar letra a mano")).not.toBeInTheDocument();
   });
 
   it("keeps the applied proposal context after reloading the request queue", () => {
@@ -332,8 +335,8 @@ describe("ChangeRequestsPanel", () => {
       { proposal: { id: "proposal-1", status: "applied", applied_revision: 5 } },
       { proposalEnabled: true, loadProposal: load },
     );
-    expect(screen.getByRole("button", { name: "Revisar y confirmar render" })).toBeEnabled();
-    expect(screen.getByRole("link", { name: "Editar letra" }))
+    expect(screen.getByRole("button", { name: "Generar el video corregido" })).toBeEnabled();
+    expect(screen.getByRole("link", { name: "Editar letra a mano" }))
       .toHaveAttribute(
         "href",
         "/videos/f7752c6feed4/edit-lyrics?change_request_id=7&proposal_id=proposal-1",
@@ -348,7 +351,7 @@ describe("ChangeRequestsPanel", () => {
     renderPanel({ publication: { ...BASE_PUBLICATION, job_status: "pending_review", prores_pending: ["umg_master"] } },
       { prepareProRes: prepare, publishDeliveryUpdate: publish,
         crPublishNotice: { requestId: 7, tone: "error", text: "La cola no está disponible" } });
-    fireEvent.click(screen.getByRole("button", { name: "Actualizar archivo profesional" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preparar el archivo profesional" }));
     expect(prepare).toHaveBeenCalledWith("f7752c6feed4", 7);
     expect(publish).not.toHaveBeenCalled();
     expect(screen.getByRole("alert").closest("footer")).not.toBeNull();
@@ -375,12 +378,12 @@ describe("ChangeRequestsPanel", () => {
       { publication: { ...BASE_PUBLICATION, needs_publish: true } },
       { publishDeliveryUpdate: publish },
     );
-    fireEvent.click(screen.getByRole("button", { name: "Publicar actualización" }));
+    fireEvent.click(screen.getByRole("button", { name: "Publicar en el portal y dar por resuelto" }));
     expect(publish).toHaveBeenCalledWith("f7752c6feed4", "chile", 7, expect.objectContaining({ needs_publish: true }));
   });
 
   it.each([
-    ["fresh_preflight_required", "Analizar y revisar este corte", "qc_focus=findings"],
+    ["fresh_preflight_required", "Revisar este corte antes de publicar", "qc_focus=findings"],
     ["manual_review_required", "Completar revisión del video", "qc_focus=manual"],
   ])("routes a blocked publication to the required video review (%s)", (reason, label, focus) => {
     const publish = vi.fn();
@@ -396,10 +399,34 @@ describe("ChangeRequestsPanel", () => {
     const review = screen.getByRole("link", { name: label });
     expect(review).toHaveAttribute("href", expect.stringContaining(focus));
     expect(review).toHaveAttribute("href", expect.stringContaining("change_request_id%3D7"));
-    expect(screen.queryByRole("button", { name: "Publicar actualización" })).not.toBeInTheDocument();
-    expect(screen.getByRole("status", { name: "Preflight pendiente" }))
-      .toHaveTextContent(/publicación está pausada/i);
+    expect(screen.queryByRole("button", { name: "Publicar en el portal y dar por resuelto" })).not.toBeInTheDocument();
+    const banner = screen.getByRole("status", { name: "Revisión del video pendiente" });
+    expect(banner).toHaveTextContent(/publicación está pausada/i);
+    expect(banner.textContent).not.toMatch(/preflight|fingerprint|\bQC\b/i);
+    expect(screen.getByText(/en pausa/)).toBeInTheDocument();
     expect(publish).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [undefined, "without a gate"],
+    [{ blocked: false, reason: "manual_review_required" }, "with a gate that does not block"],
+    [{ reason: "fresh_preflight_required" }, "with a gate that never says blocked"],
+  ])("never shows the video-review CTA or banner when the gate is not blocking (%j, %s)", (gate) => {
+    const publish = vi.fn();
+    renderPanel({
+      publication: { ...BASE_PUBLICATION, needs_publish: true },
+      delivery_qc_gate: gate,
+      workflow: {
+        key: "publish", activeStep: 3, label: "Revisar video y publicar actualización",
+        detail: "", tone: "attention", allowed_actions: ["edit", "publish", "resolve"],
+      },
+    }, { publishDeliveryUpdate: publish });
+    expect(screen.queryByRole("link", { name: /Revisar este corte antes de publicar|Completar revisión del video/ }))
+      .not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "Revisión del video pendiente" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/publicación está pausada|en pausa/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Publicar en el portal y dar por resuelto" }));
+    expect(publish).toHaveBeenCalledTimes(1);
   });
 
   it("links a blocked publication to the pending QC review", async () => {
@@ -432,27 +459,30 @@ describe("ChangeRequestsPanel", () => {
       },
       { publishDeliveryUpdate: publish },
     );
-    fireEvent.click(screen.getByRole("button", { name: "Elegir formato y actualizar .mov" }));
+    fireEvent.click(screen.getByRole("button", { name: "Elegir formato y preparar el archivo profesional" }));
     expect(await screen.findByRole("dialog", {
       name: "Configurar y actualizar el archivo profesional",
     })).toBeInTheDocument();
     expect(publish).not.toHaveBeenCalled();
   });
 
-  it("keeps manual resolution available but names it for what it is", () => {
+  it("keeps manual resolution available, collapsed, and names it for what it is", () => {
     renderPanel();
-    // Marcar resuelto sin publicar no cambia el archivo del cliente: la
-    // etiqueta lo dice, para que no se use como si lo hiciera.
-    expect(
-      screen.getByRole("button", { name: "Marcar como resuelto" }),
-    ).toBeInTheDocument();
+    // Cerrar sin publicar no cambia el archivo del cliente: la etiqueta lo
+    // dice, y el formulario queda plegado hasta que se pide.
+    expect(screen.queryByLabelText("Motivo del cierre sin publicar")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cerrar sin publicar" }));
+    expect(screen.getByText("Cierra el pedido en el portal sin generar ni publicar otro video. El cliente ve tu nota."))
+      .toBeInTheDocument();
+    expect(screen.getByLabelText("Motivo del cierre sin publicar").tagName).toBe("TEXTAREA");
   });
 
   it("requires a manual-close motive and ignores the global shortcut inside that field", () => {
     const resolve = vi.fn();
     const generate = vi.fn();
     renderPanel({}, { resolveChangeRequest: resolve, proposalEnabled: true, generateProposal: generate });
-    const close = screen.getByRole("button", { name: "Marcar como resuelto" });
+    fireEvent.click(screen.getByRole("button", { name: "Cerrar sin publicar" }));
+    const close = screen.getByRole("button", { name: "Confirmar cierre" });
     expect(close).toBeDisabled();
     const reason = screen.getByLabelText("Motivo del cierre sin publicar");
     fireEvent.change(reason, { target: { value: "Cliente confirmó que no requiere otro video" } });
@@ -469,7 +499,7 @@ describe("ChangeRequestsPanel", () => {
     renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true },
       workflow: { key: "unknown", activeStep: 0, label: "Falta verificar", detail: "Actualizá", tone: "attention", allowed_actions: ["refresh"] },
     }, { refreshChangeRequests: refresh });
-    expect(screen.queryByRole("button", { name: "Publicar actualización" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Publicar en el portal y dar por resuelto" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Actualizar estado" }));
     expect(refresh).toHaveBeenCalledTimes(1);
   });
@@ -508,7 +538,7 @@ describe("ChangeRequestsPanel", () => {
   it("offers deterministic analysis when the assist flag is enabled", () => {
     const generate = vi.fn();
     renderPanel({}, { proposalEnabled: true, generateProposal: generate });
-    fireEvent.click(screen.getByRole("button", { name: "Analizar pedido" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pedir sugerencia a la IA" }));
     expect(generate).toHaveBeenCalledWith(7);
   });
 
@@ -518,7 +548,7 @@ describe("ChangeRequestsPanel", () => {
       { proposal: { id: "proposal-1", status: "ready", applicable_count: 2 } },
       { proposalEnabled: true, loadProposal: load },
     );
-    fireEvent.click(screen.getByRole("button", { name: "Ver propuesta" }));
+    fireEvent.click(screen.getByRole("button", { name: "Revisar los cambios sugeridos" }));
     expect(load).toHaveBeenCalledWith(7);
   });
 
@@ -788,5 +818,116 @@ describe("ChangeRequestsPanel", () => {
         7, "proposal-3", "op-1", "Texto corregido por operador", 4, "hash-preview-3",
       );
     });
+  });
+});
+
+describe("ChangeRequestsPanel: tres pasos y una sola acción principal", () => {
+  const footerButtons = () => within(screen.getByRole("contentinfo"));
+
+  it("muestra tres pasos con su estado y una frase en lenguaje llano", () => {
+    renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true } });
+    const steps = within(screen.getByRole("list", { name: "Pasos del pedido" })).getAllByRole("listitem");
+    expect(steps.map((step) => step.textContent)).toEqual([
+      expect.stringContaining("Corregir"),
+      expect.stringContaining("Generar el video nuevo"),
+      expect.stringContaining("Publicar"),
+    ]);
+    expect(steps[0]).toHaveTextContent("(hecho)");
+    expect(steps[1]).toHaveTextContent("(hecho)");
+    expect(steps[2]).toHaveAttribute("aria-current", "step");
+    expect(screen.getByText(/El video nuevo está listo\. Miralo y publicalo/)).toBeInTheDocument();
+  });
+
+  it("no usa jerga interna en un estado normal", () => {
+    renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true } }, { proposalEnabled: true });
+    const text = document.body.textContent;
+    expect(text).not.toMatch(/preflight|fingerprint/i);
+    expect(text).not.toMatch(/\bQC\b/);
+    expect(text).not.toMatch(/Analizar pedido|Analizar este pedido|Convertir el pedido|Marcar como resuelto/);
+  });
+
+  it.each([
+    ["sin corrección todavía", {}, { proposalEnabled: true }, "Corregir en el editor"],
+    ["con la corrección guardada", { proposal: { id: "p1", status: "applied" } }, { proposalEnabled: true }, "Generar el video corregido"],
+    ["con propuesta lista", { proposal: { id: "p1", status: "ready" } }, { proposalEnabled: true }, "Revisar los cambios sugeridos"],
+    ["generando", { publication: { ...BASE_PUBLICATION, job_status: "rendering" } }, {}, "Generando el video nuevo…"],
+    ["listo para publicar", { publication: { ...BASE_PUBLICATION, needs_publish: true } }, {}, "Publicar en el portal y dar por resuelto"],
+    ["resuelto", { resolved_at: "2026-09-15T18:30:00Z", resolution_source: "publication", resolved_by_revision: 2 }, {}, "Reabrir pedido"],
+  ])("ofrece exactamente una acción principal (%s)", (_name, overrides, props, label) => {
+    renderPanel(overrides, props);
+    const primary = footerButtons().getAllByText(label, { exact: true });
+    expect(primary).toHaveLength(1);
+    // Lo principal es el único control con el estilo del botón de marca.
+    const branded = [...screen.getByRole("contentinfo").querySelectorAll("a, button")]
+      .filter((node) => node.className.includes("bg-brand"));
+    expect(branded).toHaveLength(1);
+    expect(branded[0]).toHaveTextContent(label);
+  });
+
+  it("muestra el botón principal deshabilitado mientras se genera el video", () => {
+    renderPanel({ publication: { ...BASE_PUBLICATION, job_status: "rendering" } });
+    expect(screen.getByRole("button", { name: "Generando el video nuevo…" })).toBeDisabled();
+  });
+
+  it("los enlaces secundarios son chicos y no duplican la acción principal", () => {
+    renderPanel({}, { proposalEnabled: true });
+    const links = within(screen.getByRole("group", { name: "Otras acciones" }));
+    expect(links.getByRole("button", { name: "Pedir sugerencia a la IA" })).toBeInTheDocument();
+    expect(links.getByRole("button", { name: "Cerrar sin publicar" })).toHaveAttribute("aria-expanded", "false");
+    expect(links.queryByText("Editar letra a mano")).not.toBeInTheDocument();
+  });
+
+  it("Cmd/Ctrl+Enter dispara la acción principal", () => {
+    const publish = vi.fn();
+    renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true } }, { publishDeliveryUpdate: publish });
+    fireEvent.keyDown(window, { key: "Enter", ctrlKey: true });
+    expect(publish).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    expect(publish).toHaveBeenCalledTimes(2);
+  });
+
+  it("Cmd/Ctrl+Enter no hace nada si la acción principal está deshabilitada", () => {
+    const publish = vi.fn();
+    renderPanel({ publication: { ...BASE_PUBLICATION, job_status: "rendering", needs_publish: true } },
+      { publishDeliveryUpdate: publish });
+    fireEvent.keyDown(window, { key: "Enter", ctrlKey: true });
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it("cuando ya se publicó, el cierre con nota es la acción principal y pide la nota", () => {
+    const resolve = vi.fn();
+    renderPanel({
+      publication: { ...BASE_PUBLICATION, render_matches_editor: true },
+      workflow: { key: "review", activeStep: 3, label: "Publicación registrada", detail: "", tone: "action",
+        allowed_actions: ["edit", "resolve"] },
+    }, { resolveChangeRequest: resolve });
+    const primary = screen.getByRole("button", { name: "Dar por resuelto" });
+    expect(primary).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Cerrar sin publicar" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Motivo del cierre sin publicar"), { target: { value: "Ya estaba en la versión 2" } });
+    expect(primary).toBeEnabled();
+    fireEvent.click(primary);
+    expect(resolve).toHaveBeenCalledWith(7, "Ya estaba en la versión 2");
+  });
+
+  it("cuando falla la generación ofrece Ver el error con el motivo en palabras", () => {
+    renderPanel({
+      publication: { ...BASE_PUBLICATION, job_status: "error" },
+      workflow: { key: "blocked", activeStep: 2, label: "La generación necesita atención", detail: "", tone: "attention",
+        allowed_actions: ["edit", "refresh"] },
+    });
+    expect(screen.getByRole("link", { name: "Ver el error" })).toHaveAttribute(
+      "href", expect.stringContaining("/videos/f7752c6feed4/edit-lyrics"),
+    );
+    expect(screen.getByText(/No se pudo generar el video nuevo/)).toBeInTheDocument();
+  });
+
+  it("un error de publicación llega con el mensaje y deja reintentar", () => {
+    renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true } }, {
+      crPublishNotice: { requestId: 7, tone: "error",
+        text: "El video cambió mientras se publicaba. Actualizá y reintentá." },
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("Actualizá y reintentá");
+    expect(screen.getByRole("button", { name: "Publicar en el portal y dar por resuelto" })).toBeEnabled();
   });
 });
