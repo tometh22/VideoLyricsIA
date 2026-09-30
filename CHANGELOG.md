@@ -3,6 +3,22 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.83] - 2026-09-30
+
+### Added
+
+- Campaigns get a "Cambios del cliente" view with the client change requests of
+  that campaign (portal, step, wait against a 48 business hour goal, the
+  client's own approval), a banner with how many songs have a cut newer than
+  the client portal, and "Cerrar con nota" for the campaign owner and admins.
+- A campaign portal send can close the client requests the operator ticks
+  (and only those), with a note the client reads. Every id is validated with
+  one rule at send time and again by the worker; nothing is closed by default.
+  New local column `delivery_batch_items.change_request_intent` (additive
+  migration `d3f5a7c9e1b4`, also required by the worker schema gate).
+- Everything is behind `CAMPAIGN_CHANGE_REQUESTS_ENABLED` and
+  `CAMPAIGN_CHANGE_REQUEST_ACTIONS`, both off by default.
+
 ## [1.1.82] - 2026-09-30
 
 ### Added

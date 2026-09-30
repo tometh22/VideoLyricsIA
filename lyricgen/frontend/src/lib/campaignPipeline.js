@@ -93,7 +93,7 @@ export function campaignNextStep(counts, kind = "lyric_video", { portalSends = t
 // links, saved return paths and editor "Volver" keep landing somewhere sane.
 const LEGACY_VIEWS = { review: "lyrics", creative: "ready", history: "qc", deliveries: "approved", contract: "config" };
 const LEGACY_TABS = { pending: "lyrics", drafts: "lyrics", approved: "all", all: "all", discarded: "discarded" };
-export const DETAIL_VIEWS = ["all", ...STAGE_KEYS, "config"];
+export const DETAIL_VIEWS = ["all", ...STAGE_KEYS, "changes", "config"];
 
 export function resolveView(params, kind = "lyric_video") {
   const raw = params.get("view");
@@ -102,6 +102,30 @@ export function resolveView(params, kind = "lyric_video") {
   const tab = params.get("tab");
   if (tab && LEGACY_TABS[tab]) return kind === "art_track" && LEGACY_TABS[tab] === "lyrics" ? "qc" : LEGACY_TABS[tab];
   return "all";
+}
+
+/** Hours elapsed since `value`, skipping Saturdays and Sundays (local time). */
+export function businessHoursSince(value, now = Date.now()) {
+  const start = new Date(value).getTime();
+  if (!Number.isFinite(start) || start >= now) return 0;
+  let total = 0;
+  let cursor = start;
+  while (cursor < now) {
+    const day = new Date(cursor);
+    const nextMidnight = new Date(day.getFullYear(), day.getMonth(), day.getDate() + 1).getTime();
+    const end = Math.min(now, nextMidnight);
+    if (day.getDay() !== 0 && day.getDay() !== 6) total += end - cursor;
+    cursor = end;
+  }
+  return total / 3600000;
+}
+
+/** Answer within 48 business hours; warn from 24. */
+export const CHANGE_SLA_HOURS = 48;
+export function changeSlaTone(hours) {
+  if (hours >= CHANGE_SLA_HOURS) return "danger";
+  if (hours >= CHANGE_SLA_HOURS / 2) return "warning";
+  return "neutral";
 }
 
 export function formatDuration(seconds) {

@@ -261,3 +261,17 @@ def test_variants_outside_the_campaign_are_not_sendable(db, setup, monkeypatch):
         row = pipeline.campaign_pipeline(campaign.id, actor, db)["items"][0]
     assert row["current_is_variant"] is True
     assert row["current_sendable"] is False
+
+
+def test_pipeline_reports_admin_and_inbox_flag(db, setup, monkeypatch):
+    campaign, _, actor = setup
+    monkeypatch.delenv("CAMPAIGN_CHANGE_REQUESTS_ENABLED", raising=False)
+    with portal([]) as session:
+        monkeypatch.setattr(creative, "scoped_deliveries_db", session)
+        off = pipeline.campaign_pipeline(campaign.id, actor, db)
+        monkeypatch.setenv("CAMPAIGN_CHANGE_REQUESTS_ENABLED", "1")
+        monkeypatch.setenv("BATCH_CAMPAIGN_SCOPES", campaign.tenant_id)
+        owner = pipeline.campaign_pipeline(campaign.id, {**actor, "role": "user"}, db)
+        on = pipeline.campaign_pipeline(campaign.id, actor, db)
+    assert off["features"] == {"change_requests_inbox": False, "change_request_actions": False} and off["is_admin"] is True
+    assert on["features"] == {"change_requests_inbox": True, "change_request_actions": False} and owner["is_admin"] is False

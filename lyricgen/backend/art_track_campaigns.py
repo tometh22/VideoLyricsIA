@@ -124,6 +124,10 @@ class DeliveryCreate(BaseModel):
     job_ids: list[str] | None = Field(default=None, max_length=1000)
     destination_portal: str | None = Field(default=None, max_length=32)
     idempotency_key: str = Field(..., min_length=16, max_length=160)
+    # job_id -> client request ids this send was reviewed to close. Nothing is
+    # closed unless listed here; the worker re-validates every id.
+    resolve_requests: dict[str, list[int]] | None = None
+    resolution_note: str | None = Field(default=None, max_length=2000)
 
 
 def _asset_key(asset: BatchCampaignAsset) -> str:
@@ -605,6 +609,45 @@ def delivery_preview(campaign_id: str, destination_portal: str | None = Query(de
     return {"destination_portal": destination, "hostname": DESTINATIONS[destination], "eligible": eligible, "blocked": blocked, "eligible_count": len(eligible)}
 
 
+def _validated_close_intents(db, ddb, campaign, candidates, destination, body) -> dict[str, dict]:
+    """Which client requests each selected song may close when it is published.
+
+    Rejects the whole send (nothing is created) if any id is not closable by
+    THIS cut in THIS portal, so the operator's ticks never silently turn into
+    something else. The worker checks again before resolving.
+    """
+    if not body.resolve_requests or not any(body.resolve_requests.values()):
+        return {}
+    from campaign_change_requests import actions_enabled, closable_on_publish
+    if campaign.kind == "art_track" or not actions_enabled():
+        raise HTTPException(status_code=409, detail={"code": "feature_disabled"})
+    from database import DeliveryChangeRequest, EditorDocument
+    from delivery_replacement import target
+    by_job = {job.job_id: job for _, job in candidates}
+    note = (body.resolution_note or "").strip() or None
+    intents: dict[str, dict] = {}
+    for job_id, raw_ids in body.resolve_requests.items():
+        ids = sorted(set(raw_ids))
+        if not ids:
+            continue
+        job = by_job.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=409, detail={"code": "change_request_job_not_in_send", "job_id": job_id})
+        active, _duplicate = target(db, ddb, job, destination)
+        if active is None:
+            raise HTTPException(status_code=409, detail={"code": "change_request_not_closable", "job_id": job_id, "reason": "no_delivery_in_portal"})
+        document = db.query(EditorDocument).filter(EditorDocument.job_id == job.job_id).first()
+        found = {row.id: row for row in ddb.query(DeliveryChangeRequest).filter(
+            DeliveryChangeRequest.id.in_(ids), DeliveryChangeRequest.delivery_id == active.id).all()}
+        for request_id in ids:
+            row = found.get(request_id)
+            ok, reason = closable_on_publish(row, job, active, document) if row is not None else (False, "not_found")
+            if not ok:
+                raise HTTPException(status_code=409, detail={"code": "change_request_not_closable", "job_id": job_id, "request_id": request_id, "reason": reason})
+        intents[job_id] = {"request_ids": ids, "segments_revision": job.segments_revision, "note": note}
+    return intents
+
+
 @router.post("/art-track-campaigns/{campaign_id}/deliveries")
 @router.post("/campaigns/{campaign_id}/deliveries")
 def create_delivery_batch(campaign_id: str, body: DeliveryCreate, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db), ddb: Session = Depends(get_deliveries_db)):
@@ -639,10 +682,11 @@ def create_delivery_batch(campaign_id: str, body: DeliveryCreate, current_user: 
     if not candidates:
         code = "no_approved_art_tracks" if campaign.kind == "art_track" else "no_approved_videos"
         raise HTTPException(status_code=409, detail={"code": code})
+    intents = _validated_close_intents(db, ddb, campaign, candidates, destination, body)
     operation = DeliveryBatch(id=str(uuid.uuid4()), campaign_id=campaign.id, tenant_id=campaign.tenant_id, destination_portal=destination, status="queued", idempotency_key=body.idempotency_key, created_by=current_user["id"], total_count=len(candidates), created_at=_now(), updated_at=_now())
     db.add(operation); db.flush()
     for item, job in candidates:
-        db.add(DeliveryBatchItem(id=str(uuid.uuid4()), delivery_batch_id=operation.id, campaign_id=campaign.id, job_id=job.job_id, approved_render_fingerprint=_fingerprint(job), status="pending", created_at=_now(), updated_at=_now()))
+        db.add(DeliveryBatchItem(id=str(uuid.uuid4()), delivery_batch_id=operation.id, campaign_id=campaign.id, job_id=job.job_id, approved_render_fingerprint=_fingerprint(job), status="pending", change_request_intent=intents.get(job.job_id), created_at=_now(), updated_at=_now()))
     db.commit()
     # Publication itself is deliberately a durable operation. A later worker
     # can call process_delivery_batch; the request never fires 500 network
@@ -829,6 +873,37 @@ def enqueue_delivery_batch(operation_id: str) -> bool:
         return False
 
 
+def _evaluate_close_intent(db, ddb, row, job, active, changed) -> tuple[list, list[dict]]:
+    """Requests the operator ticked that this publication may really close.
+
+    Returns (rows to resolve, skipped with reason). Skipping is never an error:
+    the song still publishes, the request just stays open and the receipt says
+    why.
+    """
+    intent = row.change_request_intent or {}
+    ids = intent.get("request_ids") or []
+    if not ids:
+        return [], []
+    if active is None or not changed:
+        return [], [{"id": rid, "reason": "content_unchanged" if active is not None else "no_delivery"} for rid in ids]
+    if intent.get("segments_revision") != job.segments_revision:
+        return [], [{"id": rid, "reason": "cut_changed_after_review"} for rid in ids]
+    from campaign_change_requests import closable_on_publish
+    from database import DeliveryChangeRequest, EditorDocument
+    document = db.query(EditorDocument).filter(EditorDocument.job_id == job.job_id).first()
+    resolvable, skipped = [], []
+    for rid in ids:
+        request = ddb.query(DeliveryChangeRequest).filter(
+            DeliveryChangeRequest.id == rid, DeliveryChangeRequest.delivery_id == active.id,
+        ).populate_existing().with_for_update().first()
+        ok, reason = closable_on_publish(request, job, active, document) if request is not None else (False, "not_found")
+        if ok:
+            resolvable.append(request)
+        else:
+            skipped.append({"id": rid, "reason": reason})
+    return resolvable, skipped
+
+
 def process_delivery_batch(operation_id: str) -> dict[str, int]:
     """Worker entry point; safe to call repeatedly after a crash."""
     from database import Delivery
@@ -956,6 +1031,9 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     row.attempts = int(row.attempts or 0) + 1; failed += 1
                     continue
                 is_new_delivery = active is None
+                # Decide BEFORE touching the delivery: once its fingerprint is
+                # updated the corrected cut no longer reads as "needs publish".
+                resolvable, skipped_requests = _evaluate_close_intent(db, ddb, row, job, active, changed)
                 if active is None:
                     # Las columnas de frescura se escriben también acá. Sin
                     # esto, TODA fila publicada por campaña nacía sin
@@ -989,7 +1067,7 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     active.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
                     active.added_by_user_id = deliveries_added_by(op.created_by)
                     active.added_at = _now()
-                row.delivery_id = active.id; row.status = "sent"; row.receipt = {"delivery_id": active.id, "portal": op.destination_portal, "replaced_job_id": replaced_job_id, "previous_publication": previous_publication}; row.attempts = int(row.attempts or 0) + 1; sent += 1
+                row.delivery_id = active.id; row.status = "sent"; row.receipt = {"delivery_id": active.id, "portal": op.destination_portal, "replaced_job_id": replaced_job_id, "previous_publication": previous_publication, **({"change_requests": {"resolved": [r.id for r in resolvable], "skipped": skipped_requests}} if row.change_request_intent else {})}; row.attempts = int(row.attempts or 0) + 1; sent += 1
                 archive_duplicate(duplicate, _now())
                 active.published_file_keys = pinned
                 active.published_render_fingerprint = delivery_freshness.render_fingerprint(job)
@@ -1000,15 +1078,23 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                 if changed or active.content_updated_at is None:
                     active.content_updated_at = _now()
                 # A campaign send attests the selected cut, not every client
-                # request predating it. Until the batch intent carries explicit
-                # reviewed request/revision evidence, keep requests open; the
-                # Corrections workflow can verify and close the intended case.
+                # request predating it. Only the requests the operator ticked in
+                # the send (and that still pass the same rule the worker just
+                # re-checked) are closed; everything else stays open.
+                _now_closed = _now()
+                for closed in resolvable:
+                    closed.resolved_at = _now_closed; closed.updated_at = _now_closed
+                    closed.resolved_by_user_id = deliveries_added_by(op.created_by)
+                    closed.resolved_by_revision = active.published_revision
+                    closed.resolution_source = "publication"
+                    closed.resolution_note = (row.change_request_intent or {}).get("note") or f"Resuelto al publicar la versión {active.published_revision}."
                 row.error_code = None; row.error_detail = None
                 db.add(AuditLog(user_id=op.created_by, action="delivery.create" if is_new_delivery else "delivery.update", detail={
                     "job_id": job.job_id, "label": delivery_label, "portal_id": op.destination_portal,
                     "artist": job.artist, "song": job.song_title, "revision": active.published_revision,
                     "content_changed": changed, "source": "campaign_bulk", "delivery_batch_id": op.id,
                     "replaced_job_id": replaced_job_id, "previous_publication": previous_publication,
+                    "resolved_change_requests": [r.id for r in resolvable],
                 }))
                 ddb.commit()
                 db.commit()
