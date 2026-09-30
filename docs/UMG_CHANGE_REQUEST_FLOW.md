@@ -6,7 +6,7 @@
 2. From Changes, open **Revisar y confirmar render**: the original request and complete saved lyrics appear together. Confirm **Aprobar y re-renderizar**. The editor uses the same durable approval and render endpoint.
 3. Stay in Changes while the render runs. Once finished, review the resulting video. Prepare its professional master if required.
 4. Confirm **Publicar actualización**. This performs final video approval through the existing QC/billing gates, then publishes to the request's original Argentina/Chile portal. Only the ONE request selected in Changes is resolved, and only when the published content actually changed; other open requests on the same delivery stay open. The published revision is reported.
-5. Alternatively **Marcar como resuelto** closes the request visibly in the portal without implying a render or publication. The operator UI requires a reason (the client sees it in the portal); the API itself accepts an empty note. Resolved requests can be reopened; a reopened request sorts first in the admin list (ordered by latest lifecycle change, not by submission date).
+5. Alternatively **Marcar como resuelto** closes the request visibly in the portal without implying a render or publication. A reason is required (the client sees it in the portal): the API answers 422 `resolution_reason_required` without one. Resolved requests can be reopened; a reopened request sorts first in the admin list (ordered by latest lifecycle change, not by submission date).
 
 Approval of lyrics does not publish. Publication requires the same editor revision and render fingerprint the operator reviewed. A newer save requires another review/render; double-clicks use the transactional outbox's idempotency controls.
 
