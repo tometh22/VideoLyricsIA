@@ -40,6 +40,7 @@ REQUIRED_COLUMNS = {
     ("quality_patterns", "fingerprint"),
     ("quality_fix_proposals", "candidate_config"),
     ("quality_experiment_runs", "candidate_config_hash"),
+    ("delivery_batch_items", "change_request_intent"),
     ("batch_campaigns", "id"),
     ("batch_campaign_items", "id"),
     ("batch_upload_sessions", "id"),

@@ -23,11 +23,12 @@ from sqlalchemy.orm import Session
 
 import delivery_freshness
 from auth import get_current_user
+from change_request_workflow import latest_overwrite, render_state, timestamp
 from batch_campaigns import _aware, _campaign_or_404, _require_scope
 from campaign_pipeline import _load_items, _load_lineage
 from batch_campaigns import _require_manager
 from database import (
-    AuditLog, Delivery, DeliveryChangeRequest, Job, deliveries_added_by, get_db, get_deliveries_db, scoped_deliveries_db,
+    AuditLog, Delivery, EditorDocument, DeliveryChangeRequest, Job, deliveries_added_by, get_db, get_deliveries_db, scoped_deliveries_db,
 )
 
 router = APIRouter(prefix="/batch/campaigns", tags=["campaign-change-requests"])
@@ -48,6 +49,30 @@ def actions_enabled() -> bool:
 def _iso(value: datetime | None) -> str | None:
     value = _aware(value)
     return value.isoformat() if value else None
+
+
+def closable_on_publish(request, job, delivery, document=None) -> tuple[bool, str]:
+    """Whether publishing ``job``'s current cut may close ``request``.
+
+    One rule shared by the inbox (what to offer), the send endpoint (what to
+    accept) and the worker (what to apply), so they cannot disagree. Evidence
+    only: the request is still open, was submitted BEFORE the corrected render
+    finished, that render matches what the editor saved, and the portal still
+    shows an older cut.
+    """
+    if request.resolved_at is not None:
+        return False, "not_open"
+    if job is None or job.status not in _FINISHED:
+        return False, "job_not_ready"
+    if not delivery_freshness.needs_publish(job, delivery):
+        return False, "content_unchanged"
+    rendered_at = latest_overwrite(job) or timestamp(job.completed_at)
+    submitted_at = timestamp(request.submitted_at)
+    if rendered_at is None or submitted_at is None or submitted_at > rendered_at:
+        return False, "newer_than_cut"
+    if document is not None and not render_state(job, document, request)["render_matches_editor"]:
+        return False, "render_not_current"
+    return True, "ok"
 
 
 def _step(request: DeliveryChangeRequest, job: Job | None, delivery: Delivery) -> dict[str, str]:
@@ -116,6 +141,14 @@ def campaign_change_requests(
             job = jobs_by_id.get(job.parent_job_id)
         return None
 
+    # A song's CURRENT job is its newest live cut: a request on an older
+    # delivery is answered by what the song would publish next.
+    current_by_song: dict[str, Job] = {}
+    for job in sorted(jobs, key=lambda j: (_aware(j.created_at) or datetime.min.replace(tzinfo=timezone.utc), j.job_id)):
+        song = song_of(job)
+        if song is not None and job.status not in ("error", "failed", "discarded", "rejected"):
+            current_by_song[song.id] = job
+
     empty = {"campaign_id": campaign.id, "available": True, "counts": {"open": 0, "resolved": 0, "oldest_open_at": None},
              "items": [], "next_cursor": None}
     if not jobs_by_id:
@@ -144,10 +177,19 @@ def campaign_change_requests(
                 query = query.filter(or_(order_key < stamp, and_(order_key == stamp, DeliveryChangeRequest.id < after[1])))
             rows = query.order_by(order_key.desc(), DeliveryChangeRequest.id.desc()).limit(limit + 1).all()
             page, more = rows[:limit], len(rows) > limit
+            current_ids = set()
+            for _request, _delivery in page:
+                _song = song_of(jobs_by_id.get(_delivery.job_id))
+                if _song is not None and _song.id in current_by_song:
+                    current_ids.add(current_by_song[_song.id].job_id)
+            documents = {doc.job_id: doc for doc in db.query(EditorDocument).filter(
+                EditorDocument.job_id.in_(current_ids or {""})).all()}
             payload = []
             for request, delivery in page:
-                job = jobs_by_id.get(delivery.job_id)
-                song = song_of(job)
+                song = song_of(jobs_by_id.get(delivery.job_id))
+                job = current_by_song.get(song.id) if song is not None else jobs_by_id.get(delivery.job_id)
+                job = job or jobs_by_id.get(delivery.job_id)
+                closable, _ = closable_on_publish(request, job, delivery, documents.get(job.job_id) if job else None)
                 payload.append({
                     "id": request.id, "delivery_id": delivery.id,
                     "portal_id": delivery.portal_id or "argentina",
@@ -160,6 +202,8 @@ def campaign_change_requests(
                     "published_revision": delivery.published_revision or 1,
                     "client_approval": _client_approval(delivery),
                     "step": _step(request, job, delivery),
+                    "current_job_id": job.job_id if job is not None else None,
+                    "closable_on_publish": closable,
                 })
             last = page[-1][0] if more and page else None
             next_cursor = (f"{_iso(last.updated_at or last.submitted_at)}|{last.id}" if last is not None else None)

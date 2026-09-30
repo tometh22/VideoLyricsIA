@@ -1045,6 +1045,9 @@ class DeliveryBatchItem(Base):
     error_code = Column(String(120), nullable=True)
     error_detail = Column(String(500), nullable=True)
     receipt = Column(JSONB, nullable=True)
+    # Client requests this send was reviewed to close (ids + reviewed cut). The
+    # worker re-validates each one before resolving; never resolves on its own.
+    change_request_intent = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
