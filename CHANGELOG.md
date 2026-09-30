@@ -3,6 +3,25 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.87] - 2026-10-01
+
+### Fixed
+
+- Campaigns: deliveries published before fingerprints existed (legacy rows) were
+  never flagged as outdated, so a corrected video looked up to date under
+  "Entregada". They are now detected with the same evidence the admin screen uses
+  (the job was overwritten after the portal last received it).
+
+### Changed
+
+- Songs with a cut newer than the portal's are split by what the operator must do
+  next: "Listas para reenviar" (approved, only need sending) and "Corte nuevo sin
+  aprobar" (approve first). The banner says how many of each and links to each
+  list, the filter has both options, every song carries a matching mark
+  ("Listo para reenviar" / "Falta aprobar el corte nuevo"), and the Entregada tab
+  shows how many of its songs need resending. The pipeline flags expose
+  `resend_ready` and `resend_review`.
+
 ## [1.1.86] - 2026-09-30
 
 ### Changed

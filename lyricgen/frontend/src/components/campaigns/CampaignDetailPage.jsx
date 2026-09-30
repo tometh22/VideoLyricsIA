@@ -19,7 +19,7 @@ import SongTable from "./SongTable";
 import StyleAssignment from "./StyleAssignment";
 import VideoReviewPlayer from "./VideoReviewPlayer";
 import {
-  CLASSIFICATIONS, PORTAL_FILTERS, buildSongs, canDiscard, canGenerate, canSend, classificationCounts, filterSongs, nextLyricSong, primaryAction, sortSongs,
+  CLASSIFICATIONS, PORTAL_FILTERS, buildSongs, canDiscard, canGenerate, canSend, classificationCounts, filterSongs, isApprovedStage, nextLyricSong, primaryAction, sortSongs,
 } from "./songModel";
 import { Banner, Button, Chip, EmptyState, InfoTip, Kbd, Modal, Skeleton, inputClass } from "./ui";
 
@@ -44,6 +44,13 @@ const EMPTY = {
  * published one. Decided PER SONG: a delivery that still has a frozen copy keeps
  * serving the old cut even while others follow the newest render.
  */
+/** Songs whose current cut is newer than the portal's: split by what the operator must do next. */
+export function resendCounts(songs) {
+  const outdated = songs.filter((song) => song.portal_outdated);
+  const ready = outdated.filter(isApprovedStage).length;
+  return { ready, review: outdated.length - ready, total: outdated.length };
+}
+
 export function outdatedWording(songs) {
   const outdated = songs.filter((song) => song.portal_outdated);
   const latest = outdated.filter((song) => song.portal_serves_latest).length;
@@ -111,7 +118,7 @@ export default function CampaignDetailPage({ id }) {
   const kind = campaign?.kind || pipe.data?.kind || "lyric_video";
   const inboxEnabled = Boolean(pipe.data?.features?.change_requests_inbox);
   const openRequests = Number(pipe.data?.flags?.change_requests_open) || 0;
-  const outdatedCount = Number(pipe.data?.flags?.portal_outdated) || 0;
+  const outdatedCount = Number(pipe.data?.flags?.portal_outdated) || 0; // kept for API parity; the UI derives the split from the songs
   const known = Boolean(campaign || pipe.data);
   const lyric = kind !== "art_track";
   const view = resolveView(params, kind);
@@ -131,6 +138,7 @@ export default function CampaignDetailPage({ id }) {
   const songs = useMemo(() => buildSongs(pipe.data?.items || [], {
     reviewRows: lyrics.data?.items, creativeItems: creative.data?.items, videos: report.data?.videos,
   }), [pipe.data, lyrics.data, creative.data, report.data]);
+  const resend = useMemo(() => resendCounts(songs), [songs]);
   const filters = Object.fromEntries(FILTER_KEYS.map((key) => [key, params.get(key) || ""]));
   const visible = useMemo(() => sortSongs(filterSongs(songs, {
     view, q: filters.q, drafts: !!filters.drafts, mine: !!filters.mine, version: filters.version, classification: filters.cls, portal: filters.portal,
@@ -375,7 +383,7 @@ export default function CampaignDetailPage({ id }) {
       </div>
     </header>
 
-    <PipelineBar counts={counts} kind={kind} value={view === "config" || view === "changes" ? null : view} onChange={setView} loading={!pipe.data} />
+    <PipelineBar counts={counts} kind={kind} value={view === "config" || view === "changes" ? null : view} onChange={setView} loading={!pipe.data} badges={{ delivered: resend.ready }} />
 
     {approvedSong && <Banner tone="success" action={<div className="flex gap-2">
       {nextAfterApproval && <Button size="sm" variant="primary" onClick={() => openReview(nextAfterApproval)}>Revisar siguiente: {nextAfterApproval.title}</Button>}
@@ -391,8 +399,14 @@ export default function CampaignDetailPage({ id }) {
         const ids = songs.filter((song) => jobIds.includes(song.current_job_id)).map((song) => song.id);
         setView("approved"); setSelected(new Set(ids));
       }} />}
-    {outdatedCount > 0 && view !== "config" && view !== "changes" && <Banner tone="warning" action={<Button size="sm" onClick={() => updateParams({ view: null, portal: "outdated", song: null, focus: null }, { push: true })}>Ver {outdatedCount === 1 ? "la canción" : "las canciones"}</Button>}>
-      <strong>{outdatedCount}</strong> {outdatedCount === 1 ? "canción tiene" : "canciones tienen"} un corte nuevo que todavía no se envió: {outdatedWording(songs)}
+    {resend.total > 0 && view !== "config" && view !== "changes" && <Banner tone="warning" action={<div className="flex flex-wrap gap-2">
+      {resend.ready > 0 && <Button size="sm" variant="primary" onClick={() => updateParams({ view: null, portal: "resend_ready", song: null, focus: null }, { push: true })}>Ver las {resend.ready} para reenviar</Button>}
+      {resend.review > 0 && <Button size="sm" onClick={() => updateParams({ view: null, portal: "resend_review", song: null, focus: null }, { push: true })}>Ver las {resend.review} sin aprobar</Button>}
+    </div>}>
+      {[resend.ready > 0 && <span key="r"><strong>{resend.ready}</strong> {resend.ready === 1 ? "lista" : "listas"} para reenviar al portal</span>,
+        resend.review > 0 && <span key="a"><strong>{resend.review}</strong> {resend.review === 1 ? "falta" : "faltan"} aprobar el corte nuevo</span>]
+        .filter(Boolean).reduce((parts, part, index) => (index ? [...parts, " · ", part] : [part]), [])}
+      {" — "}{outdatedWording(songs)}
     </Banner>}
     {pipe.data && pipe.data.portal_status_available === false && <Banner tone="warning">No pudimos consultar el portal del cliente: por ahora las entregas figuran como aprobadas.</Banner>}
     {pipe.error && known && <Banner tone="danger" action={<Button size="sm" onClick={refresh}>Reintentar</Button>}>No se pudo actualizar el estado: {pipe.error.message}</Banner>}

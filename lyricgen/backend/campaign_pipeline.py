@@ -198,6 +198,7 @@ def _snapshot(
         # Open client requests (not songs) and how long the oldest has waited:
         # what the campaign list needs to say "3 cambios · el más antiguo hace 2 días".
         "change_requests_open": 0, "oldest_change_request_at": None,
+        "resend_ready": 0, "resend_review": 0,
     }
     oldest_request: datetime | None = None
     rows: list[dict[str, Any]] = []
@@ -246,8 +247,22 @@ def _snapshot(
                 fingerprint = _current_fingerprint(job)
                 if fingerprints and fingerprint and any(fp != fingerprint for fp in fingerprints):
                     outdated = True
+                elif not fingerprints and job.status in ("done", "pending_review"):
+                    # Deliveries published before fingerprints existed carry none, and the
+                    # check above could never flag them: a corrected video stayed invisible
+                    # as "needs resending". The same evidence the admin screen uses: the job
+                    # was overwritten after the portal last received it.
+                    from change_request_workflow import latest_overwrite, timestamp
+                    baseline = timestamp(publication.get("published_baseline_at"))
+                    overwritten = latest_overwrite(job)
+                    if baseline is not None and overwritten is not None and overwritten > baseline:
+                        outdated = True
         portals.sort()
         flags["portal_outdated"] += int(outdated)
+        if outdated:
+            # Two different jobs for the operator: resend what is approved, approve
+            # what is not. They were one undifferentiated "outdated" bucket.
+            flags["resend_ready" if stage in ("delivered", "approved") else "resend_review"] += 1
         flags["change_requests"] += int(bool(change_requests))
         flags["change_requests_open"] += change_requests
         flags["metadata_missing"] += int(item.metadata_error == "missing_metadata")

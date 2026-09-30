@@ -533,7 +533,7 @@ def portal_history(job_ids, tenant_id):
             func.min(DeliveryChangeRequest.submitted_at),
             Delivery.published_render_fingerprint, Delivery.published_revision,
             Delivery.stale_since, Delivery.stale_reason,
-            Delivery.approved_at, Delivery.content_updated_at,
+            Delivery.approved_at, Delivery.content_updated_at, Delivery.added_at,
         ).outerjoin(DeliveryChangeRequest, and_(
             DeliveryChangeRequest.delivery_id == Delivery.id,
             DeliveryChangeRequest.resolved_at.is_(None),
@@ -544,7 +544,7 @@ def portal_history(job_ids, tenant_id):
             Delivery.job_id, Delivery.portal_id,
             Delivery.published_render_fingerprint, Delivery.published_revision,
             Delivery.stale_since, Delivery.stale_reason,
-            Delivery.approved_at, Delivery.content_updated_at,
+            Delivery.approved_at, Delivery.content_updated_at, Delivery.added_at,
         ).all()
         # Which of these jobs still have a FROZEN copy behind an active delivery.
         # Read in Python (a JSON column cannot be grouped, and JSON null must read
@@ -556,7 +556,7 @@ def portal_history(job_ids, tenant_id):
         }
     result = {}
     for (job_id, portal_id, pending, oldest_pending, fingerprint, revision,
-         stale_since, stale_reason, approved_at, content_updated_at) in publications:
+         stale_since, stale_reason, approved_at, content_updated_at, added_at) in publications:
         row = result.setdefault(job_id, {
             "umg_portals": [], "pending_change_requests": 0,
             # Fingerprints publicados, para que el llamador compare contra el
@@ -565,7 +565,13 @@ def portal_history(job_ids, tenant_id):
             "portal_updating": False, "portal_awaiting_review": False,
             "oldest_change_request_at": None,
             "snapshot_pinned": job_id in frozen_jobs,
+            # When the portal last got this job (legacy rows have no fingerprint, so
+            # "corrected after this moment" is the only evidence that they are stale).
+            "published_baseline_at": None,
         })
+        baseline = content_updated_at or added_at
+        if baseline is not None and (row["published_baseline_at"] is None or baseline > row["published_baseline_at"]):
+            row["published_baseline_at"] = baseline
         portal = portal_id or "argentina"
         if portal not in row["umg_portals"]:
             row["umg_portals"].append(portal)
