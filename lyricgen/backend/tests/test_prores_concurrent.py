@@ -220,7 +220,9 @@ def test_transcode_uses_pure_recode_when_dims_fps_match(fake_outputs, monkeypatc
     # ffprobe says the source already matches the target.
     monkeypatch.setattr(
         _pipeline, "_probe_dims_fps",
-        lambda p: (spec.width, spec.height, spec.fps_str),
+        # ffprobe emits an integer fps as a rational, while RenderSpec uses
+        # "24.0". They represent the same rate and must take the pure path.
+        lambda p: (spec.width, spec.height, "24/1"),
     )
 
     with patch.object(_pipeline.subprocess, "run") as mock_run:

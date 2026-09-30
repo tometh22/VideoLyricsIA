@@ -43,10 +43,11 @@ def clean_art_rows():
         db.close()
 
 
-def _create(client, token):
+def _create(client, token, *, destination="argentina", render_params=None):
     response = client.post(
         "/batch/campaigns", headers={"Authorization": f"Bearer {token}"},
-        json={"name": "Art tracks AR", "expected_count": 2, "kind": "art_track", "destination_portal": "argentina"},
+        json={"name": "Art tracks AR", "expected_count": 2, "kind": "art_track", "destination_portal": destination,
+              "default_render_params": render_params or {}},
     )
     assert response.status_code == 200, response.text
     return response.json()["id"]
@@ -95,7 +96,8 @@ def test_art_manifest_rejects_duplicate_technical_codes_without_server_error(cli
 
 def test_art_render_never_creates_transcription_and_is_idempotent(client, admin_token, monkeypatch):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
-    campaign_id = _create(client, admin_token)
+    campaign_id = _create(client, admin_token, destination="files",
+                          render_params={"art_track_preset": "colombia_static"})
     auth = {"Authorization": f"Bearer {admin_token}"}
     manifest = client.post(
         f"/batch/art-track-campaigns/{campaign_id}/manifest", headers=auth,
@@ -125,8 +127,15 @@ def test_art_render_never_creates_transcription_and_is_idempotent(client, admin_
     try:
         job = db.query(Job).filter(Job.campaign_id == campaign_id).one()
         assert job.render_params["art_track"] is True
+        assert job.render_params["art_track_preset"] == "colombia_static"
         assert job.status == "queued"
         assert db.query(JobOutboxEvent).filter(JobOutboxEvent.job_id == job.job_id, JobOutboxEvent.event_type == "transcription.enqueue").count() == 0
+        event = db.query(JobOutboxEvent).filter(JobOutboxEvent.job_id == job.job_id, JobOutboxEvent.event_type == "pipeline.enqueue").one()
+        assert event.payload["pipeline_kwargs"]["art_track_preset"] == "colombia_static"
+        # The outbox must not include kwargs that the worker pipeline rejects.
+        from inspect import signature
+        from pipeline import run_pipeline
+        signature(run_pipeline).bind_partial(**event.payload["pipeline_kwargs"])
     finally:
         db.close()
     again = client.post(f"/batch/art-track-campaigns/{campaign_id}/start-rendering", headers=auth)

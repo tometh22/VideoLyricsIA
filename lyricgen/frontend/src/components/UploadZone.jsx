@@ -319,6 +319,7 @@ export default function UploadZone({
   const [deliveryProfile, setDeliveryProfile] = useState(delivery?.delivery_profile || "youtube");
   // Art track: línea legal opcional en pantalla (℗/© sello), per-batch.
   const [labelLine, setLabelLine] = useState(delivery?.label_line || "");
+  const [artTrackPreset, setArtTrackPreset] = useState(delivery?.art_track_preset || "waveform");
   // umg_frame_size: now operator-selectable end-to-end. The pipeline
   // renders the source MP4 at the chosen UMG dims+fps (via
   // RenderSpec.umg_intermediate_master) so the lazy ProRes transcode
@@ -1047,12 +1048,13 @@ export default function UploadZone({
       umg_fps: umgFps,
       umg_prores_profile: umgProresProfile,
       label_line: labelLine,
+      art_track_preset: artTrackPreset,
       // Art track moving effect (batch-wide). The art-track submit path
       // builds its own FormData and reads it from here (the lyric path
       // sends per-song effect instead).
       effect: batchDefaults.effect || "",
     });
-  }, [deliveryProfile, umgFrameSize, umgFps, umgProresProfile, labelLine, batchDefaults.effect, onDeliveryChange]);
+  }, [deliveryProfile, umgFrameSize, umgFps, umgProresProfile, labelLine, artTrackPreset, batchDefaults.effect, onDeliveryChange]);
 
   useEffect(() => {
     if (bgMode === "library" && !libraryLoaded) {
@@ -1710,7 +1712,15 @@ export default function UploadZone({
         </div>
       )}
       {artTrack && (
-        <div className="mt-3 space-y-1" onClick={(e) => e.stopPropagation()}>
+        <div className="mt-3 space-y-3" onClick={(e) => e.stopPropagation()}>
+          <div>
+            <label className="text-[10px] uppercase tracking-[0.18em] text-gray-500 block mb-1">{t("upload.art_track_preset") || "Estilo de Art Track"}</label>
+            <select value={artTrackPreset} onChange={(e) => setArtTrackPreset(e.target.value)} className="w-full sm:w-96 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-brand/60">
+              <option value="waveform">{t("upload.art_track_waveform") || "Portada + onda animada"}</option>
+              <option value="colombia_static">{t("upload.art_track_colombia_static") || "Portada fija + título y artista"}</option>
+            </select>
+          </div>
+          <div>
           <label className="text-[10px] uppercase tracking-[0.18em] text-gray-500 block">
             {t("upload.label_line_label") || "Línea legal / sello (opcional)"}
           </label>
@@ -1725,6 +1735,7 @@ export default function UploadZone({
           <p className="text-[11px] text-gray-500">
             {t("upload.label_line_hint") || "Se muestra chica abajo a la izquierda del video, en todos los formatos."}
           </p>
+          </div>
         </div>
       )}
     </div>
@@ -1838,7 +1849,7 @@ export default function UploadZone({
       {artTrack && (
         <p className="mt-2 text-sm text-gray-400 max-w-xl">
           {t("upload.video_type_art_hint") ||
-            "Master audio + cover, sin letra. Subí la portada en el paso “Modo”; el video muestra el cover centrado sobre un fondo difuminado con movimiento sutil."}
+            "Master audio + portada, sin letra. Elegí entre el estilo con onda animada y una composición fija con portada y título."}
         </p>
       )}
     </div>
@@ -3919,7 +3930,18 @@ export default function UploadZone({
                cover con sombra a la derecha + barras EQ latiendo + título en
                zona segura), aproximación visual del render. */
             <div className="relative w-full aspect-video rounded-xl overflow-hidden bg-black">
-              {customPreviewUrl ? (
+              {customPreviewUrl ? artTrackPreset === "colombia_static" ? (
+                <>
+                  <img src={customPreviewUrl} alt="" className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl brightness-[.43]" />
+                  <div className="absolute inset-0 bg-gradient-to-r from-black/10 to-black/60" />
+                  <img src={customPreviewUrl} alt="" className="absolute left-[5.5%] top-1/2 -translate-y-1/2 h-[73%] aspect-square object-cover shadow-2xl shadow-black/70" />
+                  <div className="absolute left-[52%] right-[6%] top-1/2 -translate-y-1/2 text-white">
+                    <div className="font-extrabold text-xl md:text-3xl leading-tight drop-shadow line-clamp-3">{titlePreviewSong || t("upload.video_type_art") || "Art Track"}</div>
+                    <div className="mt-3 text-sm md:text-lg text-white/85 drop-shadow">{titlePreviewArtist}</div>
+                  </div>
+                  {(labelLine || "").trim() && <div className="absolute left-[52%] bottom-[6%] text-[9px] md:text-[11px] text-white/55 drop-shadow">{labelLine}</div>}
+                </>
+              ) : (
                 <>
                   <style>{`@keyframes atwave { 0%, 100% { transform: scaleY(0.45); } 50% { transform: scaleY(1); } }`}</style>
                   <img src={customPreviewUrl} alt="" className="absolute inset-0 w-full h-full object-cover scale-110 blur-2xl brightness-50 saturate-[.75]" />
@@ -4126,7 +4148,7 @@ export default function UploadZone({
                   se mueven sobre la portada). Reusa los mismos loops que los
                   lyric videos. NO mostramos los estilos de movimiento de
                   cámara — no aplican al formato art track. */}
-              {artTrack && (
+              {artTrack && artTrackPreset === "waveform" && (
                 <div className="mt-4 pt-3 border-t border-white/[0.05]">
                   <p className="text-[11px] text-gray-400 font-medium">
                     {t("upload.arttrack_effect_title") || "Efecto en movimiento (opcional)"}

@@ -4976,6 +4976,7 @@ export default function App() {
         if (jobList[i].songTitle) body.append("song_title", jobList[i].songTitle);
         body.append("segments_json", "[]");
         body.append("art_track", "true");
+        body.append("art_track_preset", delivery.art_track_preset || "waveform");
         if ((delivery.label_line || "").trim()) {
           body.append("label_line", delivery.label_line.trim());
         }

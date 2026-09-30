@@ -493,6 +493,9 @@ def start_art_rendering(campaign_id: str, current_user: dict = Depends(get_curre
     if not has_art_track_access(current_user): raise HTTPException(status_code=403, detail="Art Track is not enabled for this account.")
     campaign = _campaign_art_or_409(db, campaign_id, current_user); _require_manager(campaign, current_user)
     if campaign.status != "active": raise HTTPException(status_code=409, detail="Campaign is not active.")
+    art_track_preset = (campaign.default_render_params or {}).get("art_track_preset", "waveform")
+    if art_track_preset not in ("waveform", "colombia_static"):
+        raise HTTPException(status_code=422, detail="Unknown Art Track visual preset.")
     rows = db.query(BatchCampaignItem).filter(BatchCampaignItem.campaign_id == campaign.id).order_by(BatchCampaignItem.ordinal).with_for_update().all()
     cover_ids = {r.cover_asset_id for r in rows if r.cover_asset_id}
     covers = {
@@ -523,12 +526,13 @@ def start_art_rendering(campaign_id: str, current_user: dict = Depends(get_curre
                             initial_status="transcribed_pending", input_r2_key=item.upload_key, workload_class="batch",
                             campaign_id=campaign.id, campaign_item_id=item.id, commit=False)
         job = db.query(Job).filter(Job.job_id == job_id).one()
-        job.render_params = {**(campaign.default_render_params or {}), "art_track": True, "batch_art_track": True, "cover_asset_id": cover.id, "render_version": 1}
+        job.render_params = {**(campaign.default_render_params or {}), "art_track": True, "art_track_preset": art_track_preset, "batch_art_track": True, "cover_asset_id": cover.id, "render_version": 1}
         job.segments_json = []
         event = create_pipeline_outbox_event(db, job=job, purpose="art_track_batch", mp3_path=None, artist=item.artist or "Unknown", style="oscuro", plan="100", tenant_id=campaign.tenant_id,
             pipeline_kwargs={"art_track": True, "segments_override": [], "input_r2_key": item.upload_key, "bg_r2_key": cover.upload_key,
                              "background_path": None, "song_title": item.title or "", "delivery_profile": "both", "umg_spec": umg_spec,
-                             "workload_class": "batch", "label_line": (campaign.default_render_params or {}).get("label_line", "")})
+                             "label_line": (campaign.default_render_params or {}).get("label_line", ""),
+                             "art_track_preset": art_track_preset})
         job.status = "queued"; job.current_step = "queued"; job.progress = 0
         created.append(job_id); events.append(event.id)
     db.commit()

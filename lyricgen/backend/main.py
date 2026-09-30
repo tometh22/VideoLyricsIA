@@ -10545,6 +10545,7 @@ async def generate_with_segments(
     # cover centered over a blurred fill + subtle motion, NO lyrics. The cover
     # comes in via background_file (image). Skips transcription + AI background.
     art_track: bool = Form(False),
+    art_track_preset: str = Form("waveform", max_length=32),
     # Línea legal opcional en pantalla para art tracks, ej.
     # "℗ 2026 Universal Music Chile". Vacía = no se dibuja.
     label_line: str = Form("", max_length=120),
@@ -10817,6 +10818,10 @@ async def generate_with_segments(
     # incompatible options BEFORE quota/AI gates so it costs 1 credit and is
     # not treated as an AI-background job.
     if art_track:
+        if art_track_preset not in ("waveform", "colombia_static"):
+            raise HTTPException(status_code=422, detail="Unknown Art Track visual preset.")
+        if art_track_preset == "colombia_static":
+            effect = ""
         # Feature gate (default OFF salvo admin / tenant en allowlist). Corta
         # acá aunque el front no muestre la opción — un tenant sin acceso que
         # pegue a la API con art_track=true no debe poder generar.
@@ -11140,7 +11145,7 @@ async def generate_with_segments(
     if art_track:
         try:
             from jobs import merge_render_params
-            _params = {"art_track": True}
+            _params = {"art_track": True, "art_track_preset": art_track_preset}
             if (label_line or "").strip():
                 _params["label_line"] = label_line.strip()
             merge_render_params(job_id, _params)
@@ -11392,6 +11397,7 @@ async def generate_with_segments(
         # subtle motion), no lyrics. Validated above (cover required, image
         # only). The pipeline skips transcription + AI background.
         art_track=art_track,
+        art_track_preset=art_track_preset if art_track else "waveform",
         label_line=(label_line or "").strip() if art_track else "",
         render_profile=_render_profile,
         preserve_approved_timing=bool(
@@ -18870,7 +18876,7 @@ async def retry_job(
               # Art track: heredable — sin esto un retry de un art track se
               # re-renderiza como lyric video vacío y re-corre Whisper.
               # Persistido por pipeline/endpoint en render_params.
-              "art_track",
+              "art_track", "art_track_preset",
               # Línea legal del art track (℗/© sello), persistida junto al
               # marker para que el retry la re-dibuje igual.
               "label_line"):
@@ -18927,6 +18933,7 @@ async def edit_art_track(
     song_title: str = Form(None),
     artist: str = Form(None),
     label_line: str = Form("", max_length=120),
+    art_track_preset: str | None = Form(None, max_length=32),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -18965,6 +18972,9 @@ async def edit_art_track(
             status_code=400,
             detail="This endpoint only edits Art Track jobs.",
         )
+    art_track_preset = art_track_preset or (job.render_params or {}).get("art_track_preset", "waveform")
+    if art_track_preset not in ("waveform", "colombia_static"):
+        raise HTTPException(status_code=422, detail="Unknown Art Track visual preset.")
 
     # Re-gate de la feature con el acceso ACTUAL del usuario (igual que
     # /generate y /retry): un tenant al que se le sacó el acceso no sigue
@@ -19033,12 +19043,13 @@ async def edit_art_track(
 
     # Persistir los ejes editables en render_params (autoritativo: vacío =
     # limpiar). Así el re-render y cualquier /retry futuro los re-dibujan.
-    effect_val = (effect or "").strip()
+    effect_val = "" if art_track_preset == "colombia_static" else (effect or "").strip()
     label_val = (label_line or "").strip()
     merge_render_params(job_id, {
         "art_track": True,
         "effect": effect_val,
         "label_line": label_val,
+        "art_track_preset": art_track_preset,
     })
 
     # Título/artista viven en columnas; se actualizan solo si vinieron.
@@ -19107,6 +19118,7 @@ async def edit_art_track(
         segments_override=job.segments_json if job.segments_json else None,
         bg_r2_key=bg_r2_key,
         art_track=True,
+        art_track_preset=art_track_preset,
         effect=effect_val,
         label_line=label_val,
     )
