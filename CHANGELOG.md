@@ -3,6 +3,13 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.80] - 2026-09-30
+
+### Fixed
+
+- Hide content hashes stored as technical codes in campaign lists and the song
+  drawer header instead of showing them as if they were catalog codes.
+
 ## [1.1.79] - 2026-09-30
 
 ### Added
