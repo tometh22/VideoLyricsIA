@@ -3,6 +3,18 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.82] - 2026-09-30
+
+### Added
+
+- Staging-only kill switches so corrections can be published while delivery
+  QC is being redesigned: `DELIVERY_QC_STAGING_GATES_OFF=1` stops the delivery
+  QC/preflight gate from blocking approval and publication, and
+  `LANGUAGE_REVIEW_STAGING_ADVISORY=1` stops the language review from returning
+  `language_review_unresolved` on approve and approve-lyrics. Both are inert
+  unless `ENVIRONMENT` is exactly `staging` and default to off; reports are still
+  generated and shown.
+
 ## [1.1.81] - 2026-09-30
 
 ### Fixed
