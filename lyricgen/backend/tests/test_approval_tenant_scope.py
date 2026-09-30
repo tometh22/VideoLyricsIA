@@ -153,6 +153,38 @@ def test_umg_approval_requires_signed_current_video_review(client, db):
     assert db.query(Job).filter(Job.job_id == job_id).one().status == "pending_review"
 
 
+def test_status_exposes_expiring_campaign_bypass_for_stale_preflight(
+    client, db, monkeypatch,
+):
+    owner_token, owner = _register(client, "approval_umg_bypass_status")
+    job_id = _seed_pending_review(db, owner)
+    job = db.query(Job).filter(Job.job_id == job_id).one()
+    job.delivery_profile = "umg"
+    job.campaign_id = "camp_over_01"
+    job.delivery_qc = {
+        "status": "STALE",
+        "mode": "enforce",
+        "approval": {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"},
+        "issues": [{"issue_id": "old-cut", "status": "OPEN", "summary": "Hallazgo de otro corte"}],
+    }
+    db.commit()
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "1")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS", "camp_over_01")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_UNTIL_UTC", "2099-01-01T00:00:00Z")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_PREFLIGHT_BYPASS", "1")
+
+    response = client.get(f"/status/{job_id}", headers=_auth(owner_token))
+
+    assert response.status_code == 200, response.text
+    report = response.json()["delivery_qc"]
+    assert report["status"] == "BYPASSED"
+    assert report["approval"]["can_approve"] is True
+    assert report["approval"]["blocked"] is False
+    assert report["approval"]["reason"] == "staging_preflight_bypass"
+    assert report["issues"] == []  # findings from the replaced cut are never shown as current
+
+
 def test_admin_override_can_approve_campaign_qc_blocker_with_audit(
     client, admin_token, admin_user_id, db,
 ):
