@@ -42,8 +42,8 @@ export function Chip({ tone = "neutral", className = "", title, children }) {
   return <span title={title} className={`inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 ${CHIP[tone]} ${className}`}>{children}</span>;
 }
 
-export function Kbd({ children }) {
-  return <kbd aria-hidden="true" className="inline-flex min-w-[1.4rem] items-center justify-center rounded-md border border-white/15 bg-white/[0.06] px-1.5 py-0.5 font-mono text-[10px] text-ink-secondary">{children}</kbd>;
+export function Kbd({ children, className = "" }) {
+  return <kbd aria-hidden="true" className={`${className || "inline-flex"} min-w-[1.4rem] items-center justify-center rounded-md border border-white/15 bg-white/[0.06] px-1.5 py-0.5 font-mono text-[10px] text-ink-secondary`}>{children}</kbd>;
 }
 
 export function Skeleton({ className = "" }) {

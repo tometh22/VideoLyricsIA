@@ -18,7 +18,7 @@ import SongTable from "./SongTable";
 import StyleAssignment from "./StyleAssignment";
 import VideoReviewPlayer from "./VideoReviewPlayer";
 import {
-  CLASSIFICATIONS, PORTAL_FILTERS, buildSongs, canGenerate, canSend, classificationCounts, filterSongs, nextLyricSong, primaryAction, sortSongs,
+  CLASSIFICATIONS, PORTAL_FILTERS, buildSongs, canDiscard, canGenerate, canSend, classificationCounts, filterSongs, nextLyricSong, primaryAction, sortSongs,
 } from "./songModel";
 import { Banner, Button, Chip, EmptyState, InfoTip, Kbd, Modal, Skeleton, inputClass } from "./ui";
 
@@ -50,7 +50,7 @@ function SongToolbar({ view, params, setParam, songs, lyricSongs, searchRef, onH
   const chip = (active) => `inline-flex h-8 items-center gap-1.5 rounded-full px-3 text-xs font-medium ring-1 transition ${active ? "bg-brand/20 text-white ring-brand/50" : "bg-white/[0.03] text-ink-secondary ring-white/10 hover:text-white"}`;
   return <div className="flex flex-col gap-3 border-b border-white/[0.06] p-4 lg:flex-row lg:items-center">
     <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
-      <div className="w-full sm:w-72" ref={searchRef}><CampaignSearch value={q} onChange={(value) => setParam("q", value)} /></div>
+      <div className="w-full sm:w-80" ref={searchRef}><CampaignSearch value={q} placeholder="Buscar canción, artista o código" onChange={(value) => setParam("q", value)} /></div>
       {view === "lyrics" && <>
         <button type="button" aria-pressed={!!params.get("drafts")} onClick={() => toggle("drafts")} className={chip(!!params.get("drafts"))}>Con cambios guardados <span className="tabular-nums opacity-70">{drafts}</span></button>
         <button type="button" aria-pressed={!!params.get("mine")} onClick={() => toggle("mine")} className={chip(!!params.get("mine"))}>Mis revisiones</button>
@@ -70,7 +70,7 @@ function SongToolbar({ view, params, setParam, songs, lyricSongs, searchRef, onH
     </div>
     <div className="flex items-center gap-3 text-xs text-ink-secondary">
       <span className="tabular-nums" aria-live="polite">{songs.length} {songs.length === 1 ? "canción" : "canciones"}</span>
-      <Button size="sm" variant="ghost" onClick={onHelp} aria-label="Atajos de teclado"><Kbd>?</Kbd> Atajos</Button>
+      <Button size="sm" variant="ghost" onClick={onHelp} aria-label="Atajos de teclado" className="hidden md:inline-flex"><Kbd>?</Kbd> Atajos</Button>
     </div>
   </div>;
 }
@@ -98,10 +98,11 @@ export default function CampaignDetailPage({ id }) {
   const known = Boolean(campaign || pipe.data);
   const lyric = kind !== "art_track";
   const view = resolveView(params, kind);
-  const section = params.get("section") || "general";
+  // `?view=contract` predates the settings tab; it still lands on the report.
+  const section = params.get("section") || (params.get("view") === "contract" ? "contract" : "general");
   const order = params.get("order") === "learning" ? "learning" : "effort";
   const [styleTargets, setStyleTargets] = useState(null);
-  const needs = (views, settingsSections = []) => known && lyric && (views.includes(view) || (view === "settings" && settingsSections.includes(section)));
+  const needs = (views, settingsSections = []) => known && lyric && (views.includes(view) || (view === "config" && settingsSections.includes(section)));
   const lyrics = useCampaignResource(`${prefix}lyrics:${order}`, ({ signal }) => loadReviewQueue(id, { order, signal }), { enabled: needs(["all", "lyrics", "discarded"], ["activity"]) });
   const creative = useCampaignResource(`${prefix}creative`, ({ signal }) => campaignRequest(`${base}/creative`, { signal }), { enabled: needs(["all", "ready"], ["style", "contract"]) || Boolean(styleTargets) });
   const report = useCampaignResource(`${prefix}report`, ({ signal }) => campaignRequest(`${base}/creative/report`, { signal }), { enabled: needs(["all", "qc", "approved", "delivered"], ["contract"]) });
@@ -160,6 +161,16 @@ export default function CampaignDetailPage({ id }) {
     const timer = setTimeout(() => updateParams({ focus: null, scroll: null }), 6000);
     return () => { cancelAnimationFrame(frame); clearTimeout(timer); };
   }, [focusId, songs.length, updateParams]);
+
+  // The editor's "Descartar canción" returns here with ?discard=<item>.
+  const discardId = params.get("discard");
+  useEffect(() => {
+    if (!discardId || !pipe.data || (lyric && !lyrics.data && !lyrics.error)) return;
+    const target = songs.find((song) => song.id === discardId);
+    if (target && canDiscard(target)) setDialog({ type: "discard", songs: [target], mode: "discard" });
+    else setFlash({ tone: "warning", text: "La canción cambió de estado y no se puede descartar desde esta revisión." });
+    updateParams({ discard: null });
+  }, [discardId, lyric, lyrics.data, lyrics.error, pipe.data, songs, updateParams]);
 
   const returnPath = useCallback((song) => {
     const context = new URLSearchParams(location.search);
@@ -246,7 +257,7 @@ export default function CampaignDetailPage({ id }) {
   // Keyboard: J/K move, Enter acts, X selects, / searches, N next step.
   useEffect(() => {
     const onKey = (event) => {
-      if (event.metaKey || event.ctrlKey || event.altKey || dialog || drawerSong || help || view === "settings") return;
+      if (event.metaKey || event.ctrlKey || event.altKey || dialog || drawerSong || help || view === "config") return;
       if (document.querySelector("[role=dialog]")) return;
       const typing = isTyping(event.target);
       if (event.key === "Escape" && selected.size && !typing) { setSelected(new Set()); return; }
@@ -290,6 +301,9 @@ export default function CampaignDetailPage({ id }) {
   };
 
   const approvedSong = approvedJob ? songs.find((song) => song.job_id === approvedJob) : null;
+  // Back from the editor, the song may have moved on (approved, discarded…).
+  const movedSong = focusId && !approvedSong && visible.length && !visible.some((song) => song.job_id === focusId || song.id === focusId)
+    ? songs.find((song) => song.job_id === focusId || song.id === focusId) : null;
   const nextAfterApproval = approvedSong ? nextLyricSong(sortSongs(lyricSongs, "lyrics")) : null;
 
   if (!known && (head.error || pipe.error)) {
@@ -324,18 +338,21 @@ export default function CampaignDetailPage({ id }) {
         </p>
       </div>
       <div className="flex flex-wrap items-center gap-2">
-        {canManage && lyric && <Button variant="ghost" onClick={() => updateParams({ view: "settings", section: "upload", song: null }, { push: true })}>Subir audios</Button>}
-        <Button variant={view === "settings" ? "secondary" : "ghost"} onClick={() => (view === "settings" ? setView("all") : updateParams({ view: "settings", song: null }, { push: true }))} aria-pressed={view === "settings"}>Configuración</Button>
-        {next && !next.passive && <Button variant="primary" size="lg" onClick={runNextStep}>{next.label} <Kbd>N</Kbd></Button>}
+        {canManage && lyric && <Button variant="ghost" onClick={() => updateParams({ view: "config", section: "upload", song: null }, { push: true })}>Subir audios</Button>}
+        <Button variant={view === "config" ? "secondary" : "ghost"} onClick={() => (view === "config" ? setView("all") : updateParams({ view: "config", song: null }, { push: true }))} aria-pressed={view === "config"}>Configuración</Button>
+        {next && !next.passive && <Button variant="primary" size="lg" onClick={runNextStep}>{next.label} <Kbd className="hidden sm:inline-flex">N</Kbd></Button>}
       </div>
     </header>
 
-    <PipelineBar counts={counts} kind={kind} value={view === "settings" ? null : view} onChange={setView} loading={!pipe.data} />
+    <PipelineBar counts={counts} kind={kind} value={view === "config" ? null : view} onChange={setView} loading={!pipe.data} />
 
     {approvedSong && <Banner tone="success" action={<div className="flex gap-2">
       {nextAfterApproval && <Button size="sm" variant="primary" onClick={() => openReview(nextAfterApproval)}>Revisar siguiente: {nextAfterApproval.title}</Button>}
       <Button size="sm" variant="ghost" onClick={() => updateParams({ approved: null })}>Cerrar</Button></div>}>
       Letra aprobada: <strong>{approvedSong.title}</strong>. Quedó lista para generar.
+    </Banner>}
+    {movedSong && view !== "config" && <Banner tone="info" action={<Button size="sm" onClick={() => updateParams({ view: movedSong.stage, focus: movedSong.job_id || movedSong.id, tab: null, stage: null, ...Object.fromEntries(FILTER_KEYS.map((key) => [key, null])) }, { push: true })}>Ver en {stageMeta(movedSong.stage).label}</Button>}>
+      <strong>{movedSong.title}</strong> ahora está en «{stageMeta(movedSong.stage).title}».
     </Banner>}
     {params.get("delivery_op") && <CampaignDeliveryProgress operationId={params.get("delivery_op")} request={campaignRequest} onSettled={refresh}
       onSelectFailed={(jobIds) => {
@@ -346,7 +363,7 @@ export default function CampaignDetailPage({ id }) {
     {pipe.error && known && <Banner tone="danger" action={<Button size="sm" onClick={refresh}>Reintentar</Button>}>No se pudo actualizar el estado: {pipe.error.message}</Banner>}
     {flash && <Banner tone={flash.tone} role={flash.tone === "danger" ? "alert" : "status"} action={<Button size="sm" variant="ghost" onClick={() => setFlash(null)}>Cerrar</Button>}>{flash.text}</Banner>}
 
-    {view === "settings" && campaign
+    {view === "config" && campaign
       ? <CampaignSettings campaign={campaign} section={section} onSection={(value) => updateParams({ section: value })} canManage={canManage} isAdmin={canManage}
         creative={creative.data} report={report.data} lyrics={lyrics.data} onChanged={refresh} remaining={Math.max(0, 1000 - (pipe.data?.total || 0))}
         onUploaded={(summary) => { void refresh(); if (summary?.uploaded) setFlash({ tone: "success", text: `${summary.uploaded} audios subidos. La transcripción arranca sola.` }); }} />
@@ -364,10 +381,10 @@ export default function CampaignDetailPage({ id }) {
           highlightedId={focusId || approvedJob} cursor={cursor} onCursor={setCursor} focusRequest={focusRequest} busyIds={busyIds}
           emptyState={<EmptyState title={filtered ? "No hay coincidencias con los filtros" : emptyCopy[0]} description={filtered ? "Probá con otra búsqueda o limpiá los filtros." : emptyCopy[1]}
             action={filtered ? <Button size="sm" onClick={() => updateParams(Object.fromEntries(FILTER_KEYS.map((key) => [key, null])))}>Limpiar filtros</Button>
-              : view === "all" && canManage && lyric ? <Button size="sm" variant="primary" onClick={() => updateParams({ view: "settings", section: "upload" }, { push: true })}>Subir audios</Button> : null} />} />
+              : view === "all" && canManage && lyric ? <Button size="sm" variant="primary" onClick={() => updateParams({ view: "config", section: "upload" }, { push: true })}>Subir audios</Button> : null} />} />
       </section>}
 
-    {view !== "settings" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
+    {view !== "config" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
 
     {drawerSong && <SongDrawer song={drawerSong} kind={kind} campaignId={id} canManage={canManage}
       reviewerEnabled={campaign?.reviewer_campaign_status?.enabled === true}

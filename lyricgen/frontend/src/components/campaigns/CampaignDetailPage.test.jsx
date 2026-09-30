@@ -206,6 +206,18 @@ describe("campaign workspace", () => {
     expect(location()).toContain("/review/j2?return_to=/campaigns/c1?view=lyrics&focus=j2");
   });
 
+  it("opens the discard dialog requested by the editor, or explains why it cannot", async () => {
+    const api = createCampaignApi({ songs: [makeSong(1, "lyrics"), makeSong(2, "qc")] });
+    mount(api, "/campaigns/c1?tab=all&discard=i1");
+    const dialog = await screen.findByRole("dialog", { name: "Descartar canción" });
+    expect(within(dialog).getByRole("heading")).toHaveTextContent("Canción 1");
+    expect(location()).not.toContain("discard=");
+    cleanup(); clearCampaignResourceCache();
+    mount(createCampaignApi({ songs: [makeSong(2, "qc")] }), "/campaigns/c1?discard=i2");
+    await screen.findByText("La canción cambió de estado y no se puede descartar desde esta revisión.");
+    expect(screen.queryByRole("dialog", { name: "Descartar canción" })).not.toBeInTheDocument();
+  });
+
   it("moves through songs with the keyboard and acts with Enter", async () => {
     const api = createCampaignApi({ songs: [makeSong(1, "lyrics"), makeSong(2, "lyrics")] });
     mount(api, "/campaigns/c1?view=lyrics");

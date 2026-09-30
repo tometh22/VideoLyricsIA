@@ -37,7 +37,7 @@ describe("campaign pipeline vocabulary", () => {
     expect(resolveView(params("view=creative"))).toBe("ready");
     expect(resolveView(params("view=history&video_state=review"))).toBe("qc");
     expect(resolveView(params("view=deliveries"))).toBe("approved");
-    expect(resolveView(params("view=contract"))).toBe("settings");
+    expect(resolveView(params("view=contract"))).toBe("config");
     expect(resolveView(params("tab=drafts"))).toBe("lyrics");
     expect(resolveView(params("tab=approved&stage=final"))).toBe("all");
     expect(resolveView(params("tab=discarded"))).toBe("discarded");

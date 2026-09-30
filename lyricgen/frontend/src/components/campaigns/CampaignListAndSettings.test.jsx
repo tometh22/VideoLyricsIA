@@ -208,7 +208,7 @@ describe("settings from the workspace", () => {
   it("pauses the campaign and asks before cancelling", async () => {
     const api = createCampaignApi({ songs: [makeSong(1, "lyrics")] });
     vi.stubGlobal("fetch", api.fetchMock);
-    render(<MemoryRouter initialEntries={["/campaigns/c1?view=settings"]}><Routes><Route path="/campaigns/:campaignId" element={<CampaignsPage />} /></Routes></MemoryRouter>);
+    render(<MemoryRouter initialEntries={["/campaigns/c1?view=config"]}><Routes><Route path="/campaigns/:campaignId" element={<CampaignsPage />} /></Routes></MemoryRouter>);
     fireEvent.click(await screen.findByRole("radio", { name: "Pausada" }));
     await waitFor(() => expect(api.state.calls.find((call) => call.method === "PATCH")?.body).toEqual({ status: "paused" }));
     fireEvent.click(screen.getByRole("button", { name: "Cancelar campaña" }));

@@ -38,7 +38,7 @@ function StageDetail({ song }) {
   if (song.pending_change_requests) chips.push(<Chip key="cr" tone="warning">{song.pending_change_requests} {song.pending_change_requests === 1 ? "cambio pedido" : "cambios pedidos"}</Chip>);
   if (song.current_is_variant) chips.push(<Chip key="var">Variante</Chip>);
   if (song.video_count > 1) chips.push(<Chip key="vc">{song.video_count} versiones</Chip>);
-  return chips.length ? <div className="flex flex-wrap gap-1.5">{chips}</div> : <span className="text-xs text-ink-secondary/60">—</span>;
+  return chips.length ? <div className="flex flex-wrap gap-1.5">{chips}</div> : <span className="hidden text-xs text-ink-secondary/60 lg:inline">—</span>;
 }
 
 export default function SongTable({
@@ -86,6 +86,7 @@ export default function SongTable({
   const selectableVisible = selectable ? songs.filter(selectable) : [];
   const allSelected = selectableVisible.length > 0 && selectableVisible.every((song) => selected.has(song.id));
   const showDuration = !["qc", "approved", "delivered"].includes(view);
+  const showThumbs = ["all", "qc", "approved", "delivered"].includes(view);
 
   if (loading) {
     return <div className="divide-y divide-white/[0.05]" aria-busy="true">
@@ -98,6 +99,10 @@ export default function SongTable({
   if (!songs.length) return emptyState || <EmptyState title="No hay canciones en esta etapa" />;
 
   return <div>
+    {selectable && selectableVisible.length > 0 && <label className="flex items-center gap-3 border-b border-white/[0.06] px-4 py-2.5 text-xs text-ink-secondary md:hidden">
+      <input type="checkbox" checked={allSelected} onChange={() => onToggleAll(allSelected ? [] : selectableVisible.map((song) => song.id))} className="h-4 w-4 accent-[#7557FF]" />
+      {allSelected ? "Quitar selección" : `Seleccionar todas (${selectableVisible.length})`}
+    </label>}
     <table className="block w-full text-left text-sm md:table">
       <thead className="hidden border-b border-white/[0.06] text-[11px] uppercase tracking-wider text-ink-secondary md:table-header-group">
         <tr>
@@ -128,7 +133,7 @@ export default function SongTable({
             </td>
             <td className="min-w-0 md:py-3 md:pr-3">
               <div className="flex min-w-0 items-center gap-3">
-                <Thumbnail song={song} />
+                {showThumbs && <Thumbnail song={song} />}
                 <div className="min-w-0">
                   <button type="button" onClick={() => onOpen(song)} className="block max-w-full truncate text-left font-medium text-white hover:underline focus-visible:underline focus-visible:outline-none">{song.title}</button>
                   <p className="truncate text-xs text-ink-secondary">{song.artist || "Artista sin informar"}{song.technical_code ? <span className="text-ink-secondary/60"> · {song.technical_code}</span> : null}</p>
@@ -141,7 +146,7 @@ export default function SongTable({
                 {note && <span className="max-w-[16rem] truncate text-xs text-ink-secondary" title={note}>{note}</span>}
               </div>
             </td>
-            <td className="hidden md:py-3 md:pr-3 lg:table-cell"><StageDetail song={song} /></td>
+            <td className="col-span-2 col-start-2 row-start-3 md:hidden md:py-3 md:pr-3 lg:table-cell"><StageDetail song={song} /></td>
             {showDuration && <td className="hidden tabular-nums text-ink-secondary md:py-3 md:pr-3 xl:table-cell">{formatDuration(song.duration_seconds)}</td>}
             <td className="col-start-3 row-span-2 row-start-1 md:py-3 md:pr-4">
               <div className="flex items-center justify-end gap-1.5">

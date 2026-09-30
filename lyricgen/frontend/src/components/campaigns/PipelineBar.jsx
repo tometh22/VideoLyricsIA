@@ -32,16 +32,16 @@ export default function PipelineBar({ counts, kind, value, onChange, loading = f
           style={{ width: `${(100 * count) / active}%` }} /> : null;
       })}
     </div>
-    <div className="-mx-1 overflow-x-auto pb-1">
-      <div role="tablist" aria-label="Etapas de la campaña" className="flex min-w-max gap-1 px-1">
+    <div className="-mx-1">
+      <div role="tablist" aria-label="Etapas de la campaña" className="flex flex-wrap gap-0.5 px-1">
         {tabs.map((tab, index) => {
           const selected = value === tab.key;
           return <button key={tab.key} type="button" role="tab" aria-selected={selected} tabIndex={selected ? 0 : -1}
             title={tab.title} onClick={() => onChange(tab.key)} onKeyDown={(event) => move(event, index)}
-            className={`group flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium transition duration-brand focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand ${selected ? "bg-white/[0.09] text-white ring-1 ring-white/15" : tab.count ? "text-ink-secondary hover:bg-white/[0.05] hover:text-white" : "text-ink-secondary/60 hover:bg-white/[0.04]"}`}>
+            className={`group flex items-center gap-1.5 rounded-xl px-2 py-1.5 text-sm font-medium transition duration-brand focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand ${selected ? "bg-white/[0.09] text-white ring-1 ring-white/15" : tab.count ? "text-ink-secondary hover:bg-white/[0.05] hover:text-white" : "text-ink-secondary/60 hover:bg-white/[0.04]"}`}>
             {tab.tone && <span aria-hidden="true" className={`h-2 w-2 rounded-full ${tab.tone.dot} ${tab.count ? "" : "opacity-30"}`} />}
             <span>{tab.label}</span>
-            <span className={`rounded-md px-1.5 py-0.5 text-xs tabular-nums ${selected ? "bg-white/10 text-white" : tab.human && tab.count ? "bg-white/[0.07] text-white" : "text-ink-secondary"}`}>
+            <span className={`rounded-md px-1 py-0.5 text-xs tabular-nums ${selected ? "bg-white/10 text-white" : tab.human && tab.count ? "bg-white/[0.07] text-white" : "text-ink-secondary"}`}>
               {loading ? "—" : tab.count}
             </span>
           </button>;

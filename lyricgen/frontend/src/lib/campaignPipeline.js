@@ -87,11 +87,13 @@ export function campaignNextStep(counts, kind = "lyric_video") {
   return null;
 }
 
+// `?view=config` (not "settings": the app shell treats `view=settings` on any
+// route as the account settings deep link from billing emails).
 // `?view=` values used before the pipeline redesign stay valid so copied
 // links, saved return paths and editor "Volver" keep landing somewhere sane.
-const LEGACY_VIEWS = { review: "lyrics", creative: "ready", history: "qc", deliveries: "approved", contract: "settings" };
+const LEGACY_VIEWS = { review: "lyrics", creative: "ready", history: "qc", deliveries: "approved", contract: "config" };
 const LEGACY_TABS = { pending: "lyrics", drafts: "lyrics", approved: "all", all: "all", discarded: "discarded" };
-export const DETAIL_VIEWS = ["all", ...STAGE_KEYS, "settings"];
+export const DETAIL_VIEWS = ["all", ...STAGE_KEYS, "config"];
 
 export function resolveView(params, kind = "lyric_video") {
   const raw = params.get("view");

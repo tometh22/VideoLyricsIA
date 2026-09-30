@@ -6541,11 +6541,7 @@ export default function App() {
           <Route path="/review/:jobId" element={wizardScreen} />
           <Route path="/campaigns" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
           <Route path="/campaigns/:campaignId" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
-          <Route path="/admin/cola" element={
-            user?.role === "admin"
-              ? <Suspense fallback={<RouteSuspenseFallback />}><ReviewQueuePage /></Suspense>
-              : <Navigate to="/dashboard" replace />
-          } />
+          <Route path="/admin/cola" element={<Suspense fallback={<RouteSuspenseFallback />}><ReviewQueuePage /></Suspense>} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
             <Suspense fallback={<RouteSuspenseFallback />}>

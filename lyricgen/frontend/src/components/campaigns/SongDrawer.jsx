@@ -94,7 +94,7 @@ export default function SongDrawer({ song, kind, campaignId, canManage, reviewer
           {song.stage === "attention" && canDiscard(song) && <Button size="sm" variant="ghost" onClick={() => onAction(song, "discard")}>Descartar</Button>}
           {lyricStagePassed && song.job_id && <Button size="sm" variant="secondary" onClick={() => onAction(song, "edit-lyrics")}>Editar letra y tiempos</Button>}
           {videoJob && ["qc", "approved", "delivered", "rendering"].includes(song.stage) && <Button size="sm" variant="ghost" onClick={() => onNavigate(`/videos/${encodeURIComponent(videoJob)}`)}>Detalle del video</Button>}
-          {canManage && canSend(song) && song.stage === "delivered" && !song.portal_outdated && <Button size="sm" variant="ghost" onClick={() => onAction(song, "send")}>Reenviar</Button>}
+          {canManage && canSend(song) && song.stage === "delivered" && !song.portal_outdated && <Button size="sm" variant="ghost" onClick={() => onAction(song, "send")}>Enviar a otro portal</Button>}
           {canManage && canSend(song) && song.video?.evidence?.video_sha256 && <Button size="sm" variant="ghost" onClick={() => onAction(song, "record-delivery")}>Registrar entrega manual</Button>}
         </div>
       </header>
