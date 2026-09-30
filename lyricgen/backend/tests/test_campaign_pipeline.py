@@ -58,12 +58,15 @@ def portal(rows):
         conn.execute(text(
             "CREATE TABLE deliveries (id INTEGER, job_id TEXT, portal_id TEXT, tenant_snapshot TEXT,"
             " removed_at TEXT, published_render_fingerprint TEXT, published_revision INTEGER,"
-            " stale_since TEXT, stale_reason TEXT, approved_at TEXT, content_updated_at TEXT)"
+            " stale_since TEXT, stale_reason TEXT, approved_at TEXT, content_updated_at TEXT,"
+            " published_file_keys TEXT)"
         ))
         conn.execute(text("CREATE TABLE delivery_change_requests (id INTEGER, delivery_id INTEGER, resolved_at TEXT, submitted_at TEXT)"))
-        for n, (job_id, portal_id, tenant, pending) in enumerate(rows, start=1):
-            conn.execute(text("INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,NULL,NULL,1,NULL,NULL,NULL,NULL)"),
-                         dict(n=n, job=job_id, portal=portal_id, tenant=tenant))
+        for n, row in enumerate(rows, start=1):
+            job_id, portal_id, tenant, pending = row[:4]
+            keys = row[4] if len(row) > 4 else None   # a JSON string = this delivery serves a frozen snapshot
+            conn.execute(text("INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,NULL,NULL,1,NULL,NULL,NULL,NULL,:keys)"),
+                         dict(n=n, job=job_id, portal=portal_id, tenant=tenant, keys=keys))
             for request in range(pending):
                 conn.execute(text("INSERT INTO delivery_change_requests VALUES (:id,:delivery,NULL,:submitted)"),
                              dict(id=n * 100 + request, delivery=n,
@@ -277,15 +280,21 @@ def test_pipeline_reports_admin_and_inbox_flag(db, setup, monkeypatch):
     assert on["features"] == {"change_requests_inbox": True, "change_request_actions": False} and owner["is_admin"] is False
 
 
-def test_pipeline_reports_whether_the_portal_serves_the_latest_render(db, setup, monkeypatch):
+def test_pipeline_reports_per_delivery_whether_the_portal_serves_the_latest_render(db, setup, monkeypatch):
     campaign, items, actor = setup
-    job = add_job(db, campaign, actor, item=items[0], status="done")
+    fresh = add_job(db, campaign, actor, item=items[0], status="done")
+    frozen = add_job(db, campaign, actor, item=items[1], status="done")
     db.commit()
-    with portal([(job.job_id, "chile", campaign.tenant_id, 0)]) as session:
+    rows = [(fresh.job_id, "chile", campaign.tenant_id, 0),
+            (frozen.job_id, "chile", campaign.tenant_id, 0, '{"video": "t/j/lyric_video.mp4.published-abc"}')]
+    with portal(rows) as session:
         monkeypatch.setattr(creative, "scoped_deliveries_db", session)
         monkeypatch.delenv("PUBLISH_LATEST_POINTER", raising=False)
-        frozen = pipeline.campaign_pipeline(campaign.id, actor, db)
+        off = pipeline.campaign_pipeline(campaign.id, actor, db)
         monkeypatch.setenv("PUBLISH_LATEST_POINTER", "1")
-        latest = pipeline.campaign_pipeline(campaign.id, actor, db)
-    assert frozen["publication_mode"] == "snapshot" and frozen["items"][0]["portal_serves_latest"] is False
-    assert latest["publication_mode"] == "pointer" and latest["items"][0]["portal_serves_latest"] is True
+        on = pipeline.campaign_pipeline(campaign.id, actor, db)
+    by_title = lambda result: {row["title"]: row["portal_serves_latest"] for row in result["items"]}
+    assert off["publication_mode"] == "snapshot" and set(by_title(off).values()) == {False}
+    assert on["publication_mode"] == "pointer"
+    # Mixed population: only the delivery WITHOUT a snapshot follows the newest render.
+    assert by_title(on)["Tema 0"] is True and by_title(on)["Tema 1"] is False

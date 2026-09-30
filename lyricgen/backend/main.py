@@ -11899,6 +11899,14 @@ async def delete_job_endpoint(
                 status_code=409,
                 detail=f"Cannot delete a job in status '{status_val}'. Only stuck or failed jobs can be deleted.",
             )
+        if reason == "published_in_portal":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "published_in_portal",
+                    "message": "Este video está publicado en un portal de cliente y el portal lo sirve desde sus archivos. Retirá la entrega antes de borrarlo.",
+                },
+            )
         raise HTTPException(status_code=400, detail=reason)
     return {"deleted": job_id}
 
@@ -18133,6 +18141,13 @@ def request_edit(
     # The old capture here was a no-op because it read AFTER the
     # job.artist assignment.
     db.commit()
+    # The delivered files are about to change. Say so NOW, not when the worker
+    # reaches them: the MP4 goes live the moment it lands (no copy is frozen in
+    # pointer mode) and, until something marks the delivery in flight, the old
+    # broadcast master and the client's approval still look current. Best effort
+    # (mark_deliveries_stale contains its own failures), like /retry and approve.
+    if getattr(job, "s3_keys", None):
+        delivery_freshness.mark_deliveries_stale(job_id, delivery_freshness.STALE_EDITING)
     # Send 202 after the durable DB commit; Redis delivery happens after the
     # response. A missing response can therefore be retried by payload hash
     # without incrementing edit_count, cloning audit rows or forking renders.

@@ -8,7 +8,7 @@ import pytest
 import art_track_campaigns as atc
 import campaign_change_requests as inbox
 import delivery_freshness
-from database import AuditLog, Delivery, DeliveryBatchItem, DeliveryChangeRequest, Job, SessionLocal
+from database import AuditLog, Delivery, DeliveryBatchItem, DeliveryChangeRequest, EditorDocument, Job, SessionLocal
 from tests.test_art_track_campaigns import _campaign_for, _seed_campaign_job, clean_art_rows, publication_storage  # noqa: F401
 from tests.test_bulk_delivery_robustness import KEYS, storage_ready  # noqa: F401
 
@@ -39,6 +39,11 @@ def scenario(client, admin_token, cleanup, name):
     with SessionLocal() as db:
         job = db.query(Job).filter_by(job_id=job_id).one()
         job.completed_at = NOW - timedelta(hours=1)  # the corrected render finished an hour ago
+        job.segments_revision = 3
+        job.render_params = {"_rendered_segments_revision": 3, "_rendered_at": (NOW - timedelta(hours=1)).isoformat()}
+        # The fix was saved in the editor 3 hours ago (revision 3) and rendered afterwards.
+        db.add(EditorDocument(job_id=job_id, tenant_id=campaign.tenant_id, current_segments=[], original_segments=[],
+                              revision=3, updated_at=NOW - timedelta(hours=3)))
         delivery = Delivery(job_id=job_id, label="Campaña", file_types=["video"], artist_snapshot="Artist",
                             song_title_snapshot="Song", tenant_snapshot=campaign.tenant_id, added_by_user_id=job.user_id,
                             portal_id="chile", published_revision=1, published_render_fingerprint="old-cut")
@@ -168,6 +173,18 @@ def test_a_render_that_does_not_match_the_saved_editor_is_not_closable(monkeypat
     fresh = _job(_rendered_segments_revision=4, _rendered_at=NOW.isoformat())
     assert inbox.closable_on_publish(request, stale, delivery, document) == (False, "render_not_current")
     assert inbox.closable_on_publish(request, fresh, delivery, document) == (True, "ok")
-    assert inbox.closable_on_publish(request, fresh, delivery, None) == (True, "ok")
+    assert inbox.closable_on_publish(request, fresh, delivery, None) == (False, "render_not_current")   # no editor document, no evidence
     assert inbox.closable_on_publish(SimpleNamespace(resolved_at=NOW, submitted_at=NOW), fresh, delivery, document) == (False, "not_open")
     assert inbox.closable_on_publish(request, SimpleNamespace(**{**vars(fresh), "status": "rendering"}), delivery, document) == (False, "job_not_ready")
+
+
+def test_a_request_that_arrived_after_the_last_editor_save_is_not_closable(monkeypatch):
+    """Submitted while the render was running: before the render finished, after the
+    save that holds the fix, so this cut cannot have answered it."""
+    monkeypatch.setattr(delivery_freshness, "needs_publish", lambda job, delivery: True)
+    request = SimpleNamespace(resolved_at=None, submitted_at=NOW - timedelta(minutes=30))
+    job = _job(_rendered_segments_revision=4, _rendered_at=NOW.isoformat())
+    saved_earlier = SimpleNamespace(revision=4, updated_at=NOW - timedelta(hours=2))
+    saved_after = SimpleNamespace(revision=4, updated_at=NOW - timedelta(minutes=10))
+    assert inbox.closable_on_publish(request, job, SimpleNamespace(), saved_earlier) == (False, "newer_than_cut")
+    assert inbox.closable_on_publish(request, job, SimpleNamespace(), saved_after) == (True, "ok")

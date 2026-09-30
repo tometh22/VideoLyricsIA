@@ -3,7 +3,7 @@ import pytest
 from fastapi import HTTPException
 
 import art_track_campaigns as atc
-from database import AuditLog, DeliveryBatch, DeliveryBatchItem, SessionLocal
+from database import AuditLog, DeliveryBatch, DeliveryBatchItem, Job, SessionLocal
 from tests.test_art_track_campaigns import (  # noqa: F401  (autouse fixtures)
     _campaign_for, _run_bulk_delivery, _seed_campaign_job, clean_art_rows, publication_storage,
 )
@@ -62,9 +62,10 @@ def test_unexpected_error_does_not_leave_the_operation_sending(client, admin_tok
         return real(job)
 
     monkeypatch.setattr(atc.delivery_freshness, 'render_fingerprint', boom)
-    atc.process_delivery_batch(op)
+    assert atc.process_delivery_batch(op) == {'sent': 1, 'failed': 1}
     items = _items(op)
     assert items[first][:2] == ('failed', 'unexpected_error')
+    assert items[second][0] == 'sent'   # one broken song never stops the ones after it
     with SessionLocal() as db:
         operation = db.get(DeliveryBatch, op)
         assert operation.status == 'partial'  # retryable, not stuck in "sending"
@@ -196,3 +197,94 @@ def test_pointer_mode_bulk_send_copies_nothing_and_leaves_the_pointer_null(clien
     with SessionLocal() as db:
         rows = db.query(Delivery).filter(Delivery.job_id.in_([first, second])).all()
         assert len(rows) == 2 and all(row.published_file_keys is None for row in rows)
+
+
+def test_a_failure_marked_earlier_survives_a_later_crash(client, admin_token, monkeypatch, storage_ready):
+    """A `continue`-path failure (stale approval) is uncommitted when the next song
+    raises; the rollback of that song must not turn it back into 'pending'."""
+    _, first, second, op = _two_song_operation(client, admin_token, 'survives')
+    with SessionLocal() as db:
+        rows = db.query(DeliveryBatchItem).filter_by(delivery_batch_id=op).order_by(DeliveryBatchItem.created_at, DeliveryBatchItem.id).all()
+        ordered = [r.job_id for r in rows]
+        stale = db.query(Job).filter_by(job_id=ordered[0]).one()
+        stale.render_params = {**(stale.render_params or {}), 'edited_after_approval': True}  # changes the fingerprint
+        db.commit()
+    real = atc.delivery_freshness.render_fingerprint
+
+    def boom(job):
+        if job.job_id == ordered[1]:
+            raise RuntimeError('synthetic outage')
+        return real(job)
+
+    monkeypatch.setattr(atc.delivery_freshness, 'render_fingerprint', boom)
+    atc.process_delivery_batch(op)
+    items = _items(op)
+    assert items[ordered[0]][:2] == ('failed', 'stale_approval')
+    assert items[ordered[1]][:2] == ('failed', 'unexpected_error')
+
+
+def test_items_are_processed_in_a_stable_order(client, admin_token, monkeypatch, storage_ready):
+    _, first, second, op = _two_song_operation(client, admin_token, 'ordered')
+    seen = []
+    real = atc.delivery_freshness.render_fingerprint
+    monkeypatch.setattr(atc.delivery_freshness, 'render_fingerprint', lambda job: (seen.append(job.job_id), real(job))[1])
+    atc.process_delivery_batch(op)
+    with SessionLocal() as db:
+        expected = [r.job_id for r in db.query(DeliveryBatchItem).filter_by(delivery_batch_id=op).order_by(DeliveryBatchItem.created_at, DeliveryBatchItem.id)]
+    assert [j for j in dict.fromkeys(seen)] == expected
+
+
+def _mark(op, job_id, status, code=None, operation_status=None):
+    with SessionLocal() as db:
+        row = db.query(DeliveryBatchItem).filter_by(delivery_batch_id=op, job_id=job_id).one()
+        row.status = status; row.error_code = code
+        if operation_status:
+            db.get(DeliveryBatch, op).status = operation_status
+        db.commit()
+
+
+def test_a_stale_approval_is_not_offered_a_retry_that_can_never_work(client, admin_token, monkeypatch, storage_ready):
+    _, first, second, op = _two_song_operation(client, admin_token, 'stale-no-retry')
+    auth = {'Authorization': f'Bearer {admin_token}'}
+    monkeypatch.setattr(atc, 'enqueue_delivery_batch', lambda operation_id: True)
+    monkeypatch.setattr(atc, '_delivery_batch_rq_state', lambda operation_id: None)
+    _mark(op, first, 'failed', 'stale_approval', 'partial')
+    _mark(op, second, 'sent')
+    body = client.get(f'/batch/delivery-operations/{op}', headers=auth).json()
+    assert next(i for i in body['items'] if i['job_id'] == first)['retryable'] is False
+    refused = client.post(f'/batch/delivery-operations/{op}/retry', headers=auth)
+    assert refused.status_code == 409 and refused.json()['detail']['code'] == 'nothing_to_retry'
+    _mark(op, first, 'failed', 'deliverables_not_ready')   # a retryable failure does get one
+    assert client.post(f'/batch/delivery-operations/{op}/retry', headers=auth).status_code == 202
+
+
+def test_an_unreachable_redis_is_never_read_as_no_job(client, admin_token, monkeypatch, storage_ready):
+    _, first, second, op = _two_song_operation(client, admin_token, 'redis-down')
+    auth = {'Authorization': f'Bearer {admin_token}'}
+    queued = []
+    monkeypatch.setattr(atc, 'enqueue_delivery_batch', lambda operation_id: (queued.append(operation_id), True)[1])
+    monkeypatch.setattr(atc, '_delivery_batch_rq_state', lambda operation_id: 'unknown')
+    response = client.post(f'/batch/delivery-operations/{op}/retry', headers=auth)
+    assert response.status_code == 202 and response.json()['outcome'] == 'unavailable'
+    assert queued == []
+
+
+def test_the_sweeper_moves_on_from_operations_it_cannot_requeue(client, admin_token, monkeypatch, storage_ready):
+    _, first, second, op = _two_song_operation(client, admin_token, 'sweep-bump')
+    monkeypatch.setattr(atc, 'enqueue_delivery_batch', lambda operation_id: True)
+    monkeypatch.setattr(atc, '_delivery_batch_rq_state', lambda operation_id: 'started')
+    _age(op, atc.STALL_AFTER_SECONDS + 60)
+    with SessionLocal() as db:
+        assert atc.reconcile_stalled_delivery_batches(db) == 0
+    body = client.get(f'/batch/delivery-operations/{op}', headers={'Authorization': f'Bearer {admin_token}'}).json()
+    assert body['stalled'] is False   # looked at once; it will be considered again in 10 minutes
+
+
+def test_a_send_cannot_carry_an_unbounded_list_of_ticks(client, admin_token, monkeypatch, storage_ready):
+    monkeypatch.setenv('CAMPAIGN_CHANGE_REQUEST_ACTIONS', '1')
+    campaign = _campaign_for(client, admin_token, 'caps')
+    job_id = _seed_campaign_job(campaign, umg_spec=None, s3_keys=dict(KEYS))
+    response = client.post(f'/batch/campaigns/{campaign.id}/deliveries', headers={'Authorization': f'Bearer {admin_token}'},
+                           json={'job_ids': [job_id], 'destination_portal': 'chile', 'idempotency_key': 'caps-operation-key-1',
+                                 'resolve_requests': {f'j{n}': [n] for n in range(201)}})
+    assert response.status_code == 422 and response.json()['detail'] == {'code': 'too_many_change_requests'}

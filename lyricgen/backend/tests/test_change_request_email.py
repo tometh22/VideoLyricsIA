@@ -39,3 +39,12 @@ def test_html_in_the_client_comment_is_escaped():
     with patch("emails._send_email") as sent:
         emails.send_umg_change_request_notification("A", "S", "<script>x</script>", 1, "j", request_id=3)
     assert "<script>" not in sent.call_args.args[2]
+
+
+def test_a_newline_in_the_song_metadata_cannot_break_the_subject():
+    (call,) = _send(request_id=5, portal_id="chile")
+    with patch("emails._send_email") as sent:
+        emails.send_umg_change_request_notification("Art\r\nista", "Can\nción", "x", 1, "j", request_id=5, portal_id="chile")
+    subject = sent.call_args.args[1]
+    assert "\n" not in subject and "\r" not in subject
+    assert subject == "UMG Chile pidió un cambio — Art ista · Can ción"

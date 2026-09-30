@@ -546,6 +546,14 @@ def portal_history(job_ids, tenant_id):
             Delivery.stale_since, Delivery.stale_reason,
             Delivery.approved_at, Delivery.content_updated_at,
         ).all()
+        # Which of these jobs still have a FROZEN copy behind an active delivery.
+        # Read in Python (a JSON column cannot be grouped, and JSON null must read
+        # as "no snapshot" like everywhere else in the app).
+        frozen_jobs = {
+            frozen_job for frozen_job, keys in ddb.query(Delivery.job_id, Delivery.published_file_keys).filter(
+                Delivery.job_id.in_(job_ids), Delivery.tenant_snapshot == tenant_id, Delivery.removed_at.is_(None),
+            ).all() if keys is not None
+        }
     result = {}
     for (job_id, portal_id, pending, oldest_pending, fingerprint, revision,
          stale_since, stale_reason, approved_at, content_updated_at) in publications:
@@ -556,6 +564,7 @@ def portal_history(job_ids, tenant_id):
             "published_fingerprints": [], "published_revision": 1,
             "portal_updating": False, "portal_awaiting_review": False,
             "oldest_change_request_at": None,
+            "snapshot_pinned": job_id in frozen_jobs,
         })
         portal = portal_id or "argentina"
         if portal not in row["umg_portals"]:
