@@ -504,7 +504,10 @@ def list_campaigns(
     if current_user.get("role") != "admin":
         query = query.filter(BatchCampaign.tenant_id == current_user["tenant_id"])
     rows = query.order_by(BatchCampaign.created_at.desc()).limit(100).all()
-    return {"items": [_summary(db, row) for row in rows]}
+    from campaign_pipeline import pipeline_counts
+    return {"items": [
+        {**_summary(db, row), "pipeline": pipeline_counts(db, row)} for row in rows
+    ]}
 
 
 @router.get("/campaigns/{campaign_id}")
