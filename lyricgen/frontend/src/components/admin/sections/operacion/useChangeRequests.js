@@ -52,6 +52,8 @@ function proposalMatchesSummary(proposal, item) {
     || revision === proposal.lyrics_context.revision;
 }
 
+export const INTERPRETATION_POLL_MS = 4000;
+
 export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   const { flashError } = useAdmin();
   const [changeRequests, setChangeRequests] = useState([]);
@@ -167,6 +169,26 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     setCrProposalDetails((current) => ({ ...current, [requestId]: proposal }));
   }, []);
 
+  // La interpretación del pedido corre en el servidor (~1 min): se consulta
+  // sin bloquear el panel hasta que la propuesta queda lista.
+  const followInterpretation = useCallback(async (requestId, generation) => {
+    const deadline = Date.now() + 6 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, INTERPRETATION_POLL_MS));
+      if (proposalGenerationRef.current.get(String(requestId)) !== generation) return;
+      try {
+        const data = await fetchJson(`${API}/admin/change-requests/${requestId}/proposals/current`);
+        storeProposal(requestId, data.proposal, generation);
+        if (data.proposal?.status !== "interpreting") {
+          await loadChangeRequests({ silent: true });
+          return;
+        }
+      } catch {
+        // Un corte de red no cancela: se reintenta en la próxima vuelta.
+      }
+    }
+  }, [loadChangeRequests, storeProposal]);
+
   const generateChangeRequestProposal = useCallback(async (requestId) => {
     const generation = startProposalRequest(requestId);
     const work = beginProposalWork(requestId);
@@ -177,6 +199,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       });
       storeProposal(requestId, data.proposal, generation);
       await loadChangeRequests();
+      if (data.proposal?.status === "interpreting") followInterpretation(requestId, generation);
       return data.proposal;
     } catch (err) {
       setCrPublishNotice({ requestId, tone: "error", text: `No pude analizar el pedido: ${err.message || err}` });
@@ -185,7 +208,8 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     } finally {
       endProposalWork(work);
     }
-  }, [flashError, loadChangeRequests, storeProposal, startProposalRequest, beginProposalWork, endProposalWork]);
+  }, [flashError, loadChangeRequests, storeProposal, startProposalRequest, beginProposalWork, endProposalWork,
+    followInterpretation]);
 
   const loadChangeRequestProposal = useCallback(async (requestId) => {
     const generation = startProposalRequest(requestId);
@@ -197,6 +221,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       );
       storeProposal(requestId, data.proposal, generation);
       await loadChangeRequests({ silent: true });
+      if (data.proposal?.status === "interpreting") followInterpretation(requestId, generation);
       return data.proposal;
     } catch (err) {
       setCrPublishNotice({ requestId, tone: "error", text: `No pude cargar la propuesta: ${err.message || err}` });
@@ -205,7 +230,8 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     } finally {
       endProposalWork(work);
     }
-  }, [flashError, storeProposal, startProposalRequest, loadChangeRequests, beginProposalWork, endProposalWork]);
+  }, [flashError, storeProposal, startProposalRequest, loadChangeRequests, beginProposalWork, endProposalWork,
+    followInterpretation]);
 
   const adjustChangeRequestProposal = useCallback(async (
     requestId, proposalId, operationId, requestedText, baseRevision, expectedProposalHash,

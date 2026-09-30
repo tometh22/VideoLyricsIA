@@ -5,6 +5,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- UMG change requests written in free prose are now turned into concrete,
+  reviewable lyric changes. The strict parser only understood quoted
+  "cambiar X por Y" and converted 4 of 77 instructions in requests
+  #112-#131; a model (Gemini 2.5 Pro via Vertex) now reads the comment with
+  the numbered lines and proposes rewrites, line splits/joins and timing
+  moves. A deterministic validator only offers what the client wrote: any
+  word that enters or leaves must be in the comment, the change must fall
+  near a cited time, and timing comes from the heard words, never from the
+  model. On the 20 requests: 136 applicable changes instead of 4, manual
+  items 73 -> 17; where UMG wrote the exact text it wanted, the proposal
+  contains it in 86 of 95 items (the operators' saved lyrics: 56). Nothing
+  is applied automatically: the admin request panel shows each change with
+  the client's words and applies the selected ones. The interpretation runs
+  in the background (~1 min, status "interpreting") behind
+  `CHANGE_REQUEST_INTERPRETER_ENABLED`; a model failure leaves the request as
+  before.
+
 ### Fixed
 
 - Revisión rápida no longer proposes a single automatic ear's text as a fix.

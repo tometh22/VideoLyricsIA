@@ -21639,7 +21639,7 @@ async def admin_list_change_requests(
         proposal_status = proposal.status if proposal else None
         if (
             proposal_status in {"ready", "partial", "needs_input"}
-            and proposal.parser_version != current_change_request_parser_version
+            and str(proposal.parser_version or "").split("+")[0] != current_change_request_parser_version
         ):
             proposal_status = "stale"
         publication = (
@@ -21807,7 +21807,7 @@ def _serialize_change_request_proposal(
     payload["satisfied_count"] = sum(op.get('status') == 'already_satisfied' for op in payload['operations'])
     if payload["status"] in {"ready", "partial", "needs_input"}:
         from change_request_parser import SCHEMA_VERSION as current_parser_version
-        if row.parser_version != current_parser_version:
+        if str(row.parser_version or "").split("+")[0] != current_parser_version:
             payload["status"] = "stale"
     if document is not None:
         from change_request_proposals import lyrics_preview_context
@@ -21920,9 +21920,109 @@ class ChangeRequestProposalDismiss(BaseModel):
     )
 
 
+_INTERPRETING_STALE_AFTER = timedelta(minutes=10)
+
+
+def _aware_utc(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _proposal_needs_interpretation(row: ChangeRequestProposal) -> bool:
+    """Queda algo del pedido sin convertir en cambios y el intérprete está
+    prendido: se completa en segundo plano."""
+    if not _change_request_flag("CHANGE_REQUEST_INTERPRETER_ENABLED"):
+        return False
+    if "+" in str(row.parser_version or "") or row.status not in {"needs_input", "partial"}:
+        return False
+    from change_request_proposals import MANUAL_KINDS
+    return any(
+        isinstance(op, dict) and not op.get("applicable") and op.get("kind") in MANUAL_KINDS
+        and op.get("kind") != "background_review"
+        for op in (row.operations or [])
+    )
+
+
+def _interpret_change_request_proposal(proposal_id: str, cr_id: int) -> None:
+    """Corre fuera del request: una llamada al modelo (~1 min) y la propuesta
+    pasa de "interpreting" a lista. Si la letra cambió mientras tanto, queda
+    vieja y el operador la recalcula."""
+    from database import DeliveriesSessionLocal, SessionLocal as _Session
+
+    db, ddb = _Session(), DeliveriesSessionLocal()
+    try:
+        row = db.get(ChangeRequestProposal, proposal_id)
+        if row is None or row.status != "interpreting":
+            return
+        history = [dict(item) for item in (row.decision_history or []) if isinstance(item, dict)][-99:]
+        previous = next((item.get("from_status") for item in reversed(history)
+                         if item.get("decision") == "interpretation_started"), "needs_input")
+        try:
+            cr, delivery = _read_change_request_context(db, ddb, cr_id)
+            job = db.query(Job).filter(Job.job_id == row.job_id).first()
+            document = db.query(EditorDocument).filter(EditorDocument.job_id == row.job_id).first()
+            if job is None or document is None or int(document.revision or 0) != int(row.base_revision):
+                row.status = "stale"
+                history.append({"decision": "interpretation_stale",
+                                "decided_at": datetime.now(timezone.utc).isoformat()})
+            else:
+                from change_request_interpreter import interpretation_for
+                from change_request_proposals import build_proposal
+                segments = list(document.current_segments or [])
+                interpretation = interpretation_for(
+                    cr.comment, segments, evidence=document.machine_evidence,
+                    title=job.song_title or "", artist=job.artist or "",
+                )
+                built = build_proposal(
+                    comment=cr.comment, segments=segments,
+                    base_revision=int(document.revision or 0),
+                    audio_revision=int(job.audio_revision or 0),
+                    audio_sha256=str(job.input_audio_sha256 or ""),
+                    background_context={
+                        "background_hint": (job.render_params or {}).get("background_hint"),
+                        "background_mode": (job.render_params or {}).get("background_mode"),
+                        "concept": (job.render_params or {}).get("concept"),
+                        "genre": (job.render_params or {}).get("genre"),
+                        "artist": job.artist, "song_title": job.song_title,
+                        "scene_plan": job.scene_plan,
+                    },
+                    interpretation=interpretation,
+                )
+                if built["segments_content_hash"] != row.segments_content_hash:
+                    row.status = "stale"
+                else:
+                    row.operations = built["operations"]
+                    row.parser_version = built["parser_version"]
+                    row.schema_version = built["schema_version"]
+                    row.status = built["status"]
+                history.append({
+                    "decision": "interpreted", "decided_at": datetime.now(timezone.utc).isoformat(),
+                    "model": interpretation.get("model"), "status": row.status,
+                    "applicable_count": built["applicable_count"], "unresolved_count": built["unresolved_count"],
+                })
+                db.add(ProductEvent(
+                    tenant_id=str(job.tenant_id), user_id=row.created_by, job_id=job.job_id,
+                    name="change_request_interpreted",
+                    properties={"status": row.status, "applicable_count": built["applicable_count"],
+                                "unresolved_count": built["unresolved_count"],
+                                "model": interpretation.get("model"), "portal_id": row.portal_id},
+                ))
+        except Exception as exc:  # el pedido queda como estaba, a mano
+            logger.warning("[CR-INTERPRETER] %s failed: %s", proposal_id, exc)
+            row.status = previous
+            history.append({"decision": "interpretation_failed", "reason": type(exc).__name__,
+                            "decided_at": datetime.now(timezone.utc).isoformat()})
+        row.decision_history = history
+        row.updated_at = datetime.now(timezone.utc)
+        db.commit()
+    finally:
+        db.close()
+        ddb.close()
+
+
 @app.post("/admin/change-requests/{cr_id}/proposals")
 def admin_generate_change_request_proposal(
     cr_id: int,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
@@ -21957,12 +22057,18 @@ def admin_generate_change_request_proposal(
         .order_by(ChangeRequestProposal.created_at.desc())
         .first()
     )
+    stuck = (
+        cached is not None and cached.status == "interpreting"
+        and cached.updated_at is not None
+        and datetime.now(timezone.utc) - _aware_utc(cached.updated_at) > _INTERPRETING_STALE_AFTER
+    )
     if (
         cached is not None
         and cached.status not in {"stale", "dismissed"}
+        and not stuck
         and (
             cached.status not in {"ready", "partial", "needs_input"}
-            or cached.parser_version == current_parser_version
+            or str(cached.parser_version or "").split("+")[0] == current_parser_version
         )
     ):
         return {
@@ -21999,7 +22105,7 @@ def admin_generate_change_request_proposal(
         db.query(ChangeRequestProposal)
         .filter(ChangeRequestProposal.portal_id == portal_id)
         .filter(ChangeRequestProposal.change_request_id == cr_id)
-        .filter(ChangeRequestProposal.status.in_(("ready", "partial", "needs_input")))
+        .filter(ChangeRequestProposal.status.in_(("ready", "partial", "needs_input", "interpreting")))
         .all()
     )
     for stale in stale_rows:
@@ -22092,6 +22198,16 @@ def admin_generate_change_request_proposal(
             ),
         }
     db.refresh(row)
+    if _proposal_needs_interpretation(row):
+        history = [dict(item) for item in (row.decision_history or []) if isinstance(item, dict)][-99:]
+        history.append({"decision": "interpretation_started", "from_status": row.status,
+                        "decided_at": datetime.now(timezone.utc).isoformat()})
+        row.status = "interpreting"
+        row.decision_history = history
+        row.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(row)
+        background_tasks.add_task(_interpret_change_request_proposal, row.id, cr_id)
     return {
         "ok": True, "cached": False, "recalculated": recalculated,
         "proposal": _serialize_change_request_proposal(row, document=document),

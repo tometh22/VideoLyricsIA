@@ -362,3 +362,25 @@ it("closing review invalidates its late network response", async () => {
   await act(async () => { pending.resolve({ change_request_id: 85 }); await loading; });
   expect(result.current.crRenderReview).toBeNull();
 });
+it("follows a request being interpreted until its proposal is ready", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  let reads = 0;
+  mocks.fetchJson.mockImplementation((url, opts) => {
+    if (url === "/admin/change-requests/7/proposals") return Promise.resolve({ proposal: { id: "p", status: "interpreting" } });
+    if (url === "/admin/change-requests/7/proposals/current") {
+      reads += 1;
+      return Promise.resolve({ proposal: { id: "p", status: reads < 2 ? "interpreting" : "ready" } });
+    }
+    return previous(url, opts);
+  });
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const { result } = renderHook(() => useChangeRequests());
+  await act(() => result.current.generateChangeRequestProposal(7));
+  expect(result.current.crProposalDetails[7].status).toBe("interpreting");
+  await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+  await waitFor(() => expect(result.current.crProposalDetails[7].status).toBe("ready"));
+  const before = reads;
+  await act(async () => { await vi.advanceTimersByTimeAsync(12000); });
+  expect(reads).toBe(before);
+});
