@@ -46,6 +46,20 @@ describe("campaign list", () => {
     expect(screen.getByTestId("location")).toHaveTextContent("/campaigns/b");
   });
 
+  it("flags open client change requests on the campaign card with the age of the oldest", async () => {
+    const oldest = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
+    vi.stubGlobal("fetch", vi.fn(async () => json({ items: [
+      { id: "a", name: "UMG Agosto", status: "active", kind: "lyric_video", registered_count: 10,
+        pipeline: { counts: { delivered: 3 }, flags: { change_requests: 2, change_requests_open: 3, oldest_change_request_at: oldest } } },
+      { id: "b", name: "Sin pedidos", status: "active", kind: "lyric_video", registered_count: 4,
+        pipeline: { counts: { delivered: 1 }, flags: { change_requests_open: 0 } } },
+    ] })));
+    render(<MemoryRouter initialEntries={["/campaigns"]}><Routes><Route path="/campaigns" element={<CampaignsPage />} /></Routes></MemoryRouter>);
+    const card = await screen.findByRole("button", { name: /UMG Agosto/ });
+    expect(card).toHaveTextContent("3 cambios pedidos por el cliente · el más antiguo: hace 2 días");
+    expect(screen.getByRole("button", { name: /Sin pedidos/ })).not.toHaveTextContent("cambio");
+  });
+
   it("creates a campaign, saves a visual base style and offers the browser uploader", async () => {
     const calls = [];
     vi.stubGlobal("fetch", vi.fn(async (input, options = {}) => {
