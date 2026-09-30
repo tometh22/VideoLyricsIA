@@ -149,6 +149,7 @@ from transcription_language import (
 from language_review import (
     reference_text_of as _job_reference_text,
     review_payload as _language_review_payload,
+    staging_advisory as _language_staging_advisory,
 )
 from provenance import job_was_delivered
 from batch_profiles import (
@@ -12959,6 +12960,7 @@ async def approve_job(
     if (
         _language_review["needs_language_review"]
         and not _language_review["language_review_resolved"]
+        and not _language_staging_advisory()
     ):
         if not override_allowed:
             raise HTTPException(

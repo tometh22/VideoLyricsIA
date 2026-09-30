@@ -515,7 +515,28 @@ def delivery_qc_source_fingerprint(job: Any) -> str:
     })
 
 
+def staging_delivery_gates_off() -> bool:
+    """Staging-only kill switch: delivery QC/preflight never blocks anything.
+
+    Staging writes to the live portal database, so this is an explicit,
+    reversible operator decision (env var), never a code default, and it is
+    inert anywhere ENVIRONMENT is not exactly "staging" (production included).
+    Reports are still generated and shown; they just stop gating.
+    """
+    if os.environ.get("ENVIRONMENT", "").strip().lower() != "staging":
+        return False
+    return os.environ.get("DELIVERY_QC_STAGING_GATES_OFF", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def delivery_readiness_gate(job: Any, report: Mapping[str, Any] | None, *, for_umg_delivery: bool = False) -> dict[str, Any]:
+    if staging_delivery_gates_off():
+        return {
+            "blocked": False, "can_approve": True,
+            "reason": "staging_delivery_gates_off",
+            "staging_gates_off": True,
+            "staging_preflight_bypass": True,
+            "staging_manual_review_bypass": True,
+        }
     required = for_umg_delivery or is_umg_delivery_job(job)
     if required and staging_umg_preflight_bypass_enabled(job):
         return {

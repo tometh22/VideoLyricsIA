@@ -1344,12 +1344,14 @@ def approve_campaign_lyrics(
     # review checkboxes above are necessary but not sufficient when the text
     # does not match the reference.
     from language_review import review_payload as _language_review_payload
+    from language_review import staging_advisory as _language_staging_advisory
     _language_review = _language_review_payload(
         job.segments_json, job.transcription_quality, job.segments_revision,
     )
     if (
         _language_review["needs_language_review"]
         and not _language_review["language_review_resolved"]
+        and not _language_staging_advisory()
     ):
         raise HTTPException(
             status_code=409,
