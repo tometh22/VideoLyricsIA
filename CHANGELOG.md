@@ -3,6 +3,44 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.79] - 2026-09-30
+
+### Added
+
+- UMG change requests written in free prose are now turned into concrete,
+  reviewable lyric changes. The strict parser only understood quoted
+  "cambiar X por Y" and converted 4 of 77 instructions in requests
+  #112-#131; a model (Gemini 2.5 Pro via Vertex) now reads the comment with
+  the numbered lines and proposes rewrites, line splits/joins and timing
+  moves. A deterministic validator only offers what the client wrote: any
+  word that enters or leaves must be in the comment, the change must fall
+  near a cited time, and timing comes from the heard words, never from the
+  model. On the 20 requests: 136 applicable changes instead of 4, manual
+  items 73 -> 17; where UMG wrote the exact text it wanted, the proposal
+  contains it in 86 of 95 items (the operators' saved lyrics: 56). Nothing
+  is applied automatically: the admin request panel shows each change with
+  the client's words and applies the selected ones. The interpretation runs
+  in the background (~1 min, status "interpreting") behind
+  `CHANGE_REQUEST_INTERPRETER_ENABLED`; a model failure leaves the request as
+  before.
+
+### Fixed
+
+- Revisión rápida no longer proposes a single automatic ear's text as a fix.
+  On staging "El Cigarrito" it offered "pito → pido" (Chilean slang) and
+  "de a vara → de habara". Measured over 298 approved songs, single-ear
+  points were ~1 false alarm per song and, on the 136 UMG change requests,
+  found the right place 48 times but the right text only 6. They now read
+  "Escuchá este tramo": the line stays as is, the doubtful words are
+  underlined, the ear's version goes in the reason, and Enter plays the
+  audio instead of applying anything.
+- Differences that are the same sound cut differently ("a vara"/"habara")
+  are no longer raised unless the official lyrics say so.
+- Timing suggestions left the panel (52 alerts, 1 real request); timing is
+  reviewed in "Ajustar tiempos".
+- When nothing blocks approval, suggestions stay behind "Ver N sugerencias
+  (opcional)" instead of taking the main card.
+
 ## [1.1.78] - 2026-09-30
 
 ### Fixed

@@ -465,10 +465,55 @@ def _background_prompt_operation(
     }
 
 
+def _spans_overlap(item: dict, spans: list[tuple[int, int]]) -> bool:
+    start, end = item.get("source_start"), item.get("source_end")
+    if start is None or end is None:
+        return False
+    return any(a < end and start < b for a, b in spans)
+
+
+def _merge_interpretation(
+    operations: list[dict], unresolved: list[dict], interpretation: dict,
+) -> tuple[list[dict], list[dict]]:
+    """Suma los cambios que interpretó el modelo (change_request_interpreter)
+    a los del parser estricto: lo determinístico gana sobre la misma línea y
+    un pendiente manual desaparece sólo si su texto quedó cubierto."""
+    claimed = {segments_content_hash([row]) for op in operations for row in op.get("current_segments") or []}
+    added = []
+    for op in interpretation.get("operations") or []:
+        rows = op.get("current_segments") or []
+        if not rows or any(segments_content_hash([row]) in claimed for row in rows):
+            continue
+        claimed.update(segments_content_hash([row]) for row in rows)
+        added.append(op)
+    spans = [(op["source_start"], op["source_end"]) for op in added
+             if op.get("source_start") is not None and op.get("source_end") is not None]
+    remaining = [item for item in unresolved if not _spans_overlap(item, spans)]
+    covered_manual = [(item.get("source_start"), item.get("source_end")) for item in remaining]
+    for item in interpretation.get("manual") or []:
+        if item.get("reason") == "visual":
+            continue  # el fondo lo resuelve su propio flujo
+        if item.get("source_start") is not None and any(
+                a is not None and a == item["source_start"] for a, _ in covered_manual):
+            continue
+        remaining.append({
+            "id": _operation_id("interp-manual", item.get("quote"), item.get("reason")),
+            "kind": "manual_review", "origin": "interpreter", "status": "pending",
+            "applicable": False, "automatic_apply_allowed": False,
+            "reason": f"interpreter_{item.get('reason') or 'unclear'}",
+            "why": item.get("why", ""), "source_excerpt": item.get("quote", ""),
+            "source_start": item.get("source_start"), "source_end": item.get("source_end"),
+            "timecode_seconds": None, "confidence": "low", "scope": "single",
+            "current_segments": [], "proposed_segments": [], "warnings": [],
+        })
+    return [*operations, *added], remaining
+
+
 def build_proposal(
     *, comment: str, segments: Iterable[dict], base_revision: int,
     audio_revision: int = 0, audio_sha256: str = "",
     background_context: dict | None = None,
+    interpretation: dict | None = None,
 ) -> dict:
     current = normalize_segments([dict(row) for row in segments])
     parsed = parse_change_request(comment)
@@ -553,6 +598,9 @@ def build_proposal(
         else:
             unresolved.append(_manual_operation(instruction))
 
+    if interpretation:
+        operations, unresolved = _merge_interpretation(operations, unresolved, interpretation)
+
     # Detect competing claims before presenting a jointly applicable selection.
     claims: dict[str, list[dict]] = {}
     for operation in operations:
@@ -590,7 +638,8 @@ def build_proposal(
         status = "needs_input"
     return {
         "schema_version": SCHEMA_VERSION,
-        "parser_version": parsed["schema_version"],
+        "parser_version": parsed["schema_version"] + (
+            f"+{interpretation.get('schema')}" if interpretation else ""),
         "status": status,
         "request_sha256": request_hash(comment),
         "base_revision": int(base_revision),
@@ -661,9 +710,9 @@ def apply_operations(
         before = operation.get("current_segments") or []
         after = operation.get("proposed_segments") or []
         kind = operation.get("kind")
-        if not before or len(after) != 1:
+        if not before or not after or (len(after) != 1 and kind != "relayout"):
             raise ValueError("change request operations need source segments and one result")
-        if kind != "merge_phrase" and len(before) != 1:
+        if kind not in {"merge_phrase", "relayout"} and len(before) != 1:
             raise ValueError("text change request operations must replace one segment")
         before_hash = segments_content_hash(before)
         after_hash = segments_content_hash(after)
@@ -683,6 +732,30 @@ def apply_operations(
                 or float(proposed.get("end") or 0) != float(ordered[-1].get("end") or 0)
             ):
                 raise ValueError("structural merge changed phrase boundaries")
+        if kind == "relayout":
+            # Re-cortar una frase o sumar una línea cantada: las líneas nuevas
+            # quedan en orden, sin superponerse entre sí ni con las vecinas.
+            outer_start = min(float(row.get("start") or 0) for row in before)
+            outer_end = max(float(row.get("end") or 0) for row in before)
+            before_hashes = {segments_content_hash([row]) for row in before}
+            others = [row for row in current if segments_content_hash([row]) not in before_hashes]
+            lower = max((float(row.get("end") or 0) for row in others
+                         if float(row.get("end") or 0) <= outer_start + 1e-6), default=0.0)
+            upper = min((float(row.get("start") or 0) for row in others
+                         if float(row.get("start") or 0) >= outer_end - 1e-6), default=float("inf"))
+            spans = [(float(row.get("start") or 0), float(row.get("end") or 0)) for row in after]
+            if (spans[0][0] < lower - 1e-6 or spans[-1][1] > upper + 1e-6
+                    or any(a[1] > b[0] + 1e-6 or a[0] >= a[1] for a, b in zip(spans, spans[1:]))
+                    or spans[-1][0] >= spans[-1][1]):
+                raise ValueError("structural relayout left the phrase span")
+        if kind == "timing":
+            old, new = before[0], after[0]
+            if _identity(old.get("text")) != _identity(new.get("text")):
+                raise ValueError("timing change request changed text")
+            if (abs(float(new.get("start") or 0) - float(old.get("start") or 0)) > 6
+                    or abs(float(new.get("end") or 0) - float(old.get("end") or 0)) > 6
+                    or float(new.get("start") or 0) >= float(new.get("end") or 0)):
+                raise ValueError("timing change request moved the line too far")
         claimed.update(before_row_hashes)
 
     result = [row for row in current if segments_content_hash([row]) not in claimed]
@@ -691,7 +764,7 @@ def apply_operations(
     result = normalize_segments(result)
     # Plain text operations must never move the timeline. Structural merges
     # deliberately replace adjacent fragments by their exact outer span.
-    if not any(row.get("kind") == "merge_phrase" for row in selected):
+    if not any(row.get("kind") in {"merge_phrase", "relayout", "timing"} for row in selected):
         before_timing = [(row["start"], row["end"]) for row in current]
         after_timing = [(row["start"], row["end"]) for row in result]
         if before_timing != after_timing:

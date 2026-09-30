@@ -114,6 +114,12 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
       tone: proposalStatus === "needs_input" ? "attention" : "action",
     };
   }
+  if (proposalStatus === "interpreting") {
+    return {
+      key: "apply", activeStep: 1, label: "Interpretando el pedido…",
+      detail: "Ubicando cada cambio en la letra. En un minuto queda para revisar.", tone: "busy",
+    };
+  }
   if (proposalStatus === "stale" || proposalStatus === "dismissed") {
     return {
       key: "analyze", activeStep: 0, label: "Hay que recalcular",

@@ -638,6 +638,42 @@ describe("ChangeRequestsPanel", () => {
     expect(screen.getByRole("link", { name: "Abrir editor de escenas" })).toBeInTheDocument();
   });
 
+  it("says the request is being interpreted instead of asking for manual work", () => {
+    renderPanel({}, { proposalEnabled: true, proposalDetails: { 7: {
+      id: "p-interp", status: "interpreting", base_revision: 4, operations: [],
+    } } });
+    expect(screen.getByTestId("change-request-interpreting")).toHaveTextContent(/alrededor de un minuto/);
+    expect(screen.getAllByText("Interpretando el pedido…").length).toBeGreaterThan(0);
+  });
+
+  it("shows what UMG asked next to each interpreted change, including a split and a timing change", () => {
+    renderPanel({}, { proposalEnabled: true, proposalDetails: { 7: {
+      id: "p-interp", status: "ready", base_revision: 4,
+      operations: [
+        { id: "t1", kind: "replace_text", origin: "interpreter", applicable: true, status: "pending",
+          why: "Falta el Que al principio", source_excerpt: '0:58 falta el "QUE" del principio',
+          current_segments: [{ text: "Hace un año atrás", start: 57, end: 60 }],
+          proposed_segments: [{ text: "Que hace un año atrás", start: 57, end: 60 }] },
+        { id: "r1", kind: "relayout", origin: "interpreter", applicable: true, status: "pending",
+          source_excerpt: "Falta la frase dormite ya",
+          current_segments: [{ text: "Tu garantía de reloco se fundió", start: 43.5, end: 47.8 }],
+          proposed_segments: [{ text: "Tu garantía de reloco se fundió", start: 43.5, end: 47.8 },
+            { text: "dormite ya", start: 48, end: 48.9 }] },
+        { id: "m1", kind: "timing", origin: "interpreter", applicable: true, status: "pending",
+          source_excerpt: "1:00 alargar brasero",
+          current_segments: [{ text: "Debo cuidarme de caer en el brasero", start: 60.5, end: 61.8 }],
+          proposed_segments: [{ text: "Debo cuidarme de caer en el brasero", start: 60.5, end: 63.7 }] },
+      ],
+    } } });
+    expect(screen.getByText(/«0:58 falta el "QUE" del principio»/)).toBeInTheDocument();
+    expect(screen.getByText("Falta el Que al principio")).toBeInTheDocument();
+    expect(screen.getByText("Tu garantía de reloco se fundió / dormite ya")).toBeInTheDocument();
+    expect(screen.getByText("1:01.8")).toBeInTheDocument();
+    expect(screen.getByText("1:03.7")).toBeInTheDocument();
+    // El cambio de tiempo no ofrece editar el texto.
+    expect(screen.getAllByRole("textbox").map((node) => node.value)).not.toContain("Debo cuidarme de caer en el brasero");
+  });
+
   it("presents already satisfied text as a textual check, not a failed manual action or published video", () => {
     renderPanel({}, { proposalEnabled: true, proposalDetails: { 7: {
       id: "p-satisfied", status: "ready", base_revision: 4,

@@ -835,6 +835,7 @@ function ChangeRequestCard({
 }
 
 const PROPOSAL_LABELS = {
+  interpreting: "Interpretando el pedido…",
   ready: "Lista para revisar",
   partial: "Propuesta parcial",
   needs_input: "Necesita intervención",
@@ -1022,6 +1023,31 @@ function LyricsProposalPreview({
   );
 }
 
+function clock(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return "--:--";
+  return `${Math.floor(seconds / 60)}:${(seconds % 60).toFixed(1).padStart(4, "0")}`;
+}
+
+// Un cambio de tiempo: la línea y qué borde se mueve, con el valor anterior.
+function TimingChange({ operation }) {
+  const before = operation.current_segments?.[0] || {};
+  const after = operation.proposed_segments?.[0] || {};
+  const edges = [["start", "Aparece"], ["end", "Termina"]]
+    .filter(([key]) => Number(before[key]) !== Number(after[key]));
+  return (
+    <div>
+      <p className="text-caption text-white break-words">{before.text}</p>
+      {edges.map(([key, label]) => (
+        <p key={key} className="text-label text-gray-400">
+          {label} <span className="text-gray-500 line-through">{clock(before[key])}</span>{" "}
+          <span className="text-emerald-200">{clock(after[key])}</span>
+        </p>
+      ))}
+    </div>
+  );
+}
+
 function ChangeRequestProposal({
   summary, proposal, requestComment, busy, applyEnabled, jobId, requestId,
   onGenerate, onLoad, onAdjust, onApply, onDismiss, onRegenerateBackground, onSeek,
@@ -1184,12 +1210,23 @@ function ChangeRequestProposal({
         )}
       </div>
 
+      {status === "interpreting" && (
+        <div role="status" data-testid="change-request-interpreting"
+          className="flex items-center gap-3 rounded-button bg-white/[0.04] p-3 ring-1 ring-white/[0.08]">
+          <span className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-white/20 border-t-brand-light" aria-hidden="true" />
+          <p className="text-caption text-gray-300">
+            Leyendo el pedido y ubicando cada cambio en la letra. Tarda alrededor de un minuto; podés seguir con otra cosa.
+          </p>
+        </div>
+      )}
+
       {operations.map((operation) => {
         const currentText = (operation.current_segments || [])
           .map((row) => row?.text || "")
           .join(" / ");
-        const proposedText = textDrafts[operation.id]
-          ?? operation.proposed_segments?.[0]?.text ?? "";
+        const proposedText = operation.kind === "relayout"
+          ? (operation.proposed_segments || []).map((row) => row?.text || "").join(" / ")
+          : textDrafts[operation.id] ?? operation.proposed_segments?.[0]?.text ?? "";
         if (!operation.applicable) {
           if (operation.status === "already_satisfied") {
             return (
@@ -1319,6 +1356,7 @@ function ChangeRequestProposal({
         const textEditable = (
           operation.current_segments?.length === 1
           && operation.proposed_segments?.length === 1
+          && operation.kind !== "timing"
         );
         return (
           <div key={operation.id} className="block rounded-button bg-black/20 ring-1 ring-white/[0.06] p-2">
@@ -1333,7 +1371,16 @@ function ChangeRequestProposal({
                 />
               )}
               <div className="min-w-0 flex-1">
+                {operation.origin === "interpreter" && operation.source_excerpt && (
+                  <p className="mb-1 text-label text-gray-400 break-words">
+                    <span className="text-gray-500">UMG: </span>«{operation.source_excerpt}»
+                  </p>
+                )}
+                {operation.kind === "timing" ? (
+                  <TimingChange operation={operation} />
+                ) : (
                 <p className="text-label text-gray-500 line-through break-words">{currentText}</p>
+                )}
                 {operation.status === "pending" && textEditable ? (
                   <div className="mt-1 flex gap-2">
                     <input
@@ -1354,12 +1401,14 @@ function ChangeRequestProposal({
                             : saveStates[operation.id] === "pending" ? "Autoguardado pendiente" : ""}
                     </span>
                   </div>
-                ) : (
+                ) : operation.kind !== "timing" && (
                   <p className="text-caption text-emerald-200 break-words">{proposedText}</p>
                 )}
                 <p className="text-label text-gray-500 mt-1">
                   {operation.operator_adjusted
                     ? "Ajustado por operador"
+                    : operation.origin === "interpreter"
+                      ? (operation.why || "Interpretado del pedido")
                     : operation.kind === "remove_terminal_period"
                       ? "Formato determinístico"
                       : operation.kind === "merge_phrase"

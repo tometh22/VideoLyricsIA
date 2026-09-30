@@ -100,7 +100,10 @@ test("quick review is resolved from the keyboard before approval", async ({ page
     .flatMap((segment) => segment.qa_dismissed || [])).toEqual(["tres"]);
   await expect(panel.getByTestId("lyric-review-heading")).toHaveText("Todo listo para aprobar");
 
-  // La sugerencia queda a la vista con su otra opción (tecla 1), sin bloquear.
+  // Las sugerencias quedan a mano, sin bloquear ni ocupar la tarjeta.
+  await expect(page.getByTestId("lyric-review-active")).toHaveCount(0);
+  await panel.getByRole("button", { name: "Ver 1 sugerencia (opcional)" }).click();
+  await panel.focus();
   await page.waitForTimeout(300);
   await panel.press("1");
   await expect(page.locator('input[aria-label="Letra de la línea 3"]')).toHaveValue("Vos sos la mar");
