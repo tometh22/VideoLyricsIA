@@ -9,6 +9,10 @@ import { fmtDate, fmtAgo } from "../../adminApi";
 import FilterBar from "../../primitives/FilterBar";
 import EmptyState from "../../primitives/EmptyState";
 import TableSkeleton from "../../primitives/TableSkeleton";
+
+const fmtDateTime = (value) => value
+  ? new Date(value).toLocaleString("es-AR", { dateStyle: "medium", timeStyle: "short" })
+  : "Sin fecha";
 import EnableProResModal from "../../../EnableProResModal";
 import ChangeRequestQueue from "./ChangeRequestQueue";
 import RequestWorkflowStepper from "./RequestWorkflowStepper";
@@ -682,6 +686,9 @@ function ChangeRequestCard({
               {item.comment}
             </p>
             <p className="mt-3 text-label text-gray-600">Enviado el {fmtDate(item.submitted_at)}</p>
+            <p className="mt-1 text-label text-gray-500">
+              Última actualización: {fmtDateTime(item.updated_at || item.resolved_at || item.submitted_at)}
+            </p>
           </section>
 
           {!isResolved && proposalEnabled && (

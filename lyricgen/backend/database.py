@@ -1465,6 +1465,11 @@ class DeliveryChangeRequest(Base):
     submitted_at = Column(
         DateTime(timezone=True), default=utcnow, nullable=False,
     )
+    # Keep the latest lifecycle change after reopening clears resolved_at.
+    updated_at = Column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow,
+        nullable=False, server_default=text("CURRENT_TIMESTAMP"),
+    )
     # Set when the operator marks the request handled (re-rendered,
     # edited, dismissed). Null = still pending.
     resolved_at = Column(DateTime(timezone=True), nullable=True)
@@ -1487,6 +1492,7 @@ class DeliveryChangeRequest(Base):
             "delivery_id": self.delivery_id,
             "comment": self.comment,
             "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "resolution_note": self.resolution_note,
             "resolved_by_revision": self.resolved_by_revision,

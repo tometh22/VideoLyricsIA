@@ -20773,6 +20773,7 @@ def admin_create_delivery_from_job(
             # different case was never reviewed by this publication intent.
             validate_reviewed_cut()
             request.resolved_at = now
+            request.updated_at = now
             request.resolved_by_user_id = added_by
             request.resolved_by_revision = delivery.published_revision
             request.resolution_source = "publication"
@@ -21081,9 +21082,12 @@ async def portal_submit_change_request(
     )
     if not delivery:
         raise HTTPException(status_code=404, detail="Delivery no encontrada.")
+    submitted_at = datetime.now(timezone.utc)
     cr = DeliveryChangeRequest(
         delivery_id=delivery_id,
         comment=comment,
+        submitted_at=submitted_at,
+        updated_at=submitted_at,
     )
     ddb.add(cr)
     ddb.commit()
@@ -21371,6 +21375,7 @@ async def portal_get_items(
                 "id": cr.id,
                 "comment": cr.comment,
                 "submitted_at": cr.submitted_at.isoformat() if cr.submitted_at else None,
+                "updated_at": cr.updated_at.isoformat() if cr.updated_at else None,
                 "resolved_at": cr.resolved_at.isoformat() if cr.resolved_at else None,
                 "resolution_note": cr.resolution_note,
                 # Qué versión publicada contestó el pedido, para que el
@@ -21660,6 +21665,7 @@ async def admin_list_change_requests(
             "id": cr.id,
             "comment": cr.comment,
             "submitted_at": cr.submitted_at.isoformat() if cr.submitted_at else None,
+            "updated_at": cr.updated_at.isoformat() if cr.updated_at else None,
             "resolved_at": cr.resolved_at.isoformat() if cr.resolved_at else None,
             "resolution_note": cr.resolution_note,
             "resolved_by": resolver.username if resolver else None,
@@ -22820,7 +22826,12 @@ async def admin_resolve_change_request(
     if cr.resolved_at is not None:
         # Idempotent — return current state instead of erroring, so a
         # double-click in the UI doesn't surface a scary error.
-        return {"ok": True, "already_resolved": True}
+        return {
+            "ok": True,
+            "already_resolved": True,
+            "resolved_at": cr.resolved_at.isoformat(),
+            "updated_at": cr.updated_at.isoformat() if cr.updated_at else None,
+        }
     note = ((body or {}).get("resolution_note") or "").strip() if isinstance(body, dict) else ""
     if len(note) > 2000:
         raise HTTPException(status_code=400, detail="resolution_note too long (max 2000)")
@@ -22829,7 +22840,9 @@ async def admin_resolve_change_request(
             "code": "resolution_reason_required",
             "message": "Explicá por qué el pedido está atendido. Cerrar manualmente no publica otro video.",
         })
-    cr.resolved_at = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
+    cr.resolved_at = now
+    cr.updated_at = now
     # resolved_by_user_id es FK a users de la DB de deliveries → mapear.
     cr.resolved_by_user_id = deliveries_added_by(current_user["id"])
     cr.resolution_note = note or None
@@ -22848,7 +22861,11 @@ async def admin_resolve_change_request(
         },
     ))
     db.commit()
-    return {"ok": True, "resolved_at": cr.resolved_at.isoformat()}
+    return {
+        "ok": True,
+        "resolved_at": cr.resolved_at.isoformat(),
+        "updated_at": cr.updated_at.isoformat(),
+    }
 
 
 @app.post("/admin/change-requests/{cr_id}/reopen")
@@ -22867,7 +22884,12 @@ async def admin_reopen_change_request(
     if not cr:
         raise HTTPException(status_code=404, detail="Change request not found")
     if cr.resolved_at is None:
-        return {"ok": True, "already_pending": True}
+        return {
+            "ok": True,
+            "already_pending": True,
+            "updated_at": cr.updated_at.isoformat() if cr.updated_at else None,
+        }
+    cr.updated_at = datetime.now(timezone.utc)
     cr.resolved_at = None
     cr.resolved_by_user_id = None
     cr.resolution_note = None
@@ -22880,4 +22902,4 @@ async def admin_reopen_change_request(
         detail={"change_request_id": cr_id, "delivery_id": cr.delivery_id},
     ))
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "updated_at": cr.updated_at.isoformat()}

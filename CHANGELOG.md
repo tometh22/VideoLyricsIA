@@ -3,7 +3,7 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.1.79] - 2026-09-30
 
 ### Added
 
@@ -40,6 +40,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   reviewed in "Ajustar tiempos".
 - When nothing blocks approval, suggestions stay behind "Ver N sugerencias
   (opcional)" instead of taking the main card.
+
+## [1.1.78] - 2026-09-30
+
+### Fixed
+
+- Add a short-lived, exact job allowlist for staging UMG manual review during
+  urgent Chile corrections. The existing Argentina campaign preflight bypass
+  remains separate; Chile still requires a fresh report and objective checks.
+
+## [1.1.77] - 2026-09-30
+
+### Fixed
+
+- Track the latest change request update through submission, resolution, and
+  reopening, and show its date and time in the admin queue.
 
 ## [1.1.76] - 2026-09-30
 
