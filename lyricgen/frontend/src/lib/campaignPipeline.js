@@ -106,6 +106,7 @@ export function resolveView(params, kind = "lyric_video") {
 
 /** Hours elapsed since `value`, skipping Saturdays and Sundays (local time). */
 export function businessHoursSince(value, now = Date.now()) {
+  if (value == null || value === "") return 0;
   const start = new Date(value).getTime();
   if (!Number.isFinite(start) || start >= now) return 0;
   let total = 0;

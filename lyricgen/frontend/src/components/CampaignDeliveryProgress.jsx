@@ -8,6 +8,10 @@ const errors = {
   ambiguous_replacement: "Hay varios pedidos del cliente vinculados a esta canción. Elegí la entrega a corregir desde Cambios antes de publicar.",
   unexpected_error: "Ocurrió un error inesperado al publicar. Se puede reintentar.",
 };
+const RETRY_CODES = {
+  operation_in_progress: "El envío todavía se está procesando. Esperá a que termine o a que aparezca como detenido.",
+  nothing_to_retry: "No queda nada para reintentar en este envío.",
+};
 const RETRY_OUTCOME = {
   queued: { tone: "ok", text: "Reintento en marcha." },
   already_running: { tone: "ok", text: "El envío ya se está procesando; esperá a que termine." },
@@ -49,7 +53,10 @@ export default function CampaignDeliveryProgress({ operationId, request, onSelec
   }, [operationId, request, refresh]);
   const failed = operation?.items?.filter(item => item.status === "failed") || [];
   const retryable = failed.filter(item => item.retryable !== false);
-  const canRetry = Boolean(operation) && (retryable.length > 0 || operation.stalled) && operation.status !== "completed";
+  // A send that is still running normally is not retryable; the server would
+  // answer 409 operation_in_progress. Offer it only once it stopped or stalled.
+  const settled = ["partial", "failed"].includes(operation?.status);
+  const canRetry = Boolean(operation) && operation.status !== "completed" && (operation.stalled || (settled && retryable.length > 0));
   const portal = portals[operation?.destination_portal];
   const retry = async () => {
     if (retrying) return;
@@ -59,7 +66,7 @@ export default function CampaignDeliveryProgress({ operationId, request, onSelec
       setRetryNotice(RETRY_OUTCOME[result.outcome] || RETRY_OUTCOME.queued);
       setRefresh(n => n + 1);
     } catch (e) {
-      setRetryNotice({ tone: "error", text: e.message || "No se pudo reintentar." });
+      setRetryNotice({ tone: "error", text: RETRY_CODES[e.code] || e.message || "No se pudo reintentar." });
     } finally {
       setRetrying(false);
     }

@@ -1,3 +1,5 @@
+import { byPublicationMode } from "./publicationMode";
+
 export const PORTAL_LABELS = {
   argentina: "UMG Argentina",
   chile: "UMG Chile",
@@ -53,7 +55,10 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
   if (BUSY_JOB_STATUSES.has(publication.job_status)) {
     return {
       key: "rendering", activeStep: 2, label: "Generando corte nuevo",
-      detail: "El portal conserva la versión anterior hasta que revises y publiques.",
+      detail: byPublicationMode({
+        snapshot: "El portal conserva la versión anterior hasta que revises y publiques.",
+        pointer: "El cliente verá el video nuevo apenas termine. Después revisalo y publicá para registrar la versión.",
+      }),
       tone: "busy",
     };
   }
@@ -67,7 +72,7 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
   }
   if (publication.render_matches_editor && publication.needs_publish && !(publication.prores_pending || []).length) {
     return { key: "publish", activeStep: 3, label: "Corte listo · revisar y publicar",
-      detail: "Reproducí el video y confirmá Publicar actualización para actualizar el portal.", tone: "attention" };
+      detail: "Reproducí el video y publicalo en el portal para dar por resuelto el pedido.", tone: "attention" };
   }
   // A missing/old master says nothing about whether this client's request was
   // interpreted. Do not paint those stages complete or hide the analyze action.
@@ -193,4 +198,280 @@ export function workflowCounts(items, proposals, proposalEnabled) {
 
 export function isBusyJobStatus(status) {
   return BUSY_JOB_STATUSES.has(status);
+}
+
+// ---------------------------------------------------------------------------
+// Vista de 3 pasos para el operador.
+//
+// El servidor sigue proyectando 5 etapas (Interpretar, Aplicar, Renderizar,
+// Revisar, Publicar). Acá sólo se traducen a lo que el operador hace de
+// verdad: corregir, generar el video nuevo y publicar. La interpretación con
+// IA es una ayuda opcional dentro de "Corregir", no un paso. Nada de esto
+// cambia el contrato `workflow` del servidor ni sus `allowed_actions`.
+// ---------------------------------------------------------------------------
+
+export const CORRECTION_STEPS = [
+  { key: "correct", label: "Corregir" },
+  { key: "render", label: "Generar el video nuevo" },
+  { key: "publish", label: "Publicar" },
+];
+
+export const PRIMARY_LABELS = {
+  edit: "Corregir en el editor",
+  review_proposal: "Revisar los cambios sugeridos",
+  render: "Generar el video corregido",
+  rendering: "Generando el video nuevo…",
+  publish: "Publicar en el portal y dar por resuelto",
+  publishing: "Publicando…",
+  prepare_master: "Preparar el archivo profesional",
+  prepare_master_setup: "Elegir formato y preparar el archivo profesional",
+  preparing_master: "Preparando el archivo…",
+  reopen: "Reabrir pedido",
+  reopening: "Reabriendo…",
+  see_error: "Ver el error",
+  close: "Dar por resuelto",
+  refresh: "Actualizar estado",
+  none: "Sin acción disponible",
+};
+
+export const SECONDARY_LABELS = {
+  suggest: "Pedir sugerencia a la IA",
+  suggesting: "Analizando…",
+  edit: "Editar letra a mano",
+  close: "Cerrar sin publicar",
+};
+
+/** Un `action` del servidor está permitido; sin lista (datos viejos) todo lo está. */
+export function workflowAllows(workflow, action) {
+  return !Array.isArray(workflow?.allowed_actions) || workflow.allowed_actions.includes(action);
+}
+
+// Posición en los 3 pasos: 0..2 = paso activo, 3 = todo hecho, -1 = nada hecho.
+function stepPosition(workflow) {
+  switch (workflow?.key) {
+    case "resolved":
+      // El servidor manda activeStep >= 3 si se resolvió al publicar. La
+      // bandeja de campaña no manda activeStep: su "resolved" siempre publicó.
+      return workflow.activeStep == null || workflow.activeStep >= 3 ? 3 : -1;
+    case "closed": return -1;
+    case "review": return 3;
+    case "publish": return 2;
+    case "render": case "rendering": case "blocked": return 1;
+    default: return 0;
+  }
+}
+
+/** Los 3 pasos con su estado. Una clave desconocida cae en "Corregir". */
+export function correctionStepList(workflow) {
+  const position = stepPosition(workflow);
+  return CORRECTION_STEPS.map((step, index) => ({
+    ...step,
+    state: position === -1 ? "todo" : index < position ? "done" : index === position ? "active" : "todo",
+  }));
+}
+
+export const STEP_STATE_LABELS = { done: "hecho", active: "en curso", todo: "pendiente" };
+
+/**
+ * UNA sola acción principal, con el nombre de lo que hace. Devuelve siempre un
+ * objeto {key, label, disabled}; el panel le agrega el href o el handler.
+ *
+ * El orden replica el de las reglas anteriores (revisión bloqueante, reabrir,
+ * refrescar, error, master, publicar, render en curso, propuesta, render,
+ * cierre): sólo cambia el nombre, y "Analizar pedido" pasa a ser una ayuda
+ * secundaria en vez de la acción principal.
+ */
+export function correctionPrimary(workflow, ctx = {}) {
+  const {
+    isResolved = false, hasJob = true, publication = null, status = {},
+    effectiveProposal = null, loadedProposal = null, summaryProposal = null,
+    proposalEnabled = false, qcReview = null, busy = {},
+  } = ctx;
+  const allows = (action) => workflowAllows(workflow, action);
+  const server = Array.isArray(workflow?.allowed_actions);
+  const proresPending = Boolean(publication?.prores_pending?.length);
+  const pick = (key, label = PRIMARY_LABELS[key], disabled = false) => ({ key, label, disabled });
+  const edit = () => (hasJob ? pick("edit") : pick("none", PRIMARY_LABELS.none, true));
+  const master = () => pick("prepare_master",
+    busy.publishing ? PRIMARY_LABELS.preparing_master
+      : status.needsProResSetup ? PRIMARY_LABELS.prepare_master_setup : PRIMARY_LABELS.prepare_master,
+    Boolean(busy.publishing));
+  const publish = () => pick("publish", busy.publishing ? PRIMARY_LABELS.publishing : PRIMARY_LABELS.publish,
+    Boolean(busy.publishing));
+  const reopen = () => pick("reopen", busy.resolving ? PRIMARY_LABELS.reopening : PRIMARY_LABELS.reopen,
+    Boolean(busy.resolving));
+  const reviewProposal = () => pick("review_proposal", undefined, Boolean(busy.proposal));
+  const close = () => pick("close", undefined, Boolean(busy.resolving || busy.noNote));
+
+  if (qcReview) return pick("qc_review", qcReview.label);
+
+  if (server) {
+    if (isResolved && allows("reopen")) return reopen();
+    if (["refresh", "unknown"].includes(workflow.key) && allows("refresh")) return pick("refresh");
+    if (workflow.key === "blocked" && allows("edit") && hasJob) return pick("see_error");
+    if (workflow.key === "analyze" && allows("analyze")) return edit();
+    if (allows("prepare_master") && proresPending) return master();
+    if (allows("publish") && status.canPublish) return publish();
+    if (workflow.key === "rendering") return pick("rendering", undefined, true);
+    if (allows("review_proposal") && ["apply", "analyze"].includes(workflow.key)) return reviewProposal();
+    if (allows("review_render")) return pick("render", undefined, Boolean(busy.proposal || busy.publishing));
+    if (allows("resolve")) return close();
+    if (allows("refresh")) return pick("refresh");
+    if (allows("edit") && hasJob) return pick("edit");
+    return pick("none", PRIMARY_LABELS.none, true);
+  }
+
+  // Datos sin proyección del servidor: se infiere de la publicación y la propuesta.
+  if (isResolved) return reopen();
+  if (workflow?.key === "analyze" && !effectiveProposal) return edit();
+  if (status.canPublish) return proresPending ? master() : publish();
+  if (workflow?.key === "rendering") return pick("rendering", undefined, true);
+  if (publication?.render_matches_editor && !publication?.needs_publish) return close();
+  if (proposalEnabled && !effectiveProposal) return edit();
+  if (PROPOSAL_APPLIED_STATUSES.has(effectiveProposal?.status) && hasJob) {
+    return pick("render", undefined, Boolean(busy.proposal));
+  }
+  if (proposalEnabled && summaryProposal && !loadedProposal) return reviewProposal();
+  if (PROPOSAL_REVIEW_STATUSES.has(loadedProposal?.status)) return pick("review_proposal");
+  return edit();
+}
+
+/** Enlaces chicos bajo el botón principal. Nunca repiten lo que ya hace el principal. */
+export function correctionSecondary(workflow, primary, ctx = {}) {
+  const {
+    isResolved = false, hasJob = true, effectiveProposal = null, proposalEnabled = false,
+    publication = null, busy = {},
+  } = ctx;
+  if (isResolved) return [];
+  const links = [];
+  const canSuggest = proposalEnabled && workflowAllows(workflow, "analyze")
+    && ["analyze", "manual", "render"].includes(workflow?.key)
+    && (!effectiveProposal || workflow.key === "analyze");
+  if (canSuggest) {
+    links.push({ key: "suggest", label: busy.proposal ? SECONDARY_LABELS.suggesting : SECONDARY_LABELS.suggest,
+      disabled: Boolean(busy.proposal) });
+  }
+  // Camino directo al render cuando el principal es otro (p. ej. revisar
+  // cambios sugeridos pero la letra ya se corrigió a mano).
+  if (workflowAllows(workflow, "review_render") && publication?.can_render
+    && workflow?.key !== "rendering" && primary.key !== "render") {
+    links.push({ key: "render", label: PRIMARY_LABELS.render, disabled: Boolean(busy.proposal || busy.publishing) });
+  }
+  if (hasJob && !["edit", "see_error"].includes(primary.key)) {
+    links.push({ key: "edit", label: SECONDARY_LABELS.edit });
+  }
+  if (primary.key !== "close" && workflowAllows(workflow, "resolve")) {
+    links.push({ key: "close", label: SECONDARY_LABELS.close });
+  }
+  return links;
+}
+
+/**
+ * Una frase en lenguaje llano para el paso actual. Sin jerga interna: nunca
+ * "preflight", "QC" ni "fingerprint".
+ */
+export function correctionSentence(workflow, ctx = {}) {
+  const { qcReview = null, publication = null, proposalEnabled = false } = ctx;
+  const pending = Number(workflow?.pending_manual) || 0;
+  const manual = pending > 0
+    ? ` Hay ${pending} ${pending === 1 ? "indicación" : "indicaciones"} que hay que comprobar a mano en el video.`
+    : "";
+  if (qcReview) {
+    return "La publicación está en pausa: falta revisar el video antes de publicar.";
+  }
+  switch (workflow?.key) {
+    case "empty": return "Elegí un pedido de la cola.";
+    case "analyze":
+      return proposalEnabled
+        ? `Corregí lo que pidió el cliente en el editor. Si querés, la IA te sugiere los cambios primero.${manual}`
+        : `Corregí lo que pidió el cliente en el editor.${manual}`;
+    case "manual": return `Corregí lo que pidió el cliente en el editor.${manual}`;
+    case "apply":
+      return `La IA sugirió cambios. Revisalos y aplicá los que correspondan.${manual}`;
+    case "render":
+      return `La corrección está guardada, pero el video todavía es el anterior. Generá el video corregido.${manual}`;
+    case "rendering":
+      return byPublicationMode({
+        snapshot: "Estamos generando el video nuevo. El portal sigue mostrando el anterior hasta que lo publiques.",
+        pointer: "Estamos generando el video nuevo. El cliente lo verá apenas termine; después publicalo para registrar la versión.",
+      });
+    case "blocked":
+      return "No se pudo generar el video nuevo. Abrí el error para ver el motivo y no vuelvas a aplicar los cambios guardados.";
+    case "publish": {
+      // The server knows something the plain sentence does not: a proposal is still
+      // open but the operator already corrected by hand, so it need not be reapplied.
+      // Keep that note verbatim instead of swallowing it.
+      const proposalNote = String(workflow?.detail || "").match(/La propuesta sigue pendiente:[\s\S]*$/)?.[0];
+      const tail = `${manual}${proposalNote ? ` ${proposalNote}` : ""}`;
+      return publication?.prores_pending?.length
+        ? `El video nuevo está listo. Falta preparar el archivo profesional antes de publicar.${tail}`
+        : `El video nuevo está listo. Miralo y publicalo: el cliente lo ve en el portal y el pedido queda resuelto.${tail}`;
+    }
+    case "review":
+      return "Ya hay una versión publicada. Revisá que lo pedido esté en el video y cerrá el pedido con una nota.";
+    case "resolved": case "closed":
+      return stepPosition(workflow) === 3
+        ? "Pedido resuelto: el video nuevo ya está en el portal."
+        : "Pedido cerrado sin publicar un video nuevo.";
+    case "refresh":
+      return "La propuesta cambió. Actualizá el estado y revisá los cambios antes de seguir.";
+    default:
+      return "Todavía no podemos confirmar en qué punto está este pedido. Actualizá el estado.";
+  }
+}
+
+/** Todo junto: pasos, acción principal, enlaces secundarios y la frase del paso. */
+export function correctionSteps(workflow, ctx = {}) {
+  const primary = correctionPrimary(workflow, ctx);
+  return {
+    steps: correctionStepList(workflow),
+    primary,
+    secondary: correctionSecondary(workflow, primary, ctx),
+    sentence: correctionSentence(workflow, ctx),
+  };
+}
+
+// Mensajes de error al publicar, con qué hacer. Nunca un callejón sin salida:
+// lo desconocido igual nombra el estado HTTP o el código.
+export function describePublishError(error) {
+  const detail = error?.detail;
+  const code = String(
+    (detail && typeof detail === "object" ? detail.code : detail) || error?.code || "",
+  ).trim();
+  const status = error?.status;
+  const has = (...needles) => needles.some((needle) => code.includes(needle));
+  if (status === 402 || has("quota", "insufficient_credit", "payment_required")) {
+    return "Falta crédito en la cuenta del video. Cargá crédito y volvé a publicar.";
+  }
+  if (has("language_review_unresolved")) {
+    return "La letra no coincide con el idioma de la referencia. Abrí el editor y confirmá el idioma.";
+  }
+  if (has("lyric_review_pending")) {
+    return "Quedan líneas de la letra sin revisar. Abrí el editor, revisalas y volvé a publicar.";
+  }
+  if (has("change_request_job_mismatch")) {
+    return "Este pedido pertenece a otro video. Actualizá la pantalla y abrí el pedido de nuevo.";
+  }
+  if (has("fresh_preflight_required", "stale_preflight", "delivery_qc_report_stale", "preflight_stale")) {
+    return "El video cambió desde la última revisión. Volvé a revisarlo y después publicá.";
+  }
+  if (has("publication_context_has_pending_writes")) {
+    return "El video todavía se está guardando. Esperá un minuto, actualizá y reintentá.";
+  }
+  if (has("publication_storage_unavailable")) {
+    return byPublicationMode({
+      snapshot: "No pudimos verificar los archivos del video antes de publicar. El portal conserva la versión anterior; reintentá en un minuto.",
+      pointer: "No pudimos verificar los archivos del video antes de publicar. Reintentá en un minuto.",
+    });
+  }
+  if (has("prores_required", "prores_stale_without_spec")) {
+    return "Falta preparar el archivo profesional antes de publicar. Usá “Preparar el archivo profesional”.";
+  }
+  if (status === 403) return "Tu usuario no tiene permiso para publicar. Pedile a un administrador que lo haga.";
+  if (status === 404) return "No encontramos el video o el pedido. Actualizá la pantalla.";
+  if (status === 409) return "El video cambió mientras se publicaba. Actualizá y reintentá.";
+  const rawReason = typeof detail === "string" && detail.includes(" ") ? detail : (error?.message || code);
+  const reason = String(rawReason || "").replace(/[.\s]+$/, "");
+  const tag = [status ? `HTTP ${status}` : "", code && !code.includes(" ") ? code : ""].filter(Boolean).join(" · ");
+  return `No se pudo publicar${tag ? ` (${tag})` : ""}${reason && reason !== code ? `: ${reason}` : ""}. Actualizá la pantalla y reintentá; si se repite, avisá al equipo con el número del pedido.`;
 }

@@ -1,8 +1,9 @@
 // Workspace operativo de pedidos de cambio de UMG
 // (delivery_change_requests). Una cola compacta mantiene el contexto y el
-// panel de detalle guía el caso por cinco etapas: interpretar, aplicar,
-// renderizar, revisar y publicar. El pedido seleccionado queda en la URL
-// para que el editor pueda devolver al operador al mismo punto del flujo.
+// panel de detalle guía el caso por tres pasos (corregir, generar el video
+// nuevo, publicar) con UNA acción principal por estado. El pedido
+// seleccionado queda en la URL para que el editor pueda devolver al operador
+// al mismo punto del flujo.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { fmtDate, fmtAgo } from "../../adminApi";
@@ -17,10 +18,13 @@ import EnableProResModal from "../../../EnableProResModal";
 import ChangeRequestQueue from "./ChangeRequestQueue";
 import RequestWorkflowStepper from "./RequestWorkflowStepper";
 import RequestVideo from "./RequestVideo";
+import { byPublicationMode } from "./publicationMode";
 import {
   PORTAL_LABELS,
+  correctionSteps,
   requestSearchText,
   requestWorkflow,
+  workflowAllows,
   workflowMatchesFilter,
 } from "./changeRequestWorkflow";
 
@@ -54,9 +58,12 @@ export function publicationStatus(publication) {
     return {
       tone: "busy",
       title: "Re-renderizando",
-      detail:
-        "Mientras tanto el portal sigue entregando la versión anterior. " +
-        "Cuando termine, publicá la actualización desde acá.",
+      detail: byPublicationMode({
+        snapshot: "Mientras tanto el portal sigue entregando la versión anterior. " +
+          "Cuando termine, publicá la actualización desde acá.",
+        pointer: "El cliente verá el video nuevo apenas termine. " +
+          "Cuando termine, publicá la actualización desde acá para registrar la versión.",
+      }),
       canPublish: false,
     };
   }
@@ -73,7 +80,7 @@ export function publicationStatus(publication) {
           "Esta entrega vieja perdió la configuración de resolución, cuadros por segundo y perfil. " +
           "Elegilos una vez para generar el .mov del último render. Esto no aplica cambios de letra pendientes.",
         canPublish: true,
-        publishLabel: "Elegir formato y actualizar .mov",
+        publishLabel: "Elegir formato y preparar el archivo profesional",
         needsProResSetup: true,
       };
     }
@@ -84,18 +91,21 @@ export function publicationStatus(publication) {
         "El archivo profesional está pendiente respecto del último render. " +
         "Actualizar el .mov no renderiza cambios de letra pendientes ni publica en el portal.",
       canPublish: true,
-      publishLabel: "Actualizar archivo profesional",
+      publishLabel: "Preparar el archivo profesional",
     };
   }
   if (publication.needs_publish) {
     return {
       tone: "warn",
       title: "El render nuevo está listo para revisar",
-      detail:
-        "Abrí el video de esta tarjeta y comprobá el cambio. El portal sigue " +
-        "entregando el corte anterior hasta que publiques la actualización.",
+      detail: byPublicationMode({
+        snapshot: "Abrí el video de esta tarjeta y comprobá el cambio. El portal sigue " +
+          "entregando el corte anterior hasta que publiques la actualización.",
+        pointer: "Abrí el video de esta tarjeta y comprobá el cambio. El cliente ya descarga este corte: " +
+          "publicá para registrar la versión nueva y dar por resuelto el pedido.",
+      }),
       canPublish: true,
-      publishLabel: "Publicar actualización",
+      publishLabel: "Publicar en el portal y dar por resuelto",
     };
   }
   if (!Number.isInteger(revision) || revision < 1) {
@@ -195,12 +205,12 @@ export default function ChangeRequestsPanel({
     return params.get("change_request_id") || params.get("request");
   }, []);
   const [selectedId, setSelectedId] = useState(initialRequestId);
-  const [returnNotice, setReturnNotice] = useState(() => {
-    if (typeof window === "undefined") return null;
-    return new URLSearchParams(window.location.search).get("render_submitted") === "1"
-      ? "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el portal conserva el corte anterior hasta que lo publiques."
-      : null;
-  });
+  // Only the FACT is stored; the wording depends on the publication mode, which
+  // the list load sets after this first render, so it is chosen when rendering.
+  const [returnNotice, setReturnNotice] = useState(() => (
+    typeof window !== "undefined"
+    && new URLSearchParams(window.location.search).get("render_submitted") === "1"
+  ));
   const setDraft = (id, val) => setDrafts((d) => ({ ...d, [id]: val }));
 
   const filterOptions = [
@@ -323,8 +333,11 @@ export default function ChangeRequestsPanel({
 
       {returnNotice && (
         <div role="status" className="flex items-start justify-between gap-3 rounded-xl bg-sky-500/[0.08] p-3 text-caption text-sky-100 ring-1 ring-sky-400/20">
-          <span>{returnNotice}</span>
-          <button type="button" onClick={() => setReturnNotice(null)} className="shrink-0 text-label opacity-70 hover:opacity-100">
+          <span>{byPublicationMode({
+            snapshot: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el portal conserva el corte anterior hasta que lo publiques.",
+            pointer: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el cliente verá el video nuevo apenas termine.",
+          })}</span>
+          <button type="button" onClick={() => setReturnNotice(false)} className="shrink-0 text-label opacity-70 hover:opacity-100">
             Cerrar
           </button>
         </div>
@@ -466,13 +479,13 @@ function ChangeRequestCard({
     ? `/videos/${encodeURIComponent(d.job_id)}?qc_focus=${qcGate?.reason === "manual_review_required" ? "manual" : "findings"}&return_to=${encodeURIComponent(`/admin?section=cambios&change_request_id=${item.id}`)}`
     : null;
   const qcReviewLabel = qcGate?.reason === "fresh_preflight_required"
-    ? "Analizar y revisar este corte"
+    ? "Revisar este corte antes de publicar"
     : "Completar revisión del video";
   const qcReviewMessage = qcGate?.reason === "fresh_preflight_required"
-    ? "Este corte todavía no tiene un preflight vigente. Analizalo y revisá el resultado antes de publicar."
+    ? "Este corte todavía no tiene una revisión al día. Abrilo, revisalo y después publicá."
     : qcGate?.reason === "manual_review_required"
-      ? "El preflight está actualizado, pero falta completar la revisión del video."
-      : "El preflight encontró puntos pendientes que hay que resolver antes de publicar.";
+      ? "Falta completar la revisión del video antes de publicar."
+      : "La revisión del video encontró puntos pendientes que hay que resolver antes de publicar.";
   const videoRef = useRef(null);
   const proposalRef = useRef(null);
   // Un pedido resuelto AL PUBLICAR no necesita que nadie confirme nada: la
@@ -491,81 +504,53 @@ function ChangeRequestCard({
   const editorUrl = editorUrlWithRequest(
     d.job_id, item.id, ["applied", "partially_applied"].includes(effectiveProposal?.status) ? effectiveProposal?.id : null,
   );
-  let primaryAction;
-  const serverActions = workflow.allowed_actions;
-  const allows = (action) => !Array.isArray(serverActions) || serverActions.includes(action);
-  if (qcNeedsReview && qcReviewHref) {
-    primaryAction = { label: qcReviewLabel, href: qcReviewHref };
-  } else if (Array.isArray(serverActions)) {
-    if (isResolved && allows("reopen")) {
-      primaryAction = { label: resolving ? "Reabriendo…" : "Reabrir pedido", onClick: onReopen, disabled: resolving };
-    } else if (["refresh", "unknown"].includes(workflow.key) && allows("refresh")) {
-      primaryAction = { label: "Actualizar estado", onClick: onRefresh, disabled: false };
-    } else if (workflow.key === "blocked" && allows("edit") && d.job_id) {
-      primaryAction = { label: "Revisar trabajo", href: editorUrl };
-    } else if (workflow.key === "analyze" && allows("analyze")) {
-      primaryAction = { label: proposalBusy ? "Analizando…" : "Analizar pedido", onClick: onGenerateProposal, disabled: proposalBusy };
-    } else if (allows("prepare_master") && item.publication?.prores_pending?.length) {
-      primaryAction = { label: publishing ? "Solicitando actualización…" : status.publishLabel || "Actualizar archivo profesional", onClick: onPublish, disabled: publishing };
-    } else if (allows("publish") && status.canPublish) {
-      primaryAction = { label: publishing ? "Publicando…" : "Publicar actualización", onClick: onPublish, disabled: publishing };
-    } else if (workflow.key === "rendering") {
-      primaryAction = { label: "Generando corte nuevo…", disabled: true };
-    } else if (allows("review_proposal") && ["apply", "analyze"].includes(workflow.key)) {
-      primaryAction = { label: proposalBusy ? "Cargando…" : "Revisar propuesta", disabled: proposalBusy,
-        onClick: proposal ? () => proposalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }) : onLoadProposal };
-    } else if (allows("review_render")) {
-      primaryAction = { label: "Revisar y confirmar render", onClick: onReviewRender, disabled: proposalBusy || publishing };
-    } else if (allows("resolve")) {
-      primaryAction = { label: "Marcar como resuelto", onClick: onResolve, disabled: resolving || !draft.trim() };
-    } else if (allows("refresh")) {
-      primaryAction = { label: "Actualizar estado", onClick: onRefresh, disabled: false };
-    } else if (allows("edit") && d.job_id) {
-      primaryAction = { label: "Editar letra", href: editorUrl };
-    } else {
-      primaryAction = { label: "Revisá el motivo del bloqueo", disabled: true };
-    }
-  } else if (isResolved) {
-    primaryAction = { label: resolving ? "Reabriendo…" : "Reabrir pedido", onClick: onReopen, disabled: resolving };
-  } else if (workflow.key === "analyze" && !effectiveProposal) {
-    primaryAction = { label: proposalBusy ? "Analizando…" : "Analizar pedido", onClick: onGenerateProposal, disabled: proposalBusy };
-  } else if (status.canPublish) {
-    primaryAction = {
-      label: publishing
-        ? (item.publication?.prores_pending?.length ? "Solicitando actualización…" : "Publicando…")
-        : status.publishLabel || "Publicar actualización",
-      onClick: onPublish,
-      disabled: publishing,
-    };
-  } else if (workflow.key === "rendering") {
-    primaryAction = { label: "Generando corte nuevo…", disabled: true };
-  } else if (item.publication?.render_matches_editor && !item.publication?.needs_publish) {
-    primaryAction = { label: "Marcar como resuelto", onClick: onResolve, disabled: resolving || !draft.trim() };
-  } else if (proposalEnabled && !effectiveProposal) {
-    primaryAction = { label: proposalBusy ? "Analizando…" : "Analizar pedido", onClick: onGenerateProposal, disabled: proposalBusy };
-  } else if (["applied", "partially_applied"].includes(effectiveProposal?.status) && d.job_id) {
-    // The compact queue already carries the applied proposal id.  Do not make
-    // the operator reload the full diff just to enter the render step: that
-    // extra round-trip used to fall back to a request-only URL and lose the
-    // explicit render intent after a page refresh.
-    primaryAction = { label: "Revisar y confirmar render", onClick: onReviewRender, disabled: proposalBusy };
-  } else if (proposalEnabled && item.proposal && !proposal) {
-    primaryAction = { label: proposalBusy ? "Cargando…" : "Ver propuesta", onClick: onLoadProposal, disabled: proposalBusy };
-  } else if (["ready", "partial", "needs_input"].includes(proposal?.status)) {
-    primaryAction = {
-      label: "Revisar propuesta",
-      onClick: () => proposalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
-    };
-  } else if (d.job_id) {
-    primaryAction = { label: "Editar letra", href: editorUrl };
-  } else {
-    primaryAction = { label: "Sin acción disponible", disabled: true };
-  }
+
+  // UNA acción principal por estado y enlaces chicos debajo. Qué mostrar lo
+  // decide `correctionSteps` (puro y testeado); acá sólo se le conecta cada
+  // acción con su handler o su enlace.
+  const [closeOpen, setCloseOpen] = useState(false);
+  const closeRef = useRef(null);
+  // A different request, or this one resolved/reopened, never inherits an open form.
+  useEffect(() => { setCloseOpen(false); }, [item.id, isResolved]);
+  const view = correctionSteps(workflow, {
+    isResolved,
+    hasJob: Boolean(d.job_id),
+    publication: item.publication,
+    status,
+    effectiveProposal,
+    loadedProposal: proposal,
+    summaryProposal: item.proposal,
+    proposalEnabled,
+    qcReview: qcNeedsReview && qcReviewHref ? { label: qcReviewLabel } : null,
+    busy: { proposal: proposalBusy, publishing, resolving, noNote: !draft.trim() },
+  });
+  const scrollToProposal = () => proposalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  const primaryWiring = {
+    qc_review: { href: qcReviewHref },
+    edit: { href: editorUrl },
+    see_error: { href: editorUrl },
+    refresh: { onClick: onRefresh },
+    reopen: { onClick: onReopen },
+    publish: { onClick: onPublish },
+    prepare_master: { onClick: onPublish },
+    review_proposal: { onClick: proposal ? scrollToProposal : onLoadProposal },
+    render: { onClick: onReviewRender },
+    close: { onClick: onResolve },
+  };
+  const primaryAction = { ...view.primary, ...(primaryWiring[view.primary.key] || {}) };
+  const closeForm = !isResolved && (closeOpen || view.primary.key === "close");
+  const allows = (action) => workflowAllows(workflow, action);
+
+  useEffect(() => {
+    if (closeOpen) closeRef.current?.focus();
+  }, [closeOpen]);
 
   useEffect(() => {
     const handleShortcut = (event) => {
       if (!(event.metaKey || event.ctrlKey) || event.key !== "Enter") return;
-      if (event.defaultPrevented || event.target?.closest?.("input, textarea, select, [contenteditable='true'], [role='dialog']")
+      // A focused button/link owns the keypress (for example "Confirmar cierre"):
+      // the shortcut must never run the PRIMARY action, which may be publishing.
+      if (event.defaultPrevented || event.target?.closest?.("input, textarea, select, button, a, summary, [contenteditable='true'], [role='dialog']")
         || document.querySelector("[role='dialog'][aria-modal='true']")) return;
       if (primaryAction.disabled) return;
       event.preventDefault();
@@ -615,7 +600,7 @@ function ChangeRequestCard({
 
       <div className="grid min-w-0 gap-5 p-4 sm:p-5 lg:grid-cols-[minmax(18rem,0.9fr)_minmax(0,1.1fr)]">
         <div className="min-w-0 space-y-4 lg:sticky lg:top-4 lg:self-start">
-          <RequestWorkflowStepper workflow={workflow} />
+          <RequestWorkflowStepper workflow={workflow} steps={view.steps} sentence={view.sentence} />
 
           <div className="overflow-hidden rounded-2xl bg-black/30 ring-1 ring-white/[0.08]">
             {d.video_url ? (
@@ -665,15 +650,19 @@ function ChangeRequestCard({
             </a>
           )}
 
-          <div className={`rounded-xl ring-1 p-3 ${TONE_STYLES[status.tone]}`}>
-            <p className="text-caption font-semibold">{status.title}</p>
-            <p className="text-label opacity-80 mt-0.5 leading-relaxed">{status.detail}</p>
-            {item.publication?.stale_since && (
-              <p className="text-label opacity-70 mt-1">
-                Cambios en curso desde {fmtAgo(item.publication.stale_since)}.
-              </p>
-            )}
-          </div>
+          {/* La frase del paso ya explica qué falta; acá sólo queda la versión
+              publicada y, si corresponde, cuánto hace que hay cambios en curso. */}
+          {status.tone === "ok" && (
+            <div className={`rounded-xl ring-1 p-3 ${TONE_STYLES.ok}`}>
+              <p className="text-caption font-semibold">{status.title}</p>
+              <p className="text-label opacity-80 mt-0.5 leading-relaxed">{status.detail}</p>
+            </div>
+          )}
+          {item.publication?.stale_since && (
+            <p className="text-label text-gray-400">
+              Cambios en curso desde {fmtAgo(item.publication.stale_since)}.
+            </p>
+          )}
         </div>
 
         <div className="min-w-0 space-y-4">
@@ -727,45 +716,46 @@ function ChangeRequestCard({
                 </p>
               )}
             </div>
-          ) : (
-            <section aria-label="Resolver pedido" className="rounded-xl bg-white/[0.02] ring-1 ring-white/[0.06]">
-              <h3 className="px-4 py-3 text-label text-gray-300">Marcar como resuelto en el portal</h3>
-              <div className="space-y-2 border-t border-white/[0.06] p-4">
-                <p className="text-label text-gray-500">
-                  Cierra el pedido en el portal correspondiente, sin generar ni publicar otro video.
-                </p>
-                <input
-                  type="text"
-                  placeholder="Motivo del cierre sin publicar (obligatorio)"
-                  aria-label="Motivo del cierre sin publicar"
-                  required
-                  value={draft}
-                  onChange={(event) => onDraftChange(event.target.value)}
-                  maxLength={2000}
-                  className="w-full rounded-xl bg-surface-3/40 px-3 py-2 text-caption text-white ring-1 ring-white/[0.06] placeholder:text-gray-600 focus:outline-none focus:ring-brand/40"
-                />
-                <div className="flex justify-end">
+          ) : closeForm ? (
+            <section aria-label="Cerrar pedido" className="space-y-2 rounded-xl bg-white/[0.02] p-4 ring-1 ring-white/[0.06]">
+              <p className="text-label text-gray-400">
+                {view.primary.key === "close"
+                  ? "Escribí una nota para el cliente y tocá “Dar por resuelto”. El cliente la ve en el portal."
+                  : "Cierra el pedido en el portal sin generar ni publicar otro video. El cliente ve tu nota."}
+              </p>
+              <textarea
+                ref={closeRef}
+                placeholder="Nota para el cliente (obligatoria)"
+                aria-label="Motivo del cierre sin publicar"
+                required
+                rows={3}
+                value={draft}
+                onChange={(event) => onDraftChange(event.target.value)}
+                maxLength={2000}
+                className="w-full rounded-xl bg-surface-3/40 px-3 py-2 text-caption text-white ring-1 ring-white/[0.06] placeholder:text-gray-600 focus:outline-none focus:ring-brand/40"
+              />
+              {view.primary.key !== "close" && (
+                <div className="flex justify-end gap-2">
+                  <button type="button" onClick={() => setCloseOpen(false)}
+                    className="rounded-lg px-3 py-1.5 text-caption text-gray-400 hover:text-white">
+                    Cancelar
+                  </button>
                   <button
+                    type="button"
                     onClick={onResolve}
                     disabled={resolving || !draft.trim() || !allows("resolve")}
                     className="rounded-lg bg-white/[0.07] px-3 py-1.5 text-caption font-medium text-white hover:bg-white/[0.12] disabled:opacity-50"
                   >
-                    {resolving ? "Guardando…" : "Marcar como resuelto"}
+                    {resolving ? "Guardando…" : "Confirmar cierre"}
                   </button>
                 </div>
-              </div>
+              )}
             </section>
-          )}
+          ) : null}
         </div>
       </div>
 
-      <footer className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 rounded-b-2xl border-t border-white/[0.08] bg-surface-2/95 px-4 py-3 shadow-[0_-18px_40px_rgba(0,0,0,0.24)] backdrop-blur sm:px-5">
-        {!isResolved && allows("review_render") && item.publication?.can_render && workflow.key !== "rendering" && primaryAction.onClick !== onReviewRender && (
-          <button type="button" onClick={onReviewRender} disabled={proposalBusy || publishing}
-            className="rounded-lg bg-white/10 px-3 py-2 text-caption text-white disabled:opacity-40">
-            Revisar letra y re-renderizar
-          </button>
-        )}
+      <footer className="sticky bottom-0 z-10 flex flex-wrap items-start justify-between gap-3 rounded-b-2xl border-t border-white/[0.08] bg-surface-2/95 px-4 py-3 shadow-[0_-18px_40px_rgba(0,0,0,0.24)] backdrop-blur sm:px-5">
         {actionNotice && <div role={actionNotice.tone === "error" ? "alert" : "status"}
           aria-label="Estado de la acción"
           className={`w-full rounded-lg p-3 text-caption ${actionNotice.tone === "error" ? "bg-red-500/10 text-red-200" : "bg-sky-500/10 text-sky-100"}`}>
@@ -781,34 +771,21 @@ function ChangeRequestCard({
               href={actionNotice.actionHref}
               className="mt-2 inline-flex min-h-9 items-center rounded-lg bg-white/10 px-3 py-1.5 font-semibold text-white hover:bg-white/15"
             >
-              {actionNotice.actionLabel || "Revisar controles"}
+              {actionNotice.actionLabel || "Revisar el video"}
             </a>
           )}
         </div>}
         {qcNeedsReview && !actionNotice && (
-          <div role="status" aria-label="Preflight pendiente"
+          <div role="status" aria-label="Revisión del video pendiente"
             className="w-full rounded-lg bg-amber-400/[0.08] p-3 text-caption text-amber-100 ring-1 ring-amber-300/20">
             <p className="font-semibold">La publicación está pausada</p>
             <p className="mt-0.5 text-label text-amber-50/80">{qcReviewMessage}</p>
           </div>
         )}
-        <div className="min-w-0">
-          <p className="text-caption font-semibold text-white">
-            {qcNeedsReview ? "Revisión del video pendiente" : workflow.label}
-          </p>
-          <p className="truncate text-label text-gray-500">
-            {isResolved ? "Podés reabrirlo si el cliente necesita otra corrección." : qcNeedsReview ? qcReviewMessage : "Acción recomendada para este pedido"}
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          {!isResolved && d.job_id && primaryAction.label !== "Editar letra" && (
-            <a
-              href={editorUrl}
-              className="rounded-xl px-3 py-2 text-caption font-medium text-gray-300 hover:bg-white/[0.06] hover:text-white"
-            >
-              Editar letra
-            </a>
-          )}
+        <p className="min-w-0 flex-1 self-center text-label text-gray-500">
+          {isResolved ? "Podés reabrirlo si el cliente necesita otra corrección." : ""}
+        </p>
+        <div className="ml-auto flex flex-col items-end gap-1.5">
           {primaryAction.href ? (
             <a
               href={primaryAction.href}
@@ -827,6 +804,26 @@ function ChangeRequestCard({
               {primaryAction.label}
               {!primaryAction.disabled && <span className="ml-2 hidden text-[10px] opacity-60 sm:inline">⌘↵</span>}
             </button>
+          )}
+          {view.secondary.length > 0 && (
+            <div role="group" aria-label="Otras acciones" className="flex flex-wrap justify-end gap-x-3 gap-y-1">
+              {view.secondary.map((link) => {
+                const linkClass = "text-label text-gray-400 underline-offset-2 hover:text-white hover:underline disabled:cursor-not-allowed disabled:opacity-50";
+                if (link.key === "edit") {
+                  return <a key={link.key} href={editorUrl} className={linkClass}>{link.label}</a>;
+                }
+                const onClick = link.key === "suggest" ? onGenerateProposal
+                  : link.key === "render" ? onReviewRender
+                    : () => setCloseOpen((open) => !open);
+                return (
+                  <button key={link.key} type="button" onClick={onClick} disabled={link.disabled}
+                    aria-expanded={link.key === "close" ? closeForm : undefined}
+                    className={linkClass}>
+                    {link.label}
+                  </button>
+                );
+              })}
+            </div>
           )}
         </div>
       </footer>
@@ -1144,20 +1141,9 @@ function ChangeRequestProposal({
     jobId, requestId, ["applied", "partially_applied"].includes(status) ? effective?.id : null,
   );
 
-  if (!effective) {
-    return (
-      <div className="rounded-2xl bg-brand/[0.06] ring-1 ring-brand/20 p-4">
-        <p className="text-caption font-semibold text-white">Convertir el pedido en cambios revisables</p>
-        <p className="text-label text-gray-400 mt-1">
-          Revisá una propuesta de cambios basada en los tiempos y las frases del cliente antes de aplicarla.
-        </p>
-        <button type="button" onClick={onGenerate} disabled={busy}
-          className="mt-3 rounded-lg bg-brand px-3 py-2 text-caption text-white disabled:opacity-50">
-          {busy ? "Analizando este pedido…" : "Analizar este pedido"}
-        </button>
-      </div>
-    );
-  }
+  // Sin propuesta no hay nada que mostrar: pedirla a la IA es una ayuda
+  // opcional ("Pedir sugerencia a la IA") junto a la acción principal.
+  if (!effective) return null;
 
   if (!proposal) {
     return (

@@ -70,6 +70,8 @@ describe("change request SLA", () => {
     expect(businessHoursSince(friday, monday)).toBeCloseTo(12, 5);
     expect(businessHoursSince(new Date(2026, 8, 26, 9).getTime(), new Date(2026, 8, 27, 20).getTime())).toBe(0);
     expect(businessHoursSince("nonsense", at("2026-09-30"))).toBe(0);
+    expect(businessHoursSince(null, at("2026-09-30"))).toBe(0);      // never the epoch
+    expect(businessHoursSince("", at("2026-09-30"))).toBe(0);
     expect(businessHoursSince(at("2026-09-30T10:00:00"), at("2026-09-30T09:00:00"))).toBe(0);
   });
 

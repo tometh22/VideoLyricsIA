@@ -3,6 +3,7 @@ import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-rou
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { clearCampaignResourceCache } from "../../hooks/useCampaignResource";
 import CampaignsPage from "../CampaignsPage";
+import { outdatedWording } from "./CampaignDetailPage";
 import { createCampaignApi, json, makeSong } from "./campaignTestApi";
 
 vi.mock("../../i18n", () => ({ useI18n: () => ({ t: () => "" }) }));
@@ -57,7 +58,7 @@ describe("campaign workspace", () => {
     fireEvent.click(button);
     expect(await screen.findByText("Cambiar la palabra final")).toBeInTheDocument();
     expect(location()).toContain("view=changes");
-    expect(screen.getByRole("link", { name: "Resolver en Admin →" })).toHaveAttribute("href", "/admin?section=cambios&change_request_id=7");
+    expect(screen.getByRole("link", { name: "Abrir y resolver" })).toHaveAttribute("href", "/admin?section=cambios&change_request_id=7");
     expect(screen.queryByRole("button", { name: /Generar|Enviar/ })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Ver canción" }));
     await waitFor(() => expect(location()).toContain("song=item-1"));
@@ -345,5 +346,17 @@ describe("campaign workspace", () => {
     fireEvent.keyDown(focused, { key: "Enter" });
     await screen.findByText("Editor de letra");
     expect(location()).toContain("/review/j2");
+  });
+});
+
+describe("outdatedWording", () => {
+  const song = (extra) => ({ portal_outdated: true, ...extra });
+  it("tells the truth per song when frozen copies and newest-render deliveries coexist", () => {
+    expect(outdatedWording([])).toMatch(/sigue mostrando el anterior/);
+    expect(outdatedWording([song({ portal_serves_latest: false })])).toMatch(/sigue mostrando el anterior/);
+    expect(outdatedWording([song({ portal_serves_latest: true })])).toMatch(/ya descarga el archivo nuevo/);
+    const mixed = outdatedWording([song({ portal_serves_latest: true }), song({ portal_serves_latest: true }), song({ portal_serves_latest: false })]);
+    expect(mixed).toBe("2 ya descargan el archivo nuevo (falta registrar la versión) y 1 sigue mostrando la versión anterior.");
+    expect(outdatedWording([song({ portal_serves_latest: true }), { portal_outdated: false }])).toMatch(/ya descarga el archivo nuevo/);
   });
 });

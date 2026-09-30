@@ -6,6 +6,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useAdmin } from "../../AdminContext";
 import { API, fetchJson } from "../../adminApi";
+import { describePublishError } from "./changeRequestWorkflow";
+import { byPublicationMode, setPublicationMode } from "./publicationMode";
 
 const ACTIVE_RENDER_STATUSES = new Set([
   "queued", "processing", "rendering", "editing", "transcribed_pending",
@@ -147,6 +149,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       setCrPendingCount(data.pending_count || 0);
       setCrResolvedCount(data.resolved_count || 0);
       setCrProposalEnabled(data.proposal_enabled === true);
+      setPublicationMode(data.publication_mode);
       setCrProposalApplyEnabled(data.proposal_apply_enabled === true);
     } catch (err) {
       if (generation === listGenerationRef.current && requestedFilter === crStatusRef.current) {
@@ -415,7 +418,10 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         tone: "wait",
         text: data.deduplicated
           ? "Este pedido de fondo ya fue recibido. Consultá su resultado antes de solicitar otra opción; todavía no se publicó."
-          : "La regeneración empezó. El portal conserva el corte anterior: esperá a que termine, abrí el video nuevo y publicalo sólo si quedó bien.",
+          : byPublicationMode({
+            snapshot: "La regeneración empezó. El portal conserva el corte anterior: esperá a que termine, abrí el video nuevo y publicalo sólo si quedó bien.",
+            pointer: "La regeneración empezó. El cliente verá el fondo nuevo apenas termine: esperá a que termine, abrí el video nuevo y publicalo para registrarlo.",
+          }),
       });
       await loadChangeRequests({ silent: true });
       return data;
@@ -546,7 +552,10 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     mutationLocksRef.current.add(lock);
     setCrPublishingId(crId ?? jobId);
     setCrPublishNotice({ requestId: crId, tone: "wait",
-      text: "Publicando en UMG… Estamos verificando y copiando los archivos. No vuelvas a publicar mientras termina." });
+      text: byPublicationMode({
+        snapshot: "Publicando en UMG… Estamos verificando y copiando los archivos. No vuelvas a publicar mientras termina.",
+        pointer: "Publicando en UMG… Estamos registrando la nueva versión. No vuelvas a publicar mientras termina.",
+      }) });
     try {
       let data;
       try {
@@ -568,12 +577,12 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
             requestId: crId,
             tone: "wait",
             text: gate?.reason === "manual_review_required"
-              ? "Falta firmar la revisión del video para este corte. Abrí los controles, completalos y después volvé a publicar."
+              ? "Falta confirmar la revisión del video de este corte. Abrí la revisión, completala y después volvé a publicar."
               : gate?.reason === "fresh_preflight_required"
-                ? "Este corte todavía no tiene un preflight vigente. Analizalo antes de publicar."
-                : "El preflight encontró puntos que requieren atención antes de publicar.",
+                ? "Este corte todavía no tiene una revisión al día. Abrilo, revisalo y después volvé a publicar."
+                : "La revisión del video encontró puntos pendientes. Resolvelos y después volvé a publicar.",
             actionLabel: gate?.reason === "fresh_preflight_required"
-              ? "Analizar y revisar este corte"
+              ? "Revisar este corte antes de publicar"
               : "Completar revisión del video",
             actionHref: reviewUrl,
           });
@@ -583,8 +592,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
           setCrPublishNotice({ requestId: crId, outcomeUnknown: true, tone: "wait",
             text: "Se perdió la respuesta. La publicación podría haberse publicado; consultá el estado antes de reintentar." });
         } else {
-          setCrPublishNotice({ requestId: crId, tone: "error",
-            text: `El servidor no aceptó la publicación: ${err.message || err}` });
+          setCrPublishNotice({ requestId: crId, tone: "error", text: describePublishError(err) });
         }
         await loadChangeRequests({ silent: true });
         return;

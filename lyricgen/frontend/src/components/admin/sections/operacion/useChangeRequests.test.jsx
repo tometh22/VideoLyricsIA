@@ -384,3 +384,41 @@ it("follows a request being interpreted until its proposal is ready", async () =
   await act(async () => { await vi.advanceTimersByTimeAsync(12000); });
   expect(reads).toBe(before);
 });
+
+function rejectPublication(error) {
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => url.includes("/deliveries/from-job/")
+    ? Promise.reject(error) : previous(url, opts));
+}
+const publicationError = (status, detail) => Object.assign(
+  new Error(typeof detail === "string" ? detail : detail?.code || `HTTP ${status}`),
+  { status, detail, code: typeof detail === "object" ? detail?.code : detail },
+);
+const PUBLICATION = { editor_revision: 4, render_fingerprint: "render4" };
+
+it.each([
+  [409, { code: "language_review_unresolved" }, "La letra no coincide con el idioma de la referencia. Abrí el editor y confirmá el idioma."],
+  [402, { code: "quota_exceeded" }, "Falta crédito en la cuenta del video"],
+  [409, "change_request_job_mismatch", "pertenece a otro video"],
+  [409, "El corte cambió durante la publicación.", "El video cambió mientras se publicaba. Actualizá y reintentá."],
+  [422, { code: "algo_raro" }, "HTTP 422"],
+])("explains publication failure %s %j in plain Spanish with what to do", async (status, detail, expected) => {
+  rejectPublication(publicationError(status, detail));
+  const { result } = renderHook(() => useChangeRequests());
+  await act(() => result.current.publishDeliveryUpdate("job-85", "chile", 85, PUBLICATION));
+  expect(result.current.crPublishNotice).toMatchObject({ requestId: 85, tone: "error" });
+  expect(result.current.crPublishNotice.text).toContain(expected);
+  expect(result.current.crPublishNotice.text).not.toContain("El servidor no aceptó");
+  expect(result.current.crPublishNotice.outcomeUnknown).toBeUndefined();
+});
+
+it("keeps the review link for a blocked publication without technical words", async () => {
+  rejectPublication(publicationError(409, { code: "delivery_qc_blocked", delivery_qc: { reason: "fresh_preflight_required" } }));
+  const { result } = renderHook(() => useChangeRequests());
+  await act(() => result.current.publishDeliveryUpdate("job-85", "chile", 85, PUBLICATION));
+  const notice = result.current.crPublishNotice;
+  expect(notice.actionHref).toContain("/videos/job-85?qc_focus=findings&return_to=");
+  expect(notice.actionHref).toContain(encodeURIComponent("change_request_id=85"));
+  expect(notice.actionLabel).toBe("Revisar este corte antes de publicar");
+  expect(`${notice.text} ${notice.actionLabel}`).not.toMatch(/preflight|fingerprint|\bQC\b/i);
+});

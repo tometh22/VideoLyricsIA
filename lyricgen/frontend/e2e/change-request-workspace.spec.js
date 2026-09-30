@@ -64,9 +64,9 @@ test("routes a QC-blocked publish to the video checklist and back to the same UM
   const announcement = page.getByRole("button", { name: /Entendido|Entendí|Cancelar|Cerrar novedades/ }).first();
   if (await announcement.isVisible()) await announcement.click();
   page.once("dialog", dialog => dialog.accept());
-  await page.getByRole("button", { name: "Publicar actualización", exact: true }).click();
+  await page.getByRole("button", { name: "Publicar en el portal y dar por resuelto", exact: true }).click();
   await expect(page.getByRole("status", { name: "Estado de la acción" }))
-    .toContainText("Falta firmar la revisión del video");
+    .toContainText("Falta confirmar la revisión del video");
   await page.getByRole("link", { name: "Completar revisión del video" }).click();
 
   await expect(page).toHaveURL(new RegExp(`/videos/${jobId}\\?qc_focus=manual&return_to=`));
@@ -116,7 +116,7 @@ test("a response lost after publication never tells the operator it definitely d
   const announcement = page.getByRole("button", { name: /Entendido|Entendí|Cancelar|Cerrar novedades/ }).first();
   if (await announcement.isVisible()) await announcement.click();
   page.once("dialog", dialog => dialog.accept());
-  await page.getByRole("button", { name: "Publicar actualización", exact: true }).click();
+  await page.getByRole("button", { name: "Publicar en el portal y dar por resuelto", exact: true }).click();
   const notice = page.getByRole("status", { name: "Resultado del pedido" });
   await expect(notice).toContainText("podría haberse publicado");
   await expect(notice).not.toContainText("No se publicó");
@@ -161,17 +161,17 @@ test('reviews saved lyrics, confirms one render, then publishes to Chile without
   await page.goto('/admin?section=cambios&change_request_id=85');
   const announcement = page.getByRole('button', { name: /Entendido|Entendí|Cancelar|Cerrar novedades/ }).first();
   if (await announcement.isVisible()) await announcement.click();
-  await page.getByRole('button', { name: 'Revisar y confirmar render', exact: true }).click();
+  await page.getByRole('button', { name: 'Generar el video corregido', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Revisar letra y confirmar render' });
   await expect(dialog).toContainText(text);
   const approve = dialog.getByRole('button', { name: 'Aprobar y re-renderizar' });
   await expect(approve).toBeDisabled();
   await dialog.getByRole('checkbox').check();
   await approve.click();
-  await expect(page.getByRole('button', { name: 'Publicar actualización' })).toBeVisible({ timeout: 12000 });
+  await expect(page.getByRole('button', { name: 'Publicar en el portal y dar por resuelto' })).toBeVisible({ timeout: 12000 });
   expect(writes).toEqual([{ path: '/admin/change-requests/85/render', body: { editor_revision: 58 } }]);
   page.once('dialog', dialog => dialog.accept());
-  await page.getByRole('button', { name: 'Publicar actualización' }).click();
+  await page.getByRole('button', { name: 'Publicar en el portal y dar por resuelto' }).click();
   await expect(page.getByRole('status', { name: 'Resultado del pedido' })).toContainText('Publicada la versión 2');
   expect(writes[1].body).toEqual({ portal_id: 'chile', change_request_id: 85,
     reviewed_render_fingerprint: 'render58', reviewed_editor_revision: 58 });
@@ -213,9 +213,9 @@ test('publishes a manually corrected current cut without forcing an advisory pro
   const announcement = page.getByRole('button', { name: /Entendido|Entendí|Cancelar|Cerrar novedades/ }).first();
   if (await announcement.isVisible()) await announcement.click();
   await expect(page.getByText(/La propuesta sigue pendiente:/)).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Publicar actualización', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Publicar en el portal y dar por resuelto', exact: true })).toBeVisible();
   page.once('dialog', dialog => dialog.accept());
-  await page.getByRole('button', { name: 'Publicar actualización', exact: true }).click();
+  await page.getByRole('button', { name: 'Publicar en el portal y dar por resuelto', exact: true }).click();
   await expect(page.getByRole('status', { name: 'Resultado del pedido' })).toContainText('Publicada la versión 3');
   expect(writes).toEqual([{ path: '/admin/deliveries/from-job/job-85', body: {
     portal_id: 'chile', change_request_id: 85, reviewed_render_fingerprint: 'manual-render59', reviewed_editor_revision: 59,
@@ -269,7 +269,7 @@ test("keeps the player running through polling, prepares without publishing, and
   await expect.poll(() => video.evaluate(el => el.readyState)).toBeGreaterThanOrEqual(2);
   await video.evaluate(el => { el.muted = true; return el.play(); });
   const source = await video.getAttribute("src");
-  await page.getByRole("button", { name: "Actualizar archivo profesional", exact: true }).click();
+  await page.getByRole("button", { name: "Preparar el archivo profesional", exact: true }).click();
   await expect(page.getByRole("status", { name: "Estado de la acción" })).toContainText("Actualización del .mov encolada");
   await expect.poll(() => video.evaluate(el => el.currentTime), { timeout: 12_000 }).toBeGreaterThan(6);
   expect(await video.evaluate(el => el.paused)).toBe(false);

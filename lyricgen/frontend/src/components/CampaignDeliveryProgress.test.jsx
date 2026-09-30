@@ -79,3 +79,23 @@ it("flags a stalled operation and offers a retry even without failed songs", asy
   expect(await screen.findByText(/parece detenido/)).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Reintentar envío" })).toBeInTheDocument();
 });
+
+it("does not offer a retry while a send is still running normally", async () => {
+  const request = vi.fn().mockResolvedValue({ status: "sending", stalled: false, sent_count: 1, total_count: 3, items: [
+    { job_id: "a", status: "sent" }, { job_id: "b", status: "failed", error_code: "deliverables_not_ready", retryable: true }, { job_id: "c", status: "pending" },
+  ] });
+  render(<CampaignDeliveryProgress operationId="op-run" request={request} onSelectFailed={vi.fn()} />);
+  await screen.findByText(/En curso/);
+  expect(screen.queryByRole("button", { name: /Reintentar/ })).toBeNull();
+});
+
+it("explains a refused retry in plain words instead of showing the raw code", async () => {
+  const request = vi.fn(async (path, options = {}) => {
+    if (options.method === "POST") throw Object.assign(new Error("operation_in_progress"), { code: "operation_in_progress" });
+    return { status: "partial", sent_count: 0, total_count: 1, items: [{ job_id: "b", status: "failed", error_code: "deliverables_not_ready", retryable: true }] };
+  });
+  render(<CampaignDeliveryProgress operationId="op-refused" request={request} onSelectFailed={vi.fn()} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Reintentar 1 fallido" }));
+  expect(await screen.findByText(/todavía se está procesando/)).toBeInTheDocument();
+  expect(screen.queryByText("operation_in_progress")).toBeNull();
+});
