@@ -8,6 +8,7 @@ function authHeaders() {
 
 const TONES = {
   PASS: "text-emerald-300 bg-emerald-500/10 ring-emerald-500/25",
+  BYPASSED: "text-amber-100 bg-amber-500/10 ring-amber-400/25",
   REVIEW: "text-amber-200 bg-amber-500/10 ring-amber-500/25",
   BLOCK: "text-red-300 bg-red-500/10 ring-red-500/25",
   STALE: "text-ink-secondary bg-white/[0.04] ring-white/10",
@@ -96,12 +97,14 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
     () => (report?.repairs?.actions || []).filter((row) => row.status === "APPLIED"),
     [report],
   );
-  const rawState = report?.status === "STALE" ? "STALE" : (report?.decision || "UNKNOWN");
+  const isPreflightBypassed = report?.status === "BYPASSED"
+    && report?.approval?.staging_preflight_bypass === true;
+  const rawState = isPreflightBypassed ? "BYPASSED" : report?.status === "STALE" ? "STALE" : (report?.decision || "UNKNOWN");
   // Delivery QC is currently an observation layer for interactive editing.
   // A stale/legacy report may still say BLOCK, but that must not make the
   // editor look unavailable unless the report explicitly runs in enforce mode.
   const isNonBlocking = report?.mode === "observe" && report?.approval?.blocked !== true;
-  const state = report?.approval?.blocked === true ? "BLOCK" : rawState;
+  const state = isPreflightBypassed ? "BYPASSED" : report?.approval?.blocked === true ? "BLOCK" : rawState;
   // Rendering must not change the server's findings: an apparent OCR swap is
   // evidence to review, never permission to promote FAIL to PASS locally.
   const checkStatus = (check) => check.status;
@@ -252,7 +255,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
             </button>
           )}
           <span className={`px-2.5 py-1 rounded-full text-[11px] font-semibold ring-1 ${TONES[state] || TONES.STALE}`}>
-            {state === "PASS" ? "Sin hallazgos" : state === "REVIEW" ? (isNonBlocking ? "Revisión informativa" : "Revisar") : state === "BLOCK" ? (isNonBlocking ? "Hallazgos del informe" : "Bloqueado") : state === "STALE" ? "Desactualizado" : "Verificación pendiente"}
+            {state === "PASS" ? "Sin hallazgos" : state === "BYPASSED" ? "Omitido temporalmente" : state === "REVIEW" ? (isNonBlocking ? "Revisión informativa" : "Revisar") : state === "BLOCK" ? (isNonBlocking ? "Hallazgos del informe" : "Bloqueado") : state === "STALE" ? "Desactualizado" : "Verificación pendiente"}
           </span>
         </div>
       </div>
@@ -263,14 +266,20 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
         </div>
       )}
 
-      {!reportToken && (
+      {isPreflightBypassed && (
+        <div role="status" data-testid="delivery-qc-staging-bypass" className="mb-4 rounded-xl bg-amber-500/[0.08] px-3 py-2 text-xs text-amber-100 ring-1 ring-amber-400/20">
+          La revisión preflight está omitida temporalmente para esta campaña de staging. La aprobación de letra, los archivos requeridos y ProRes mantienen sus controles habituales.
+        </div>
+      )}
+
+      {!reportToken && !isPreflightBypassed && (
         <div role="alert" className="mb-4 rounded-xl bg-amber-500/10 p-3 text-xs text-amber-200">
           Este informe no tiene una identidad verificable. Actualizá el preflight antes de firmar una revisión.
           <button type="button" onClick={refresh} disabled={Boolean(busy)} className="ml-2 underline">Actualizar informe para revisar</button>
         </div>
       )}
 
-      {forUmgDelivery && (report.approval?.blocked || report.approval?.reason === "fresh_preflight_required") && (
+      {forUmgDelivery && !isPreflightBypassed && (report.approval?.blocked || report.approval?.reason === "fresh_preflight_required") && (
         <div role="alert" aria-label="Motivo del bloqueo de aprobación"
           className={`mb-4 rounded-xl p-3 text-xs ring-1 ${objectiveFailures.length ? "bg-red-500/10 text-red-200 ring-red-400/20" : "bg-amber-500/10 text-amber-100 ring-amber-400/20"}`}>
           <p className="font-semibold">{report.approval.reason === "fresh_preflight_required"
@@ -351,7 +360,7 @@ export default function DeliveryQCPanel({ job, onJobUpdate, onSeek, onOpenEditor
         </div>
       )}
 
-      {report.status !== "COMPLETE" && <div className="mb-3 space-y-2"><p className="text-xs text-amber-200">El informe no está vigente o completo. Actualizá el preflight y esperá a que termine antes de firmar o aplicar sugerencias.</p><button disabled={Boolean(busy)} onClick={refresh} className="btn-secondary h-9 px-3 text-xs">{busy === "refresh" ? "Actualizando preflight…" : "Actualizar preflight"}</button></div>}
+      {!isPreflightBypassed && report.status !== "COMPLETE" && <div className="mb-3 space-y-2"><p className="text-xs text-amber-200">El informe no está vigente o completo. Actualizá el preflight y esperá a que termine antes de firmar o aplicar sugerencias.</p><button disabled={Boolean(busy)} onClick={refresh} className="btn-secondary h-9 px-3 text-xs">{busy === "refresh" ? "Actualizando preflight…" : "Actualizar preflight"}</button></div>}
       <div className="space-y-2">
         {issues.filter(issue => !isManualIssue(issue)).map((issue) => (
           <div key={issue.issue_id} data-issue-id={issue.issue_id}
