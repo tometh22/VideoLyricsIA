@@ -116,6 +116,17 @@ export const PORTALS = {
   chile: { label: "Chile", host: "umgchile.genly.pro" },
 };
 
+/**
+ * Catalog codes (ARF/ARUM, ISRC-like) are short. Some campaigns stored a
+ * content hash in `technical_code`; it identifies nothing for a person, so
+ * it is not shown in lists (the drawer still shows the raw value).
+ */
+export function displayCode(code) {
+  const value = String(code || "").trim();
+  if (!value || value.length > 20 || /^[0-9a-f]{24,}$/i.test(value)) return "";
+  return value;
+}
+
 export function portalLabel(id) {
   return PORTALS[id]?.label || id;
 }
