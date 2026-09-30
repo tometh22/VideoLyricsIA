@@ -428,7 +428,10 @@ export default function CampaignDetailPage({ id }) {
       onClose={() => setDialog(null)} onStarted={(operation, portal, total) => {
         setDialog(null); setSelected(new Set());
         updateParams({ delivery_op: operation.operation_id }, { push: true });
-        setFlash({ tone: "success", text: `Envío iniciado para ${operation.total_count || total} ${total === 1 ? "video" : "videos"} a ${portal === "chile" ? "Chile" : portal === "argentina" ? "Argentina" : portal}. Sigue en segundo plano.` });
+        const target = `${operation.total_count || total} ${total === 1 ? "video" : "videos"} a ${portal === "chile" ? "Chile" : portal === "argentina" ? "Argentina" : portal}`;
+        setFlash(operation.scheduled === false
+          ? { tone: "warning", text: `El envío de ${target} quedó guardado, pero no pudimos ponerlo en cola. Usá «Reintentar» en el seguimiento del envío.` }
+          : { tone: "success", text: `Envío iniciado para ${target}. Sigue en segundo plano.` });
       }} />}
     {dialog?.type === "record" && <RecordDeliveryDialog campaignId={id} song={dialog.song} onClose={() => setDialog(null)} onDone={() => { setDialog(null); setFlash({ tone: "success", text: "Entrega registrada." }); void refresh(); }} />}
     {dialog?.type === "discard" && <DiscardDialog campaignId={id} songs={dialog.songs} mode={dialog.mode} onClose={() => setDialog(null)} onDone={(result) => {
