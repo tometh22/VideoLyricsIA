@@ -739,7 +739,6 @@ def serialize_document(
         ),
         "latest_approved_version": latest_approved_payload,
         "quality_proposal": proposal,
-        "lyric_review": _lyric_review(db, document, job),
         **pilot,
         **actor_for(db, document.updated_by),
         "updated_at": _aware(document.updated_at).isoformat() if document.updated_at else None,
@@ -750,12 +749,6 @@ def serialize_document(
             "expires_at": lock_expires.isoformat() if lock_active else None,
         },
     }
-
-
-def _lyric_review(db: Session, document: EditorDocument, job: Job | None) -> dict:
-    from lyric_review_sources import review_for_document
-
-    return review_for_document(db, document, job)
 
 
 def _proposal_for_response(document: EditorDocument) -> dict | None:
@@ -2187,15 +2180,31 @@ def approve_document(
     *,
     editor_revision: int | None = None,
     editor_version_id: str | None = None,
+    review_scope: str = "full",
 ) -> tuple[EditorDocument, EditorVersion]:
     """Freeze and approve the exact current persisted snapshot.
 
     A version id is not permission to render an old snapshot after somebody
     else saved. Both selectors must still identify the document's current
     revision, otherwise approval fails closed with the standard conflict.
+
+    ``review_scope`` decides which Revisión rápida points block: ``full``
+    (editor and campaign approval), ``missing_only`` (change-request renders:
+    only sung words that were lost) or ``none``.
     """
     if getattr(job, "pilot_id", None):
         raise ValueError("pilot_copy_cannot_be_approved")
+    # La revisión se calcula ANTES de bloquear las filas: puede tardar y no
+    # debe frenar al pipeline ni a otros guardados. Bajo el lock sólo se
+    # confirma que la letra revisada sigue siendo la misma.
+    from lyric_review_sources import pending_for
+    unlocked = db.query(EditorDocument).filter(
+        EditorDocument.job_id == job.job_id, EditorDocument.tenant_id == job.tenant_id,
+    ).first()
+    reviewed_revision = unlocked.revision if unlocked is not None else None
+    review_error = (
+        pending_for(db, unlocked, job, scope=review_scope) if unlocked is not None else None
+    )
     job = (
         db.query(Job)
         .filter(Job.job_id == job.job_id)
@@ -2212,11 +2221,6 @@ def approve_document(
         document = get_or_create_document(db, job.job_id, job.tenant_id, job.segments_json or [])
     require_machine_snapshot(job, document)
     validate_approval_snapshot(document.current_segments)
-    # Revisión rápida: lo que falta, lo que se escucha distinto y las reglas
-    # de estilo UMG. Cada punto obligatorio se aplica o se descarta antes de
-    # aprobar (lyric_review.py).
-    from lyric_review_sources import require_resolved
-    require_resolved(db, document, job)
     selected = None
     selected_is_equivalent_current = False
     if editor_version_id:
@@ -2236,6 +2240,13 @@ def approve_document(
             raise RuntimeError("editor_revision_conflict")
     if editor_version_id is None and editor_revision is None:
         raise ValueError("editor approval selector required")
+    # Revisión rápida: lo que falta, lo que se escucha distinto y las reglas
+    # de estilo UMG (lyric_review.py). Va después de los chequeos de revisión
+    # para que un cliente desactualizado reciba el conflicto, no esto.
+    if document.revision != reviewed_revision:
+        review_error = pending_for(db, document, job, scope=review_scope)
+    if review_error is not None:
+        raise review_error
     version = selected or _ensure_version(
         db, document, document.revision, document.current_segments,
         user_id, "approve", approved=True,

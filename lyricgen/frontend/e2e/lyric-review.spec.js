@@ -13,7 +13,8 @@ const SEGMENTS = [
 
 function item(id, required, title, segmentId, start, before, after, fix, extra = {}) {
   return {
-    id, kind: extra.kind || "heard_different", required, title, why: extra.why || "Coinciden Gemini y el testigo",
+    id, kind: extra.kind || "heard_different", group: extra.group || "text", required, title,
+    why: extra.why || "Coinciden Gemini y el testigo",
     action: extra.action || "Corregir", dismiss: extra.dismiss || "Está bien así", keys: [id],
     start, end: start + 0.5, sources: ["gemini", "witness"], alternatives: extra.alternatives || [],
     occurrences: [{ line_segment_id: segmentId, start, end: start + 0.5, before, after, fix }],
@@ -28,7 +29,8 @@ function lyricReview(segments, official) {
   const add = (value) => { if (!value.keys.every((key) => dismissed.has(key))) items.push(value); };
   if (/[¿?]/.test(text("seg-a"))) {
     add(item("q", true, "Signos de pregunta", "seg-a", 0.4, text("seg-a"), text("seg-a").replace(/[¿?]/g, ""),
-      { type: "punctuation", mode: "remove_question" }, { kind: "question_marks", why: "«Cuando» sin tilde no pregunta" }));
+      { type: "punctuation", mode: "remove_question" },
+      { kind: "question_marks", group: "style", why: "«Cuando» sin tilde no pregunta: van sin signos" }));
   }
   if (!text("seg-b").includes("dormite")) {
     add(item("dormite", true, "Falta texto", "seg-b", 1.5, text("seg-b"), `${text("seg-b")} dormite ya`,
@@ -58,38 +60,59 @@ test("quick review is resolved from the keyboard before approval", async ({ page
   await harness.open();
 
   const panel = page.getByTestId("lyric-review-panel");
-  await expect(panel).toContainText("3 para decidir antes de aprobar");
-  await expect(panel).toContainText("Tu garantía de reloco se fundió dormite ya");
+  const approve = page.getByRole("button", { name: /Aprobar y generar/i });
+  await expect(panel.getByTestId("lyric-review-heading")).toHaveText("Faltan 3 para aprobar");
+  await expect(page.locator('[data-lyric-review-blocked="true"]')).toContainText("Faltan para aprobar");
   await expect(panel).toContainText("Ver 1 sugerencia (no bloquean)");
   await panel.screenshot({ path: "test-results/lyric-review-panel.png" });
   await page.screenshot({ path: "test-results/lyric-review-editor.png" });
 
-  // Aprobar no avanza: lleva al panel.
-  await page.getByRole("button", { name: /Aprobar y generar/i }).click();
+  // En pantallas angostas nada se desborda.
+  await page.setViewportSize({ width: 390, height: 900 });
+  await expect.poll(() => panel.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+  await panel.screenshot({ path: "test-results/lyric-review-mobile.png" });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+
+  // "Aprobar" no avanza: lleva al panel y dice qué falta.
+  await approve.click();
   await expect(panel).toBeFocused();
+  await expect(panel.getByTestId("lyric-review-status")).toContainText("resolvé estos 3 puntos");
   expect(harness.approvals).toHaveLength(0);
 
-  // A aplica y pasa al siguiente; N descarta.
-  await panel.press("a");
+  // Enter aplica, la línea queda marcada y el panel pasa al siguiente.
+  await panel.press("Enter");
   await expect(page.locator('input[aria-label="Letra de la línea 1"]')).toHaveValue("Cuando vuelva");
-  await panel.press("a");
+  await expect(panel.getByTestId("lyric-review-status")).toContainText("Aplicado");
+  await page.waitForTimeout(300);
+  await panel.press("Enter");
   await expect(page.locator('input[aria-label="Letra de la línea 2"]')).toHaveValue("Tu garantía de reloco se fundió dormite ya");
-  await panel.press("n");
+  await page.waitForTimeout(300);
+  // Z deshace la última decisión y el punto vuelve.
+  await panel.press("z");
+  await expect(page.locator('input[aria-label="Letra de la línea 2"]')).toHaveValue("Tu garantía de reloco se fundió");
+  await page.waitForTimeout(300);
+  await panel.press("Enter");
+  await expect(page.locator('input[aria-label="Letra de la línea 2"]')).toHaveValue("Tu garantía de reloco se fundió dormite ya");
+  await page.waitForTimeout(300);
+  // Backspace: "está bien así", queda guardado en la línea.
+  await panel.press("Backspace");
   await expect.poll(() => (harness.saves.at(-1)?.segments || [])
     .flatMap((segment) => segment.qa_dismissed || [])).toEqual(["tres"]);
-  await expect(panel).toContainText("todo listo para aprobar");
+  await expect(panel.getByTestId("lyric-review-heading")).toHaveText("Todo listo para aprobar");
 
-  // La sugerencia queda a la vista con su otra opción, sin bloquear.
-  await panel.getByRole("button", { name: "la mar" }).click();
+  // La sugerencia queda a la vista con su otra opción (tecla 1), sin bloquear.
+  await page.waitForTimeout(300);
+  await panel.press("1");
   await expect(page.locator('input[aria-label="Letra de la línea 3"]')).toHaveValue("Vos sos la mar");
 
   // La letra oficial pegada se usa sólo para comparar.
-  await panel.getByRole("button", { name: "Pegar letra oficial" }).click();
+  await panel.getByRole("button", { name: "Comparar con letra oficial" }).click();
   await panel.getByLabel("Letra oficial").fill("Cuando vuelvas\nTu garantía de reloj se fundió, dormite ya");
   await panel.getByRole("button", { name: "Comparar con esta letra" }).click();
   await expect(panel).toContainText("letra oficial (pegada)");
   await panel.screenshot({ path: "test-results/lyric-review-done.png" });
 
-  await page.getByRole("button", { name: /Aprobar y generar/i }).click();
+  await expect(page.locator('[data-lyric-review-blocked="false"]')).toBeVisible();
+  await approve.click();
   await expect.poll(() => harness.approvals.length).toBe(1);
 });

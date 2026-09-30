@@ -21,8 +21,9 @@ function overlapDistance(segment, start, end) {
 export function findAlertLineIndex(segments, alert) {
   if (!Array.isArray(segments) || segments.length === 0 || !alert) return -1;
   if (alert.line_segment_id) {
-    const byId = segments.findIndex((s) => String(s.segment_id || "") === String(alert.line_segment_id));
-    if (byId !== -1) return byId;
+    // Si la línea tiene identidad y ya no existe (se borró o se partió), el
+    // arreglo NO se aplica en la vecina: se devuelve -1 y el editor avisa.
+    return segments.findIndex((s) => String(s.segment_id || "") === String(alert.line_segment_id));
   }
   const start = Number(alert.start);
   const end = Number(alert.end);
@@ -40,6 +41,14 @@ export function findAlertLineIndex(segments, alert) {
 
 function insertionIndex(tokens, alert) {
   const norms = tokens.map(normToken);
+  const hinted = Number.isInteger(alert.insert_at_word) ? alert.insert_at_word : null;
+  // La posición que calculó el servidor manda si la palabra de al lado sigue
+  // ahí ("Dame, dame tu amor": no confundir con el otro "dame").
+  if (hinted != null && hinted <= tokens.length) {
+    if (alert.anchor_before && hinted > 0 && norms[hinted - 1] === alert.anchor_before) return hinted;
+    if (alert.anchor_after && norms[hinted] === alert.anchor_after) return hinted;
+    if (!alert.anchor_before && !alert.anchor_after) return hinted;
+  }
   if (alert.anchor_before) {
     const index = norms.lastIndexOf(alert.anchor_before);
     if (index !== -1) return index + 1;
@@ -48,8 +57,7 @@ function insertionIndex(tokens, alert) {
     const index = norms.indexOf(alert.anchor_after);
     if (index !== -1) return index;
   }
-  const hinted = Number.isInteger(alert.insert_at_word) ? alert.insert_at_word : tokens.length;
-  return Math.max(0, Math.min(tokens.length, hinted));
+  return Math.max(0, Math.min(tokens.length, hinted ?? tokens.length));
 }
 
 function capitalize(text) {

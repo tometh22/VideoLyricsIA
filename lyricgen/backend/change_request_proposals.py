@@ -88,34 +88,59 @@ def _replace_quoted_fragment(current: str, requested: str) -> str:
     "...HACE UN AÑO ATRÁS...": citan el pedazo que corrigen, no la línea
     entera. Reemplazar la línea completa borraba lo que quedaba fuera de la
     cita ("dormite ya", el "Que" inicial; pedidos 112/113 del 29-09-2026).
-    Si la cita es más corta que la línea, se reemplaza la ventana de la
-    línea que más se le parece y el resto queda intacto.
+
+    Es un fragmento sólo si es claramente más corto que la línea (o trae
+    "…") y coincide con ella en la primera y la última palabra. Si no, es la
+    línea completa que pide el cliente, incluso para BORRAR palabras
+    ("Hace un año atrás te fuiste" sin el "Que").
     """
     literal = requested
+    has_ellipsis = bool(_ELLIPSIS.search(requested))
     requested = _ELLIPSIS.sub("", _ELLIPSIS.sub("", requested)).strip()
     cur_words, req_words = current.split(), requested.split()
-    if not cur_words or not req_words or len(req_words) >= len(cur_words):
+    if not cur_words or not req_words:
+        return literal
+    if not has_ellipsis and len(req_words) > 0.8 * len(cur_words):
+        return literal
+    if len(req_words) >= len(cur_words):
         return literal
     target = "".join(_fold_word(w) for w in req_words)
     best = None
     for size in range(max(1, len(req_words) - 1), min(len(cur_words), len(req_words) + 2) + 1):
         for start in range(0, len(cur_words) - size + 1):
-            window = "".join(_fold_word(w) for w in cur_words[start:start + size])
-            ratio = difflib.SequenceMatcher(a=window, b=target, autojunk=False).ratio()
+            window = cur_words[start:start + size]
+            if not has_ellipsis and (
+                _fold_word(window[0]) != _fold_word(req_words[0])
+                or _fold_word(window[-1]) != _fold_word(req_words[-1])
+            ):
+                continue
+            joined = "".join(_fold_word(w) for w in window)
+            ratio = difflib.SequenceMatcher(a=joined, b=target, autojunk=False).ratio()
             if best is None or ratio > best[0]:
                 best = (ratio, start, size)
     if best is None or best[0] < 0.6 or best[2] == len(cur_words):
         return literal
     _, start, size = best
+    def surface(word: str) -> str:
+        return re.sub(r"[^\w']", "", unicodedata.normalize("NFC", word).lower())
+    if [surface(w) for w in cur_words[start:start + size]] == [surface(w) for w in req_words]:
+        # La cita ya está tal cual en la línea: lo único que puede estar
+        # pidiendo es sacar el resto ("Yo te quiero mucho" sin el otro "mucho").
+        return literal
     replacement = requested
     letters = [c for c in requested if c.isalpha()]
     if letters and all(c.isupper() for c in letters) and not current.isupper():
         replacement = requested.lower()
         if start == 0 and cur_words[0][:1].isupper():
             replacement = replacement[:1].upper() + replacement[1:]
-    last = cur_words[start + size - 1]
-    trailing = re.search(r"[,;:.!?]+$", last)
-    if trailing and not re.search(r"[,;:.!?]$", replacement):
+    if start == 0 and cur_words[0].lstrip("¿¡\"'(«")[:1].isupper() and replacement[:1].islower():
+        replacement = replacement[:1].upper() + replacement[1:]
+    first, last = cur_words[start], cur_words[start + size - 1]
+    leading = re.match(r"^[¿¡\"'(«]+", first)
+    if leading and not re.match(r"^[¿¡\"'(«]", replacement):
+        replacement = leading.group(0) + replacement
+    trailing = re.search(r"[,;:.!?»\")]+$", last)
+    if trailing and not re.search(r"[,;:.!?»\")]$", replacement):
         replacement += trailing.group(0)
     return " ".join(cur_words[:start] + [replacement] + cur_words[start + size:])
 

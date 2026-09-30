@@ -45,10 +45,43 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   overwrites the whole line; only the quoted span is replaced ("…se fundió,
   dormite ya", "Que hace un año atrás").
 
+### Changed (adversarial review, 2026-09-30)
+
+- Review panel redesigned for zero-mouse review: one card at a time with a
+  word diff (added in green, removed struck through, punctuation-only
+  changes marked per sign), Enter/⌫/1–3/E/J/K/M/Z/? keys that never leak to
+  the editor's own shortcuts, optional auto-listen, the lyric line of the
+  active point highlighted (and flashed green after applying), undo that
+  brings the point back, a failed fix that stays visible instead of
+  vanishing, and an "Aprobar" button that turns into "Faltan N · Revisar".
+- Fixes are applied by line identity and word position: correcting one
+  repetition in a line no longer changes the other, a stale point never
+  lands on a neighbouring line, merges keep word timings, chorus copies
+  keep their punctuation.
+- Precision: official-lyrics veto on sound-alike ears, phonetic
+  corroboration, spelling-only differences only with the official lyrics,
+  real questions and legitimate accent pairs no longer flagged,
+  question/orphan points keyed by line, stable dismissal keys, NFC input.
+  New suggestions: line breaks like the official lyrics and timing (a line
+  that leaves before its last sung word).
+- Safety and performance: bounded alignment (a 400-line repetitive song
+  went from 45 s to under 1 s), review computed outside row locks and off
+  the event loop and cached by content, lrclib fetched without holding a
+  DB connection (max 2 at a time, own cache namespace) and never for batch
+  campaigns (audio-only rule), correction memory scoped to the tenant,
+  review reads in a savepoint, official-lyrics paste recorded as a product
+  event.
+- Change requests: a partial client quote replaces only its span, but a
+  quote that only drops words (or matches the whole line) still replaces
+  the line; leading ¿¡ and trailing punctuation are kept.
+
 ### Configuration
 
 - `LYRIC_REVIEW_MODE`: `enforce` (default), `observe` (show without
   blocking) or `off`.
+- `LYRIC_REVIEW_ENFORCE_TENANTS`: comma-separated tenants where approval is
+  blocked; when unset, only batch campaigns block and everything else shows
+  the panel without blocking.
 - `LYRIC_REVIEW_FETCH_OFFICIAL`: `1` (default) fetches missing official
   lyrics from lrclib in the background; `0` disables it.
 

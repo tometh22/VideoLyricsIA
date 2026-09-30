@@ -36,7 +36,8 @@ import VersionHistory from "./VersionHistory";
 import WrapWarningDialog from "./WrapWarningDialog";
 import QualityProposalPanel from "./QualityProposalPanel";
 import LyricReviewPanel from "./LyricReviewPanel";
-import { applyReviewItem, dismissReviewItem } from "../lib/lyricReview";
+import { applyReviewItem, dismissReviewItem, validItems } from "../lib/lyricReview";
+import { findAlertLineIndex } from "../lib/heardWords";
 import CompleteReviewerCandidate from "./CompleteReviewerCandidate";
 import CatalogReference from "./CatalogReference";
 
@@ -2873,37 +2874,86 @@ export default function LyricsEditor({
 
   // Revisión rápida (lyric_review.py): lo que falta, lo que se escucha
   // distinto y el estilo UMG. El servidor la recalcula en cada guardado; acá
-  // se ocultan al instante los puntos que el revisor ya resolvió, hasta que
-  // el próximo guardado confirme la letra nueva.
+  // se ocultan al instante los puntos que el revisor ya resolvió hasta que el
+  // servidor confirme la letra nueva.
   const lyricReview = durableEditor.document?.lyric_review || null;
   const lyricReviewMode = lyricReview?.mode || "enforce";
   const [reviewResolvedIds, setReviewResolvedIds] = useState(() => new Set());
+  const [reviewFailedIds, setReviewFailedIds] = useState(() => new Set());
+  const [reviewDecisions, setReviewDecisions] = useState([]);
+  const [reviewStatus, setReviewStatus] = useState("");
+  const [reviewActiveSegId, setReviewActiveSegId] = useState(null);
+  const [reviewAppliedSegIds, setReviewAppliedSegIds] = useState(() => new Set());
+  const [reviewAutoPlayRaw, setReviewAutoPlayRaw] = useLocalStorage("genly.lyricReview.autoplay", "1");
+  const reviewAutoPlay = reviewAutoPlayRaw !== "0";
   const reviewPanelRef = useRef(null);
-  const isDirtyRef = useRef(isDirty);
-  isDirtyRef.current = isDirty;
   useEffect(() => {
-    const present = new Set((lyricReview?.items || []).map((item) => item.id));
+    // Cuando la letra en pantalla es exactamente la que revisó el servidor,
+    // él manda: lo que siga apareciendo vuelve a mostrarse (p. ej. tras
+    // deshacer). Mientras haya cambios sin guardar, se respeta lo resuelto.
+    const present = new Set((lyricReview?.items || []).map((item) => item?.id));
+    const synced = segmentsEquivalent(
+      durableEditor.document?.segments || [],
+      sanitizeSegmentsForPersistence(editedRef.current),
+    );
     setReviewResolvedIds((previous) => {
       if (!previous.size) return previous;
-      return new Set([...previous].filter((id) => present.has(id) && isDirtyRef.current));
+      return synced ? new Set() : new Set([...previous].filter((id) => present.has(id)));
     });
+    setReviewFailedIds((previous) => (previous.size && synced ? new Set() : previous));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lyricReview]);
   const pendingReviewItems = useMemo(() => (
     lyricReviewMode === "off" ? []
-      : (lyricReview?.items || []).filter((item) => !reviewResolvedIds.has(item.id))
+      : validItems(lyricReview?.items).filter((item) => !reviewResolvedIds.has(item.id))
   ), [lyricReview, lyricReviewMode, reviewResolvedIds]);
   const pendingRequiredReview = pendingReviewItems.filter((item) => item.required).length;
-  const focusLyricReview = useCallback(() => {
+  const reviewBlocksApproval = lyricReviewMode === "enforce" && pendingRequiredReview > 0;
+  const focusLyricReview = useCallback((scroll = true) => {
     const panel = reviewPanelRef.current;
     if (!panel) return;
-    panel.scrollIntoView({ block: "center", behavior: "smooth" });
+    if (scroll) panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
     panel.focus({ preventScroll: true });
   }, []);
-  const resolveReviewItem = useCallback((item, decision, apply) => {
+  // Con puntos obligatorios, el panel toma el teclado al abrir la canción
+  // (sin mover la página ni robar el foco de un campo en el que se escribe).
+  const reviewAutoFocused = useRef(false);
+  useEffect(() => {
+    if (reviewAutoFocused.current || !reviewBlocksApproval) return;
+    const tag = (document.activeElement?.tagName || "").toUpperCase();
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    reviewAutoFocused.current = true;
+    window.requestAnimationFrame(() => focusLyricReview(false));
+  }, [focusLyricReview, reviewBlocksApproval]);
+  const lineIdForReviewItem = useCallback((item, segments = editedRef.current) => {
+    const occurrence = item?.occurrences?.[0];
+    if (!occurrence) return null;
+    const index = findAlertLineIndex(segments, {
+      line_segment_id: occurrence.line_segment_id, start: occurrence.start, end: occurrence.end,
+    });
+    return index === -1 ? null : segments[index]?._id ?? null;
+  }, []);
+  const activateReviewItem = useCallback((item, { scroll = true } = {}) => {
+    const id = item ? lineIdForReviewItem(item) : null;
+    setReviewActiveSegId(id);
+    if (scroll && id != null) rowRefs.current[id]?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+  }, [lineIdForReviewItem]);
+  const recordReviewDecision = useCallback((item, decision, next, lineIds = []) => {
     pushEditHistory();
-    setEdited(apply);
+    setEdited(next);
     setReviewResolvedIds((previous) => new Set(previous).add(item.id));
+    setReviewFailedIds((previous) => {
+      if (!previous.has(item.id)) return previous;
+      const copy = new Set(previous);
+      copy.delete(item.id);
+      return copy;
+    });
+    setReviewDecisions((previous) => [...previous, item.id]);
     setFlushCounter((count) => count + 1);
+    if (lineIds.length) {
+      setReviewAppliedSegIds(new Set(lineIds));
+      window.setTimeout(() => setReviewAppliedSegIds(new Set()), 1200);
+    }
     trackEditorEvent("editor_lyric_review_decision", {
       decision, kind: item.kind, required: Boolean(item.required),
       sources: item.sources, occurrences: (item.occurrences || []).length,
@@ -2911,27 +2961,48 @@ export default function LyricsEditor({
     window.requestAnimationFrame(() => reviewPanelRef.current?.focus({ preventScroll: true }));
   }, [pushEditHistory, setEdited, trackEditorEvent]);
   const applyLyricReview = useCallback((item, alternative = null) => {
-    let applied = 0;
-    resolveReviewItem(item, alternative ? "apply_alternative" : "apply", (previous) => {
-      const result = applyReviewItem(previous, item, {
-        alternative,
-        mint: () => ({
-          _id: previous.reduce((max, segment) => Math.max(max, segment._id), -1) + 1,
-          segment_id: mintSegmentId(),
-        }),
-      });
-      applied = result.applied;
-      return result.segments;
+    const current = editedRef.current;
+    const result = applyReviewItem(current, item, {
+      alternative,
+      mint: () => ({
+        _id: current.reduce((max, segment) => Math.max(max, segment._id), -1) + 1,
+        segment_id: mintSegmentId(),
+      }),
     });
-    window.setTimeout(() => {
-      if (!applied) {
-        toast({ message: "Esa línea ya cambió: revisala a mano en la lista.", tone: "info" });
-      }
-    }, 0);
-  }, [resolveReviewItem, toast]);
-  const dismissLyricReview = useCallback((item) => resolveReviewItem(
-    item, "dismiss", (previous) => dismissReviewItem(previous, item),
-  ), [resolveReviewItem]);
+    if (!result.applied) {
+      // El punto se queda: la revisora lo corrige a mano (M) o lo descarta.
+      setReviewFailedIds((previous) => new Set(previous).add(item.id));
+      setReviewStatus("No se pudo aplicar: la línea cambió. Corregila a mano o marcá que está bien así.");
+      trackEditorEvent("editor_lyric_review_decision", { decision: "apply_failed", kind: item.kind });
+      return;
+    }
+    recordReviewDecision(item, alternative ? "apply_alternative" : "apply", result.segments, result.lines);
+    setReviewStatus(`Aplicado${result.applied > 1 ? ` en ${result.applied} líneas` : ""} · Z para deshacer`);
+  }, [recordReviewDecision, trackEditorEvent]);
+  const dismissLyricReview = useCallback((item) => {
+    recordReviewDecision(item, "dismiss", dismissReviewItem(editedRef.current, item));
+    setReviewStatus(`${item.dismiss || "Está bien así"} · Z para deshacer`);
+  }, [recordReviewDecision]);
+  const undoLyricReview = useCallback(() => {
+    const last = reviewDecisions[reviewDecisions.length - 1];
+    if (!last) return;
+    undoEdit();
+    setReviewDecisions((previous) => previous.slice(0, -1));
+    setReviewResolvedIds((previous) => {
+      const copy = new Set(previous);
+      copy.delete(last);
+      return copy;
+    });
+    setFlushCounter((count) => count + 1);
+    setReviewStatus("Deshecho");
+  }, [reviewDecisions, undoEdit]);
+  const editLyricReviewByHand = useCallback((item) => {
+    const id = lineIdForReviewItem(item);
+    if (id == null) return;
+    const row = rowRefs.current[id];
+    row?.scrollIntoView?.({ block: "center", behavior: "smooth" });
+    row?.querySelector?.('input[aria-label^="Letra de la línea"]')?.focus();
+  }, [lineIdForReviewItem]);
   const playLyricReview = useCallback((item) => playGuidedWindow({
     id: item.id, start: item.start, end: item.end,
   }), [playGuidedWindow]);
@@ -2946,7 +3017,7 @@ export default function LyricsEditor({
       if (!response.ok) throw new Error(`http-${response.status}`);
       const body = await response.json();
       durableEditor.updateDocument({ lyric_review: body.lyric_review });
-      toast({ message: "Listo: la letra oficial se usa para comparar. Tu letra no cambió.", tone: "info" });
+      setReviewStatus("Letra oficial cargada: se usa sólo para comparar, tu letra no cambió.");
       return true;
     } catch {
       toast({ message: "No pudimos guardar la letra oficial. Reintentá.", tone: "error" });
@@ -3267,7 +3338,7 @@ export default function LyricsEditor({
   // in sync mode so the operator can recover from a mistap.
   useEffect(() => {
     const onKey = (e) => {
-      if (draftRecoveryRef.current) return;
+      if (draftRecoveryRef.current || e.defaultPrevented) return;
       const tag = (document.activeElement?.tagName || "").toUpperCase();
       const editing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || document.activeElement?.isContentEditable;
       if (editing) return;
@@ -4096,12 +4167,9 @@ export default function LyricsEditor({
       setLanguageResolutionOpen(true);
       return;
     }
-    if (lyricReviewMode === "enforce" && pendingRequiredReview > 0) {
+    if (reviewBlocksApproval) {
       focusLyricReview();
-      toast({
-        message: `Antes de aprobar, resolvé ${pendingRequiredReview === 1 ? "el punto" : `los ${pendingRequiredReview} puntos`} de la revisión rápida.`,
-        tone: "info",
-      });
+      setReviewStatus(`Para aprobar, resolvé ${pendingRequiredReview === 1 ? "este punto" : `estos ${pendingRequiredReview} puntos`}.`);
       return;
     }
     if (editorV2Enabled && (!durableHydrated || durableEditor.loading)) {
@@ -4212,13 +4280,11 @@ export default function LyricsEditor({
       }
       // El guardado recién hecho es la verdad: si la letra que se va a
       // aprobar todavía tiene puntos obligatorios, se deciden antes.
-      if (lyricReviewMode === "enforce" && saveResult?.lyricReview?.required_count > 0) {
+      if (saveResult?.lyricReview?.mode === "enforce"
+        && validItems(saveResult.lyricReview.items).some((item) => item.required)) {
         setReviewResolvedIds(new Set());
         focusLyricReview();
-        toast({
-          message: "Antes de aprobar, resolvé los puntos de la revisión rápida.",
-          tone: "info",
-        });
+        setReviewStatus("Para aprobar, resolvé los puntos de la revisión rápida.");
         return;
       }
       let approvalResult = null;
@@ -4791,11 +4857,20 @@ export default function LyricsEditor({
             data-quality-review-required={campaignQualityReview ? "true" : "false"}
             data-review-incomplete={campaignReviewIncomplete ? "true" : "false"}
             data-tour="editor-approve-floating"
-            className="editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-brand-light px-5 text-sm font-semibold text-white shadow-xl shadow-brand/25 transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
+            data-lyric-review-blocked={reviewBlocksApproval ? "true" : "false"}
+            title={reviewBlocksApproval ? `Faltan ${pendingRequiredReview} puntos de la revisión rápida` : undefined}
+            className={`editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl px-5 text-sm font-semibold transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60 ${reviewBlocksApproval
+              ? "bg-surface-2 text-amber-100 ring-2 ring-amber-300/70"
+              : "bg-gradient-to-r from-brand to-brand-light text-white shadow-xl shadow-brand/25"}`}
           >
+            {reviewBlocksApproval && !isApproving && (
+              <span className="rounded-md bg-amber-300 px-1.5 text-xs font-bold text-black">{pendingRequiredReview}</span>
+            )}
             {isApproving
               ? (t("editor.applying_changes") || "Aplicando cambios…")
-              : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
+              : reviewBlocksApproval
+                ? "Faltan para aprobar · Revisar"
+                : (submitLabel || (isBatch ? t("editor.approve_next") : t("editor.approve_generate")))}
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path d="M5 12h14M12 5l7 7-7 7" />
             </svg>
@@ -4967,10 +5042,19 @@ export default function LyricsEditor({
           ref={reviewPanelRef}
           review={lyricReview}
           items={pendingReviewItems}
+          failedIds={reviewFailedIds}
+          decidedCount={reviewDecisions.length}
+          status={reviewStatus}
           playingId={guidedPlayingWindowId}
+          autoPlay={reviewAutoPlay}
+          onToggleAutoPlay={() => setReviewAutoPlayRaw(reviewAutoPlay ? "0" : "1")}
           onPlay={playLyricReview}
           onApply={applyLyricReview}
           onDismiss={dismissLyricReview}
+          onEdit={editLyricReviewByHand}
+          onUndo={undoLyricReview}
+          canUndo={reviewDecisions.length > 0}
+          onActivate={activateReviewItem}
           onPasteOfficial={editorRequest ? pasteOfficialLyrics : null}
         />
       )}
@@ -6362,6 +6446,8 @@ export default function LyricsEditor({
                     : `border-l-4 ${!isArmed && !isActive && !wasRecentlyAnchored && (showIndividualReviewSignal || isUnsafeMarker) ? "border-amber-400/50" : "border-transparent"}`}
                   ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
                   ${flashReviewId === seg._id ? "ring-1 ring-amber-400/50" : ""}
+                  ${reviewAppliedSegIds.has(seg._id) ? "ring-2 ring-emerald-300/70 bg-emerald-400/[0.08]"
+                    : reviewActiveSegId === seg._id ? "ring-2 ring-amber-300/60" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
               >
                 <div className="flex items-start gap-2 p-1">

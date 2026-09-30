@@ -145,7 +145,8 @@ def test_lonely_word_merges_into_the_closest_line():
             _line("Que", 150.9, 151.2, "b"), _line("Dejó el temor de tener que olvidar", 151.3, 154, "c")]
     [item] = build_review(segs, title="")["items"]
     assert item["kind"] == "orphan_word"
-    assert item["occurrences"][0]["fix"] == {"type": "merge", "direction": "next"}
+    fix = item["occurrences"][0]["fix"]
+    assert (fix["type"], fix["direction"], fix["other_segment_id"]) == ("merge", "next", "c")
 
 
 def test_regional_apocope_and_silent_h_are_not_errors():
@@ -183,11 +184,12 @@ def test_official_lyrics_only_insert_from_a_live_version_is_ignored():
     assert [i for i in review["items"] if i["kind"] == "missing"] == []
 
 
-def test_approval_gate(monkeypatch):
-    monkeypatch.delenv("LYRIC_REVIEW_MODE", raising=False)
+def _gate_fixture(workload_class="batch", tenant="umg"):
     segs = [_line("¿Cuando vuelvas?", 10, 12, "a")]
-    document = SimpleNamespace(job_id="j", current_segments=segs, original_segments=segs, machine_evidence=None)
-    job = SimpleNamespace(job_id="j", artist="", song_title="", campaign_item_id=None)
+    document = SimpleNamespace(job_id="j", current_segments=segs, original_segments=segs,
+                               machine_evidence=None, revision=1)
+    job = SimpleNamespace(job_id="j", artist="", song_title="", campaign_item_id=None,
+                          tenant_id=tenant, workload_class=workload_class)
 
     class _Query:
         def filter(self, *a, **k):
@@ -196,12 +198,30 @@ def test_approval_gate(monkeypatch):
         def first(self):
             return None
 
-    db = SimpleNamespace(query=lambda *a, **k: _Query())
+    return SimpleNamespace(query=lambda *a, **k: _Query()), document, job
+
+
+def test_approval_gate_blocks_umg_campaigns(monkeypatch):
+    monkeypatch.delenv("LYRIC_REVIEW_MODE", raising=False)
+    monkeypatch.delenv("LYRIC_REVIEW_ENFORCE_TENANTS", raising=False)
+    db, document, job = _gate_fixture()
     with pytest.raises(LyricReviewPending) as exc:
         require_resolved(db, document, job)
     assert exc.value.review["required_count"] == 1
+    # Un re-render por pedido de cambio sólo frena por letra perdida.
+    require_resolved(db, document, job, scope="missing_only")
     monkeypatch.setenv("LYRIC_REVIEW_MODE", "observe")
     require_resolved(db, document, job)
+
+
+def test_approval_gate_scope_by_tenant(monkeypatch):
+    monkeypatch.delenv("LYRIC_REVIEW_MODE", raising=False)
+    db, document, job = _gate_fixture(workload_class="single", tenant="b2c")
+    monkeypatch.delenv("LYRIC_REVIEW_ENFORCE_TENANTS", raising=False)
+    require_resolved(db, document, job)  # fuera de campañas: sólo se muestra
+    monkeypatch.setenv("LYRIC_REVIEW_ENFORCE_TENANTS", "b2c,umg")
+    with pytest.raises(LyricReviewPending):
+        require_resolved(db, document, job)
 
 
 def test_chorus_fixed_in_one_repetition_suggests_the_others():

@@ -19,8 +19,15 @@ describe("heard words placement", () => {
       .toBe("Que hace un año atrás y siempre tú");
   });
 
-  it("finds the line by id and falls back to time", () => {
+  it("finds the line by id, and never guesses a neighbour when the id is gone", () => {
     expect(findAlertLineIndex(pajaro, { line_segment_id: "c", start: 0, end: 0 })).toBe(2);
-    expect(findAlertLineIndex(pajaro, { line_segment_id: "gone", start: 49, end: 50 })).toBe(2);
+    expect(findAlertLineIndex(pajaro, { line_segment_id: "gone", start: 49, end: 50 })).toBe(-1);
+    expect(findAlertLineIndex(pajaro, { start: 49, end: 50 })).toBe(2);
+  });
+
+  it("uses the server position when its anchor is still there", () => {
+    const segments = [{ start: 0, end: 3, text: "Dame, dame tu amor" }];
+    expect(lineWithAlertInserted(segments, 0, { text: "más", anchor_before: "dame", insert_at_word: 1 }))
+      .toBe("Dame, más dame tu amor");
   });
 });

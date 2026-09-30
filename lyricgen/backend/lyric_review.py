@@ -48,15 +48,20 @@ from heard_words import (
     _f,
     _is_loop,
     _same,
+    aligned_opcodes,
     find_missing_heard_words,
     machine_words,
     norm_token,
+    opcode_similarity,
     witness_words,
 )
 
 SCHEMA = "lyric-review-v1"
 MAX_BLOCK_TOKENS = 8
 MAX_ITEMS = 60
+# Más palabras que esto no se comparan contra los oídos (se avisa como canción
+# difícil): protege al servidor de letras gigantes o pegadas a propósito.
+MAX_REVIEW_TOKENS = 2500
 
 # Palabras cortas cuya sola diferencia casi siempre es ruido de un oído.
 _FUNCTION = {
@@ -64,26 +69,41 @@ _FUNCTION = {
     "o", "u", "que", "se", "me", "te", "mi", "tu", "su", "un", "una", "es",
     "ya", "no", "si", "con", "por", "pa", "le", "les", "nos",
 }
-# Formas con tilde que no son error de escritura sino otra palabra.
+# Formas con y sin tilde que son OTRA palabra, no un error de escritura.
 _DIACRITIC_PAIRS = {
     "tu", "si", "el", "mi", "te", "se", "de", "mas", "solo", "aun", "que",
     "como", "cuando", "donde", "quien", "cual", "cuanto", "este", "esta",
-    "ese", "esa", "o", "esto", "aquel", "aquella",
+    "ese", "esa", "o", "esto", "aquel", "aquella", "estas", "estos", "esas",
+    "hacia", "seria", "sabia", "rio", "continuo", "ultimo", "publico",
+    "practico", "critico", "animo", "deposito", "liquido", "habito",
+    "calculo", "medico", "termino", "limite", "secretaria", "envio", "confio",
+    "varias", "rie", "rien", "sabana", "papa", "mama", "cortes", "ingles",
+    "domino", "transito", "numero", "canto", "llego", "paso", "amo", "hablo",
 }
 _INTERROGATIVES = {
     "qué", "cómo", "cuándo", "dónde", "adónde", "quién", "quiénes", "cuál",
     "cuáles", "cuánto", "cuánta", "cuántos", "cuántas", "acaso",
 }
+_ACCENTED_INTERROGATIVE = {
+    "cuando": "cuándo", "como": "cómo", "donde": "dónde", "adonde": "adónde",
+    "que": "qué", "quien": "quién", "quienes": "quiénes", "cual": "cuál",
+    "cuales": "cuáles", "cuanto": "cuánto", "cuanta": "cuánta",
+    "cuantos": "cuántos", "cuantas": "cuántas",
+}
+# "¿Cuando vuelvas?" casi nunca es pregunta (UMG #117, #121); "¿Que hora es?"
+# casi siempre sí, y le falta la tilde.
+_RELATIVE_NOT_QUESTION = {"cuando", "como", "donde", "adonde"}
 _EXCLAMATIVE = re.compile(
-    r"^\s*¿?\s*(qué|cómo|cuán|cuánto|cuánta)\s+"
-    r"(lind[oa]s?|bell[oa]s?|hermos[oa]s?|bonit[oa]s?|trist[ea]s?|buen[oa]s?|"
-    r"grande|feo|fea|mal|bien|tant[oa]s?|lejos|rico|rica|dulce|lindo)\b",
+    r"^\s*¿?\s*(qué|cómo|cuán)\s+"
+    r"(lind[oa]s?|bell[oa]s?|hermos[oa]s?|bonit[oa]s?|trist[ea]s?|"
+    r"grande|feo|fea|lejos|ric[oa]|dulce)\b",
     re.I,
 )
 _ORPHANS = {"que", "y", "si", "a", "de", "la", "el", "en", "o", "no", "me",
             "te", "se", "lo", "un", "es", "mi", "tu", "por", "con"}
 _WORD_RE = re.compile(r"[^\W_]+(?:'[^\W_]*)?", re.UNICODE)
 _NON_LATIN = re.compile(r"[Ͱ-ϿЀ-ӿ֐-ۿ぀-ヿ一-鿿]")
+_FILLERS = {"eh", "ehh", "ah", "ahh", "mm", "mmm", "hmm", "aja", "uh", "um", "em"}
 
 SOURCE_LABELS = {
     "machine": "la máquina",
@@ -91,6 +111,15 @@ SOURCE_LABELS = {
     "gemini": "Gemini",
     "official": "la letra oficial",
     "memory": "una corrección anterior de este artista",
+}
+
+# Tipo de punto → etiqueta corta y grupo visual en el editor.
+KIND_GROUP = {
+    "missing": "text", "heard_different": "text", "correction_memory": "text",
+    "chorus_propagate": "chorus", "question_marks": "style",
+    "title_spelling": "style", "accent_inconsistent": "style",
+    "joined_words": "style", "orphan_word": "layout", "layout_official": "layout",
+    "timing": "timing",
 }
 
 
@@ -104,6 +133,19 @@ def mode() -> str:
 def fold(text: str) -> str:
     folded = unicodedata.normalize("NFKD", str(text or "").lower())
     return "".join(ch for ch in folded if not unicodedata.combining(ch))
+
+
+def sound(word: str) -> str:
+    """Clave fonética gruesa del español rioplatense/chileno: seseo, yeísmo,
+    b/v, h muda, s aspirada y -ado → -ao."""
+    w = fold(word)
+    w = re.sub(r"ado\b", "ao", w)
+    for a, b in (("ch", "x"), ("sh", "x"), ("qu", "k"), ("ll", "y"), ("v", "b"),
+                 ("z", "s"), ("ce", "se"), ("ci", "si"), ("c", "k"), ("h", "")):
+        w = w.replace(a, b)
+    w = re.sub(r"s(?=[bcdfgjklmnpqrstvxz]|\b)", "", w)
+    w = re.sub(r"y\b", "i", w)
+    return re.sub(r"(.)\1+", r"\1", w)
 
 
 def _words(text: str) -> list[str]:
@@ -156,16 +198,83 @@ def _split_punct(raw: str) -> tuple[str, str, str]:
     return (m.group(1), m.group(2), m.group(3)) if m else ("", raw, "")
 
 
-def _replacement_for(screen_raw: list[str], heard_raw: list[str]) -> str:
-    """Palabras oídas con la puntuación y las mayúsculas de la pantalla."""
-    lead = _split_punct(screen_raw[0])[0] if screen_raw else ""
-    trail = _split_punct(screen_raw[-1])[2] if screen_raw else ""
-    clean = [_split_punct(w)[1] for w in heard_raw]
-    clean = [w for w in clean if w]
-    body = " ".join(clean)
+def _replacement_for(screen_raw: list[str], heard: list[dict], *, at_line_start: bool) -> str:
+    """Palabras oídas con la puntuación de la pantalla. Mayúscula sólo al
+    empezar la línea o en nombres propios ("Kapelusz"), nunca copiada de la
+    palabra que se reemplaza ("Vos sos Lo más")."""
+    words = []
+    for h in heard:
+        body = _split_punct(h["raw"])[1]
+        if not body:
+            continue
+        proper = body[:1].isupper() and not h.get("bol")
+        words.append(body if proper else body.lower())
+    text = " ".join(words)
     if screen_raw:
-        body = _match_case(_split_punct(screen_raw[0])[1], body)
-    return f"{lead}{body}{trail}"
+        first = _split_punct(screen_raw[0])[1]
+        letters = [c for c in " ".join(screen_raw) if c.isalpha()]
+        if letters and len(letters) > 1 and all(c.isupper() for c in letters):
+            text = text.upper()
+        elif at_line_start and first[:1].isupper():
+            text = text[:1].upper() + text[1:]
+        lead = _split_punct(screen_raw[0])[0]
+        trail = _split_punct(screen_raw[-1])[2]
+        return f"{lead}{text}{trail}"
+    return text
+
+
+def replace_words(text: str, find: str, replacement: str, *,
+                  at_word: int | None = None, scope: str = "all") -> str | None:
+    """Mismo algoritmo que el editor (lyricReview.js ``replaceWords``): por
+    palabras, conservando los signos de la pantalla. ``scope="one"`` cambia
+    sólo la aparición en ``at_word`` (o la primera): en "Te quiero, te
+    quiero" corregir una no toca la otra."""
+    tokens = unicodedata.normalize("NFC", str(text or "")).split()
+    target = [t for t in (norm_token(w) for w in str(find or "").split()) if t]
+    if not target:
+        return None
+    core = _split_punct(unicodedata.normalize("NFC", str(replacement or "")).strip())[1]
+    words = [(i, norm_token(t)) for i, t in enumerate(tokens)]
+    words = [(i, t) for i, t in words if t]
+    starts = [k for k in range(len(words) - len(target) + 1)
+              if [t for _, t in words[k:k + len(target)]] == target]
+    if not starts:
+        return None
+    if scope == "one":
+        chosen = [k for k in starts if words[k][0] == at_word] or starts[:1]
+    else:
+        chosen = starts
+    out, skip_until = [], -1
+    spans = {words[k][0]: words[k + len(target) - 1][0] for k in chosen}
+    for i, tok in enumerate(tokens):
+        if i <= skip_until:
+            continue
+        if i in spans:
+            last = spans[i]
+            lead = _split_punct(tokens[i])[0]
+            trail = _split_punct(tokens[last])[2]
+            out.append(f"{lead}{core}{trail}")
+            skip_until = last
+        else:
+            out.append(tok)
+    return " ".join(out)
+
+
+def apply_punctuation(text: str, mode: str, clause: str | None = None) -> str:
+    """Misma operación que hace el editor: sólo sobre la frase marcada."""
+    text = unicodedata.normalize("NFC", str(text or ""))
+    target = clause if clause and clause in text else text
+    body = re.sub(r"\s{2,}", " ", target.replace("¿", "").replace("?", "")).strip()
+    if mode == "exclaim":
+        fixed = "¡" + body.lstrip("¡").rstrip("!") + "!"
+    elif mode == "accent_question":
+        first, _, rest = body.partition(" ")
+        lead, core, trail = _split_punct(first)
+        accented = _ACCENTED_INTERROGATIVE.get(fold(core), core)
+        fixed = "¿" + lead + _match_case(core, accented) + trail + (" " + rest if rest else "") + "?"
+    else:
+        fixed = body
+    return text.replace(target, fixed, 1) if target is not text else fixed
 
 
 # --------------------------------------------------------------------------
@@ -177,86 +286,123 @@ def _screen_tokens(segments: list[dict]) -> list[dict]:
     for i, seg in enumerate(segments):
         if not isinstance(seg, dict):
             continue
-        for k, raw in enumerate(str(seg.get("text") or "").split()):
+        raw_words = str(seg.get("text") or "").split()
+        first_word = next((k for k, r in enumerate(raw_words) if norm_token(r)), None)
+        for k, raw in enumerate(raw_words):
             tok = norm_token(raw)
             if tok:
-                out.append({"tok": tok, "raw": raw, "line": i, "pos": k})
+                out.append({"tok": tok, "raw": raw, "line": i, "pos": k,
+                            "line_start": k == first_word})
     return out
 
 
-_FILLERS = {"eh", "ehh", "ah", "ahh", "mm", "mmm", "hmm", "aja", "uh", "um", "em"}
+def clean_official(text: str) -> str:
+    """Saca etiquetas LRC ("[00:12.3]", "Offset:-2915") y encabezados."""
+    lines = []
+    for line in str(text or "").splitlines():
+        line = re.sub(r"\[[^\]]*\]", " ", line).strip()
+        if not line or re.fullmatch(r"[A-Za-z]+\s*:\s*[-+\w.]*", line):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _ear_tokens(text: str) -> list[dict]:
     out = []
-    for raw in str(text or "").split():
-        tok = norm_token(raw)
-        if tok and tok not in _FILLERS and not _NON_LATIN.search(raw):
-            out.append({"tok": tok, "raw": raw})
+    for line_no, line in enumerate(str(text or "").splitlines() or [""]):
+        first = True
+        for raw in line.split():
+            tok = norm_token(raw)
+            if tok and tok not in _FILLERS and not _NON_LATIN.search(raw):
+                out.append({"tok": tok, "raw": raw, "bol": first, "line": line_no})
+                first = False
     return out
 
 
-def _ear_blocks(segments: list[dict], screen: list[dict], ear_text: str,
-                source: str, witness: list[dict] | None = None) -> tuple[list[dict], float]:
-    """Diferencias pantalla↔oído, alineadas en orden. Devuelve también qué
-    tanto se parece el oído a la pantalla: si casi nada coincide (otra
-    versión de la canción, alucinación), el oído no se usa."""
-    ear = _ear_tokens(ear_text)
+def _looks_corrupt(ear: list[dict], screen: list[dict]) -> bool:
+    """lrclib a veces trae letras con las vocales acentuadas borradas
+    ("slo", "ms"): esa fuente no sirve para comparar."""
+    vocab = {s["tok"] for s in screen}
+    stripped = defaultdict(set)
+    for w in vocab:
+        for k, ch in enumerate(w):
+            if ch in "aeiou":
+                stripped[w[:k] + w[k + 1:]].add(w)
+    bad = sum(1 for e in ear if e["tok"] not in vocab and e["tok"] in stripped)
+    return bad >= 3 and bad * 50 >= len(ear)
+
+
+def _ear_blocks(segments: list[dict], screen: list[dict], ear: list[dict],
+                source: str, witness: list[dict] | None = None):
+    """Diferencias pantalla↔oído alineadas en orden. Devuelve los bloques, qué
+    tanto se parece el oído a la pantalla y qué palabras de la pantalla
+    confirmó este oído."""
     if not screen or len(ear) < 8:
-        return [], 0.0
-    sm = difflib.SequenceMatcher(
-        a=[s["tok"] for s in screen], b=[e["tok"] for e in ear], autojunk=False,
-    )
-    similarity = sm.ratio()
+        return [], 0.0, set()
+    ops = aligned_opcodes([s["tok"] for s in screen], [e["tok"] for e in ear])
+    similarity = opcode_similarity(ops, len(screen), len(ear))
+    confirmed: set[int] = set()
     out = []
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    for tag, i1, i2, j1, j2 in ops:
         if tag == "equal":
+            confirmed.update(range(i1, i2))
             continue
         scr, heard = screen[i1:i2], ear[j1:j2]
         if not heard or len(heard) > MAX_BLOCK_TOKENS or len(scr) > MAX_BLOCK_TOKENS:
             continue
         s_toks, h_toks = [s["tok"] for s in scr], [h["tok"] for h in heard]
-        if _same("".join(s_toks), "".join(h_toks)):
-            continue  # separado/pegado u ortografía: lo cubren las reglas
+        if "".join(s_toks) == "".join(h_toks):
+            continue  # separado/pegado: lo cubre la regla de palabras pegadas
         if _is_loop([{"word": h["raw"]} for h in heard]):
             continue
-        diff_heard = [t for t in h_toks if not any(_same(t, s) for s in s_toks)]
+        spelling_only = bool(scr) and _same("".join(s_toks), "".join(h_toks))
+        if spelling_only:
+            diff_heard = [t for t in h_toks if t not in s_toks]
+            diff_screen = [t for t in s_toks if t not in h_toks]
+        else:
+            diff_heard = [t for t in h_toks if not any(_same(t, s) for s in s_toks)]
+            diff_screen = [t for t in s_toks if not any(_same(t, h) for h in h_toks)]
         if not diff_heard:
             continue
-        if scr and _only_style_difference([s["raw"] for s in scr], [h["raw"] for h in heard]):
-            continue
+        # Apócopes y h muda: sólo cuentan si la letra oficial también lo dice
+        # ("urgo"/"hurgo" sí; "Ay"/"Hay" de dos oídos, no).
+        style_only = bool(scr) and source != "official" and _only_style_difference(
+            [s["raw"] for s in scr], [h["raw"] for h in heard])
         if scr:
-            lines = {s["line"] for s in scr}
-            if len(lines) > 1:
+            if len({s["line"] for s in scr}) > 1:
                 continue  # una corrección nunca cruza carteles
             line = scr[0]["line"]
+            raw_line = str(segments[line].get("text") or "").split()
+            p0, p1 = scr[0]["pos"], scr[-1]["pos"]
+            span = raw_line[p0:p1 + 1]
             fix = {
-                "type": "replace",
-                "find": " ".join(s["raw"] for s in scr),
-                "replace": _replacement_for([s["raw"] for s in scr], [h["raw"] for h in heard]),
+                "type": "replace", "find": " ".join(span),
+                "replace": _replacement_for(span, heard, at_line_start=scr[0]["line_start"]),
+                "at_word": p0, "scope": "one",
             }
         else:
-            # El oído tiene palabras que la pantalla no: se insertan en la
-            # línea del vecino que sí coincide.
+            # Lo que la pantalla no tiene va en la línea a la que pertenece en
+            # el oído: si el oído empieza ahí una línea, va a la siguiente; si
+            # no, al final de la anterior.
             before = screen[i1 - 1] if i1 > 0 else None
             after = screen[i1] if i1 < len(screen) else None
-            anchor = before or after
-            if anchor is None:
+            if before is None and after is None:
                 continue
-            line = anchor["line"]
-            if before is not None and after is not None and before["line"] != after["line"]:
-                # Entre dos carteles: va al final del anterior salvo que el
-                # siguiente empiece la frase (mayúscula).
-                line = after["line"] if after["raw"][:1].isupper() else before["line"]
-            same_line = [s for s in screen if s["line"] == line]
-            fix = {
-                "type": "insert",
-                "text": " ".join(_split_punct(h["raw"])[1] for h in heard),
-                "anchor_before": before["tok"] if before and before["line"] == line else "",
-                "anchor_after": after["tok"] if after and after["line"] == line else "",
-                "insert_at_word": (before["pos"] + 1) if before and before["line"] == line else 0,
-            }
-            if not same_line:
+            to_next = after is not None and (
+                before is None or (before["line"] != after["line"] and heard[0].get("bol")))
+            if to_next:
+                line = after["line"]
+                fix_anchor = {"anchor_before": "", "anchor_after": after["tok"],
+                              "insert_at_word": after["pos"]}
+            else:
+                line = before["line"]
+                fix_anchor = {"anchor_before": before["tok"],
+                              "anchor_after": after["tok"] if after and after["line"] == line else "",
+                              "insert_at_word": before["pos"] + 1}
+            fix = {"type": "insert",
+                   "text": " ".join(_split_punct(h["raw"])[1] for h in heard).strip(),
+                   **fix_anchor}
+            if not fix["text"]:
                 continue
         seg = segments[line]
         if witness is not None:
@@ -267,11 +413,11 @@ def _ear_blocks(segments: list[dict], screen: list[dict], ear_text: str,
             if not all(any(_same(t, w) for w in window) for t in diff_heard):
                 continue
         out.append({
-            "line": line, "fix": fix, "source": source,
-            "diff_heard": diff_heard,
-            "diff_screen": [t for t in s_toks if not any(_same(t, h) for h in h_toks)],
+            "line": line, "fix": fix, "source": source, "scr_range": (i1, i2),
+            "diff_heard": diff_heard, "diff_screen": diff_screen,
+            "spelling_only": spelling_only or style_only,
         })
-    return out, similarity
+    return out, similarity, confirmed
 
 
 def _only_style_difference(screen_raw: list[str], heard_raw: list[str]) -> bool:
@@ -300,6 +446,13 @@ def _fix_signature(fix: dict) -> tuple:
 _SOURCE_RANK = {"official": 3, "gemini": 2, "witness": 1}
 
 
+def _sounds_closer(candidate: str, target: str, screen: str) -> bool:
+    c, t, s = sound(candidate), sound(target), sound(screen)
+    to_target = difflib.SequenceMatcher(a=c, b=t).ratio()
+    to_screen = difflib.SequenceMatcher(a=c, b=s).ratio()
+    return to_target >= 0.75 and to_target - to_screen >= 0.15
+
+
 def _merge_ear_blocks(blocks: list[dict]) -> list[dict]:
     """Une lo que varios oídos proponen para la misma línea. Si coinciden en
     el mismo cambio, el punto es obligatorio; si proponen cosas distintas
@@ -311,17 +464,16 @@ def _merge_ear_blocks(blocks: list[dict]) -> list[dict]:
         for key, g in grouped.items():
             if key[0] != b["line"] or key[1][0] != sig[1][0]:
                 continue
-            same_find = sig[1][0] == "insert" or _same(
-                "".join(key[1][1].split()), "".join(sig[1][1].split()))
-            same_fix = _same("".join(key[1][-1 if sig[1][0] == "replace" else 1].split()),
-                             "".join(sig[1][-1 if sig[1][0] == "replace" else 1].split()))
-            if same_find and same_fix:
+            idx = -1 if sig[1][0] == "replace" else 1
+            same_find = sig[1][0] == "insert" or key[1][1] == sig[1][1]
+            if same_find and "".join(key[1][idx].split()) == "".join(sig[1][idx].split()):
                 match = g
                 break
         if match is None:
             grouped[sig] = {**b, "sources": {b["source"]}}
         else:
             match["sources"].add(b["source"])
+            match["spelling_only"] = match["spelling_only"] and b["spelling_only"]
             if b["source"] == "official":
                 match["fix"] = b["fix"]  # la letra oficial escribe mejor
     merged = list(grouped.values())
@@ -333,11 +485,23 @@ def _merge_ear_blocks(blocks: list[dict]) -> list[dict]:
         else:
             out.append(m)
     for options in by_span.values():
+        official = next((o for o in options if "official" in o["sources"]), None)
+        if official is not None:
+            # Un oído que SUENA como la letra oficial la corrobora ("la mar" ≈
+            # "lo más" no, "largor" ≈ "algura" ≈ "largura" sí).
+            for o in options:
+                if o is official:
+                    continue
+                if _sounds_closer(o["fix"]["replace"], official["fix"]["replace"], o["fix"]["find"]):
+                    official["sources"] |= o["sources"]
+                    o["absorbed"] = True
+            options = [o for o in options if not o.get("absorbed")]
         options.sort(key=lambda o: (len(o["sources"]), max(_SOURCE_RANK.get(x, 0) for x in o["sources"])),
                      reverse=True)
         best = options[0]
         best["alternatives"] = [
-            {"replace": o["fix"]["replace"], "why": _why(o["sources"]), "sources": sorted(o["sources"])}
+            {"label": o["fix"]["replace"], "replace": o["fix"]["replace"],
+             "why": _why(o["sources"]), "sources": sorted(o["sources"])}
             for o in options[1:]
         ]
         out.append(best)
@@ -348,46 +512,58 @@ def _merge_ear_blocks(blocks: list[dict]) -> list[dict]:
 # Reglas deterministas (medidas sobre los pedidos #112-#131).
 # --------------------------------------------------------------------------
 
-_RELATIVES = {"cuando", "como", "donde", "adonde", "que", "quien", "quienes",
-              "cual", "cuales", "cuanto", "cuanta", "cuantos", "cuantas"}
-
-
 def _rule_question_marks(segments: list[dict]) -> list[dict]:
-    """Sólo los tres casos que UMG devolvió; una pregunta de sí/no ("¿Me
-    querés?") es legítima y no se toca."""
+    """Sólo los casos que UMG devolvió; una pregunta de sí/no ("¿Me
+    querés?") es legítima y no se toca. El arreglo toca sólo esa frase."""
     out = []
     for i, seg in enumerate(segments):
         text = str(seg.get("text") or "")
         if "?" not in text and "¿" not in text:
             continue
-        for part in re.findall(r"¿([^?¿]*)\??|^([^¿]*)\?", text):
-            body = (part[0] or part[1]).strip()
+        for m in re.finditer(r"¿[^?¿]*\??|^[^¿?]*\?", text):
+            clause = m.group(0)
+            body = clause.replace("¿", "").replace("?", "").strip()
             words = _words(body)
             if not words:
                 continue
             first = words[0]
+            alternatives = []
+            required = True
             if _EXCLAMATIVE.search(body):
-                why, mode = "Es una exclamación: va con ¡ !", "exclaim"
-            elif fold(first) in _RELATIVES and first.lower() not in _INTERROGATIVES:
-                why = f"«{first}» sin tilde no pregunta: sin signos de pregunta"
-                mode = "remove_question"
+                why, mode_ = "Es una exclamación: va con ¡ !", "exclaim"
+            elif {w.lower() for w in words} & _INTERROGATIVES:
+                continue  # ya pregunta con tilde ("¿que dónde llega…?")
+            elif fold(first) in _ACCENTED_INTERROGATIVE and first.lower() not in _INTERROGATIVES:
+                accent = _ACCENTED_INTERROGATIVE[fold(first)]
+                if fold(first) in _RELATIVE_NOT_QUESTION:
+                    why = f"«{first}» sin tilde no pregunta: van sin signos"
+                    mode_, alt_mode, alt_label = "remove_question", "accent_question", f"Es pregunta: «{accent}»"
+                else:
+                    # "¿Que hora es?" pide tilde; "¿Que el mundo gira al revés?"
+                    # no: se sugiere, no se exige.
+                    why = f"Si es pregunta, «{first}» lleva tilde"
+                    mode_, alt_mode, alt_label = "accent_question", "remove_question", "No es pregunta"
+                    required = False
+                alternatives.append({
+                    "label": alt_label, "why": "",
+                    "fix": {"type": "punctuation", "mode": alt_mode, "clause": clause},
+                })
             elif fold(" ".join(words[:3])).startswith("a ver si"):
-                why, mode = "«A ver si…» no es una pregunta", "remove_question"
+                why, mode_ = "«A ver si…» no es una pregunta", "remove_question"
             else:
                 continue
             out.append({
-                "kind": "question_marks", "line": i, "required": True,
+                "kind": "question_marks", "line": i, "required": required,
                 "title": "Signos de pregunta", "why": why,
-                "fix": {"type": "punctuation", "mode": mode},
-                "action": "Corregir",
+                "fix": {"type": "punctuation", "mode": mode_, "clause": clause},
+                "alternatives": alternatives, "action": "Corregir",
             })
-            break
     return out
 
 
 def _title_words(title: str) -> list[str]:
     title = unicodedata.normalize("NFC", str(title or ""))
-    title = re.sub(r"\(.*?\)|\[.*?\]", " ", str(title or ""))
+    title = re.sub(r"\(.*?\)|\[.*?\]", " ", title)
     title = re.split(r"\s[-–—]\s|\sft\.?\s|\sfeat\.?\s", title, flags=re.I)[0]
     return _words(title)
 
@@ -405,8 +581,8 @@ def _rule_title(segments: list[dict], title: str) -> list[dict]:
     for i, seg in enumerate(segments):
         raw = str(seg.get("text") or "").split()
         core = [fold(_split_punct(w)[1]) for w in raw]
-        hit = None
         n = len(words)
+        hits = []
         for k in range(0, len(raw) - n + 1):
             span = core[k:k + n]
             diffs = [j for j in range(n) if span[j] != folded[j]]
@@ -415,22 +591,21 @@ def _rule_title(segments: list[dict], title: str) -> list[dict]:
                 fixed = list(raw[k:k + n])
                 lead, body, trail = _split_punct(fixed[j])
                 fixed[j] = f"{lead}{body}s{trail}"
-                hit = (k, n, " ".join(fixed))
-                break
-        if hit is None and n >= 2:
+                hits.append((k, n, " ".join(fixed)))
+        if not hits:
             for k in range(0, len(raw) - (n - 1) + 1):
                 span = core[k:k + n - 1]
                 if "".join(span) == "".join(folded) and span != folded:
-                    title_words = [w.lower() for w in words]
-                    hit = (k, n - 1, _replacement_for(raw[k:k + n - 1], title_words))
-                    break
-        if hit:
-            k, size, replacement = hit
+                    hits.append((k, n - 1, _replacement_for(
+                        raw[k:k + n - 1], [{"raw": w.lower()} for w in words],
+                        at_line_start=k == 0)))
+        for k, size, replacement in hits[:1]:
             out.append({
                 "kind": "title_spelling", "line": i, "required": True,
                 "title": "Como en el título",
                 "why": f"El título dice «{' '.join(words)}»",
-                "fix": {"type": "replace", "find": " ".join(raw[k:k + size]), "replace": replacement},
+                "fix": {"type": "replace", "find": " ".join(raw[k:k + size]),
+                        "replace": replacement, "scope": "all"},
                 "action": "Corregir",
             })
     return out
@@ -452,47 +627,54 @@ def _rule_accents(segments: list[dict]) -> list[dict]:
         if not accented:
             continue
         best = max(accented, key=lambda v: variants[v])
+        others = sum(c for v, c in variants.items() if v != best)
+        # Obligatorio sólo si la forma con tilde domina la canción ("Mío" x5,
+        # "Mio" x1); si está pareja, puede ser otra palabra: sugerencia.
+        required = variants[best] >= 2 * others
         for i, seg in enumerate(segments):
-            text = str(seg.get("text") or "")
-            for w in _words(text):
+            for w in _words(seg.get("text")):
                 if fold(w) == base and w.lower() != best:
                     out.append({
-                        "kind": "accent_inconsistent", "line": i, "required": True,
+                        "kind": "accent_inconsistent", "line": i, "required": required,
                         "title": "Tildes distintas",
                         "why": f"En la canción aparece «{best}» y también «{w.lower()}»",
-                        "fix": {"type": "replace", "find": w, "replace": _match_case(w, best)},
+                        "fix": {"type": "replace", "find": w, "replace": _match_case(w, best),
+                                "scope": "all"},
                         "action": "Unificar",
                     })
     return out
 
 
 _ENCLITICS = {"me", "te", "se", "la", "lo", "le", "nos", "los", "las", "les", "sela", "selo"}
-_REAL_COMPOUNDS = {"porque", "porqué", "sino", "aunque", "también", "tampoco", "adonde", "quizás"}
+_REAL_COMPOUNDS = {
+    "porque", "porqué", "sino", "aunque", "también", "tampoco", "adonde", "quizás",
+    "enseguida", "deprisa", "sinvergüenza", "sinfín", "sobretodo", "contracorriente",
+    "damajuana", "quesillo", "quesillos", "bienvenido", "bienvenida", "mediodía",
+}
 
 
 def _rule_joined(segments: list[dict], ear_bigrams: set[tuple[str, str]],
                  ear_vocab: set[str]) -> list[dict]:
     """Dos palabras pegadas: sólo si un oído las escuchó SEPARADAS y seguidas
-    ("logro entender", "si esto"). Así "Desnúdate", "comerme" o "porque"
-    nunca se separan."""
+    ("logro entender", "si esto") y ninguno la escuchó junta. Así
+    "Desnúdate", "comerme" o "porque" nunca se separan."""
     out = []
     for i, seg in enumerate(segments):
-        text = str(seg.get("text") or "")
-        for raw in text.split():
+        for raw in str(seg.get("text") or "").split():
             # Coma sin espacio ("vuelvo,vuelvo"): siempre es un error de tipeo.
             if re.search(r"[^\W\d_][,;][^\W\d_]", raw):
                 fixed = re.sub(r"([,;])(?=[^\W\d_])", r"\1 ", raw)
                 out.append({
                     "kind": "joined_words", "line": i, "required": True,
                     "title": "Falta un espacio", "why": "Después de la coma va un espacio",
-                    "fix": {"type": "replace", "find": raw, "replace": fixed},
+                    "fix": {"type": "replace", "find": raw, "replace": fixed, "scope": "all"},
                     "action": "Separar",
                 })
                 continue
             word = _split_punct(raw)[1]
             tok = norm_token(word)
             if len(tok) < 5 or fold(word) in _REAL_COMPOUNDS or tok in ear_vocab:
-                continue  # algún oído la escuchó junta: es una palabra
+                continue
             for k in range(2, len(tok) - 1):
                 left, right = tok[:k], tok[k:]
                 if right in _ENCLITICS or (left, right) not in ear_bigrams:
@@ -503,9 +685,8 @@ def _rule_joined(segments: list[dict], ear_bigrams: set[tuple[str, str]],
                     continue
                 out.append({
                     "kind": "joined_words", "line": i, "required": True,
-                    "title": "Palabras pegadas",
-                    "why": f"«{word}» son dos palabras",
-                    "fix": {"type": "replace", "find": word, "replace": fixed},
+                    "title": "Palabras pegadas", "why": f"«{word}» son dos palabras",
+                    "fix": {"type": "replace", "find": word, "replace": fixed, "scope": "all"},
                     "action": "Separar",
                 })
                 break
@@ -538,11 +719,13 @@ def _rule_orphans(segments: list[dict]) -> list[dict]:
             "kind": "orphan_word", "line": i, "required": True,
             "title": "Palabra sola en pantalla",
             "why": f"«{words[0]}» queda sola; va con la línea {'siguiente' if direction == 'next' else 'anterior'}",
-            "fix": {"type": "merge", "direction": direction},
+            "fix": {"type": "merge", "direction": direction,
+                    "other_segment_id": other.get("segment_id"),
+                    "expect": _key_text(seg.get("text"))},
             "preview_after": (
-                f"{seg.get('text', '').strip()} {str(other.get('text') or '').strip()}"
+                f"{str(seg.get('text') or '').strip()} {str(other.get('text') or '').strip()}"
                 if direction == "next" else
-                f"{str(other.get('text') or '').strip()} {seg.get('text', '').strip()}"
+                f"{str(other.get('text') or '').strip()} {str(seg.get('text') or '').strip()}"
             ),
             "action": "Unir",
         })
@@ -569,7 +752,8 @@ def _rule_memory(segments: list[dict], pairs: dict[str, str],
                 "title": "Ya se corrigió en otra canción",
                 "why": f"En este artista «{word}» se corrigió a «{right}»",
                 "sources": {"memory"} | ({"witness"} if corroborated else set()),
-                "fix": {"type": "replace", "find": word, "replace": _match_case(word, right)},
+                "fix": {"type": "replace", "find": word, "replace": _match_case(word, right),
+                        "scope": "all"},
                 "action": "Corregir",
             })
     return out
@@ -606,12 +790,13 @@ def _rule_chorus(segments: list[dict], original_segments: Any) -> list[dict]:
             groups[key].append(orig)
     out = []
     for key, members in groups.items():
-        if len(members) < 2:
+        if len(members) < 2 or len(members) > 40:
             continue
-        mapped = [(m, _map_to_current(segments, m)) for m in members]
-        current = [(i, str(segments[i].get("text") or "")) for _, i in mapped if i is not None]
+        mapped = [_map_to_current(segments, m) for m in members]
+        current = [(i, str(segments[i].get("text") or "")) for i in mapped if i is not None]
         if len({i for i, _ in current}) < 2:
             continue
+
         # Sólo correcciones del mismo coro, no líneas unidas o reordenadas:
         # misma cantidad de palabras (±2) y mayormente las mismas.
         def is_correction(text: str) -> bool:
@@ -622,7 +807,7 @@ def _rule_chorus(segments: list[dict], original_segments: Any) -> list[dict]:
         if not edited or not untouched:
             continue
         variants = Counter(_key_text(t) for _, t in edited)
-        best_key, votes = variants.most_common(1)[0]
+        best_key = variants.most_common(1)[0][0]
         best_text = next(t for _, t in edited if _key_text(t) == best_key)
         for i in sorted(set(untouched)):
             out.append({
@@ -631,11 +816,117 @@ def _rule_chorus(segments: list[dict], original_segments: Any) -> list[dict]:
                 "kind": "chorus_propagate", "line": i, "required": False,
                 "title": "Coro corregido en parte",
                 "why": f"Esta frase se repite {len(current)} veces y la corregiste en {len(edited)}",
-                "fix": {"type": "replace", "find": str(segments[i].get("text") or ""),
-                        "replace": best_text},
+                "fix": {"type": "set_text", "text": best_text, "expect": key},
                 "action": "Igualar",
                 "dismiss": "Esta repetición es distinta",
             })
+    return out
+
+
+def _rule_layout_official(segments: list[dict], screen: list[dict],
+                          official: list[dict], ops: list[tuple]) -> list[dict]:
+    """Cortes de línea como en la letra oficial cuando la pantalla deja 1-3
+    palabras del borde en la línea equivocada ("¿Cuando vuelvas quiero /
+    Verte a solas" → "Cuando vuelvas / Quiero verte a solas", UMG #121)."""
+    to_official: dict[int, int] = {}
+    for tag, i1, i2, j1, _j2 in ops:
+        if tag == "equal":
+            for k in range(i2 - i1):
+                to_official[i1 + k] = official[j1 + k]["line"]
+    by_line: dict[int, list[int]] = defaultdict(list)
+    for idx, s in enumerate(screen):
+        by_line[s["line"]].append(idx)
+    out = []
+    lines = sorted(by_line)
+    for a, b in zip(lines, lines[1:]):
+        if b != a + 1:
+            continue
+        ta, tb = by_line[a], by_line[b]
+        if any(i not in to_official for i in ta + tb):
+            continue
+        la, lb = [to_official[i] for i in ta], [to_official[i] for i in tb]
+        moved_tail = [k for k in range(len(ta)) if la[k] == lb[0] and la[0] != lb[0]]
+        moved_head = [k for k in range(len(tb)) if lb[k] == la[-1] and lb[-1] != la[-1]]
+        raw_a = str(segments[a].get("text") or "").split()
+        raw_b = str(segments[b].get("text") or "").split()
+        def lower_first(word: str) -> str:
+            return word[:1].lower() + word[1:] if word[:1].isupper() and word[1:] == word[1:].lower() else word
+        if moved_tail and 1 <= len(moved_tail) <= 3 and moved_tail[-1] == len(ta) - 1:
+            cut = screen[ta[moved_tail[0]]]["pos"]
+            # La palabra que abría la línea siguiente deja de abrirla.
+            new_a = raw_a[:cut]
+            new_b = raw_a[cut:] + ([lower_first(raw_b[0])] + raw_b[1:] if raw_b else [])
+        elif moved_head and 1 <= len(moved_head) <= 3 and moved_head[0] == 0:
+            cut = screen[tb[moved_head[-1]]]["pos"] + 1
+            moved = raw_b[:cut]
+            new_a = raw_a + ([lower_first(moved[0])] + moved[1:] if moved else [])
+            new_b = raw_b[cut:]
+        else:
+            continue
+        if not new_a or not new_b:
+            continue
+        text_a, text_b = " ".join(new_a), " ".join(new_b)
+        text_b = text_b[:1].upper() + text_b[1:]
+        out.append({
+            "kind": "layout_official", "line": a, "required": False,
+            "title": "Corte de línea", "why": "Así corta la frase la letra oficial",
+            "fix": {"type": "relayout", "lines": [
+                {"segment_id": segments[a].get("segment_id"), "text": text_a,
+                 "expect": _key_text(segments[a].get("text"))},
+                {"segment_id": segments[b].get("segment_id"), "text": text_b,
+                 "expect": _key_text(segments[b].get("text"))},
+            ]},
+            "preview_before": f"{segments[a].get('text')} / {segments[b].get('text')}",
+            "preview_after": f"{text_a} / {text_b}",
+            "action": "Cortar así",
+        })
+    return out
+
+
+def _rule_timing(segments: list[dict], witness: list[dict], machine: list[dict]) -> list[dict]:
+    """La línea se va antes de que termine la última palabra ("alargar
+    brasero", UMG #115) o aparece mucho antes de que se cante. Sólo si la
+    máquina y el testigo coinciden en el tiempo de esa palabra."""
+    out = []
+    for i, seg in enumerate(segments):
+        toks = [t for t in (norm_token(w) for w in str(seg.get("text") or "").split()) if t]
+        if len(toks) < 2:
+            continue
+        start, end = _f(seg.get("start")), _f(seg.get("end"))
+        nxt = segments[i + 1] if i + 1 < len(segments) else None
+        prv = segments[i - 1] if i > 0 else None
+
+        def times(tok: str, lo: float, hi: float, stream: list[dict]) -> list[dict]:
+            return [w for w in stream if lo <= w["start"] <= hi and norm_token(w["word"]) == tok]
+        last_w = times(toks[-1], end - 1.5, end + 2.5, witness)
+        last_m = times(toks[-1], end - 1.5, end + 2.5, machine)
+        if last_w and last_m:
+            we, me = max(w["end"] for w in last_w), max(w["end"] for w in last_m)
+            limit = (_f(nxt.get("start")) - 0.05) if nxt else we + 1.0
+            if abs(we - me) <= 0.4 and min(we, me) > end + 0.5 and limit > end + 0.3:
+                new_end = round(min(max(we, me) + 0.1, limit), 2)
+                out.append({
+                    "kind": "timing", "line": i, "required": False,
+                    "title": "Timing",
+                    "why": f"Se va {min(we, me) - end:.1f} s antes de que termine «{toks[-1]}»",
+                    "fix": {"type": "timing", "end": new_end},
+                    "preview_after": f"Termina en {new_end:.1f} s", "action": "Alargar",
+                })
+                continue
+        first_w = times(toks[0], start - 1.0, start + 2.5, witness)
+        first_m = times(toks[0], start - 1.0, start + 2.5, machine)
+        if first_w and first_m:
+            ws, ms = min(w["start"] for w in first_w), min(w["start"] for w in first_m)
+            floor = (_f(prv.get("end")) + 0.05) if prv else 0.0
+            if abs(ws - ms) <= 0.4 and min(ws, ms) > start + 0.7:
+                new_start = round(max(min(ws, ms) - 0.1, floor), 2)
+                out.append({
+                    "kind": "timing", "line": i, "required": False,
+                    "title": "Timing",
+                    "why": f"Aparece {min(ws, ms) - start:.1f} s antes de que se cante",
+                    "fix": {"type": "timing", "start": new_start},
+                    "preview_after": f"Aparece en {new_start:.1f} s", "action": "Ajustar",
+                })
     return out
 
 
@@ -643,43 +934,51 @@ def _rule_chorus(segments: list[dict], original_segments: Any) -> list[dict]:
 # Armado final.
 # --------------------------------------------------------------------------
 
-def apply_punctuation(text: str, mode: str) -> str:
-    """Misma operación que hace el editor al aplicar el arreglo."""
-    body = re.sub(r"\s{2,}", " ", text.replace("¿", "").replace("?", "")).strip()
-    if mode == "exclaim":
-        return "¡" + body.lstrip("¡").rstrip("!") + "!"
-    return body
+def _insert_preview(segments: list[dict], line: int, fix: dict) -> str:
+    before = str(segments[line].get("text") or "")
+    tokens = before.split()
+    at = max(0, min(len(tokens), int(fix.get("insert_at_word") or 0)))
+    words = fix.get("text", "")
+    if at == 0 and tokens:
+        words = words[:1].upper() + words[1:]
+        first = tokens[0]
+        if first[:1].isupper() and first[1:] == first[1:].lower():
+            tokens = [first[:1].lower() + first[1:]] + tokens[1:]
+    return " ".join(tokens[:at] + [words] + tokens[at:])
 
 
 def _preview(segments: list[dict], line: int, fix: dict) -> tuple[str, str]:
     before = str(segments[line].get("text") or "") if 0 <= line < len(segments) else ""
     if fix["type"] == "punctuation":
-        return before, apply_punctuation(before, fix["mode"])
+        return before, apply_punctuation(before, fix["mode"], fix.get("clause"))
     if fix["type"] == "replace":
-        # Igual que el editor: todas las apariciones en la línea.
-        return before, before.replace(fix["find"], fix["replace"])
+        after = replace_words(before, fix["find"], fix["replace"],
+                              at_word=fix.get("at_word"), scope=fix.get("scope", "all"))
+        return before, after if after is not None else before
     if fix["type"] == "insert":
-        tokens = before.split()
-        at = max(0, min(len(tokens), int(fix.get("insert_at_word") or 0)))
-        words = fix.get("text", "")
-        if at == 0 and tokens:
-            words = words[:1].upper() + words[1:]
-        return before, " ".join(tokens[:at] + [words] + tokens[at:])
+        return before, _insert_preview(segments, line, fix)
+    if fix["type"] == "set_text":
+        return before, fix["text"]
     return before, before
 
 
-def _item_key(kind: str, fix: dict, start: float | None = None) -> str:
+def _item_key(kind: str, fix: dict, line_text: str = "") -> str:
+    """Identidad estable de un punto: no depende de tiempos ni de posiciones,
+    así mover una línea no revive lo que ya se decidió."""
     if fix["type"] == "replace":
-        base = f"{kind}:{_key_text(fix['find'])}>{_key_text(fix['replace'])}"
-    elif fix["type"] == "punctuation":
-        base = f"{kind}:{fix['mode']}"
-    elif fix["type"] == "merge":
-        base = f"{kind}:{fix.get('direction')}"
-    else:
-        base = f"{kind}:+{_key_text(fix.get('text'))}"
-    if start is not None:
-        base += f"@{int(round(start))}"
-    return base
+        return f"{kind}:{_key_text(fix['find'])}>{_key_text(fix['replace'])}"
+    if fix["type"] == "punctuation":
+        return f"{kind}:{fix['mode']}:{_key_text(line_text)}"
+    if fix["type"] == "merge":
+        return f"{kind}:{fix.get('direction')}:{_key_text(line_text)}"
+    if fix["type"] == "set_text":
+        return f"{kind}:{fix.get('expect')}>{_key_text(fix['text'])}"
+    if fix["type"] == "relayout":
+        return f"{kind}:" + "/".join(_key_text(x["text"]) for x in fix["lines"])
+    if fix["type"] == "timing":
+        return f"{kind}:{_key_text(line_text)}:{'end' if 'end' in fix else 'start'}"
+    return (f"{kind}:+{_key_text(fix.get('text'))}|{fix.get('anchor_before', '')}"
+            f"|{fix.get('anchor_after', '')}")
 
 
 def _occurrence(segments: list[dict], line: int, fix: dict) -> dict:
@@ -710,19 +1009,27 @@ def _missing_items(segments, witness, machine) -> list[dict]:
                    "anchor_after": alert["anchor_after"],
                    "insert_at_word": alert["insert_at_word"]}
         line = alert["line_index"] if alert["line_index"] is not None else 0
-        occ = _occurrence(segments, line, fix) if segments else {}
+        occ = _occurrence(segments, line, fix)
         if fix["type"] == "new_line":
-            occ.update({"start": fix["start"], "end": fix["end"],
+            occ.update({"start": fix["start"], "end": fix["end"], "line_segment_id": None,
                         "before": "", "after": alert["text"][:1].upper() + alert["text"][1:]})
         else:
             occ.update({"start": alert["start"], "end": alert["end"]})
         items.append({
             "kind": "missing", "required": True, "title": "Falta texto",
             "why": _why(sources), "sources": sources, "action": "Agregar",
-            "dismiss": "No se canta", "key": alert["key"],
+            "dismiss": "No se canta", "key": alert["key"], "evidence_time": alert["start"],
             "occurrences": [occ], "text": alert["text"],
         })
     return items
+
+
+def _empty(reason: str | None = None) -> dict:
+    return {
+        "schema": SCHEMA, "mode": mode(), "items": [], "required_count": 0,
+        "suggested_count": 0, "sources": {}, "risk": {
+            "level": "high" if reason else "normal", "reasons": [reason] if reason else []},
+    }
 
 
 def build_review(
@@ -735,47 +1042,76 @@ def build_review(
     memory_pairs: dict[str, str] | None = None,
 ) -> dict:
     """Todos los puntos de la letra actual, listos para el editor."""
-    segments = [s for s in (segments or []) if isinstance(s, dict)]
+    segments = [
+        {**s, "text": unicodedata.normalize("NFC", str(s.get("text") or ""))}
+        for s in (segments or []) if isinstance(s, dict)
+    ]
+    if not segments:
+        return _empty()
+    screen = _screen_tokens(segments)
+    if len(screen) > MAX_REVIEW_TOKENS:
+        return _empty("La letra es demasiado larga para la revisión automática")
     witness = witness_words(machine_evidence)
     machine = machine_words(original_segments)
     gemini = gemini_text(machine_evidence)
-    screen = _screen_tokens(segments)
+    official_clean = clean_official(official_text or "")
     items: list[dict] = []
 
     items.extend(_missing_items(segments, witness, machine))
 
     blocks: list[dict] = []
     similarity: dict[str, float] = {}
+    confirmed_by_official: set[int] = set()
+    official_tokens = _ear_tokens(official_clean)
+    official_ops: list[tuple] = []
+    if official_tokens and _looks_corrupt(official_tokens, screen):
+        official_tokens = []
     witness_text = " ".join(w["word"] for w in witness)
-    for source, text, timed in (
-        ("witness", witness_text, witness),
-        ("gemini", gemini, None),
-        ("official", official_text or "", None),
+    for source, tokens, timed in (
+        ("witness", _ear_tokens(witness_text), witness),
+        ("gemini", _ear_tokens(gemini), None),
+        ("official", official_tokens, None),
     ):
-        found, sim = _ear_blocks(segments, screen, text, source, timed)
+        if len(tokens) > MAX_REVIEW_TOKENS:
+            continue
+        found, sim, confirmed = _ear_blocks(segments, screen, tokens, source, timed)
         similarity[source] = round(sim, 3)
         # Un oído que casi no coincide con la pantalla es otra versión o una
         # alucinación: no aporta.
         if sim >= (0.45 if source != "witness" else 0.35):
             blocks.extend(found)
+        if source == "official":
+            confirmed_by_official = confirmed
+            if tokens:
+                official_ops = aligned_opcodes([s["tok"] for s in screen], [t["tok"] for t in tokens])
     same_version = similarity.get("official", 0.0) >= 0.85
     human_edited = _human_edited_lines(segments, original_segments)
     for block in _merge_ear_blocks(blocks):
         sources = block["sources"]
         only_official = sources == {"official"}
+        i1, i2 = block["scr_range"]
+        if same_version and "official" not in sources:
+            # Veto de la letra oficial: si confirma lo que dice la pantalla,
+            # dos oídos que suenan parecido ("ya"/"ella") no la corrigen.
+            covered = range(i1, i2) if i2 > i1 else (i1 - 1, i1)
+            if all(k in confirmed_by_official for k in covered):
+                continue
         if only_official and block["fix"]["type"] == "insert" and (
             not same_version or len(block["diff_heard"]) > 3
         ):
             # Otra versión (en vivo, con partes habladas): lo que sólo la
             # letra oficial agrega no se propone.
             continue
+        if block["spelling_only"] and "official" not in sources:
+            continue  # "urgo"/"hurgo" sólo lo decide la letra oficial
         only_function = all(t in _FUNCTION for t in block["diff_heard"] + block["diff_screen"])
         if len(sources) < 2 and only_function and not (only_official and same_version):
             continue
         kind = "heard_different" if block["fix"]["type"] == "replace" else "missing"
         # Si una persona ya cambió ese texto a propósito (por ejemplo, por un
         # pedido del cliente), no se la obliga a volver a decidir: sugerencia.
-        edited = block["fix"]["type"] == "replace" and _key_text(block["fix"]["find"]) in human_edited.get(block["line"], set())
+        edited = block["fix"]["type"] == "replace" and \
+            _key_text(block["fix"]["find"]) in human_edited.get(block["line"], set())
         items.append({
             "kind": kind, "line": block["line"], "required": len(sources) >= 2 and not edited,
             "title": "Se escucha distinto" if kind == "heard_different" else "Falta texto",
@@ -786,14 +1122,17 @@ def build_review(
         })
 
     vocabulary = {norm_token(w["word"]) for w in witness} | {
-        t["tok"] for t in _ear_tokens(gemini)} | {t["tok"] for t in _ear_tokens(official_text or "")}
+        t["tok"] for t in _ear_tokens(gemini)} | {t["tok"] for t in official_tokens}
     items.extend(_rule_question_marks(segments))
     items.extend(_rule_title(segments, title))
     items.extend(_rule_accents(segments))
-    items.extend(_rule_joined(segments, _bigrams(witness_text, gemini, official_text or ""), vocabulary))
+    items.extend(_rule_joined(segments, _bigrams(witness_text, gemini, official_clean), vocabulary))
     items.extend(_rule_orphans(segments))
     items.extend(_rule_memory(segments, memory_pairs or {}, witness))
     items.extend(_rule_chorus(segments, original_segments))
+    items.extend(_rule_timing(segments, witness, machine))
+    if same_version and official_ops:
+        items.extend(_rule_layout_official(segments, screen, official_tokens, official_ops))
 
     items = _finalize(segments, items)
     dismissed = dismissed_keys(segments)
@@ -808,7 +1147,7 @@ def build_review(
         "suggested_count": sum(1 for i in pending if not i["required"]),
         "sources": {
             "witness": bool(witness), "gemini": bool(gemini),
-            "official": bool(official_text), "memory": len(memory_pairs or {}),
+            "official": bool(official_tokens), "memory": len(memory_pairs or {}),
             "similarity": similarity,
         },
         "risk": _risk(witness, similarity, pending, len(segments)),
@@ -818,45 +1157,69 @@ def build_review(
 def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
     """Deduplica (misma línea y mismo arreglo) y agrupa arreglos idénticos en
     distintas líneas en un solo punto con varias repeticiones."""
-    per_line: dict[tuple, dict] = {}
+    # Lo mismo faltante detectado por el testigo con tiempo y por un oído sin
+    # tiempo es UN punto: queda el del testigo, que sabe dónde va.
+    timed = [(i["text"], i["evidence_time"]) for i in raw
+             if i["kind"] == "missing" and "evidence_time" in i]
+    kept = []
     for item in raw:
-        if item["kind"] == "missing" and "occurrences" in item:
+        if item["kind"] == "missing" and "evidence_time" not in item and "occurrences" not in item:
+            text = _key_text(item["fix"].get("text"))
+            start = _f(segments[item["line"]].get("start"))
+            end = _f(segments[item["line"]].get("end"))
+            if any(_key_text(t) == text and start - 4 <= at <= end + 4 for t, at in timed):
+                continue
+        kept.append(item)
+    per_line: dict[tuple, dict] = {}
+    for item in kept:
+        if "occurrences" in item:
             occ = item["occurrences"][0]
-            sig = (occ["line_index"], _fix_signature(occ["fix"]) if occ["fix"]["type"] != "new_line"
-                   else ("new_line", _key_text(item["text"]), occ["start"]))
-            item = {**item, "_line": occ["line_index"], "_occ": occ}
+            fix = occ["fix"]
+            line = occ["line_index"]
+            sig = (line, ("new_line", _key_text(item["text"]), occ["start"])
+                   if fix["type"] == "new_line" else _fix_signature(fix))
         else:
-            occ = _occurrence(segments, item["line"], item["fix"])
+            line = item["line"]
+            fix = item["fix"]
+            occ = _occurrence(segments, line, fix)
             if "preview_after" in item:
                 occ["after"] = item.pop("preview_after")
-            ftype = item["fix"]["type"]
-            sig = (item["line"], _fix_signature(item["fix"]) if ftype in {"replace", "insert"}
-                   else (ftype, item["fix"].get("direction") or item["fix"].get("mode")))
-            item = {**item, "_line": item["line"], "_occ": occ}
+            if "preview_before" in item:
+                occ["before"] = item.pop("preview_before")
+            sig = (line, _fix_signature(fix) if fix["type"] in {"replace", "insert"}
+                   else (fix["type"], item["kind"], _item_key(item["kind"], fix,
+                                                              segments[line].get("text", ""))))
+        item = {**item, "_occ": occ, "_line_text": segments[line].get("text", "")
+                if 0 <= line < len(segments) else ""}
         prev = per_line.get(sig)
         if prev is None:
             item["sources"] = set(item.get("sources") or ())
             per_line[sig] = item
         else:
             prev["sources"] |= set(item.get("sources") or ())
-            prev["required"] = prev["required"] or item["required"] or len(prev["sources"]) >= 2
-            if prev["sources"]:
-                prev["why"] = _why(prev["sources"]) if prev["kind"] in {
-                    "missing", "heard_different"} else prev["why"]
+            prev["required"] = prev["required"] or item["required"] or (
+                prev["kind"] in {"missing", "heard_different"} and len(prev["sources"]) >= 2)
+            if prev["kind"] in {"missing", "heard_different"} and prev["sources"]:
+                prev["why"] = _why(prev["sources"])
     grouped: dict[tuple, dict] = {}
     for sig, item in per_line.items():
         occ = item["_occ"]
         fix = occ["fix"]
         if fix["type"] == "new_line":
             group_sig = ("new_line", sig[1:])
-        else:
+        elif fix["type"] in {"replace", "insert"}:
             group_sig = (item["kind"], sig[1])
+        else:
+            # Signos, uniones, cortes y timing: sólo se agrupan líneas con el
+            # mismo texto (un coro), nunca líneas distintas.
+            group_sig = (item["kind"], fix["type"], _key_text(item["_line_text"]),
+                         fix.get("mode"), fix.get("direction"))
+        key = item.get("key") or _item_key(item["kind"], fix, item["_line_text"])
         g = grouped.get(group_sig)
-        key = item.get("key") or _item_key(
-            item["kind"], fix, occ["start"] if item["kind"] == "missing" else None)
         if g is None:
             grouped[group_sig] = {
-                "kind": item["kind"], "required": bool(item["required"]),
+                "kind": item["kind"], "group": KIND_GROUP.get(item["kind"], "text"),
+                "required": bool(item["required"]),
                 "title": item["title"], "why": item.get("why", ""),
                 "sources": sorted(item["sources"]), "action": item.get("action", "Corregir"),
                 "dismiss": item.get("dismiss", "Está bien así"),
@@ -876,7 +1239,8 @@ def _finalize(segments: list[dict], raw: list[dict]) -> list[dict]:
         g["end"] = g["occurrences"][0]["end"]
         g["id"] = hashlib.sha1("|".join(g["keys"]).encode("utf-8")).hexdigest()[:12]
         out.append(g)
-    out.sort(key=lambda g: (not g["required"], g["start"]))
+    # Primero lo obligatorio con más fuentes (más seguro), después por tiempo.
+    out.sort(key=lambda g: (not g["required"], -len(g["sources"]), g["start"]))
     return out
 
 
@@ -885,11 +1249,10 @@ def _human_edited_lines(segments: list[dict], original_segments: Any) -> dict[in
     las escribió una persona."""
     orig = [t["tok"] for t in _screen_tokens([s for s in (original_segments or []) if isinstance(s, dict)])]
     screen = _screen_tokens(segments)
-    if not orig:
+    if not orig or len(orig) > MAX_REVIEW_TOKENS:
         return {}
-    sm = difflib.SequenceMatcher(a=[s["tok"] for s in screen], b=orig, autojunk=False)
     edited: dict[int, set[str]] = defaultdict(set)
-    for tag, i1, i2, _j1, _j2 in sm.get_opcodes():
+    for tag, i1, i2, _j1, _j2 in aligned_opcodes([s["tok"] for s in screen], orig):
         if tag in {"replace", "delete"}:
             for s in screen[i1:i2]:
                 edited[s["line"]].add(s["tok"])
@@ -934,20 +1297,34 @@ def gemini_text(machine_evidence: Any) -> str:
     return ""
 
 
+def required_for_scope(review: dict, scope: str) -> list[dict]:
+    """Puntos que bloquean según el camino de aprobación: ``full`` (editor y
+    campañas), ``missing_only`` (re-render por pedido de cambio: sólo lo que
+    se canta y se perdió) o ``none``."""
+    if scope == "none":
+        return []
+    items = [i for i in review.get("items") or [] if i.get("required")]
+    if scope == "missing_only":
+        items = [i for i in items if i.get("kind") == "missing"]
+    return items
+
+
 class LyricReviewPending(Exception):
     """La letra no puede aprobarse con puntos obligatorios sin decidir."""
 
-    def __init__(self, review: dict):
+    def __init__(self, review: dict, pending: list[dict] | None = None):
         super().__init__("lyric_review_pending")
         self.review = review
+        self.pending = pending if pending is not None else [
+            i for i in review.get("items", []) if i.get("required")]
 
 
 def conflict_detail(exc: LyricReviewPending) -> dict:
-    pending = [i for i in exc.review.get("items", []) if i.get("required")]
+    n = len(exc.pending)
     return {
         "code": "lyric_review_pending",
         "message": (
-            f"Quedan {len(pending)} puntos de la revisión rápida por decidir. "
+            f"Quedan {n} {'punto' if n == 1 else 'puntos'} de la revisión rápida por decidir. "
             "Abrí el editor, aplicá cada arreglo o marcá que está bien así, y volvé a aprobar."
         ),
         "lyric_review": exc.review,

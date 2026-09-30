@@ -40,14 +40,38 @@ revisor.
 
 ## Cómo se usa en el editor
 
-1. Abrí la canción: arriba de la letra está **Revisión rápida**.
-2. Resolvé los puntos marcados como obligatorios (el botón "Aprobar" no
-   avanza sin eso). Con el panel enfocado: **A** aplica, **N** "está bien
-   así", **E** escucha el tramo, **J/K** pasan al siguiente o al anterior.
-3. Las sugerencias (una sola fuente) no bloquean: miralas si la canción está
-   marcada como **difícil**.
-4. Si tenés la letra oficial (Google, planilla de UMG), usá **Pegar letra
-   oficial**: sólo se usa para comparar, no cambia tu letra ni los tiempos.
-5. Si la canción está marcada como **difícil** (en vivo, casi hablada, los
+1. Abrí la canción: arriba de la letra está **Revisión rápida**, con una
+   tarjeta a la vez. La línea de la letra correspondiente queda marcada.
+2. Cada tarjeta muestra la línea como va a quedar: en verde lo que entra,
+   tachado lo que sale (en un cambio de signos, sólo el signo).
+3. Teclado (el panel toma el teclado al abrir la canción):
+
+   | Tecla | Qué hace |
+   |---|---|
+   | **Enter** | aplica el arreglo y pasa al siguiente |
+   | **⌫** | "está bien así" / "no se canta" |
+   | **1–3** | elige otra opción cuando los oídos no coinciden |
+   | **E** | escucha el tramo (con "Escuchar solo" suena al pasar de punto) |
+   | **J / K** | siguiente / anterior |
+   | **M** | lleva el cursor a esa línea para corregirla a mano |
+   | **Z** | deshace la última decisión |
+   | **?** | muestra los atajos |
+
+4. "Aprobar" dice **Faltan N · Revisar** mientras quede algo obligatorio;
+   al tocarlo te lleva al panel. Las sugerencias no bloquean.
+5. Si tenés la letra oficial (Google, planilla de UMG), usá **Comparar con
+   letra oficial**: sólo se usa para comparar, no cambia tu letra ni los
+   tiempos. Con la letra oficial el panel encuentra bastante más (en los
+   pedidos de septiembre, 115 de 136 cambios contra 97 sin ella).
+6. Si la canción está marcada como **difícil** (en vivo, casi hablada, los
    oídos automáticos no coinciden), escuchala entera o pedí una segunda
    revisión.
+
+## Qué bloquea y dónde
+
+- Bloquea la aprobación en las campañas batch (UMG) o en los tenants de
+  `LYRIC_REVIEW_ENFORCE_TENANTS`; en el resto el panel se muestra sin frenar.
+- Un re-render por pedido de cambio sólo frena si se perdió letra cantada.
+- Un cambio de fondo o tipografía nunca frena por la letra.
+- Las campañas batch son "sólo audio": nunca se busca letra en lrclib para
+  ellas; la letra oficial entra por la planilla o pegada por el operador.

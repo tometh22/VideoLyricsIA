@@ -48,7 +48,7 @@ RUN_SPLIT_S = 1.0
 MACHINE_MIN_SCORE = 0.5
 # Una palabra de la máquina corrobora a una del testigo si están así de cerca.
 CORROBORATION_S = 1.0
-MAX_ALERTS = 40
+MAX_ALERTS = 80
 
 _WITNESS_TRANSFORMATIONS = {
     "live_independent_verify_raw",
@@ -82,6 +82,48 @@ def _same(a: str, b: str) -> bool:
     if min(len(a), len(b)) < 4:
         return False
     return difflib.SequenceMatcher(a=a, b=b, autojunk=False).ratio() >= 0.8
+
+
+# Tope de trabajo por alineación fina. Una canción normal (60 líneas, ~360
+# palabras) queda muy por debajo; una de 400 líneas de "la la la" no.
+_FINE_ALIGN_CELLS = 250_000
+
+
+def aligned_opcodes(a: list[str], b: list[str]) -> list[tuple]:
+    """Opcodes de difflib sin su peor caso.
+
+    ``SequenceMatcher(autojunk=False)`` es cuadrático o peor con tokens muy
+    repetidos (vocalizaciones, coros): 400 líneas de "la la la" tardaban
+    45 s y congelaban el servidor en cada autoguardado. Primero se anclan
+    las palabras poco frecuentes con ``autojunk=True`` (rápido) y después se
+    alinea fino sólo cada tramo acotado entre anclas. Un tramo gigante sin
+    anclas se devuelve como un solo bloque, que los detectores descartan por
+    tamaño: se pierde la alerta, nunca el servidor.
+    """
+    if len(a) * len(b) <= _FINE_ALIGN_CELLS:
+        return difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_opcodes()
+    coarse = difflib.SequenceMatcher(a=a, b=b, autojunk=True).get_matching_blocks()
+    ops: list[tuple] = []
+    ai = bi = 0
+    for blk in coarse:
+        sa, sb = a[ai:blk.a], b[bi:blk.b]
+        if sa or sb:
+            if sa and sb and len(sa) * len(sb) <= _FINE_ALIGN_CELLS:
+                for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+                        a=sa, b=sb, autojunk=False).get_opcodes():
+                    ops.append((tag, i1 + ai, i2 + ai, j1 + bi, j2 + bi))
+            else:
+                tag = "replace" if sa and sb else ("delete" if sa else "insert")
+                ops.append((tag, ai, blk.a, bi, blk.b))
+        if blk.size:
+            ops.append(("equal", blk.a, blk.a + blk.size, blk.b, blk.b + blk.size))
+        ai, bi = blk.a + blk.size, blk.b + blk.size
+    return ops
+
+
+def opcode_similarity(ops: list[tuple], len_a: int, len_b: int) -> float:
+    equal = sum(i2 - i1 for tag, i1, i2, _j1, _j2 in ops if tag == "equal")
+    return 2.0 * equal / (len_a + len_b) if (len_a + len_b) else 1.0
 
 
 def witness_words(machine_evidence: Any) -> list[dict]:
@@ -171,9 +213,8 @@ def _deleted_words(heard: list[dict], final: list[dict]) -> list[dict]:
     """
     h_tok = [norm_token(w["word"]) for w in heard]
     f_tok = [f["tok"] for f in final]
-    sm = difflib.SequenceMatcher(a=h_tok, b=f_tok, autojunk=False)
     out = []
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    for tag, i1, i2, j1, j2 in aligned_opcodes(h_tok, f_tok):
         if tag not in ("delete", "replace"):
             continue
         block = [w for w, t in zip(heard[i1:i2], h_tok[i1:i2]) if t]
@@ -191,6 +232,21 @@ def _deleted_words(heard: list[dict], final: list[dict]) -> list[dict]:
                 # donde se pierde lo que queda fuera de una cita pegada.
                 excess = (i2 - i1) - len(fin)
                 block = block[:excess] if block[0] is heard[i1] else block[-excess:]
+        if len(block) >= 2:
+            # Una frase se evalúa entera: que "ya" aparezca en la línea vecina
+            # no puede dejar "dormite ya" reducido a "dormite". Sólo se
+            # descarta si la frase completa está, seguida, en una línea cercana
+            # (un coro que el alineado cruzó).
+            mid = {"start": block[0]["start"], "end": block[-1]["end"]}
+            near = _near_line(mid, final, LINE_PAD_S)
+            toks = [norm_token(w["word"]) for w in block]
+            present = any(
+                all(_same(toks[k], near[s + k]) for k in range(len(toks)))
+                for s in range(len(near) - len(toks) + 1)
+            )
+            if not present:
+                out.extend(block)
+            continue
         for w in block:
             near = _near_line(w, final, LINE_PAD_S)
             tok = norm_token(w["word"])
