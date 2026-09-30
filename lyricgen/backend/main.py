@@ -11457,6 +11457,7 @@ def status(
     # backend allows approval but the disabled button prevents the request.
     needs_live_qc_gate = bool(
         job.get("workload_class") == "batch"
+        or job.get("campaign_id")
         or job.get("delivery_profile") in {"umg", "both"}
         or job.get("umg_spec")
     )
