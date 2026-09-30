@@ -925,6 +925,35 @@ def test_change_request_submit_and_admin_lists_it(
     assert pending["pending_count"] == 1
 
 
+def test_reopened_change_request_surfaces_first_in_the_admin_list(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """A reopened request keeps its old submitted_at; ordering by that pushed it
+    below the list cut, so the reopened case went unseen."""
+    delivery = client.post(f"/admin/deliveries/from-job/{approved_job.job_id}",
+                           headers=auth(admin_token), json={})
+    assert delivery.status_code == 200, delivery.text
+    delivery_id = delivery.json()["delivery_id"]
+    ids = []
+    with patch("main.emails.send_umg_change_request_notification"):
+        for comment in ("primer pedido", "segundo pedido"):
+            res = client.post(f"/api/deliveries/{delivery_id}/change-request",
+                              headers={"X-Portal-Token": PORTAL_TOKEN}, json={"comment": comment})
+            assert res.status_code == 200, res.text
+            ids.append(res.json()["id"])
+    first, second = ids
+
+    def pending_order():
+        listing = client.get("/admin/change-requests?status=pending", headers=auth(admin_token)).json()
+        return [item["id"] for item in listing["items"]]
+
+    assert pending_order() == [second, first]
+    assert client.post(f"/admin/change-requests/{first}/resolve", headers=auth(admin_token),
+                       json={"resolution_note": "listo"}).status_code == 200
+    assert client.post(f"/admin/change-requests/{first}/reopen", headers=auth(admin_token)).status_code == 200
+    assert pending_order() == [first, second]
+
+
 def test_change_request_list_surfaces_missing_current_preflight(
     client, admin_token, approved_job, all_r2_files_present, db,
 ):

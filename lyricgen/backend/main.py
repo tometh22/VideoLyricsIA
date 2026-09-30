@@ -21575,8 +21575,14 @@ async def admin_list_change_requests(
         q = q.filter(DeliveryChangeRequest.resolved_at.is_(None))
     elif status == "resolved":
         q = q.filter(DeliveryChangeRequest.resolved_at.isnot(None))
+    # Latest lifecycle change first: a request the client REOPENED keeps its old
+    # submitted_at and used to sink below the 200-row cut, unseen. updated_at
+    # (set on submit, resolve and reopen) brings it back to the top.
     crs = (
-        q.order_by(DeliveryChangeRequest.submitted_at.desc())
+        q.order_by(
+            func.coalesce(DeliveryChangeRequest.updated_at, DeliveryChangeRequest.submitted_at).desc(),
+            DeliveryChangeRequest.id.desc(),
+        )
         .limit(limit)
         .all()
     )
