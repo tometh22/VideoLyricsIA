@@ -54,9 +54,10 @@ line automatically.  This is especially important for live songs.
 - Reviewer decisions, accepted repair types, approval outcome and later label QC
   finding counts are structured product events. Existing editor `active_edit_ms`
   supplies minutes-per-song before/after.
-- `DELIVERY_QC_MODE=observe` never blocks ordinary approval. UMG publication
-  always requires a fresh report, correction of objective open `FAIL`
+- `DELIVERY_QC_MODE=observe` never blocks ordinary approval. By default, UMG
+  publication requires a fresh report, correction of objective open `FAIL`
   findings, and one audited human attestation for the complete current render.
+  The temporary staging exception below is the only opt-in override.
   The attestation resolves the grouped visual/listening checklist in one
   operation; generic reminders are not displayed or signed as individual
   issues. Other open `REVIEW` findings remain recommendations and never become
