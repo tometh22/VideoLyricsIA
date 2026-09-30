@@ -91,7 +91,7 @@ def test_every_song_has_exactly_one_stage_and_counts_add_up(db, setup, monkeypat
     delivered = add_job(db, campaign, actor, item=items[7], status="done")
     add_job(db, campaign, actor, item=items[8], status="error", video=False)
     add_job(db, campaign, actor, item=items[9], status="discarded", video=False)
-    add_job(db, campaign, actor, item=items[10], status="background_generating", video=False)
+    add_job(db, campaign, actor, item=items[10], status="editing", video=False)
     add_job(db, campaign, actor, item=items[11], status="separating", video=False)
     db.commit()
     with portal([(delivered.job_id, "argentina", campaign.tenant_id, 0)]) as session:
