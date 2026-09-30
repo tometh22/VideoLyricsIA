@@ -26,6 +26,7 @@ Campaign publication uses the same immutable-file contract. Batch counters are c
 
 - Sole release owner must coordinate the shared portal schema and both environments. Staging's `DELIVERIES_DATABASE_URL` points to the live portal DB; a staging-only migration is insufficient.
 - Apply additive migration `a7b9c1d3e5f7` to the actual shared deliveries DB **before** starting any API/worker with this model. No destructive migration or bulk request-resolution backfill is needed.
+- Before deploying change-request timestamp tracking, also add `delivery_change_requests.updated_at` to the shared deliveries DB with migration `b8c0d2e4f6a8`.
 - Deploy the snapshot-aware portal API as well as rendering/publishing APIs and workers. An older portal API ignores the snapshot pointer; do not advertise publication isolation while any serving portal API is old.
 - Release `VERSION`, frontend `package.json`/lock and `CHANGELOG.md` together, run clean-checkout CI, then merge/deploy under one owner.
 - Smoke with synthetic Argentina and Chile deliveries: publish A, render B, verify portal still serves A, explicitly publish B, verify revision/request and downloaded bytes. Include a failed snapshot, concurrent newer edit, manual resolution, and campaign resend. Do not approve/publish customer videos as smoke tests without specific authorization.
