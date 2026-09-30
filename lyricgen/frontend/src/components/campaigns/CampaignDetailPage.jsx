@@ -3,7 +3,7 @@ import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import useCampaignResource, { invalidateCampaignResources, mutateCampaignResource } from "../../hooks/useCampaignResource";
 import { campaignPost, campaignRequest, loadReviewQueue } from "../../lib/campaignApi";
 import {
-  campaignNextStep, doneCount, relativeDate, resolveView, stageMeta,
+  FILES_DESTINATION, campaignNextStep, doneCount, relativeDate, resolveView, stageMeta,
 } from "../../lib/campaignPipeline";
 import CampaignDeliveryProgress from "../CampaignDeliveryProgress";
 import CampaignSearch from "../CampaignSearch";
@@ -108,6 +108,8 @@ export default function CampaignDetailPage({ id }) {
   const report = useCampaignResource(`${prefix}report`, ({ signal }) => campaignRequest(`${base}/creative/report`, { signal }), { enabled: needs(["all", "qc", "approved", "delivered"], ["contract"]) });
 
   const canManage = Boolean(pipe.data?.can_manage);
+  // Art-track campaigns delivered as files have no portal to send to.
+  const portalSends = campaign?.destination_portal !== FILES_DESTINATION;
   const counts = pipe.data?.counts || {};
   const songs = useMemo(() => buildSongs(pipe.data?.items || [], {
     reviewRows: lyrics.data?.items, creativeItems: creative.data?.items, videos: report.data?.videos,
@@ -235,7 +237,7 @@ export default function CampaignDetailPage({ id }) {
     }
   }, [openEditLyrics, openReview, updateParams, visible]);
 
-  const next = campaignNextStep(counts, kind);
+  const next = campaignNextStep(counts, kind, { portalSends });
   const runNextStep = useCallback(() => {
     if (!next || next.passive) return;
     if (next.stage === "lyrics") {
@@ -254,7 +256,7 @@ export default function CampaignDetailPage({ id }) {
       if (items.length) setDialog({ type: "generate", items }); else setView("ready");
       return;
     }
-    if (next.stage === "approved" && canManage) {
+    if (next.stage === "approved" && canManage && portalSends) {
       const list = songs.filter((song) => song.stage === "approved" && canSend(song));
       if (list.length) setDialog({ type: "send", songs: list }); else setView("approved");
       return;
@@ -290,13 +292,13 @@ export default function CampaignDetailPage({ id }) {
       } else if (key === "enter" && cursor >= 0 && event.target?.tagName === "TR" && event.target.dataset.song === visible[cursor].id) {
         event.preventDefault();
         const song = visible[cursor];
-        const chosen = primaryAction(song, { kind, canManage });
+        const chosen = primaryAction(song, { kind, canManage, portalSends });
         onAction(song, chosen ? chosen.key : "detail");
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [canManage, cursor, dialog, drawerSong, help, kind, onAction, runNextStep, selected.size, view, visible]);
+  }, [canManage, cursor, dialog, drawerSong, help, kind, onAction, portalSends, runNextStep, selected.size, view, visible]);
 
   const selectedVisible = visible.filter((song) => selected.has(song.id));
   const hiddenSelected = selected.size - selectedVisible.length;
@@ -384,7 +386,7 @@ export default function CampaignDetailPage({ id }) {
           {view === "lyrics" && lyrics.error && <Banner tone="warning">No se cargaron las alertas: {lyrics.error.message}</Banner>}
         </div>}
         <SongToolbar view={view} params={params} setParam={setParam} songs={visible} lyricSongs={lyricSongs} searchRef={searchRef} onHelp={() => setHelp(true)} />
-        <SongTable songs={visible} view={view} kind={kind} canManage={canManage} loading={!pipe.data}
+        <SongTable songs={visible} view={view} kind={kind} canManage={canManage} portalSends={portalSends} loading={!pipe.data}
           selectable={() => true} selected={selected}
           onToggle={(songId) => setSelected((old) => { const copy = new Set(old); if (copy.has(songId)) copy.delete(songId); else copy.add(songId); return copy; })}
           onToggleAll={(ids) => setSelected(new Set(ids))}
@@ -395,9 +397,9 @@ export default function CampaignDetailPage({ id }) {
               : view === "all" && canManage && lyric ? <Button size="sm" variant="primary" onClick={() => updateParams({ view: "config", section: "upload" }, { push: true })}>Subir audios</Button> : null} />} />
       </section>}
 
-    {view !== "config" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
+    {view !== "config" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
 
-    {drawerSong && <SongDrawer song={drawerSong} kind={kind} campaignId={id} canManage={canManage}
+    {drawerSong && <SongDrawer song={drawerSong} kind={kind} campaignId={id} canManage={canManage} portalSends={portalSends}
       reviewerEnabled={campaign?.reviewer_campaign_status?.enabled === true}
       onClose={() => updateParams({ song: null })} onAction={(song, key) => { if (!["detail", "metadata"].includes(key)) updateParams({ song: null }); onAction(song, key); }}
       onNavigate={(path) => navigate(path.includes("return_to") ? path : `${path}${path.includes("?") ? "&" : "?"}return_to=${encodeURIComponent(returnPath(drawerSong))}`)}

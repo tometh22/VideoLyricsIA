@@ -41,7 +41,7 @@ export function canDiscard(song) {
 }
 
 /** What the row's single primary button does, by stage. */
-export function primaryAction(song, { kind = "lyric_video", canManage = false } = {}) {
+export function primaryAction(song, { kind = "lyric_video", canManage = false, portalSends = true } = {}) {
   switch (song.stage) {
     case "audio":
       if (canManage && song.upload_state === "error") return { key: "retry", label: "Reintentar" };
@@ -59,9 +59,9 @@ export function primaryAction(song, { kind = "lyric_video", canManage = false } 
     case "qc":
       return song.has_video || song.video?.video_url ? { key: "play", label: "Revisar video" } : { key: "detail", label: "Ver detalle" };
     case "approved":
-      return canManage && canSend(song) ? { key: "send", label: "Enviar" } : { key: "play", label: "Ver video" };
+      return canManage && portalSends && canSend(song) ? { key: "send", label: "Enviar" } : { key: "play", label: "Ver video" };
     case "delivered":
-      return canManage && song.portal_outdated && canSend(song) ? { key: "send", label: "Reenviar" } : { key: "play", label: "Ver video" };
+      return canManage && portalSends && song.portal_outdated && canSend(song) ? { key: "send", label: "Reenviar" } : { key: "play", label: "Ver video" };
     case "attention":
       return canManage ? { key: "retry", label: "Reintentar" } : { key: "detail", label: "Ver detalle" };
     case "discarded":

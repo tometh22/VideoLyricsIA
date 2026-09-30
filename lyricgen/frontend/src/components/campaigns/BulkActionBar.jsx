@@ -2,10 +2,10 @@ import { Button, Kbd } from "./ui";
 import { canDiscard, canGenerate, canSend } from "./songModel";
 
 /** Floating bar for the current selection; only shows actions that apply. */
-export default function BulkActionBar({ songs, kind, canManage, onClear, onAction, hiddenCount = 0 }) {
+export default function BulkActionBar({ songs, kind, canManage, portalSends = true, onClear, onAction, hiddenCount = 0 }) {
   if (!songs.length) return null;
   const generate = kind !== "art_track" ? songs.filter(canGenerate) : [];
-  const send = canManage ? songs.filter(canSend) : [];
+  const send = canManage && portalSends ? songs.filter(canSend) : [];
   const discard = songs.filter(canDiscard);
   const restore = songs.filter((song) => song.stage === "discarded");
   const retry = canManage ? songs.filter((song) => song.stage === "attention" || (song.stage === "audio" && song.upload_state === "error")) : [];

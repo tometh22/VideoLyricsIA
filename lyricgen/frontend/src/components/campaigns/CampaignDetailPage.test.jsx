@@ -257,6 +257,21 @@ describe("campaign workspace", () => {
     expect(screen.getByRole("button", { name: "Ver video · Canción 3" })).toBeInTheDocument();
   });
 
+  it("file-delivered art tracks never offer portal sends", async () => {
+    const api = createCampaignApi({ kind: "art_track", songs: [makeSong(1, "approved"), makeSong(2, "approved")] });
+    Object.assign(api.state.campaign, { destination_portal: "files", default_render_params: { art_track_preset: "colombia_static" } });
+    mount(api, "/campaigns/c1?view=approved");
+    await screen.findByText("Canción 2");
+    expect(screen.queryByRole("button", { name: /^Enviar/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Seleccionar 2 canciones" }));
+    expect(within(screen.getByRole("region", { name: "Acciones sobre la selección" })).queryByRole("button", { name: /portal/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Configuración" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Carga de audios" }));
+    expect(await screen.findByText(/Entrega por archivos/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Enviar aprobados" })).not.toBeInTheDocument();
+    expect(screen.getByText(/portada fija \+ título/)).toBeInTheDocument();
+  });
+
   it("moves through songs with the keyboard and acts with Enter", async () => {
     const api = createCampaignApi({ songs: [makeSong(1, "lyrics"), makeSong(2, "lyrics")] });
     mount(api, "/campaigns/c1?view=lyrics");

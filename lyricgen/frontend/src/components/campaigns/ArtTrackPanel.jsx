@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { campaignPost, campaignRequest } from "../../lib/campaignApi";
+import { FILES_DESTINATION, artTrackPresetLabel } from "../../lib/campaignPipeline";
 import { Banner, Button, ProgressBar } from "./ui";
 
 async function digest(file) {
@@ -85,6 +86,7 @@ export default function ArtTrackPanel({ campaign, onChanged }) {
       <div className="max-w-xl">
         <h3 className="font-semibold">Audios y portadas</h3>
         <p className="mt-1 text-sm text-ink-secondary">Elegí una carpeta con hasta 500 audios y sus portadas (<span className="font-mono text-xs">Artista - Título</span>). Las que no se asocian quedan bloqueadas para corregirlas a mano.</p>
+        <p className="mt-1 text-xs text-ink-secondary">Estilo: {artTrackPresetLabel(campaign.default_render_params?.art_track_preset).toLowerCase()}</p>
       </div>
       <Button variant="primary" disabled={!!busy} onClick={() => input.current?.click()}>{busy === "upload" ? "Subiendo…" : "Elegir carpeta"}</Button>
       <input ref={input} type="file" multiple webkitdirectory="" directory="" accept=".wav,.mp3,.jpg,.jpeg,.png" className="sr-only" aria-label="Carpeta de art tracks"
@@ -97,6 +99,9 @@ export default function ArtTrackPanel({ campaign, onChanged }) {
         const result = await campaignPost(`/batch/art-track-campaigns/${id}/start-rendering`);
         setMessage(`Generación iniciada: ${result.created_count} art tracks; ${result.blocked_item_ids?.length || 0} pendientes de asociación.`);
       })}>{busy === "render" ? "Confirmando…" : "Confirmar asociados y generar"}</Button>
+      {campaign.destination_portal === FILES_DESTINATION
+        ? <span className="self-center text-xs text-ink-secondary">Entrega por archivos: cada máster queda disponible por canción; la entrega del lote se coordina aparte.</span>
+        : <>
       <Button variant="ghost" disabled={!!busy} onClick={() => run("preview", async () => {
         const result = await campaignPost(`/batch/art-track-campaigns/${id}/delivery-preview`);
         setMessage(`${result.eligible_count} art tracks aprobados para ${result.hostname}.`);
@@ -107,6 +112,7 @@ export default function ArtTrackPanel({ campaign, onChanged }) {
           ? `Envío guardado (${result.total_count} canciones), pendiente de worker en ${result.hostname}.`
           : `Envío durable creado: ${result.total_count} canciones a ${result.hostname}.`);
       })}>Enviar aprobados</Button>
+        </>}
     </div>
     {message && <Banner tone="success">{message}</Banner>}
     {error && <Banner tone="danger">{error}</Banner>}

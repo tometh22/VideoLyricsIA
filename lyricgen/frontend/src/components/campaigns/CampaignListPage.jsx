@@ -25,7 +25,7 @@ function CampaignCard({ campaign, onOpen }) {
   const kind = campaign.kind || "lyric_video";
   const total = totalOf(counts) || campaign.registered_count || 0;
   const done = doneCount(counts);
-  const next = campaignNextStep(counts, kind);
+  const next = campaignNextStep(counts, kind, { portalSends: campaign.destination_portal !== "files" });
   const percent = total ? Math.round((100 * done) / total) : 0;
   return <button type="button" onClick={onOpen} aria-label={`${campaign.name} · ${STATUS_LABEL[campaign.status] || campaign.status}`}
     className="group flex flex-col gap-4 rounded-card bg-surface-2/50 p-5 text-left ring-1 ring-white/[0.07] transition duration-brand hover:-translate-y-0.5 hover:bg-surface-2/80 hover:ring-brand/40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand">

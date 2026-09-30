@@ -83,8 +83,11 @@ describe("campaign list", () => {
     fireEvent.change(within(wizard).getByLabelText("Nombre de la campaña"), { target: { value: "Art" } });
     fireEvent.click(within(wizard).getByRole("radio", { name: /Art tracks/ }));
     expect(within(wizard).getByRole("button", { name: "Crear y seguir" })).toBeDisabled();
-    fireEvent.change(within(wizard).getByLabelText("Portal de destino"), { target: { value: "chile" } });
+    fireEvent.change(within(wizard).getByLabelText("Portal de destino"), { target: { value: "files" } });
     expect(within(wizard).getByRole("button", { name: "Crear y seguir" })).toBeEnabled();
+    expect(within(wizard).getByRole("radio", { name: /Portada \+ onda/ })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(within(wizard).getByRole("radio", { name: /Portada fija/ }));
+    expect(within(wizard).getByRole("radio", { name: /Portada fija/ })).toHaveAttribute("aria-checked", "true");
   });
 });
 

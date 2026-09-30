@@ -77,11 +77,11 @@ export function doneCount(counts) {
 }
 
 /** The single most useful next step for the whole campaign. */
-export function campaignNextStep(counts, kind = "lyric_video") {
+export function campaignNextStep(counts, kind = "lyric_video", { portalSends = true } = {}) {
   if (kind !== "art_track" && counts.lyrics > 0) return { stage: "lyrics", label: `Revisar ${counts.lyrics} ${counts.lyrics === 1 ? "letra" : "letras"}` };
   if (counts.qc > 0) return { stage: "qc", label: `Revisar ${counts.qc} ${counts.qc === 1 ? "video" : "videos"}` };
   if (kind !== "art_track" && counts.ready > 0) return { stage: "ready", label: `Generar ${counts.ready} ${counts.ready === 1 ? "video" : "videos"}` };
-  if (counts.approved > 0) return { stage: "approved", label: `Enviar ${counts.approved} ${counts.approved === 1 ? "aprobada" : "aprobadas"}` };
+  if (portalSends && counts.approved > 0) return { stage: "approved", label: `Enviar ${counts.approved} ${counts.approved === 1 ? "aprobada" : "aprobadas"}` };
   if (counts.attention > 0) return { stage: "attention", label: `Resolver ${counts.attention} ${counts.attention === 1 ? "problema" : "problemas"}` };
   if (counts.audio > 0 || counts.rendering > 0) return { stage: counts.audio > 0 ? "audio" : "rendering", label: "Procesando…", passive: true };
   return null;
@@ -118,6 +118,17 @@ export const PORTALS = {
 
 export function portalLabel(id) {
   return PORTALS[id]?.label || id;
+}
+
+/** Art-track campaigns may deliver loose files instead of a client portal. */
+export const FILES_DESTINATION = "files";
+export const ART_TRACK_PRESETS = [
+  { key: "waveform", label: "Portada + onda", description: "La portada con barras que laten con el audio." },
+  { key: "colombia_static", label: "Portada fija + título", description: "Portada quieta con título y artista, sin animación." },
+];
+
+export function artTrackPresetLabel(key) {
+  return ART_TRACK_PRESETS.find((preset) => preset.key === key)?.label || ART_TRACK_PRESETS[0].label;
 }
 
 export function relativeDate(value, now = Date.now()) {

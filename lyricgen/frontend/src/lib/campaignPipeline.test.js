@@ -28,6 +28,7 @@ describe("campaign pipeline vocabulary", () => {
     expect(campaignNextStep({ audio: 2 })).toMatchObject({ passive: true });
     expect(campaignNextStep({ delivered: 3 })).toBeNull();
     expect(campaignNextStep({ lyrics: 5, qc: 1 }, "art_track")).toEqual({ stage: "qc", label: "Revisar 1 video" });
+    expect(campaignNextStep({ approved: 4, attention: 1 }, "art_track", { portalSends: false })).toEqual({ stage: "attention", label: "Resolver 1 problema" });
   });
 
   it("keeps old links and editor return paths valid", () => {

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { campaignApiBase, campaignRequest } from "../../lib/campaignApi";
-import { PORTALS } from "../../lib/campaignPipeline";
+import { PORTALS, artTrackPresetLabel } from "../../lib/campaignPipeline";
 import { CampaignReviewerSummary } from "../CampaignReviewerStatus";
 import ArtTrackPanel from "./ArtTrackPanel";
 import CampaignAudioUploader from "./CampaignAudioUploader";
@@ -64,7 +64,8 @@ function General({ campaign, canManage, isAdmin, onChanged }) {
           {cancelled && <p className="text-sm text-red-200">Campaña cancelada. No se puede reactivar.</p>}
           <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
             <dt className="text-ink-secondary">Tipo</dt><dd>{campaign.kind === "art_track" ? "Art tracks" : "Lyric videos"}</dd>
-            <dt className="text-ink-secondary">Portal</dt><dd>{PORTALS[campaign.destination_portal]?.label || (campaign.destination_portal ? campaign.destination_portal : "Se elige al enviar")}</dd>
+            <dt className="text-ink-secondary">Portal</dt><dd>{campaign.destination_portal === "files" ? "Archivos (sin portal)" : PORTALS[campaign.destination_portal]?.label || (campaign.destination_portal ? campaign.destination_portal : "Se elige al enviar")}</dd>
+            {campaign.kind === "art_track" && <><dt className="text-ink-secondary">Estilo</dt><dd>{artTrackPresetLabel(campaign.default_render_params?.art_track_preset)}</dd></>}
             <dt className="text-ink-secondary">Creada</dt><dd>{campaign.created_at ? new Date(campaign.created_at).toLocaleDateString("es-AR", { day: "numeric", month: "long", year: "numeric" }) : "—"}</dd>
             <dt className="text-ink-secondary">Esperadas</dt><dd className="tabular-nums">{campaign.expected_count || "—"}</dd>
           </dl>

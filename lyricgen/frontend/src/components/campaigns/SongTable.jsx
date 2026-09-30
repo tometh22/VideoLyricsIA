@@ -43,7 +43,7 @@ function StageDetail({ song }) {
 
 export default function SongTable({
   songs, view, kind, canManage, loading, selectable, selected, onToggle, onToggleAll,
-  onAction, onOpen, highlightedId, cursor, onCursor, focusRequest, emptyState, busyIds,
+  onAction, onOpen, highlightedId, cursor, onCursor, focusRequest, emptyState, busyIds, portalSends = true,
 }) {
   const [limit, setLimit] = useState(PAGE);
   const sentinel = useRef(null);
@@ -118,7 +118,7 @@ export default function SongTable({
       </thead>
       <tbody className="block md:table-row-group">
         {visible.map((song, index) => {
-          const action = primaryAction(song, { kind, canManage });
+          const action = primaryAction(song, { kind, canManage, portalSends });
           const isSelectable = selectable?.(song);
           const highlighted = highlightedId && (song.id === highlightedId || song.job_id === highlightedId || song.current_job_id === highlightedId);
           const note = statusNote(song);

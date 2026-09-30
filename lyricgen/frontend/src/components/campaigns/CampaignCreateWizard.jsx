@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { campaignPost, campaignRequest } from "../../lib/campaignApi";
-import { PORTALS } from "../../lib/campaignPipeline";
+import { ART_TRACK_PRESETS, FILES_DESTINATION, PORTALS } from "../../lib/campaignPipeline";
 import ArtTrackPanel from "./ArtTrackPanel";
 import CampaignAudioUploader from "./CampaignAudioUploader";
 import StyleControls, { StylePreview } from "./StyleControls";
@@ -81,6 +81,7 @@ export default function CampaignCreateWizard({ artTrackAllowed = true, onClose, 
   const [kind, setKind] = useState("lyric_video");
   const [destination, setDestination] = useState("");
   const [expected, setExpected] = useState("");
+  const [preset, setPreset] = useState("waveform");
   const [campaign, setCampaign] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -96,7 +97,7 @@ export default function CampaignCreateWizard({ artTrackAllowed = true, onClose, 
         expected_count: Number(expected) || 0,
         kind,
         destination_portal: destination || null,
-        default_render_params: art ? { delivery_profile: "both", art_track: true } : { background_mode: "ai", delivery_profile: "youtube" },
+        default_render_params: art ? { delivery_profile: "both", art_track: true, art_track_preset: preset } : { background_mode: "ai", delivery_profile: "youtube" },
       });
       setCampaign(created);
       setStep(art ? 2 : 1);
@@ -119,11 +120,18 @@ export default function CampaignCreateWizard({ artTrackAllowed = true, onClose, 
             {artTrackAllowed && <KindCard value="art_track" current={kind} title="Art tracks" description="Portada + audio, sin letra. Hasta 500 canciones." onSelect={setKind} />}
           </div>
         </div>
+        {art && <div>
+          <p className="mb-2 text-xs font-medium text-ink-secondary">Estilo de Art Track</p>
+          <div role="radiogroup" aria-label="Estilo de Art Track" className="grid gap-2 sm:grid-cols-2">
+            {ART_TRACK_PRESETS.map((item) => <KindCard key={item.key} value={item.key} current={preset} title={item.label} description={item.description} onSelect={setPreset} />)}
+          </div>
+        </div>}
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label={art ? "Portal de destino" : "Portal de destino (opcional)"} hint={art ? undefined : "Si lo dejás vacío, lo elegís al enviar."}>
             <select aria-label="Portal de destino" className={inputClass} value={destination} onChange={(event) => setDestination(event.target.value)}>
               <option value="">{art ? "Elegí un portal" : "Elegir al enviar"}</option>
               {Object.entries(PORTALS).map(([id, value]) => <option key={id} value={id}>UMG {value.label} · {value.host}</option>)}
+              {art && <option value={FILES_DESTINATION}>Archivos (sin portal)</option>}
             </select>
           </Field>
           <Field label="Canciones esperadas (opcional)" hint="Sólo para seguir el avance; se ajusta sola al subir.">

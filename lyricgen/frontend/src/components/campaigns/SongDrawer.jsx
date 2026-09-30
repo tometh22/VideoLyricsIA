@@ -66,12 +66,12 @@ function MetadataForm({ campaignId, song, onSaved }) {
   </form>;
 }
 
-export default function SongDrawer({ song, kind, campaignId, canManage, reviewerEnabled, onClose, onAction, onNavigate, onChanged }) {
+export default function SongDrawer({ song, kind, campaignId, canManage, portalSends = true, reviewerEnabled, onClose, onAction, onNavigate, onChanged }) {
   const dialogRef = useDialogA11y({ onClose });
   const [editing, setEditing] = useState(false);
   useEffect(() => { setEditing(song?.metadata_error === "missing_metadata"); }, [song?.id, song?.metadata_error]);
   if (!song) return null;
-  const action = primaryAction(song, { kind, canManage });
+  const action = primaryAction(song, { kind, canManage, portalSends });
   const note = statusNote(song);
   const videoJob = song.current_job_id;
   const lyricStagePassed = kind !== "art_track" && ["ready", "rendering", "qc", "approved", "delivered"].includes(song.stage);
@@ -94,7 +94,7 @@ export default function SongDrawer({ song, kind, campaignId, canManage, reviewer
           {song.stage === "attention" && canDiscard(song) && <Button size="sm" variant="ghost" onClick={() => onAction(song, "discard")}>Descartar</Button>}
           {lyricStagePassed && song.job_id && <Button size="sm" variant="secondary" onClick={() => onAction(song, "edit-lyrics")}>Editar letra y tiempos</Button>}
           {videoJob && ["qc", "approved", "delivered", "rendering"].includes(song.stage) && <Button size="sm" variant="ghost" onClick={() => onNavigate(`/videos/${encodeURIComponent(videoJob)}`)}>Detalle del video</Button>}
-          {canManage && canSend(song) && song.stage === "delivered" && !song.portal_outdated && <Button size="sm" variant="ghost" onClick={() => onAction(song, "send")}>Enviar a otro portal</Button>}
+          {canManage && portalSends && canSend(song) && song.stage === "delivered" && !song.portal_outdated && <Button size="sm" variant="ghost" onClick={() => onAction(song, "send")}>Enviar a otro portal</Button>}
           {canManage && canSend(song) && song.video?.evidence?.video_sha256 && <Button size="sm" variant="ghost" onClick={() => onAction(song, "record-delivery")}>Registrar entrega manual</Button>}
         </div>
       </header>
