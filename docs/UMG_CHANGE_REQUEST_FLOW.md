@@ -5,8 +5,8 @@
 1. Analyze the request; compare the proposal with the saved lyrics. Apply selected operations or edit manually.
 2. From Changes, open **Revisar y confirmar render**: the original request and complete saved lyrics appear together. Confirm **Aprobar y re-renderizar**. The editor uses the same durable approval and render endpoint.
 3. Stay in Changes while the render runs. Once finished, review the resulting video. Prepare its professional master if required.
-4. Confirm **Publicar actualización**. This performs final video approval through the existing QC/billing gates, then publishes to the request's original Argentina/Chile portal. The selected request is resolved and the published revision is reported.
-5. Alternatively **Marcar como resuelto** closes the request visibly in the portal without implying a render or publication. A response is optional. Resolved requests can be reopened.
+4. Confirm **Publicar actualización**. This performs final video approval through the existing QC/billing gates, then publishes to the request's original Argentina/Chile portal. Only the ONE request selected in Changes is resolved, and only when the published content actually changed; other open requests on the same delivery stay open. The published revision is reported.
+5. Alternatively **Marcar como resuelto** closes the request visibly in the portal without implying a render or publication. The operator UI requires a reason (the client sees it in the portal); the API itself accepts an empty note. Resolved requests can be reopened; a reopened request sorts first in the admin list (ordered by latest lifecycle change, not by submission date).
 
 Approval of lyrics does not publish. Publication requires the same editor revision and render fingerprint the operator reviewed. A newer save requires another review/render; double-clicks use the transactional outbox's idempotency controls.
 
@@ -20,7 +20,7 @@ Legacy deliveries are pinned before working files are overwritten (render upload
 
 Legacy render detection uses a successful job plus an archived overwrite after both the saved document and the request, not the proposal's `applied` status. New partial renders record their exact editor revision and completion time.
 
-Campaign publication uses the same immutable-file contract. Batch counters are computed after flushing item transitions; old `partial` operations with all items sent are reported as completed. Completion refreshes the campaign history. Republishing a corrected campaign cut resolves older requests for that delivery; requests newer than the cut stay open.
+Campaign publication uses the same immutable-file contract. Batch counters are computed after flushing item transitions; old `partial` operations with all items sent are reported as completed. Completion refreshes the campaign history. Republishing a corrected campaign cut does NOT resolve any client request (decision of 2026-09-18, `6af323c1`): a campaign send attests the selected cut, not every instruction that preceded it, so the requests stay open until closed from Changes ("Publicar actualización" for the reviewed one, or "Marcar como resuelto"). A failed song no longer aborts the operation: it is reported per song (`error_code`, `error_detail`, `retryable`), a stalled operation can be retried (`POST /batch/delivery-operations/{id}/retry`) and the reconciler re-queues one that lost its worker.
 
 ## Deployment requirements (not executed by this change)
 
