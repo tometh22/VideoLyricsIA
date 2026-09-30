@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useAdmin } from "../../AdminContext";
 import { API, fetchJson } from "../../adminApi";
+import { describePublishError } from "./changeRequestWorkflow";
 
 const ACTIVE_RENDER_STATUSES = new Set([
   "queued", "processing", "rendering", "editing", "transcribed_pending",
@@ -568,12 +569,12 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
             requestId: crId,
             tone: "wait",
             text: gate?.reason === "manual_review_required"
-              ? "Falta firmar la revisión del video para este corte. Abrí los controles, completalos y después volvé a publicar."
+              ? "Falta confirmar la revisión del video de este corte. Abrí la revisión, completala y después volvé a publicar."
               : gate?.reason === "fresh_preflight_required"
-                ? "Este corte todavía no tiene un preflight vigente. Analizalo antes de publicar."
-                : "El preflight encontró puntos que requieren atención antes de publicar.",
+                ? "Este corte todavía no tiene una revisión al día. Abrilo, revisalo y después volvé a publicar."
+                : "La revisión del video encontró puntos pendientes. Resolvelos y después volvé a publicar.",
             actionLabel: gate?.reason === "fresh_preflight_required"
-              ? "Analizar y revisar este corte"
+              ? "Revisar este corte antes de publicar"
               : "Completar revisión del video",
             actionHref: reviewUrl,
           });
@@ -583,8 +584,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
           setCrPublishNotice({ requestId: crId, outcomeUnknown: true, tone: "wait",
             text: "Se perdió la respuesta. La publicación podría haberse publicado; consultá el estado antes de reintentar." });
         } else {
-          setCrPublishNotice({ requestId: crId, tone: "error",
-            text: `El servidor no aceptó la publicación: ${err.message || err}` });
+          setCrPublishNotice({ requestId: crId, tone: "error", text: describePublishError(err) });
         }
         await loadChangeRequests({ silent: true });
         return;
