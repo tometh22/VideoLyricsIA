@@ -12,6 +12,30 @@ Approval of lyrics does not publish. Publication requires the same editor revisi
 
 Approved background edits: the editor now honors the same platform-admin permission as Changes (done/rejected as well as pending_review), including AI, library and uploaded backgrounds. Other roles keep their existing permissions. Multi-scene jobs must use the scene editor; neither route can overwrite the timeline with one background. Generation remains an explicit action and does not resolve/publish the request.
 
+## Publication modes: frozen copy vs pointer to the newest render
+
+`PUBLISH_LATEST_POINTER` (default off) chooses how publishing treats files:
+
+- **Off (snapshot mode, the default):** every publication copies the files into
+  immutable `.published-<uuid>` objects (see "File safety"). Safe against
+  overwrites, but each publication stores several GB per portal and takes
+  minutes.
+- **On (pointer mode):** publishing copies nothing and leaves
+  `published_file_keys` NULL, so the portal serves the job's current render
+  directly. The client always downloads the newest cut, even before the
+  operator clicks Publish; Publish still registers the new revision, resets the
+  client's approval and resolves the reviewed request, but as a few database
+  writes. `pin_legacy_deliveries` does nothing in this mode (nothing is frozen
+  before a re-render). A delivery that already has a snapshot keeps serving it
+  until its next publication, which clears the pointer. The broadcast ProRes
+  masters (`umg_master`, `umg_short`) are hidden from the portal while the
+  delivery is marked in flight (`editing` / `prores_pending`), because R2 keeps
+  the previous master until the new one is transcoded.
+- Unreferenced `.published-*` and `.vN` objects are not deleted by this change.
+- APIs expose the mode (`publication_mode` on `/admin/change-requests` and the
+  campaign pipeline) so the UI does not claim "the portal still shows the old
+  cut" when it does not.
+
 ## File safety
 
 `deliveries.published_file_keys` points to immutable server-side copies. A successful publication switches the database pointer only after every required copy succeeds. Argentina and Chile have independent pointers. A failed copy leaves the previous publication and open request intact.

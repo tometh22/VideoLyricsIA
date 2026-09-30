@@ -103,7 +103,7 @@ export const PORTAL_FILTERS = [
   { key: "", label: "Todos los envíos" },
   { key: "sent", label: "Enviadas al portal" },
   { key: "unsent", label: "Sin enviar" },
-  { key: "outdated", label: "Portal desactualizado" },
+  { key: "outdated", label: "Con corte nuevo sin enviar" },
   { key: "changes", label: "Con cambios solicitados" },
 ];
 

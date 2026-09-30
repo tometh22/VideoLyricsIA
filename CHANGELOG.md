@@ -3,6 +3,20 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.84] - 2026-09-30
+
+### Added
+
+- `PUBLISH_LATEST_POINTER` (off by default): publish to a client portal without
+  copying any file. The portal then serves the job's newest render, publishing
+  becomes a few database writes instead of minutes and several GB of copies per
+  portal, and nothing is frozen before a re-render. ProRes masters stay hidden
+  while a re-render is in flight so the client never gets the old master next
+  to a new MP4. Existing snapshots are untouched until their next publication.
+- The campaign pipeline and `/admin/change-requests` report `publication_mode`;
+  the campaign UI says "corte nuevo sin registrar" instead of "portal
+  desactualizado" when the portal already serves the newest render.
+
 ## [1.1.83] - 2026-09-30
 
 ### Added

@@ -379,7 +379,9 @@ export default function CampaignDetailPage({ id }) {
         setView("approved"); setSelected(new Set(ids));
       }} />}
     {outdatedCount > 0 && view !== "config" && view !== "changes" && <Banner tone="warning" action={<Button size="sm" onClick={() => updateParams({ view: null, portal: "outdated", song: null, focus: null }, { push: true })}>Ver {outdatedCount === 1 ? "la canción" : "las canciones"}</Button>}>
-      <strong>{outdatedCount}</strong> {outdatedCount === 1 ? "canción tiene" : "canciones tienen"} un corte nuevo que todavía no se envió: el portal del cliente sigue mostrando el anterior.
+      <strong>{outdatedCount}</strong> {outdatedCount === 1 ? "canción tiene" : "canciones tienen"} un corte nuevo que todavía no se envió: {pipe.data?.publication_mode === "pointer"
+        ? "el cliente ya descarga el archivo nuevo, pero falta registrar la versión y reiniciar su aprobación."
+        : "el portal del cliente sigue mostrando el anterior."}
     </Banner>}
     {pipe.data && pipe.data.portal_status_available === false && <Banner tone="warning">No pudimos consultar el portal del cliente: por ahora las entregas figuran como aprobadas.</Banner>}
     {pipe.error && known && <Banner tone="danger" action={<Button size="sm" onClick={refresh}>Reintentar</Button>}>No se pudo actualizar el estado: {pipe.error.message}</Banner>}

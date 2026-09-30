@@ -183,3 +183,16 @@ def test_a_stalled_operation_is_reported_to_the_client(client, admin_token, stor
     assert client.get(f'/batch/delivery-operations/{op}', headers=auth).json()['stalled'] is False
     _age(op, atc.STALL_AFTER_SECONDS + 60)
     assert client.get(f'/batch/delivery-operations/{op}', headers=auth).json()['stalled'] is True
+
+
+def test_pointer_mode_bulk_send_copies_nothing_and_leaves_the_pointer_null(client, admin_token, monkeypatch, storage_ready):
+    from database import Delivery
+    monkeypatch.setenv('PUBLISH_LATEST_POINTER', '1')
+    def forbidden(*args, **kwargs):
+        raise AssertionError('pointer mode must not copy files')
+    monkeypatch.setattr('delivery_snapshots.copy_snapshot', forbidden)
+    _, first, second, op = _two_song_operation(client, admin_token, 'pointer')
+    assert atc.process_delivery_batch(op) == {'sent': 2, 'failed': 0}
+    with SessionLocal() as db:
+        rows = db.query(Delivery).filter(Delivery.job_id.in_([first, second])).all()
+        assert len(rows) == 2 and all(row.published_file_keys is None for row in rows)

@@ -465,3 +465,92 @@ def test_staging_switch_lets_a_failed_qc_report_publish(
     detail = response.json().get('detail') if response.status_code >= 400 else None
     assert not (isinstance(detail, dict) and detail.get('code') == 'delivery_qc_blocked'), response.text
     assert response.status_code < 400, response.text
+
+
+# --- Pointer mode: publishing copies nothing; the portal follows the newest render ---
+
+def test_snapshot_mode_still_copies_and_freezes_by_default(
+    client, admin_token, approved_job, db, fake_r2, monkeypatch,
+):
+    monkeypatch.delenv('PUBLISH_LATEST_POINTER', raising=False)
+    job_id, delivery_id, ids, body = _prepare(client, admin_token, db, approved_job, fake_r2)
+    response = _publish(client, admin_token, job_id, **body)
+    assert response.status_code == 200, response.text
+    assert fake_r2['copies'], 'default mode must keep copying'
+    db.expire_all()
+    assert db.get(Delivery, delivery_id).published_file_keys
+
+
+def test_pointer_mode_publishes_without_copying_and_serves_the_newest_render(
+    client, admin_token, approved_job, db, fake_r2, monkeypatch,
+):
+    from delivery_snapshots import portal_key
+    monkeypatch.setenv('PUBLISH_LATEST_POINTER', '1')
+    job_id, delivery_id, ids, body = _prepare(client, admin_token, db, approved_job, fake_r2)
+    response = _publish(client, admin_token, job_id, **body)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload['revision'] == 2 and payload['content_changed'] is True
+    assert payload['resolved_change_requests'] == [ids[0]]   # still closes exactly the reviewed case
+    assert fake_r2['copies'] == []                           # the point: nothing duplicated in storage
+    db.expire_all()
+    row = db.get(Delivery, delivery_id)
+    assert row.published_file_keys is None
+    assert row.approved_at is None                           # client approval still reset for the new cut
+    for file_type in FILENAMES:
+        key = portal_key(row, file_type)
+        assert key == working_key(row.tenant_snapshot, row.job_id, file_type)
+        assert fake_r2['objects'][key].startswith(b'render-B-')   # newest bytes, not a frozen A
+    _assert_open(db, [ids[1]])
+
+
+def test_pointer_mode_republishing_an_unchanged_cut_is_a_noop_for_the_client(
+    client, admin_token, approved_job, db, fake_r2, monkeypatch,
+):
+    monkeypatch.setenv('PUBLISH_LATEST_POINTER', '1')
+    job_id, delivery_id, ids, body = _prepare(client, admin_token, db, approved_job, fake_r2)
+    assert _publish(client, admin_token, job_id, **body).status_code == 200
+    again = _publish(client, admin_token, job_id)
+    assert again.status_code == 200, again.text
+    assert again.json()['revision'] == 2 and again.json()['content_changed'] is False
+    assert fake_r2['copies'] == []
+
+
+def test_pointer_mode_does_not_freeze_working_files_before_a_rerender(monkeypatch):
+    import delivery_snapshots
+    calls = []
+    monkeypatch.setattr(delivery_snapshots, 'copy_snapshot', lambda *a, **k: calls.append(a) or {})
+    monkeypatch.setenv('PUBLISH_LATEST_POINTER', '1')
+    delivery_snapshots.pin_legacy_deliveries('any-job')
+    assert calls == []   # default mode would copy every unpinned delivery first
+
+
+def test_pointer_mode_hides_a_stale_broadcast_master_but_not_the_mp4():
+    from types import SimpleNamespace
+    from delivery_snapshots import portal_key
+    import os
+    os.environ['PUBLISH_LATEST_POINTER'] = '1'
+    try:
+        in_flight = SimpleNamespace(published_file_keys=None, tenant_snapshot='t', job_id='j',
+                                    stale_since=datetime.now(timezone.utc), stale_reason='editing')
+        assert portal_key(in_flight, 'umg_master') is None
+        assert portal_key(in_flight, 'umg_short') is None
+        assert portal_key(in_flight, 'video') == working_key('t', 'j', 'video')
+        ready = SimpleNamespace(published_file_keys=None, tenant_snapshot='t', job_id='j', stale_since=None, stale_reason=None)
+        assert portal_key(ready, 'umg_master') == working_key('t', 'j', 'umg_master')
+        pinned = SimpleNamespace(published_file_keys={'umg_master': 'frozen'}, tenant_snapshot='t', job_id='j',
+                                 stale_since=datetime.now(timezone.utc), stale_reason='editing')
+        assert portal_key(pinned, 'umg_master') == 'frozen'      # an existing snapshot is untouched
+    finally:
+        del os.environ['PUBLISH_LATEST_POINTER']
+    failed = SimpleNamespace(published_file_keys=None, tenant_snapshot='t', job_id='j',
+                             stale_since=datetime.now(timezone.utc), stale_reason='editing')
+    assert portal_key(failed, 'umg_master') == working_key('t', 'j', 'umg_master')   # default mode unchanged
+
+
+def test_admin_list_reports_the_publication_mode(client, admin_token, monkeypatch):
+    monkeypatch.delenv('PUBLISH_LATEST_POINTER', raising=False)
+    snapshot = client.get('/admin/change-requests?status=all', headers=auth(admin_token)).json()
+    monkeypatch.setenv('PUBLISH_LATEST_POINTER', '1')
+    pointer = client.get('/admin/change-requests?status=all', headers=auth(admin_token)).json()
+    assert snapshot['publication_mode'] == 'snapshot' and pointer['publication_mode'] == 'pointer'

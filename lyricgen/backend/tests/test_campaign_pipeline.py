@@ -275,3 +275,17 @@ def test_pipeline_reports_admin_and_inbox_flag(db, setup, monkeypatch):
         on = pipeline.campaign_pipeline(campaign.id, actor, db)
     assert off["features"] == {"change_requests_inbox": False, "change_request_actions": False} and off["is_admin"] is True
     assert on["features"] == {"change_requests_inbox": True, "change_request_actions": False} and owner["is_admin"] is False
+
+
+def test_pipeline_reports_whether_the_portal_serves_the_latest_render(db, setup, monkeypatch):
+    campaign, items, actor = setup
+    job = add_job(db, campaign, actor, item=items[0], status="done")
+    db.commit()
+    with portal([(job.job_id, "chile", campaign.tenant_id, 0)]) as session:
+        monkeypatch.setattr(creative, "scoped_deliveries_db", session)
+        monkeypatch.delenv("PUBLISH_LATEST_POINTER", raising=False)
+        frozen = pipeline.campaign_pipeline(campaign.id, actor, db)
+        monkeypatch.setenv("PUBLISH_LATEST_POINTER", "1")
+        latest = pipeline.campaign_pipeline(campaign.id, actor, db)
+    assert frozen["publication_mode"] == "snapshot" and frozen["items"][0]["portal_serves_latest"] is False
+    assert latest["publication_mode"] == "pointer" and latest["items"][0]["portal_serves_latest"] is True

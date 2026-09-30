@@ -151,6 +151,7 @@ from language_review import (
     review_payload as _language_review_payload,
     staging_advisory as _language_staging_advisory,
 )
+from delivery_snapshots import latest_pointer_enabled as _latest_pointer_enabled
 from provenance import job_was_delivered
 from batch_profiles import (
     RenderProfileError, normalize_render_profile, pipeline_fields,
@@ -20649,7 +20650,7 @@ def admin_create_delivery_from_job(
     # A broadcast copy can take minutes. Both databases terminate idle
     # transactions after 60 s, so never hold the job lock/DB connections
     # while copying. Revalidate both identities under locks afterwards.
-    from delivery_snapshots import copy_snapshot
+    from delivery_snapshots import copy_snapshot, latest_pointer_enabled
     prepared_snapshot = existing.published_file_keys if existing else None
     if (replaced_job_id or not prepared_snapshot or existing.file_types != delivery_file_types
             or delivery_freshness.needs_publish(job, existing)):
@@ -20662,7 +20663,8 @@ def admin_create_delivery_from_job(
         if ddb is not db:
             ddb.rollback()
         try:
-            prepared_snapshot = copy_snapshot(snapshot_tenant, job_id, delivery_file_types)
+            # Pointer mode: nothing to copy; the portal serves the newest render.
+            prepared_snapshot = None if latest_pointer_enabled() else copy_snapshot(snapshot_tenant, job_id, delivery_file_types)
         except Exception as exc:
             raise HTTPException(status_code=503, detail='No se pudo preparar la publicación. El portal conserva la versión anterior.') from exc
         job = (db.query(Job).filter(Job.job_id == job_id)
@@ -21799,6 +21801,9 @@ async def admin_list_change_requests(
         "resolved_count": resolved_count,
         "proposal_enabled": _change_request_flag("CHANGE_REQUEST_ASSIST_ENABLED"),
         "proposal_apply_enabled": _change_request_flag("CHANGE_REQUEST_APPLY_ENABLED"),
+        # "pointer": the portal serves the newest render (publishing copies
+        # nothing); "snapshot": it serves a frozen copy made at publication.
+        "publication_mode": "pointer" if _latest_pointer_enabled() else "snapshot",
     }
 
 
