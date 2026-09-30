@@ -12,11 +12,107 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Keep the animated waveform preset available as a separate option.
 - Expose the preset in single-song uploads, campaigns, and the Art Track editor,
   with high-quality ProRes export and individual campaign master downloads.
+- **Revisión rápida** in the lyrics editor: one panel lists everything that
+  should be decided before approving, each with a one-click fix, the audio
+  of that moment and a preview of how the line will read. Built from the 20
+  UMG change requests of 2026-09-29 (136 items, Argentina and Chile), where
+  the dominant error was a machine mishearing that passed review untouched.
+  Sources, all already stored or cached (no new paid calls):
+  - words heard by the machine and the whole-song witness that the lyrics
+    lost ("Falta texto", e.g. "dormite ya", the leading "Que");
+  - where two independent ears (Gemini without reference, the witness,
+    official lyrics) agree against the screen ("Se escucha distinto"),
+    with alternatives when they disagree;
+  - official lyrics from the campaign sheet, the lrclib cache (fetched in
+    the background when missing) or pasted by the operator, used only for
+    comparison;
+  - corrections already made in other songs of the same artist;
+  - UMG style rules: question marks on non-questions and exclamations,
+    title spelling, inconsistent accents, joined words and missing spaces,
+    a lonely word on screen;
+  - a chorus corrected in only some of its repetitions (suggestion, since
+    the corrected copy may itself carry a typo).
+  Identical fixes are grouped ("se corrigen juntas" across every chorus).
+  Only points with two agreeing sources or an objective rule block
+  approval (409 `lyric_review_pending` on /generate, /edit and campaign
+  lyric approval); single-source points are non-blocking suggestions.
+  Keyboard: A apply, N keep, E listen, J/K move. Decisions are stored on
+  the line (`qa_dismissed`). Songs where the ears fail are flagged as
+  difficult. Backtest: 102 of the 136 requested changes had a point in the
+  panel; over 313 approved staging songs 77 % would have no blocking point
+  (p90 2, max 5).
+- `docs/UMG_GUIA_ESTILO_LETRAS.md`: UMG lyric style guide derived from the
+  131 portal change requests, also reachable from the panel.
+
+- **Campañas as a pipeline**: every campaign screen counts the same unit
+  (the song) with one stage per song — Audio, Letra, Lista, Generando,
+  QC video, Aprobada, Entregada (+ Atención, Descartadas) — from a new
+  read-only `GET /batch/campaigns/{id}/pipeline`; the campaign list carries
+  the same counts through bulk queries. Variants never add songs and
+  "Entregada" is decided by the current cut published in a portal.
+- Campaign workspace: pipeline bar, one song table with one primary action
+  per row, song drawer (history, versions, portal, metadata), floating bulk
+  bar (generate, send, assign style, discard/restore, retry), QC focus
+  player with "Aprobar y siguiente" and keyboard shortcuts, 3-step creation
+  wizard, browser folder upload (resumable, SHA-256 dedup, CSV metadata),
+  visual style editor and a settings tab (general, upload, style, contract,
+  activity). Snapshots are cached between tabs and cleared on logout.
+- `/admin/cola` now opens the campaign's lyric stage ("Revisión de letras").
 
 ### Fixed
 
 - Preserve the legal `℗` mark when a selected font lacks the glyph, and keep
   compatible frame rates on the fast ProRes conversion path.
+
+- Applying a change request whose quote is only part of the line no longer
+  overwrites the whole line; only the quoted span is replaced ("…se fundió,
+  dormite ya", "Que hace un año atrás").
+
+### Changed (adversarial review, 2026-09-30)
+
+- Review panel redesigned for zero-mouse review: one card at a time with a
+  word diff (added in green, removed struck through, punctuation-only
+  changes marked per sign), Enter/⌫/1–3/E/J/K/M/Z/? keys that never leak to
+  the editor's own shortcuts, optional auto-listen, the lyric line of the
+  active point highlighted (and flashed green after applying), undo that
+  brings the point back, a failed fix that stays visible instead of
+  vanishing, and an "Aprobar" button that turns into "Faltan N · Revisar".
+- Visual pass: the panel follows the Genly design system (neutral surfaces,
+  violet only for the primary action, green/red only for what enters and
+  leaves the line, one progress bar); shortcuts, compared sources and the
+  UMG guide live behind "?". Official lyrics enter through a single dialog
+  shared with "Pegar letra oficial", with two explicit outcomes: Comparar
+  (nothing changes) or Reemplazar y re-sincronizar.
+- Fixes are applied by line identity and word position: correcting one
+  repetition in a line no longer changes the other, a stale point never
+  lands on a neighbouring line, merges keep word timings, chorus copies
+  keep their punctuation.
+- Precision: official-lyrics veto on sound-alike ears, phonetic
+  corroboration, spelling-only differences only with the official lyrics,
+  real questions and legitimate accent pairs no longer flagged,
+  question/orphan points keyed by line, stable dismissal keys, NFC input.
+  New suggestions: line breaks like the official lyrics and timing (a line
+  that leaves before its last sung word).
+- Safety and performance: bounded alignment (a 400-line repetitive song
+  went from 45 s to under 1 s), review computed outside row locks and off
+  the event loop and cached by content, lrclib fetched without holding a
+  DB connection (max 2 at a time, own cache namespace) and never for batch
+  campaigns (audio-only rule), correction memory scoped to the tenant,
+  review reads in a savepoint, official-lyrics paste recorded as a product
+  event.
+- Change requests: a partial client quote replaces only its span, but a
+  quote that only drops words (or matches the whole line) still replaces
+  the line; leading ¿¡ and trailing punctuation are kept.
+
+### Configuration
+
+- `LYRIC_REVIEW_MODE`: `enforce` (default), `observe` (show without
+  blocking) or `off`.
+- `LYRIC_REVIEW_ENFORCE_TENANTS`: comma-separated tenants where approval is
+  blocked; when unset, only batch campaigns block and everything else shows
+  the panel without blocking.
+- `LYRIC_REVIEW_FETCH_OFFICIAL`: `1` (default) fetches missing official
+  lyrics from lrclib in the background; `0` disables it.
 
 ## [1.1.75] - 2026-09-30
 

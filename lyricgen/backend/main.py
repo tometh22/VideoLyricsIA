@@ -90,6 +90,7 @@ from auth import (
 import storage
 import delivery_freshness
 from machine_evidence import MachineSnapshotMissing, SCHEMA as MACHINE_EVIDENCE_SCHEMA
+from lyric_review import LyricReviewPending, conflict_detail as lyric_review_conflict
 from datetime import datetime, timedelta, timezone
 
 from database import (
@@ -10725,6 +10726,8 @@ async def generate_with_segments(
                 )
             except LookupError:
                 raise HTTPException(status_code=409, detail="editor_version_not_found") from None
+            except LyricReviewPending as exc:
+                raise HTTPException(status_code=409, detail=lyric_review_conflict(exc)) from None
             except MachineSnapshotMissing as exc:
                 raise HTTPException(
                     status_code=409,
@@ -14364,6 +14367,11 @@ async def get_editor_document(
         "transcription_quality": editor_quality,
     })
     db.commit()  # lazy migration/reconciliation/expiry is an intentional side effect
+    # Revisión rápida: después del commit (sin filas bloqueadas) y fuera del
+    # event loop, que no se congele el servidor con una canción larga.
+    from lyric_review_sources import review_for_document
+    from starlette.concurrency import run_in_threadpool
+    payload["lyric_review"] = await run_in_threadpool(review_for_document, db, document, job)
     payload["reviewer_candidate"] = None
     if candidate_inputs is not None:
         # Never yield while retaining editor row locks: a second synchronous
@@ -14441,13 +14449,53 @@ async def patch_editor_document(
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from None
     _dispatch_editor_quality_outbox(quality_outbox_id)
+    lyric_review = None
+    if applied:
+        # Sin cambios no hay nada nuevo que revisar: el editor conserva la
+        # revisión anterior.
+        from lyric_review_sources import review_for_document
+        from starlette.concurrency import run_in_threadpool
+        lyric_review = await run_in_threadpool(review_for_document, db, document, job)
     return {
         "job_id": job_id,
         "revision": document.revision,
         "version_id": version.id if version else None,
         "saved_at": document.updated_at.isoformat(),
         "applied": applied,
+        "lyric_review": lyric_review,
     }
+
+
+class OfficialLyricsRequest(BaseModel):
+    text: str = Field(..., max_length=20000)
+
+
+@app.post("/editor/{job_id}/official-lyrics")
+async def save_editor_official_lyrics(
+    job_id: str,
+    body: OfficialLyricsRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Letra oficial pegada por el operador (Google, planilla, UMG).
+
+    Sólo sirve de referencia para la revisión rápida: no toca la letra ni el
+    timing. Devuelve la revisión recalculada para mostrarla al instante.
+    """
+    job, document = _editor_document_or_404(db, job_id, current_user)
+    _audit_cross_tenant_access(db, current_user, job, "editor_official_lyrics", commit=False)
+    from lyric_review_sources import review_for_document, save_operator_reference
+    save_operator_reference(db, job, body.text)
+    # Quién pegó la referencia queda registrado (el texto no).
+    db.add(ProductEvent(
+        tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job_id,
+        name="editor_official_lyrics_saved",
+        properties={"chars": len(body.text or ""), "lines": len((body.text or "").splitlines())},
+    ))
+    db.commit()
+    from starlette.concurrency import run_in_threadpool
+    review = await run_in_threadpool(review_for_document, db, document, job)
+    return {"job_id": job_id, "lyric_review": review}
 
 
 @app.post("/editor/{job_id}/quality-proposals/{proposal_id}/apply")
@@ -17543,13 +17591,23 @@ def request_edit(
         if not current_user.get("features", {}).get("editor_v2") and not _has_change_request_context:
             raise HTTPException(status_code=404, detail="Job not found.")
         try:
+            # Un cambio de fondo o tipografía no re-decide la letra; un
+            # re-render por pedido de cambio sólo frena si se perdió letra
+            # cantada (lo que pasó con "dormite ya").
+            _review_scope = (
+                "none" if body.edit_type != "lyrics"
+                else "missing_only" if _has_change_request_context else "full"
+            )
             _editor_document, _approved_editor_version = approve_document(
                 db, job, current_user["id"],
                 editor_revision=body.editor_revision,
                 editor_version_id=body.editor_version_id,
+                review_scope=_review_scope,
             )
         except LookupError:
             raise HTTPException(status_code=409, detail="editor_version_not_found") from None
+        except LyricReviewPending as exc:
+            raise HTTPException(status_code=409, detail=lyric_review_conflict(exc)) from None
         except RuntimeError:
             _current_document = get_or_create_document(
                 db, job_id, job.tenant_id, job.segments_json or [],

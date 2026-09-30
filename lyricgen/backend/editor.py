@@ -2180,15 +2180,31 @@ def approve_document(
     *,
     editor_revision: int | None = None,
     editor_version_id: str | None = None,
+    review_scope: str = "full",
 ) -> tuple[EditorDocument, EditorVersion]:
     """Freeze and approve the exact current persisted snapshot.
 
     A version id is not permission to render an old snapshot after somebody
     else saved. Both selectors must still identify the document's current
     revision, otherwise approval fails closed with the standard conflict.
+
+    ``review_scope`` decides which Revisión rápida points block: ``full``
+    (editor and campaign approval), ``missing_only`` (change-request renders:
+    only sung words that were lost) or ``none``.
     """
     if getattr(job, "pilot_id", None):
         raise ValueError("pilot_copy_cannot_be_approved")
+    # La revisión se calcula ANTES de bloquear las filas: puede tardar y no
+    # debe frenar al pipeline ni a otros guardados. Bajo el lock sólo se
+    # confirma que la letra revisada sigue siendo la misma.
+    from lyric_review_sources import pending_for
+    unlocked = db.query(EditorDocument).filter(
+        EditorDocument.job_id == job.job_id, EditorDocument.tenant_id == job.tenant_id,
+    ).first()
+    reviewed_revision = unlocked.revision if unlocked is not None else None
+    review_error = (
+        pending_for(db, unlocked, job, scope=review_scope) if unlocked is not None else None
+    )
     job = (
         db.query(Job)
         .filter(Job.job_id == job.job_id)
@@ -2224,6 +2240,13 @@ def approve_document(
             raise RuntimeError("editor_revision_conflict")
     if editor_version_id is None and editor_revision is None:
         raise ValueError("editor approval selector required")
+    # Revisión rápida: lo que falta, lo que se escucha distinto y las reglas
+    # de estilo UMG (lyric_review.py). Va después de los chequeos de revisión
+    # para que un cliente desactualizado reciba el conflicto, no esto.
+    if document.revision != reviewed_revision:
+        review_error = pending_for(db, document, job, scope=review_scope)
+    if review_error is not None:
+        raise review_error
     version = selected or _ensure_version(
         db, document, document.revision, document.current_segments,
         user_id, "approve", approved=True,
