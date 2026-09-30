@@ -86,7 +86,7 @@ for (const width of [1440, 390]) {
     const table = page.getByRole("table");
     await expect(table.getByText("En Chile", { exact: true })).toBeVisible();
     await expect(table.getByText("1 cambio pedido", { exact: true })).toBeVisible();
-    await expect(table.getByText("Portal desactualizado", { exact: true })).toBeVisible();
+    await expect(table.getByText("Listo para reenviar", { exact: true })).toBeVisible();   // approved + portal has an older cut
     await page.getByLabel("Filtrar por envío al portal").selectOption("sent");
     await expect(page.getByText("Mataz", { exact: true })).toHaveCount(0);
     await page.getByRole("searchbox", { name: "Buscar canción o artista" }).fill("lucybell");

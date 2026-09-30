@@ -269,7 +269,9 @@ test("keeps the player running through polling, prepares without publishing, and
   await expect.poll(() => video.evaluate(el => el.readyState)).toBeGreaterThanOrEqual(2);
   await video.evaluate(el => { el.muted = true; return el.play(); });
   const source = await video.getAttribute("src");
-  await page.getByRole("button", { name: "Preparar el archivo profesional", exact: true }).click();
+  // The main button now publishes (and prepares the master by itself); preparing
+  // WITHOUT publishing is the small secondary link.
+  await page.getByRole("button", { name: "Solo preparar el archivo profesional (sin publicar)", exact: true }).click();
   await expect(page.getByRole("status", { name: "Estado de la acción" })).toContainText("Actualización del .mov encolada");
   await expect.poll(() => video.evaluate(el => el.currentTime), { timeout: 12_000 }).toBeGreaterThan(6);
   expect(await video.evaluate(el => el.paused)).toBe(false);
@@ -282,3 +284,46 @@ test("keeps the player running through polling, prepares without publishing, and
   await expect(page.getByText("Coincide con el pedido", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Volver a analizar con la letra actual" })).toBeDisabled();
 });
+
+test("one click on Publicar waits for the professional master and publishes by itself", async ({ page }) => {
+  await installEditorHarness(page, { jobId: "job-85", role: "admin" });
+  const publishes = [];
+  await page.route("**/*", async route => {
+    const req = route.request();
+    const url = new URL(req.url());
+    const json = body => route.fulfill({ json: body });
+    if (url.pathname === "/service-status/summary") return json({ status: "operational", incidents: [] });
+    if (url.pathname === "/admin/stats") return json({});
+    if (url.pathname === "/admin/change-requests") {
+      const done = publishes.length >= 2;
+      return json({ pending_count: done ? 0 : 1, resolved_count: done ? 1 : 0, proposal_enabled: true, proposal_apply_enabled: true,
+        items: [{ id: 85, comment: "Corregir la letra", submitted_at: "2026-09-17T00:00:00Z",
+          proposal: { id: "proposal-85", status: "applied", applied_revision: 3, applicable_count: 1 },
+          resolved_at: done ? "2026-09-30T20:00:00Z" : null, resolution_source: done ? "publication" : null,
+          publication: { job_status: "done", prores_configured: true, prores_pending: done ? [] : ["umg_master"],
+            render_matches_editor: true, needs_publish: !done, render_fingerprint: "render4", editor_revision: 4, revision: 1 },
+          delivery: { job_id: "job-85", artist: "Test", song: "Pedido 85", portal_id: "argentina" } }] });
+    }
+    if (req.method() === "POST" && url.pathname.includes("/deliveries/from-job/")) {
+      publishes.push(req.postDataJSON());
+      // First answer: the server started the master. Second: it is ready, published.
+      return publishes.length === 1
+        ? json({ ok: false, status: "preparing_prores", retry_after: 1, missing: ["umg_master"], stale: [], enqueued: ["umg_master"] })
+        : json({ ok: true, content_changed: true, revision: 2, portal_id: "argentina", job_id: "job-85", resolved_change_requests: [85] });
+    }
+    return route.fallback();
+  });
+  page.once("dialog", dialog => dialog.accept());
+  await page.addLocatorHandler(page.getByRole("dialog"), async () => {
+    await page.getByRole("dialog").getByRole("button", { name: "Cancelar" }).click();
+  });
+  await page.goto("/admin?section=cambios&change_request_id=85");
+  const publish = page.getByRole("button", { name: "Publicar en el portal y dar por resuelto", exact: true });
+  await publish.click();
+  await expect(page.getByRole("status", { name: "Estado de la acción" })).toContainText("Se publica solo cuando esté listo");
+  await expect(page.getByRole("button", { name: /Preparando el archivo y publicando/ })).toBeDisabled();   // nothing to press twice
+  await expect(page.getByRole("status", { name: "Estado de la acción" })).toContainText("Publicada la versión 2", { timeout: 20_000 });
+  expect(publishes).toHaveLength(2);
+  expect(publishes[1]).toEqual(publishes[0]);   // the very same reviewed cut, asked again
+});
+

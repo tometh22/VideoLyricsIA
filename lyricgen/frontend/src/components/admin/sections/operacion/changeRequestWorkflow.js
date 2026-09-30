@@ -223,9 +223,10 @@ export const PRIMARY_LABELS = {
   rendering: "Generando el video nuevo…",
   publish: "Publicar en el portal y dar por resuelto",
   publishing: "Publicando…",
-  prepare_master: "Preparar el archivo profesional",
-  prepare_master_setup: "Elegir formato y preparar el archivo profesional",
-  preparing_master: "Preparando el archivo…",
+  // Publishing prepares the professional master by itself when it is missing.
+  prepare_master: "Publicar en el portal y dar por resuelto",
+  prepare_master_setup: "Elegir formato y publicar",
+  preparing_master: "Preparando el archivo y publicando…",
   reopen: "Reabrir pedido",
   reopening: "Reabriendo…",
   see_error: "Ver el error",
@@ -239,6 +240,7 @@ export const SECONDARY_LABELS = {
   suggesting: "Analizando…",
   edit: "Editar letra a mano",
   close: "Cerrar sin publicar",
+  prepare_only: "Solo preparar el archivo profesional (sin publicar)",
 };
 
 /** Un `action` del servidor está permitido; sin lista (datos viejos) todo lo está. */
@@ -357,6 +359,9 @@ export function correctionSecondary(workflow, primary, ctx = {}) {
     && workflow?.key !== "rendering" && primary.key !== "render") {
     links.push({ key: "render", label: PRIMARY_LABELS.render, disabled: Boolean(busy.proposal || busy.publishing) });
   }
+  if (primary.key === "prepare_master" && !ctx.status?.needsProResSetup && workflowAllows(workflow, "prepare_master")) {
+    links.push({ key: "prepare_only", label: SECONDARY_LABELS.prepare_only, disabled: Boolean(busy.publishing) });
+  }
   if (hasJob && !["edit", "see_error"].includes(primary.key)) {
     links.push({ key: "edit", label: SECONDARY_LABELS.edit });
   }
@@ -404,7 +409,7 @@ export function correctionSentence(workflow, ctx = {}) {
       const proposalNote = String(workflow?.detail || "").match(/La propuesta sigue pendiente:[\s\S]*$/)?.[0];
       const tail = `${manual}${proposalNote ? ` ${proposalNote}` : ""}`;
       return publication?.prores_pending?.length
-        ? `El video nuevo está listo. Falta preparar el archivo profesional antes de publicar.${tail}`
+        ? `El video nuevo está listo. Al publicar, el archivo profesional se prepara solo (unos minutos) y el video sale cuando termine.${tail}`
         : `El video nuevo está listo. Miralo y publicalo: el cliente lo ve en el portal y el pedido queda resuelto.${tail}`;
     }
     case "review":

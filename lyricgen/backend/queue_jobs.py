@@ -1857,11 +1857,35 @@ def enqueue_quality_proposal_validation(proposal_id: str,
     return queued.id
 
 
+def _live_prewarm_job(queue, rq_id: str):
+    """The RQ job for ``rq_id`` when it is still going to run (or is running).
+
+    Returns None when there is none, it finished/failed/was cancelled, or a
+    ``started`` entry is older than any transcode can take (a dead worker's
+    leftover), so a stuck entry can never block a retry.
+    """
+    try:
+        from rq.job import Job as RqJob
+        rq_job = RqJob.fetch(rq_id, connection=queue.connection)
+        status = rq_job.get_status(refresh=True)
+    except Exception:
+        return None
+    if status not in ("queued", "started", "scheduled", "deferred"):
+        return None
+    if status == "started" and rq_job.started_at is not None:
+        from datetime import datetime, timezone
+        started = rq_job.started_at if rq_job.started_at.tzinfo else rq_job.started_at.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - started).total_seconds() > PRORES_PREWARM_TIMEOUT + 120:
+            return None
+    return rq_job
+
+
 def enqueue_prores_prewarm(
     job_id: str,
     file_type: str,
     *,
     force: bool = False,
+    dedupe_live: bool = False,
 ) -> str | None:
     """Schedule the ProRes transcode for `job_id` on the enterprise queue.
 
@@ -1907,6 +1931,17 @@ def enqueue_prores_prewarm(
             depth, PRORES_PREWARM_MAX_QUEUE_DEPTH, job_id, file_type,
         )
         return None
+    if dedupe_live:
+        # An operator's click while the same transcode is already queued or
+        # running. RQ re-runs an existing id instead of ignoring it, so a second
+        # click used to start a second multi-GB transcode + upload of the same
+        # key. Only for click-driven callers: the edit pipeline relies on the
+        # re-run to refresh a master after a correction.
+        live = _live_prewarm_job(q_enterprise, f"prewarm:{job_id}:{file_type}")
+        if live is not None:
+            logger.info("[PRORES] prewarm already %s for %s/%s; not enqueuing a duplicate",
+                        live.get_status(), job_id, file_type)
+            return live.id
     rq_job = q_enterprise.enqueue(
         "prores.prewarm_prores",
         args=(job_id, file_type),

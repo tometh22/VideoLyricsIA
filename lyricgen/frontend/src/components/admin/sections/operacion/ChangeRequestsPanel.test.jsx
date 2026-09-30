@@ -141,7 +141,9 @@ describe("publicationStatus", () => {
     expect(status.title).toMatch(/archivo profesional/);
     // Publicar SÍ se ofrece: encola el master y el backend contesta 202.
     expect(status.canPublish).toBe(true);
-    expect(status.publishLabel).toMatch(/Preparar el archivo profesional/);
+    // One click: publishing prepares the master by itself and waits for it.
+    expect(status.publishLabel).toBe("Publicar en el portal y dar por resuelto");
+    expect(status.detail).toMatch(/se prepara solo/);
   });
 
   it("asks for the missing ProRes format on a legacy delivery", () => {
@@ -346,15 +348,19 @@ describe("ChangeRequestsPanel", () => {
     expect(load).toHaveBeenCalledWith(7);
   });
 
-  it("updates a configured master without invoking publication", () => {
+  it("publishes in ONE click when the master is pending, and keeps 'solo preparar' as a small link", () => {
     const prepare = vi.fn();
     const publish = vi.fn();
     renderPanel({ publication: { ...BASE_PUBLICATION, job_status: "pending_review", prores_pending: ["umg_master"] } },
       { prepareProRes: prepare, publishDeliveryUpdate: publish,
         crPublishNotice: { requestId: 7, tone: "error", text: "La cola no está disponible" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preparar el archivo profesional" }));
+    // The explicit "prepare without publishing" path still exists, but is not the main button.
+    fireEvent.click(screen.getByRole("button", { name: "Solo preparar el archivo profesional (sin publicar)" }));
     expect(prepare).toHaveBeenCalledWith("f7752c6feed4", 7);
     expect(publish).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Publicar en el portal y dar por resuelto" }));
+    expect(publish).toHaveBeenCalledWith("f7752c6feed4", "chile", 7, expect.objectContaining({ prores_pending: ["umg_master"] }));
+    expect(prepare).toHaveBeenCalledTimes(1);   // the main button no longer needs a separate prepare step
     expect(screen.getByRole("alert").closest("footer")).not.toBeNull();
   });
 
@@ -460,9 +466,9 @@ describe("ChangeRequestsPanel", () => {
       },
       { publishDeliveryUpdate: publish },
     );
-    fireEvent.click(screen.getByRole("button", { name: "Elegir formato y preparar el archivo profesional" }));
+    fireEvent.click(screen.getByRole("button", { name: "Elegir formato y publicar" }));
     expect(await screen.findByRole("dialog", {
-      name: "Configurar y actualizar el archivo profesional",
+      name: "Elegir el formato y publicar",
     })).toBeInTheDocument();
     expect(publish).not.toHaveBeenCalled();
   });

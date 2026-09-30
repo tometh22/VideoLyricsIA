@@ -366,7 +366,7 @@ def test_missing_prores_is_prepared_instead_of_returning_dead_end(
         patch("main.storage.object_exists", side_effect=object_exists),
         patch(
             "main.enqueue_prores_prewarm",
-            side_effect=lambda _job_id, file_type, *, force=False: (
+            side_effect=lambda _job_id, file_type, *, force=False, dedupe_live=False: (
                 f"rq:{file_type}" if force else None
             ),
         ) as enqueue,
@@ -383,7 +383,7 @@ def test_missing_prores_is_prepared_instead_of_returning_dead_end(
     assert body["missing"] == ["umg_master", "umg_short"]
     assert body["enqueued"] == ["umg_master", "umg_short"]
     assert enqueue.call_count == 2
-    assert all(call.kwargs == {"force": True} for call in enqueue.call_args_list)
+    assert all(call.kwargs == {"force": True, "dedupe_live": True} for call in enqueue.call_args_list)
 
 
 def test_youtube_only_job_requests_prores_configuration(
@@ -655,7 +655,7 @@ def test_portal_can_prepare_missing_prores_for_its_delivery(
         )
     assert res.status_code == 202, res.text
     assert res.json()["status"] == "queued"
-    enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True)
+    enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True, dedupe_live=True)
 
 
 def test_portal_can_prepare_staging_delivery_without_local_job(
@@ -1348,7 +1348,7 @@ def test_stale_prores_blocks_publication_instead_of_shipping_a_mismatched_pair(
         patch("main.storage.object_exists", return_value=True),
         patch(
             "main.enqueue_prores_prewarm",
-            side_effect=lambda _job_id, file_type, *, force=False: f"rq:{file_type}",
+            side_effect=lambda _job_id, file_type, *, force=False, dedupe_live=False: f"rq:{file_type}",
         ) as enqueue,
     ):
         res = client.post(
@@ -1361,7 +1361,7 @@ def test_stale_prores_blocks_publication_instead_of_shipping_a_mismatched_pair(
     assert body["status"] == "preparing_prores"
     assert body["stale"] == ["umg_master"]
     assert body["missing"] == ["umg_master"]
-    enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True)
+    enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True, dedupe_live=True)
 
 
 def test_publishing_a_corrected_cut_reopens_the_client_review(
@@ -1871,7 +1871,7 @@ def test_con_la_cola_libre_el_portal_sigue_preparando(
         )
     assert ok.status_code == 202, ok.text
     enqueue.assert_called_once()
-    assert enqueue.call_args.kwargs == {"force": True}
+    assert enqueue.call_args.kwargs == {"force": True, "dedupe_live": True}
 
 
 def test_sin_redis_el_freno_no_bloquea_el_portal(

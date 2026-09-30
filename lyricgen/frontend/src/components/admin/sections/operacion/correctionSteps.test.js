@@ -41,7 +41,8 @@ describe("correctionSteps: mapeo de las 5 etapas del servidor a 3 pasos", () => 
       ["done", "done", "active"], "Publicar en el portal y dar por resuelto", ["edit", "close"]],
     ["publish", ["edit", "resolve", "prepare_master"], { activeStep: 3 },
       { status: { canPublish: true }, publication: { prores_pending: ["umg_master"] } },
-      ["done", "done", "active"], "Preparar el archivo profesional", ["edit", "close"]],
+      // One click: publishing prepares the master by itself; "solo preparar" stays as a small link.
+      ["done", "done", "active"], "Publicar en el portal y dar por resuelto", ["prepare_only", "edit", "close"]],
     ["review", ["edit", "resolve", "analyze"], { activeStep: 3 }, {},
       ["done", "done", "done"], "Dar por resuelto", ["edit"]],
     ["resolved", ["reopen"], { activeStep: 5, tone: "done" }, { isResolved: true },
@@ -139,7 +140,7 @@ describe("correctionSteps: una única acción principal", () => {
       "Publicar actualización", "Marcar como resuelto", "Editar letra", "Revisá el motivo del bloqueo"]
       .forEach((old) => expect(labels.has(old), old).toBe(false));
     ["Corregir en el editor", "Revisar los cambios sugeridos", "Generar el video corregido",
-      "Publicar en el portal y dar por resuelto", "Preparar el archivo profesional",
+      "Publicar en el portal y dar por resuelto", "Solo preparar el archivo profesional (sin publicar)",
       "Reabrir pedido", "Ver el error", "Pedir sugerencia a la IA", "Editar letra a mano",
       "Cerrar sin publicar"].forEach((name) => expect(labels.has(name), name).toBe(true));
   });
@@ -187,7 +188,7 @@ describe("correctionSteps: una única acción principal", () => {
   it("pide elegir el formato del archivo profesional cuando falta configurarlo", () => {
     expect(correctionPrimary(workflow("publish", ["prepare_master"]), {
       publication: { prores_pending: ["m"] }, status: { needsProResSetup: true },
-    }).label).toBe("Elegir formato y preparar el archivo profesional");
+    }).label).toBe("Elegir formato y publicar");
   });
 
   it("una revisión bloqueante ocupa el lugar del principal y sólo si el llamador la indica", () => {
@@ -315,7 +316,7 @@ describe("the publish sentence keeps what the server knows about a pending propo
   });
   it("also keeps it when the professional master is still pending", () => {
     const sentence = correctionSentence({ key: "publish", detail }, { publication: { prores_pending: ["umg_master"] } });
-    expect(sentence).toMatch(/Falta preparar el archivo profesional/);
+    expect(sentence).toMatch(/el archivo profesional se prepara solo/);
     expect(sentence).toMatch(/La propuesta sigue pendiente:/);
   });
 });
