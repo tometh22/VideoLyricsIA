@@ -63,6 +63,21 @@ describe("campaign workspace", () => {
     await waitFor(() => expect(location()).toContain("song=item-1"));
   });
 
+  it("warns how many songs have a newer cut than the portal and filters them", async () => {
+    const api = createCampaignApi({ songs: [makeSong(1, "delivered", { portal_outdated: true }), makeSong(2, "delivered"), makeSong(3, "qc")] });
+    vi.stubGlobal("fetch", async (input, options) => {
+      const response = await api.fetchMock(input, options);
+      if (new URL(String(input), "http://test").pathname !== "/batch/campaigns/c1/pipeline") return response;
+      return json({ ...(await response.json()), flags: { portal_outdated: 1 } });
+    });
+    render(<MemoryRouter initialEntries={["/campaigns/c1"]}><Location /><Routes><Route path="/campaigns/:campaignId" element={<CampaignsPage />} /></Routes></MemoryRouter>);
+    expect(await screen.findByText(/canción tiene/)).toHaveTextContent("1 canción tiene un corte nuevo que todavía no se envió");
+    fireEvent.click(screen.getByRole("button", { name: "Ver la canción" }));
+    await waitFor(() => expect(location()).toContain("portal=outdated"));
+    expect(await screen.findByText("Canción 1")).toBeInTheDocument();
+    expect(screen.queryByText("Canción 2")).toBeNull();
+  });
+
   it("counts every song once with the same numbers in every tab", async () => {
     const api = createCampaignApi({ songs: [makeSong(1, "lyrics"), makeSong(2, "lyrics"), makeSong(3, "ready"), makeSong(4, "qc"), makeSong(5, "delivered"), makeSong(6, "discarded")] });
     mount(api);

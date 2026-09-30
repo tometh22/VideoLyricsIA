@@ -98,6 +98,7 @@ export default function CampaignDetailPage({ id }) {
   const kind = campaign?.kind || pipe.data?.kind || "lyric_video";
   const inboxEnabled = Boolean(pipe.data?.features?.change_requests_inbox);
   const openRequests = Number(pipe.data?.flags?.change_requests_open) || 0;
+  const outdatedCount = Number(pipe.data?.flags?.portal_outdated) || 0;
   const known = Boolean(campaign || pipe.data);
   const lyric = kind !== "art_track";
   const view = resolveView(params, kind);
@@ -377,6 +378,9 @@ export default function CampaignDetailPage({ id }) {
         const ids = songs.filter((song) => jobIds.includes(song.current_job_id)).map((song) => song.id);
         setView("approved"); setSelected(new Set(ids));
       }} />}
+    {outdatedCount > 0 && view !== "config" && view !== "changes" && <Banner tone="warning" action={<Button size="sm" onClick={() => updateParams({ view: null, portal: "outdated", song: null, focus: null }, { push: true })}>Ver {outdatedCount === 1 ? "la canción" : "las canciones"}</Button>}>
+      <strong>{outdatedCount}</strong> {outdatedCount === 1 ? "canción tiene" : "canciones tienen"} un corte nuevo que todavía no se envió: el portal del cliente sigue mostrando el anterior.
+    </Banner>}
     {pipe.data && pipe.data.portal_status_available === false && <Banner tone="warning">No pudimos consultar el portal del cliente: por ahora las entregas figuran como aprobadas.</Banner>}
     {pipe.error && known && <Banner tone="danger" action={<Button size="sm" onClick={refresh}>Reintentar</Button>}>No se pudo actualizar el estado: {pipe.error.message}</Banner>}
     {flash && <Banner tone={flash.tone} role={flash.tone === "danger" ? "alert" : "status"} action={<Button size="sm" variant="ghost" onClick={() => setFlash(null)}>Cerrar</Button>}>{flash.text}</Banner>}
