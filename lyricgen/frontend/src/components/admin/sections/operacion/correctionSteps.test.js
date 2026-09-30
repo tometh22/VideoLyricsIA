@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { getPublicationMode, setPublicationMode } from "./publicationMode";
 
 import {
   CORRECTION_STEPS,
@@ -274,5 +275,31 @@ describe("describePublishError", () => {
       .toContain("HTTP 400");
     expect(describePublishError(err(418, undefined, "Soy una tetera"))).toContain("HTTP 418");
     expect(describePublishError(new Error("boom"))).toContain("boom");
+  });
+});
+
+describe("wording follows the publication mode", () => {
+  afterEach(() => setPublicationMode("snapshot"));
+  const rendering = { key: "rendering", activeStep: 2 };
+
+  it("never promises that the portal keeps the old cut when it serves the newest render", () => {
+    setPublicationMode("snapshot");
+    expect(correctionSentence(rendering)).toMatch(/sigue mostrando el anterior/);
+    expect(describePublishError({ status: 503, detail: { code: "publication_storage_unavailable" } })).toMatch(/conserva la versión anterior/);
+
+    setPublicationMode("pointer");
+    const sentence = correctionSentence(rendering);
+    expect(sentence).toMatch(/cliente lo verá apenas termine/);
+    expect(sentence).not.toMatch(/sigue mostrando/);
+    expect(describePublishError({ status: 503, detail: { code: "publication_storage_unavailable" } })).not.toMatch(/copiar|conserva/);
+    expect(requestWorkflow({ publication: { job_status: "rendering" } }, null, true).detail).toMatch(/cliente verá el video nuevo/);
+  });
+
+  it("only the exact value 'pointer' switches the wording", () => {
+    setPublicationMode("pointer");
+    setPublicationMode(undefined);
+    expect(getPublicationMode()).toBe("snapshot");
+    setPublicationMode("anything-else");
+    expect(getPublicationMode()).toBe("snapshot");
   });
 });

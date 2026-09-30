@@ -18,6 +18,7 @@ import EnableProResModal from "../../../EnableProResModal";
 import ChangeRequestQueue from "./ChangeRequestQueue";
 import RequestWorkflowStepper from "./RequestWorkflowStepper";
 import RequestVideo from "./RequestVideo";
+import { byPublicationMode } from "./publicationMode";
 import {
   PORTAL_LABELS,
   correctionSteps,
@@ -57,9 +58,12 @@ export function publicationStatus(publication) {
     return {
       tone: "busy",
       title: "Re-renderizando",
-      detail:
-        "Mientras tanto el portal sigue entregando la versión anterior. " +
-        "Cuando termine, publicá la actualización desde acá.",
+      detail: byPublicationMode({
+        snapshot: "Mientras tanto el portal sigue entregando la versión anterior. " +
+          "Cuando termine, publicá la actualización desde acá.",
+        pointer: "El cliente verá el video nuevo apenas termine. " +
+          "Cuando termine, publicá la actualización desde acá para registrar la versión.",
+      }),
       canPublish: false,
     };
   }
@@ -94,9 +98,12 @@ export function publicationStatus(publication) {
     return {
       tone: "warn",
       title: "El render nuevo está listo para revisar",
-      detail:
-        "Abrí el video de esta tarjeta y comprobá el cambio. El portal sigue " +
-        "entregando el corte anterior hasta que publiques la actualización.",
+      detail: byPublicationMode({
+        snapshot: "Abrí el video de esta tarjeta y comprobá el cambio. El portal sigue " +
+          "entregando el corte anterior hasta que publiques la actualización.",
+        pointer: "Abrí el video de esta tarjeta y comprobá el cambio. El cliente ya descarga este corte: " +
+          "publicá para registrar la versión nueva y dar por resuelto el pedido.",
+      }),
       canPublish: true,
       publishLabel: "Publicar en el portal y dar por resuelto",
     };
@@ -201,7 +208,10 @@ export default function ChangeRequestsPanel({
   const [returnNotice, setReturnNotice] = useState(() => {
     if (typeof window === "undefined") return null;
     return new URLSearchParams(window.location.search).get("render_submitted") === "1"
-      ? "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el portal conserva el corte anterior hasta que lo publiques."
+      ? byPublicationMode({
+        snapshot: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el portal conserva el corte anterior hasta que lo publiques.",
+        pointer: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el cliente verá el video nuevo apenas termine.",
+      })
       : null;
   });
   const setDraft = (id, val) => setDrafts((d) => ({ ...d, [id]: val }));

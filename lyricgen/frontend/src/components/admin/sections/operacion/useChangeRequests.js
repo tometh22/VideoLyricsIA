@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useAdmin } from "../../AdminContext";
 import { API, fetchJson } from "../../adminApi";
 import { describePublishError } from "./changeRequestWorkflow";
+import { byPublicationMode, setPublicationMode } from "./publicationMode";
 
 const ACTIVE_RENDER_STATUSES = new Set([
   "queued", "processing", "rendering", "editing", "transcribed_pending",
@@ -148,6 +149,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       setCrPendingCount(data.pending_count || 0);
       setCrResolvedCount(data.resolved_count || 0);
       setCrProposalEnabled(data.proposal_enabled === true);
+      setPublicationMode(data.publication_mode);
       setCrProposalApplyEnabled(data.proposal_apply_enabled === true);
     } catch (err) {
       if (generation === listGenerationRef.current && requestedFilter === crStatusRef.current) {
@@ -416,7 +418,10 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         tone: "wait",
         text: data.deduplicated
           ? "Este pedido de fondo ya fue recibido. Consultá su resultado antes de solicitar otra opción; todavía no se publicó."
-          : "La regeneración empezó. El portal conserva el corte anterior: esperá a que termine, abrí el video nuevo y publicalo sólo si quedó bien.",
+          : byPublicationMode({
+            snapshot: "La regeneración empezó. El portal conserva el corte anterior: esperá a que termine, abrí el video nuevo y publicalo sólo si quedó bien.",
+            pointer: "La regeneración empezó. El cliente verá el fondo nuevo apenas termine: esperá a que termine, abrí el video nuevo y publicalo para registrarlo.",
+          }),
       });
       await loadChangeRequests({ silent: true });
       return data;

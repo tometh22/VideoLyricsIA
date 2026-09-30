@@ -1,3 +1,5 @@
+import { byPublicationMode } from "./publicationMode";
+
 export const PORTAL_LABELS = {
   argentina: "UMG Argentina",
   chile: "UMG Chile",
@@ -53,7 +55,10 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
   if (BUSY_JOB_STATUSES.has(publication.job_status)) {
     return {
       key: "rendering", activeStep: 2, label: "Generando corte nuevo",
-      detail: "El portal conserva la versión anterior hasta que revises y publiques.",
+      detail: byPublicationMode({
+        snapshot: "El portal conserva la versión anterior hasta que revises y publiques.",
+        pointer: "El cliente verá el video nuevo apenas termine. Después revisalo y publicá para registrar la versión.",
+      }),
       tone: "busy",
     };
   }
@@ -386,7 +391,10 @@ export function correctionSentence(workflow, ctx = {}) {
     case "render":
       return `La corrección está guardada, pero el video todavía es el anterior. Generá el video corregido.${manual}`;
     case "rendering":
-      return "Estamos generando el video nuevo. El portal sigue mostrando el anterior hasta que lo publiques.";
+      return byPublicationMode({
+        snapshot: "Estamos generando el video nuevo. El portal sigue mostrando el anterior hasta que lo publiques.",
+        pointer: "Estamos generando el video nuevo. El cliente lo verá apenas termine; después publicalo para registrar la versión.",
+      });
     case "blocked":
       return "No se pudo generar el video nuevo. Abrí el error para ver el motivo y no vuelvas a aplicar los cambios guardados.";
     case "publish":
@@ -445,7 +453,10 @@ export function describePublishError(error) {
     return "El video todavía se está guardando. Esperá un minuto, actualizá y reintentá.";
   }
   if (has("publication_storage_unavailable")) {
-    return "No se pudieron copiar los archivos al portal. El portal conserva la versión anterior; reintentá en un minuto.";
+    return byPublicationMode({
+      snapshot: "No se pudieron copiar los archivos al portal. El portal conserva la versión anterior; reintentá en un minuto.",
+      pointer: "No se pudo preparar la publicación. Reintentá en un minuto.",
+    });
   }
   if (has("prores_required", "prores_stale_without_spec")) {
     return "Falta preparar el archivo profesional antes de publicar. Usá “Preparar el archivo profesional”.";
