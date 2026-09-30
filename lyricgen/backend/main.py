@@ -12984,6 +12984,9 @@ async def approve_job(
                 "staging_manual_review_bypass": bool(
                     _delivery_gate.get("staging_manual_review_bypass")
                 ),
+                "staging_preflight_bypass": bool(
+                    _delivery_gate.get("staging_preflight_bypass")
+                ),
                 "archived_failed_attempts": _archived_n,
                 "tenant_id": job.tenant_id,
                 "owner_user_id": job.user_id,
@@ -13011,6 +13014,9 @@ async def approve_job(
             "warn_count": int(_qc_summary.get("warn_count") or 0),
             "staging_manual_review_bypass": bool(
                 _delivery_gate.get("staging_manual_review_bypass")
+            ),
+            "staging_preflight_bypass": bool(
+                _delivery_gate.get("staging_preflight_bypass")
             ),
         },
     ))
@@ -20695,6 +20701,9 @@ def admin_create_delivery_from_job(
             "resolved_change_requests": resolved_requests,
             "staging_manual_review_bypass": bool(
                 _umg_gate.get("staging_manual_review_bypass")
+            ),
+            "staging_preflight_bypass": bool(
+                _umg_gate.get("staging_preflight_bypass")
             ),
             "replaced_job_id": replaced_job_id,
             "previous_publication": previous_publication,
