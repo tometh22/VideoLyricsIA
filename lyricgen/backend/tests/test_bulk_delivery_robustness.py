@@ -140,3 +140,46 @@ def test_retry_refuses_completed_and_fresh_sending_operations(client, admin_toke
     atc.process_delivery_batch(op)
     done = client.post(f'/batch/delivery-operations/{op}/retry', headers=auth)
     assert done.status_code == 409 and done.json()['detail']['code'] == 'nothing_to_retry'
+
+
+def _age(op, seconds):
+    from datetime import datetime, timedelta, timezone
+    with SessionLocal() as db:
+        operation = db.get(DeliveryBatch, op)
+        operation.updated_at = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+        db.commit()
+
+
+def test_sweeper_requeues_a_stalled_operation_once(client, admin_token, monkeypatch, storage_ready):
+    _, first, second, op = _two_song_operation(client, admin_token, 'sweep')
+    queued = []
+    monkeypatch.setattr(atc, 'enqueue_delivery_batch', lambda operation_id: (queued.append(operation_id), True)[1])
+    monkeypatch.setattr(atc, '_delivery_batch_rq_state', lambda operation_id: None)
+    with SessionLocal() as db:
+        assert atc.reconcile_stalled_delivery_batches(db) == 0  # fresh: leave it alone
+        assert queued == []
+    _age(op, atc.STALL_AFTER_SECONDS + 60)
+    with SessionLocal() as db:
+        assert atc.reconcile_stalled_delivery_batches(db) == 1
+        assert queued == [op]
+        assert atc.reconcile_stalled_delivery_batches(db) == 0  # updated_at was refreshed
+        assert db.query(AuditLog).filter_by(action='delivery.batch_requeued').count() == 1
+
+
+def test_sweeper_never_duplicates_a_live_worker(client, admin_token, monkeypatch, storage_ready):
+    _, first, second, op = _two_song_operation(client, admin_token, 'live')
+    queued = []
+    monkeypatch.setattr(atc, 'enqueue_delivery_batch', lambda operation_id: (queued.append(operation_id), True)[1])
+    monkeypatch.setattr(atc, '_delivery_batch_rq_state', lambda operation_id: 'started')
+    _age(op, atc.STALL_AFTER_SECONDS + 60)
+    with SessionLocal() as db:
+        assert atc.reconcile_stalled_delivery_batches(db) == 0
+    assert queued == []
+
+
+def test_a_stalled_operation_is_reported_to_the_client(client, admin_token, storage_ready):
+    _, first, second, op = _two_song_operation(client, admin_token, 'flag')
+    auth = {'Authorization': f'Bearer {admin_token}'}
+    assert client.get(f'/batch/delivery-operations/{op}', headers=auth).json()['stalled'] is False
+    _age(op, atc.STALL_AFTER_SECONDS + 60)
+    assert client.get(f'/batch/delivery-operations/{op}', headers=auth).json()['stalled'] is True

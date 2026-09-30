@@ -752,6 +752,34 @@ def requeue_delivery_batch(operation_id: str) -> str:
     return "queued" if enqueue_delivery_batch(operation_id) else "unavailable"
 
 
+def reconcile_stalled_delivery_batches(db: Session, limit: int = 20) -> int:
+    """Re-schedule operations left queued/sending by a lost enqueue or a dead worker.
+
+    Called from the campaign reconciler. Safe to run every tick: an operation is
+    only touched when it has unfinished items, has not moved for
+    STALL_AFTER_SECONDS and has no live RQ job.
+    """
+    from datetime import timedelta
+    cutoff = _now() - timedelta(seconds=STALL_AFTER_SECONDS)
+    candidates = db.query(DeliveryBatch).filter(
+        DeliveryBatch.status.in_(("queued", "sending")), DeliveryBatch.updated_at < cutoff,
+    ).order_by(DeliveryBatch.updated_at.asc()).limit(limit).all()
+    requeued = 0
+    for operation in candidates:
+        unfinished = db.query(func.count(DeliveryBatchItem.id)).filter(
+            DeliveryBatchItem.delivery_batch_id == operation.id,
+            DeliveryBatchItem.status.in_(("pending", "failed")),
+        ).scalar() or 0
+        if not unfinished:
+            continue
+        outcome = requeue_delivery_batch(operation.id)
+        if outcome == "queued":
+            operation.status = "queued"; operation.updated_at = _now()
+            db.add(AuditLog(user_id=None, action="delivery.batch_requeued", detail={"delivery_batch_id": operation.id, "campaign_id": operation.campaign_id, "source": "reconciler", "unfinished_items": int(unfinished)}))
+            db.commit(); requeued += 1
+    return requeued
+
+
 @router.post("/art-track-delivery-operations/{operation_id}/retry")
 @router.post("/delivery-operations/{operation_id}/retry")
 def retry_delivery_batch(operation_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):

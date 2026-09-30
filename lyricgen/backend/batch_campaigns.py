@@ -2615,6 +2615,14 @@ def reconcile_batch_campaigns() -> dict[str, int]:
                 campaign.updated_at = _now()
                 db.commit()
         promoted = len(event_ids)
+        try:
+            from art_track_campaigns import reconcile_stalled_delivery_batches
+            reconcile_stalled_delivery_batches(db)
+        except Exception:
+            # A stuck portal send is recoverable by hand (retry endpoint); it
+            # must never stop the transcription feeder above.
+            db.rollback()
+            logger.exception("[BATCH] stalled delivery sweep failed")
     finally:
         db.close()
     from transactional_outbox import dispatch_outbox_event
