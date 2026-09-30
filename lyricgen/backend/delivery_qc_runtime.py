@@ -143,6 +143,21 @@ def staging_umg_manual_review_bypass_enabled(job: Any) -> bool:
     return bool(campaign_id and campaign_id in allowed_campaigns)
 
 
+def staging_umg_preflight_bypass_enabled(job: Any) -> bool:
+    """Opt into skipping the UMG preflight gate for one staging campaign.
+
+    This broader emergency bypass requires the existing campaign allowlist and
+    expiry, plus its own explicit switch. It never affects production or other
+    campaigns. Independent approval/publication requirements remain enforced
+    by their owning routes.
+    """
+    if not staging_umg_manual_review_bypass_enabled(job):
+        return False
+    return os.environ.get("DELIVERY_QC_UMG_STAGING_PREFLIGHT_BYPASS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def segments_hash(segments: Sequence[Mapping[str, Any]]) -> str:
     from transcription_quality import segments_hash as quality_segments_hash
     return quality_segments_hash([dict(row) for row in segments if isinstance(row, Mapping)])
@@ -473,6 +488,13 @@ def delivery_qc_source_fingerprint(job: Any) -> str:
 
 def delivery_readiness_gate(job: Any, report: Mapping[str, Any] | None, *, for_umg_delivery: bool = False) -> dict[str, Any]:
     required = for_umg_delivery or is_umg_delivery_job(job)
+    if required and staging_umg_preflight_bypass_enabled(job):
+        return {
+            "blocked": False, "can_approve": True,
+            "reason": "staging_preflight_bypass",
+            "staging_preflight_bypass": True,
+            "staging_manual_review_bypass": True,
+        }
     if required:
         if str(getattr(job, "status", "")) not in {"pending_review", "done", "rejected"} or not report or report.get("status") != "COMPLETE":
             return {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"}

@@ -144,19 +144,27 @@ also proposal-only unless an independent verifier confirms them.
 ### Temporary staging review-gate exception
 
 For an explicitly named staging campaign only, operators can temporarily skip
-the generic signed-review checklist when a **fresh** QC report exists. Objective
-blocking `FAIL`s, stale/missing reports, the independent language-discrepancy
-gate, required render files and ProRes freshness remain enforced. This is not a
-QC pass and does not alter production behavior. Each approval and portal publish
-records `staging_manual_review_bypass=true` in its audit event.
+the generic signed-review checklist when a **fresh** QC report exists. A second,
+independent emergency switch can skip the UMG preflight gate entirely for that
+same allowlisted campaign, including stale/missing reports and unresolved QC
+findings. This does not disable independent language-discrepancy, required-file,
+or ProRes readiness/freshness checks in approval and publication routes. Neither
+switch affects other campaigns or production. This is not a QC pass. Each
+approval and portal publish records the active bypass in its audit event.
 
-The exception is disabled unless all three staging environment variables are
-set: `DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS=1`,
+The manual-review exception is disabled unless all three staging environment
+variables are set: `DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS=1`,
 `DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS` containing the exact
 campaign IDs, and `DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_UNTIL_UTC` containing a
 timezone-aware UTC expiry. It fails closed outside `ENVIRONMENT=staging`, for
 unlisted campaigns, or after expiry. Remove the flag, IDs and expiry once the
 local review flow is ready; never add these variables to production.
+
+The broader preflight exception additionally requires
+`DELIVERY_QC_UMG_STAGING_PREFLIGHT_BYPASS=1` and all of the same scope, campaign,
+environment and expiry checks. It cannot operate by itself. Remove this switch
+alongside the original review-bypass configuration as soon as the campaign is
+published or the exception is no longer needed.
 
 The first rollout must measure precision per repair type and minutes of human
 correction saved.  Enforcement is enabled per repair type, never as one global

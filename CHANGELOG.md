@@ -3,6 +3,15 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.74] - 2026-09-30
+
+### Changed
+
+- Add a temporary, staging-only UMG preflight bypass requiring the existing
+  exact-campaign allowlist and UTC expiry. The bypass is separately switched,
+  audited at approval and publication, and leaves independent language,
+  required-file and ProRes checks in place.
+
 ## [1.1.73] - 2026-09-29
 
 ### Added
