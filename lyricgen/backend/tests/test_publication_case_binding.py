@@ -352,7 +352,7 @@ def test_pending_prores_concurrent_replays_release_locks_and_keep_portal_unchang
     # holding their own short DB transaction at this moment.
     real_enqueue_calls = []
 
-    def enqueue(_job_id, file_type, *, force=False):
+    def enqueue(_job_id, file_type, *, force=False, dedupe_live=False):
         assert force
         assert not thread_state.last_session.in_transaction()
         # Queue work must not run on the application loop.
