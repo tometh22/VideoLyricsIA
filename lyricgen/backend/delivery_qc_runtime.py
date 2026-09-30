@@ -7,7 +7,7 @@ be gated.  Observe mode is deliberately non-blocking.
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -110,13 +110,8 @@ def effective_delivery_qc_mode() -> str:
     return mode if mode in {"off", "observe", "enforce"} else "off"
 
 
-def staging_umg_manual_review_bypass_enabled(job: Any) -> bool:
-    """Opt into skipping only non-objective UMG review reminders in staging.
-
-    A fresh report is still mandatory, objective blocking FAILs still block,
-    and the campaign must be explicitly allowlisted. This is a temporary
-    operational escape hatch for a named staging campaign, never production.
-    """
+def _staging_umg_campaign_review_bypass_enabled(job: Any) -> bool:
+    """Existing campaign-scoped review bypass, also used by preflight bypass."""
     if os.environ.get("ENVIRONMENT", "").strip().lower() != "staging":
         return False
     if os.environ.get("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "").strip().lower() not in {
@@ -143,6 +138,40 @@ def staging_umg_manual_review_bypass_enabled(job: Any) -> bool:
     return bool(campaign_id and campaign_id in allowed_campaigns)
 
 
+def staging_umg_manual_review_bypass_enabled(job: Any) -> bool:
+    """Skip manual reminders in staging for an expiring campaign or job scope.
+
+    The job scope is deliberately separate from the legacy campaign scope:
+    enabling it must not inherit that campaign's broader preflight bypass.
+    Fresh QC and objective FAIL checks remain mandatory for the job scope.
+    """
+    if _staging_umg_campaign_review_bypass_enabled(job):
+        return True
+    if os.environ.get("ENVIRONMENT", "").strip().lower() != "staging":
+        return False
+    if os.environ.get("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        return False
+    try:
+        scope = json.loads(os.environ.get("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_JOB_SCOPE", ""))
+        campaign_id = str(scope["campaign_id"]).strip()
+        job_ids = scope["job_ids"]
+        expires_at = datetime.fromisoformat(str(scope["until_utc"]).replace("Z", "+00:00"))
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
+    if not isinstance(job_ids, list) or not 1 <= len(job_ids) <= 5:
+        return False
+    now = datetime.now(timezone.utc)
+    if expires_at.tzinfo is None or not now < expires_at <= now + timedelta(hours=2):
+        return False
+    return bool(
+        campaign_id
+        and campaign_id == str(getattr(job, "campaign_id", "") or "").strip()
+        and str(getattr(job, "job_id", "") or "").strip() in job_ids
+    )
+
+
 def staging_umg_preflight_bypass_enabled(job: Any) -> bool:
     """Opt into skipping the UMG preflight gate for one staging campaign.
 
@@ -151,7 +180,7 @@ def staging_umg_preflight_bypass_enabled(job: Any) -> bool:
     campaigns. Independent approval/publication requirements remain enforced
     by their owning routes.
     """
-    if not staging_umg_manual_review_bypass_enabled(job):
+    if not _staging_umg_campaign_review_bypass_enabled(job):
         return False
     return os.environ.get("DELIVERY_QC_UMG_STAGING_PREFLIGHT_BYPASS", "").strip().lower() in {
         "1", "true", "yes", "on",
