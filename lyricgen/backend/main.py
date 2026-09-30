@@ -655,6 +655,8 @@ from campaign_creative import router as campaign_creative_router
 app.include_router(campaign_creative_router)
 from campaign_pipeline import router as campaign_pipeline_router
 app.include_router(campaign_pipeline_router)
+from campaign_change_requests import router as campaign_change_requests_router
+app.include_router(campaign_change_requests_router)
 app.include_router(art_track_campaign_router)
 # Página de status pública (/service-status/*, sin auth) + redacción de
 # incidentes para admin (/admin/status/*). Ver status_page.py.

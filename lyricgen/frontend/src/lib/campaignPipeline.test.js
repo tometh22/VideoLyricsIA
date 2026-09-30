@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { displayCode, campaignCounts, campaignNextStep, doneCount, formatDuration, resolveView, stagesFor, totalOf } from "./campaignPipeline";
+import { businessHoursSince, changeSlaTone, displayCode, campaignCounts, campaignNextStep, doneCount, formatDuration, resolveView, stagesFor, totalOf } from "./campaignPipeline";
 
 const params = (query) => new URLSearchParams(query);
 
@@ -58,5 +58,24 @@ describe("displayCode", () => {
     expect(displayCode("ARF149800014")).toBe("ARF149800014");
     expect(displayCode("A89F72D8FD864CC1BC56C269B1A66E4D")).toBe("");
     expect(displayCode(null)).toBe("");
+  });
+});
+
+describe("change request SLA", () => {
+  const at = (text) => new Date(text).getTime();
+  it("counts business hours only, skipping the weekend", () => {
+    // Friday 18:00 -> Monday 06:00 local time: 6 h Friday + 6 h Monday.
+    const friday = new Date(2026, 8, 25, 18, 0).getTime();
+    const monday = new Date(2026, 8, 28, 6, 0).getTime();
+    expect(businessHoursSince(friday, monday)).toBeCloseTo(12, 5);
+    expect(businessHoursSince(new Date(2026, 8, 26, 9).getTime(), new Date(2026, 8, 27, 20).getTime())).toBe(0);
+    expect(businessHoursSince("nonsense", at("2026-09-30"))).toBe(0);
+    expect(businessHoursSince(at("2026-09-30T10:00:00"), at("2026-09-30T09:00:00"))).toBe(0);
+  });
+
+  it("warns at half the goal and alarms at the goal", () => {
+    expect(changeSlaTone(1)).toBe("neutral");
+    expect(changeSlaTone(24)).toBe("warning");
+    expect(changeSlaTone(48)).toBe("danger");
   });
 });

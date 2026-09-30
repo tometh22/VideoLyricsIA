@@ -13,6 +13,7 @@ import { RecordDeliveryDialog, SendToPortalDialog } from "./DeliveryDialogs";
 import DiscardDialog from "./DiscardDialog";
 import GenerateDialog, { generationSummary } from "./GenerateDialog";
 import PipelineBar from "./PipelineBar";
+import ClientChangesInbox from "./ClientChangesInbox";
 import SongDrawer from "./SongDrawer";
 import SongTable from "./SongTable";
 import StyleAssignment from "./StyleAssignment";
@@ -95,6 +96,8 @@ export default function CampaignDetailPage({ id }) {
   const pipe = useCampaignResource(`${prefix}pipeline`, ({ signal }) => campaignRequest(`${base}/pipeline`, { signal }));
   const campaign = head.data;
   const kind = campaign?.kind || pipe.data?.kind || "lyric_video";
+  const inboxEnabled = Boolean(pipe.data?.features?.change_requests_inbox);
+  const openRequests = Number(pipe.data?.flags?.change_requests_open) || 0;
   const known = Boolean(campaign || pipe.data);
   const lyric = kind !== "art_track";
   const view = resolveView(params, kind);
@@ -267,7 +270,7 @@ export default function CampaignDetailPage({ id }) {
   // Keyboard: J/K move, Enter acts, X selects, / searches, N next step.
   useEffect(() => {
     const onKey = (event) => {
-      if (event.metaKey || event.ctrlKey || event.altKey || dialog || drawerSong || help || view === "config") return;
+      if (event.metaKey || event.ctrlKey || event.altKey || dialog || drawerSong || help || view === "config" || view === "changes") return;
       if (document.querySelector("[role=dialog]")) return;
       const typing = isTyping(event.target);
       if (event.key === "Escape" && selected.size && !typing) { setSelected(new Set()); return; }
@@ -351,12 +354,14 @@ export default function CampaignDetailPage({ id }) {
       </div>
       <div className="flex flex-wrap items-center gap-2">
         {canManage && lyric && <Button variant="ghost" onClick={() => updateParams({ view: "config", section: "upload", song: null }, { push: true })}>Subir audios</Button>}
+        {(inboxEnabled || view === "changes") && <Button variant={view === "changes" ? "secondary" : "ghost"} aria-pressed={view === "changes"} onClick={() => (view === "changes" ? setView("all") : setView("changes"))}>
+          Cambios del cliente{openRequests > 0 && <span className="ml-1.5 rounded-full bg-amber-400/20 px-1.5 text-xs tabular-nums text-amber-200">{openRequests}</span>}</Button>}
         <Button variant={view === "config" ? "secondary" : "ghost"} onClick={() => (view === "config" ? setView("all") : updateParams({ view: "config", song: null }, { push: true }))} aria-pressed={view === "config"}>Configuración</Button>
         {next && !next.passive && <Button variant="primary" size="lg" onClick={runNextStep}>{next.label} <Kbd className="hidden sm:inline-flex">N</Kbd></Button>}
       </div>
     </header>
 
-    <PipelineBar counts={counts} kind={kind} value={view === "config" ? null : view} onChange={setView} loading={!pipe.data} />
+    <PipelineBar counts={counts} kind={kind} value={view === "config" || view === "changes" ? null : view} onChange={setView} loading={!pipe.data} />
 
     {approvedSong && <Banner tone="success" action={<div className="flex gap-2">
       {nextAfterApproval && <Button size="sm" variant="primary" onClick={() => openReview(nextAfterApproval)}>Revisar siguiente: {nextAfterApproval.title}</Button>}
@@ -376,7 +381,9 @@ export default function CampaignDetailPage({ id }) {
     {pipe.error && known && <Banner tone="danger" action={<Button size="sm" onClick={refresh}>Reintentar</Button>}>No se pudo actualizar el estado: {pipe.error.message}</Banner>}
     {flash && <Banner tone={flash.tone} role={flash.tone === "danger" ? "alert" : "status"} action={<Button size="sm" variant="ghost" onClick={() => setFlash(null)}>Cerrar</Button>}>{flash.text}</Banner>}
 
-    {view === "config" && campaign
+    {view === "changes"
+      ? <ClientChangesInbox campaignId={id} isAdmin={Boolean(pipe.data?.is_admin)} onOpenSong={(songId) => updateParams({ song: songId }, { push: true })} />
+      : view === "config" && campaign
       ? <CampaignSettings campaign={campaign} section={section} onSection={(value) => updateParams({ section: value })} canManage={canManage} isAdmin={canManage}
         creative={creative.data} report={report.data} lyrics={lyrics.data} onChanged={refresh} remaining={Math.max(0, 1000 - (pipe.data?.total || 0))}
         onUploaded={(summary) => { void refresh(); if (summary?.uploaded) setFlash({ tone: "success", text: `${summary.uploaded} audios subidos. La transcripción arranca sola.` }); }} />
@@ -397,7 +404,7 @@ export default function CampaignDetailPage({ id }) {
               : view === "all" && canManage && lyric ? <Button size="sm" variant="primary" onClick={() => updateParams({ view: "config", section: "upload" }, { push: true })}>Subir audios</Button> : null} />} />
       </section>}
 
-    {view !== "config" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
+    {view !== "config" && view !== "changes" && <BulkActionBar songs={selectedVisible} kind={kind} canManage={canManage} portalSends={portalSends} hiddenCount={hiddenSelected} onClear={() => setSelected(new Set())} onAction={onBulk} />}
 
     {drawerSong && <SongDrawer song={drawerSong} kind={kind} campaignId={id} canManage={canManage} portalSends={portalSends}
       reviewerEnabled={campaign?.reviewer_campaign_status?.enabled === true}

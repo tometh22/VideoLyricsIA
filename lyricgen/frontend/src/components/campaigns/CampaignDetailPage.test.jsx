@@ -33,6 +33,36 @@ const tab = (name) => screen.getByRole("tab", { name: new RegExp(`^${name}`) });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); clearCampaignResourceCache(); localStorage.clear(); });
 
 describe("campaign workspace", () => {
+  it("offers the client changes inbox only when the backend enables it and opens it as its own view", async () => {
+    const off = createCampaignApi({ songs: [makeSong(1, "qc")] });
+    mount(off);
+    await screen.findByText("Canción 1");
+    expect(screen.queryByRole("button", { name: /Cambios del cliente/ })).toBeNull();
+    cleanup(); clearCampaignResourceCache();
+
+    const api = createCampaignApi({ songs: [makeSong(1, "qc")] });
+    const change = { id: 7, delivery_id: 70, portal_id: "chile", job_id: "j1", song_id: "item-1", artist: "Artista", song: "Canción 1", comment: "Cambiar la palabra final",
+      submitted_at: new Date().toISOString(), updated_at: new Date().toISOString(), resolved_at: null, published_revision: 2, client_approval: "pending",
+      step: { key: "correct", tone: "idle", label: "Sin atender" } };
+    vi.stubGlobal("fetch", async (input, options) => {
+      const path = new URL(String(input), "http://test").pathname;
+      if (path === "/batch/campaigns/c1/change-requests") return json({ campaign_id: "c1", available: true, counts: { open: 1, resolved: 0, oldest_open_at: null }, items: [change], next_cursor: null });
+      const response = await api.fetchMock(input, options);
+      if (path !== "/batch/campaigns/c1/pipeline") return response;
+      return json({ ...(await response.json()), features: { change_requests_inbox: true }, flags: { change_requests_open: 1 }, is_admin: true });
+    });
+    render(<MemoryRouter initialEntries={["/campaigns/c1"]}><Location /><Routes><Route path="/campaigns/:campaignId" element={<CampaignsPage />} /></Routes></MemoryRouter>);
+    const button = await screen.findByRole("button", { name: /Cambios del cliente/ });
+    expect(button).toHaveTextContent("1");
+    fireEvent.click(button);
+    expect(await screen.findByText("Cambiar la palabra final")).toBeInTheDocument();
+    expect(location()).toContain("view=changes");
+    expect(screen.getByRole("link", { name: "Resolver en Admin →" })).toHaveAttribute("href", "/admin?section=cambios&change_request_id=7");
+    expect(screen.queryByRole("button", { name: /Generar|Enviar/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Ver canción" }));
+    await waitFor(() => expect(location()).toContain("song=item-1"));
+  });
+
   it("counts every song once with the same numbers in every tab", async () => {
     const api = createCampaignApi({ songs: [makeSong(1, "lyrics"), makeSong(2, "lyrics"), makeSong(3, "ready"), makeSong(4, "qc"), makeSong(5, "delivered"), makeSong(6, "discarded")] });
     mount(api);
