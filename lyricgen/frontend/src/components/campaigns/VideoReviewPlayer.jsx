@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useMediaUrl } from "../../mediaUrl";
 import { campaignPost } from "../../lib/campaignApi";
-import { portalLabel } from "../../lib/campaignPipeline";
+import { displayCode, portalLabel } from "../../lib/campaignPipeline";
 import { Button, Chip, Kbd, Modal } from "./ui";
 
 function isTyping(target) {
@@ -74,7 +74,7 @@ export default function VideoReviewPlayer({ queue, startId, onClose, onApproved,
         <div className="min-w-0">
           <p className="text-[11px] font-semibold uppercase tracking-[.18em] text-brand-light">Revisión de video · {index + 1} de {queue.length}{remaining ? ` · ${remaining} por aprobar` : ""}</p>
           <h2 className="mt-1 truncate text-xl font-semibold">{song.title}</h2>
-          <p className="text-sm text-ink-secondary">{song.artist}{song.technical_code ? ` · ${song.technical_code}` : ""}</p>
+          <p className="text-sm text-ink-secondary">{song.artist}{displayCode(song.technical_code) ? ` · ${displayCode(song.technical_code)}` : ""}</p>
           <div className="mt-2 flex flex-wrap gap-1.5">
             {approvedIds.has(song.id) && <Chip tone="success">Aprobado</Chip>}
             {song.portals?.length > 0 && <Chip tone="brand">En {song.portals.map(portalLabel).join(" y ")}</Chip>}

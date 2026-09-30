@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { campaignCounts, campaignNextStep, doneCount, formatDuration, resolveView, stagesFor, totalOf } from "./campaignPipeline";
+import { displayCode, campaignCounts, campaignNextStep, doneCount, formatDuration, resolveView, stagesFor, totalOf } from "./campaignPipeline";
 
 const params = (query) => new URLSearchParams(query);
 
@@ -50,5 +50,13 @@ describe("campaign pipeline vocabulary", () => {
     expect(formatDuration(149.6)).toBe("2:30");
     expect(formatDuration(null)).toBe("—");
     expect(formatDuration(0)).toBe("—");
+  });
+});
+
+describe("displayCode", () => {
+  it("shows catalog codes and hides content hashes", () => {
+    expect(displayCode("ARF149800014")).toBe("ARF149800014");
+    expect(displayCode("A89F72D8FD864CC1BC56C269B1A66E4D")).toBe("");
+    expect(displayCode(null)).toBe("");
   });
 });

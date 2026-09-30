@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import useDialogA11y from "../../hooks/useDialogA11y";
 import { campaignRequest } from "../../lib/campaignApi";
-import { formatDuration, portalLabel, relativeDate, stageMeta, stagesFor, toneOf } from "../../lib/campaignPipeline";
+import { displayCode, formatDuration, portalLabel, relativeDate, stageMeta, stagesFor, toneOf } from "../../lib/campaignPipeline";
 import CampaignReviewWork from "../CampaignReviewWork";
 import { CampaignReviewerRow } from "../CampaignReviewerStatus";
 import { canDiscard, canSend, primaryAction, statusNote } from "./songModel";
@@ -83,7 +83,7 @@ export default function SongDrawer({ song, kind, campaignId, canManage, portalSe
           <div className="min-w-0">
             <p className="text-[11px] font-semibold uppercase tracking-[.18em] text-ink-secondary">Canción #{song.ordinal}</p>
             <h2 className="mt-1 break-words text-lg font-semibold leading-tight">{song.title}</h2>
-            <p className="mt-0.5 text-sm text-ink-secondary">{song.artist || "Artista sin informar"}{song.technical_code ? ` · ${song.technical_code}` : ""}</p>
+            <p className="mt-0.5 text-sm text-ink-secondary">{song.artist || "Artista sin informar"}{displayCode(song.technical_code) ? ` · ${displayCode(song.technical_code)}` : ""}</p>
           </div>
           <Button variant="ghost" size="sm" onClick={onClose} aria-label="Cerrar detalle">✕</Button>
         </div>
@@ -144,7 +144,7 @@ export default function SongDrawer({ song, kind, campaignId, canManage, portalSe
             : <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1.5 text-sm">
               <dt className="text-ink-secondary">Archivo</dt><dd className="truncate" title={song.filename}>{song.filename}</dd>
               <dt className="text-ink-secondary">Duración</dt><dd className="tabular-nums">{formatDuration(song.duration_seconds)}</dd>
-              <dt className="text-ink-secondary">Código</dt><dd className="font-mono">{song.technical_code || "—"}</dd>
+              <dt className="text-ink-secondary">Código</dt><dd className="break-all font-mono text-xs leading-5">{song.technical_code || "—"}</dd>
               {song.uploaded_at && <><dt className="text-ink-secondary">Subida</dt><dd>{relativeDate(song.uploaded_at)}</dd></>}
               {song.approved_at && <><dt className="text-ink-secondary">Aprobada</dt><dd>{relativeDate(song.approved_at)}{song.approved_by_name ? ` · ${song.approved_by_name}` : ""}</dd></>}
             </dl>}

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLazyMediaUrl } from "../../mediaUrl";
-import { formatDuration, portalLabel, stageMeta } from "../../lib/campaignPipeline";
+import { displayCode, formatDuration, portalLabel, stageMeta } from "../../lib/campaignPipeline";
 import { primaryAction, statusNote } from "./songModel";
 import { Button, Chip, EmptyState, Skeleton, StageBadge } from "./ui";
 
@@ -136,7 +136,7 @@ export default function SongTable({
                 {showThumbs && <Thumbnail song={song} />}
                 <div className="min-w-0">
                   <button type="button" onClick={() => onOpen(song)} className="block max-w-full truncate text-left font-medium text-white hover:underline focus-visible:underline focus-visible:outline-none">{song.title}</button>
-                  <p className="truncate text-xs text-ink-secondary">{song.artist || "Artista sin informar"}{song.technical_code ? <span className="text-ink-secondary/60"> · {song.technical_code}</span> : null}</p>
+                  <p className="truncate text-xs text-ink-secondary">{song.artist || "Artista sin informar"}{displayCode(song.technical_code) ? <span className="text-ink-secondary/60"> · {displayCode(song.technical_code)}</span> : null}</p>
                 </div>
               </div>
             </td>
