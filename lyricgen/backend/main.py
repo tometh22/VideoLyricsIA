@@ -11449,11 +11449,47 @@ def status(
     # límite" instead of a remaining count.
     _is_admin = current_user.get("role") == "admin"
     campaign_context = None
+    delivery_qc = job.get("delivery_qc")
+    # Approval is polled from this endpoint, so calculate the live server gate
+    # here instead of returning the snapshot cached inside an older QC report.
+    # In particular, a temporary staging campaign bypass must be reflected in
+    # the UI even when the stored report is stale or missing; otherwise the
+    # backend allows approval but the disabled button prevents the request.
+    needs_live_qc_gate = bool(
+        job.get("workload_class") == "batch"
+        or job.get("campaign_id")
+        or job.get("delivery_profile") in {"umg", "both"}
+        or job.get("umg_spec")
+    )
+    qc_job_model = None
+    if needs_live_qc_gate:
+        qc_job_query = db.query(Job).filter(Job.job_id == job_id)
+        if current_user.get("role") != "admin":
+            qc_job_query = qc_job_query.filter(
+                Job.tenant_id == current_user["tenant_id"],
+            )
+        qc_job_model = qc_job_query.first()
+    if qc_job_model is not None:
+        from delivery_qc_runtime import delivery_readiness_gate
+        live_gate = delivery_readiness_gate(qc_job_model, delivery_qc)
+        if live_gate.get("staging_preflight_bypass"):
+            # Old findings refer to the previous cut and are not evidence for
+            # the current render. Return an explicit status so the reviewer
+            # sees why approval is enabled, without presenting stale findings.
+            delivery_qc = {
+                "status": "BYPASSED",
+                "mode": "staging_campaign_bypass",
+                "issues": [],
+                "checks": [],
+                "approval": live_gate,
+                "staging_preflight_bypass": True,
+            }
+        elif isinstance(delivery_qc, dict):
+            delivery_qc = {**delivery_qc, "approval": live_gate}
     if job.get("workload_class") == "batch":
         from batch_campaigns import context_for_job
-        job_model = db.query(Job).filter(Job.job_id == job_id).first()
-        if job_model is not None:
-            campaign_context = context_for_job(db, job_model)
+        if qc_job_model is not None:
+            campaign_context = context_for_job(db, qc_job_model)
     return {
         "job_id": job["job_id"],
         "parent_job_id": job.get("parent_job_id"),
@@ -11535,7 +11571,7 @@ def status(
         # endpoint.  Returning it here is essential: /jobs is only the list
         # bootstrap, while a refresh and every render/edit completion hydrate
         # the editor from /status/{job_id}.
-        "delivery_qc": job.get("delivery_qc"),
+        "delivery_qc": delivery_qc,
         "bg_r2_key_cached": job.get("bg_r2_key_cached"),
         # Approval state. JobDetail uses these to render the "Aprobado"
         # badge and to gate the "Enviar a UMG" button (admin-only). Both

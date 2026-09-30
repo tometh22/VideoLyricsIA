@@ -3,6 +3,15 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.75] - 2026-09-30
+
+### Fixed
+
+- Return the live UMG approval gate from the job status endpoint, so an
+  authorized campaign-scoped staging bypass is reflected in the review UI.
+- Label the temporary preflight bypass clearly and hide stale-cut findings
+  while preserving the independent lyric, file, and ProRes gates.
+
 ## [1.1.74] - 2026-09-30
 
 ### Changed

@@ -21,6 +21,17 @@ const job = {
 };
 
 describe("DeliveryQCPanel", () => {
+  it("explica el bypass temporal de staging sin mostrar hallazgos del corte anterior", () => {
+    render(<DeliveryQCPanel job={{ job_id: "abc123", delivery_qc: {
+      status: "BYPASSED", mode: "staging_campaign_bypass", issues: [], checks: [],
+      approval: { blocked: false, can_approve: true, staging_preflight_bypass: true },
+    } }} forUmgDelivery />);
+    expect(screen.getByText("Omitido temporalmente")).toBeInTheDocument();
+    expect(screen.getByTestId("delivery-qc-staging-bypass")).toHaveTextContent("La aprobación de letra");
+    expect(screen.queryByText("Actualizar preflight")).not.toBeInTheDocument();
+    expect(screen.queryByText("Hallazgo de otro corte")).not.toBeInTheDocument();
+  });
+
   it("permite iniciar el preflight UMG aunque todavía no haya reporte", async () => {
     const onJobUpdate = vi.fn();
     const report = { status: "COMPLETE", mode: "enforce", issues: [] };
