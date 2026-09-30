@@ -150,7 +150,7 @@ export default function SongTable({
             {showDuration && <td className="hidden tabular-nums text-ink-secondary md:py-3 md:pr-3 xl:table-cell">{formatDuration(song.duration_seconds)}</td>}
             <td className="col-start-3 row-span-2 row-start-1 md:py-3 md:pr-4">
               <div className="flex items-center justify-end gap-1.5">
-                {action && <Button size="sm" variant={["review", "play", "generate", "send"].includes(action.key) ? "primary" : "secondary"}
+                {action && <Button size="sm" variant={["review", "play", "generate", "send"].includes(action.key) ? "soft" : "secondary"}
                   disabled={busy} onClick={() => onAction(song, action.key)} aria-label={`${action.label} · ${song.title}`}>{action.label}</Button>}
                 <Button size="sm" variant="ghost" onClick={() => onOpen(song)} aria-label={`Detalle de ${song.title}`} className="!px-2">
                   <span aria-hidden="true">›</span>

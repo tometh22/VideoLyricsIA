@@ -7,6 +7,7 @@ import { stageMeta, toneOf } from "../../lib/campaignPipeline";
 
 const BUTTON = {
   primary: "bg-brand text-white shadow-[0_8px_24px_rgba(117,87,255,.28)] hover:bg-[#6a4cf5] disabled:shadow-none",
+  soft: "bg-brand/15 text-violet-100 ring-1 ring-brand/30 hover:bg-brand/25",
   secondary: "bg-white/[0.06] text-white ring-1 ring-white/10 hover:bg-white/[0.1]",
   ghost: "text-ink-secondary hover:bg-white/[0.06] hover:text-white",
   danger: "bg-red-500/15 text-red-100 ring-1 ring-red-400/25 hover:bg-red-500/25",

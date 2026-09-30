@@ -218,6 +218,16 @@ describe("campaign workspace", () => {
     expect(screen.queryByRole("dialog", { name: "Descartar canción" })).not.toBeInTheDocument();
   });
 
+  it("opens the song drawer from a shared link and closes it with Escape", async () => {
+    const api = createCampaignApi({ songs: [makeSong(1, "lyrics"), makeSong(2, "qc")] });
+    mount(api, "/campaigns/c1?view=lyrics&song=i2");
+    const drawer = await screen.findByRole("dialog", { name: "Canción Canción 2" });
+    expect(within(drawer).getByText("Video por revisar", { selector: "span" })).toBeInTheDocument();
+    fireEvent.keyDown(drawer, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(location()).not.toContain("song=");
+  });
+
   it("moves through songs with the keyboard and acts with Enter", async () => {
     const api = createCampaignApi({ songs: [makeSong(1, "lyrics"), makeSong(2, "lyrics")] });
     mount(api, "/campaigns/c1?view=lyrics");
