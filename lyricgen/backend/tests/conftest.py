@@ -57,6 +57,9 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///test.db")
 os.environ["JWT_SECRET"] = "test-secret-key-for-tests"
 os.environ["ADMIN_PASSWORD"] = "testadmin123"
 os.environ["RATE_LIMIT_ENABLED"] = "false"
+# La revisión rápida busca la letra oficial en lrclib en segundo plano; los
+# tests nunca salen a la red.
+os.environ.setdefault("LYRIC_REVIEW_FETCH_OFFICIAL", "0")
 os.environ.setdefault("QUALITY_LEARNING_HMAC_KEY_ID", "test-v1")
 os.environ.setdefault(
     "QUALITY_LEARNING_HMAC_KEY", "quality-test-key-0123456789-ABCDEF",

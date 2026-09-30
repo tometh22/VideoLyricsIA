@@ -1216,13 +1216,16 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  background_policy_fingerprint: str | None = None,
                  # Art track ("official audio"): background_path es un COVER
                  # (imagen). El pipeline saltea transcripción, alineado y
-                 # generación de fondo AI; compone el cover (blur + centrado +
-                 # zoom sutil) y rinde SIN letra. delivery_profile sigue
+                 # generación de fondo AI; compone la portada y rinde SIN
+                 # letra. delivery_profile sigue
                  # funcionando (youtube/umg/both). Default False = lyric video.
                  art_track: bool = False,
                  # Línea legal opcional en pantalla (art tracks): ej.
                  # "℗ 2026 Universal Music Chile". Vacía = no se dibuja.
                  label_line: str = "",
+                 # Visual style for art tracks. The historical waveform style
+                 # remains the default; Colombia's fixed frame is opt-in.
+                 art_track_preset: str = "waveform",
                  # Canonical allowlisted batch contract. Individual fields
                  # above remain for backwards compatibility; this object is
                  # persisted verbatim (after API validation) for audit/retry.
@@ -1420,6 +1423,9 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
 
     wants_youtube = delivery_profile in ("youtube", "both")
     wants_umg = delivery_profile in ("umg", "both")
+    if art_track and art_track_preset not in ART_TRACK_PRESETS:
+        update_job(job_id, status="error", error="Unknown Art Track visual preset")
+        return
 
     # P3 2026-07-17: validación observe en paralelo con el encode. Se
     # inicializan ANTES del try para que el join del happy-path y el join
@@ -1459,7 +1465,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             _persist_segments = False
             try:
                 from jobs import merge_render_params
-                _params = {"art_track": True}
+                _params = {"art_track": True, "art_track_preset": art_track_preset}
                 if (label_line or "").strip():
                     _params["label_line"] = label_line.strip()
                 merge_render_params(job_id, _params)
@@ -2307,10 +2313,11 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 title_song_break=title_song_break,
                 # Multi-escena: el fondo ya es un timeline del largo completo.
                 bg_prelooped=_scenes_active,
-                # Art track: compone el cover (blur + tarjeta + onda reactiva)
-                # y rinde sin letra. bg_image_path es el cover (imagen).
+                # Art track: compone el cover con el preset visual elegido y
+                # rinde sin letra. bg_image_path es el cover (imagen).
                 art_track=art_track,
                 label_line=label_line,
+                art_track_preset=art_track_preset,
                 # "Quieta de verdad": si el fondo entregado es una IMAGEN y el
                 # operador eligió Estático o Foto fija, no le metemos el zoom
                 # del 15%. Foto fija conserva el código legacy foto-parallax.
@@ -2366,6 +2373,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         mp3_path, bg_source, job_dir, spec=_short_spec,
                         artist=artist, song_title=song_title,
                         label_line=label_line, effect=effect,
+                        art_track_preset=art_track_preset,
                     )
                 else:
                     generate_short(
@@ -2411,6 +2419,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     generate_art_track_thumbnail(
                         bg_source, mp3_path, job_dir, artist=artist,
                         song_title=song_title, label_line=label_line,
+                        art_track_preset=art_track_preset,
                     )
                 else:
                     generate_thumbnail(
@@ -17222,11 +17231,193 @@ def _build_art_track_base(cover_path: str, out_path: str, *,
     return out_path
 
 
+ART_TRACK_PRESETS = frozenset({"waveform", "colombia_static"})
+
+
+def _build_art_track_colombia_base(cover_path: str, out_path: str, *,
+                                   spec: "RenderSpec", artist: str,
+                                   song_title: str, label_line: str = "") -> str:
+    """Fixed official-audio frame: cover left, text right, blurred cover fill.
+
+    The portrait derivative stacks the same elements. No reactive waveform,
+    particle effect, animation, or third-party watermark is drawn.
+    """
+    from PIL import ImageEnhance, ImageFilter, ImageOps
+    import numpy as np
+
+    W, H = spec.width, spec.height
+    portrait = H > W
+    cover = Image.open(cover_path).convert("RGB")
+    bg = ImageOps.fit(cover, (W, H), method=Image.LANCZOS)
+    bg = bg.filter(ImageFilter.GaussianBlur(max(24, H // 12)))
+    bg = ImageEnhance.Brightness(bg).enhance(0.43).convert("RGBA")
+    # Give the title a dark, even field without flattening the cover colors.
+    if portrait:
+        alpha = np.linspace(12, 95, H, dtype=np.uint8)[:, None]
+        alpha = np.broadcast_to(alpha, (H, W))
+    else:
+        alpha = np.linspace(8, 115, W, dtype=np.uint8)[None, :]
+        alpha = np.broadcast_to(alpha, (H, W))
+    shade = np.zeros((H, W, 4), dtype=np.uint8)
+    shade[:, :, 3] = alpha
+    base = Image.alpha_composite(bg, Image.fromarray(shade, "RGBA"))
+
+    card_size = int((W * 0.72) if portrait else (H * 0.73))
+    card_x = (W - card_size) // 2 if portrait else int(W * 0.055)
+    card_y = int(H * 0.13) if portrait else (H - card_size) // 2
+    card = ImageOps.fit(cover, (card_size, card_size), method=Image.LANCZOS)
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow)
+    offset = max(6, int(H * 0.012))
+    shadow_draw.rectangle(
+        (card_x + offset, card_y + offset,
+         card_x + card_size + offset, card_y + card_size + offset),
+        fill=(0, 0, 0, 180),
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(max(14, int(H * 0.025))))
+    base = Image.alpha_composite(base, shadow)
+    base.alpha_composite(card.convert("RGBA"), (card_x, card_y))
+    draw = ImageDraw.Draw(base)
+
+    def font(size: int, bold: bool = False):
+        filename = "Montserrat-ExtraBold.ttf" if bold else "Montserrat-Bold.ttf"
+        try:
+            return ImageFont.truetype(os.path.join(_FONTS_DIR, filename), size)
+        except Exception:
+            return ImageFont.load_default()
+
+    text_x = W // 2 if portrait else int(W * 0.52)
+    max_width = int(W * (0.84 if portrait else 0.42))
+    title = spanish_smart_title((song_title or "").strip())
+    title_size = max(30, int((W if portrait else H) * (0.058 if portrait else 0.069)))
+    min_title_size = max(20, int(title_size * 0.50))
+
+    def title_lines(size: int):
+        face = font(size, bold=True)
+        lines = []
+        for word in title.split():
+            candidate = f"{lines[-1]} {word}" if lines else word
+            if lines and draw.textlength(candidate, font=face) > max_width:
+                lines.append(word)
+            elif lines:
+                lines[-1] = candidate
+            else:
+                lines.append(word)
+        return lines or [""], face
+
+    while title_size > min_title_size:
+        lines, title_font = title_lines(title_size)
+        if len(lines) <= 3 and all(draw.textlength(line, font=title_font) <= max_width for line in lines):
+            break
+        title_size -= 2
+    lines, title_font = title_lines(title_size)
+    artist_text = (artist or "").strip()
+    artist_size = max(22, int((W if portrait else H) * (0.038 if portrait else 0.039)))
+    artist_font = font(artist_size)
+    while artist_size > 18 and draw.textlength(artist_text, font=artist_font) > max_width:
+        artist_size -= 2
+        artist_font = font(artist_size)
+    artist_lines = [artist_text]
+    if artist_text and draw.textlength(artist_text, font=artist_font) > max_width:
+        words = artist_text.split()
+        artist_lines = []
+        for word in words:
+            candidate = f"{artist_lines[-1]} {word}" if artist_lines else word
+            if artist_lines and draw.textlength(candidate, font=artist_font) > max_width:
+                artist_lines.append(word)
+            elif artist_lines:
+                artist_lines[-1] = candidate
+            else:
+                artist_lines.append(word)
+    title_step = int(title_size * 1.16)
+    gap = int((W if portrait else H) * (0.025 if portrait else 0.030))
+    artist_step = int(artist_size * 1.18)
+    group_height = len(lines) * title_step + (gap + len(artist_lines) * artist_step if artist_text else 0)
+    top = int(H * 0.60) if portrait else (H - group_height) // 2
+    anchor = "ma" if portrait else "la"
+
+    def text(y: int, value: str, face, fill):
+        draw.text((text_x + 2, y + 3), value, font=face,
+                  fill=(0, 0, 0, 175), anchor=anchor)
+        draw.text((text_x, y), value, font=face, fill=fill, anchor=anchor)
+
+    for line in lines:
+        if line:
+            text(top, line, title_font, (255, 255, 255, 255))
+        top += title_step
+    if artist_text:
+        for index, artist_line in enumerate(artist_lines):
+            text(top + gap + index * artist_step, artist_line,
+                 artist_font, (232, 232, 236, 255))
+
+    if (label_line or "").strip():
+        # Montserrat lacks U+2117 (the phonogram ℗ mark), which is required
+        # in label credits. The bundled Roboto face includes that glyph.
+        legal_size = max(14, int(H * 0.018))
+        try:
+            legal_font = ImageFont.truetype(
+                os.path.join(_FONTS_DIR, "Roboto-Bold.ttf"), legal_size)
+        except Exception:
+            legal_font = font(legal_size)
+        legal_x = W // 2 if portrait else text_x
+        legal_anchor = "ma" if portrait else "la"
+        draw.text((legal_x, int(H * 0.94)), label_line.strip(),
+                  font=legal_font, fill=(220, 220, 225, 170), anchor=legal_anchor)
+
+    base.convert("RGB").save(out_path)
+    return out_path
+
+
+def _render_art_track_colombia(cover_path: str, mp3_path: str, job_dir: str, *,
+                               spec: "RenderSpec", artist: str, song_title: str,
+                               duration: float, out_name: str | None = None,
+                               win_start: float = 0.0,
+                               win_dur: float | None = None,
+                               label_line: str = "") -> str:
+    """Loop one fixed frame for the exact audio window, with no waveform work."""
+    dur = float(win_dur) if win_dur else float(duration)
+    stem = (out_name or "art").replace(".mp4", "").replace(".mov", "")
+    base_path = os.path.join(job_dir, stem + "_colombia_base.png")
+    _build_art_track_colombia_base(
+        cover_path, base_path, spec=spec, artist=artist,
+        song_title=song_title, label_line=label_line,
+    )
+    out_path = os.path.join(job_dir, out_name or f"lyric_video.{spec.container}")
+    if spec.codec == "libx264":
+        vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-pix_fmt", spec.pix_fmt]
+    elif spec.codec == "prores_ks":
+        vargs = ["-c:v", "prores_ks", "-profile:v", str(spec.prores_profile),
+                 "-pix_fmt", spec.pix_fmt, "-vendor", "apl0"]
+    else:
+        vargs = ["-c:v", spec.codec, "-pix_fmt", spec.pix_fmt]
+    if spec.audio_codec == "aac":
+        aargs = ["-c:a", "aac", "-b:a", "320k"]
+    elif spec.audio_codec == "pcm_s24le":
+        aargs = ["-c:a", "pcm_s24le", "-ar", "48000", "-ac", "2"]
+    else:
+        aargs = ["-c:a", spec.audio_codec]
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-loop", "1", "-framerate", spec.fps_str, "-i", os.path.abspath(base_path),
+        "-ss", str(max(0.0, win_start)), "-t", str(dur), "-i", os.path.abspath(mp3_path),
+        "-map", "0:v", "-map", "1:a", *vargs, *aargs, "-r", spec.fps_str,
+        "-t", str(dur), "-movflags", "+faststart", "-shortest",
+        os.path.basename(out_path),
+    ]
+    timeout = 1800 if (spec.codec == "prores_ks" or spec.width >= 3000) else 900
+    run_checked(cmd, label="ffmpeg-art-track-colombia", timeout=timeout,
+                output_path=out_path, cwd=job_dir)
+    _validate_rendered_mp4(out_path, dur)
+    return out_path
+
+
 def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
                       spec: "RenderSpec", artist: str, song_title: str,
                       duration: float, out_name: str | None = None,
                       win_start: float = 0.0, win_dur: float | None = None,
-                      label_line: str = "", effect: str = "") -> str:
+                      label_line: str = "", effect: str = "",
+                      art_track_preset: str = "waveform") -> str:
     """Render the full art-track ("official audio") video: PIL builds the static
     composite once (blurred cover + shadowed card + title/artist + tag/legal),
     then ffmpeg loops that base image and overlays the AUDIO-REACTIVE waveform
@@ -17243,6 +17434,15 @@ def _render_art_track(cover_path: str, mp3_path: str, job_dir: str, *,
     length. Spec-driven so YouTube MP4, the 9:16 short, and the UMG
     intermediate master (→ lazy ProRes) share this code.
     """
+    if art_track_preset == "colombia_static":
+        return _render_art_track_colombia(
+            cover_path, mp3_path, job_dir, spec=spec, artist=artist,
+            song_title=song_title, duration=duration, out_name=out_name,
+            win_start=win_start, win_dur=win_dur, label_line=label_line,
+        )
+    if art_track_preset != "waveform":
+        raise ValueError(f"Unknown Art Track preset: {art_track_preset}")
+
     import shutil
 
     import art_track_wave
@@ -18025,6 +18225,15 @@ def _probe_dims_fps(path: str) -> tuple[int, int, str] | None:
         return None
 
 
+def _same_frame_rate(source: str, target: str) -> bool:
+    """Compare ffprobe and RenderSpec rates by value, not text formatting."""
+    from fractions import Fraction
+    try:
+        return Fraction(source) == Fraction(target)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return False
+
+
 def _transcode_to_prores(input_path: str, mov_path: str,
                           spec: "RenderSpec",
                           timeout_sec: int = 600) -> None:
@@ -18078,7 +18287,7 @@ def _transcode_to_prores(input_path: str, mov_path: str,
         src is not None
         and src[0] == spec.width
         and src[1] == spec.height
-        and src[2] == spec.fps_str
+        and _same_frame_rate(src[2], spec.fps_str)
     )
 
     vf_chain = (
@@ -18815,11 +19024,12 @@ def generate_lyric_video(
     # Multi-escena: bg_image_path ya es un timeline del largo completo (escenas
     # con xfade) → no re-loopear en el render. Se propaga a _render_lyrics_ass.
     bg_prelooped: bool = False,
-    # Art tracks: bg_image_path es un cover (imagen). Se compone el fondo de
-    # art track (cover blur + tarjeta con sombra + onda reactiva) y se rinde
-    # SIN letra ni title card. Requiere una imagen como bg_image_path.
+    # Art tracks: bg_image_path es un cover (imagen). El preset compone el
+    # fondo, la portada y el texto; se rinde SIN letra ni title card.
+    # Requiere una imagen como bg_image_path.
     art_track: bool = False,
     label_line: str = "",
+    art_track_preset: str = "waveform",
     # "Quieta de verdad" (2026-07-30). Un fondo que es IMAGEN recibía SIEMPRE un
     # zoom del 15% (`_prerender_kenburns_bg`), así que "sin movimiento" no
     # existía para una foto subida por el operador: la única forma de que su
@@ -18910,6 +19120,7 @@ def generate_lyric_video(
             bg_source, mp3_path, job_dir, spec=spec,
             artist=artist, song_title=title_song, duration=duration,
             label_line=label_line, effect=effect,
+            art_track_preset=art_track_preset,
         )
         audio.close()
         return out, font, bg_source
@@ -19812,11 +20023,12 @@ def generate_art_track_short(
     window_sec: float = 30.0,
     label_line: str = "",
     effect: str = "",
+    art_track_preset: str = "waveform",
 ) -> str:
-    """Render the vertical (9:16) art-track short: the same VEVO composite as
-    the master (blurred cover fill + shadowed cover card + reactive waveform +
-    title) over a 30s high-energy window of the audio. The bars react to that
-    window's audio. Writes `short.mp4` in job_dir (same contract as
+    """Render the vertical (9:16) art-track short in the selected visual
+    preset over a 30s high-energy window of the audio. The waveform preset's
+    bars react to that window; the fixed preset stays still. Writes
+    `short.mp4` in job_dir (same contract as
     generate_short); `_render_art_track` writes its own output name so it never
     clobbers the master's `lyric_video.mp4`.
     """
@@ -19832,6 +20044,7 @@ def generate_art_track_short(
         artist=artist, song_title=song_title, duration=win,
         out_name="short.mp4", win_start=start, win_dur=win,
         label_line=label_line, effect=effect,
+        art_track_preset=art_track_preset,
     )
     logger.info("[ART] art-track short window %.0f-%.0fs", start, start + win)
     return out_path
@@ -20333,12 +20546,12 @@ def generate_art_track_thumbnail(
     artist: str = "",
     song_title: str = "",
     label_line: str = "",
+    art_track_preset: str = "waveform",
 ) -> str:
-    """Thumbnail for art tracks: the SAME composite as the video (blurred
-    cover + shadowed card + title + a static whole-song waveform strip) at
-    1280×720, instead of the generic raw-cover crop — so the thumbnail
-    matches what plays. The static strip uses the full-track RMS envelope
-    (a "fingerprint" of the song, same visual language as the live bars).
+    """Thumbnail matching the selected art-track preset at 1280×720.
+
+    The waveform preset includes a whole-song RMS strip. The fixed preset
+    contains only cover, title, artist, and optional legal line.
     """
     import dataclasses
 
@@ -20351,10 +20564,19 @@ def generate_art_track_thumbnail(
 
     spec = dataclasses.replace(RenderSpec.youtube_default(),
                                width=1280, height=720)
-    L = _art_track_layout(spec)
     base_path = os.path.join(job_dir, "thumbnail_base.png")
     out_path = os.path.join(job_dir, "thumbnail.jpg")
     try:
+        if art_track_preset == "colombia_static":
+            _build_art_track_colombia_base(
+                cover_path, base_path, spec=spec, artist=artist,
+                song_title=song_title, label_line=label_line,
+            )
+            Image.open(base_path).convert("RGB").save(out_path, quality=92)
+            return out_path
+        if art_track_preset != "waveform":
+            raise ValueError(f"Unknown Art Track preset: {art_track_preset}")
+        L = _art_track_layout(spec)
         _build_art_track_base(cover_path, base_path, spec=spec, artist=artist,
                               song_title=song_title, label_line=label_line)
         img = Image.open(base_path).convert("RGBA")

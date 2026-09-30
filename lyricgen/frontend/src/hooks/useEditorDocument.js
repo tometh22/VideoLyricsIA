@@ -203,6 +203,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
             revision: body.revision,
             segments,
             updated_at: body.saved_at,
+            ...(body.lyric_review ? { lyric_review: body.lyric_review } : {}),
           };
           documentRef.current = next;
           return next;
@@ -218,6 +219,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
         versionId: body.version_id,
         applied: body.applied !== false,
         segments,
+        lyricReview: body.lyric_review || null,
       };
     } catch (err) {
       return { ok: false, reason: navigator.onLine === false ? "offline" : "network", error: String(err) };
@@ -318,9 +320,19 @@ export function useEditorDocument({ jobId, enabled, request }) {
     return { ok: true, document: body };
   }, [applyDocument, jobId, request]);
 
+  // Actualiza campos derivados del documento (p. ej. la revisión rápida al
+  // pegar la letra oficial) sin tocar revisión ni letra.
+  const updateDocument = useCallback((fields) => {
+    const current = documentRef.current;
+    if (!current || !mountedRef.current) return;
+    const next = { ...current, ...fields };
+    documentRef.current = next;
+    setDocument(next);
+  }, []);
+
   return {
     document, loading, error, errorStatus, lock,
     revisionRef, load, save, reconcile,
-    listVersions, restoreVersion, undoAutoRepair,
+    listVersions, restoreVersion, undoAutoRepair, updateDocument,
   };
 }

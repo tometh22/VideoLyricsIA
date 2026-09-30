@@ -361,14 +361,14 @@ class CampaignCreate(BaseModel):
     expected_count: int = Field(default=0, ge=0, le=ITEM_LIMIT)
     default_render_params: dict[str, Any] = Field(default_factory=dict)
     kind: str = Field(default="lyric_video", pattern="^(lyric_video|art_track)$")
-    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile)$")
+    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile|files)$")
 
 
 class CampaignPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
     status: str | None = None
     default_render_params: dict[str, Any] | None = None
-    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile)$")
+    destination_portal: str | None = Field(default=None, pattern="^(argentina|chile|files)$")
 
 
 class SourceReferenceInput(BaseModel):
@@ -504,7 +504,11 @@ def list_campaigns(
     if current_user.get("role") != "admin":
         query = query.filter(BatchCampaign.tenant_id == current_user["tenant_id"])
     rows = query.order_by(BatchCampaign.created_at.desc()).limit(100).all()
-    return {"items": [_summary(db, row) for row in rows]}
+    from campaign_pipeline import pipeline_counts_bulk
+    pipelines = pipeline_counts_bulk(db, rows)
+    return {"items": [
+        {**_summary(db, row), "pipeline": pipelines.get(row.id)} for row in rows
+    ]}
 
 
 @router.get("/campaigns/{campaign_id}")
@@ -1380,6 +1384,7 @@ def approve_campaign_lyrics(
     if not reference_ok:
         raise HTTPException(status_code=409, detail={"code": reference_reason})
     from editor import approve_document
+    from lyric_review import LyricReviewPending, conflict_detail as lyric_review_conflict
     try:
         document, version = approve_document(
             db,
@@ -1390,6 +1395,8 @@ def approve_campaign_lyrics(
         )
     except LookupError:
         raise HTTPException(status_code=409, detail="editor_version_not_found") from None
+    except LyricReviewPending as exc:
+        raise HTTPException(status_code=409, detail=lyric_review_conflict(exc)) from None
     except MachineSnapshotMissing:
         raise HTTPException(
             status_code=409,

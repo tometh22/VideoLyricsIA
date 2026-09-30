@@ -4,6 +4,7 @@ import { resolveSavedLanguageReview } from "./lib/languageResolution";
 import { reanchorHttpFailure } from "./lib/reanchorResult";
 import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
 import { safeReviewReturnPath } from "./lib/reviewerNavigation";
+import { clearCampaignResourceCache } from "./hooks/useCampaignResource";
 import {
   Routes, Route, Navigate, Outlet,
   useNavigate, useLocation, useParams,
@@ -2753,6 +2754,9 @@ export default function App() {
     // PR E: User B no debe heredar los segments editados de User A en la
     // misma máquina — el store es a nivel módulo, no muere con el unmount.
     try { segmentsStore.evictAll(); } catch { /* */ }
+    // Campaign snapshots (pipeline, review queue, videos) live in a module
+    // cache for instant tab switches; the next user must never see them.
+    try { clearCampaignResourceCache(); } catch { /* */ }
 
     // Short-lived media tokens (preview/download URLs scoped to
     // job+filetype). Without this, User B sees /preview URLs that
@@ -4972,6 +4976,7 @@ export default function App() {
         if (jobList[i].songTitle) body.append("song_title", jobList[i].songTitle);
         body.append("segments_json", "[]");
         body.append("art_track", "true");
+        body.append("art_track_preset", delivery.art_track_preset || "waveform");
         if ((delivery.label_line || "").trim()) {
           body.append("label_line", delivery.label_line.trim());
         }
@@ -6541,11 +6546,7 @@ export default function App() {
           <Route path="/review/:jobId" element={wizardScreen} />
           <Route path="/campaigns" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
           <Route path="/campaigns/:campaignId" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
-          <Route path="/admin/cola" element={
-            user?.role === "admin"
-              ? <Suspense fallback={<RouteSuspenseFallback />}><ReviewQueuePage /></Suspense>
-              : <Navigate to="/dashboard" replace />
-          } />
+          <Route path="/admin/cola" element={<Suspense fallback={<RouteSuspenseFallback />}><ReviewQueuePage /></Suspense>} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
             <Suspense fallback={<RouteSuspenseFallback />}>
