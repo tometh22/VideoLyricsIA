@@ -57,7 +57,7 @@ describe("campaign workspace", () => {
     fireEvent.click(button);
     expect(await screen.findByText("Cambiar la palabra final")).toBeInTheDocument();
     expect(location()).toContain("view=changes");
-    expect(screen.getByRole("link", { name: "Resolver en Admin →" })).toHaveAttribute("href", "/admin?section=cambios&change_request_id=7");
+    expect(screen.getByRole("link", { name: "Abrir y resolver" })).toHaveAttribute("href", "/admin?section=cambios&change_request_id=7");
     expect(screen.queryByRole("button", { name: /Generar|Enviar/ })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Ver canción" }));
     await waitFor(() => expect(location()).toContain("song=item-1"));

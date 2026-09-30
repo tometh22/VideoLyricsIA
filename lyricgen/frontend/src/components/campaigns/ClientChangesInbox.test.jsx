@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import ClientChangesInbox from "./ClientChangesInbox";
 
@@ -21,11 +21,38 @@ describe("client changes inbox", () => {
     expect(screen.getByText("Argentina")).toBeInTheDocument();
     expect(screen.getByText("Corregido: falta publicar")).toBeInTheDocument();
     expect(screen.getByText("Cliente aprobó · v2")).toBeInTheDocument();
-    expect(screen.getAllByRole("link", { name: "Resolver en Admin →" })[0]).toHaveAttribute("href", "/admin?section=cambios&change_request_id=1");
+    expect(screen.getAllByRole("link", { name: "Abrir y resolver" })[0]).toHaveAttribute("href", "/admin?section=cambios&change_request_id=1");
     expect(request.mock.calls[0][0]).toBe("/batch/campaigns/c1/change-requests?status=open&limit=50");
     rerender(<ClientChangesInbox campaignId="c1" isAdmin={false} request={request} />);
-    expect(screen.queryByRole("link", { name: "Resolver en Admin →" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "Abrir y resolver" })).toBeNull();
     expect(screen.getAllByText("Lo resuelve un admin")).toHaveLength(2);
+  });
+
+  it.each([
+    ["correct", ["active", "todo", "todo"]],
+    ["rendering", ["done", "active", "todo"]],
+    ["blocked", ["done", "active", "todo"]],
+    ["publish", ["done", "done", "active"]],
+    ["resolved", ["done", "done", "done"]],
+    ["closed", ["todo", "todo", "todo"]],
+    ["unknown", ["active", "todo", "todo"]],
+  ])("shows the same three steps as Admin for a request in '%s'", async (key, expected) => {
+    const request = vi.fn().mockResolvedValue(page([item(1, { step: { key, tone: "idle", label: `Paso ${key}` } })]));
+    render(<ClientChangesInbox campaignId="c1" isAdmin request={request} />);
+    const progress = await screen.findByRole("list", { name: "Pasos del pedido" });
+    const steps = within(progress).getAllByRole("listitem");
+    expect(steps.map((step) => step.textContent.replace(/\s*\(.*\)$/, "")))
+      .toEqual(["Corregir", "Generar el video nuevo", "Publicar"]);
+    const label = { done: "(hecho)", active: "(en curso)", todo: "(pendiente)" };
+    expected.forEach((state, index) => expect(steps[index]).toHaveTextContent(label[state]));
+    expect(steps.filter((step) => step.getAttribute("aria-current") === "step")).toHaveLength(expected.includes("active") ? 1 : 0);
+  });
+
+  it("keeps working when an older API sends no step", async () => {
+    const request = vi.fn().mockResolvedValue(page([item(1, { step: undefined })]));
+    render(<ClientChangesInbox campaignId="c1" isAdmin request={request} />);
+    expect(await screen.findByRole("list", { name: "Pasos del pedido" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Abrir y resolver" })).toHaveAttribute("href", "/admin?section=cambios&change_request_id=1");
   });
 
   it("opens the song of a request", async () => {

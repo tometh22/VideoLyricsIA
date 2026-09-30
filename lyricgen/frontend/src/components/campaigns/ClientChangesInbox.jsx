@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { campaignRequest } from "../../lib/campaignApi";
 import { CHANGE_SLA_HOURS, businessHoursSince, changeSlaTone, portalLabel, relativeDate } from "../../lib/campaignPipeline";
+import { STEP_STATE_LABELS, correctionStepList } from "../admin/sections/operacion/changeRequestWorkflow";
 import { Banner, Button, Chip, EmptyState, Skeleton, inputClass } from "./ui";
 
 const FILTERS = [["open", "Abiertos"], ["resolved", "Resueltos"], ["all", "Todos"]];
@@ -11,6 +12,18 @@ const NOTE_TEMPLATES = [
   "Pedido duplicado de otro ya atendido.",
 ];
 const APPROVAL = { approved: "El cliente aprobó esta versión", pending: "El cliente todavía no aprobó esta versión" };
+const DOT = { done: "bg-emerald-400", active: "bg-brand", todo: "bg-white/20" };
+
+/** Los mismos 3 pasos que Admin > Cambios (Corregir, Generar el video nuevo, Publicar). */
+function StepProgress({ step }) {
+  return <ol aria-label="Pasos del pedido" className="flex flex-wrap items-center gap-x-3 gap-y-1">
+    {correctionStepList(step).map((item) => <li key={item.key} aria-current={item.state === "active" ? "step" : undefined}
+      className={`flex items-center gap-1.5 text-[11px] ${item.state === "active" ? "font-medium text-white" : item.state === "done" ? "text-emerald-300" : "text-ink-secondary"}`}>
+      <span aria-hidden="true" className={`h-1.5 w-1.5 rounded-full ${DOT[item.state]}`} />
+      {item.label}<span className="sr-only"> ({STEP_STATE_LABELS[item.state]})</span>
+    </li>)}
+  </ol>;
+}
 
 /**
  * Client change requests for this campaign. Read-only on purpose: every action
@@ -103,12 +116,13 @@ export default function ClientChangesInbox({ campaignId, isAdmin = false, canRes
                 {item.client_approval && <Chip tone={item.client_approval === "approved" ? "success" : "neutral"} title={APPROVAL[item.client_approval]}>
                   {item.client_approval === "approved" ? "Cliente aprobó" : "Cliente sin aprobar"} · v{item.published_revision}</Chip>}
               </div>
+              <div className="mt-2"><StepProgress step={item.step} /></div>
             </div>
             <div className="flex items-center gap-2">
               {item.song_id && <Button size="sm" variant="ghost" onClick={() => onOpenSong?.(item.song_id)}>Ver canción</Button>}
               {open && canResolve && <Button size="sm" variant="ghost" onClick={() => setClosing({ id: item.id, note: "", busy: false, error: "" })}>Cerrar con nota</Button>}
               {open && (isAdmin
-                ? <a className="text-sm text-brand-light underline" href={`/admin?section=cambios&change_request_id=${encodeURIComponent(item.id)}`}>Resolver en Admin →</a>
+                ? <a className="text-sm text-brand-light underline" href={`/admin?section=cambios&change_request_id=${encodeURIComponent(item.id)}`}>Abrir y resolver</a>
                 : <span className="text-xs text-ink-secondary">Lo resuelve un admin</span>)}
             </div>
           </div>

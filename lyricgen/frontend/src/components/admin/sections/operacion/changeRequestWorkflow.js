@@ -67,7 +67,7 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
   }
   if (publication.render_matches_editor && publication.needs_publish && !(publication.prores_pending || []).length) {
     return { key: "publish", activeStep: 3, label: "Corte listo · revisar y publicar",
-      detail: "Reproducí el video y confirmá Publicar actualización para actualizar el portal.", tone: "attention" };
+      detail: "Reproducí el video y publicalo en el portal para dar por resuelto el pedido.", tone: "attention" };
   }
   // A missing/old master says nothing about whether this client's request was
   // interpreted. Do not paint those stages complete or hide the analyze action.
