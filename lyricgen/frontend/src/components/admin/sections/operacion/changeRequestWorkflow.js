@@ -397,10 +397,16 @@ export function correctionSentence(workflow, ctx = {}) {
       });
     case "blocked":
       return "No se pudo generar el video nuevo. Abrí el error para ver el motivo y no vuelvas a aplicar los cambios guardados.";
-    case "publish":
+    case "publish": {
+      // The server knows something the plain sentence does not: a proposal is still
+      // open but the operator already corrected by hand, so it need not be reapplied.
+      // Keep that note verbatim instead of swallowing it.
+      const proposalNote = String(workflow?.detail || "").match(/La propuesta sigue pendiente:[\s\S]*$/)?.[0];
+      const tail = `${manual}${proposalNote ? ` ${proposalNote}` : ""}`;
       return publication?.prores_pending?.length
-        ? `El video nuevo está listo. Falta preparar el archivo profesional antes de publicar.${manual}`
-        : `El video nuevo está listo. Miralo y publicalo: el cliente lo ve en el portal y el pedido queda resuelto.${manual}`;
+        ? `El video nuevo está listo. Falta preparar el archivo profesional antes de publicar.${tail}`
+        : `El video nuevo está listo. Miralo y publicalo: el cliente lo ve en el portal y el pedido queda resuelto.${tail}`;
+    }
     case "review":
       return "Ya hay una versión publicada. Revisá que lo pedido esté en el video y cerrá el pedido con una nota.";
     case "resolved": case "closed":

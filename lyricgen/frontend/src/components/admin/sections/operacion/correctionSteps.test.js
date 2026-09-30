@@ -303,3 +303,20 @@ describe("wording follows the publication mode", () => {
     expect(getPublicationMode()).toBe("snapshot");
   });
 });
+
+describe("the publish sentence keeps what the server knows about a pending proposal", () => {
+  const detail = "El corte corresponde a la letra guardada. La propuesta sigue pendiente: revisá el pedido completo en el video antes de publicar; no hace falta volver a aplicarla si lo corregiste a mano.";
+  it("appends the proposal note verbatim and only when the server sent it", () => {
+    const withNote = correctionSentence({ key: "publish", activeStep: 3, detail });
+    expect(withNote).toMatch(/La propuesta sigue pendiente: revisá el pedido completo en el video antes de publicar; no hace falta volver a aplicarla si lo corregiste a mano\.$/);
+    expect(withNote).toMatch(/^El video nuevo está listo\. Miralo y publicalo/);
+    const without = correctionSentence({ key: "publish", activeStep: 3, detail: "Reproducí el video y publicalo en el portal para dar por resuelto el pedido." });
+    expect(without).not.toMatch(/propuesta/);
+  });
+  it("also keeps it when the professional master is still pending", () => {
+    const sentence = correctionSentence({ key: "publish", detail }, { publication: { prores_pending: ["umg_master"] } });
+    expect(sentence).toMatch(/Falta preparar el archivo profesional/);
+    expect(sentence).toMatch(/La propuesta sigue pendiente:/);
+  });
+});
+
