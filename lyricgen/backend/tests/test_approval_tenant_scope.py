@@ -157,10 +157,18 @@ def test_status_exposes_expiring_campaign_bypass_for_stale_preflight(
     client, db, monkeypatch,
 ):
     owner_token, owner = _register(client, "approval_umg_bypass_status")
+    campaign_id = "camp_over_01"
+    db.add(BatchCampaign(
+        id=campaign_id,
+        tenant_id=owner["tenant_id"],
+        created_by=owner["id"],
+        name="Stale preflight bypass fixture",
+    ))
+    db.flush()
     job_id = _seed_pending_review(db, owner)
     job = db.query(Job).filter(Job.job_id == job_id).one()
     job.delivery_profile = "umg"
-    job.campaign_id = "camp_over_01"
+    job.campaign_id = campaign_id
     job.delivery_qc = {
         "status": "STALE",
         "mode": "enforce",
@@ -170,7 +178,7 @@ def test_status_exposes_expiring_campaign_bypass_for_stale_preflight(
     db.commit()
     monkeypatch.setenv("ENVIRONMENT", "staging")
     monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "1")
-    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS", "camp_over_01")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS", campaign_id)
     monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_UNTIL_UTC", "2099-01-01T00:00:00Z")
     monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_PREFLIGHT_BYPASS", "1")
 
