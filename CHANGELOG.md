@@ -54,6 +54,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   active point highlighted (and flashed green after applying), undo that
   brings the point back, a failed fix that stays visible instead of
   vanishing, and an "Aprobar" button that turns into "Faltan N · Revisar".
+- Visual pass: the panel follows the Genly design system (neutral surfaces,
+  violet only for the primary action, green/red only for what enters and
+  leaves the line, one progress bar); shortcuts, compared sources and the
+  UMG guide live behind "?". Official lyrics enter through a single dialog
+  shared with "Pegar letra oficial", with two explicit outcomes: Comparar
+  (nothing changes) or Reemplazar y re-sincronizar.
 - Fixes are applied by line identity and word position: correcting one
   repetition in a line no longer changes the other, a stale point never
   lands on a neighbouring line, merges keep word timings, chorus copies

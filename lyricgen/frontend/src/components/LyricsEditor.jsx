@@ -2887,6 +2887,9 @@ export default function LyricsEditor({
   const [reviewAutoPlayRaw, setReviewAutoPlayRaw] = useLocalStorage("genly.lyricReview.autoplay", "1");
   const reviewAutoPlay = reviewAutoPlayRaw !== "0";
   const reviewPanelRef = useRef(null);
+  // La letra oficial entra por un solo lugar: comparar (no toca la letra) o
+  // reemplazar y re-sincronizar.
+  const canCompareOfficial = Boolean(editorV2Enabled && lyricReview && editorRequest);
   useEffect(() => {
     // Cuando la letra en pantalla es exactamente la que revisó el servidor,
     // él manda: lo que siga apareciendo vuelve a mostrarse (p. ej. tras
@@ -4860,11 +4863,11 @@ export default function LyricsEditor({
             data-lyric-review-blocked={reviewBlocksApproval ? "true" : "false"}
             title={reviewBlocksApproval ? `Faltan ${pendingRequiredReview} puntos de la revisión rápida` : undefined}
             className={`editor-primary-cta ml-auto inline-flex h-11 items-center gap-2 rounded-xl px-5 text-sm font-semibold transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60 ${reviewBlocksApproval
-              ? "bg-surface-2 text-amber-100 ring-2 ring-amber-300/70"
+              ? "bg-surface-2 text-white ring-1 ring-white/15 hover:bg-surface-3"
               : "bg-gradient-to-r from-brand to-brand-light text-white shadow-xl shadow-brand/25"}`}
           >
             {reviewBlocksApproval && !isApproving && (
-              <span className="rounded-md bg-amber-300 px-1.5 text-xs font-bold text-black">{pendingRequiredReview}</span>
+              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-amber-300/15 px-1.5 text-[11px] font-bold tabular-nums text-amber-200">{pendingRequiredReview}</span>
             )}
             {isApproving
               ? (t("editor.applying_changes") || "Aplicando cambios…")
@@ -4882,8 +4885,15 @@ export default function LyricsEditor({
         <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4">
           <section role="dialog" aria-modal="true" aria-labelledby="paste-lyrics-title"
             className="w-full max-w-2xl rounded-2xl bg-surface-1 p-6 shadow-2xl ring-1 ring-white/15">
-            <h2 id="paste-lyrics-title" className="text-lg font-semibold text-white">{t("editor.paste_lyrics") || "Pegar letra oficial y re-sincronizar"}</h2>
-            <p className="mt-2 text-sm text-ink-secondary">{t("editor.paste_lyrics_hint") || "Pegá la letra correcta, una línea por renglón. Las líneas iguales conservan su ajuste manual; las distintas se reemplazan y quedan marcadas para revisar."}</p>
+            <h2 id="paste-lyrics-title" className="text-lg font-semibold text-white">{canCompareOfficial ? "Letra oficial" : (t("editor.paste_lyrics") || "Pegar letra oficial y re-sincronizar")}</h2>
+            {canCompareOfficial ? (
+              <ul className="mt-2 space-y-1 text-sm text-ink-secondary">
+                <li><strong className="font-medium text-white">Comparar</strong>: la Revisión rápida marca las palabras que se escuchan distinto. Tu letra y los tiempos no cambian.</li>
+                {canReanchor && <li><strong className="font-medium text-white">Reemplazar</strong>: pisa el texto con esta letra y re-sincroniza con el audio.</li>}
+              </ul>
+            ) : (
+              <p className="mt-2 text-sm text-ink-secondary">{t("editor.paste_lyrics_hint") || "Pegá la letra correcta, una línea por renglón. Las líneas iguales conservan su ajuste manual; las distintas se reemplazan y quedan marcadas para revisar."}</p>
+            )}
             {sourceReference?.text && (
               <button type="button" data-testid="paste-lyrics-use-sheet" onClick={() => { setPasteText(sourceReference.text); setPasteStructure(null); }}
                 className="mt-3 rounded-lg bg-white/[0.06] px-3 py-1.5 text-xs text-white ring-1 ring-white/10">{t("editor.paste_lyrics_use_sheet") || "Usar la letra de la planilla"}</button>
@@ -4918,10 +4928,25 @@ export default function LyricsEditor({
                   className="rounded-lg bg-amber-500/80 px-4 py-2 text-sm font-medium text-black disabled:opacity-50">
                   {pasteBusy ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.paste_lyrics_confirm_anyway") || "Confirmar letra y re-sincronizar")}
                 </button>
-              ) : (
+              ) : (canReanchor || !canCompareOfficial) && (
                 <button type="button" data-testid="paste-lyrics-submit" disabled={pasteBusy || pasteLineCount < 3} onClick={() => submitPasteLyrics(false)}
-                  className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
+                  className={canCompareOfficial
+                    ? "rounded-lg px-4 py-2 text-sm font-medium text-white ring-1 ring-white/15 hover:bg-white/[0.06] disabled:opacity-50"
+                    : "rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50"}>
                   {pasteBusy ? (t("editor.reanchor_running") || "Re-sincronizando…") : (t("editor.paste_lyrics_submit") || "Reemplazar letra y re-sincronizar")}
+                </button>
+              )}
+              {canCompareOfficial && !pasteStructure && (
+                <button type="button" data-testid="paste-lyrics-compare" disabled={pasteBusy || !pasteText.trim()}
+                  onClick={async () => {
+                    if (await pasteOfficialLyrics(pasteText)) {
+                      setPasteOpen(false);
+                      setPasteText("");
+                      reviewPanelRef.current?.focus({ preventScroll: true });
+                    }
+                  }}
+                  className="rounded-lg bg-brand px-4 py-2 text-sm font-semibold text-white hover:bg-brand-light disabled:opacity-50">
+                  Comparar
                 </button>
               )}
             </div>
@@ -5055,7 +5080,7 @@ export default function LyricsEditor({
           onUndo={undoLyricReview}
           canUndo={reviewDecisions.length > 0}
           onActivate={activateReviewItem}
-          onPasteOfficial={editorRequest ? pasteOfficialLyrics : null}
+          onOpenOfficial={editorRequest ? openPasteLyrics : null}
         />
       )}
 
@@ -6446,8 +6471,8 @@ export default function LyricsEditor({
                     : `border-l-4 ${!isArmed && !isActive && !wasRecentlyAnchored && (showIndividualReviewSignal || isUnsafeMarker) ? "border-amber-400/50" : "border-transparent"}`}
                   ${!isArmed && !isActive && wasRecentlyAnchored ? "bg-brand/[0.05] ring-1 ring-brand/40" : ""}
                   ${flashReviewId === seg._id ? "ring-1 ring-amber-400/50" : ""}
-                  ${reviewAppliedSegIds.has(seg._id) ? "ring-2 ring-emerald-300/70 bg-emerald-400/[0.08]"
-                    : reviewActiveSegId === seg._id ? "ring-2 ring-amber-300/60" : ""}
+                  ${reviewAppliedSegIds.has(seg._id) ? "ring-1 ring-emerald-300/50 bg-emerald-400/[0.06]"
+                    : reviewActiveSegId === seg._id ? "ring-1 ring-brand-light/60 bg-brand/[0.06]" : ""}
                   ${isAnchored ? "opacity-60" : ""}`}
               >
                 <div className="flex items-start gap-2 p-1">

@@ -106,10 +106,15 @@ test("quick review is resolved from the keyboard before approval", async ({ page
   await expect(page.locator('input[aria-label="Letra de la línea 3"]')).toHaveValue("Vos sos la mar");
 
   // La letra oficial pegada se usa sólo para comparar.
+  // Un solo lugar para la letra oficial: comparar no toca la letra.
   await panel.getByRole("button", { name: "Comparar con letra oficial" }).click();
-  await panel.getByLabel("Letra oficial").fill("Cuando vuelvas\nTu garantía de reloj se fundió, dormite ya");
-  await panel.getByRole("button", { name: "Comparar con esta letra" }).click();
-  await expect(panel).toContainText("letra oficial (pegada)");
+  const dialog = page.getByRole("dialog", { name: "Letra oficial" });
+  await dialog.getByTestId("paste-lyrics-textarea").fill("Cuando vuelvas\nTu garantía de reloj se fundió, dormite ya");
+  await dialog.screenshot({ path: "test-results/lyric-review-official.png" });
+  await dialog.getByRole("button", { name: "Comparar", exact: true }).click();
+  await expect(dialog).toBeHidden();
+  await expect(panel.getByRole("button", { name: "Letra oficial" })).toBeVisible();
+  await expect(page.locator('input[aria-label="Letra de la línea 3"]')).toHaveValue("Vos sos la mar");
   await panel.screenshot({ path: "test-results/lyric-review-done.png" });
 
   await expect(page.locator('[data-lyric-review-blocked="false"]')).toBeVisible();

@@ -51,17 +51,19 @@ revisor.
    | **Enter** | aplica el arreglo y pasa al siguiente |
    | **⌫** | "está bien así" / "no se canta" |
    | **1–3** | elige otra opción cuando los oídos no coinciden |
-   | **E** | escucha el tramo (con "Escuchar solo" suena al pasar de punto) |
+   | **E** | escucha el tramo (con "Reproducir al avanzar" suena solo al pasar de punto) |
    | **J / K** | siguiente / anterior |
-   | **M** | lleva el cursor a esa línea para corregirla a mano |
+   | **M** | lleva el cursor a esa línea para editarla a mano |
    | **Z** | deshace la última decisión |
-   | **?** | muestra los atajos |
+   | **?** | muestra los atajos, las fuentes comparadas y esta guía |
 
 4. "Aprobar" dice **Faltan N · Revisar** mientras quede algo obligatorio;
    al tocarlo te lleva al panel. Las sugerencias no bloquean.
-5. Si tenés la letra oficial (Google, planilla de UMG), usá **Comparar con
-   letra oficial**: sólo se usa para comparar, no cambia tu letra ni los
-   tiempos. Con la letra oficial el panel encuentra bastante más (en los
+5. Si tenés la letra oficial (Google, planilla de UMG), pegala **apenas abrís
+   la canción**, antes de pasar las tarjetas: **Comparar con letra oficial**
+   (abajo del panel) o **Pegar letra oficial** (barra de la letra) abren la
+   misma ventana. **Comparar** no cambia tu letra ni los tiempos;
+   **Reemplazar** pisa el texto y re-sincroniza. Con la letra oficial el panel encuentra bastante más (en los
    pedidos de septiembre, 115 de 136 cambios contra 97 sin ella).
 6. Si la canción está marcada como **difícil** (en vivo, casi hablada, los
    oídos automáticos no coinciden), escuchala entera o pedí una segunda

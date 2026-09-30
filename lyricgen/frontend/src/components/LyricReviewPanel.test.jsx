@@ -23,7 +23,7 @@ const review = (items, extra = {}) => ({
 function renderPanel(items, extra = {}, props = {}) {
   const all = { review: review(items, extra), items, failedIds: new Set(), playingId: null,
     onPlay: vi.fn(), onApply: vi.fn(), onDismiss: vi.fn(), onEdit: vi.fn(), onUndo: vi.fn(),
-    onActivate: vi.fn(), onPasteOfficial: vi.fn(async () => true), ...props };
+    onActivate: vi.fn(), onOpenOfficial: vi.fn(), ...props };
   render(<LyricReviewPanel {...all} />);
   return all;
 }
@@ -99,15 +99,25 @@ describe("LyricReviewPanel", () => {
     expect(screen.getByTestId("lyric-review-heading").textContent).toBe("1 para revisar");
   });
 
-  it("compares with pasted official lyrics and shows the guide and shortcuts", () => {
+  it("opens the shared official-lyrics dialog and keeps the guide behind help", () => {
     const props = renderPanel([]);
+    expect(screen.getByText("Sin puntos para revisar en esta letra.")).toBeTruthy();
     fireEvent.click(screen.getByText("Comparar con letra oficial"));
-    fireEvent.change(screen.getByLabelText("Letra oficial"), { target: { value: "Letra" } });
-    fireEvent.click(screen.getByText("Comparar con esta letra"));
-    expect(props.onPasteOfficial).toHaveBeenCalledWith("Letra");
-    fireEvent.click(screen.getByText("Guía UMG"));
-    expect(screen.getByTestId("lyric-review-guide").textContent).toMatch(/una sola pantalla/);
+    expect(props.onOpenOfficial).toHaveBeenCalled();
+    expect(screen.queryByTestId("lyric-review-help")).toBeNull();
     fireEvent.keyDown(screen.getByTestId("lyric-review-panel"), { key: "?" });
     expect(screen.getByTestId("lyric-review-help").textContent).toMatch(/deshacer/);
+    expect(screen.getByTestId("lyric-review-help").textContent).toMatch(/Gemini · testigo/);
+    fireEvent.click(screen.getByText("Guía UMG"));
+    expect(screen.getByTestId("lyric-review-guide").textContent).toMatch(/una sola pantalla/);
+  });
+
+  it("toggles auto-listen as a pressed button", () => {
+    const onToggleAutoPlay = vi.fn();
+    renderPanel([missing], {}, { autoPlay: true, onToggleAutoPlay });
+    const toggle = screen.getByRole("button", { name: /Reproducir al avanzar/ });
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(toggle);
+    expect(onToggleAutoPlay).toHaveBeenCalled();
   });
 });
