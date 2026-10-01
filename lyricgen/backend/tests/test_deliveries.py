@@ -353,6 +353,53 @@ def test_umg_publish_rejects_qc_after_prores_spec_changes_until_rechecked(
     assert response.json()["detail"]["delivery_qc"]["reason"] == "fresh_preflight_required"
 
 
+@pytest.mark.parametrize('head_fails', [False, True])
+def test_portal_storage_io_has_no_database_transaction(
+    client, admin_token, approved_job, all_r2_files_present, db, head_fails,
+):
+    """A cold listing must not hold a DB transaction while it waits on R2/Redis
+    (PostgreSQL kills idle transactions after ~1 min) and must not block the
+    event loop. Ported from the production line (ace4063b)."""
+    from database import DeliveryChangeRequest
+    from sqlalchemy.orm import Session
+    import main
+
+    created = client.post(f'/admin/deliveries/from-job/{approved_job.job_id}',
+                          headers=auth(admin_token), json={})
+    delivery_id = created.json()['delivery_id']
+    db.add(DeliveryChangeRequest(delivery_id=delivery_id, comment='corregir fondo',
+                                resolved_at=datetime.now(timezone.utc),
+                                resolution_note='Fondo corregido'))
+    db.commit()
+    sessions = []
+    original_rollback = Session.rollback
+
+    def rollback(session):
+        original_rollback(session)
+        sessions.append(session)
+
+    def head(**kwargs):
+        assert sessions and all(not s.in_transaction() for s in sessions)
+        if head_fails:
+            raise TimeoutError('R2 unavailable')
+        return {'ContentLength': 12345}
+
+    with patch.object(Session, 'rollback', rollback), patch(
+        'queue_jobs._init_redis', side_effect=RuntimeError('no cache'),
+    ), patch('main.storage._get_metadata_client') as r2, patch(
+        'main.storage.generate_signed_url', return_value='https://files.test/cut',
+    ):
+        r2.return_value.head_object.side_effect = head
+        response = client.get('/api/deliveries/items', headers={'X-Portal-Token': PORTAL_TOKEN})
+    assert response.status_code == 200, response.text
+    version = response.json()['songs'][0]['versions'][0]
+    assert version['pending_change_requests'] == 0
+    assert version['change_requests'][0]['resolution_note'] == 'Fondo corregido'
+    assert all(f['available'] is not head_fails for f in version['files'])
+    import inspect
+    assert not inspect.iscoroutinefunction(main.portal_get_items)
+
+
 def test_missing_prores_is_prepared_instead_of_returning_dead_end(
     client, admin_token, approved_job,
 ):

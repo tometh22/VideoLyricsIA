@@ -9,6 +9,8 @@ from database import engine
 
 
 REQUIRED_COLUMNS = {
+    ("ai_provenance", "predict_time_ms"),
+    ("ai_provenance", "queue_time_ms"),
     ("jobs", "transcription_quality"),
     ("jobs", "machine_snapshot_required"),
     ("jobs", "quality_learning_epoch"),

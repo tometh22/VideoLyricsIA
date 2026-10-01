@@ -3,6 +3,32 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.90] - 2026-10-01
+
+### Fixed
+
+Alignment of the production line (`tometh22/umg-chile-portal`) and `main` with staging:
+the hotfixes that existed only there are now in staging, ported by hand (a plain
+`git merge main` would duplicate tables and leave the app unable to start).
+
+- Portal listing (`/api/deliveries/items`, from production `ace4063b`): the handler is no
+  longer `async` (it did synchronous DB/Redis/R2 work on the event loop), all database
+  state is read and the session released BEFORE any Redis/R2 I/O (PostgreSQL kills idle
+  transactions after about a minute), the size cache uses one `mget` and a pipelined
+  `setex`, and the HEAD fan-out has a hard 12 s deadline on the bounded metadata client.
+  Keeps staging's client visibility rules, `files_hidden` and revision fields.
+- Transcription retries (`main` #1218): a failure by deadline is deterministic, so the
+  RQ retry of a job whose previous attempt hit the deadline is discarded instead of
+  re-running (and re-billing) demucs + WhisperX; transient failures still retry. Failures
+  now carry an `error_code`.
+- ASGI replay (`main` #1220): the replay `receive` now propagates the real client
+  disconnect instead of waiting forever, which could hang SSE endpoints.
+- Provenance (`main` #1219): `ai_provenance.duration_ms` is split into queue time and
+  inference time (`predict_time_ms`, `queue_time_ms`). New idempotent Alembic revision
+  `ba888d1665d8`, re-chained behind `e5a7c9b1d3f6` (single head); the workers wait for
+  its columns at startup.
+- Gap-refetch gate (production `d8c45331`): `_reference_is_live` can no longer be unbound.
+
 ## [1.1.89] - 2026-10-01
 
 ### Security
