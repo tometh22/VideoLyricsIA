@@ -329,6 +329,21 @@ def test_a_song_whose_changes_are_unpublished_is_hidden_from_the_client_unless_f
     assert (by_title["Tema 3"]["portal_hidden"], by_title["Tema 3"]["portal_serves_latest"]) == (False, False)
 
 
+def test_a_song_hidden_in_one_portal_but_visible_in_the_other_is_not_reported_as_hidden(db, setup, monkeypatch):
+    campaign, items, actor = setup
+    both = add_job(db, campaign, actor, item=items[0], status="done")
+    db.commit()
+    added = "2026-09-14 10:00:00.000000"
+    rows = [(both.job_id, "argentina", campaign.tenant_id, 0, None, added, None, "hidden"),
+            (both.job_id, "chile", campaign.tenant_id, 0, None, added, None, None)]
+    with portal(rows) as session:
+        monkeypatch.setattr(creative, "scoped_deliveries_db", session)
+        monkeypatch.setenv("PUBLISH_LATEST_POINTER", "1")
+        result = pipeline.campaign_pipeline(campaign.id, actor, db)
+    song = {row["title"]: row for row in result["items"]}["Tema 0"]
+    assert song["portal_hidden"] is False and song["portal_serves_latest"] is True
+
+
 def _overwritten(db, job, when):
     job.previous_versions = [{"archived_at": when.isoformat(), "key": "old"}]
     db.flush()

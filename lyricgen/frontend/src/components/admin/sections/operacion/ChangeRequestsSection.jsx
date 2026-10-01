@@ -53,6 +53,7 @@ export default function ChangeRequestsSection({ initialPendingCount, onPendingCo
         <PublicationModeSwitch
           mode={changes.crPublicationMode}
           busy={changes.crModeBusy}
+          canChange={changes.crCanChangeMode}
           onChange={changes.changePublicationMode}
         />
         <ChangeRequestsPanel

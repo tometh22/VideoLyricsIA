@@ -10,6 +10,7 @@ describe("visibilityMessage", () => {
     expect(visibilityMessage({ client_visibility: "visible", hidden_from_client: false })).toMatch(/Siempre visible/);
     expect(visibilityMessage({ client_visibility: "hidden", hidden_from_client: true })).toMatch(/hasta que lo muestres/);
     expect(visibilityMessage({})).toMatch(/Visible/);
+    expect(visibilityMessage({ client_visibility: "auto", snapshot_pinned: true })).toMatch(/sigue viendo la versión anterior/);
   });
 });
 
@@ -41,8 +42,9 @@ describe("ClientVisibilityControl", () => {
 });
 
 describe("PublicationModeSwitch", () => {
-  it("toggles between copying files and publishing without copies", () => {
+  it("toggles between copying files and publishing without copies, after confirming", () => {
     const onChange = vi.fn();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const { rerender } = render(<PublicationModeSwitch mode="snapshot" onChange={onChange} />);
     const toggle = screen.getByRole("switch", { name: /Publicar sin copiar archivos/ });
     expect(toggle).not.toBeChecked();
@@ -54,5 +56,14 @@ describe("PublicationModeSwitch", () => {
     expect(screen.getByText(/se oculta solo mientras tiene cambios sin publicar/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("switch"));
     expect(onChange).toHaveBeenLastCalledWith("snapshot");
+    confirm.mockReturnValue(false);
+    fireEvent.click(screen.getByRole("switch"));
+    expect(onChange).toHaveBeenCalledTimes(2);
+    confirm.mockRestore();
+  });
+
+  it("is disabled for admins who are not super admin", () => {
+    render(<PublicationModeSwitch mode="snapshot" canChange={false} onChange={() => {}} />);
+    expect(screen.getByRole("switch")).toBeDisabled();
   });
 });

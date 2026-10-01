@@ -19,3 +19,12 @@ export function getPublicationMode() {
 export function byPublicationMode({ snapshot, pointer }) {
   return mode === "pointer" ? pointer : snapshot;
 }
+
+/**
+ * Same as byPublicationMode, but a delivery that still has a FROZEN copy keeps
+ * serving it whatever the global mode says (it was published in copy mode).
+ */
+export function byRowMode(publication, texts) {
+  if (publication?.snapshot_pinned === true) return texts.snapshot;
+  return byPublicationMode(texts);
+}

@@ -37,8 +37,13 @@ def test_auto_hides_everything_while_changes_are_unpublished_and_shows_after_pub
     assert ds.portal_key(published, 'video', for_client=True).endswith('lyric_video.mp4')
 
 
-def test_a_failed_edit_is_hidden_too_until_the_operator_decides():
-    assert ds.is_hidden_from_client(row(stale_since=NOW, stale_reason='edit_failed')) is True
+def test_only_in_flight_changes_auto_hide_a_dead_edit_or_unknown_reason_does_not():
+    # A failed edit has nothing to "publish away": hiding it would strand the client
+    # with no way out for the operator, and it was served before this rule existed.
+    assert ds.is_hidden_from_client(row(stale_since=NOW, stale_reason='edit_failed')) is False
+    assert ds.is_hidden_from_client(row(stale_since=NOW, stale_reason=None)) is False
+    assert ds.is_hidden_from_client(row(stale_since=NOW, stale_reason='prores_pending')) is True
+    assert ds.is_hidden_from_client(row(stale_since=NOW, stale_reason='edit_failed', client_visibility='hidden')) is True
 
 
 def test_a_frozen_snapshot_is_never_auto_hidden():
@@ -84,6 +89,7 @@ def test_admin_sets_the_mode_audits_it_and_rejects_garbage(client, admin_token, 
     user_id, tenant_id = _admin_identity(db)
     job_id = _create_pending_review_job(db, tenant_id, user_id, s3_keys={'video': 't/j/lyric_video.mp4'})
     delivery_id = _make(db, job_id, tenant_id, user_id)
+    _cleanup([])   # ids are reused after deletes: start from a clean audit trail
     try:
         url = f'/admin/deliveries/{delivery_id}/visibility'
         bad = client.put(url, headers=auth(admin_token), json={'mode': 'maybe'})
@@ -92,7 +98,8 @@ def test_admin_sets_the_mode_audits_it_and_rejects_garbage(client, admin_token, 
         assert ok.status_code == 200 and ok.json() == {'ok': True, 'client_visibility': 'hidden', 'hidden_from_client': True}
         with SessionLocal() as other:
             assert other.get(Delivery, delivery_id).client_visibility == 'hidden'
-            audit = other.query(AuditLog).filter(AuditLog.action == 'delivery.visibility').all()
+            audit = [a for a in other.query(AuditLog).filter(AuditLog.action == 'delivery.visibility').all()
+                     if a.detail['delivery_id'] == delivery_id]
             assert [a.detail['to'] for a in audit] == ['hidden'] and audit[0].detail['from'] == 'auto'
         back = client.put(url, headers=auth(admin_token), json={'mode': 'auto'})
         assert back.json()['hidden_from_client'] is False

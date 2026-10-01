@@ -20863,6 +20863,10 @@ def admin_create_delivery_from_job(
         "content_changed": content_changed,
         "resolved_change_requests": resolved_requests,
         "replaced_job_id": replaced_job_id,
+        # A manually hidden delivery stays hidden after publishing: say so, so the
+        # operator is never told "the client has it" when the portal shows nothing.
+        "client_visibility": delivery.client_visibility or "auto",
+        "hidden_from_client": is_hidden_from_client(delivery),
     }
 
 
@@ -20996,9 +21000,11 @@ async def admin_set_publication_settings(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Switch publishing between "copy files" and "no copies" without a deploy."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
+    """Switch publishing between "copy files" and "no copies" without a deploy.
+
+    Deployment-wide, so only the super admin (not any admin) may change it."""
+    if current_user.get("role") != "admin" or not current_user.get("is_super_admin"):
+        raise HTTPException(status_code=403, detail="Super admin only")
     from delivery_snapshots import POINTER_SETTING, latest_pointer_enabled
     import system_settings
     mode = str((body or {}).get("publication_mode") or "").strip().lower()
@@ -21067,6 +21073,9 @@ async def portal_prepare_prores(
     if delivery is None:
         raise HTTPException(status_code=404, detail="Delivery no encontrada.")
     if file_type not in (delivery.file_types or []):
+        raise HTTPException(status_code=404, detail="Archivo no disponible para esta entrega.")
+    if is_hidden_from_client(delivery):
+        # The portal shows no files for it, so nothing legitimate asks for a master.
         raise HTTPException(status_code=404, detail="Archivo no disponible para esta entrega.")
 
     job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
@@ -21907,6 +21916,8 @@ async def admin_list_change_requests(
         # "pointer": the portal serves the newest render (publishing copies
         # nothing); "snapshot": it serves a frozen copy made at publication.
         "publication_mode": "pointer" if _latest_pointer_enabled() else "snapshot",
+        # Only the super admin may flip the deployment-wide switch.
+        "can_change_publication_mode": bool(current_user.get("is_super_admin")),
     }
 
 

@@ -552,9 +552,11 @@ def portal_history(job_ids, tenant_id):
         # as "no snapshot" like everywhere else in the app).
         from delivery_snapshots import is_hidden_from_client
         frozen_jobs = set()
-        hidden_jobs = set()
-        for frozen_job, keys, stale_since, visibility in ddb.query(
-                Delivery.job_id, Delivery.published_file_keys, Delivery.stale_since, Delivery.client_visibility,
+        deliveries_per_job: dict = {}
+        hidden_per_job: dict = {}
+        for frozen_job, keys, stale_since, stale_reason_, visibility in ddb.query(
+                Delivery.job_id, Delivery.published_file_keys, Delivery.stale_since, Delivery.stale_reason,
+                Delivery.client_visibility,
         ).filter(
             Delivery.job_id.in_(job_ids), Delivery.tenant_snapshot == tenant_id, Delivery.removed_at.is_(None),
         ).all():
@@ -562,9 +564,13 @@ def portal_history(job_ids, tenant_id):
                 frozen_jobs.add(frozen_job)
             # What the client's portal keeps out of view right now (operator choice
             # or the automatic rule for unpublished changes).
+            deliveries_per_job[frozen_job] = deliveries_per_job.get(frozen_job, 0) + 1
             if is_hidden_from_client(SimpleNamespace(
-                    published_file_keys=keys, stale_since=stale_since, client_visibility=visibility)):
-                hidden_jobs.add(frozen_job)
+                    published_file_keys=keys, stale_since=stale_since, stale_reason=stale_reason_,
+                    client_visibility=visibility)):
+                hidden_per_job[frozen_job] = hidden_per_job.get(frozen_job, 0) + 1
+        # "The client sees nothing": every active portal row of the job is hidden.
+        hidden_jobs = {job for job, total in deliveries_per_job.items() if hidden_per_job.get(job) == total}
     result = {}
     for (job_id, portal_id, pending, oldest_pending, fingerprint, revision,
          stale_since, stale_reason, approved_at, content_updated_at, added_at) in publications:

@@ -61,17 +61,22 @@ def is_hidden_from_client(delivery) -> bool:
     * 'hidden': the operator hid it.
     * 'visible': the operator forces it on (the ProRes guard in ``portal_key``
       still applies: a stale master is never served).
-    * 'auto': while the row has unpublished changes (``stale_since``) and no
-      frozen snapshot, the portal would otherwise serve the newest, unapproved
-      render. A snapshot is already stable, so it is never auto-hidden.
+    * 'auto': while a re-render is IN FLIGHT (``stale_reason`` editing /
+      prores_pending) and there is no frozen snapshot, the portal would otherwise
+      serve the newest, unapproved render. A snapshot is already stable, so it is
+      never auto-hidden. A DEAD edit (``edit_failed``) is not hidden: nothing is
+      being worked on, the operator cannot "publish" it away, and it was served
+      before this rule existed.
     """
     mode = client_visibility_mode(delivery)
     if mode == 'hidden':
         return True
     if mode == 'visible':
         return False
+    from delivery_freshness import STALE_IN_FLIGHT
     return (getattr(delivery, 'published_file_keys', None) is None
-            and getattr(delivery, 'stale_since', None) is not None)
+            and getattr(delivery, 'stale_since', None) is not None
+            and (getattr(delivery, 'stale_reason', None) or '') in STALE_IN_FLIGHT)
 
 
 def portal_key(delivery, file_type, *, for_client=False):

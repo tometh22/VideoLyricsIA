@@ -109,7 +109,7 @@ export default function SongDrawer({ song, kind, campaignId, canManage, portalSe
           <h3 className="text-xs font-semibold uppercase tracking-wider text-ink-secondary">Revisión asistida</h3>
           <CampaignReviewerRow status={song.review.reviewer_campaign_status} jobId={song.job_id} onOpen={onNavigate} />
         </section>}
-        {(song.portals?.length > 0 || song.portal_outdated || song.pending_change_requests > 0) && <section className="space-y-2">
+        {(song.portals?.length > 0 || song.portal_outdated || song.portal_hidden || song.pending_change_requests > 0) && <section className="space-y-2">
           <h3 className="text-xs font-semibold uppercase tracking-wider text-ink-secondary">Portal del cliente</h3>
           <div className="flex flex-wrap gap-1.5">
             {song.portals?.map((portal) => <Chip key={portal} tone="brand">En {portalLabel(portal)}</Chip>)}
@@ -118,6 +118,7 @@ export default function SongDrawer({ song, kind, campaignId, canManage, portalSe
               : song.portal_serves_latest
                 ? <Chip tone="warning">Corte nuevo sin registrar: el cliente ya descarga el archivo nuevo</Chip>
                 : <Chip tone="success">{song.portal_hidden ? "Listo para reenviar: el cliente no ve el video hasta que lo publiques" : "Listo para reenviar: el portal entrega el corte anterior"}</Chip>)}
+            {song.portal_hidden && !song.portal_outdated && <Chip tone="warning">Oculto para el cliente: no ve este video ahora</Chip>}
             {song.pending_change_requests > 0 && <Chip tone="warning">{song.pending_change_requests} {song.pending_change_requests === 1 ? "cambio pedido" : "cambios pedidos"}</Chip>}
           </div>
         </section>}

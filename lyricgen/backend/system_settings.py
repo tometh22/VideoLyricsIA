@@ -29,8 +29,12 @@ def get_setting(key: str):
         finally:
             db.close()
     except Exception:
-        # Keep the last known value through a blip; otherwise "no override".
-        return hit[1] if hit else None
+        # Keep the last known value through a blip (or "no override" if there is
+        # none) and wait a full TTL before asking again, so an outage is not a
+        # query per call.
+        value = hit[1] if hit else None
+        _CACHE[key] = (now, value)
+        return value
     _CACHE[key] = (now, value)
     return value
 

@@ -15,6 +15,7 @@ export function visibilityMessage(publication) {
   if (mode === "hidden") return "Oculto: el cliente no ve este video hasta que lo muestres.";
   if (mode === "visible") return "Siempre visible: el cliente ve el video aunque haya cambios sin publicar.";
   if (hidden) return "Oculto por ahora: tiene cambios sin publicar. Aparece solo cuando lo publiques.";
+  if (publication?.snapshot_pinned) return "Visible. Mientras se edita, el cliente sigue viendo la versión anterior.";
   return "Visible. Si el video se edita, se oculta solo hasta que lo publiques.";
 }
 
@@ -52,7 +53,7 @@ export function ClientVisibilityControl({ publication, deliveryId, busy = false,
   );
 }
 
-export function PublicationModeSwitch({ mode, busy = false, onChange }) {
+export function PublicationModeSwitch({ mode, busy = false, canChange = true, onChange }) {
   const pointer = mode === "pointer";
   return (
     <div className="flex flex-wrap items-center gap-3 rounded-xl bg-white/[0.03] px-3 py-2 ring-1 ring-white/[0.08]" aria-label="Modo de publicación">
@@ -61,8 +62,16 @@ export function PublicationModeSwitch({ mode, busy = false, onChange }) {
           type="checkbox"
           role="switch"
           checked={pointer}
-          disabled={busy}
-          onChange={(event) => onChange?.(event.target.checked ? "pointer" : "snapshot")}
+          disabled={busy || !canChange}
+          title={canChange ? undefined : "Solo el super administrador puede cambiar esto."}
+          onChange={(event) => {
+            const next = event.target.checked ? "pointer" : "snapshot";
+            const question = next === "pointer"
+              ? "Publicar sin copiar archivos afecta a TODAS las publicaciones nuevas. Cada video se oculta solo mientras tiene cambios sin publicar. ¿Seguir?"
+              : "Volver a guardar una copia de cada publicación (más lento y ocupa espacio). Afecta a TODAS las publicaciones nuevas. ¿Seguir?";
+            if (typeof window !== "undefined" && !window.confirm(question)) return;
+            onChange?.(next);
+          }}
         />
         <span className="font-medium">Publicar sin copiar archivos</span>
       </label>

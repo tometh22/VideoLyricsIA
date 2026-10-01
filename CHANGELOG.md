@@ -12,14 +12,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   changes and shows it again when it is published, **Siempre visible** keeps the
   newest cut available, **Oculto** keeps it out of the portal until an operator
   changes it. The portal keeps the card (and the client's requests) and only drops
-  the files (`files_hidden`). A frozen snapshot is never auto-hidden; a stale
+  the files (`files_hidden`). Only an edit IN FLIGHT (`editing`, `prores_pending`)
+  auto-hides: a frozen snapshot is never hidden and a dead edit (`edit_failed`) is
+  not either, so the operator is never left without a way out. A stale
   professional master is never served, even when forced visible. Previously
-  issued signed links keep working until they expire (7 days).
+  issued signed links keep working until they expire (7 days). Publishing a
+  manually hidden delivery now says so ("OJO: el cliente todavía no la ve"), and a
+  hidden delivery cannot have a master prepared from the portal.
 - Admin switch "Publicar sin copiar archivos": picks copy-the-files or no-copies
-  publication without a Railway edit or deploy. The panel choice overrides
+  publication without a Railway edit or deploy. Deployment-wide, so it asks for
+  confirmation and only the super admin can change it. The panel choice overrides
   `PUBLISH_LATEST_POINTER`, which remains only the default.
-- Campaigns: songs the client cannot see yet are reported as `portal_hidden` and
-  worded accordingly ("el cliente no ve el video hasta que lo publiques").
+- Campaigns: songs the client cannot see at all (hidden in EVERY portal they are
+  published to) are reported as `portal_hidden` and worded accordingly ("Oculto
+  para el cliente", "el cliente no ve el video hasta que lo publiques").
 
 ### Database
 

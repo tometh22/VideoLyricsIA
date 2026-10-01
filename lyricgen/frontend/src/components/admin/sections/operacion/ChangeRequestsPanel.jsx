@@ -18,7 +18,7 @@ import EnableProResModal from "../../../EnableProResModal";
 import ChangeRequestQueue from "./ChangeRequestQueue";
 import RequestWorkflowStepper from "./RequestWorkflowStepper";
 import RequestVideo from "./RequestVideo";
-import { byPublicationMode } from "./publicationMode";
+import { byPublicationMode, byRowMode } from "./publicationMode";
 import { ClientVisibilityControl } from "./ClientVisibility";
 import {
   PORTAL_LABELS,
@@ -59,7 +59,7 @@ export function publicationStatus(publication) {
     return {
       tone: "busy",
       title: "Re-renderizando",
-      detail: byPublicationMode({
+      detail: byRowMode(publication, {
         snapshot: "Mientras tanto el portal sigue entregando la versión anterior. " +
           "Cuando termine, publicá la actualización desde acá.",
         pointer: "El cliente no ve este video hasta que lo publiques (salvo que esté “Siempre visible”). " +
@@ -99,7 +99,7 @@ export function publicationStatus(publication) {
     return {
       tone: "warn",
       title: "El render nuevo está listo para revisar",
-      detail: byPublicationMode({
+      detail: byRowMode(publication, {
         snapshot: "Abrí el video de esta tarjeta y comprobá el cambio. El portal sigue " +
           "entregando el corte anterior hasta que publiques la actualización.",
         pointer: "Abrí el video de esta tarjeta y comprobá el cambio. El cliente no lo ve hasta que lo publiques (salvo que esté “Siempre visible”): " +

@@ -33,16 +33,17 @@ Approved background edits: the editor now honors the same platform-admin permiss
   delivery is marked in flight (`editing` / `prores_pending`), because R2 keeps
   the previous master until the new one is transcoded.
 - **Client visibility** (`deliveries.client_visibility`, Admin > Cambios UMG >
-  "Qué ve el cliente"): `auto` (NULL, default) hides the delivery's files while
-  `stale_since` is set and no snapshot exists, `visible` keeps the newest cut
+  "Qué ve el cliente"): `auto` (NULL, default) hides the delivery's files while an
+  edit is in flight (`stale_reason` editing / prores_pending) and no snapshot exists
+  (a dead `edit_failed` is not hidden), `visible` keeps the newest cut
   available, `hidden` keeps it out until changed. The portal listing keeps the
   card and the client's requests with `files: []` and `files_hidden: true`. The
   value sits on the shared portal row because the portal is served by the
   production backend: the rule only takes effect for clients once that backend
   runs this code. Signed links already handed out stay valid until they expire.
 - The publication mode can be switched from the admin panel (`/admin/publication-settings`,
-  stored in the local `system_settings` table); `PUBLISH_LATEST_POINTER` is only
-  the default when nobody has chosen.
+  stored in the local `system_settings` table, super admin only);
+  `PUBLISH_LATEST_POINTER` is only the default when nobody has chosen.
 - Unreferenced `.published-*` and `.vN` objects are not deleted by this change.
 - APIs expose the mode (`publication_mode` on `/admin/change-requests` and the
   campaign pipeline) so the UI does not claim "the portal still shows the old

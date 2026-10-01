@@ -389,6 +389,7 @@ def publication_state(job, delivery) -> dict:
         "needs_publish": changed,
         "client_visibility": getattr(delivery, "client_visibility", None) or "auto",
         "hidden_from_client": is_hidden_from_client(delivery),
+        "snapshot_pinned": getattr(delivery, "published_file_keys", None) is not None,
         "prores_pending": pending,
         "awaiting_review": bool(
             delivery.content_updated_at and delivery.approved_at is None
