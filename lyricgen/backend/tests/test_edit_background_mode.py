@@ -18,7 +18,7 @@ import uuid
 from database import Job as JobModel, User as UserModel
 
 
-def _create_pending_review_job(db, tenant_id, user_id):
+def _create_pending_review_job(db, tenant_id, user_id, *, status="pending_review"):
     """Insert a Job in pending_review status that satisfies request_edit's
     pre-checks: bg_r2_key_cached + segments_json + edit_count=0."""
     job_id = uuid.uuid4().hex[:12]
@@ -29,7 +29,7 @@ def _create_pending_review_job(db, tenant_id, user_id):
         artist="Test",
         song_title="BG Mode Test",
         filename="test.mp3",
-        status="pending_review",
+        status=status,
         delivery_profile="youtube",
         progress=100,
         bg_r2_key_cached="fake/bg.mp4",
@@ -74,7 +74,7 @@ def test_bg_mode_imagen_forwarded_to_edit_params(client, admin_token, db, monkey
             "background_hint": "tropical mountain dawn, no people",
         },
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert len(captured) == 1
     edit_params = captured[0]["edit_params"]
     assert edit_params.get("background_mode") == "imagen", (
@@ -97,8 +97,37 @@ def test_bg_mode_veo_explicit_also_forwarded(client, admin_token, db, monkeypatc
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "background", "background_mode": "veo"},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert captured[0]["edit_params"].get("background_mode") == "veo"
+
+
+def test_admin_can_regenerate_background_for_already_delivered_job(
+    client, admin_token, db, monkeypatch,
+):
+    """Cambios UMG starts from a shipped/done job, not pending_review."""
+    captured = _capture_enqueue_calls(monkeypatch)
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _create_pending_review_job(
+        db, tenant_id, user_id, status="done",
+    )
+
+    res = client.post(
+        f"/edit/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "edit_type": "background",
+            "background_hint": "Nueva escena urbana, sin armas ni texto",
+            "background_mode": "veo",
+            "bg_verbatim": True,
+            "force_content_validation": True,
+        },
+    )
+
+    assert res.status_code == 202, res.text
+    assert captured[0]["edit_params"]["background_hint"] == (
+        "Nueva escena urbana, sin armas ni texto"
+    )
+    assert captured[0]["edit_params"]["force_content_validation"] is True
 
 
 def test_bg_mode_absent_leaves_edit_params_clean(client, admin_token, db, monkeypatch):
@@ -114,7 +143,7 @@ def test_bg_mode_absent_leaves_edit_params_clean(client, admin_token, db, monkey
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "background"},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert "background_mode" not in captured[0]["edit_params"], (
         "When background_mode is absent from the body, it should NOT "
         "appear in edit_params either — let the pipeline's default kick in"
@@ -159,7 +188,7 @@ def test_bg_mode_ignored_for_typography_edit(client, admin_token, db, monkeypatc
             "font": "bebas-neue",
         },
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     edit_params = captured[0]["edit_params"]
     assert "background_mode" not in edit_params, (
         "background_mode should be ignored for non-background edit_types"
@@ -203,7 +232,7 @@ def test_background_edit_rejected_for_scene_jobs(client, admin_token, db, monkey
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "typography"},
     )
-    assert res2.status_code == 200, res2.text
+    assert res2.status_code == 202, res2.text
     assert len(captured) == 1
 
 
@@ -239,7 +268,7 @@ def test_bg_verbatim_absent_does_not_clobber_persisted_true(client, admin_token,
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "background", "movement_style": "animado"},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     edit_params = captured[0]["edit_params"]
     assert "bg_verbatim" not in edit_params, (
         f"omitted bg_verbatim must not be written; got {edit_params!r}"
@@ -263,7 +292,7 @@ def test_bg_verbatim_explicit_false_is_written(client, admin_token, db, monkeypa
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "background", "bg_verbatim": False},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert captured[0]["edit_params"].get("bg_verbatim") is False
 
 
@@ -289,7 +318,7 @@ def test_scene_axes_forwarded_and_persisted(client, admin_token, db, monkeypatch
             "match_lyrics": False,
         },
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     ep = captured[0]["edit_params"]
     assert ep.get("genre") == "pop"
     assert ep.get("concept") == "naturaleza"
@@ -314,7 +343,7 @@ def test_scene_axes_absent_keep_persisted(client, admin_token, db, monkeypatch):
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "background", "movement_style": "animado"},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     ep = captured[0]["edit_params"]
     assert "genre" not in ep and "concept" not in ep and "match_lyrics" not in ep
     db.expire_all()
@@ -344,7 +373,7 @@ def test_background_hint_empty_string_is_explicit_clear(client, admin_token, db,
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "background", "background_hint": "", "match_lyrics": True},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     edit_params = captured[0]["edit_params"]
     assert edit_params.get("background_hint") == ""
     assert edit_params.get("match_lyrics") is True
@@ -369,7 +398,7 @@ def test_background_hint_whitespace_only_is_clear_too(client, admin_token, db, m
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "background", "background_hint": "   "},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert captured[0]["edit_params"].get("background_hint") == ""
     db.expire_all()
     job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
@@ -388,7 +417,7 @@ def test_background_hint_absent_keeps_persisted(client, admin_token, db, monkeyp
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "background", "movement_style": "animado"},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert "background_hint" not in captured[0]["edit_params"]
     db.expire_all()
     job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
@@ -408,7 +437,7 @@ def test_background_hint_ignored_for_non_background(client, admin_token, db, mon
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "typography", "font": "bebas-neue", "background_hint": ""},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     assert "background_hint" not in captured[0]["edit_params"]
     db.expire_all()
     job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
@@ -446,7 +475,7 @@ def test_e2e_regen_change_genre_keeps_prompt_and_scene(client, admin_token, db, 
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"edit_type": "background", "genre": "pop", "force_content_validation": True},
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
 
     # 2) Persistencia REAL: género nuevo, todo lo demás intacto (sin clobber).
     db.expire_all()

@@ -67,7 +67,7 @@ except Exception:
 # Veo standard at the cost of slightly less polish; operator can swap
 # specific clips for hand-crafted ones via Admin UI if needed).
 IMAGEN_MODEL = os.environ.get("LIBRARY_IMAGEN_MODEL", "imagen-4.0-ultra-generate-001")
-VEO_MODEL    = os.environ.get("LIBRARY_VEO_MODEL",    "veo-3.1-fast-generate-001")
+VEO_MODEL    = "veo-3.1-lite-generate-001"
 
 
 # SEED: list[tuple[concept_slug, asset_type, prompt]]

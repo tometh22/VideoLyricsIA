@@ -30,6 +30,41 @@ from tests.conftest import auth
 PORTAL_TOKEN = os.environ.get("DELIVERY_PORTAL_TOKEN", "test-portal-token")
 
 
+def _signed_umg_qc_report(job, reviewer_id):
+    from delivery_qc_runtime import (
+        MANDATORY_REVIEW_CHECKS, delivery_qc_source_fingerprint,
+        delivery_qc_visual_fingerprint, segments_hash,
+    )
+
+    now = datetime.now(timezone.utc).isoformat()
+    issues = [{
+        "issue_id": f"manual-{code}", "code": code, "severity": "FAIL",
+        "result_status": "REVIEW", "status": "RESOLVED_MANUAL",
+        "manual_verification_required": True,
+        "operator_decision": {
+            "decision": "resolved_manual", "user_id": reviewer_id,
+            "decided_at": now,
+        },
+    } for code, _summary, _description in MANDATORY_REVIEW_CHECKS]
+    return {
+        "status": "COMPLETE", "mode": "enforce", "generated_at": now,
+        "report_id": "current-test-report",
+        "segments_revision": int(job.segments_revision or 0),
+        "segments_hash": segments_hash(job.segments_json or []),
+        "delivery_spec": dict(job.umg_spec or {}),
+        "source_fingerprint": delivery_qc_source_fingerprint(job),
+        "visual_fingerprint": delivery_qc_visual_fingerprint(job),
+        "job_input_fingerprint": delivery_qc_source_fingerprint(job),
+        "render_identity": {"edit_count": int(job.edit_count or 0)},
+        "issues": issues,
+    }
+
+
+def _refresh_umg_qc(job):
+    """Model an operator reviewing the exact current render before delivery."""
+    job.delivery_qc = _signed_umg_qc_report(job, job.user_id)
+
+
 @pytest.fixture(autouse=True)
 def _portal_token_env():
     """Make sure DELIVERY_PORTAL_TOKEN is set during this module's tests
@@ -41,6 +76,27 @@ def _portal_token_env():
         os.environ.pop("DELIVERY_PORTAL_TOKEN", None)
     else:
         os.environ["DELIVERY_PORTAL_TOKEN"] = old
+
+
+@pytest.fixture(autouse=True)
+def _publication_copy_succeeds(monkeypatch):
+    # This suite mocks R2 existence; copying that same fake storage is also
+    # an I/O boundary. Failure/byte isolation is tested separately.
+    monkeypatch.setattr('storage.copy_object', lambda *_, **kwargs: True)
+    # Legacy test scenarios customize the bool stub; adapt that fake at the
+    # boundary while production now distinguishes missing from unavailable.
+    import storage
+    original_exists, original_status = storage.object_exists, storage.object_status
+    monkeypatch.setattr(storage, 'object_status', lambda key: (
+        original_status(key) if storage.object_exists is original_exists
+        else 'exists' if storage.object_exists(key) else 'missing'))
+    def identity(key):
+        source = key.split('.published-', 1)[0]
+        status = storage.object_status(source)
+        return {'status': status, **({'etag': 'synthetic-version', 'size': 100}
+                                    if status == 'exists' else {})}
+    monkeypatch.setattr(storage, 'object_identity', identity)
+    monkeypatch.setattr(storage, 'object_status_bounded', lambda key: storage.object_status(key))
 
 
 @pytest.fixture
@@ -78,6 +134,8 @@ def approved_job(db, admin_token, client):
     db.add(job)
     db.commit()
     db.refresh(job)
+    job.delivery_qc = _signed_umg_qc_report(job, me["id"])
+    db.commit()
     yield job
     # Cleanup: remove the job + any deliveries we created against it.
     # Change requests reference deliveries via a FK (delivery_change_requests
@@ -85,7 +143,10 @@ def approved_job(db, admin_token, client):
     # test DB silently ignores it, so deleting the CRs first is required or
     # this teardown 500s and leaves testjob12345 behind, breaking every
     # subsequent test that reuses this fixture's hardcoded job_id.
-    from database import Delivery, DeliveryChangeRequest
+    from database import (
+        ChangeRequestProposal, Delivery, DeliveryChangeRequest,
+        EditorDocument, EditorVersion, JobOutboxEvent,
+    )
     delivery_ids = [
         d.id for d in db.query(Delivery).filter(Delivery.job_id == "testjob12345").all()
     ]
@@ -93,6 +154,18 @@ def approved_job(db, admin_token, client):
         db.query(DeliveryChangeRequest).filter(
             DeliveryChangeRequest.delivery_id.in_(delivery_ids)
         ).delete(synchronize_session=False)
+    db.query(ChangeRequestProposal).filter(
+        ChangeRequestProposal.job_id == "testjob12345"
+    ).delete(synchronize_session=False)
+    db.query(JobOutboxEvent).filter(
+        JobOutboxEvent.job_id == "testjob12345"
+    ).delete(synchronize_session=False)
+    db.query(EditorVersion).filter(
+        EditorVersion.job_id == "testjob12345"
+    ).delete(synchronize_session=False)
+    db.query(EditorDocument).filter(
+        EditorDocument.job_id == "testjob12345"
+    ).delete(synchronize_session=False)
     db.query(Delivery).filter(Delivery.job_id == "testjob12345").delete()
     db.query(Job).filter(Job.id == job.id).delete()
     db.commit()
@@ -120,6 +193,213 @@ def test_admin_can_create_delivery(client, admin_token, approved_job, all_r2_fil
     assert body["replaced"] is False
 
 
+def test_publication_blocks_when_qc_report_is_missing(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    approved_job.delivery_qc = None
+    db.commit()
+
+    response = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "delivery_qc_blocked"
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "fresh_preflight_required"
+
+
+def test_publication_blocks_until_required_manual_checks_are_signed(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    report = dict(approved_job.delivery_qc)
+    report["issues"] = [dict(row) for row in report["issues"]]
+    report["issues"][0].update({"status": "OPEN", "operator_decision": None})
+    approved_job.delivery_qc = report
+    db.commit()
+
+    response = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "argentina"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "manual_review_required"
+
+
+def test_staging_campaign_bypass_allows_publication_but_keeps_audit(
+    client, admin_token, approved_job, db, all_r2_files_present, monkeypatch,
+):
+    from database import AuditLog, BatchCampaign
+
+    report = dict(approved_job.delivery_qc)
+    report["issues"] = [dict(row) for row in report["issues"]]
+    report["issues"][0].update({"status": "OPEN", "operator_decision": None})
+    approved_job.delivery_qc = report
+    campaign_id = "umg-stg-01"
+    db.add(BatchCampaign(
+        id=campaign_id,
+        tenant_id=approved_job.tenant_id,
+        created_by=approved_job.user_id,
+        name="Staging UMG bypass fixture",
+    ))
+    db.flush()
+    approved_job.campaign_id = campaign_id
+    db.commit()
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "1")
+    monkeypatch.setenv(
+        "DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS",
+        "umg-stg-01",
+    )
+    monkeypatch.setenv(
+        "DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_UNTIL_UTC",
+        "2099-01-01T00:00:00Z",
+    )
+
+    response = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "argentina"},
+    )
+    assert response.status_code == 200
+    audit = db.query(AuditLog).filter(
+        AuditLog.action == "delivery.create",
+    ).order_by(AuditLog.id.desc()).first()
+    assert audit.detail["staging_manual_review_bypass"] is True
+
+
+def test_publication_does_not_start_prores_when_qc_needs_correction(
+    client, admin_token, approved_job, db,
+):
+    report = dict(approved_job.delivery_qc)
+    report["issues"] = [dict(row) for row in report["issues"]]
+    report["issues"].append({
+        "issue_id": "objective-black-frame", "code": "MEDIA_BLACK_FRAME",
+        "status": "OPEN", "severity": "FAIL", "result_status": "FAIL",
+        "blocking": True,
+    })
+    approved_job.delivery_qc = report
+    db.commit()
+
+    with patch("main.enqueue_prores_prewarm") as enqueue:
+        response = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={"portal_id": "chile"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "open_fail"
+    enqueue.assert_not_called()
+
+
+def test_objective_fail_cannot_be_manually_cleared_through_api(
+    client, admin_token, approved_job, db,
+):
+    report = dict(approved_job.delivery_qc)
+    report["issues"] = [dict(row) for row in report["issues"]]
+    report["issues"].append({
+        "issue_id": "objective-black-frame", "code": "MEDIA_BLACK_FRAME",
+        "status": "OPEN", "severity": "FAIL", "result_status": "FAIL",
+        "blocking": True,
+    })
+    approved_job.delivery_qc = report
+    db.commit()
+
+    response = client.post(
+        f"/jobs/{approved_job.job_id}/delivery-qc/issues/objective-black-frame/decision",
+        headers=auth(admin_token),
+        json={"decision": "resolved_manual", "reason": "try to bypass", "expected_report_id": report["report_id"]},
+    )
+
+    assert response.status_code == 422, response.json()
+    assert response.json()["detail"] == "blocking_fail_requires_correction_and_new_preflight"
+
+
+def test_umg_publish_rejects_qc_from_a_different_scene_render(
+    client, admin_token, approved_job, db, monkeypatch,
+):
+    approved_job.scene_plan = {"scenes": [{"prompt": "new scene"}]}
+    db.commit()
+    monkeypatch.setattr(
+        "main.storage.object_status_bounded",
+        lambda *_args, **_kwargs: pytest.fail("QC must block before storage verification"),
+    )
+
+    response = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "delivery_qc_blocked"
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "fresh_preflight_required"
+
+
+def test_umg_publish_rejects_qc_after_prores_spec_changes_until_rechecked(
+    client, admin_token, approved_job, db, monkeypatch,
+):
+    approved_job.umg_spec = {"frame_size": "UHD-4K", "fps": 29.97}
+    db.commit()
+    monkeypatch.setattr(
+        "main.storage.object_status_bounded",
+        lambda *_args, **_kwargs: pytest.fail("QC must block before storage verification"),
+    )
+
+    response = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "delivery_qc_blocked"
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "fresh_preflight_required"
+
+
+@pytest.mark.parametrize('head_fails', [False, True])
+def test_portal_storage_io_has_no_database_transaction(
+    client, admin_token, approved_job, all_r2_files_present, db, head_fails,
+):
+    """A cold listing must not hold a DB transaction while it waits on R2/Redis
+    (PostgreSQL kills idle transactions after ~1 min) and must not block the
+    event loop. Ported from the production line (ace4063b)."""
+    from database import DeliveryChangeRequest
+    from sqlalchemy.orm import Session
+    import main
+
+    created = client.post(f'/admin/deliveries/from-job/{approved_job.job_id}',
+                          headers=auth(admin_token), json={})
+    delivery_id = created.json()['delivery_id']
+    db.add(DeliveryChangeRequest(delivery_id=delivery_id, comment='corregir fondo',
+                                resolved_at=datetime.now(timezone.utc),
+                                resolution_note='Fondo corregido'))
+    db.commit()
+    sessions = []
+    original_rollback = Session.rollback
+
+    def rollback(session):
+        original_rollback(session)
+        sessions.append(session)
+
+    def head(**kwargs):
+        assert sessions and all(not s.in_transaction() for s in sessions)
+        if head_fails:
+            raise TimeoutError('R2 unavailable')
+        return {'ContentLength': 12345}
+
+    with patch.object(Session, 'rollback', rollback), patch(
+        'queue_jobs._init_redis', side_effect=RuntimeError('no cache'),
+    ), patch('main.storage._get_metadata_client') as r2, patch(
+        'main.storage.generate_signed_url', return_value='https://files.test/cut',
+    ):
+        r2.return_value.head_object.side_effect = head
+        response = client.get('/api/deliveries/items', headers={'X-Portal-Token': PORTAL_TOKEN})
+    assert response.status_code == 200, response.text
+    version = response.json()['songs'][0]['versions'][0]
+    assert version['pending_change_requests'] == 0
+    assert version['change_requests'][0]['resolution_note'] == 'Fondo corregido'
+    assert all(f['available'] is not head_fails for f in version['files'])
+    import inspect
+    assert not inspect.iscoroutinefunction(main.portal_get_items)
+
+
 def test_missing_prores_is_prepared_instead_of_returning_dead_end(
     client, admin_token, approved_job,
 ):
@@ -133,7 +413,7 @@ def test_missing_prores_is_prepared_instead_of_returning_dead_end(
         patch("main.storage.object_exists", side_effect=object_exists),
         patch(
             "main.enqueue_prores_prewarm",
-            side_effect=lambda _job_id, file_type, *, force=False: (
+            side_effect=lambda _job_id, file_type, *, force=False, dedupe_live=False: (
                 f"rq:{file_type}" if force else None
             ),
         ) as enqueue,
@@ -150,7 +430,7 @@ def test_missing_prores_is_prepared_instead_of_returning_dead_end(
     assert body["missing"] == ["umg_master", "umg_short"]
     assert body["enqueued"] == ["umg_master", "umg_short"]
     assert enqueue.call_count == 2
-    assert all(call.kwargs == {"force": True} for call in enqueue.call_args_list)
+    assert all(call.kwargs == {"force": True, "dedupe_live": True} for call in enqueue.call_args_list)
 
 
 def test_youtube_only_job_requests_prores_configuration(
@@ -158,6 +438,7 @@ def test_youtube_only_job_requests_prores_configuration(
 ):
     approved_job.umg_spec = None
     approved_job.delivery_profile = "youtube"
+    _refresh_umg_qc(approved_job)
     db.commit()
 
     def object_exists(key):
@@ -275,6 +556,8 @@ def test_portal_items_lists_active_deliveries(client, admin_token, approved_job,
     # Then list
     res = client.get("/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN})
     assert res.status_code == 200
+    assert res.headers["cache-control"] == "private, no-store, max-age=0"
+    assert res.headers["pragma"] == "no-cache"
     payload = res.json()
     assert "songs" in payload
     assert "file_type_labels" in payload
@@ -290,6 +573,83 @@ def test_portal_items_lists_active_deliveries(client, admin_token, approved_job,
     assert isinstance(v.get("delivery_id"), int)
     # 5 files expected (umg_master, umg_short, video, short, thumbnail)
     assert len(v["files"]) == 5
+
+
+def test_chile_portal_does_not_expose_non_chile_delivery(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The Chile surface only exposes rows explicitly sent to Chile.
+
+    The fixture is published with the default Argentina destination, which
+    Chile must not inherit even when both portals use the same token.
+    """
+    client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    res = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    )
+    assert res.status_code == 200
+    assert not any(
+        song["artist"] == "Test Artist" for song in res.json()["songs"]
+    )
+
+
+def test_same_job_can_be_published_to_both_portals(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The destination is part of the delivery identity, not the job.
+
+    This is the regression test for the admin workflow: a video sent first to
+    Argentina must remain independently publishable to Chile.
+    """
+    argentina = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    chile = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert argentina.status_code == 200, argentina.text
+    assert chile.status_code == 200, chile.text
+    assert argentina.json()["portal_id"] == "argentina"
+    assert chile.json()["portal_id"] == "chile"
+    assert argentina.json()["delivery_id"] != chile.json()["delivery_id"]
+
+    argentina_items = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "argentina"},
+    ).json()
+    chile_items = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    ).json()
+    assert any(song["artist"] == "Test Artist" for song in argentina_items["songs"])
+    assert any(song["artist"] == "Test Artist" for song in chile_items["songs"])
+
+    status = client.get(
+        f"/status/{approved_job.job_id}", headers=auth(admin_token),
+    ).json()
+    assert set(status["umg_portals"]) == {"argentina", "chile"}
+
+
+def test_chile_publish_accepts_source_from_any_tenant(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The selected Chile destination, not the source tenant, controls visibility."""
+    res = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert res.status_code == 200, res.text
+    items = client.get(
+        "/api/deliveries/items",
+        headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+    ).json()
+    assert any(song["artist"] == "Test Artist" for song in items["songs"])
 
 
 def test_portal_can_delete(client, admin_token, approved_job, all_r2_files_present):
@@ -322,6 +682,135 @@ def test_admin_delete_via_jwt(client, admin_token, approved_job, all_r2_files_pr
 
     res = client.delete(f"/admin/deliveries/{delivery_id}", headers=auth(admin_token))
     assert res.status_code == 200
+
+
+def test_portal_can_prepare_missing_prores_for_its_delivery(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+
+    with patch("main.enqueue_prores_prewarm", return_value="prewarm:test") as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_master"},
+        )
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "queued"
+    enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True, dedupe_live=True)
+
+
+def test_a_hidden_delivery_cannot_have_a_master_prepared_and_publish_reports_the_visibility(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    # The publish response tells the operator whether the client can see it at all.
+    assert published.json()["client_visibility"] == "auto"
+    assert published.json()["hidden_from_client"] is False
+    delivery_id = published.json()["delivery_id"]
+    hidden = client.put(f"/admin/deliveries/{delivery_id}/visibility",
+                        headers=auth(admin_token), json={"mode": "hidden"})
+    assert hidden.status_code == 200, hidden.text
+    again = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["client_visibility"] == "hidden" and again.json()["hidden_from_client"] is True
+    with patch("main.enqueue_prores_prewarm", return_value="prewarm:test") as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_master"},
+        )
+    assert res.status_code == 404
+    enqueue.assert_not_called()
+
+
+def test_portal_can_prepare_staging_delivery_without_local_job(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    """The shared portal DB contains deliveries created by staging, while
+    production's jobs DB deliberately does not contain those Job rows."""
+    from database import Job
+
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+    db.query(Job).filter(Job.id == approved_job.id).delete()
+    db.commit()
+
+    with patch(
+        "main.enqueue_delivery_prores_prewarm", return_value="portal-prewarm:test",
+    ) as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_master"},
+        )
+
+    assert res.status_code == 202, res.text
+    assert res.json()["status"] == "queued"
+    enqueue.assert_called_once_with(
+        approved_job.job_id, "umg_master", "default", frame_size="HD",
+    )
+
+
+def test_portal_can_prepare_legacy_mp4_only_delivery(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+    approved_job.umg_spec = None
+    db.commit()
+
+    with patch(
+        "main.enqueue_delivery_prores_prewarm", return_value="portal-prewarm:test",
+    ) as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_short"},
+        )
+
+    assert res.status_code == 202, res.text
+    enqueue.assert_called_once_with(
+        approved_job.job_id, "umg_short", "default", frame_size="HD",
+    )
+
+
+def test_portal_cannot_prepare_prores_from_the_other_portal(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    chile_delivery_id = published.json()["delivery_id"]
+    with patch("main.enqueue_prores_prewarm"):
+        res = client.post(
+            f"/api/deliveries/{chile_delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "argentina"},
+            json={"file_type": "umg_master"},
+        )
+    assert res.status_code == 404
 
 
 def test_status_endpoint_includes_is_in_umg_portal(
@@ -472,6 +961,9 @@ def test_change_request_submit_and_admin_lists_it(
     assert call_args[0] == "Test Artist"        # artist
     assert call_args[2] == "poner la tipografía más grande"  # comment
     assert call_args[3] == delivery_id          # delivery_id
+    # El mail linkea al pedido exacto y dice a qué portal pertenece.
+    assert mock_notify.call_args.kwargs["request_id"] == cr_id
+    assert mock_notify.call_args.kwargs["portal_id"]
     assert call_args[4] == approved_job.job_id  # job_id
 
     # El admin lo ve como pendiente.
@@ -484,6 +976,8 @@ def test_change_request_submit_and_admin_lists_it(
     assert item["delivery"]["artist"] == "Test Artist"
     assert item["delivery"]["job_id"] == approved_job.job_id
     assert item["resolved_at"] is None
+    assert item["publication"]["prores_configured"] is True
+    assert item["delivery_qc_gate"]["can_approve"] is True
 
     # Resolver lo saca de "pending" y lo pasa a "resolved".
     res = client.post(f"/admin/change-requests/{cr_id}/resolve",
@@ -507,6 +1001,270 @@ def test_change_request_submit_and_admin_lists_it(
     pending = client.get("/admin/change-requests?status=pending",
                           headers=auth(admin_token)).json()
     assert pending["pending_count"] == 1
+
+
+def test_reopened_change_request_surfaces_first_in_the_admin_list(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """A reopened request keeps its old submitted_at; ordering by that pushed it
+    below the list cut, so the reopened case went unseen."""
+    delivery = client.post(f"/admin/deliveries/from-job/{approved_job.job_id}",
+                           headers=auth(admin_token), json={})
+    assert delivery.status_code == 200, delivery.text
+    delivery_id = delivery.json()["delivery_id"]
+    ids = []
+    with patch("main.emails.send_umg_change_request_notification"):
+        for comment in ("primer pedido", "segundo pedido"):
+            res = client.post(f"/api/deliveries/{delivery_id}/change-request",
+                              headers={"X-Portal-Token": PORTAL_TOKEN}, json={"comment": comment})
+            assert res.status_code == 200, res.text
+            ids.append(res.json()["id"])
+    first, second = ids
+
+    def pending_order():
+        listing = client.get("/admin/change-requests?status=pending", headers=auth(admin_token)).json()
+        return [item["id"] for item in listing["items"]]
+
+    assert pending_order() == [second, first]
+    assert client.post(f"/admin/change-requests/{first}/resolve", headers=auth(admin_token),
+                       json={"resolution_note": "listo"}).status_code == 200
+    assert client.post(f"/admin/change-requests/{first}/reopen", headers=auth(admin_token)).status_code == 200
+    assert pending_order() == [first, second]
+
+
+def test_change_request_list_surfaces_missing_current_preflight(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    delivery = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert delivery.status_code == 200, delivery.text
+    delivery_id = delivery.json()["delivery_id"]
+    with patch("main.emails.send_umg_change_request_notification"):
+        request = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": "revisar el corte corregido"},
+        )
+    assert request.status_code == 200, request.text
+
+    approved_job.delivery_qc = None
+    db.commit()
+    listed = client.get(
+        "/admin/change-requests?status=pending", headers=auth(admin_token),
+    )
+    assert listed.status_code == 200, listed.text
+    item = next(
+        row for row in listed.json()["items"] if row["id"] == request.json()["id"]
+    )
+    assert item["delivery_qc_gate"]["blocked"] is True
+    assert item["delivery_qc_gate"]["reason"] == "fresh_preflight_required"
+
+
+def test_change_request_proposal_applies_revisioned_text_but_stays_open_until_publish(
+    client, admin_token, approved_job, all_r2_files_present, db, monkeypatch,
+):
+    monkeypatch.setenv("CHANGE_REQUEST_ASSIST_ENABLED", "1")
+    monkeypatch.setenv("CHANGE_REQUEST_APPLY_ENABLED", "1")
+    approved_job.segments_json = [
+        {"start": 0.0, "end": 2.0, "text": "Texto equivocado"},
+        {"start": 2.2, "end": 4.0, "text": "Otra línea"},
+    ]
+    approved_job.segments_revision = 0
+    approved_job.bg_r2_key_cached = "backgrounds/testjob12345.mp4"
+    _refresh_umg_qc(approved_job)
+    db.commit()
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    with patch("main.emails.send_umg_change_request_notification"):
+        cr_id = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": '0:01 "Texto correcto"'},
+        ).json()["id"]
+
+    generated = client.post(
+        f"/admin/change-requests/{cr_id}/proposals",
+        headers=auth(admin_token),
+    )
+    assert generated.status_code == 200, generated.text
+    proposal = generated.json()["proposal"]
+    operation_ids = [
+        row["id"] for row in proposal["operations"] if row["applicable"]
+    ]
+    assert len(operation_ids) == 1
+
+    with patch("main._dispatch_editor_quality_outbox"):
+        applied = client.post(
+            f"/admin/change-requests/{cr_id}/proposals/{proposal['id']}/apply",
+            headers=auth(admin_token),
+            json={
+                "base_revision": proposal["base_revision"],
+                "expected_proposal_hash": proposal["content_hash"],
+                "operation_ids": operation_ids,
+                "idempotency_key": "test-change-request-apply-0001",
+            },
+        )
+    assert applied.status_code == 200, applied.text
+    db.expire_all()
+    from database import DeliveryChangeRequest, Job
+    job = db.query(Job).filter(Job.job_id == approved_job.job_id).one()
+    request = db.query(DeliveryChangeRequest).filter(
+        DeliveryChangeRequest.id == cr_id
+    ).one()
+    assert job.segments_json[0]["text"] == "Texto correcto"
+    assert job.segments_revision == 1
+    assert request.resolved_at is None
+
+    # Network retries with the same key must not create another editor
+    # revision or lose the editor handoff URL.
+    with patch("main._dispatch_editor_quality_outbox"):
+        repeated = client.post(
+            f"/admin/change-requests/{cr_id}/proposals/{proposal['id']}/apply",
+            headers=auth(admin_token),
+            json={
+                "base_revision": proposal["base_revision"],
+                "expected_proposal_hash": proposal["content_hash"],
+                "operation_ids": operation_ids,
+                "idempotency_key": "test-change-request-apply-0001",
+            },
+        )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["idempotent"] is True
+    assert repeated.json()["revision"] == 1
+    assert repeated.json()["editor_url"].startswith(
+        f"/videos/{approved_job.job_id}/edit-lyrics"
+    )
+    db.expire_all()
+    assert db.query(Job).filter(Job.job_id == approved_job.job_id).one().segments_revision == 1
+
+    # The proposal already persisted revision 1, so the editor has no local
+    # diff.  Its explicit UMG context must still enqueue that exact saved
+    # revision for rendering instead of producing "No cambiaste nada".
+    current_segments = db.query(Job).filter(
+        Job.job_id == approved_job.job_id
+    ).one().segments_json
+    invalid_context = client.post(
+        f"/edit/{approved_job.job_id}",
+        headers=auth(admin_token),
+        json={
+            "edit_type": "lyrics",
+            "segments": current_segments,
+            "base_revision": 1,
+            "change_request_id": cr_id,
+            "change_request_proposal_id": "not-the-applied-proposal",
+        },
+    )
+    assert invalid_context.status_code == 409
+    assert invalid_context.json()["detail"]["code"] == "change_request_proposal_not_renderable"
+
+    with patch("main.enqueue_edit", return_value="edit:test"):
+        render = client.post(
+            f"/edit/{approved_job.job_id}",
+            headers={
+                **auth(admin_token),
+                "Idempotency-Key": f"umg-change:{cr_id}:{proposal['id']}:1",
+            },
+            json={
+                "edit_type": "lyrics",
+                "segments": current_segments,
+                "base_revision": 1,
+                "change_request_id": cr_id,
+                "change_request_proposal_id": proposal["id"],
+            },
+        )
+    assert render.status_code == 202, render.text
+    db.expire_all()
+    from database import JobOutboxEvent
+    event = db.query(JobOutboxEvent).filter(
+        JobOutboxEvent.job_id == approved_job.job_id,
+        JobOutboxEvent.event_type == "edit.enqueue",
+    ).order_by(JobOutboxEvent.created_at.desc()).first()
+    assert event is not None
+    assert event.payload["change_request_id"] == cr_id
+    assert event.payload["change_request_proposal_id"] == proposal["id"]
+
+
+def test_change_request_dismissed_proposal_can_be_recalculated(
+    client, admin_token, approved_job, all_r2_files_present, db, monkeypatch,
+):
+    monkeypatch.setenv("CHANGE_REQUEST_ASSIST_ENABLED", "1")
+    approved_job.segments_json = [{"start": 0.0, "end": 2.0, "text": "Viejo"}]
+    approved_job.segments_revision = 0
+    _refresh_umg_qc(approved_job)
+    db.commit()
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    with patch("main.emails.send_umg_change_request_notification"):
+        cr_id = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": '0:01 debe decir "Nuevo"'},
+        ).json()["id"]
+    proposal = client.post(
+        f"/admin/change-requests/{cr_id}/proposals", headers=auth(admin_token),
+    ).json()["proposal"]
+    dismissed = client.post(
+        f"/admin/change-requests/{cr_id}/proposals/{proposal['id']}/dismiss",
+        headers=auth(admin_token), json={"reason": "incorrect_parse"},
+    )
+    assert dismissed.status_code == 200, dismissed.text
+
+    recalculated = client.post(
+        f"/admin/change-requests/{cr_id}/proposals", headers=auth(admin_token),
+    )
+    assert recalculated.status_code == 200, recalculated.text
+    payload = recalculated.json()
+    assert payload["recalculated"] is True
+    assert payload["proposal"]["id"] == proposal["id"]
+    assert payload["proposal"]["status"] == "ready"
+
+
+def test_change_request_apply_rejects_stale_editor_revision(
+    client, admin_token, approved_job, all_r2_files_present, db, monkeypatch,
+):
+    monkeypatch.setenv("CHANGE_REQUEST_ASSIST_ENABLED", "1")
+    monkeypatch.setenv("CHANGE_REQUEST_APPLY_ENABLED", "1")
+    approved_job.segments_json = [{"start": 0.0, "end": 2.0, "text": "Viejo"}]
+    approved_job.segments_revision = 0
+    _refresh_umg_qc(approved_job)
+    db.commit()
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    with patch("main.emails.send_umg_change_request_notification"):
+        cr_id = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": '0:01 debe decir "Nuevo"'},
+        ).json()["id"]
+    proposal = client.post(
+        f"/admin/change-requests/{cr_id}/proposals", headers=auth(admin_token),
+    ).json()["proposal"]
+    operation_id = next(row["id"] for row in proposal["operations"] if row["applicable"])
+
+    # Simulate a concurrent editor save after proposal generation.
+    approved_job.segments_revision = 1
+    approved_job.segments_json = [{"start": 0.0, "end": 2.0, "text": "Edición humana"}]
+    db.commit()
+    response = client.post(
+        f"/admin/change-requests/{cr_id}/proposals/{proposal['id']}/apply",
+        headers=auth(admin_token),
+        json={
+            "base_revision": proposal["base_revision"],
+            "expected_proposal_hash": proposal["content_hash"],
+            "operation_ids": [operation_id],
+            "idempotency_key": "test-change-request-stale-0001",
+        },
+    )
+    assert response.status_code == 409
+    assert "stale" in str(response.json()["detail"])
 
 
 def test_change_request_notification_failure_does_not_break_submit(
@@ -614,3 +1372,606 @@ def test_media_token_404_cuando_el_entregable_no_existe(
     res = client.get(f"/media-token/{approved_job.job_id}/video",
                      headers=auth(admin_token))
     assert res.status_code == 200, res.text
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Ciclo de vida de una corrección: editar → publicar → el cliente revisa.
+#
+# El portal reconstruye la key de R2 y la firma, y el render escribe en esa
+# misma key. Así que una corrección llega al cliente sin link nuevo — lo que
+# queremos — y sin rastro en ninguna fila: mismo label, misma fecha, misma
+# pastilla verde de "aprobado" sobre un corte que nunca vio. Estos tests
+# fijan las dos consecuencias que se vieron en producción.
+# ───────────────────────────────────────────────────────────────────────────
+
+def _edit_the_render(db, job):
+    """Simula lo que deja un re-render de edición en la fila del job.
+
+    run_edit_pipeline archiva los entregables previos, re-sube el MP4 e
+    invalida las keys del ProRes; el prewarm las reescribe cuando el master
+    fresco está arriba. Reproducir esa forma es lo que hace verificable el
+    estado intermedio.
+    """
+    job.edit_count = (job.edit_count or 0) + 1
+    job.segments_revision = (job.segments_revision or 0) + 1
+    job.previous_versions = (job.previous_versions or []) + [{
+        "version": len(job.previous_versions or []) + 1,
+        "archived_at": datetime.now(timezone.utc).isoformat(),
+        "keys": {"video": "default/testjob12345/lyric_video.mp4.v1"},
+    }]
+    _refresh_umg_qc(job)
+    db.commit()
+
+
+def test_stale_prores_blocks_publication_instead_of_shipping_a_mismatched_pair(
+    client, admin_token, approved_job, db,
+):
+    """El .mov PRE-EDIT sigue en su key y contesta el HEAD.
+
+    Con la sola prueba de existencia el gate daba OK y el portal entregaba
+    el master viejo al lado del MP4 nuevo (incidente 2026-08-03). El oráculo
+    es la fila: el edit borró s3_keys["umg_master"] y el prewarm todavía no
+    la reescribió.
+    """
+    approved_job.s3_keys = {
+        "video": "default/testjob12345/lyric_video.mp4",
+        "short": "default/testjob12345/short.mp4",
+        "thumbnail": "default/testjob12345/thumbnail.jpg",
+        "umg_short": "default/testjob12345/umg_short.mov",
+    }
+    _edit_the_render(db, approved_job)
+
+    with (
+        # TODOS los objetos están en R2 — incluido el master viejo.
+        patch("main.storage.object_exists", return_value=True),
+        patch(
+            "main.enqueue_prores_prewarm",
+            side_effect=lambda _job_id, file_type, *, force=False, dedupe_live=False: f"rq:{file_type}",
+        ) as enqueue,
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={},
+        )
+
+    assert res.status_code == 202, res.text
+    body = res.json()
+    assert body["status"] == "preparing_prores"
+    assert body["stale"] == ["umg_master"]
+    assert body["missing"] == ["umg_master"]
+    enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True, dedupe_live=True)
+
+
+def test_publishing_a_corrected_cut_reopens_the_client_review(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """New content resets client approval, but is not proof a case was reviewed."""
+    from database import Delivery, DeliveryChangeRequest
+
+    first = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["revision"] == 1
+    delivery_id = first.json()["delivery_id"]
+
+    # El cliente aprueba y después pide un cambio sobre esa versión.
+    assert client.post(
+        f"/api/deliveries/{delivery_id}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+    ).status_code == 200
+    with patch("main.emails.send_umg_change_request_notification"):
+        cr_id = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": "falta una línea en el estribillo"},
+        ).json()["id"]
+
+    _edit_the_render(db, approved_job)
+
+    second = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert second.status_code == 200, second.text
+    body = second.json()
+    assert body["replaced"] is True
+    assert body["content_changed"] is True
+    assert body["revision"] == 2
+    assert body["resolved_change_requests"] == []
+
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    db.refresh(row)
+    assert row.published_revision == 2
+    assert row.content_updated_at is not None
+    # La aprobación era sobre el corte anterior: el portal vuelve a ofrecer
+    # Aprobar / Rechazar sin tocar nada del lado del cliente.
+    assert row.approved_at is None
+    assert row.approved_by_label is None
+
+    cr = db.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
+    db.refresh(cr)
+    assert cr.resolved_at is None
+    assert cr.resolved_by_revision is None
+    assert cr.resolution_source is None
+
+
+def test_resending_the_same_cut_keeps_the_approval_and_the_open_request(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """El contrapeso del test anterior.
+
+    Si un reenvío contara como versión nueva, cada doble clic anularía una
+    aprobación legítima de UMG y les pediría revisar de nuevo algo idéntico.
+    """
+    from database import Delivery, DeliveryChangeRequest
+
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    client.post(
+        f"/api/deliveries/{delivery_id}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+    )
+    with patch("main.emails.send_umg_change_request_notification"):
+        cr_id = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": "consulta, no cambio"},
+        ).json()["id"]
+
+    again = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["content_changed"] is False
+    assert again.json()["revision"] == 1
+    assert again.json()["resolved_change_requests"] == []
+
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    db.refresh(row)
+    assert row.published_revision == 1
+    assert row.approved_at is not None
+
+    cr = db.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
+    db.refresh(cr)
+    assert cr.resolved_at is None
+
+
+def test_legacy_row_with_proven_later_overwrite_requires_new_approval(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Migración: filas viejas no tienen con qué comparar.
+
+    Tratarlas como contenido nuevo habría dado de baja, de una sola vez,
+    todas las aprobaciones vigentes del portal.
+    """
+    from database import Delivery
+
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    client.post(
+        f"/api/deliveries/{delivery_id}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+    )
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    row.published_render_fingerprint = None
+    db.commit()
+
+    _edit_the_render(db, approved_job)
+    again = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert again.json()["content_changed"] is True
+    db.refresh(row)
+    assert row.approved_at is None
+
+
+def test_a_legacy_row_marked_stale_publishes_the_corrected_cut(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """A real edit marker disambiguates legacy rows without fingerprints.
+
+    This is the historical-delivery case where the admin used to show only
+    "Marcar resuelto sin publicar" even though a corrected render existed.
+    """
+    from database import Delivery, DeliveryChangeRequest
+
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    client.post(
+        f"/api/deliveries/{delivery_id}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+    )
+    with patch("main.emails.send_umg_change_request_notification"):
+        request_id = client.post(
+            f"/api/deliveries/{delivery_id}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"comment": "publicar la corrección"},
+        ).json()["id"]
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    row.published_render_fingerprint = None
+    row.stale_since = datetime.now(timezone.utc)
+    row.stale_reason = "editing"
+    db.commit()
+
+    _edit_the_render(db, approved_job)
+    admin_item = next(
+        item for item in client.get(
+            "/admin/change-requests?status=pending",
+            headers=auth(admin_token),
+        ).json()["items"]
+        if item["id"] == request_id
+    )
+    assert admin_item["publication"]["needs_publish"] is True
+
+    again = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+
+    assert again.status_code == 200, again.text
+    assert again.json()["content_changed"] is True
+    assert again.json()["revision"] == 2
+    assert again.json()["resolved_change_requests"] == []
+    db.refresh(row)
+    assert row.approved_at is None
+    assert row.stale_since is None
+    assert row.stale_reason is None
+    request = (
+        db.query(DeliveryChangeRequest)
+        .filter(DeliveryChangeRequest.id == request_id)
+        .one()
+    )
+    assert request.resolution_source is None
+    assert request.resolved_by_revision is None
+
+
+def test_portal_listing_tells_the_client_there_is_a_new_version(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Sin estos campos el cliente no tenía UN indicio de que el archivo
+    detrás de su descarga cambió: mismo label, misma fecha, mismo peso
+    (cacheado 30 días) y su propia aprobación intacta."""
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    client.post(
+        f"/api/deliveries/{delivery_id}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+    )
+
+    _edit_the_render(db, approved_job)
+    client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+
+    items = client.get(
+        "/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN},
+    ).json()
+    version = next(
+        v for song in items["songs"] for v in song["versions"]
+        if v["delivery_id"] == delivery_id
+    )
+    assert version["revision"] == 2
+    assert version["content_updated_at"] is not None
+    assert version["awaiting_review"] is True
+    assert version["approved_at"] is None
+    # Publicar cierra la ventana de "se están aplicando cambios".
+    assert version["updating"] is False
+
+
+def test_requesting_a_re_render_marks_the_publication_as_updating(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """La ventana honesta: desde que se pide el re-render, el portal deja de
+    presentar la descarga como final. El MP4 se reemplaza minutos antes que
+    el master, así que el aviso tiene que empezar antes, no después."""
+    from database import Delivery
+
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+
+    # Sin entregables trackeados no hay nada publicado que marcar; con
+    # s3_keys el /retry sabe que sí.
+    approved_job.s3_keys = {"video": "default/testjob12345/lyric_video.mp4"}
+    approved_job.input_r2_key = "inputs/default/testjob12345/song.mp3"
+    approved_job.status = "error"
+    db.commit()
+
+    with patch("main.enqueue_pipeline", return_value="rq:1"):
+        retry = client.post(
+            f"/retry/{approved_job.job_id}", headers=auth(admin_token),
+        )
+    assert retry.status_code in (200, 202), retry.text
+
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    db.refresh(row)
+    assert row.stale_since is not None
+    assert row.stale_reason == "editing"
+
+    items = client.get(
+        "/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN},
+    ).json()
+    version = next(
+        v for song in items["songs"] for v in song["versions"]
+        if v["delivery_id"] == delivery_id
+    )
+    assert version["updating"] is True
+    assert version["updating_reason"] == "editing"
+
+
+def test_a_dead_re_render_stops_promising_the_client_work_in_progress(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Si el edit muere, la fila sigue marcada para el operador pero el
+    portal deja de decir "estamos aplicando cambios": prometerle trabajo en
+    curso a un cliente cuando nadie está trabajando es peor que no decir
+    nada, y no tiene forma de destrabarse solo."""
+    from database import Delivery
+
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    row.stale_since = datetime.now(timezone.utc)
+    row.stale_reason = "edit_failed"
+    db.commit()
+
+    version = next(
+        v for song in client.get(
+            "/api/deliveries/items", headers={"X-Portal-Token": PORTAL_TOKEN},
+        ).json()["songs"] for v in song["versions"]
+        if v["delivery_id"] == delivery_id
+    )
+    assert version["updating"] is False
+    # El operador sí lo ve: el motivo viaja igual.
+    assert version["updating_reason"] == "edit_failed"
+
+
+def test_stale_master_without_a_prores_spec_says_what_is_actually_wrong(
+    client, admin_token, approved_job, db,
+):
+    """Los dos casos frenan, pero no significan lo mismo.
+
+    Entrega 289 (2026-09-15): `delivery_profile="youtube"` y `umg_spec` en
+    JSON null sobre un job que YA se entregó como UMG y cuyo master de 4,3 GB
+    sigue descargable, del corte anterior. Decirle al operador "este video fue
+    generado sólo para YouTube" lo manda a buscar el problema al lugar
+    equivocado mientras el cliente se lleva el archivo viejo.
+    """
+    approved_job.umg_spec = None
+    approved_job.delivery_profile = "youtube"
+    approved_job.s3_keys = {
+        "video": "default/testjob12345/lyric_video.mp4",
+        "short": "default/testjob12345/short.mp4",
+        "thumbnail": "default/testjob12345/thumbnail.jpg",
+    }
+    _edit_the_render(db, approved_job)
+
+    with (
+        # El .mov viejo sigue en R2 y contesta el HEAD.
+        patch("main.storage.object_exists", return_value=True),
+        patch("main.enqueue_prores_prewarm") as enqueue,
+    ):
+        res = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={},
+        )
+
+    assert res.status_code == 409, res.text
+    detail = res.json()["detail"]
+    assert detail["code"] == "prores_stale_without_spec"
+    assert detail["stale"] == ["umg_master", "umg_short"]
+    assert "ANTES de la edición" in detail["message"]
+    # No se encola nada: sin spec no hay con qué transcodificar.
+    enqueue.assert_not_called()
+
+
+def test_republishing_does_not_rename_the_delivery(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Visto en vivo al reparar la entrega 289 (2026-09-15).
+
+    `_compute_default_delivery_label` cuenta las entregas activas de esa
+    canción, y la fila que se está actualizando se cuenta a sí misma: publicar
+    de nuevo rebautizaba "Campaña" como "Opción 2" — una segunda opción que no
+    existe, en la pantalla del cliente. Con "Publicar actualización" como
+    botón, pasaría en cada corrección.
+    """
+    from database import Delivery
+
+    first = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"label": "Campaña"},
+    )
+    assert first.status_code == 200, first.text
+    delivery_id = first.json()["delivery_id"]
+    assert first.json()["label"] == "Campaña"
+
+    _edit_the_render(db, approved_job)
+    again = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["label"] == "Campaña"
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    db.refresh(row)
+    assert row.label == "Campaña"
+
+    # Un label explícito sigue mandando.
+    renamed = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"label": "Renderizado v3"},
+    )
+    assert renamed.json()["label"] == "Renderizado v3"
+
+
+def test_a_genuinely_new_delivery_still_gets_opcion_n(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """El contrapeso: la convención de "Opción N" es para una entrega nueva de
+    la misma canción, y esa sí tiene que numerarse."""
+    client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    # Otro job, misma canción y artista: es una segunda opción de verdad.
+    from database import Job
+    me = client.get("/auth/me", headers=auth(admin_token)).json()
+    sibling = Job(
+        job_id="testjob54321", user_id=me["id"], tenant_id="default",
+        artist=approved_job.artist, song_title=approved_job.song_title,
+        filename="test.mp3", status="done", delivery_profile="umg",
+        umg_spec={"frame_size": "HD", "fps": 24.0, "prores_profile": 3},
+        approved_by=me["id"], approved_at=datetime.now(timezone.utc),
+        video_url="/download/testjob54321/video",
+        short_url="/download/testjob54321/short",
+        thumbnail_url="/download/testjob54321/thumbnail",
+    )
+    db.add(sibling)
+    db.commit()
+    _refresh_umg_qc(sibling)
+    db.commit()
+    try:
+        res = client.post(
+            f"/admin/deliveries/from-job/{sibling.job_id}",
+            headers=auth(admin_token), json={},
+        )
+        assert res.status_code == 200, res.text
+        assert res.json()["label"] == "Opción 2"
+    finally:
+        from database import Delivery, DeliveryChangeRequest
+        ids = [d.id for d in db.query(Delivery).filter(Delivery.job_id == "testjob54321").all()]
+        if ids:
+            db.query(DeliveryChangeRequest).filter(
+                DeliveryChangeRequest.delivery_id.in_(ids)
+            ).delete(synchronize_session=False)
+        db.query(Delivery).filter(Delivery.job_id == "testjob54321").delete()
+        db.query(Job).filter(Job.job_id == "testjob54321").delete()
+        db.commit()
+
+
+def test_items_identifies_its_portal_scope(client, admin_token, approved_job, all_r2_files_present):
+    """El portal de Chile falla CERRADO si el listado no se identifica.
+
+    `index.template.html` compara `data.portal_id !== "chile"` y, si no
+    coincide, tira "El backend Chile todavía no está actualizado" y muestra
+    CERO entregas. Es a propósito: evita que umgchile.genly.pro renderice el
+    listado global de un backend viejo. Producción ya devolvía el campo y
+    staging no, así que promover staging vaciaba el portal del cliente el día
+    del deploy (verificado en vivo el 2026-09-15). Este test es la única cosa
+    que impide que se vuelva a caer en la promoción.
+    """
+    client.post(f"/admin/deliveries/from-job/{approved_job.job_id}",
+                headers=auth(admin_token), json={"portal_id": "chile"})
+    for portal in ("argentina", "chile"):
+        res = client.get(
+            "/api/deliveries/items",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": portal},
+        )
+        assert res.status_code == 200, res.text
+        assert res.json()["portal_id"] == portal, (
+            f"el listado de {portal} no se identifica; el portal falla cerrado"
+        )
+
+
+def test_el_portal_no_encola_transcodes_con_la_cola_llena(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Este endpoint saltea la backpressure a propósito (`force=True`), y eso
+    está bien para UN click humano que está esperando su archivo.
+
+    Lo que no está bien es una avalancha: medido el 2026-09-16, entre los dos
+    portales hay 178 archivos ausentes, o sea 178 botones a un click, en la
+    MISMA cola que sirve los renders de cliente. Si ya hay trabajo esperando,
+    este pedido no es urgente y se rechaza con 503 en vez de ponerse delante.
+    """
+    res = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    delivery_id = res.json()["delivery_id"]
+
+    with (
+        patch("main.queue_depth", return_value={"enterprise": 50}),
+        patch("main.enqueue_prores_prewarm") as enqueue,
+        patch("main.enqueue_delivery_prores_prewarm") as enqueue_snapshot,
+    ):
+        busy = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_short"},
+        )
+    assert busy.status_code == 503, busy.text
+    assert busy.json()["detail"]["code"] == "prores_queue_busy"
+    assert busy.headers.get("Retry-After") == "300"
+    # Y lo importante: no encoló nada por ninguno de los dos caminos.
+    enqueue.assert_not_called()
+    enqueue_snapshot.assert_not_called()
+
+
+def test_con_la_cola_libre_el_portal_sigue_preparando(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """El contrapeso: el freno no puede volver inútil al botón. Con la cola
+    tranquila, un click humano sigue saltando la backpressure — que es
+    exactamente para lo que está."""
+    res = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    delivery_id = res.json()["delivery_id"]
+
+    with (
+        patch("main.queue_depth", return_value={"enterprise": 0}),
+        patch("main.enqueue_prores_prewarm", return_value="rq:1") as enqueue,
+    ):
+        ok = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_short"},
+        )
+    assert ok.status_code == 202, ok.text
+    enqueue.assert_called_once()
+    assert enqueue.call_args.kwargs == {"force": True, "dedupe_live": True}
+
+
+def test_sin_redis_el_freno_no_bloquea_el_portal(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Si no se puede leer la cola, no hay cola que proteger: fallar cerrado
+    acá dejaría al cliente sin poder pedir su archivo por un problema nuestro
+    de observabilidad."""
+    res = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    delivery_id = res.json()["delivery_id"]
+
+    with (
+        patch("main.queue_depth", side_effect=RuntimeError("redis caído")),
+        patch("main.enqueue_prores_prewarm", return_value="rq:1") as enqueue,
+    ):
+        ok = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_short"},
+        )
+    assert ok.status_code == 202, ok.text
+    enqueue.assert_called_once()

@@ -4,8 +4,9 @@ The chokepoint is the architectural invariant for Bugs B + D: every
 return path that ships segments MUST go through `_emit_segments`, which
 (a) calls `set_timing_source` so the job is never tagged with NULL,
 (b) runs `normalize_words` so FA word-stamps with score are preserved
-while Whisper-raw words are stripped, and (c) applies `_snap` (split +
-beat-snap + chorus repetitions).
+while Whisper-raw words are stripped, (c) applies `_snap` (split + beat-snap +
+chorus repetitions), and (d) removes lyric-video terminal periods from the
+final emitted lines.
 
 We test the invariant two ways:
 
@@ -89,6 +90,13 @@ def test_orchestrator_imports_timing_sources():
         "main.py must reference VALID_TIMING_SOURCES — registry is the source of truth"
 
 
+def test_orchestrator_applies_terminal_period_policy_at_emit_chokepoint():
+    src = _MAIN_PATH.read_text()
+    orchestrator = ast.get_source_segment(src, _find_orchestrator(ast.parse(src)))
+    assert "strip_terminal_line_periods as _strip_terminal_line_periods" in orchestrator
+    assert "_strip_terminal_line_periods(\n                _snap(_normalize_words(deduped))" in orchestrator
+
+
 def test_all_expected_source_constants_are_valid():
     """Each known emission point in the orchestrator uses a constant
     from `timing_sources`. Asserting they're all in `VALID_TIMING_SOURCES`
@@ -111,3 +119,20 @@ def test_deprecated_sources_not_emitted_by_orchestrator():
         bad_pattern = f'set_timing_source(job_id, "{dep}")'
         assert bad_pattern not in src, \
             f"Deprecated timing_source {dep!r} appears in main.py — Bug regression"
+
+
+def test_orchestrator_freezes_raw_recognition_before_selected_output():
+    """Training provenance must survive catalogue reconciliation privately."""
+    src = _MAIN_PATH.read_text()
+    assert "_recognition_hypotheses" in src
+    assert "_recognition_collector.snapshot()" in src
+    assert 'out["_recognition_hypotheses"]' in src
+    assert 'out["_recognition_attempt_count"]' in src
+    assert 'if key != "_recognition_family"' in src
+    orchestrator = ast.get_source_segment(
+        src, _find_orchestrator(ast.parse(src)),
+    )
+    assert "run_in_executor" not in orchestrator, (
+        "recognizers must use asyncio.to_thread so the per-job provenance "
+        "context reaches provider wrappers"
+    )

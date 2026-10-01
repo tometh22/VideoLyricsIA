@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { mergeThreeWay, segmentsEquivalent } from "../editorMerge";
+import { editorSessionHeaders } from "../lib/editorSession";
 
 async function responseBody(response) {
   try { return await response.clone().json(); } catch { return {}; }
@@ -122,7 +123,10 @@ export function useEditorDocument({ jobId, enabled, request }) {
     let stopped = false;
     const heartbeat = async () => {
       try {
-        const response = await request(`/editor/${jobId}/lock/heartbeat`, { method: "POST" });
+        const response = await request(`/editor/${jobId}/lock/heartbeat`, {
+          method: "POST",
+          headers: editorSessionHeaders(),
+        });
         const body = await responseBody(response);
         if (!stopped && response.ok) setLock({
           active: true, user: body.user, expires_at: body.expires_at,
@@ -135,7 +139,11 @@ export function useEditorDocument({ jobId, enabled, request }) {
     return () => {
       stopped = true;
       window.clearInterval(timer);
-      request(`/editor/${jobId}/lock`, { method: "DELETE", keepalive: true }).catch(() => {});
+      request(`/editor/${jobId}/lock`, {
+        method: "DELETE",
+        keepalive: true,
+        headers: editorSessionHeaders(),
+      }).catch(() => {});
     };
   }, [enabled, hasDocument, jobId, request]);
 
@@ -195,6 +203,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
             revision: body.revision,
             segments,
             updated_at: body.saved_at,
+            ...(body.lyric_review ? { lyric_review: body.lyric_review } : {}),
           };
           documentRef.current = next;
           return next;
@@ -210,6 +219,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
         versionId: body.version_id,
         applied: body.applied !== false,
         segments,
+        lyricReview: body.lyric_review || null,
       };
     } catch (err) {
       return { ok: false, reason: navigator.onLine === false ? "offline" : "network", error: String(err) };
@@ -295,9 +305,34 @@ export function useEditorDocument({ jobId, enabled, request }) {
     return { ok: true, document: body };
   }, [applyDocument, document, jobId, request]);
 
+  const undoAutoRepair = useCallback(async () => {
+    const response = await request(`/editor/${jobId}/auto-repair/undo`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base_revision: revisionRef.current }),
+    });
+    const body = await responseBody(response);
+    if (response.status === 409) {
+      return { ok: false, reason: "stale-revision" };
+    }
+    if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+    applyDocument({ ...documentRef.current, ...body });
+    return { ok: true, document: body };
+  }, [applyDocument, jobId, request]);
+
+  // Actualiza campos derivados del documento (p. ej. la revisión rápida al
+  // pegar la letra oficial) sin tocar revisión ni letra.
+  const updateDocument = useCallback((fields) => {
+    const current = documentRef.current;
+    if (!current || !mountedRef.current) return;
+    const next = { ...current, ...fields };
+    documentRef.current = next;
+    setDocument(next);
+  }, []);
+
   return {
     document, loading, error, errorStatus, lock,
     revisionRef, load, save, reconcile,
-    listVersions, restoreVersion,
+    listVersions, restoreVersion, undoAutoRepair, updateDocument,
   };
 }

@@ -1,10 +1,7 @@
-"""Unit tests for `_maybe_anchor_align` — Versión B (anchor lyrics → CTC).
+"""Unit tests for operator lyrics alignment.
 
-Contract under test: gated by ANCHOR_LYRICS_ENABLED (default OFF), never
-raises, and returns the input `result` UNCHANGED on flag-off / empty anchor /
-<3 lines / decline / exception so the transcription falls back to Versión A
-(the current cascade). ctc_align + vocal_sep are mocked so these run without
-torch / Replicate (same pattern as test_karaoke_align.py).
+The reference is authoritative content: CTC is preferred, Whisper-DP is the
+fallback, and a double decline is explicit so upload callers can fail closed.
 """
 import asyncio
 
@@ -57,7 +54,7 @@ def _no_stem(monkeypatch):
     monkeypatch.setenv("CTC_ALIGN_COMPUTE_STEM", "0")
 
 
-def test_flag_off_is_identity_and_never_calls_engine(monkeypatch):
+def test_flag_off_with_submitted_reference_declines_and_never_calls_engine(monkeypatch):
     monkeypatch.delenv("ANCHOR_LYRICS_ENABLED", raising=False)
 
     def _boom(*a, **k):
@@ -66,21 +63,39 @@ def test_flag_off_is_identity_and_never_calls_engine(monkeypatch):
     monkeypatch.setattr(vocal_sep, "separate_vocals", _boom)
     result = _result()
     out = _run(result, ANCHOR)
-    assert out is result
+    assert out["segments"] == result["segments"]
+    assert out["anchor_alignment"]["status"] == "declined"
+    assert out["anchor_alignment"]["reason"] == "feature_disabled"
 
 
-def test_empty_anchor_and_short_anchor_are_noop(monkeypatch):
+def test_catalog_alignment_has_distinct_provenance_without_global_flag(monkeypatch):
+    monkeypatch.delenv("ANCHOR_LYRICS_ENABLED", raising=False)
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *a, **k: _retimed())
+    out = _run(_result(), ANCHOR, content_source="catalog_reference", enabled=True)
+    assert out["anchor_alignment"]["content_source"] == "catalog_reference"
+    assert all(row["content_source"] == "catalog_reference" for row in out["segments"])
+    assert out["segments"][0]["provider_evidence"]["source"] == "catalog_reference"
+
+
+def test_empty_anchor_is_noop_but_short_anchor_uses_fallback(monkeypatch):
     monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
-
-    def _boom(*a, **k):
-        raise AssertionError("engine must not run without a usable anchor")
-    monkeypatch.setattr(ctc_align, "retime_segments", _boom)
-    monkeypatch.setattr(vocal_sep, "separate_vocals", _boom)
+    _no_stem(monkeypatch)
     result = _result()
     assert _run(result, "") is result
     assert _run(result, "  \n \n") is result
-    # < 3 non-empty lines → no-op
-    assert _run(result, "una linea\n\ndos lineas") is result
+    monkeypatch.setattr(
+        "lyrics_whisper_align.whisper_word_align",
+        lambda *_a, **_kw: [
+            {"start": 1.0, "end": 2.0, "text": "una linea"},
+            {"start": 3.0, "end": 4.0, "text": "dos lineas"},
+        ],
+    )
+    out = _run(result, "una linea\n\ndos lineas")
+    assert [segment["text"] for segment in out["segments"]] == [
+        "una linea", "dos lineas",
+    ]
+    assert out["anchor_alignment"]["timing_source"] == "whisper_align"
     # result no dict → no-op
     assert _run(None, ANCHOR) is None
 
@@ -163,7 +178,7 @@ def test_review_threshold_bad_env_falls_back_to_default(monkeypatch):
     assert [s.get("review") is True for s in out["segments"]] == [False, False, False]
 
 
-def test_decline_keeps_result_intact(monkeypatch):
+def test_double_decline_is_explicit_and_preserves_provider_evidence(monkeypatch):
     monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
     _no_stem(monkeypatch)
     monkeypatch.setattr(ctc_align, "retime_segments",
@@ -173,28 +188,34 @@ def test_decline_keeps_result_intact(monkeypatch):
     result = _result()
     before = [dict(s) for s in result["segments"]]
     out = _run(result, ANCHOR)
-    assert out is result
     assert out["segments"] == before
     assert "timing_source" not in out
+    assert out["reference_lyrics"] == ANCHOR
+    assert out["anchor_alignment"]["status"] == "declined"
+    assert out["anchor_alignment"]["reason"] == "structural"
 
 
-def test_exception_never_propagates(monkeypatch):
+def test_ctc_exception_uses_whisper_fallback(monkeypatch):
     monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
     _no_stem(monkeypatch)
 
     def _raise(*a, **k):
         raise RuntimeError("ctc exploded")
     monkeypatch.setattr(ctc_align, "retime_segments", _raise)
+    monkeypatch.setattr(
+        "lyrics_whisper_align.whisper_word_align",
+        lambda *_a, **_kw: _retimed(),
+    )
     result = _result()
-    before = [dict(s) for s in result["segments"]]
     out = _run(result, ANCHOR)
-    assert out is result                          # swallowed → unchanged
-    assert out["segments"] == before
-    assert "timing_source" not in out
+    assert out["timing_source"] == "anchor_ctc"
+    assert out["anchor_alignment"]["status"] == "applied"
+    assert out["anchor_alignment"]["timing_source"] == "whisper_align"
+    assert out["anchor_alignment"]["ctc_decline_reason"] == "ctc_RuntimeError"
 
 
-def test_stem_lookup_failure_still_never_raises(monkeypatch):
-    # vocal_sep itself exploding must degrade to "no anchor", not a 500.
+def test_stem_lookup_failure_aligns_on_mix(monkeypatch):
+    # vocal_sep exploding must still allow a safe mix-based alignment.
     monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
 
     def _raise(*a, **k):
@@ -204,4 +225,293 @@ def test_stem_lookup_failure_still_never_raises(monkeypatch):
                         lambda *a, **k: _retimed())
     result = _result()
     out = _run(result, ANCHOR)
-    assert out is result
+    assert out["timing_source"] == "anchor_ctc"
+    assert out["anchor_alignment"]["status"] == "applied"
+    assert [segment["text"] for segment in out["segments"]] == ANCHOR.splitlines()
+
+
+def test_ctc_decline_uses_whisper_fallback_and_keeps_official_text(monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        ctc_align, "last_decline_reason", "short_repeated_motif", raising=False,
+    )
+    seen = {}
+
+    def _fallback(_audio, lines, *, language=None, job_id=None):
+        seen["lines"] = lines
+        seen["language"] = language
+        seen["job_id"] = job_id
+        return _retimed()
+
+    monkeypatch.setattr("lyrics_whisper_align.whisper_word_align", _fallback)
+    out = _run(_result(), ANCHOR)
+
+    assert seen == {
+        "lines": ANCHOR.splitlines(),
+        "language": None,
+        "job_id": "j-anchor",
+    }
+    assert [segment["text"] for segment in out["segments"]] == ANCHOR.splitlines()
+    assert out["reference_lyrics"] == ANCHOR
+    assert out["anchor_alignment"] == {
+        "status": "applied",
+        "content_source": "operator_reference",
+        "timing_source": "whisper_align",
+        "ctc_decline_reason": "short_repeated_motif",
+        "original_provider_segment_count": 3,
+        "review_count": 2,
+    }
+
+
+def test_ctc_decline_accepts_complete_monotonic_hosted_alignment(monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        ctc_align, "last_decline_reason", "short_repeated_motif", raising=False,
+    )
+    monkeypatch.setattr(
+        "forced_align.forced_align_lyrics", lambda *_a, **_kw: _retimed(),
+    )
+    monkeypatch.setattr(
+        "lyrics_whisper_align.whisper_word_align",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("Whisper fallback must not run after safe hosted FA")
+        ),
+    )
+
+    out = _run(_result(), ANCHOR)
+
+    assert out["anchor_alignment"]["status"] == "applied"
+    assert out["anchor_alignment"]["timing_source"] == "forced_align"
+    assert [segment["text"] for segment in out["segments"]] == ANCHOR.splitlines()
+
+
+def test_collapsed_hosted_alignment_is_rejected(monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ctc_align, "last_decline_reason", "structural", raising=False)
+    collapsed = _retimed()
+    collapsed[1]["start"] = collapsed[0]["start"]
+    monkeypatch.setattr(
+        "forced_align.forced_align_lyrics", lambda *_a, **_kw: collapsed,
+    )
+    monkeypatch.setattr(
+        "lyrics_whisper_align.whisper_word_align", lambda *_a, **_kw: None,
+    )
+
+    out = _run(_result(), ANCHOR)
+
+    assert out["anchor_alignment"]["status"] == "declined"
+    assert "timing_source" not in out
+
+
+# ---------------------------------------------------------------------------
+# Veredicto acústico compartido (incidentes 13/14-sep-2026)
+# ---------------------------------------------------------------------------
+
+
+def _crammed_retimed():
+    """CTC over a lyric with verses the audio never sings: the 4-line anchor
+    comes back as four 0.4 s lines with score ≈ 0 (forced_align, no skips)."""
+    out = []
+    for i, text in enumerate(ANCHOR4.splitlines()):
+        out.append({
+            "start": 10.0 + i * 0.5, "end": 10.0 + i * 0.5 + 0.4, "text": text,
+            "words": [{"word": w, "start": 10.0 + i * 0.5, "end": 10.0 + i * 0.5 + 0.1,
+                       "score": 0.01} for w in text.split()],
+        })
+    return out
+
+
+ANCHOR4 = "\n".join([
+    "primera estrofa que no existe",
+    "segunda estrofa que no existe",
+    "tercera estrofa que no existe",
+    "cuarta estrofa que no existe",
+])
+
+
+def test_crammed_ctc_alignment_is_declined_on_upload_path(monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: _crammed_retimed())
+    out = _run(_result(), ANCHOR4)
+    aa = out["anchor_alignment"]
+    assert aa["status"] == "declined"
+    assert aa["reason"] == "structural_mismatch"
+    assert aa["timing_source"] == "ctc_timing_only"
+    assert aa["structural"]["crammed_run"] == 4
+    # Los segments del proveedor quedan tal cual: nada se publicó.
+    assert [s["text"] for s in out["segments"]] == [s["text"] for s in _result()["segments"]]
+
+
+def test_crammed_guard_can_be_disabled_on_upload_path(monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    monkeypatch.setenv("REANCHOR_CRAMMED_GUARD", "0")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: _crammed_retimed())
+    out = _run(_result(), ANCHOR4)
+    assert out["anchor_alignment"]["status"] == "applied"
+
+
+def test_whisper_fallback_mostly_interpolated_is_rejected(monkeypatch):
+    """Buseca (14-sep): Whisper-DP anchored 29/51 lines and guessed the rest.
+    A fallback that guessed more than 30 % of the song is not an alignment."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ctc_align, "last_decline_reason", "short_repeated_motif", raising=False)
+
+    def _fallback(_audio, lines, *, language=None, job_id=None):
+        segs = _retimed()
+        segs[1]["interpolated"] = True
+        segs[2]["interpolated"] = True
+        return segs
+
+    monkeypatch.setattr("lyrics_whisper_align.whisper_word_align", _fallback)
+    out = _run(_result(), ANCHOR)
+    assert out["anchor_alignment"]["status"] == "declined"
+    assert out["anchor_alignment"]["reason"] == "short_repeated_motif"
+
+
+def test_whisper_fallback_with_few_interpolated_lines_is_accepted(monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+
+    def _fallback(_audio, lines, *, language=None, job_id=None):
+        segs = _retimed()
+        segs[2]["interpolated"] = True  # 1 de 3 = 33 % > 30 %… tope subido abajo
+        return segs
+
+    monkeypatch.setattr("lyrics_whisper_align.whisper_word_align", _fallback)
+    monkeypatch.setenv("ANCHOR_MAX_INTERPOLATED_FRAC", "0.5")
+    out = _run(_result(), ANCHOR)
+    assert out["anchor_alignment"]["status"] == "applied"
+    assert out["anchor_alignment"]["timing_source"] == "whisper_align"
+
+
+# ---------------------------------------------------------------------------
+# Alineado forzado LOCAL — último testigo antes del fail-closed
+# (job 18dc85ecd8d6 "Navidad de Aimogasta", 15-sep-2026)
+# ---------------------------------------------------------------------------
+
+
+def _every_engine_declines(monkeypatch):
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ctc_align, "last_decline_reason", "median_word_score",
+                        raising=False)
+    monkeypatch.setattr("forced_align.forced_align_lyrics",
+                        lambda *_a, **_kw: None)
+    monkeypatch.setattr("lyrics_whisper_align.whisper_word_align",
+                        lambda *_a, **_kw: None)
+
+
+def test_local_forced_align_rescues_a_song_every_other_engine_declined(monkeypatch):
+    """CTC 0.29 < 0.30, hosted declined, Whisper-DP guessed 23/40 lines: the
+    operator used to get "No se pudo re-sincronizar" and nothing else."""
+    _every_engine_declines(monkeypatch)
+    seen = {}
+
+    def _local(audio_path, lines, *, language=None, job_id=""):
+        seen["lines"] = list(lines)
+        seen["language"] = language
+        return _retimed()
+
+    monkeypatch.setattr("lyrics_local_forced_align.local_forced_align", _local)
+
+    out = _run(_result(), ANCHOR)
+
+    assert out["anchor_alignment"]["status"] == "applied"
+    assert out["anchor_alignment"]["timing_source"] == "local_forced_align"
+    # The engine that declined first is still recorded for the operator.
+    assert out["anchor_alignment"]["ctc_decline_reason"] == "median_word_score"
+    assert [segment["text"] for segment in out["segments"]] == ANCHOR.splitlines()
+    assert seen["lines"] == ANCHOR.splitlines()
+    # Same language resolution as the Whisper-DP stage above it.
+    from main import resolve_transcription_language
+    assert seen["language"] == resolve_transcription_language(
+        "", reference_text=ANCHOR)
+
+
+def test_local_forced_align_never_runs_when_an_earlier_engine_answered(monkeypatch):
+    """It is a last resort, not a second opinion: no model load, no CPU."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    _no_stem(monkeypatch)
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+    monkeypatch.setattr("lyrics_whisper_align.whisper_word_align",
+                        lambda *_a, **_kw: _retimed())
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("local forced align must not run after a success")
+
+    monkeypatch.setattr("lyrics_local_forced_align.local_forced_align", _boom)
+
+    out = _run(_result(), ANCHOR)
+    assert out["anchor_alignment"]["timing_source"] == "whisper_align"
+
+
+def test_local_forced_align_keeps_failing_closed_on_an_unsafe_result(monkeypatch):
+    """Whisper will force ANY text onto ANY audio: the shared safety verdict
+    (monotonic occurrences) still has the last word."""
+    _every_engine_declines(monkeypatch)
+    collapsed = _retimed()
+    collapsed[1]["start"] = collapsed[0]["start"]
+    monkeypatch.setattr("lyrics_local_forced_align.local_forced_align",
+                        lambda *_a, **_kw: collapsed)
+
+    result = _result()
+    before = [dict(s) for s in result["segments"]]
+    out = _run(result, ANCHOR)
+
+    assert out["anchor_alignment"]["status"] == "declined"
+    assert out["anchor_alignment"]["reason"] == "median_word_score"
+    assert out["segments"] == before
+
+
+def test_local_forced_align_is_crammed_guarded_like_every_other_engine(monkeypatch):
+    """Pasting another version's lyric over this audio (Color Esperanza,
+    13-sep) must not become acceptable just because a new engine answered."""
+    _every_engine_declines(monkeypatch)
+    crammed = [
+        {"start": 10.0 + 0.6 * i, "end": 10.4 + 0.6 * i, "text": text,
+         "words": [{"word": w, "start": 10.0 + 0.6 * i, "end": 10.4 + 0.6 * i,
+                    "score": 0.01} for w in text.split()]}
+        for i, text in enumerate(ANCHOR.splitlines())
+    ]
+    monkeypatch.setattr("lyrics_local_forced_align.local_forced_align",
+                        lambda *_a, **_kw: crammed)
+
+    out = _run(_result(), ANCHOR)
+    assert out["anchor_alignment"]["status"] == "declined"
+    assert out["anchor_alignment"]["reason"] == "structural_mismatch"
+
+
+def test_local_forced_align_tries_the_stem_before_the_mix(monkeypatch):
+    """Same stem-then-mix order as Whisper-DP: Demucs can erase a distant
+    vocal, and the untouched mix is an independent acoustic view."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    monkeypatch.setattr(vocal_sep, "separate_vocals",
+                        lambda path, cache_only=False: "/tmp/stem.wav")
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+    monkeypatch.setattr("forced_align.forced_align_lyrics", lambda *_a, **_kw: None)
+    monkeypatch.setattr("lyrics_whisper_align.whisper_word_align",
+                        lambda *_a, **_kw: None)
+    tried = []
+
+    def _local(audio_path, lines, *, language=None, job_id=""):
+        tried.append(audio_path)
+        return _retimed() if audio_path == "/tmp/a.mp3" else None
+
+    monkeypatch.setattr("lyrics_local_forced_align.local_forced_align", _local)
+
+    out = _run(_result(), ANCHOR)
+
+    assert tried == ["/tmp/stem.wav", "/tmp/a.mp3"]
+    assert out["anchor_alignment"]["timing_source"] == "local_forced_align"

@@ -10,6 +10,7 @@ import pytest
 import logging
 
 import gap_rescue as gr
+from recognition_provenance import begin_collection, end_collection
 
 
 def test_transcribe_window_redacts_provider_exception_message(
@@ -101,16 +102,93 @@ def test_ventana_whisper_registra_provenance_del_job(monkeypatch):
         lambda **kwargs: captured.update(kwargs) or _Recorder(),
     )
 
-    words = gr._transcribe_window(
-        "song.wav", 10.0, 20.0, language="es", job_id="gap-job",
-    )
+    collector, token = begin_collection()
+    try:
+        words = gr._transcribe_window(
+            "song.wav", 10.0, 20.0, language="es", job_id="gap-job",
+        )
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
 
     assert words[0]["start"] == 10.1
+    assert snapshot["completed_attempt_count"] == 1
+    assert snapshot["hypotheses"][0]["events"] == [
+        {"word": "hola", "start": 0.1, "end": 0.5},
+    ]
+    assert snapshot["hypotheses"][0]["transformation"] == "gap_rescue_raw"
     assert captured["client_options"] == {"timeout": 60.0, "max_retries": 0}
     assert captured["job_id"] == "gap-job"
     assert captured["tool_name"] == "whisper-1-gap-rescue"
     assert captured["tool_provider"] == "openai"
     assert captured["summary"] == "succeeded"
+
+
+def test_ventana_whisper_applies_bounded_artist_lexicon_prompt(monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+    import openai
+
+    captured = {}
+
+    class _Transcriptions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(words=[])
+
+    class _Client:
+        audio = SimpleNamespace(transcriptions=_Transcriptions())
+
+        def __init__(self, **_kwargs):
+            pass
+
+    def _ffmpeg(cmd, **_kwargs):
+        Path(cmd[-1]).write_bytes(b"audio")
+
+    monkeypatch.setattr("subprocess.run", _ffmpeg)
+    monkeypatch.setattr(openai, "OpenAI", _Client)
+    gr._transcribe_window(
+        "song.wav", 0.0, 2.0, language="es",
+        prompt="Vocabulario posible del catálogo: Legalícenla, Intoxicados",
+    )
+    assert captured["prompt"].startswith("Vocabulario posible")
+    assert len(captured["prompt"]) <= 850
+
+
+def test_gap_rescue_preserves_malformed_provider_word_before_mapping():
+    from types import SimpleNamespace
+
+    class OpaqueWord:
+        def __getattr__(self, _name):
+            raise AttributeError
+
+        def __str__(self):
+            raise RuntimeError("SDK object cannot be stringified")
+
+    class HostileWordDict(dict):
+        def keys(self):
+            raise RuntimeError("SDK mapping cannot be copied")
+
+        def __iter__(self):
+            raise RuntimeError("SDK mapping cannot be copied")
+
+        def __str__(self):
+            raise RuntimeError("SDK mapping cannot be stringified")
+
+    source, raw = gr._raw_provider_words(SimpleNamespace(words=[
+        SimpleNamespace(word="bien", start=0.1, end=0.5),
+        SimpleNamespace(word="mal", start="not-a-time", end=1.0),
+        OpaqueWord(),
+        HostileWordDict(word="hostile", start=2.0, end=2.4),
+    ]))
+
+    assert len(source) == 4
+    assert raw == [
+        {"word": "bien", "start": 0.1, "end": 0.5},
+        {"word": "mal", "start": "not-a-time", "end": 1.0},
+        {"raw": "<opaque-provider-value-OpaqueWord>"},
+        {"raw": "<opaque-provider-value-HostileWordDict>"},
+    ]
 
 
 def test_ignora_huecos_chicos():

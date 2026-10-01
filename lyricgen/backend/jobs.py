@@ -94,6 +94,10 @@ def create_job(
     initial_status: str = "processing",
     song_title: str = "",
     input_r2_key: Optional[str] = None,
+    workload_class: str = "interactive",
+    campaign_id: Optional[str] = None,
+    campaign_item_id: Optional[str] = None,
+    commit: bool = True,
 ) -> str:
     """Create a new job and return its ID.
 
@@ -103,6 +107,9 @@ def create_job(
       - "transcribed_pending": user has called /transcribe; the audio is
         persisted but the user is still editing lyrics. /generate will
         flip the row to processing/queued once the segments come in.
+      - "transcribing": synchronous legacy /transcribe is still producing
+        and atomically freezing its mandatory pre-human evidence. The job is
+        deliberately not editor-ready in this state.
       - "awaiting_upload": browser is still PUTting bytes directly to
         R2 via a presigned URL. /transcribe-uploaded promotes to
         transcribed_pending once the upload completes.
@@ -112,8 +119,8 @@ def create_job(
         The worker promotes to "bg_preview_done" / "bg_preview_failed".
     """
     valid_states = (
-        "processing", "queued", "transcribed_pending", "awaiting_upload",
-        "bg_preview_queued",
+        "processing", "queued", "transcribing", "transcribed_pending",
+        "awaiting_upload", "bg_preview_queued",
     )
     if initial_status not in valid_states:
         raise ValueError(f"unsupported initial_status {initial_status!r}")
@@ -132,14 +139,21 @@ def create_job(
         current_step=(
             "whisper" if initial_status == "processing"
             else "queued" if initial_status == "queued"
+            else "transcribing" if initial_status == "transcribing"
             else "uploading" if initial_status == "awaiting_upload"
             else "editing"
         ),
         progress=0,
         input_r2_key=input_r2_key,
+        workload_class=("batch" if workload_class == "batch" else "interactive"),
+        campaign_id=campaign_id,
+        campaign_item_id=campaign_item_id,
     )
     db.add(job)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return job_id
 
 
@@ -570,7 +584,108 @@ def _archive_veo_budget_spend(db: Session, job_rows: list[Job]) -> None:
         ))
 
 
-def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
+def _archive_deleted_job_lyrics(
+    db: Session, job_rows: list[Job], deleted_by_user_id: Optional[int] = None,
+) -> None:
+    """Copy any human-edited lyrics for jobs about to be hard-deleted into
+    `deleted_job_lyrics_archive`, before the ON DELETE CASCADE on
+    editor_documents/editor_versions removes them along with the Job row.
+
+    Incident (audited 2026-08-24): 137 jobs carrying real operator lyric
+    corrections were hard-deleted via this cleanup flow with no recoverable
+    trace of which song they belonged to — editor_documents/editor_versions
+    cascade with the Job, and by the time anyone notices, the Job row's
+    artist/song_title are gone too. This copies exactly that missing
+    context BEFORE the delete, into a table with no FK back to jobs.job_id,
+    so it survives the delete it was taken ahead of.
+
+    Best-effort and additive only: writes in the same transaction as the
+    delete (so a rollback of the delete rolls this back too) but never
+    raises to block it, and only inserts a row when there's actually
+    something to recover — a non-empty `editor_documents.current_segments`
+    (preferred: the operator's latest working copy), or failing that the
+    most recent `editor_versions` checkpoint. Jobs nobody ever touched in
+    the editor produce no row here; this is a safety net for lost human
+    work, not a full audit log of every deletion.
+    """
+    from database import DeletedJobLyricsArchive, EditorDocument, EditorVersion
+
+    if not job_rows:
+        return
+    job_ids = [j.job_id for j in job_rows]
+
+    docs_by_job = {
+        d.job_id: d
+        for d in (
+            db.query(EditorDocument)
+            .filter(EditorDocument.job_id.in_(job_ids))
+            .order_by(EditorDocument.job_id)
+            .all()
+        )
+    }
+    latest_version_by_job: dict = {}
+    for v in (
+        db.query(EditorVersion)
+        .filter(EditorVersion.job_id.in_(job_ids))
+        .order_by(EditorVersion.job_id, EditorVersion.created_at.desc())
+        .all()
+    ):
+        # First hit per job_id wins — rows arrive ordered by created_at DESC.
+        latest_version_by_job.setdefault(v.job_id, v)
+
+    now = datetime.now(timezone.utc)
+    for job in job_rows:
+        doc = docs_by_job.get(job.job_id)
+        segments = None
+        source = None
+        if doc is not None and doc.current_segments:
+            segments = doc.current_segments
+            source = "editor_documents"
+        else:
+            version = latest_version_by_job.get(job.job_id)
+            if version is not None and version.segments:
+                segments = version.segments
+                source = "editor_versions"
+        if segments is None:
+            continue
+        db.add(DeletedJobLyricsArchive(
+            job_id=job.job_id,
+            tenant_id=job.tenant_id,
+            artist=job.artist,
+            song_title=job.song_title,
+            job_status_at_deletion=job.status,
+            segments=segments,
+            source=source,
+            archived_at=now,
+            deleted_by_user_id=deleted_by_user_id,
+        ))
+
+
+def _served_from_working_files(job_ids: list[str]) -> set[str]:
+    """Jobs with an ACTIVE delivery that has no frozen snapshot.
+
+    The portal serves such a delivery straight from the job's own R2 files, so
+    deleting those objects leaves the client with dead download links. A
+    delivery with a snapshot does not depend on them. If the deliveries database
+    cannot be read the answer is 'all of them': deleting is never worth a guess.
+    """
+    if not job_ids:
+        return set()
+    try:
+        from database import Delivery, scoped_deliveries_db
+        with scoped_deliveries_db() as ddb:
+            rows = ddb.query(Delivery.job_id, Delivery.published_file_keys).filter(
+                Delivery.job_id.in_(job_ids), Delivery.removed_at.is_(None),
+            ).all()
+        return {job_id for job_id, keys in rows if keys is None}
+    except Exception:
+        _logger.warning("could not read deliveries before deleting jobs", exc_info=True)
+        return set(job_ids)
+
+
+def delete_job(
+    db: Session, job_id: str, tenant_id: str, deleted_by_user_id: Optional[int] = None,
+) -> tuple[bool, str]:
     """Hard-delete a job row owned by `tenant_id`. Returns (ok, reason).
 
     Safety: only stuck/failed jobs can be deleted — done/pending_review jobs
@@ -591,7 +706,10 @@ def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
         return False, "not_found"
     if job.status not in _DELETABLE_STATUSES:
         return False, f"protected_status:{job.status}"
+    if _served_from_working_files([job_id]):
+        return False, "published_in_portal"
     _archive_veo_budget_spend(db, [job])
+    _archive_deleted_job_lyrics(db, [job], deleted_by_user_id)
     db.query(AIProvenance).filter(AIProvenance.job_id == job_id).delete(synchronize_session=False)
     db.delete(job)
     db.commit()
@@ -605,7 +723,9 @@ def delete_job(db: Session, job_id: str, tenant_id: str) -> tuple[bool, str]:
     return True, "ok"
 
 
-def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
+def bulk_delete_jobs(
+    db: Session, job_ids: list[str], tenant_id: str, deleted_by_user_id: Optional[int] = None,
+) -> dict:
     """Delete many jobs in one transaction. Returns {deleted: [...], skipped: {id: reason}}.
 
     Skipped reasons: 'not_found', 'protected_status:<status>'. The endpoint
@@ -630,9 +750,12 @@ def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
             skipped[jid] = "not_found"
 
     deletable_ids: list[str] = []
+    in_portal = _served_from_working_files([r.job_id for r in rows if r.status in _DELETABLE_STATUSES])
     for r in rows:
         if r.status not in _DELETABLE_STATUSES:
             skipped[r.job_id] = f"protected_status:{r.status}"
+        elif r.job_id in in_portal:
+            skipped[r.job_id] = "published_in_portal"
         else:
             deletable_ids.append(r.job_id)
 
@@ -643,6 +766,7 @@ def bulk_delete_jobs(db: Session, job_ids: list[str], tenant_id: str) -> dict:
         r2_rows = [r for r in rows if r.job_id in deletable_set]
 
         _archive_veo_budget_spend(db, r2_rows)
+        _archive_deleted_job_lyrics(db, r2_rows, deleted_by_user_id)
         db.query(AIProvenance).filter(AIProvenance.job_id.in_(deletable_ids)).delete(synchronize_session=False)
         db.query(Job).filter(Job.tenant_id == tenant_id, Job.job_id.in_(deletable_ids)).delete(synchronize_session=False)
         db.commit()
@@ -698,6 +822,7 @@ def get_all_jobs(
     tenant_id: str = "default",
     limit: int = 200,
     user_id: int = None,
+    include_batch: bool = False,
 ) -> list[dict]:
     """Return all jobs for a tenant, sorted by creation time (newest first).
 
@@ -721,6 +846,11 @@ def get_all_jobs(
         # independently of status, so they can never leak into Historial.
         ~Job.filename.startswith("bgpreview_"),
     )
+    if not include_batch:
+        # Campaigns have their own paginated panel. Keeping them out of the
+        # legacy 200-row history prevents a 600-song manifest from hiding an
+        # operator's ordinary videos without changing the existing contract.
+        query = query.filter(Job.workload_class != "batch")
     if tenant_id is not None:
         query = query.filter(Job.tenant_id == tenant_id)
     else:

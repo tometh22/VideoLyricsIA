@@ -49,6 +49,9 @@ def _scores(words: list[dict]) -> list[float]:
     for word in words or []:
         if not isinstance(word, dict):
             continue
+        probability_origin = word.get("probability_provenance")
+        if isinstance(probability_origin, dict) and probability_origin.get("score_equivalence") is False:
+            continue
         raw = word.get("score", word.get("probability"))
         value = _f(raw, float("nan"))
         if math.isfinite(value) and 0.0 <= value <= 1.0:
@@ -168,6 +171,16 @@ def annotate_provider_evidence(
             item.pop("content_asr_min_score", None)
         item["content_source"] = resolved_source
         output.append(item)
+    from timing_validation import SCHEMA as TIMING_VALIDATION_SCHEMA, diagnose
+    for item in output:
+        # Recompute only our derived diagnostic when the pipeline supplies new
+        # word evidence. Do not preserve a stale warning after a real alignment
+        # replacement, or erase unrelated/human metadata.
+        previous_validation = item.get("timing_validation")
+        if isinstance(previous_validation, dict) and previous_validation.get("schema") == TIMING_VALIDATION_SCHEMA:
+            item.pop("timing_validation")
+    for finding in diagnose(output):
+        output[finding["segment_index"]]["timing_validation"] = finding
     return output
 
 

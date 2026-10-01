@@ -11,6 +11,119 @@ from auth import create_user
 from database import Job
 
 
+def test_quality_window_cap_allows_difficult_live_songs(monkeypatch):
+    monkeypatch.setenv("TRANSCRIPTION_QUALITY_MAX_WINDOWS", "200")
+    assert quality_jobs._max_windows() == 64
+
+
+def test_structural_t4_shadow_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("QUALITY_T4_STRUCTURAL_OBSERVE_ENABLED", raising=False)
+    quality = {"decision": "review_required"}
+
+    assert quality_jobs._attach_structural_t4_shadow(quality, []) is quality
+
+
+def test_text_rollout_does_not_enable_timing_suggestions(monkeypatch):
+    monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    monkeypatch.delenv(
+        "QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", raising=False,
+    )
+
+    candidates, report = quality_jobs._timing_operator_suggestions(
+        [{"start": 1.0, "end": 2.0, "text": "line"}], "missing.wav",
+    )
+
+    assert quality_jobs.operator_text_suggestions_enabled() is True
+    assert quality_jobs.operator_timing_suggestions_enabled() is False
+    assert candidates == []
+    assert report == {
+        "enabled": False,
+        "proposal_count": 0,
+        "automatic_apply_allowed": False,
+    }
+
+
+def test_no_window_replay_persists_text_only_suggestions(monkeypatch):
+    monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    monkeypatch.delenv(
+        "QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", raising=False,
+    )
+    segments = [{"start": 1.0, "end": 2.0, "text": "JAMAS"}]
+    content_hash = tq.segments_hash(segments)
+    captured = {}
+    monkeypatch.setattr(quality_jobs, "_snapshot", lambda _job_id: {
+        "revision": 3,
+        "segments": segments,
+        "quality": {
+            "decision": "pass", "unsafe_windows": [],
+            "analysis_status": "pending",
+        },
+        "audio_revision": 2,
+        "audio_sha256": "a" * 64,
+        "active_quality_attempt_id": "attempt-text-only",
+    })
+
+    def persist(_job_id, _revision, _content_hash, quality, **kwargs):
+        captured["quality"] = quality
+        captured["proposal"] = kwargs.get("operator_proposal")
+        return True
+
+    monkeypatch.setattr(quality_jobs, "_persist_if_current", persist)
+
+    result = quality_jobs.run_transcription_quality_job(
+        "job-id", expected_revision=3,
+        expected_segments_hash=content_hash,
+        expected_audio_revision=2, expected_audio_sha256="a" * 64,
+        analysis_attempt_id="attempt-text-only",
+    )
+
+    assert result["status"] == "persisted"
+    assert result["operator_proposal_count"] == 1
+    assert captured["quality"]["retry"]["mutated_segments"] is False
+    assert captured["quality"]["segment_only_operator_replay_complete"] is True
+    windows = captured["proposal"]["windows"]
+    assert [window["suggestion_type"] for window in windows] == ["text"]
+    assert windows[0]["proposed_segments"][0]["text"] == "JAMÁS"
+
+
+def test_text_only_replay_completion_does_not_relax_prior_quality_decision():
+    quality = {
+        "decision": "retry_failed",
+        "render_blocked": True,
+        "segment_only_operator_replay_complete": True,
+    }
+
+    assert quality_jobs._analysis_status_for_quality(quality) == "complete"
+    assert quality["decision"] == "retry_failed"
+    assert quality["render_blocked"] is True
+
+
+def test_failed_audio_replay_without_text_completion_stays_failed():
+    assert quality_jobs._analysis_status_for_quality({
+        "decision": "retry_failed",
+    }) == "failed"
+
+
+def test_structural_t4_shadow_is_observable_but_never_mutates(monkeypatch):
+    monkeypatch.setenv("QUALITY_T4_STRUCTURAL_OBSERVE_ENABLED", "1")
+    segments = [{
+        "start": 1.0, "end": 2.0, "text": "line",
+        "words": [{"start": 1.0, "end": 2.5, "word": "line", "score": .9}],
+    }]
+    frozen = json.loads(json.dumps(segments))
+
+    output = quality_jobs._attach_structural_t4_shadow(
+        {"decision": "review_required"}, segments,
+    )
+
+    assert segments == frozen
+    assert output["t4_structural_shadow"]["mode"] == "observe"
+    assert output["t4_structural_shadow"]["proposal_count"] == 0
+    assert output["t4_structural_shadow"][
+        "automatic_timing_change_allowed"
+    ] is False
+
+
 def test_cardinality_route_does_not_promote_ambiguous_best_path_to_fact():
     structure = {
         "best_partition": {"event_count": 8},
@@ -80,6 +193,70 @@ def test_attested_asr_context_connects_persisted_words_by_independent_family(
     assert quality_jobs._attested_asr_context([first])["_asr_words"] == []
     second["content_provenance"]["lineage"]["correlated_family"] = "forged-family"
     assert quality_jobs._attested_asr_context([second])["_asr_words"] == []
+
+
+def test_attested_asr_context_recovers_lora_from_immutable_machine_snapshot():
+    from machine_evidence import snapshot_hash
+
+    words = [{"word": "hola", "start": 1.0, "end": 1.4}]
+    evidence = {
+        "hypotheses_by_family": [{
+            "role": "candidate",
+            "family": "openai_whisper_large_v3_turbo_lora_v1",
+            "kind": "word_stream",
+            "events": words,
+            "event_count": len(words),
+            "events_sha256": snapshot_hash(words),
+        }],
+    }
+
+    context = quality_jobs._attested_asr_context([], evidence)
+
+    assert context["_lora_asr_family"] == (
+        "openai_whisper_large_v3_turbo_lora_v1"
+    )
+    assert context["_lora_asr_words"] == words
+
+    evidence["hypotheses_by_family"][0]["events"][0]["word"] = "forged"
+    assert quality_jobs._attested_asr_context([], evidence).get(
+        "_lora_asr_words"
+    ) is None
+
+
+def test_lora_shadow_counters_survive_quality_sanitizer():
+    payload = {
+        "lora_shadow": {
+            "enabled": True,
+            "comparisons": 3,
+            "with_consensus": 2,
+            "without_consensus": 1,
+            "lora_contributed_lines": 2,
+            "new_consensus_lines": 1,
+            "lost_consensus_lines": 0,
+        },
+    }
+    sanitized = quality_jobs._sanitize_analytical_evidence(payload)
+    assert sanitized == payload
+
+
+def test_operator_suggestion_counts_survive_quality_sanitizer():
+    payload = {
+        "spanish_orthography": {
+            "enabled": True, "finding_count": 2, "candidate_count": 2,
+            "automatic_apply_allowed": False,
+        },
+        "timing_review_suggestions": {
+            "enabled": False, "proposal_count": 0,
+            "automatic_apply_allowed": False,
+        },
+        "operator_suggestions": {
+            "candidate_count": 2, "proposal_count": 2,
+            "declined_overlap_count": 0,
+            "by_type": {"text": 2, "timing": 0, "vocalization": 0},
+            "automatic_apply_allowed": False,
+        },
+    }
+    assert quality_jobs._sanitize_analytical_evidence(payload) == payload
 
 
 def test_failure_callback_persists_only_error_type_not_provider_message(
@@ -339,6 +516,80 @@ def test_quality_persist_discards_same_hash_from_older_audio_revision(db):
     db.expire_all()
     row = db.query(Job).filter(Job.job_id == job_id).one()
     assert row.transcription_quality["audio_revision"] == 8
+    assert row.active_quality_attempt_id is None
+
+
+def test_quality_persist_preserves_batch_reference_and_human_approval(db):
+    tenant = f"quality_batch_{uuid.uuid4().hex[:8]}"
+    user = create_user(
+        db, f"quality_batch_{uuid.uuid4().hex[:8]}", "testpass12345", None,
+        tenant_id=tenant,
+    )
+    job_id = uuid.uuid4().hex[:12]
+    segments = [{"start": 1.0, "end": 2.0, "text": "line"}]
+    content_hash = tq.segments_hash(segments)
+    reference = {
+        "schema": "batch-reference-hypothesis-v1",
+        "audio_sha256": "a" * 64,
+        "audio_revision": 1,
+        "review_status": "human_line_review_approved",
+    }
+    approval = {
+        "schema": "batch-pre-background-approval-v1",
+        "segments_sha256": content_hash,
+        "lyrics_confirmed": True,
+        "timings_confirmed": True,
+    }
+    catalog = {
+        "schema_version": "batch-catalog-reference-v1",
+        "status": "rejected", "used": False,
+        "source_audio_sha256": "a" * 64, "source_audio_revision": 1,
+        "reason": "attestation_audio_first",
+    }
+    reviewer_receipt = {
+        "status": "complete", "candidate_available": True,
+        "source": {"audio_sha256": "a" * 64, "segments_revision": 2},
+        "candidate_registry_identity": "immutable-candidate-pointer",
+    }
+    db.add(Job(
+        job_id=job_id, user_id=user.id, tenant_id=tenant,
+        artist="Artist", song_title="Song", filename="song.wav",
+        style="oscuro", status="lyrics_approved",
+        current_step="lyrics_and_timing_approved",
+        delivery_profile="youtube", segments_json=segments,
+        segments_revision=2, input_audio_sha256="a" * 64,
+        audio_revision=1, active_quality_attempt_id="attempt-current",
+        transcription_quality={
+            "analysis_status": "pending",
+            "reference_hypothesis": reference,
+            "catalog_reference": catalog,
+            "reviewer_campaign_status": reviewer_receipt,
+            "pre_background_approval": approval,
+        },
+    ))
+    db.commit()
+
+    candidate = tq.evaluate(segments, None)
+    assert "reference_hypothesis" not in candidate
+    assert "pre_background_approval" not in candidate
+    # Analytical replay cannot replace the transcription's source decision.
+    candidate["catalog_reference"] = {"status": "audio_validated", "used": True}
+    candidate["reviewer_campaign_status"] = {"status": "pending", "candidate_available": False}
+    persisted = quality_jobs._persist_if_current(
+        job_id, 2, content_hash, candidate,
+        expected_audio_revision=1,
+        expected_audio_sha256="a" * 64,
+        analysis_attempt_id="attempt-current",
+    )
+
+    assert persisted is True
+    db.expire_all()
+    row = db.query(Job).filter(Job.job_id == job_id).one()
+    assert row.transcription_quality["reference_hypothesis"] == reference
+    assert row.transcription_quality["catalog_reference"] == catalog
+    assert row.transcription_quality["reviewer_campaign_status"] == reviewer_receipt
+    assert row.transcription_quality["pre_background_approval"] == approval
+    assert row.transcription_quality["analysis_status"] == "complete"
     assert row.active_quality_attempt_id is None
 
 

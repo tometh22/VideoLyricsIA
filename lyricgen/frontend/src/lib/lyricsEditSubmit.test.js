@@ -5,6 +5,7 @@
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
+  campaignApprovalFailure,
   submitLyricsEdit,
   normalizeSegmentsForEdit,
   segmentsUnchanged,
@@ -72,6 +73,17 @@ describe("layoutChanged", () => {
 });
 
 describe("translateBackendError", () => {
+  it("normaliza el bloqueo estructurado del preflight a texto accionable", () => {
+    const out = translateBackendError({
+      code: "delivery_qc_blocked",
+      message: "El preflight de entrega tiene hallazgos pendientes.",
+      delivery_qc: { blocked: true, reason: "open_fail" },
+    }, () => null);
+    expect(typeof out).toBe("string");
+    expect(out).toContain("preflight");
+    expect(out).not.toContain("[object Object]");
+  });
+
   it("maps the structured edit_in_progress conflict", () => {
     const out = translateBackendError(
       { code: "edit_in_progress", message: "An edit is already being rendered." },
@@ -108,6 +120,33 @@ describe("translateBackendError", () => {
 
   it("returns null when raw is null", () => {
     expect(translateBackendError(null, () => null)).toBeNull();
+  });
+
+  it("explains a missing audio reference instead of leaking its code", () => {
+    const out = translateBackendError(
+      { code: "reference_hypothesis_missing" },
+      () => null,
+    );
+    expect(out).toMatch(/referencia de audio válida/);
+    expect(out).toMatch(/revisión quedó guardada/);
+  });
+
+  it("retries only editor conflicts and exposes other campaign 409 errors", () => {
+    const missing = campaignApprovalFailure(
+      { status: 409 },
+      { detail: { code: "reference_hypothesis_missing" } },
+      () => null,
+    );
+    expect(missing.reason).toBe("http-409");
+    expect(missing.message).toMatch(/referencia de audio válida/);
+
+    const revision = campaignApprovalFailure(
+      { status: 409 },
+      { detail: "editor_revision_conflict" },
+      () => null,
+    );
+    expect(revision.reason).toBe("conflict");
+    expect(revision.message).toBeNull();
   });
 });
 

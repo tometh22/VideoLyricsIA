@@ -26,6 +26,7 @@ import {
   buildEditCurrent,
   resolveEditSubmission,
   backgroundEditBlockedReason,
+  buildCampaignEditApproval,
   EDIT_TYPE_PRIORITY,
 } from "./editSubmission.js";
 import { computeFieldDiff } from "./editWizardDiff.js";
@@ -111,6 +112,23 @@ describe("invariante: un job sin tocar no produce diff", () => {
     expect(out.payload).toBeNull();
     expect(out.editType).toBeNull();
   });
+
+  it("renderiza la revisión ya guardada cuando viene de un pedido UMG", () => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const current = currentFrom(JOB_FULL);
+    const out = resolveEditSubmission({
+      baseline,
+      current,
+      jobStatus: "done",
+      forceLyricsRerender: true,
+    });
+    expect(out.presentBuckets).toEqual(["lyrics"]);
+    expect(out.editType).toBe("lyrics");
+    expect(out.payload).toMatchObject({
+      edit_type: "lyrics",
+      segments: current.segments,
+    });
+  });
 });
 
 describe("invariante estructural: baseline y current cubren las mismas claves", () => {
@@ -138,6 +156,34 @@ describe("invariante estructural: baseline y current cubren las mismas claves", 
   });
 });
 
+describe("reaprobación de un edit de campaña", () => {
+  it("binds the exact durable revision and complete line identities", () => {
+    expect(buildCampaignEditApproval(
+      { campaignId: "campaign-1" },
+      { editorRevision: 21, editorVersionId: "version-21", confirmedLineIds: ["line-1", "line-2"] },
+    )).toEqual({
+      valid: true,
+      campaignId: "campaign-1",
+      body: {
+        editor_revision: 21,
+        editor_version_id: "version-21",
+        confirmed_line_ids: ["line-1", "line-2"],
+        lyrics_confirmed: true,
+        timings_confirmed: true,
+        heard_against_audio: true,
+      },
+    });
+  });
+
+  it("fails closed without a campaign, durable revision, or complete lines", () => {
+    expect(buildCampaignEditApproval({}, {})).toBeNull();
+    expect(buildCampaignEditApproval({ campaignId: "campaign-1" }, { editorRevision: 21 })).toEqual({
+      valid: false,
+      campaignId: "campaign-1",
+    });
+  });
+});
+
 describe("un cambio real sí viaja", () => {
   it("movimiento: pending_review manda edit_type=background", () => {
     const { baseline } = buildEditReview(JOB_FULL, null);
@@ -161,6 +207,31 @@ describe("un cambio real sí viaja", () => {
     });
     expect(out.editType).toBe("typography");
     expect(out.payload.font).toBe("anton");
+  });
+
+  it("minúsculas + letra corregida viajan juntas en un único POST lyrics", () => {
+    // Es el payload exacto del incidente: editar letra no puede borrar ni
+    // esconder una selección tipográfica hecha en el mismo wizard.
+    const bareUpper = {
+      ...JOB_FULL,
+      status: "done",
+      render_params: { ...JOB_FULL.render_params, text_case: "upper" },
+    };
+    const { baseline } = buildEditReview(bareUpper, null);
+    const current = currentFrom(bareUpper, { textCase: "lower" });
+    current.segments = [{ start: 1, end: 2, text: "letra corregida" }];
+
+    const out = resolveEditSubmission({
+      baseline,
+      current,
+      jobStatus: "done",
+    });
+
+    expect(out.editType).toBe("lyrics");
+    expect(out.payload.text_case).toBe("lower");
+    expect(out.payload.segments).toEqual([
+      { start: 1, end: 2, text: "letra corregida" },
+    ]);
   });
 });
 
@@ -503,6 +574,25 @@ describe("job LEGACY con un movement_style no canónico", () => {
 });
 
 describe("backgroundEditBlockedReason: se sabe ANTES de tocar nada", () => {
+  it.each(["done", "rejected"])("admin can regenerate a %s background without dropping the prompt", (jobStatus) => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const options = { jobStatus, allowApprovedBackground: true };
+    expect(backgroundEditBlockedReason(options)).toBeNull();
+    const result = resolveEditSubmission({ ...options, baseline,
+      current: currentFrom(JOB_FULL, { backgroundHint: "Un paisaje nocturno sin personas" }),
+    });
+    expect(result.blocked).toBeNull();
+    expect(result.editType).toBe("background");
+    expect(result.willDrop).toEqual([]);
+    expect(result.payload.background_hint).toBe("Un paisaje nocturno sin personas");
+  });
+
+  it("admin permission does not unlock active renders or replace scene timelines", () => {
+    expect(backgroundEditBlockedReason({ jobStatus: "editing", allowApprovedBackground: true })).toBe("status");
+    expect(backgroundEditBlockedReason({ jobStatus: "done", allowApprovedBackground: true,
+      scenePlan: { scenes: [{ recurrence_key: "coro" }] },
+    })).toBe("scenes");
+  });
   // Detectado manejando la app real con un navegador: el aviso salía sólo
   // DESPUÉS de que el operador configuraba el fondo, porque se derivaba de
   // `resolveEditSubmission`, que corta temprano cuando no hay cambios. Al

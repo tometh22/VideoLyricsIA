@@ -50,6 +50,22 @@ function stripFile(obj) {
   return meta ? { ...rest, _fileMetadata: meta } : rest;
 }
 
+// Signed R2 media URLs are short-lived capabilities, not wizard state. Keep
+// them out of sessionStorage too; a reload re-fetches a fresh URL from the
+// authorized endpoint, while lyric drafts remain resumable.
+function stripEphemeralMedia(obj) {
+  if (!obj || typeof obj !== "object") return obj;
+  const {
+    audioUrl,
+    audioSource,
+    audioPreviewPending,
+    audioPreviewRetryAt,
+    audioRefreshAt,
+    ...rest
+  } = obj;
+  return rest;
+}
+
 function stripQueue(queue) {
   if (!Array.isArray(queue)) return [];
   return queue.map(stripFile);
@@ -88,7 +104,10 @@ export function save({
       files: Array.isArray(files) ? files.map(stripFile) : [],
       approvedJobs: Array.isArray(approvedJobs) ? approvedJobs.map(stripFile) : [],
       currentReview: currentReview
-        ? { ...stripFile(currentReview), queue: stripQueue(currentReview.queue) }
+        ? {
+          ...stripEphemeralMedia(stripFile(currentReview)),
+          queue: stripQueue(currentReview.queue),
+        }
         : null,
       reviewQueue: stripQueue(reviewQueue),
       // Audit fix 2026-05-25: extended snapshot.

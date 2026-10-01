@@ -449,3 +449,43 @@ def test_generate_reuse_requires_and_honors_confirmed_revision(client, monkeypat
     )
     assert accepted.status_code == 200, accepted.text
     assert enqueued and enqueued[0]["segments_override"] == segments
+
+
+def test_save_segments_rejects_bulk_writes_across_many_jobs(client, monkeypatch):
+    """Incidente 2026-09-13: un script con token admin pisó 185 borradores a
+    un job por segundo vía este endpoint. Más de N jobs distintos en la
+    ventana → 429 y el job NO se toca."""
+    from database import AuditLog, Job, SessionLocal
+
+    username, token, user_id, tenant_id = _make_user(client)
+    job_id = _seed_transcribed_pending(user_id, tenant_id)
+    monkeypatch.setenv("SEGMENT_WRITE_MAX_DISTINCT_JOBS", "5")
+    s = SessionLocal()
+    try:
+        for _ in range(5):
+            s.add(AuditLog(user_id=user_id, action="lyrics.segments_diff",
+                           detail={"job_id": uuid.uuid4().hex[:12]}))
+        s.commit()
+    finally:
+        s.close()
+
+    res = client.post(
+        f"/jobs/{job_id}/save-segments", headers=auth(token),
+        json={"segments": [{"start": 0.0, "end": 1.0, "text": "pisada por un bot"}]},
+    )
+    assert res.status_code == 429, res.text
+    assert res.json()["detail"]["code"] == "segment_write_velocity"
+    assert res.json()["detail"]["distinct_jobs"] == 6
+    s = SessionLocal()
+    try:
+        row = s.query(Job).filter(Job.job_id == job_id).first()
+        assert not any((seg.get("text") == "pisada por un bot") for seg in (row.segments_json or []))
+    finally:
+        s.close()
+
+    monkeypatch.setenv("SEGMENT_WRITE_MAX_DISTINCT_JOBS", "0")
+    res = client.post(
+        f"/jobs/{job_id}/save-segments", headers=auth(token),
+        json={"segments": [{"start": 0.0, "end": 1.0, "text": "guardado normal"}]},
+    )
+    assert res.status_code == 200, res.text

@@ -8,6 +8,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Column,
+    Date,
     DateTime,
     Enum,
     Float,
@@ -94,9 +95,16 @@ DATABASE_URL = os.environ.get(
     "postgresql://genly:genly@localhost:5432/genly",
 )
 
-# Handle Heroku-style postgres:// URLs
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+def _normalize_postgres_driver(url: str) -> str:
+    """Pin generic Postgres URLs to the installed psycopg2 DBAPI."""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+psycopg2://", 1)
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return url
+
+
+DATABASE_URL = _normalize_postgres_driver(DATABASE_URL)
 
 # Pool sizing is *per-process*. The formula that has to hold under
 # burst is:
@@ -201,10 +209,7 @@ def get_db():
 # get_db → prod y dev quedan byte-a-byte iguales que hoy. NO se corre
 # create_all contra este engine: la DB externa (prod) es dueña de su schema.
 DELIVERIES_DATABASE_URL = os.environ.get("DELIVERIES_DATABASE_URL", "").strip()
-if DELIVERIES_DATABASE_URL.startswith("postgres://"):
-    DELIVERIES_DATABASE_URL = DELIVERIES_DATABASE_URL.replace(
-        "postgres://", "postgresql://", 1
-    )
+DELIVERIES_DATABASE_URL = _normalize_postgres_driver(DELIVERIES_DATABASE_URL)
 
 # El added_by_user_id de deliveries es FK NOT NULL a users.id de la DB
 # destino. Un user id de staging no existe en prod → al escribir en la DB
@@ -270,8 +275,7 @@ def deliveries_added_by(default_user_id):
 # SOLO LECTURA por convención: no se corre create_all contra este engine y
 # ningún camino de escritura lo usa.
 PEER_DATABASE_URL = os.environ.get("PEER_DATABASE_URL", "").strip() or DELIVERIES_DATABASE_URL
-if PEER_DATABASE_URL.startswith("postgres://"):
-    PEER_DATABASE_URL = PEER_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+PEER_DATABASE_URL = _normalize_postgres_driver(PEER_DATABASE_URL)
 
 if (
     PEER_DATABASE_URL
@@ -543,6 +547,20 @@ class Job(Base):
     job_id = Column(String(12), unique=True, nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     tenant_id = Column(String(100), nullable=False, index=True)
+    # Workload isolation. Existing rows and all ordinary wizard uploads stay
+    # interactive; campaign-created rows are marked batch by the server and
+    # route to dedicated RQ fleets. Clients never choose this value.
+    workload_class = Column(
+        String(16), nullable=False, default="interactive",
+        server_default="interactive", index=True,
+    )
+    campaign_id = Column(
+        String(12), ForeignKey("batch_campaigns.id"), nullable=True, index=True,
+    )
+    campaign_item_id = Column(
+        String(36), ForeignKey("batch_campaign_items.id"), nullable=True,
+        unique=True, index=True,
+    )
     artist = Column(String(255), nullable=False)
     song_title = Column(String(500), nullable=True)
     style = Column(String(50), default="oscuro")
@@ -638,6 +656,14 @@ class Job(Base):
     # metrics, retry evidence and revision-scoped acknowledgement together
     # prevents API/editor/worker drift without adding a column per metric.
     transcription_quality = Column(JSONB, nullable=True)
+    # Set atomically with the durable pre-human editor snapshot.  Approval
+    # fails closed for these jobs when the snapshot is absent or inconsistent.
+    machine_snapshot_required = Column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+    # Final-render label-style preflight.  Kept separate from transcription
+    # quality because it is bound to an encoded render, not only to segments.
+    delivery_qc = Column(JSONB, nullable=True)
     # Server-owned optimistic concurrency version for editor writes.
     segments_revision = Column(BigInteger, default=0, nullable=False, server_default="0")
     # Monotonic invalidation fence for asynchronous correction learning. Every
@@ -666,6 +692,14 @@ class Job(Base):
     # se borra, la variante sobrevive como job independiente. Indexado
     # para listar hijos en /jobs eficientemente.
     parent_job_id = Column(String(32), nullable=True, index=True)
+    # Piloto de revisor: identifica una COPIA DE PRUEBA y a qué corrida
+    # pertenece. NULL = job normal (todos los existentes). No nulo implica,
+    # por sí solo y verificado en el servidor: copia de prueba, fuera de
+    # campaña, escribible únicamente por su usuario de agente
+    # (editor.save_document) y no aprobable. Deliberadamente NO se agregó
+    # una columna de "learning_eligible": machine_snapshot_required=False
+    # ya excluye el job de training_corpus y de learning_triggers.
+    pilot_id = Column(String(64), nullable=True)
     # Set by /edit when the operator triggers an edit (typography/lyrics/
     # background). The reaper uses this to detect edits that died mid-render
     # (worker killed by deploy/OOM): if a job is status="editing" and
@@ -738,6 +772,9 @@ class Job(Base):
             "style": self.style,
             "filename": self.filename,
             "tenant_id": self.tenant_id,
+            "workload_class": self.workload_class or "interactive",
+            "campaign_id": self.campaign_id,
+            "campaign_item_id": self.campaign_item_id,
             "status": self.status,
             "current_step": self.current_step,
             "progress": self.progress,
@@ -775,6 +812,7 @@ class Job(Base):
             "segments_json": self.segments_json,
             "segments_revision": self.segments_revision or 0,
             "transcription_quality": self.transcription_quality,
+            "delivery_qc": self.delivery_qc,
             "bg_r2_key_cached": self.bg_r2_key_cached,
             # Storyboard multi-escena (NULL en jobs de fondo único). El panel
             # de edición lo usa para mostrar las escenas y ofrecer "regenerar
@@ -804,6 +842,9 @@ class Job(Base):
             "artist": self.artist,
             "song_title": self.song_title,
             "filename": self.filename,
+            "workload_class": self.workload_class or "interactive",
+            "campaign_id": self.campaign_id,
+            "campaign_item_id": self.campaign_item_id,
             "delivery_profile": self.delivery_profile,
             "umg_spec": self.umg_spec,
             "prores_ready": (
@@ -829,6 +870,188 @@ class Job(Base):
         }
 
 
+class BatchCampaign(Base):
+    """Tenant-scoped durable container for a high-volume audio campaign."""
+
+    __tablename__ = "batch_campaigns"
+    __table_args__ = (
+        Index("ix_batch_campaigns_tenant_created", "tenant_id", text("created_at DESC")),
+    )
+
+    id = Column(String(12), primary_key=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String(160), nullable=False)
+    # ``lyric_video`` is the legacy default.  The value is immutable once an
+    # item has been imported so a lyric campaign can never be turned into an
+    # art-track campaign (or vice versa) by a later PATCH.
+    kind = Column(String(24), nullable=False, default="lyric_video", server_default="lyric_video")
+    # Destination is a business contract, not a tenant id.  It is kept on
+    # the campaign so an AR/CL choice cannot drift with a filename or a
+    # worker environment variable.
+    destination_portal = Column(String(32), nullable=True)
+    preset_version = Column(String(40), nullable=False, default="art-track-v1", server_default="art-track-v1")
+    status = Column(String(20), nullable=False, default="active", server_default="active")
+    expected_count = Column(Integer, nullable=False, default=0, server_default="0")
+    default_render_params = Column(JSONB, nullable=False, default=dict, server_default="{}")
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class BatchCampaignItem(Base):
+    """One source audio registered before a Job is promoted for transcription."""
+
+    __tablename__ = "batch_campaign_items"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "sha256", name="uq_batch_item_campaign_sha"),
+        UniqueConstraint("campaign_id", "technical_code", name="uq_batch_item_campaign_code"),
+        Index("ix_batch_items_campaign_upload", "campaign_id", "upload_state", "ordinal"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    campaign_id = Column(
+        String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    tenant_id = Column(String(100), nullable=False, index=True)
+    ordinal = Column(Integer, nullable=False)
+    filename = Column(String(500), nullable=False)
+    title = Column(String(500), nullable=True)
+    artist = Column(String(255), nullable=True)
+    technical_code = Column(String(64), nullable=True)
+    size_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    duration_seconds = Column(Float, nullable=True)
+    sha256 = Column(String(64), nullable=False)
+    metadata_error = Column(String(255), nullable=True)
+    upload_state = Column(String(20), nullable=False, default="registered", server_default="registered")
+    upload_key = Column(Text, nullable=True)
+    multipart_upload_id = Column(Text, nullable=True)
+    upload_error = Column(String(500), nullable=True)
+    upload_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    uploaded_at = Column(DateTime(timezone=True), nullable=True)
+    render_overrides = Column(JSONB, nullable=False, default=dict, server_default="{}")
+    # Art-track association.  A cover asset is a separate row so one album
+    # cover can be referenced by many songs without duplicating bytes.
+    cover_asset_id = Column(String(36), ForeignKey("batch_campaign_assets.id"), nullable=True, index=True)
+    cover_match_state = Column(String(20), nullable=False, default="pending", server_default="pending")
+    cover_match_method = Column(String(32), nullable=True)
+    cover_match_error = Column(String(255), nullable=True)
+    association_confirmed = Column(Boolean, nullable=False, default=False, server_default="false")
+    approved_render_fingerprint = Column(String(64), nullable=True)
+    discard_record = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class BatchUploadSession(Base):
+    """Short-lived, campaign-only credential exchanged from a pairing code."""
+
+    __tablename__ = "batch_upload_sessions"
+
+    id = Column(String(36), primary_key=True)
+    campaign_id = Column(
+        String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    tenant_id = Column(String(100), nullable=False, index=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    code_hash = Column(String(64), nullable=False, unique=True, index=True)
+    token_hash = Column(String(64), nullable=True, unique=True, index=True)
+    code_expires_at = Column(DateTime(timezone=True), nullable=False)
+    token_expires_at = Column(DateTime(timezone=True), nullable=True)
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class BatchCampaignAsset(Base):
+    """Deduplicated audio/cover input owned by one campaign.
+
+    Audio rows created by the original uploader remain in
+    ``batch_campaign_items`` for backwards compatibility.  New art-track
+    manifests use this table for both roles and point items at the cover row.
+    """
+
+    __tablename__ = "batch_campaign_assets"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "role", "sha256", name="uq_batch_asset_campaign_role_sha"),
+        Index("ix_batch_assets_campaign_role_state", "campaign_id", "role", "upload_state"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    campaign_id = Column(String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    role = Column(String(12), nullable=False)  # audio | cover
+    filename = Column(String(500), nullable=False)
+    relative_path = Column(String(1000), nullable=True)
+    sha256 = Column(String(64), nullable=False)
+    size_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    mime_type = Column(String(120), nullable=False)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    upload_state = Column(String(20), nullable=False, default="registered", server_default="registered")
+    upload_key = Column(Text, nullable=True)
+    multipart_upload_id = Column(Text, nullable=True)
+    upload_error = Column(String(500), nullable=True)
+    upload_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    uploaded_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class DeliveryBatch(Base):
+    """Durable snapshot of one bulk publication operation."""
+
+    __tablename__ = "delivery_batches"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "idempotency_key", name="uq_delivery_batch_campaign_idempotency"),
+        Index("ix_delivery_batches_campaign_status", "campaign_id", "status"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    campaign_id = Column(String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    tenant_id = Column(String(100), nullable=False, index=True)
+    destination_portal = Column(String(32), nullable=False)
+    status = Column(String(24), nullable=False, default="queued", server_default="queued")
+    idempotency_key = Column(String(160), nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    total_count = Column(Integer, nullable=False, default=0, server_default="0")
+    sent_count = Column(Integer, nullable=False, default=0, server_default="0")
+    failed_count = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class DeliveryBatchItem(Base):
+    """Immutable item selection and per-song receipt for a delivery batch."""
+
+    __tablename__ = "delivery_batch_items"
+    __table_args__ = (
+        UniqueConstraint("delivery_batch_id", "job_id", name="uq_delivery_batch_item_job"),
+        Index("ix_delivery_batch_items_status", "delivery_batch_id", "status"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    delivery_batch_id = Column(String(36), ForeignKey("delivery_batches.id", ondelete="CASCADE"), nullable=False, index=True)
+    campaign_id = Column(String(12), ForeignKey("batch_campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    job_id = Column(String(12), nullable=False, index=True)
+    approved_render_fingerprint = Column(String(64), nullable=False)
+    status = Column(String(24), nullable=False, default="pending", server_default="pending")
+    delivery_id = Column(Integer, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    error_code = Column(String(120), nullable=True)
+    error_detail = Column(String(500), nullable=True)
+    receipt = Column(JSONB, nullable=True)
+    # Client requests this send was reviewed to close (ids + reviewed cut). The
+    # worker re-validates each one before resolving; never resolves on its own.
+    change_request_intent = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
 class EditorDocument(Base):
     """Durable editor working copy layered over the legacy Job snapshot."""
     __tablename__ = "editor_documents"
@@ -843,12 +1066,64 @@ class EditorDocument(Base):
     updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     lock_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Browser-tab identity. User id alone cannot distinguish two tabs opened
+    # by the same reviewer, so both used to believe they owned one document.
+    lock_session_id = Column(String(64), nullable=True)
     lock_expires_at = Column(DateTime(timezone=True), nullable=True)
     # Raw proposal text is intentionally tenant-scoped in the editor layer;
     # analytics/quality JSON stores only hashes and aggregate diagnostics.
     quality_proposal = Column(JSONB, nullable=True)
+    # Tenant-private raw hypotheses and machine decisions captured before any
+    # human edit.  Unlike analytics lineage this intentionally preserves text.
+    machine_evidence = Column(JSONB, nullable=True)
 
     job = relationship("Job", back_populates="editor_document")
+
+
+class ChangeRequestProposal(Base):
+    """Revision-bound operator proposal for one external portal request.
+
+    Change requests may live in ``DELIVERIES_DATABASE_URL`` while jobs and
+    editor documents live in the local application database.  The external
+    identifiers therefore cannot be foreign keys; ``job_id`` is the local
+    integrity anchor and every apply revalidates the external request.
+    """
+    __tablename__ = "change_request_proposals"
+    __table_args__ = (
+        UniqueConstraint(
+            "portal_id", "change_request_id", "request_sha256",
+            "base_revision", name="uq_change_request_proposal_snapshot",
+        ),
+        Index("ix_crp_request_status", "portal_id", "change_request_id", "status"),
+        Index("ix_crp_job_created", "job_id", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    portal_id = Column(String(32), nullable=False, default="argentina")
+    change_request_id = Column(Integer, nullable=False)
+    delivery_id = Column(Integer, nullable=False)
+    job_id = Column(
+        String(12), ForeignKey("jobs.job_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    request_sha256 = Column(String(64), nullable=False)
+    base_revision = Column(Integer, nullable=False)
+    segments_hash = Column(String(64), nullable=False)
+    segments_content_hash = Column(String(64), nullable=False)
+    audio_revision = Column(Integer, nullable=False, default=0, server_default="0")
+    audio_sha256 = Column(String(64), nullable=False, default="", server_default="")
+    parser_version = Column(String(64), nullable=False)
+    schema_version = Column(String(64), nullable=False)
+    status = Column(String(24), nullable=False)
+    operations = Column(JSONB, nullable=False)
+    decision_history = Column(JSONB, nullable=False, default=list)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    applied_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    applied_at = Column(DateTime(timezone=True), nullable=True)
+    applied_revision = Column(Integer, nullable=True)
+    idempotency_hash = Column(String(64), nullable=True)
 
 
 class JobOutboxEvent(Base):
@@ -1053,7 +1328,7 @@ class QualityExperimentRun(Base):
 
 
 class Delivery(Base):
-    # Versions exposed on the UMG deliverables portal (umg.genly.pro).
+    # Versions exposed on the UMG deliverables portals (Argentina and Chile).
     # Replaces the previous static items.json workflow — admins click
     # "Enviar a UMG" on an approved job and a row lands here; the portal
     # fetches the list dynamically and signs R2 URLs on demand.
@@ -1089,6 +1364,13 @@ class Delivery(Base):
     artist_snapshot = Column(String(255), nullable=False)
     song_title_snapshot = Column(String(500), nullable=False)
     tenant_snapshot = Column(String(100), nullable=False)
+    # Destination surface for this published version. Legacy rows are
+    # Argentina by default; the row-level destination lets one job be
+    # published independently to both portals.
+    portal_id = Column(
+        String(20), nullable=False, default="argentina",
+        server_default="argentina", index=True,
+    )
     frame_size_snapshot = Column(String(20), nullable=True)  # HD | UHD-4K | DCI-4K
     added_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     added_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -1103,6 +1385,45 @@ class Delivery(Base):
     # leave room for per-user portal logins to write usernames here later.
     approved_at = Column(DateTime(timezone=True), nullable=True, index=True)
     approved_by_label = Column(String(120), nullable=True)
+    # ── Freshness of the published content ────────────────────────────
+    # The portal does not store a file or a frozen URL: it rebuilds the
+    # R2 key from (tenant, job_id, file_type) and signs it on demand, so
+    # a re-render silently replaces what the client downloads. That is
+    # the behaviour we want (a correction reaches them without a new
+    # link) and also the hazard: the row kept saying "approved by UMG,
+    # published on <old date>" about content they never saw.
+    #
+    # These four columns make the row describe the content it is
+    # actually serving, so both the portal and the operator can tell a
+    # re-send of the same cut from a genuinely new version.
+    #
+    # published_render_fingerprint: identity of the render that was in
+    # R2 at publish time (delivery_freshness.render_fingerprint). A
+    # publish whose fingerprint differs is new content, not a re-send.
+    published_render_fingerprint = Column(String(64), nullable=True)
+    # Immutable objects served by the portal. Working render keys must never
+    # replace a client's approved cut before an explicit publication.
+    published_file_keys = Column(JSONB, nullable=True)
+    # Human-facing version counter. Starts at 1 and only advances when
+    # the fingerprint changes, so "Versión 2" always means the client
+    # has something new to look at.
+    published_revision = Column(
+        Integer, nullable=False, default=1, server_default="1",
+    )
+    # When the served files last changed. Distinct from added_at, which
+    # also moves on a plain re-send.
+    content_updated_at = Column(DateTime(timezone=True), nullable=True)
+    # Set while a re-render is in flight for this job: the files in R2
+    # are about to be replaced (or already partially were — the MP4
+    # lands minutes before the ProRes master). Cleared on the next
+    # publish. Non-null means "do not treat this download as final".
+    stale_since = Column(DateTime(timezone=True), nullable=True)
+    stale_reason = Column(String(40), nullable=True)
+    # What the CLIENT may see of this row. NULL/'auto': hidden while the delivery
+    # has unpublished changes, shown again on publish. 'visible' / 'hidden' are
+    # the operator's manual override (delivery_snapshots.is_hidden_from_client).
+    # Lives on the shared row because the portal is served by another backend.
+    client_visibility = Column(String(10), nullable=True)
 
     def to_dict(self):
         return {
@@ -1113,11 +1434,22 @@ class Delivery(Base):
             "artist": self.artist_snapshot,
             "song_title": self.song_title_snapshot,
             "tenant": self.tenant_snapshot,
+            "portal_id": self.portal_id or "argentina",
             "frame_size": self.frame_size_snapshot,
             "added_at": self.added_at.isoformat() if self.added_at else None,
             "removed_at": self.removed_at.isoformat() if self.removed_at else None,
             "approved_at": self.approved_at.isoformat() if self.approved_at else None,
             "approved_by_label": self.approved_by_label,
+            "published_revision": self.published_revision or 1,
+            "content_updated_at": (
+                self.content_updated_at.isoformat()
+                if self.content_updated_at else None
+            ),
+            "stale_since": (
+                self.stale_since.isoformat() if self.stale_since else None
+            ),
+            "stale_reason": self.stale_reason,
+            "client_visibility": self.client_visibility or "auto",
         }
 
 
@@ -1142,6 +1474,11 @@ class DeliveryChangeRequest(Base):
     submitted_at = Column(
         DateTime(timezone=True), default=utcnow, nullable=False,
     )
+    # Keep the latest lifecycle change after reopening clears resolved_at.
+    updated_at = Column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow,
+        nullable=False, server_default=text("CURRENT_TIMESTAMP"),
+    )
     # Set when the operator marks the request handled (re-rendered,
     # edited, dismissed). Null = still pending.
     resolved_at = Column(DateTime(timezone=True), nullable=True)
@@ -1149,6 +1486,14 @@ class DeliveryChangeRequest(Base):
         Integer, ForeignKey("users.id"), nullable=True,
     )
     resolution_note = Column(Text, nullable=True)
+    # Which published revision answered this request, when it was closed
+    # by actually shipping a new cut rather than by hand. Lets the portal
+    # say "atendido en la versión 2" instead of a bare "resuelto", and
+    # lets the operator see that a request was auto-closed.
+    resolved_by_revision = Column(Integer, nullable=True)
+    # "manual" (operator ticked it off) | "publication" (a new revision
+    # was published). Null on rows predating this column.
+    resolution_source = Column(String(20), nullable=True)
 
     def to_dict(self):
         return {
@@ -1156,8 +1501,11 @@ class DeliveryChangeRequest(Base):
             "delivery_id": self.delivery_id,
             "comment": self.comment,
             "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "resolution_note": self.resolution_note,
+            "resolved_by_revision": self.resolved_by_revision,
+            "resolution_source": self.resolution_source,
         }
 
 
@@ -1193,6 +1541,16 @@ class Invoice(Base):
             "period_end": self.period_end.isoformat() if self.period_end else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class SystemSetting(Base):
+    """Operator-editable switches that used to be Railway env vars (local DB only)."""
+    __tablename__ = "system_settings"
+
+    key = Column(String(80), primary_key=True)
+    value = Column(String(200), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_by_user_id = Column(Integer, nullable=True)
 
 
 class UserSettings(Base):
@@ -1620,6 +1978,78 @@ class VeoBudgetLedger(Base):
     )
 
 
+class DeletedJobLyricsArchive(Base):
+    """Best-effort copy of an operator's hand-corrected lyrics, taken right
+    before a stuck/failed Job row (and its ON DELETE CASCADE children
+    editor_documents/editor_versions) is hard-deleted via delete_job /
+    bulk_delete_jobs.
+
+    Incident (audited 2026-08-24): 137 jobs with real lyric corrections were
+    hard-deleted via the operator cleanup flow with no recoverable trace of
+    which song they belonged to — editor_documents/editor_versions cascade
+    with the Job, and the Job row itself (artist/song_title) is gone by the
+    time anyone notices. This table exists solely to survive that delete:
+
+    - `job_id` is a PLAIN string, deliberately with NO ForeignKey to
+      jobs.job_id — the whole point is that this row outlives the job.
+    - `artist`/`song_title` are copied from the Job BEFORE it's deleted,
+      which is exactly the piece of context the 137 lost rows are missing.
+
+    Never blocks deletion: written best-effort in the same transaction as
+    the delete, and only when there's actually something to archive (a
+    non-empty editor_documents.current_segments, or at least one
+    editor_versions row). Jobs nobody ever touched in the editor produce no
+    row here — this is a safety net for lost human work, not a full audit
+    log of every deletion.
+    """
+    __tablename__ = "deleted_job_lyrics_archive"
+    __table_args__ = (
+        Index(
+            "ix_deleted_job_lyrics_archive_archived_at", "archived_at",
+        ),
+        Index(
+            "ix_deleted_job_lyrics_archive_tenant_job",
+            "tenant_id",
+            "job_id",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(12), nullable=False, index=True)
+    tenant_id = Column(String(100), nullable=False)
+    artist = Column(String(255), nullable=True)
+    song_title = Column(String(500), nullable=True)
+    job_status_at_deletion = Column(String(20), nullable=False)
+    segments = Column(JSONB, nullable=False)
+    # "editor_documents" | "editor_versions" — which table the segments were
+    # recovered from. editor_documents.current_segments is preferred (it's
+    # the operator's latest working copy); editor_versions is the fallback
+    # when there's no live document but at least one saved checkpoint.
+    source = Column(String(20), nullable=False)
+    archived_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    # Nullable, deliberately no ForeignKey (unlike AuditLog.user_id): this
+    # archive must survive independently of both the job AND the acting
+    # user's row, and users.id has no ON DELETE behavior defined today —
+    # a strict FK here would risk a future user deletion blocking on, or
+    # cascading into, lyrics-recovery history that has nothing to do with
+    # user-account lifecycle.
+    deleted_by_user_id = Column(Integer, nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "job_id": self.job_id,
+            "tenant_id": self.tenant_id,
+            "artist": self.artist,
+            "song_title": self.song_title,
+            "job_status_at_deletion": self.job_status_at_deletion,
+            "segments": self.segments,
+            "source": self.source,
+            "archived_at": self.archived_at.isoformat() if self.archived_at else None,
+            "deleted_by_user_id": self.deleted_by_user_id,
+        }
+
+
 class LyricsCache(Base):
     """Reference lyrics fetched via Gemini-grounded web search, cached
     per (artist, title) so we only pay Gemini once per song across the
@@ -1713,6 +2143,234 @@ class CostSnapshot(Base):
     __table_args__ = (
         UniqueConstraint("period", "source", name="uq_cost_snapshot_period_source"),
     )
+
+
+class CostCollectionRun(Base):
+    """Did we manage to ask provider X about day D — and what happened.
+
+    THE POINT OF THIS TABLE: without it, a day the collector could not fetch
+    is indistinguishable from a cheap day. `cost_daily` would simply have no
+    rows for it, the month total would quietly drop, and the panel would
+    render a dip that looks like good news. The whole reason the cost panel
+    exists is to be trusted without a monthly manual audit, so "failed
+    silently" is a worse outcome than "no panel".
+
+    The row is written with status='pending' BEFORE the provider call. A
+    crash mid-call therefore leaves evidence; a missing row means the
+    collector never even got to that day, which is itself the alarm.
+    """
+    __tablename__ = "cost_collection_runs"
+
+    day = Column(Date, primary_key=True)
+    source = Column(String(32), primary_key=True)
+    # pending | ok | error | not_configured
+    status = Column(String(20), nullable=False, default="pending")
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    last_attempt_at = Column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        Index("ix_cost_runs_status_day", "status", "day"),
+    )
+
+
+class CostDaily(Base):
+    """One raw cost fact, at the finest grain the provider will give us.
+
+    DESIGN RULE — the collector stores the provider's RAW granularity; every
+    business rule is applied at read time. That rule is not stylistic, it is
+    what keeps the numbers correct:
+
+      * R2's free allowances (10 GB-month, 1M class-A, 10M class-B) are a
+        function of the MONTH. Subtracting 1M class-A per day yields $0 every
+        day even when the month blows past the million.
+      * Railway's plan minimum is `max(metered, 20)` over the month — no
+        per-day split reproduces it.
+      * OpenAI's line-item filter changes over time (July's `gpt-4o-mini` was
+        not ours; August's is). Filtering at collect time freezes a wrong
+        answer into history forever.
+
+    `amount_usd` is NULLABLE for the same reason as CostSnapshot: a source we
+    could not reach must never read as $0.
+
+    `grain` exists because a monthly-only fact (flat subscriptions, or the
+    invoice total itself) must never be summed into a day range. Mixing the
+    two in one table without it is how a month gets counted twice.
+
+    Writes are DELETE-then-INSERT per (day, source, grain) inside one
+    transaction, never upsert: a dimension that stops being reported (a SKU
+    reversed to a credit, a tenant that went quiet) must disappear, or
+    `SUM(dims)` drifts above `total` forever.
+    """
+    __tablename__ = "cost_daily"
+
+    day = Column(Date, primary_key=True)
+    source = Column(String(32), primary_key=True)
+    grain = Column(String(8), primary_key=True)        # day | month
+    dim_type = Column(String(16), primary_key=True)    # total | sku | service | line_item | job
+    dim_value = Column(String(255), primary_key=True)
+
+    qty = Column(Float, nullable=True)                 # cantidad cruda del proveedor
+    unit = Column(String(32), nullable=True)           # GB-min, requests, seconds...
+    amount_usd = Column(Float, nullable=True)
+
+    # fijo | variable | stock — separa el piso mensual del costo marginal por
+    # video. Sin esto el "$/video" baja al subir el volumen y hace parecer
+    # una mejora lo que en realidad recorta la ganancia absoluta.
+    cost_behavior = Column(String(10), nullable=True)
+
+    basis = Column(String(16), nullable=False, default="measured")  # measured|allocated|invoice_manual
+    basis_detail = Column(Text, nullable=True)
+    is_estimate = Column(Boolean, nullable=False, default=False)
+    fetched_at = Column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        Index("ix_cost_daily_day_source", "day", "source"),
+        Index("ix_cost_daily_dim", "dim_type", "dim_value"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gold corpus annotation (validator calibration — 50-song blind double-
+# annotation project, see corpus.py). Deliberately separate from Job: these
+# rows are never client jobs, never render anything, and must never be
+# joined into tenant-scoped job queries by accident.
+# ---------------------------------------------------------------------------
+
+class CorpusSong(Base):
+    """One gold-corpus song. The audio itself is not duplicated here — it
+    already lives in R2 (same bucket other jobs use); this row is just the
+    pointer + metadata an admin registers once via POST /admin/corpus/songs."""
+    __tablename__ = "corpus_songs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    artist = Column(String(255), nullable=False)
+    title = Column(String(500), nullable=False)
+    # R2 key of the source audio (mp3/wav), same object-storage mechanism
+    # jobs.input_r2_key uses. Text (not VARCHAR) — mirrors jobs.input_r2_key,
+    # which was widened after R2 handed back keys longer than 255 chars.
+    audio_r2_key = Column(Text, nullable=False)
+    audio_sha256 = Column(String(64), nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    notes = Column(Text, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Pre-review precarga (see corpus_reference.py): cleaned-down copy of
+    # the already-human-reviewed editor_documents.current_segments for the
+    # delivered job this song was copied from — [{start, end, text,
+    # event_type}], event_type always "lexical" (production data has no
+    # vocalization/mixed classification). NULL means "start empty", either
+    # because this is a control song (see is_control) or because no
+    # reviewed editor_documents row could be matched for it.
+    reference_segments = Column(JSONB, nullable=True)
+    # True for the handful of songs deliberately held out with NO
+    # precarga (marked "CONTROL:" in `notes`) — the check that annotators
+    # do just as well starting from zero as they do reviewing a precarga.
+    # Never combine this with a populated reference_segments: the backfill
+    # in corpus_reference.py enforces that, and _get_or_create_own_annotation
+    # in corpus.py double-checks it before seeding a draft.
+    is_control = Column(Boolean, nullable=False, default=False, server_default="false")
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def to_dict(self, *, include_admin_fields: bool = False):
+        d = {
+            "id": self.id,
+            "artist": self.artist,
+            "title": self.title,
+            "duration_seconds": self.duration_seconds,
+            "notes": self.notes,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+        if include_admin_fields:
+            # Admin-only: revealing `is_control` to an annotator would tell
+            # her which song is the blind control, defeating its purpose.
+            # Annotator-facing responses must never call to_dict(True).
+            d["is_control"] = self.is_control
+            d["has_reference_segments"] = bool(self.reference_segments)
+        return d
+
+
+class CorpusAnnotatorToken(Base):
+    """Magic-link identity for one non-technical annotator. Knowledge of the
+    `token` string IS the auth — no username/password, no login screen, and
+    (deliberately) no expiry: the annotator is a real person doing manual
+    work over days/weeks and must never get logged out mid-song. Admin
+    revokes access by flipping `is_active` off, not by rotating a secret."""
+    __tablename__ = "corpus_annotator_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(200), nullable=False)
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "token": self.token,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "last_used_at": self.last_used_at.isoformat() if self.last_used_at else None,
+        }
+
+
+class CorpusAnnotation(Base):
+    """One annotator's segment markup for one corpus song — draft or
+    submitted. Blind by construction: every token-scoped endpoint in
+    corpus.py resolves `annotator_token_id` from the caller's OWN URL
+    token and filters by it server-side. There is no endpoint that accepts
+    an arbitrary annotator id, so annotator A's request can never reach
+    annotator B's row for the same song — the only surface that can see
+    both sides at once is the admin-only comparison endpoint."""
+    __tablename__ = "corpus_annotations"
+    __table_args__ = (
+        UniqueConstraint(
+            "song_id", "annotator_token_id",
+            name="uq_corpus_annotation_song_annotator",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    song_id = Column(
+        Integer, ForeignKey("corpus_songs.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    annotator_token_id = Column(
+        Integer, ForeignKey("corpus_annotator_tokens.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # List of {start, end, text, event_type} — event_type in
+    # (lexical, vocalization, mixed). Validated at the API boundary, not
+    # here — the column itself just carries whatever the annotator saved.
+    segments = Column(JSONB, nullable=False, default=list)
+    status = Column(String(20), nullable=False, default="draft", server_default="draft")
+    # True when this row's initial `segments` came from the song's
+    # reference_segments precarga (set once, at row creation, in
+    # corpus._get_or_create_own_annotation — never touched again, even if
+    # the annotator later empties every line). Lets the frontend keep
+    # showing the "this one already has a first pass — verify it" note on
+    # every later open of the song, not just the very first one.
+    seeded_from_reference = Column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+    submitted_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "song_id": self.song_id,
+            "segments": self.segments or [],
+            "status": self.status,
+            "seeded_from_reference": self.seeded_from_reference,
+            "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1916,6 +2574,8 @@ def _migrate_user_columns():
         # Edit-requests feature: partial re-render support at review stage.
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_json JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS transcription_quality JSONB",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS machine_snapshot_required BOOLEAN DEFAULT FALSE NOT NULL",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS delivery_qc JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS render_params JSONB",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS edit_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS bg_r2_key_cached TEXT",
@@ -1939,6 +2599,9 @@ def _migrate_user_columns():
         # delete del padre no rompa la variante. Indexado para que el
         # /jobs liste con `variant_count` eficientemente.
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS parent_job_id VARCHAR(32)",
+        # Reviewer pilot test copies. Nullable and unindexed: every existing
+        # row stays NULL and no read path filters on it.
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pilot_id VARCHAR(64)",
         "CREATE INDEX IF NOT EXISTS ix_jobs_parent_job_id ON jobs(parent_job_id)",
         # Archive of previous deliverable s3_keys overwritten by a partial
         # re-render (lyrics/typography/background edit). Populated by
@@ -1955,6 +2618,26 @@ def _migrate_user_columns():
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ",
         "CREATE INDEX IF NOT EXISTS ix_deliveries_approved_at ON deliveries(approved_at)",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS approved_by_label VARCHAR(120)",
+        # Destination surface for published versions. Alembic is the
+        # canonical production migration; this startup mirror keeps older
+        # staging/dev databases self-healing when they boot without the
+        # release runner.
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS portal_id VARCHAR(20) DEFAULT 'argentina' NOT NULL",
+        "CREATE INDEX IF NOT EXISTS ix_deliveries_portal_id ON deliveries(portal_id)",
+        # Publication freshness. The portal serves whatever sits at the
+        # deterministic R2 key, so a re-render replaces the client's
+        # download in place; these columns let the row say which cut it
+        # is actually serving. Alembic (b4c6d8e0f2a4) is canonical — this
+        # mirror keeps older databases self-healing on boot.
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_render_fingerprint VARCHAR(64)",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_file_keys JSONB",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_revision INTEGER DEFAULT 1 NOT NULL",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS content_updated_at TIMESTAMPTZ",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_reason VARCHAR(40)",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS client_visibility VARCHAR(10)",
+        "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolved_by_revision INTEGER",
+        "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolution_source VARCHAR(20)",
         # Categoría del error para el dashboard de actividad (PR telemetría).
         # Se setea en los sinks de error del pipeline/reaper vía
         # error_taxonomy.classify_error(). Espejo de la migración Alembic
@@ -1976,6 +2659,7 @@ def _migrate_user_columns():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER DEFAULT 0 NOT NULL",
         "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segments_revision BIGINT DEFAULT 0 NOT NULL",
         "ALTER TABLE editor_documents ADD COLUMN IF NOT EXISTS quality_proposal JSONB",
+        "ALTER TABLE editor_documents ADD COLUMN IF NOT EXISTS machine_evidence JSONB",
         "ALTER TABLE job_outbox_events ADD COLUMN IF NOT EXISTS processing_at TIMESTAMPTZ",
         "ALTER TABLE job_outbox_events ADD COLUMN IF NOT EXISTS processing_token VARCHAR(36)",
         "ALTER TABLE job_outbox_events ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ",

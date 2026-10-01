@@ -201,6 +201,8 @@ def create_transcription_outbox_event(
     job,
     audio_path: str,
     transcription_kwargs: dict[str, Any],
+    request_fingerprint: str = "",
+    idempotency_key_hash: str = "",
 ):
     """Commit-ready intent for a transcription invocation."""
     event = create_outbox_event(
@@ -211,6 +213,8 @@ def create_transcription_outbox_event(
         payload={
             "audio_path": audio_path,
             "transcription_kwargs": dict(transcription_kwargs),
+            "request_fingerprint": str(request_fingerprint)[:64],
+            "idempotency_key_hash": str(idempotency_key_hash)[:64],
         },
     )
     job.active_transcription_attempt_id = event.id
@@ -225,6 +229,19 @@ def _publish(
     transcription_publisher: Callable[..., str | None] | None = None,
 ) -> str | None:
     payload = dict(event.payload or {})
+    if event.event_type == "correction.enqueue":
+        from queue_jobs import enqueue_correction_learning
+        from database import SessionLocal, Job
+        with SessionLocal() as snapshot_db:
+            job = snapshot_db.query(Job).filter_by(job_id=event.job_id).one()
+            if (job.input_audio_sha256 != payload.get('audio_sha256')
+                    or job.audio_revision != payload.get('audio_revision')):
+                raise OutboxDeliveryError('correction_audio_snapshot_stale', retryable=False)
+        rq_id = enqueue_correction_learning(event.job_id, str(payload['approved_version_id']),
+                                            source_confidence='operational_review')
+        if str(rq_id).startswith('disabled:'):
+            raise OutboxDeliveryError('correction_capture_disabled', retryable=False)
+        return rq_id
     if event.event_type == "edit.enqueue":
         if edit_publisher is None:
             from queue_jobs import enqueue_edit as edit_publisher
@@ -235,6 +252,7 @@ def _publish(
             edit_params=dict(payload.get("edit_params") or {}),
             plan=str(payload.get("plan") or "100"),
             tenant_id=str(payload.get("tenant_id") or ""),
+            workload_class=str(payload.get("workload_class") or "interactive"),
             publication_id=str(event.id),
             publication_dedupe_key=str(event.dedupe_key),
         )

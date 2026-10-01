@@ -66,3 +66,12 @@ def test_ass_render_validates_output_before_returning():
     validator = src[src.index("def _validate_rendered_mp4"):src.index("def _render_lyrics_ass")]
     assert "moov" in validator and "faststart" in validator
     assert "no video stream" in validator and "no audio stream" in validator
+
+
+def test_selected_visual_options_cannot_fall_back_to_plain_renderers():
+    src = _src()
+    assert "selected visual effects/lyric animations require the ASS renderer" in src
+    assert "ASS render failed while selected visual options were " in src
+    assert 'f"requested (effect=' in src
+    assert "short-libass-required" in src
+    assert "short effect overlay failed" in src

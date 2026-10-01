@@ -1,0 +1,43 @@
+# Railway Config-as-Code para el cron de costos.
+# Contrato con el dashboard: Root Directory=/lyricgen,
+# Config File=/railway/cost-collector.toml.
+#
+# Por qué un servicio con cronSchedule y no un thread en `api`
+# ------------------------------------------------------------
+# `api` corre numReplicas=2 con `uvicorn --workers 2` = 4 procesos. Los loops
+# de fondo de main.py son `sleep(N)` desde el boot, no un horario: "diario a
+# las 06:00" es imposible, y cada deploy resetea el reloj. Además el advisory
+# lock retiene una conexión del pool toda la corrida y `pool_recycle=120` la
+# mata. Un proceso que arranca, trabaja y sale no tiene ninguno de esos
+# problemas.
+#
+# 06:00 UTC = 03:00 en Argentina: los proveedores ya cerraron el día anterior
+# (el colector nunca pide "hoy", que todavía está acumulando) y no compite con
+# el pico de renders.
+#
+# Caveats del cron de Railway que el diseño ya contempla:
+#   * NO reintenta una corrida fallida  → el backfill es guiado por huecos,
+#     así que la corrida de mañana repara lo de hoy.
+#   * SALTEA la siguiente si la anterior sigue corriendo → la corrida normal
+#     no toca proveedores (0 huecos) y termina en segundos.
+#
+# Las credenciales viven en el servicio `api`. Referenciarlas con
+# ${{api.VAR}} en el dashboard en vez de copiarlas: si se duplican, rotar una
+# deja la otra vieja y el panel queda incompleto sin que nadie se entere.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile.worker"
+watchPatterns = [
+    "lyricgen/backend/cost_daily_collector.py",
+    "lyricgen/backend/cost_series.py",
+    "lyricgen/backend/billing_sources.py",
+    "lyricgen/backend/scripts/collect_costs.py",
+    "railway/cost-collector.toml",
+]
+
+[deploy]
+startCommand = "python backend/scripts/collect_costs.py"
+cronSchedule = "0 6 * * *"
+restartPolicyType = "NEVER"
+numReplicas = 1

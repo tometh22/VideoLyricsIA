@@ -10,6 +10,7 @@ import os
 import math
 import hashlib
 import json
+from copy import deepcopy
 from typing import Iterable
 
 from evidence_attestation import verify_artifact
@@ -55,9 +56,13 @@ _PIPELINE_CONFIG_KEYS = (
     "TARGETED_STRUCTURAL_AUTOREPAIR_MODE",
     "TRANSCRIPTION_QUALITY_CALIBRATED",
     "TRANSCRIPTION_QUALITY_INLINE_RETRY",
+    "REFERENCE_ATTESTATION_MODE",
+    "DELIVERY_REPAIR_SHADOW_MODE",
     "PERFORMANCE_GRAPH_V6_ENABLED", "QUALITY_V6_ANALYSIS_ENABLED",
     "TARGETED_RESIDUAL_ASR_ENABLED", "QUALITY_V6_MAX_PRIMITIVE_DTW_PAIRS",
     "QUALITY_V6_PROPOSALS_ENABLED", "QUALITY_V6_MODEL_ENABLED",
+    "LYRIC_AUTO_REPAIR_ENABLED", "LYRIC_AUTO_REPAIR_TIMING_ENABLED",
+    "LYRIC_AUTO_REPAIR_CONTENT_ENABLED",
 )
 
 RELEASE_REPORT_REQUIRED_CHECKS = frozenset({
@@ -348,9 +353,10 @@ def supersede_pending_analysis(
     """Invalidate every quality artifact when a human changes the snapshot.
 
     Even a terminal verdict is stale after a text/timing edit.  Preserve only
-    immutable runtime identity and the *bounds* that still need re-analysis;
-    acoustic evidence, scores, acknowledgements and fingerprints must never
-    cross a segment hash boundary.
+    immutable runtime identity and the *bounds* that still need re-analysis.
+    Segment-bound acoustic evidence, scores, acknowledgements and fingerprints
+    never cross a segment hash boundary. Recording-bound reference hypotheses
+    and old campaign provenance survive, without their human approval.
     """
     if not isinstance(quality, dict):
         return quality
@@ -377,6 +383,24 @@ def supersede_pending_analysis(
         "audio_sha256", "mode",
     }
     updated = {key: quality[key] for key in identity_keys if key in quality}
+    # Keep the old source binding as provenance. status_for_job compares it to
+    # the new revision and exposes "stale", never a current completed review.
+    if isinstance(quality.get("reviewer_campaign_status"), dict):
+        updated["reviewer_campaign_status"] = deepcopy(quality["reviewer_campaign_status"])
+    # This hypothesis is bound to the recording, not the edited segment hash.
+    # Dropping it here makes every subsequent campaign approval fail its audio
+    # binding gate. Preserve the hypothesis without carrying a human approval:
+    # validate_binding still checks its exact audio SHA/revision at approval.
+    reference = quality.get("reference_hypothesis")
+    if isinstance(reference, dict):
+        reference = deepcopy(reference)
+        reference.pop("reviewed_editor_revision", None)
+        reference["review_status"] = ("manual_full_review_required"
+            if reference.get("availability") == "unavailable" else "pending_human_line_review")
+        updated["reference_hypothesis"] = reference
+        for key in ("reference_hypothesis_unavailable", "manual_full_review_required"):
+            if key in quality:
+                updated[key] = deepcopy(quality[key])
     updated.update({
         "decision": "review_required", "render_blocked": True,
         "analysis_pending": False,
@@ -444,6 +468,8 @@ def quality_fingerprint(quality: dict, *, revision: int,
             "retry": quality.get("retry"),
             "acoustic_evidence": quality.get("acoustic_evidence"),
             "analysis_windows": quality.get("analysis_windows"),
+            "reference_attestation": quality.get("reference_attestation"),
+            "delivery_repair_shadow": quality.get("delivery_repair_shadow"),
         },
     }
     encoded = json.dumps(
@@ -535,7 +561,9 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
              unsafe_windows: list[dict] | None = None,
              retry_stats: dict | None = None,
              require_independent: bool = False,
+             is_live: bool = False,
              acoustic_evidence: dict | None = None,
+             reference_attestation: dict | None = None,
              resolved_reason_counts: dict[str, int] | None = None) -> dict:
     """Evaluate output and return a serializable, explainable verdict."""
     required_evidence = {
@@ -572,6 +600,44 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
         add("empty_transcription", "critical", 0, 50)
     if not evidence_available:
         add("quality_evidence_unavailable", "critical", True, 40)
+
+    # Published live masters remain a Tier-2 workflow. Crowd vocals,
+    # improvisations and performance-only structure are not calibrated well
+    # enough for unattended approval, even when generic checks happen to pass.
+    # Keep this explicit so a future signed calibration cannot accidentally
+    # turn live recordings into Tier-1 auto-approvals.
+    if is_live:
+        add("live_recording_requires_human_review", "critical", True, 0)
+
+    # A catalogue hit is a candidate, not proof that those words occur in this
+    # recording.  Put the independent audio-first attestation in the same
+    # quality verdict that drives editor review and render safety.
+    reference_attestation = (
+        dict(reference_attestation)
+        if isinstance(reference_attestation, dict) else {}
+    )
+    if reference_attestation:
+        reference_status = str(
+            reference_attestation.get("text_status") or "unknown"
+        )
+        if not reference_attestation.get("allow_vocabulary_reconciliation"):
+            add(
+                "reference_text_unattested", "critical",
+                reference_status, 45,
+            )
+        is_live_attestation = (
+            "live_structure_requires_local_alignment"
+            in set(reference_attestation.get("reasons") or [])
+        )
+        if (
+            not is_live_attestation
+            and reference_attestation.get("allow_vocabulary_reconciliation")
+            and not reference_attestation.get("allow_global_forced_alignment")
+        ):
+            add(
+                "reference_structure_unattested", "critical",
+                reference_status, 40,
+            )
     independent_words = int(coverage.get("independent_witness_words") or 0)
     independent_required_fields = {
         "independent_audio_coverage", "independent_text_mismatches",
@@ -659,6 +725,12 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
         )
     from line_evidence import evidence_issues
     line_issue_counts: dict[str, int] = {}
+    # Diagnostic-only signal: deliberately not added to build_unsafe_windows,
+    # so this check does not trigger new paid recovery calls.
+    from timing_validation import diagnose
+    timing_findings = diagnose(segments)
+    if timing_findings:
+        add("word_timing_not_validated", "critical", len(timing_findings), 30)
     for issue in evidence_issues(segments):
         for code in issue.get("reasons") or []:
             line_issue_counts[str(code)] = line_issue_counts.get(str(code), 0) + 1
@@ -814,7 +886,8 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
             "independent_text_audio_mismatch", "live_lexical_unverified",
             "empty_lyric_lines", "empty_transcription",
             "low_asr_content_confidence", "isolated_tail_low_support",
-            "text_word_cardinality_mismatch",
+            "text_word_cardinality_mismatch", "reference_text_unattested",
+            "reference_structure_unattested",
         },
         "event_count": {
             "live_structural_disagreement", "acoustic_mapping_ambiguous",
@@ -881,6 +954,7 @@ def evaluate(segments: list[dict], coverage: dict | None, *,
         "shadow_decision": shadow_decision,
         "retry": retry_stats,
         "acoustic_evidence": acoustic_evidence,
+        "reference_attestation": reference_attestation or None,
         "evidence_lineage": evidence_lineage,
         "segments_hash": segments_hash(segments),
         **runtime_identity(),

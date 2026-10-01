@@ -60,6 +60,10 @@ Kill switches independientes:
 `QUALITY_LEARNING_HMAC_KEY_ID` es obligatorio y se rota junto con la clave. Los
 identificadores se normalizan con Unicode NFKC, case-fold y whitespace canónico;
 la minería nunca mezcla generaciones de HMAC.
+Los deltas de corpus guardan ese `key_id`. Para seguir verificándolos después de
+una rotación, conservar las claves anteriores en
+`QUALITY_LEARNING_HMAC_KEYRING_JSON` como un objeto JSON `key_id → secreto`;
+esta keyring se usa sólo para verificación privada y nunca se registra ni exporta.
 
 ## Operación y privacidad
 

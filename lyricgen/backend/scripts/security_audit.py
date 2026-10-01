@@ -41,8 +41,13 @@ def main() -> int:
         package = dependency["name"].lower()
         for vuln in dependency.get("vulns", []):
             key = (package, vuln["id"])
-            observed.add(key)
-            if key not in allowed:
+            # PyPI can publish a new PYSEC identifier for a CVE already
+            # reviewed here. Match only aliases from this audit response,
+            # within the same package, retaining the existing expiry.
+            identifiers = {vuln["id"], *vuln.get("aliases", [])}
+            reviewed = {(package, identifier) for identifier in identifiers} & allowed.keys()
+            observed.update(reviewed or {key})
+            if not reviewed:
                 unexpected.append(f"{package}=={dependency['version']} {vuln['id']}")
 
     if unexpected:

@@ -359,8 +359,30 @@ def _gcp_credentials() -> str:
 #
 # Resource metrics come back as unit-MINUTES accumulated over the window
 # (e.g. MEMORY_USAGE_GB is GB-minutes), except NETWORK_TX_GB which is a
-# flow already expressed in GB. Validated against the jun-2026 invoice:
-# this model produced $126.02 against $124.54 actually billed (1.2% off).
+# flow already expressed in GB. La propia UI de Railway lo dice: "Metrics
+# are shown as minutely accumulated values".
+#
+# EL MES FACTURABLE DE RAILWAY SON 30 DÍAS FIJOS, NO EL MES REAL.
+#
+# Las tarifas mensuales de acá abajo siempre estuvieron bien; lo que estaba
+# mal era el denominador. Derivado del "Bill Breakdown" del dashboard
+# (ciclo 20-jul→20-ago-2026), que coincide a 7 cifras:
+#
+#   memoria  101,9424 / 440390,97 GB-min = 0,000231482 = 10   / 43200
+#   cpu       11,3129 /  24435,87 vCPU-min = 0,000462963 = 20  / 43200
+#   volumen    1,3267 / 382099,00 GB-min = 0,000003472 = 0,15 / 43200
+#   backup     0,1026 /  29545,52 GB-min = 0,000003473 = 0,15 / 43200
+#
+# Esta línea se equivocó dos veces seguidas:
+#   1. Dividía por los minutos de la VENTANA → 26,9x de más en grano diario
+#      (Σ7 días = $613,51 contra $101,14 del mes).
+#   2. Pasó a dividir por los minutos del MES REAL, que corregía el 26,9x
+#      pero dejaba ±3% en meses de 28 o 31 días. Un agosto de 31 días se
+#      valorizaba 3,2% barato.
+# Railway cobra contra 43200 minutos siempre, tenga el mes los días que
+# tenga. Por eso es una constante y no `calendar.monthrange`.
+RAILWAY_MINUTES_PER_BILLED_MONTH = 43200          # 30 días × 24 h × 60 min
+
 RAILWAY_RATES_PER_UNIT_MONTH = {
     "CPU_USAGE": float(os.environ.get("RAILWAY_USD_PER_VCPU_MONTH", "20.0")),
     "MEMORY_USAGE_GB": float(os.environ.get("RAILWAY_USD_PER_GB_MONTH", "10.0")),
@@ -368,8 +390,146 @@ RAILWAY_RATES_PER_UNIT_MONTH = {
     "EPHEMERAL_DISK_USAGE_GB": 0.0,     # included in the plan
     "BACKUP_USAGE_GB": float(os.environ.get("RAILWAY_USD_PER_BACKUP_GB_MONTH", "0.15")),
 }
+
+# Lo que se usa para valorizar: por unidad-MINUTO, igual que la factura.
+RAILWAY_RATES_PER_UNIT_MINUTE = {
+    m: r / RAILWAY_MINUTES_PER_BILLED_MONTH
+    for m, r in RAILWAY_RATES_PER_UNIT_MONTH.items()
+}
+
 # Charged per GB transferred, not per GB-month.
 RAILWAY_USD_PER_EGRESS_GB = float(os.environ.get("RAILWAY_USD_PER_EGRESS_GB", "0.05"))
+
+RAILWAY_GRAPHQL_URL = "https://backboard.railway.app/graphql/v2"
+
+
+# ---------------------------------------------------------------------------
+# Railway "Agent Usage" — la SEXTA línea de la factura. Se lee y se reporta,
+# pero NO se suma. Esto no es un olvido, es la conclusión de investigarla.
+# ---------------------------------------------------------------------------
+#
+# El Bill Breakdown del ciclo 20-jul→20-ago-2026 tiene seis líneas: Memory,
+# CPU, Egress, Volume, Backup y Agent. Las cinco primeras salen de la query
+# `usage` y reconcilian contra la factura al 0,3%. La sexta fueron US$5,07
+# sobre US$204,09 (2,5%) y no sale de ahí: `MetricMeasurement` no tiene
+# ninguna medición de agente, así que ni `usage`, ni `estimatedUsage`, ni
+# `workspaceUsageTotals` la pueden traer.
+#
+# LO QUE SÍ EXPONE LA API (introspección + llamada real, 1-sep-2026)
+#
+#     agentUsage(workspaceId: String!): AgentUsageSummary!
+#         "Get unified AI usage for a workspace"
+#     AgentUsageSummary {
+#         totalUsedCents: Int!      # centavos, no dólares
+#         hardLimitCents: Int
+#         softLimitCents: Int
+#         billingPeriodEnd: DateTime!
+#         usageRemaining: Float
+#     }
+#
+# POR QUÉ NO SE PUEDE VALORIZAR NI POR MES NI POR DÍA
+#
+# 1. NO ACEPTA RANGO. Pasarle `startDate` devuelve
+#    `Unknown argument "startDate" on field "Query.agentUsage"`. Es un
+#    contador acumulado del ciclo ABIERTO — un gauge, no una serie.
+# 2. EL CICLO NO ES EL MES. Va del 20 al 20, así que pisa dos meses
+#    calendario. Sumarlo a un mes contaría el mismo dinero dos veces:
+#    preguntar por 2026-08 y por 2026-09 devuelve EL MISMO contador.
+# 3. NO HAY DIMENSIÓN. Es workspace-wide: no se puede partir por proyecto,
+#    por servicio ni por día. Repartirlo entre los servicios de Railway
+#    sería inventar la atribución que el desglose existe para dar.
+# 4. LOS CICLOS CERRADOS NO VUELVEN. Sólo se puede leer el vigente, así que
+#    los $5,07 del ciclo 20-jul→20-ago son irrecuperables por API. Nada de
+#    lo que se construya acá puede tapar ese agujero hacia atrás.
+#
+# Precedente idéntico ya resuelto en este archivo: `fetch_github` conserva
+# `observed_cycle_amount_usd` y se niega a atribuirlo a un mes calendario.
+# Se hace lo mismo: el número queda en el `breakdown` (que sí se persiste en
+# `cost_snapshots` y sale por `/cost/real`) y en el `detail`, marcado como
+# excluido del total, para que se vea sin contaminar la reconciliación.
+#
+# El techo de exposición sí es conocido y lo confirma la propia API:
+# `hardLimitCents` = 2000, o sea el tope de US$20/mes configurado en la
+# cuenta. Si esta línea se vuelve material, va a ser visible acá primero.
+
+
+def _railway_headers(token: str) -> dict[str, str]:
+    """Headers de backboard.
+
+    El `User-Agent` explícito no es decorativo: Cloudflare contesta 1010 y
+    tumba la consulta cuando el cliente no manda uno identificable.
+    """
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "genly-cost-collector/1.0",
+    }
+
+
+_RAILWAY_WORKSPACE_BY_PROJECT: dict[str, str] = {}
+
+
+def _railway_workspace_id(token: str, project_id: str) -> str | None:
+    """`workspaceId` del proyecto, cacheado por proceso.
+
+    `agentUsage` exige un workspace y los deployments sólo tienen
+    `RAILWAY_PROJECT_ID` seteado. Si no se puede resolver se devuelve None y
+    el llamador sigue sin el dato: una consulta accesoria no puede tumbar la
+    recolección del gasto real.
+    """
+    if not project_id:
+        return None
+    cached = _RAILWAY_WORKSPACE_BY_PROJECT.get(project_id)
+    if cached:
+        return cached
+    try:
+        resp = requests.post(
+            RAILWAY_GRAPHQL_URL, headers=_railway_headers(token),
+            json={"query": "query($id:String!){project(id:$id){workspaceId}}",
+                  "variables": {"id": project_id}},
+            timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        ws = (((resp.json().get("data") or {}).get("project") or {})
+              .get("workspaceId"))
+    except Exception:                                          # noqa: BLE001
+        logger.debug("railway: no se pudo resolver el workspace del proyecto",
+                     exc_info=True)
+        return None
+    if ws:
+        _RAILWAY_WORKSPACE_BY_PROJECT[project_id] = str(ws)
+        return str(ws)
+    return None
+
+
+def railway_agent_usage(token: str, workspace_id: str) -> dict | None:
+    """Contador de Agent Usage del ciclo ABIERTO, en dólares. None si falla.
+
+    La API responde `Int` en CENTAVOS. Dejarlos pasar tal cual reporta $507
+    donde hay $5,07 — por eso la conversión vive acá y no en el llamador.
+    """
+    query = ("query($w:String!){agentUsage(workspaceId:$w){"
+             "totalUsedCents hardLimitCents softLimitCents billingPeriodEnd}}")
+    try:
+        resp = requests.post(
+            RAILWAY_GRAPHQL_URL, headers=_railway_headers(token),
+            json={"query": query, "variables": {"w": workspace_id}},
+            timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        summary = (resp.json().get("data") or {}).get("agentUsage")
+    except Exception:                                          # noqa: BLE001
+        logger.debug("railway: agentUsage no disponible", exc_info=True)
+        return None
+    if not isinstance(summary, dict) or summary.get("totalUsedCents") is None:
+        # Un workspace sin la feature, un token sin permiso o un esquema que
+        # cambió. "No lo pude leer" no es "salió cero".
+        return None
+    hard = summary.get("hardLimitCents")
+    return {
+        "used_usd": round(int(summary["totalUsedCents"]) / 100.0, 2),
+        "hard_limit_usd": (None if hard is None
+                           else round(int(hard) / 100.0, 2)),
+        "billing_period_end": summary.get("billingPeriodEnd"),
+    }
 
 
 def _railway_plan_minimum_usd() -> float:
@@ -406,6 +566,10 @@ def fetch_railway(period: str) -> SourceCost:
     Marked `is_estimate` because we price the metrics ourselves — Railway
     exposes no billed figure over the API. Watch `NETWORK_TX_GB`: egress
     doubled between jun and jul 2026 and is the fastest-moving line.
+
+    `amount_usd` cubre cinco de las seis líneas de la factura. La sexta,
+    Agent Usage, se reporta en el breakdown y en el detail pero NO se suma:
+    ver el bloque de comentarios sobre `railway_agent_usage`.
     """
     token = os.environ.get("RAILWAY_API_TOKEN", "").strip()
     if not token:
@@ -487,12 +651,14 @@ def fetch_railway(period: str) -> SourceCost:
             cost = raw_value * RAILWAY_USD_PER_EGRESS_GB
             units, unit_label = raw_value, "GB transferidos"
         else:
-            rate = RAILWAY_RATES_PER_UNIT_MONTH.get(measurement)
+            rate = RAILWAY_RATES_PER_UNIT_MINUTE.get(measurement)
             if rate is None:
                 continue
-            units = raw_value / minutes_in_period      # unit-minutes → unit-months
-            cost = units * rate
-            unit_label = "unidad-mes"
+            # Directo: la métrica YA viene en unidad-minutos y la tarifa es
+            # por unidad-minuto. Sin dividir por la ventana no hay forma de
+            # que el largo del período distorsione el precio.
+            units, cost = raw_value, raw_value * rate
+            unit_label = "unidad-minuto"
         total += cost
         breakdown.append({
             "measurement": measurement,
@@ -517,6 +683,42 @@ def fetch_railway(period: str) -> SourceCost:
         total = plan_minimum
     breakdown.sort(key=lambda r: -r["cost"])
 
+    # Agent Usage: se reporta, no se suma. El bloque de comentarios arriba de
+    # `railway_agent_usage` explica por qué no se puede atribuir a un mes.
+    # Sólo tiene sentido preguntarlo para el período vigente: es el contador
+    # del ciclo abierto, y estamparlo sobre un mes cerrado sería fechar mal
+    # un número de hoy.
+    agent = None
+    if period == current_period():
+        ws_for_agent = workspace_id or _railway_workspace_id(token, project_id)
+        if ws_for_agent:
+            agent = railway_agent_usage(token, ws_for_agent)
+    agent_detail = ""
+    if agent is not None:
+        breakdown.append({
+            "measurement": "AGENT_USAGE",
+            "units": 1.0,
+            "unit": "ciclo de facturación (no mes calendario)",
+            # Cero de verdad, no redondeo: esta fila NO entra en amount_usd.
+            "cost": 0.0,
+            "excluded_from_total": True,
+            "observed_cycle_amount_usd": agent["used_usd"],
+            "cycle_end": agent["billing_period_end"],
+            "hard_limit_usd": agent["hard_limit_usd"],
+            "detail": (
+                "contador acumulado del ciclo ABIERTO y de todo el "
+                "workspace; la API no acepta rango de fechas ni desglosa por "
+                "proyecto/servicio/día, así que no se puede imputar a este "
+                "mes ni a este proyecto sin inventarlo"
+            ),
+        })
+        tope = ("" if agent["hard_limit_usd"] is None
+                else f", tope ${agent['hard_limit_usd']:.2f}/mes")
+        agent_detail = (
+            f" | Agent Usage observado en el ciclo abierto: "
+            f"${agent['used_usd']:.2f}{tope} — NO sumado a este mes"
+        )
+
     return SourceCost(
         source="railway", period=period, amount_usd=round(total, 2),
         breakdown=breakdown, is_estimate=True,
@@ -528,12 +730,14 @@ def fetch_railway(period: str) -> SourceCost:
                 "sin imputar el compromiso account-wide al proyecto "
             )
             + "(Railway no expone el importe facturado por API)"
+            + agent_detail
         ),
         raw={"scope": project_id or workspace_id or "cuenta completa",
              "minutes_in_period": minutes_in_period,
              "metered_usage_usd": round(metered_total, 4),
              "plan_minimum_usd": round(plan_minimum, 2),
-             "plan_minimum_applied": minimum_applies},
+             "plan_minimum_applied": minimum_applies,
+             "agent_usage": agent},
     )
 
 

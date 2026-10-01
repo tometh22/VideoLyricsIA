@@ -83,6 +83,45 @@ def test_gate_blocks_text_audio_mismatch_even_with_full_coverage(monkeypatch):
     )
 
 
+def test_unattested_catalogue_reference_is_a_blocking_text_risk():
+    quality = tq.evaluate(
+        [_segment(10, 13, "audio first words")],
+        {
+            "audio_coverage": 1.0, "text_mismatches": 0,
+            "voiced_gap_s": 0, "uncovered_seconds": 0,
+        },
+        reference_attestation={
+            "text_status": "unsafe_without_witness",
+            "allow_vocabulary_reconciliation": False,
+            "allow_global_forced_alignment": False,
+            "reasons": ["reference_text_not_attested"],
+        },
+    )
+    codes = {reason["code"] for reason in quality["reasons"]}
+    assert "reference_text_unattested" in codes
+    assert quality["risk_dimensions"]["text"] == 0.92
+    assert quality["decision"] == "review_required"
+
+
+def test_live_local_reference_does_not_claim_global_structure_or_block():
+    quality = tq.evaluate(
+        [_segment(10, 13, "performance words")],
+        {
+            "audio_coverage": 1.0, "text_mismatches": 0,
+            "voiced_gap_s": 0, "uncovered_seconds": 0,
+        },
+        reference_attestation={
+            "text_status": "independently_attested",
+            "allow_vocabulary_reconciliation": True,
+            "allow_global_forced_alignment": False,
+            "reasons": ["live_structure_requires_local_alignment"],
+        },
+    )
+    codes = {reason["code"] for reason in quality["reasons"]}
+    assert "reference_text_unattested" not in codes
+    assert "reference_structure_unattested" not in codes
+
+
 def test_gate_detects_the_exact_backwards_selector_failure():
     quality = tq.evaluate(
         [_segment(45.9, 48), _segment(45.1, 47)],
@@ -104,6 +143,31 @@ def test_missing_evidence_and_nonfinite_timing_never_pass():
     quality = tq.evaluate([_segment(float("nan"), 2)], evidence)
     assert quality["metrics"]["invalid_ranges"] == 1
     assert quality["decision"] == "review_required"
+
+
+def test_live_recording_always_requires_human_review(monkeypatch):
+    monkeypatch.setattr(
+        tq,
+        "calibration_identity",
+        lambda: {
+            "calibrated": True,
+            "calibration_id": "test-calibration",
+            "artifact_sha256": "test",
+        },
+    )
+    evidence = {
+        "audio_coverage": 1.0,
+        "uncovered_seconds": 0.0,
+        "text_mismatches": 0,
+        "voiced_gap_s": 0.0,
+    }
+
+    quality = tq.evaluate([_segment(1, 2)], evidence, is_live=True)
+
+    assert quality["decision"] == "review_required"
+    assert "live_recording_requires_human_review" in {
+        reason["code"] for reason in quality["reasons"]
+    }
 
 
 def test_ack_is_revision_scoped(monkeypatch):
@@ -512,6 +576,28 @@ def test_human_revision_supersedes_and_invalidates_all_stale_evidence():
     ):
         assert key not in updated
     assert pending["analysis_pending"] is True
+
+
+def test_human_edit_preserves_audio_reference_but_not_human_approval():
+    from reference_hypothesis import build_unavailable, validate_binding
+    reference = build_unavailable(audio_sha256="a" * 64, audio_revision=2)
+    reference.update(review_status="human_line_review_approved", reviewed_editor_revision=4)
+    quality = {"reference_hypothesis": reference, "reference_hypothesis_unavailable": True,
+               "reviewer_campaign_status": {"status": "complete", "source": {"segments_revision": 4}},
+               "pre_background_approval": {"editor_revision": 4}, "score": 99}
+    updated = tq.supersede_pending_analysis(quality, revision=5)
+    retained = updated["reference_hypothesis"]
+    assert validate_binding(retained, audio_sha256="a" * 64, audio_revision=2) == (True, "ok")
+    assert not validate_binding(retained, audio_sha256="b" * 64, audio_revision=2)[0]
+    assert retained["review_status"] == "manual_full_review_required"
+    assert "reviewed_editor_revision" not in retained
+    assert "pre_background_approval" not in updated and "score" not in updated
+    assert updated["reference_hypothesis_unavailable"] is True
+    assert reference["reviewed_editor_revision"] == 4
+    assert retained is not reference
+    assert updated["reviewer_campaign_status"] == quality["reviewer_campaign_status"]
+    assert updated["reviewer_campaign_status"] is not quality["reviewer_campaign_status"]
+    assert updated["reviewer_campaign_status"]["source"]["segments_revision"] == 4
 
 
 def test_eight_witness_words_cannot_certify_a_five_minute_song():

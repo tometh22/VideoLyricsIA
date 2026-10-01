@@ -17,7 +17,9 @@ def run_correction_observation_job(job_id: str, approved_version_id: str,
                                    session_hmac: str | None = None,
                                    expected_revision: int | None = None,
                                    expected_approved_hash: str | None = None,
-                                   expected_learning_epoch: int | None = None) -> dict:
+                                   expected_learning_epoch: int | None = None,
+                                   expected_audio_sha256: str | None = None,
+                                   expected_audio_revision: int | None = None) -> dict:
     from correction_learning import create_observation, StaleCorrectionSnapshot
     from database import SessionLocal
     started = time.monotonic()
@@ -33,6 +35,8 @@ def run_correction_observation_job(job_id: str, approved_version_id: str,
             expected_revision=expected_revision,
             expected_approved_hash=expected_approved_hash,
             expected_learning_epoch=expected_learning_epoch,
+            expected_audio_sha256=expected_audio_sha256,
+            expected_audio_revision=expected_audio_revision,
         )
         metrics = dict(row.metrics or {})
         if "operational" not in metrics:
@@ -66,6 +70,19 @@ def run_correction_observation_job(job_id: str, approved_version_id: str,
             }
             row.metrics = metrics
         db.commit()
+        # Milestone triggers are deliberately best-effort: the correction
+        # observation is already durable, and a Redis/executor outage must not
+        # turn a successful approval into a failed learning capture.
+        try:
+            from learning_triggers import trigger_after_capture
+            if source_confidence != 'operational_review':
+                trigger_after_capture()
+        except Exception as exc:
+            import logging
+            logging.getLogger("genly.quality_learning").warning(
+                "[LEARNING-TRIGGERS] post-capture hook failed error_type=%s",
+                type(exc).__name__,
+            )
         return {
             "observation_id": row.id, "label_tier": row.label_tier,
             "mutated_segments": False,
@@ -112,6 +129,13 @@ def run_daily_quality_learning() -> dict:
             detail=result,
         ))
         db.commit()
+        try:
+            from learning_triggers import trigger_after_capture
+            result["learning_triggers"] = trigger_after_capture()
+        except Exception as exc:
+            result["learning_triggers"] = {
+                "status": "trigger_hook_failed", "error_type": type(exc).__name__,
+            }
         try:
             from queue_jobs import ensure_daily_quality_learning_scheduled
             result["next_job_id"] = ensure_daily_quality_learning_scheduled()

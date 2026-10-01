@@ -19,11 +19,71 @@ def test_ci_runs_for_stacked_pull_requests():
     )
 
 
+def test_ci_is_merge_queue_ready_without_weakening_current_pr_gates():
+    """Queue rollout stays fail-closed until the explicit repository toggle.
+
+    GitHub applies one required-check set to both ``pull_request`` and
+    ``merge_group``.  The stable ``ci-gate`` context therefore has to switch
+    what it validates by event, while the legacy full PR suite remains the
+    default until queue activation has been proven end to end.
+    """
+    workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text()
+
+    trigger_block = workflow.split("on:", 1)[1].split("permissions:", 1)[0]
+    assert "pull_request:" in trigger_block
+    assert "merge_group:" in trigger_block
+    assert "types: [checks_requested]" in trigger_block
+    assert "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in workflow
+
+    assert "backend_fast:" in workflow
+    assert "name: backend-fast" in workflow
+    assert "timeout-minutes: 10" in workflow
+    assert "github.event_name == 'pull_request'" in workflow
+
+    fail_safe = "vars.STAGING_MERGE_QUEUE_ENABLED != 'true'"
+    # Backend, frontend, real editor collaboration, and Sentinel keep running
+    # on PRs when the opt-in variable is absent (the current repository state).
+    assert workflow.count(fail_safe) >= 5
+    # The staging-specific switch must never weaken PRs to main or stacked PRs.
+    assert workflow.count("github.base_ref != 'staging'") >= 5
+    assert "BASE_REF: ${{ github.base_ref }}" in workflow
+
+    assert "ci_gate:" in workflow
+    assert "name: ci-gate" in workflow
+    assert "if: always()" in workflow
+    assert 'if event == "pull_request":' in workflow
+    assert 'if result != "success"' in workflow
+
+
 def test_railway_uses_one_config_per_service():
     assert not (REPO / "railway.toml").exists()
     assert {p.name for p in (REPO / "railway").glob("*.toml")} == {
         "api.toml", "worker.toml", "short-worker.toml", "quality-worker.toml",
+        "batch-worker.toml", "batch-short-worker.toml",
+        # Cron de costos. Es un servicio y no un thread de fondo en `api`
+        # porque `api` corre numReplicas=2 x --workers 2 = 4 procesos, y los
+        # loops de main.py son sleep() desde el boot: un horario fijo es
+        # imposible y cada deploy resetea el reloj.
+        "cost-collector.toml",
     }
+
+
+def test_cost_collector_is_a_cron_that_exits_not_a_daemon():
+    """El colector tiene que arrancar, trabajar y salir.
+
+    `restartPolicyType = NEVER` es lo que impide que Railway lo reinicie en
+    loop cuando termina bien. Si alguien lo pasara a ON_FAILURE junto con un
+    cronSchedule, cada corrida exitosa dispararía un reinicio y el colector
+    pegaría a los proveedores en bucle — el panel de costos generando costo.
+    """
+    cfg = _config("cost-collector.toml")
+    assert cfg["deploy"]["cronSchedule"] == "0 6 * * *"
+    assert cfg["deploy"]["restartPolicyType"] == "NEVER"
+    assert cfg["deploy"]["numReplicas"] == 1
+    assert cfg["deploy"]["startCommand"] == "python backend/scripts/collect_costs.py"
+    # Comparte imagen con los workers: no necesita uvicorn ni healthcheck HTTP.
+    assert cfg["build"]["dockerfilePath"] == "Dockerfile.worker"
+    assert "healthcheckPath" not in cfg["deploy"]
 
 
 def test_api_deployment_contract():
@@ -42,17 +102,23 @@ def test_api_deployment_contract():
 
 
 def test_worker_deployment_contracts_share_image_without_http_healthcheck():
-    expected_replicas = {"worker.toml": 7, "short-worker.toml": 3}
+    expected_replicas = {
+        "worker.toml": 7, "short-worker.toml": 3,
+        "batch-worker.toml": 2, "batch-short-worker.toml": 2,
+    }
     expected_queues = {
         "worker.toml": "enterprise,default,canary",
-        "short-worker.toml": "transcription,bg_preview",
+        "short-worker.toml": "transcription,bg_preview,audio_preview",
+        "batch-worker.toml": "batch_render",
+        "batch-short-worker.toml": "campaign_control,transcription_batch",
     }
     for name, replicas in expected_replicas.items():
         cfg = _config(name)
         assert cfg["build"]["dockerfilePath"] == "Dockerfile.worker"
+        workload = "WORKLOAD_CLASS=batch " if name.startswith("batch-") else ""
         expected_start = (
             "sh -c 'python backend/scripts/require_worker_schema.py "
-            f"&& exec env QUEUES={expected_queues[name]} python backend/worker.py'"
+            f"&& exec env {workload}QUEUES={expected_queues[name]} python backend/worker.py'"
         )
         assert cfg["deploy"]["startCommand"] == expected_start
         assert cfg["deploy"]["numReplicas"] == replicas
@@ -128,6 +194,7 @@ def test_staging_and_production_default_to_strict_7_plus_3(monkeypatch):
         "FLEET_READINESS_STRICT",
         "EXPECTED_WORKER_REPLICAS",
         "EXPECTED_SHORT_WORKER_REPLICAS",
+        "TRANSCRIPTION_QUALITY_QUEUE_ENABLED",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -146,6 +213,7 @@ def test_staging_strict_gate_can_be_disabled_only_explicitly(monkeypatch):
     from observability import _fleet_readiness_config
 
     monkeypatch.setenv("FLEET_READINESS_STRICT", "0")
+    monkeypatch.delenv("TRANSCRIPTION_QUALITY_QUEUE_ENABLED", raising=False)
     strict, expected = _fleet_readiness_config("staging")
     assert strict is False
     assert expected == {"worker": 7, "short_worker": 3}
@@ -180,6 +248,33 @@ def test_quality_producer_requires_an_isolated_quality_consumer(monkeypatch):
     # normal defaults require 7+3; isolate the queue contract itself.
     expected = {"worker": 1, "short_worker": 1, "quality_worker": 1}
     assert worker_fleet_coherence(workers, "sha", 2, expected)["coherent"] is True
+
+
+def test_batch_campaign_flag_requires_both_reserved_worker_pools(monkeypatch):
+    from observability import _fleet_readiness_config, worker_fleet_coherence
+
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    strict, expected = _fleet_readiness_config("staging")
+    assert strict is True
+    assert expected["batch_short_worker"] == 2
+    assert expected["batch_worker"] == 2
+    workers = [
+        {"service": "Worker", "release": "sha", "rq_payload_version": 2,
+         "queues": ["enterprise", "default"]},
+        {"service": "ShortWorker", "release": "sha", "rq_payload_version": 2,
+         "queues": ["transcription", "bg_preview"]},
+        {"service": "BatchShortWorker", "release": "sha", "rq_payload_version": 2,
+         "queues": ["campaign_control", "transcription_batch"]},
+        {"service": "BatchWorker", "release": "sha", "rq_payload_version": 2,
+         "queues": ["batch_render"]},
+    ]
+    compact_expected = {
+        "worker": 1, "short_worker": 1,
+        "batch_short_worker": 1, "batch_worker": 1,
+    }
+    assert worker_fleet_coherence(
+        workers, "sha", 2, compact_expected,
+    )["coherent"] is True
 
 
 def test_frontend_only_deploy_no_marca_la_flota_como_incoherente():
@@ -267,6 +362,104 @@ def test_el_protocolo_sigue_siendo_bloqueante_aunque_la_huella_coincida():
     out = worker_fleet_coherence(workers, "sha", 2, api_code_fingerprint="abc123")
     assert out["protocol_match"] is False
     assert out["coherent"] is False
+
+
+def test_readiness_ignora_release_reemplazado_solo_con_cohorte_actual_completa():
+    """El TTL del worker viejo no causa un 503 después del rollout completo."""
+    from observability import worker_fleet_coherence
+
+    def row(service, release, fingerprint, queues):
+        return {
+            "worker": f"{service}-{release}",
+            "service": service,
+            "release": release,
+            "code_fingerprint": fingerprint,
+            "rq_payload_version": 2,
+            "queues": queues,
+        }
+
+    old = [
+        row("Worker", "sha-old", "old-code", ["enterprise", "default"]),
+        row("ShortWorker", "sha-old", "old-code", ["transcription", "bg_preview"]),
+    ]
+    current = [
+        row("Worker", "sha-new", "new-code", ["enterprise", "default"]),
+        row("ShortWorker", "sha-new", "new-code", ["transcription", "bg_preview"]),
+    ]
+    out = worker_fleet_coherence(
+        old + current,
+        "sha-new",
+        2,
+        {"worker": 1, "short_worker": 1},
+        api_code_fingerprint="new-code",
+    )
+
+    assert out["coherent"] is True
+    assert out["release_match"] is True
+    assert out["service_counts"] == {"worker": 1, "short_worker": 1}
+    assert out["active_release_rows"] == current
+    assert out["superseded_release_rows"] == old
+
+
+def test_readiness_no_descarta_release_viejo_durante_rollout_incompleto():
+    """La generación vieja no puede completar colas/réplicas para la nueva."""
+    from observability import worker_fleet_coherence
+
+    old = [
+        {"service": "Worker", "release": "sha-old",
+         "code_fingerprint": "old-code", "rq_payload_version": 2,
+         "queues": ["enterprise", "default"]},
+        {"service": "ShortWorker", "release": "sha-old",
+         "code_fingerprint": "old-code", "rq_payload_version": 2,
+         "queues": ["transcription", "bg_preview"]},
+    ]
+    only_one_current_pool = [{
+        "service": "Worker", "release": "sha-new",
+        "code_fingerprint": "new-code", "rq_payload_version": 2,
+        "queues": ["enterprise", "default"],
+    }]
+    out = worker_fleet_coherence(
+        old + only_one_current_pool,
+        "sha-new",
+        2,
+        {"worker": 1, "short_worker": 1},
+        api_code_fingerprint="new-code",
+    )
+
+    assert out["coherent"] is False
+    assert out["release_match"] is False
+    assert out["superseded_release_rows"] == []
+    assert len(out["active_release_rows"]) == 3
+
+
+def test_readiness_no_oculta_protocolo_incompatible_del_release_actual():
+    """Un release nuevo completo en réplicas pero incompatible sigue rojo."""
+    from observability import worker_fleet_coherence
+
+    current = [
+        {"service": "Worker", "release": "sha-new",
+         "code_fingerprint": "new-code", "rq_payload_version": 1,
+         "queues": ["enterprise", "default"]},
+        {"service": "ShortWorker", "release": "sha-new",
+         "code_fingerprint": "new-code", "rq_payload_version": 1,
+         "queues": ["transcription", "bg_preview"]},
+    ]
+    old = [{
+        "service": "Worker", "release": "sha-old",
+        "code_fingerprint": "old-code", "rq_payload_version": 2,
+        "queues": ["enterprise", "default"],
+    }]
+    out = worker_fleet_coherence(
+        old + current,
+        "sha-new",
+        2,
+        {"worker": 1, "short_worker": 1},
+        api_code_fingerprint="new-code",
+    )
+
+    assert out["coherent"] is False
+    assert out["protocol_match"] is False
+    assert out["superseded_release_rows"] == []
 
 
 def test_la_huella_es_estable_y_no_incluye_los_tests():

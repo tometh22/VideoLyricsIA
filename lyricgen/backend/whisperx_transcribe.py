@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+from copy import deepcopy
 
 logger = logging.getLogger("genly.whisperx")
 
@@ -55,6 +56,11 @@ def is_enabled() -> bool:
     """On only when the flag is set AND a Replicate token is present."""
     flag = os.environ.get("WHISPERX_ENABLED", "0").strip().lower() in _TRUE
     return flag and bool(os.environ.get("REPLICATE_API_TOKEN", "").strip())
+
+
+def recognition_family() -> str:
+    """Stable provider/model identity persisted with raw hypotheses."""
+    return f"replicate/{_MODEL}"
 
 
 def _find_voice_onset_after_adlib(
@@ -256,7 +262,13 @@ def _retranscribe_slice(
                 start_s, end_s, rc.returncode,
             )
             return None
-        raw = _transcribe_via_openai_api(chunk_path, language=language)
+        raw = _transcribe_via_openai_api(
+            chunk_path, language=language,
+            provenance_view="bounded_vocal_window",
+            provenance_transformation=(
+                f"whisperx_adlib_retranscribe_raw:start={start_s:.3f};end={end_s:.3f}"
+            ),
+        )
         if not raw:
             return None
         result: list[dict] = []
@@ -672,14 +684,30 @@ def _compute_cache_key(audio_path: str, language: str | None, lyrics_hint: str |
     # this env var (e.g. "2") without touching the DB. Default "1" preserves
     # all pre-existing rows so changing it is a deliberate opt-in bust.
     ver = os.environ.get("WHISPERX_CACHE_VERSION", "1").strip() or "1"
+    # El modelo y la identidad del pipeline TIENEN que entrar en la clave. En el
+    # canary del 2026-09-02, 15 de 30 canciones sirvieron resultados de agosto
+    # porque la clave sólo miraba el audio: el lote "probó" un pipeline que
+    # nunca corrió. Cambiar el modelo, el release o cualquiera de las 72 flags
+    # de configuración ahora invalida la entrada sola.
+    try:
+        from transcription_quality import runtime_identity
+        identity = runtime_identity()
+        release = str(identity.get("pipeline_release") or "unknown")[:16]
+        config = str(identity.get("pipeline_config_fingerprint") or "unknown")[:16]
+    except Exception:
+        release, config = "unknown", "unknown"
+    model_id = hashlib.sha1(str(_MODEL).encode("utf-8")).hexdigest()[:12]
     # vad_onset/vad_offset change the output, so they MUST be part of the key —
     # otherwise a VAD tweak silently serves stale pre-tweak cached results.
-    key = f"wx:{audio_hash}:{lang}:{hint_hash}:{ver}:vo{vad_onset}:vf{vad_offset}"
+    key = (
+        f"wx:{audio_hash}:{lang}:{hint_hash}:{ver}:vo{vad_onset}:vf{vad_offset}"
+        f":m{model_id}:r{release}:c{config}"
+    )
     return (key, audio_hash, hint_hash)
 
 
-def _cache_lookup(cache_key: str, expected_audio_hash: str | None = None) -> list[dict] | None:
-    """Return cached segments for `cache_key`, or None on miss / error.
+def _cache_lookup(cache_key: str, expected_audio_hash: str | None = None) -> dict | list | None:
+    """Return the cache payload for `cache_key`, or None on miss / error.
     Errors are swallowed — cache is best-effort, the path falls through
     to the live Replicate call.
 
@@ -722,8 +750,14 @@ def _cache_lookup(cache_key: str, expected_audio_hash: str | None = None) -> lis
 
 
 def _cache_write(cache_key: str, audio_hash: str, lyrics_hint_hash: str,
-                 language: str | None, segments: list[dict]) -> None:
-    """Persist `segments` under `cache_key`. Swallows all errors — a
+                 language: str | None, segments: list[dict],
+                 *, raw_segments: list[dict]) -> None:
+    """Persist processed and raw mapped segments under `cache_key`.
+
+    Legacy cache rows contain only the processed list. They remain readable
+    at the storage layer but are deliberately treated as misses by the caller:
+    post-filter output cannot honestly stand in for raw recognition evidence.
+    Swallows all errors — a
     failed write must not break the request that just succeeded."""
     try:
         from database import TranscriptionCache, SessionLocal
@@ -737,7 +771,11 @@ def _cache_write(cache_key: str, audio_hash: str, lyrics_hint_hash: str,
                 engine="whisperx",
                 language=(language or "")[:8] or None,
                 lyrics_hint_hash=lyrics_hint_hash or None,
-                segments=json.dumps(segments),
+                segments=json.dumps({
+                    "schema": "whisperx-cache-v2",
+                    "raw_segments": raw_segments,
+                    "processed_segments": segments,
+                }),
             )
             db.merge(row)   # idempotent upsert (cache_key is PK)
             db.commit()
@@ -802,6 +840,47 @@ def _map_segments(output) -> list[dict]:
             seg["words"] = words
         segs.append(seg)
     return segs
+
+
+def _raw_provider_segments_unchecked(output) -> list[dict]:
+    """Serialize the normal Replicate output shape before mapping."""
+    from recognition_provenance import bounded_provider_string
+    if isinstance(output, dict):
+        if "segments" not in output:
+            return [{"raw": bounded_provider_string(output)}]
+        source = output.get("segments")
+    elif isinstance(output, list):
+        source = output
+    else:
+        return [] if output is None else [{
+            "raw": bounded_provider_string(output),
+        }]
+    if not isinstance(source, list):
+        return [] if source is None else [{
+            "raw": bounded_provider_string(source),
+        }]
+    rows: list[dict] = []
+    for row in source:
+        if isinstance(row, dict):
+            try:
+                rows.append(deepcopy(row))
+            except Exception:
+                rows.append({"raw": bounded_provider_string(row)})
+        else:
+            rows.append({"raw": bounded_provider_string(row)})
+    return rows
+
+
+def _raw_provider_segments(output) -> list[dict]:
+    """Preserve every Replicate row; hostile SDK containers never escape."""
+    from recognition_provenance import bounded_provider_string
+    try:
+        return _raw_provider_segments_unchecked(output)
+    except Exception as exc:
+        return [{
+            "raw": bounded_provider_string(output),
+            "serialization_error": type(exc).__name__,
+        }]
 
 
 def _filter_ghosts(segs: list[dict]) -> list[dict]:
@@ -960,7 +1039,9 @@ def _apply_lead_in(segs: list[dict], *, lead_ms: int | None = None) -> list[dict
 
 
 def transcribe_whisperx(audio_path: str, language: str | None = None,
-                        lyrics_hint: str | None = None) -> list[dict] | None:
+                        lyrics_hint: str | None = None,
+                        provenance_view: str = "alignment_audio",
+                        ) -> list[dict] | None:
     """Transcribe `audio_path` with whisperX. Returns segments with word
     stamps, or None (disabled / failure / empty). Never raises.
 
@@ -997,15 +1078,42 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     cache_key, audio_hash, hint_hash = _compute_cache_key(
         audio_path, language, lyrics_hint, vad_onset, vad_offset)
     if cache_key:
-        cached_segs = _cache_lookup(cache_key, expected_audio_hash=audio_hash)
-        if cached_segs is not None:
+        cached_payload = _cache_lookup(cache_key, expected_audio_hash=audio_hash)
+        if (
+            isinstance(cached_payload, dict)
+            and cached_payload.get("schema") == "whisperx-cache-v2"
+            and isinstance(cached_payload.get("raw_segments"), list)
+            and isinstance(cached_payload.get("processed_segments"), list)
+            and all(
+                isinstance(segment, dict)
+                for segment in cached_payload["raw_segments"]
+            )
+            and all(
+                isinstance(segment, dict)
+                for segment in cached_payload["processed_segments"]
+            )
+        ):
+            cached_raw = cached_payload["raw_segments"]
+            cached_segs = cached_payload["processed_segments"]
+            from recognition_provenance import record_completed
+            record_completed(
+                family=recognition_family(),
+                events=cached_raw,
+                view=provenance_view,
+                transformation="cache_hit_raw",
+            )
             logger.info(
                 "[WHISPERX] cache hit audio_hash=%s (%d segs, $0 + 0 s vs ~75-180 s + $0.005)",
                 audio_hash, len(cached_segs),
             )
             return cached_segs
+        if cached_payload is not None:
+            logger.warning(
+                "[WHISPERX] legacy/malformed cache lacks raw evidence; "
+                "forcing live recompute"
+            )
 
-    payload: dict = {"align_output": True,
+    payload: dict = {"task": "transcribe", "align_output": True,
                      "vad_onset": vad_onset, "vad_offset": vad_offset}
     if language:
         payload["language"] = language
@@ -1078,6 +1186,14 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
     if output is None:
         return None
 
+    raw_segs = _raw_provider_segments(output)
+    from recognition_provenance import record_completed
+    record_completed(
+        family=recognition_family(),
+        events=raw_segs,
+        view=provenance_view,
+        transformation="replicate_raw",
+    )
     segs = _map_segments(output)
     raw_n = len(segs)
     segs = _vad_split_adlib_segments(segs, audio_path, language)
@@ -1104,6 +1220,9 @@ def transcribe_whisperx(audio_path: str, language: str | None = None,
 
     # Persist result for future identical calls. Errors silenced inside.
     if cache_key:
-        _cache_write(cache_key, audio_hash, hint_hash, language, segs)
+        _cache_write(
+            cache_key, audio_hash, hint_hash, language, segs,
+            raw_segments=raw_segs,
+        )
 
     return segs

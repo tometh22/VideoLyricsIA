@@ -48,6 +48,66 @@ except (TypeError, ValueError):
     R2_CLEANUP_SPIKE_THRESHOLD = 100
 
 _client = None
+_metadata_client = None
+_metadata_client_lock = threading.Lock()
+
+
+def _get_metadata_client():
+    """Small bounded HEAD pool, independent of long-running upload/copy I/O."""
+    global _metadata_client
+    if _metadata_client is not None:
+        return _metadata_client
+    if not is_enabled():
+        return None
+    with _metadata_client_lock:
+        if _metadata_client is None:
+            import boto3
+            from botocore.config import Config
+            _metadata_client = boto3.client(
+                "s3", endpoint_url=R2_ENDPOINT_URL,
+                aws_access_key_id=R2_ACCESS_KEY_ID,
+                aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                config=Config(signature_version="s3v4", connect_timeout=3,
+                              read_timeout=5, max_pool_connections=8,
+                              retries={"total_max_attempts": 1, "mode": "standard"}),
+            )
+    return _metadata_client
+
+
+def object_identity(key: str) -> dict:
+    """Tri-state object identity for publication fences, not a content checksum.
+
+    ETags can be multipart/provider-specific; size+ETag is an object revision
+    precondition, not proof that several files came from one render generation.
+    Missing/invalid metadata and transport/auth failures are unknown, never a
+    missing object or a successful verification.
+    """
+    try:
+        client = _get_metadata_client()
+        if client is None or not key:
+            return {"status": "unavailable"}
+        value = client.head_object(Bucket=R2_BUCKET, Key=key)
+        etag = value.get("ETag")
+        size = value.get("ContentLength")
+        if (not isinstance(etag, str) or not etag.strip().strip('"')
+                or isinstance(size, bool) or not isinstance(size, int) or size < 0):
+            return {"status": "unavailable"}
+        return {"status": "exists", "etag": etag.strip().strip('"'), "size": size}
+    except Exception as exc:
+        code = str((getattr(exc, "response", {}) or {}).get("Error", {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return {"status": "missing"}
+        logger.warning("[R2] Object identity unavailable (%s)", type(exc).__name__)
+        return {"status": "unavailable"}
+
+
+def object_status_bounded(key: str) -> str:
+    """Tri-state audit HEAD through the short-timeout metadata pool.
+
+    Callers doing a batch must also enforce an overall deadline; socket timeouts
+    are not a hard wall-clock bound on DNS/scheduling for an entire batch.
+    """
+    return object_identity(key)["status"]
 
 
 def is_enabled() -> bool:
@@ -329,6 +389,11 @@ def _transfer_config():
 # tenant prefix and then ask /download to sign that key.
 _KEY_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
+# This is deliberately explicit and immutable. Bumping the version creates a
+# new content-addressed object, so an encoder change can never silently serve
+# bytes produced by an older format.
+EDITOR_AUDIO_PREVIEW_FORMAT_VERSION = "aac-stereo-96k-v1"
+
 
 def _safe_filename(filename: str) -> str:
     """Sanitize a user-controlled filename so it is safe to use as the
@@ -380,6 +445,26 @@ def content_addressed_input_key(
         f"inputs/{_safe_key_component(tenant_id)}/{_safe_key_component(job_id)}"
         f"/sha256/{digest}/{_safe_filename(filename)}"
     )
+
+
+def editor_audio_preview_key(
+    audio_sha256: str,
+    format_version: str = EDITOR_AUDIO_PREVIEW_FORMAT_VERSION,
+) -> str:
+    """Return the shared editor-preview key for an immutable audio digest.
+
+    The key intentionally contains no tenant or job identifier: identical
+    source bytes share one preview across jobs and tenants. Callers must still
+    perform authorization before probing or signing this key; this helper is
+    not an authorization boundary.
+    """
+    digest = str(audio_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("audio_sha256 must be a lowercase SHA-256 digest")
+    version = str(format_version or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", version):
+        raise ValueError("format_version contains invalid characters")
+    return f"editor-previews/{digest}/{version}.m4a"
 
 
 def upload_master(local_path: str, tenant_id: str, job_id: str, filename: str) -> Optional[str]:
@@ -563,6 +648,30 @@ def presign_put_url(
     return {"url": url, "key": key, "expires_in": expiry_seconds}
 
 
+def presign_put_object_key(
+    key: str,
+    *,
+    content_type: Optional[str] = None,
+    expiry_seconds: int = 900,
+) -> Optional[dict]:
+    """Sign an already-scoped object key.
+
+    Campaign audio is registered before a Job exists, so it cannot use the
+    historical ``inputs/<tenant>/<job>`` key builder. Callers must construct
+    and tenant-scope the key; this helper only signs it.
+    """
+    client = _get_client()
+    if client is None:
+        return None
+    params = {"Bucket": R2_BUCKET, "Key": key}
+    if content_type:
+        params["ContentType"] = content_type
+    url = client.generate_presigned_url(
+        "put_object", Params=params, ExpiresIn=expiry_seconds,
+    )
+    return {"url": url, "key": key, "expires_in": expiry_seconds}
+
+
 def multipart_init(
     tenant_id: str,
     job_id: str,
@@ -601,6 +710,29 @@ def multipart_init(
         )
         return None
     return {"upload_id": resp["UploadId"], "key": key}
+
+
+def multipart_init_object_key(
+    key: str,
+    *,
+    content_type: Optional[str] = None,
+) -> Optional[dict]:
+    """Begin multipart upload for a pre-scoped campaign object key."""
+    client = _get_client()
+    if client is None:
+        return None
+    args = {"Bucket": R2_BUCKET, "Key": key}
+    if content_type:
+        args["ContentType"] = content_type
+    try:
+        response = client.create_multipart_upload(**args)
+    except Exception as exc:
+        logger.error(
+            "campaign multipart_init failed key=%s: %s", key, exc,
+            exc_info=True,
+        )
+        return None
+    return {"upload_id": response["UploadId"], "key": key}
 
 
 def multipart_presign_part(
@@ -833,6 +965,40 @@ def multipart_last_activity(key: str, upload_id: str):
         )
         return None
     return newest
+
+
+def multipart_list_parts(key: str, upload_id: str) -> Optional[list[dict]]:
+    """Return completed parts, or ``None`` when the upload no longer exists.
+
+    An empty list is a valid newly-created upload. ``None`` lets the campaign
+    API replace an expired/aborted upload id instead of handing the local
+    uploader presigned URLs that can never succeed.
+    """
+    client = _get_client()
+    if client is None:
+        return None
+    marker = 0
+    completed: list[dict] = []
+    try:
+        while True:
+            response = client.list_parts(
+                Bucket=R2_BUCKET, Key=key, UploadId=upload_id,
+                MaxParts=1000, PartNumberMarker=marker,
+            )
+            completed.extend({
+                "part_number": int(part["PartNumber"]),
+                "etag": str(part["ETag"]).strip('"'),
+                "size": int(part.get("Size") or 0),
+            } for part in response.get("Parts", []))
+            if not response.get("IsTruncated"):
+                break
+            marker = int(response.get("NextPartNumberMarker") or 0)
+            if not marker:
+                break
+    except Exception as exc:
+        logger.warning("[R2] could not list resumable parts key=%s: %s", key, exc)
+        return None
+    return completed
 
 
 def head_object_size(key: str) -> Optional[int]:
@@ -1158,7 +1324,7 @@ def delete_object(key: str) -> None:
         raise
 
 
-def copy_object(src_key: str, dst_key: str) -> bool:
+def copy_object(src_key: str, dst_key: str, *, expected_etag: str | None = None) -> bool:
     """Server-side copy from src_key to dst_key within the same bucket.
 
     Used by run_edit_pipeline to archive the previous version of a deliverable
@@ -1176,11 +1342,26 @@ def copy_object(src_key: str, dst_key: str) -> bool:
     client = _get_client()
     if client is None:
         return False
-    if not object_exists(src_key):
+    if expected_etag is None and not object_exists(src_key):
         return False
+    conditions = {}
+    if expected_etag is not None:
+        normalized_etag = str(expected_etag).strip().strip('"')
+        if not normalized_etag or any(char in normalized_etag for char in '\r\n"'):
+            raise ValueError("invalid_copy_source_etag")
+        conditions["CopySourceIfMatch"] = f'"{normalized_etag}"'
     src = {"Bucket": R2_BUCKET, "Key": src_key}
+    managed_args = {"ExtraArgs": conditions} if conditions else {}
+    if src_key.lower().endswith('.mov'):
+        # Broadcast masters are frequently multi-GB. A single CopyObject
+        # can consume all read-timeout retries before reaching the multipart
+        # fallback below, leaving publication/render progress frozen for
+        # minutes. The managed transfer selects multipart by size up front.
+        client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key, **managed_args)
+        logger.info("[R2] Copied master %s -> %s", src_key, dst_key)
+        return True
     try:
-        client.copy_object(Bucket=R2_BUCKET, Key=dst_key, CopySource=src)
+        client.copy_object(Bucket=R2_BUCKET, Key=dst_key, CopySource=src, **conditions)
     except ClientError as e:
         code = (e.response or {}).get("Error", {}).get("Code", "")
         # Single-operation CopyObject caps at 5 GB on S3/R2 → a multi-GB
@@ -1189,7 +1370,7 @@ def copy_object(src_key: str, dst_key: str) -> bool:
         # which has no such limit.
         if code in ("EntityTooLarge", "InvalidRequest", "InvalidArgument"):
             logger.info("[R2] %s exceeds single-copy limit (%s) — using multipart copy", src_key, code)
-            client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key)
+            client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key, **managed_args)
         else:
             raise
     except (ReadTimeoutError, ConnectTimeoutError) as e:
@@ -1203,7 +1384,7 @@ def copy_object(src_key: str, dst_key: str) -> bool:
         # well under the timeout — so the same multipart path that handles
         # EntityTooLarge also dodges the per-request timeout.
         logger.info("[R2] %s single-copy timed out (%s) — using multipart copy", src_key, type(e).__name__)
-        client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key)
+        client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key, **managed_args)
     logger.info("[R2] Copied %s -> %s", src_key, dst_key)
     return True
 
@@ -1214,6 +1395,8 @@ def _guess_content_type(filename: str) -> Optional[str]:
         return "video/quicktime"
     if low.endswith(".mp4"):
         return "video/mp4"
+    if low.endswith(".m4a"):
+        return "audio/mp4"
     if low.endswith(".jpg") or low.endswith(".jpeg"):
         return "image/jpeg"
     if low.endswith(".png"):

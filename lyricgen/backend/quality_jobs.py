@@ -22,6 +22,151 @@ import unicodedata
 
 logger = logging.getLogger("genly.quality_jobs")
 
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def operator_text_suggestions_enabled() -> bool:
+    """Return whether human-click text proposals may be generated."""
+    return os.environ.get(
+        "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
+    ).strip().lower() in _TRUE_ENV_VALUES
+
+
+def operator_timing_suggestions_enabled() -> bool:
+    """Timing proposals have a separate, fail-closed rollout switch."""
+    return os.environ.get(
+        "QUALITY_TIMING_OPERATOR_SUGGESTIONS_ENABLED", "0",
+    ).strip().lower() in _TRUE_ENV_VALUES
+
+
+def _spanish_operator_suggestions(
+    segments: list[dict],
+) -> tuple[list[dict], dict]:
+    """Build deterministic text candidates without requiring audio windows."""
+    report = {
+        "enabled": False, "finding_count": 0, "candidate_count": 0,
+        "automatic_apply_allowed": False,
+    }
+    if not operator_text_suggestions_enabled():
+        return [], report
+    try:
+        from spanish_orthography import analyze_spanish_orthography
+
+        raw_report = analyze_spanish_orthography(segments)
+        candidates = list(raw_report.pop("candidates", []) or [])
+        # Persist raw lyric text only in the revision-bound editor proposal.
+        # Global quality telemetry keeps counts and policy metadata.
+        raw_report.pop("findings", None)
+        return candidates, {**raw_report, "enabled": True}
+    except Exception as exc:
+        logger.warning(
+            "[SPANISH-ORTHOGRAPHY] fail-closed error=%s",
+            type(exc).__name__,
+        )
+        return [], {
+            "enabled": True, "finding_count": 0, "candidate_count": 0,
+            "failure": type(exc).__name__,
+            "automatic_apply_allowed": False,
+        }
+
+
+def _timing_operator_suggestions(
+    segments: list[dict], stem_path: str,
+) -> tuple[list[dict], dict]:
+    """Build timing candidates only behind their explicit rollout switch."""
+    report = {
+        "enabled": False, "proposal_count": 0,
+        "automatic_apply_allowed": False,
+    }
+    if not operator_timing_suggestions_enabled():
+        return [], report
+    try:
+        from pathlib import Path
+        from timing_review_suggestions import (
+            build_timing_review_candidates, load_acoustic_track,
+        )
+
+        acoustic_track = load_acoustic_track(Path(stem_path))
+        candidates, raw_report = build_timing_review_candidates(
+            segments, acoustic_track,
+        )
+        return candidates, {**raw_report, "enabled": True}
+    except Exception as exc:
+        # Suggestions are optional and human-operated. A pitch failure must
+        # not fail transcription quality.
+        logger.warning(
+            "[T4-SUGGESTION] fail-closed error=%s",
+            type(exc).__name__,
+        )
+        return [], {
+            "enabled": True, "proposal_count": 0,
+            "failure": type(exc).__name__,
+            "automatic_apply_allowed": False,
+        }
+
+
+def _segment_only_operator_replay(
+    job_id: str, snapshot: dict, *, expected_revision: int,
+    expected_segments_hash: str, expected_audio_revision: int | None,
+    expected_audio_sha256: str, analysis_attempt_id: str,
+) -> dict:
+    """Reissue deterministic text proposals when no audio window is unsafe."""
+    from operator_review_proposals import build_operator_review_proposal
+
+    candidates, spanish_report = _spanish_operator_suggestions(
+        snapshot["segments"],
+    )
+    proposal, telemetry = build_operator_review_proposal(
+        snapshot["segments"], text_candidates=candidates,
+    )
+    quality = dict(snapshot["quality"])
+    retry = dict(quality.get("retry") or {})
+    retry["spanish_orthography"] = _sanitize_analytical_evidence(
+        spanish_report,
+    )
+    retry["operator_suggestions"] = _sanitize_analytical_evidence(telemetry)
+    retry["mutated_segments"] = False
+    quality["retry"] = retry
+    quality["operator_suggestions_persisted"] = False
+    # This replay completed its full, intentionally text-only scope. Preserve
+    # the prior quality decision/render gate, but do not let a historical
+    # ``retry_failed`` decision mislabel this successful attempt as failed.
+    quality["segment_only_operator_replay_complete"] = True
+    persisted = _persist_if_current(
+        job_id, expected_revision, expected_segments_hash, quality,
+        expected_audio_revision=expected_audio_revision,
+        expected_audio_sha256=expected_audio_sha256,
+        analysis_attempt_id=analysis_attempt_id,
+        operator_proposal=proposal,
+    )
+    return {
+        "status": "persisted" if persisted else "discarded",
+        "reason": None if persisted else "stale_after_analysis",
+        "decision": quality.get("decision"),
+        "operator_proposal_count": int(telemetry.get("proposal_count") or 0),
+    }
+
+
+def _analysis_status_for_quality(quality: dict) -> str:
+    """Separate attempt completion from the conservative quality decision."""
+    if quality.get("segment_only_operator_replay_complete") is True:
+        return "complete"
+    return "failed" if quality.get("decision") == "retry_failed" else "complete"
+
+
+def _attach_structural_t4_shadow(quality: dict, segments: list[dict]) -> dict:
+    """Persist T4 evidence only when the staging observation flag is on."""
+
+    if os.environ.get(
+        "QUALITY_T4_STRUCTURAL_OBSERVE_ENABLED", "0",
+    ).strip().lower() not in {"1", "true", "yes", "on"}:
+        return quality
+    from structural_t4_shadow import build_structural_t4_shadow
+
+    output = dict(quality)
+    output["t4_structural_shadow"] = build_structural_t4_shadow(segments)
+    return output
+
 
 def _pending_marker_is_stale(quality: dict, *, now=None, max_age_s: int = 900) -> bool:
     """Pure predicate for recovering a crash between DB marker and Redis."""
@@ -209,7 +354,10 @@ def _max_windows() -> int:
         configured = int(os.environ.get("TRANSCRIPTION_QUALITY_MAX_WINDOWS", "4"))
     except (TypeError, ValueError):
         configured = 4
-    return max(1, min(12, configured))
+    # High-gap live recordings can legitimately contain dozens of review
+    # windows.  The downstream billed-audio and wall-clock budgets remain the
+    # authoritative cost/safety limits; this cap only guards malformed input.
+    return max(1, min(64, configured))
 
 
 def _release() -> str:
@@ -221,28 +369,90 @@ def _release() -> str:
 
 
 def _snapshot(job_id: str):
-    from database import Job, SessionLocal
+    from database import EditorDocument, Job, SessionLocal
+    from sqlalchemy import func
 
     db = SessionLocal()
     try:
         row = db.query(Job).filter(Job.job_id == job_id).first()
         if row is None:
             return None
+        document = db.query(EditorDocument).filter(
+            EditorDocument.job_id == row.job_id,
+            EditorDocument.tenant_id == row.tenant_id,
+        ).first()
+        # Bounded same-artist vocabulary is a decoding hint, never evidence.
+        # It can help names/slang already present in this tenant's approved
+        # catalogue, but a suggestion still requires independent audio
+        # consensus before it reaches the operator.
+        lexicon_terms: list[str] = []
+        lexicon_enabled = os.environ.get(
+            "ARTIST_LEXICON_RAG_ENABLED", "0",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        artist = str(row.artist or "").strip()
+        if artist and lexicon_enabled:
+            catalog_rows = db.query(Job.segments_json).filter(
+                Job.tenant_id == row.tenant_id,
+                Job.job_id != row.job_id,
+                Job.status == "done",
+                func.lower(Job.artist) == artist.lower(),
+                Job.segments_json.isnot(None),
+            ).order_by(Job.approved_at.desc()).limit(12).all()
+            seen = set()
+            for (catalog_segments,) in catalog_rows:
+                for segment in catalog_segments or []:
+                    if not isinstance(segment, dict):
+                        continue
+                    for token in re.findall(
+                        r"[A-Za-zÀ-ÖØ-öø-ÿÑñ0-9][A-Za-zÀ-ÖØ-öø-ÿÑñ0-9'’-]{2,}",
+                        str(segment.get("text") or ""),
+                    ):
+                        folded = unicodedata.normalize("NFKC", token).casefold()
+                        if folded in seen:
+                            continue
+                        seen.add(folded)
+                        lexicon_terms.append(token)
+                        if len(lexicon_terms) >= 120:
+                            break
+                    if len(lexicon_terms) >= 120:
+                        break
+                if len(lexicon_terms) >= 120:
+                    break
         return {
             "revision": int(row.segments_revision or 0),
+            "status": row.status,
+            "approved_at": row.approved_at.isoformat() if row.approved_at else None,
             "segments": [dict(item) for item in (row.segments_json or [])],
+            "original_segments": list(document.original_segments or []) if document is not None else [],
+            # The immutable machine snapshot carries the LoRA word stream
+            # after the worker removes transport-only keys.  Quality replay
+            # must be able to compare the attested family with/without it.
+            "machine_evidence": (
+                dict(document.machine_evidence)
+                if document is not None
+                and isinstance(document.machine_evidence, dict)
+                else None
+            ),
             "quality": dict(row.transcription_quality or {}),
             "input_r2_key": row.input_r2_key,
             "audio_revision": int(row.audio_revision or 0),
             "audio_sha256": str(row.input_audio_sha256 or ""),
             "active_quality_attempt_id": str(row.active_quality_attempt_id or ""),
             "filename": row.filename,
+            "artist_lexicon_prompt": (
+                "Vocabulario posible del catálogo del mismo artista: "
+                + ", ".join(lexicon_terms)
+            )[:850] if lexicon_terms else "",
+            "artist_lexicon_terms": len(lexicon_terms),
+            "artist_lexicon_enabled": lexicon_enabled,
         }
     finally:
         db.close()
 
 
-def _attested_asr_context(segments: list[dict]) -> dict:
+def _attested_asr_context(
+    segments: list[dict], machine_evidence: dict | None = None,
+) -> dict:
     """Recover provider-family witnesses without trusting segment labels.
 
     New transcriptions persist word timing plus an HMAC-attested provenance
@@ -309,12 +519,36 @@ def _attested_asr_context(segments: list[dict]) -> dict:
     )
     primary = ranked[0] if ranked else ("", [])
     independent = ranked[1] if len(ranked) > 1 else ("", [])
-    return {
+    context = {
         "_asr_words": primary[1],
         "_primary_asr_family": primary[0],
         "_independent_asr_words": independent[1],
         "_independent_asr_family": independent[0],
     }
+    # LoRA is persisted as a private hypothesis, not on editable segment
+    # rows.  Accept only the exact attested family and a matching snapshot
+    # hash; user-edited text can therefore never manufacture a witness.
+    if isinstance(machine_evidence, dict):
+        from machine_evidence import snapshot_hash
+
+        for hypothesis in machine_evidence.get("hypotheses_by_family") or []:
+            if not isinstance(hypothesis, dict):
+                continue
+            family = str(hypothesis.get("family") or "").strip()
+            if family != "openai_whisper_large_v3_turbo_lora_v1":
+                continue
+            events = hypothesis.get("events")
+            if (
+                hypothesis.get("kind") != "word_stream"
+                or not isinstance(events, list)
+                or hypothesis.get("events_sha256") != snapshot_hash(events)
+            ):
+                continue
+            words = [item for item in events if isinstance(item, dict)]
+            context["_lora_asr_words"] = words
+            context["_lora_asr_family"] = family
+            break
+    return context
 
 
 def _queue_wait_seconds() -> float | None:
@@ -353,7 +587,9 @@ def _persist_if_current(job_id: str, expected_revision: int,
                         expected_audio_revision: int | None = None,
                         expected_audio_sha256: str = "",
                         analysis_attempt_id: str = "",
-                        quality_proposal: dict | None = None) -> bool:
+                        quality_proposal: dict | None = None,
+                        quality_observation: dict | None = None,
+                        operator_proposal: dict | None = None) -> bool:
     from database import Job, SessionLocal
     from transcription_quality import quality_fingerprint, segments_hash
 
@@ -395,9 +631,21 @@ def _persist_if_current(job_id: str, expected_revision: int,
         previous = dict(row.transcription_quality or {})
         ack = previous.get("acknowledgement")
         quality = dict(quality)
-        quality["analysis_status"] = (
-            "failed" if quality.get("decision") == "retry_failed" else "complete"
-        )
+        # The quality replay is analytical and may finish after the
+        # transcription worker has attached the batch reference contract (or
+        # even after a reviewer has approved it).  Replacing the JSON blob
+        # must not erase those durable, operator-facing gates.  They are
+        # produced outside the replay and are therefore authoritative over
+        # any same-named field in the analytical result.
+        for durable_key in (
+            "reference_hypothesis",
+            "catalog_reference",
+            "reviewer_campaign_status",
+            "pre_background_approval",
+        ):
+            if durable_key in previous:
+                quality[durable_key] = previous[durable_key]
+        quality["analysis_status"] = _analysis_status_for_quality(quality)
         quality["analysis_pending"] = False
         if previous.get("analysis_job_id"):
             quality["analysis_job_id"] = str(previous["analysis_job_id"])
@@ -420,7 +668,26 @@ def _persist_if_current(job_id: str, expected_revision: int,
                 "available": False, "reason": "prediction_failed",
                 "mutated_segments": False,
             }
-        if quality_proposal:
+        if operator_proposal:
+            try:
+                from editor import persist_operator_review_proposal_if_current
+                quality["operator_suggestions_persisted"] = bool(
+                    persist_operator_review_proposal_if_current(
+                        db, job_id=job_id,
+                        expected_revision=expected_revision,
+                        expected_segments_hash=expected_hash,
+                        expected_audio_revision=audio_revision,
+                        expected_audio_sha256=audio_sha256,
+                        proposal=operator_proposal,
+                    )
+                )
+            except Exception:
+                logger.error(
+                    "[OPERATOR-SUGGESTION] fail-closed persistence job=%s",
+                    job_id,
+                )
+                quality["operator_suggestions_persisted"] = False
+        elif quality_proposal:
             try:
                 from editor import persist_quality_proposal_if_current
                 quality["review_proposal_persisted"] = bool(
@@ -438,6 +705,24 @@ def _persist_if_current(job_id: str, expected_revision: int,
                     "[QUALITY-PROPOSAL] fail-closed persistence job=%s", job_id,
                 )
                 quality["review_proposal_persisted"] = False
+        elif quality_observation:
+            try:
+                from editor import persist_quality_observation_if_current
+                quality["review_observation_persisted"] = bool(
+                    persist_quality_observation_if_current(
+                        db, job_id=job_id,
+                        expected_revision=expected_revision,
+                        expected_segments_hash=expected_hash,
+                        expected_audio_revision=audio_revision,
+                        expected_audio_sha256=audio_sha256,
+                        proposal=quality_observation,
+                    )
+                )
+            except Exception:
+                logger.error(
+                    "[QUALITY-OBSERVATION] fail-closed persistence job=%s", job_id,
+                )
+                quality["review_observation_persisted"] = False
         new_fingerprint = quality_fingerprint(
             quality, revision=revision, content_hash=current_hash,
         )
@@ -526,18 +811,22 @@ _ANALYTICAL_KEYS = frozenset({
     # Containers and identity-safe references.
     "windows", "window", "window_id", "id", "parent_window_id",
     "analysis_windows", "acoustic_structure", "content_mapping", "events",
+    "editorial_content_route", "omission_content_route",
     "subevents", "performance_boundaries", "best_partition", "n_best",
     "cardinality_posterior", "motif_groups", "self_similarity", "diagnostics",
     "phonetic_evidence", "phonetic_candidates", "model_identity",
     "evidence_lineage", "parent_coverage", "resolved_window_ids",
     "review_proposal", "blockers", "reasons", "reason", "declined",
+    "timing_review_suggestions", "spanish_orthography", "operator_suggestions", "reviewer_assist",
     "structural_hybrid_diagnostics", "current_segments", "proposed_segments",
     # Booleans, counters and bounded measurements.
     "accepted", "complete", "attempted", "failed", "blocked", "suggested",
+    "allow_lexical_ranking", "safe_for_auto_insert", "review_required",
     "applied", "mutated_segments", "phonetic_verified",
     "v6_legacy_mutation_blocked",
     "independent_content_verified", "acoustic_crowd_evidence", "cache_hit",
     "windows_processed", "windows_total", "windows_skipped", "windows_truncated",
+    "content_gate_declined", "omission_only",
     "windows_considered", "windows_tiled", "windows_resolved", "window_count",
     "parent_windows_total", "parent_windows_incomplete", "boundary_count",
     "n_best_count", "event_count", "word_count", "text_count", "text_length",
@@ -548,6 +837,16 @@ _ANALYTICAL_KEYS = frozenset({
     "structural_hybrid_attempts", "structural_hybrid_accepts",
     "strong_unassigned_events", "unassigned_events", "viable_hypotheses",
     "authorized_windows", "candidates", "invalid_candidates",
+    "finding_count", "candidate_count", "proposal_count",
+    "provider_calls", "processed_windows", "generated", "tool_errors",
+    "declined_overlap_count", "by_type", "text", "timing", "vocalization",
+    "automatic_apply_allowed",
+    # Paired LoRA-v1 shadow attribution (with/without the additional family).
+    # Keep these counters in the analytical allow-list so the quality row can
+    # be aggregated over the first 30–50 real songs.
+    "lora_shadow", "lora_contributed_lines", "new_consensus_lines",
+    "lost_consensus_lines", "with_consensus", "without_consensus",
+    "comparisons", "enabled",
     "start", "end", "core_start", "core_end", "duration", "margin",
     "phase_margin", "max_phase_delta", "median_phase_delta", "starts",
     "raw_score", "score", "confidence", "probability", "coverage",
@@ -556,6 +855,7 @@ _ANALYTICAL_KEYS = frozenset({
     "estimated_openai_asr_cost_usd", "estimated_gemini_cost_usd",
     "cost_complete", "stem_cache_hit", "calibration_id", "schema",
     "policy_version", "kind", "taxonomy", "composition", "source", "status",
+    "policy_id", "content_type", "display",
     "failure_reason", "selected_candidate_id", "evidence_sha256",
     "model_revision", "stem_sha256", "mix_sha256", "cache_ref",
     "evidence_fingerprint", "stem_fingerprint", "mix_fingerprint",
@@ -566,6 +866,9 @@ _ANALYTICAL_RAW_HASH_KEYS = frozenset({
 })
 
 _ANALYTICAL_STRING_VALUES = frozenset({
+    "reviewer_assist_tool_error", "persistent_cache_directory_required",
+    "human_approval_preserved", "text_suggestion_rollout_disabled",
+    "stem_unavailable", "source_audio_hash_mismatch",
     "lyrics-quality-v6", "lyrics-quality-v6-diagnostic-v1",
     "lyrics-quality-v6-review-proposal-v1", "review_proposal",
     "review_proposal_window", "diagnostic_finding", "unknown", "accepted",
@@ -575,6 +878,14 @@ _ANALYTICAL_STRING_VALUES = frozenset({
     "cross_occurrence_content_consensus", "recurrence_content_disagreement",
     "SUNG_LEAD", "SUNG_CROWD", "SPEECH", "NONLEXICAL", "METADATA",
     "CROWD_NOISE", "UNKNOWN", "lexical", "vocalization", "sustained",
+    "none", "speech", "lexical_candidate", "melodic_vocalization", "ambiguous",
+    "normal", "parenthesize", "do_not_show", "review",
+    "no_acoustic_events", "long_melodic_interjection",
+    "short_melodic_interjection", "speech_compositionality_unknown",
+    "independent_text_consensus_required", "mixed_or_unknown_acoustic_events",
+    "rotor-umg-display-policy-v2", "acoustic-editorial-route-v1",
+    "omission-content-route-v1", "content_gate_abstention",
+    "acoustic_content_supports_lexical_ranking", "not_an_omission_only_window",
     "lexical_plus_vocalization", "source_audio_demucs",
     *_WINDOW_REASON_PRIORITY.keys(),
     "acoustic_cardinality_disagreement", "quality_windows_unprocessed",
@@ -619,6 +930,9 @@ def _sanitize_analytical_evidence(value, *, _key: str = ""):
     if isinstance(value, dict):
         sanitized = {}
         for key, item in value.items():
+            if key == "text" and _key == "by_type" and isinstance(item, (int, float)):
+                sanitized["text"] = item
+                continue
             if key == "text":
                 sanitized["text_present"] = bool(str(item or "").strip())
                 sanitized["text_length"] = len(str(item or ""))
@@ -665,7 +979,8 @@ def _sanitize_analytical_evidence(value, *, _key: str = ""):
 
 
 def _build_review_proposal(segments: list[dict], raw_windows: list[dict],
-                           coverage: dict[str, dict]) -> tuple[dict | None, dict]:
+                           coverage: dict[str, dict], *,
+                           observation_only: bool = False) -> tuple[dict | None, dict]:
     """Build a typed tenant-scoped proposal; return only text-free telemetry."""
     from quality_v6_calibration import runtime_review_proposal_authorization
     from quality_v6_contracts import (
@@ -695,6 +1010,7 @@ def _build_review_proposal(segments: list[dict], raw_windows: list[dict],
             "current_segments": [], "proposed_segments": [],
             "certification": candidate.certification,
             "certification_conflict": False,
+            "source_families": set(),
         })
         if group["certification"] != candidate.certification:
             group["certification_conflict"] = True
@@ -703,6 +1019,11 @@ def _build_review_proposal(segments: list[dict], raw_windows: list[dict],
         group["reasons"].update(candidate.reasons)
         group["current_segments"].extend(dict(item) for item in candidate.current_segments)
         group["proposed_segments"].extend(dict(item) for item in candidate.proposed_segments)
+        if isinstance(raw.get("source_families"), (list, tuple)):
+            group["source_families"].update(
+                str(item).strip() for item in raw["source_families"]
+                if str(item).strip()
+            )
 
     def key(item: dict) -> tuple:
         return (
@@ -725,10 +1046,25 @@ def _build_review_proposal(segments: list[dict], raw_windows: list[dict],
         if any(key(item) not in current_keys for item in group["current_segments"]):
             authorization_blockers.add("proposal_current_segments_mismatch")
             continue
-        authorization = runtime_review_proposal_authorization(group.pop("certification", None))
-        authorization_blockers.update(authorization.get("blockers") or [])
-        if not authorization.get("authorized"):
-            continue
+        certification = group.pop("certification", None)
+        if observation_only:
+            from consensus_review_certificate import canonical_source_family
+            independent_families = {
+                canonical_source_family(item) for item in group["source_families"]
+                if canonical_source_family(item)
+            }
+            if len(independent_families) < 2:
+                authorization_blockers.add("independent_source_family_missing")
+                continue
+            group["source_families"] = sorted(independent_families)
+        else:
+            authorization = runtime_review_proposal_authorization(certification)
+            authorization_blockers.update(authorization.get("blockers") or [])
+            if not authorization.get("authorized"):
+                continue
+            # The signed production proposal contract intentionally contains
+            # no observational metadata.
+            group.pop("source_families", None)
         for field in ("current_segments", "proposed_segments"):
             unique = {}
             for item in group[field]:
@@ -754,6 +1090,17 @@ def _build_review_proposal(segments: list[dict], raw_windows: list[dict],
             "review_only": True,
             "windows": windows,
         }).to_dict()
+        if observation_only:
+            metadata = {
+                str(item["id"]): list(item.get("source_families") or [])
+                for item in windows
+            }
+            proposal["observation_only"] = True
+            proposal["certificate_policy_version"] = (
+                "independent-consensus-review-policy-v1"
+            )
+            for item in proposal["windows"]:
+                item["source_families"] = metadata.get(str(item["id"]), [])
     except (TypeError, ValueError):
         telemetry["blocked"] = True
         telemetry["blockers"] = sorted(set(telemetry["blockers"] + ["invalid_contract"]))
@@ -970,11 +1317,20 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
     quality_before = snapshot["quality"]
     windows = list(quality_before.get("unsafe_windows") or [])
     if not windows:
+        if operator_text_suggestions_enabled():
+            return _segment_only_operator_replay(
+                job_id, snapshot, expected_revision=expected_revision,
+                expected_segments_hash=expected_segments_hash,
+                expected_audio_revision=expected_audio_revision,
+                expected_audio_sha256=expected_audio_sha256,
+                analysis_attempt_id=analysis_attempt_id,
+            )
         return {"status": "discarded", "reason": "no_unsafe_windows"}
     if not snapshot.get("input_r2_key"):
         failed = evaluate(
             snapshot["segments"], quality_before.get("metrics") or {},
             unsafe_windows=windows,
+            is_live=bool((quality_before.get("metrics") or {}).get("is_live")),
             retry_stats={
                 "attempted": True, "failed": True,
                 "failure_reason": "input_r2_key_missing",
@@ -1031,6 +1387,9 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             ]
             windows = prioritized_windows
             from quality_windows import parent_coverage, tile_unsafe_windows
+            from lyric_content_policy import (
+                classify_acoustic_window, route_omission_window,
+            )
             all_tiles = tile_unsafe_windows(
                 prioritized_windows, core_seconds=24.0, context_seconds=3.0,
                 audio_duration=float(audio_duration),
@@ -1073,9 +1432,15 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                     for event in best_events if isinstance(event, dict)
                 )
                 cache_hits += int(hit)
+                content_route = classify_acoustic_window(structure)
+                omission_route = route_omission_window(bounded, content_route)
+                bounded["editorial_content_route"] = content_route
+                bounded["omission_content_route"] = omission_route
                 analyses.append({
                     "window": bounded,
                     "structure": _structure_summary(structure),
+                    "editorial_content_route": content_route,
+                    "omission_content_route": omission_route,
                 })
             # selected_tiles contains the same dictionaries mutated above;
             # provider retries now consume acoustic disagreement directly.
@@ -1095,7 +1460,22 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 "stem_cache_hit": stem_cache_hit,
                 "demucs_attempts": 0 if stem_cache_hit else 1,
             }
+            lexical_retry_tiles = [
+                item for item in selected_tiles
+                if (item.get("omission_content_route") or {}).get(
+                    "allow_lexical_ranking"
+                ) is not False
+            ]
+            retry_stats["content_gate_declined"] = (
+                len(selected_tiles) - len(lexical_retry_tiles)
+            )
             raw_proposal_windows = []
+            timing_review_candidates, timing_review_report = (
+                _timing_operator_suggestions(snapshot["segments"], stem_path)
+            )
+            spanish_orthography_candidates, spanish_orthography_report = (
+                _spanish_operator_suggestions(snapshot["segments"])
+            )
             # The provider/content retry remains separately kill-switchable.
             # Raw rows stay in memory until the typed, signed review-proposal
             # gate accepts them; global quality analytics receive only counts.
@@ -1103,16 +1483,36 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 "1", "true", "yes", "on",
             }:
                 from targeted_consensus import reprocess
-                asr_context = _attested_asr_context(snapshot["segments"])
+                asr_context = _attested_asr_context(
+                    snapshot["segments"], snapshot.get("machine_evidence"),
+                )
+                if snapshot.get("artist_lexicon_prompt"):
+                    asr_context["_artist_lexicon_prompt"] = snapshot[
+                        "artist_lexicon_prompt"
+                    ]
                 _ignored, provider_stats = reprocess(
                     {"segments": snapshot["segments"], **asr_context},
-                    audio_path, selected_tiles, job_id=job_id, stem_path=stem_path,
+                    audio_path, lexical_retry_tiles,
+                    job_id=job_id, stem_path=stem_path,
                 )
                 raw_proposal_windows = list(
                     provider_stats.pop("quality_proposal_windows", []) or []
                 )
                 retry_stats.update(provider_stats)
+                retry_stats["artist_lexicon_terms"] = int(
+                    snapshot.get("artist_lexicon_terms") or 0
+                )
+                retry_stats["artist_lexicon_enabled"] = bool(
+                    snapshot.get("artist_lexicon_enabled")
+                )
                 retry_stats["mutated_segments"] = False
+
+            retry_stats["timing_review_suggestions"] = (
+                _sanitize_analytical_evidence(timing_review_report)
+            )
+            retry_stats["spanish_orthography"] = (
+                _sanitize_analytical_evidence(spanish_orthography_report)
+            )
 
             evidence_windows = [
                 {
@@ -1142,9 +1542,70 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
                 snapshot["segments"], raw_proposal_windows, coverage,
             )
             retry_stats["review_proposal"] = proposal_telemetry
+            quality_observation = None
+            if (
+                quality_proposal is None
+                and os.environ.get(
+                    "QUALITY_CONSENSUS_OBSERVATIONS_ENABLED", "0",
+                ).strip().lower() in {"1", "true", "yes", "on"}
+            ):
+                quality_observation, observation_telemetry = _build_review_proposal(
+                    snapshot["segments"], raw_proposal_windows, coverage,
+                    observation_only=True,
+                )
+                retry_stats["review_observation"] = observation_telemetry
             complete_parent_ids = {
                 parent_id for parent_id, item in coverage.items() if item.get("complete")
             }
+            operator_proposal = None
+            if (
+                operator_text_suggestions_enabled()
+                or operator_timing_suggestions_enabled()
+            ):
+                from operator_review_proposals import build_operator_review_proposal
+
+                operator_proposal, operator_telemetry = (
+                    build_operator_review_proposal(
+                        snapshot["segments"],
+                        timing_candidates=(
+                            timing_review_candidates
+                            if operator_timing_suggestions_enabled() else []
+                        ),
+                        text_candidates=(
+                            [
+                                *raw_proposal_windows,
+                                *spanish_orthography_candidates,
+                            ]
+                            if operator_text_suggestions_enabled() else []
+                        ),
+                        complete_parent_ids=complete_parent_ids,
+                    )
+                )
+                retry_stats["operator_suggestions"] = (
+                    _sanitize_analytical_evidence(operator_telemetry)
+                )
+            # Default-off reviewer uses the same human-operated proposal path.
+            # Never replace a native suggestion batch to attach agent output.
+            if operator_proposal is None:
+                from reviewer_assist import enabled as reviewer_assist_enabled
+                if reviewer_assist_enabled():
+                    try:
+                        from reviewer_assist_runtime import run_snapshot
+                        operator_proposal, assist_stats = run_snapshot(
+                            job_id, snapshot, audio_path, stem_path,
+                        )
+                        retry_stats["reviewer_assist"] = assist_stats
+                        retry_stats["provider_attempts"] += int(assist_stats.get("provider_calls", 0))
+                        if assist_stats.get("provider_calls"):
+                            retry_stats["cost_complete"] = False
+                    except Exception as exc:
+                        logger.warning("[REVIEWER-ASSIST] %s job=%s", type(exc).__name__, job_id)
+                        retry_stats["cost_complete"] = False
+                        retry_stats["reviewer_assist"] = {
+                            "enabled": True, "failed": True, "tool_errors": 1,
+                            "failure_reason": "reviewer_assist_tool_error",
+                            "automatic_apply_allowed": False,
+                        }
             complete_windows = [
                 item for item in windows
                 if str(item.get("id")) in complete_parent_ids
@@ -1173,6 +1634,7 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             quality = evaluate(
                 snapshot["segments"], metrics,
                 unsafe_windows=remaining_windows,
+                is_live=bool(metrics.get("is_live")),
                 retry_stats=_sanitize_analytical_evidence(retry_stats),
                 acoustic_evidence=diagnostic,
                 resolved_reason_counts=resolved_reasons,
@@ -1180,6 +1642,9 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             )
             quality["analysis_windows"] = _sanitize_analytical_evidence(analyses)
             quality["timing_source"] = quality_before.get("timing_source", "unknown")
+            quality = _attach_structural_t4_shadow(
+                quality, snapshot["segments"],
+            )
 
         usage_after = resource.getrusage(resource.RUSAGE_SELF)
         quality["quality_job"] = {
@@ -1210,6 +1675,8 @@ def run_transcription_quality_job(job_id: str, *, expected_revision: int,
             expected_audio_sha256=expected_audio_sha256,
             analysis_attempt_id=analysis_attempt_id,
             quality_proposal=quality_proposal,
+            quality_observation=quality_observation,
+            operator_proposal=operator_proposal,
         )
         return {
             "status": "persisted" if persisted else "discarded",
@@ -1262,6 +1729,9 @@ def transcription_quality_failure_callback(job, connection, type_, value, traceb
         failed = evaluate(
             snapshot["segments"], snapshot["quality"].get("metrics") or {},
             unsafe_windows=snapshot["quality"].get("unsafe_windows") or [],
+            is_live=bool(
+                (snapshot["quality"].get("metrics") or {}).get("is_live")
+            ),
             retry_stats={
                 "attempted": True, "failed": True,
                 "failure_reason": (

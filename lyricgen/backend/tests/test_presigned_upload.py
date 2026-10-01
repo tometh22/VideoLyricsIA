@@ -530,13 +530,15 @@ def test_transcribe_uploaded_async_enqueues_without_api_download(
         headers=auth(token),
     ).json()["job_id"]
 
+    idem_key = "test-transcription-attempt-0001"
     res = client.post(
         "/transcribe-uploaded",
         json={"job_id": job_id, "language": "es"},
-        headers=auth(token),
+        headers={**auth(token), "Idempotency-Key": idem_key},
     )
 
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
+    assert res.headers["location"] == f"/transcription-status/{job_id}"
     assert res.json()["status"] == "transcribing_queued"
     assert downloads == []
     assert len(enqueued) == 1
@@ -545,10 +547,19 @@ def test_transcribe_uploaded_async_enqueues_without_api_download(
     duplicate = client.post(
         "/transcribe-uploaded",
         json={"job_id": job_id, "language": "es"},
-        headers=auth(token),
+        headers={**auth(token), "Idempotency-Key": idem_key},
     )
-    assert duplicate.status_code == 200
+    assert duplicate.status_code == 202
     assert duplicate.json()["deduplicated"] is True
+    assert duplicate.json()["outbox_event_id"] == res.json()["outbox_event_id"]
+    assert len(enqueued) == 1
+    conflict = client.post(
+        "/transcribe-uploaded",
+        json={"job_id": job_id, "language": "en"},
+        headers={**auth(token), "Idempotency-Key": idem_key},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "idempotency_key_conflict"
     assert len(enqueued) == 1
     s = SessionLocal()
     try:
@@ -556,8 +567,23 @@ def test_transcribe_uploaded_async_enqueues_without_api_download(
         assert row.status == "transcribing_queued"
         assert row.current_step == "transcribe.prepare"
         assert row.progress == 1
+        row.status = "transcribed_pending"
+        row.current_step = "editing"
+        s.commit()
     finally:
         s.close()
+    # A response can be lost after the worker has consumed the event. The
+    # same explicit key must replay that event even once the job is terminal
+    # from the transcription endpoint's perspective.
+    late_duplicate = client.post(
+        "/transcribe-uploaded",
+        json={"job_id": job_id, "language": "es"},
+        headers={**auth(token), "Idempotency-Key": idem_key},
+    )
+    assert late_duplicate.status_code == 202
+    assert late_duplicate.json()["deduplicated"] is True
+    assert late_duplicate.json()["outbox_event_id"] == res.json()["outbox_event_id"]
+    assert len(enqueued) == 1
 
 
 def test_transcribe_uploaded_promotes_status_and_calls_pipeline(

@@ -51,7 +51,11 @@ describe("GuidedTimingReview", () => {
     expect(screen.getByText("¿La frase aparece cuando empieza la voz?")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Sí, está bien" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "No, ajustar" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /mover 0,1 segundos antes/i })).toBeNull();
+    // Después de escuchar, la frase seleccionada y sus ajustes ya están a la
+    // vista: no hace falta pasar por "No, ajustar" para poder corregir.
+    expect(screen.getByTestId("guided-phrase-panel")).toHaveTextContent("0:10.2 → 0:12.4");
+    expect(screen.getByRole("button", { name: /mover 0,1 segundos antes/i })).toBeInTheDocument();
+    expect(screen.queryByTestId("guided-phrase-coachmark")).toBeNull();
 
     await userEvent.click(screen.getByRole("button", { name: "No, ajustar" }));
     expect(screen.getByRole("button", { name: /mover 0,1 segundos antes/i })).toBeInTheDocument();
@@ -66,10 +70,32 @@ describe("GuidedTimingReview", () => {
     await userEvent.click(screen.getByRole("button", { name: /Escuchar fragmento/ }));
     await userEvent.click(screen.getByRole("button", { name: "Sí, está bien" }));
     expect(screen.getByTestId("guided-confirm-coachmark")).toHaveTextContent("No muevas la frase");
-    expect(screen.getByRole("button", { name: /confirmar y seguir/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /confirmar tramo/i })).toBeEnabled();
     expect(onMove).not.toHaveBeenCalled();
-    await userEvent.click(screen.getByRole("button", { name: /confirmar y seguir/i }));
+    await userEvent.click(screen.getByRole("button", { name: /confirmar tramo/i }));
     expect(onConfirm).toHaveBeenCalledWith(WINDOWS[0]);
+  });
+
+  it("muestra la pregunta desde el principio y explica por qué no se puede confirmar", async () => {
+    render(<GuidedTimingReview {...props()} />);
+    // La pregunta es lo que se le pide al revisor: visible antes de escuchar,
+    // con las respuestas deshabilitadas y el motivo escrito.
+    expect(screen.getByText("¿La frase aparece cuando empieza la voz?")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sí, está bien" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "No, ajustar" })).toBeDisabled();
+    expect(screen.getByTestId("guided-alignment-question")).toHaveTextContent("Escuchá el fragmento para poder responder");
+    expect(screen.getByRole("button", { name: /confirmar tramo/i })).toBeDisabled();
+    expect(screen.getByTestId("guided-confirm-blocked")).toHaveTextContent("primero escuchá el fragmento");
+    // Motivo del tramo en lenguaje de revisor, no código interno.
+    expect(screen.getByText("La frase puede entrar antes o después de la voz")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /Escuchar fragmento/ }));
+    expect(screen.getByRole("button", { name: "Sí, está bien" })).toBeEnabled();
+    expect(screen.getByTestId("guided-confirm-blocked")).toHaveTextContent("respondé si la frase coincide");
+
+    await userEvent.click(screen.getByRole("button", { name: "Sí, está bien" }));
+    expect(screen.queryByTestId("guided-confirm-blocked")).toBeNull();
+    expect(screen.getByRole("button", { name: /confirmar tramo/i })).toBeEnabled();
   });
 
   it("permite repetir el tutorial desde Cómo funciona", async () => {
@@ -84,7 +110,7 @@ describe("GuidedTimingReview", () => {
 
     expect(screen.getByTestId("guided-timing-review")).toHaveTextContent("Encontramos 2 partes");
     expect(screen.getByText("Parte 1 de 2")).toBeInTheDocument();
-    expect(screen.getByText("El inicio o final puede estar corrido")).toBeInTheDocument();
+    expect(screen.getByText("La frase puede entrar antes o después de la voz")).toBeInTheDocument();
     expect(screen.getByText("Audio de la canción")).toBeInTheDocument();
     expect(screen.getByText("Los picos muestran dónde hay voz o sonido")).toBeInTheDocument();
     expect(screen.getAllByText("Primera frase")).toHaveLength(1);
@@ -116,11 +142,11 @@ describe("GuidedTimingReview", () => {
     await userEvent.click(screen.getByRole("button", { name: /mover 0,1 segundos antes/i }));
     expect(onMove).toHaveBeenCalledWith("line-1", 10.1, 12.3, { operation: "guided_nudge" });
 
-    await userEvent.click(screen.getByRole("button", { name: /confirmar y seguir/i }));
+    await userEvent.click(screen.getByRole("button", { name: /confirmar tramo/i }));
     expect(onStopPlayback).toHaveBeenCalled();
     expect(onConfirm).toHaveBeenCalledWith(WINDOWS[0]);
     expect(screen.getByText("Parte 2 de 2")).toBeInTheDocument();
-    expect(screen.getByText("Puede faltar o sobrar una frase")).toBeInTheDocument();
+    expect(screen.getByText("Puede faltar o sobrar una frase en este tramo")).toBeInTheDocument();
   });
 
   it("cancela un gesto interrumpido sin guardar el movimiento", async () => {
@@ -187,7 +213,7 @@ describe("GuidedTimingReview", () => {
 
     expect(screen.getByText(/fuera de la duración del audio/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /fuera de la duración del audio/i })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /confirmar y seguir/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /confirmar tramo/i })).toBeDisabled();
     expect(onPlayWindow).not.toHaveBeenCalled();
     expect(onConfirm).not.toHaveBeenCalled();
   });
@@ -196,7 +222,7 @@ describe("GuidedTimingReview", () => {
     const onRetryAudio = vi.fn();
     render(<GuidedTimingReview {...props({ audioAvailable: false, audioLoading: false, onRetryAudio })} />);
     expect(screen.getByRole("button", { name: /audio no disponible/i })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /confirmar y seguir/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /confirmar tramo/i })).toBeDisabled();
     await userEvent.click(screen.getByRole("button", { name: /reintentar audio/i }));
     expect(onRetryAudio).toHaveBeenCalledTimes(1);
   });
@@ -279,5 +305,53 @@ describe("GuidedTimingReview", () => {
 
     rerender(<GuidedTimingReview {...props({ confirmedIds: new Set(["chorus", "outro"]) })} />);
     expect(screen.getByTestId("guided-timing-complete")).toHaveTextContent("Sincronización revisada");
+  });
+
+  it("muestra asa y tiempo de inicio en cada frase antes de escuchar, y progreso por tramo", () => {
+    render(<GuidedTimingReview {...props()} />);
+    const chip = screen.getByTestId("guided-segment-line-1");
+    expect(chip).toHaveTextContent("0:10.2");
+    expect(chip).toHaveTextContent("Primera frase");
+    expect(chip.querySelector("svg")).toBeInTheDocument();
+    expect(screen.getByTestId("guided-progress-dots").querySelectorAll("li")).toHaveLength(2);
+    // Un solo escape secundario en el pie: la timeline avanzada vive en el panel de la frase.
+    expect(screen.queryByRole("button", { name: /timeline avanzada/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /revisar después/i })).toBeInTheDocument();
+  });
+
+  it("ajustar la frase cuenta como responder 'No, ajustar' y habilita confirmar", async () => {
+    const onMove = vi.fn();
+    const onOpenAdvanced = vi.fn();
+    render(<GuidedTimingReview {...props({ onMove, onOpenAdvanced })} />);
+    await userEvent.click(screen.getByRole("button", { name: /Escuchar fragmento/ }));
+    expect(screen.getByRole("button", { name: /confirmar tramo/i })).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: /mover 0,1 segundos después/i }));
+    expect(onMove).toHaveBeenCalledTimes(1);
+    const [id, start, end, meta] = onMove.mock.calls[0];
+    expect(id).toBe("line-1");
+    expect(start).toBeCloseTo(10.3, 5);
+    expect(end).toBeCloseTo(12.5, 5);
+    expect(meta).toEqual({ operation: "guided_nudge" });
+    expect(screen.getByRole("button", { name: /confirmar tramo/i })).toBeEnabled();
+    expect(screen.getByTestId("guided-confirm-coachmark")).toHaveTextContent("Cuando termines el ajuste");
+    await userEvent.click(screen.getByRole("button", { name: /timeline avanzada/i }));
+    expect(onOpenAdvanced).toHaveBeenCalled();
+  });
+
+  it("permite elegir entre varias frases del tramo", async () => {
+    render(<GuidedTimingReview {...props({
+      windows: [{ id: "w", start: 10, end: 16, reasons: ["timing"] }],
+      segments: [
+        { _id: "a", start: 10.2, end: 12.4, text: "Primera frase" },
+        { _id: "b", start: 12.6, end: 15.0, text: "Segunda frase" },
+      ],
+    })} />);
+    await userEvent.click(screen.getByRole("button", { name: /Escuchar fragmento/ }));
+    expect(screen.getByTestId("guided-phrase-panel")).toHaveTextContent("Frase 1 de 2");
+    await userEvent.click(screen.getByRole("button", { name: "Frase siguiente" }));
+    expect(screen.getByTestId("guided-phrase-panel")).toHaveTextContent("Frase 2 de 2");
+    expect(screen.getByTestId("guided-phrase-panel")).toHaveTextContent("0:12.6 → 0:15.0");
+    await userEvent.click(screen.getByTestId("guided-segment-a"));
+    expect(screen.getByTestId("guided-phrase-panel")).toHaveTextContent("Frase 1 de 2");
   });
 });

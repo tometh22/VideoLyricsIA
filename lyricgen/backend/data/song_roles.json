@@ -1,0 +1,1165 @@
+{
+ "schema": "song-role-registry-v1",
+ "entries": [
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "Luna Tucumana",
+   "artist": "Atahualpa Yupanqui",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "c5f60273c812"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "Carismático",
+   "artist": "Babasonicos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "f8113ff0ba0c"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "El Colmo",
+   "artist": "Babasonicos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "42ad7696d2a7"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": "a25338115d54f483aefea41276fb681ec6232f904e500983a35edbe2b96610ad",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "Estoy Rabioso",
+   "artist": "Babasonicos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "eb5ce54efb30"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "a650c2460eba"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "d9de7d52d0f94378f8ffdada1c92e7e2cf086bc4a054cfea17ff51cb8527c5a0",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "Flora y Fauno",
+   "artist": "Babasonicos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "34bbf1872ae4"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "0632f3678bb8"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "ca66d399871dc2067fb9a3176793429d8c7aee72666d84707fff5e670fd0dc03",
+   "needs_sha256": false,
+   "role": "val",
+   "title": "Pijamas",
+   "artist": "Babasonicos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "2771136f15ad"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "78f19d77bfb6"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=validation en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Yo Anuncio",
+   "artist": "Babasonicos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "fef30a2434d0"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Yo anuncio",
+   "artist": "Babasonicos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "bd0bab38f3aa"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "val",
+   "title": "El Viejo De Arriba (Live In Buenos Aires 2001)",
+   "artist": "Bersuit",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "be25dc55da34"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=validation en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "val",
+   "title": "La Argentinidad Al Palo",
+   "artist": "Bersuit",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "d0a1f8acf039"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=validation en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "Convalescencia En Valencia",
+   "artist": "Bersuit Vergarabat",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "2070a7d0f08a"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "La Bolsa (Live In Buenos Aires 2001)",
+   "artist": "Bersuit Vergarabat",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "d1814cf914f0"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": "b698f8994f2d955010d11ad55d7871f426ff2f96c977b5112e35fe83b7ec03ed",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "Que Pasó",
+   "artist": "Bersuit Vergarabat",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "fdb3a36d20b7"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "50b1fbd5a85d"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "4696b5c4e09c03b32f5d18e17fcbf1d75e0ffd46ce6f9e84692f8aad3dab87f9",
+   "needs_sha256": false,
+   "role": "eval_holdout",
+   "title": "Va Por Chapultepec",
+   "artist": "Bersuit Vergarabat",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "808d64aa5221"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "bbaeb55662dd"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Otra Vez En Vivo",
+   "artist": "COTI",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "a2893308c85e"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "ec5568d9a0ebce1ed1046de7e2aeb5b7d4ab53301bd00583e1578a94ae0735df",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "Entero O A Pedazos",
+   "artist": "Catupecu Machu",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "0e05f381a281"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "d30890207e6e"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "02844c7b062ba71f8f0a3fd3d665dd2bffa8fa8ff0103e2658b9cad57d524829",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "Perfectos Cromosomas",
+   "artist": "Catupecu Machu",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "8119212892a3"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "28807bdd224b"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "val",
+   "title": "Dias",
+   "artist": "Coti",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "b5ee8a4a3d38"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=validation en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Nada Fue Un Error",
+   "artist": "Coti",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "398e6c004fa6"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "3ad431fc534d6029d92f7fa716e88a2dc48e605ae27d2d2185f24fa9bb97c243",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "Tu Nombre",
+   "artist": "Coti Ft. Chano",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "8b79a73aa822"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "22d5257936fb"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Ortega Y Gases",
+   "artist": "Divididos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "44f1095c0753"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "5800d34bd298528a194d6a6c2648132f17a0189c19f9dd6038fac9183a6bbae2",
+   "needs_sha256": false,
+   "role": "eval_holdout",
+   "title": "Sisters",
+   "artist": "Divididos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "0470deaebd04"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "e5355356865b"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "val",
+   "title": "Dale Pascual",
+   "artist": "Enanitos Verdes",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "b20be28c4621"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=validation en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "Piel De Nopal",
+   "artist": "Enanitos Verdes",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "7a295254ab9d"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Parte Del Aire",
+   "artist": "Fito Paez y Spinetta",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "bc2485d619cb"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "0b48091d804a3a8f23fe88643847e3857da37d1cf7225db0c2a848154d885d46",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "Departamento Deshabitado",
+   "artist": "Intoxicados",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "eb820712f1ac"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "efcb24cd5235"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "2c332f31e04955b35bca4396f53dda31b0e1fbf9cdef06cd7bdf568de7413fee",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "La Hija Del Diablo",
+   "artist": "Intoxicados",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "b7a217f4e4a4"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "be81f46ece80"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "Rock Del Vuelo 20773",
+   "artist": "Intoxicados",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "5097fac65a89"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Rodando Por Ahi",
+   "artist": "Intoxicados",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "a9b4b62c3489"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "801d44eeecd6b8cdcb15c06889238c312ce806054a3fa194954f59ac44295ab1",
+   "needs_sha256": false,
+   "role": "eval_holdout",
+   "title": "Un Gran Camping",
+   "artist": "Intoxicados",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "3ac8c2b7b975"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "635c85d2f6d4"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": "10e9f4ef58b37f171b7f9cfac3eec98095e2be7ef4998d8a831943db32b7cff6",
+   "needs_sha256": false,
+   "role": "eval_holdout",
+   "title": "Viviendo Con Él",
+   "artist": "Intoxicados",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "c54adb6de148"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "Arte Infernal",
+   "artist": "La Renga",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "9ffe4c854c3b"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": "937e966c1a48754de0e5a911e501fef2aaaadd96a11521006ce405f0ec47018f",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "En el Baldío",
+   "artist": "La Renga",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "d228f1da80bd"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "7dcc3a8a09ac"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "a454557f1331e7c574b958cb73a5d1f4cd0d3d77b9d983ba5c63295c11d0c9f1",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "Panic Show",
+   "artist": "La Renga",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "f44edb310fb4"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "f631d0c1468b"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Triste Cancion de amor",
+   "artist": "La Renga",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "b7a9ae138f09"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "140f1931c35a7b9e89389c4be563ec045b9ccfe4fa016b67bce348c69fb5bb13",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "En La Fuente De La Unión",
+   "artist": "Los Abuelos De La Nada",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "cca79f9919a6"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "ec5bd53c1dbd"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "87469cc88879d616e06cf849266b1095b240ed87222345d124661d5bf0c592e1",
+   "needs_sha256": false,
+   "role": "val",
+   "title": "Ir A Más",
+   "artist": "Los Abuelos De La Nada",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "db23953660b0"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "c6a85b73ae24"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=validation en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "No Se Desesperen",
+   "artist": "Los Abuelos De La Nada",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "00a7189bc28c"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Hombre Lobo",
+   "artist": "Los Abuelos de la Nada",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "4af8c731051c"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "040ab6654083db5d8d740055324d6ff5647a63ae5d55a4ed8c233153306acab2",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "Me Enamoré De Una Zamba",
+   "artist": "Los Nocheros",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "2822253d32d4"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "7432c6494d35"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "0dd7558b790eb89416f2901884b77e550e703a1205854ade43991615e7e56be1",
+   "needs_sha256": false,
+   "role": "eval_holdout",
+   "title": "Eso Es Real (Live)",
+   "artist": "Los Pericos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "72ccd9f64daf"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "b22448a57eb4"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": "74f03bc9663adea24f06187686329a716e92c425a15fc5013fb51c642a332d6b",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "La Mirada",
+   "artist": "Los Pericos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "bf0f97b5b69b"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "cd4ab66650db"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "1d845cf2c3be35840d5f7b5597ccc058f89cfaa498672bf7d3f4446404ed7917",
+   "needs_sha256": false,
+   "role": "val",
+   "title": "Parate y Mira",
+   "artist": "Los Pericos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "6ce7471f2eee"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "1c2fc48a4786"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=validation en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "afe7a1f640b81ed0bf0261b2779d0fb630745c059074ffe51dd74acf6984f88b",
+   "needs_sha256": false,
+   "role": "eval_holdout",
+   "title": "Pupilas Lejanas",
+   "artist": "Los Pericos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "99b008285857"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "6bd2142c0f6d"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": "0deaaab9c75ec439e60af738ab32c0ed6f19a2a3ac5811b9bec17f2adf7ea89f",
+   "needs_sha256": false,
+   "role": "eval_holdout",
+   "title": "Runaway",
+   "artist": "Los Pericos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "ffa93697b8fb"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "ba06b8d3c0f1"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Torito",
+   "artist": "Los Pericos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "f0a15106c107"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "val",
+   "title": "Mi Resistencia",
+   "artist": "LosPericos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "83f95d0e2679"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=validation en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "Desde Que Tu Te Has Ido",
+   "artist": "Luciano Pereyra",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "29712b01a948"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": "aab567dc195810075623fcccefe45764b2f88d248b5545eab22132da13d45d82",
+   "needs_sha256": false,
+   "role": "eval_holdout",
+   "title": "Eres Perfecta",
+   "artist": "Luciano Pereyra",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "04a3a7530640"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "3d472bef6945"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "holdout del sprint 2026-09-03 (Rol 1)",
+   "history": []
+  },
+  {
+   "sha256": "420b420a47a612738e9f9918c99b44226dc565a98f03a21b31fdbc89c99e48a2",
+   "needs_sha256": false,
+   "role": "eval_holdout",
+   "title": "Te Estas Enamorando De Mi",
+   "artist": "Luciano Pereyra",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "ad2a155868e6"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "8ce07aa22528"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": "372e6a098f6cdf0e7485f07ee8b7fe19d8087e363cbd9b9bb502c60ad30a9670",
+   "needs_sha256": false,
+   "role": "eval_holdout",
+   "title": "Una Mujer Como Tu",
+   "artist": "Luciano Pereyra",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "195f117a2a2b"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "02bfe792438b"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "Alfonsina Y El Mar",
+   "artist": "Mercedes Sosa",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "c22e68b90847"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "Gracias A La Vida",
+   "artist": "Mercedes Sosa",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "b4ff9574d14c"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Sube sube sube",
+   "artist": "Mercedes Sosa",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "c040348b681c"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "TodoCambia",
+   "artist": "MercedesSosa",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "9b1332ebc3d7"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "475af0f7208db34c521a49bfd9f1244d8d338713e25168766c1038a3e8eb3bc8",
+   "needs_sha256": false,
+   "role": "eval_holdout",
+   "title": "Instant-Taneas",
+   "artist": "Paez y Spinetta",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "24a8c89b36b5"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "9ceed4d22a95"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Hacé Lo Que Quieras",
+   "artist": "Pericos",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "76e0700e91a4"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "La Foto de tu cuerpo",
+   "artist": "Rodrigo",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "2ed1d6124725"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "cb65b998b7070b238ecd498a02e8954291343f43f8f31d26903bcfef49b55140",
+   "needs_sha256": false,
+   "role": "val",
+   "title": "Chico De La Oculta",
+   "artist": "Viejas Locas",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "4731f1c1e630"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "2f3d9e44a5a1"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=validation en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "9250d62806991463f40aa073d4ef573882cfc469eb77fa3537e45d4f179a0450",
+   "needs_sha256": false,
+   "role": "val",
+   "title": "Damelo",
+   "artist": "Viejas Locas",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "9858aa88f108"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "7ec9bad02c0d"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=validation en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "a8df1475183897614d0f5ab9985ef982e7518742978e66f4f6ad10beff250088",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "Descansar En Paz",
+   "artist": "Viejas Locas",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "f4654cb485fc"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "0f3692932131"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Difícil De Entender",
+   "artist": "Viejas Locas",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "3ed05746d7b8"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "train",
+   "title": "Excusas",
+   "artist": "Viejas Locas",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "8f3a08ef5be2"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": "7984504d3bf1124b402fc294de033a6f598f885eb5ad4855f9b141ee33fa27f3",
+   "needs_sha256": false,
+   "role": "train",
+   "title": "Perra",
+   "artist": "Viejas Locas",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "962334f0a483"
+    },
+    {
+     "env": "staging_canary",
+     "job_id": "daea96cbd7f6"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "song_split=train en lora-v1-prep",
+   "history": []
+  },
+  {
+   "sha256": null,
+   "needs_sha256": true,
+   "role": "eval_holdout",
+   "title": "Psicodélica Mujer",
+   "artist": "Viejas Locas",
+   "known_job_ids": [
+    {
+     "env": "production_or_staging_gold",
+     "job_id": "1734a6cec812"
+    }
+   ],
+   "assigned_at": "2026-09-03",
+   "reason": "cohorte canónica / eval_only del LoRA v1",
+   "history": []
+  }
+ ]
+}

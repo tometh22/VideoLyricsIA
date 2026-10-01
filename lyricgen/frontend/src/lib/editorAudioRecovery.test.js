@@ -46,6 +46,23 @@ describe("editor source audio recovery", () => {
     expect(wait).not.toHaveBeenCalled();
   });
 
+  it("accepts additive preview metadata without changing the legacy URL contract", async () => {
+    const request = vi.fn().mockResolvedValue(response(200, {
+      url: "https://r2.example/original.wav",
+      expires_in: 3600,
+      source: "input",
+      preview_status: "pending",
+      preview_retry_after_seconds: 5,
+    }));
+    await expect(loadEditorAudio({ request })).resolves.toMatchObject({
+      ok: true,
+      url: "https://r2.example/original.wav",
+      source: "input",
+      previewStatus: "pending",
+      previewRetryAfterSeconds: 5,
+    });
+  });
+
   it("keeps 5xx/network failures retryable instead of converting them to a missing file", async () => {
     const request = vi.fn()
       .mockRejectedValueOnce(new Error("network"))
@@ -86,6 +103,22 @@ describe("editor source audio recovery", () => {
       ...previous,
       audioLoading: false,
       audioUnavailableReason: null,
+      audioRefreshAt: 31_000,
+    });
+  });
+
+  it("keeps the original source during a pending-preview poll", () => {
+    const previous = {
+      audioUrl: "https://r2.example/original.wav",
+      audioLoading: false,
+    };
+    expect(editorAudioFailureState(previous, {
+      reason: "preview_pending",
+      failureReason: "temporary",
+      now: () => 1_000,
+    })).toMatchObject({
+      audioUrl: previous.audioUrl,
+      audioLoading: false,
       audioRefreshAt: 31_000,
     });
   });

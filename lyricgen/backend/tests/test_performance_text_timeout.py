@@ -111,6 +111,45 @@ def test_each_performance_window_records_one_billable_call(monkeypatch):
     assert all("finish" in r for r in records)
 
 
+def test_each_performance_window_freezes_raw_provider_text(monkeypatch):
+    """Raw Gemini text survives even when the parser drops a stage label."""
+    import performance_text as pt
+    import pipeline
+    from recognition_provenance import begin_collection, end_collection
+
+    raw = "[00:01.0] línea válida\n[00:02.0] Público aplaudiendo"
+    monkeypatch.setattr(
+        pipeline, "_call_with_timeout",
+        lambda fn, timeout_s, label="": fn(),
+    )
+    genai, client = _fake_genai_and_client(raw)
+    y = np.zeros(16000 * 10, dtype="float32")
+    collector, token = begin_collection()
+    try:
+        out = pt._one_pass(
+            client, genai, y, sr=16000, dur=10.0, who="test",
+        )
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
+
+    assert out == [
+        (1.0, "línea válida", 0),
+        (2.0, "Público aplaudiendo", 0),
+    ]
+    assert snapshot["completed_attempt_count"] == 1
+    assert snapshot["hypotheses"] == [{
+        "attempt_id": 0,
+        "family": f"google/{pt.MODEL}",
+        "kind": "text",
+        "events": [{"text": raw}],
+        "view": "performance_audio_window",
+        "transformation": (
+            "performance_text_raw:window=0;start=0.000;end=10.000"
+        ),
+    }]
+
+
 def test_hung_chunk_times_out_and_counts_as_failure(monkeypatch):
     """Si pipeline._call_with_timeout dispara el timeout real (chunk
     colgado), _one_pass debe tratarlo como un fallo de ventana —no

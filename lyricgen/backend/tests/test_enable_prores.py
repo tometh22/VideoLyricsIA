@@ -6,7 +6,6 @@ inválidos. El transcoding en sí NO se ejecuta — el endpoint solo
 persiste umg_spec + encola; la transcodificación es del worker.
 """
 
-import os
 import uuid
 import pytest
 
@@ -14,8 +13,8 @@ import auth
 from database import Job as JobModel
 
 
-def _create_done_youtube_job(db, tenant_id="default", umg_spec=None):
-    """Insert a job in `done` state with delivery_profile=youtube.
+def _create_done_youtube_job(db, tenant_id="default", umg_spec=None, status="done"):
+    """Insert a completed job with delivery_profile=youtube.
 
     Modela el caso real: la compañera subió audio con el profile por
     defecto y el render terminó OK. El job tiene MP4 pero no umg_spec.
@@ -28,7 +27,7 @@ def _create_done_youtube_job(db, tenant_id="default", umg_spec=None):
         artist="Test Artist",
         song_title="Test Song",
         filename="test.mp3",
-        status="done",
+        status=status,
         delivery_profile="youtube",
         umg_spec=umg_spec,
         progress=100,
@@ -66,10 +65,11 @@ def test_admin_can_enable_prores_for_other_tenant(
     monkeypatch.setattr(auth, "PRORES_TENANTS", {"some-other-tenant"})
     job_id = _create_done_youtube_job(db, tenant_id="some-other-tenant")
 
+    calls = []
     with pytest.MonkeyPatch.context() as queue_patch:
         queue_patch.setattr(
             "main.enqueue_prores_prewarm",
-            lambda *_args, **_kwargs: "rq-test",
+            lambda *args, **kwargs: calls.append((args, kwargs)) or "rq-test",
         )
         res = client.post(
             f"/enable-prores/{job_id}",
@@ -86,6 +86,39 @@ def test_admin_can_enable_prores_for_other_tenant(
     fresh = db.query(JobModel).filter(JobModel.job_id == job_id).first()
     assert fresh.tenant_id == "some-other-tenant"
     assert fresh.umg_spec["frame_size"] == "HD"
+    assert calls
+    assert all(kwargs.get("force") is True for _args, kwargs in calls)
+
+
+def test_admin_can_enable_prores_while_render_waits_for_review(
+    monkeypatch, client, admin_token, db,
+):
+    """pending_review already has a completed MP4 and must support the same
+    legacy ProRes recovery as done jobs."""
+    monkeypatch.setattr(auth, "PRORES_TENANTS", set())
+    job_id = _create_done_youtube_job(
+        db, tenant_id="default", status="pending_review",
+    )
+    calls = []
+    monkeypatch.setattr(
+        "main.enqueue_prores_prewarm",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or "rq-test",
+    )
+
+    res = client.post(
+        f"/enable-prores/{job_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "umg_frame_size": "HD",
+            "umg_fps": "29.97",
+            "umg_prores_profile": "3",
+        },
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "queued"
+    assert [args[1] for args, _kwargs in calls] == ["umg_master", "umg_short"]
+    assert all(kwargs.get("force") is True for _args, kwargs in calls)
 
 
 def test_regular_user_cannot_enable_prores_for_other_tenant(
@@ -138,7 +171,7 @@ def test_enable_prores_400_when_job_not_done(monkeypatch, client, admin_token, d
         },
     )
     assert res.status_code == 400, f"expected 400, got {res.status_code}: {res.text[:200]}"
-    assert "done" in res.text.lower() or "processing" in res.text.lower()
+    assert "renderizar" in res.text.lower() or "processing" in res.text.lower()
 
 
 def test_enable_prores_400_invalid_params(monkeypatch, client, admin_token, db):
@@ -164,6 +197,9 @@ def test_enable_prores_happy_path_persists_umg_spec(monkeypatch, client, admin_t
     umg_spec queda persistido en la fila del job, response incluye
     el umg_spec parseado."""
     monkeypatch.setattr(auth, "PRORES_TENANTS", set())
+    monkeypatch.setattr(
+        "main.enqueue_prores_prewarm", lambda *_args, **_kwargs: "rq-test",
+    )
     job_id = _create_done_youtube_job(db, tenant_id="default")
 
     res = client.post(
@@ -211,6 +247,9 @@ def test_enable_prores_idempotent_overwrites_umg_spec(monkeypatch, client, admin
     en os.path.exists). Para el escenario MP4-only del producto (sin
     .mov previo), esto no aplica."""
     monkeypatch.setattr(auth, "PRORES_TENANTS", set())
+    monkeypatch.setattr(
+        "main.enqueue_prores_prewarm", lambda *_args, **_kwargs: "rq-test",
+    )
     job_id = _create_done_youtube_job(
         db, tenant_id="default",
         umg_spec={"frame_size": "1280x720", "fps": 24.0, "prores_profile": 2},

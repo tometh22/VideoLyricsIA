@@ -29,6 +29,29 @@ def test_pipeline_rejects_api_worker_policy_mismatch_before_work(monkeypatch):
     assert "configuration changed" in updates[-1]["error"]
 
 
+def test_lyric_anchor_rollout_is_part_of_api_worker_lockstep(monkeypatch):
+    monkeypatch.setenv("BACKGROUND_SMOKE_POLICY_MODE", "shadow")
+    monkeypatch.setenv("BG_LYRIC_ANCHORS", "off")
+    legacy = runtime_rollout_fingerprint()
+    assert legacy == "background-v5:shadow"
+
+    monkeypatch.setenv("BG_LYRIC_ANCHORS", "on")
+    assert runtime_rollout_fingerprint() == "background-v5:shadow:lyrics=on"
+
+    updates = []
+    monkeypatch.setattr(pipeline, "update_job", lambda *a, **kw: updates.append(kw))
+    pipeline.run_pipeline(
+        "anchorlockstepjob",
+        "missing.mp3",
+        "Artist",
+        "auto",
+        background_policy_fingerprint=legacy,
+    )
+
+    assert updates[-1]["status"] == "error"
+    assert "configuration changed" in updates[-1]["error"]
+
+
 def test_pipeline_enforce_rejects_legacy_job_without_lockstep_token(monkeypatch):
     updates = []
     monkeypatch.setenv("BACKGROUND_SMOKE_POLICY_MODE", "enforce")

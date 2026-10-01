@@ -69,6 +69,135 @@ def test_source_audio_url_returns_signed_url(client, admin_token, db, monkeypatc
     assert signed_calls[0][1]["response_content_type"] == "audio/mpeg"
 
 
+def test_source_audio_url_prefers_ready_content_addressed_preview(
+    client, admin_token, db, monkeypatch,
+):
+    """A ready preview is signed directly and the original is untouched."""
+    import storage
+
+    digest = "c" * 64
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _create_job(db, tenant_id, user_id)
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    row.input_audio_sha256 = digest
+    db.commit()
+    calls = []
+    probed = []
+
+    monkeypatch.setattr(
+        storage, "object_exists",
+        lambda key: probed.append(key) or True,
+    )
+    monkeypatch.setattr(
+        storage, "generate_signed_url",
+        lambda key, expiry_seconds=3600, **kwargs: calls.append((key, kwargs))
+        or f"https://r2.fake/{key}?sig=ok",
+    )
+
+    res = client.get(
+        f"/jobs/{job_id}/source-audio-url",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["source"] == "editor_preview"
+    assert body["preview_status"] == "ready"
+    assert calls[0][0] == storage.editor_audio_preview_key(digest)
+    assert calls[0][1]["response_content_type"] == "audio/mp4"
+    assert probed == [storage.editor_audio_preview_key(digest)]
+
+
+def test_source_audio_url_miss_falls_back_to_original_and_queues_once(
+    client, admin_token, db, monkeypatch,
+):
+    """A cold preview never blocks the editor or replaces the source key."""
+    import storage
+    import queue_jobs
+
+    digest = "d" * 64
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _create_job(db, tenant_id, user_id)
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    row.input_audio_sha256 = digest
+    db.commit()
+    queued = []
+
+    def fake_enqueue(*args):
+        queued.append(args)
+        return {"status": "queued", "deduplicated": False}
+
+    # Input exists, preview does not. The second call is still safe: the real
+    # enqueue helper's Redis lock dedupes it, while this endpoint test proves
+    # the non-blocking response and fallback contract.
+    monkeypatch.setattr(
+        storage, "object_exists",
+        lambda key: key == row.input_r2_key,
+    )
+    monkeypatch.setattr(queue_jobs, "enqueue_editor_audio_preview", fake_enqueue)
+    monkeypatch.setattr(
+        storage, "generate_signed_url",
+        lambda key, expiry_seconds=3600, **kwargs: f"https://r2.fake/{key}?sig=original",
+    )
+
+    res = client.get(
+        f"/jobs/{job_id}/source-audio-url",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["source"] == "input"
+    assert body["preview_status"] == "pending"
+    assert body["preview_pending"] is True
+    assert body["preview_retry_after_seconds"] == 5
+    assert queued and queued[0][0] == row.input_r2_key
+
+
+def test_source_audio_url_can_bypass_a_broken_preview_without_disabling_cache(
+    client, admin_token, db, monkeypatch,
+):
+    import storage
+
+    digest = "1" * 64
+    user_id, tenant_id = _admin_identity(db)
+    job_id = _create_job(db, tenant_id, user_id)
+    row = db.query(JobModel).filter(JobModel.job_id == job_id).one()
+    row.input_audio_sha256 = digest
+    db.commit()
+    signed = []
+    monkeypatch.setattr(storage, "object_exists", lambda key: True)
+    monkeypatch.setattr(
+        storage, "generate_signed_url",
+        lambda key, expiry_seconds=3600, **kwargs: signed.append(key)
+        or f"https://r2.fake/{key}?sig=original",
+    )
+
+    res = client.get(
+        f"/jobs/{job_id}/source-audio-url?prefer_original=1",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["source"] == "input"
+    assert signed == [row.input_r2_key]
+
+
+def test_source_audio_url_rejects_foreign_tenant_before_preview_probe(
+    client, user_token, db, monkeypatch,
+):
+    """A foreign user cannot use a known digest to probe/sign shared R2."""
+    import storage
+
+    admin_id, admin_tenant = _admin_identity(db)
+    job_id = _create_job(db, admin_tenant, admin_id)
+    probes = []
+    monkeypatch.setattr(storage, "object_exists", lambda key: probes.append(key) or True)
+    res = client.get(
+        f"/jobs/{job_id}/source-audio-url",
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert res.status_code == 404
+    assert probes == []
+
+
 def test_source_audio_url_404_when_no_input_key(client, admin_token, db, monkeypatch):
     """input_r2_key NULL (jobs viejos) → 404, no 500."""
     import storage

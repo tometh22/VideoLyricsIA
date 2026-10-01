@@ -24,10 +24,20 @@ MAX_BY_NUMBER = {
     "retry_count": 100,
     "media_error_code": 4,
     "status": 599,
+    "total": 10_000,
+    "seconds": 60,
+    "timing_count": 10_000,
+    "text_count": 10_000,
+    "vocalization_count": 10_000,
+    "impact_ms": 3_600_000,
 }
-SIGNED_NUMBERS = {"delta_ms"}
+SIGNED_NUMBERS = {"delta_ms", "proposed_delta_ms", "chosen_delta_ms", "distance_to_proposal_ms"}
 BOOLEANS = {"quality_acknowledged", "automatic_recovery_available"}
 ENUMS = {
+    "kind": {"generated", "shown", "examined", "active_seconds"},
+    "decision": {"accepted", "edited", "rejected", "applied", "manual_edit", "manual_override", "edited_after_accept"},
+    "suggestion_type": {"text", "timing", "vocalization", "unknown"},
+    "confidence": {"high", "medium", "low", "unknown"},
     "view": {"basic", "advanced"},
     "from": {"basic", "advanced"},
     "to": {"basic", "advanced"},
@@ -71,4 +81,8 @@ def valid_property(key: str, value) -> bool:
         return isinstance(value, str) and value in ENUMS[key]
     if key in SLUG_CATEGORIES:
         return isinstance(value, str) and bool(re.fullmatch(r"[a-z0-9_.:-]{1,40}", value))
+    if key in {"proposal_id", "window_id", "candidate_id", "event_id"}:
+        return isinstance(value, str) and bool(re.fullmatch(r"[a-zA-Z0-9_.:-]{1,128}", value))
+    if key == "pipeline_release":
+        return isinstance(value, str) and bool(re.fullmatch(r"[a-zA-Z0-9_.+-]{1,64}", value))
     return False

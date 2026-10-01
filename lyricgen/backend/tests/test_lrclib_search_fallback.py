@@ -12,6 +12,7 @@ Tests cubren:
 - Pick prefiere synced sobre plain-only
 - /search HTTP error / network failure → graceful None
 """
+import json
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -136,6 +137,69 @@ def test_search_handles_missing_artist_or_song():
     assert _try_lrclib_search("X", "") == []
 
 
+def test_short_title_does_not_select_a_different_song_by_the_same_artist():
+    """The staging Hoy upload picked LRCLIB's Hoy Es Adios despite a 40 s gap."""
+    from pipeline import _pick_best_lrclib_candidate
+
+    wrong_song = _candidate("Alejandro Lerner", "Hoy Es Adios", _id=28743290)
+    wrong_song["duration"] = 277.0
+    assert _pick_best_lrclib_candidate(
+        [wrong_song], "Alejandro Lerner", "Hoy", audio_duration=237.0,
+    ) is None
+
+
+def test_title_guard_allows_editions_but_keeps_distinct_title_words():
+    from pipeline import _lrclib_title_matches
+
+    assert _lrclib_title_matches(
+        "Noches Sin Sueño", "Noches Sin Sueno - Remastered 2011",
+    )
+    assert _lrclib_title_matches("Hoy", "Hoy (feat. Otra Artista)")
+    assert not _lrclib_title_matches("Hoy", "Hoy - Es Adios")
+    assert not _lrclib_title_matches("Cerca de ti", "Cerca de mi")
+
+
+def test_get_response_with_different_title_is_rejected():
+    from pipeline import _fetch_lrclib
+
+    wrong_song = _candidate("Alejandro Lerner", "Hoy Es Adios", _id=28743290)
+    wrong_song["duration"] = 277.0
+
+    def fake_get(url, **_kwargs):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = (
+            wrong_song if "/api/get" in url else []
+        )
+        return response
+
+    with patch("requests.get", side_effect=fake_get):
+        assert _fetch_lrclib(
+            "Alejandro Lerner", "Hoy", db=None, audio_duration=237.0,
+        ) is None
+
+
+def test_previously_cached_wrong_title_is_ignored():
+    """A deployed cache entry must not restore the rejected lyrics on retry."""
+    from pipeline import _fetch_lrclib
+
+    cached = {
+        "plain": "letra de otra canción",
+        "synced": "[00:10.00] letra de otra canción",
+        "duration": 277.0,
+        "source_record_id": 28743290,
+        "source_artist_name": "Alejandro Lerner",
+        "source_track_name": "Hoy Es Adios",
+    }
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value.lyrics = json.dumps(cached)
+    fake_get, _ = _mock_get_then_search(404, [])
+    with patch("requests.get", side_effect=fake_get):
+        assert _fetch_lrclib(
+            "Alejandro Lerner", "Hoy", db=db, audio_duration=237.0,
+        ) is None
+
+
 # ─── Network failure handling ───────────────────────────────────────
 
 def test_search_network_failure_returns_empty():
@@ -187,6 +251,8 @@ def test_get_success_skips_search_entirely():
                 "plainLyrics": "Línea uno\nLínea dos",
                 "syncedLyrics": "[00:10.00] Línea uno\n[00:14.00] Línea dos",
                 "duration": 120.0,
+                "trackName": "Song",
+                "artistName": "Test",
             }
             return resp
         if "/api/search" in url:

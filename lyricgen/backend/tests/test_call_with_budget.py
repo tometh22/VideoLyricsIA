@@ -64,6 +64,63 @@ def test_succeeds_on_first_try(monkeypatch):
     assert out == {"ok": True}
 
 
+def test_completed_output_is_frozen_before_forced_alignment_mapping(monkeypatch):
+    """Opaque/malformed rows survive even if a caller later rejects them."""
+    from recognition_provenance import begin_collection, end_collection
+
+    class OpaqueWordstamp:
+        def model_dump(self):
+            raise ValueError("malformed Replicate row")
+
+        def __str__(self):
+            return "opaque-replicate-wordstamp"
+
+    class UnprintableMetadata:
+        def model_dump(self):
+            raise ValueError("malformed Replicate metadata")
+
+        def __str__(self):
+            raise RuntimeError("SDK object cannot be stringified")
+
+    provider_output = {
+        "wordstamps": [
+            {"word": "hola", "start": 1.0, "end": 1.4},
+            OpaqueWordstamp(),
+        ],
+        "language": "es",
+        "metadata": UnprintableMetadata(),
+    }
+    monkeypatch.setattr("replicate.run", lambda *a, **kw: provider_output)
+
+    collector, token = begin_collection()
+    try:
+        out = forced_align._call_with_budget(
+            "cureau/force-align-wordstamps:exact-version",
+            lambda: {"x": 1},
+            total_budget_s=10,
+            backoff=[0],
+        )
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
+
+    assert out is provider_output
+    assert snapshot["completed_attempt_count"] == 1
+    hypothesis = snapshot["hypotheses"][0]
+    assert hypothesis["family"] == (
+        "cureau/force-align-wordstamps:exact-version"
+    )
+    assert hypothesis["kind"] == "forced_alignment"
+    frozen = hypothesis["events"][0]["provider_output"]
+    assert frozen["wordstamps"][0]["word"] == "hola"
+    assert frozen["wordstamps"][1] == {
+        "raw": "opaque-replicate-wordstamp",
+    }
+    assert frozen["metadata"] == {
+        "raw": "<opaque-provider-UnprintableMetadata>",
+    }
+
+
 def test_retries_then_succeeds(monkeypatch):
     """Transient flake on attempt 1 → sleep → retry succeeds. Mirrors
     cureau's intermittent `[1, 2, 0]` first-attempt error pattern."""

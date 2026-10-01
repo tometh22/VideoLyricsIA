@@ -151,7 +151,7 @@ def test_background_edit_with_current_segments_advances_job_and_document_togethe
             "base_revision": 5,
         },
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
 
     job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
     document = db.query(EditorDocument).filter(EditorDocument.job_id == job_id).first()
@@ -184,7 +184,7 @@ def test_lyrics_edit_also_keeps_job_and_document_in_sync(client, admin_token, db
             "base_revision": 2,
         },
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == 202, res.text
     job = db.query(JobModel).filter(JobModel.job_id == job_id).first()
     document = db.query(EditorDocument).filter(EditorDocument.job_id == job_id).first()
     assert job.segments_json == REAL_EDITED_LYRICS

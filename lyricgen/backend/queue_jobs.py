@@ -1,10 +1,12 @@
 """Redis-backed job queue.
 
-Replaces the fire-and-forget threading.Thread model with a durable queue that
-survives API restarts and bounds concurrency. Two queues by priority:
+Replaces the fire-and-forget threading.Thread model with durable queues that
+survive API restarts and bound concurrency. Render jobs use two queues by
+priority; editor audio previews use their own derivative-only queue:
 
     enterprise  -> UMG and any tenant with plan == "unlimited"
     default     -> everyone else
+    audio_preview -> bounded AAC derivatives for the editor
 
 Workers pick enterprise first. If Redis is unavailable AND we're not in
 production, the helpers fall back to threading.Thread so the dev loop still
@@ -17,7 +19,10 @@ import logging
 import os
 import hashlib
 import re
+import secrets
 import threading
+
+import storage
 
 logger = logging.getLogger("genly.queue")
 
@@ -195,6 +200,13 @@ _redis = None
 _queue_default = None
 _queue_enterprise = None
 
+EDITOR_AUDIO_PREVIEW_JOB_TIMEOUT = int(
+    os.environ.get("EDITOR_AUDIO_PREVIEW_JOB_TIMEOUT_SECONDS", "900")
+)
+EDITOR_AUDIO_PREVIEW_LOCK_TTL = max(EDITOR_AUDIO_PREVIEW_JOB_TIMEOUT + 300, 600)
+_editor_audio_preview_local_locks: dict[str, threading.Lock] = {}
+_editor_audio_preview_local_locks_guard = threading.Lock()
+
 
 def _init_redis():
     """Lazy-init Redis + RQ queues. Returns (redis, default_q, enterprise_q) or
@@ -287,6 +299,23 @@ def _pick_queue(plan: str, tenant_id: str = ""):
     return q_default
 
 
+def _pick_workload_queue(
+    workload_class: str,
+    *,
+    interactive_queue: str,
+    plan: str = "100",
+    tenant_id: str = "",
+):
+    """Server-owned batch routing; public payloads never select a queue."""
+    if workload_class != "batch":
+        return _pick_queue(plan, tenant_id=tenant_id)
+    _, q_default, _ = _init_redis()
+    if q_default is None:
+        return None
+    from rq import Queue
+    return Queue(interactive_queue, connection=q_default.connection)
+
+
 def _capture_job_failure(layer: str, job_id_db: str, type_, value) -> None:
     """Send a tagged Sentry event for a permanently-failed RQ job.
 
@@ -365,6 +394,11 @@ def transcription_failure_callback(job, connection, type_, value, traceback) -> 
         # the SIGKILL case where transcription_worker's in-process capture
         # never got the chance to run.
         _capture_job_failure("transcription", job_id_db, type_, value)
+        try:
+            from ops_metrics import increment
+            increment(f"{meta.get('workload_class') or 'interactive'}_transcription_failed")
+        except Exception:
+            pass
         is_abandoned = "AbandonedJobError" in (type_.__name__ if type_ else "")
         from error_taxonomy import public_error
         if is_abandoned:
@@ -468,6 +502,11 @@ def pipeline_failure_callback(job, connection, type_, value, traceback) -> None:
         # Surface to Sentry tagged with job/tenant — a permanently-dead
         # render is always incident-worthy, doubly so for a B2B tenant.
         _capture_job_failure("render_pipeline", job_id_db, type_, value)
+        try:
+            from ops_metrics import increment
+            increment(f"{meta.get('workload_class') or 'interactive'}_render_failed")
+        except Exception:
+            pass
         # Guardrail "nunca degradar": si el reintento automático no alcanzó a
         # generar el fondo real, NO dejamos el job en "error" crudo — lo
         # marcamos para que la UI muestre una tarjeta accionable (reintentar /
@@ -577,7 +616,10 @@ def cancel_rq_job(job_id: str) -> bool:
         # terminal state, and jobs.update_job's terminal-state guard would
         # silently discard the result (incident 2026-05-26).
         all_queues = [q_default, q_enterprise]
-        for extra_name in ("transcription", "transcription_quality", "bg_preview"):
+        for extra_name in (
+            "transcription", "transcription_batch", "transcription_quality",
+            "bg_preview", "batch_render", "campaign_control",
+        ):
             try:
                 all_queues.append(_Q(extra_name, connection=r))
             except Exception:
@@ -602,6 +644,32 @@ def cancel_rq_job(job_id: str) -> bool:
     except Exception as e:  # pragma: no cover
         logger.warning("RQ Job.delete failed for %s: %s", job_id, e)
     return True
+
+
+def rq_job_is_active(job_id: str) -> bool | None:
+    """True=RQ todavia lo sirve; False=ausente/terminal; None=desconocido.
+
+    El tercer estado es deliberado: un reaper nunca debe interpretar una
+    caida de Redis como evidencia de que un job desaparecio y matar trabajo
+    que simplemente sigue en cola.
+    """
+    if not job_id:
+        return False
+    connection, _, _ = _init_redis()
+    if connection is None:
+        return None
+    try:
+        from rq.job import Job as RQJob
+        from rq.exceptions import NoSuchJobError
+        existing = RQJob.fetch(job_id, connection=connection)
+        status = existing.get_status(refresh=True)
+        value = str(getattr(status, "value", status) or "").lower()
+        return value in {"queued", "started", "deferred", "scheduled"}
+    except NoSuchJobError:
+        return False
+    except Exception as exc:
+        logger.warning("RQ liveness check failed for %s: %s", job_id, exc)
+        return None
 
 
 def _evict_stale_rq_job(connection, rq_job_id: str) -> None:
@@ -655,6 +723,52 @@ def _active_rq_job(connection, rq_job_id: str):
     return None
 
 
+def _editor_audio_preview_lock_key(audio_sha256: str) -> str:
+    return (
+        "genly:lock:editor-audio-preview:"
+        f"{str(audio_sha256 or '').strip().lower()}:"
+        f"{storage.EDITOR_AUDIO_PREVIEW_FORMAT_VERSION}"
+    )
+
+
+def _acquire_editor_audio_preview_lock(
+    redis_connection, audio_sha256: str,
+) -> str | None:
+    """Acquire one cross-request lock for a digest/version pair."""
+    token = secrets.token_urlsafe(24)
+    if redis_connection is not None:
+        acquired = redis_connection.set(
+            _editor_audio_preview_lock_key(audio_sha256),
+            token,
+            nx=True,
+            ex=EDITOR_AUDIO_PREVIEW_LOCK_TTL,
+        )
+        return token if acquired else None
+    lock_id = _editor_audio_preview_lock_key(audio_sha256)
+    with _editor_audio_preview_local_locks_guard:
+        lock = _editor_audio_preview_local_locks.setdefault(lock_id, threading.Lock())
+    return token if lock.acquire(blocking=False) else None
+
+
+def release_editor_audio_preview_lock(audio_sha256: str, token: str) -> None:
+    """Release only the lock owned by this worker attempt."""
+    redis_connection, _, _ = _init_redis()
+    lock_key = _editor_audio_preview_lock_key(audio_sha256)
+    if redis_connection is not None:
+        # Compare-and-delete prevents a slow/expired worker from deleting a
+        # newer request's lock.
+        redis_connection.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('del', KEYS[1]) else return 0 end",
+            1, lock_key, token,
+        )
+        return
+    with _editor_audio_preview_local_locks_guard:
+        lock = _editor_audio_preview_local_locks.get(lock_key)
+    if lock and lock.locked():
+        lock.release()
+
+
 def _existing_rq_job(connection, rq_job_id: str):
     """Return an RQ record in any state, for outbox event idempotency."""
     try:
@@ -673,6 +787,7 @@ def enqueue_pipeline(
     tenant_id: str = "",
     publication_id: str | None = None,
     publication_dedupe_key: str | None = None,
+    workload_class: str = "interactive",
     **kwargs,
 ) -> str:
     """Enqueue a run_pipeline job. Returns RQ job id (or 'thread:<job_id>' in
@@ -688,7 +803,12 @@ def enqueue_pipeline(
     # execute a v2-produced job during the bounded cutover. Metadata is the
     # new source for v2 workers; the legacy argument remains for N-1.
     kwargs["background_policy_fingerprint"] = policy_fingerprint
-    q = _pick_queue(plan, tenant_id=tenant_id)
+    q = _pick_workload_queue(
+        workload_class,
+        interactive_queue="batch_render",
+        plan=plan,
+        tenant_id=tenant_id,
+    )
     if q is not None:
         from rq import Retry
         if publication_id:
@@ -741,11 +861,17 @@ def enqueue_pipeline(
             meta=rq_payload_metadata(
                 "pipeline", background_policy_fingerprint=policy_fingerprint,
                 db_job_id=job_id,
+                workload_class=workload_class,
                 outbox_event_id=publication_id,
             ),
             retry=retry,
             on_failure=pipeline_failure_callback,
         )
+        try:
+            from ops_metrics import increment
+            increment(f"{workload_class}_render_enqueued")
+        except Exception:
+            pass
         return rq_job.id
 
     # Redis-less path. In production this would silently bypass JOB_TIMEOUT,
@@ -794,8 +920,13 @@ def enqueue_transcription(
     live: bool = False,
     tenant_id: str = "",
     anchor_lyrics: str = "",
+    reference_required: bool = False,
     publication_id: str | None = None,
     publication_dedupe_key: str | None = None,
+    workload_class: str = "interactive",
+    pipeline_stage: str = "full",
+    parallel_audio_reference: bool = False,
+    catalog_reference: dict | None = None,
 ) -> str:
     """Enqueue una transcripción en la queue `transcription` (alta prioridad,
     drenada por el mismo worker container que enterprise/default).
@@ -811,13 +942,6 @@ def enqueue_transcription(
     aparte. Si en el futuro la cola se acumula y un tenant grande está
     bloqueado, mover la decisión de queue acá.
     """
-    # Tenants de un solo idioma (UMG Chile = siempre español) fijan el idioma
-    # acá para que WhisperX no lo auto-detecte mal y envenene la cache de
-    # transcripción con `en` (incidente 2026-08-12, Sebastián/UMG Chile).
-    # Aplica al path real del frontend (enqueue → ShortWorker).
-    from transcription_language import forced_language_for_tenant
-    language = forced_language_for_tenant(tenant_id, language)
-
     _require_submissions_open()
     _, q_default, _ = _init_redis()
     if q_default is not None:
@@ -825,11 +949,17 @@ def enqueue_transcription(
         # cambiar la inicialización (que no la incluye por compat con workers
         # existentes que no la conocen).
         from rq import Queue, Retry
-        q = Queue("transcription", connection=_redis)
+        queue_name = "transcription_batch" if workload_class == "batch" else "transcription"
+        q = Queue(queue_name, connection=_redis)
         transcription_kwargs = {
             "language": language, "artist": artist, "title": title,
             "filename": filename, "live": live,
             "anchor_lyrics": anchor_lyrics,
+            "reference_required": reference_required,
+            "workload_class": workload_class,
+            "pipeline_stage": pipeline_stage,
+            "parallel_audio_reference": parallel_audio_reference,
+        **({"catalog_reference": catalog_reference} if catalog_reference is not None else {}),
         }
         if publication_id:
             from transactional_outbox import run_outbox_transcription as target
@@ -870,6 +1000,7 @@ def enqueue_transcription(
             job_id=rq_job_id,
             meta=rq_payload_metadata(
                 "transcription", db_job_id=job_id,
+                workload_class=workload_class,
                 outbox_event_id=publication_id,
             ),
             retry=retry,
@@ -881,6 +1012,11 @@ def enqueue_transcription(
             # `transcription_failed` so the operator sees a real error.
             on_failure=transcription_failure_callback,
         )
+        try:
+            from ops_metrics import increment
+            increment(f"{workload_class}_transcription_enqueued")
+        except Exception:
+            pass
         return rq_job.id
 
     # Dev fallback (sin Redis): thread daemon, idéntico al de enqueue_pipeline.
@@ -896,6 +1032,11 @@ def enqueue_transcription(
         "language": language, "artist": artist, "title": title,
         "filename": filename, "live": live,
         "anchor_lyrics": anchor_lyrics,
+        "reference_required": reference_required,
+        "workload_class": workload_class,
+        "pipeline_stage": pipeline_stage,
+        "parallel_audio_reference": parallel_audio_reference,
+        **({"catalog_reference": catalog_reference} if catalog_reference is not None else {}),
     }
     if publication_id:
         from transactional_outbox import run_outbox_transcription as target
@@ -996,6 +1137,96 @@ def enqueue_bg_preview(
     )
     t.start()
     return f"thread:bgpreview:{job_id}"
+
+
+def enqueue_editor_audio_preview(
+    input_r2_key: str,
+    audio_sha256: str,
+    preview_r2_key: str,
+) -> dict:
+    """Queue one shared editor-audio preview, with concurrency dedupe.
+
+    The endpoint calls this only after authenticating the owning job and
+    probing the original object. No request thread runs ffmpeg. A Redis
+    SETNX lock closes the check-then-enqueue race; the deterministic RQ id
+    also protects against a duplicate enqueue if a request retries.
+    """
+    digest = str(audio_sha256 or "").strip().lower()
+    expected_key = storage.editor_audio_preview_key(digest)
+    if preview_r2_key != expected_key:
+        raise ValueError("preview_r2_key does not match audio_sha256")
+    redis_connection, q_default, _ = _init_redis()
+    if redis_connection is None:
+        # Unlike legacy development paths, this derivative never falls back
+        # to a thread in the API process: ffmpeg belongs exclusively to RQ
+        # workers. The caller will serve the original audio instead.
+        if _ENVIRONMENT in {"production", "prod", "staging"}:
+            raise RuntimeError("editor audio preview queue unavailable")
+        return {"status": "unavailable", "deduplicated": False}
+
+    lock_token = _acquire_editor_audio_preview_lock(redis_connection, digest)
+    rq_job_id = f"editor-audio-preview:{digest}:{storage.EDITOR_AUDIO_PREVIEW_FORMAT_VERSION}"
+    if lock_token is None:
+        return {"status": "pending", "deduplicated": True, "job_id": rq_job_id}
+
+    try:
+        if q_default is not None:
+            from rq import Queue, Retry
+            from audio_preview import run_editor_audio_preview_job
+
+            q = Queue("audio_preview", connection=redis_connection)
+            # An in-flight attempt remains the sole producer. Terminal
+            # records are intentionally retained: if ffmpeg/R2 is broken,
+            # repeated editor polling must not create an unbounded retry loop
+            # (the RQ Retry policy already handles transient worker failures).
+            existing = _existing_rq_job(redis_connection, rq_job_id)
+            if existing is not None:
+                status = existing.get_status(refresh=True)
+                value = str(getattr(status, "value", status) or "").lower()
+                if value in {"queued", "started", "deferred", "scheduled"}:
+                    release_editor_audio_preview_lock(digest, lock_token)
+                    return {
+                        "status": "pending", "deduplicated": True,
+                        "job_id": rq_job_id,
+                    }
+                if value in {
+                    "failed", "finished", "stopped", "canceled", "cancelled",
+                }:
+                    release_editor_audio_preview_lock(digest, lock_token)
+                    return {
+                        "status": "unavailable", "deduplicated": True,
+                        "job_id": rq_job_id,
+                    }
+            # A record with an unknown status is treated as unsafe to replace;
+            # do not risk duplicate work while Redis/RQ is in an ambiguous
+            # state. Missing records are the only enqueue-safe case.
+            if existing is not None:
+                release_editor_audio_preview_lock(digest, lock_token)
+                return {
+                    "status": "pending", "deduplicated": True,
+                    "job_id": rq_job_id,
+                }
+            rq_job = q.enqueue(
+                run_editor_audio_preview_job,
+                args=(input_r2_key, digest, preview_r2_key, lock_token),
+                job_timeout=EDITOR_AUDIO_PREVIEW_JOB_TIMEOUT,
+                result_ttl=RESULT_TTL,
+                failure_ttl=FAILURE_TTL,
+                job_id=rq_job_id,
+                meta=rq_payload_metadata(
+                    "editor_audio_preview", audio_sha256=digest,
+                ),
+                retry=Retry(max=2, interval=30),
+            )
+            return {
+                "status": "queued", "deduplicated": False,
+                "job_id": rq_job.id,
+            }
+
+        raise RuntimeError("editor audio preview queue unavailable")
+    except Exception:
+        release_editor_audio_preview_lock(digest, lock_token)
+        raise
 
 
 _AUDIO_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1437,6 +1668,8 @@ def enqueue_correction_learning(job_id: str, approved_version_id: str, *,
         expected_revision = int(document.revision or 0)
         expected_approved_hash = lyric_snapshot_hash(version.segments or [])
         expected_learning_epoch = int(document.job.quality_learning_epoch or 0)
+        expected_audio_sha256 = document.job.input_audio_sha256
+        expected_audio_revision = document.job.audio_revision
         # The browser-provided active_edit_ms remains telemetry only. Learning
         # gates consume exclusively contiguous server-side heartbeat evidence.
         server_active_edit_ms = derive_server_active_edit_ms(
@@ -1464,6 +1697,8 @@ def enqueue_correction_learning(job_id: str, approved_version_id: str, *,
             "expected_revision": expected_revision,
             "expected_approved_hash": expected_approved_hash,
             "expected_learning_epoch": expected_learning_epoch,
+            "expected_audio_sha256": expected_audio_sha256,
+            "expected_audio_revision": expected_audio_revision,
         },
         job_timeout=int(os.environ.get("QUALITY_LEARNING_JOB_TIMEOUT", "600")),
         result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL, job_id=rq_id,
@@ -1501,6 +1736,39 @@ def ensure_daily_quality_learning_scheduled() -> str | None:
         job_timeout=int(os.environ.get("QUALITY_LEARNING_MINING_TIMEOUT", "900")),
         result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL, job_id=rq_id,
         meta=rq_payload_metadata("quality_learning_daily"),
+    )
+    return queued.id
+
+
+def ensure_learning_triggers_scheduled() -> str | None:
+    """Wake the count-based research trigger reconciler periodically.
+
+    The reconciler is intentionally lightweight; it only counts immutable
+    approvals and schedules deterministic milestone jobs.  It does not run a
+    model or mutate a Job.  Capture hooks provide prompt scheduling, while
+    this wake-up covers approvals captured while Redis was unavailable.
+    """
+    if not transcription_quality_queue_enabled():
+        return None
+    _init_redis()
+    if _redis is None:
+        return None
+    from datetime import datetime, timedelta, timezone
+    from rq import Queue
+    from learning_triggers import run_learning_trigger_reconciler
+
+    interval_s = max(60, int(os.environ.get("LEARNING_TRIGGER_RECONCILE_SECONDS", "900")))
+    due = datetime.now(timezone.utc) + timedelta(seconds=interval_s)
+    bucket = int(due.timestamp()) // interval_s
+    rq_id = f"learning-trigger-reconciler:{bucket}"
+    active = _active_rq_job(_redis, rq_id)
+    if active is not None:
+        return active.id
+    _evict_stale_rq_job(_redis, rq_id)
+    queued = Queue("transcription_quality", connection=_redis).enqueue_in(
+        timedelta(seconds=interval_s), run_learning_trigger_reconciler,
+        job_timeout=120, result_ttl=RESULT_TTL, failure_ttl=FAILURE_TTL,
+        job_id=rq_id, meta=rq_payload_metadata("learning_trigger_reconciler"),
     )
     return queued.id
 
@@ -1589,11 +1857,35 @@ def enqueue_quality_proposal_validation(proposal_id: str,
     return queued.id
 
 
+def _live_prewarm_job(queue, rq_id: str):
+    """The RQ job for ``rq_id`` when it is still going to run (or is running).
+
+    Returns None when there is none, it finished/failed/was cancelled, or a
+    ``started`` entry is older than any transcode can take (a dead worker's
+    leftover), so a stuck entry can never block a retry.
+    """
+    try:
+        from rq.job import Job as RqJob
+        rq_job = RqJob.fetch(rq_id, connection=queue.connection)
+        status = rq_job.get_status(refresh=True)
+    except Exception:
+        return None
+    if status not in ("queued", "started", "scheduled", "deferred"):
+        return None
+    if status == "started" and rq_job.started_at is not None:
+        from datetime import datetime, timezone
+        started = rq_job.started_at if rq_job.started_at.tzinfo else rq_job.started_at.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - started).total_seconds() > PRORES_PREWARM_TIMEOUT + 120:
+            return None
+    return rq_job
+
+
 def enqueue_prores_prewarm(
     job_id: str,
     file_type: str,
     *,
     force: bool = False,
+    dedupe_live: bool = False,
 ) -> str | None:
     """Schedule the ProRes transcode for `job_id` on the enterprise queue.
 
@@ -1639,6 +1931,17 @@ def enqueue_prores_prewarm(
             depth, PRORES_PREWARM_MAX_QUEUE_DEPTH, job_id, file_type,
         )
         return None
+    if dedupe_live:
+        # An operator's click while the same transcode is already queued or
+        # running. RQ re-runs an existing id instead of ignoring it, so a second
+        # click used to start a second multi-GB transcode + upload of the same
+        # key. Only for click-driven callers: the edit pipeline relies on the
+        # re-run to refresh a master after a correction.
+        live = _live_prewarm_job(q_enterprise, f"prewarm:{job_id}:{file_type}")
+        if live is not None:
+            logger.info("[PRORES] prewarm already %s for %s/%s; not enqueuing a duplicate",
+                        live.get_status(), job_id, file_type)
+            return live.id
     rq_job = q_enterprise.enqueue(
         "prores.prewarm_prores",
         args=(job_id, file_type),
@@ -1654,6 +1957,64 @@ def enqueue_prores_prewarm(
         # for hygiene). If RQ is ever upgraded, re-verify this re-run
         # behavior or the post-edit re-warm silently stops firing.
         job_id=f"prewarm:{job_id}:{file_type}",
+    )
+    prewarm_enqueued_total += 1
+    return rq_job.id
+
+
+def enqueue_delivery_prores_prewarm(
+    job_id: str,
+    file_type: str,
+    tenant_id: str,
+    *,
+    frame_size: str | None = None,
+) -> str:
+    """Prepare ProRes from an immutable portal-delivery snapshot.
+
+    Staging and production publish into the same deliveries database, but
+    their ``jobs`` tables are intentionally separate.  The central portal
+    therefore cannot always load the originating Job row.  A Delivery still
+    has everything needed to materialise the derivative: tenant + job id
+    identify the deterministic R2 source keys, and legacy MP4-only campaign
+    renders are HD/24fps.  Enqueue the existing DB-independent transcode
+    primitive with that snapshot instead of requiring a local Job row.
+
+    This is only used for an explicit portal click, so it intentionally
+    bypasses the optional/background prewarm flag and queue-depth backpressure.
+    """
+    _require_submissions_open()
+    global prewarm_enqueued_total
+    if file_type not in ("umg_master", "umg_short"):
+        raise ValueError(f"Unsupported ProRes file type: {file_type!r}")
+
+    _, _, q_enterprise = _init_redis()
+    if q_enterprise is None:
+        raise RuntimeError("ProRes queue unavailable")
+
+    safe_tenant = storage._safe_filename(tenant_id)
+    safe_job_id = storage._safe_filename(job_id)
+    selected_frame_size = frame_size if frame_size in {
+        "HD", "UHD-4K", "DCI-2K", "DCI-4K",
+    } else "HD"
+    job_snapshot = {
+        "umg_spec": {
+            "frame_size": selected_frame_size,
+            "fps": 24.0,
+            "prores_profile": 3,
+        },
+        "s3_keys": {
+            "video": f"{safe_tenant}/{safe_job_id}/lyric_video.mp4",
+            "short": f"{safe_tenant}/{safe_job_id}/short.mp4",
+        },
+    }
+    rq_job = q_enterprise.enqueue(
+        "prores.ensure_prores_exists",
+        args=(job_id, file_type, job_snapshot, tenant_id),
+        job_timeout=PRORES_PREWARM_TIMEOUT,
+        result_ttl=RESULT_TTL,
+        failure_ttl=FAILURE_TTL,
+        meta=rq_payload_metadata("prores_prewarm"),
+        job_id=f"portal-prewarm:{job_id}:{file_type}",
     )
     prewarm_enqueued_total += 1
     return rq_job.id
@@ -1688,6 +2049,11 @@ def edit_failure_callback(job, connection, type_, value, traceback) -> None:
             return
         # Surface to Sentry tagged with job/tenant before the DB write.
         _capture_job_failure("edit", rq_job_id, type_, value)
+        try:
+            from ops_metrics import increment
+            increment(f"{meta.get('workload_class') or 'interactive'}_edit_failed")
+        except Exception:
+            pass
         # Guardrail "nunca degradar" (ver pipeline_failure_callback): un edit
         # cuyo fondo no se pudo generar no cae a "error" crudo — se marca para
         # la tarjeta accionable. El video anterior sigue intacto en R2.
@@ -1729,6 +2095,7 @@ def enqueue_edit(
     tenant_id: str = "",
     publication_id: str = "",
     publication_dedupe_key: str = "",
+    workload_class: str = "interactive",
 ) -> str:
     """Enqueue a run_edit_pipeline job (partial re-render).
 
@@ -1746,7 +2113,12 @@ def enqueue_edit(
     _require_submissions_open()
     from background_policy import runtime_rollout_fingerprint
     _policy_fingerprint = runtime_rollout_fingerprint()
-    q = _pick_queue(plan, tenant_id=tenant_id)
+    q = _pick_workload_queue(
+        workload_class,
+        interactive_queue="batch_render",
+        plan=plan,
+        tenant_id=tenant_id,
+    )
     if q is not None:
         from rq import Retry
         from pipeline import run_edit_pipeline
@@ -1805,12 +2177,18 @@ def enqueue_edit(
             meta=rq_payload_metadata(
                 "edit", background_policy_fingerprint=_policy_fingerprint,
                 domain_job_id=job_id,
+                workload_class=workload_class,
                 outbox_event_id=publication_id or None,
                 outbox_dedupe_key=publication_dedupe_key or None,
             ),
             retry=retry,
             on_failure=edit_failure_callback,
         )
+        try:
+            from ops_metrics import increment
+            increment(f"{workload_class}_edit_enqueued")
+        except Exception:
+            pass
         return rq_job.id
 
     if _ENVIRONMENT == "production":
@@ -1890,12 +2268,23 @@ def enqueue_drive_delivery(transfer_id: str, plan: str = "100") -> str:
 
 
 def queue_depth() -> dict:
-    """Return {'default': n, 'enterprise': n, 'backend': 'redis'|'threads'}."""
-    _, q_default, q_enterprise = _init_redis()
+    """Return queue depth split by latency-sensitive and batch workloads."""
+    redis, q_default, q_enterprise = _init_redis()
     if q_default is None:
-        return {"default": 0, "enterprise": 0, "backend": "threads"}
-    return {
+        return {
+            "default": 0, "enterprise": 0, "transcription": 0,
+            "bg_preview": 0, "transcription_batch": 0,
+            "batch_render": 0, "campaign_control": 0, "backend": "threads",
+        }
+    from rq import Queue
+    result = {
         "default": len(q_default),
         "enterprise": len(q_enterprise),
-        "backend": "redis",
     }
+    for name in (
+        "transcription", "bg_preview", "transcription_batch",
+        "batch_render", "campaign_control",
+    ):
+        result[name] = len(Queue(name, connection=redis))
+    result["backend"] = "redis"
+    return result

@@ -33,10 +33,12 @@ export function buildGenerationJob(a) {
     editorRevision: Number.isInteger(a.editorRevision) ? a.editorRevision : null,
     editorVersionId: a.editorVersionId || null,
     transcribeJobId: a.transcribeJobId || null,
+    campaignId: a.campaignId || null,
+    campaignItemId: a.campaignItemId || null,
     operatorMetrics: a.operatorMetrics || null,
     // The backend recomputes and validates this key; preserving it here only
     // avoids throwing away a completed preview between wizard steps.
-    bgCacheKey: a.bgCacheKey || null,
+    bgCacheKey: a.campaignId ? null : (a.bgCacheKey || null),
     status: "queued",
     current_step: null,
     progress: 0,

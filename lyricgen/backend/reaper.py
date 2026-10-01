@@ -106,6 +106,29 @@ _MULTIPART_SWEEP_INTERVAL_S = int(os.environ.get(
 ))
 _last_multipart_sweep_ts = 0.0
 
+# Delivery files are large (especially ProRes) but portal cleanup does not
+# need to run every five minutes. The sweep is still driven from this
+# single-runner reaper so multiple API replicas do not race on the same
+# external deliveries database or spam R2 with duplicate deletes.
+_DELIVERY_RETENTION_SWEEP_INTERVAL_S = int(os.environ.get(
+    "REAPER_DELIVERY_RETENTION_INTERVAL_S", str(24 * 3600),
+))
+_last_delivery_retention_sweep_ts = 0.0
+
+# Auditoría de integridad de las entregas del portal, en el mismo ritmo
+# diario y bajo el mismo runner único. Pregunta dos cosas que nadie miraba:
+# si el archivo que la fila promete existe en R2, y si el render cambió
+# después de publicarse. Las dos veces que fallaron (2026-09-15: 28 masters
+# fantasma en el portal de Chile, y una entrega sirviendo un corte anterior)
+# nos enteramos de casualidad, preguntando por otra cosa.
+_DELIVERY_AUDIT_INTERVAL_S = int(os.environ.get(
+    "REAPER_DELIVERY_AUDIT_INTERVAL_S", str(24 * 3600),
+))
+# Arranca "ya corrida": con 0.0 la auditoría salía en el primer ciclo de
+# CADA deploy, o sea ~1000 HEAD a R2 por cada release en vez de una vez al
+# día. El primer reporte llega al día siguiente, que es el ritmo que tiene.
+_last_delivery_audit_ts = time.time()
+
 # Edit-request abandon threshold. The worst case is a background edit
 # which re-runs Veo (~3 min p99) plus the full video composite (~5-8 min
 # for a 4-min song). 30 min gives 2-3× headroom over the slowest healthy
@@ -563,6 +586,13 @@ def _reason_for_transcription(job: Job) -> str:
     )
 
 
+def _transcription_rq_job_id(job: Job) -> str:
+    attempt_id = str(getattr(job, "active_transcription_attempt_id", "") or "")
+    if attempt_id:
+        return f"transcription:{attempt_id}"
+    return f"transcribe:{job.job_id}"
+
+
 def reap_stuck_transcription(db: Session, job: Job) -> None:
     """Flip a stuck transcription to `transcription_failed` and cancel its
     RQ entry. Caller commits.
@@ -570,9 +600,9 @@ def reap_stuck_transcription(db: Session, job: Job) -> None:
     Different reaping path from `reap_stuck_job` because:
       1. Status target is `transcription_failed` (editor's "Reintentar" CTA),
          not the generic `error` (post-render retry).
-      2. Transcription RQ ids are prefixed `transcribe:<job_id>` to avoid
-         collision with the render job sharing the same Postgres job_id;
-         cancel_rq_job is called with the prefixed form.
+      2. Transcription RQ ids use the active outbox attempt id (legacy jobs
+         fall back to `transcribe:<job_id>`), so cancellation targets the
+         exact durable publication instead of a stale/bare DB id.
     """
     # Race guard (audit 2026-05-26): the row read in find_stuck_transcriptions
     # had no lock; the worker may have finished between then and now.
@@ -594,13 +624,31 @@ def reap_stuck_transcription(db: Session, job: Job) -> None:
         )
         return
 
+    # Una fila queued vieja NO es un zombie si su RQ entry sigue queued,
+    # deferred o scheduled. Con olas grandes puede esperar mas de 120 min sin
+    # que ningun worker la haya tocado. Antes el reaper mataba esa cola sana.
+    # Ante Redis caido (None) tambien preservamos: ausencia de evidencia no es
+    # evidencia de muerte. `transcribing` conserva el heartbeat timeout de
+    # siempre porque ahi el worker ya tomo el job.
+    rq_job_id = _transcription_rq_job_id(locked)
+    if locked.status == "transcribing_queued":
+        try:
+            from queue_jobs import rq_job_is_active
+            rq_active = rq_job_is_active(rq_job_id)
+        except Exception:
+            rq_active = None
+        if rq_active is not False:
+            logger.info(
+                "reaper: preserve queued transcription %s — rq_active=%s",
+                locked.job_id, rq_active,
+            )
+            return
+
     rq_removed = False
     previous_status = locked.status  # capture before mutation for audit
     try:
         from queue_jobs import cancel_rq_job
-        # enqueue_transcription uses `transcribe:<job_id>` as the RQ id
-        # (queue_jobs.py:457). Cancelling the bare job_id would miss it.
-        rq_removed = cancel_rq_job(f"transcribe:{locked.job_id}")
+        rq_removed = cancel_rq_job(rq_job_id)
     except Exception as e:  # pragma: no cover
         logger.warning(
             "cancel_rq_job (transcription) failed for %s: %s", locked.job_id, e,
@@ -1049,11 +1097,17 @@ _REAPER_ADVISORY_LOCK_KEY = 9118364455199101
 
 # Queues that must ALWAYS have a live RQ consumer. With the Tier-3 segmented
 # fleet, Worker serves enterprise/default and ShortWorker serves
-# transcription/bg_preview — if any pool dies, its queues go unserved.
+# transcription/bg_preview/audio_preview — if any pool dies, its queues go
+# unserved.
 # Env-tunable so a future queue rename/split doesn't need a code change.
+_DEFAULT_EXPECTED_QUEUES = "transcription,bg_preview,audio_preview,enterprise,default"
+if os.environ.get("BATCH_CAMPAIGN_ENABLED", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}:
+    _DEFAULT_EXPECTED_QUEUES += ",transcription_batch,batch_render,campaign_control"
 _EXPECTED_QUEUES = [
     q.strip() for q in os.environ.get(
-        "EXPECTED_QUEUES", "transcription,bg_preview,enterprise,default"
+        "EXPECTED_QUEUES", _DEFAULT_EXPECTED_QUEUES,
     ).split(",") if q.strip()
 ]
 
@@ -1160,6 +1214,8 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
     # Keep a dedicated checked-out connection for the entire sweep instead.
     lock_connection = None
     got_lock = False
+    delivery_audit_due = False
+    sweep_completed = False
     try:
         # Try to take the advisory lock. pg_try_advisory_lock is non-
         # blocking; if another replica already has it, returns false
@@ -1230,6 +1286,28 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
                     logger.info("[REAPER] stale multipart sweep: %s", _rep)
             except Exception as e:
                 logger.warning("[REAPER] stale multipart sweep failed: %s", e)
+
+        # Protective retention inventory only: no row hiding or object
+        # deletion. DeliveriesSessionLocal may point at the real portal DB;
+        # destructive retention requires coordinated shared-domain ownership.
+        global _last_delivery_retention_sweep_ts
+        if time.time() - _last_delivery_retention_sweep_ts >= _DELIVERY_RETENTION_SWEEP_INTERVAL_S:
+            _last_delivery_retention_sweep_ts = time.time()
+            try:
+                from delivery_retention import cleanup_expired_deliveries
+                _rep = cleanup_expired_deliveries()
+                if _rep.get("expired") or _rep.get("deleted") or _rep.get("failed"):
+                    logger.info("[REAPER] delivery retention sweep: %s", _rep)
+            except Exception as e:
+                logger.warning("[REAPER] delivery retention sweep failed: %s", e)
+
+        # Decide scheduling while this replica owns the sweep, but do NOT
+        # perform network HEAD requests while its work transaction/lock
+        # connection remain open. The audit runs after cleanup in finally.
+        # Cadence is process-local, not a cross-environment singleton promise.
+        global _last_delivery_audit_ts
+        if time.time() - _last_delivery_audit_ts >= _DELIVERY_AUDIT_INTERVAL_S:
+            delivery_audit_due = True
 
         _n_tr = _n_up = _n_ed = 0
         for job in abandoned:
@@ -1304,6 +1382,7 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             db.rollback()
             logger.warning("[REAPER] review reminder sweep failed: %s", e)
         if not stuck and not orphans and not stalled:
+            sweep_completed = True
             return 0
         # reap_stuck_job returns False when its in-function race guard
         # (re-fetch + recheck status under FOR UPDATE) detects the worker
@@ -1326,6 +1405,7 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
         # care about "what got reaped this cycle", not which sweep flagged
         # it. de-dup above already guaranteed no overlap.
         stuck = stuck + orphans + stalled
+        sweep_completed = True
     finally:
         # Release through the exact dedicated connection that acquired the
         # session-level lock. Closing it is the final fail-safe.
@@ -1343,6 +1423,13 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             finally:
                 lock_connection.close()
         db.close()
+        if delivery_audit_due and sweep_completed:
+            _last_delivery_audit_ts = time.time()
+            try:
+                from delivery_integrity import audit_active_deliveries, log_audit
+                log_audit(audit_active_deliveries())
+            except Exception as exc:
+                logger.warning("[REAPER] delivery integrity audit failed: %s", type(exc).__name__)
 
     # Side-effect notifications happen AFTER the DB commit so a failed
     # email/Sentry call never rolls back a successful reap.

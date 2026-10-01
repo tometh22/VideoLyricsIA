@@ -148,8 +148,11 @@ def test_health_stalled_tick_degrades(monkeypatch):
     is silently stuck — degrade."""
     obs = _reload_observability()
     _stub_plenty_of_disk(monkeypatch)
-    # Simulate an old tick: monotonic value from 800 seconds ago
-    obs._REAPER_LAST_OK_TS = time.monotonic() - 800
+    # Simulate an old tick deterministically.  Earlier TestClient lifespans
+    # leave a real daemon reaper alive for part of the full suite; assigning
+    # the module timestamp directly lets that thread race this assertion and
+    # reset it to "just now".  Stub the public observation boundary instead.
+    monkeypatch.setattr(obs, "reaper_seconds_since_last_ok", lambda: 800.0)
     snap = obs.health_snapshot()
     reaper = snap.get("reaper")
     assert isinstance(reaper, dict)

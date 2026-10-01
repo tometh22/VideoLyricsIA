@@ -85,5 +85,6 @@ jobs:
           else
             python3 -m scripts.preflight.edit_smoke \
               --api-url "$EDIT_SMOKE_API_URL" \
-              --allow-quality-gate-block
+              --allow-quality-gate-block \
+              --require-delivery-qc
           fi

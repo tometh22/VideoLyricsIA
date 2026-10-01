@@ -58,8 +58,14 @@ export default function useInsights() {
         // Margen por tenant (consolidación 2026-06-11: vivía escondido en
         // Negocio→Costos; acá está con el resto de la vista por-tenant).
         // economics acepta days 7..90 — clamp inferior.
+        // El endpoint exige super-admin. Un 403 tiene que quedar
+        // DISTINGUIBLE de "todavía no cargó": el consumidor derivaba
+        // `loading` de `economics == null`, así que un admin sin permiso
+        // veía un esqueleto girando para siempre bajo el título "Margen
+        // por tenant". Un centinela lo convierte en "no te corresponde".
         targetNav.level === "app"
-          ? fetchJson(`${API}/admin/metrics/economics?days=${Math.max(targetDays, 7)}`).catch(() => null)
+          ? fetchJson(`${API}/admin/metrics/economics?days=${Math.max(targetDays, 7)}`)
+              .catch(() => ({ __forbidden: true }))
           : Promise.resolve(null),
         // Sesiones de wizard del usuario (profundidad 2026-06-11).
         targetNav.level === "user"

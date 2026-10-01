@@ -62,7 +62,7 @@ async function apiPost(path, body) {
  * `upload.onprogress` is the only browser-portable way to get a real
  * 0-100% bar during the PUT.
  */
-function putToR2WithProgress(url, blob, contentType, onProgress, signal) {
+export function putToR2WithProgress(url, blob, contentType, onProgress, signal) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", url, true);
@@ -97,7 +97,7 @@ function putToR2WithProgress(url, blob, contentType, onProgress, signal) {
 }
 
 /** Backoff helper for retrying a single multipart part. */
-async function withRetry(fn, { maxAttempts = 6, baseMs = 1000 } = {}) {
+export async function withRetry(fn, { maxAttempts = 6, baseMs = 1000 } = {}) {
   let lastErr;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {

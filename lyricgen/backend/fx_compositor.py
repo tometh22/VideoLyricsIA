@@ -950,6 +950,17 @@ def build_video_filter(*, ass_basename: str | None, font_dir: str, width: int,
     grade = grade_filter(style, custom_colors)
     fx = effect_path(effect)
 
+    # A selected effect must never collapse into the cheap no-effect branch.
+    # That used to happen when the worker image missed an asset: the job still
+    # rendered successfully, but the operator's visual choice disappeared.
+    # Keep the empty value as the explicit opt-out; every other value is a
+    # contract that must be backed by a bundled loop.
+    effect_name = str(effect or "").strip().lower()
+    if effect_name not in {"", "none"} and not fx:
+        raise RuntimeError(
+            f"effect '{effect_name}' was requested but its overlay asset is unavailable"
+        )
+
     if not fx:
         # No effect: keep the original cheap -vf path (optionally graded).
         steps = [s for s in (grade, subs) if s]

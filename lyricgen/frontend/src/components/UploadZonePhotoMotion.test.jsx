@@ -44,13 +44,13 @@ const audioEntry = () => ({
   songTitle: "Tema",
 });
 
-function Harness({ backgroundFile = jpg(), bgMode = "custom" }) {
+function Harness({ backgroundFile = jpg(), bgMode = "custom", reviewResume = false }) {
   const [animateImage, setAnimateImage] = useState(false);
   // `files` en estado a propósito: el fan-out de los batch defaults a cada
   // canción pasa por `onFiles`, y de ahí App lee `jobList[i].movementStyle` para
   // armar el FormData. Un `onFiles={() => {}}` descartaría justo el camino que
   // queremos probar.
-  const [files, setFiles] = useState([audioEntry()]);
+  const [files, setFiles] = useState(reviewResume ? [] : [audioEntry()]);
   return (
     <>
       <UploadZone
@@ -66,6 +66,7 @@ function Harness({ backgroundFile = jpg(), bgMode = "custom" }) {
         onStartReview={() => {}}
         onGenerateDirect={() => {}}
         onUploadAdvance={() => {}}
+        hasReviewableContent={reviewResume}
       />
       {/* Espejo de lo que viajaría al backend: `animate_image` sale del estado de
           App y `movement_style` del entry de la canción. Sin espiar el FormData. */}
@@ -107,6 +108,13 @@ afterEach(() => {
 });
 
 describe("foto subida: el eje de movimiento son 2 opciones reales", () => {
+  it("no deja vacío Movimiento al retomar /review sin un File de audio local", () => {
+    render(<Harness reviewResume />);
+    goStep(3);
+    openMovementSlot();
+    expect(cards()).toEqual(["quieta", "animar"]);
+  });
+
   it("muestra exactamente 'quieta' y 'animar', no las 6 tarjetas del eje de IA", () => {
     render(<Harness />);
     goStep(3);
@@ -131,6 +139,7 @@ describe("foto subida: el eje de movimiento son 2 opciones reales", () => {
     fireEvent.click(document.querySelector('[data-photo-motion="animar"]'));
     expect(checked()).toEqual(["animar"]);
     expect(JSON.parse(screen.getByTestId("wire").textContent).animateImage).toBe(true);
+    expect(document.querySelector('[data-testid="photo-motion-preview-pending"]')).not.toBeNull();
   });
 
   it("siempre hay UNA opción marcada (no cero, no dos)", () => {

@@ -22,6 +22,7 @@ custom_background_r2_key. Contratos pineados acá:
 """
 import io
 import uuid
+import pytest
 
 from database import Job as JobModel, User as UserModel
 
@@ -125,7 +126,7 @@ def test_custom_as_is_forwards_and_does_not_consume_slot(client, admin_token, db
             headers={"Authorization": f"Bearer {admin_token}"},
             json={"edit_type": "custom", "custom_background_r2_key": key},
         )
-        assert res.status_code == 200, res.text
+        assert res.status_code == 202, res.text
         assert len(captured) == 1
         cbg = captured[0]["edit_params"].get("custom_bg")
         assert cbg and cbg["bg_r2_key"] == key
@@ -154,7 +155,7 @@ def test_custom_animated_consumes_slot_and_runs_veo_step(client, admin_token, db
                 "animate_image": True,
             },
         )
-        assert res.status_code == 200, res.text
+        assert res.status_code == 202, res.text
         cbg = captured[0]["edit_params"].get("custom_bg")
         assert cbg["animate_image"] is True
         db.expire_all()
@@ -184,13 +185,14 @@ def test_multiscene_job_rejected(client, admin_token, db):
         _cleanup(db, job_ids=[job_id])
 
 
-def test_upload_endpoint_stores_and_returns_key(client, admin_token, db, monkeypatch):
+@pytest.mark.parametrize('status', ['pending_review', 'done', 'rejected'])
+def test_upload_endpoint_stores_and_returns_key(client, admin_token, db, monkeypatch, status):
     """POST /edit/{job}/custom-background sube a R2 y devuelve la key sin
     persistir bg_r2_key_cached (persist_cache=False), namespaceada bajo el
     tenant DEL JOB."""
     import main
     user_id, tenant_id = _admin_identity(db)
-    job_id = _create_pending_review_job(db, tenant_id, user_id)
+    job_id = _create_pending_review_job(db, tenant_id, user_id, status=status)
     expected_key = _valid_key(tenant_id, job_id, ext="png")
 
     seen = {}
@@ -216,9 +218,9 @@ def test_upload_endpoint_stores_and_returns_key(client, admin_token, db, monkeyp
         _cleanup(db, job_ids=[job_id])
 
 
-def test_upload_endpoint_rejects_non_pending_review(client, admin_token, db):
+def test_upload_endpoint_rejects_active_render(client, admin_token, db):
     user_id, tenant_id = _admin_identity(db)
-    job_id = _create_pending_review_job(db, tenant_id, user_id, status="done")
+    job_id = _create_pending_review_job(db, tenant_id, user_id, status="editing")
     try:
         res = client.post(
             f"/edit/{job_id}/custom-background",

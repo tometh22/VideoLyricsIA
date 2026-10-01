@@ -1,0 +1,1471 @@
+import hashlib
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from fastapi import HTTPException
+
+import batch_campaigns as batch
+from database import (
+    AIProvenance, AuditLog, BatchCampaign, BatchCampaignItem, BatchUploadSession,
+    EditorDocument, Job, JobOutboxEvent, ProductEvent, SessionLocal, User,
+)
+from editor import acquire_lock, release_lock
+from machine_evidence import build_machine_evidence, finalize_machine_evidence
+from reference_hypothesis import build as build_reference_hypothesis
+from reference_hypothesis import build_unavailable as build_unavailable_reference
+from transcription_quality import segments_hash
+
+
+@pytest.fixture(autouse=True)
+def clean_batch_campaign_rows():
+    """Campaign tests commit deliberately; keep their outbox rows isolated.
+
+    The full PostgreSQL suite shares one database for speed. Leaving the 50
+    feeder events from the window tests behind can fill the next outbox
+    reconciliation page and make an unrelated stale-consumer test wait for a
+    second cycle.
+    """
+    def clean():
+        session = SessionLocal()
+        try:
+            job_ids = [row[0] for row in session.query(Job.job_id).filter(
+                Job.workload_class == "batch",
+            ).all()]
+            if job_ids:
+                session.query(AIProvenance).filter(
+                    AIProvenance.job_id.in_(job_ids),
+                ).delete(synchronize_session=False)
+                session.query(ProductEvent).filter(
+                    ProductEvent.job_id.in_(job_ids),
+                ).delete(synchronize_session=False)
+                session.query(EditorDocument).filter(
+                    EditorDocument.job_id.in_(job_ids),
+                ).delete(synchronize_session=False)
+                session.query(JobOutboxEvent).filter(
+                    JobOutboxEvent.job_id.in_(job_ids),
+                ).delete(synchronize_session=False)
+            session.query(Job).filter(
+                Job.workload_class == "batch",
+            ).delete(synchronize_session=False)
+            session.query(BatchUploadSession).delete(synchronize_session=False)
+            session.query(AuditLog).filter(
+                AuditLog.action.in_((
+                    "batch.lyrics_and_timing_approved",
+                    "batch.lyrics_approval_reopened",
+                    "batch.reference_hypothesis_recovered",
+                )),
+            ).delete(synchronize_session=False)
+            session.query(BatchCampaignItem).delete(synchronize_session=False)
+            session.query(BatchCampaign).delete(synchronize_session=False)
+            session.commit()
+        finally:
+            session.close()
+
+    clean()
+    yield
+    clean()
+
+
+def _campaign(db, count=60):
+    user = db.query(User).first()
+    tenant = f"batch-test-{uuid.uuid4().hex[:8]}"
+    campaign = BatchCampaign(
+        id=uuid.uuid4().hex[:12], tenant_id=tenant, created_by=user.id,
+        name="Campaña Unicode ñ", status="active", expected_count=count,
+        default_render_params={"background_mode": "ai"},
+    )
+    db.add(campaign)
+    db.flush()
+    for ordinal in range(1, count + 1):
+        db.add(BatchCampaignItem(
+            id=str(uuid.uuid4()), campaign_id=campaign.id, tenant_id=tenant,
+            ordinal=ordinal, filename=f"Canción_{ordinal}_Artista_ARF{ordinal}.wav",
+            title=f"Canción {ordinal}", artist="Artista",
+            technical_code=f"ARF{ordinal}", size_bytes=1024,
+            duration_seconds=180, sha256=hashlib.sha256(str(ordinal).encode()).hexdigest(),
+            upload_state="uploaded", upload_key=f"campaign/{ordinal}.wav",
+            render_overrides={},
+        ))
+    db.commit()
+    return campaign
+
+
+def test_discard_is_audited_recoverable_and_excluded_from_pending(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter_by(campaign_id=campaign.id).one()
+    user = db.query(User).first()
+    actor = {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}
+    segments = [{"start": 0, "end": 1, "text": "borrador conservado"}]
+    job = Job(job_id=uuid.uuid4().hex[:12], user_id=user.id, tenant_id=campaign.tenant_id,
+              artist=item.artist, song_title=item.title, filename=item.filename,
+              campaign_id=campaign.id, campaign_item_id=item.id, workload_class="batch",
+              status="transcribed_pending", segments_json=segments)
+    db.add(job); db.commit()
+    batch.discard_campaign_item(campaign.id, item.id, batch.DiscardRequest(reason="Instrumental · pedido de Universal"), actor, db)
+    assert job.status == "discarded"
+    assert job.segments_json == segments
+    assert batch._queue_state("lyrics", job, None) == "discarded"
+    assert batch._summary(db, campaign)["counters"]["discarded"] == 1
+    args = dict(stage="lyrics", order="effort", state=None, version=None,
+                background_mode=None, artist=None, search=None, reviewed_by=None,
+                audit_preapproved=False, page=1, limit=1000, current_user=actor, db=db)
+    assert batch.review_queue(campaign.id, scope="pending", **args)["items"] == []
+    queue = batch.review_queue(campaign.id, scope="discarded", **args)
+    assert queue["campaign_totals"]["discarded"] == 1
+    assert queue["items"][0]["discard"]["reason"] == "Instrumental · pedido de Universal"
+    batch.restore_campaign_item(campaign.id, item.id, actor, db)
+    assert job.status == "transcribed_pending"
+    assert job.segments_json == segments
+    assert item.discard_record["restored_by"] == user.id
+    assert len(batch.review_queue(campaign.id, scope="pending", **args)["items"]) == 1
+    actions = {log.action for log in db.query(AuditLog).filter(AuditLog.action.in_(["batch.song_discarded", "batch.song_restored"])).all() if log.detail.get("job_id") == job.job_id}
+    assert actions == {"batch.song_discarded", "batch.song_restored"}
+    job.status = "rendering"; db.commit()
+    with pytest.raises(HTTPException) as error:
+        batch.discard_campaign_item(campaign.id, item.id, batch.DiscardRequest(reason="No se usa"), actor, db)
+    assert error.value.status_code == 409
+    db.rollback()
+    foreign = {"id": user.id, "tenant_id": "another-tenant", "role": "user"}
+    with pytest.raises(HTTPException):
+        batch.restore_campaign_item(campaign.id, item.id, foreign, db)
+
+
+def test_reconciler_respects_30_active_and_50_ready_windows(db):
+    campaign = _campaign(db, 60)
+    first = batch._promote_campaign(db, campaign)
+    assert len(first) == 30
+    assert db.query(Job).filter(
+        Job.campaign_id == campaign.id,
+        Job.status == "transcribing_queued",
+    ).count() == 30
+    assert batch._promote_campaign(db, campaign) == []
+
+    jobs = db.query(Job).filter(Job.campaign_id == campaign.id).all()
+    for job in jobs:
+        job.status = "transcribed_pending"
+    db.commit()
+    second = batch._promote_campaign(db, campaign)
+    assert len(second) == 20
+    assert db.query(Job).filter(Job.campaign_id == campaign.id).count() == 50
+    assert all(job.workload_class == "batch" for job in db.query(Job).filter(
+        Job.campaign_id == campaign.id,
+    ))
+
+
+def test_campaign_transcription_uses_auto_language_for_initial_and_retry(db):
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    item.title = "Sisters (Live)"
+    db.commit()
+
+    first = batch._batch_transcription_kwargs(campaign, item)
+    retry = batch._batch_transcription_kwargs(campaign, item)
+
+    assert first == retry
+    assert first["language"] == ""
+    assert first["live"] is True
+    assert first["reference_required"] is True
+
+
+def test_reconciler_reserves_ready_buffer_for_active_transcriptions(db):
+    campaign = _campaign(db, 80)
+    batch._promote_campaign(db, campaign)
+    jobs = db.query(Job).filter(Job.campaign_id == campaign.id).all()
+    for job in jobs[:25]:
+        job.status = "transcribed_pending"
+    db.commit()
+
+    # 25 ready + 5 still active already reserve 30 of the 50 ready slots,
+    # while the 30-active window has room for another 25.
+    promoted = batch._promote_campaign(db, campaign)
+    assert len(promoted) == 20
+    assert db.query(Job).filter(Job.campaign_id == campaign.id).count() == 50
+
+
+def test_campaign_can_explicitly_raise_ready_limit_for_300_stage1_rows(
+    db, monkeypatch,
+):
+    campaign = _campaign(db, 60)
+    campaign.default_render_params = {
+        "stage1_pipeline": {"lyrics_ready_limit": 60},
+    }
+    db.commit()
+    monkeypatch.setattr(batch, "TRANSCRIPTION_WINDOW", 60)
+
+    promoted = batch._promote_campaign(db, campaign)
+
+    assert len(promoted) == 60
+    assert batch.LYRICS_READY_LIMIT == 50
+
+
+def test_staged_campaign_prewarms_every_stem_before_releasing_asr(
+    db, monkeypatch,
+):
+    campaign = _campaign(db, 3)
+    campaign.default_render_params = {
+        "stage1_pipeline": {
+            "prewarm_separation": True,
+            "lyrics_ready_limit": 310,
+        },
+    }
+    db.commit()
+    monkeypatch.setattr(batch, "SEPARATION_WINDOW", 2)
+    monkeypatch.setattr(batch, "TRANSCRIPTION_WINDOW", 2)
+
+    first = batch._promote_campaign(db, campaign)
+    assert len(first) == 2
+    first_events = db.query(JobOutboxEvent).filter(
+        JobOutboxEvent.id.in_(first),
+    ).all()
+    assert {
+        event.payload["transcription_kwargs"]["pipeline_stage"]
+        for event in first_events
+    } == {"separation"}
+    assert db.query(Job).filter(
+        Job.campaign_id == campaign.id,
+        Job.status == "transcribing_queued",
+    ).count() == 0
+
+    for job in db.query(Job).filter(Job.campaign_id == campaign.id):
+        job.status = "separation_ready"
+    db.commit()
+    second = batch._promote_campaign(db, campaign)
+    assert len(second) == 1
+    last = db.query(Job).filter(
+        Job.campaign_id == campaign.id,
+        Job.status == "separation_queued",
+    ).one()
+    last.status = "separation_ready"
+    db.commit()
+
+    full = batch._promote_campaign(db, campaign)
+    assert len(full) == 2
+    full_events = db.query(JobOutboxEvent).filter(
+        JobOutboxEvent.id.in_(full),
+    ).all()
+    assert {
+        event.payload["transcription_kwargs"]["pipeline_stage"]
+        for event in full_events
+    } == {"full"}
+
+
+def test_staged_campaign_canary_limit_is_resumable_in_delivery_order(
+    db, monkeypatch,
+):
+    campaign = _campaign(db, 3)
+    campaign.default_render_params = {
+        "stage1_pipeline": {
+            "prewarm_separation": True,
+            "promotion_limit": 2,
+        },
+    }
+    db.commit()
+    monkeypatch.setattr(batch, "SEPARATION_WINDOW", 3)
+    monkeypatch.setattr(batch, "TRANSCRIPTION_WINDOW", 3)
+
+    first = batch._promote_campaign(db, campaign)
+    assert len(first) == 2
+    linked_ordinals = [row[0] for row in db.query(
+        BatchCampaignItem.ordinal,
+    ).join(Job, Job.campaign_item_id == BatchCampaignItem.id).filter(
+        Job.campaign_id == campaign.id,
+    ).order_by(BatchCampaignItem.ordinal).all()]
+    assert linked_ordinals == [1, 2]
+    assert db.query(Job).filter(Job.campaign_id == campaign.id).count() == 2
+    for job in db.query(Job).filter(Job.campaign_id == campaign.id):
+        job.status = "separation_ready"
+    db.commit()
+
+    canary_full = batch._promote_campaign(db, campaign)
+    assert len(canary_full) == 2
+    assert db.query(Job).filter(Job.campaign_id == campaign.id).count() == 2
+
+    campaign.default_render_params = {
+        "stage1_pipeline": {
+            "prewarm_separation": True,
+            "promotion_limit": 3,
+        },
+    }
+    db.commit()
+    resumed = batch._promote_campaign(db, campaign)
+    assert len(resumed) == 1
+    assert db.query(Job).filter(Job.campaign_id == campaign.id).count() == 3
+
+
+def test_failed_separation_is_red_but_does_not_block_other_asr(db, monkeypatch):
+    campaign = _campaign(db, 3)
+    campaign.default_render_params = {
+        "stage1_pipeline": {"prewarm_separation": True},
+    }
+    db.commit()
+    monkeypatch.setattr(batch, "SEPARATION_WINDOW", 3)
+
+    batch._promote_campaign(db, campaign)
+    jobs = db.query(Job).filter(Job.campaign_id == campaign.id).order_by(Job.id).all()
+    jobs[0].status = "transcription_failed"
+    jobs[1].status = "separation_ready"
+    jobs[2].status = "separation_ready"
+    db.commit()
+
+    released = batch._promote_campaign(db, campaign)
+
+    assert len(released) == 2
+    assert jobs[0].status == "transcription_failed"
+    assert batch._phase("uploaded", jobs[0].status) == "failed"
+
+
+def test_individual_failure_does_not_stop_the_campaign_wave(db):
+    campaign = _campaign(db, 31)
+    batch._promote_campaign(db, campaign)
+    failed = db.query(Job).filter(Job.campaign_id == campaign.id).first()
+    failed.status = "transcription_failed"
+    db.commit()
+
+    promoted = batch._promote_campaign(db, campaign)
+
+    assert len(promoted) == 1
+    assert db.query(Job).filter(Job.campaign_id == campaign.id).count() == 31
+    assert batch._queue_state("lyrics", failed, None) == "failed"
+
+
+def test_admin_lists_and_opens_campaigns_across_tenants(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    user = db.query(User).first()
+    admin = {"id": user.id, "tenant_id": "platform-admin", "role": "admin"}
+
+    listed = batch.list_campaigns(current_user=admin, db=db)
+
+    assert campaign.id in {row["id"] for row in listed["items"]}
+    assert batch.get_campaign(
+        campaign.id, current_user=admin, db=db,
+    )["id"] == campaign.id
+
+
+def test_non_admin_cannot_open_another_tenants_campaign(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    monkeypatch.setenv("BATCH_CAMPAIGN_SCOPES", "another-tenant")
+    campaign = _campaign(db, 1)
+    user = db.query(User).first()
+    other_tenant = {"id": user.id, "tenant_id": "another-tenant", "role": "user"}
+
+    with pytest.raises(HTTPException) as exc:
+        batch.get_campaign(campaign.id, current_user=other_tenant, db=db)
+
+    assert exc.value.status_code == 404
+
+
+def test_render_capacity_is_separate_and_bounded(db):
+    campaign = _campaign(db, 11)
+    items = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).order_by(BatchCampaignItem.ordinal).all()
+    user = db.query(User).first()
+    for index, item in enumerate(items):
+        db.add(Job(
+            job_id=uuid.uuid4().hex[:12], user_id=user.id,
+            tenant_id=campaign.tenant_id, artist=item.artist,
+            song_title=item.title, filename=item.filename,
+            status="transcribed_pending" if index == 0 else "queued",
+            workload_class="batch", campaign_id=campaign.id,
+            campaign_item_id=item.id,
+        ))
+    db.commit()
+    candidate = db.query(Job).filter(
+        Job.campaign_id == campaign.id,
+        Job.status == "transcribed_pending",
+    ).one()
+    candidate.status = "lyrics_approved"
+    candidate.segments_json = [{
+        "segment_id": "line-one", "start": 0, "end": 1, "text": "Hola",
+    }]
+    candidate.input_audio_sha256 = "a" * 64
+    candidate.audio_revision = 1
+    candidate.segments_revision = 0
+    candidate.transcription_quality = {
+        "reference_hypothesis": build_reference_hypothesis(
+            text="Hola", provider="gemini-2.5-flash-audio",
+            audio_sha256="a" * 64, audio_revision=1,
+            source_kind="gemini_complete_audio_derived",
+            complete_audio_verified=True,
+        ),
+        "pre_background_approval": {
+            "audio_sha256": "a" * 64, "audio_revision": 1,
+            "editor_revision": 0,
+            "segments_sha256": segments_hash(candidate.segments_json),
+            "lyrics_confirmed": True, "timings_confirmed": True,
+            "heard_against_audio": True,
+        },
+    }
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        batch.enforce_render_capacity(db, candidate)
+    assert exc.value.status_code == 429
+    assert exc.value.detail["code"] == "batch_render_window_full"
+
+
+def test_render_capacity_fails_closed_before_human_approval(db):
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+    )
+    db.add(job)
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        batch.enforce_render_capacity(db, job)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "reference_hypothesis_missing"
+
+
+def test_render_capacity_allows_batch_art_track_without_lyrics_approval(db):
+    """Art tracks use the shared capacity gate but never have lyric approval."""
+    campaign = _campaign(db, 1)
+    campaign.kind = "art_track"
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="queued", workload_class="batch", campaign_id=campaign.id,
+        campaign_item_id=item.id, render_params={"art_track": True},
+    )
+    db.add(job)
+    db.commit()
+
+    # No reference hypothesis, segments, or human lyric approval exists —
+    # capacity enforcement must still allow the art-track render to proceed.
+    batch.enforce_render_capacity(db, job)
+
+
+def test_render_capacity_reuses_the_current_final_review_slot(db, monkeypatch):
+    monkeypatch.setattr(batch, "FINAL_REVIEW_LIMIT", 2)
+    campaign = _campaign(db, 2)
+    items = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).order_by(BatchCampaignItem.ordinal).all()
+    user = db.query(User).first()
+    segments = [{"segment_id": "line-one", "start": 0, "end": 1, "text": "Hola"}]
+    audio_sha = "e" * 64
+    candidate = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=items[0].artist,
+        song_title=items[0].title, filename=items[0].filename,
+        status="pending_review", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=items[0].id,
+        segments_json=segments, segments_revision=3,
+        input_audio_sha256=audio_sha, audio_revision=1,
+        transcription_quality={
+            "reference_hypothesis": build_reference_hypothesis(
+                text="Hola", provider="lrclib", audio_sha256=audio_sha,
+                audio_revision=1, source_kind="catalogue_candidate_audio_verified",
+                complete_audio_verified=True,
+            ),
+            "pre_background_approval": {
+                "audio_sha256": audio_sha, "audio_revision": 1,
+                "editor_revision": 3,
+                "segments_sha256": segments_hash(segments),
+                "lyrics_confirmed": True, "timings_confirmed": True,
+                "heard_against_audio": True,
+            },
+        },
+    )
+    other = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=items[1].artist,
+        song_title=items[1].title, filename=items[1].filename,
+        status="pending_review", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=items[1].id,
+    )
+    db.add_all([candidate, other])
+    db.commit()
+
+    # Candidate + one other fills the two-slot buffer. Re-rendering the
+    # candidate replaces its own slot and must remain possible.
+    batch.enforce_render_capacity(db, candidate)
+
+
+@pytest.mark.parametrize("reference_available", [True, False])
+@pytest.mark.parametrize("admin_tenant", ["campaign", "platform-admin"])
+def test_human_approval_binds_every_line_audio_and_editor_revision(
+    db, monkeypatch, reference_available, admin_tenant,
+):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    segments = [
+        {"segment_id": "line-1", "start": 0, "end": 1, "text": "Hello"},
+        {"segment_id": "line-2", "start": 1, "end": 2, "text": "mundo"},
+    ]
+    audio_sha = "b" * 64
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+        segments_json=segments, segments_revision=0,
+        input_audio_sha256=audio_sha, input_audio_etag=audio_sha,
+        audio_revision=1,
+        transcription_quality={
+            "reference_hypothesis": (
+                build_reference_hypothesis(
+                text="Hello\nmundo", provider="lrclib",
+                audio_sha256=audio_sha, audio_revision=1,
+                source_kind="catalogue_candidate_audio_verified",
+                complete_audio_verified=True,
+                ) if reference_available else build_unavailable_reference(
+                    audio_sha256=audio_sha, audio_revision=1,
+                )
+            ),
+            **({} if reference_available else {
+                "reference_hypothesis_unavailable": True,
+                "manual_full_review_required": True,
+            }),
+        },
+    )
+    db.add(job)
+    db.add(EditorDocument(
+        job_id=job.job_id, tenant_id=campaign.tenant_id,
+        current_segments=segments, original_segments=segments, revision=0,
+    ))
+    db.commit()
+    response = batch.approve_campaign_lyrics(
+        campaign.id,
+        job.job_id,
+        batch.LyricsApprovalRequest(
+            editor_revision=0,
+            confirmed_line_ids=["line-1", "line-2"],
+            lyrics_confirmed=True,
+            timings_confirmed=True,
+            heard_against_audio=True,
+        ),
+        {
+            "id": user.id,
+            "tenant_id": campaign.tenant_id
+            if admin_tenant == "campaign" else admin_tenant,
+            "role": "admin",
+        },
+        db,
+    )
+    assert response["status"] == "lyrics_approved"
+    db.refresh(job)
+    approval = batch.require_prebackground_approval(job)
+    assert approval["confirmed_line_count"] == 2
+    assert approval["review_scope"] == "song"
+    assert job.transcription_quality["reference_hypothesis"]["review_status"] == "human_line_review_approved"
+    capture = db.query(JobOutboxEvent).filter_by(job_id=job.job_id, event_type='correction.enqueue').one()
+    assert capture.payload['approved_version_id'] == response['approved_version_id']
+    assert capture.payload['audio_sha256'] == audio_sha
+    from transactional_outbox import _publish
+    calls = []
+    monkeypatch.setattr('queue_jobs.enqueue_correction_learning',
+        lambda *args, **kwargs: calls.append((args, kwargs)) or 'fixture-capture')
+    assert _publish(capture) == 'fixture-capture'
+    assert calls[0][1]['source_confidence'] == 'operational_review'
+    from correction_learning import create_observation
+    observation = create_observation(db, job.job_id, response['approved_version_id'], source_confidence='operational_review')
+    repeated = create_observation(db, job.job_id, response['approved_version_id'], source_confidence='operational_review')
+    assert observation.id == repeated.id
+    assert observation.label_tier == 'observed'
+    assert observation.metrics['operational_history']['approved_version_id'] == response['approved_version_id']
+
+    # Reopening/unchanged autosave preserves approval; an actual edit returns
+    # this pre-render song to the queue and permits a new explicit approval.
+    from editor import save_document
+    from database import EditorVersion
+    document = db.query(EditorDocument).filter_by(job_id=job.job_id).one()
+    approved_revision = document.revision
+    document, _, applied = save_document(
+        db, job, document, user.id, document.revision,
+        list(document.current_segments), "draft",
+    )
+    assert not applied
+    assert job.status == "lyrics_approved"
+    assert batch.require_prebackground_approval(job) == approval
+    changed = [dict(line) for line in document.current_segments]
+    changed[0]["end"] = 0.9
+    document, _, applied = save_document(
+        db, job, document, user.id, document.revision, changed, "draft",
+    )
+    db.commit()
+    assert applied and document.revision == approved_revision + 1
+    assert job.status == "transcribed_pending"
+    assert job.approved_at is None and job.approved_by is None
+    assert batch._queue_state("lyrics", job, document) == "ready"
+    with pytest.raises(HTTPException) as missing:
+        batch.require_prebackground_approval(job)
+    assert missing.value.detail["code"] == "lyrics_and_timing_approval_missing"
+    event = db.query(AuditLog).filter_by(action="batch.lyrics_approval_reopened").one()
+    assert event.detail["previous_approval"] == approval
+    assert db.query(EditorVersion).filter_by(id=response["approved_version_id"]).one().is_approved
+    renewed = batch.approve_campaign_lyrics(
+        campaign.id, job.job_id,
+        batch.LyricsApprovalRequest(editor_revision=document.revision,
+            confirmed_line_ids=["line-1", "line-2"], lyrics_confirmed=True,
+            timings_confirmed=True, heard_against_audio=True),
+        {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}, db,
+    )
+    assert renewed["status"] == "lyrics_approved"
+    assert renewed["approved_version_id"] != response["approved_version_id"]
+    assert batch.require_prebackground_approval(job)["editor_revision"] == approved_revision + 1
+
+
+def test_human_approval_accepts_ordered_ids_for_legacy_document(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    segments = [
+        {"start": 0, "end": 1, "text": "Hello"},
+        {"start": 1, "end": 2, "text": "mundo"},
+    ]
+    audio_sha = "c" * 64
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+        segments_json=segments, segments_revision=0,
+        input_audio_sha256=audio_sha, input_audio_etag=audio_sha,
+        audio_revision=1,
+        transcription_quality={
+            "reference_hypothesis": build_unavailable_reference(
+                audio_sha256=audio_sha, audio_revision=1,
+            ),
+            "reference_hypothesis_unavailable": True,
+            "manual_full_review_required": True,
+        },
+    )
+    db.add(job)
+    db.add(EditorDocument(
+        job_id=job.job_id, tenant_id=campaign.tenant_id,
+        current_segments=segments, original_segments=segments, revision=0,
+    ))
+    db.commit()
+
+    response = batch.approve_campaign_lyrics(
+        campaign.id,
+        job.job_id,
+        batch.LyricsApprovalRequest(
+            editor_revision=0,
+            confirmed_line_ids=["index:0", "index:1"],
+            lyrics_confirmed=True,
+            timings_confirmed=True,
+            heard_against_audio=True,
+        ),
+        {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"},
+        db,
+    )
+
+    assert response["status"] == "lyrics_approved"
+    assert batch.require_prebackground_approval(job)["confirmed_line_count"] == 2
+
+
+def test_human_approval_recovers_missing_reference_from_machine_evidence(
+    db, monkeypatch,
+):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    segments = [
+        {"segment_id": "line-1", "start": 0, "end": 1, "text": "Hola"},
+        {"segment_id": "line-2", "start": 1, "end": 2, "text": "mundo"},
+    ]
+    audio_sha = "9" * 64
+    quality = {
+        "pipeline_release": "historical-release",
+        "pipeline_config_fingerprint": "historical-config",
+        "reference_attestation": {"text_status": "audio_attested"},
+    }
+    captured = build_machine_evidence({
+        "segments": segments,
+        "_recognition_attempt_count": 1,
+        "_recognition_hypotheses": [{
+            "family": "google/gemini-2.5-flash-audio",
+            "kind": "text",
+            "events": [{"text": "Hola\nmundo"}],
+            "attempt_id": 0,
+            "view": "full_audio_with_reference",
+            "transformation": "gemini_cleanup_raw",
+        }],
+    })
+    evidence = finalize_machine_evidence(
+        captured,
+        original_segments=segments,
+        quality=quality,
+        audio_sha256=audio_sha,
+        audio_revision=1,
+    )
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+        segments_json=segments, segments_revision=0,
+        input_audio_sha256=audio_sha, input_audio_etag=audio_sha,
+        audio_revision=1, transcription_quality=quality,
+        machine_snapshot_required=True,
+    )
+    document = EditorDocument(
+        job_id=job.job_id, tenant_id=campaign.tenant_id,
+        current_segments=segments, original_segments=segments, revision=0,
+        machine_evidence=evidence,
+    )
+    db.add_all([job, document])
+    db.commit()
+
+    response = batch.approve_campaign_lyrics(
+        campaign.id,
+        job.job_id,
+        batch.LyricsApprovalRequest(
+            editor_revision=0,
+            confirmed_line_ids=["line-1", "line-2"],
+            lyrics_confirmed=True,
+            timings_confirmed=True,
+            heard_against_audio=True,
+        ),
+        {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"},
+        db,
+    )
+
+    assert response["status"] == "lyrics_approved"
+    db.refresh(job)
+    recovered = job.transcription_quality["reference_hypothesis"]
+    assert recovered["reference_text"] == "Hola\nmundo"
+    assert recovered["review_status"] == "human_line_review_approved"
+    repair = db.query(AuditLog).filter_by(
+        action="batch.reference_hypothesis_recovered",
+    ).one()
+    assert repair.detail["job_id"] == job.job_id
+    assert repair.detail["source"] == "editor_document.machine_evidence"
+
+
+def test_post_render_reapproval_restores_gate_without_hiding_video_from_review(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    segments = [
+        {"segment_id": "line-1", "start": 0, "end": 1, "text": "Hola"},
+        {"segment_id": "line-2", "start": 1, "end": 2, "text": "mundo"},
+    ]
+    audio_sha = "d" * 64
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="pending_review", current_step="thumbnail",
+        workload_class="batch", campaign_id=campaign.id,
+        campaign_item_id=item.id, segments_json=segments,
+        segments_revision=7, input_audio_sha256=audio_sha,
+        input_audio_etag=audio_sha, audio_revision=1,
+        video_url="/download/video", bg_r2_key_cached="background.mp4",
+        transcription_quality={
+            "reference_hypothesis": build_reference_hypothesis(
+                text="Hola\nmundo", provider="lrclib",
+                audio_sha256=audio_sha, audio_revision=1,
+                source_kind="catalogue_candidate_audio_verified",
+                complete_audio_verified=True,
+            ),
+        },
+    )
+    db.add(job)
+    db.add(EditorDocument(
+        job_id=job.job_id, tenant_id=campaign.tenant_id,
+        current_segments=segments, original_segments=segments, revision=7,
+    ))
+    db.commit()
+
+    response = batch.approve_campaign_lyrics(
+        campaign.id, job.job_id,
+        batch.LyricsApprovalRequest(
+            editor_revision=7,
+            confirmed_line_ids=["line-1", "line-2"],
+            lyrics_confirmed=True, timings_confirmed=True,
+            heard_against_audio=True,
+        ),
+        {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"},
+        db,
+    )
+
+    db.refresh(job)
+    assert response["status"] == "pending_review"
+    assert job.status == "pending_review"
+    assert job.current_step == "thumbnail"
+    assert batch.require_prebackground_approval(job)["editor_revision"] == 7
+    event = db.query(AuditLog).filter_by(
+        action="batch.lyrics_and_timing_approved",
+    ).order_by(AuditLog.id.desc()).first()
+    assert event.detail["post_render_reapproval"] is True
+    assert event.detail["preserved_status"] == "pending_review"
+
+
+def test_platform_admin_can_skip_to_next_job_in_foreign_tenant(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 2)
+    items = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).order_by(BatchCampaignItem.ordinal).all()
+    for item in items:
+        db.add(Job(
+            job_id=uuid.uuid4().hex[:12],
+            user_id=campaign.created_by,
+            tenant_id=campaign.tenant_id,
+            artist=item.artist,
+            song_title=item.title,
+            filename=item.filename,
+            status="transcribed_pending",
+            current_step="editing",
+            progress=100,
+            workload_class="batch",
+            campaign_id=campaign.id,
+            campaign_item_id=item.id,
+            segments_json=[{
+                "segment_id": f"line-{item.ordinal}",
+                "start": 0,
+                "end": 1,
+                "text": f"línea {item.ordinal}",
+            }],
+        ))
+    db.commit()
+    actor = {
+        "id": campaign.created_by,
+        "tenant_id": "platform-admin",
+        "role": "admin",
+    }
+    first = batch.claim_next_review(
+        campaign.id, None, "platform_admin_session", actor, db,
+    )
+    second = batch.claim_next_review(
+        campaign.id, first["job_id"], "platform_admin_session", actor, db,
+    )
+    assert first["job_id"]
+    assert second["job_id"]
+    assert second["job_id"] != first["job_id"]
+
+
+def test_review_queue_uses_blind_v2_semaforo_order_and_learning_sample(
+    db, monkeypatch,
+):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 3)
+    items = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).order_by(BatchCampaignItem.ordinal).all()
+    items[1].title = "Canción 2 (Live)"
+    items[0].render_overrides = {
+        "review_reference_links": [
+            {"kind": "official_channel", "url": "https://youtube.com/watch?v=ok"},
+            {"kind": "licensed_musixmatch", "url": "https://lyricstranslate.com/bad"},
+            {"kind": "fan_site", "url": "javascript:alert(1)"},
+        ],
+    }
+    user = db.query(User).first()
+    jobs = []
+    for item in items:
+        audio_sha256 = hashlib.sha256(item.id.encode()).hexdigest()
+        job = Job(
+            job_id=uuid.uuid4().hex[:12], user_id=user.id,
+            tenant_id=campaign.tenant_id, artist=item.artist,
+            song_title=item.title, filename=item.filename,
+            status="transcribed_pending", workload_class="batch",
+            campaign_id=campaign.id, campaign_item_id=item.id,
+            input_audio_sha256=audio_sha256, audio_revision=1,
+            segments_json=[{
+                "segment_id": f"line-{item.ordinal}", "start": 0,
+                "end": 1, "text": f"línea {item.ordinal}",
+            }],
+                transcription_quality={
+                "analysis_status": "complete",
+                "reference_hypothesis": build_reference_hypothesis(
+                    text=f"línea {item.ordinal}", provider="gemini",
+                    audio_sha256=audio_sha256, audio_revision=1,
+                    source_kind="gemini_complete_audio_derived",
+                    complete_audio_verified=True,
+                ),
+            },
+        )
+        db.add(job)
+        jobs.append(job)
+    db.flush()
+    colors = ("red", "green", "green")
+    disagreements = (0.2, 0.9, 0.1)
+    for job, color, disagreement in zip(jobs, colors, disagreements):
+        db.add(AuditLog(
+            action="semaforo.verdict.v2",
+            detail={
+                "job_id": job.job_id, "color": color,
+                "rank_key": 0 if color == "green" else 20,
+                "inputs": {"disagreement": disagreement},
+            },
+        ))
+    heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+    for offset in (0, 15):
+        db.add(ProductEvent(
+            tenant_id=campaign.tenant_id, user_id=user.id,
+            job_id=jobs[0].job_id, name="editor_activity_heartbeat",
+            occurred_at=heartbeat_at + timedelta(seconds=offset), properties={},
+        ))
+    db.commit()
+    actor = {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}
+
+    queue_args = {
+        "stage": "lyrics", "state": None, "version": None,
+        "background_mode": None, "artist": None, "audit_preapproved": False,
+        "page": 1, "limit": 50, "current_user": actor, "db": db,
+    }
+    delivery = batch.review_queue(campaign.id, order="delivery", **queue_args)
+    assert [row["job_id"] for row in delivery["items"]] == [
+        jobs[0].job_id, jobs[1].job_id, jobs[2].job_id,
+    ]
+    assert [row["priority"] for row in delivery["items"]] == ["1", "2", "3"]
+    assert all(row["semaforo"] is None for row in delivery["items"])
+    assert delivery["confidence"]["colors_visible"] is False
+    first_job = next(row for row in delivery["items"] if row["job_id"] == jobs[0].job_id)
+    assert first_job["active_minutes"] == 0.25
+    assert first_job["reference"]["external_links"] == [{
+        "kind": "official_channel", "url": "https://youtube.com/watch?v=ok",
+    }]
+    assert first_job["reference"]["available"] is True
+    assert first_job["reference"]["manual_full_review_required"] is False
+    assert first_job["review_group"] == "standard"
+    assert first_job["review_priority"] == "standard"
+    assert first_job["review_domains"]["text"]["status"] == "standard"
+    assert first_job["review_domains"]["timing"]["status"] == "standard"
+    assert delivery["classification_counts"] == {
+        "manual_full": 0, "timing_targeted": 0, "standard": 3, "blocked": 0,
+    }
+    assert first_job["background_mode"] is None
+    assert delivery["background_split"] is None
+
+    learning = batch.review_queue(
+        campaign.id, order="learning", **queue_args,
+    )
+    assert [row["job_id"] for row in learning["items"]] == [jobs[1].job_id]
+    assert learning["counters"]["ready"] == 3
+
+
+def test_review_queue_separates_text_and_timing_priority_with_visible_reasons(
+    db, monkeypatch,
+):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 3)
+    items = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).order_by(BatchCampaignItem.ordinal).all()
+    user = db.query(User).first()
+    jobs = []
+    for index, item in enumerate(items):
+        audio_sha256 = hashlib.sha256(f"classification-{item.id}".encode()).hexdigest()
+        quality = {}
+        if index == 1:
+            quality = {
+                "reference_hypothesis": build_reference_hypothesis(
+                    text="línea válida", provider="gemini",
+                    audio_sha256=audio_sha256, audio_revision=1,
+                    source_kind="gemini_complete_audio_derived",
+                    complete_audio_verified=True,
+                ),
+                "unsafe_windows": [{"start": 1.0, "end": 2.0}],
+            }
+        elif index == 2:
+            quality = {
+                "reference_hypothesis": build_reference_hypothesis(
+                    text="línea válida", provider="gemini",
+                    audio_sha256=audio_sha256, audio_revision=1,
+                    source_kind="gemini_complete_audio_derived",
+                    complete_audio_verified=True,
+                ),
+            }
+        job = Job(
+            job_id=uuid.uuid4().hex[:12], user_id=user.id,
+            tenant_id=campaign.tenant_id, artist=item.artist,
+            song_title=item.title, filename=item.filename,
+            status="transcribed_pending", workload_class="batch",
+            campaign_id=campaign.id, campaign_item_id=item.id,
+            input_audio_sha256=audio_sha256, audio_revision=1,
+            segments_json=[{
+                "segment_id": f"line-{item.ordinal}", "start": 0,
+                "end": 1, "text": "línea válida" if index else "",
+            }],
+            transcription_quality=quality,
+        )
+        db.add(job)
+        jobs.append(job)
+    db.commit()
+
+    result = batch.review_queue(
+        campaign.id, stage="lyrics", order="delivery", state=None,
+        version=None, background_mode=None, artist=None,
+        audit_preapproved=False, page=1, limit=50, current_user={
+            "id": user.id, "tenant_id": campaign.tenant_id, "role": "admin",
+        }, db=db,
+    )
+
+    assert [row["job_id"] for row in result["items"]] == [
+        jobs[2].job_id, jobs[1].job_id, jobs[0].job_id,
+    ]
+    assert [row["review_priority"] for row in result["items"]] == [
+        "timing_targeted", "timing_targeted", "manual_full",
+    ]
+    assert result["classification_counts"] == {
+        "manual_full": 1, "timing_targeted": 2, "standard": 0, "blocked": 0,
+    }
+    timing_row, localized_timing_row, text_row = result["items"]
+    assert text_row["review_domains"]["text"]["status"] == "manual_full"
+    assert {reason["code"] for reason in text_row["review_domains"]["text"]["reasons"]} == {
+        "missing_reference", "empty_transcription",
+    }
+    assert localized_timing_row["review_domains"]["text"]["status"] == "standard"
+    assert localized_timing_row["review_domains"]["timing"]["status"] == "targeted"
+    assert localized_timing_row["review_domains"]["timing"]["reasons"][0]["domain"] == "timing"
+    assert localized_timing_row["review_domains"]["timing"]["reasons"][0]["count"] == 1
+    assert localized_timing_row["timing_evidence"] == [{
+        "id": "window-1", "start": 1.0, "end": 2.0, "reasons": [],
+    }]
+    assert timing_row["review_domains"]["text"]["status"] == "standard"
+    assert timing_row["review_domains"]["timing"]["status"] == "targeted"
+    assert result["classification"]["calibrated"] is False
+
+
+def test_manual_metadata_stays_red_reviewable_without_visual_fields(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter_by(campaign_id=campaign.id).one()
+    item.metadata_error = "manual_metadata_review"
+    user = db.query(User).first()
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+    )
+    db.add(job)
+    db.commit()
+    monkeypatch.setattr(batch, "_latest_semaforo_verdicts", lambda *_: {
+        job.job_id: {"color": "green", "rank_key": 0.1},
+    })
+
+    result = batch.review_queue(
+        campaign.id, stage="lyrics", order="delivery", state=None,
+        version=None, background_mode=None, artist=None,
+        audit_preapproved=False, page=1, limit=50, current_user={
+            "id": campaign.created_by, "tenant_id": campaign.tenant_id,
+            "role": "admin",
+        }, db=db,
+    )
+
+    row = result["items"][0]
+    assert row["metadata_review_required"] is True
+    assert row["reference"]["manual_full_review_required"] is True
+    assert row["background_mode"] is None
+
+
+def test_bound_unavailable_reference_is_manual_in_review_queue(db, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter_by(campaign_id=campaign.id).one()
+    user = db.query(User).first()
+    audio_sha256 = "a" * 64
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+        input_audio_sha256=audio_sha256, audio_revision=1,
+        transcription_quality={
+            "reference_hypothesis": build_unavailable_reference(
+                audio_sha256=audio_sha256, audio_revision=1,
+            ),
+        },
+    )
+    db.add(job)
+    db.commit()
+
+    result = batch.review_queue(
+        campaign.id, stage="lyrics", order="delivery", state=None,
+        version=None, background_mode=None, artist=None,
+        audit_preapproved=False, page=1, limit=50, current_user={
+            "id": campaign.created_by, "tenant_id": campaign.tenant_id,
+            "role": "admin",
+        }, db=db,
+    )
+
+    reference = result["items"][0]["reference"]
+    assert reference["available"] is False
+    assert reference["manual_full_review_required"] is True
+    assert result["items"][0]["review_group"] == "manual"
+    assert result["items"][0]["manual_reasons"] == [
+        "missing_reference", "empty_transcription",
+    ]
+
+
+def test_review_queue_scope_keeps_pending_categories_and_approved_filter_aligned(
+    db, monkeypatch,
+):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 3)
+    items = db.query(BatchCampaignItem).filter_by(campaign_id=campaign.id).order_by(
+        BatchCampaignItem.ordinal,
+    ).all()
+    user = db.query(User).first()
+    jobs = []
+    for item in items:
+        job = Job(
+            job_id=uuid.uuid4().hex[:12], user_id=user.id,
+            tenant_id=campaign.tenant_id, artist=item.artist,
+            song_title=item.title, filename=item.filename,
+            status="transcribed_pending", workload_class="batch",
+            campaign_id=campaign.id, campaign_item_id=item.id,
+            segments_json=[{"start": 0, "end": 1, "text": "línea"}],
+            transcription_quality={"analysis_status": "complete"},
+        )
+        db.add(job); jobs.append(job)
+    db.flush()
+    jobs[0].status = "lyrics_approved"
+    jobs[0].approved_at = datetime.now(timezone.utc)
+    db.commit()
+    actor = {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}
+    args = dict(stage="lyrics", order="delivery", state=None, version=None,
+                background_mode=None, artist=None, audit_preapproved=False,
+                page=1, limit=50, current_user=actor, db=db)
+
+    pending = batch.review_queue(campaign.id, scope="pending", **args)
+    approved = batch.review_queue(campaign.id, scope="approved", **args)
+    assert pending["scope"]["key"] == "pending"
+    assert pending["total"] == 2
+    assert sum(pending["classification_counts"].values()) == 2
+    assert {row["job_id"] for row in pending["items"]} == {jobs[1].job_id, jobs[2].job_id}
+    assert pending["campaign_totals"] == {"songs": 3, "approved": 1, "approved_today": 0, "discarded": 0, "drafts": 0}
+    assert approved["scope"]["key"] == "approved"
+    assert approved["total"] == 1
+    assert sum(approved["classification_counts"].values()) == 1
+    assert approved["items"][0]["job_id"] == jobs[0].job_id
+
+    # Opening a document alone is not a saved draft. Edited, unapproved
+    # documents are discoverable, including older drafts saved before this tab.
+    for index, job in enumerate(jobs):
+        db.add(EditorDocument(
+            job_id=job.job_id, tenant_id=campaign.tenant_id,
+            current_segments=job.segments_json, original_segments=job.segments_json,
+            revision=index, updated_by=user.id if index != 2 else None,
+            updated_at=datetime(2026, 9, 9, index, tzinfo=timezone.utc),
+        ))
+    db.commit()
+    # An automatic document update is not human work, even with an actor.
+    assert batch.review_queue(campaign.id, scope="drafts", **args)["items"] == []
+    db.add(AuditLog(user_id=user.id, action="editor.review_saved", detail={
+        "job_id": jobs[1].job_id, "checkpoint": "draft", "from_revision": 0, "to_revision": 1,
+    }, created_at=datetime(2026, 9, 9, 1, tzinfo=timezone.utc)))
+    db.add(ProductEvent(job_id=jobs[1].job_id, user_id=user.id, tenant_id=campaign.tenant_id,
+        name="editor_activity_heartbeat", properties={"revision": 1},
+        created_at=datetime(2026, 9, 9, 1, tzinfo=timezone.utc)))
+    db.commit()
+    drafts = batch.review_queue(campaign.id, scope="drafts", **args)
+    assert [row["job_id"] for row in drafts["items"]] == [jobs[1].job_id]
+    assert drafts["items"][0]["is_draft"] is True
+    assert drafts["campaign_totals"]["drafts"] == 1
+    document = db.query(EditorDocument).filter_by(job_id=jobs[2].job_id).one()
+    document.updated_by = user.id
+    db.add(AuditLog(user_id=user.id, action="editor.review_saved", detail={
+        "job_id": jobs[2].job_id, "checkpoint": "manual", "from_revision": 1, "to_revision": 2,
+    }, created_at=datetime(2026, 9, 9, 2, tzinfo=timezone.utc)))
+    db.add(ProductEvent(job_id=jobs[2].job_id, user_id=user.id, tenant_id=campaign.tenant_id,
+        name="editor_activity_heartbeat", properties={"revision": 2},
+        created_at=datetime(2026, 9, 9, 2, tzinfo=timezone.utc)))
+    db.commit()
+    drafts = batch.review_queue(campaign.id, scope="drafts", **{**args, "order": "learning"})
+    assert drafts["order"] == "recent"
+    assert [row["job_id"] for row in drafts["items"]] == [jobs[2].job_id, jobs[1].job_id]
+    assert batch.review_queue(campaign.id, scope="approved", **args)["campaign_totals"]["drafts"] == 2
+    jobs[2].status = "discarded"
+    jobs[1].status = "lyrics_approved"
+    db.commit()
+    assert batch.review_queue(campaign.id, scope="drafts", **args)["items"] == []
+
+def test_paused_campaign_cannot_start_a_new_render(db):
+    campaign = _campaign(db, 1)
+    campaign.status = "paused"
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    user = db.query(User).first()
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+    )
+    db.add(job)
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        batch.enforce_render_capacity(db, job)
+    assert exc.value.status_code == 409
+
+
+def test_same_account_different_tabs_cannot_share_editor_lock(db):
+    campaign = _campaign(db, 1)
+    user = db.query(User).first()
+    item = db.query(BatchCampaignItem).filter(
+        BatchCampaignItem.campaign_id == campaign.id,
+    ).one()
+    job = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id,
+        tenant_id=campaign.tenant_id, artist=item.artist,
+        song_title=item.title, filename=item.filename,
+        status="transcribed_pending", workload_class="batch",
+        campaign_id=campaign.id, campaign_item_id=item.id,
+        segments_json=[{"segment_id": "one", "start": 0, "end": 1, "text": "Hola"}],
+    )
+    db.add(job)
+    db.add(EditorDocument(
+        job_id=job.job_id, tenant_id=campaign.tenant_id,
+        current_segments=job.segments_json, original_segments=job.segments_json,
+        revision=0,
+    ))
+    db.commit()
+    document = db.query(EditorDocument).filter(EditorDocument.job_id == job.job_id).one()
+    assert acquire_lock(db, document, user.id, session_id="tab_session_one")["acquired"] is True
+    assert acquire_lock(db, document, user.id, session_id="tab_session_two")["acquired"] is False
+    assert release_lock(db, document, user.id, session_id="tab_session_two") is False
+    assert release_lock(db, document, user.id, session_id="tab_session_one") is True
+
+
+def test_pairing_code_registers_unicode_manifest_without_account_token(
+    client, admin_token, monkeypatch,
+):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    auth = {"Authorization": f"Bearer {admin_token}"}
+    created = client.post("/batch/campaigns", headers=auth, json={
+        "name": "Catálogo música 2026", "expected_count": 2,
+        "default_render_params": {"background_mode": "ai"},
+    })
+    assert created.status_code == 200, created.text
+    campaign_id = created.json()["id"]
+    pairing = client.post(
+        f"/batch/campaigns/{campaign_id}/upload-session", headers=auth,
+    )
+    assert pairing.status_code == 200
+    exchange = client.post("/batch/upload-sessions/exchange", json={
+        "campaign_id": campaign_id,
+        "code": pairing.json()["pairing_code"],
+    })
+    assert exchange.status_code == 200
+    probe = client.get(
+        "/batch/upload-sessions/me",
+        headers={"X-Batch-Upload-Token": exchange.json()["upload_token"]},
+    )
+    assert probe.status_code == 200
+    assert probe.json()["campaign_id"] == campaign_id
+    assert probe.json()["renewable"] is True
+    token = exchange.json()["upload_token"]
+    manifest = client.post(
+        f"/batch/campaigns/{campaign_id}/manifest",
+        headers={"X-Batch-Upload-Token": token},
+        json={"items": [
+            {
+                "client_id": "one", "filename": "Canción_Única_ARF123.wav",
+                "title": "Canción", "artist": "Única", "technical_code": "ARF123",
+                "size_bytes": 1234, "duration_seconds": 123.4,
+                "sha256": "a" * 64,
+            },
+            {
+                "client_id": "two", "filename": "sin metadata.mp3",
+                "size_bytes": 4567, "sha256": "b" * 64,
+                "metadata_error": "missing_metadata",
+            },
+        ]},
+    )
+    assert manifest.status_code == 200, manifest.text
+    listed = client.get(
+        f"/batch/campaigns/{campaign_id}/items", headers=auth,
+    )
+    assert listed.status_code == 200
+    assert listed.json()["total"] == 2
+    missing = next(item for item in listed.json()["items"] if item["filename"] == "sin metadata.mp3")
+    assert missing["metadata_error"] == "missing_metadata"
+
+    same_hash = client.post(
+        f"/batch/campaigns/{campaign_id}/manifest",
+        headers={"X-Batch-Upload-Token": token},
+        json={"items": [{
+            "client_id": "same-hash", "filename": "copia.wav",
+            "title": "Copia", "artist": "Otra", "technical_code": "ARF999",
+            "size_bytes": 1234, "duration_seconds": 123.4,
+            "sha256": "a" * 64,
+        }]},
+    )
+    assert same_hash.json()["items"][0]["duplicate_reason"] == "sha256"
+    same_code = client.post(
+        f"/batch/campaigns/{campaign_id}/manifest",
+        headers={"X-Batch-Upload-Token": token},
+        json={"items": [{
+            "client_id": "same-code", "filename": "otro.wav",
+            "title": "Otro", "artist": "Otra", "technical_code": "arf123",
+            "size_bytes": 9999, "duration_seconds": 140,
+            "sha256": "c" * 64,
+        }]},
+    )
+    assert same_code.json()["items"][0]["duplicate_reason"] == "technical_code"
+
+
+def test_manifest_registers_600_items_in_chunks(client, admin_token, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    auth = {"Authorization": f"Bearer {admin_token}"}
+    campaign = client.post("/batch/campaigns", headers=auth, json={
+        "name": "Carga 600", "expected_count": 600,
+    }).json()
+    pairing = client.post(
+        f"/batch/campaigns/{campaign['id']}/upload-session", headers=auth,
+    ).json()
+    token = client.post("/batch/upload-sessions/exchange", json={
+        "campaign_id": campaign["id"], "code": pairing["pairing_code"],
+    }).json()["upload_token"]
+    for start in range(0, 600, 100):
+        rows = []
+        for index in range(start, start + 100):
+            rows.append({
+                "client_id": str(index),
+                "filename": f"Canción_{index}_Artista_ARF{10000 + index}.wav",
+                "title": f"Canción {index}", "artist": "Artista",
+                "technical_code": f"ARF{10000 + index}",
+                "size_bytes": 1024 + index, "duration_seconds": 180,
+                "sha256": hashlib.sha256(f"audio-{index}".encode()).hexdigest(),
+            })
+        response = client.post(
+            f"/batch/campaigns/{campaign['id']}/manifest",
+            headers={"X-Batch-Upload-Token": token}, json={"items": rows},
+        )
+        assert response.status_code == 200, response.text
+    summary = client.get(
+        f"/batch/campaigns/{campaign['id']}", headers=auth,
+    ).json()
+    assert summary["registered_count"] == 600
+    assert summary["counters"]["waiting_upload"] == 600
+
+
+def test_two_tabs_and_skip_claim_different_ready_jobs(client, admin_token, monkeypatch):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    auth = {"Authorization": f"Bearer {admin_token}"}
+    campaign_id = client.post("/batch/campaigns", headers=auth, json={
+        "name": "Dos pestañas", "expected_count": 3,
+    }).json()["id"]
+    session = SessionLocal()
+    try:
+        campaign = session.query(BatchCampaign).filter(BatchCampaign.id == campaign_id).one()
+        for ordinal in (1, 2, 3):
+            item = BatchCampaignItem(
+                id=str(uuid.uuid4()), campaign_id=campaign.id,
+                tenant_id=campaign.tenant_id, ordinal=ordinal,
+                filename=f"Tema_{ordinal}_Artista_ARF{200 + ordinal}.wav",
+                title=f"Tema {ordinal}", artist="Artista",
+                technical_code=f"ARF{200 + ordinal}", size_bytes=1234,
+                duration_seconds=120,
+                sha256=hashlib.sha256(f"tab-{ordinal}".encode()).hexdigest(),
+                upload_state="uploaded", upload_key=f"tab/{ordinal}.wav",
+                render_overrides={},
+            )
+            session.add(item)
+            session.flush()
+            session.add(Job(
+                job_id=uuid.uuid4().hex[:12], user_id=campaign.created_by,
+                tenant_id=campaign.tenant_id, artist=item.artist,
+                song_title=item.title, filename=item.filename,
+                status="transcribed_pending", current_step="editing", progress=100,
+                workload_class="batch", campaign_id=campaign.id,
+                campaign_item_id=item.id,
+                segments_json=[{
+                    "segment_id": f"line-{ordinal}", "start": 0,
+                    "end": 1, "text": f"línea {ordinal}",
+                }],
+            ))
+        session.commit()
+    finally:
+        session.close()
+    first = client.post(
+        f"/batch/campaigns/{campaign_id}/next",
+        headers={**auth, "X-Editor-Session": "tab_session_alpha"},
+    )
+    skipped = client.post(
+        f"/batch/campaigns/{campaign_id}/review-queue/next"
+        f"?stage=lyrics&skip_job_id={first.json()['job_id']}",
+        headers={**auth, "X-Editor-Session": "tab_session_alpha"},
+    )
+    second = client.post(
+        f"/batch/campaigns/{campaign_id}/next",
+        headers={**auth, "X-Editor-Session": "tab_session_bravo"},
+    )
+    assert first.status_code == 200, first.text
+    assert skipped.status_code == 200, skipped.text
+    assert second.status_code == 200, second.text
+    assert first.json()["job_id"]
+    assert skipped.json()["job_id"]
+    assert second.json()["job_id"]
+    assert len({
+        first.json()["job_id"], skipped.json()["job_id"], second.json()["job_id"],
+    }) == 3
+
+@pytest.mark.parametrize("stage,status", [("lyrics", "transcribed_pending"), ("final", "pending_review")])
+def test_queue_and_next_share_accent_code_and_unordered_search(db, monkeypatch, stage, status):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign(db, 2)
+    user = db.query(User).first()
+    actor = {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}
+    items = db.query(BatchCampaignItem).filter_by(campaign_id=campaign.id).order_by(BatchCampaignItem.ordinal).all()
+    ids = []
+    for index, item in enumerate(items):
+        item.title = "Corazón en vivo" if index == 1 else "Otra canción"
+        item.artist = "Charly García" if index == 1 else "Divididos"
+        item.technical_code = f"ARUM-{index}"
+        job = Job(job_id=uuid.uuid4().hex[:12], user_id=user.id, tenant_id=campaign.tenant_id,
+                  artist=item.artist, song_title=item.title, filename=item.filename,
+                  campaign_id=campaign.id, campaign_item_id=item.id, workload_class="batch",
+                  status=status, segments_json=[{"start": 0, "end": 1, "text": "Letra"}])
+        db.add(job); ids.append(job.job_id)
+    db.commit()
+    query = "garcia ARUM 1 corazon"
+    args = dict(stage=stage, order="effort", scope="pending", state=None, version=None,
+                background_mode=None, artist=None, search=query, reviewed_by=None,
+                audit_preapproved=False, page=1, limit=1000, current_user=actor, db=db)
+    rows = batch.review_queue(campaign.id, **args)["items"]
+    assert [row["job_id"] for row in rows] == [ids[1]]
+    assert rows[0]["technical_code"] == "ARUM-1"
+    result = batch.claim_next_stage_review(campaign.id, stage=stage, skip_job_id=None,
+             search=query, version=None, artist=None, reviewed_by=None,
+             x_editor_session="campaign_search_session", current_user=actor, db=db)
+    assert result["job_id"] == ids[1]
+    if stage == "lyrics":
+        result = batch.claim_next_stage_review(campaign.id, stage=stage, skip_job_id=None,
+                 search="divididos otra", version=None, artist=None, reviewed_by=None,
+                 x_editor_session="campaign_search_session", current_user=actor, db=db)
+        assert result["job_id"] == ids[0]

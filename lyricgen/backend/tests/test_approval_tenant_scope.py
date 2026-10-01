@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from database import AuditLog, Job
+from database import AuditLog, BatchCampaign, Job
 
 
 def _auth(token: str) -> dict[str, str]:
@@ -65,6 +65,9 @@ def _cleanup(db):
         db.query(Job).filter(Job.job_id.in_(job_ids)).delete(
             synchronize_session=False,
         )
+    db.query(BatchCampaign).filter(BatchCampaign.id == "camp_over_01").delete(
+        synchronize_session=False,
+    )
     db.query(AuditLog).filter(AuditLog.action.in_([
         "job.approve",
         "job.reject",
@@ -109,6 +112,137 @@ def test_admin_can_approve_cross_tenant_job(
     )
     assert access_log.detail["job_id"] == job_id
     assert access_log.detail["kind"] == "approve_job"
+
+
+def test_umg_approval_requires_signed_current_video_review(client, db):
+    from delivery_qc_runtime import (
+        MANDATORY_REVIEW_CHECKS, delivery_qc_source_fingerprint,
+        delivery_qc_visual_fingerprint, segments_hash,
+    )
+
+    owner_token, owner = _register(client, "approval_umg_review")
+    job_id = _seed_pending_review(db, owner)
+    job = db.query(Job).filter(Job.job_id == job_id).one()
+    job.delivery_profile = "umg"
+    job.umg_spec = {"frame_size": "HD", "fps": 29.97}
+    now = datetime.now(timezone.utc).isoformat()
+    job.delivery_qc = {
+        "status": "COMPLETE", "mode": "enforce", "generated_at": now,
+        "segments_revision": int(job.segments_revision or 0),
+        "segments_hash": segments_hash(job.segments_json or []),
+        "delivery_spec": dict(job.umg_spec),
+        "source_fingerprint": delivery_qc_source_fingerprint(job),
+        "visual_fingerprint": delivery_qc_visual_fingerprint(job),
+        "render_identity": {"edit_count": int(job.edit_count or 0)},
+        "issues": [{
+            "issue_id": f"manual-{code}", "code": code,
+            "status": "OPEN", "severity": "FAIL", "result_status": "REVIEW",
+            "manual_verification_required": True,
+        } for code, _summary, _description in MANDATORY_REVIEW_CHECKS],
+    }
+    db.commit()
+
+    response = client.post(
+        f"/approve/{job_id}", headers=_auth(owner_token), json={"notes": ""},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "delivery_qc_blocked"
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "manual_review_required"
+    db.expire_all()
+    assert db.query(Job).filter(Job.job_id == job_id).one().status == "pending_review"
+
+
+def test_status_exposes_expiring_campaign_bypass_for_stale_preflight(
+    client, db, monkeypatch,
+):
+    owner_token, owner = _register(client, "approval_umg_bypass_status")
+    campaign_id = "camp_over_01"
+    db.add(BatchCampaign(
+        id=campaign_id,
+        tenant_id=owner["tenant_id"],
+        created_by=owner["id"],
+        name="Stale preflight bypass fixture",
+    ))
+    db.flush()
+    job_id = _seed_pending_review(db, owner)
+    job = db.query(Job).filter(Job.job_id == job_id).one()
+    job.delivery_profile = "umg"
+    job.campaign_id = campaign_id
+    job.delivery_qc = {
+        "status": "STALE",
+        "mode": "enforce",
+        "approval": {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"},
+        "issues": [{"issue_id": "old-cut", "status": "OPEN", "summary": "Hallazgo de otro corte"}],
+    }
+    db.commit()
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS", "1")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_CAMPAIGN_IDS", campaign_id)
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_REVIEW_BYPASS_UNTIL_UTC", "2099-01-01T00:00:00Z")
+    monkeypatch.setenv("DELIVERY_QC_UMG_STAGING_PREFLIGHT_BYPASS", "1")
+
+    response = client.get(f"/status/{job_id}", headers=_auth(owner_token))
+
+    assert response.status_code == 200, response.text
+    report = response.json()["delivery_qc"]
+    assert report["status"] == "BYPASSED"
+    assert report["approval"]["can_approve"] is True
+    assert report["approval"]["blocked"] is False
+    assert report["approval"]["reason"] == "staging_preflight_bypass"
+    assert report["issues"] == []  # findings from the replaced cut are never shown as current
+
+
+def test_admin_override_can_approve_campaign_qc_blocker_with_audit(
+    client, admin_token, admin_user_id, db,
+):
+    _, owner = _register(client, "approval_override_owner")
+    job_id = _seed_pending_review(db, owner)
+    campaign_id = "camp_over_01"
+    db.add(BatchCampaign(
+        id=campaign_id,
+        tenant_id=owner["tenant_id"],
+        created_by=owner["id"],
+        name="Approval override fixture",
+    ))
+    db.flush()
+    job = db.query(Job).filter(Job.job_id == job_id).one()
+    job.campaign_id = campaign_id
+    job.workload_class = "batch"
+    job.delivery_qc = {
+        "status": "COMPLETE",
+        "issues": [{
+            "issue_id": "title-mismatch",
+            "code": "UMG_TITLE_METADATA",
+            "severity": "FAIL",
+            "status": "OPEN",
+            "blocking": True,
+        }],
+    }
+    db.commit()
+
+    response = client.post(
+        f"/approve/{job_id}",
+        headers=_auth(admin_token),
+        json={
+            "notes": "Urgencia de campaña Chile",
+            "admin_override": True,
+            "override_reason": "Autorizado por Tomi para liberar campaña Chile y enviar a UMG Chile",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    db.expire_all()
+    assert db.query(Job).filter(Job.job_id == job_id).one().status == "done"
+    log = (
+        db.query(AuditLog)
+        .filter(AuditLog.action == "job.approve")
+        .order_by(AuditLog.id.desc())
+        .first()
+    )
+    assert log.detail["admin_override"] is True
+    assert "campaña Chile" in log.detail["override_reason"]
+    assert log.detail["cross_tenant_admin"] is True
 
 
 def test_regular_user_cannot_approve_other_tenant_job(client, db):

@@ -31,6 +31,34 @@ export const EDIT_TYPE_PRIORITY = [
   "typography",
 ];
 
+/** Build the explicit campaign re-approval that must precede a post-render
+ * edit. Returns null for ordinary jobs and a stable invalid result when the
+ * editor could not bind the current durable revision/line set. */
+export function buildCampaignEditApproval(review, saveMeta = {}) {
+  if (!review?.campaignId) return null;
+  const confirmedLineIds = Array.isArray(saveMeta.confirmedLineIds)
+    ? saveMeta.confirmedLineIds
+    : [];
+  const editorRevision = Number.isInteger(saveMeta.editorRevision)
+    ? saveMeta.editorRevision
+    : (Number.isInteger(saveMeta.baseRevision) ? saveMeta.baseRevision : null);
+  if (editorRevision == null || confirmedLineIds.length === 0) {
+    return { valid: false, campaignId: review.campaignId };
+  }
+  return {
+    valid: true,
+    campaignId: review.campaignId,
+    body: {
+      editor_revision: editorRevision,
+      editor_version_id: saveMeta.editorVersionId || null,
+      confirmed_line_ids: confirmedLineIds,
+      lyrics_confirmed: true,
+      timings_confirmed: true,
+      heard_against_audio: true,
+    },
+  };
+}
+
 // Tipos "de fondo": comparten el gate de status (exigen pending_review) y el
 // de multi-escena (se rechazan porque el fondo es un timeline). custom (fondo
 // subido en edición) entra acá: pisaría el timeline igual que un asset único.
@@ -50,14 +78,14 @@ const BACKGROUND_TYPES = ["background", "background_library", "custom"];
  *
  * @returns {"status"|"scenes"|null}
  */
-export function backgroundEditBlockedReason({ jobStatus, scenePlan } = {}) {
+export function backgroundEditBlockedReason({ jobStatus, scenePlan, allowApprovedBackground = false } = {}) {
   const hasScenes = !!(
     scenePlan && Array.isArray(scenePlan.scenes) && scenePlan.scenes.length > 0
   );
   // Multi-escena primero: aplica incluso en pending_review, y el motivo que el
   // operador necesita leer es otro (regenerá la escena desde el filmstrip).
   if (hasScenes) return "scenes";
-  if (jobStatus !== "pending_review") return "status";
+  if (jobStatus !== "pending_review" && !(allowApprovedBackground && ["done", "rejected"].includes(jobStatus))) return "status";
   return null;
 }
 
@@ -262,9 +290,26 @@ export function resolveEditSubmission({
   current,
   jobStatus,
   scenePlan,
+  forceLyricsRerender = false,
+  allowApprovedBackground = false,
 } = {}) {
   const diff = computeFieldDiff(baseline || {}, current || {});
-  const presentBuckets = Object.keys(diff);
+  let presentBuckets = Object.keys(diff);
+
+  // Applying a UMG proposal intentionally saves the corrected editor
+  // revision *before* the operator reviews it.  In that flow baseline and
+  // current are therefore byte-identical even though the rendered video is
+  // still the previous revision.  Treat the explicit, proposal-bound review
+  // as a lyrics render intent instead of showing the misleading "No cambiaste
+  // nada" guard.  Callers must only set this flag for a validated
+  // change_request_id + proposal_id deep-link; ordinary editor visits keep the
+  // strict no-op behaviour below.
+  if (presentBuckets.length === 0 && forceLyricsRerender) {
+    diff.lyrics = {
+      segments: normalizeSegmentsForEdit((current && current.segments) || []),
+    };
+    presentBuckets = ["lyrics"];
+  }
 
   const empty = {
     editType: null,
@@ -305,7 +350,7 @@ export function resolveEditSubmission({
     editType = EDIT_TYPE_PRIORITY.find(
       (k) => diff[k] && !BACKGROUND_TYPES.includes(k),
     ) || null;
-  } else if (!isPendingReview) {
+  } else if (backgroundEditBlockedReason({ jobStatus, allowApprovedBackground })) {
     const isBgType = BACKGROUND_TYPES.includes(editType);
     if (isBgType && presentBuckets.length === bgBucketsPresent.length) {
       // Sólo fondo en un job ya aprobado: el backend lo rechaza. La salida

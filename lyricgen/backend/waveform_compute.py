@@ -130,3 +130,107 @@ def compute_and_cache_waveform(
         logger.warning("[WAVEFORM] cache write failed for %s: %s", job_id, exc)
 
     return payload
+
+
+# --- High-resolution envelope for the guided timing review (2026-09-14) ---
+#
+# The 1000-bucket overview above is fine for the full-song timeline, but the
+# guided review zooms into 5-10 s windows: at 4:16 that is ~27 buckets for the
+# whole window, and on a loud live recording every bucket has the same height.
+# The operator sees evenly spaced identical bars and the copy promises "the
+# peaks show where the voice starts". This variant samples ~40 buckets per
+# second and prefers the cached vocal stem, so the peaks follow the singer
+# rather than the drums. Lazy: computed on the first guided-review open and
+# cached to R2 next to the overview.
+_HIRES_PER_SECOND = 40
+_HIRES_MAX_BUCKETS = 24000
+
+
+def hires_cache_key_for_job(job_id: str) -> str:
+    return f"waveform/{job_id}.hires.json"
+
+
+def compute_and_cache_hires_waveform(
+    job_id: str,
+    input_r2_key: str,
+    *,
+    force: bool = False,
+    prefer_stem: bool = True,
+) -> dict | None:
+    """Per-second peak envelope, vocal stem when cached, mix otherwise.
+
+    Returns ``{"peaks": [...], "duration": s, "per_second": n, "source":
+    "stem"|"mix"}`` or None (same best-effort contract as the overview).
+    """
+    if not job_id or not input_r2_key:
+        return None
+    import os
+    import storage
+
+    if not storage.is_enabled():
+        return None
+    cache_key = hires_cache_key_for_job(job_id)
+    if not force:
+        try:
+            if storage.object_exists(cache_key):
+                with tempfile.NamedTemporaryFile(suffix=".json", delete=True) as tf:
+                    if storage.download_object(cache_key, tf.name):
+                        with open(tf.name, "r", encoding="utf-8") as f:
+                            return _json.loads(f.read())
+        except Exception as exc:
+            logger.warning(
+                "[WAVEFORM] hires cache read failed for %s (will recompute): %s",
+                job_id, exc,
+            )
+
+    stem_path = None
+    source = "mix"
+    with tempfile.NamedTemporaryFile(suffix=".audio", delete=True) as tf:
+        if not storage.download_object(input_r2_key, tf.name):
+            logger.warning(
+                "[WAVEFORM] source audio download failed for %s (key=%s)",
+                job_id, input_r2_key,
+            )
+            return None
+        if prefer_stem:
+            try:
+                import vocal_sep
+                stem_path = vocal_sep.separate_vocals(tf.name, cache_only=True)
+            except Exception as exc:  # noqa: BLE001 — the stem is a bonus
+                logger.info("[WAVEFORM] stem lookup skipped for %s: %s", job_id, exc)
+                stem_path = None
+        try:
+            import librosa
+            import numpy as np
+            load_path = stem_path if stem_path and os.path.exists(stem_path) else tf.name
+            source = "stem" if load_path == stem_path else "mix"
+            y, sr = librosa.load(load_path, sr=8000, mono=True)
+        except Exception as exc:
+            logger.error("[WAVEFORM] hires librosa load failed for %s: %s", job_id, exc)
+            return None
+        finally:
+            if stem_path:
+                try:
+                    os.unlink(stem_path)
+                except OSError:
+                    pass
+
+    duration = float(len(y) / sr) if sr else 0.0
+    if duration <= 0:
+        return None
+    from waveform_utils import peak_envelope
+    buckets = int(min(_HIRES_MAX_BUCKETS, max(100, round(duration * _HIRES_PER_SECOND))))
+    peaks = peak_envelope(np.abs(y), buckets)
+    payload = {
+        "peaks": peaks,
+        "duration": round(duration, 3),
+        "per_second": round(buckets / duration, 3),
+        "source": source,
+    }
+    try:
+        storage.put_object_bytes(
+            cache_key, _json.dumps(payload).encode("utf-8"), "application/json"
+        )
+    except Exception as exc:
+        logger.warning("[WAVEFORM] hires cache write failed for %s: %s", job_id, exc)
+    return payload

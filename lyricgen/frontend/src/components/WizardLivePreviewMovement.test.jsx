@@ -160,4 +160,19 @@ describe("WizardLivePreview — movement preview reactivity (regression 0511fa3)
     );
     expect(container.querySelector("video")).toBeTruthy();
   });
+
+  it("labels an operator photo as animated without faking motion before generation", () => {
+    const { container } = render(
+      <WizardLivePreview
+        movementStyle="estatico"
+        operatorPhoto
+        photoAnimated
+        clipSrc="/operator/plaza.jpg"
+        clipIsVideo={false}
+      />,
+    );
+    expect(container.textContent).toContain("Movimiento: Foto animada");
+    const image = container.querySelector('img[src="/operator/plaza.jpg"]');
+    expect(image.getAttribute("style") || "").not.toMatch(/animation/);
+  });
 });

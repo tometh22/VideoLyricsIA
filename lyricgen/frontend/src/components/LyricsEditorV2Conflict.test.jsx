@@ -106,6 +106,7 @@ function renderEditor(editorRequest, props = {}) {
     onPersistSegments={vi.fn()}
     onApprove={props.onApprove || vi.fn()}
     onBack={vi.fn()}
+    preferApprovedVersion={props.preferApprovedVersion || false}
   />);
 }
 
@@ -241,6 +242,9 @@ describe("Editor 2.0 stale draft recovery", () => {
       name: "No pudimos abrir la versión editable",
     });
     expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeDisabled();
+    expect(loadError).toHaveTextContent("HTTP 404");
+    expect(loadError).toHaveTextContent(JOB);
+    expect(loadError).toHaveTextContent("Comprobá el enlace y los permisos");
     expect(request.mock.calls.some(([path]) => path.endsWith("/lock/heartbeat"))).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: "Reintentar" }));
@@ -250,16 +254,19 @@ describe("Editor 2.0 stale draft recovery", () => {
     expect(request.mock.calls.some(([path]) => path.endsWith("/lock/heartbeat"))).toBe(true);
   });
 
-  it("rebases a stale draft silently and keeps the local copy", async () => {
+  it("requires explicit recovery of a stale draft and keeps the local copy", async () => {
     const request = makeRequest();
     renderEditor(request);
 
+    await screen.findByRole("dialog", { name: "Encontramos un borrador anterior" });
+    expect(request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Recuperar cambios" }));
     expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
   });
 
-  it("recovers a legacy draft base from version history without opening a false conflict", async () => {
+  it("shows an older revision for explicit recovery without silently merging history", async () => {
     localStorage.clear();
     localStorage.setItem(
       `genly_editor_draft:team-a:42:${JOB}`,
@@ -268,13 +275,16 @@ describe("Editor 2.0 stale draft recovery", () => {
     const request = makeRequest({ legacyBase: true });
     renderEditor(request);
 
+    await screen.findByRole("dialog", { name: "Encontramos un borrador anterior" });
+    expect(request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Recuperar cambios" }));
     expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
-    expect(request.mock.calls.some(([path]) => path === `/editor/${JOB}/versions?limit=50`)).toBe(true);
+    expect(request.mock.calls.some(([path]) => path === `/editor/${JOB}/versions?limit=50`)).toBe(false);
     await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
   });
 
-  it("hydrates the oldest unversioned draft without a collaboration popup", async () => {
+  it("requires explicit recovery of the oldest unversioned draft", async () => {
     localStorage.clear();
     localStorage.setItem(
       `genly_editor_draft:team-a:42:${JOB}`,
@@ -283,6 +293,9 @@ describe("Editor 2.0 stale draft recovery", () => {
     const request = makeRequest();
     renderEditor(request);
 
+    await screen.findByRole("dialog", { name: "Encontramos un borrador anterior" });
+    expect(request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Recuperar cambios" }));
     expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: /Aprobar y generar/i })).toBeEnabled());
@@ -291,6 +304,9 @@ describe("Editor 2.0 stale draft recovery", () => {
   it("does not expose a conflict resolver for an old local draft", async () => {
     const request = makeRequest();
     renderEditor(request);
+    await screen.findByRole("dialog", { name: "Encontramos un borrador anterior" });
+    expect(request.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Recuperar cambios" }));
     expect(await screen.findByDisplayValue("versión local")).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /Hay una versión más nueva/i })).not.toBeInTheDocument();
     expect(request.mock.calls.some(([path]) => path.endsWith("/conflicts/resolve"))).toBe(false);
@@ -398,5 +414,122 @@ describe("Editor 2.0 quality proposal ambiguous timeout recovery", () => {
     expect(screen.getByTestId("quality-proposal-panel")).toHaveAttribute(
       "data-proposal-state", "dismissed",
     );
+  });
+});
+
+
+describe("local recovery is separate from server save status", () => {
+  const key = `genly_editor_draft:team-a:42:${JOB}`;
+  const mutations = (request) => request.mock.calls.filter(([, options]) => options?.method === "PATCH");
+
+  it("quarantines an unreadable browser draft and opens the saved version without blocking", async () => {
+    const raw = '{"segments":';
+    localStorage.setItem(key, raw);
+    const request = makeRequest();
+    renderEditor(request);
+    expect(await screen.findByDisplayValue("versión equipo")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Encontramos un borrador anterior" })).not.toBeInTheDocument();
+    expect(screen.queryByText("No se pudo guardar")).not.toBeInTheDocument();
+    expect(localStorage.getItem(key)).toBeNull();
+    expect(localStorage.getItem(`${key}:incompatible`)).toBe(raw);
+    expect(mutations(request)).toHaveLength(0);
+  });
+
+  it("opens the newer saved correction rather than old approval after quarantining an incompatible draft", async () => {
+    const raw = '{"segments":';
+    localStorage.setItem(key, raw);
+    const currentDraft = [{ ...SERVER[0], text: "borrador más nuevo sin aprobar" }];
+    const fallback = makeRequest();
+    const request = vi.fn(async (path, options = {}) => {
+      if (path === `/editor/${JOB}` && !options.method) {
+        return reply({
+          job_id: JOB,
+          revision: 6,
+          segments: currentDraft,
+          original_segments: SERVER,
+          latest_approved_version: { revision: 5, segments: SERVER },
+          lock: { active: false },
+        });
+      }
+      return fallback(path, options);
+    });
+
+    renderEditor(request, { preferApprovedVersion: true });
+
+    expect(await screen.findByDisplayValue("borrador más nuevo sin aprobar")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("versión equipo")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Encontramos un borrador anterior" })).not.toBeInTheDocument();
+    expect(localStorage.getItem(key)).toBeNull();
+    expect(localStorage.getItem(`${key}:incompatible`)).toBe(raw);
+    expect(mutations(request)).toHaveLength(0);
+  });
+
+  it("removes an equivalent old-revision copy with zero server mutations across reload", async () => {
+    localStorage.setItem(key, JSON.stringify({ segments: SERVER, base_revision: 0 }));
+    const request = makeRequest();
+    const view = renderEditor(request);
+    await screen.findByDisplayValue("versión equipo");
+    await waitFor(() => expect(localStorage.getItem(key)).toBeNull());
+    expect(screen.queryByRole("dialog", { name: "Encontramos un borrador anterior" })).not.toBeInTheDocument();
+    expect(mutations(request)).toHaveLength(0);
+    view.unmount(); renderEditor(request);
+    await screen.findByDisplayValue("versión equipo");
+    expect(mutations(request)).toHaveLength(0);
+  });
+
+  it("compares differences and discards only by explicit choice without reopening approval", async () => {
+    const request = makeRequest(); renderEditor(request);
+    const dialog = await screen.findByRole("dialog", { name: "Encontramos un borrador anterior" });
+    expect(dialog).toHaveTextContent("versión local");
+    expect(dialog).toHaveTextContent("versión equipo");
+    expect(dialog).toHaveTextContent("revisión 4");
+    expect(localStorage.getItem(key)).not.toBeNull();
+    expect(mutations(request)).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Usar versión de Genly" }));
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    expect(localStorage.getItem(key)).toBeNull();
+    expect(mutations(request)).toHaveLength(0);
+    expect(await screen.findByDisplayValue("versión equipo")).toBeInTheDocument();
+  });
+
+  it("preserves a copy changed by another tab before a discard click", async () => {
+    const request = makeRequest(); renderEditor(request);
+    await screen.findByRole("dialog", { name: "Encontramos un borrador anterior" });
+    const newer = JSON.stringify({ segments: PROPOSED, base_revision: 5 });
+    localStorage.setItem(key, newer);
+    fireEvent.click(screen.getByRole("button", { name: "Usar versión de Genly" }));
+    expect(await screen.findByText(/La copia cambió en otra pestaña/)).toBeInTheDocument();
+    expect(localStorage.getItem(key)).toBe(newer);
+    expect(mutations(request)).toHaveLength(0);
+  });
+
+  it.each([0, 0.005])("quarantines a %s-second incompatible copy and opens the server version", async (end) => {
+    const raw = JSON.stringify({ segments: [{ ...SERVER[0], end }], base_revision: 4 });
+    localStorage.setItem(key, raw);
+    const fallback = makeRequest();
+    const request = vi.fn(async (path, options = {}) => {
+      if (path === `/editor/${JOB}` && !options.method) {
+        return reply({ job_id: JOB, revision: 5,
+          segments: [{ ...SERVER[0], end: 0.01 }], original_segments: SERVER,
+          lock: { active: false } });
+      }
+      return fallback(path, options);
+    });
+    renderEditor(request);
+    await waitFor(() => expect(localStorage.getItem(key)).toBeNull());
+    expect(screen.queryByRole("dialog", { name: "Encontramos un borrador anterior" })).not.toBeInTheDocument();
+    expect(localStorage.getItem(`${key}:incompatible`)).toBe(raw);
+    expect(mutations(request)).toHaveLength(0);
+  });
+
+  it("does not clamp invalid timing into the document before quarantining it", async () => {
+    const raw = JSON.stringify({ segments: [{ ...SERVER[0], start: null }] });
+    localStorage.setItem(key, raw);
+    const request = makeRequest(); renderEditor(request);
+    expect(await screen.findByDisplayValue("versión equipo")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Encontramos un borrador anterior" })).not.toBeInTheDocument();
+    expect(localStorage.getItem(key)).toBeNull();
+    expect(localStorage.getItem(`${key}:incompatible`)).toBe(raw);
+    expect(mutations(request)).toHaveLength(0);
   });
 });

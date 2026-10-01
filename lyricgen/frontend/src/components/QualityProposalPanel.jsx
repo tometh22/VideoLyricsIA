@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
+import useReviewerCandidateTelemetry from "./useReviewerCandidateTelemetry";
 
-const CLOSED_STATUSES = new Set(["applied", "dismissed", "rejected", "cancelled"]);
+const CLOSED_STATUSES = new Set(["applied", "dismissed", "rejected", "cancelled", "observed"]);
 
 const REASON_LABELS = {
+  reviewer_audio_evidence: "Cambio puntual respaldado por escucha independiente; verificar con el audio",
   acoustic_cardinality_disagreement: "La cantidad de frases no coincide con el audio",
   event_count: "Cantidad de frases dudosa",
   low_asr_content_confidence: "Contenido con baja confianza",
@@ -48,7 +50,7 @@ function segmentView(segment, fallbackStart, fallbackEnd) {
   };
 }
 
-function SegmentList({ label, segments, fallbackStart, fallbackEnd, tone }) {
+function SegmentList({ label, segments, fallbackStart, fallbackEnd, tone, receiptForSegment }) {
   const values = Array.isArray(segments) ? segments : [];
   const toneClass = tone === "proposed"
     ? "border-emerald-400/20 bg-emerald-950/20"
@@ -68,6 +70,7 @@ function SegmentList({ label, segments, fallbackStart, fallbackEnd, tone }) {
             const hasTiming = segment.start != null || segment.end != null;
             return (
               <li
+                data-reviewer-receipt={receiptForSegment?.(rawSegment)}
                 key={`${segment.start ?? "x"}-${segment.end ?? "x"}-${index}`}
                 className="rounded-lg bg-white/[0.035] px-2.5 py-2"
               >
@@ -101,6 +104,8 @@ function parseExpiry(value) {
  * - onSeek(startSeconds, window)
  * - onApplySelected(windowIds, proposal)
  * - onDismiss(proposal)
+ * - onObserve(windowId, verdict, proposal)
+ * - onRejectWindow(windowId, reason, proposal)
  */
 export default function QualityProposalPanel({
   proposal,
@@ -108,11 +113,17 @@ export default function QualityProposalPanel({
   onSeek,
   onApplySelected,
   onDismiss,
+  onObserve,
+  onRejectWindow,
+  onReviewTelemetry,
   applying = false,
   dismissing = false,
+  observing = false,
+  rejecting = false,
 }) {
   const [selectedKeys, setSelectedKeys] = useState(() => new Set());
   const [clock, setClock] = useState(() => Date.now());
+  const telemetryRoot = useReviewerCandidateTelemetry(proposal, onReviewTelemetry);
 
   const windows = useMemo(
     () => (Array.isArray(proposal?.windows) ? proposal.windows : []),
@@ -128,6 +139,8 @@ export default function QualityProposalPanel({
   );
   const expiry = parseExpiry(proposal?.expires_at);
   const status = String(proposal?.status || "pending").toLowerCase();
+  const observationOnly = proposal?.observation_only === true;
+  const operatorOnly = proposal?.operator_suggestion_only === true;
   const closed = CLOSED_STATUSES.has(status);
   const expired = status === "expired" || (expiry != null && expiry <= clock);
   const stale = status === "stale" || (
@@ -164,7 +177,7 @@ export default function QualityProposalPanel({
   if (!proposal) return null;
 
   const selectedEntries = windowEntries.filter((entry) => selectedKeys.has(entry.key));
-  const busy = applying || dismissing;
+  const busy = applying || dismissing || observing || rejecting;
   const applyDisabled = unavailable || busy || selectedEntries.length === 0;
   const dismissDisabled = unavailable || busy;
 
@@ -195,11 +208,14 @@ export default function QualityProposalPanel({
       : closed
         ? status === "applied"
           ? "Esta propuesta ya fue aplicada."
+          : status === "observed"
+            ? "Todas las sugerencias quedaron calificadas para la calibración. No se aplicó ningún cambio."
           : "Esta propuesta ya no está disponible."
         : null;
 
   return (
     <section
+      ref={telemetryRoot}
       className="rounded-2xl border border-cyan-400/20 bg-slate-950/80 p-4 text-gray-100 shadow-xl shadow-black/20"
       aria-labelledby={`quality-proposal-title-${proposal.id}`}
       data-testid="quality-proposal-panel"
@@ -208,13 +224,21 @@ export default function QualityProposalPanel({
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-300">
-            Revisión de calidad
+            {observationOnly
+              ? "Calibración observable"
+              : operatorOnly ? "Sugerencias de un clic" : "Revisión de calidad"}
           </p>
           <h2 id={`quality-proposal-title-${proposal.id}`} className="mt-1 text-base font-semibold text-white">
-            Compará los cambios sugeridos
+            {observationOnly
+              ? "Ayudanos a medir estas sugerencias"
+              : operatorOnly ? "Corregí más rápido sin perder control" : "Compará los cambios sugeridos"}
           </h2>
           <p className="mt-1 max-w-2xl text-sm leading-relaxed text-gray-400">
-            Escuchá cada zona y elegí solamente las correcciones que quieras aplicar. Nada se aplica automáticamente.
+            {observationOnly
+              ? "Escuchá cada zona y calificá si la sugerencia coincide con el audio. Este modo nunca modifica la letra ni el timing."
+              : operatorOnly
+                ? "Escuchá el tramo y aceptá o rechazá. Cada decisión queda medida; nada se corrige automáticamente."
+                : "Escuchá cada zona y elegí solamente las correcciones que quieras aplicar. Nada se aplica automáticamente."}
           </p>
         </div>
         <span className="w-fit rounded-full border border-white/10 bg-white/5 px-2.5 py-1 font-mono text-[11px] text-gray-400">
@@ -231,6 +255,26 @@ export default function QualityProposalPanel({
         </div>
       )}
 
+      {proposal?.reviewer_assist?.candidate && (
+        <section className="mt-4 space-y-3" aria-label="Canción candidata completa">
+          <p className="text-sm text-gray-300">
+            Versión alternativa completa. Lo conservado no está certificado.
+            Usarla no aprueba la canción: después revisás y aprobás una sola vez en el editor.
+          </p>
+          <details>
+            <summary className="cursor-pointer text-sm text-cyan-300">Ver letra y timing de toda la candidata</summary>
+            <SegmentList label="Candidata completa" segments={proposal.reviewer_assist.candidate.segments} tone="proposed"
+              receiptForSegment={s => windows.find(w => w.proposed_segments?.some(p =>
+                p.text === s.text && Number(p.start) === Number(s.start) && Number(p.end) === Number(s.end)))?.telemetry_id} />
+          </details>
+          <button type="button" disabled={unavailable || busy || typeof onApplySelected !== "function"}
+            className="rounded-lg bg-cyan-400 px-4 py-2 font-semibold text-slate-950 disabled:opacity-50"
+            onClick={() => onApplySelected?.(windows.map(w => w.id), proposal)}>
+            Usar candidata completa para revisar
+          </button>
+        </section>
+      )}
+
       <fieldset className="mt-5 space-y-4" disabled={unavailable || busy}>
         <legend className="sr-only">Ventanas de corrección disponibles</legend>
         {windowEntries.length === 0 ? (
@@ -242,25 +286,31 @@ export default function QualityProposalPanel({
           const range = `${formatTime(proposalWindow?.start)} a ${formatTime(proposalWindow?.end)}`;
           const reasons = Array.isArray(proposalWindow?.reasons) ? proposalWindow.reasons : [];
           const checked = selectedKeys.has(key);
+          const suggestionType = String(proposalWindow?.suggestion_type || "text");
+          const confidence = String(proposalWindow?.confidence || "medium");
+          const currentEnd = asFiniteNumber(proposalWindow?.current_end);
+          const proposedEnd = asFiniteNumber(proposalWindow?.proposed_end);
+          const previewStart = asFiniteNumber(proposalWindow?.preview_start ?? proposalWindow?.start);
 
           return (
             <article
               key={key}
+              data-reviewer-receipt={proposalWindow.telemetry_id || undefined}
               className={`rounded-2xl border p-3 transition-colors sm:p-4 ${
                 checked ? "border-cyan-300/50 bg-cyan-950/20" : "border-white/10 bg-white/[0.025]"
               }`}
               data-testid={`quality-proposal-window-${key}`}
             >
               <div className="flex flex-wrap items-center justify-between gap-3">
-                <label className="flex min-w-0 cursor-pointer items-center gap-3 text-sm font-semibold text-white">
-                  <input
+                <label className="flex min-w-0 items-center gap-3 text-sm font-semibold text-white">
+                  {!observationOnly && <input
                     type="checkbox"
                     className="h-4 w-4 shrink-0 accent-cyan-400"
                     checked={checked}
                     onChange={() => toggleWindow(key)}
                     disabled={unavailable || busy}
                     aria-label={`Seleccionar ${label.toLowerCase()}, ${range}`}
-                  />
+                  />}
                   <span>
                     {label}
                     <span className="ml-2 font-mono text-xs font-normal text-gray-400">
@@ -272,11 +322,11 @@ export default function QualityProposalPanel({
                   type="button"
                   className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-gray-200 hover:border-cyan-300/40 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
                   onClick={() => {
-                    const start = asFiniteNumber(proposalWindow?.start);
+                    const start = previewStart;
                     if (start != null && typeof onSeek === "function") onSeek(start, proposalWindow);
                   }}
-                  disabled={asFiniteNumber(proposalWindow?.start) == null}
-                  aria-label={`Escuchar ${label.toLowerCase()} desde ${formatTime(proposalWindow?.start)}`}
+                  disabled={previewStart == null}
+                  aria-label={`Escuchar ${label.toLowerCase()} desde ${formatTime(previewStart)}`}
                 >
                   Escuchar
                 </button>
@@ -295,6 +345,39 @@ export default function QualityProposalPanel({
                 </ul>
               )}
 
+              {operatorOnly && (
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
+                  <span className="rounded-full bg-cyan-300/10 px-2 py-1 font-semibold uppercase tracking-wide text-cyan-200">
+                    {suggestionType === "timing" ? "Timing" : suggestionType === "vocalization" ? "Vocalización" : "Texto"}
+                  </span>
+                  <span className="rounded-full bg-white/5 px-2 py-1 text-gray-300">
+                    {proposal?.reviewer_assist
+                      ? "Sugerencia sin calibrar · no certifica la línea"
+                      : `Confianza ${confidence === "high" ? "alta" : confidence === "low" ? "baja" : "media"}`}
+                  </span>
+                  {proposalWindow?.impact_ms != null && (
+                    <span className="rounded-full bg-white/5 px-2 py-1 text-gray-400">
+                      Impacto {Math.round(Number(proposalWindow.impact_ms))} ms
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {operatorOnly && suggestionType === "timing" && currentEnd != null && proposedEnd != null && (
+                <div className="mt-3 rounded-xl border border-cyan-300/15 bg-cyan-950/15 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <span className="text-gray-400">Fin actual <b className="font-mono text-white">{formatTime(currentEnd)}</b></span>
+                    <span className="text-cyan-200">Fin propuesto <b className="font-mono text-white">{formatTime(proposedEnd)}</b></span>
+                  </div>
+                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/10" aria-hidden="true">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-gray-400 to-cyan-300"
+                      style={{ width: `${Math.max(12, Math.min(100, 50 + Math.abs(proposedEnd - currentEnd) * 12))}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+
               <div className="mt-3 grid gap-3 md:grid-cols-2">
                 <SegmentList
                   label="Antes"
@@ -311,12 +394,55 @@ export default function QualityProposalPanel({
                   tone="proposed"
                 />
               </div>
+              {observationOnly && (
+                <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-white/10 pt-3">
+                  {proposalWindow?.human_verdict ? (
+                    <p className="text-xs font-medium text-emerald-300">
+                      Calificada: {proposalWindow.human_verdict === "correct" ? "correcta" : proposalWindow.human_verdict === "incorrect" ? "incorrecta" : "dudosa"}
+                    </p>
+                  ) : [
+                    ["correct", "Correcta"],
+                    ["incorrect", "Incorrecta"],
+                    ["uncertain", "No se distingue"],
+                  ].map(([verdict, text]) => (
+                    <button
+                      key={verdict}
+                      type="button"
+                      className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-gray-200 hover:border-cyan-300/40 disabled:cursor-not-allowed disabled:opacity-50"
+                      onClick={() => onObserve?.(proposalWindow?.id, verdict, proposal)}
+                      disabled={unavailable || busy || typeof onObserve !== "function"}
+                    >
+                      {text}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {operatorOnly && (
+                <div className="mt-3 flex flex-wrap items-center justify-end gap-2 border-t border-white/10 pt-3">
+                  <button
+                    type="button"
+                    className="rounded-lg border border-rose-300/25 bg-rose-950/20 px-3 py-1.5 text-xs font-semibold text-rose-100 hover:border-rose-300/50 disabled:opacity-50"
+                    onClick={() => onRejectWindow?.(proposalWindow?.id, "operator_rejected", proposal)}
+                    disabled={unavailable || busy || typeof onRejectWindow !== "function"}
+                  >
+                    Rechazar
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-lg bg-cyan-400 px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-cyan-300 disabled:bg-gray-700 disabled:text-gray-400"
+                    onClick={() => onApplySelected?.([proposalWindow?.id], proposal)}
+                    disabled={unavailable || busy || typeof onApplySelected !== "function"}
+                  >
+                    Aceptar
+                  </button>
+                </div>
+              )}
             </article>
           );
         })}
       </fieldset>
 
-      <div className="mt-5 flex flex-col-reverse gap-2 border-t border-white/10 pt-4 sm:flex-row sm:items-center sm:justify-between">
+      {!observationOnly && <div className="mt-5 flex flex-col-reverse gap-2 border-t border-white/10 pt-4 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-xs text-gray-400" aria-live="polite">
           {selectedEntries.length === 0
             ? "No seleccionaste ninguna corrección."
@@ -340,7 +466,7 @@ export default function QualityProposalPanel({
             {applying ? "Aplicando…" : `Aplicar seleccionadas (${selectedEntries.length})`}
           </button>
         </div>
-      </div>
+      </div>}
     </section>
   );
 }

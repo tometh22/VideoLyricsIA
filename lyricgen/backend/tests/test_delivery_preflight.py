@@ -1,0 +1,296 @@
+import json
+
+from delivery_preflight import build_delivery_preflight, frame_timecode
+
+
+def test_frame_timecode_is_non_drop_and_configurable():
+    assert frame_timecode(75.8, 30) == "00:01:15:24"
+    assert frame_timecode(1.133, 30) == "00:00:01:04"
+
+
+def test_universal_example_groups_spelling_and_flags_metadata():
+    segments = [
+        {"start": 74.367, "end": 75.5, "text": "TENDRAS una vida mejor"},
+        {"start": 75.8, "end": 76.9, "text": "JAMAS podrás olvidarme"},
+        {"start": 77.967, "end": 79.1, "text": "JAMAS, aunque lo intentes"},
+        {"start": 186.7, "end": 188.2, "text": "POR LA AVENTRUA"},
+    ]
+    approved = [
+        "TENDRÁS una vida mejor",
+        "JAMÁS podrás olvidarme",
+        "JAMÁS, aunque lo intentes",
+        "POR LA AVENTURA",
+    ]
+    report = build_delivery_preflight(
+        metadata={
+            "artist": "Enanitos Verdes",
+            "title": "Tu Cárcel",
+            "version": "Lyric Video / En Vivo Desde Tijuana, Mexico/2004",
+            "isrc": "MXUV72602826",
+        },
+        asset={
+            "filename": "Enanitos_Verdes_-_Tu_Carcel_En_Vivo.mov",
+            "duration": 241.909,
+            "rendered_title": "Tu Carcel_En Vivo",
+            "title_time": 1.133,
+        },
+        segments=segments,
+        approved_lyrics=approved,
+        reference_trusted=True,
+        fps=30,
+    )
+
+    assert report["decision"] == "BLOCK"
+    assert report["summary"] == {
+        "issue_count": 4,
+        "fail_count": 1,
+        "warn_count": 3,
+        "open_count": 4,
+        "segment_count": 4,
+    }
+    by_actual = {item["actual"]: item for item in report["issues"]}
+    assert by_actual["Tu Carcel_En Vivo"]["timecode"] == "00:00:01:04"
+    assert by_actual["Tu Carcel_En Vivo"]["expected"] == "Tu Cárcel"
+    assert by_actual["TENDRAS"]["expected"] == "TENDRÁS"
+    assert by_actual["JAMAS"]["occurrence_count"] == 2
+    assert by_actual["JAMAS"]["frequency"] == "INTERMITTENT"
+    assert by_actual["JAMAS"]["timecodes"] == ["00:01:15:24", "00:01:17:29"]
+    assert by_actual["AVENTRUA"]["expected"] == "AVENTURA"
+    assert by_actual["AVENTRUA"]["timecode"] == "00:03:06:21"
+    assert by_actual["AVENTRUA"]["auto_fixable"] is False
+
+
+def test_umg_tu_carcel_four_findings_without_reference():
+    """The UMG acceptance shape must work without a lyric oracle."""
+    report = build_delivery_preflight(
+        metadata={
+            "artist": "Enanitos Verdes", "title": "Tu Cárcel",
+            "version": "En Vivo", "isrc": "MXUV72602826",
+        },
+        asset={
+            "filename": "Enanitos_Verdes_-_Tu_Carcel_En_Vivo.mov",
+            "rendered_title": "Tu Carcel_En Vivo", "title_time": 1.133,
+        },
+        segments=[
+            {"start": 74.367, "end": 75.2, "text": "TENDRAS"},
+            {"start": 75.8, "end": 76.6, "text": "JAMAS"},
+            {"start": 77.967, "end": 78.8, "text": "JAMAS"},
+            {"start": 186.7, "end": 188.0, "text": "AVENTRUA"},
+        ],
+        approved_lyrics=None,
+        reference_trusted=False,
+        fps=30,
+    )
+
+    assert report["summary"] == {
+        "issue_count": 4,
+        "fail_count": 1,
+        "warn_count": 3,
+        "open_count": 4,
+        "segment_count": 4,
+    }
+    assert [
+        (row["code"], row["actual"], row["expected"], row["occurrence_count"])
+        for row in report["issues"]
+    ] == [
+        ("METADATA_TITLE_MISMATCH", "Tu Carcel_En Vivo", "Tu Cárcel", 1),
+        ("LYRIC_ORTHOGRAPHY_MISMATCH", "TENDRAS", "TENDRÁS", 1),
+        ("LYRIC_ORTHOGRAPHY_MISMATCH", "JAMAS", "JAMÁS", 2),
+        ("LYRIC_TOKEN_TYPO", "AVENTRUA", "AVENTURA", 1),
+    ]
+    assert all(row["auto_fixable"] is False for row in report["issues"][1:])
+
+
+def test_untrusted_catalogue_cannot_raise_lyric_corrections():
+    report = build_delivery_preflight(
+        metadata={"title": "Live song"},
+        asset={"duration": 20},
+        segments=[{"start": 1, "end": 3, "text": "Improvised live lyric"}],
+        approved_lyrics=["Completely different studio lyric"],
+        reference_trusted=False,
+    )
+    assert report["issues"] == []
+    assert report["decision"] == "PASS"
+    assert {item["reason"] for item in report["abstentions"]} == {
+        "reference_not_trusted", "rendered_title_or_ocr_missing"
+    }
+
+
+def test_timeline_invariants_can_block_delivery():
+    report = build_delivery_preflight(
+        metadata={"title": "Broken"},
+        asset={"duration": 10},
+        segments=[
+            {"start": 2, "end": 2, "text": "zero"},
+            {"start": 9, "end": 12, "text": "outside"},
+        ],
+    )
+    assert report["decision"] == "BLOCK"
+    assert {item["code"] for item in report["issues"]} >= {
+        "INVALID_LYRIC_RANGE", "LYRIC_OUTSIDE_ASSET"
+    }
+
+
+def test_clean_delivery_passes():
+    report = build_delivery_preflight(
+        metadata={"artist": "Artist", "title": "Song", "version": "Live"},
+        asset={
+            "rendered_artist": "Artist", "rendered_title": "Song",
+            "rendered_version": "Live",
+            "duration": 10,
+        },
+        segments=[{"start": 1, "end": 3, "text": "Jamás te olvidaré"}],
+        approved_lyrics=["Jamás te olvidaré"],
+        reference_trusted=True,
+    )
+    assert report["decision"] == "PASS"
+    assert report["issues"] == []
+
+
+def test_title_card_with_artist_and_title_matches_separate_metadata_fields():
+    report = build_delivery_preflight(
+        metadata={"artist": "Los Huasos Quincheros", "title": "El Corralero"},
+        asset={"rendered_title": "LOS HUASOS QUINCHEROS El Corralero"},
+        segments=[{"start": 1, "end": 3, "text": "Una letra"}],
+    )
+    assert not any(row["code"] == "METADATA_TITLE_MISMATCH" for row in report["issues"])
+
+
+def test_title_card_suffix_still_fails_metadata_check():
+    report = build_delivery_preflight(
+        metadata={"artist": "Los Huasos Quincheros", "title": "El Corralero"},
+        asset={"rendered_title": "LOS HUASOS QUINCHEROS El Corralero En Vivo"},
+        segments=[{"start": 1, "end": 3, "text": "Una letra"}],
+    )
+    assert any(row["code"] == "METADATA_TITLE_MISMATCH" for row in report["issues"])
+
+
+def test_terminal_line_period_preflight_blocks_only_single_final_periods():
+    report = build_delivery_preflight(
+        metadata={"artist": "Artist", "title": "Song"},
+        asset={"rendered_artist": "Artist", "rendered_title": "Song"},
+        segments=[
+            {"start": 1, "end": 2, "text": "Termina."},
+            {"start": 3, "end": 4, "text": "Sigue..."},
+            {"start": 5, "end": 6, "text": "¿Pregunta?"},
+            {"start": 7, "end": 8, "text": "Humana.", "locked": True},
+        ],
+    )
+
+    issue = next(row for row in report["issues"] if row["code"] == "LYRIC_TERMINAL_PERIOD")
+    assert report["decision"] == "BLOCK"
+    assert issue["occurrence_count"] == 2
+    assert issue["timecodes"] == ["00:00:01:00", "00:00:07:00"]
+    assert issue["auto_fixable"] is False
+
+
+def test_reference_free_preflight_flags_fragmented_display_run_for_review():
+    report = build_delivery_preflight(
+        metadata={"artist": "A", "title": "T"},
+        segments=[
+            {"start": 0.0, "end": 0.8, "text": "Yo"},
+            {"start": 0.9, "end": 1.7, "text": "no sé"},
+            {"start": 1.8, "end": 2.6, "text": "por qué"},
+        ],
+        asset={"rendered_title": "T", "rendered_artist": "A", "duration": 3},
+    )
+    issue = next(row for row in report["issues"] if row["code"] == "LYRIC_FRAGMENTATION")
+    assert issue["severity"] == "WARN"
+    assert issue["auto_fixable"] is False
+
+
+def test_reference_free_preflight_flags_near_repeat_without_choosing_truth():
+    report = build_delivery_preflight(
+        metadata={"artist": "A", "title": "T"},
+        segments=[
+            {"start": 0, "end": 3, "text": "Vodka con naranja en el bar"},
+            {"start": 4, "end": 6, "text": "otra frase distinta ahora"},
+            {"start": 7, "end": 10, "text": "Vodka con Gancia en el bar"},
+        ],
+        asset={"rendered_title": "T", "rendered_artist": "A", "duration": 11},
+    )
+    issue = next(
+        row for row in report["issues"]
+        if row["code"] == "LYRIC_REPEAT_INCONSISTENCY"
+    )
+    assert issue["severity"] == "WARN"
+    assert issue["auto_fixable"] is False
+
+
+def test_reference_free_preflight_flags_card_ending_before_last_word_timestamp():
+    report = build_delivery_preflight(
+        metadata={"artist": "A", "title": "T"},
+        segments=[{
+            "start": 0, "end": 2, "text": "Última palabra",
+            "words": [
+                {"start": 0, "end": 0.8, "word": "Última"},
+                {"start": 0.9, "end": 2.4, "word": "palabra"},
+            ],
+        }],
+        asset={"rendered_title": "T", "rendered_artist": "A", "duration": 3},
+    )
+    issue = next(
+        row for row in report["issues"]
+        if row["code"] == "LYRIC_END_BEFORE_WORD_END"
+    )
+    assert issue["severity"] == "WARN"
+    assert issue["expected"] == "2.400"
+
+
+def test_repeated_card_endings_are_one_issue_with_many_timecodes():
+    report = build_delivery_preflight(
+        metadata={"artist": "A", "title": "T"},
+        segments=[
+            {"start": 0, "end": 1, "text": "Una", "words": [{"start": 0, "end": 1.4, "word": "Una"}]},
+            {"start": 2, "end": 3, "text": "Dos", "words": [{"start": 2, "end": 3.5, "word": "Dos"}]},
+            {"start": 4, "end": 5, "text": "Tres", "words": [{"start": 4, "end": 5.7, "word": "Tres"}]},
+        ],
+        asset={"rendered_title": "T", "rendered_artist": "A", "duration": 6},
+    )
+    issues = [row for row in report["issues"] if row["code"] == "LYRIC_END_BEFORE_WORD_END"]
+    assert len(issues) == 1
+    assert issues[0]["occurrence_count"] == 3
+    assert len(issues[0]["timecodes"]) == 3
+
+
+def test_reference_health_blocks_wrong_or_incomplete_catalogue_text():
+    report = build_delivery_preflight(
+        metadata={"title": "Wrong catalogue"},
+        asset={"duration": 200},
+        segments=[{"start": 10, "end": 40, "text": "catalogue candidate"}],
+        reference_health={
+            "text_status": "unsafe_without_witness",
+            "timeline_status": "incomplete",
+            "allow_vocabulary_reconciliation": False,
+            "reasons": ["reference_text_not_attested", "timeline_incomplete"],
+            "metrics": {
+                "timeline_completion_ratio": 0.2,
+                "trailing_gap_s": 160,
+            },
+        },
+    )
+    assert report["decision"] == "BLOCK"
+    assert {item["code"] for item in report["issues"]} == {
+        "REFERENCE_TEXT_UNATTESTED", "REFERENCE_TIMELINE_INCOMPLETE"
+    }
+
+
+def test_report_is_strict_json_even_with_non_finite_upstream_diagnostics():
+    report = build_delivery_preflight(
+        metadata={"artist": "Artist", "title": "Song"},
+        asset={"duration": float("inf")},
+        segments=[{
+            "start": 1.0, "end": float("nan"), "text": "corrupt timing",
+        }],
+        quality={"metrics": {"endpoint_error": float("nan")}},
+        reference_health={"metrics": {"coverage": float("inf")}},
+        acoustic_findings=[{"seconds": float("nan"), "score": float("inf")}],
+        fps=float("nan"),
+    )
+
+    # allow_nan=False models the strict JSON accepted by PostgreSQL JSONB.
+    json.dumps(report, allow_nan=False)
+    assert report["asset"]["fps"] == 30.0
+    assert report["asset"]["duration"] is None
+    assert report["upstream_quality"]["metrics"]["endpoint_error"] is None
+    assert report["reference_health"]["metrics"]["coverage"] is None

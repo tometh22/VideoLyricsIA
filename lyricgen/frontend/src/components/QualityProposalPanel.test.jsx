@@ -32,8 +32,39 @@ const PROPOSAL = {
 };
 
 afterEach(cleanup);
+afterEach(() => vi.unstubAllGlobals());
 
 describe("QualityProposalPanel", () => {
+  it("mide exposición real separada de examen, sin contar carga como rechazo", async () => {
+    let notify;
+    vi.stubGlobal("IntersectionObserver", class {
+      constructor(callback) { notify = callback; }
+      observe() {} disconnect() {}
+    });
+    const user = userEvent.setup(), telemetry = vi.fn();
+    const proposal = { ...PROPOSAL, operator_suggestion_only: true, reviewer_assist: { version: "v1" },
+      windows: PROPOSAL.windows.map((w, i) => ({ ...w, telemetry_id: `receipt-${i}` })) };
+    render(<QualityProposalPanel proposal={proposal} currentRevision={12} onReviewTelemetry={telemetry} onSeek={vi.fn()} />);
+    expect(telemetry).not.toHaveBeenCalled();
+    const target = screen.getByTestId("quality-proposal-window-outro-a");
+    notify([{ target, isIntersecting: true, intersectionRatio: 0.8 }]);
+    notify([{ target, isIntersecting: true, intersectionRatio: 0.8 }]);
+    expect(telemetry.mock.calls.filter(([e]) => e.kind === "shown")).toHaveLength(1);
+    await user.click(within(target).getByRole("button", { name: /Escuchar zona 1/ }));
+    expect(telemetry.mock.calls.some(([e]) => e.kind === "examined")).toBe(true);
+    expect(telemetry.mock.calls.some(([e]) => e.kind === "rejected")).toBe(false);
+  });
+  it("permite usar una candidata completa sin aceptar cada ventana", async () => {
+    const user = userEvent.setup();
+    const apply = vi.fn();
+    const proposal = { ...PROPOSAL, operator_suggestion_only: true,
+      reviewer_assist: { candidate: { segments: [{ text: "Canción completa", start: 0, end: 3 }] } } };
+    render(<QualityProposalPanel proposal={proposal} currentRevision={12} onApplySelected={apply} />);
+    expect(apply).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Usar candidata completa para revisar" }));
+    expect(apply).toHaveBeenCalledWith(["outro-a", "outro-b"], proposal);
+    expect(screen.getByText(/Lo conservado no está certificado/)).toBeInTheDocument();
+  });
   it("compara antes/después y nunca selecciona ni aplica automáticamente", () => {
     const onApplySelected = vi.fn();
     const onDismiss = vi.fn();
@@ -105,6 +136,80 @@ describe("QualityProposalPanel", () => {
     await user.click(screen.getByRole("button", { name: "Descartar propuesta" }));
     expect(onDismiss).toHaveBeenCalledTimes(1);
     expect(onDismiss).toHaveBeenCalledWith(PROPOSAL);
+  });
+
+  it("ofrece aceptar o rechazar con un clic en sugerencias operativas", async () => {
+    const user = userEvent.setup();
+    const onApplySelected = vi.fn();
+    const onRejectWindow = vi.fn();
+    const operatorProposal = {
+      ...PROPOSAL,
+      id: "operator-v1",
+      operator_suggestion_only: true,
+      automatic_apply_allowed: false,
+      windows: [{
+        ...PROPOSAL.windows[0],
+        id: "timing-a",
+        suggestion_type: "timing",
+        confidence: "high",
+        impact_ms: 920,
+        current_end: 70.83,
+        proposed_end: 69.91,
+        preview_start: 68.5,
+      }],
+    };
+    const onSeek = vi.fn();
+    render(
+      <QualityProposalPanel
+        proposal={operatorProposal}
+        currentRevision={12}
+        onApplySelected={onApplySelected}
+        onRejectWindow={onRejectWindow}
+        onSeek={onSeek}
+      />,
+    );
+
+    expect(screen.getByText(/Sugerencias de un clic/i)).toBeInTheDocument();
+    expect(screen.getByText(/Fin actual/i)).toHaveTextContent("1:10.8");
+    expect(screen.getByText(/Fin propuesto/i)).toHaveTextContent("1:09.9");
+    await user.click(screen.getByRole("button", { name: /Escuchar zona 1/i }));
+    expect(onSeek).toHaveBeenCalledWith(68.5, operatorProposal.windows[0]);
+    await user.click(screen.getByRole("button", { name: "Aceptar" }));
+    expect(onApplySelected).toHaveBeenCalledWith(["timing-a"], operatorProposal);
+    await user.click(screen.getByRole("button", { name: "Rechazar" }));
+    expect(onRejectWindow).toHaveBeenCalledWith(
+      "timing-a", "operator_rejected", operatorProposal,
+    );
+  });
+
+  it("califica observaciones sin ofrecer ninguna acción de aplicación", async () => {
+    const user = userEvent.setup();
+    const onObserve = vi.fn();
+    const observation = {
+      ...PROPOSAL,
+      id: "observation-v1",
+      status: "observing",
+      observation_only: true,
+      windows: [PROPOSAL.windows[0]],
+    };
+    render(
+      <QualityProposalPanel
+        proposal={observation}
+        currentRevision={12}
+        onApplySelected={vi.fn()}
+        onDismiss={vi.fn()}
+        onObserve={onObserve}
+      />,
+    );
+
+    expect(screen.getByText(/Calibración observable/i)).toBeInTheDocument();
+    expect(screen.getByText(/nunca modifica la letra ni el timing/i)).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Aplicar seleccionadas/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Descartar propuesta/i })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Correcta" }));
+    expect(onObserve).toHaveBeenCalledWith("outro-a", "correct", observation);
   });
 
   it("marca como obsoleta una propuesta de otra revisión y bloquea mutaciones", () => {

@@ -9,7 +9,10 @@ from database import engine
 
 
 REQUIRED_COLUMNS = {
+    ("ai_provenance", "predict_time_ms"),
+    ("ai_provenance", "queue_time_ms"),
     ("jobs", "transcription_quality"),
+    ("jobs", "machine_snapshot_required"),
     ("jobs", "quality_learning_epoch"),
     ("jobs", "quality_learning_invalidated_at"),
     ("jobs", "input_audio_sha256"),
@@ -23,7 +26,12 @@ REQUIRED_COLUMNS = {
     ("jobs", "segments_json"),
     ("jobs", "render_params"),
     ("jobs", "last_progress_at"),
+    ("jobs", "workload_class"),
+    ("jobs", "campaign_id"),
+    ("jobs", "campaign_item_id"),
     ("editor_documents", "quality_proposal"),
+    ("editor_documents", "machine_evidence"),
+    ("editor_documents", "lock_session_id"),
     ("editor_versions", "provenance"),
     ("job_outbox_events", "dedupe_key"),
     ("job_outbox_events", "available_at"),
@@ -34,6 +42,10 @@ REQUIRED_COLUMNS = {
     ("quality_patterns", "fingerprint"),
     ("quality_fix_proposals", "candidate_config"),
     ("quality_experiment_runs", "candidate_config_hash"),
+    ("delivery_batch_items", "change_request_intent"),
+    ("batch_campaigns", "id"),
+    ("batch_campaign_items", "id"),
+    ("batch_upload_sessions", "id"),
 }
 
 

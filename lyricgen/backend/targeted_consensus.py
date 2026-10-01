@@ -167,6 +167,14 @@ def _proposal_candidate_payload(
         "proposed_segments": [dict(item) for item in proposed_segments],
         "source": str(source),
     }
+    if isinstance(calibrated_evidence, dict):
+        source_families = calibrated_evidence.get("source_families") or (
+            calibrated_evidence.get("independent_content_attestation") or {}
+        ).get("families")
+        if isinstance(source_families, (list, tuple, set)):
+            payload["source_families"] = sorted({
+                str(family).strip() for family in source_families if str(family).strip()
+            })
     certification = _calibrated_review_certification(calibrated_evidence)
     if certification is not None:
         payload["certification"] = certification
@@ -190,6 +198,10 @@ def _stream_family_map(result: dict | None = None) -> dict[str, str]:
         "mix": targeted,
         "primary": primary,
         "witness": str(result.get("_independent_asr_family") or "").strip(),
+        # LoRA-v1 is deliberately an optional *additional* family.  It is
+        # populated only by lora_family.attach_hypothesis after an attested
+        # evaluation report; absent/unknown metadata cannot create a vote.
+        "lora": str(result.get("_lora_asr_family") or "").strip(),
     }
 
 
@@ -197,6 +209,7 @@ def choose_consensus(stem_words: list[dict], mix_words: list[dict],
                      primary_words: list[dict], *,
                      slowed_words: list[dict] | None = None,
                      witness_words: list[dict] | None = None,
+                     lora_words: list[dict] | None = None,
                      stream_families: dict[str, str] | None = None,
                      threshold: float = 0.72):
     """Return the agreed word stream and evidence, or ``(None, ...)``.
@@ -209,6 +222,7 @@ def choose_consensus(stem_words: list[dict], mix_words: list[dict],
         "stem": stem_words, "slowed_stem": slowed_words or [],
         "mix": mix_words, "primary": primary_words,
         "witness": witness_words or [],
+        "lora": lora_words or [],
     }
     texts = {name: _text(words) for name, words in streams.items()}
     families = {
@@ -227,7 +241,7 @@ def choose_consensus(stem_words: list[dict], mix_words: list[dict],
     best = None
     family_rejections = 0
     for isolated in ("stem", "slowed_stem"):
-        for independent in ("primary", "witness", "mix"):
+        for independent in ("primary", "witness", "mix", "lora"):
             if isolated not in eligible or independent not in eligible:
                 continue
             isolated_family = families.get(isolated, "")
@@ -259,6 +273,44 @@ def choose_consensus(stem_words: list[dict], mix_words: list[dict],
     evidence["sources"] = [best[1], best[2]]
     evidence["source_families"] = [families[best[1]], families[best[2]]]
     return streams[best[1]], evidence
+
+
+def _record_lora_shadow(stats: dict, *, lora_words: list[dict],
+                        with_agreed: list[dict] | None,
+                        with_evidence: dict,
+                        without_agreed: list[dict] | None,
+                        without_evidence: dict) -> None:
+    """Attribute genuinely new consensus lines to the LoRA witness.
+
+    This is a cheap paired shadow: both decisions use the exact same window
+    and streams, with only the attested LoRA words removed in the control.
+    It never changes the selected output and lets the first 30–50 real songs
+    report ``with`` versus ``without`` without paying for a second ASR pass.
+    """
+    if not lora_words:
+        return
+    shadow = stats.setdefault("lora_shadow", {
+        "enabled": True, "comparisons": 0,
+        "with_consensus": 0, "without_consensus": 0,
+        "lora_contributed_lines": 0, "new_consensus_lines": 0,
+        "lost_consensus_lines": 0,
+    })
+    # The stats template pre-seeds ``enabled: False`` so a song without LoRA
+    # words reports the shadow as inactive; setdefault therefore never flips
+    # it. Any recorded comparison means the witness was present.
+    shadow["enabled"] = True
+    shadow["comparisons"] += 1
+    with_pass = bool(with_agreed)
+    without_pass = bool(without_agreed)
+    shadow["with_consensus"] += int(with_pass)
+    shadow["without_consensus"] += int(without_pass)
+    lora_sources = set(with_evidence.get("sources") or [])
+    if with_pass and "lora" in lora_sources:
+        shadow["lora_contributed_lines"] += 1
+        if not without_pass:
+            shadow["new_consensus_lines"] += 1
+    if without_pass and not with_pass:
+        shadow["lost_consensus_lines"] += 1
 
 
 def _transcribe_slowed_window(stem_path: str, start: float, duration: float,
@@ -361,6 +413,8 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
     fd, clip = tempfile.mkstemp(prefix="genly_gemini_vocal_", suffix=".wav")
     os.close(fd)
     recorder = None
+    provider_completed = False
+    provider_recorded = False
     prompt = (
         "Transcribí únicamente los eventos vocales audibles en este fragmento. "
         "Cada evento debe ser una frase o ciclo vocal completo: no dividas una "
@@ -431,10 +485,52 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
             timeout_s=60.0,
             label="TARGETED-GEMINI-VERIFY",
         )
-        raw = (response.text or "").strip()
-        payload = json.loads(raw)
+        provider_completed = True
+        from recognition_provenance import (
+            record_completed,
+            response_text_completion,
+        )
+        raw, raw_events = response_text_completion(
+            response, label="opaque-targeted-gemini-response",
+        )
+        raw = raw.strip()
+        if not raw:
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=raw_events,
+                kind="text",
+                view="bounded_vocal_window",
+                transformation="targeted_consensus_empty_or_unreadable",
+            )
+            provider_recorded = True
+            return []
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=([{"text": raw}] if raw else []),
+                kind="text",
+                view="bounded_vocal_window",
+                transformation="targeted_consensus_unparsed_raw",
+            )
+            provider_recorded = True
+            raise
         events = payload.get("events") if isinstance(payload, dict) else None
-        if not isinstance(events, list) or len(events) > 16:
+        if not isinstance(events, list):
+            from recognition_provenance import record_completed
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=([{"text": raw}] if raw else []),
+                kind="text",
+                view="bounded_vocal_window",
+                transformation="targeted_consensus_invalid_shape_raw",
+            )
+            provider_recorded = True
+            return []
+        _record_gemini_event_response(raw, events)
+        provider_recorded = True
+        if len(events) > 16:
             return []
         out = []
         from pipeline import _is_whisper_hallucination
@@ -468,6 +564,14 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
             recorder.finish(response_summary=f"events={len(out)}")
         return out
     except Exception as exc:
+        if provider_completed and not provider_recorded:
+            from recognition_provenance import record_completed
+            record_completed(
+                family="google/gemini-2.5-flash-audio",
+                events=[],
+                view="bounded_vocal_window",
+                transformation="targeted_consensus_parse_failed",
+            )
         if recorder:
             recorder.finish(
                 response_summary=f"error:{_safe_error_type(exc)}",
@@ -482,6 +586,34 @@ def _transcribe_gemini_events(audio_path: str, start: float, duration: float,
             os.unlink(clip)
         except OSError:
             pass
+
+
+def _record_gemini_event_response(raw: str, events: list) -> None:
+    """Freeze the provider response before semantic row validation.
+
+    A JSON ``events`` list can still contain strings, numbers, or other
+    malformed rows.  The recognition collector intentionally accepts only
+    dictionaries, so passing that list directly would make a completed call
+    look like an empty hypothesis.  Preserve the complete raw response as a
+    text event in that case; downstream parsing may still reject it.
+    """
+    from recognition_provenance import record_completed
+
+    if all(isinstance(event, dict) for event in events):
+        record_completed(
+            family="google/gemini-2.5-flash-audio",
+            events=events,
+            view="bounded_vocal_window",
+            transformation="targeted_consensus_raw",
+        )
+        return
+    record_completed(
+        family="google/gemini-2.5-flash-audio",
+        events=([{"text": raw}] if raw else []),
+        kind="text",
+        view="bounded_vocal_window",
+        transformation="targeted_consensus_malformed_events_raw",
+    )
 
 
 def _word_tokens(text: str) -> list[str]:
@@ -891,6 +1023,11 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _max_targeted_windows() -> int:
+    """Bound malformed inputs without truncating legitimate live-song gaps."""
+    return min(64, _env_int("TARGETED_CONSENSUS_MAX_WINDOWS", 3))
+
+
 def reprocess(result: dict, audio_path: str, windows: list[dict], *,
               language: str = "", job_id: str = "",
               transcribe_fn=None, gemini_fn=None,
@@ -913,6 +1050,14 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         "structural_hybrid_attempts": 0, "structural_hybrid_accepts": 0,
         "structural_hybrid_declined": [],
         "structural_hybrid_diagnostics": [],
+        # Paired with/without-LoRA attribution.  The control reuses every
+        # already-decoded stream, so it adds no provider cost.
+        "lora_shadow": {
+            "enabled": False, "comparisons": 0,
+            "with_consensus": 0, "without_consensus": 0,
+            "lora_contributed_lines": 0, "new_consensus_lines": 0,
+            "lost_consensus_lines": 0,
+        },
         # Raw proposal content is returned only to the tenant-scoped quality
         # worker.  It is removed before Job quality analytics are persisted.
         "quality_proposal_windows": [],
@@ -927,6 +1072,7 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 return _transcribe_window(
                     path, start, duration, lang, current_job_id,
                     provenance_step="targeted_consensus",
+                    prompt=str(result.get("_artist_lexicon_prompt") or "") or None,
                 )
         if not stem_path:
             import vocal_sep
@@ -938,9 +1084,12 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
 
         # Environment values may tune downward but can never remove the hard
         # operational ceiling.
-        max_windows = min(4, _env_int("TARGETED_CONSENSUS_MAX_WINDOWS", 3))
+        # Do not truncate difficult live songs at the historical 12-window
+        # pilot limit.  Spend is still bounded independently by
+        # TARGETED_CONSENSUS_MAX_BILLED_SECONDS and the hard deadline.
+        max_windows = _max_targeted_windows()
         configured_billed_s = min(
-            180.0,
+            360.0,
             _env_float("TARGETED_CONSENSUS_MAX_BILLED_SECONDS", 120.0),
         )
         job_asr_budget = min(
@@ -959,11 +1108,12 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
         primary = result.get("_asr_words") or []
         independent_witness = result.get("_independent_asr_words") or []
         stream_families = _stream_family_map(result)
+        lora_words = result.get("_lora_asr_words") or []
         segments = [dict(s) for s in (result.get("segments") or [])]
         stats["attempted"] = True
         started_at = time.monotonic()
         hard_deadline_s = min(
-            150.0, _env_float("TARGETED_CONSENSUS_DEADLINE_SECONDS", 120.0)
+            600.0, _env_float("TARGETED_CONSENSUS_DEADLINE_SECONDS", 120.0)
         )
         from quality_mutation import mutation_authorized
         allow_insertions = mutation_authorized(job_id=job_id)
@@ -1414,9 +1564,21 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                 pw = _words_in(primary, a, b)
                 iw = _words_in(independent_witness, a, b)
                 sloww = _words_in(slowed_words, a, b)
+                lw = _words_in(lora_words, a, b)
                 agreed, evidence = choose_consensus(
                     sw, mw, pw, slowed_words=sloww, witness_words=iw,
+                    lora_words=lw,
                     stream_families=stream_families,
+                )
+                without_lora, without_lora_evidence = choose_consensus(
+                    sw, mw, pw, slowed_words=sloww, witness_words=iw,
+                    lora_words=[], stream_families=stream_families,
+                )
+                _record_lora_shadow(
+                    stats, lora_words=lw,
+                    with_agreed=agreed, with_evidence=evidence,
+                    without_agreed=without_lora,
+                    without_evidence=without_lora_evidence,
                 )
                 if not agreed or not _safe_line(agreed):
                     continue
@@ -1485,8 +1647,58 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                         mix_group, primary_group,
                         slowed_words=group if is_slow_group else slow_group,
                         witness_words=witness_group,
+                        lora_words=_words_in(lora_words, a, b, pad=0.6),
                         stream_families=stream_families,
                     )
+                    group_lora = _words_in(lora_words, a, b, pad=0.6)
+                    without_lora, without_lora_evidence = choose_consensus(
+                        normal_group if is_slow_group else group,
+                        mix_group, primary_group,
+                        slowed_words=group if is_slow_group else slow_group,
+                        witness_words=witness_group,
+                        lora_words=[], stream_families=stream_families,
+                    )
+                    _record_lora_shadow(
+                        stats, lora_words=group_lora,
+                        with_agreed=agreed, with_evidence=_evidence,
+                        without_agreed=without_lora,
+                        without_evidence=without_lora_evidence,
+                    )
+                    matched_gemini = None
+                    if not agreed and gemini_events:
+                        isolated_text = _text(group)
+                        viable_events = [
+                            event for event in gemini_events
+                            if isinstance(event, dict)
+                            and _f(event.get("end")) >= a - 0.9
+                            and _f(event.get("start")) <= b + 0.9
+                        ]
+                        if viable_events:
+                            matched_gemini = max(
+                                viable_events,
+                                key=lambda event: _similarity(
+                                    isolated_text,
+                                    str(event.get("text") or ""),
+                                ),
+                            )
+                            agreement = _similarity(
+                                isolated_text,
+                                str(matched_gemini.get("text") or ""),
+                            )
+                            isolated_family = str(
+                                stream_families.get(
+                                    "slowed_stem" if is_slow_group else "stem"
+                                ) or ""
+                            )
+                            if agreement >= 0.90 and isolated_family:
+                                agreed = group
+                                _evidence = {
+                                    "sources": [isolated_source, "gemini"],
+                                    "source_families": [
+                                        isolated_family, "gemini_audio",
+                                    ],
+                                    "agreement": round(agreement, 3),
+                                }
                     if not agreed:
                         continue
                     agreed_a = _f(agreed[0].get("start"))
@@ -1505,7 +1717,48 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                     cross_model = (
                         bool(result.get("live_audio_truth"))
                         and "primary" in sources
-                    )
+                    ) or "gemini" in sources
+                    operator_mode = os.environ.get(
+                        "QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "0",
+                    ).strip().lower() in _TRUE
+                    if operator_mode and cross_model:
+                        proposal_reasons = set(reasons)
+                        proposed_text = _text(agreed)
+                        tokens = _word_tokens(proposed_text)
+                        is_vocalization = bool(
+                            (matched_gemini or {}).get("kind") == "vocalization"
+                            or (
+                                b - a >= 0.75 and tokens
+                                and all(token in _VOCALIZATION_TOKENS for token in tokens)
+                            )
+                        )
+                        if is_vocalization:
+                            proposal_reasons.add("vocalization")
+                            proposed_text = f"({proposed_text})"
+                        stats["quality_proposal_windows"].append(
+                            _proposal_candidate_payload(
+                                candidate_id=str(window.get("id") or ""),
+                                parent_window_id=str(
+                                    window.get("parent_window_id")
+                                    or window.get("id") or ""
+                                ),
+                                start=agreed_a, end=agreed_b,
+                                reasons=proposal_reasons,
+                                current_segments=[],
+                                proposed_segments=[{
+                                    "start": round(agreed_a, 3),
+                                    "end": round(agreed_b, 3),
+                                    "text": proposed_text,
+                                    "review": True,
+                                    "consensus_reprocessed": True,
+                                    "consensus_sources": sorted(sources),
+                                }],
+                                source="independent_gap_consensus",
+                                calibrated_evidence=_evidence,
+                            )
+                        )
+                        stats["lines_suggested"] += 1
+                        continue
                     if not allow_insertions or not cross_model:
                         # Observe mode measures how often consensus could help
                         # but cannot mutate the delivered lyric. Auto-insertions

@@ -14,7 +14,17 @@ import { useState, useEffect, useCallback } from "react";
 import { API, fetchJson } from "../../adminApi";
 import { useAdmin } from "../../AdminContext";
 
-export default function useNegocio() {
+// `soloFacturas` apaga la carga del panel de márgenes.
+//
+// Los dos datasets se pedían SIEMPRE al montar, así que la tab de
+// Facturación disparaba `/admin/margin` sin mostrarlo nunca.
+//
+// El motivo NO es performance: medido contra la base de producción, la
+// agregación más pesada de `cost_dashboard_global` corre en ~2 ms sobre
+// 1.924 filas de ai_provenance. El motivo es que `/admin/margin` devuelve
+// `by_user` con los usernames de TODOS los tenants, y pedirlo desde una
+// pantalla de facturas es superficie de datos regalada.
+export default function useNegocio({ soloFacturas = false } = {}) {
   const { flashError } = useAdmin();
 
   // --- Costos ---------------------------------------------------------------
@@ -24,6 +34,7 @@ export default function useNegocio() {
   const [costLoading, setCostLoading] = useState(false);
 
   const loadCostDashboard = useCallback(async () => {
+    if (soloFacturas) return;
     setCostLoading(true);
     try {
       const url = `${API}/admin/margin?since_days=${costSinceDays}` +
@@ -34,12 +45,16 @@ export default function useNegocio() {
     } finally {
       setCostLoading(false);
     }
-  }, [costSinceDays, costRevenuePerVideo, flashError]);
+  }, [costSinceDays, costRevenuePerVideo, soloFacturas, flashError]);
 
   useEffect(() => { loadCostDashboard(); }, [loadCostDashboard]);
 
-  // El "Margen por tenant" (economics, super-admin) se mudó al panel
-  // Insights en la consolidación 2026-06-11 — su fetch vive en useInsights.
+  // El "Margen por tenant" (economics, super-admin) vive en Insights; su
+  // fetch está en useInsights. No se fusionó con la página de Costos a
+  // propósito: usa otro denominador (`approved_videos`, por `approved_at`)
+  // y otro precio (`PLANS[plan].price_per_video`, fijo) que el precio
+  // editable de esa página. Ponerlos en la misma fila invitaría a restar
+  // peras de manzanas.
 
   // --- Invoices -------------------------------------------------------------
   const [invoices, setInvoices] = useState([]);

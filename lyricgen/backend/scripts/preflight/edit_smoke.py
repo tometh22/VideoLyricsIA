@@ -13,7 +13,8 @@ existe para cazar.
      Corazón", byte 0xf3) — el disparador real del UnicodeDecodeError que
      activó el 234.
   2. Lo sube directo a R2 con el flujo vigente (/upload-url), lo transcribe
-     (/transcribe-uploaded), genera el video y espera pending_review.
+     (/transcribe-uploaded), guarda una corrección de timing pre-aprobación,
+     genera el video y espera pending_review.
   3. Pide un edit de metadata (/edit) — recorre run_edit_pipeline: la
      apertura moviepy del source_audio, el fallback UTF-8, el re-render y
      el re-upload de deliverables.
@@ -31,13 +32,15 @@ Uso:
 from __future__ import annotations
 
 import argparse
-import io
+import base64
+import hashlib
 import json
 import os
 import struct
 import sys
 import time
-import wave
+import zlib
+from pathlib import Path
 
 import requests
 
@@ -46,15 +49,15 @@ _TITLE = "Estrechez de Corazón (smoke)"
 _ARTIST = "Los Prisioneros - smoke"  # separador ASCII: el tag va en latin-1
 
 
-def _accented_wav_bytes(seconds: int = 2) -> bytes:
-    """WAV PCM válido + chunk LIST/INFO con metadata latin-1."""
-    raw = io.BytesIO()
-    with wave.open(raw, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(8000)
-        w.writeframes(b"\x00\x00" * (8000 * seconds))
-    data = bytearray(raw.getvalue())
+def _accented_wav_bytes() -> bytes:
+    """Voiced WAV fixture + LIST/INFO metadata encoded as latin-1."""
+    fixture = (
+        Path(__file__).with_name("fixtures")
+        / "voiced_smoke.wav.zlib.b64"
+    )
+    data = bytearray(zlib.decompress(base64.b64decode(fixture.read_bytes())))
+    if not data.startswith(b"RIFF") or data[8:12] != b"WAVE":
+        raise RuntimeError("voiced smoke fixture is not a RIFF/WAVE file")
 
     def sub(cid: bytes, text: str) -> bytes:
         b = text.encode("latin-1") + b"\x00"
@@ -70,6 +73,29 @@ def _accented_wav_bytes(seconds: int = 2) -> bytes:
 def _fail(msg: str) -> int:
     print(f"[edit-smoke] NO-GO: {msg}", file=sys.stderr)
     return 1
+
+
+def _timing_only_edit(segments: list[dict]) -> list[dict]:
+    """Move one real machine line while preserving every other line."""
+    if not segments or not all(isinstance(row, dict) for row in segments):
+        raise ValueError("la transcripción no produjo líneas de máquina")
+    first = segments[0]
+    if not str(first.get("text") or "").strip():
+        raise ValueError("la primera línea de máquina no contiene texto")
+    try:
+        start = float(first["start"])
+        end = float(first["end"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("la primera línea no tiene timing válido") from exc
+    shifted_start = round(start + 0.1, 4)
+    if shifted_start >= end:
+        shifted_start = round(max(0.0, start - 0.1), 4)
+    if shifted_start == start or shifted_start >= end:
+        raise ValueError("la primera línea es demasiado corta para el delta")
+
+    edited = [dict(row) for row in segments]
+    edited[0]["start"] = shifted_start
+    return edited
 
 
 _QUALITY_GATE_CODES = {
@@ -107,6 +133,40 @@ def _quality_gate_go(job_id: str, phase: str, code: str) -> int:
     return 0
 
 
+def _delivery_qc_contract_error(status_payload: dict) -> str | None:
+    """Validate that /status exposes a fresh report for the current render."""
+    report = status_payload.get("delivery_qc")
+    if not isinstance(report, dict):
+        return "delivery_qc ausente en /status"
+    if report.get("status") != "COMPLETE":
+        return f"delivery_qc no está fresco (status={report.get('status')})"
+    if report.get("mode") not in {"observe", "enforce"}:
+        return f"delivery_qc mode inválido: {report.get('mode')}"
+    if not report.get("generated_at") or not report.get("segments_hash"):
+        return "delivery_qc no tiene identidad temporal/de segmentos"
+    expected_revision = int(status_payload.get("segments_revision") or 0)
+    if int(report.get("segments_revision") or 0) != expected_revision:
+        return (
+            "delivery_qc corresponde a otra revisión "
+            f"({report.get('segments_revision')} != {expected_revision})"
+        )
+    identity = report.get("render_identity") or {}
+    expected_edit_count = int(status_payload.get("edit_count") or 0)
+    if int(identity.get("edit_count") or 0) != expected_edit_count:
+        return (
+            "delivery_qc corresponde a otro render/edit "
+            f"({identity.get('edit_count')} != {expected_edit_count})"
+        )
+    technical = report.get("technical") or {}
+    video = technical.get("video") or {}
+    if not video.get("codec") or int(technical.get("audio_streams") or 0) < 1:
+        return "delivery_qc no certificó streams de audio/video"
+    approval = report.get("approval") or {}
+    if report.get("mode") == "observe" and approval.get("blocked") is not False:
+        return "delivery_qc observe bloqueó la aprobación"
+    return None
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--api-url", required=True)
@@ -117,6 +177,13 @@ def main() -> int:
         help=(
             "acepta un 409 fail-closed del gate v6 para este fixture de silencio; "
             "staging lo usa con enforcement, producción conserva el smoke completo"
+        ),
+    )
+    p.add_argument(
+        "--require-delivery-qc", action="store_true",
+        help=(
+            "exige que cada render publique en /status un preflight fresco, "
+            "ligado a la revisión y al edit_count actuales"
         ),
     )
     args = p.parse_args()
@@ -165,17 +232,52 @@ def main() -> int:
         return _fail(f"R2 PUT {r.status_code}: {r.text[:300]}")
 
     r = requests.post(
-        f"{api}/transcribe-uploaded", headers=headers,
+        f"{api}/transcribe-uploaded",
+        headers={
+            **headers,
+            "Idempotency-Key": f"edit-smoke-transcribe-{job_id}",
+        },
         json={
             "job_id": job_id,
             "language": "es",
             "artist": _ARTIST,
             "title": _TITLE,
         },
-        timeout=120,
+        timeout=15,
     )
     if not r.ok:
         return _fail(f"/transcribe-uploaded {r.status_code}: {r.text[:300]}")
+    if r.status_code != 202 or not r.headers.get("Location"):
+        return _fail(
+            "/transcribe-uploaded no devolvió el contrato 202+Location: "
+            f"{r.status_code} {r.text[:300]}"
+        )
+    _transcription_acceptance = r.json()
+    if _transcription_acceptance.get("status_url") != f"/transcription-status/{job_id}":
+        return _fail("/transcribe-uploaded status_url inconsistente")
+    # Exercise the lost-response retry contract before polling. The same key
+    # must return the same durable event and must not enqueue a second job.
+    duplicate = requests.post(
+        f"{api}/transcribe-uploaded",
+        headers={
+            **headers,
+            "Idempotency-Key": f"edit-smoke-transcribe-{job_id}",
+        },
+        json={
+            "job_id": job_id,
+            "language": "es",
+            "artist": _ARTIST,
+            "title": _TITLE,
+        },
+        timeout=15,
+    )
+    if not duplicate.ok or duplicate.status_code != 202:
+        return _fail(f"/transcribe-uploaded retry {duplicate.status_code}: {duplicate.text[:300]}")
+    if (
+        not duplicate.json().get("deduplicated")
+        or duplicate.json().get("outbox_event_id") != _transcription_acceptance.get("outbox_event_id")
+    ):
+        return _fail("/transcribe-uploaded retry no reutilizó el evento durable")
     print(f"[edit-smoke] job {job_id} subido — esperando transcripción…")
 
     transcription_deadline = time.time() + args.render_timeout
@@ -207,6 +309,34 @@ def main() -> int:
     else:
         return _fail(f"transcripción no terminó en {args.render_timeout}s")
 
+    # 2.5. Autosave pre-aprobación — además de probar el endpoint del editor,
+    # deja un delta de timing real entre la hipótesis de máquina y la versión
+    # que /generate congela como aprobada. Guardarlo después de /generate no
+    # sirve para entrenamiento: sería contaminación posterior a la aprobación.
+    try:
+        edited_segments = _timing_only_edit(segments)
+    except ValueError as exc:
+        return _fail(f"fixture no apto para delta de timing: {exc}")
+    r = requests.post(
+        f"{api}/jobs/{job_id}/save-segments", headers=headers,
+        json={"segments": edited_segments}, timeout=30,
+    )
+    if not r.ok:
+        return _fail(f"/save-segments {r.status_code}: {r.text[:300]}")
+    saved = r.json()
+    if saved.get("count") != len(edited_segments):
+        return _fail(
+            "/save-segments persistió "
+            f"{saved.get('count')} != {len(edited_segments)}"
+        )
+    saved_revision = saved.get("revision")
+    if not isinstance(saved_revision, int) or saved_revision < 1:
+        return _fail(
+            "/save-segments no devolvió una revisión durable positiva"
+        )
+    segments = edited_segments
+    print(f"[edit-smoke] save-segments pre-aprobación ok (count={saved['count']})")
+
     # Generar reusando el audio ya persistido y los segmentos aprobados: es
     # exactamente el contrato que usa el wizard después del editor de letra.
     generate_fields = {
@@ -214,6 +344,7 @@ def main() -> int:
         "artist": _ARTIST,
         "song_title": _TITLE,
         "segments_json": json.dumps(segments, ensure_ascii=False),
+        "base_revision": str(saved_revision),
         "delivery_profile": "youtube",
     }
     r = requests.post(
@@ -262,36 +393,58 @@ def main() -> int:
     gate_code = _status_quality_gate_code(st)
     if args.allow_quality_gate_block and gate_code:
         return _quality_gate_go(job_id, "render", gate_code)
-
-    # 2.5. Autosave del editor — el camino que los operadores reportan como
-    # frágil (issue #934). GO/NO-GO: POST /jobs/{id}/save-segments con una
-    # corrección de timing debe 200 y persistir el count. Sin esto el gate
-    # verde no decía nada sobre el guardado del editor (incidente Seba
-    # 21-jul: autosave fallando en prod con smoke verde).
-    _segs = [
-        {"start": 0.2, "end": 1.4, "text": "estrechez de corazón (smoke)"},
-        {"start": 1.5, "end": 2.0, "text": "línea dos"},
-    ]
-    r = requests.post(
-        f"{api}/jobs/{job_id}/save-segments", headers=headers,
-        json={"segments": _segs}, timeout=30,
-    )
-    if not r.ok:
-        return _fail(f"/save-segments {r.status_code}: {r.text[:300]}")
-    _saved = r.json()
-    if _saved.get("count") != len(_segs):
-        return _fail(f"/save-segments persistió {_saved.get('count')} != {len(_segs)}")
-    print(f"[edit-smoke] save-segments ok (count={_saved['count']})")
+    _initial_qc_generated_at = None
+    if args.require_delivery_qc:
+        contract_error = _delivery_qc_contract_error(st)
+        if contract_error:
+            return _fail(f"render inicial: {contract_error}")
+        _initial_qc_generated_at = st["delivery_qc"]["generated_at"]
+        print("[edit-smoke] delivery_qc inicial fresco y ligado al render")
 
     # 3. Edit de metadata — recorre run_edit_pipeline completo (apertura
     # moviepy del source_audio + fallback UTF-8 + re-render) sin costo Veo.
     r = requests.post(
-        f"{api}/edit/{job_id}", headers=headers,
+        f"{api}/edit/{job_id}",
+        headers={
+            **headers,
+            "Idempotency-Key": (
+                "edit-smoke-edit-"
+                + hashlib.sha256(
+                    f"{job_id}:{_TITLE}:metadata".encode("utf-8"),
+                ).hexdigest()
+            ),
+        },
         json={"edit_type": "metadata", "song_title": f"{_TITLE} · editado"},
-        timeout=30,
+        timeout=15,
     )
     if not r.ok:
         return _fail(f"/edit {r.status_code}: {r.text[:300]}")
+    if r.status_code != 202 or not r.headers.get("Location"):
+        return _fail(f"/edit no devolvió el contrato 202+Location: {r.status_code}")
+    _edit_acceptance = r.json()
+    if _edit_acceptance.get("status_url") != f"/status/{job_id}":
+        return _fail("/edit status_url inconsistente")
+    duplicate = requests.post(
+        f"{api}/edit/{job_id}",
+        headers={
+            **headers,
+            "Idempotency-Key": (
+                "edit-smoke-edit-"
+                + hashlib.sha256(
+                    f"{job_id}:{_TITLE}:metadata".encode("utf-8"),
+                ).hexdigest()
+            ),
+        },
+        json={"edit_type": "metadata", "song_title": f"{_TITLE} · editado"},
+        timeout=15,
+    )
+    if not duplicate.ok or duplicate.status_code != 202:
+        return _fail(f"/edit retry {duplicate.status_code}: {duplicate.text[:300]}")
+    if (
+        not duplicate.json().get("deduplicated")
+        or duplicate.json().get("outbox_event_id") != _edit_acceptance.get("outbox_event_id")
+    ):
+        return _fail("/edit retry no reutilizó el evento durable")
     print("[edit-smoke] edit aceptado — esperando re-render…")
     try:
         st = wait_for({"pending_review", "done"}, "edit")
@@ -303,6 +456,13 @@ def main() -> int:
         if args.allow_quality_gate_block and gate_code:
             return _quality_gate_go(job_id, "edit", gate_code)
         return _fail(f"edit dejó error residual: {st['error']}")
+    if args.require_delivery_qc:
+        contract_error = _delivery_qc_contract_error(st)
+        if contract_error:
+            return _fail(f"re-render editado: {contract_error}")
+        if st["delivery_qc"]["generated_at"] == _initial_qc_generated_at:
+            return _fail("el edit reutilizó el delivery_qc del render anterior")
+        print("[edit-smoke] delivery_qc regenerado y ligado al edit actual")
     print(f"[edit-smoke] GO ✅ — job {job_id}: upload→render→edit→re-render OK")
     return 0
 

@@ -47,9 +47,22 @@ const DEFAULTS = {
   umg_prores_profile: "3",
 };
 
-export default function EnableProResModal({ jobId, onClose, onSuccess }) {
+export default function EnableProResModal({
+  jobId,
+  onClose,
+  onSuccess,
+  title,
+  description,
+  submitLabel,
+  initialFrameSize,
+}) {
   const { t } = useI18n();
-  const [form, setForm] = useState(DEFAULTS);
+  const [form, setForm] = useState(() => ({
+    ...DEFAULTS,
+    ...(FRAME_SIZES.some(({ value }) => value === initialFrameSize)
+      ? { umg_frame_size: initialFrameSize }
+      : {}),
+  }));
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   // El modal se desmonta apenas onSuccess flipea el state upstream; el
@@ -97,10 +110,10 @@ export default function EnableProResModal({ jobId, onClose, onSuccess }) {
         aria-labelledby="enable-prores-title"
       >
         <h3 id="enable-prores-title" className="text-lg font-semibold text-white mb-1">
-          {t("prores.enable_title") || "Exportar a ProRes"}
+          {title || t("prores.enable_title") || "Exportar a ProRes"}
         </h3>
         <p className="text-xs text-gray-400 mb-5">
-          {t("prores.enable_desc") ||
+          {description || t("prores.enable_desc") ||
             "Generamos un máster ProRes (.mov) a partir del MP4 ya renderizado. Tarda 1-5 minutos según la duración."}
         </p>
 
@@ -177,7 +190,7 @@ export default function EnableProResModal({ jobId, onClose, onSuccess }) {
           >
             {submitting
               ? (t("prores.submitting") || "Encolando…")
-              : (t("prores.submit") || "Generar ProRes")}
+              : (submitLabel || t("prores.submit") || "Generar ProRes")}
           </button>
         </div>
       </div>

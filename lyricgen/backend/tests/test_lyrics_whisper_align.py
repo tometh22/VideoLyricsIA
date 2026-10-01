@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import os
+import inspect
 
 BACKEND = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if BACKEND not in sys.path:
@@ -21,9 +22,85 @@ from lyrics_whisper_align import (  # noqa: E402
     _tokens_with_line,
     _build_segments,
     _lev_similarity,
+    _map_provider_words,
+    _provider_response_words,
+    _raw_provider_words,
+    whisper_word_align,
     MIN_ANCHOR_RATIO,
     MIN_SEG_DUR_S,
 )
+
+
+def test_provider_word_mapping_preserves_empty_completion_and_sdk_objects():
+    assert _map_provider_words([]) == []
+    sdk_word = type("Word", (), {
+        "word": "hola", "start": 1.0, "end": 1.4,
+    })()
+    assert _map_provider_words([sdk_word, {
+        "word": "mundo", "start": 1.5, "end": 2.0,
+    }]) == [
+        {"word": "hola", "start": 1.0, "end": 1.4},
+        {"word": "mundo", "start": 1.5, "end": 2.0},
+    ]
+
+
+def test_raw_provider_words_preserves_opaque_rows_before_mapping():
+    class OpaqueWord:
+        def model_dump(self):
+            raise ValueError("malformed SDK row")
+
+        def __getattr__(self, _name):
+            raise AttributeError
+
+        def __str__(self):
+            raise RuntimeError("SDK object cannot be stringified")
+
+    class HostileWordDict(dict):
+        def keys(self):
+            raise RuntimeError("SDK mapping cannot be copied")
+
+        def __iter__(self):
+            raise RuntimeError("SDK mapping cannot be copied")
+
+        def __str__(self):
+            raise RuntimeError("SDK mapping cannot be stringified")
+
+    raw = _raw_provider_words([
+        {"word": "hola", "start": 1.0, "end": 1.4},
+        OpaqueWord(),
+        HostileWordDict(word="hostile", start=2.0, end=2.4),
+    ])
+
+    assert raw == [
+        {"word": "hola", "start": 1.0, "end": 1.4},
+        {"raw": "<opaque-provider-value-OpaqueWord>"},
+        {"raw": "<opaque-provider-value-HostileWordDict>"},
+    ]
+
+
+def test_provider_response_words_preserves_hostile_stream_getter():
+    class HostileResponse:
+        @property
+        def words(self):
+            raise RuntimeError("deferred SDK failure")
+
+    words, raw = _provider_response_words(HostileResponse())
+
+    assert words == []
+    assert raw == [{
+        "raw": "<opaque-whisper-word-response-HostileResponse>",
+        "serialization_error": "RuntimeError",
+    }]
+
+
+def test_alignment_records_raw_words_before_selection_mapping():
+    source = inspect.getsource(whisper_word_align)
+    raw_index = source.index(
+        "words, raw_word_dicts = _provider_response_words(response)"
+    )
+    record_index = source.index("record_completed(", raw_index)
+    map_index = source.index("word_dicts = _map_provider_words(words)")
+    assert raw_index < record_index < map_index
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -410,3 +487,30 @@ def test_integration_638_like_synthetic():
     # Strict monotonicity.
     for i in range(1, len(segs)):
         assert segs[i]["start"] > segs[i - 1]["start"]
+
+
+def test_build_segments_marks_interpolated_lines():
+    """Lines whose start came from interpolation carry `interpolated: True`;
+    anchored lines do not (2026-09-14: the caller refuses mostly-guessed
+    fallbacks)."""
+    from lyrics_whisper_align import _build_segments, _tokens_with_line
+
+    lines = ["hola mundo", "linea sin anclar", "otra linea sin anclar", "chau mundo"]
+    tokens = _tokens_with_line(lines)
+    words = [
+        {"word": "hola", "start": 1.0, "end": 1.4},
+        {"word": "mundo", "start": 1.5, "end": 1.9},
+        {"word": "chau", "start": 9.0, "end": 9.4},
+        {"word": "mundo", "start": 9.5, "end": 9.9},
+    ]
+    mapping = []
+    for li, tok in tokens:
+        if li == 0:
+            mapping.append(0 if tok == "hola" else 1)
+        elif li == 3:
+            mapping.append(2 if tok == "chau" else 3)
+        else:
+            mapping.append(-1)
+    segs = _build_segments(lines, tokens, mapping, words, audio_dur=12.0)
+    assert [s["text"] for s in segs] == lines
+    assert [bool(s.get("interpolated")) for s in segs] == [False, True, True, False]

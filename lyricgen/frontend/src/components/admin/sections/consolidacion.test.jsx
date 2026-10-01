@@ -1,5 +1,5 @@
 /**
- * Consolidación del admin (2026-06-11): 4 secciones por pregunta.
+ * Consolidación del admin: secciones principales por tarea.
  * Verifica el NAV nuevo (con gating de Insights), el switch de Gestión y
  * los KPIs WoW de Rendimiento contra fixtures con la forma exacta de
  * /admin/metrics/timeseries.
@@ -19,11 +19,12 @@ afterEach(() => {
 describe("AdminSidebar consolidado", () => {
   const props = { section: "ahora", subTab: null, onNavigate: () => {} };
 
-  it("muestra las 4 secciones por pregunta (Insights solo super-admin)", () => {
+  it("muestra Cambios como sección principal (Insights solo super-admin)", () => {
     render(<AdminSidebar {...props} showInsights />);
-    for (const label of ["Ahora", "Rendimiento", "Insights", "Gestión"]) {
+    for (const label of ["Ahora", "Cambios UMG", "Rendimiento", "Insights", "Gestión"]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
+    expect(screen.getByText("Pedidos de corrección del portal")).toBeInTheDocument();
     // Las secciones viejas por origen-del-dato no existen más
     for (const gone of ["Operación", "Usuarios", "Contenido", "Negocio"]) {
       expect(screen.queryByText(gone)).toBe(null);
@@ -43,6 +44,7 @@ describe("AdminSidebar consolidado", () => {
     // siendo el triaje en vivo: abrir Admin durante una caída tiene que
     // mostrar qué se rompió, no el formulario para contarlo.
     expect(defaultSubTab("ahora")).toBe("pipeline");
+    expect(defaultSubTab("cambios")).toBe(null);
   });
 });
 

@@ -102,10 +102,16 @@ def test_negative_people_rail_is_still_built_independently():
     import inspect
 
     src = inspect.getsource(pipeline)
-    # 4 sitios: prompt de Veo, prompt de Imagen y los dos system prompts del
-    # planner de Gemini (lyrics-mode y auto-mode).
-    assert src.count('"" if allow_people else') == 4, (
-        "el riel debe seguir armándose desde allow_people en los 4 sitios"
+    # 5 sitios: prompt de Veo, prompt de Imagen, los dos system prompts del
+    # planner de Gemini (lyrics-mode y auto-mode) y —desde 2026-09-03— el
+    # compositor anclado de "Inspirado en la letra" (_ANCHORED_PEOPLE_RULE).
+    # El 5º se sumó por la MISMA razón que existe este guardrail: el compositor
+    # anclado necesitaba su propia redacción (la del motor viejo trae cuatro
+    # ejemplos de objetos —"the empty chair", "the two coffee cups"— que el
+    # modelo copiaba), y el riesgo a cubrir es que alguien la escriba SIN
+    # colgarla de allow_people. Sigue colgada.
+    assert src.count('"" if allow_people else') == 5, (
+        "el riel debe seguir armándose desde allow_people en los 5 sitios"
     )
     assert "no recognizable faces" in src
     assert "no person as the subject of the shot" in src

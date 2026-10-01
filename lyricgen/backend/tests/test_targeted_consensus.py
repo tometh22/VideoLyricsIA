@@ -1,10 +1,17 @@
 import logging
+import inspect
 
 import targeted_consensus as tc
 import quality_mutation
 import transcription_quality
 import vocal_sep
+from recognition_provenance import begin_collection, end_collection
 from quality_v6_contracts import PROPOSAL_CANDIDATE_SCHEMA, ReviewProposalCandidate
+
+
+def test_targeted_window_cap_allows_difficult_live_songs(monkeypatch):
+    monkeypatch.setenv("TARGETED_CONSENSUS_MAX_WINDOWS", "200")
+    assert tc._max_targeted_windows() == 64
 
 
 def words(text, start=10.0, step=0.7):
@@ -26,6 +33,23 @@ def gemini_events(lines, starts):
         {"start": start, "end": start + 1.2, "text": line, "kind": "sung"}
         for line, start in zip(lines, starts)
     ]
+
+
+def test_malformed_gemini_event_list_preserves_raw_provider_response():
+    raw = '{"events":["letra cruda",7]}'
+    collector, token = begin_collection()
+    try:
+        tc._record_gemini_event_response(raw, ["letra cruda", 7])
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
+
+    assert snapshot["completed_attempt_count"] == 1
+    assert snapshot["hypotheses"][0]["events"] == [{"text": raw}]
+    assert snapshot["hypotheses"][0]["kind"] == "text"
+    assert snapshot["hypotheses"][0]["transformation"] == (
+        "targeted_consensus_malformed_events_raw"
+    )
 
 
 def test_consensus_requires_stem_and_a_distinct_recognition_family():
@@ -322,6 +346,37 @@ def test_gap_candidate_is_dark_in_observe_and_reviewable_in_enforce(monkeypatch)
     assert enforced["segments"] == []
 
 
+def test_gap_gemini_consensus_becomes_one_click_vocalization(monkeypatch):
+    monkeypatch.setenv("QUALITY_OPERATOR_SUGGESTIONS_ENABLED", "1")
+    monkeypatch.setenv("TARGETED_GEMINI_VERIFY_ENABLED", "1")
+    recovered = words("oh oh oh", start=10.0, step=0.3)
+
+    output, stats = tc.reprocess(
+        {
+            "segments": [], "_asr_words": [],
+            "_targeted_asr_family": "targeted_openai_asr",
+        },
+        "mix.wav",
+        [{"id": "gap-oh", "start": 9, "end": 14,
+          "reasons": ["voiced_gap"]}],
+        transcribe_fn=lambda *_a, **_k: recovered,
+        gemini_fn=lambda *_a, **_k: [{
+            "start": 10.0, "end": 11.2, "text": "oh oh oh",
+            "kind": "vocalization",
+        }],
+        stem_path="stem.wav",
+    )
+
+    assert output["segments"] == []
+    proposal = stats["quality_proposal_windows"][0]
+    assert proposal["current_segments"] == []
+    assert proposal["proposed_segments"][0]["text"] == "(oh oh oh)"
+    assert "vocalization" in proposal["reasons"]
+    assert proposal["source_families"] == [
+        "gemini_audio", "targeted_openai_asr",
+    ]
+
+
 def test_slowed_and_same_model_witness_cannot_suggest_insertion(
         monkeypatch):
     recovered = words("real wow wow", start=60.0)
@@ -548,6 +603,14 @@ def test_gemini_event_schema_is_bounded_to_vocal_events():
     assert item["properties"]["kind"]["enum"] == [
         "sung", "vocalization", "speech",
     ]
+
+
+def test_gemini_provenance_freezes_raw_events_before_candidate_filters():
+    source = inspect.getsource(tc._transcribe_gemini_events)
+    raw_record = source.index("_record_gemini_event_response(raw, events)")
+    candidate_filter = source.index("out = []")
+    assert raw_record < candidate_filter
+    assert "events=out" not in source
 
 
 def test_structural_repair_is_suggestion_only_in_observe_mode():

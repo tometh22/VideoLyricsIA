@@ -101,6 +101,10 @@ export default function WizardLivePreview({
   // nunca —ni "quieta" ni "animada" la mueven— así que no se le puede aplicar
   // la animación CSS de cámara del eje de IA.
   operatorPhoto = false,
+  // La síntesis image-to-video ocurre recién al aprobar. La foto central queda
+  // inmóvil antes de eso, pero el caption debe reflejar la decisión real en
+  // vez de mentir "Estático (cámara fija)" cuando animate_image está prendido.
+  photoAnimated = false,
   effect = "",
   lyricsAnimation = "none",
   lineTransition = "none",
@@ -438,7 +442,9 @@ export default function WizardLivePreview({
   // mismo string es cómo una opción termina llamándose distinto en dos
   // pantallas del mismo flujo.
   const _moveLabels = MOVEMENT_LABELS(t);
-  const moveLabel = _moveLabels[movementStyle] ?? _moveLabels[""];
+  const moveLabel = operatorPhoto && photoAnimated
+    ? (t("upload.photo_motion_animate") || "Foto animada")
+    : (_moveLabels[movementStyle] ?? _moveLabels[""]);
   const effectLabel = effect ? (EFFECT_LABELS(t)[effect] || "") : "";
   const modeLabel = {
     auto: t("upload.mode_auto") || "Auto",

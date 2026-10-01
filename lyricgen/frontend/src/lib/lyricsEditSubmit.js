@@ -8,7 +8,10 @@
 // module only builds the payload, posts, retries, and returns a result
 // shape the caller can branch on.
 
-import { editorRevisionConflictDetail } from "./editorRevisionConflict";
+import {
+  editorRevisionConflictDetail,
+  isEditorRevisionConflict,
+} from "./editorRevisionConflict";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -67,6 +70,33 @@ export function layoutChanged(baseline, payloadSegments) {
 export function translateBackendError(raw, t) {
   if (raw == null) return null;
   const tr = typeof t === "function" ? t : () => null;
+  if (raw && typeof raw === "object" && raw.code === "batch_render_window_full") {
+    return "La cola de generación de tu equipo está completa. Esperá a que terminen algunos videos para enviar los siguientes.";
+  }
+  if (raw && typeof raw === "object" && raw.code === "batch_final_review_full") {
+    return "Tu equipo tiene demasiados videos pendientes de revisión final. Revisá y aprobá o rechazá algunos para poder generar más.";
+  }
+  if (
+    raw === "reference_hypothesis_missing"
+    || (raw && typeof raw === "object" && raw.code === "reference_hypothesis_missing")
+  ) {
+    return "No encontramos una referencia de audio válida para confirmar esta canción. La revisión quedó guardada; volvé a abrirla y, si continúa, pedí una reparación técnica.";
+  }
+  if (
+    raw === "reference_hypothesis_invalid"
+    || (raw && typeof raw === "object" && [
+      "reference_hypothesis_invalid",
+      "reference_audio_mismatch",
+      "reference_audio_revision_mismatch",
+      "reference_complete_audio_unverified",
+      "reference_memory_policy_missing",
+    ].includes(raw.code))
+  ) {
+    return "La referencia de audio de esta canción no coincide con la versión que estás revisando. Tus cambios quedaron guardados; recargá antes de volver a aprobar.";
+  }
+  if (raw && typeof raw === "object" && raw.code === "lyric_review_pending") {
+    return raw.message || "Quedan puntos de la revisión rápida por decidir. Abrí el editor, aplicá cada arreglo o marcá que está bien así, y volvé a aprobar.";
+  }
   if (raw && typeof raw === "object" && raw.code === "edit_in_progress") {
     return tr("edit.error_already_editing") ||
       "Este video se está re-renderizando ahora. Esperá a que termine (revisalo en la página del video) y volvé a aplicar tus cambios.";
@@ -78,6 +108,18 @@ export function translateBackendError(raw, t) {
     return tr("edit.error_revision_conflict") ||
       "La letra cambió en el servidor mientras editabas. Recargá el editor para traer la última versión y volvé a aplicar tus cambios.";
   }
+  if (raw && typeof raw === "object" && raw.code === "delivery_qc_blocked") {
+    return tr("detail.delivery_qc_blocked") ||
+      "El preflight de entrega tiene hallazgos pendientes. Actualizá el preflight y resolvé los checks del panel antes de aprobar.";
+  }
+  if (raw === "delivery_qc_report_stale" || (raw && typeof raw === "object" && raw.code === "fresh_preflight_required")) {
+    return tr("detail.delivery_qc_stale") ||
+      "El preflight quedó desactualizado. Actualizalo desde el panel del video antes de aprobar.";
+  }
+  if (raw === "mandatory_reviewer_check_requires_signed_manual_resolution") {
+    return tr("detail.delivery_qc_manual_required") ||
+      "Este check requiere una firma manual del revisor.";
+  }
   let str;
   if (typeof raw === "string") {
     str = raw;
@@ -86,7 +128,7 @@ export function translateBackendError(raw, t) {
       .map((e) => (e && typeof e === "object" && e.msg) ? e.msg : String(e))
       .join("; ");
   } else if (typeof raw === "object") {
-    str = raw.msg || raw.detail || JSON.stringify(raw);
+    str = raw.msg || (typeof raw.detail === "string" ? raw.detail : raw.message) || JSON.stringify(raw);
   } else {
     str = String(raw);
   }
@@ -127,6 +169,16 @@ export function translateBackendError(raw, t) {
       "Este video no tiene letras guardadas para editar. Subí la canción de nuevo.";
   }
   return str;
+}
+
+export function campaignApprovalFailure(response, payload, t) {
+  const conflict = isEditorRevisionConflict(response, payload);
+  return {
+    ok: false,
+    reason: conflict ? "conflict" : `http-${response?.status || 0}`,
+    conflict: conflict ? (payload?.detail || null) : null,
+    message: conflict ? null : translateBackendError(payload?.detail, t),
+  };
 }
 
 // Single POST with the 409 youtube_already_published retry. Returns

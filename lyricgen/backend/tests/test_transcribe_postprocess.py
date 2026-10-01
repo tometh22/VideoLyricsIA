@@ -16,7 +16,9 @@ from transcribe_postprocess import (
     dedup_collisions,
     filter_intro_rescue_candidates,
     filter_rescue_candidates,
+    has_terminal_line_period,
     is_suspiciously_repetitive,
+    strip_terminal_line_periods,
 )
 
 
@@ -45,6 +47,47 @@ def test_normalize_strips_words_when_no_score_whisper_raw_path():
     }]
     out = normalize_words(segs)
     assert "words" not in out[0]
+
+
+def test_terminal_line_period_policy_changes_only_one_final_period():
+    segments = [
+        {"text": "Una línea."},
+        {"text": "Una línea.   "},
+        {"text": "Una línea, con pausa."},
+        {"text": "¿Una línea?"},
+        {"text": "¡Una línea!"},
+        {"text": "Una línea..."},
+        {"text": "Una línea…"},
+        {"text": "Sr. Sol no termina aquí"},
+    ]
+
+    output = strip_terminal_line_periods(segments)
+
+    assert [row["text"] for row in output] == [
+        "Una línea",
+        "Una línea   ",
+        "Una línea, con pausa",
+        "¿Una línea?",
+        "¡Una línea!",
+        "Una línea...",
+        "Una línea…",
+        "Sr. Sol no termina aquí",
+    ]
+    assert segments[0]["text"] == "Una línea."
+    assert has_terminal_line_period("Final.") is True
+    assert has_terminal_line_period("Final...") is False
+
+
+def test_terminal_line_period_policy_preserves_human_locked_lines():
+    segments = [
+        {"text": "Locked.", "locked": True},
+        {"text": "Operator.", "operator_locked": True},
+        {"text": "Machine."},
+    ]
+
+    assert [row["text"] for row in strip_terminal_line_periods(segments)] == [
+        "Locked.", "Operator.", "Machine",
+    ]
 
 
 # ─── dedup_collisions (2026-05-25 fix) ────────────────────────────

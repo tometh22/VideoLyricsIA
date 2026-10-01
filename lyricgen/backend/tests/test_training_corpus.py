@@ -1,0 +1,770 @@
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+import uuid
+
+from database import EditorVersion, Job
+from editor import (
+    _record_training_delta,
+    approve_document,
+    attach_machine_evidence,
+    ensure_document,
+    save_document,
+)
+from machine_evidence import (
+    approval_training_provenance,
+    build_machine_evidence,
+    finalize_machine_evidence,
+    snapshot_hash,
+)
+from training_corpus import build_line_delta_audit, materialize_training_pair
+
+
+def _ref(value):
+    from correction_learning import hmac_identifier
+    return hmac_identifier("audit_lyric", value)
+
+
+def test_line_delta_is_complete_and_filters_sub_50ms_jitter():
+    before = [
+        {"_id": f"line-{index}", "start": index, "end": index + 0.5, "text": f"old {index}"}
+        for index in range(25)
+    ]
+    after = [dict(row) for row in before]
+    for index, row in enumerate(after):
+        row["end"] += 0.2
+        row["text"] = f"new {index}"
+    # Text changed, but this tiny start drift must not become a timing label.
+    after[0]["start"] += 0.0037
+    after.pop(3)
+    after.append({"_id": "inserted", "start": 30, "end": 31, "text": "new line"})
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=1, to_revision=2,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert payload["truncated"] is False
+    assert len(payload["changes"]) == 26
+    assert payload["summary"]["deletions"] == 1
+    assert payload["summary"]["insertions"] == 1
+    assert payload["summary"]["reorders"] == 0
+    first = next(row for row in payload["changes"] if row["line_id"] == "line-0")
+    assert first["before"]["start"] == 0.0
+    assert first["after"]["start"] == 0.0037
+    assert first["fields"]["start"] is False
+    assert first["start_delta_ms"] == 0.0
+    assert first["fields"]["end"] is True
+
+
+def test_first_id_assignment_aligns_edit_around_new_insertion():
+    before = [
+        {"start": 0.0, "end": 1.0, "text": "ola"},
+        {"start": 2.0, "end": 3.0, "text": "world"},
+    ]
+    after = [
+        {"_id": "intro", "start": 0.0, "end": 0.3, "text": "intro"},
+        {"_id": "greeting", "start": 0.3, "end": 1.0, "text": "hola"},
+        {"_id": "world", "start": 2.0, "end": 3.0, "text": "world"},
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    updates = [row for row in payload["changes"] if row["operation"] == "update"]
+    inserts = [row for row in payload["changes"] if row["operation"] == "insert"]
+    assert [(row["line_id"], row["from_index"], row["to_index"]) for row in updates] == [
+        ("greeting", 0, 1),
+    ]
+    assert [row["line_id"] for row in inserts] == ["intro"]
+    assert payload["summary"]["reorders"] == 0
+
+
+def test_zero_stable_id_survives_duplicate_and_edit_in_same_save():
+    before = [
+        {"_id": 0, "start": 0.0, "end": 1.0, "text": "first line"},
+        {"_id": 1, "start": 2.0, "end": 3.0, "text": "second line"},
+    ]
+    after = [
+        {"_id": 0, "start": 0.0, "end": 1.2, "text": "first edited"},
+        {"_id": "duplicate", "start": 1.1, "end": 2.0, "text": "first line"},
+        {"_id": 1, "start": 2.0, "end": 3.0, "text": "second line"},
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert [
+        (row["operation"], row["line_id"], row["from_index"], row["to_index"])
+        for row in payload["changes"]
+    ] == [
+        ("update", "0", 0, 0),
+        ("insert", "duplicate", None, 1),
+    ]
+    assert payload["alignment_complete"] is True
+
+
+def test_duplicate_stable_ids_fail_alignment_closed():
+    before = [
+        {"_id": "same", "start": 0.0, "end": 1.0, "text": "first"},
+        {"_id": "same", "start": 2.0, "end": 3.0, "text": "second"},
+    ]
+    after = [
+        {"_id": "same", "start": 0.0, "end": 1.2, "text": "first edited"},
+        {"_id": "same", "start": 2.0, "end": 3.0, "text": "second"},
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert payload["alignment_complete"] is False
+    assert payload["summary"]["deletions"] == 2
+    assert payload["summary"]["insertions"] == 2
+    assert payload["summary"]["text_changes"] == 4
+
+
+def test_large_alignment_uses_bounded_fallback_without_corrupting_insert(monkeypatch):
+    import training_corpus
+
+    monkeypatch.setattr(training_corpus, "MAX_ALIGNMENT_CELLS", 1)
+    before = [
+        {"start": 0.0, "end": 1.0, "text": "ola"},
+        {"start": 2.0, "end": 3.0, "text": "world"},
+    ]
+    after = [
+        {"_id": "intro", "start": 0.0, "end": 0.3, "text": "intro"},
+        {"_id": "greeting", "start": 0.3, "end": 1.0, "text": "hola"},
+        {"_id": "world", "start": 2.0, "end": 3.0, "text": "world"},
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert [
+        (row["operation"], row["line_id"])
+        for row in payload["changes"]
+    ] == [("insert", "intro"), ("update", "greeting")]
+
+
+def test_bounded_alignment_preserves_multiple_consecutive_gaps(monkeypatch):
+    import training_corpus
+
+    monkeypatch.setattr(training_corpus, "MAX_ALIGNMENT_CELLS", 1)
+    before = [
+        {"start": 0.0, "end": 1.0, "text": "first original"},
+        {"start": 2.0, "end": 3.0, "text": "second original"},
+        {"start": 4.0, "end": 5.0, "text": "third original"},
+        {"start": 6.0, "end": 7.0, "text": "fourth original"},
+    ]
+    after = [
+        {"_id": "new-a", "start": -1.0, "end": -0.7, "text": "new a"},
+        {"_id": "new-b", "start": -0.6, "end": -0.3, "text": "new b"},
+        {"_id": "first", "start": 0.1, "end": 1.1, "text": "first edited"},
+        {"_id": "second", "start": 2.0, "end": 3.0, "text": "second original"},
+        # An old row is deleted here; the tail must still retain identity.
+        {"_id": "tail", "start": 6.1, "end": 7.1, "text": "fourth edited"},
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    updates = {
+        row["line_id"]: (row["from_index"], row["to_index"])
+        for row in payload["changes"] if row["operation"] == "update"
+    }
+    inserts = {
+        row["line_id"] for row in payload["changes"] if row["operation"] == "insert"
+    }
+    deletes = {
+        row["from_index"] for row in payload["changes"] if row["operation"] == "delete"
+    }
+    assert updates == {"first": (0, 2), "tail": (3, 4)}
+    assert inserts == {"new-a", "new-b"}
+    assert deletes == {2}
+    assert payload["summary"]["reorders"] == 0
+    assert payload["alignment_complete"] is True
+
+
+def test_bounded_alignment_widens_for_large_localized_gap_runs(monkeypatch):
+    import training_corpus
+
+    monkeypatch.setattr(training_corpus, "MAX_ALIGNMENT_CELLS", 1)
+    before = [
+        {"start": index, "end": index + .5, "text": f"old {index}"}
+        for index in range(100)
+    ]
+    after = [
+        {"_id": f"new-{index}", "start": index / 10, "end": index / 10 + .1,
+         "text": f"insert {index}"}
+        for index in range(40)
+    ] + [
+        {"_id": f"kept-{index}", "start": index + .1, "end": index + .6,
+         "text": f"old {index} edited"}
+        for index in range(60)
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert payload["alignment_complete"] is True
+    assert payload["summary"]["insertions"] == 40
+    assert payload["summary"]["deletions"] == 40
+    assert sum(
+        row["operation"] == "update" for row in payload["changes"]
+    ) == 60
+
+
+def test_ambiguous_large_alignment_fails_closed_for_training(monkeypatch):
+    import training_corpus
+
+    monkeypatch.setattr(training_corpus, "MAX_ALIGNMENT_CELLS", 1)
+    monkeypatch.setattr(training_corpus, "MAX_BANDED_ALIGNMENT_CELLS", 1)
+    before = [
+        {"start": index, "end": index + .5, "text": f"old {index}"}
+        for index in range(100)
+    ]
+    after = [
+        {"_id": f"new-{index}", "start": index / 10, "end": index / 10 + .1,
+         "text": f"insert {index}"}
+        for index in range(40)
+    ] + [
+        {"_id": f"kept-{index}", "start": index + .1, "end": index + .6,
+         "text": f"old {index} edited"}
+        for index in range(60)
+    ]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert payload["alignment_complete"] is False
+
+
+def test_short_gap_excursion_in_large_edit_fails_closed():
+    before = [
+        {"start": index, "end": index + .5, "text": f"old {index}"}
+        for index in range(1000)
+    ]
+    # The 40-row displacement exists for only five retained rows, so sampled
+    # or fixed-band alignment cannot safely infer it. Every retained row is
+    # also edited to prevent exact-signature matching from hiding the case.
+    after = [
+        {"_id": f"kept-{index}", "start": index + .1, "end": index + .6,
+         "text": f"old {index} edited"}
+        for index in range(1000)
+    ]
+    after[500:500] = [
+        {"_id": f"new-{index}", "start": 500 + index / 10,
+         "end": 500 + index / 10 + .1, "text": f"insert {index}"}
+        for index in range(40)
+    ]
+    del after[545:585]
+
+    payload = build_line_delta_audit(
+        before, after, job_id="job", from_revision=0, to_revision=1,
+        checkpoint="draft", text_ref=_ref,
+    )
+
+    assert payload["alignment_complete"] is False
+
+
+def test_metadata_only_editor_change_is_not_training_noise():
+    before = [{"_id": "a", "start": 1, "end": 2, "text": "hola", "pos": {"x": .2}}]
+    after = [{"_id": "a", "start": 1.01, "end": 2.01, "text": "hola", "pos": {"x": .9}}]
+    assert build_line_delta_audit(
+        before, after, job_id="job", from_revision=1, to_revision=2,
+        checkpoint="draft", text_ref=_ref,
+    ) is None
+
+
+def test_unenrolled_job_keeps_only_bounded_operational_audit():
+    class CaptureWrites:
+        rows = []
+
+        def add(self, value):
+            self.rows.append(value)
+
+    target = CaptureWrites()
+    before = [
+        {"_id": f"line-{index}", "start": index, "end": index + 1, "text": "before"}
+        for index in range(25)
+    ]
+    after = [
+        {"_id": f"line-{index}", "start": index, "end": index + 2, "text": "after"}
+        for index in range(25)
+    ]
+    assert _record_training_delta(
+        target,
+        job=SimpleNamespace(job_id="legacy", machine_snapshot_required=False),
+        user_id=1,
+        previous=before,
+        current=after,
+        from_revision=0,
+        to_revision=1,
+        checkpoint="draft",
+    ) is True
+    assert len(target.rows) == 1
+    audit = target.rows[0]
+    assert audit.action == "lyrics.segments_diff"
+    assert audit.detail["job_id"] == "legacy"
+    assert audit.detail["correction_summary"] == {
+        "changed_lines": 25,
+        "text_changes": 25,
+        "timing_changes": 25,
+        "reorders": 0,
+    }
+    assert len(audit.detail["changed"]) == 20
+    assert audit.detail["truncated"] is True
+    assert "before" not in str(audit.detail) and "after" not in str(audit.detail)
+
+
+def test_training_pair_materializes_machine_gold_families_and_edits(monkeypatch):
+    original = [{"_id": "a", "start": 0, "end": 1, "text": "ola"}]
+    approved_segments = [{"_id": "a", "start": 0, "end": 1.2, "text": "hola"}]
+    quality = {
+        "decision": "review_required", "risk": .4,
+        "policy_version": "lyrics-quality-v6",
+    }
+    evidence = finalize_machine_evidence(
+        build_machine_evidence({
+            "segments": original,
+            "_primary_asr_family": "whisper-large-v3",
+            "_asr_words": [{"word": "ola", "start": 0, "end": 1}],
+        }),
+        original_segments=original,
+        quality=quality,
+        audio_sha256="a" * 64,
+        audio_revision=0,
+    )
+    job = SimpleNamespace(
+        job_id="job123", tenant_id="tenant", artist="Artist", song_title="Song",
+    )
+    document = SimpleNamespace(original_segments=original, machine_evidence=evidence)
+    initial = SimpleNamespace(
+        id="v0", revision=0, segments=original, reason="transcription",
+        is_approved=False, provenance=None, created_at=datetime.now(timezone.utc),
+    )
+    approval = approval_training_provenance(
+        segments=approved_segments, quality=quality, revision=1,
+    )
+    approved = SimpleNamespace(
+        id="v1", revision=1, segments=approved_segments, reason="approve",
+        is_approved=True, provenance={"training_approval": approval},
+        created_at=datetime.now(timezone.utc),
+    )
+    delta = build_line_delta_audit(
+        original, approved_segments, job_id=job.job_id,
+        from_revision=0, to_revision=1, checkpoint="autosave", text_ref=_ref,
+    )
+    audit = SimpleNamespace(id=1, detail=delta, created_at=datetime.now(timezone.utc))
+
+    pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved], audits=[audit],
+    )
+
+    assert pair["complete"] is True
+    assert pair["pre_human"]["segments"] == original
+    assert pair["approved"]["segments"] == approved_segments
+    assert pair["hypotheses_by_family"][0]["family"] == "whisper-large-v3"
+    assert pair["machine_capture"]["recognition_attempt_count"] == 1
+    assert len(pair["intermediate_line_deltas"]) == 1
+
+    # Rotation must not invalidate already captured corrections when the old
+    # verification-only generation remains in the private keyring.
+    monkeypatch.setenv("QUALITY_LEARNING_HMAC_KEY_ID", "test-v2")
+    monkeypatch.setenv(
+        "QUALITY_LEARNING_HMAC_KEY", "new-quality-test-key-0123456789-ABCDEF",
+    )
+    monkeypatch.setenv(
+        "QUALITY_LEARNING_HMAC_KEYRING_JSON",
+        '{"test-v1":"quality-test-key-0123456789-ABCDEF"}',
+    )
+    after_rotation = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved], audits=[audit],
+    )
+    assert after_rotation["complete"] is True
+
+    corrupt_text_reference = deepcopy(delta)
+    corrupt_text_reference["changes"][0]["before"]["text_hmac"] = "0" * 64
+    corrupt_reference_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[SimpleNamespace(
+            id=17, detail=corrupt_text_reference,
+            created_at=datetime.now(timezone.utc),
+        )],
+    )
+    assert corrupt_reference_pair["complete"] is False
+    assert "editor_delta_content_mismatch:0->1" in corrupt_reference_pair["issues"]
+
+    missing_text_reference = deepcopy(delta)
+    missing_text_reference["changes"][0]["after"]["text_hmac"] = None
+    missing_reference_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[SimpleNamespace(
+            id=18, detail=missing_text_reference,
+            created_at=datetime.now(timezone.utc),
+        )],
+    )
+    assert missing_reference_pair["complete"] is False
+    assert "editor_delta_content_mismatch:0->1" in missing_reference_pair["issues"]
+
+    missing_origin = materialize_training_pair(
+        job=job, document=document, versions=[approved], audits=[],
+    )
+    assert missing_origin["complete"] is False
+    assert "transcription_checkpoint_missing" in missing_origin["issues"]
+
+    wrong_origin = SimpleNamespace(
+        id="wrong-v0", revision=0,
+        segments=[{"_id": "a", "start": 0, "end": 1, "text": "different"}],
+        reason="transcription", is_approved=False, provenance=None,
+        created_at=datetime.now(timezone.utc),
+    )
+    mismatched_origin = materialize_training_pair(
+        job=job, document=document, versions=[wrong_origin, approved], audits=[audit],
+    )
+    assert mismatched_origin["complete"] is False
+    assert "transcription_checkpoint_snapshot_mismatch" in mismatched_origin["issues"]
+
+    missing_delta = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved], audits=[],
+    )
+    assert missing_delta["complete"] is False
+    assert "editor_delta_missing:0->1" in missing_delta["issues"]
+
+    ambiguous_delta = deepcopy(delta)
+    ambiguous_delta["alignment_complete"] = False
+    ambiguous_audit = SimpleNamespace(
+        id=8, detail=ambiguous_delta, created_at=datetime.now(timezone.utc),
+    )
+    ambiguous_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[ambiguous_audit],
+    )
+    assert ambiguous_pair["complete"] is False
+    assert "editor_delta_alignment_ambiguous:0->1" in ambiguous_pair["issues"]
+
+    jitter_segments = [
+        {"_id": "a", "start": 0.0037, "end": 1.0037, "text": "ola"},
+    ]
+    jitter_approval = approval_training_provenance(
+        segments=jitter_segments, quality=quality, revision=1,
+    )
+    jitter_approved = SimpleNamespace(
+        id="v1-jitter", revision=1, segments=jitter_segments, reason="approve",
+        is_approved=True, provenance={"training_approval": jitter_approval},
+        created_at=datetime.now(timezone.utc),
+    )
+    unexpected_delta = materialize_training_pair(
+        job=job, document=document, versions=[initial, jitter_approved],
+        audits=[audit],
+    )
+    assert unexpected_delta["complete"] is False
+    assert "editor_delta_unexpected:0->1" in unexpected_delta["issues"]
+
+    corrupt_delta = deepcopy(delta)
+    corrupt_delta["changes"][0]["after"]["end"] = 99.0
+    corrupt_audit = SimpleNamespace(
+        id=9, detail=corrupt_delta, created_at=datetime.now(timezone.utc),
+    )
+    invalid_chain = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[corrupt_audit],
+    )
+    assert invalid_chain["complete"] is False
+    assert "editor_delta_content_mismatch:0->1" in invalid_chain["issues"]
+
+    corrupt_summary = deepcopy(delta)
+    corrupt_summary["summary"]["timing_changes"] = 999
+    corrupt_summary_audit = SimpleNamespace(
+        id=12, detail=corrupt_summary, created_at=datetime.now(timezone.utc),
+    )
+    invalid_summary = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[corrupt_summary_audit],
+    )
+    assert invalid_summary["complete"] is False
+    assert "editor_delta_content_mismatch:0->1" in invalid_summary["issues"]
+
+    malformed_summary = deepcopy(delta)
+    malformed_summary["summary"]["timing_changes"] = {"not": "a number"}
+    malformed_summary_audit = SimpleNamespace(
+        id=13, detail=malformed_summary, created_at=datetime.now(timezone.utc),
+    )
+    malformed_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[malformed_summary_audit],
+    )
+    assert malformed_pair["complete"] is False
+    assert "editor_delta_content_mismatch:0->1" in malformed_pair["issues"]
+
+    malformed_changes = deepcopy(delta)
+    malformed_changes["changes"] = 7
+    malformed_changes_audit = SimpleNamespace(
+        id=14, detail=malformed_changes, created_at=datetime.now(timezone.utc),
+    )
+    malformed_changes_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[malformed_changes_audit],
+    )
+    assert malformed_changes_pair["complete"] is False
+    assert "editor_delta_content_mismatch:0->1" in malformed_changes_pair["issues"]
+
+    float_revision = deepcopy(delta)
+    float_revision["from_revision"] = 0.9
+    float_revision["to_revision"] = 1.9
+    float_revision_audit = SimpleNamespace(
+        id=15, detail=float_revision, created_at=datetime.now(timezone.utc),
+    )
+    invalid_revision_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[float_revision_audit],
+    )
+    assert invalid_revision_pair["complete"] is False
+    assert "editor_delta_revision_invalid" in invalid_revision_pair["issues"]
+
+    scalar_audit = SimpleNamespace(
+        id=16, detail=7, created_at=datetime.now(timezone.utc),
+    )
+    scalar_audit_pair = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved],
+        audits=[scalar_audit],
+    )
+    assert scalar_audit_pair["complete"] is False
+    assert "editor_delta_detail_invalid" in scalar_audit_pair["issues"]
+
+    malformed_document = SimpleNamespace(
+        original_segments=original, machine_evidence=["not", "a", "mapping"],
+    )
+    malformed_evidence_pair = materialize_training_pair(
+        job=job, document=malformed_document, versions=[initial, approved],
+        audits=[audit],
+    )
+    assert malformed_evidence_pair["complete"] is False
+    assert "machine_evidence_malformed" in malformed_evidence_pair["issues"]
+
+    after_approval_segments = [
+        {"_id": "a", "start": 0, "end": 1.4, "text": "hola otra vez"},
+    ]
+    after_approval = SimpleNamespace(
+        id="v2", revision=2, segments=after_approval_segments, reason="autosave",
+        is_approved=False, provenance=None, created_at=datetime.now(timezone.utc),
+    )
+    post_delta = build_line_delta_audit(
+        approved_segments, after_approval_segments, job_id=job.job_id,
+        from_revision=1, to_revision=2, checkpoint="autosave", text_ref=_ref,
+    )
+    post_audit = SimpleNamespace(
+        id=2, detail=post_delta, created_at=datetime.now(timezone.utc),
+    )
+    bounded = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved, after_approval],
+        audits=[audit, post_audit],
+    )
+    assert bounded["complete"] is True
+    assert [row["revision"] for row in bounded["intermediate_checkpoints"]] == [0, 1]
+    assert [row["to_revision"] for row in bounded["intermediate_line_deltas"]] == [1]
+
+    tampered = deepcopy(approval)
+    tampered["song_quality_signal"]["traffic_light"] = "purple"
+    tampered["evidence_sha256"] = snapshot_hash({
+        key: value for key, value in tampered.items() if key != "evidence_sha256"
+    })
+    approved.provenance = {"training_approval": tampered}
+    invalid_signal = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved], audits=[audit],
+    )
+    assert invalid_signal["complete"] is False
+    assert "machine_quality_signal_invalid" in invalid_signal["issues"]
+
+    malformed_signal = deepcopy(approval)
+    malformed_signal["song_quality_signal"]["traffic_light"] = {"bad": "value"}
+    malformed_signal["evidence_sha256"] = snapshot_hash({
+        key: value for key, value in malformed_signal.items()
+        if key != "evidence_sha256"
+    })
+    approved.provenance = {"training_approval": malformed_signal}
+    malformed_quality = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved], audits=[audit],
+    )
+    assert malformed_quality["complete"] is False
+    assert "machine_quality_signal_invalid" in malformed_quality["issues"]
+
+    corrupt_hash = deepcopy(approval)
+    corrupt_hash["evidence_sha256"] = "0" * 64
+    approved.provenance = {"training_approval": corrupt_hash}
+    invalid_hash = materialize_training_pair(
+        job=job, document=document, versions=[initial, approved], audits=[audit],
+    )
+    assert invalid_hash["complete"] is False
+    assert "approval_evidence_hash_mismatch" in invalid_hash["issues"]
+
+    reverted_approval = approval_training_provenance(
+        segments=original, quality=quality, revision=2,
+    )
+    reverted = SimpleNamespace(
+        id="v2-reverted", revision=2, segments=original, reason="approve",
+        is_approved=True, provenance={"training_approval": reverted_approval},
+        created_at=datetime.now(timezone.utc),
+    )
+    intermediate = [{"_id": "a", "start": 0, "end": 1, "text": "temporary"}]
+    outward = SimpleNamespace(
+        id=10,
+        detail=build_line_delta_audit(
+            original, intermediate, job_id=job.job_id,
+            from_revision=0, to_revision=1, checkpoint="draft", text_ref=_ref,
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+    backward = SimpleNamespace(
+        id=11,
+        detail=build_line_delta_audit(
+            intermediate, original, job_id=job.job_id,
+            from_revision=1, to_revision=2, checkpoint="restore", text_ref=_ref,
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+    orphaned = materialize_training_pair(
+        job=job, document=document, versions=[initial, reverted],
+        audits=[outward, backward],
+    )
+    assert orphaned["complete"] is False
+    assert "editor_delta_orphaned:0->1" in orphaned["issues"]
+    assert "editor_delta_orphaned:1->2" in orphaned["issues"]
+
+
+def test_five_new_jobs_are_exportable_end_to_end(db):
+    from scripts.export_training_pairs import export_pairs
+
+    jobs = []
+    for index in range(5):
+        job = Job(
+            job_id=uuid.uuid4().hex[:12], user_id=1, tenant_id="training-e2e",
+            artist=f"Artist {index}", song_title=f"Song {index}",
+            filename=f"song-{index}.wav", style="oscuro",
+            status="transcribed_pending", current_step="editing",
+            delivery_profile="youtube", machine_snapshot_required=True,
+            segments_json=[{
+                "_id": "line-a", "start": 0.0, "end": 1.0,
+                "text": "machine lyric",
+            }],
+            transcription_quality={
+                "decision": "review_required", "risk": .31,
+                "policy_version": "lyrics-quality-v6",
+            },
+        )
+        db.add(job)
+        db.flush()
+        document = ensure_document(
+            db, job.job_id, job.tenant_id, job.segments_json,
+            initial_reason="transcription",
+        )
+        evidence = finalize_machine_evidence(
+            build_machine_evidence({
+                "segments": job.segments_json,
+                "_primary_asr_family": "whisper-large-v3",
+                "_asr_words": [{
+                    "word": "machine lyric", "start": 0.0, "end": 1.0,
+                }],
+                "_independent_asr_family": "gemini-audio",
+                "_independent_asr_words": [{
+                    "word": "machine lyric", "start": 0.0, "end": 1.0,
+                }],
+            }),
+            original_segments=document.original_segments,
+            quality=job.transcription_quality,
+            audio_sha256=(f"{index:x}" * 64)[:64],
+            audio_revision=0,
+        )
+        attach_machine_evidence(db, document, evidence)
+        document, _version, applied = save_document(
+            db, job, document, 1, document.revision,
+            [{
+                "_id": "line-a", "start": 0.0, "end": 1.2,
+                "text": "approved lyric",
+            }],
+            "draft",
+        )
+        assert applied is True
+        approve_document(db, job, 1, editor_revision=document.revision)
+        jobs.append(job)
+    db.flush()
+
+    exported = export_pairs(db, jobs)
+
+    assert len(exported) == 5
+    assert all(row["complete"] is True for row in exported)
+    assert all(row["schema"] == "transcription-training-pair-v2" for row in exported)
+    assert all(len(row["hypotheses_by_family"]) == 3 for row in exported)
+    assert all(
+        row["machine_capture"]["recognition_attempt_count"] == 1
+        for row in exported
+    )
+    assert all(len(row["intermediate_line_deltas"]) == 1 for row in exported)
+    assert all(row["approved"]["training_approval"] for row in exported)
+
+
+def test_latest_export_filters_approval_before_limit(db):
+    from scripts.export_training_pairs import _latest_eligible_jobs
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    expected = []
+    for index in range(60):
+        job_id = uuid.uuid4().hex[:12]
+        job = Job(
+            job_id=job_id, user_id=1, tenant_id="latest-export-tests",
+            artist="Artist", song_title=f"Song {index}", filename="song.wav",
+            style="oscuro", status="transcribed_pending", current_step="editing",
+            delivery_profile="youtube", segments_json=[],
+            machine_snapshot_required=True,
+            created_at=base + timedelta(minutes=index),
+        )
+        db.add(job)
+        db.flush()
+        if index < 5:
+            db.add(EditorVersion(
+                id=str(uuid.uuid4()), job_id=job_id, tenant_id=job.tenant_id,
+                revision=0, segments=[], reason="approve", is_approved=True,
+                created_by=1,
+            ))
+            expected.append(job_id)
+    db.flush()
+
+    selected = _latest_eligible_jobs(db, 5)
+
+    assert [row.job_id for row in selected] == list(reversed(expected))
+
+
+def test_require_complete_fails_when_requested_sample_count_is_short():
+    from scripts.export_training_pairs import _required_export_failed
+
+    assert _required_export_failed({"rows": 0, "incomplete_rows": 0}, 5) is True
+    assert _required_export_failed({"rows": 4, "incomplete_rows": 0}, 5) is True
+    assert _required_export_failed({"rows": 5, "incomplete_rows": 1}, 5) is True
+    assert _required_export_failed({"rows": 5, "incomplete_rows": 0}, 5) is False
+
+
+def test_private_export_writer_tightens_existing_file_before_payload(tmp_path):
+    from scripts.export_training_pairs import _write_private
+
+    target = tmp_path / "pairs.jsonl"
+    target.write_text("old", encoding="utf-8")
+    target.chmod(0o644)
+
+    _write_private(target, b"private lyrics\n")
+
+    assert target.read_bytes() == b"private lyrics\n"
+    assert target.stat().st_mode & 0o777 == 0o600

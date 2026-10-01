@@ -30,4 +30,22 @@ describe("wizardPersistence — enableScenes roundtrip (audit B1)", () => {
     expect(tl.customColors).toBe("#fff,#000");
     expect(tl.enableScenes).toBe(true);
   });
+
+  it("no persiste URLs firmadas ni el estado efímero del preview", () => {
+    save({
+      files: [],
+      currentReview: {
+        audioUrl: "https://r2.example/signed?secret=capability",
+        audioSource: "editor_preview",
+        audioPreviewPending: true,
+        audioPreviewRetryAt: 123,
+        audioRefreshAt: 456,
+        segments: [],
+      },
+    });
+    const serialized = sessionStorage.getItem("genly:wizard:v1");
+    expect(serialized).not.toContain("signed?secret=capability");
+    expect(load().currentReview).not.toHaveProperty("audioUrl");
+    expect(load().currentReview).not.toHaveProperty("audioPreviewRetryAt");
+  });
 });

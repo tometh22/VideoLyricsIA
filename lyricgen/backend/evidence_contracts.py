@@ -324,6 +324,9 @@ def freeze_provider_output(provider_output: Mapping[str, Any]) -> FrozenProvider
     ]
     scores = []
     for word in words:
+        probability_origin = word.get("probability_provenance")
+        if isinstance(probability_origin, Mapping) and probability_origin.get("score_equivalence") is False:
+            continue
         score = _finite_score(word.get("score", word.get("probability")))
         if score is not None:
             scores.append(score)
@@ -574,16 +577,23 @@ def build_line_evidence_contract(
         expected_output_hash is None
         or expected_output_hash == frozen.output_sha256
     )
+    previous_content = segment.get("content_provenance")
+    previous_content_lineage = {}
+    if (isinstance(previous_content, Mapping)
+            and verify_content_provenance_attestation(previous_content)
+            and previous_content.get("source") == source
+            and previous_content.get("raw_output_sha256") == frozen.output_sha256):
+        previous_content_lineage = previous_content.get("lineage") or {}
     lineage = model_view_lineage(
         segment,
         source=source,
-        provider=provider,
-        model=model,
-        model_revision=model_revision,
-        view=view,
-        transformation=transformation,
-        parent_audio_sha256=parent_audio_sha256,
-        correlated_family=correlated_family,
+        provider=provider or previous_content_lineage.get("provider"),
+        model=model or previous_content_lineage.get("model"),
+        model_revision=model_revision or previous_content_lineage.get("model_revision"),
+        view=view or previous_content_lineage.get("view"),
+        transformation=transformation or previous_content_lineage.get("transformation"),
+        parent_audio_sha256=parent_audio_sha256 or previous_content_lineage.get("parent_audio_sha256"),
+        correlated_family=correlated_family or previous_content_lineage.get("correlated_family"),
     )
     reference_kind = kind in {
         SourceKind.REFERENCE, SourceKind.CATALOG, SourceKind.OPERATOR,
@@ -614,12 +624,14 @@ def build_line_evidence_contract(
         lineage=lineage.to_dict(),
     )
 
+    previous_timing = segment.get("timing_provenance")
+    previous_timing = previous_timing if isinstance(previous_timing, Mapping) else {}
     timing_name = str(
         timing_source or segment.get("timing_source")
         or ("ctc_alignment" if any(
             segment.get(key) is not None
             for key in ("alignment_score", "ctc_mean_score", "ctc_score", "ctc_confidence")
-        ) else "provider_timestamps")
+        ) else previous_timing.get("source") or "provider_timestamps")
     )
     timing_kind = classify_source(timing_name)
     alignment = None
@@ -627,19 +639,22 @@ def build_line_evidence_contract(
         alignment = _finite_score(segment.get(key))
         if alignment is not None:
             break
+    previous_lineage = previous_timing.get("lineage") or {}
+    if previous_timing.get("source") != timing_name:
+        previous_lineage = {}
     timing_lineage = model_view_lineage(
         segment,
         source=timing_name,
-        provider=segment.get("timing_provider") or provider,
-        model=segment.get("timing_model") or segment.get("ctc_model") or model,
+        provider=segment.get("timing_provider") or provider or previous_lineage.get("provider"),
+        model=segment.get("timing_model") or segment.get("ctc_model") or model or previous_lineage.get("model"),
         model_revision=(
             segment.get("timing_model_revision")
-            or segment.get("ctc_model_revision") or model_revision
+            or segment.get("ctc_model_revision") or model_revision or previous_lineage.get("model_revision")
         ),
-        view=segment.get("timing_view") or view,
-        transformation=segment.get("timing_transformation") or transformation,
-        parent_audio_sha256=parent_audio_sha256,
-        correlated_family=segment.get("timing_correlated_family"),
+        view=segment.get("timing_view") or view or previous_lineage.get("view"),
+        transformation=segment.get("timing_transformation") or transformation or previous_lineage.get("transformation"),
+        parent_audio_sha256=parent_audio_sha256 or previous_lineage.get("parent_audio_sha256"),
+        correlated_family=segment.get("timing_correlated_family") or previous_lineage.get("correlated_family"),
     )
     return LineEvidenceContract(
         schema=SCHEMA_VERSION,

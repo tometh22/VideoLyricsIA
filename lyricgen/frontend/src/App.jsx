@@ -1,4 +1,10 @@
+import { reviewCreativeSettings } from "./lib/campaignCreative";
+import useCampaignCreativeSave from "./hooks/useCampaignCreativeSave";
+import { resolveSavedLanguageReview } from "./lib/languageResolution";
+import { reanchorHttpFailure } from "./lib/reanchorResult";
 import { useState, useRef, useCallback, useEffect, lazy, Suspense, useMemo } from "react";
+import { safeReviewReturnPath } from "./lib/reviewerNavigation";
+import { clearCampaignResourceCache } from "./hooks/useCampaignResource";
 import {
   Routes, Route, Navigate, Outlet,
   useNavigate, useLocation, useParams,
@@ -42,10 +48,16 @@ const HistoryView = lazy(() => import("./components/HistoryView"));
 const Dashboard = lazy(() => import("./components/Dashboard"));
 const UploadZone = lazy(() => import("./components/UploadZone"));
 const SearchPalette = lazy(() => import("./components/SearchPalette"));
+const CampaignsPage = lazy(() => import("./components/CampaignsPage"));
+const ReviewQueuePage = lazy(() => import("./components/ReviewQueuePage"));
 // Paso final del wizard de variante: la letra en modo LECTURA (el POST
 // /variant no lleva segments y el autosave del editor le escribiría al
 // job padre). Ver components/VariantLyricsSummary.jsx.
 const VariantLyricsSummary = lazy(() => import("./components/VariantLyricsSummary"));
+// Herramienta de anotación del corpus (calibración del validador). Página
+// pública standalone, sin relación con LyricsEditor/AppShell — ver
+// components/CorpusAnnotator.jsx y backend/corpus.py.
+const CorpusAnnotator = lazy(() => import("./components/CorpusAnnotator"));
 // Página pública de estado del servicio. Lazy y fuera de AppShell: la abre
 // gente sin login (y sin token válido, si el outage es de auth) y no tiene
 // que arrastrar el bundle del workspace. Ver components/StatusPage.jsx.
@@ -62,13 +74,18 @@ import {
   useBackgroundPreview,
 } from "./hooks/useBackgroundPreview";
 import { useMediaUrl, clearMediaCache } from "./mediaUrl";
-import { translateBackendError } from "./lib/lyricsEditSubmit";
+import { campaignApprovalFailure, translateBackendError } from "./lib/lyricsEditSubmit";
 import { segmentsStore, useJobSegmentsValue } from "./state/segmentsStore";
 import { loadReviewWaveform } from "./lib/loadReviewWaveform";
 import { persistSegments } from "./lib/persistSegments";
 import { appendBackgroundFields } from "./lib/bgPayload";
 import { backgroundRegenExtras } from "./lib/editWizardDiff";
-import { buildEditReview, buildEditCurrent, resolveEditSubmission, backgroundEditBlockedReason } from "./lib/editSubmission";
+import { buildEditReview, buildEditCurrent, resolveEditSubmission, backgroundEditBlockedReason, buildCampaignEditApproval } from "./lib/editSubmission";
+import {
+  changeRequestAdminPath,
+  parseChangeRequestEditContext,
+  recoverChangeRequestEditContext,
+} from "./lib/changeRequestEditFlow";
 import { normalizeMovementCode } from "./lib/catalogCodes";
 import { buildVariantPayload } from "./lib/variantPayload";
 import { prefetchKey } from "./lib/prefetchKey";
@@ -91,7 +108,9 @@ import {
   PROACTIVE_URL_RETRY_MS,
 } from "./lib/editorAudioRecovery";
 import { isReusableEditSnapshot } from "./lib/reviewRecovery";
-import { reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
+import { beginReviewResume, reviewJobIdFromLocation, reviewJobPath } from "./lib/reviewJobRoute";
+import { creativeFieldsForReviewResume } from "./lib/reviewResume";
+import { editorSessionHeaders } from "./lib/editorSession";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -566,6 +585,8 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
   const activeView =
     (pathname === "/new" || pathname === "/review" || pathname === "/generating") ? "new" :
     (pathname === "/videos" || pathname.startsWith("/videos/")) ? "history" :
+    pathname === "/admin/cola" ? "review_queue" :
+    pathname.startsWith("/campaigns") ? "campaigns" :
     pathname === "/account" ? "settings" :
     pathname === "/admin" ? "admin" :
     "dashboard";
@@ -623,6 +644,8 @@ function AppShell({ user, history, sidebarOpen, setSidebarOpen, onLogout, onOpen
     if (id === "dashboard") navigate("/dashboard");
     else if (id === "new") navigate("/new");
     else if (id === "history") navigate("/videos");
+    else if (id === "campaigns") navigate("/campaigns");
+    else if (id === "review_queue") navigate("/admin/cola");
     else if (id === "settings") navigate("/account");
     else if (id === "admin") navigate("/admin");
   };
@@ -690,6 +713,8 @@ function LegacyVideoRedirect() {
 function JobDetailRoute({ fetchHistory }) {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const returnTo = safeReviewReturnPath(new URLSearchParams(location.search).get("return_to"));
   const [job, setJob] = useState(null);
   const [error, setError] = useState(false);
 
@@ -714,7 +739,7 @@ function JobDetailRoute({ fetchHistory }) {
     return (
       <div className="text-center mt-16">
         <p className="text-gray-500 mb-4">No se encontró el video.</p>
-        <button onClick={() => navigate("/dashboard")} className="btn-secondary">Volver</button>
+        <button onClick={() => navigate(returnTo || "/dashboard")} className="btn-secondary">Volver</button>
       </div>
     );
   }
@@ -739,7 +764,31 @@ function JobDetailRoute({ fetchHistory }) {
       >
         <JobDetail
           job={job}
-          onBack={() => navigate("/dashboard")}
+          onBack={async () => {
+            if (returnTo) {
+              navigate(returnTo);
+              return;
+            }
+            if (!job?.campaign_id) {
+              navigate("/dashboard");
+              return;
+            }
+            try {
+              await authFetch(`${API}/editor/${job.job_id}/lock`, {
+                method: "DELETE", headers: editorSessionHeaders(),
+              });
+              const response = await authFetch(
+                `${API}/batch/campaigns/${job.campaign_id}/review-queue/next?stage=final`,
+                { method: "POST", headers: editorSessionHeaders() },
+              );
+              const next = await response.json().catch(() => ({}));
+              navigate(response.ok && next.job_id
+                ? (next.open_path || `/videos/${next.job_id}`)
+                : `/campaigns/${job.campaign_id}`);
+            } catch {
+              navigate(`/campaigns/${job.campaign_id}`);
+            }
+          }}
           onJobUpdate={(updatedJob) => {
             // fetchHistory() is the expensive call (lists every job in the
             // tenant). It only needs to refresh on a status BOUNDARY —
@@ -766,7 +815,15 @@ function JobDetailRoute({ fetchHistory }) {
 // recarga la ruta para que el editor monte solo. Para otros estados
 // no-editable (queued, processing, error), muestra el mensaje estático
 // de antes con un botón "Volver al video".
-function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
+function EditingNotEditablePanel({
+  jobId,
+  jobStatus,
+  isRendering,
+  onBack,
+  onComplete,
+  returnsToChangeRequest = false,
+  t,
+}) {
   const [polledStatus, setPolledStatus] = useState(jobStatus);
   const [polledProgress, setPolledProgress] = useState(null);
   const [polledStep, setPolledStep] = useState(null);
@@ -784,9 +841,11 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
         setPolledStatus(newStatus);
         if (typeof data.progress === "number") setPolledProgress(data.progress);
         if (typeof data.current_step === "string") setPolledStep(data.current_step);
-        // Transition a un estado editable → recargá la página para que
-        // EditLyricsRoute corra su bootstrap de nuevo y monte el editor.
-        const editable = ["done", "pending_review", "rejected"].includes(newStatus);
+        // Transition a un estado editable.  En una corrección UMG el trabajo
+        // ya terminó: volver a montar el editor hace parecer que el render no
+        // se aplicó.  Ese flujo vuelve al pedido; una edición común conserva
+        // el reload histórico.
+        const editable = ["done", "pending_review", "rejected", "lyrics_approved"].includes(newStatus);
         if (editable) {
           // [editor-reload-loop] capture (P0 UMG Chile 2026-06-16). This reload
           // re-runs EditLyricsRoute's bootstrap. If the job keeps flipping back
@@ -807,7 +866,8 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
               });
             }
           } catch { /* sessionStorage unavailable — proceed with the reload */ }
-          window.location.reload();
+          if (onComplete) onComplete(data);
+          else window.location.reload();
         }
       } catch {
         // Silent — siguiente tick reintenta.
@@ -816,7 +876,7 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
     const iv = setInterval(tick, 5000);
     tick(); // primero tick inmediato
     return () => { cancelled = true; clearInterval(iv); };
-  }, [jobId, isRendering]);
+  }, [jobId, isRendering, jobStatus, onComplete]);
 
   if (isRendering) {
     const pct = Math.max(3, Math.min(100, polledProgress || 0));
@@ -829,8 +889,10 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
           {t("edit.editing_in_progress_title") || "El video se está re-renderizando"}
         </h2>
         <p className="text-sm text-gray-500 mb-4">
-          {t("edit.editing_in_progress_subtitle") ||
-            "Estamos aplicando los cambios del edit anterior. Volveremos a abrir el editor automáticamente cuando termine."}
+          {returnsToChangeRequest
+            ? "Estamos aplicando la corrección. Cuando termine volverás al pedido para verificar el resultado y publicarlo."
+            : (t("edit.editing_in_progress_subtitle") ||
+              "Estamos aplicando los cambios del edit anterior. Volveremos a abrir el editor automáticamente cuando termine.")}
         </p>
         <div className="mt-3 h-1.5 rounded-full bg-surface-3/60 overflow-hidden max-w-xs mx-auto">
           <div
@@ -842,7 +904,7 @@ function EditingNotEditablePanel({ jobId, jobStatus, isRendering, onBack, t }) {
           {polledStep || "video"} · {polledProgress || 0}%
         </p>
         <button onClick={onBack} className="btn-secondary mt-6">
-          {t("detail.back") || "Volver al video"}
+          {returnsToChangeRequest ? "Volver al pedido" : (t("detail.back") || "Volver al video")}
         </button>
       </div>
     );
@@ -902,6 +964,21 @@ function EditLyricsRoute({
 }) {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const explicitChangeRequestContext = useMemo(
+    () => parseChangeRequestEditContext(location.search),
+    [location.search],
+  );
+  const [recoveredChangeRequestContext, setRecoveredChangeRequestContext] = useState(null);
+  const changeRequestContext = explicitChangeRequestContext || recoveredChangeRequestContext;
+  const handleRenderingComplete = useCallback(() => {
+    const requestPath = changeRequestAdminPath(changeRequestContext, "completed");
+    if (requestPath) {
+      navigate(requestPath, { replace: true });
+      return;
+    }
+    window.location.reload();
+  }, [changeRequestContext, navigate]);
   // status: "loading" | "ready" | "no_segments" | "not_editable" |
   //         "not_found" | "error". Loading hasta que tanto el job como
   // las URLs firmadas aterricen; ready hace montar el wizardScreen.
@@ -975,11 +1052,25 @@ function EditLyricsRoute({
         return;
       }
 
+      let resolvedChangeRequestContext;
+      try {
+        resolvedChangeRequestContext = await recoverChangeRequestEditContext({
+          search: location.search, job,
+          request: (path) => authFetchCriticalRead(`${API}${path}`),
+        });
+      } catch {
+        if (alive) setState({ status: "request_error" });
+        return;
+      }
+      if (!alive) return;
+      setRecoveredChangeRequestContext(resolvedChangeRequestContext);
+
       // Solo pending_review/done/rejected son editables (mismo gating
       // que canEditLyrics en JobDetail). Editing/queued/processing →
       // bail-out: no tiene sentido abrir el editor sobre un render en curso.
       const editable =
         job.status === "pending_review" ||
+        job.status === "lyrics_approved" ||
         job.status === "done" ||
         job.status === "rejected";
       if (!editable) {
@@ -1048,6 +1139,10 @@ function EditLyricsRoute({
       // preview without bg image. Operator can edit text/timing immediately.
       setCurrentReview({
         editingJobId: id,
+        // Preserva el origen UMG a través del autosave y del render.  Es una
+        // intención explícita y acotada: permite re-renderizar la revisión
+        // que la propuesta ya guardó aunque no exista un diff local.
+        changeRequestContext: resolvedChangeRequestContext,
         // editMode + baseline son la API del flow edit-wizard. App.jsx los
         // lee en handleApproveLyrics para emitir POSTs /edit con el diff
         // contra baseline. UploadZone los lee para mostrar UIs de edición
@@ -1076,6 +1171,9 @@ function EditLyricsRoute({
         filename: job.filename || job.artist || "lyrics",
         file: null,
         audioUrl: null,           // populated by Phase B
+        audioSource: null,
+        audioPreviewPending: false,
+        audioPreviewRetryAt: null,
         audioLoading: true,       // Phase B en vuelo → el editor muestra
                                   // "Cargando audio…" en vez de "no disponible"
         // `temporary` means the API/R2 path was unavailable, NOT that the
@@ -1083,6 +1181,7 @@ function EditLyricsRoute({
         audioUnavailableReason: null,
         waveform: null,           // populated by Phase B
         waveformLoading: true,    // independent enhancement request in flight
+        waveformHiresLoading: true,
         bgUrl: null,              // populated by Phase B
         transcriptionQuality: job.transcription_quality || null,
         coverageWarning: !!job.coverage_warning,
@@ -1092,7 +1191,12 @@ function EditLyricsRoute({
         queue: [],
         queueIdx: 0,
         transcribeJobId: null,
-        referenceLyrics: "",
+        referenceLyrics: job.reference_lyrics || "",
+        // A rendered batch job still belongs to the campaign review contract.
+        // Keeping this identity in edit mode makes the CTA attest the exact
+        // line set again before /edit re-renders it.
+        campaignId: job.campaign_id || null,
+        campaignItemId: job.campaign_item_id || null,
       });
       // CRITICAL FIX 2026-05-27 (fix/edit-lyrics-set-wizard-stage): el
       // wizardScreen lee wizardStage para decidir qué renderear (upload
@@ -1160,8 +1264,11 @@ function EditLyricsRoute({
       // is a false claim: the DB could not validate the session long enough to
       // presign the R2 object. Respect the server's Retry-After, preserve the
       // local draft, and keep a user-initiated retry available afterwards.
-      retryAudio = async ({ reason = "initial" } = {}) => {
+      retryAudio = async ({ reason = "initial", preferOriginal = false } = {}) => {
         const preventive = reason === "signed_url_expiring";
+        const previewPoll = reason === "preview_pending";
+        const useOriginal = preferOriginal || reason === "media_error";
+        const nonBlocking = preventive || previewPoll;
         // A real media error has priority over the clock-driven refresh. Do not
         // let a later timer invalidate an in-flight recovery for broken audio.
         if (preventive && reactiveAudioRequestInFlight) return;
@@ -1173,7 +1280,7 @@ function EditLyricsRoute({
             ...prev,
             // A preventive refresh must not cover the timing workspace with a
             // loading state while the current URL (or local Blob) still works.
-            audioLoading: preventive && prev.audioUrl ? false : true,
+            audioLoading: nonBlocking && prev.audioUrl ? false : true,
             audioUnavailableReason: null,
           };
         });
@@ -1182,7 +1289,7 @@ function EditLyricsRoute({
           // short cap turns pool backpressure into a recoverable UI state
           // instead of holding the timing screen on a spinner for a minute.
           request: () => authFetchWithTimeout(
-            `${API}/jobs/${id}/source-audio-url`,
+            `${API}/jobs/${id}/source-audio-url${useOriginal ? "?prefer_original=1" : ""}`,
             { cache: "no-store" },
             8_000,
           ),
@@ -1204,12 +1311,31 @@ function EditLyricsRoute({
         setCurrentReview((prev) => {
           if (!prev || prev.editingJobId !== id) return prev;
           if (result.ok) {
+            const resultSource = result.source || prev.audioSource || "input";
+            const keepCurrentSource = previewPoll
+              && prev.audioUrl
+              && prev.audioSource !== "editor_preview"
+              && resultSource !== "editor_preview";
+            const previewPending = !useOriginal && result.previewStatus === "pending";
             return {
               ...prev,
-              audioUrl: result.url,
+              audioUrl: keepCurrentSource ? prev.audioUrl : result.url,
+              audioSource: keepCurrentSource ? prev.audioSource : resultSource,
               audioLoading: false,
               audioUnavailableReason: null,
+              audioPreviewPending: previewPending,
+              audioPreviewRetryAt: previewPending
+                ? Date.now() + Math.max(1, result.previewRetryAfterSeconds || 5) * 1_000
+                : null,
               audioRefreshAt: Date.now() + audioUrlRefreshDelayMs(result.expiresIn),
+            };
+          }
+          if (nonBlocking && prev.audioUrl && result.reason === "temporary") {
+            return {
+              ...prev,
+              audioLoading: false,
+              audioUnavailableReason: null,
+              audioPreviewRetryAt: previewPoll ? Date.now() + PROACTIVE_URL_RETRY_MS : prev.audioPreviewRetryAt,
             };
           }
           return editorAudioFailureState(prev, {
@@ -1229,6 +1355,16 @@ function EditLyricsRoute({
         (d) => d,
         { loadingKey: "waveformLoading" },
       );
+      // Guía de audio a resolución de tramo para la revisión guiada (~40
+      // picos/s, stem de voz si está cacheado). Se pide aparte porque la
+      // primera vez puede tardar: el overview de 1000 picos llega antes y
+      // la revisión lo usa mientras tanto.
+      enhanceField(
+        `${API}/jobs/${id}/waveform?resolution=hires`,
+        "waveformHires",
+        (d) => d,
+        { loadingKey: "waveformHiresLoading", retries: 1 },
+      );
       enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
     })();
 
@@ -1238,7 +1374,7 @@ function EditLyricsRoute({
     };
     // setCurrentReview is stable via useState; only re-bootstrap on id change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
+  }, [id, location.search]);
 
   // Cleanup en unmount: si el operador navega lejos sin aprobar (back-button,
   // sidebar, etc.), borrar el editingJobId del currentReview para que un
@@ -1317,7 +1453,11 @@ function EditLyricsRoute({
         jobId={id}
         jobStatus={state.jobStatus}
         isRendering={isRendering}
-        onBack={() => navigate(`/videos/${id}`)}
+        onBack={() => navigate(
+          changeRequestAdminPath(changeRequestContext) || `/videos/${id}`,
+        )}
+        onComplete={handleRenderingComplete}
+        returnsToChangeRequest={!!changeRequestContext}
         t={t}
       />
     );
@@ -1341,6 +1481,14 @@ function EditLyricsRoute({
         <button onClick={() => navigate(`/videos/${id}`)} className="btn-secondary">
           {t("detail.back") || "Volver al video"}
         </button>
+      </div>
+    );
+  }
+  if (state.status === "request_error") {
+    return (
+      <div className="text-center mt-16">
+        <p className="text-gray-500 mb-4">No pudimos recuperar los cambios de este pedido. Reintentá para revisar la versión guardada.</p>
+        <button onClick={() => window.location.reload()} className="btn-secondary">Reintentar</button>
       </div>
     );
   }
@@ -1505,6 +1653,9 @@ function VariantWizardRoute({
         filename: job.filename || job.artist || "lyrics",
         file: null,
         audioUrl: null,           // Fase B
+        audioSource: null,
+        audioPreviewPending: false,
+        audioPreviewRetryAt: null,
         waveform: null,           // Fase B
         bgUrl: null,              // Fase B
         ...initialFields,
@@ -1535,6 +1686,7 @@ function VariantWizardRoute({
       };
       enhanceField(`${API}/jobs/${id}/source-audio-url`, "audioUrl", (d) => d?.url || null);
       enhanceField(`${API}/jobs/${id}/waveform`, "waveform", (d) => d);
+      enhanceField(`${API}/jobs/${id}/waveform?resolution=hires`, "waveformHires", (d) => d);
       enhanceField(`${API}/jobs/${id}/background-url`, "bgUrl", (d) => d?.url || null);
     })();
 
@@ -1620,6 +1772,42 @@ function VariantWizardRoute({
   }
   return wizardScreen;
 }
+
+// Sondeo del modo tarea del re-anclado (ver reanchorSegmentsOnBackend).
+const REANCHOR_TASK_POLL_MS = 3000;
+const REANCHOR_TASK_TIMEOUT_MS = 12 * 60 * 1000;
+const pollReanchorTask = async (jobId, taskId, onProgress) => {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < REANCHOR_TASK_TIMEOUT_MS) {
+    await new Promise((resolve) => setTimeout(resolve, REANCHOR_TASK_POLL_MS));
+    const elapsedS = Math.round((Date.now() - startedAt) / 1000);
+    if (typeof onProgress === "function") {
+      try { onProgress({ elapsedS, taskId }); } catch { /* progress is best-effort */ }
+    }
+    let res;
+    try {
+      res = await authFetch(`${API}/jobs/${jobId}/reanchor/tasks/${taskId}`, { cache: "no-store" });
+    } catch (err) {
+      console.warn("[reanchor] task poll network error", err);
+      continue; // transient: keep polling until the deadline
+    }
+    if (res.status === 404) {
+      console.warn("[reanchor] task registry lost", taskId);
+      return { ok: false, reason: "task-lost" };
+    }
+    if (!res.ok) continue;
+    let record = null;
+    try { record = await res.json(); } catch { continue; }
+    if (record?.status !== "done") continue;
+    const httpStatus = Number(record.http_status);
+    const payload = record.payload || {};
+    if (httpStatus >= 200 && httpStatus < 300) return payload;
+    console.warn("[reanchor] task failed", httpStatus, payload?.detail || payload?.code || "");
+    return reanchorHttpFailure(httpStatus, payload, { terminal: true });
+  }
+  console.warn("[reanchor] task poll timed out", taskId);
+  return { ok: false, reason: "task-lost" };
+};
 
 export default function App() {
   const { t } = useI18n();
@@ -1708,9 +1896,30 @@ export default function App() {
   // transient API/DB failure never strands the timing editor without audio.
   const reviewAudioRequestSequenceRef = useRef(0);
   const reviewReactiveAudioRequestRef = useRef(false);
-  const retryTranscriptionReviewAudio = useCallback(async (jobId, { reason = "initial" } = {}) => {
+  const campaignReviewSafeExitRef = useRef(null);
+  const registerCampaignReviewSafeExit = useCallback((handler) => {
+    campaignReviewSafeExitRef.current = typeof handler === "function" ? handler : null;
+  }, []);
+  // Campaign review links carry a durable return target so the editor's own
+  // back action and the browser back action land on the exact queue context
+  // (tab, search, filters, order, page and focus), rather than the legacy
+  // admin queue. Only campaign and queue paths are accepted; arbitrary URLs never
+  // become an open redirect.
+  const campaignReturnPath = useMemo(() => {
+    const candidate = new URLSearchParams(location.search).get("return_to");
+    return safeReviewReturnPath(candidate);
+  }, [location.search]);
+  const withCampaignReturn = useCallback((path) => {
+    if (!campaignReturnPath || !String(path || "").startsWith("/review/")) return path;
+    const separator = String(path).includes("?") ? "&" : "?";
+    return `${path}${separator}return_to=${encodeURIComponent(campaignReturnPath)}`;
+  }, [campaignReturnPath]);
+  const retryTranscriptionReviewAudio = useCallback(async (jobId, { reason = "initial", preferOriginal = false } = {}) => {
     if (!jobId) return;
     const preventive = reason === "signed_url_expiring";
+    const previewPoll = reason === "preview_pending";
+    const useOriginal = preferOriginal || reason === "media_error";
+    const nonBlocking = preventive || previewPoll;
     if (preventive && reviewReactiveAudioRequestRef.current) return;
     const requestSequence = ++reviewAudioRequestSequenceRef.current;
     if (!preventive) reviewReactiveAudioRequestRef.current = true;
@@ -1718,14 +1927,14 @@ export default function App() {
       previous?.transcribeJobId === jobId
         ? {
           ...previous,
-          audioLoading: preventive && previous.audioUrl ? false : true,
+          audioLoading: nonBlocking && previous.audioUrl ? false : true,
           audioUnavailableReason: null,
         }
         : previous
     ));
     const result = await loadEditorAudio({
       request: () => authFetchWithTimeout(
-        `${API}/jobs/${jobId}/source-audio-url`,
+        `${API}/jobs/${jobId}/source-audio-url${useOriginal ? "?prefer_original=1" : ""}`,
         { cache: "no-store" },
         8_000,
       ),
@@ -1746,18 +1955,35 @@ export default function App() {
     }
     setCurrentReview((previous) => {
       if (previous?.transcribeJobId !== jobId) return previous;
-      return result.ok
-        ? {
+      if (result.ok) {
+        const resultSource = result.source || previous.audioSource || "input";
+        const keepCurrentSource = previewPoll
+          && previous.audioUrl
+          && previous.audioSource !== "editor_preview"
+          && resultSource !== "editor_preview";
+        const previewPending = !useOriginal && result.previewStatus === "pending";
+        return {
           ...previous,
-          audioUrl: result.url,
+          audioUrl: keepCurrentSource ? previous.audioUrl : result.url,
+          audioSource: keepCurrentSource ? previous.audioSource : resultSource,
           audioLoading: false,
           audioUnavailableReason: null,
+          audioPreviewPending: previewPending,
+          audioPreviewRetryAt: previewPending
+            ? Date.now() + Math.max(1, result.previewRetryAfterSeconds || 5) * 1_000
+            : null,
           audioRefreshAt: Date.now() + audioUrlRefreshDelayMs(result.expiresIn),
-        }
-        : editorAudioFailureState(previous, {
-          reason,
-          failureReason: result.reason,
-        });
+        };
+      }
+      if (nonBlocking && previous.audioUrl && result.reason === "temporary") {
+        return {
+          ...previous,
+          audioLoading: false,
+          audioUnavailableReason: null,
+          audioPreviewRetryAt: previewPoll ? Date.now() + PROACTIVE_URL_RETRY_MS : previous.audioPreviewRetryAt,
+        };
+      }
+      return editorAudioFailureState(previous, { reason, failureReason: result.reason });
     });
     if (!preventive && requestSequence === reviewAudioRequestSequenceRef.current) {
       reviewReactiveAudioRequestRef.current = false;
@@ -1767,21 +1993,27 @@ export default function App() {
     || currentReview?.transcribeJobId
     || null;
   const activeReviewAudioRefreshAt = currentReview?.audioRefreshAt || null;
+  const activeReviewAudioPreviewRetryAt = currentReview?.audioPreviewRetryAt || null;
   useEffect(() => {
-    if (!activeReviewAudioJobId || !activeReviewAudioRefreshAt || currentReview?.audioLoading) {
+    if (!activeReviewAudioJobId || currentReview?.audioLoading
+      || (!activeReviewAudioRefreshAt && !activeReviewAudioPreviewRetryAt)) {
       return undefined;
     }
-    const delayMs = Math.max(0, activeReviewAudioRefreshAt - Date.now());
+    const previewPoll = activeReviewAudioPreviewRetryAt
+      && (!activeReviewAudioRefreshAt || activeReviewAudioPreviewRetryAt <= activeReviewAudioRefreshAt);
+    const nextAt = previewPoll ? activeReviewAudioPreviewRetryAt : activeReviewAudioRefreshAt;
+    const delayMs = Math.max(0, nextAt - Date.now());
     const timer = window.setTimeout(() => {
       const retry = currentReview?.editingJobId
         ? editorAudioRetryRef.current
         : (options) => retryTranscriptionReviewAudio(activeReviewAudioJobId, options);
-      if (retry) void retry({ reason: "signed_url_expiring" });
+      if (retry) void retry({ reason: previewPoll ? "preview_pending" : "signed_url_expiring" });
     }, Math.min(delayMs, 2_147_483_647));
     return () => window.clearTimeout(timer);
   }, [
     activeReviewAudioJobId,
     activeReviewAudioRefreshAt,
+    activeReviewAudioPreviewRetryAt,
     currentReview?.audioLoading,
     currentReview?.editingJobId,
     retryTranscriptionReviewAudio,
@@ -1891,10 +2123,14 @@ export default function App() {
   useEffect(() => {
     const jobId = currentReview?.transcribeJobId;
     if (!jobId || wizardStage !== "review") return;
+    // A selected song in the URL owns identity. Never redirect a new deep
+    // link back to the previous editor while its status request is pending.
+    if (reviewJobIdFromLocation(location.pathname, location.search)) return;
     if (location.pathname !== "/new" && !location.pathname.startsWith("/review")) return;
-    const target = reviewJobPath(jobId);
-    if (location.pathname !== target) navigate(target, { replace: true });
-  }, [currentReview?.transcribeJobId, location.pathname, navigate, wizardStage]);
+    const targetPath = reviewJobPath(jobId);
+    const target = `${targetPath}${location.pathname.startsWith("/review") ? location.search : ""}`;
+    if (location.pathname !== targetPath) navigate(target, { replace: true });
+  }, [currentReview?.transcribeJobId, location.pathname, location.search, navigate, wizardStage]);
 
   const [jobs, setJobs] = useState([]);
   // Pre-fetched transcription results for batch review songs 1..N-1.
@@ -1938,6 +2174,43 @@ export default function App() {
   // brand-new clip — UMG's path for getting a unique video off a
   // library asset they already used (or want to differentiate from).
   const [backgroundMode, setBackgroundMode] = useState("as_is");
+  const creativeReviewRef = useRef(currentReview);
+  creativeReviewRef.current = currentReview;
+  const campaignCreativeSave = useCampaignCreativeSave({
+    identity: currentReview?.campaignCreativeRevision != null && currentReview?.campaignId
+      ? `${currentReview.campaignId}/${currentReview.campaignItemId}` : null,
+    revision: currentReview?.campaignCreativeRevision,
+    settings: reviewCreativeSettings(currentReview || {}, {
+      style, custom_colors: customColors || "", background_id: bgSelectMode === "auto" ? null : backgroundId || null,
+      background_mode: backgroundMode, animate_image: animateImage, enable_scenes: enableScenes,
+      match_lyrics: inspiredByLyrics, delivery_profile: delivery.delivery_profile,
+      umg_frame_size: delivery.umg_frame_size || "HD", umg_fps: String(delivery.umg_fps || "25"),
+      umg_prores_profile: String(delivery.umg_prores_profile || "3"),
+    }),
+    file: bgSelectMode === "custom" ? backgroundFile : null,
+    onSave: async (settings, revision, file) => {
+      const review = currentReview;
+      const visual = { ...settings };
+      if (file) {
+        const media = new FormData(); media.set("file", file); media.set("name", file.name);
+        const uploaded = await authFetch(`${API}/batch/campaigns/${review.campaignId}/creative/assets`, { method: "POST", body: media });
+        const asset = await uploaded.json().catch(() => ({}));
+        if (!uploaded.ok) throw new Error(typeof asset.detail === "string" ? asset.detail : "No se pudo guardar el fondo propio");
+        visual.background_id = asset.id;
+        if (creativeReviewRef.current?.transcribeJobId === review.transcribeJobId) {
+          setBackgroundId(asset.id); setBgSelectMode("library"); setBackgroundFile(null);
+        }
+      }
+      const response = await authFetch(`${API}/batch/campaigns/${review.campaignId}/creative/items/${review.campaignItemId}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision, settings: visual }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "No se pudieron guardar los ajustes de la canción");
+      setCurrentReview(previous => previous?.transcribeJobId === review.transcribeJobId
+        ? { ...previous, campaignCreativeRevision: result.revision } : previous);
+      return result;
+    },
+  });
   const [sidebarOpen, setSidebarOpen] = useState(
     typeof window !== "undefined" && window.innerWidth >= 768
   );
@@ -2127,45 +2400,90 @@ export default function App() {
   useEffect(() => {
     const resumeJobId = reviewJobIdFromLocation(location.pathname, location.search);
     if (!resumeJobId) return;
-    if (resumeJobAttemptedRef.current === resumeJobId) return;
-    resumeJobAttemptedRef.current = resumeJobId;
-
-    let cancelled = false;
+    const attempt = beginReviewResume(resumeJobAttemptedRef, resumeJobId);
+    if (!attempt) return;
     (async () => {
       try {
         const statusRes = await authFetchCriticalRead(`${API}/status/${resumeJobId}`);
         if (!statusRes.ok) throw new Error(`status ${statusRes.status}`);
         const job = await statusRes.json();
-        if (cancelled) return;
+        if (attempt.cancelled) return;
+        if (job.status === "discarded" && job.campaign_id) {
+          navigate(`/campaigns/${encodeURIComponent(job.campaign_id)}?tab=discarded`, { replace: true });
+          return;
+        }
         const segments = job.segments || job.segments_json || [];
+        const resumedCreativeFields = creativeFieldsForReviewResume(job);
+        const campaignPreset = {
+          ...(job.campaign?.default_render_params || {}),
+          ...(job.campaign?.render_overrides || {}),
+        };
+        const preset = (snake, camel, fallback = "") =>
+          campaignPreset[snake] ?? campaignPreset[camel] ?? fallback;
         setCurrentReview({
           file: null,                            // no tenemos el File original
           filename: job.filename || `${job.song_title || job.artist || "audio"}.wav`,
           audioUrl: null,
+          audioSource: null,
+          audioPreviewPending: false,
+          audioPreviewRetryAt: null,
           audioLoading: true,
           audioUnavailableReason: null,
           artist: job.artist || "",
           songTitle: job.song_title || "",
-          language: job.language || "es",
-          genre: job.genre || "",
-          font: job.font || "",
-          concept: job.concept || "",
-          movementStyle: job.movement_style || "",
-          effect: job.effect || "",
-          textCase: job.text_case || "upper",
-          fontScale: String(job.font_scale || "1.0"),
-          lyricsAnimation: job.lyrics_animation || "none",
-          lineTransition: job.line_transition || "none",
-          lyricColor: job.lyric_color || "#FFFFFF",
-          lyricSungColor: job.lyric_sung_color || "#FFFFFF",
-          textContrast: job.text_contrast || "medium",
+          // Do NOT coerce an unknown language to "es" on reload: that silently
+          // relabels a mis-transcribed song as Spanish. Leave it empty (auto)
+          // and let the recomputed flags below drive the warning.
+          language: job.language || "",
+          // Recomputed by the server from persisted segments + reference, so the
+          // language / discrepancy warning and the approval block survive a
+          // reload / deep-link and recalculate after an edit (see /status).
+          languageConflict: !!job.language_conflict,
+          languageUncertain: !!job.language_uncertain,
+          mixedLanguage: !!job.mixed_language,
+          outputReferenceDivergence: !!job.output_reference_divergence,
+          needsLanguageReview: !!job.needs_language_review,
+          languageReviewResolved: !!job.language_review_resolved,
+          outputReferenceUnexplainedIndices:
+            job.output_reference_unexplained_indices || [],
+          ...resumedCreativeFields,
+          genre: preset("genre", "genre", resumedCreativeFields.genre),
+          concept: preset("concept", "concept", resumedCreativeFields.concept),
+          movementStyle: preset("movement_style", "movementStyle", resumedCreativeFields.movementStyle),
+          effect: preset("effect", "effect", resumedCreativeFields.effect),
+          backgroundHint: preset("background_hint", "backgroundHint", resumedCreativeFields.backgroundHint),
+          font: preset("font", "font", job.font || ""),
+          textCase: preset("text_case", "textCase", job.text_case || "upper"),
+          frameFormat: preset("frame_format", "frameFormat", "full"),
+          fontScale: String(preset("font_scale", "fontScale", job.font_scale || "1.0")),
+          lyricsAnimation: preset("lyrics_animation", "lyricsAnimation", job.lyrics_animation || "none"),
+          lineTransition: preset("line_transition", "lineTransition", job.line_transition || "none"),
+          lyricColor: preset("lyric_color", "lyricColor", job.lyric_color || "#FFFFFF"),
+          lyricSungColor: preset("lyric_sung_color", "lyricSungColor", job.lyric_sung_color || "#FFFFFF"),
+          textContrast: preset("text_contrast", "textContrast", job.text_contrast || "medium"),
           segments,
           segmentsRevision: Number.isInteger(job.segments_revision) ? job.segments_revision : 0,
           referenceLyrics: job.reference_lyrics || "",
+          referenceLinks: job.campaign?.review_reference_links || [],
+          sourceReference: job.campaign?.source_reference || null,
+          campaignCreativeRevision: campaignPreset.creative_assignment?.revision ?? null,
+          bgVerbatim: preset("bg_verbatim", "bgVerbatim", resumedCreativeFields.bgVerbatim),
+          matchLyrics: preset("match_lyrics", "matchLyrics", true),
+          titleTemplate: preset("title_template", "titleTemplate", "auto"),
+          titleSize: String(preset("title_size", "titleSize", "1.0")),
+          titleArtistFont: preset("title_artist_font", "titleArtistFont", ""),
+          titleSongFont: preset("title_song_font", "titleSongFont", ""),
+          titleSongBreak: preset("title_song_break", "titleSongBreak", ""),
+          referenceUnavailable: Boolean(
+            job.transcription_quality?.manual_full_review_required
+            || job.transcription_quality?.reference_hypothesis?.availability === "unavailable"
+          ),
           coverageWarning: !!job.coverage_warning,
           transcriptionQuality: job.transcription_quality || null,
           recoverySource: job.recovery_source || "",
           transcribeJobId: resumeJobId,           // backend reusa R2 audio
+          campaignId: job.campaign_id || null,
+          campaignItemId: job.campaign_item_id || null,
           queueIdx: 0,
           queue: [{ filename: job.filename || "audio.wav" }],
         });
@@ -2179,23 +2497,47 @@ export default function App() {
         // silencio (la variante "resume" del bug de Ana M.). El job
         // resumido no trae fondo propio (transcribed, pre-/generate), así
         // que IA es el default correcto.
-        setBackgroundFile(null); setBackgroundId(null);
-        setBgSelectMode("auto"); setAnimateImage(false); setEnableScenes(false);
+        setBackgroundFile(null);
+        const presetBackgroundId = preset("background_id", "backgroundId", null);
+        setBackgroundId(job.campaign_id ? presetBackgroundId : null);
+        setBgSelectMode(job.campaign_id && presetBackgroundId ? "library" : "auto");
+        setBackgroundMode(preset("background_mode", "backgroundMode", "as_is") === "variation" ? "variation" : "as_is");
+        setAnimateImage(job.campaign_id
+          ? preset("animate_image", "animateImage", false) === true
+          : !!resumedCreativeFields.animateImage);
+        setEnableScenes(job.campaign_id ? preset("enable_scenes", "enableScenes", false) === true : false);
         setArtTrack(false);
+        if (job.campaign_id) {
+          setStyle(preset("style", "style", "auto"));
+          setCustomColors(preset("custom_colors", "customColors", ""));
+          setInspiredByLyrics(preset("match_lyrics", "matchLyrics", true) !== false);
+          setDelivery((current) => ({
+            ...current,
+            delivery_profile: preset("delivery_profile", "deliveryProfile", "youtube"),
+            umg_frame_size: preset("umg_frame_size", "umgFrameSize", current.umg_frame_size),
+            umg_fps: preset("umg_fps", "umgFps", current.umg_fps),
+            umg_prores_profile: preset("umg_prores_profile", "umgProresProfile", current.umg_prores_profile),
+          }));
+        }
         setWizardStage("review");
         // Canonicalize legacy /new?resume= links without adding a history
         // entry. Direct /review/:jobId links already point at this target.
-        navigate(reviewJobPath(resumeJobId), { replace: true });
+        if (location.pathname === "/new") {
+          const params = new URLSearchParams(location.search);
+          params.delete("resume");
+          navigate(`${reviewJobPath(resumeJobId)}${params.size ? `?${params}` : ""}`, { replace: true });
+        }
       } catch (err) {
+        if (attempt.cancelled) return;
         console.warn("[RESUME] no pude cargar el job:", err);
-        resumeJobAttemptedRef.current = null;   // permitir reintento si el operador cambia URL
+        attempt.cancel(); // liberar sólo este intento, nunca el de otra canción
         // Fallback honesto: si el resume falla (auth no lista, red, 4xx),
         // mandar al JobDetail en vez de dejar al usuario varado en /new
         // con el wizard vacío — que parece "crear video nuevo".
         navigate(`/videos/${resumeJobId}`, { replace: true });
       }
     })();
-    return () => { cancelled = true; };
+    return () => attempt.cancel();
   }, [location.pathname, location.search, navigate, retryTranscriptionReviewAudio]);
 
   // Imperative resume — called by the banner's "Continuar" button.
@@ -2412,6 +2754,9 @@ export default function App() {
     // PR E: User B no debe heredar los segments editados de User A en la
     // misma máquina — el store es a nivel módulo, no muere con el unmount.
     try { segmentsStore.evictAll(); } catch { /* */ }
+    // Campaign snapshots (pipeline, review queue, videos) live in a module
+    // cache for instant tab switches; the next user must never see them.
+    try { clearCampaignResourceCache(); } catch { /* */ }
 
     // Short-lived media tokens (preview/download URLs scoped to
     // job+filetype). Without this, User B sees /preview URLs that
@@ -3062,7 +3407,8 @@ export default function App() {
       setTranscribing(false);
       setTranscribeProgress(null);
       setCurrentReview({
-        file: entry.file, artist: entry.artist, language: entry.language,
+        file: entry.file, artist: entry.artist,
+        language: entry.language || data.reference_language || data.detected_language || "",
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
         concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
@@ -3089,6 +3435,9 @@ export default function App() {
         coverageWarning: !!data.coverage_warning,
         transcriptionQuality: data.transcription_quality || null,
         recoverySource: data.recovery_source || "",
+        languageConflict: !!data.language_conflict,
+        languageUncertain: !!data.language_uncertain,
+        mixedLanguage: !!data.mixed_language,
         transcribeJobId: data.job_id || jobId,
         queueIdx: idx, queue,
       });
@@ -3147,7 +3496,8 @@ export default function App() {
           setTranscribing(false);
           setTranscribeProgress(null);
           setCurrentReview({
-            file: entry.file, artist: entry.artist, language: entry.language,
+            file: entry.file, artist: entry.artist,
+            language: entry.language || data.reference_language || data.detected_language || "",
             songTitle: entry.songTitle || "",
             genre: entry.genre || "", font: entry.font || "",
             concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
@@ -3165,6 +3515,9 @@ export default function App() {
             coverageWarning: !!data.coverage_warning,
             transcriptionQuality: data.transcription_quality || null,
             recoverySource: data.recovery_source || "",
+            languageConflict: !!data.language_conflict,
+            languageUncertain: !!data.language_uncertain,
+            mixedLanguage: !!data.mixed_language,
             transcribeJobId: data.job_id || cached.jobId,
             queueIdx: idx, queue,
           });
@@ -3302,7 +3655,8 @@ export default function App() {
       setTranscribing(false);
       setTranscribeProgress(null);
       setCurrentReview({
-        file: entry.file, artist: entry.artist, language: entry.language,
+        file: entry.file, artist: entry.artist,
+        language: entry.language || data.reference_language || data.detected_language || "",
         songTitle: entry.songTitle || "",
         genre: entry.genre || "", font: entry.font || "",
         concept: entry.concept || "", movementStyle: entry.movementStyle || "", effect: entry.effect || "",
@@ -3325,22 +3679,24 @@ export default function App() {
         coverageWarning: !!data.coverage_warning,
         transcriptionQuality: data.transcription_quality || null,
         recoverySource: data.recovery_source || "",
+        languageConflict: !!data.language_conflict,
+        languageUncertain: !!data.language_uncertain,
+        mixedLanguage: !!data.mixed_language,
         transcribeJobId: data.job_id || uploadJobId,
+        audioUrl: null,
+        audioSource: null,
+        audioPreviewPending: false,
+        audioPreviewRetryAt: null,
+        audioLoading: true,
         queueIdx: idx, queue,
       });
-      // Phase B: fetch signed R2 audio URL in background so LyricsEditor
-      // can use a durable server-side URL instead of the ephemeral blob.
-      // Fire-and-forget — editor already works with the blob URL; this just
-      // upgrades it to avoid ERR_FILE_NOT_FOUND when the blob gets revoked.
+      // Phase B: use the same bounded loader as resumed/edit sessions. It
+      // serves the original immediately when the shared preview is cold,
+      // polls until the AAC is ready, and falls back automatically if media
+      // decoding or R2 fails. The local Blob remains an immediate fallback.
       const _newJobId = data.job_id || uploadJobId;
       if (_newJobId) {
-        authFetch(`${API}/jobs/${_newJobId}/source-audio-url`)
-          .then((r) => r.ok ? r.json() : null)
-          .then((d) => {
-            const url = d?.url || null;
-            if (url) setCurrentReview((prev) => prev?.transcribeJobId === _newJobId ? { ...prev, audioUrl: url } : prev);
-          })
-          .catch(() => { /* blob URL still works as fallback */ });
+        void retryTranscriptionReviewAudio(_newJobId);
       }
       // Kick off background upload+transcription for songs idx+1..N-1
       // while the user is reading/editing the current song's lyrics.
@@ -3424,19 +3780,40 @@ export default function App() {
   // timing re-anclado respetando las líneas `locked`. Devuelve el payload
   // del endpoint ({ok, count, review_count, segments}) para que el
   // LyricsEditor refresque su estado y muestre el toast de resultado.
-  const reanchorSegmentsOnBackend = useCallback(async (jobId, baseRevision) => {
+  // `extra` (2026-09-13): { lyrics_text, confirm_structure } cuando el
+  // operador pega la letra oficial; vacío = re-anclar el texto ya editado.
+  // 2026-09-14 "modo tarea": la alineación tarda 2-5 min en canciones largas
+  // y el request no sobrevive (el proxy re-envía el POST a los ~60 s; un
+  // deploy corta la conexión mientras el server sigue y persiste igual).
+  // Pedimos async_mode: el backend contesta 202 {task_id} al instante y acá
+  // sondeamos GET /reanchor/tasks/{task_id} hasta que termine, devolviendo
+  // EXACTAMENTE la misma forma que el camino síncrono (LyricsEditor no
+  // cambia). Si el registro se perdió (404: réplica reemplazada) o el
+  // sondeo vence, devolvemos reason "task-lost" y el editor cae en su
+  // reconciliación por revisión. Un backend viejo responde 200/4xx directo
+  // y sigue el manejo síncrono de siempre.
+  const reanchorSegmentsOnBackend = useCallback(async (jobId, baseRevision, extra = {}) => {
     if (!jobId) return { ok: false, reason: "no-job" };
+    const { onProgress, ...requestExtra } = extra || {};
     try {
       const res = await authFetch(`${API}/jobs/${jobId}/reanchor`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base_revision: baseRevision }),
+        body: JSON.stringify({ base_revision: baseRevision, ...requestExtra, async_mode: true }),
       });
+      if (res.status === 202) {
+        let started = null;
+        try { started = await res.clone().json(); } catch { /* non-JSON body */ }
+        const taskId = started?.task_id;
+        if (!taskId) return { ok: false, reason: "task-lost" };
+        return await pollReanchorTask(jobId, taskId, onProgress);
+      }
       if (!res.ok) {
         let detail = "";
-        try { detail = (await res.clone().json())?.detail || ""; } catch { /* non-JSON body */ }
-        console.warn("[reanchor] failed", res.status, detail);
-        return { ok: false, reason: `http-${res.status}`, status: res.status, detail };
+        let payload = null;
+        try { payload = await res.clone().json(); detail = payload?.detail || ""; } catch { /* non-JSON body */ }
+        console.warn("[reanchor] failed", res.status, detail || payload?.code || "");
+        return reanchorHttpFailure(res.status, payload);
       }
       return await res.json();
     } catch (err) {
@@ -3444,6 +3821,46 @@ export default function App() {
       return { ok: false, reason: "network", error: String(err) };
     }
   }, []);
+
+  // 2026-09-14: la alineación puede tardar >60 s; el proxy re-envía el POST y
+  // el cliente puede recibir el error del duplicado (409 stale_revision) o un
+  // corte aunque el servidor ya aplicó todo. Antes de mostrar error, el editor
+  // mira el estado real: si la revisión avanzó, fue éxito.
+  const reanchorReconcileFromServer = useCallback(async (jobId, baseRevision) => {
+    if (!jobId) return { ok: false, reason: "no-job" };
+    try {
+      const res = await authFetch(`${API}/status/${jobId}`, { cache: "no-store" });
+      if (!res.ok) return { ok: false, reason: `http-${res.status}` };
+      const job = await res.json();
+      const revision = Number(job?.segments_revision);
+      const segments = Array.isArray(job?.segments_json) ? job.segments_json : [];
+      if (!Number.isInteger(revision) || revision <= Number(baseRevision ?? -1) || !segments.length) {
+        return { ok: false, reason: "not-advanced", revision };
+      }
+      return { ok: true, recovered: true, revision, segments, count: segments.length,
+        review_count: segments.filter((s) => s && s.review).length };
+    } catch (err) {
+      console.warn("[reanchor] reconcile error", err);
+      return { ok: false, reason: "network" };
+    }
+  }, []);
+
+  // The editor flushes first and supplies its exact saved revision.
+  const handleResolveLanguageReview = async ({ baseRevision } = {}) => {
+    const jobId = currentReview?.transcribeJobId || currentReview?.editingJobId;
+    const result = await resolveSavedLanguageReview(
+      (path, options) => authFetch(`${API}${path}`, options), jobId, baseRevision,
+    );
+    if (result.ok) {
+      setCurrentReview((cur) => (
+        cur && (cur.transcribeJobId || cur.editingJobId) === jobId ? {
+          ...cur, languageReviewResolved: true, languageUncertain: false,
+          languageConflict: false, needsLanguageReview: false,
+        } : cur
+      ));
+    }
+    return result;
+  };
 
   const handleApproveLyrics = async (editedSegments, saveMeta = {}) => {
     const r = currentReview;
@@ -3462,6 +3879,26 @@ export default function App() {
     // el fondo, aunque no toques ningún campo).
     if (r.variantMode) {
       const parentJobId = r.parentJobId;
+      // Audit 2026-08-26 (incidente Universal "Tu Cárcel"): buildVariantPayload
+      // sólo sabe mandar background_id/background_mode (Biblioteca) — no tiene
+      // ningún campo para el archivo subido ni para animateImage, así que un
+      // bgSelectMode "custom" se descartaba en silencio: el operador subía su
+      // foto, tildaba "Animar con AI", el POST /variant salía sin ninguno de
+      // los dos, y el backend generaba una escena random con Gemini/Veo — sin
+      // error, gastando la llamada a Veo, con contenido sin relación a la foto.
+      // Hasta que /variant soporte fondo custom + animate (mismo camino que ya
+      // funciona en /edit), cortamos acá con un error claro en vez de dejar
+      // pasar el submit y quemar cuota de Veo para nada.
+      if (bgSelectMode === "custom") {
+        alert({
+          title: t("variant.custom_bg_unsupported_title") ||
+            "\"Subir la mía\" no está disponible en variantes",
+          description: t("variant.custom_bg_unsupported_desc") ||
+            "Crear variante sólo genera fondos con IA o de la Biblioteca. Para animar tu foto, usá \"Editar\" en vez de \"Crear variante\".",
+          tone: "warning",
+        });
+        return;
+      }
       if (editSubmitLockRef.current) return;
       editSubmitLockRef.current = true;
       setVariantSubmitting(true);
@@ -3592,6 +4029,8 @@ export default function App() {
           current,
           jobStatus: r.jobStatus,
           scenePlan: r.scenePlan,
+          forceLyricsRerender: !!r.changeRequestContext,
+          allowApprovedBackground: user?.role === "admin",
         });
 
         if (submission.presentBuckets.length === 0) {
@@ -3619,7 +4058,7 @@ export default function App() {
               ? (t("edit.bg_locked_scenes_desc") ||
                  "El fondo es un timeline multi-escena. Regenerá la escena que quieras cambiar desde el filmstrip del video — no consume cupo de edición.")
               : (t("edit.bg_locked_done_desc") ||
-                 "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo."),
+                 "Pedile a un administrador que regenere el fondo desde Cambios o desde el editor. No hace falta crear otro video."),
             tone: "warning",
           });
           return;
@@ -3650,6 +4089,10 @@ export default function App() {
           dropped: submission.willDrop,
         });
         const payload = submission.payload;
+        if (r.changeRequestContext) {
+          payload.change_request_id = r.changeRequestContext.changeRequestId;
+          payload.change_request_proposal_id = r.changeRequestContext.proposalId;
+        }
         // Regen de fondo IA (Veo/Imagen + validación): paridad con la tarjeta
         // "Regenerar fondo" que se plegó al wizard (unificación #973). Motor y
         // política de validación son MODIFICADORES de un regen, no campos del
@@ -3716,10 +4159,72 @@ export default function App() {
           }
         }
 
+        // Campaign lyrics are approved against an exact editor/audio
+        // snapshot before their first background is generated. A real
+        // post-render correction invalidates that old snapshot during
+        // autosave, so renew the same explicit attestation before /edit.
+        // The backend keeps pending_review/done/rejected unchanged until the
+        // render request is accepted, avoiding a half-finished state if the
+        // second request loses the network race.
+        const campaignEditApproval = buildCampaignEditApproval(r, saveMeta);
+        if (campaignEditApproval) {
+          if (!campaignEditApproval.valid) {
+            alert({
+              title: t("edit.error_title") || "No pudimos aplicar el edit",
+              description: "No pudimos vincular la revisión completa de letra y timing. Volvé a revisar la versión actual e intentá nuevamente.",
+              tone: "error",
+            });
+            return { ok: false, reason: "campaign-approval-incomplete" };
+          }
+          let approvalResponse;
+          try {
+            approvalResponse = await authFetch(
+              `${API}/batch/campaigns/${campaignEditApproval.campaignId}/jobs/${editedJobId}/approve-lyrics`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(campaignEditApproval.body),
+              },
+            );
+          } catch {
+            alert({
+              title: t("edit.error_title") || "No pudimos aplicar el edit",
+              description: t("common.network_error") || "Error de red. Reintentá en unos segundos.",
+              tone: "error",
+            });
+            return { ok: false, reason: "campaign-approval-network" };
+          }
+          if (!approvalResponse.ok) {
+            const approvalData = await approvalResponse.json().catch(() => ({}));
+            alert({
+              title: t("edit.error_title") || "No pudimos aplicar el edit",
+              description: translateBackendError(approvalData?.detail, t) || `Error ${approvalResponse.status}`,
+              tone: "error",
+            });
+            return { ok: false, reason: `campaign-approval-${approvalResponse.status}` };
+          }
+        }
+
+        // The key must identify ONE submit: the same editor revision can carry a
+        // lyrics render and later a background regeneration for the same request,
+        // and a key shared across them made the backend answer 409 (same key,
+        // different body). Retries inside this submit reuse the nonce.
+        const submitNonce = (typeof crypto !== "undefined" && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
         const doPost = async (body) => {
+          const requestRevision = Number.isInteger(body.editor_revision)
+            ? body.editor_revision
+            : (Number.isInteger(body.base_revision) ? body.base_revision : r.segmentsRevision);
+          const umgIdempotencyKey = r.changeRequestContext
+            ? `umg-change:${r.changeRequestContext.changeRequestId}:${r.changeRequestContext.proposalId ?? "manual"}:${submission.editType}:${requestRevision}:${submitNonce}`
+            : null;
           const res = await authFetch(`${API}/edit/${editedJobId}`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              ...(umgIdempotencyKey ? { "Idempotency-Key": umgIdempotencyKey } : {}),
+            },
             body: JSON.stringify(body),
           });
           let data = {};
@@ -3751,7 +4256,11 @@ export default function App() {
             wizardPersistence.clear();
             segmentsStore.evict(reviewStoreKey(r));
             segmentsStore.evict(r.transcribeJobId);
-            navigate(`/videos/${editedJobId}`, { replace: true });
+            navigate(
+              changeRequestAdminPath(r.changeRequestContext, "submitted")
+                || `/videos/${editedJobId}`,
+              { replace: true },
+            );
             return { ok: true, duplicate: true };
           }
           const conflict = isEditorRevisionConflict(res, data);
@@ -3780,10 +4289,66 @@ export default function App() {
         // la entrada leakea. Se evicta también transcribeJobId por las dudas.
         segmentsStore.evict(reviewStoreKey(r));
         segmentsStore.evict(r.transcribeJobId);
-        navigate(`/videos/${editedJobId}`, { replace: true });
+        navigate(
+          changeRequestAdminPath(r.changeRequestContext, "submitted")
+            || `/videos/${editedJobId}`,
+          { replace: true },
+        );
         return { ok: true, approvedEditorVersionId: data?.approved_editor_version_id || null };
       } finally {
         editSubmitLockRef.current = false;
+      }
+    }
+
+    // Campaign stage 1 ends at durable human approval. It must never share
+    // the generic wizard's approve→generate transition: backgrounds and
+    // renders are a separate, later stage triggered outside this screen.
+    if (r.campaignId && r.transcribeJobId) {
+      // Never infer review from mere presence in the submitted document.
+      // LyricsEditor supplies only the identities explicitly confirmed (or
+      // deliberately edited) by the operator; the backend then compares this
+      // ordered set with the exact durable editor revision and fails closed.
+      const confirmedLineIds = Array.isArray(saveMeta.confirmedLineIds)
+        ? saveMeta.confirmedLineIds
+        : [];
+      try {
+        if (r.campaignCreativeRevision != null) await campaignCreativeSave.save();
+        const response = await authFetch(
+          `${API}/batch/campaigns/${r.campaignId}/jobs/${r.transcribeJobId}/approve-lyrics`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              editor_revision: Number.isInteger(saveMeta.editorRevision)
+                ? saveMeta.editorRevision
+                : (Number.isInteger(saveMeta.baseRevision) ? saveMeta.baseRevision : 0),
+              editor_version_id: saveMeta.editorVersionId || null,
+              confirmed_line_ids: confirmedLineIds,
+              review_scope: "song",
+              lyrics_confirmed: true,
+              timings_confirmed: true,
+              heard_against_audio: true,
+            }),
+          },
+        );
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          return campaignApprovalFailure(response, body, t);
+        }
+        wizardPersistence.clear();
+        segmentsStore.evict(reviewStoreKey(r));
+        localStorage.removeItem(`genly:line-review:${r.transcribeJobId}`);
+        localStorage.removeItem(`genly:quality-window-review:${r.transcribeJobId}`);
+        setCurrentReview(null);
+        const returnUrl = new URL(campaignReturnPath || "/admin/cola", window.location.origin);
+        returnUrl.searchParams.set("approved", r.transcribeJobId);
+        navigate(`${returnUrl.pathname}${returnUrl.search}`, {
+          replace: true,
+        });
+        return { ok: true, approvedEditorVersionId: body?.approved_version_id || null };
+      } catch (error) {
+        console.warn("[campaign-review] approval failed", error);
+        return { ok: false, reason: "network" };
       }
     }
 
@@ -3827,10 +4392,13 @@ export default function App() {
       transcribeJobId: r.transcribeJobId || null,
       operatorMetrics: saveMeta.operatorMetrics || null,
       transcriptionQuality: r.transcriptionQuality || null,
+      campaignId: r.campaignId || null,
+      campaignItemId: r.campaignItemId || null,
+      campaignCreativeRevision: r.campaignCreativeRevision ?? null,
       // Capa C 2026-05-24: bgCacheKey viene del useBackgroundPreview hook
       // que corrió durante review. Si null = no se hizo pre-gen (free-tier
       // o params no estables); pipeline corre Veo/Imagen como siempre.
-      bgCacheKey: r.bgCacheKey || null,
+      bgCacheKey: r.campaignId ? null : (r.bgCacheKey || null),
     }];
     track("wizard.approve_lyrics", { segments: (editedSegments || []).length });
     setApprovedJobs(newApproved);
@@ -3929,8 +4497,9 @@ export default function App() {
       ...buildGenerationJob(entry),
       _approvedSource: entry,
     }));
+    const campaignId = jobList.length === 1 ? jobList[0].campaignId : null;
     setJobs(jobList);
-    navigate("/generating");
+    if (!campaignId) navigate("/generating");
     setReadyToGenerate(false);
 
     // Remove a song from the recoverable wizard state only once the backend
@@ -3942,6 +4511,48 @@ export default function App() {
       setFiles((prev) => prev.filter((entry) => entry?.file !== job._file));
       setReviewQueue((prev) => prev.filter((entry) => entry?.file !== job._file));
     };
+
+    const openNextCampaignReview = async () => {
+      try {
+        const next = await authFetch(`${API}/batch/campaigns/${campaignId}/next`, {
+          method: "POST",
+          headers: editorSessionHeaders(),
+        });
+        const data = await next.json().catch(() => ({}));
+        setJobs([]);
+        if (next.ok && data.job_id) {
+          navigate(reviewJobPath(data.job_id), { replace: true });
+          return;
+        }
+        navigate(`/campaigns/${campaignId}`, { replace: true });
+        if (!next.ok) throw new Error(
+          typeof data.detail === "string" ? data.detail : "No se pudo abrir la siguiente canción.",
+        );
+      } catch (error) {
+        setJobs([]);
+        navigate(`/campaigns/${campaignId}`, { replace: true });
+        alert({
+          title: "El video quedó generando",
+          description: `No pudimos abrir la siguiente canción. Volvé a intentar desde la campaña. ${error?.message || ""}`,
+          tone: "warning",
+        });
+      }
+    };
+
+    const restoreCampaignReview = (job, segments) => {
+      if (!campaignId) return;
+      setCurrentReview({ ...job._approvedSource, segments });
+      setWizardStage("review");
+      setJobs([]);
+      navigate(reviewJobPath(job.transcribeJobId), { replace: true });
+    };
+
+    if (campaignId && !window.confirm(
+      "Confirmo que escuché el audio completo y verifiqué, línea por línea, la letra y cada timing. La referencia fue tratada como hipótesis y no agregué texto que el audio no confirme."
+    )) {
+      restoreCampaignReview(jobList[0], jobList[0].segments);
+      return;
+    }
 
     let nextIdx = 0;
     const worker = async () => {
@@ -3957,6 +4568,7 @@ export default function App() {
         // backend didn't return a job_id (older deploy).
         if (jobList[i].transcribeJobId) {
           formData.append("job_id", jobList[i].transcribeJobId);
+          if (jobList[i].campaignCreativeRevision != null) formData.append("campaign_creative_revision", String(jobList[i].campaignCreativeRevision));
         } else {
           formData.append("file", jobList[i]._file);
         }
@@ -4026,6 +4638,41 @@ export default function App() {
 
         let res = null;
         try {
+          if (campaignId) {
+            const confirmedLineIds = generationSegments.map((segment) =>
+              String(segment?.segment_id || segment?.id || "")
+            );
+            const approvalResponse = await authFetch(
+              `${API}/batch/campaigns/${campaignId}/jobs/${jobList[i].transcribeJobId}/approve-lyrics`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  editor_revision: generationBaseRevision,
+                  editor_version_id: generationVersionId,
+                  confirmed_line_ids: confirmedLineIds,
+                  lyrics_confirmed: true,
+                  timings_confirmed: true,
+                  heard_against_audio: true,
+                }),
+              },
+            );
+            const approvalData = await approvalResponse.json().catch(() => ({}));
+            if (!approvalResponse.ok || approvalData.status !== "lyrics_approved") {
+              const reason = translateBackendError(approvalData.detail, t)
+                || "No se pudo registrar la aprobación completa de letra y timing.";
+              setJobs((prev) => prev.map((j, idx) =>
+                idx === i ? { ...j, status: "error", error: reason } : j
+              ));
+              alert({
+                title: "La canción no quedó aprobada",
+                description: reason,
+                tone: "error",
+              });
+              restoreCampaignReview(jobList[i], generationSegments);
+              continue;
+            }
+          }
           res = await authFetch(`${API}/generate`, { method: "POST", body: formData });
           let data;
           try {
@@ -4039,6 +4686,7 @@ export default function App() {
             // Surface it — a silent status="error" left the single-song hero
             // frozen on "Construyendo tu video" with no feedback (audit 2026-07-27).
             alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
+            restoreCampaignReview(jobList[i], generationSegments);
             continue;
           }
 
@@ -4128,17 +4776,22 @@ export default function App() {
             if (!editorConflict) {
               alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
             }
+            if (campaignId) {
+              restoreCampaignReview(jobList[i], generationSegments);
+            }
             continue;
           }
           setJobs((prev) => prev.map((j, idx) => (idx === i ? { ...j, job_id: data.job_id } : j)));
           markGenerationAccepted(jobList[i]);
-          await pollJob(data.job_id);
+          if (campaignId) await openNextCampaignReview();
+          else await pollJob(data.job_id);
         } catch (err) {
           const reason = await describeFetchError(err, res, t);
           setJobs((prev) => prev.map((j, idx) =>
             idx === i ? { ...j, status: "error", error: reason } : j
           ));
           alert({ title: t("generate.failed_title") || "No se pudo generar el video", description: reason, tone: "error" });
+          restoreCampaignReview(jobList[i], generationSegments);
         }
       }
     };
@@ -4330,6 +4983,7 @@ export default function App() {
         if (jobList[i].songTitle) body.append("song_title", jobList[i].songTitle);
         body.append("segments_json", "[]");
         body.append("art_track", "true");
+        body.append("art_track_preset", delivery.art_track_preset || "waveform");
         if ((delivery.label_line || "").trim()) {
           body.append("label_line", delivery.label_line.trim());
         }
@@ -4753,7 +5407,7 @@ export default function App() {
       // Variante: el pre-gen tampoco sirve. El job nuevo lo crea el
       // backend con su propio pipeline y no le pasamos bgCacheKey, así
       // que pre-generar sería pura quema de cuota Gemini/Veo.
-      editMode: !!currentReview?.editMode || !!currentReview?.variantMode,
+      editMode: !!currentReview?.editMode || !!currentReview?.variantMode || !!currentReview?.campaignId,
       bgSelectMode,
       enableScenes,
     }),
@@ -4838,13 +5492,15 @@ export default function App() {
         }),
         jobStatus: r.jobStatus,
         scenePlan: r.scenePlan,
+        forceLyricsRerender: !!r.changeRequestContext,
+        allowApprovedBackground: user?.role === "admin",
       });
     } catch {
       // El resumen es informativo: si algo falla, el wizard sigue usable y el
       // submit real vuelve a calcularlo. Nunca romper la pantalla por un chip.
       return null;
     }
-  }, [currentReview, liveReviewSegments, bgSelectMode, backgroundId]);
+  }, [currentReview, liveReviewSegments, bgSelectMode, backgroundId, user?.role]);
 
   // Resume banner shown on /new and /review when sessionStorage has a
   // pending batch from a prior visit. Lets the operator restore their
@@ -5176,8 +5832,8 @@ export default function App() {
         // render_params → la semántica del diff no cambia. Auditado contra los
         // 60 consumidores de batchDefaults: no hay camino a un POST sin click
         // explícito del operador.
-        editSeed={_wizardOnExistingJob ? {
-          jobId: currentReview.editingJobId || currentReview.parentJobId,
+        editSeed={(_wizardOnExistingJob || currentReview?.campaignId) ? {
+          jobId: currentReview.editingJobId || currentReview.parentJobId || currentReview.transcribeJobId,
           genre: currentReview.genre,
           concept: currentReview.concept,
           backgroundHint: currentReview.backgroundHint,
@@ -5225,6 +5881,7 @@ export default function App() {
           ? backgroundEditBlockedReason({
               jobStatus: currentReview.jobStatus,
               scenePlan: currentReview.scenePlan,
+              allowApprovedBackground: user?.role === "admin",
             })
           : null}
         editsRemaining={_wizardOnExistingJob ? currentReview.editsRemaining : null}
@@ -5272,6 +5929,64 @@ export default function App() {
       window.prompt("Copiá el enlace de revisión", url);
     }
   }, [alert, currentReview?.transcribeJobId]);
+
+  const handleCampaignReviewExit = useCallback(async (destination = null) => {
+    const review = currentReview;
+    try { await campaignCreativeSave.save(); }
+    catch (error) { alert({ title: "No se guardaron los ajustes", description: error.message, tone: "error" }); return; }
+    if (review?.transcribeJobId) {
+      try {
+        await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
+          method: "DELETE",
+          headers: editorSessionHeaders(),
+        });
+      } catch { /* the lock expires safely even if release is unavailable */ }
+    }
+    setCurrentReview(null);
+    wizardPersistence.clear();
+    if (review) segmentsStore.evict(reviewStoreKey(review));
+    navigate(typeof destination === "string" ? destination : campaignReturnPath || "/admin/cola");
+  }, [campaignReturnPath, currentReview, navigate, campaignCreativeSave.save, alert]);
+
+  const handleCampaignReviewNext = useCallback(async () => {
+    const review = currentReview;
+    if (!review?.campaignId || !review?.transcribeJobId) {
+      await handleCampaignReviewExit();
+      return;
+    }
+    try { await campaignCreativeSave.save(); }
+    catch (error) { alert({ title: "No se guardaron los ajustes", description: error.message, tone: "error" }); return; }
+    let nextPath = campaignReturnPath || "/admin/cola";
+    const returnParams = campaignReturnPath
+      ? new URL(campaignReturnPath, window.location.origin).searchParams
+      : null;
+    try {
+      const nextQuery = new URLSearchParams({ stage: "lyrics" });
+      if (review.transcribeJobId) nextQuery.set("skip_job_id", review.transcribeJobId);
+      if (returnParams?.get("q")) nextQuery.set("search", returnParams.get("q"));
+      if (returnParams?.get("version")) nextQuery.set("version", returnParams.get("version"));
+      if (returnParams?.get("artist")) nextQuery.set("artist", returnParams.get("artist"));
+      if (returnParams?.get("mine") === "1") nextQuery.set("reviewed_by", "me");
+      const response = await authFetch(
+        `${API}/batch/campaigns/${review.campaignId}/review-queue/next?${nextQuery.toString()}`,
+        { method: "POST", headers: editorSessionHeaders() },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok && payload.job_id) {
+        nextPath = withCampaignReturn(payload.open_path || reviewJobPath(payload.job_id));
+      }
+    } catch { /* leave through the queue; the current draft is already saved */ }
+    try {
+      await authFetch(`${API}/editor/${review.transcribeJobId}/lock`, {
+        method: "DELETE",
+        headers: editorSessionHeaders(),
+      });
+    } catch { /* the lock expires safely even if release is unavailable */ }
+    setCurrentReview(null);
+    wizardPersistence.clear();
+    segmentsStore.evict(reviewStoreKey(review));
+    navigate(nextPath);
+  }, [campaignReturnPath, currentReview, handleCampaignReviewExit, navigate, withCampaignReturn, campaignCreativeSave.save, alert]);
 
   // /review handles three sub-states (transcribing spinner, LyricsEditor,
   // LyricsEditor when a song is ready to review, and the batch summary
@@ -5392,14 +6107,84 @@ export default function App() {
                   {reviewJobPath(currentReview.transcribeJobId)}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={handleCopyReviewLink}
-                className="btn-secondary shrink-0 px-3 py-2 text-xs"
-              >
-                Copiar enlace
-              </button>
+              <div className="flex gap-2">
+                {currentReview.campaignId && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const safeExit = campaignReviewSafeExitRef.current;
+                        if (safeExit) void safeExit();
+                        else void handleCampaignReviewExit();
+                      }}
+                      className="btn-secondary shrink-0 px-4 py-2 text-xs"
+                    >
+                      Guardar borrador y salir
+                    </button>
+                    {currentReview.campaignItemId && <button
+                      type="button"
+                      onClick={() => {
+                        const path = `/campaigns/${encodeURIComponent(currentReview.campaignId)}?tab=all&discard=${encodeURIComponent(currentReview.campaignItemId)}`;
+                        const leave = () => handleCampaignReviewExit(path);
+                        const safeExit = campaignReviewSafeExitRef.current;
+                        if (safeExit) void safeExit(leave);
+                        else void leave();
+                      }}
+                      className="btn-secondary shrink-0 px-4 py-2 text-xs"
+                    >Descartar canción</button>}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const safeExit = campaignReviewSafeExitRef.current;
+                        if (safeExit) void safeExit(handleCampaignReviewNext);
+                        else void handleCampaignReviewNext();
+                      }}
+                      className="btn-primary shrink-0 px-4 py-2 text-xs"
+                    >
+                      Siguiente
+                    </button>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={handleCopyReviewLink}
+                  className="btn-secondary shrink-0 px-3 py-2 text-xs"
+                >
+                  Copiar enlace
+                </button>
+              </div>
             </div>
+          )}
+          {currentReview.campaignCreativeRevision != null && <div className="mb-3 text-sm" role={campaignCreativeSave.error ? "alert" : "status"}>
+            {campaignCreativeSave.error ? <span className="text-red-300">Ajustes sin guardar: {campaignCreativeSave.error} <button className="underline" onClick={() => campaignCreativeSave.save().catch(() => {})}>Reintentar guardado</button></span>
+              : campaignCreativeSave.status === "saved" ? "Ajustes de campaña guardados" : "Guardando ajustes de esta canción…"}
+          </div>}
+          {currentReview.transcriptionQuality?.auto_repair?.status === "applied" && (
+            <section
+              role="status"
+              aria-live="polite"
+              className="mb-3 rounded-xl bg-emerald-400/[0.08] px-4 py-3 ring-1 ring-emerald-300/25"
+              data-testid="auto-repair-summary"
+            >
+              <p className="text-sm font-semibold text-emerald-100">
+                Aplicamos mejoras automáticas antes de abrir el editor.
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-emerald-100/75">
+                Ya podés seguir con la canción; revisá los cambios en el editor si querés.
+              </p>
+              <p className="mt-1 text-xs text-emerald-100/60">
+                {["timing_reversible", "content_reversible"].map((action) => {
+                  const count = Number(
+                    currentReview.transcriptionQuality.auto_repair.applied_actions?.[action] || 0,
+                  );
+                  if (!count) return null;
+                  const label = action === "timing_reversible"
+                    ? (count === 1 ? "ajuste de timing" : "ajustes de timing")
+                    : (count === 1 ? "corrección de letra" : "correcciones de letra");
+                  return `${count} ${label}`;
+                }).filter(Boolean).join(" · ")}
+              </p>
+            </section>
           )}
           <Suspense fallback={<EditorSuspenseFallback />}>
           <LyricsEditor
@@ -5451,6 +6236,8 @@ export default function App() {
             filename={currentReview.file?.name || currentReview.filename || ""}
             audioFile={currentReview.file}
             audioUrl={currentReview.audioUrl || null}
+            audioSource={currentReview.audioSource || null}
+            audioPreviewPending={!!currentReview.audioPreviewPending}
             audioLoading={!!currentReview.audioLoading}
             audioUnavailableReason={currentReview.audioUnavailableReason || null}
             onRetryAudio={currentReview.editingJobId
@@ -5460,12 +6247,33 @@ export default function App() {
                 : null}
             waveform={currentReview.waveform || null}
             waveformLoading={currentReview.waveformLoading ?? (!!currentReview.transcribeJobId && !currentReview.waveform)}
+            waveformHires={currentReview.waveformHires || null}
+            waveformHiresLoading={currentReview.waveformHiresLoading ?? false}
             referenceLyrics={currentReview.referenceLyrics || ""}
+            referenceLinks={currentReview.referenceLinks || []}
+            sourceReference={currentReview.sourceReference || null}
+            referenceUnavailable={!!currentReview.referenceUnavailable}
+            requireLineReview={!!currentReview.campaignId}
+            preferApprovedVersion={!!currentReview.editingJobId}
             coverageWarning={currentReview.coverageWarning}
             transcriptionQuality={currentReview.transcriptionQuality}
             recoverySource={currentReview.recoverySource}
+            languageConflict={!!currentReview.languageConflict}
+            languageUncertain={!!currentReview.languageUncertain}
+            mixedLanguage={!!currentReview.mixedLanguage}
+            outputReferenceDivergence={!!currentReview.outputReferenceDivergence}
+            outputReferenceUnexplainedIndices={currentReview.outputReferenceUnexplainedIndices || []}
+            needsLanguageReview={!!currentReview.needsLanguageReview}
+            languageReviewResolved={!!currentReview.languageReviewResolved}
+            onResolveLanguageReview={handleResolveLanguageReview}
             onApprove={handleApproveLyrics}
-            onBack={handleBackInReview}
+            submitLabel={currentReview.changeRequestContext ? "Aprobar y re-renderizar" : (currentReview.campaignId ? "Aprobar letra y timing" : null)}
+            onRegisterSafeExit={currentReview.campaignId
+              ? registerCampaignReviewSafeExit
+              : null}
+            onBack={currentReview.campaignId
+              ? handleCampaignReviewExit
+              : handleBackInReview}
             // Post-render edit: cuando editingJobId está set, el autosave
             // de /save-segments va al job real (no al transcribeJob, que
             // en este flow es null). Orden importante: editingJobId gana.
@@ -5476,9 +6284,26 @@ export default function App() {
             segmentsRevision={currentReview.segmentsRevision || 0}
             storeKey={reviewStoreKey(currentReview)}
             onPersistSegments={persistSegmentsToBackend}
+            onAutoRepairUndone={(document) => {
+              setCurrentReview((previous) => previous && (
+                previous.editingJobId || previous.transcribeJobId
+              ) === document.job_id ? {
+                ...previous,
+                segments: document.segments,
+                segmentsRevision: document.revision,
+                transcriptionQuality: {
+                  ...(previous.transcriptionQuality || {}),
+                  auto_repair: {
+                    ...(previous.transcriptionQuality?.auto_repair || {}),
+                    status: "undone",
+                  },
+                },
+              } : previous);
+            }}
             editorRequest={editorRequest}
             saveQueue={segmentsSaveQueueRef.current}
             onReanchor={reanchorSegmentsOnBackend}
+            onReanchorReconcile={reanchorReconcileFromServer}
             onReloadServer={({ draftKey, storeKey }) => {
               try { if (draftKey) localStorage.removeItem(draftKey); } catch { /* best effort */ }
               try { wizardPersistence.clear(); } catch { /* best effort */ }
@@ -5608,7 +6433,10 @@ export default function App() {
   // y el stepper persisten desde el drop del audio hasta "Crear videos".
   // wizardStage queda como flag de back-compat (sessionStorage, /review
   // como ruta legacy) pero NO controla qué pantalla se renderiza.
-  const wizardScreen = newBatchScreen;
+  const requestedReviewId = reviewJobIdFromLocation(location.pathname, location.search);
+  const wizardScreen = requestedReviewId && currentReview?.transcribeJobId !== requestedReviewId
+    ? <div role="status" className="mx-auto max-w-xl p-12 text-center text-ink-secondary">Cargando la canción seleccionada…</div>
+    : newBatchScreen;
 
   const generatingScreen = jobs.length > 0
     ? (
@@ -5664,6 +6492,17 @@ export default function App() {
                 />
           }
         />
+        {/* Anotación del corpus (calibración del validador): link mágico
+            público, sin JWT/login. Fuera de <RequireAuth> a propósito —
+            el anotador (no técnico, externo) nunca tiene una cuenta. */}
+        <Route
+          path="/annotate/:token"
+          element={
+            <Suspense fallback={<RouteSuspenseFallback />}>
+              <CorpusAnnotator />
+            </Suspense>
+          }
+        />
         {/* Estado del servicio: público, sin JWT y FUERA de <RequireAuth>
             a propósito. Si el outage es de login, el cliente igual tiene
             que poder abrir esta página — es el único momento en que de
@@ -5712,6 +6551,9 @@ export default function App() {
           <Route path="/new" element={wizardScreen} />
           <Route path="/review" element={wizardScreen} />
           <Route path="/review/:jobId" element={wizardScreen} />
+          <Route path="/campaigns" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
+          <Route path="/campaigns/:campaignId" element={<Suspense fallback={<RouteSuspenseFallback />}><CampaignsPage /></Suspense>} />
+          <Route path="/admin/cola" element={<Suspense fallback={<RouteSuspenseFallback />}><ReviewQueuePage /></Suspense>} />
           <Route path="/generating" element={generatingScreen} />
           <Route path="/videos" element={
             <Suspense fallback={<RouteSuspenseFallback />}>

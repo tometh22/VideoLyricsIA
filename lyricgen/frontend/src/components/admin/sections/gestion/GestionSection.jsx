@@ -1,16 +1,20 @@
 // Sección "Gestión" — administrar la plataforma (consolidación 2026-06-11).
 // Absorbe las viejas secciones Usuarios (gestión de cuentas), Contenido
-// (fondos + compliance) y Negocio (costos + facturación): cinco sub-tabs
-// de ADMINISTRACIÓN, separadas de las vistas de operación/análisis.
+// (fondos + compliance) y Negocio (costos + facturación): sub-tabs de
+// ADMINISTRACIÓN, separadas de las vistas de operación/análisis.
 //
-// Las vistas y hooks existentes se reusan tal cual desde sus carpetas de
-// origen — esta sección solo enruta el subTab; cada rama monta su hook
-// únicamente cuando está activa (mismo costo de red que antes).
+// Esta sección solo enruta el subTab; cada rama monta su hook únicamente
+// cuando está activa.
+//
+// "Costos y márgenes" y "Costo de infra" eran dos sub-tabs distintas hasta
+// ago-2026 y respondían la misma pregunta con dos períodos y dos números
+// que no coincidían. Ahora son una sola página con tres bloques rotulados
+// (ver `CostosPage`).
 import GestionView from "../usuarios/GestionView";
 import FondosView from "../contenido/FondosView";
 import ComplianceView from "../contenido/ComplianceView";
 import useContenido from "../contenido/useContenido";
-import CostosView from "../negocio/CostosView";
+import CostosPage from "../negocio/CostosPage";
 import InvoicesView from "../negocio/InvoicesView";
 import CreditsView from "../negocio/CreditsView";
 import useNegocio from "../negocio/useNegocio";
@@ -41,32 +45,21 @@ function ComplianceTab() {
   return <ComplianceView compliance={c.compliance} />;
 }
 
-function CostosTab() {
-  // El "Margen por tenant" (super-admin) ya NO vive acá: se mudó al panel
-  // Insights, donde está el resto de la vista por-tenant del CEO. Esta tab
-  // conserva el dashboard global de costos (nivel admin).
-  const n = useNegocio();
-  return (
-    <CostosView
-      costSinceDays={n.costSinceDays}
-      setCostSinceDays={n.setCostSinceDays}
-      costRevenuePerVideo={n.costRevenuePerVideo}
-      setCostRevenuePerVideo={n.setCostRevenuePerVideo}
-      costDashboard={n.costDashboard}
-      costLoading={n.costLoading}
-    />
-  );
-}
-
 function InvoicesTab() {
-  const n = useNegocio();
+  // `soloFacturas` evita que esta tab dispare la agregación de /admin/margin,
+  // que no usa. Antes `useNegocio` cargaba los dos datasets al montar y cada
+  // tab pagaba la consulta de la otra.
+  const n = useNegocio({ soloFacturas: true });
   return <InvoicesView invoices={n.invoices} invoicesLoading={n.invoicesLoading} />;
 }
 
 export default function GestionSection({ subTab }) {
   if (subTab === "fondos") return <FondosTab />;
   if (subTab === "compliance") return <ComplianceTab />;
-  if (subTab === "costos") return <CostosTab />;
+  // `infra` era una sub-tab aparte antes de la consolidación. Se conserva
+  // como alias: el sub-tab activo se persiste, así que sin esto quien la
+  // tuviera abierta caía en la pantalla de usuarios sin entender por qué.
+  if (subTab === "costos" || subTab === "infra") return <CostosPage />;
   if (subTab === "facturacion") return <InvoicesTab />;
   if (subTab === "creditos") return <CreditsView />;
   return <GestionView />;

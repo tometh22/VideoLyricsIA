@@ -81,6 +81,7 @@ def test_edit_art_track_reenqueues_with_new_params(client, admin_token):
             headers={"Authorization": f"Bearer {admin_token}"},
             data={
                 "effect": "bokeh",
+                "art_track_preset": "colombia_static",
                 "song_title": "Hacia el Espacio (Remaster)",
                 "artist": "Amanda Pujó",
                 "label_line": "℗ 2026 Universal Music Chile",
@@ -96,7 +97,8 @@ def test_edit_art_track_reenqueues_with_new_params(client, admin_token):
     assert enq.called
     kwargs = enq.call_args.kwargs
     assert kwargs["art_track"] is True
-    assert kwargs["effect"] == "bokeh"
+    assert kwargs["art_track_preset"] == "colombia_static"
+    assert kwargs["effect"] == ""
     assert kwargs["label_line"] == "℗ 2026 Universal Music Chile"
     # reusa el cover cacheado (no se subió uno nuevo)
     assert kwargs["bg_r2_key"].endswith("bg_custom.jpg")
@@ -104,7 +106,8 @@ def test_edit_art_track_reenqueues_with_new_params(client, admin_token):
     # persistencia: render_params + columnas + status
     row = _read_job(job_id)
     assert row.status == "editing"
-    assert row.render_params["effect"] == "bokeh"
+    assert row.render_params["art_track_preset"] == "colombia_static"
+    assert row.render_params["effect"] == ""
     assert row.render_params["label_line"] == "℗ 2026 Universal Music Chile"
     assert row.render_params["art_track"] is True
     assert row.song_title == "Hacia el Espacio (Remaster)"

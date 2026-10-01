@@ -172,3 +172,112 @@ def test_librosa_failure_returns_none():
          patch("librosa.load", side_effect=RuntimeError("malformed audio")):
         result = compute_and_cache_waveform("abc", "inputs/abc.mp3")
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# High-resolution envelope for the guided timing review (2026-09-14)
+# ---------------------------------------------------------------------------
+
+
+def test_hires_cache_key_is_distinct_from_overview():
+    from waveform_compute import hires_cache_key_for_job
+    assert hires_cache_key_for_job("abc") == "waveform/abc.hires.json"
+    assert hires_cache_key_for_job("abc") != cache_key_for_job("abc")
+
+
+def test_hires_prefers_cached_vocal_stem_and_scales_buckets_with_duration(tmp_path):
+    """~40 buckets per second (a 7 s window gets ~280 bars, not 27) and the
+    cached vocal stem wins over the mix so peaks follow the singer."""
+    import numpy as np
+    from waveform_compute import compute_and_cache_hires_waveform
+
+    stem = tmp_path / "stem.wav"
+    stem.write_bytes(b"\x00" * 10)
+
+    def fake_download(key, path):
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 100)
+        return True
+
+    loaded = {}
+
+    def fake_load(path, sr=None, mono=True):
+        loaded["path"] = path
+        return np.abs(np.sin(np.linspace(0, 200, 8000 * 30))).astype(np.float32), 8000  # 30 s
+
+    uploads = {}
+    with patch("storage.is_enabled", return_value=True), \
+         patch("storage.object_exists", return_value=False), \
+         patch("storage.download_object", side_effect=fake_download), \
+         patch("storage.put_object_bytes", side_effect=lambda k, b, c: uploads.setdefault(k, b)), \
+         patch("vocal_sep.separate_vocals", return_value=str(stem)), \
+         patch("librosa.load", side_effect=fake_load):
+        result = compute_and_cache_hires_waveform("abc", "inputs/abc.mp3")
+
+    assert result is not None
+    assert loaded["path"] == str(stem)
+    assert result["source"] == "stem"
+    assert result["duration"] == pytest.approx(30.0, abs=1e-3)
+    assert len(result["peaks"]) == 1200            # 30 s × 40/s
+    assert result["per_second"] == pytest.approx(40.0, abs=0.01)
+    assert "waveform/abc.hires.json" in uploads
+    assert not stem.exists(), "the temp stem is removed after use"
+
+
+def test_hires_falls_back_to_mix_when_no_stem_is_cached():
+    import numpy as np
+    from waveform_compute import compute_and_cache_hires_waveform
+
+    def fake_download(key, path):
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 100)
+        return True
+
+    with patch("storage.is_enabled", return_value=True), \
+         patch("storage.object_exists", return_value=False), \
+         patch("storage.download_object", side_effect=fake_download), \
+         patch("storage.put_object_bytes", return_value=None), \
+         patch("vocal_sep.separate_vocals", return_value=None), \
+         patch("librosa.load", return_value=(np.ones(8000 * 4, dtype=np.float32), 8000)):
+        result = compute_and_cache_hires_waveform("abc", "inputs/abc.mp3")
+
+    assert result["source"] == "mix"
+    assert len(result["peaks"]) == 160             # 4 s × 40/s
+
+
+def test_hires_stem_lookup_failure_is_not_fatal():
+    import numpy as np
+    from waveform_compute import compute_and_cache_hires_waveform
+
+    def fake_download(key, path):
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 100)
+        return True
+
+    with patch("storage.is_enabled", return_value=True), \
+         patch("storage.object_exists", return_value=False), \
+         patch("storage.download_object", side_effect=fake_download), \
+         patch("storage.put_object_bytes", return_value=None), \
+         patch("vocal_sep.separate_vocals", side_effect=RuntimeError("replicate down")), \
+         patch("librosa.load", return_value=(np.ones(8000 * 2, dtype=np.float32), 8000)):
+        result = compute_and_cache_hires_waveform("abc", "inputs/abc.mp3")
+
+    assert result is not None and result["source"] == "mix"
+
+
+def test_hires_cache_hit_short_circuits():
+    from waveform_compute import compute_and_cache_hires_waveform
+    cached = {"peaks": [0.1, 0.2], "duration": 0.05, "per_second": 40.0, "source": "stem"}
+
+    def fake_download(key, path):
+        import json
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cached, f)
+        return True
+
+    with patch("storage.is_enabled", return_value=True), \
+         patch("storage.object_exists", return_value=True), \
+         patch("storage.download_object", side_effect=fake_download) as dl:
+        result = compute_and_cache_hires_waveform("abc", "inputs/abc.mp3")
+    assert result == cached
+    assert dl.call_count == 1

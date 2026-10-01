@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { getDownloadUrl, useMediaUrl } from "../mediaUrl";
 import { JobDetailTour } from "./OnboardingTour";
 import ProResBadge from "./ProResBadge";
 import EditRequestPanel from "./EditRequestPanel";
+import DeliveryQCPanel from "./DeliveryQCPanel";
 import ArtTrackEditPanel from "./ArtTrackEditPanel";
 import ContentValidationToggle, { isUniversalAccount } from "./ContentValidationToggle";
 import { useAlert } from "./AlertProvider";
@@ -18,7 +19,10 @@ import ReviewVideoPlayer from "./ReviewVideoPlayer";
 import JobSettingsCard from "./JobSettingsCard";
 import { SingleGeneratingHero } from "./BatchProgress";
 import { hasArtTrackAccess } from "../lib/artTrackAccess";
+import { safeReviewReturnPath } from "../lib/reviewerNavigation";
 import { reviewJobPath } from "../lib/reviewJobRoute";
+import { editorSessionHeaders } from "../lib/editorSession";
+import { translateBackendError } from "../lib/lyricsEditSubmit";
 
 const API = import.meta.env.VITE_API_URL || "";
 
@@ -43,6 +47,32 @@ const MEDIA_TABS = [
   { key: "video", label: "Lyric Video", desc: "1920x1080" },
   { key: "short", label: "Short", desc: "1080x1920" },
   { key: "thumbnail", label: "Thumbnail", desc: "1280x720" },
+];
+
+const UMG_PORTALS = [
+  { id: "argentina", labelKey: "umg.portal_argentina", label: "Argentina", host: "umg.genly.pro" },
+  { id: "chile", labelKey: "umg.portal_chile", label: "Chile", host: "umgchile.genly.pro" },
+];
+
+function getUmgPortals(job) {
+  if (Array.isArray(job.umg_portals)) {
+    return UMG_PORTALS.map(({ id }) => id).filter((id) => job.umg_portals.includes(id));
+  }
+  // Old /status responses only exposed a boolean, which represented the
+  // original Argentina portal.
+  return job.is_in_umg_portal ? ["argentina"] : [];
+}
+
+// Canvas de Spotify: SOLO admin. Tres variantes del mismo fondo (encuadre
+// izquierda / centro / derecha) para poder rotar el Canvas durante la
+// campaña sin volver a producir. Van aparte de MEDIA_TABS porque se montan
+// detrás de `features.canvas` — el backend igual devuelve 403 en
+// /media-token, /download y /preview, esto es sólo para no mostrar un tab
+// que no se puede abrir.
+const CANVAS_TABS = [
+  { key: "canvas", label: "Canvas 1", desc: "1080x1920 · Spotify" },
+  { key: "canvas_v2", label: "Canvas 2", desc: "1080x1920 · Spotify" },
+  { key: "canvas_v3", label: "Canvas 3", desc: "1080x1920 · Spotify" },
 ];
 
 /**
@@ -367,6 +397,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const { t } = useI18n();
   const { alert } = useAlert();
   const navigate = useNavigate();
+  const location = useLocation();
+  const campaignReturn = safeReviewReturnPath(new URLSearchParams(location.search).get("return_to"));
+  const withReturn = path => campaignReturn ? `${path}?return_to=${encodeURIComponent(campaignReturn)}` : path;
   const [activeTab, setActiveTab] = useState("video");
   const [uploading, setUploading] = useState(false);
   const [youtubeResult, setYoutubeResult] = useState(job.youtube || null);
@@ -393,6 +426,33 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [approving, setApproving] = useState(false);
   const [retrying, setRetrying] = useState(false);
 
+  useEffect(() => {
+    if (!job?.campaign_id || job?.status !== "pending_review") return undefined;
+    let stopped = false;
+    const heartbeat = async () => {
+      try {
+        const res = await fetch(`${API}/editor/${job.job_id}/lock/heartbeat`, {
+          method: "POST",
+          headers: { ...authHeaders(), ...editorSessionHeaders() },
+        });
+        if (!res.ok) throw new Error(`Heartbeat failed: ${res.status}`);
+      } catch {
+        // The visible queue remains authoritative; the next heartbeat retries.
+      }
+    };
+    heartbeat();
+    const timer = window.setInterval(() => { if (!stopped) heartbeat(); }, 20_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+      fetch(`${API}/editor/${job.job_id}/lock`, {
+        method: "DELETE",
+        headers: { ...authHeaders(), ...editorSessionHeaders() },
+        keepalive: true,
+      }).catch(() => {});
+    };
+  }, [job?.campaign_id, job?.job_id, job?.status]);
+
   // "Enviar a UMG" button state. Gated by role=admin AND status=done — we
   // resolve the role at render time from localStorage so we don't need to
   // pass `user` through JobDetailRoute. isInUmgPortal mirrors the value
@@ -406,7 +466,15 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const isUmgAdmin = currentUser?.role === "admin";
   const [sendingUmg, setSendingUmg] = useState(false);
   const [umgSendStage, setUmgSendStage] = useState(null);
+  const [umgPreflightRequested, setUmgPreflightRequested] = useState(false);
+  const [qcFocusRequest, setQcFocusRequest] = useState(() => (
+    new URLSearchParams(location.search).has("qc_focus") ? 1 : 0
+  ));
   const [sendUmgAfterProres, setSendUmgAfterProres] = useState(false);
+  const [umgPortals, setUmgPortals] = useState(() => getUmgPortals(job));
+  const [showUmgPortalPicker, setShowUmgPortalPicker] = useState(false);
+  const [selectedUmgPortal, setSelectedUmgPortal] = useState("argentina");
+  const [sendUmgPortal, setSendUmgPortal] = useState("argentina");
   const [isInUmgPortal, setIsInUmgPortal] = useState(
     Boolean(job.is_in_umg_portal),
   );
@@ -416,7 +484,8 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // state wouldn't know).
   useEffect(() => {
     setIsInUmgPortal(Boolean(job.is_in_umg_portal));
-  }, [job.is_in_umg_portal]);
+    setUmgPortals(getUmgPortals(job));
+  }, [job.is_in_umg_portal, job.umg_portals]);
 
   const waitForUmgMasters = async (retryAfterSeconds = 10) => {
     const deadline = Date.now() + (10 * 60 * 1000);
@@ -447,21 +516,75 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     throw timeout;
   };
 
-  const publishToUMG = async () => {
+  const publishToUMG = async (requestedPortal = sendUmgPortal) => {
     if (sendingUmg) return;
+    const targetPortal = UMG_PORTALS.some(({ id }) => id === requestedPortal)
+      ? requestedPortal
+      : "argentina";
+    const target = UMG_PORTALS.find(({ id }) => id === targetPortal) || UMG_PORTALS[0];
     setSendingUmg(true);
     setUmgSendStage("publishing");
     try {
       let resp;
       let result;
       let preparationRounds = 0;
+      let qcRefreshRounds = 0;
       do {
         resp = await fetch(`${API}/admin/deliveries/from-job/${job.job_id}`, {
           method: "POST",
           headers: { ...authHeaders(), "Content-Type": "application/json" },
-          body: JSON.stringify({}),
+          body: JSON.stringify({ portal_id: targetPortal }),
         });
         result = await resp.json().catch(() => ({}));
+        // Enabling ProRes changes the QC input fingerprint (delivery spec),
+        // even though the MP4 the operator reviewed is unchanged. Refresh the
+        // current report and retry automatically; the backend carries the
+        // signed visual attestation forward only when that exact artifact still
+        // matches. This avoids leaving the operator with a dead-end 409 after
+        // waiting for the masters.
+        if (!resp.ok && resp.status === 409
+            && result.detail?.code === "delivery_qc_blocked"
+            && qcRefreshRounds < 1) {
+          const gate = result.detail.delivery_qc || {};
+          if (["fresh_preflight_required", "manual_review_required", "review_required"].includes(gate.reason)) {
+            qcRefreshRounds += 1;
+            setUmgSendStage("preflight");
+            const qcResponse = await fetch(`${API}/jobs/${job.job_id}/delivery-qc/recheck`, {
+              method: "POST",
+              headers: { ...authHeaders(), "Content-Type": "application/json" },
+              body: JSON.stringify({ for_umg_delivery: true }),
+            });
+            const qcResult = await qcResponse.json().catch(() => ({}));
+            const refreshedReport = qcResult.delivery_qc;
+            if (qcResponse.ok && refreshedReport) {
+              onJobUpdate?.({ ...job, delivery_qc: refreshedReport });
+              setUmgPreflightRequested(true);
+              if (refreshedReport.approval?.can_approve === true) {
+                setUmgSendStage("publishing");
+                continue;
+              }
+              const failures = (refreshedReport.issues || []).filter(issue => (
+                issue.status === "OPEN" && !issue.manual_verification_required
+                && (issue.result_status === "FAIL" || issue.severity === "FAIL")
+              ));
+              setQcFocusRequest(value => value + 1);
+              alert({
+                title: failures.length ? "Hay puntos que corregir" : "Revisión pendiente",
+                description: failures.length
+                  ? `Encontramos ${failures.length} ${failures.length === 1 ? "fallo" : "fallos"} que deben corregirse antes de publicar.`
+                  : "Revisá el corte actual y confirmá la revisión para continuar.",
+                tone: "warning",
+              });
+              return;
+            }
+            alert({
+              title: "No se pudo actualizar el preflight",
+              description: qcResult.detail?.message || qcResult.detail || "Revisá la conexión y volvé a intentar publicar.",
+              tone: "error",
+            });
+            return;
+          }
+        }
         if (resp.status !== 202 || result.status !== "preparing_prores") break;
         preparationRounds += 1;
         if (preparationRounds > 2) {
@@ -492,11 +615,34 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         return;
       }
       setIsInUmgPortal(true);
+      setUmgPortals((previous) => [
+        ...new Set([...previous, targetPortal]),
+      ]);
       const label = result.label || "";
-      const verbed = result.replaced ? "actualizado" : "publicado";
+      // Decir QUÉ pasó, no sólo que salió bien. Un reenvío del mismo corte y
+      // una versión nueva se ven igual desde acá y significan cosas opuestas
+      // para el cliente: en el segundo caso su aprobación anterior se dio de
+      // baja y tiene que volver a revisar.
+      const resolved = result.resolved_change_requests?.length || 0;
+      const parts = [label ? `Aparece como "${label}".` : null];
+      if (result.replaced_job_id) {
+        parts.push("Esta variante reemplazó el video anterior en la misma entrega. El pedido de cambios queda asociado a la versión corregida.");
+      }
+      if (result.content_changed) {
+        parts.push(
+          `Es la versión ${result.revision}: el cliente la ve como pendiente de aprobar.`,
+        );
+        if (resolved) {
+          parts.push(
+            `Se cerr${resolved === 1 ? "ó" : "aron"} ${resolved} pedido${resolved === 1 ? "" : "s"} de cambio.`,
+          );
+        }
+      } else if (result.replaced) {
+        parts.push("Es el mismo corte que ya estaba publicado: la aprobación del cliente sigue vigente.");
+      }
       alert({
-        title: `Video ${verbed} en umg.genly.pro`,
-        description: label ? `Aparece como "${label}".` : undefined,
+        title: `Video ${result.replaced ? "actualizado" : "publicado"} en ${target.host}`,
+        description: parts.filter(Boolean).join(" ") || undefined,
         tone: "success",
       });
     } catch (err) {
@@ -514,13 +660,66 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     }
   };
 
-  const handleSendToUMG = () => {
+  const refreshUmgPreflight = async (portalId, publishWhenReady = false, jobSnapshot = job) => {
+    if (sendingUmg) return false;
+    setSendingUmg(true);
+    setUmgSendStage("preflight");
+    setUmgPreflightRequested(true);
+    let ready = false;
+    try {
+      const response = await fetch(`${API}/jobs/${job.job_id}/delivery-qc/recheck`, {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ for_umg_delivery: true }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.delivery_qc) {
+        const detail = data.detail;
+        throw new Error((typeof detail === "string" ? detail : detail?.message) || "No se pudo analizar este corte.");
+      }
+      onJobUpdate?.({ ...jobSnapshot, delivery_qc: data.delivery_qc });
+      ready = data.delivery_qc.approval?.can_approve === true;
+      if (!ready) setQcFocusRequest((value) => value + 1);
+    } catch (error) {
+      alert({ title: "No se pudo revisar el video", description: error?.message || "Revisá tu conexión y probá otra vez.", tone: "error" });
+    } finally {
+      setSendingUmg(false);
+      setUmgSendStage(null);
+    }
+    if (ready && publishWhenReady) publishToUMG(portalId);
+    return ready;
+  };
+
+  const beginUmgPublish = async (portalId) => {
+    setSelectedUmgPortal(portalId);
+    setSendUmgPortal(portalId);
+    setShowUmgPortalPicker(false);
+    setUmgPreflightRequested(true);
+    if (sendingUmg) return;
+    const isReady = await refreshUmgPreflight(portalId);
+    if (!isReady) return;
     if (!job.umg_spec) {
       setSendUmgAfterProres(true);
       setShowProResModal(true);
       return;
     }
-    publishToUMG();
+    publishToUMG(portalId);
+  };
+
+  const continueUmgPublish = () => {
+    if (!job.umg_spec) {
+      setSendUmgAfterProres(true);
+      setShowProResModal(true);
+      return;
+    }
+    publishToUMG(sendUmgPortal);
+  };
+
+  const handleSendToUMG = () => {
+    // Updating an existing cut should default to its current destination,
+    // not silently highlight the OTHER country's portal.
+    setSelectedUmgPortal(umgPortals[0] || "argentina");
+    setShowUmgPortalPicker(true);
   };
   // Dropdown for HD/2K/4K selection on retry. Only shown when the job
   // has a meaningful umg_spec to override (i.e. went through the UMG
@@ -1153,7 +1352,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     const body = job.error || (isContent
       ? (t("detail.bg_attention_content_body") || "El fondo generado no cumplió con las reglas de contenido y el ajuste automático no alcanzó. Probá con otra descripción o estilo para el fondo.")
       : (t("detail.bg_attention_provider_body") || "El servicio de fondos tuvo una interrupción momentánea y no pudimos generar tu fondo. Tu trabajo está guardado — reintentá el fondo en un momento."));
-    const goAdjust = () => navigate(`/videos/${job.job_id}/edit-lyrics`);
+    const goAdjust = () => navigate(withReturn(`/videos/${job.job_id}/edit-lyrics`));
     return (
       <div className="w-full max-w-2xl animate-fade-in">
         <div className="flex items-center gap-3 mb-6">
@@ -1545,7 +1744,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || `${t("detail.approve_error_description")} (${res.status})`);
+        throw new Error(translateBackendError(data.detail, t) || `${t("detail.approve_error_description")} (${res.status})`);
       }
       try {
         const statusRes = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
@@ -1559,6 +1758,28 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           description: refreshError?.message || t("detail.refresh_error_description"),
           tone: "warning",
         });
+      }
+      if (job.campaign_id) {
+        const releaseRes = await fetch(`${API}/editor/${job.job_id}/lock`, {
+          method: "DELETE",
+          headers: { ...authHeaders(), ...editorSessionHeaders() },
+        });
+        // Approval already succeeded. If release fails, return to the queue
+        // instead of claiming another song while this lock may still be held.
+        if (!releaseRes.ok) {
+          navigate(campaignReturn || `/campaigns/${job.campaign_id}?view=history`);
+          return;
+        }
+        const nextQuery = new URLSearchParams({ stage: "final", skip_job_id: job.job_id });
+        const filters = new URLSearchParams(campaignReturn?.split("?")[1] || "");
+        if (filters.get("q")) nextQuery.set("search", filters.get("q"));
+        if (filters.get("artist")) nextQuery.set("artist", filters.get("artist"));
+        const nextRes = await fetch(
+          `${API}/batch/campaigns/${job.campaign_id}/review-queue/next?${nextQuery}`,
+          { method: "POST", headers: { ...authHeaders(), ...editorSessionHeaders() } },
+        );
+        const next = await nextRes.json().catch(() => ({}));
+        navigate(nextRes.ok && next.job_id ? withReturn(next.open_path || `/videos/${next.job_id}`) : campaignReturn || `/campaigns/${job.campaign_id}?view=history`);
       }
     } catch (err) {
       alert({
@@ -1587,7 +1808,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || `${t("detail.reject_error_description")} (${res.status})`);
+        throw new Error(translateBackendError(data.detail, t) || `${t("detail.reject_error_description")} (${res.status})`);
       }
       // Refresh the job state for any listing in the parent so the row
       // shows "rejected", then go back. Staying on the detail screen
@@ -1671,9 +1892,14 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   // dejaba un <video> vacío que 404eaba y un botón de descarga muerto, así
   // que se ofrece únicamente lo que existe. `video` va siempre: si faltara
   // el master no habría job que mirar.
-  const availableMediaTabs = MEDIA_TABS.filter(
-    (tab) => tab.key === "video" || !!job.files?.[`${tab.key}_url`],
-  );
+  // `features.canvas` es admin-only y lo resuelve el backend; acá sólo
+  // decide si los tabs se montan. El filtro por archivo existente sigue
+  // valiendo: un job sin canvas (porque no es de un admin) no muestra nada.
+  const canvasEnabled = currentUser?.features?.canvas === true;
+  const availableMediaTabs = [
+    ...MEDIA_TABS,
+    ...(canvasEnabled ? CANVAS_TABS : []),
+  ].filter((tab) => tab.key === "video" || !!job.files?.[`${tab.key}_url`]);
 
   const ALL_TABS = [
     ...availableMediaTabs,
@@ -1803,27 +2029,80 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                     {t("detail.download_short_prores") || "Short ProRes"}
                   </button>
                 )}
-                {/* "Enviar a UMG" — admin only, only for approved jobs. Publishes
-                    the 5-file set (ProRes master + ProRes short + MP4 + MP4 short
-                    + thumbnail) to umg.genly.pro. Re-sending the same job_id
-                    replaces the existing entry rather than duplicating. */}
+                {/* "Enviar a UMG" — admin only, only for approved jobs. The
+                    destination picker lets one job be published independently
+                    to Argentina and Chile. Re-sending within a destination
+                    replaces that portal's entry rather than duplicating. */}
                 {isUmgAdmin && isDone && job.approved_by && (
-                  <button
-                    onClick={handleSendToUMG}
-                    disabled={sendingUmg || isInUmgPortal}
-                    className="btn-secondary text-xs h-10 px-4 disabled:opacity-60"
-                    title={isInUmgPortal
-                      ? "Este video ya está publicado en umg.genly.pro"
-                      : "Publicar este video en umg.genly.pro (visible para Universal Music)"}
-                  >
-                    {isInUmgPortal
-                      ? (t("detail.in_umg_portal") || "✓ En UMG")
-                      : umgSendStage === "preparing"
+                  <div className="relative">
+                    <button
+                      onClick={handleSendToUMG}
+                      disabled={sendingUmg}
+                      className="btn-secondary text-xs h-10 px-4 disabled:opacity-60"
+                      title={isInUmgPortal
+                        ? "Actualizar este video en un portal UMG"
+                        : "Publicar este video en un portal UMG"}
+                    >
+                      {umgSendStage === "preflight"
+                        ? "Analizando corte…"
+                        : umgSendStage === "preparing"
                         ? "Preparando masters…"
                         : sendingUmg
                           ? (t("detail.sending_umg") || "Enviando…")
-                        : (t("detail.send_umg") || "Enviar a UMG")}
-                  </button>
+                          : umgPortals.length
+                            ? `${t("detail.update_umg") || "Publicar actualización"} (${umgPortals.map((id) => UMG_PORTALS.find((portal) => portal.id === id)?.label).join(" + ")})`
+                            : (t("detail.send_umg") || "Enviar a UMG")}
+                    </button>
+                    {showUmgPortalPicker && (
+                      <div className="absolute right-0 top-full z-30 mt-2 w-72 rounded-xl bg-surface-1 p-3 shadow-2xl ring-1 ring-white/10">
+                        <p className="mb-1 text-sm font-semibold text-ink-primary">
+                          {t("umg.choose_destination") || "Elegir portal de destino"}
+                        </p>
+                        <p className="mb-3 text-xs text-ink-secondary">
+                          {t("umg.destination_hint") || "Elegí dónde querés publicar este video."}
+                        </p>
+                        {job.parent_job_id && (
+                          <p className="mb-3 text-xs text-ink-primary">
+                            Si el video original tiene un pedido de cambios pendiente en ese portal,
+                            esta variante lo reemplaza en la misma entrega y cierra el pedido.
+                            No necesitás enviarlo otra vez desde la campaña.
+                          </p>
+                        )}
+                        <div className="space-y-2">
+                          {UMG_PORTALS.map((portal) => {
+                            const published = umgPortals.includes(portal.id);
+                            const selected = selectedUmgPortal === portal.id;
+                            return (
+                              <button
+                                key={portal.id}
+                                type="button"
+                                onClick={() => beginUmgPublish(portal.id)}
+                                disabled={sendingUmg}
+                                className={`flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-xs ring-1 transition-colors ${selected ? "bg-brand/15 ring-brand/40" : "bg-surface-2/60 ring-white/[0.06] hover:bg-surface-2"}`}
+                              >
+                                <span>
+                                  <span className="block font-semibold text-ink-primary">
+                                    {t(portal.labelKey) || portal.label}
+                                  </span>
+                                  <span className="block text-[11px] text-ink-secondary">{portal.host}</span>
+                                </span>
+                                <span className="text-[11px] text-ink-secondary">
+                                  {published ? (t("umg.update") || "Actualizar") : (t("umg.publish") || "Publicar")}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setShowUmgPortalPicker(false)}
+                          className="mt-3 w-full text-xs text-ink-secondary hover:text-ink-primary"
+                        >
+                          {t("umg.cancel") || "Cancelar"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 )}
               </>
             );
@@ -2057,7 +2336,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           {/* File info */}
           <div className="flex items-center justify-between mb-6">
             <p className="text-xs text-gray-500">
-              {MEDIA_TABS.find((t) => t.key === activeTab)?.desc}
+              {availableMediaTabs.find((t) => t.key === activeTab)?.desc}
               {activeTab !== "thumbnail" ? " MP4" : " JPG"}
             </p>
             {canDownload && downloadHref && (
@@ -2066,7 +2345,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                   <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
                 </svg>
-                {t("detail.download")} {MEDIA_TABS.find((tb) => tb.key === activeTab)?.label}
+                {t("detail.download")} {availableMediaTabs.find((tb) => tb.key === activeTab)?.label}
               </a>
             )}
           </div>
@@ -2109,12 +2388,25 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           job={job}
           // Única acción: abrir el Studio Console (mismo layout 3-col que
           // /new). Todo el editing —incluido el fondo— vive ahí ahora.
-          onLyricsClick={() => navigate(`/videos/${job.job_id}/edit-lyrics`)}
+          onLyricsClick={() => navigate(withReturn(`/videos/${job.job_id}/edit-lyrics`))}
         />
       )}
 
       {canEditArtTrack && (
         <ArtTrackEditPanel job={job} onEdited={handleEditTriggered} />
+      )}
+
+      {(isPendingReview || isDone || isRejected) && (
+        <DeliveryQCPanel
+          job={job}
+          onJobUpdate={onJobUpdate}
+          onSeek={seekVideo}
+          onOpenEditor={() => navigate(withReturn(`/videos/${job.job_id}/edit-lyrics`))}
+          forUmgDelivery={umgPreflightRequested || isUmgJob || isInUmgPortal}
+          focusRequest={qcFocusRequest}
+          onContinueToPublish={umgPreflightRequested ? continueUmgPublish : undefined}
+          onReturnToPublish={campaignReturn ? () => navigate(campaignReturn) : undefined}
+        />
       )}
 
       {/* Approval panel for pending_review */}
@@ -2149,7 +2441,13 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           <div className="flex flex-wrap gap-3">
             <button
               onClick={handleApprove}
-              disabled={approving}
+              // Delivery QC is informational until a report explicitly opts
+              // into enforce mode. Legacy persisted reports can carry a stale
+              // approval.blocked flag, which must not trap the editor.
+              disabled={approving || (
+                job.delivery_qc?.mode === "enforce"
+                && job.delivery_qc?.approval?.blocked === true
+              )}
               className="inline-flex items-center justify-center h-12 px-6 rounded-button text-sm font-semibold text-white bg-accent hover:bg-accent/90 disabled:opacity-50 transition-colors"
             >
               {approving ? (
@@ -2230,9 +2528,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
             // Trigger un refresh del job en el próximo tick para que
             // isUmgJob flipee a true (gracias al umg_spec recién
             // persistido) y aparezca el tab de Máster ProRes.
-            onJobUpdate?.({ ...job, umg_spec: data.umg_spec });
+            const configuredJob = { ...job, umg_spec: data.umg_spec };
+            onJobUpdate?.(configuredJob);
             if (shouldContinueToUmg) {
-              publishToUMG();
+              refreshUmgPreflight(sendUmgPortal, true, configuredJob);
             }
           }}
         />

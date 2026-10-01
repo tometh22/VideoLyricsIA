@@ -120,7 +120,7 @@ def test_edit_endpoint_persists_title_song_break_to_render_params(
             "title_song_break": "Donde Estan\nCorazón",
         },
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
 
     # Forwarded to the worker
     assert len(captured) == 1
@@ -157,7 +157,7 @@ def test_edit_endpoint_without_title_song_break_leaves_render_params_intact(
         # No title_song_break — only a font change.
         json={"edit_type": "typography", "font": "anton"},
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
     # edit_params doesn't carry the field (it wasn't asked to change)
     assert "title_song_break" not in captured[0]["edit_params"]
     # And the pre-set value in render_params is untouched
@@ -186,7 +186,7 @@ def test_edit_endpoint_can_clear_title_song_break_with_empty_string(
         headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"},
         json={"edit_type": "typography", "title_song_break": ""},
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
     assert captured[0]["edit_params"]["title_song_break"] == ""
     db.expire_all()
     row = db.query(Job).filter(Job.job_id == jid).first()
@@ -277,7 +277,7 @@ def test_render_params_includes_title_song_break_after_explicit_set(
         headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"},
         json=payload,
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
     db.expire_all()
     row = db.query(Job).filter(Job.job_id == jid).first()
     assert row.render_params["title_song_break"] == "El Árbol\nDe La Vida"

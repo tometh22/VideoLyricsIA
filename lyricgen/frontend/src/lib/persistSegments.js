@@ -63,6 +63,13 @@ export async function persistSegments(authFetch, API, jobId, segments, opts = {}
         let detail = "";
         try { detail = (await res.clone().json())?.detail || ""; } catch { /* non-JSON */ }
         console.warn("[autosave] /save-segments rejected 400", detail);
+      } else if (res.status === 429) {
+        // Tope de velocidad (incidente 2026-09-13): demasiadas canciones
+        // distintas guardadas en pocos minutos por el mismo usuario. Es
+        // un freno contra scripts; un revisor humano casi nunca lo toca.
+        let code = "";
+        try { code = (await res.clone().json())?.detail?.code || ""; } catch { /* non-JSON */ }
+        console.warn("[autosave] /save-segments rejected 429", code);
       } else if (res.status !== 404) {
         // 404 = el job ya fue reapeado — nada contra qué guardar. Lo logueamos
         // como warning suave; el usuario verá el error real al "Crear videos".
@@ -76,6 +83,8 @@ export async function persistSegments(authFetch, API, jobId, segments, opts = {}
           ? "job-gone"
           : res.status === 409
             ? "stale-revision"
+            : res.status === 429
+              ? "velocity"
             : res.status === 428
               ? "client-upgrade-required"
               : `http-${res.status}`,

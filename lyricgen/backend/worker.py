@@ -195,10 +195,17 @@ class WarmOnlyWorker(_RQWorker):
         # este worker está vivo. Si la huella no se puede calcular, se manda
         # vacía y el gate cae a comparar el SHA — nunca se cae el heartbeat.
         try:
-            from observability import backend_code_fingerprint
+            from observability import backend_code_fingerprint, runtime_timing_config
             _fingerprint = backend_code_fingerprint()
+            _timing_config = runtime_timing_config()
         except Exception:
-            _fingerprint = ""
+            _fingerprint = "unknown"
+            _timing_config = None
+        try:
+            from queue_jobs import _transcription_quality_runtime_token
+            _runtime_token = _transcription_quality_runtime_token()
+        except Exception:
+            _runtime_token = None
 
         ttl = _release_heartbeat_ttl_seconds()
         queues = [getattr(q, "name", str(q)) for q in getattr(self, "queues", [])]
@@ -218,6 +225,16 @@ class WarmOnlyWorker(_RQWorker):
             # commits de sólo-frontend, lo que dejaba /health en `down` con todo
             # funcionando.
             "code_fingerprint": _fingerprint,
+            # Token de identidad de runtime (política + release + las 72 flags
+            # de configuración + calibración). Si difiere entre el servicio que
+            # encola y el quality-worker, cada replay se descarta con
+            # runtime_identity_mismatch sin dejar rastro; publicarlo acá es lo
+            # que permite verlo en /health en vez de descubrirlo 21 días tarde.
+            "runtime_token": _runtime_token,
+            # API and every worker capable of transcription must agree on the
+            # same timing constants. /health/ready compares this canonical
+            # payload and fails closed on mismatch or missing publication.
+            "timing_config": _timing_config,
             "rq_payload_version": RQ_PAYLOAD_VERSION,
             "rq_supported_payload_versions": sorted(RQ_SUPPORTED_PAYLOAD_VERSIONS),
             "environment": (
@@ -275,16 +292,17 @@ def _warn_if_shutdown_grace_too_short() -> None:
         )
 
 
-_DEFAULT_QUEUES = "transcription,bg_preview,enterprise,default,canary"
+_DEFAULT_QUEUES = "transcription,bg_preview,enterprise,default,audio_preview,canary"
 
 
 def _resolve_queue_names() -> list:
     """Queue names this worker process listens on, in priority order.
 
     Env-driven (QUEUES, comma-separated) so the SAME image runs as a segmented
-    fleet: a small ShortWorker pool (QUEUES=transcription,bg_preview) drains the
-    always-short jobs without waiting behind 12-20 min renders, while the render
-    pool (QUEUES=enterprise,default) owns the heavy work. RQ priority alone
+    fleet: a small ShortWorker pool (QUEUES=transcription,bg_preview,audio_preview)
+    drains latency-sensitive and derivative jobs while the render pool
+    (QUEUES=enterprise,default) owns heavy work. Editor previews stay on the
+    short-worker pool so they can never occupy a render slot. RQ priority alone
     doesn't preempt — once all render workers are inside long renders, a short
     transcription waits the full render time; a dedicated pool fixes that.
 
@@ -315,6 +333,14 @@ def _schedule_worker_maintenance(queue_names: list[str]) -> dict[str, bool]:
             except Exception as exc:
                 scheduled[name] = False
                 logger.warning("[WORKER] %s scheduler unavailable: %s", name, exc)
+        # Keep this new scheduler out of the legacy health result shape: older
+        # admin callers compare the two established keys exactly. Its own RQ
+        # id/audit row is the source of truth for research trigger status.
+        try:
+            import queue_jobs
+            queue_jobs.ensure_learning_triggers_scheduled()
+        except Exception as exc:
+            logger.warning("[WORKER] learning trigger scheduler unavailable: %s", exc)
     if "default" in queue_names:
         try:
             from queue_jobs import ensure_job_outbox_reconciler_scheduled
@@ -323,6 +349,14 @@ def _schedule_worker_maintenance(queue_names: list[str]) -> dict[str, bool]:
         except Exception as exc:
             scheduled["job_outbox"] = False
             logger.warning("[WORKER] job outbox scheduler unavailable: %s", exc)
+    if "campaign_control" in queue_names:
+        try:
+            from batch_campaigns import ensure_campaign_reconciler_scheduled
+            ensure_campaign_reconciler_scheduled()
+            scheduled["batch_campaigns"] = True
+        except Exception as exc:
+            scheduled["batch_campaigns"] = False
+            logger.warning("[WORKER] batch campaign scheduler unavailable: %s", exc)
     return scheduled
 
 
@@ -430,14 +464,19 @@ def main():
         VALID_POLICY_MODES as _bg_policy_modes,
         policy_mode as _bg_policy_mode,
     )
+    from lyric_anchors import (
+        ANCHORS_ENV as _lyric_anchors_env,
+        VALID_ANCHOR_MODES as _lyric_anchor_modes,
+        anchors_mode as _lyric_anchors_mode,
+    )
     from observability import _resolve_release as _resolve_runtime_release
     logger.info(
         "[BG_POLICY][STARTUP] process=rq-worker release=%s environment=%s "
-        "policy_version=%s policy_mode=%s cache_namespace=%s queues=%s "
-        "rq_payload_version=%s",
+        "policy_version=%s policy_mode=%s lyric_anchor_mode=%s "
+        "cache_namespace=%s queues=%s rq_payload_version=%s",
         _resolve_runtime_release(),
         os.environ.get("ENVIRONMENT", "production").lower().strip(),
-        _bg_policy_version, _bg_policy_mode(),
+        _bg_policy_version, _bg_policy_mode(), _lyric_anchors_mode(),
         _bg_policy_version,
         ",".join(_resolve_queue_names()),
         os.environ.get("RQ_PAYLOAD_VERSION", "2"),
@@ -447,6 +486,12 @@ def main():
         logger.warning(
             "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
             _bg_policy_env, _raw_bg_policy_mode,
+        )
+    _raw_lyric_anchor_mode = os.environ.get(_lyric_anchors_env, "off").strip().lower()
+    if _raw_lyric_anchor_mode not in _lyric_anchor_modes:
+        logger.warning(
+            "[BG_POLICY][STARTUP] invalid %s=%r; resolved fail-safe to off",
+            _lyric_anchors_env, _raw_lyric_anchor_mode,
         )
 
     _warn_if_shutdown_grace_too_short()
@@ -479,9 +524,12 @@ def main():
     #      no debe bloquear los renders finales (default). Latencia ~60-120s.
     #   3. enterprise — premium tenants (UMG/OMG) van antes que default.
     #   4. default — todo lo demás.
+    #   5. audio_preview — derivative-only AAC work, best effort and always
+    #      behind generation/render work.
     # Workers listen in this order; RQ pickup respects it. The set is
     # env-driven (QUEUES) so this image can run as a segmented fleet — see
-    # _resolve_queue_names(). Default = all four = current behavior.
+    # _resolve_queue_names(). Default = the shared legacy queues plus the
+    # isolated audio-preview queue.
     queue_names = _resolve_queue_names()
     queues = [Queue(name, connection=conn) for name in queue_names]
     _schedule_worker_maintenance(queue_names)

@@ -5,6 +5,7 @@ import types
 from unittest.mock import MagicMock
 
 import whisperx_transcribe as wx
+from recognition_provenance import begin_collection, end_collection
 
 
 class _SucceededPrediction:
@@ -106,6 +107,36 @@ def test_map_segments_handles_non_dict_output():
     assert wx._map_segments("nope") == []
     # bare list of segments also accepted
     assert wx._map_segments([{"start": 0, "end": 1, "text": "hi"}])[0]["text"] == "hi"
+
+
+def test_raw_provider_segments_preserves_rows_the_mapper_rejects():
+    class OpaqueRow:
+        def __str__(self):
+            raise RuntimeError("SDK object cannot be stringified")
+
+    class HostileRowDict(dict):
+        def __deepcopy__(self, _memo):
+            raise RuntimeError("SDK mapping cannot be copied")
+
+        def __str__(self):
+            raise RuntimeError("SDK mapping cannot be stringified")
+
+    output = {"segments": [
+        {"start": 0, "end": 1, "text": "   "},
+        {"start": "bad", "end": 2, "text": "unmappable"},
+        OpaqueRow(),
+        HostileRowDict(start=2, end=3, text=""),
+        {"start": 2, "end": 3, "text": "usable"},
+    ]}
+
+    assert [row.get("text") for row in wx._map_segments(output)] == ["usable"]
+    assert wx._raw_provider_segments(output) == [
+        {"start": 0, "end": 1, "text": "   "},
+        {"start": "bad", "end": 2, "text": "unmappable"},
+        {"raw": "<opaque-provider-value-OpaqueRow>"},
+        {"raw": "<opaque-provider-value-HostileRowDict>"},
+        {"start": 2, "end": 3, "text": "usable"},
+    ]
 
 
 def test_filter_ghosts_drops_short_oneword_segments():
@@ -292,12 +323,64 @@ def test_transcribe_maps_on_success(monkeypatch, tmp_path):
     f = tmp_path / "a.mp3"
     f.write_bytes(b"x")
     out = {"segments": [
+        {"start": "bad", "end": 0, "text": "rejected raw"},
         {"start": 0, "end": 1, "text": "uno"},
         {"start": 1, "end": 2, "text": "dos"},
     ]}
     _fake_replicate(monkeypatch, run=MagicMock(return_value=out))
-    segs = wx.transcribe_whisperx(str(f), language="es")
+    collector, token = begin_collection()
+    try:
+        segs = wx.transcribe_whisperx(str(f), language="es")
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
     assert [s["text"] for s in segs] == ["uno", "dos"]
+    assert [
+        row["text"] for row in snapshot["hypotheses"][0]["events"]
+    ] == ["rejected raw", "uno", "dos"]
+
+
+def test_cache_hit_returns_processed_but_records_raw(monkeypatch, tmp_path):
+    monkeypatch.setenv("WHISPERX_ENABLED", "1")
+    monkeypatch.setenv("REPLICATE_API_TOKEN", "r8_x")
+    audio = tmp_path / "cache.mp3"
+    audio.write_bytes(b"cache-fixture")
+    _fake_replicate(
+        monkeypatch,
+        run=MagicMock(side_effect=AssertionError("cache hit must not run")),
+    )
+    raw = [
+        {"start": 0.0, "end": 8.0, "text": "raw merged line"},
+        {"start": 8.0, "end": 10.0, "text": "raw second"},
+    ]
+    processed = [
+        {"start": 0.0, "end": 4.0, "text": "processed one"},
+        {"start": 4.0, "end": 8.0, "text": "processed two"},
+    ]
+    monkeypatch.setattr(
+        wx, "_compute_cache_key",
+        lambda *args, **kwargs: ("cache-key", "audio-hash", "hint-hash"),
+    )
+    monkeypatch.setattr(
+        wx, "_cache_lookup",
+        lambda *args, **kwargs: {
+            "schema": "whisperx-cache-v2",
+            "raw_segments": raw,
+            "processed_segments": processed,
+        },
+    )
+
+    collector, token = begin_collection()
+    try:
+        returned = wx.transcribe_whisperx(str(audio), language="es")
+        snapshot = collector.snapshot()
+    finally:
+        end_collection(token)
+
+    assert returned == processed
+    assert snapshot["completed_attempt_count"] == 1
+    assert snapshot["hypotheses"][0]["events"] == raw
+    assert snapshot["hypotheses"][0]["transformation"] == "cache_hit_raw"
 
 
 # ──────────────────────────────────────────────────────────────────────

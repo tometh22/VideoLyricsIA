@@ -65,26 +65,27 @@ export async function installEditorHarness(page, options = {}) {
   const transcriptionQuality = options.transcriptionQuality || null;
   const saves = [];
   const approvals = [];
-  let durableRevision = 0;
+  let durableRevision = options.initialRevision || 0;
   let durableSegments = JSON.parse(JSON.stringify(empty ? [] : segments));
   const durableOriginal = JSON.parse(JSON.stringify(durableSegments));
+  let officialText = "";
   const versions = [];
   const heartbeats = [];
   let sourceAudioRequests = 0;
   const audioBytes = createSyntheticWav();
 
-  await page.addInitScript(({ token }) => {
-    localStorage.clear();
-    sessionStorage.clear();
+  await page.addInitScript(({ token, role, preserveStorage }) => {
+    if (!preserveStorage || !sessionStorage.getItem("e2e-initialized")) { localStorage.clear(); sessionStorage.clear(); }
+    sessionStorage.setItem("e2e-initialized", "1");
     localStorage.setItem("genly_token", token);
     localStorage.setItem("genly_lang", "es");
     localStorage.setItem("genly_user", JSON.stringify({
       id: "e2e-user",
       email: "e2e@example.test",
       name: "E2E Operator",
-      role: "user",
+      role,
     }));
-  }, { token: authToken() });
+  }, { token: authToken(), role: options.role || "user", preserveStorage: !!options.preserveStorage });
 
   await page.route("**/*", async (route) => {
     const request = route.request();
@@ -115,7 +116,7 @@ export async function installEditorHarness(page, options = {}) {
     }
 
     if (request.method() === "GET" && path === "/auth/me") {
-      await route.fulfill(jsonResponse({ id: "e2e-user", email: "e2e@example.test", role: "user", tenant_id: "e2e-team", features: { editor_v2: editorV2 } }));
+      await route.fulfill(jsonResponse({ id: "e2e-user", email: "e2e@example.test", role: options.role || "user", tenant_id: "e2e-team", features: { editor_v2: editorV2 } }));
       return;
     }
 
@@ -125,6 +126,8 @@ export async function installEditorHarness(page, options = {}) {
         revision: durableRevision,
         segments: durableSegments,
         original_segments: durableOriginal,
+        latest_approved_version: options.latestApprovedVersion || null,
+        ...(options.lyricReview ? { lyric_review: options.lyricReview(durableSegments, officialText) } : {}),
         updated_by: null,
         updated_at: new Date().toISOString(),
         lock: { active: false, user: null, expires_at: null },
@@ -152,7 +155,16 @@ export async function installEditorHarness(page, options = {}) {
         versions.unshift({ id: versionId, revision: durableRevision, reason: body.checkpoint, is_approved: false, created_at: new Date().toISOString() });
       }
       saves.push(body);
-      await route.fulfill(jsonResponse({ applied: changed, revision: durableRevision, version_id: versionId, saved_at: new Date().toISOString() }));
+      await route.fulfill(jsonResponse({
+        applied: changed, revision: durableRevision, version_id: versionId, saved_at: new Date().toISOString(),
+        ...(options.lyricReview ? { lyric_review: options.lyricReview(durableSegments, officialText) } : {}),
+      }));
+      return;
+    }
+
+    if (editorV2 && options.lyricReview && request.method() === "POST" && path === `/editor/${jobId}/official-lyrics`) {
+      officialText = request.postDataJSON().text;
+      await route.fulfill(jsonResponse({ job_id: jobId, lyric_review: options.lyricReview(durableSegments, officialText) }));
       return;
     }
 
@@ -182,12 +194,12 @@ export async function installEditorHarness(page, options = {}) {
     if (request.method() === "GET" && path === `/status/${jobId}`) {
       await route.fulfill(jsonResponse({
         job_id: jobId,
-        status: "pending_review",
+        status: options.jobStatus || "pending_review",
         filename: "e2e-song.mp3",
         artist: "E2E Artist",
         song_title: "E2E Song",
         segments_json: empty ? [] : segments,
-        segments_revision: 0,
+        segments_revision: options.initialRevision || 0,
         transcription_quality: transcriptionQuality,
         render_params: {},
       }));

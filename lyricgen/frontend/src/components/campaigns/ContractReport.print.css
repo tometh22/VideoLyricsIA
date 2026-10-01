@@ -1,0 +1,13 @@
+@media print {
+  html:has(#campaign-contract-report), body:has(#campaign-contract-report) { background: white !important; color: black !important; height: auto !important; overflow: visible !important; }
+  body:has(#campaign-contract-report) *:not(:has(#campaign-contract-report)):not(#campaign-contract-report):not(#campaign-contract-report *) { display: none !important; }
+  body:has(#campaign-contract-report) *:has(#campaign-contract-report) { display: block !important; position: static !important; width: auto !important; max-width: none !important; height: auto !important; min-height: 0 !important; max-height: none !important; overflow: visible !important; margin: 0 !important; padding: 0 !important; transform: none !important; background: white !important; }
+  #campaign-contract-report, #campaign-contract-report * { visibility: visible !important; color: black !important; background: transparent !important; box-shadow: none !important; }
+  #campaign-contract-report { position: static !important; width: 100% !important; overflow: visible !important; font-size: 10pt; }
+  #campaign-contract-report .overflow-x-auto { overflow: visible !important; }
+  #campaign-contract-report table { width: 100%; table-layout: fixed; font-size: 8pt; border-collapse: collapse; }
+  #campaign-contract-report th, #campaign-contract-report td { overflow-wrap: anywhere; padding: 4px; }
+  #campaign-contract-report h2, #campaign-contract-report h3 { break-after: avoid; }
+  #campaign-contract-report p { orphans: 3; widows: 3; }
+  #campaign-contract-report .campaign-no-print { display: none !important; }
+}
