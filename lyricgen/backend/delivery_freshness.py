@@ -371,6 +371,7 @@ def publication_state(job, delivery) -> dict:
     # Current rows compare exact render identity; legacy rows use durable
     # stale evidence written by a successful edit path.
     changed = needs_publish(job, delivery)
+    from delivery_snapshots import is_hidden_from_client
     return {
         "revision": delivery.published_revision or 1,
         "content_updated_at": (
@@ -386,6 +387,8 @@ def publication_state(job, delivery) -> dict:
         ),
         "stale_reason": delivery.stale_reason,
         "needs_publish": changed,
+        "client_visibility": getattr(delivery, "client_visibility", None) or "auto",
+        "hidden_from_client": is_hidden_from_client(delivery),
         "prores_pending": pending,
         "awaiting_review": bool(
             delivery.content_updated_at and delivery.approved_at is None

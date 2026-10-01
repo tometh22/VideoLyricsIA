@@ -114,10 +114,10 @@ export default function SongDrawer({ song, kind, campaignId, canManage, portalSe
           <div className="flex flex-wrap gap-1.5">
             {song.portals?.map((portal) => <Chip key={portal} tone="brand">En {portalLabel(portal)}</Chip>)}
             {song.portal_outdated && (!isApprovedStage(song)
-              ? <Chip tone="warning">Falta aprobar el corte nuevo: el portal entrega el anterior</Chip>
+              ? <Chip tone="warning">{song.portal_hidden ? "Falta aprobar el corte nuevo: el cliente no ve el video por ahora" : "Falta aprobar el corte nuevo: el portal entrega el anterior"}</Chip>
               : song.portal_serves_latest
                 ? <Chip tone="warning">Corte nuevo sin registrar: el cliente ya descarga el archivo nuevo</Chip>
-                : <Chip tone="success">Listo para reenviar: el portal entrega el corte anterior</Chip>)}
+                : <Chip tone="success">{song.portal_hidden ? "Listo para reenviar: el cliente no ve el video hasta que lo publiques" : "Listo para reenviar: el portal entrega el corte anterior"}</Chip>)}
             {song.pending_change_requests > 0 && <Chip tone="warning">{song.pending_change_requests} {song.pending_change_requests === 1 ? "cambio pedido" : "cambios pedidos"}</Chip>}
           </div>
         </section>}

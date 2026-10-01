@@ -25,12 +25,60 @@ def working_key(tenant, job_id, file_type):
     return storage._object_key(tenant, job_id, FILENAMES[file_type])
 
 
+POINTER_SETTING = 'publish_latest_pointer'
+VISIBILITY_MODES = ('auto', 'visible', 'hidden')
+_TRUE = {'1', 'true', 'yes', 'on'}
+
+
+def latest_pointer_setting():
+    """The operator's choice from the admin panel (True/False), or None if unset."""
+    import system_settings
+    raw = system_settings.get_setting(POINTER_SETTING)
+    if raw is None:
+        return None
+    return raw.strip().lower() in _TRUE
+
+
 def latest_pointer_enabled() -> bool:
-    """Publish without copying; serve the job's newest render (see module doc)."""
-    return os.environ.get('PUBLISH_LATEST_POINTER', '').strip().lower() in {'1', 'true', 'yes', 'on'}
+    """Publish without copying; serve the job's newest render (see module doc).
+
+    The admin-panel switch wins; ``PUBLISH_LATEST_POINTER`` is only the default
+    for an environment where nobody has chosen yet."""
+    chosen = latest_pointer_setting()
+    if chosen is not None:
+        return chosen
+    return os.environ.get('PUBLISH_LATEST_POINTER', '').strip().lower() in _TRUE
 
 
-def portal_key(delivery, file_type):
+def client_visibility_mode(delivery) -> str:
+    mode = (getattr(delivery, 'client_visibility', None) or 'auto').strip().lower()
+    return mode if mode in VISIBILITY_MODES else 'auto'
+
+
+def is_hidden_from_client(delivery) -> bool:
+    """Should the client's portal show NOTHING of this delivery right now?
+
+    * 'hidden': the operator hid it.
+    * 'visible': the operator forces it on (the ProRes guard in ``portal_key``
+      still applies: a stale master is never served).
+    * 'auto': while the row has unpublished changes (``stale_since``) and no
+      frozen snapshot, the portal would otherwise serve the newest, unapproved
+      render. A snapshot is already stable, so it is never auto-hidden.
+    """
+    mode = client_visibility_mode(delivery)
+    if mode == 'hidden':
+        return True
+    if mode == 'visible':
+        return False
+    return (getattr(delivery, 'published_file_keys', None) is None
+            and getattr(delivery, 'stale_since', None) is not None)
+
+
+def portal_key(delivery, file_type, *, for_client=False):
+    """R2 key behind a download. ``for_client`` applies the visibility rules; the
+    admin preview keeps seeing what is published even while the client does not."""
+    if for_client and is_hidden_from_client(delivery):
+        return None
     keys = getattr(delivery, 'published_file_keys', None)
     if keys is not None:
         # A partial snapshot must not leak through to a newer working cut.

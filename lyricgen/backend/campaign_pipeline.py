@@ -223,6 +223,7 @@ def _snapshot(
 
         portals: list[str] = []
         pinned_snapshot = False
+        client_hidden = False
         change_requests = 0
         outdated = False
         updating = False
@@ -236,6 +237,7 @@ def _snapshot(
                     portals.append(portal)
             change_requests += int(publication.get("pending_change_requests") or 0)
             pinned_snapshot = pinned_snapshot or bool(publication.get("snapshot_pinned"))
+            client_hidden = client_hidden or bool(publication.get("client_hidden"))
             published_oldest = _aware(publication.get("oldest_change_request_at"))
             if published_oldest is not None and (oldest_request is None or published_oldest < oldest_request):
                 oldest_request = published_oldest
@@ -328,7 +330,10 @@ def _snapshot(
             "portal_outdated": outdated,
             # In pointer mode the portal already serves the newest render, so an
             # 'outdated' song means "registration pending", not "client sees old".
-            "portal_serves_latest": serves_latest and not pinned_snapshot,
+            "portal_serves_latest": serves_latest and not pinned_snapshot and not client_hidden,
+            # The client sees NOTHING of this song right now (hidden by the operator
+            # or automatically while it has unpublished changes).
+            "portal_hidden": client_hidden,
             "portal_updating": updating,
             "published_other_version": published_other and not published_current,
             "pending_change_requests": change_requests,

@@ -290,10 +290,10 @@ describe("wording follows the publication mode", () => {
 
     setPublicationMode("pointer");
     const sentence = correctionSentence(rendering);
-    expect(sentence).toMatch(/cliente lo verá apenas termine/);
+    expect(sentence).toMatch(/cliente no lo ve hasta que lo publiques/);
     expect(sentence).not.toMatch(/sigue mostrando/);
     expect(describePublishError({ status: 503, detail: { code: "publication_storage_unavailable" } })).not.toMatch(/copiar|conserva/);
-    expect(requestWorkflow({ publication: { job_status: "rendering" } }, null, true).detail).toMatch(/cliente verá el video nuevo/);
+    expect(requestWorkflow({ publication: { job_status: "rendering" } }, null, true).detail).toMatch(/cliente no ve este video hasta que lo publiques/);
   });
 
   it("only the exact value 'pointer' switches the wording", () => {

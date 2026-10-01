@@ -35,7 +35,7 @@ function StageDetail({ song }) {
   if (song.portals?.length) chips.push(<Chip key="portal" tone="brand">En {song.portals.map(portalLabel).join(" y ")}</Chip>);
   if (song.portal_outdated && !isApprovedStage(song)) chips.push(<Chip key="old" tone="warning" title="Hay un corte nuevo, pero todavía falta aprobarlo para poder enviarlo al portal.">Falta aprobar el corte nuevo</Chip>);
   else if (song.portal_outdated && song.portal_serves_latest) chips.push(<Chip key="old" tone="warning" title="Se volvió a renderizar después de la última publicación. El cliente ya descarga el archivo nuevo, pero falta registrar la versión y reiniciar su aprobación.">Corte nuevo sin registrar</Chip>);
-  else if (song.portal_outdated) chips.push(<Chip key="old" tone="success" title="Aprobado y listo: el portal todavía muestra el corte anterior. Enviá la canción para actualizarlo.">Listo para reenviar</Chip>);
+  else if (song.portal_outdated) chips.push(<Chip key="old" tone="success" title={song.portal_hidden ? "Aprobado y listo: el cliente no ve el video hasta que lo publiques. Enviá la canción para publicarlo." : "Aprobado y listo: el portal todavía muestra el corte anterior. Enviá la canción para actualizarlo."}>Listo para reenviar</Chip>);
   if (song.published_other_version) chips.push(<Chip key="other" tone="info">Otra versión publicada</Chip>);
   if (song.pending_change_requests) chips.push(<Chip key="cr" tone="warning">{song.pending_change_requests} {song.pending_change_requests === 1 ? "cambio pedido" : "cambios pedidos"}</Chip>);
   if (song.current_is_variant) chips.push(<Chip key="var">Variante</Chip>);

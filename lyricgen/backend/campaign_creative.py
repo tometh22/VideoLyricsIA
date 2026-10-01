@@ -7,6 +7,7 @@ or job changes before applying a bulk operation.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 import copy
 import csv
 import hashlib
@@ -549,11 +550,21 @@ def portal_history(job_ids, tenant_id):
         # Which of these jobs still have a FROZEN copy behind an active delivery.
         # Read in Python (a JSON column cannot be grouped, and JSON null must read
         # as "no snapshot" like everywhere else in the app).
-        frozen_jobs = {
-            frozen_job for frozen_job, keys in ddb.query(Delivery.job_id, Delivery.published_file_keys).filter(
-                Delivery.job_id.in_(job_ids), Delivery.tenant_snapshot == tenant_id, Delivery.removed_at.is_(None),
-            ).all() if keys is not None
-        }
+        from delivery_snapshots import is_hidden_from_client
+        frozen_jobs = set()
+        hidden_jobs = set()
+        for frozen_job, keys, stale_since, visibility in ddb.query(
+                Delivery.job_id, Delivery.published_file_keys, Delivery.stale_since, Delivery.client_visibility,
+        ).filter(
+            Delivery.job_id.in_(job_ids), Delivery.tenant_snapshot == tenant_id, Delivery.removed_at.is_(None),
+        ).all():
+            if keys is not None:
+                frozen_jobs.add(frozen_job)
+            # What the client's portal keeps out of view right now (operator choice
+            # or the automatic rule for unpublished changes).
+            if is_hidden_from_client(SimpleNamespace(
+                    published_file_keys=keys, stale_since=stale_since, client_visibility=visibility)):
+                hidden_jobs.add(frozen_job)
     result = {}
     for (job_id, portal_id, pending, oldest_pending, fingerprint, revision,
          stale_since, stale_reason, approved_at, content_updated_at, added_at) in publications:
@@ -565,6 +576,7 @@ def portal_history(job_ids, tenant_id):
             "portal_updating": False, "portal_awaiting_review": False,
             "oldest_change_request_at": None,
             "snapshot_pinned": job_id in frozen_jobs,
+            "client_hidden": job_id in hidden_jobs,
             # When the portal last got this job (legacy rows have no fingerprint, so
             # "corrected after this moment" is the only evidence that they are stale).
             "published_baseline_at": None,

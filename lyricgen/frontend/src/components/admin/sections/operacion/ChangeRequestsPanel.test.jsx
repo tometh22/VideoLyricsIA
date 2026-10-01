@@ -527,7 +527,7 @@ describe("ChangeRequestsPanel", () => {
     setPublicationMode("pointer");
     try {
       renderPanel();
-      expect(screen.getByRole("status")).toHaveTextContent(/el cliente verá el video nuevo apenas termine/);
+      expect(screen.getByRole("status")).toHaveTextContent(/el cliente no lo ve hasta que lo publiques/);
       expect(screen.getByRole("status")).not.toHaveTextContent(/conserva el corte anterior/);
     } finally {
       setPublicationMode("snapshot");

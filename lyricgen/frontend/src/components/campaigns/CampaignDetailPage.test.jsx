@@ -376,4 +376,12 @@ describe("outdatedWording", () => {
     expect(mixed).toBe("2 ya descargan el archivo nuevo (falta registrar la versión) y 1 sigue mostrando la versión anterior.");
     expect(outdatedWording([song({ portal_serves_latest: true }), { portal_outdated: false }])).toMatch(/ya descarga el archivo nuevo/);
   });
+
+  it("says the client sees nothing for songs that are hidden until published", () => {
+    expect(outdatedWording([song({ portal_hidden: true })])).toBe("el cliente no ve estos videos hasta que los publiques.");
+    const three = outdatedWording([song({ portal_hidden: true }), song({ portal_serves_latest: true }), song({})]);
+    expect(three).toBe("1 está oculta para el cliente hasta que la publiques, 1 ya descarga el archivo nuevo (falta registrar la versión) y 1 sigue mostrando la versión anterior.");
+    expect(outdatedWording([song({ portal_hidden: true }), song({ portal_hidden: true }), song({})]))
+      .toBe("2 están ocultas para el cliente hasta que las publiques y 1 sigue mostrando la versión anterior.");
+  });
 });

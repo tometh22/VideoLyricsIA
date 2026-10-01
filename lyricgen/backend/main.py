@@ -152,6 +152,7 @@ from language_review import (
     staging_advisory as _language_staging_advisory,
 )
 from delivery_snapshots import latest_pointer_enabled as _latest_pointer_enabled
+from delivery_snapshots import is_hidden_from_client
 from provenance import job_was_delivered
 from batch_profiles import (
     RenderProfileError, normalize_render_profile, pipeline_fields,
@@ -20933,6 +20934,89 @@ def _soft_delete_delivery(
     return {"ok": True}
 
 
+@app.put("/admin/deliveries/{delivery_id}/visibility")
+async def admin_set_delivery_visibility(
+    delivery_id: int,
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """Choose what the client's portal shows of one delivery. Admin only.
+
+    ``auto`` hides it while it has unpublished changes, ``visible`` always shows
+    it, ``hidden`` never does. The value sits on the shared portal row because
+    the portal is served by another backend."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    from delivery_snapshots import VISIBILITY_MODES
+    mode = str((body or {}).get("mode") or "").strip().lower()
+    if mode not in VISIBILITY_MODES:
+        raise HTTPException(status_code=422, detail="invalid_visibility_mode")
+    delivery = (
+        ddb.query(Delivery)
+        .filter(Delivery.id == delivery_id, Delivery.removed_at.is_(None))
+        .with_for_update().first()
+    )
+    if delivery is None:
+        raise HTTPException(status_code=404, detail="Delivery not found")
+    previous = delivery.client_visibility or "auto"
+    delivery.client_visibility = None if mode == "auto" else mode
+    ddb.commit()
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="delivery.visibility",
+        detail={"delivery_id": delivery_id, "job_id": delivery.job_id,
+                "portal_id": delivery.portal_id or "argentina",
+                "from": previous, "to": mode},
+    ))
+    db.commit()
+    return {"ok": True, "client_visibility": mode,
+            "hidden_from_client": is_hidden_from_client(delivery)}
+
+
+def _publication_settings_payload():
+    from delivery_snapshots import latest_pointer_enabled, latest_pointer_setting
+    return {
+        "publication_mode": "pointer" if latest_pointer_enabled() else "snapshot",
+        "source": "panel" if latest_pointer_setting() is not None else "default",
+    }
+
+
+@app.get("/admin/publication-settings")
+async def admin_get_publication_settings(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    return _publication_settings_payload()
+
+
+@app.put("/admin/publication-settings")
+async def admin_set_publication_settings(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Switch publishing between "copy files" and "no copies" without a deploy."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    from delivery_snapshots import POINTER_SETTING, latest_pointer_enabled
+    import system_settings
+    mode = str((body or {}).get("publication_mode") or "").strip().lower()
+    if mode not in {"pointer", "snapshot"}:
+        raise HTTPException(status_code=422, detail="invalid_publication_mode")
+    previous = "pointer" if latest_pointer_enabled() else "snapshot"
+    system_settings.set_setting(
+        db, POINTER_SETTING, "1" if mode == "pointer" else "0", current_user["id"],
+    )
+    db.add(AuditLog(
+        user_id=current_user["id"],
+        action="publication.mode",
+        detail={"from": previous, "to": mode},
+    ))
+    db.commit()
+    return _publication_settings_payload()
+
+
 @app.delete("/api/deliveries/{delivery_id}")
 async def portal_delete_delivery(
     delivery_id: int,
@@ -21348,7 +21432,7 @@ async def portal_get_items(
             if ft not in _DELIVERY_FILE_TYPES:
                 continue
             from delivery_snapshots import portal_key
-            r2_key = portal_key(d, ft)
+            r2_key = portal_key(d, ft, for_client=True)
             if not r2_key:
                 continue
             head_jobs.append((di, ft, r2_key))
@@ -21448,7 +21532,7 @@ async def portal_get_items(
             if ft not in _DELIVERY_FILE_TYPES:
                 continue
             from delivery_snapshots import portal_key
-            r2_key = portal_key(d, ft)
+            r2_key = portal_key(d, ft, for_client=True)
             if not r2_key:
                 continue
             dl_name = f"{_delivery_safe_filename(d.artist_snapshot, d.song_title_snapshot)}.{_DELIVERY_FILE_TYPES[ft]['ext']}"
@@ -21516,6 +21600,10 @@ async def portal_get_items(
                 d.stale_since is not None
                 and (d.stale_reason or "") in delivery_freshness.STALE_IN_FLIGHT
             ),
+            # True when the operator (or the automatic rule while changes are
+            # unpublished) is keeping this version's files out of the client's
+            # view: the card stays so the client still sees their request.
+            "files_hidden": is_hidden_from_client(d),
             "updating_since": (
                 d.stale_since.isoformat() if d.stale_since else None
             ),

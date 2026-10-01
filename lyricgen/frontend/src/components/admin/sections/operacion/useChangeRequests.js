@@ -77,6 +77,9 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   const [crPublishingId, setCrPublishingId] = useState(null);
   const [crPublishNotice, setCrPublishNotice] = useState(null);
   const [crRenderReview, setCrRenderReview] = useState(null);
+  const [crPublicationMode, setCrPublicationMode] = useState("snapshot");
+  const [crModeBusy, setCrModeBusy] = useState(false);
+  const [crVisibilityBusyId, setCrVisibilityBusyId] = useState(null);
   const renderReviewRef = useRef(crRenderReview);
   renderReviewRef.current = crRenderReview;
   const renderLockRef = useRef(false);
@@ -163,6 +166,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       setCrResolvedCount(data.resolved_count || 0);
       setCrProposalEnabled(data.proposal_enabled === true);
       setPublicationMode(data.publication_mode);
+      setCrPublicationMode(data.publication_mode === "pointer" ? "pointer" : "snapshot");
       setCrProposalApplyEnabled(data.proposal_apply_enabled === true);
     } catch (err) {
       if (generation === listGenerationRef.current && requestedFilter === crStatusRef.current) {
@@ -433,7 +437,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
           ? "Este pedido de fondo ya fue recibido. Consultá su resultado antes de solicitar otra opción; todavía no se publicó."
           : byPublicationMode({
             snapshot: "La regeneración empezó. El portal conserva el corte anterior: esperá a que termine, abrí el video nuevo y publicalo sólo si quedó bien.",
-            pointer: "La regeneración empezó. El cliente verá el fondo nuevo apenas termine: esperá a que termine, abrí el video nuevo y publicalo para registrarlo.",
+            pointer: "La regeneración empezó. El cliente no verá el fondo nuevo hasta que lo publiques (salvo que esté “Siempre visible”): esperá a que termine, abrí el video nuevo y publicalo para registrarlo.",
           }),
       });
       await loadChangeRequests({ silent: true });
@@ -749,6 +753,42 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     await loadChangeRequests({ silent: true });
   }, [loadChangeRequests]);
 
+  // What the client sees of ONE delivery: "auto" | "visible" | "hidden".
+  const setDeliveryVisibility = useCallback(async (deliveryId, mode) => {
+    setCrVisibilityBusyId(deliveryId);
+    try {
+      await fetchJson(`${API}/admin/deliveries/${deliveryId}/visibility`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      await loadChangeRequests({ silent: true });
+    } catch (err) {
+      flashError(`No pude cambiar lo que ve el cliente: ${err.message || err}`);
+    } finally {
+      setCrVisibilityBusyId(null);
+    }
+  }, [flashError, loadChangeRequests]);
+
+  // Global: publish by copying files ("snapshot") or without copies ("pointer").
+  const changePublicationMode = useCallback(async (mode) => {
+    setCrModeBusy(true);
+    try {
+      const data = await fetchJson(`${API}/admin/publication-settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ publication_mode: mode }),
+      });
+      setPublicationMode(data.publication_mode);
+      setCrPublicationMode(data.publication_mode === "pointer" ? "pointer" : "snapshot");
+      await loadChangeRequests({ silent: true });
+    } catch (err) {
+      flashError(`No pude cambiar el modo de publicación: ${err.message || err}`);
+    } finally {
+      setCrModeBusy(false);
+    }
+  }, [flashError, loadChangeRequests]);
+
   const reopenChangeRequest = useCallback(async (id) => {
     setCrResolvingId(id);
     try {
@@ -793,5 +833,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     reviewForRender, confirmRender, crRenderReview, setCrRenderReview: closeRenderReview,
     prepareProRes,
     handleProResConfigured,
+    crPublicationMode, crModeBusy, changePublicationMode,
+    crVisibilityBusyId, setDeliveryVisibility,
   };
 }

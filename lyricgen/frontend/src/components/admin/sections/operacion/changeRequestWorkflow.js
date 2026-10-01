@@ -57,7 +57,7 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
       key: "rendering", activeStep: 2, label: "Generando corte nuevo",
       detail: byPublicationMode({
         snapshot: "El portal conserva la versión anterior hasta que revises y publiques.",
-        pointer: "El cliente verá el video nuevo apenas termine. Después revisalo y publicá para registrar la versión.",
+        pointer: "El cliente no ve este video hasta que lo publiques (salvo que esté “Siempre visible”). Después revisalo y publicá para registrar la versión.",
       }),
       tone: "busy",
     };
@@ -398,7 +398,7 @@ export function correctionSentence(workflow, ctx = {}) {
     case "rendering":
       return byPublicationMode({
         snapshot: "Estamos generando el video nuevo. El portal sigue mostrando el anterior hasta que lo publiques.",
-        pointer: "Estamos generando el video nuevo. El cliente lo verá apenas termine; después publicalo para registrar la versión.",
+        pointer: "Estamos generando el video nuevo. El cliente no lo ve hasta que lo publiques (salvo que esté “Siempre visible”).",
       });
     case "blocked":
       return "No se pudo generar el video nuevo. Abrí el error para ver el motivo y no vuelvas a aplicar los cambios guardados.";

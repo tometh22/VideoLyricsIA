@@ -1419,6 +1419,11 @@ class Delivery(Base):
     # publish. Non-null means "do not treat this download as final".
     stale_since = Column(DateTime(timezone=True), nullable=True)
     stale_reason = Column(String(40), nullable=True)
+    # What the CLIENT may see of this row. NULL/'auto': hidden while the delivery
+    # has unpublished changes, shown again on publish. 'visible' / 'hidden' are
+    # the operator's manual override (delivery_snapshots.is_hidden_from_client).
+    # Lives on the shared row because the portal is served by another backend.
+    client_visibility = Column(String(10), nullable=True)
 
     def to_dict(self):
         return {
@@ -1444,6 +1449,7 @@ class Delivery(Base):
                 self.stale_since.isoformat() if self.stale_since else None
             ),
             "stale_reason": self.stale_reason,
+            "client_visibility": self.client_visibility or "auto",
         }
 
 
@@ -1535,6 +1541,16 @@ class Invoice(Base):
             "period_end": self.period_end.isoformat() if self.period_end else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class SystemSetting(Base):
+    """Operator-editable switches that used to be Railway env vars (local DB only)."""
+    __tablename__ = "system_settings"
+
+    key = Column(String(80), primary_key=True)
+    value = Column(String(200), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_by_user_id = Column(Integer, nullable=True)
 
 
 class UserSettings(Base):
@@ -2609,6 +2625,7 @@ def _migrate_user_columns():
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS content_updated_at TIMESTAMPTZ",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_reason VARCHAR(40)",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS client_visibility VARCHAR(10)",
         "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolved_by_revision INTEGER",
         "ALTER TABLE delivery_change_requests ADD COLUMN IF NOT EXISTS resolution_source VARCHAR(20)",
         # Categoría del error para el dashboard de actividad (PR telemetría).

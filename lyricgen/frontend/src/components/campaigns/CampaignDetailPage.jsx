@@ -54,9 +54,16 @@ export function resendCounts(songs) {
 export function outdatedWording(songs) {
   const outdated = songs.filter((song) => song.portal_outdated);
   const latest = outdated.filter((song) => song.portal_serves_latest).length;
-  if (!outdated.length || latest === 0) return "el portal del cliente sigue mostrando el anterior.";
+  const hidden = outdated.filter((song) => song.portal_hidden).length;
+  const old = outdated.length - latest - hidden;
+  if (!outdated.length || (latest === 0 && hidden === 0)) return "el portal del cliente sigue mostrando el anterior.";
   if (latest === outdated.length) return "el cliente ya descarga el archivo nuevo, pero falta registrar la versión y reiniciar su aprobación.";
-  return `${latest} ya ${latest === 1 ? "descarga" : "descargan"} el archivo nuevo (falta registrar la versión) y ${outdated.length - latest} ${outdated.length - latest === 1 ? "sigue mostrando" : "siguen mostrando"} la versión anterior.`;
+  if (hidden === outdated.length) return "el cliente no ve estos videos hasta que los publiques.";
+  const parts = [];
+  if (hidden) parts.push(`${hidden} ${hidden === 1 ? "está oculta" : "están ocultas"} para el cliente hasta que ${hidden === 1 ? "la publiques" : "las publiques"}`);
+  if (latest) parts.push(`${latest} ya ${latest === 1 ? "descarga" : "descargan"} el archivo nuevo (falta registrar la versión)`);
+  if (old) parts.push(`${old} ${old === 1 ? "sigue mostrando" : "siguen mostrando"} la versión anterior`);
+  return `${parts.length > 1 ? `${parts.slice(0, -1).join(", ")} y ${parts[parts.length - 1]}` : parts[0]}.`;
 }
 
 function isTyping(target) {
