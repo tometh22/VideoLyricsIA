@@ -354,7 +354,7 @@ def test_history_reads_external_active_portals_and_pending_changes_while_editing
             # que sirve, no sólo que existe.
             " published_render_fingerprint TEXT, published_revision INTEGER,"
             " stale_since TEXT, stale_reason TEXT, approved_at TEXT,"
-            " content_updated_at TEXT, published_file_keys TEXT, added_at TEXT)"
+            " content_updated_at TEXT, published_file_keys TEXT, added_at TEXT, client_visibility TEXT)"
         ))
         conn.execute(text("CREATE TABLE delivery_change_requests (id INTEGER, delivery_id INTEGER, resolved_at TEXT, submitted_at TEXT)"))
         # `fingerprint` es el del render publicado. "viejo" no coincide con
@@ -369,7 +369,7 @@ def test_history_reads_external_active_portals_and_pending_changes_while_editing
         ]:
             conn.execute(text(
                 "INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,:removed,"
-                ":fingerprint,:revision,NULL,NULL,NULL,NULL,NULL,NULL)"
+                ":fingerprint,:revision,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"
             ), dict(n=n, job=job, portal=portal, tenant=tenant, removed=removed,
                     fingerprint=fingerprint, revision=revision))
         conn.execute(text("INSERT INTO delivery_change_requests VALUES (1,1,NULL,'2026-09-20 10:00:00.000000'),(2,1,'resolved','2026-09-19 10:00:00.000000'),(3,2,NULL,'2026-09-20 10:00:00.000000'),(4,3,NULL,'2026-09-20 10:00:00.000000'),(5,4,NULL,'2026-09-20 10:00:00.000000'),(6,5,NULL,'2026-09-20 10:00:00.000000')"))

@@ -87,6 +87,12 @@
       "owner": "backend/video"
     },
     {
+      "package": "transformers",
+      "id": "CVE-2026-80047",
+      "expires": "2026-10-14",
+      "owner": "backend/video"
+    },
+    {
       "package": "ecdsa",
       "id": "PYSEC-2026-1325",
       "expires": "2026-10-31",

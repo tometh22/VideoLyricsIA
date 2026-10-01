@@ -110,6 +110,23 @@ describe("campaign workspace", () => {
     expect(screen.queryByText("Listo para reenviar")).toBeNull();
   });
 
+  it("says the client sees nothing for a hidden song, outdated or not", async () => {
+    const api = createCampaignApi({ songs: [
+      makeSong(1, "delivered", { portal_hidden: true }),                          // hidden by hand, up to date
+      makeSong(2, "delivered", { portal_outdated: true, portal_hidden: true }),   // changes in flight
+    ] });
+    vi.stubGlobal("fetch", async (input, options) => {
+      const response = await api.fetchMock(input, options);
+      if (new URL(String(input), "http://test").pathname !== "/batch/campaigns/c1/pipeline") return response;
+      return json({ ...(await response.json()), publication_mode: "pointer", flags: { portal_outdated: 1, resend_ready: 1, resend_review: 0 } });
+    });
+    render(<MemoryRouter initialEntries={["/campaigns/c1"]}><Location /><Routes><Route path="/campaigns/:campaignId" element={<CampaignsPage />} /></Routes></MemoryRouter>);
+    expect(await screen.findByText("Oculto para el cliente")).toBeInTheDocument();
+    const banner = await screen.findByText(/para reenviar al portal/);
+    expect(banner.parentElement).toHaveTextContent("el cliente no ve estos videos hasta que los publiques");
+    expect(screen.getByText("Listo para reenviar")).toBeInTheDocument();
+  });
+
   it("counts every song once with the same numbers in every tab", async () => {
     const api = createCampaignApi({ songs: [makeSong(1, "lyrics"), makeSong(2, "lyrics"), makeSong(3, "ready"), makeSong(4, "qc"), makeSong(5, "delivered"), makeSong(6, "discarded")] });
     mount(api);
@@ -375,5 +392,13 @@ describe("outdatedWording", () => {
     const mixed = outdatedWording([song({ portal_serves_latest: true }), song({ portal_serves_latest: true }), song({ portal_serves_latest: false })]);
     expect(mixed).toBe("2 ya descargan el archivo nuevo (falta registrar la versión) y 1 sigue mostrando la versión anterior.");
     expect(outdatedWording([song({ portal_serves_latest: true }), { portal_outdated: false }])).toMatch(/ya descarga el archivo nuevo/);
+  });
+
+  it("says the client sees nothing for songs that are hidden until published", () => {
+    expect(outdatedWording([song({ portal_hidden: true })])).toBe("el cliente no ve estos videos hasta que los publiques.");
+    const three = outdatedWording([song({ portal_hidden: true }), song({ portal_serves_latest: true }), song({})]);
+    expect(three).toBe("1 está oculta para el cliente hasta que la publiques, 1 ya descarga el archivo nuevo (falta registrar la versión) y 1 sigue mostrando la versión anterior.");
+    expect(outdatedWording([song({ portal_hidden: true }), song({ portal_hidden: true }), song({})]))
+      .toBe("2 están ocultas para el cliente hasta que las publiques y 1 sigue mostrando la versión anterior.");
   });
 });

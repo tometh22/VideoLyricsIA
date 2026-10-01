@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import ChangeRequestsPanel from "./ChangeRequestsPanel";
 import useChangeRequests from "./useChangeRequests";
 import ChangeRequestRenderReview from "./ChangeRequestRenderReview";
+import { PublicationModeSwitch } from "./ClientVisibility";
 
 export default function ChangeRequestsSection({ initialPendingCount, onPendingCountChange }) {
   const changes = useChangeRequests({ initialPendingCount });
@@ -49,7 +50,15 @@ export default function ChangeRequestsSection({ initialPendingCount, onPendingCo
           <span>UMG Argentina y UMG Chile · más recientes primero</span>
           <span className="hidden sm:inline">J/K navega · / busca · ⌘↵ ejecuta la acción recomendada</span>
         </div>
+        <PublicationModeSwitch
+          mode={changes.crPublicationMode}
+          busy={changes.crModeBusy}
+          canChange={changes.crCanChangeMode}
+          onChange={changes.changePublicationMode}
+        />
         <ChangeRequestsPanel
+          visibilityBusyId={changes.crVisibilityBusyId}
+          setDeliveryVisibility={changes.setDeliveryVisibility}
           changeRequests={changes.changeRequests}
           crStatusFilter={changes.crStatusFilter}
           setCrStatusFilter={changes.setCrStatusFilter}

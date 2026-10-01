@@ -1,4 +1,4 @@
-import { byPublicationMode } from "./publicationMode";
+import { byPublicationMode, byRowMode } from "./publicationMode";
 
 export const PORTAL_LABELS = {
   argentina: "UMG Argentina",
@@ -55,9 +55,9 @@ export function requestWorkflow(item, loadedProposal, proposalEnabled = true) {
   if (BUSY_JOB_STATUSES.has(publication.job_status)) {
     return {
       key: "rendering", activeStep: 2, label: "Generando corte nuevo",
-      detail: byPublicationMode({
+      detail: byRowMode(publication, {
         snapshot: "El portal conserva la versión anterior hasta que revises y publiques.",
-        pointer: "El cliente verá el video nuevo apenas termine. Después revisalo y publicá para registrar la versión.",
+        pointer: "El cliente no ve este video hasta que lo publiques (salvo que esté “Siempre visible”). Después revisalo y publicá para registrar la versión.",
       }),
       tone: "busy",
     };
@@ -396,9 +396,9 @@ export function correctionSentence(workflow, ctx = {}) {
     case "render":
       return `La corrección está guardada, pero el video todavía es el anterior. Generá el video corregido.${manual}`;
     case "rendering":
-      return byPublicationMode({
+      return byRowMode(publication, {
         snapshot: "Estamos generando el video nuevo. El portal sigue mostrando el anterior hasta que lo publiques.",
-        pointer: "Estamos generando el video nuevo. El cliente lo verá apenas termine; después publicalo para registrar la versión.",
+        pointer: "Estamos generando el video nuevo. El cliente no lo ve hasta que lo publiques (salvo que esté “Siempre visible”).",
       });
     case "blocked":
       return "No se pudo generar el video nuevo. Abrí el error para ver el motivo y no vuelvas a aplicar los cambios guardados.";
@@ -416,7 +416,9 @@ export function correctionSentence(workflow, ctx = {}) {
       return "Ya hay una versión publicada. Revisá que lo pedido esté en el video y cerrá el pedido con una nota.";
     case "resolved": case "closed":
       return stepPosition(workflow) === 3
-        ? "Pedido resuelto: el video nuevo ya está en el portal."
+        ? (publication?.hidden_from_client
+          ? "Pedido resuelto. El video nuevo está publicado, pero el cliente todavía no lo ve: está oculto."
+          : "Pedido resuelto: el video nuevo ya está en el portal.")
         : "Pedido cerrado sin publicar un video nuevo.";
     case "refresh":
       return "La propuesta cambió. Actualizá el estado y revisá los cambios antes de seguir.";

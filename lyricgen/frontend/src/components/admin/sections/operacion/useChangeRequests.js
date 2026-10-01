@@ -17,6 +17,8 @@ const ACTIVE_RENDER_STATUSES = new Set([
 // decision back to the operator, and the shortest pause between checks.
 const PREPARE_TIMEOUT_S = 15 * 60;
 const PREPARE_POLL_MIN_MS = 5000;
+const HIDDEN_HINT = " Elegí “Automático” o “Siempre visible” en “Qué ve el cliente” para mostrárselo.";
+const MODE_SETTLE_MS = 12000;
 const sleepMs = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 function publicationHasPendingWork(publication) {
@@ -77,6 +79,13 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   const [crPublishingId, setCrPublishingId] = useState(null);
   const [crPublishNotice, setCrPublishNotice] = useState(null);
   const [crRenderReview, setCrRenderReview] = useState(null);
+  const [crPublicationMode, setCrPublicationMode] = useState("snapshot");
+  const [crModeBusy, setCrModeBusy] = useState(false);
+  const [crCanChangeMode, setCrCanChangeMode] = useState(false);
+  // The API replicas cache the setting for a few seconds: right after the operator
+  // flips it, a list read from another replica must not flip the switch back.
+  const modeSetAtRef = useRef(0);
+  const [crVisibilityBusyId, setCrVisibilityBusyId] = useState(null);
   const renderReviewRef = useRef(crRenderReview);
   renderReviewRef.current = crRenderReview;
   const renderLockRef = useRef(false);
@@ -162,7 +171,11 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       setCrPendingCount(data.pending_count || 0);
       setCrResolvedCount(data.resolved_count || 0);
       setCrProposalEnabled(data.proposal_enabled === true);
-      setPublicationMode(data.publication_mode);
+      setCrCanChangeMode(data.can_change_publication_mode === true);
+      if (Date.now() - modeSetAtRef.current > MODE_SETTLE_MS) {
+        setPublicationMode(data.publication_mode);
+        setCrPublicationMode(data.publication_mode === "pointer" ? "pointer" : "snapshot");
+      }
       setCrProposalApplyEnabled(data.proposal_apply_enabled === true);
     } catch (err) {
       if (generation === listGenerationRef.current && requestedFilter === crStatusRef.current) {
@@ -433,7 +446,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
           ? "Este pedido de fondo ya fue recibido. Consultá su resultado antes de solicitar otra opción; todavía no se publicó."
           : byPublicationMode({
             snapshot: "La regeneración empezó. El portal conserva el corte anterior: esperá a que termine, abrí el video nuevo y publicalo sólo si quedó bien.",
-            pointer: "La regeneración empezó. El cliente verá el fondo nuevo apenas termine: esperá a que termine, abrí el video nuevo y publicalo para registrarlo.",
+            pointer: "La regeneración empezó. El cliente no verá el fondo nuevo hasta que lo publiques (salvo que esté “Siempre visible”): esperá a que termine, abrí el video nuevo y publicalo para registrarlo.",
           }),
       });
       await loadChangeRequests({ silent: true });
@@ -643,17 +656,17 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         setCrPublishNotice({
           requestId: crId,
           tone: "ok",
-          text: `Publicada la versión ${data.revision}. El cliente la ve como pendiente de aprobar${
+          text: `Publicada la versión ${data.revision}. ${data.hidden_from_client ? "OJO: el cliente todavía no la ve, este video está oculto" : "El cliente la ve como pendiente de aprobar"}${
             data.resolved_change_requests?.length
               ? ` y se cerraron ${data.resolved_change_requests.length} pedido(s)`
               : ""
-          }.`,
+          }.${data.hidden_from_client ? HIDDEN_HINT : ""}`,
         });
       } else {
         setCrPublishNotice({
           requestId: crId,
           tone: "ok",
-          text: "Reenviado. El render es el mismo que ya estaba publicado, así que la versión y la aprobación no cambian.",
+          text: `Reenviado. El render es el mismo que ya estaba publicado, así que la versión y la aprobación no cambian.${data.hidden_from_client ? ` OJO: el cliente no lo ve, está oculto.${HIDDEN_HINT}` : ""}`,
         });
       }
       // A committed publication stays confirmed even if the follow-up list read
@@ -749,6 +762,42 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     await loadChangeRequests({ silent: true });
   }, [loadChangeRequests]);
 
+  // What the client sees of ONE delivery: "auto" | "visible" | "hidden".
+  const setDeliveryVisibility = useCallback(async (deliveryId, mode) => {
+    setCrVisibilityBusyId(deliveryId);
+    try {
+      await fetchJson(`${API}/admin/deliveries/${deliveryId}/visibility`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      await loadChangeRequests({ silent: true });
+    } catch (err) {
+      flashError(`No pude cambiar lo que ve el cliente: ${err.message || err}`);
+    } finally {
+      setCrVisibilityBusyId(null);
+    }
+  }, [flashError, loadChangeRequests]);
+
+  // Global: publish by copying files ("snapshot") or without copies ("pointer").
+  const changePublicationMode = useCallback(async (mode) => {
+    setCrModeBusy(true);
+    try {
+      const data = await fetchJson(`${API}/admin/publication-settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ publication_mode: mode }),
+      });
+      modeSetAtRef.current = Date.now();
+      setPublicationMode(data.publication_mode);
+      setCrPublicationMode(data.publication_mode === "pointer" ? "pointer" : "snapshot");
+    } catch (err) {
+      flashError(`No pude cambiar el modo de publicación: ${err.message || err}`);
+    } finally {
+      setCrModeBusy(false);
+    }
+  }, [flashError]);
+
   const reopenChangeRequest = useCallback(async (id) => {
     setCrResolvingId(id);
     try {
@@ -793,5 +842,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     reviewForRender, confirmRender, crRenderReview, setCrRenderReview: closeRenderReview,
     prepareProRes,
     handleProResConfigured,
+    crPublicationMode, crModeBusy, crCanChangeMode, changePublicationMode,
+    crVisibilityBusyId, setDeliveryVisibility,
   };
 }

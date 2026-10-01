@@ -59,15 +59,19 @@ def portal(rows):
             "CREATE TABLE deliveries (id INTEGER, job_id TEXT, portal_id TEXT, tenant_snapshot TEXT,"
             " removed_at TEXT, published_render_fingerprint TEXT, published_revision INTEGER,"
             " stale_since TEXT, stale_reason TEXT, approved_at TEXT, content_updated_at TEXT,"
-            " published_file_keys TEXT, added_at TEXT)"
+            " published_file_keys TEXT, added_at TEXT, client_visibility TEXT)"
         ))
         conn.execute(text("CREATE TABLE delivery_change_requests (id INTEGER, delivery_id INTEGER, resolved_at TEXT, submitted_at TEXT)"))
         for n, row in enumerate(rows, start=1):
             job_id, portal_id, tenant, pending = row[:4]
             keys = row[4] if len(row) > 4 else None   # a JSON string = this delivery serves a frozen snapshot
             added = row[5] if len(row) > 5 else "2026-09-14 10:00:00.000000"   # when the portal last received it
-            conn.execute(text("INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,NULL,NULL,1,NULL,NULL,NULL,NULL,:keys,:added)"),
-                         dict(n=n, job=job_id, portal=portal_id, tenant=tenant, keys=keys, added=added))
+            stale = row[6] if len(row) > 6 else None            # unpublished changes in flight
+            visibility = row[7] if len(row) > 7 else None       # the operator's manual choice
+            conn.execute(text("INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,NULL,NULL,1,:stale,"
+                              "CASE WHEN :stale IS NULL THEN NULL ELSE 'editing' END,NULL,NULL,:keys,:added,:vis)"),
+                         dict(n=n, job=job_id, portal=portal_id, tenant=tenant, keys=keys, added=added,
+                              stale=stale, vis=visibility))
             for request in range(pending):
                 conn.execute(text("INSERT INTO delivery_change_requests VALUES (:id,:delivery,NULL,:submitted)"),
                              dict(id=n * 100 + request, delivery=n,
@@ -299,6 +303,45 @@ def test_pipeline_reports_per_delivery_whether_the_portal_serves_the_latest_rend
     assert on["publication_mode"] == "pointer"
     # Mixed population: only the delivery WITHOUT a snapshot follows the newest render.
     assert by_title(on)["Tema 0"] is True and by_title(on)["Tema 1"] is False
+
+
+def test_a_song_whose_changes_are_unpublished_is_hidden_from_the_client_unless_forced_visible(db, setup, monkeypatch):
+    campaign, items, actor = setup
+    editing = add_job(db, campaign, actor, item=items[0], status="done")
+    forced = add_job(db, campaign, actor, item=items[1], status="done")
+    hidden = add_job(db, campaign, actor, item=items[2], status="done")
+    frozen = add_job(db, campaign, actor, item=items[3], status="done")
+    db.commit()
+    stale = "2026-09-30 10:00:00.000000"
+    rows = [(editing.job_id, "chile", campaign.tenant_id, 0, None, "2026-09-14 10:00:00.000000", stale),
+            (forced.job_id, "chile", campaign.tenant_id, 0, None, "2026-09-14 10:00:00.000000", stale, "visible"),
+            (hidden.job_id, "chile", campaign.tenant_id, 0, None, "2026-09-14 10:00:00.000000", None, "hidden"),
+            (frozen.job_id, "chile", campaign.tenant_id, 0, '{"video": "k.published-1"}', "2026-09-14 10:00:00.000000", stale)]
+    with portal(rows) as session:
+        monkeypatch.setattr(creative, "scoped_deliveries_db", session)
+        monkeypatch.setenv("PUBLISH_LATEST_POINTER", "1")
+        result = pipeline.campaign_pipeline(campaign.id, actor, db)
+    by_title = {row["title"]: row for row in result["items"]}
+    assert (by_title["Tema 0"]["portal_hidden"], by_title["Tema 0"]["portal_serves_latest"]) == (True, False)
+    assert (by_title["Tema 1"]["portal_hidden"], by_title["Tema 1"]["portal_serves_latest"]) == (False, True)
+    assert (by_title["Tema 2"]["portal_hidden"], by_title["Tema 2"]["portal_serves_latest"]) == (True, False)
+    # A frozen snapshot is never auto-hidden: it keeps serving the approved cut.
+    assert (by_title["Tema 3"]["portal_hidden"], by_title["Tema 3"]["portal_serves_latest"]) == (False, False)
+
+
+def test_a_song_hidden_in_one_portal_but_visible_in_the_other_is_not_reported_as_hidden(db, setup, monkeypatch):
+    campaign, items, actor = setup
+    both = add_job(db, campaign, actor, item=items[0], status="done")
+    db.commit()
+    added = "2026-09-14 10:00:00.000000"
+    rows = [(both.job_id, "argentina", campaign.tenant_id, 0, None, added, None, "hidden"),
+            (both.job_id, "chile", campaign.tenant_id, 0, None, added, None, None)]
+    with portal(rows) as session:
+        monkeypatch.setattr(creative, "scoped_deliveries_db", session)
+        monkeypatch.setenv("PUBLISH_LATEST_POINTER", "1")
+        result = pipeline.campaign_pipeline(campaign.id, actor, db)
+    song = {row["title"]: row for row in result["items"]}["Tema 0"]
+    assert song["portal_hidden"] is False and song["portal_serves_latest"] is True
 
 
 def _overwritten(db, job, when):

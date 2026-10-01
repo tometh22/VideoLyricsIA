@@ -3,6 +3,43 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.88] - 2026-10-01
+
+### Added
+
+- Per-delivery control of what the CLIENT sees (Admin > Cambios UMG, "Qué ve el
+  cliente"): **Automático** (default) hides the delivery while it has unpublished
+  changes and shows it again when it is published, **Siempre visible** keeps the
+  newest cut available, **Oculto** keeps it out of the portal until an operator
+  changes it. The portal keeps the card (and the client's requests) and only drops
+  the files (`files_hidden`). Only an edit IN FLIGHT (`editing`, `prores_pending`)
+  auto-hides: a frozen snapshot is never hidden and a dead edit (`edit_failed`) is
+  not either, so the operator is never left without a way out. A stale
+  professional master is never served, even when forced visible. Previously
+  issued signed links keep working until they expire (7 days). Publishing a
+  manually hidden delivery now says so ("OJO: el cliente todavía no la ve"), and a
+  hidden delivery cannot have a master prepared from the portal.
+- Admin switch "Publicar sin copiar archivos": picks copy-the-files or no-copies
+  publication without a Railway edit or deploy. Deployment-wide, so it asks for
+  confirmation and only the super admin can change it. The panel choice overrides
+  `PUBLISH_LATEST_POINTER`, which remains only the default.
+- Campaigns: songs the client cannot see at all (hidden in EVERY portal they are
+  published to) are reported as `portal_hidden` and worded accordingly ("Oculto
+  para el cliente", "el cliente no ve el video hasta que lo publiques").
+
+### Database
+
+- `deliveries.client_visibility VARCHAR(10)`: nullable, no default, added with
+  `IF NOT EXISTS` (Alembic `e5a7c9b1d3f6`). The portal rows live in the production
+  database, so the column must exist there before staging reads it; code that
+  ignores it keeps working. Also a local `system_settings` table (never the shared
+  portal database).
+
+### Changed
+
+- No-copies publication wording no longer promises the client sees the new cut as
+  soon as it renders: with the automatic mode they see it when it is published.
+
 ## [1.1.87] - 2026-10-01
 
 ### Fixed

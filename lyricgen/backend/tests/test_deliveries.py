@@ -658,6 +658,37 @@ def test_portal_can_prepare_missing_prores_for_its_delivery(
     enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True, dedupe_live=True)
 
 
+def test_a_hidden_delivery_cannot_have_a_master_prepared_and_publish_reports_the_visibility(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    # The publish response tells the operator whether the client can see it at all.
+    assert published.json()["client_visibility"] == "auto"
+    assert published.json()["hidden_from_client"] is False
+    delivery_id = published.json()["delivery_id"]
+    hidden = client.put(f"/admin/deliveries/{delivery_id}/visibility",
+                        headers=auth(admin_token), json={"mode": "hidden"})
+    assert hidden.status_code == 200, hidden.text
+    again = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["client_visibility"] == "hidden" and again.json()["hidden_from_client"] is True
+    with patch("main.enqueue_prores_prewarm", return_value="prewarm:test") as enqueue:
+        res = client.post(
+            f"/api/deliveries/{delivery_id}/prepare-prores",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+            json={"file_type": "umg_master"},
+        )
+    assert res.status_code == 404
+    enqueue.assert_not_called()
+
+
 def test_portal_can_prepare_staging_delivery_without_local_job(
     client, admin_token, approved_job, all_r2_files_present, db,
 ):

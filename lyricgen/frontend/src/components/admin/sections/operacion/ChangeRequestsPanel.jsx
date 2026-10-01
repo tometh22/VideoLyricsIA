@@ -18,7 +18,8 @@ import EnableProResModal from "../../../EnableProResModal";
 import ChangeRequestQueue from "./ChangeRequestQueue";
 import RequestWorkflowStepper from "./RequestWorkflowStepper";
 import RequestVideo from "./RequestVideo";
-import { byPublicationMode } from "./publicationMode";
+import { byPublicationMode, byRowMode } from "./publicationMode";
+import { ClientVisibilityControl } from "./ClientVisibility";
 import {
   PORTAL_LABELS,
   correctionSteps,
@@ -58,10 +59,10 @@ export function publicationStatus(publication) {
     return {
       tone: "busy",
       title: "Re-renderizando",
-      detail: byPublicationMode({
+      detail: byRowMode(publication, {
         snapshot: "Mientras tanto el portal sigue entregando la versión anterior. " +
           "Cuando termine, publicá la actualización desde acá.",
-        pointer: "El cliente verá el video nuevo apenas termine. " +
+        pointer: "El cliente no ve este video hasta que lo publiques (salvo que esté “Siempre visible”). " +
           "Cuando termine, publicá la actualización desde acá para registrar la versión.",
       }),
       canPublish: false,
@@ -98,10 +99,10 @@ export function publicationStatus(publication) {
     return {
       tone: "warn",
       title: "El render nuevo está listo para revisar",
-      detail: byPublicationMode({
+      detail: byRowMode(publication, {
         snapshot: "Abrí el video de esta tarjeta y comprobá el cambio. El portal sigue " +
           "entregando el corte anterior hasta que publiques la actualización.",
-        pointer: "Abrí el video de esta tarjeta y comprobá el cambio. El cliente ya descarga este corte: " +
+        pointer: "Abrí el video de esta tarjeta y comprobá el cambio. El cliente no lo ve hasta que lo publiques (salvo que esté “Siempre visible”): " +
           "publicá para registrar la versión nueva y dar por resuelto el pedido.",
       }),
       canPublish: true,
@@ -192,6 +193,8 @@ export default function ChangeRequestsPanel({
   onProResConfigured = () => {},
   reviewForRender = () => {},
   refreshChangeRequests = () => {},
+  visibilityBusyId = null,
+  setDeliveryVisibility = () => {},
 }) {
   // Draft local del input de "respuesta" por CR. Clave = id del CR.
   const [drafts, setDrafts] = useState({});
@@ -331,7 +334,7 @@ export default function ChangeRequestsPanel({
         <div role="status" className="flex items-start justify-between gap-3 rounded-xl bg-sky-500/[0.08] p-3 text-caption text-sky-100 ring-1 ring-sky-400/20">
           <span>{byPublicationMode({
             snapshot: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el portal conserva el corte anterior hasta que lo publiques.",
-            pointer: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el cliente verá el video nuevo apenas termine.",
+            pointer: "El render corregido fue enviado. Podés seguir su progreso desde este pedido; el cliente no lo ve hasta que lo publiques (salvo que esté “Siempre visible”).",
           })}</span>
           <button type="button" onClick={() => setReturnNotice(false)} className="shrink-0 text-label opacity-70 hover:opacity-100">
             Cerrar
@@ -405,6 +408,8 @@ export default function ChangeRequestsPanel({
               onPrepareOnly={() => prepareProRes(selectedItem.delivery?.job_id, selectedItem.id)}
               onReviewRender={() => reviewForRender(selectedItem.id)}
               onRefresh={() => refreshChangeRequests()}
+              visibilityBusy={visibilityBusyId != null && visibilityBusyId === selectedItem.delivery?.id}
+              onChangeVisibility={setDeliveryVisibility}
               proposalEnabled={proposalEnabled}
               proposalApplyEnabled={proposalApplyEnabled}
               proposalBusy={proposalBusyId === selectedItem.id}
@@ -465,6 +470,7 @@ function ChangeRequestCard({
   proposalEnabled, proposalApplyEnabled, proposalBusy, proposal,
   onGenerateProposal, onLoadProposal, onAdjustProposal, onApplyProposal,
   onDismissProposal, onRegenerateBackground, onRefresh,
+  visibilityBusy = false, onChangeVisibility,
 }) {
   const d = item.delivery || {};
   const isResolved = !!item.resolved_at;
@@ -664,6 +670,12 @@ function ChangeRequestCard({
               Cambios en curso desde {fmtAgo(item.publication.stale_since)}.
             </p>
           )}
+          <ClientVisibilityControl
+            publication={item.publication}
+            deliveryId={d.id}
+            busy={visibilityBusy}
+            onChange={onChangeVisibility}
+          />
         </div>
 
         <div className="min-w-0 space-y-4">

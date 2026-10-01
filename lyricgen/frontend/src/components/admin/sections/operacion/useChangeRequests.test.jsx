@@ -505,3 +505,46 @@ it("does not replace the publication confirmation with the old 'preparation fini
   expect(result.current.crPublishNotice.text).not.toContain("no confirma");
 });
 
+
+// --- What the client sees ------------------------------------------------------
+
+it("warns when the publication succeeded but the delivery is hidden from the client", async () => {
+  scriptPublish([{ ...published, hidden_from_client: true, client_visibility: "hidden" }]);
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  await act(() => result.current.publishDeliveryUpdate("job-85", "chile", 85, PUBLISH_BODY));
+  const text = result.current.crPublishNotice.text;
+  expect(text).toContain("Publicada la versión 2");
+  expect(text).toContain("el cliente todavía no la ve");
+  expect(text).toContain("Qué ve el cliente");
+});
+
+it("changes what the client sees for ONE delivery and reloads the list", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => url.includes("/admin/deliveries/9/visibility")
+    ? Promise.resolve({ ok: true, client_visibility: "hidden", hidden_from_client: true })
+    : previous(url, opts));
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  await act(() => result.current.setDeliveryVisibility(9, "hidden"));
+  const call = mocks.fetchJson.mock.calls.find(([url]) => url.includes("/admin/deliveries/9/visibility"));
+  expect(call[1]).toMatchObject({ method: "PUT", body: JSON.stringify({ mode: "hidden" }) });
+  expect(result.current.crVisibilityBusyId).toBeNull();
+});
+
+it("switches the publication mode once and does not let a stale list flip it back", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => {
+    if (url.includes("/admin/publication-settings")) return Promise.resolve({ publication_mode: "pointer", source: "panel" });
+    if (url.startsWith("/admin/change-requests?")) return Promise.resolve({ items: [], publication_mode: "snapshot", can_change_publication_mode: true });
+    return previous(url, opts);
+  });
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  expect(result.current.crCanChangeMode).toBe(true);
+  await act(() => result.current.changePublicationMode("pointer"));
+  expect(result.current.crPublicationMode).toBe("pointer");
+  // Another replica still answers "snapshot" for a few seconds: the switch stays put.
+  await act(() => result.current.refreshChangeRequests({ silent: true }));
+  expect(result.current.crPublicationMode).toBe("pointer");
+});
