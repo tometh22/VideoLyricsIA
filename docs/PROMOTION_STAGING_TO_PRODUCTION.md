@@ -113,6 +113,23 @@ Producción tiene 159 variables y staging 221. Nunca copiar valores secretos ent
 `DEMUCS_LEASE_TTL_S`, `DEMUCS_SLOT_WAIT_MAX_S`, `MAX_UPLOAD_MB`, `EXPECTED_WORKER_REPLICAS`,
 `EXPECTED_SHORT_WORKER_REPLICAS` (ajustar a 7 y 3 si se activa el chequeo de flota).
 
+**Verificación de defaults (1-oct, 589 variables que lee staging contra 517 de la línea de producción):**
+74 variables son nuevas y ninguna está definida en Railway producción. Los valores por defecto que
+**se encienden solos** al promover son `ANCHOR_LOCAL_ALIGN_ENABLED` (cuarto alineador),
+`DELIVERY_QC_UMG_OCR_ENABLED`, `LYRIC_REVIEW_FETCH_OFFICIAL` y `REANCHOR_CRAMMED_GUARD`; staging corre esos
+mismos defaults, así que están probados. `LYRIC_REVIEW_MODE` tiene default `enforce` en el código y
+staging usa `observe` (efectivo solo en trabajos de campaña masiva o `LYRIC_REVIEW_ENFORCE_TENANTS`):
+**fijarlo en `observe`** en producción para igualar a staging.
+
+**Dos bloqueos de aprobación nuevos, que la línea de producción no tiene** (no existen `delivery_readiness_gate`
+ni `language_review.py` allí): (1) cualquier trabajo "de entrega UMG" (perfil `umg`/`both`, `umg_spec`, ProRes
+listo, archivos maestros UMG o clase `batch`) exige preflight COMPLETO y vigente más revisión manual para
+aprobar o publicar; (2) `409 language_review_unresolved` al aprobar la letra con una discrepancia de idioma
+sin resolver. Para conservar el comportamiento actual de producción hasta rediseñar el control de calidad,
+**fijar en producción**: `DELIVERY_QC_GATES_OFF=1` y `LANGUAGE_REVIEW_ADVISORY=1` (1.1.91). Quedan visibles en
+`/health` (`features.delivery_qc_gates_off`, `features.language_review_advisory`). Los reportes se siguen
+generando; solo dejan de bloquear. Para activar los bloqueos más adelante, borrar esas variables.
+
 **Con valor distinto (producción → staging). Decide el dueño; propuesta entre paréntesis:**
 
 | Variable | Producción | Staging | Propuesta |
@@ -152,16 +169,18 @@ Precondiciones (todas verdes antes de empezar):
 Pasos (el orden evita un doble deploy):
 1. **Llevar `main` al estado de staging** con un PR `staging` → `main` (solo con el "esto va a producción"). Mientras ningún servicio apunte a `main`, esto no despliega nada.
 2. Confirmar que el PR dejó `main` idéntico a staging (`git diff origin/staging origin/main` vacío).
-3. Aplicar las variables aprobadas a producción (sección 5) **sin redeploy** (`railway variables --set ... --skip-deploys`). Incluye `LYRIC_LEAD_IN_S=0.08` y `LYRIC_HOLD_S=0.5`.
+3. Aplicar las variables aprobadas a producción (sección 5) **sin redeploy** (`railway variables --set ... --skip-deploys`). Incluye `LYRIC_LEAD_IN_S=0.08`, `LYRIC_HOLD_S=0.5`, `LYRIC_REVIEW_MODE=observe`, `DELIVERY_QC_GATES_OFF=1` y `LANGUAGE_REVIEW_ADVISORY=1` (en los servicios que las leen: api y workers).
 4. Apuntar los cuatro triggers a `main` (mutación `deploymentTriggerUpdate(id, input: {branch: "main"})` o el panel: Settings → Source → Branch). Se dispara **un solo** deploy por servicio con el estado final.
 5. Seguir el deploy: la api migra antes de arrancar (`require_api_schema`); los workers esperan el esquema (`require_worker_schema`) y arrancan solos.
-6. Verificar: `/health` de `api.genly.pro` en `ok`, flota coherente y todos los workers en el commit nuevo; smoke de edición; portal de UMG (listado, descarga, pedido de cambio) en ambos dominios; Sentry sin errores nuevos.
-7. Vigilar 24–48 h: salud, colas, errores, costos y la tasa de errores del portal.
+6. Verificar el backend: `/health` de `api.genly.pro` en `ok`, flota coherente, todos los workers en el commit nuevo, `features.delivery_qc_gates_off` y `features.language_review_advisory` en `true`; smoke de edición; portal de UMG (listado, descarga, pedido de cambio) en ambos dominios; Sentry sin errores nuevos.
+7. **Frontend (Vercel)**: genly.pro lo sirve Vercel y su rama de Producción también apunta hoy a `tometh22/umg-chile-portal` (último deploy `397965aa`). Recién con el backend verificado, cambiar la rama de Producción del proyecto Vercel a `main` y redeployar. Orden: el backend nuevo tolera al frontend viejo; lo contrario no está garantizado.
+8. Vigilar 24–48 h: salud, colas, errores, costos y la tasa de errores del portal.
 
 **Criterios de aborto** (volver atrás sin discutir): `/health` no ok pasados 15 minutos, flota no coherente,
 portal de UMG con errores, o error de migración.
 
 **Rollback (en este orden de preferencia):**
+0. *Frontend:* en Vercel, volver la rama de Producción a `tometh22/umg-chile-portal` y redeployar, o promover el deployment anterior (`397965aa`).
 1. *Rápido, por imagen:* `deploymentRollback(id)` con los ids de la tabla de arriba (api primero, luego workers). Puede no estar disponible cuando Railway ya retiró el deployment antiguo.
 2. *Seguro, por rama:* `deploymentTriggerUpdate(id, input: {branch: "tometh22/umg-chile-portal"})` en los cuatro triggers y esperar el build (~10–15 min). Funciona siempre que la rama siga en `397965aa`.
 3. Las variables nuevas (`LYRIC_*`) se revierten con `railway variables --set LYRIC_LEAD_IN_S=0.4 LYRIC_HOLD_S=0.25`.
