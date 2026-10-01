@@ -528,12 +528,37 @@ def staging_delivery_gates_off() -> bool:
     return os.environ.get("DELIVERY_QC_STAGING_GATES_OFF", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def delivery_readiness_gate(job: Any, report: Mapping[str, Any] | None, *, for_umg_delivery: bool = False) -> dict[str, Any]:
+def delivery_gates_off_reason() -> str | None:
+    """Why the delivery QC/preflight gate is switched off right now, or None.
+
+    * ``DELIVERY_QC_GATES_OFF`` works in ANY environment, production included. It
+      exists so a promotion can keep the behaviour production had before this
+      gate existed, until the QC redesign is ready. It is an explicit operator
+      decision (env var, default off), reported in /health, never a code default.
+    * ``DELIVERY_QC_STAGING_GATES_OFF`` is the older switch and only acts when
+      ENVIRONMENT is exactly "staging".
+
+    Reports are still generated and shown; they just stop gating.
+    """
+    if os.environ.get("DELIVERY_QC_GATES_OFF", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return "delivery_gates_off"
     if staging_delivery_gates_off():
+        return "staging_delivery_gates_off"
+    return None
+
+
+def delivery_gates_off() -> bool:
+    return delivery_gates_off_reason() is not None
+
+
+def delivery_readiness_gate(job: Any, report: Mapping[str, Any] | None, *, for_umg_delivery: bool = False) -> dict[str, Any]:
+    gates_off = delivery_gates_off_reason()
+    if gates_off:
         return {
             "blocked": False, "can_approve": True,
-            "reason": "staging_delivery_gates_off",
-            "staging_gates_off": True,
+            "reason": gates_off,
+            "gates_off": True,
+            "staging_gates_off": gates_off == "staging_delivery_gates_off",
             "staging_preflight_bypass": True,
             "staging_manual_review_bypass": True,
         }
