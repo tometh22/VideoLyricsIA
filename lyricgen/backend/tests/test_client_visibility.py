@@ -115,7 +115,7 @@ def test_portal_listing_keeps_the_card_but_drops_the_files_while_hidden(client, 
     import queue_jobs
     monkeypatch.setenv('DELIVERY_PORTAL_TOKEN_ARGENTINA', 'synthetic-visibility-token')
     monkeypatch.setattr(queue_jobs, '_init_redis', lambda: (None, None, None))
-    monkeypatch.setattr(storage, '_get_client', lambda: SimpleNamespace(head_object=lambda **kw: {'ContentLength': 10}))
+    monkeypatch.setattr(storage, '_get_metadata_client', lambda: SimpleNamespace(head_object=lambda **kw: {'ContentLength': 10}))
     monkeypatch.setattr(storage, 'generate_signed_url', lambda key, **kw: 'https://synthetic.invalid/' + key)
     user_id, tenant_id = _admin_identity(db)
     job_id = _create_pending_review_job(db, tenant_id, user_id, s3_keys={'video': 't/j/lyric_video.mp4'})
