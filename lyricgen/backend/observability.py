@@ -654,6 +654,14 @@ def worker_fleet_coherence(
     }
 
 
+def _gate_switch(module: str, function: str) -> bool:
+    """Read an operator gate switch for /health without ever breaking it."""
+    try:
+        return bool(getattr(__import__(module), function)())
+    except Exception:
+        return False
+
+
 def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
     """Lightweight report of runtime health.
 
@@ -684,6 +692,9 @@ def health_snapshot(*, enforce_fleet_readiness: bool = True) -> dict:
             in ("1", "true", "yes", "on"),
             "youtube_publish": os.environ.get("YOUTUBE_PUBLISH_ENABLED", "0").strip().lower()
             in ("1", "true", "yes", "on"),
+            # Approval gates an operator has switched off: visible, never silent.
+            "delivery_qc_gates_off": _gate_switch("delivery_qc_runtime", "delivery_gates_off"),
+            "language_review_advisory": _gate_switch("language_review", "advisory"),
         },
     }
     try:

@@ -149,7 +149,7 @@ from transcription_language import (
 from language_review import (
     reference_text_of as _job_reference_text,
     review_payload as _language_review_payload,
-    staging_advisory as _language_staging_advisory,
+    advisory as _language_staging_advisory,
 )
 from delivery_snapshots import latest_pointer_enabled as _latest_pointer_enabled
 from delivery_snapshots import is_hidden_from_client

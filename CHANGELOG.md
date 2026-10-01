@@ -3,6 +3,20 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.91] - 2026-10-01
+
+### Added
+
+- Production-capable switches for the two approval gates that did not exist in the
+  production line, so a promotion can keep production's behaviour until the QC redesign
+  is ready: `DELIVERY_QC_GATES_OFF` (delivery QC/preflight never blocks, any environment)
+  and `LANGUAGE_REVIEW_ADVISORY` (the language review warns but never answers 409 on
+  approve / approve-lyrics, any environment). Both are explicit operator env vars,
+  default OFF (gates stay active), and are reported in `/health` under `features`
+  (`delivery_qc_gates_off`, `language_review_advisory`). The older staging-only switches
+  (`DELIVERY_QC_STAGING_GATES_OFF`, `LANGUAGE_REVIEW_STAGING_ADVISORY`) keep working and
+  stay inert outside staging. Reports are still generated and shown; they only stop gating.
+
 ## [1.1.90] - 2026-10-01
 
 ### Fixed
