@@ -57,42 +57,6 @@
       "platform_variant": true
     },
     {
-      "package": "transformers",
-      "id": "PYSEC-2025-217",
-      "expires": "2026-10-31",
-      "owner": "backend/video"
-    },
-    {
-      "package": "transformers",
-      "id": "PYSEC-2026-2290",
-      "expires": "2026-10-31",
-      "owner": "backend/video"
-    },
-    {
-      "package": "transformers",
-      "id": "PYSEC-2026-2288",
-      "expires": "2026-10-31",
-      "owner": "backend/video"
-    },
-    {
-      "package": "transformers",
-      "id": "PYSEC-2026-2289",
-      "expires": "2026-10-31",
-      "owner": "backend/video"
-    },
-    {
-      "package": "transformers",
-      "id": "CVE-2026-9856",
-      "expires": "2026-10-31",
-      "owner": "backend/video"
-    },
-    {
-      "package": "transformers",
-      "id": "CVE-2026-80047",
-      "expires": "2026-10-14",
-      "owner": "backend/video"
-    },
-    {
       "package": "ecdsa",
       "id": "PYSEC-2026-1325",
       "expires": "2026-10-31",
