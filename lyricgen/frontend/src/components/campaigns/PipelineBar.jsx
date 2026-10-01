@@ -4,7 +4,7 @@ import { EXTRA_STAGES, stagesFor, totalOf, toneOf } from "../../lib/campaignPipe
  * The campaign's navigation *is* its pipeline. Every tab counts songs with
  * the same backend rule, so the numbers add up to the campaign total.
  */
-export default function PipelineBar({ counts, kind, value, onChange, loading = false }) {
+export default function PipelineBar({ counts, kind, value, onChange, loading = false, badges = {} }) {
   const stages = stagesFor(kind);
   const active = totalOf(counts);
   const tabs = [
@@ -44,6 +44,10 @@ export default function PipelineBar({ counts, kind, value, onChange, loading = f
             <span className={`rounded-md px-1 py-0.5 text-xs tabular-nums ${selected ? "bg-white/10 text-white" : tab.human && tab.count ? "bg-white/[0.07] text-white" : "text-ink-secondary"}`}>
               {loading ? "—" : tab.count}
             </span>
+            {!loading && badges[tab.key] > 0 && <span title={`${badges[tab.key]} ${badges[tab.key] === 1 ? "lista para reenviar" : "listas para reenviar"} al portal`}
+              className="rounded-md bg-amber-400/15 px-1 py-0.5 text-xs tabular-nums text-amber-200">
+              <span aria-hidden="true">↻ {badges[tab.key]}</span><span className="sr-only"> · {badges[tab.key]} por reenviar</span>
+            </span>}
           </button>;
         })}
       </div>

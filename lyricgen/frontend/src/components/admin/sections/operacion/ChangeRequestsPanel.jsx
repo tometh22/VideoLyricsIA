@@ -78,9 +78,9 @@ export function publicationStatus(publication) {
         title: "Hay que elegir el formato del archivo profesional",
         detail:
           "Esta entrega vieja perdió la configuración de resolución, cuadros por segundo y perfil. " +
-          "Elegilos una vez para generar el .mov del último render. Esto no aplica cambios de letra pendientes.",
+          "Elegilos una vez: generamos el .mov del último render y publicamos el video corregido. Esto no aplica cambios de letra pendientes.",
         canPublish: true,
-        publishLabel: "Elegir formato y preparar el archivo profesional",
+        publishLabel: "Elegir formato y publicar",
         needsProResSetup: true,
       };
     }
@@ -89,9 +89,9 @@ export function publicationStatus(publication) {
       title: "Falta actualizar el archivo profesional (.mov)",
       detail:
         "El archivo profesional está pendiente respecto del último render. " +
-        "Actualizar el .mov no renderiza cambios de letra pendientes ni publica en el portal.",
+        "Al publicar se prepara solo (unos minutos) y el video sale cuando termine; no renderiza cambios de letra pendientes.",
       canPublish: true,
-      publishLabel: "Preparar el archivo profesional",
+      publishLabel: "Publicar en el portal y dar por resuelto",
     };
   }
   if (publication.needs_publish) {
@@ -290,10 +290,6 @@ export default function ChangeRequestsPanel({
       });
       return;
     }
-    if (item.publication?.prores_pending?.length) {
-      prepareProRes(item.delivery?.job_id, item.id);
-      return;
-    }
     if (item.publication?.render_fingerprint && !window.confirm(
       `¿Revisaste el video y confirmás publicar esta actualización en UMG ${item.delivery?.portal_id === "chile" ? "Chile" : "Argentina"}? El pedido quedará resuelto en ese portal.`,
     )) return;
@@ -406,6 +402,7 @@ export default function ChangeRequestsPanel({
               onResolve={() => resolveChangeRequest(selectedItem.id, drafts[selectedItem.id])}
               onReopen={() => reopenChangeRequest(selectedItem.id)}
               onPublish={() => publishItem(selectedItem)}
+              onPrepareOnly={() => prepareProRes(selectedItem.delivery?.job_id, selectedItem.id)}
               onReviewRender={() => reviewForRender(selectedItem.id)}
               onRefresh={() => refreshChangeRequests()}
               proposalEnabled={proposalEnabled}
@@ -443,14 +440,18 @@ export default function ChangeRequestsPanel({
         <EnableProResModal
           jobId={proResSetup.jobId}
           initialFrameSize={proResSetup.frameSize}
-          title="Configurar y actualizar el archivo profesional"
-          description="Elegí el formato que requiere Universal. Vamos a regenerar el .mov con el video corregido; todavía no se publicará en el portal."
-          submitLabel="Guardar formato y actualizar .mov"
+          title="Elegir el formato y publicar"
+          description="Elegí el formato que requiere Universal. Vamos a generar el archivo profesional del video corregido y publicarlo en el portal apenas esté listo."
+          submitLabel="Guardar formato y publicar"
           onClose={() => setProResSetup(null)}
           onSuccess={(data) => {
             const setup = proResSetup;
             setProResSetup(null);
             onProResConfigured(setup.requestId, data);
+            // The operator just asked for exactly this: keep going instead of
+            // stopping at "format saved" and making them press Publish again.
+            const item = changeRequests.find((row) => row.id === setup.requestId);
+            if (item) publishDeliveryUpdate(item.delivery?.job_id, item.delivery?.portal_id, item.id, item.publication);
           }}
         />
       )}
@@ -460,7 +461,7 @@ export default function ChangeRequestsPanel({
 
 function ChangeRequestCard({
   item, draft, onDraftChange, resolving, publishing, actionNotice,
-  onResolve, onReopen, onPublish, onReviewRender,
+  onResolve, onReopen, onPublish, onPrepareOnly, onReviewRender,
   proposalEnabled, proposalApplyEnabled, proposalBusy, proposal,
   onGenerateProposal, onLoadProposal, onAdjustProposal, onApplyProposal,
   onDismissProposal, onRegenerateBackground, onRefresh,
@@ -814,7 +815,8 @@ function ChangeRequestCard({
                 }
                 const onClick = link.key === "suggest" ? onGenerateProposal
                   : link.key === "render" ? onReviewRender
-                    : () => setCloseOpen((open) => !open);
+                    : link.key === "prepare_only" ? onPrepareOnly
+                      : () => setCloseOpen((open) => !open);
                 return (
                   <button key={link.key} type="button" onClick={onClick} disabled={link.disabled}
                     aria-expanded={link.key === "close" ? closeForm : undefined}

@@ -422,3 +422,86 @@ it("keeps the review link for a blocked publication without technical words", as
   expect(notice.actionLabel).toBe("Revisar este corte antes de publicar");
   expect(`${notice.text} ${notice.actionLabel}`).not.toMatch(/preflight|fingerprint|\bQC\b/i);
 });
+
+// --- One click publishes even when the professional master is not ready ---------
+
+const PUBLISH_BODY = { editor_revision: 4, render_fingerprint: "render4" };
+const preparing = { ok: false, status: "preparing_prores", retry_after: 10, stale: [], enqueued: ["umg_master"] };
+const published = { ok: true, content_changed: true, revision: 2, portal_id: "chile", job_id: "job-85", resolved_change_requests: [85] };
+
+function scriptPublish(steps) {
+  const previous = mocks.fetchJson.getMockImplementation();
+  const queue = [...steps];
+  mocks.fetchJson.mockImplementation((url, opts) => {
+    if (!url.includes("/deliveries/from-job/")) return previous(url, opts);
+    const next = queue.length > 1 ? queue.shift() : queue[0];
+    return next instanceof Error ? Promise.reject(next) : Promise.resolve(next);
+  });
+}
+const posts = () => mocks.fetchJson.mock.calls.filter(([url]) => url.includes("/deliveries/from-job/"));
+
+it("publishes by itself once the professional master is ready, asking again without a second click", async () => {
+  scriptPublish([preparing, preparing, published]);
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  vi.useFakeTimers();
+  let done;
+  await act(async () => { done = result.current.publishDeliveryUpdate("job-85", "chile", 85, PUBLISH_BODY); await vi.advanceTimersByTimeAsync(100); });
+  expect(posts()).toHaveLength(1);
+  expect(result.current.crPublishingId).toBe(85);              // the button stays busy: nothing to press again
+  expect(result.current.crPublishNotice).toMatchObject({ tone: "wait", text: expect.stringContaining("Se publica solo cuando esté listo") });
+  await act(async () => { result.current.publishDeliveryUpdate("job-85", "chile", 85, PUBLISH_BODY); });   // a second click is ignored
+  expect(posts()).toHaveLength(1);
+  await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+  expect(posts()).toHaveLength(2);
+  await act(async () => { await vi.advanceTimersByTimeAsync(10_000); await done; });
+  expect(posts()).toHaveLength(3);
+  expect(new Set(posts().map(([, options]) => options.body)).size).toBe(1);   // the same reviewed cut every time
+  expect(result.current.crPublishNotice).toMatchObject({ tone: "ok", text: expect.stringContaining("Publicada la versión 2") });
+  expect(result.current.crPublishingId).toBeNull();
+});
+
+it("hands control back with a clear message if the master takes far too long", async () => {
+  scriptPublish([preparing]);
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  vi.useFakeTimers();
+  let done;
+  await act(async () => { done = result.current.publishDeliveryUpdate("job-85", "chile", 85, PUBLISH_BODY); await vi.advanceTimersByTimeAsync(16 * 60 * 1000); await done; });
+  expect(result.current.crPublishNotice).toMatchObject({ tone: "error", text: expect.stringContaining("tarda más de lo normal") });
+  expect(result.current.crPublishNotice.text).toContain("no se perdió nada");
+  expect(result.current.crPublishingId).toBeNull();
+  expect(posts().length).toBeGreaterThan(5);
+});
+
+it("stops waiting and explains it when publishing fails while the master is being prepared", async () => {
+  scriptPublish([preparing, Object.assign(new Error("changed"), { status: 409 })]);
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  vi.useFakeTimers();
+  let done;
+  await act(async () => { done = result.current.publishDeliveryUpdate("job-85", "chile", 85, PUBLISH_BODY); await vi.advanceTimersByTimeAsync(10_500); await done; });
+  expect(posts()).toHaveLength(2);
+  expect(result.current.crPublishNotice).toMatchObject({ tone: "error", text: expect.stringContaining("El video cambió mientras se publicaba") });
+  expect(result.current.crPublishingId).toBeNull();
+});
+
+it("does not replace the publication confirmation with the old 'preparation finished' notice", async () => {
+  // The master finishing is reported by the list reload that follows a publish; it must not
+  // say "this does not publish" right after the video was published.
+  let pending = true;
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => {
+    if (url.startsWith("/admin/change-requests?")) {
+      return Promise.resolve({ items: [{ id: 85, publication: { job_status: "done", prores_pending: pending ? ["umg_master"] : [] } }] });
+    }
+    if (url.includes("/deliveries/from-job/")) { pending = false; return Promise.resolve(published); }
+    return previous(url, opts);
+  });
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  await act(() => result.current.publishDeliveryUpdate("job-85", "chile", 85, PUBLISH_BODY));
+  expect(result.current.crPublishNotice).toMatchObject({ tone: "ok", text: expect.stringContaining("Publicada la versión 2") });
+  expect(result.current.crPublishNotice.text).not.toContain("no confirma");
+});
+

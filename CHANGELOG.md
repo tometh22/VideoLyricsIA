@@ -3,6 +3,38 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.87] - 2026-10-01
+
+### Fixed
+
+- Publishing a correction is now ONE click even when the professional (ProRes)
+  master is missing: "Publicar en el portal y dar por resuelto" starts the master,
+  shows its progress, asks the server again by itself and publishes the same
+  reviewed cut when it is ready (15 minutes maximum, then it hands control back
+  with a clear message). The button stays disabled while it waits, and the old
+  "Preparar el archivo profesional" step is now a small "Solo preparar" link and
+  "Elegir formato y publicar" for legacy deliveries without a saved format.
+- A second click can no longer start a second multi-GB transcode: operator-driven
+  prewarm requests (enable-prores, publish, portal prepare, lazy download) return
+  the live job instead of enqueueing again. The edit pipeline keeps its re-run.
+- After a successful publication the screen no longer replaces "Publicada la
+  versión N" with "preparation finished, this does not publish".
+
+- Campaigns: deliveries published before fingerprints existed (legacy rows) were
+  never flagged as outdated, so a corrected video looked up to date under
+  "Entregada". They are now detected with the same evidence the admin screen uses
+  (the job was overwritten after the portal last received it).
+
+### Changed
+
+- Songs with a cut newer than the portal's are split by what the operator must do
+  next: "Listas para reenviar" (approved, only need sending) and "Corte nuevo sin
+  aprobar" (approve first). The banner says how many of each and links to each
+  list, the filter has both options, every song carries a matching mark
+  ("Listo para reenviar" / "Falta aprobar el corte nuevo"), and the Entregada tab
+  shows how many of its songs need resending. The pipeline flags expose
+  `resend_ready` and `resend_review`.
+
 ## [1.1.86] - 2026-09-30
 
 ### Changed

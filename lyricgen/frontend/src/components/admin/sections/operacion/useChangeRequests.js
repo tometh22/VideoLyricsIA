@@ -13,6 +13,12 @@ const ACTIVE_RENDER_STATUSES = new Set([
   "queued", "processing", "rendering", "editing", "transcribed_pending",
 ]);
 
+// How long one click keeps waiting for the professional master before handing the
+// decision back to the operator, and the shortest pause between checks.
+const PREPARE_TIMEOUT_S = 15 * 60;
+const PREPARE_POLL_MIN_MS = 5000;
+const sleepMs = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
 function publicationHasPendingWork(publication) {
   return ACTIVE_RENDER_STATUSES.has(publication?.job_status)
     || (publication?.prores_pending?.length || 0) > 0;
@@ -125,6 +131,10 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         .map((item) => item.id));
       const completed = [...activeRenderIdsRef.current].filter((id) => (
         !nextActive.has(id)
+        // A click on Publicar that is still waiting for the master owns the notice
+        // for that request; announcing "preparation finished, this does not publish"
+        // in the middle of it would contradict what is about to happen.
+        && !mutationLocksRef.current.has(`publish:${id}`)
         && items.some((item) => item.id === id
           && ["done", "pending_review"].includes(item.publication?.job_status))
       ));
@@ -139,6 +149,9 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
           // Completion of a different request must not hide this request's
           // actionable error or preparation acknowledgement.
           if (current?.outcomeUnknown || (current?.requestId != null && !completed.includes(current.requestId))) return current;
+          // Never overwrite the confirmation of a publication that just succeeded
+          // for this same request (the master finishing is part of that story).
+          if (current?.tone === "ok" && current?.requestId != null && /Publicada la versión|Reenviado/.test(current.text || "")) return current;
           return {
             requestId: current?.requestId ?? completed[0],
             tone: "ok",
@@ -557,7 +570,13 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         pointer: "Publicando en UMG… Estamos registrando la nueva versión. No vuelvas a publicar mientras termina.",
       }) });
     try {
+      const startedAt = Date.now();
       let data;
+      // One click publishes: when the professional master is not ready the server
+      // starts it and answers "preparing"; instead of making the operator wait and
+      // press again, ask again until it is done (the server never starts a second
+      // transcode for a click while one is running).
+      for (;;) {
       try {
         data = await fetchJson(`${API}/admin/deliveries/from-job/${jobId}`, {
           method: "POST",
@@ -598,14 +617,24 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         return;
       }
       if (data.ok === false && data.status === "preparing_prores") {
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        if (elapsed > PREPARE_TIMEOUT_S) {
+          setCrPublishNotice({ requestId: crId, tone: "error",
+            text: "El archivo profesional tarda más de lo normal y todavía no se publicó. Esperá unos minutos y volvé a apretar Publicar; no se perdió nada." });
+          await loadChangeRequests({ silent: true });
+          return;
+        }
         setCrPublishNotice({
           requestId: crId,
           tone: "wait",
-          text: data.stale?.length
-            ? "Se está actualizando el archivo profesional (.mov) con la corrección. Esperá un minuto; después vas a poder publicar."
-            : "Se está preparando el archivo profesional (.mov). Esperá un minuto; después vas a poder publicar.",
+          text: `${data.stale?.length ? "Actualizando el archivo profesional con la corrección" : "Preparando el archivo profesional"}… ${elapsed} s. Se publica solo cuando esté listo: no hace falta apretar nada más.`,
         });
-      } else if (data.ok !== true || typeof data.content_changed !== "boolean"
+        await sleepMs(Math.max(PREPARE_POLL_MIN_MS, (Number(data.retry_after) || 10) * 1000));
+        continue;
+      }
+      break;
+      }
+      if (data.ok !== true || typeof data.content_changed !== "boolean"
         || !Number.isInteger(data.revision) || data.revision < 1
         || (data.portal_id && data.portal_id !== portalId)
         || (data.job_id && data.job_id !== jobId)) {

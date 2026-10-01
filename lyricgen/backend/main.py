@@ -12260,7 +12260,7 @@ async def download(
             # Kick off a prewarm in the background, then 202.
             try:
                 from queue_jobs import enqueue_prores_prewarm, SubmissionsPausedError
-                enqueue_prores_prewarm(job_id, file_type, force=True)
+                enqueue_prores_prewarm(job_id, file_type, force=True, dedupe_live=True)
             except SubmissionsPausedError as exc:
                 from ops_control import get_submissions_state
                 state = get_submissions_state()
@@ -18495,7 +18495,7 @@ async def enable_prores_for_job(
             # atravesar el flag/backpressure de prewarm opcional igual que el
             # botón de publicar; de otro modo puede responder "queued" sin
             # haber encolado nada y dejar la pantalla esperando para siempre.
-            rq_id = enqueue_prores_prewarm(job_id, file_type, force=True)
+            rq_id = enqueue_prores_prewarm(job_id, file_type, force=True, dedupe_live=True)
             if rq_id:
                 enqueued.append(file_type)
     except Exception as e:  # pragma: no cover
@@ -20607,7 +20607,7 @@ def admin_create_delivery_from_job(
         try:
             for file_type in missing_prores:
                 rq_id = enqueue_prores_prewarm(
-                    job_id, file_type, force=True,
+                    job_id, file_type, force=True, dedupe_live=True,
                 )
                 if rq_id:
                     enqueued.append(file_type)
@@ -21026,7 +21026,7 @@ async def portal_prepare_prores(
 
     try:
         if job is not None and job.umg_spec:
-            rq_id = enqueue_prores_prewarm(job.job_id, file_type, force=True)
+            rq_id = enqueue_prores_prewarm(job.job_id, file_type, force=True, dedupe_live=True)
             prepare_source = "job"
         else:
             # Cross-environment/legacy campaign delivery. Its source MP4 is

@@ -64,19 +64,34 @@ describe("campaign workspace", () => {
     await waitFor(() => expect(location()).toContain("song=item-1"));
   });
 
-  it("warns how many songs have a newer cut than the portal and filters them", async () => {
-    const api = createCampaignApi({ songs: [makeSong(1, "delivered", { portal_outdated: true }), makeSong(2, "delivered"), makeSong(3, "qc")] });
+  it("separates what is ready to resend from what still needs approval, and finds both", async () => {
+    const api = createCampaignApi({ songs: [
+      makeSong(1, "delivered", { portal_outdated: true }),   // approved: only needs sending
+      makeSong(2, "qc", { portal_outdated: true }),          // new cut not approved yet
+      makeSong(3, "delivered"),
+    ] });
     vi.stubGlobal("fetch", async (input, options) => {
       const response = await api.fetchMock(input, options);
       if (new URL(String(input), "http://test").pathname !== "/batch/campaigns/c1/pipeline") return response;
-      return json({ ...(await response.json()), flags: { portal_outdated: 1 } });
+      return json({ ...(await response.json()), flags: { portal_outdated: 2, resend_ready: 1, resend_review: 1 } });
     });
     render(<MemoryRouter initialEntries={["/campaigns/c1"]}><Location /><Routes><Route path="/campaigns/:campaignId" element={<CampaignsPage />} /></Routes></MemoryRouter>);
-    expect(await screen.findByText(/canción tiene/)).toHaveTextContent("1 canción tiene un corte nuevo que todavía no se envió");
-    fireEvent.click(screen.getByRole("button", { name: "Ver la canción" }));
-    await waitFor(() => expect(location()).toContain("portal=outdated"));
+    const banner = await screen.findByText(/para reenviar al portal/);
+    expect(banner.parentElement).toHaveTextContent("1 lista para reenviar al portal · 1 falta aprobar el corte nuevo");
+    // The Entregada tab says how many of its songs need resending.
+    expect(tab("Entregada")).toHaveTextContent("1 por reenviar");
+
+    fireEvent.click(screen.getByRole("button", { name: "Ver las 1 para reenviar" }));
+    await waitFor(() => expect(location()).toContain("portal=resend_ready"));
     expect(await screen.findByText("Canción 1")).toBeInTheDocument();
     expect(screen.queryByText("Canción 2")).toBeNull();
+    expect(screen.getByText("Listo para reenviar")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Ver las 1 sin aprobar" }));
+    await waitFor(() => expect(location()).toContain("portal=resend_review"));
+    expect(await screen.findByText("Canción 2")).toBeInTheDocument();
+    expect(screen.queryByText("Canción 1")).toBeNull();
+    expect(screen.getByText("Falta aprobar el corte nuevo")).toBeInTheDocument();
   });
 
   it("tells the truth about the portal when it serves the newest render", async () => {
@@ -87,10 +102,12 @@ describe("campaign workspace", () => {
       return json({ ...(await response.json()), publication_mode: "pointer", flags: { portal_outdated: 1 } });
     });
     render(<MemoryRouter initialEntries={["/campaigns/c1"]}><Location /><Routes><Route path="/campaigns/:campaignId" element={<CampaignsPage />} /></Routes></MemoryRouter>);
-    expect(await screen.findByText(/canción tiene/)).toHaveTextContent("el cliente ya descarga el archivo nuevo");
+    const banner = await screen.findByText(/para reenviar al portal/);
+    expect(banner.parentElement).toHaveTextContent("el cliente ya descarga el archivo nuevo");
     expect(screen.queryByText(/sigue mostrando el anterior/)).toBeNull();
     expect(await screen.findByText("Corte nuevo sin registrar")).toBeInTheDocument();
     expect(screen.queryByText("Portal desactualizado")).toBeNull();
+    expect(screen.queryByText("Listo para reenviar")).toBeNull();
   });
 
   it("counts every song once with the same numbers in every tab", async () => {

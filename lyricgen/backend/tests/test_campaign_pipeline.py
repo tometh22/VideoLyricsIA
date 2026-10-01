@@ -59,14 +59,15 @@ def portal(rows):
             "CREATE TABLE deliveries (id INTEGER, job_id TEXT, portal_id TEXT, tenant_snapshot TEXT,"
             " removed_at TEXT, published_render_fingerprint TEXT, published_revision INTEGER,"
             " stale_since TEXT, stale_reason TEXT, approved_at TEXT, content_updated_at TEXT,"
-            " published_file_keys TEXT)"
+            " published_file_keys TEXT, added_at TEXT)"
         ))
         conn.execute(text("CREATE TABLE delivery_change_requests (id INTEGER, delivery_id INTEGER, resolved_at TEXT, submitted_at TEXT)"))
         for n, row in enumerate(rows, start=1):
             job_id, portal_id, tenant, pending = row[:4]
             keys = row[4] if len(row) > 4 else None   # a JSON string = this delivery serves a frozen snapshot
-            conn.execute(text("INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,NULL,NULL,1,NULL,NULL,NULL,NULL,:keys)"),
-                         dict(n=n, job=job_id, portal=portal_id, tenant=tenant, keys=keys))
+            added = row[5] if len(row) > 5 else "2026-09-14 10:00:00.000000"   # when the portal last received it
+            conn.execute(text("INSERT INTO deliveries VALUES (:n,:job,:portal,:tenant,NULL,NULL,1,NULL,NULL,NULL,NULL,:keys,:added)"),
+                         dict(n=n, job=job_id, portal=portal_id, tenant=tenant, keys=keys, added=added))
             for request in range(pending):
                 conn.execute(text("INSERT INTO delivery_change_requests VALUES (:id,:delivery,NULL,:submitted)"),
                              dict(id=n * 100 + request, delivery=n,
@@ -298,3 +299,46 @@ def test_pipeline_reports_per_delivery_whether_the_portal_serves_the_latest_rend
     assert on["publication_mode"] == "pointer"
     # Mixed population: only the delivery WITHOUT a snapshot follows the newest render.
     assert by_title(on)["Tema 0"] is True and by_title(on)["Tema 1"] is False
+
+
+def _overwritten(db, job, when):
+    job.previous_versions = [{"archived_at": when.isoformat(), "key": "old"}]
+    db.flush()
+
+
+def test_a_legacy_delivery_without_a_fingerprint_is_flagged_once_the_video_was_corrected(db, setup, monkeypatch):
+    """Deliveries published before fingerprints existed carry none. Before, they could
+    never be flagged, so a corrected video looked 'Entregada' and up to date."""
+    campaign, items, actor = setup
+    now = datetime.now(timezone.utc)
+    corrected = add_job(db, campaign, actor, item=items[0], status="done")       # edited after the portal got it
+    untouched = add_job(db, campaign, actor, item=items[1], status="done")       # never edited since
+    edited_before = add_job(db, campaign, actor, item=items[2], status="done")   # edited, then republished later
+    _overwritten(db, corrected, now - timedelta(days=1))
+    _overwritten(db, edited_before, now - timedelta(days=20))
+    db.commit()
+    rows = [(corrected.job_id, "argentina", campaign.tenant_id, 0, None, "2026-09-14 10:00:00.000000"),
+            (untouched.job_id, "argentina", campaign.tenant_id, 0, None, "2026-09-14 10:00:00.000000"),
+            (edited_before.job_id, "argentina", campaign.tenant_id, 0, None, (now - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S.%f"))]
+    with portal(rows) as session:
+        monkeypatch.setattr(creative, "scoped_deliveries_db", session)
+        result = pipeline.campaign_pipeline(campaign.id, actor, db)
+    flagged = {row["title"]: row["portal_outdated"] for row in result["items"][:3]}
+    assert flagged == {"Tema 0": True, "Tema 1": False, "Tema 2": False}
+    assert result["flags"]["portal_outdated"] == 1
+
+
+def test_outdated_songs_are_split_into_ready_to_resend_and_needing_approval(db, setup, monkeypatch):
+    campaign, items, actor = setup
+    now = datetime.now(timezone.utc)
+    approved = add_job(db, campaign, actor, item=items[0], status="done")
+    unapproved = add_job(db, campaign, actor, item=items[1], status="pending_review")
+    for job in (approved, unapproved):
+        _overwritten(db, job, now - timedelta(hours=3))
+    db.commit()
+    rows = [(approved.job_id, "argentina", campaign.tenant_id, 0, None, "2026-09-14 10:00:00.000000"),
+            (unapproved.job_id, "argentina", campaign.tenant_id, 0, None, "2026-09-14 10:00:00.000000")]
+    with portal(rows) as session:
+        monkeypatch.setattr(creative, "scoped_deliveries_db", session)
+        flags = pipeline.campaign_pipeline(campaign.id, actor, db)["flags"]
+    assert flags["portal_outdated"] == 2 and flags["resend_ready"] == 1 and flags["resend_review"] == 1

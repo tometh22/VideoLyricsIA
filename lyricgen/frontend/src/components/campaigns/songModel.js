@@ -103,9 +103,16 @@ export const PORTAL_FILTERS = [
   { key: "", label: "Todos los envíos" },
   { key: "sent", label: "Enviadas al portal" },
   { key: "unsent", label: "Sin enviar" },
+  { key: "resend_ready", label: "Listas para reenviar" },
+  { key: "resend_review", label: "Corte nuevo sin aprobar" },
   { key: "outdated", label: "Con corte nuevo sin enviar" },
   { key: "changes", label: "Con cambios solicitados" },
 ];
+
+/** Approved (or already delivered): a corrected cut in this state only needs to be SENT. */
+export function isApprovedStage(song) {
+  return song.stage === "approved" || song.stage === "delivered";
+}
 
 export function filterSongs(songs, { view = "all", q = "", drafts = false, mine = false, version = "", classification = "", portal = "" } = {}) {
   return songs.filter((song) => {
@@ -118,6 +125,8 @@ export function filterSongs(songs, { view = "all", q = "", drafts = false, mine 
     if (portal === "sent" && !song.portals?.length) return false;
     if (portal === "unsent" && song.portals?.length) return false;
     if (portal === "outdated" && !song.portal_outdated) return false;
+    if (portal === "resend_ready" && !(song.portal_outdated && isApprovedStage(song))) return false;
+    if (portal === "resend_review" && !(song.portal_outdated && !isApprovedStage(song))) return false;
     if (portal === "changes" && !song.pending_change_requests) return false;
     return true;
   });
