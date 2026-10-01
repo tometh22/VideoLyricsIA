@@ -161,7 +161,7 @@ cada servicio tiene un *deployment trigger* que apunta a `tometh22/umg-chile-por
 
 Precondiciones (todas verdes antes de empezar):
 1. Los PRs de alineación mergeados a staging, con CI exacta verde y staging sin trabajo a medias.
-2. Ensayo de migraciones repetido si cambió el head (sección 3).
+2. Ensayo de migraciones repetido si cambió el head (sección 3), y `check_fleet_config_parity.py production` en `OK` (sección 8, punto 5).
 3. Tabla de variables (sección 5) firmada por el dueño. Las variables a agregar o cambiar quedan **preparadas** pero se aplican en el paso 3.
 4. La rama `tometh22/umg-chile-portal` **no se borra ni se mueve** (es el punto de retorno); anotar su commit `397965aa`.
 5. Ventana de baja carga elegida, con alguien mirando.
@@ -212,11 +212,16 @@ Lo que el runbook no decía y hay que saber la próxima vez:
    con la misma configuración. En esta promoción fueron ~14 min, de los cuales ~10 por un error mío (punto 4).
 4. **`timing_config_mismatch`:** el chequeo exige que los tiempos de letra (`LYRIC_LEAD_IN_S`, `LYRIC_HOLD_S`) sean
    idénticos en TODOS los servicios, también en `quality-worker`. Hay que fijarlos en los cuatro de una vez.
-5. **`fleet_runtime_token_mismatch` (degradado, no bloquea):** en producción los servicios tienen configuraciones de
-   pipeline distintas entre sí (el `quality-worker` no define 15 variables que `api`/`Worker`/`ShortWorker` sí;
-   `CTC_ALIGN_MIN_MED_SCORE` está en `api` y `ShortWorker` pero no en `Worker`; `QUALITY_V6_*` solo en `api` y
-   `quality-worker`). Ya existía; el código nuevo lo hace visible. Alinearlas cambia comportamiento de alineado:
-   decidirlo aparte, no con prisa. En staging el token es único.
+5. **`fleet_runtime_token_mismatch` (degradado, no bloquea) — RESUELTO el mismo día.** En producción los servicios
+   tenían configuraciones de pipeline distintas entre sí (el `quality-worker` no definía 15 variables que `api`/`Worker`/
+   `ShortWorker` sí; `CTC_ALIGN_MIN_MED_SCORE=0.30` estaba en `api` y `ShortWorker` pero no en `Worker`, que usaba el
+   default 0.35; `QUALITY_V6_*` solo en `api` y `quality-worker`). Mientras difieran, un análisis de calidad encolado
+   por un servicio lo descarta el `quality-worker` en silencio (`runtime_identity_mismatch`). Se alinearon los cuatro
+   servicios a los valores de la `api` (= diseño de staging), sin conflictos de valor, y se redesplegaron juntos sobre el
+   mismo commit: un solo token, `/health` en `ok` durante todo el proceso. El único cambio de comportamiento fue
+   `CTC_ALIGN_MIN_MED_SCORE` 0.35 → 0.30 en el `Worker` (paridad con staging). **Antes de cada promoción y después de
+   tocar variables:** `PYTHONPATH=lyricgen/backend python lyricgen/backend/scripts/check_fleet_config_parity.py production`
+   (sale con 1 y lista las claves que difieren). A futuro, usar variables compartidas de Railway para que no diverjan.
 6. **Errores de infraestructura de Railway** (`failed to fetch snapshot` al construir) dejan un servicio atrás:
    reintentar con `railway redeploy --service S --environment E --from-source -y`.
 7. Corrección a la sección 5: producción **ya** usaba `LYRIC_LEAD_IN_S=0.08` en `Worker` y `ShortWorker` (los que
