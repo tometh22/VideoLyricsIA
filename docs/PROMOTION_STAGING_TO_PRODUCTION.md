@@ -191,3 +191,33 @@ portal de UMG con errores, o error de migración.
 - Una rama por entorno: `main` = producción, `staging` = pre-producción. Archivar `tometh22/umg-chile-portal` y las ramas `release/*` viejas.
 - Un hotfix va primero a `main` y se trae a `staging` el mismo día.
 - Problema de fondo, aparte de esta promoción: el trabajo gestionado de UMG corre en staging y escribe en la base de producción. Darle a staging su propia base de entregas, o asumir ese trabajo en producción.
+
+## 8. Promoción real del 2026-10-01 (staging 1.1.91 → producción) y lecciones
+
+Resultado: producción quedó en `main` = `5ac8ce05` (árbol idéntico a staging), `/health` en `ok`,
+11 workers coherentes, migración `ba888d1665d8` aplicada, interruptores `delivery_qc_gates_off` y
+`language_review_advisory` en `true`, portales de UMG respondiendo (Argentina 185 versiones y Chile 34, todas con
+archivos) y logs sin errores. La rama `tometh22/umg-chile-portal` (`397965aa`) **no se tocó**: es el punto de retorno.
+
+Lo que el runbook no decía y hay que saber la próxima vez:
+
+1. **Vercel despliega el frontend de producción al mergear a `main`.** Su rama de Producción es `main`: el merge
+   del PR a `main` publicó el frontend ~10 minutos **antes** que el backend. No hay paso separado de Vercel.
+   Para que el backend vaya primero, repuntar los disparadores de Railway a `staging` (mismo árbol), verificar, y
+   recién entonces mergear a `main`. En esta promoción la ventana (frontend nuevo con backend viejo) no produjo
+   errores observados.
+2. **Cambiar la rama de un disparador de Railway no despliega nada**: hay que lanzar el deploy
+   (`railway redeploy --service S --environment production --from-source -y`). Los cuatro servicios terminaron en ~6 min.
+3. **`/health` marca "down" (503) durante un deploy escalonado** hasta que toda la flota queda en el commit nuevo y
+   con la misma configuración. En esta promoción fueron ~14 min, de los cuales ~10 por un error mío (punto 4).
+4. **`timing_config_mismatch`:** el chequeo exige que los tiempos de letra (`LYRIC_LEAD_IN_S`, `LYRIC_HOLD_S`) sean
+   idénticos en TODOS los servicios, también en `quality-worker`. Hay que fijarlos en los cuatro de una vez.
+5. **`fleet_runtime_token_mismatch` (degradado, no bloquea):** en producción los servicios tienen configuraciones de
+   pipeline distintas entre sí (el `quality-worker` no define 15 variables que `api`/`Worker`/`ShortWorker` sí;
+   `CTC_ALIGN_MIN_MED_SCORE` está en `api` y `ShortWorker` pero no en `Worker`; `QUALITY_V6_*` solo en `api` y
+   `quality-worker`). Ya existía; el código nuevo lo hace visible. Alinearlas cambia comportamiento de alineado:
+   decidirlo aparte, no con prisa. En staging el token es único.
+6. **Errores de infraestructura de Railway** (`failed to fetch snapshot` al construir) dejan un servicio atrás:
+   reintentar con `railway redeploy --service S --environment E --from-source -y`.
+7. Corrección a la sección 5: producción **ya** usaba `LYRIC_LEAD_IN_S=0.08` en `Worker` y `ShortWorker` (los que
+   renderizan); solo el `api` tenía 0.4. El cambio real fue `LYRIC_HOLD_S` 0.25 → 0.5.
