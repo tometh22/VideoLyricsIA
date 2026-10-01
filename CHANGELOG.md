@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.92] - 2026-10-01
+
+### Added
+
+- `scripts/check_fleet_config_parity.py`: compares the pipeline/calibration environment (the inputs of the fleet
+  runtime token) across the services of a Railway environment and exits 1 listing the keys that differ. Production
+  had drifted (quality-worker missing 15 variables, `CTC_ALIGN_MIN_MED_SCORE` set on some services only), which made
+  quality jobs silently discard with `runtime_identity_mismatch` and `/health` report `fleet_runtime_token_mismatch`.
+  The production services were aligned the same day; run the check before every promotion.
+
 ## [1.1.91] - 2026-10-01
 
 ### Added
