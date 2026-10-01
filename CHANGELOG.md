@@ -3,6 +3,23 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.89] - 2026-10-01
+
+### Security
+
+- `transformers` 4.57.6 -> 5.18.0 (exact pin). The 4.x series ended at 4.57.6, which
+  is affected by CVE-2026-80047, and every fix only exists in 5.x, so this is a
+  major upgrade. The 6 temporary exceptions for `transformers` are removed from
+  `security_exceptions.json` (the audit gate now passes with the 9 that remain,
+  all `torch`/`ecdsa`). `safetensors` lower bound raised to 0.8.0 (what 5.x needs);
+  `huggingface-hub` moves to 1.x transitively.
+- Validation: on the real pinned CTC model (`jonatasgrosman/wav2vec2-large-xlsr-53-spanish`
+  at its immutable revision) the emissions on a fixed 20 s signal are bit-for-bit
+  identical to 4.57.6 (max abs diff 0.0, same vocabulary and blank id); the 227
+  alignment/LoRA/anchor tests pass; the LoRA path (`PeftModel` + the ASR pipeline with
+  word timestamps + `processor.save_pretrained`) loads and runs. No code change was
+  needed.
+
 ## [1.1.88] - 2026-10-01
 
 ### Added
