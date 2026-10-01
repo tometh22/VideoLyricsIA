@@ -22,7 +22,7 @@ def test_portal_serves_A_until_publish_then_B_with_only_selected_case_closed(
 
     monkeypatch.setenv('DELIVERY_PORTAL_TOKEN_' + portal.upper(), 'synthetic-consumer-token')
     monkeypatch.setattr(queue_jobs, '_init_redis', lambda: (None, None, None))
-    monkeypatch.setattr(storage, '_get_client', lambda: SimpleNamespace(
+    monkeypatch.setattr(storage, '_get_metadata_client', lambda: SimpleNamespace(
         head_object=lambda **kw: {'ContentLength': len(fake_r2['objects'][kw['Key']])}))
     monkeypatch.setattr(storage, 'generate_signed_url',
                         lambda key, **kw: 'https://synthetic.invalid/' + key)
