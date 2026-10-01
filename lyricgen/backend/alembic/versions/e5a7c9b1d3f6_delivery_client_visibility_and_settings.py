@@ -40,14 +40,19 @@ def upgrade():
             "updated_by_user_id INTEGER)"
         )
         return
-    op.add_column("deliveries", sa.Column("client_visibility", sa.String(10), nullable=True))
-    op.create_table(
-        "system_settings",
-        sa.Column("key", sa.String(80), primary_key=True),
-        sa.Column("value", sa.String(200)),
-        sa.Column("updated_at", sa.DateTime(timezone=True)),
-        sa.Column("updated_by_user_id", sa.Integer()),
-    )
+    # Non-PostgreSQL (dev/CI): the baseline revision builds from the current models,
+    # so either object may already exist.
+    inspector = sa.inspect(op.get_bind())
+    if "client_visibility" not in {c["name"] for c in inspector.get_columns("deliveries")}:
+        op.add_column("deliveries", sa.Column("client_visibility", sa.String(10), nullable=True))
+    if not inspector.has_table("system_settings"):
+        op.create_table(
+            "system_settings",
+            sa.Column("key", sa.String(80), primary_key=True),
+            sa.Column("value", sa.String(200)),
+            sa.Column("updated_at", sa.DateTime(timezone=True)),
+            sa.Column("updated_by_user_id", sa.Integer()),
+        )
 
 
 def downgrade():
