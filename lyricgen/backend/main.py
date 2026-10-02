@@ -21951,6 +21951,13 @@ async def portal_prores_status(
         raise HTTPException(status_code=404, detail="Entrega no encontrada.")
     if not _portal_file_is_published(delivery, file_type):
         raise HTTPException(status_code=404, detail="Archivo no disponible.")
+    if await _finalize_portal_prores(delivery, ddb, file_type):
+        _record_portal_download_attempt(
+            ddb, request, portal_id=portal_id, delivery=delivery,
+            delivery_id=delivery_id, file_type=file_type, outcome="prores_ready",
+        )
+        return {"status": "ready"}
+
     job = (
         db.query(Job)
         .filter(Job.job_id == delivery.job_id)
@@ -21958,13 +21965,14 @@ async def portal_prores_status(
         .first()
     )
     if job is None:
-        raise HTTPException(status_code=404, detail="No se encontró el video fuente.")
-    if await _finalize_portal_prores(delivery, ddb, file_type):
-        _record_portal_download_attempt(
-            ddb, request, portal_id=portal_id, delivery=delivery,
-            delivery_id=delivery_id, file_type=file_type, outcome="prores_ready",
+        # The shared portal DB also holds deliveries created by production.
+        # Their preparation runs from the delivery snapshot in staging, so
+        # there is no local Job to inspect while polling.
+        return JSONResponse(
+            status_code=202,
+            content={"status": "processing", "retry_after": 10},
+            headers={"Retry-After": "10"},
         )
-        return {"status": "ready"}
 
     if not job.umg_spec:
         job.umg_spec = _parse_umg_params(

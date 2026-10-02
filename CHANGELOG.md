@@ -19,6 +19,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Download and ProRes preparation endpoints now reject hidden deliveries and
   files outside the published set, including requests made with a direct URL.
+- ProRes progress polling now completes shared portal deliveries whose source
+  Job belongs to the other environment.
 
 ## [1.1.95] - 2026-10-02
 

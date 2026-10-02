@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from tests.conftest import auth
@@ -766,6 +766,33 @@ def test_portal_can_prepare_staging_delivery_without_local_job(
     enqueue.assert_called_once_with(
         approved_job.job_id, "umg_master", "default", frame_size="HD",
     )
+
+
+def test_portal_can_poll_prores_without_local_job(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    from database import Job
+
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+    db.query(Job).filter(Job.id == approved_job.id).delete()
+    db.commit()
+
+    with patch("main._finalize_portal_prores", new_callable=AsyncMock) as finalize:
+        finalize.side_effect = [False, True]
+        headers = {"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"}
+        pending = client.get(f"/api/deliveries/{delivery_id}/prepare-prores", headers=headers)
+        ready = client.get(f"/api/deliveries/{delivery_id}/prepare-prores", headers=headers)
+
+    assert pending.status_code == 202, pending.text
+    assert pending.json()["status"] == "processing"
+    assert ready.status_code == 200, ready.text
+    assert ready.json()["status"] == "ready"
+    assert finalize.await_count == 2
 
 
 def test_portal_can_prepare_legacy_mp4_only_delivery(
