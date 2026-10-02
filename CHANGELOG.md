@@ -3,6 +3,12 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.93] - 2026-10-02
+
+### Fixed
+
+- Reintentar automáticamente las solicitudes de publicación UMG y consulta del estado ProRes cuando la conexión con la API se interrumpe transitoriamente. Si no se puede confirmar el envío, el aviso pide verificar el portal antes de reintentar.
+
 ## [1.1.92] - 2026-10-01
 
 ### Added
