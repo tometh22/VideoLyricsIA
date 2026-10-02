@@ -3,6 +3,18 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.93] - 2026-10-01
+
+### Added
+
+- `scripts/railway_share_pipeline_config.py`: moves the pipeline/calibration/timing variables of a Railway
+  environment into SHARED variables referenced by every service (`${{shared.KEY}}`), so the fleet runtime token
+  cannot drift again. Dry run by default; only shares a key when every service holds the same value; writes
+  with skipDeploys and verifies that the rendered value of every key is unchanged (nothing restarts, a later
+  deploy resolves to the same values); idempotent; retries network blips. Applied on 2026-10-01 to staging
+  (34 keys, 6 services) and production (30 keys, 4 services); `check_fleet_config_parity.py` stays OK in both.
+  New keys that must stay uniform are added by running the tool again.
+
 ## [1.1.92] - 2026-10-01
 
 ### Added

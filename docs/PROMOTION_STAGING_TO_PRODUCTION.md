@@ -226,3 +226,20 @@ Lo que el runbook no decía y hay que saber la próxima vez:
    reintentar con `railway redeploy --service S --environment E --from-source -y`.
 7. Corrección a la sección 5: producción **ya** usaba `LYRIC_LEAD_IN_S=0.08` en `Worker` y `ShortWorker` (los que
    renderizan); solo el `api` tenía 0.4. El cambio real fue `LYRIC_HOLD_S` 0.25 → 0.5.
+
+## 9. Variables de pipeline compartidas (2026-10-01)
+
+Las variables que alimentan el token de la flota (pipeline, calibración y tiempos de letra) ya no se
+mantienen servicio por servicio: viven como **variables compartidas** del entorno de Railway y cada servicio
+las referencia (`${{shared.CLAVE}}`). Aplicado en staging (34 claves, 6 servicios) y producción (30 claves,
+4 servicios) sin reinicios, con el valor resuelto de cada servicio verificado idéntico antes y después.
+
+- Para cambiar un valor del pipeline: editar la **variable compartida** (no la del servicio) y redesplegar todos
+  los servicios juntos.
+- Para sumar una clave nueva al conjunto: `PYTHONPATH=lyricgen/backend python lyricgen/backend/scripts/railway_share_pipeline_config.py <entorno>` (simulación) y luego `--apply`.
+- Antes de cada promoción: `check_fleet_config_parity.py <entorno>` debe dar `OK`.
+- Para volver una clave a valor propio de un servicio: `railway variables --service S --environment E --set CLAVE=valor`.
+- Ramas archivadas el mismo día (sin borrarlas, bloqueadas en solo lectura y con etiqueta `archive/<rama>`):
+  `release/2026-07-22-editor-to-prod`, `release/official-lyrics-staging`, `release/staging-to-main-2026-05-15`,
+  `release/universal-es-trial-20260911`, `release/universal-trial-frontend` y `tometh22/umg-chile-portal`.
+  Para volver a escribir en una: quitar su protección de rama en GitHub. La lectura (y el rollback por rama) no se ve afectada.
