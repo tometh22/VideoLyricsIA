@@ -21123,16 +21123,6 @@ async def portal_prepare_prores(
     job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
     if job is not None and job.status != "done":
         raise HTTPException(status_code=400, detail="El video todavía no terminó de procesarse.")
-    if job is not None and not job.umg_spec:
-        job.umg_spec = _parse_umg_params(
-            delivery_profile="umg",
-            umg_frame_size=delivery.frame_size_snapshot or "HD",
-            umg_fps="24",
-            umg_prores_profile="3",
-            current_user=None,
-        )
-        db.commit()
-
     # Freno. Este endpoint encola un ffmpeg de varios GB en la cola
     # `enterprise`, la MISMA que sirve los renders de cliente, y lo hace con
     # `force=True`, que saltea a propósito el guard de profundidad.
