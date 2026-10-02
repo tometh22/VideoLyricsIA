@@ -20809,6 +20809,7 @@ def admin_create_delivery_from_job(
     # Explicit final review binds exactly one case to this cut. Publishing
     # from campaign/history alone cannot attest every pending instruction.
     resolved_requests = []
+    resolved_comments: list[str] = []
     if content_changed and body and body.change_request_id:
         pending_requests = (
             ddb.query(DeliveryChangeRequest)
@@ -20834,6 +20835,7 @@ def admin_create_delivery_from_job(
                 f"Resuelto al publicar la versión {delivery.published_revision}."
             )
             resolved_requests.append(request.id)
+            resolved_comments.append(request.comment or "")
 
     # Commit del delivery (DB externa) PRIMERO: si falla, el AuditLog local no
     # se escribe y no queda fila de auditoría huérfana. El Job local solo se
@@ -20872,6 +20874,20 @@ def admin_create_delivery_from_job(
         },
     ))
     db.commit()
+
+    # Optional mail to UMG: only for a visible publication that answered client requests, and
+    # only if the owner turned it on AND configured recipients (umg_publication_notice).
+    try:
+        import umg_publication_notice as _umg_notice
+        if _umg_notice.should_notify(content_changed=content_changed, resolved_requests=resolved_requests,
+                                     hidden_from_client=is_hidden_from_client(delivery)):
+            _notice_args = dict(artist=delivery.artist_snapshot, song=delivery.song_title_snapshot,
+                                portal_id=delivery.portal_id or portal_id,
+                                revision=int(delivery.published_revision or 1),
+                                comments=list(resolved_comments))
+            threading.Thread(target=lambda: _umg_notice.notify(**_notice_args), daemon=True).start()
+    except Exception:
+        logger.warning("[UMG-NOTICE] no se pudo preparar el aviso", exc_info=True)
 
     return {
         "ok": True,
