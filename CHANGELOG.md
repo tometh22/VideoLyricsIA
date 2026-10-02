@@ -15,6 +15,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Portal build option to preserve the live access hash and help content while
   updating the page, avoiding a password rotation during deployment.
 
+### Fixed
+
+- Download and ProRes preparation endpoints now reject hidden deliveries and
+  files outside the published set, including requests made with a direct URL.
+
 ## [1.1.95] - 2026-10-02
 
 ### Fixed

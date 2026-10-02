@@ -21098,10 +21098,7 @@ async def portal_prepare_prores(
     # Legacy deliveries may have a video but no umg_master entry in
     # file_types. Their on-demand action is added to the listing, so permit
     # that request and let the source/prores checks below validate it.
-    if file_type == "umg_short" and file_type not in (delivery.file_types or []):
-        raise HTTPException(status_code=404, detail="Archivo no disponible para esta entrega.")
-    if is_hidden_from_client(delivery):
-        # The portal shows no files for it, so nothing legitimate asks for a master.
+    if not _portal_file_is_published(delivery, file_type):
         raise HTTPException(status_code=404, detail="Archivo no disponible para esta entrega.")
 
     job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
@@ -21706,6 +21703,22 @@ def portal_get_items(
     }
 
 
+def _portal_file_is_published(delivery: Delivery, file_type: str) -> bool:
+    """Only expose files included in the client-visible publication.
+
+    A missing master is the one intentional exception: the listing offers it
+    for a published MP4 so the customer can request lazy preparation.
+    """
+    if is_hidden_from_client(delivery):
+        return False
+    file_types = delivery.file_types or []
+    return file_type in file_types or (
+        file_type == "umg_master"
+        and "video" in file_types
+        and bool(delivery.published_render_fingerprint)
+    )
+
+
 def _record_portal_download_attempt(
     db: Session,
     request: Request,
@@ -21786,8 +21799,15 @@ async def portal_download_file(
         )
         raise HTTPException(status_code=404, detail="Entrega no encontrada.")
 
+    if not _portal_file_is_published(delivery, file_type):
+        _record_portal_download_attempt(
+            ddb, request, portal_id=portal_id, delivery=delivery,
+            delivery_id=delivery_id, file_type=file_type, outcome="file_not_published",
+        )
+        raise HTTPException(status_code=404, detail="Archivo no disponible.")
+
     from delivery_snapshots import portal_key
-    key = portal_key(delivery, file_type)
+    key = portal_key(delivery, file_type, for_client=True)
     if not key:
         outcome = "prores_missing" if file_type in ("umg_master", "umg_short") else "file_not_published"
         _record_portal_download_attempt(
@@ -21929,6 +21949,8 @@ async def portal_prores_status(
     )
     if delivery is None:
         raise HTTPException(status_code=404, detail="Entrega no encontrada.")
+    if not _portal_file_is_published(delivery, file_type):
+        raise HTTPException(status_code=404, detail="Archivo no disponible.")
     job = (
         db.query(Job)
         .filter(Job.job_id == delivery.job_id)

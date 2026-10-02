@@ -813,6 +813,28 @@ def test_portal_cannot_prepare_prores_from_the_other_portal(
     assert res.status_code == 404
 
 
+def test_portal_download_guard_respects_publication_and_visibility():
+    from types import SimpleNamespace
+    import main
+
+    delivery = SimpleNamespace(
+        file_types=["video", "thumbnail"],
+        published_render_fingerprint="render-1",
+        client_visibility="visible",
+    )
+    assert main._portal_file_is_published(delivery, "video")
+    assert main._portal_file_is_published(delivery, "umg_master")
+    assert not main._portal_file_is_published(delivery, "umg_short")
+
+    delivery.client_visibility = "hidden"
+    assert not main._portal_file_is_published(delivery, "video")
+    assert not main._portal_file_is_published(delivery, "umg_master")
+
+    delivery.client_visibility = "visible"
+    delivery.published_render_fingerprint = None
+    assert not main._portal_file_is_published(delivery, "umg_master")
+
+
 def test_status_endpoint_includes_is_in_umg_portal(
     client, admin_token, approved_job, all_r2_files_present,
 ):
