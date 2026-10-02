@@ -549,7 +549,7 @@ def start_art_rendering(campaign_id: str, current_user: dict = Depends(get_curre
         event = create_pipeline_outbox_event(db, job=job, purpose="art_track_batch", mp3_path=None, artist=item.artist or "Unknown", style="oscuro", plan="100", tenant_id=campaign.tenant_id,
             pipeline_kwargs={"art_track": True, "segments_override": [], "input_r2_key": item.upload_key, "bg_r2_key": cover.upload_key,
                              "background_path": None, "song_title": item.title or "", "delivery_profile": delivery_profile, "umg_spec": umg_spec,
-                             "workload_class": "batch", "label_line": (campaign.default_render_params or {}).get("label_line", ""),
+                             "label_line": (campaign.default_render_params or {}).get("label_line", ""),
                              "art_track_preset": art_track_preset})
         job.status = "queued"; job.current_step = "queued"; job.progress = 0
         created.append(job_id); events.append(event.id)

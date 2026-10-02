@@ -353,11 +353,10 @@ def test_bulk_publish_does_not_promise_a_prores_nothing_will_create(
     enqueue.assert_not_called()
 
 
-def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
+def test_bulk_publish_defers_prores_until_a_portal_download_request(
     client, admin_token, monkeypatch,
 ):
-    """Con spec sí se puede: se publica el entregable y se encola el transcode,
-    así el archivo aparece en vez de quedar prometido para siempre."""
+    """Campaign delivery publishes MP4 outputs and leaves ProRes on demand."""
     from database import Delivery
     import art_track_campaigns as atc
 
@@ -381,45 +380,17 @@ def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
 
     db = SessionLocal()
     try:
-        assert db.query(Delivery).filter(Delivery.job_id == job_id).first() is None
+        delivery = db.query(Delivery).filter(Delivery.job_id == job_id).one()
+        assert delivery.file_types == ["video", "short", "thumbnail"]
+        assert delivery.published_file_keys["video"]
         item = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.delivery_batch_id == op).one()
-        assert item.error_code == 'deliverables_not_ready'
+        assert item.status == "sent"
+        operation = db.get(DeliveryBatch, op)
+        assert operation.status == "completed"
+        assert operation.sent_count == 1
     finally:
         db.close()
-    assert sorted(c.args[1] for c in enqueue.call_args_list) == ["umg_master", "umg_short"]
-    # SIN force: esta ruta publica hasta 500 canciones de una, y `force=True`
-    # saltea a propósito el tope de profundidad de cola. Mil transcodes de
-    # varios GB encolados de un saque se ponen delante de TODOS los renders de
-    # cliente que vengan después, en la misma cola. Acá nadie está esperando
-    # el archivo; el click humano del portal sí justifica saltear el tope.
-    assert all(c.kwargs == {} for c in enqueue.call_args_list)
-
-    # Publication waits for the generated masters. Retry only after their
-    # durable keys exist, never inventing a delivery before completion.
-    db = SessionLocal()
-    try:
-        job = db.query(Job).filter(Job.job_id == job_id).one()
-        job.s3_keys = {**job.s3_keys, "umg_master": "t/j/umg_master.mov",
-                       "umg_short": "t/j/umg_short.mov"}
-        db.commit()
-    finally:
-        db.close()
-    ready_op = _run_bulk_delivery(client, admin_token, campaign.id, "bulk-con-spec-ready-0001")
-    with (
-        patch.object(atc.storage, "is_enabled", return_value=True),
-        patch.object(atc.storage, "object_exists", return_value=True),
-    ):
-        atc.process_delivery_batch(ready_op)
-
-    # Y la fila nace con su fingerprint: sin esto, TODA entrega publicada por
-    # campaña quedaba ciega a su primera corrección.
-    db = SessionLocal()
-    try:
-        row = db.query(Delivery).filter(Delivery.job_id == job_id).one()
-        assert row.published_render_fingerprint
-        assert row.content_updated_at is not None
-    finally:
-        db.close()
+    enqueue.assert_not_called()
 
 
 def test_publicar_por_campana_no_sombrea_el_fingerprint_de_aprobacion(
