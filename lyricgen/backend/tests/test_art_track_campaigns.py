@@ -321,3 +321,57 @@ def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
         db.close()
     assert sorted(c.args[1] for c in enqueue.call_args_list) == ["umg_master", "umg_short"]
     assert all(c.kwargs == {"force": True} for c in enqueue.call_args_list)
+
+
+def test_art_track_publish_pins_mp4_and_offers_prores_later(
+    client, admin_token, monkeypatch,
+):
+    """Publishing an approved Art Track must not wait for its .mov files."""
+    from database import Delivery
+    import art_track_campaigns as atc
+
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign_id = _create(client, admin_token)
+    db = SessionLocal()
+    try:
+        campaign = db.get(BatchCampaign, campaign_id)
+        item_id = str(uuid.uuid4())
+        db.add(BatchCampaignItem(
+            id=item_id, campaign_id=campaign_id, tenant_id=campaign.tenant_id,
+            ordinal=1, filename="Album/Song.mp3", sha256=_digest(item_id),
+            size_bytes=1000,
+        ))
+        db.commit()
+        job_id = _seed_campaign_job(
+            campaign,
+            umg_spec={"frame_size": "HD", "fps": 24.0, "prores_profile": 3},
+            s3_keys={"video": "t/j/lyric_video.mp4", "short": "t/j/short.mp4",
+                     "thumbnail": "t/j/thumbnail.jpg"},
+        )
+        job = db.query(Job).filter(Job.job_id == job_id).one()
+        job.campaign_item_id = item_id
+        job.render_params = {"art_track": True}
+        db.commit()
+    finally:
+        db.close()
+
+    op = _run_bulk_delivery(client, admin_token, campaign_id, "art-lazy-prores-000001")
+    with (
+        patch.object(atc.storage, "is_enabled", return_value=True),
+        patch.object(atc.storage, "object_exists", return_value=True),
+        patch.object(atc.storage, "head_object_size", return_value=1000),
+        patch.object(atc, "enqueue_prores_prewarm") as enqueue,
+    ):
+        result = atc.process_delivery_batch(op)
+
+    assert result == {"sent": 1, "failed": 0}
+    enqueue.assert_not_called()
+    db = SessionLocal()
+    try:
+        delivery = db.query(Delivery).filter(Delivery.job_id == job_id).one()
+        assert delivery.label == "Art Track"
+        assert delivery.file_types == ["umg_master", "video", "umg_short", "short", "thumbnail"]
+        assert set(delivery.published_file_keys) == {"video", "short", "thumbnail"}
+        assert delivery.portal_id == "chile"
+    finally:
+        db.close()

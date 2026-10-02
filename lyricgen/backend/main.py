@@ -20211,6 +20211,13 @@ async def admin_create_delivery_from_job(
         if content_changed or not delivery.published_file_keys:
             delivery.published_file_keys = copy_snapshot(
                 job.tenant_id, job_id, delivery.file_types or [])
+        if content_changed or not delivery.file_sizes:
+            file_sizes = {}
+            for ft, key in (delivery.published_file_keys or {}).items():
+                size = storage.head_object_size(key)
+                if size is not None:
+                    file_sizes[ft] = size
+            delivery.file_sizes = file_sizes
     except Exception as exc:
         ddb.rollback()
         raise HTTPException(status_code=503, detail='No se pudo preparar la publicación. El portal conserva la versión anterior.') from exc
@@ -20609,6 +20616,7 @@ async def portal_get_items(
     # head_objects fall through to size=None / available=False, same as
     # the old per-iteration except.
     head_jobs: list[tuple[int, str, str]] = []  # (delivery_idx, file_type, r2_key)
+    size_map: dict[tuple[int, str], int | None] = {}
     for di, d in enumerate(deliveries):
         for ft in (d.file_types or []):
             if ft not in _DELIVERY_FILE_TYPES:
@@ -20617,9 +20625,11 @@ async def portal_get_items(
             r2_key = portal_key(d, ft)
             if not r2_key:
                 continue
+            published_size = (d.file_sizes or {}).get(ft)
+            if isinstance(published_size, int) and published_size > 0:
+                size_map[(di, ft)] = published_size
+                continue
             head_jobs.append((di, ft, r2_key))
-
-    size_map: dict[tuple[int, str], int | None] = {}
 
     # File sizes are immutable once rendered, so HEAD'ing R2 for every file
     # on every page load is pure waste — and it was the reliability bug:
@@ -20715,6 +20725,15 @@ async def portal_get_items(
             from delivery_snapshots import portal_key
             r2_key = portal_key(d, ft)
             if not r2_key:
+                if ft in ("umg_master", "umg_short") and d.label == "Art Track":
+                    files.append({
+                        "type": ft,
+                        "label": file_type_labels.get(ft, ft),
+                        "url": None,
+                        "size": "—",
+                        "available": False,
+                        "can_prepare": True,
+                    })
                 continue
             dl_name = f"{_delivery_safe_filename(d.artist_snapshot, d.song_title_snapshot)}.{_DELIVERY_FILE_TYPES[ft]['ext']}"
             try:
@@ -20735,6 +20754,7 @@ async def portal_get_items(
                 "url": url,
                 "size": _fmt_size_mb(size_bytes),
                 "available": available,
+                "can_prepare": ft in ("umg_master", "umg_short") and d.label == "Art Track",
             })
             if ft == "video" and url is not None:
                 preview_url = storage.generate_signed_url(r2_key, expiry_seconds=_DELIVERY_URL_EXPIRY_S)
@@ -20792,11 +20812,142 @@ async def portal_get_items(
         })
 
     return {
+        "portal_id": portal_id,
         "songs": list(songs.values()),
         "file_type_labels": file_type_labels,
         "expires_at_ts": now + _DELIVERY_URL_EXPIRY_S,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _portal_file_delivery(ddb: Session, delivery_id: int, portal_id: str, file_type: str):
+    if file_type not in _DELIVERY_FILE_TYPES:
+        raise HTTPException(status_code=400, detail="Tipo de archivo inválido.")
+    delivery = (_portal_delivery_query(ddb.query(Delivery), portal_id)
+                .filter(Delivery.id == delivery_id, Delivery.removed_at.is_(None))
+                .first())
+    if not delivery or file_type not in (delivery.file_types or []):
+        raise HTTPException(status_code=404, detail="Archivo no disponible.")
+    return delivery
+
+
+@app.post("/api/deliveries/{delivery_id}/download/{file_type}")
+async def portal_download_file(
+    delivery_id: int, file_type: str,
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """Sign only the pinned published file, never the mutable working key."""
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    delivery = _portal_file_delivery(ddb, delivery_id, portal_id, file_type)
+    from delivery_snapshots import portal_key
+    key = portal_key(delivery, file_type)
+    state = await asyncio.to_thread(storage.object_status, key) if key else "missing"
+    if state == "unavailable":
+        raise HTTPException(status_code=503, detail="No se pudo verificar el archivo. Reintentá.")
+    if state == "missing":
+        can_prepare = (
+            delivery.label == "Art Track"
+            and file_type in ("umg_master", "umg_short")
+            and bool((delivery.published_file_keys or {}).get(
+                "video" if file_type == "umg_master" else "short"
+            ))
+        )
+        return JSONResponse(status_code=202, content={
+            "status": "prores_missing" if can_prepare else "missing",
+            "can_prepare": can_prepare,
+        })
+    filename = (f"{_delivery_safe_filename(delivery.artist_snapshot, delivery.song_title_snapshot)}"
+                f".{_DELIVERY_FILE_TYPES[file_type]['ext']}")
+    url = storage.generate_signed_url(key, expiry_seconds=3600, download_filename=filename)
+    if not url:
+        raise HTTPException(status_code=503, detail="No se pudo iniciar la descarga.")
+    return {"status": "ready", "url": url}
+
+
+def _portal_prores_delivery(ddb: Session, delivery_id: int, portal_id: str, file_type: str):
+    if file_type not in ("umg_master", "umg_short"):
+        raise HTTPException(status_code=400, detail="Tipo de ProRes inválido.")
+    delivery = _portal_file_delivery(ddb, delivery_id, portal_id, file_type)
+    if delivery.label != "Art Track" or not delivery.published_file_keys:
+        raise HTTPException(status_code=409, detail="Esta entrega no admite generación a pedido.")
+    source_type = "video" if file_type == "umg_master" else "short"
+    if not delivery.published_file_keys.get(source_type):
+        raise HTTPException(status_code=409, detail="Falta el video fuente publicado.")
+    return delivery
+
+
+@app.post("/api/deliveries/{delivery_id}/prepare-prores")
+async def portal_prepare_prores(
+    delivery_id: int, body: dict,
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    file_type = body.get("file_type") if isinstance(body, dict) else None
+    delivery = _portal_prores_delivery(ddb, delivery_id, portal_id, file_type)
+    key = (delivery.published_file_keys or {}).get(file_type)
+    if key:
+        state = await asyncio.to_thread(storage.object_status, key)
+        if state == "exists":
+            return {"status": "ready"}
+        if state == "unavailable":
+            raise HTTPException(status_code=503, detail="No se pudo verificar el ProRes.")
+    source_type = "video" if file_type == "umg_master" else "short"
+    source_key = delivery.published_file_keys[source_type]
+    if await asyncio.to_thread(storage.object_status, source_key) != "exists":
+        raise HTTPException(status_code=409, detail="El video fuente publicado no está disponible.")
+    job = db.query(Job).filter(
+        Job.job_id == delivery.job_id,
+        Job.tenant_id == delivery.tenant_snapshot,
+    ).first()
+    fingerprint = delivery.published_render_fingerprint
+    if (not job or job.status != "done" or not job.umg_spec
+            or not fingerprint or delivery_freshness.render_fingerprint(job) != fingerprint):
+        raise HTTPException(status_code=409, detail="La versión publicada cambió. Solicitá una nueva publicación.")
+    from queue_jobs import enqueue_portal_prores
+    try:
+        enqueue_portal_prores(delivery_id, portal_id, file_type, fingerprint)
+    except Exception as exc:
+        logger.warning("[PORTAL] cannot enqueue ProRes for delivery %s: %s", delivery_id, exc)
+        raise HTTPException(status_code=503, detail="La preparación no está disponible. Reintentá en unos minutos.") from exc
+    return JSONResponse(status_code=202, content={"status": "preparing", "retry_after": 10})
+
+
+@app.get("/api/deliveries/{delivery_id}/prepare-prores")
+async def portal_prepare_prores_status(
+    delivery_id: int, file_type: str = Query(...),
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    delivery = _portal_prores_delivery(ddb, delivery_id, portal_id, file_type)
+    key = (delivery.published_file_keys or {}).get(file_type)
+    if key:
+        state = await asyncio.to_thread(storage.object_status, key)
+        if state == "exists":
+            return {"status": "ready"}
+        if state == "unavailable":
+            raise HTTPException(status_code=503, detail="No se pudo verificar el ProRes.")
+    from queue_jobs import _init_redis, portal_prores_job_id
+    redis, _, _ = _init_redis()
+    if redis is None:
+        raise HTTPException(status_code=503, detail="La preparación no está disponible.")
+    from rq.job import Job as RQJob
+    try:
+        task = RQJob.fetch(portal_prores_job_id(delivery_id, file_type), connection=redis)
+        status = task.get_status(refresh=True)
+    except Exception:
+        status = None
+    if status in ("failed", "stopped", "canceled"):
+        raise HTTPException(status_code=503, detail="Falló la preparación. Volvé a solicitarla.")
+    if status == "finished":
+        raise HTTPException(status_code=503, detail="No se pudo publicar el ProRes. Volvé a solicitarlo.")
+    return JSONResponse(status_code=202, content={"status": "preparing", "retry_after": 10})
 
 
 def _fmt_size_mb(size_bytes: int | None) -> str:

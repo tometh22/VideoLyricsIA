@@ -1,0 +1,3548 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Entrega — Universal Music · GenLy AI</title>
+<meta name="robots" content="noindex,nofollow" />
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #11111a;
+    --surface-2: #16161f;
+    --surface-3: #1c1c28;
+    --surface-hover: #20202c;
+    --brand: #8b5cf6;
+    --brand-light: #a78bfa;
+    --brand-dim: rgba(139, 92, 246, 0.15);
+    --text: #ffffff;
+    --text-2: #a1a1aa;
+    --text-3: #71717a;
+    --text-4: #52525b;
+    --border: rgba(255, 255, 255, 0.06);
+    --border-strong: rgba(255, 255, 255, 0.10);
+    --border-active: rgba(139, 92, 246, 0.32);
+    --danger: #ef4444;
+    --danger-light: #fca5a5;
+    --warn: #f59e0b;
+    --warn-light: #fcd34d;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    font-feature-settings: "ss01", "cv11";
+  }
+  a { color: inherit; text-decoration: none; }
+  button, input, textarea { font-family: inherit; }
+  .hidden { display: none !important; }
+
+  /* ───── Login screen (unchanged from v2) ───── */
+  .fullscreen { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 2.5rem 1.5rem; }
+  .card { background: rgba(22,22,31,0.6); border: 1px solid var(--border-strong); border-radius: 1rem; }
+  .brand-large { display: flex; flex-direction: column; align-items: center; margin-bottom: 2rem; }
+  .brand-large .logo { width: 2.75rem; height: 2.75rem; margin-bottom: 0.625rem; }
+  .brand-large .name { font-size: 0.8125rem; font-weight: 600; letter-spacing: -0.01em; }
+  .brand-large .tag  { font-size: 0.5625rem; color: var(--text-3); letter-spacing: 0.12em; text-transform: uppercase; margin-top: 0.25rem; }
+  .login-card { width: 100%; max-width: 26rem; padding: 1.75rem; }
+  .pretitle { font-size: 0.5625rem; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: var(--brand-light); margin-bottom: 0.4rem; }
+  .title { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.018em; line-height: 1.2; margin: 0 0 0.375rem 0; }
+  .subtitle { font-size: 0.75rem; color: var(--text-2); margin: 0.5rem 0 0 0; }
+  .label { display: block; font-size: 0.6875rem; color: var(--text-2); margin-bottom: 0.4rem; letter-spacing: 0.02em; }
+  .input, .textarea {
+    width: 100%;
+    background: rgba(17,17,26,0.6);
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+    border-radius: 0.5rem;
+    padding: 0.625rem 0.75rem;
+    font-size: 0.8125rem;
+    outline: none;
+    transition: border-color 150ms;
+  }
+  .input:focus, .textarea:focus { border-color: var(--brand); }
+  .textarea { resize: vertical; min-height: 7rem; font-size: 0.8125rem; line-height: 1.5; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 0.5rem;
+    background: var(--brand);
+    color: white; font-weight: 600; font-size: 0.8125rem;
+    border: none; border-radius: 0.5rem; padding: 0.625rem 1rem;
+    cursor: pointer;
+    transition: background 120ms, transform 80ms;
+    white-space: nowrap;
+  }
+  .btn:hover:not(:disabled) { background: var(--brand-light); }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .btn.btn-full { width: 100%; padding: 0.6875rem 1.25rem; }
+  .btn.btn-ghost {
+    background: transparent;
+    color: var(--text-2);
+    border: 1px solid var(--border-strong);
+  }
+  .btn.btn-ghost:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); }
+  .btn.btn-warn {
+    background: rgba(245, 158, 11, 0.18);
+    color: var(--warn-light);
+    border: 1px solid rgba(245, 158, 11, 0.32);
+  }
+  .btn.btn-warn:hover:not(:disabled) {
+    background: rgba(245, 158, 11, 0.28);
+  }
+  .btn.btn-success {
+    background: rgba(34, 197, 94, 0.18);
+    color: #4ade80;
+    border: 1px solid rgba(34, 197, 94, 0.32);
+  }
+  .btn.btn-success:hover:not(:disabled) {
+    background: rgba(34, 197, 94, 0.28);
+  }
+  .btn.btn-danger {
+    background: rgba(239, 68, 68, 0.16);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.32);
+  }
+  .btn.btn-danger:hover:not(:disabled) {
+    background: rgba(239, 68, 68, 0.26);
+  }
+  .btn-sm { padding: 0.4rem 0.625rem; font-size: 0.75rem; }
+  /* Approval-state ribbon shown when a delivery has been signed off */
+  .approved-pill {
+    display: inline-flex; align-items: center; gap: 0.375rem;
+    background: rgba(34, 197, 94, 0.14);
+    color: #86efac;
+    border: 1px solid rgba(34, 197, 94, 0.32);
+    padding: 0.25rem 0.625rem;
+    border-radius: 999px;
+    font-size: 0.6875rem;
+    font-weight: 600;
+  }
+  .approved-pill::before {
+    content: "✓";
+    font-weight: 800;
+  }
+  .approved-meta {
+    font-size: 0.6875rem;
+    color: var(--text-3);
+    margin-left: 0.5rem;
+  }
+  .approved-meta a {
+    color: var(--text-3);
+    text-decoration: underline dotted;
+    cursor: pointer;
+  }
+  .approved-meta a:hover { color: var(--text-2); }
+  .error { color: var(--danger-light); font-size: 0.75rem; margin: 0.5rem 0 0 0; }
+  .footer-help { font-size: 0.6875rem; color: var(--text-3); margin-top: 1.25rem; }
+
+  /* ───── Brand inline (for app shell header) ───── */
+  .brand-inline { display: inline-flex; align-items: center; gap: 0.5rem; color: var(--text-2); }
+  .brand-inline:hover { color: var(--text); }
+  .brand-inline .logo { width: 1.25rem; height: 1.25rem; }
+  .brand-inline .name { font-size: 0.6875rem; font-weight: 600; letter-spacing: -0.01em; }
+
+  /* ───── App shell (sidebar + main) ───── */
+  .app {
+    display: grid;
+    grid-template-columns: 17rem 1fr;
+    grid-template-rows: auto 1fr;
+    grid-template-areas:
+      "topbar topbar"
+      "sidebar main";
+    min-height: 100vh;
+  }
+  .topbar {
+    grid-area: topbar;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.875rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    position: sticky; top: 0; z-index: 20;
+  }
+  .topbar-left { display: flex; align-items: center; gap: 1.25rem; }
+  .topbar-search {
+    position: relative;
+    width: 26rem; max-width: 50vw;
+  }
+  .topbar-search input {
+    width: 100%;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 0.5rem;
+    padding: 0.5rem 0.75rem 0.5rem 2.25rem;
+    font-size: 0.8125rem;
+    outline: none;
+    transition: border-color 150ms, background 150ms;
+  }
+  .topbar-search input:focus { border-color: var(--brand); background: var(--surface-3); }
+  .topbar-search svg {
+    position: absolute;
+    left: 0.625rem; top: 50%; transform: translateY(-50%);
+    width: 1rem; height: 1rem;
+    color: var(--text-3);
+    pointer-events: none;
+  }
+  .topbar-right { display: flex; align-items: center; gap: 0.875rem; }
+  .topbar-meta { font-size: 0.6875rem; color: var(--text-3); }
+  .topbar-meta strong { color: var(--text-2); font-weight: 600; }
+
+  /* ───── Sidebar ───── */
+  .sidebar {
+    grid-area: sidebar;
+    border-right: 1px solid var(--border);
+    padding: 1.25rem 0 2rem 0;
+    overflow-y: auto;
+    background: var(--bg);
+    max-height: calc(100vh - 3.5rem);
+    position: sticky; top: 3.5rem;
+  }
+  .sidebar-header {
+    padding: 0 1.25rem;
+    margin-bottom: 0.75rem;
+    display: flex; align-items: baseline; justify-content: space-between;
+  }
+  .sidebar-title {
+    font-size: 0.625rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.12em; color: var(--text-3);
+  }
+  .sidebar-count {
+    font-size: 0.625rem; color: var(--text-4);
+  }
+  .sidebar-summary {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+    padding: 0 1.25rem 0.875rem;
+  }
+  .sidebar-summary-card {
+    display: flex; flex-direction: column; gap: 2px;
+    justify-content: space-between; min-height: 60px; box-sizing: border-box;
+    padding: 7px 8px; background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 7px;
+  }
+  .sidebar-summary-card span {
+    color: var(--text-3); font-size: 0.5625rem; line-height: 1.2;
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .sidebar-summary-card strong {
+    color: var(--text); font-size: 0.9375rem; line-height: 1.1;
+    font-weight: 700;
+  }
+  .sidebar-list {
+    display: flex; flex-direction: column; gap: 1px;
+  }
+  .sidebar-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.5rem 1.25rem;
+    cursor: pointer;
+    color: var(--text-2);
+    font-size: 0.8125rem;
+    border-left: 2px solid transparent;
+    transition: background 100ms, color 100ms, border-color 100ms;
+  }
+  .sidebar-item:hover { background: var(--surface-2); color: var(--text); }
+  .sidebar-item.active {
+    background: var(--brand-dim);
+    color: var(--text);
+    border-left-color: var(--brand);
+    font-weight: 600;
+  }
+  .sidebar-item-name {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    padding-right: 0.5rem;
+    display: inline-flex; align-items: baseline; gap: 0.25rem;
+  }
+  .sidebar-item-count-inline {
+    color: var(--text-4);
+    font-weight: 400;
+    font-size: 0.75rem;
+  }
+  .sidebar-item.active .sidebar-item-count-inline {
+    color: var(--brand-light);
+  }
+  .sidebar-divider {
+    margin: 0.5rem 1.25rem;
+    border-top: 1px solid var(--border);
+  }
+  .sidebar-pending-badge {
+    display: inline-flex; align-items: center; gap: 0.25rem;
+    font-size: 0.625rem;
+    color: var(--warn-light);
+    background: rgba(245, 158, 11, 0.15);
+    padding: 0.0625rem 0.4375rem;
+    border-radius: 999px;
+    margin-left: 0.375rem;
+    flex-shrink: 0;
+  }
+
+  /* ───── Main area ───── */
+  .main {
+    grid-area: main;
+    padding: 1.5rem 2rem 4rem 2rem;
+    overflow-y: auto;
+  }
+  .main-header {
+    margin-bottom: 1.5rem;
+  }
+  .main-header h2 {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+  .main-header .subline {
+    font-size: 0.8125rem;
+    color: var(--text-3);
+    margin-top: 0.25rem;
+  }
+
+  /* ───── Song list (inline rows, no modal) ───── */
+  .song-list {
+    display: flex; flex-direction: column;
+    gap: 1rem;
+  }
+  .song-block {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0.875rem;
+    overflow: hidden;
+  }
+  .song-block-head {
+    padding: 0.875rem 1.125rem;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    background: var(--surface-2);
+  }
+  .song-block-title {
+    font-size: 0.9375rem; font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 0;
+    line-height: 1.3;
+  }
+  .song-block-artist {
+    font-size: 0.6875rem; color: var(--text-3);
+    margin: 0 0 0.125rem 0;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-weight: 600;
+  }
+  .song-block-meta {
+    display: flex; gap: 0.375rem; align-items: center;
+    flex-wrap: wrap;
+  }
+  .badge {
+    font-size: 0.625rem;
+    padding: 0.125rem 0.5rem;
+    border-radius: 999px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .badge-versions { background: var(--surface-3); color: var(--text-2); }
+  .badge-frame { background: rgba(139, 92, 246, 0.15); color: var(--brand-light); }
+  .badge-pending {
+    background: rgba(245, 158, 11, 0.18);
+    color: var(--warn-light);
+    display: inline-flex; align-items: center; gap: 0.25rem;
+  }
+  .badge-pending::before {
+    content: ""; width: 0.375rem; height: 0.375rem;
+    background: var(--warn); border-radius: 50%;
+  }
+
+  /* Each version is a row inside a song block */
+  .version-row {
+    display: grid;
+    grid-template-columns: 11rem 1fr;
+    gap: 1.125rem;
+    padding: 1rem 1.125rem;
+    border-bottom: 1px solid var(--border);
+    align-items: start;
+  }
+  .version-row:last-child { border-bottom: none; }
+  .version-row-thumb {
+    aspect-ratio: 16 / 9;
+    width: 11rem;
+    border-radius: 0.5rem;
+    overflow: hidden;
+    position: relative;
+    background: var(--surface-3);
+    cursor: pointer;
+  }
+  .version-row-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .version-row-thumb-fallback {
+    width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-4); font-size: 0.6875rem;
+  }
+  .version-row-play {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.4);
+    opacity: 0;
+    transition: opacity 150ms;
+  }
+  .version-row-thumb:hover .version-row-play { opacity: 1; }
+  .version-row-play svg { width: 2.25rem; height: 2.25rem; color: white; }
+  .version-row-body { min-width: 0; display: flex; flex-direction: column; gap: 0.625rem; }
+  .version-row-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 0.5rem; flex-wrap: wrap;
+  }
+  .version-row-label {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    display: inline-flex; align-items: center; gap: 0.5rem;
+  }
+  .version-row-actions {
+    display: flex; align-items: center; gap: 0.375rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  @media (max-width: 720px) {
+    .version-row { grid-template-columns: 1fr; }
+    .version-row-thumb { width: 100%; max-width: 18rem; }
+  }
+
+  /* ───── Empty state ───── */
+  .empty-state {
+    text-align: center;
+    color: var(--text-3);
+    padding: 4rem 1rem;
+    font-size: 0.875rem;
+  }
+  .empty-state-title {
+    color: var(--text);
+    font-weight: 600;
+    font-size: 1rem;
+    margin-bottom: 0.5rem;
+  }
+  .listing-state {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    min-height: 60vh;
+    text-align: center;
+    color: var(--text-3);
+    padding: 3rem 1rem;
+    font-size: 0.875rem;
+  }
+  .listing-state.error { color: var(--danger-light); }
+  .listing-state .spinner {
+    display: inline-block; width: 1.25rem; height: 1.25rem;
+    border: 2px solid var(--border);
+    border-top-color: var(--brand-light);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-right: 0.5rem;
+    vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ───── Detail modal ───── */
+  .modal {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    display: none;
+    align-items: flex-start; justify-content: center;
+    z-index: 100;
+    overflow-y: auto;
+    padding: 2rem 1rem;
+  }
+  .modal.open { display: flex; }
+  .modal-card {
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 1rem;
+    width: 100%; max-width: 56rem;
+    max-height: calc(100vh - 4rem);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
+    margin: auto;
+  }
+  .modal-head {
+    padding: 1.25rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 1rem;
+  }
+  .modal-head-titles { min-width: 0; flex: 1; }
+  .modal-head-artist {
+    font-size: 0.625rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--brand-light);
+    margin: 0 0 0.25rem 0;
+  }
+  .modal-head-song {
+    font-size: 1.25rem;
+    font-weight: 700;
+    letter-spacing: -0.015em;
+    margin: 0;
+  }
+  .modal-head-close {
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    color: var(--text-2);
+    width: 2rem; height: 2rem;
+    border-radius: 0.5rem;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 120ms, color 120ms;
+  }
+  .modal-head-close:hover { background: var(--surface-hover); color: var(--text); }
+  .modal-body {
+    padding: 1rem 1.5rem 1.5rem 1.5rem;
+    overflow-y: auto;
+    flex: 1;
+  }
+
+  /* Frame-size pill used inside the version row label */
+  .version-label-tag.warning { background: rgba(245,158,11,.14); color: #fbbf24; }
+  .version-label-tag {
+    font-size: 0.625rem;
+    color: var(--text-3);
+    background: var(--surface-3);
+    padding: 0.125rem 0.5rem;
+    border-radius: 999px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+
+  .files {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+    gap: 0.5rem;
+  }
+  .file-btn {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--surface-3);
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    font-size: 0.75rem;
+    color: var(--text);
+    transition: background 120ms, border-color 120ms;
+    overflow: hidden;
+  }
+  .file-btn:hover {
+    background: var(--surface-hover);
+    border-color: var(--border-strong);
+  }
+  .file-btn.disabled {
+    color: var(--text-4);
+    cursor: not-allowed;
+    background: transparent;
+  }
+  .file-btn .dl-icon { width: 0.875rem; height: 0.875rem; color: var(--brand-light); flex-shrink: 0; }
+  .file-btn.disabled .dl-icon { color: var(--text-4); }
+  .file-btn .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-btn .file-size {
+    color: var(--text-3);
+    font-size: 0.6875rem;
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+  }
+  .prores-prepare-btn { cursor: pointer; text-align: left; }
+  .prores-prepare-btn:hover:not(:disabled) {
+    background: var(--surface-hover);
+    border-color: var(--brand-light);
+  }
+
+  /* ───── Change requests in version ───── */
+  .changes-block {
+    margin-top: 0.875rem;
+    padding-top: 0.875rem;
+    border-top: 1px solid var(--border);
+  }
+  .changes-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 0.625rem;
+  }
+  .changes-title {
+    font-size: 0.6875rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-3);
+  }
+  .change-item {
+    background: var(--surface-3);
+    border-left: 2px solid var(--warn);
+    padding: 0.625rem 0.75rem;
+    margin-top: 0.5rem;
+    border-radius: 0.25rem;
+    font-size: 0.75rem;
+    line-height: 1.5;
+  }
+  .change-item.resolved {
+    border-left-color: #22c55e;
+    opacity: 0.6;
+  }
+  .change-item-meta {
+    font-size: 0.625rem;
+    color: var(--text-3);
+    margin-top: 0.375rem;
+  }
+  .change-item-meta.resolved-tag {
+    color: #4ade80;
+    font-weight: 600;
+  }
+
+  /* ───── Lightbox (video/image preview) ───── */
+  .lightbox {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.92);
+    display: none;
+    align-items: center; justify-content: center;
+    z-index: 200;
+    padding: 2rem;
+  }
+  .lightbox.open { display: flex; flex-direction: column; }
+  .lightbox img, .lightbox video {
+    max-width: 100%;
+    max-height: 80vh;
+    border-radius: 0.5rem;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.8);
+  }
+  .lb-close {
+    position: absolute;
+    top: 1rem; right: 1rem;
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid var(--border-strong);
+    color: white;
+    width: 2.25rem; height: 2.25rem;
+    border-radius: 0.5rem;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    font-size: 1.125rem;
+    transition: background 120ms;
+  }
+  .lb-close:hover { background: rgba(255, 255, 255, 0.18); }
+  .lb-meta {
+    color: var(--text-2);
+    font-size: 0.75rem;
+    margin-top: 1rem;
+    text-align: center;
+  }
+
+  /* ───── Footer (subtle, inside main) ───── */
+  .main-footer {
+    margin-top: 3rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.6875rem;
+    color: var(--text-4);
+    line-height: 1.6;
+  }
+  .main-footer a { color: var(--brand-light); }
+
+  /* ───── Responsive ───── */
+  @media (max-width: 880px) {
+    .app {
+      grid-template-columns: 1fr;
+      grid-template-rows: auto auto 1fr;
+      grid-template-areas: "topbar" "sidebar" "main";
+    }
+    .sidebar {
+      position: static;
+      max-height: 14rem;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+    }
+    .topbar-search { width: 100%; }
+    .main { padding: 1rem 1rem 3rem 1rem; }
+  }
+
+  /* Status filter pills (Aprobados / Pendientes / Con cambios) */
+  .delivery-sections {
+    display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 24px;
+    padding-bottom: 14px; border-bottom: 1px solid var(--border);
+  }
+  .delivery-section {
+    background: transparent; border: 1px solid var(--border-strong);
+    color: var(--text-2); border-radius: 9px;
+    padding: 9px 14px; font: inherit; font-size: 13px; font-weight: 700;
+    cursor: pointer;
+  }
+  .delivery-section:hover { color: var(--text); background: var(--surface-2); }
+  .delivery-section.active { color: #fff; background: var(--brand); border-color: var(--brand); }
+  .delivery-section-count { margin-left: 6px; opacity: .75; }
+  .filter-group-label {
+    color: var(--text-3); font-size: 10px; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase; margin: 0 0 8px;
+  }
+  .status-filter { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 22px; }
+  .date-filter { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 22px; }
+  .status-pill {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.10);
+    color: #a0a3b1; border-radius: 999px;
+    padding: 7px 16px; font-size: 13px; font-weight: 600;
+    cursor: pointer; transition: background .15s, color .15s, border-color .15s;
+  }
+  .status-pill:hover { color: #fff; background: rgba(255,255,255,0.09); }
+  .status-pill.active { background: #6D4AFF; border-color: #6D4AFF; color: #fff; }
+  .date-pill {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.10);
+    color: #a0a3b1; border-radius: 999px;
+    padding: 7px 16px; font-size: 13px; font-weight: 600;
+    cursor: pointer; transition: background .15s, color .15s, border-color .15s;
+  }
+  .date-pill:hover { color: #fff; background: rgba(255,255,255,0.09); }
+  .date-pill.active { background: #6D4AFF; border-color: #6D4AFF; color: #fff; }
+  .custom-date-panel {
+    display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
+    margin: -10px 0 22px; padding: 12px;
+    background: rgba(255,255,255,0.035); border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .custom-date-field { display: flex; flex-direction: column; gap: 5px; }
+  .custom-date-field label {
+    color: var(--text-3); font-size: 10px; font-weight: 700;
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }
+  .custom-date-field input {
+    color-scheme: dark; color: var(--text); background: var(--surface-2);
+    border: 1px solid var(--border-strong); border-radius: 7px;
+    padding: 7px 9px; font: inherit; font-size: 12px;
+  }
+  .custom-date-field input:focus { outline: none; border-color: var(--brand); }
+  .custom-date-actions { display: flex; gap: 7px; align-items: center; }
+  .custom-date-summary { color: var(--text-3); font-size: 12px; }
+  .custom-date-error { flex-basis: 100%; margin: 0; color: var(--danger-light, #fca5a5); font-size: 12px; }
+
+  /* ═════════════════════════════════════════════════════════════════
+     HELP CENTER
+     ═════════════════════════════════════════════════════════════════ */
+
+  /* ───── Help button (topbar) ───── */
+  .help-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 2rem; height: 2rem;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text-2);
+    border-radius: 999px;
+    cursor: pointer;
+    transition: background 120ms, color 120ms, border-color 120ms, transform 120ms;
+    padding: 0;
+    flex-shrink: 0;
+  }
+  .help-btn:hover { background: var(--surface-3); color: var(--text); border-color: var(--border-strong); }
+  .help-btn:active { transform: scale(0.96); }
+  .help-btn svg { width: 1.125rem; height: 1.125rem; }
+  .help-btn.help-btn-pulse::after {
+    content: ""; position: absolute; inset: -4px;
+    border-radius: 999px; border: 2px solid var(--brand);
+    animation: helpPulse 1.8s ease-out infinite;
+    pointer-events: none;
+  }
+  @keyframes helpPulse {
+    0% { transform: scale(0.85); opacity: 0.8; }
+    100% { transform: scale(1.6); opacity: 0; }
+  }
+
+  /* ───── Drawer ───── */
+  .help-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    opacity: 0; pointer-events: none;
+    transition: opacity 200ms ease;
+    z-index: 150;
+  }
+  .help-backdrop.open { opacity: 1; pointer-events: auto; }
+
+  .help-drawer {
+    position: fixed; top: 0; right: 0; bottom: 0;
+    width: min(480px, 100vw);
+    background: var(--bg);
+    border-left: 1px solid var(--border-strong);
+    display: flex; flex-direction: column;
+    transform: translateX(100%);
+    transition: transform 240ms cubic-bezier(0.4, 0, 0.2, 1);
+    z-index: 160;
+    box-shadow: -24px 0 60px rgba(0, 0, 0, 0.4);
+  }
+  .help-drawer.open { transform: translateX(0); }
+
+  .help-drawer-head {
+    display: flex; align-items: center; gap: 0.625rem;
+    padding: 1rem 1.125rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .help-drawer-title {
+    flex: 1;
+    margin: 0;
+    font-size: 0.9375rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .help-iconbtn {
+    width: 2rem; height: 2rem;
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    color: var(--text-2);
+    border-radius: 0.5rem;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    padding: 0;
+    flex-shrink: 0;
+    transition: background 120ms, color 120ms;
+  }
+  .help-iconbtn:hover { background: var(--surface-hover); color: var(--text); }
+  .help-iconbtn svg { width: 1rem; height: 1rem; }
+
+  .help-drawer-search {
+    position: relative;
+    padding: 0.75rem 1.125rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .help-drawer-search svg {
+    position: absolute;
+    left: 1.75rem; top: 50%; transform: translateY(-50%);
+    width: 1rem; height: 1rem;
+    color: var(--text-3);
+    pointer-events: none;
+  }
+  .help-drawer-search input {
+    width: 100%;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 0.5rem;
+    padding: 0.5rem 0.75rem 0.5rem 2.25rem;
+    font-size: 0.8125rem;
+    outline: none;
+    transition: border-color 150ms, background 150ms;
+  }
+  .help-drawer-search input:focus { border-color: var(--brand); background: var(--surface-3); }
+
+  .help-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1.125rem;
+    outline: none;
+  }
+
+  .help-drawer-foot {
+    border-top: 1px solid var(--border);
+    padding: 0.75rem 1.125rem;
+    font-size: 0.6875rem;
+    color: var(--text-3);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .help-drawer-foot a { color: var(--brand-light); }
+
+  /* ───── Drawer: Home view ───── */
+  .help-section-title {
+    font-size: 0.625rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--text-3);
+    margin: 0 0 0.625rem 0;
+  }
+  .help-section-title:not(:first-child) { margin-top: 1.5rem; }
+
+  .help-categories {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.5rem;
+  }
+  .help-category-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0.625rem;
+    padding: 0.875rem;
+    cursor: pointer;
+    text-align: left;
+    color: var(--text);
+    transition: background 120ms, border-color 120ms, transform 120ms;
+    display: flex; flex-direction: column; gap: 0.375rem;
+  }
+  .help-category-card:hover {
+    background: var(--surface-2);
+    border-color: var(--border-strong);
+  }
+  .help-category-card:active { transform: scale(0.98); }
+  .help-category-icon {
+    width: 1.75rem; height: 1.75rem;
+    border-radius: 0.5rem;
+    background: var(--brand-dim);
+    color: var(--brand-light);
+    display: inline-flex; align-items: center; justify-content: center;
+    margin-bottom: 0.125rem;
+  }
+  .help-category-icon svg { width: 1rem; height: 1rem; }
+  .help-category-name {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    line-height: 1.2;
+  }
+  .help-category-count {
+    font-size: 0.625rem;
+    color: var(--text-3);
+  }
+
+  .help-featured-list, .help-article-list {
+    display: flex; flex-direction: column;
+    gap: 0.375rem;
+  }
+  .help-article-item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    padding: 0.75rem 0.875rem;
+    cursor: pointer;
+    text-align: left;
+    color: var(--text);
+    transition: background 120ms, border-color 120ms;
+    display: flex; flex-direction: column; gap: 0.25rem;
+  }
+  .help-article-item:hover { background: var(--surface-2); border-color: var(--border-strong); }
+  .help-article-item-title {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+  .help-article-item-summary {
+    font-size: 0.75rem;
+    color: var(--text-3);
+    line-height: 1.4;
+  }
+  .help-article-item mark {
+    background: rgba(139, 92, 246, 0.25);
+    color: var(--text);
+    padding: 0 2px;
+    border-radius: 2px;
+  }
+
+  /* ───── Drawer: Article view ───── */
+  .help-article-head {
+    margin-bottom: 1rem;
+  }
+  .help-article-eyebrow {
+    font-size: 0.625rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--brand-light);
+    margin: 0 0 0.5rem 0;
+  }
+  .help-article-title {
+    font-size: 1.25rem;
+    font-weight: 700;
+    letter-spacing: -0.018em;
+    line-height: 1.25;
+    margin: 0 0 0.375rem 0;
+  }
+  .help-article-summary {
+    font-size: 0.8125rem;
+    color: var(--text-2);
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .help-article-body {
+    font-size: 0.8125rem;
+    color: var(--text);
+    line-height: 1.6;
+  }
+  .help-article-body p { margin: 0 0 0.875rem 0; }
+  .help-article-body p:last-child { margin-bottom: 0; }
+  .help-article-body strong { font-weight: 700; }
+  .help-article-body em { font-style: italic; color: var(--text-2); }
+  .help-article-body a { color: var(--brand-light); border-bottom: 1px dotted var(--brand-light); }
+  .help-article-body a:hover { color: var(--brand); border-bottom-color: var(--brand); }
+  .help-article-body kbd {
+    display: inline-block;
+    background: var(--surface-3);
+    border: 1px solid var(--border-strong);
+    border-bottom-width: 2px;
+    border-radius: 0.25rem;
+    padding: 0.0625rem 0.375rem;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+    font-size: 0.6875rem;
+    color: var(--text);
+    margin: 0 0.0625rem;
+  }
+  .help-article-body code {
+    background: var(--surface-3);
+    border-radius: 0.25rem;
+    padding: 0.0625rem 0.3125rem;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+    font-size: 0.75rem;
+    color: var(--brand-light);
+  }
+  .help-article-body h4.help-h4 {
+    font-size: 0.8125rem;
+    font-weight: 700;
+    margin: 1.125rem 0 0.5rem 0;
+    color: var(--text);
+  }
+  .help-article-body .help-cta {
+    background: var(--surface);
+    border-left: 2px solid var(--brand);
+    padding: 0.625rem 0.75rem;
+    border-radius: 0.25rem;
+    font-size: 0.75rem;
+    margin-top: 1rem;
+  }
+  .help-article-body ol.help-steps,
+  .help-article-body ul.help-bullets,
+  .help-article-body ul.help-good,
+  .help-article-body ul.help-bad,
+  .help-article-body ul.help-glossary {
+    margin: 0 0 0.875rem 0;
+    padding-left: 1.125rem;
+  }
+  .help-article-body ol.help-steps li,
+  .help-article-body ul.help-bullets li,
+  .help-article-body ul.help-glossary li {
+    margin-bottom: 0.5rem;
+    padding-left: 0.25rem;
+  }
+  .help-article-body ul.help-good { list-style: none; padding-left: 0; }
+  .help-article-body ul.help-good li {
+    background: rgba(34, 197, 94, 0.06);
+    border-left: 2px solid #22c55e;
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.375rem;
+    border-radius: 0.25rem;
+    font-size: 0.78125rem;
+  }
+  .help-article-body ul.help-good li::before { content: "✓ "; color: #4ade80; font-weight: 700; }
+  .help-article-body ul.help-bad { list-style: none; padding-left: 0; }
+  .help-article-body ul.help-bad li {
+    background: rgba(239, 68, 68, 0.06);
+    border-left: 2px solid var(--danger);
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.375rem;
+    border-radius: 0.25rem;
+    font-size: 0.78125rem;
+  }
+  .help-article-body ul.help-bad li::before { content: "✗ "; color: var(--danger-light); font-weight: 700; }
+
+  .help-article-body table.help-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0 0 1rem 0;
+    font-size: 0.75rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    overflow: hidden;
+  }
+  .help-article-body .help-table th,
+  .help-article-body .help-table td {
+    padding: 0.5rem 0.625rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    line-height: 1.45;
+  }
+  .help-article-body .help-table th {
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-weight: 700;
+    text-transform: uppercase;
+    font-size: 0.625rem;
+    letter-spacing: 0.06em;
+  }
+  .help-article-body .help-table tr:last-child td { border-bottom: none; }
+  .help-article-body .help-success { color: #4ade80; }
+  .help-article-body .help-danger { color: var(--danger-light); }
+  .help-article-body .help-warn { color: var(--warn-light); }
+
+  .help-article-body dl.help-dl { margin: 0; }
+  .help-article-body dl.help-dl dt {
+    font-weight: 700;
+    color: var(--brand-light);
+    margin-top: 0.875rem;
+    font-size: 0.8125rem;
+  }
+  .help-article-body dl.help-dl dt:first-child { margin-top: 0; }
+  .help-article-body dl.help-dl dd {
+    margin: 0.25rem 0 0 0;
+    color: var(--text-2);
+    font-size: 0.78125rem;
+    line-height: 1.5;
+  }
+
+  /* Chips in glossary visual */
+  .help-chip {
+    display: inline-block;
+    font-size: 0.625rem;
+    padding: 0.125rem 0.5rem;
+    border-radius: 999px;
+    font-weight: 600;
+    margin-right: 0.25rem;
+  }
+  .help-chip-versions { background: var(--surface-3); color: var(--text-2); }
+  .help-chip-frame { background: rgba(139, 92, 246, 0.15); color: var(--brand-light); }
+  .help-chip-pending {
+    background: rgba(245, 158, 11, 0.18);
+    color: var(--warn-light);
+  }
+  .help-chip-approved {
+    background: rgba(34, 197, 94, 0.14);
+    color: #86efac;
+  }
+  .help-sidebar-pending {
+    display: inline-block;
+    font-size: 0.625rem;
+    color: var(--warn-light);
+    background: rgba(245, 158, 11, 0.15);
+    padding: 0.0625rem 0.4375rem;
+    border-radius: 999px;
+    font-weight: 600;
+    margin: 0 0.25rem;
+  }
+
+  /* ───── Article feedback (helpful?) ───── */
+  .help-feedback {
+    margin-top: 1.5rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+  .help-feedback-q {
+    font-size: 0.75rem;
+    color: var(--text-2);
+    margin: 0;
+  }
+  .help-feedback-btn {
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    color: var(--text-2);
+    padding: 0.3125rem 0.625rem;
+    border-radius: 0.5rem;
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: background 120ms, color 120ms, border-color 120ms;
+  }
+  .help-feedback-btn:hover { background: var(--surface-2); color: var(--text); }
+  .help-feedback-btn.selected { border-color: var(--brand); color: var(--brand-light); background: var(--brand-dim); }
+  .help-feedback-thanks {
+    font-size: 0.75rem;
+    color: var(--text-3);
+  }
+
+  /* ───── Empty / no results ───── */
+  .help-empty {
+    text-align: center;
+    color: var(--text-3);
+    padding: 2rem 0.5rem;
+    font-size: 0.8125rem;
+  }
+  .help-empty-title {
+    color: var(--text);
+    font-weight: 600;
+    font-size: 0.9375rem;
+    margin-bottom: 0.375rem;
+  }
+
+  /* ═════════════════════════════════════════════════════════════════
+     ANIMATED TUTORIAL DEMOS
+     ═════════════════════════════════════════════════════════════════ */
+  .anim {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0.625rem;
+    padding: 1rem;
+    margin: 0 0 1rem 0;
+    display: flex; flex-direction: column; gap: 0.625rem;
+    align-items: center;
+  }
+  .anim-stage {
+    width: 100%;
+    min-height: 8rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    padding: 0.75rem;
+    position: relative;
+    overflow: hidden;
+  }
+  .anim-replay {
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    color: var(--text-2);
+    font-size: 0.6875rem;
+    padding: 0.3125rem 0.625rem;
+    border-radius: 0.375rem;
+    cursor: pointer;
+    transition: background 120ms, color 120ms;
+  }
+  .anim-replay:hover { background: var(--surface-2); color: var(--text); }
+
+  /* — Approve flow — */
+  .anim-approve-stage {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 9rem;
+  }
+  .anim-approve-btn {
+    background: rgba(34, 197, 94, 0.18);
+    color: #4ade80;
+    border: 1px solid rgba(34, 197, 94, 0.32);
+    padding: 0.5rem 0.875rem;
+    border-radius: 0.5rem;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    position: absolute;
+    animation: aBtn 4.5s ease-in-out infinite;
+  }
+  .anim-approve-confirm {
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+    border-radius: 0.5rem;
+    padding: 0.75rem 0.875rem;
+    font-size: 0.75rem;
+    color: var(--text);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    position: absolute;
+    opacity: 0;
+    animation: aConfirm 4.5s ease-in-out infinite;
+  }
+  .anim-approve-pill {
+    display: inline-flex; align-items: center; gap: 0.375rem;
+    background: rgba(34, 197, 94, 0.14);
+    color: #86efac;
+    border: 1px solid rgba(34, 197, 94, 0.32);
+    padding: 0.3125rem 0.75rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    position: absolute;
+    opacity: 0;
+    animation: aPill 4.5s ease-in-out infinite;
+  }
+  .anim-approve-pill::before { content: "✓"; font-weight: 800; }
+  @keyframes aBtn {
+    0%, 18% { opacity: 1; transform: scale(1); }
+    22%     { opacity: 1; transform: scale(0.92); }
+    25%, 100% { opacity: 0; transform: scale(0.92); }
+  }
+  @keyframes aConfirm {
+    0%, 23% { opacity: 0; transform: translateY(8px); }
+    28%, 60% { opacity: 1; transform: translateY(0); }
+    65%, 100% { opacity: 0; transform: translateY(-8px); }
+  }
+  @keyframes aPill {
+    0%, 63% { opacity: 0; transform: scale(0.6); }
+    68%, 92% { opacity: 1; transform: scale(1); }
+    97%, 100% { opacity: 0; transform: scale(1); }
+  }
+
+  /* — Download flow — */
+  .anim-dl-stage {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 0.625rem;
+    min-height: 9rem;
+  }
+  .anim-dl-btn {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    background: var(--surface-3);
+    border: 1px solid var(--border);
+    padding: 0.4375rem 0.75rem;
+    border-radius: 0.5rem;
+    font-size: 0.75rem;
+    color: var(--text);
+    animation: dlBtn 4s ease-in-out infinite;
+  }
+  .anim-dl-btn svg { width: 0.875rem; height: 0.875rem; color: var(--brand-light); }
+  .anim-dl-bar {
+    width: 8rem; height: 0.375rem;
+    background: var(--surface-3);
+    border-radius: 999px;
+    overflow: hidden;
+    opacity: 0;
+    animation: dlBar 4s ease-in-out infinite;
+  }
+  .anim-dl-bar::after {
+    content: "";
+    display: block; height: 100%;
+    width: 0%;
+    background: linear-gradient(to right, var(--brand), var(--brand-light));
+    animation: dlFill 4s ease-in-out infinite;
+  }
+  .anim-dl-check {
+    color: #4ade80;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    opacity: 0;
+    animation: dlCheck 4s ease-in-out infinite;
+  }
+  @keyframes dlBtn {
+    0%, 12% { transform: scale(1); }
+    18% { transform: scale(0.94); background: var(--surface-hover); }
+    24%, 100% { transform: scale(1); }
+  }
+  @keyframes dlBar {
+    0%, 22% { opacity: 0; }
+    27%, 72% { opacity: 1; }
+    78%, 100% { opacity: 0; }
+  }
+  @keyframes dlFill {
+    0%, 25% { width: 0%; }
+    70% { width: 100%; }
+    78%, 100% { width: 100%; }
+  }
+  @keyframes dlCheck {
+    0%, 72% { opacity: 0; transform: translateY(4px); }
+    78%, 95% { opacity: 1; transform: translateY(0); }
+    100% { opacity: 0; }
+  }
+
+  /* — Change request flow — */
+  .anim-cr-stage {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 9.5rem;
+  }
+  .anim-cr-btn {
+    background: rgba(245, 158, 11, 0.18);
+    color: var(--warn-light);
+    border: 1px solid rgba(245, 158, 11, 0.32);
+    padding: 0.4375rem 0.75rem;
+    border-radius: 0.5rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    position: absolute;
+    animation: crBtn 5s ease-in-out infinite;
+  }
+  .anim-cr-modal {
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+    border-radius: 0.5rem;
+    padding: 0.75rem;
+    width: 14rem;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    position: absolute;
+    opacity: 0;
+    animation: crModal 5s ease-in-out infinite;
+  }
+  .anim-cr-modal-title { font-size: 0.6875rem; color: var(--text-2); margin-bottom: 0.375rem; font-weight: 600; }
+  .anim-cr-modal-ta {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 0.25rem;
+    height: 2rem;
+    width: 100%;
+    margin-bottom: 0.375rem;
+    position: relative;
+  }
+  .anim-cr-modal-ta::before {
+    content: "";
+    position: absolute;
+    top: 0.375rem; left: 0.375rem;
+    width: 0;
+    height: 0.5rem;
+    background: var(--brand);
+    border-radius: 1px;
+    animation: crType 5s ease-in-out infinite;
+  }
+  .anim-cr-modal-btn {
+    background: var(--brand);
+    color: white;
+    font-size: 0.625rem;
+    font-weight: 600;
+    padding: 0.25rem 0.5rem;
+    border-radius: 0.25rem;
+    display: inline-block;
+  }
+  .anim-cr-sent {
+    display: inline-flex; align-items: center; gap: 0.375rem;
+    background: rgba(245, 158, 11, 0.18);
+    color: var(--warn-light);
+    border: 1px solid rgba(245, 158, 11, 0.32);
+    padding: 0.3125rem 0.625rem;
+    border-radius: 0.375rem;
+    font-size: 0.6875rem;
+    position: absolute;
+    opacity: 0;
+    animation: crSent 5s ease-in-out infinite;
+  }
+  @keyframes crBtn {
+    0%, 12% { opacity: 1; transform: scale(1); }
+    16% { opacity: 1; transform: scale(0.94); }
+    20%, 100% { opacity: 0; }
+  }
+  @keyframes crModal {
+    0%, 18% { opacity: 0; transform: translateY(6px) scale(0.96); }
+    24%, 75% { opacity: 1; transform: translateY(0) scale(1); }
+    80%, 100% { opacity: 0; transform: translateY(-6px) scale(0.98); }
+  }
+  @keyframes crType {
+    0%, 28% { width: 0; }
+    32% { width: 1.5rem; }
+    40% { width: 4rem; }
+    52% { width: 7rem; }
+    62% { width: 9.5rem; }
+    72%, 100% { width: 9.5rem; }
+  }
+  @keyframes crSent {
+    0%, 78% { opacity: 0; }
+    83%, 95% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+
+  /* — Tour overview animation — */
+  .anim-tour-stage {
+    min-height: 9rem;
+    display: grid;
+    grid-template-columns: 4rem 1fr;
+    grid-template-rows: auto 1fr;
+    grid-template-areas: "top top" "sb main";
+    gap: 0.25rem;
+  }
+  .anim-tour-top { grid-area: top; background: var(--surface-2); border-radius: 0.25rem; height: 1.5rem; display: flex; align-items: center; padding: 0 0.375rem; }
+  .anim-tour-top-search { background: var(--surface-3); border-radius: 0.25rem; height: 0.75rem; flex: 1; margin-left: 0.5rem; }
+  .anim-tour-sb { grid-area: sb; background: var(--surface-2); border-radius: 0.25rem; padding: 0.375rem; display: flex; flex-direction: column; gap: 0.1875rem; }
+  .anim-tour-sb-item { background: var(--surface-3); border-radius: 0.125rem; height: 0.5rem; }
+  .anim-tour-main { grid-area: main; background: var(--surface-2); border-radius: 0.25rem; padding: 0.375rem; display: flex; flex-direction: column; gap: 0.25rem; }
+  .anim-tour-pills { display: flex; gap: 0.1875rem; }
+  .anim-tour-pill { background: var(--surface-3); border-radius: 999px; height: 0.5rem; width: 1.5rem; }
+  .anim-tour-card { background: var(--surface-3); border-radius: 0.25rem; flex: 1; }
+  .anim-tour-stage > * { transition: box-shadow 200ms, outline 200ms; }
+  .anim-tour-stage > *.hl {
+    outline: 2px solid var(--brand);
+    box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.18);
+  }
+  /* Pulses through 4 elements over 8s */
+  .anim-tour-sb { animation: tourSB 8s ease-in-out infinite; }
+  .anim-tour-top { animation: tourTop 8s ease-in-out infinite; }
+  .anim-tour-pills { animation: tourPills 8s ease-in-out infinite; }
+  .anim-tour-card { animation: tourCard 8s ease-in-out infinite; }
+  @keyframes tourSB {
+    0%, 18%   { outline: 2px solid var(--brand); box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.18); }
+    22%, 100% { outline: 2px solid transparent; box-shadow: none; }
+  }
+  @keyframes tourTop {
+    0%, 22%   { outline: 2px solid transparent; box-shadow: none; }
+    25%, 43%  { outline: 2px solid var(--brand); box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.18); }
+    47%, 100% { outline: 2px solid transparent; box-shadow: none; }
+  }
+  @keyframes tourPills {
+    0%, 47%   { outline: 2px solid transparent; box-shadow: none; }
+    50%, 68%  { outline: 2px solid var(--brand); box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.18); }
+    72%, 100% { outline: 2px solid transparent; box-shadow: none; }
+  }
+  @keyframes tourCard {
+    0%, 72%   { outline: 2px solid transparent; box-shadow: none; }
+    75%, 95%  { outline: 2px solid var(--brand); box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.18); }
+    100%      { outline: 2px solid transparent; box-shadow: none; }
+  }
+
+  /* ═════════════════════════════════════════════════════════════════
+     TOUR OVERLAY (first-visit walkthrough)
+     ═════════════════════════════════════════════════════════════════ */
+  .tour-overlay {
+    position: fixed; inset: 0;
+    z-index: 180;
+    pointer-events: none;
+    visibility: hidden;
+  }
+  .tour-overlay.open {
+    visibility: visible;
+    pointer-events: auto;
+  }
+  .tour-mask {
+    position: absolute;
+    background: rgba(0, 0, 0, 0.65);
+    backdrop-filter: blur(2px);
+    -webkit-backdrop-filter: blur(2px);
+    transition: all 300ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .tour-highlight {
+    position: absolute;
+    border: 2px solid var(--brand);
+    border-radius: 0.625rem;
+    box-shadow: 0 0 0 6px rgba(139, 92, 246, 0.25);
+    pointer-events: none;
+    transition: all 300ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .tour-tooltip {
+    position: absolute;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 0.75rem;
+    padding: 1rem 1.125rem 0.875rem 1.125rem;
+    width: min(20rem, calc(100vw - 2rem));
+    box-shadow: 0 16px 56px rgba(0, 0, 0, 0.55);
+    transition: all 300ms cubic-bezier(0.4, 0, 0.2, 1);
+    opacity: 0;
+  }
+  .tour-overlay.open .tour-tooltip { opacity: 1; }
+  .tour-step-meta {
+    font-size: 0.625rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-3);
+    margin-bottom: 0.5rem;
+  }
+  .tour-step-title {
+    font-size: 0.9375rem;
+    font-weight: 700;
+    margin: 0 0 0.375rem 0;
+    line-height: 1.3;
+    letter-spacing: -0.01em;
+  }
+  .tour-step-text {
+    font-size: 0.75rem;
+    color: var(--text-2);
+    margin: 0 0 0.875rem 0;
+    line-height: 1.5;
+  }
+  .tour-actions {
+    display: flex; justify-content: space-between; gap: 0.5rem;
+  }
+
+  /* ═════════════════════════════════════════════════════════════════
+     CONTEXTUAL TOOLTIPS (?-icons inline)
+     ═════════════════════════════════════════════════════════════════ */
+  .help-tip {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 0.9375rem; height: 0.9375rem;
+    background: var(--surface-3);
+    border: 1px solid var(--border-strong);
+    color: var(--text-3);
+    border-radius: 999px;
+    font-size: 0.5625rem;
+    font-weight: 700;
+    cursor: help;
+    margin-left: 0.25rem;
+    vertical-align: middle;
+    transition: background 120ms, color 120ms, border-color 120ms;
+    user-select: none;
+  }
+  .help-tip:hover {
+    background: var(--brand-dim);
+    color: var(--brand-light);
+    border-color: var(--border-active);
+  }
+
+  .ctx-tooltip {
+    position: fixed;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 0.5rem;
+    padding: 0.625rem 0.75rem;
+    font-size: 0.75rem;
+    color: var(--text);
+    max-width: 18rem;
+    line-height: 1.45;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 150ms;
+    z-index: 140;
+  }
+  .ctx-tooltip.open {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .ctx-tooltip a {
+    color: var(--brand-light);
+    text-decoration: underline dotted;
+    cursor: pointer;
+    display: inline-block;
+    margin-top: 0.3125rem;
+    font-size: 0.6875rem;
+  }
+
+  /* ═════════════════════════════════════════════════════════════════
+     RESPONSIVE: drawer fullscreen + tour adjustments
+     ═════════════════════════════════════════════════════════════════ */
+  @media (max-width: 600px) {
+    .help-drawer { width: 100vw; box-shadow: none; border-left: none; }
+    .help-categories { grid-template-columns: 1fr; }
+    .tour-tooltip { left: 0.75rem !important; right: 0.75rem !important; width: auto !important; }
+  }
+  @media (max-width: 880px) {
+    .topbar-meta { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ──────────── Login screen ──────────── -->
+<div id="login-screen" class="fullscreen">
+  <div class="brand-large">
+    <svg class="logo" viewBox="0 0 24 24" fill="none">
+      <defs>
+        <linearGradient id="bg-large" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#8b5cf6" />
+          <stop offset="100%" stop-color="#c084fc" />
+        </linearGradient>
+      </defs>
+      <circle cx="12" cy="12" r="10" fill="url(#bg-large)" />
+      <text x="12" y="17" font-size="14" font-weight="800" fill="white" text-anchor="middle" font-family="system-ui,sans-serif">G</text>
+    </svg>
+    <p class="name">GenLy AI</p>
+    <p class="tag">Lyric videos · Compliance UMG</p>
+  </div>
+
+  <form id="login-form" class="card login-card">
+    <p class="pretitle">Entrega protegida</p>
+    <h1 class="title" id="login-title">Cargando...</h1>
+    <p class="subtitle" id="login-subtitle"></p>
+    <div style="margin-top: 1.125rem;">
+      <label class="label" for="password-input">Contraseña</label>
+      <input id="password-input" class="input" type="password" autocomplete="off" autofocus placeholder="••••••••" />
+    </div>
+    <p id="login-error" class="error hidden">Contraseña incorrecta.</p>
+    <button id="login-submit" class="btn btn-full" type="submit" style="margin-top: 1.125rem;">Entrar</button>
+  </form>
+  <p class="footer-help">¿Problemas con el acceso? Contactá a <a href="mailto:tomas@epical.digital">tomas@epical.digital</a></p>
+</div>
+
+<!-- ──────────── Authed app shell ──────────── -->
+<div id="app-screen" class="app hidden">
+  <header class="topbar">
+    <div class="topbar-left">
+      <a href="/" class="brand-inline">
+        <svg class="logo" viewBox="0 0 24 24" fill="none">
+          <defs>
+            <linearGradient id="bg-inline" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#8b5cf6" />
+              <stop offset="100%" stop-color="#c084fc" />
+            </linearGradient>
+          </defs>
+          <circle cx="12" cy="12" r="10" fill="url(#bg-inline)" />
+          <text x="12" y="17" font-size="14" font-weight="800" fill="white" text-anchor="middle" font-family="system-ui,sans-serif">G</text>
+        </svg>
+        <span class="name">GenLy AI</span>
+      </a>
+      <div class="topbar-search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="7"></circle>
+          <path d="M21 21l-4.35-4.35"></path>
+        </svg>
+        <input id="search-input" type="search" placeholder="Buscar artista o canción..." autocomplete="off" />
+      </div>
+    </div>
+    <div class="topbar-right">
+      <p id="topbar-meta" class="topbar-meta"></p>
+      <button id="help-btn" class="help-btn" type="button" aria-label="Ayuda" title="Ayuda (?)" onclick="openHelp()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"></circle>
+          <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path>
+          <line x1="12" y1="17" x2="12.01" y2="17"></line>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <aside id="sidebar" class="sidebar"></aside>
+  <main id="main" class="main"></main>
+</div>
+
+<!-- ──────────── Change request modal ──────────── -->
+<!-- role/aria-modal/aria-labelledby: without these, screen readers
+     announce nothing when the operator clicks "Solicitar cambios" — the
+     overlay is just an unsemantic <div> visually styled as a modal.
+     Bug found in 2026-05-19 QA pass. -->
+<div id="change-modal" class="modal" role="dialog" aria-modal="true"
+     aria-labelledby="change-modal-title" aria-hidden="true"
+     onclick="onModalBackdropClick(event, 'change-modal')">
+  <div class="modal-card" style="max-width: 32rem;">
+    <div class="modal-head">
+      <div class="modal-head-titles">
+        <p id="change-modal-title" class="modal-head-artist">Solicitar cambios</p>
+        <h2 id="change-song" class="modal-head-song" style="font-size: 1rem;"></h2>
+      </div>
+      <button type="button" class="modal-head-close" aria-label="Cerrar" onclick="closeChangeModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <p style="font-size: 0.8125rem; color: var(--text-2); margin: 0 0 0.875rem 0; line-height: 1.5;">
+        Contanos qué cambios necesitás. El equipo de GenLy AI los recibe en su panel
+        de administración y vuelve a publicar la versión corregida.
+      </p>
+      <label class="label" for="change-comment">Comentario</label>
+      <textarea id="change-comment" class="textarea" placeholder="Ej: la línea 'X' aparece adelantada — moverla 0.5s más tarde."></textarea>
+      <p id="change-error" class="error hidden"></p>
+      <div style="display: flex; gap: 0.625rem; margin-top: 1rem; justify-content: flex-end;">
+        <button type="button" class="btn btn-ghost" onclick="closeChangeModal()">Cancelar</button>
+        <button type="button" id="change-submit" class="btn">Enviar</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ──────────── Lightbox (video/image preview) ──────────── -->
+<div id="lightbox" class="lightbox" role="dialog" aria-modal="true"
+     aria-label="Vista previa" aria-hidden="true"
+     onclick="onLightboxBackdropClick(event)">
+  <button type="button" class="lb-close" aria-label="Cerrar" onclick="closeLightbox()">✕</button>
+  <img id="lightbox-img" alt="" />
+  <video id="lightbox-video" controls playsinline preload="metadata" style="display:none"></video>
+  <div id="lightbox-meta" class="lb-meta"></div>
+</div>
+
+<!-- ──────────── Help Center Drawer ──────────── -->
+<div id="help-backdrop" class="help-backdrop" onclick="closeHelp()" aria-hidden="true"></div>
+<aside id="help-drawer" class="help-drawer" role="dialog" aria-modal="true"
+       aria-labelledby="help-drawer-title" aria-hidden="true">
+  <header class="help-drawer-head">
+    <button id="help-back" class="help-iconbtn help-back hidden" type="button" aria-label="Volver" onclick="helpGoBack()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+    <h2 id="help-drawer-title" class="help-drawer-title">Ayuda</h2>
+    <button class="help-iconbtn" type="button" aria-label="Cerrar" onclick="closeHelp()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+    </button>
+  </header>
+  <div class="help-drawer-search">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.35-4.35"></path>
+    </svg>
+    <input id="help-search" type="search" placeholder="Buscar en la ayuda..." autocomplete="off" aria-label="Buscar en la ayuda"/>
+  </div>
+  <div id="help-body" class="help-body" tabindex="-1"></div>
+  <footer class="help-drawer-foot">
+    ¿No encontraste lo que buscabas? <a href="mailto:tomas@epical.digital">tomas@epical.digital</a>
+  </footer>
+</aside>
+
+<!-- ──────────── Onboarding Tour Overlay ──────────── -->
+<div id="tour-overlay" class="tour-overlay" aria-hidden="true">
+  <div class="tour-mask tour-mask-top"></div>
+  <div class="tour-mask tour-mask-right"></div>
+  <div class="tour-mask tour-mask-bottom"></div>
+  <div class="tour-mask tour-mask-left"></div>
+  <div id="tour-highlight" class="tour-highlight" aria-hidden="true"></div>
+  <div id="tour-tooltip" class="tour-tooltip" role="dialog" aria-live="polite">
+    <div class="tour-step-meta"><span id="tour-step-n">1</span> de <span id="tour-step-total">4</span></div>
+    <h3 id="tour-step-title" class="tour-step-title"></h3>
+    <p id="tour-step-text" class="tour-step-text"></p>
+    <div class="tour-actions">
+      <button type="button" class="btn btn-ghost btn-sm" onclick="endTour(false)">Saltar</button>
+      <button type="button" id="tour-next" class="btn btn-sm" onclick="tourNext()">Siguiente</button>
+    </div>
+  </div>
+</div>
+
+<!-- ──────────── Contextual tooltip ──────────── -->
+<div id="ctx-tooltip" class="ctx-tooltip" role="tooltip" aria-hidden="true"></div>
+
+<script>
+"use strict";
+
+// ───── Page data (login + meta only; songs come from /api) ─────
+const PAGE_DATA = /*__PAGE_DATA__*/null;
+
+// ───── Help center content (FAQs + tutorials). Loaded once at build. ─────
+const HELP_CONTENT = /*__HELP_CONTENT__*/null;
+
+// ───── Auth helpers (unchanged from v2) ─────
+async function sha256Hex(s) {
+  const enc = new TextEncoder().encode(s);
+  const buf = await crypto.subtle.digest("SHA-256", enc);
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+const AUTH_KEY = "genly_umg_authed_v1";
+const TOKEN_KEY = "genly_umg_token_v1";
+function storageGet(key) {
+  try {
+    const value = localStorage.getItem(key);
+    if (value !== null) return value;
+  } catch (e) { /* localStorage may be blocked */ }
+  try { return sessionStorage.getItem(key); } catch (e) { return null; }
+}
+function storageSet(key, value) {
+  try {
+    localStorage.setItem(key, value);
+    return;
+  } catch (e) { /* fall back to sessionStorage */ }
+  try { sessionStorage.setItem(key, value); } catch (e) { /* best effort */ }
+}
+function storageRemove(key) {
+  try { localStorage.removeItem(key); } catch (e) {}
+  try { sessionStorage.removeItem(key); } catch (e) {}
+}
+async function checkPassword(input) {
+  const digest = await sha256Hex(PAGE_DATA.salt + input);
+  return digest === PAGE_DATA.expected_hash;
+}
+function isAuthed() { return storageGet(AUTH_KEY) === PAGE_DATA.expected_hash.slice(0, 32); }
+function setAuthed(rawPassword) {
+  storageSet(AUTH_KEY, PAGE_DATA.expected_hash.slice(0, 32));
+  if (rawPassword) storageSet(TOKEN_KEY, rawPassword);
+}
+function getPortalToken() { return storageGet(TOKEN_KEY) || ""; }
+function getPortalId() {
+  return window.location.hostname.toLowerCase() === "umgchile.genly.pro"
+    ? "chile"
+    : "argentina";
+}
+function clearAuth() {
+  storageRemove(AUTH_KEY);
+  storageRemove(TOKEN_KEY);
+}
+async function apiFetch(path, opts) {
+  const o = opts || {};
+  const headers = Object.assign({}, o.headers || {}, {
+    "X-Portal-Token": getPortalToken(),
+    "X-Portal-Id": getPortalId(),
+  });
+  return fetch(path, Object.assign({}, o, { headers }));
+}
+// ProRes for UMG's managed campaigns is rendered by staging. Keep the browser
+// request same-origin via Vercel's server-side rewrite, so the shared portal
+// token is never sent to a third-party origin from the page.
+async function apiFetchStaging(path, opts) {
+  const o = opts || {};
+  const headers = Object.assign({}, o.headers || {}, {
+    "X-Portal-Token": getPortalToken(),
+    "X-Portal-Id": getPortalId(),
+  });
+  return fetch("/api/staging" + path, Object.assign({}, o, { headers }));
+}
+async function fetchItems() {
+  const resp = await apiFetch("/api/deliveries/items");
+  if (resp.status === 401) { clearAuth(); location.reload(); return null; }
+  if (!resp.ok) throw new Error("No se pudo cargar el listado: " + resp.status);
+  const data = await resp.json();
+  // Fail closed during the Chile backend rollout. The old endpoint returned
+  // a global listing and did not identify its scope, which must never be
+  // rendered on umgchile.genly.pro.
+  if (getPortalId() === "chile" && data.portal_id !== "chile") {
+    throw new Error("El backend Chile todavía no está actualizado.");
+  }
+  return data;
+}
+
+// ───── App state ─────
+// SONGS is the full list from the API; ARTISTS is a derived
+// {name → {name, songs[], pendingChanges}} map sorted alphabetically.
+// SELECTED_ARTIST is null (= "all") or an artist name.
+// SEARCH is the topbar input value (lowercase).
+let SONGS = [];
+let ARTISTS = []; // [{name, songs[], pendingChanges}]
+let SELECTED_ARTIST = null;
+let SELECTED_CATEGORY = "all"; // all | art_track | other
+let SEARCH = "";
+let SELECTED_STATUS = null; // null = todos | "approved" | "pending" | "changes"
+let SELECTED_DATE = null; // null = todas | today | yesterday | week | month | custom
+let CUSTOM_DATE_START = "";
+let CUSTOM_DATE_END = "";
+let CUSTOM_DATE_ERROR = "";
+const PRORES_PREPARES = new Set();
+
+// Estado de una versión para el filtro. Prioridad: cambios pendientes > aprobado > pendiente.
+// (una versión aprobada con pedido de cambio abierto se muestra bajo "Con cambios").
+function versionStatus(v) {
+  if ((v.pending_change_requests || 0) > 0) return "changes";
+  // Una versión nueva sin aprobar es trabajo pendiente del cliente, no un
+  // estado neutro: se ordena antes que "aprobado".
+  if (v.awaiting_review) return "pending";
+  if (v.approved_at) return "approved";
+  return "pending";
+}
+const STATUS_OPTS = [
+  { k: null, label: "Todos", tip: "Sin filtro de estado — mostrar todas las versiones." },
+  { k: "approved", label: "Aprobados", tip: "Versiones que firmaste. Pueden seguir recibiendo pedidos de cambio.", article: "approve-vs-changes" },
+  { k: "pending", label: "Pendientes", tip: "Sin acción aún. Acciones disponibles: aprobar, rechazar o pedir cambios.", article: "how-to-approve" },
+  { k: "changes", label: "Con cambios", tip: "Versiones con pedidos de cambio abiertos. Esta categoría tiene prioridad sobre 'Aprobado'.", article: "change-lifecycle" },
+];
+const DATE_OPTS = [
+  { k: null, label: "Todas" },
+  { k: "today", label: "Hoy" },
+  { k: "yesterday", label: "Ayer" },
+  { k: "week", label: "Esta semana" },
+  { k: "month", label: "Este mes" },
+  { k: "previous_month", label: "Mes pasado" },
+  { k: "custom", label: "Personalizada" },
+];
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function dlIconSvg() {
+  return `<svg class="dl-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
+  </svg>`;
+}
+
+// Normalise an artist name so case / diacritic / "Los"-prefix variants
+// collapse to a single sidebar entry. Operators inevitably enter the
+// same band in subtly different shapes — "babasonicos" vs "Babasónicos",
+// "Los Abuelos de la Nada" vs "Los Abuelos De La Nada" — and the
+// untreated grouping showed each as a separate sidebar row.
+function normalizeArtistKey(name) {
+  const raw = (name || "(sin artista)")
+    .toLowerCase()
+    .normalize("NFD").replace(/[̀-ͯ]/g, "");             // strip diacritics
+  const withArticleRemoved = raw.replace(/^(los|las|el|la)(?=\s|$)/, "");
+  const compact = withArticleRemoved.replace(/[^a-z0-9]/g, "");
+  // Also handle the common typo "LosPericos" while avoiding false
+  // matches such as "Elton".
+  return compact.replace(/^(los|las)(?=[a-z0-9])/, "");
+}
+
+// Score variants of the same canonical artist to pick the "prettiest"
+// display name. Heuristics in priority order:
+//   1. with diacritics (Babasónicos > Babasonicos)
+//   2. most-used variant (operator's working spelling)
+//   3. has leading uppercase (Enanitos > enanitos)
+function _displayScore(name, count) {
+  const diacritics = (name.match(/[áéíóúñüÁÉÍÓÚÑÜ]/g) || []).length;
+  const startsUpper = /^[A-ZÁÉÍÓÚÑÜ]/.test(name) ? 1 : 0;
+  return diacritics * 10000 + count * 100 + startsUpper;
+}
+
+function pickBestDisplayName(variants) {
+  // variants: Map<rawName, count>
+  let best = null, bestScore = -Infinity;
+  for (const [name, count] of variants.entries()) {
+    const s = _displayScore(name, count);
+    if (s > bestScore) { bestScore = s; best = name; }
+  }
+  return best || "(sin artista)";
+}
+
+const PORTAL_DATE_FMT_AR = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "America/Argentina/Buenos_Aires",
+  year: "numeric", month: "2-digit", day: "2-digit",
+});
+
+function versionDateKey(version) {
+  if (!version || !version.added_at) return null;
+  const date = new Date(version.added_at);
+  return Number.isNaN(date.getTime()) ? null : PORTAL_DATE_FMT_AR.format(date);
+}
+
+function matchesDateFilter(version, filterKey) {
+  if (!filterKey) return true;
+  const versionDate = versionDateKey(version);
+  if (!versionDate) return false;
+
+  const now = new Date();
+  const today = PORTAL_DATE_FMT_AR.format(now);
+  if (filterKey === "today") return versionDate === today;
+
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (filterKey === "yesterday") {
+    return versionDate === PORTAL_DATE_FMT_AR.format(yesterday);
+  }
+
+  if (filterKey === "week") {
+    const weekStart = new Date(now);
+    const daysSinceMonday = (weekStart.getDay() + 6) % 7;
+    weekStart.setDate(weekStart.getDate() - daysSinceMonday);
+    return versionDate >= PORTAL_DATE_FMT_AR.format(weekStart) && versionDate <= today;
+  }
+
+  if (filterKey === "month") return versionDate.slice(0, 7) === today.slice(0, 7);
+  if (filterKey === "previous_month") {
+    const [year, month] = today.slice(0, 7).split("-").map(Number);
+    const previousMonth = month === 1
+      ? `${year - 1}-12`
+      : `${year}-${String(month - 1).padStart(2, "0")}`;
+    return versionDate.slice(0, 7) === previousMonth;
+  }
+  if (filterKey === "custom") {
+    // Keep the current list visible while the operator is filling the two
+    // fields; the filter becomes restrictive once both dates are valid.
+    if (!CUSTOM_DATE_START || !CUSTOM_DATE_END || CUSTOM_DATE_START > CUSTOM_DATE_END) return true;
+    return versionDate >= CUSTOM_DATE_START && versionDate <= CUSTOM_DATE_END;
+  }
+  return true;
+}
+
+// Build the ARTISTS array from SONGS. Each entry has a stable `key`
+// (used by selectArtist) and a `name` (used for display).
+function buildArtists() {
+  const byKey = new Map();
+  for (const song of SONGS) {
+    const rawName = song.artist || "(sin artista)";
+    const key = normalizeArtistKey(rawName);
+    let entry = byKey.get(key);
+    if (!entry) {
+      entry = { key, name: rawName, variants: new Map(), songs: [], pendingChanges: 0 };
+      byKey.set(key, entry);
+    }
+    entry.songs.push(song);
+    entry.variants.set(rawName, (entry.variants.get(rawName) || 0) + 1);
+    for (const v of (song.versions || [])) {
+      entry.pendingChanges += (v.pending_change_requests || 0);
+    }
+  }
+  for (const entry of byKey.values()) {
+    entry.name = pickBestDisplayName(entry.variants);
+  }
+  ARTISTS = Array.from(byKey.values()).sort((a, b) =>
+    a.name.localeCompare(b.name, "es", { sensitivity: "base" })
+  );
+}
+
+// Songs visible after applying the current search, date, status and (unless
+// disabled) artist filters. The sidebar intentionally omits the selected
+// artist filter so its counters always describe the full filtered list.
+// SELECTED_ARTIST holds the NORMALIZED key, not the display name — that's
+// why we re-normalize each song's artist when filtering.
+function filteredSongs({ includeArtist = true } = {}) {
+  let out = SONGS;
+  if (includeArtist && SELECTED_ARTIST) {
+    out = out.filter(s => normalizeArtistKey(s.artist) === SELECTED_ARTIST);
+  }
+  if (SEARCH) {
+    const q = SEARCH.toLowerCase();
+    out = out.filter(s =>
+      (s.artist || "").toLowerCase().includes(q) ||
+      (s.song || "").toLowerCase().includes(q)
+    );
+  }
+  if (SELECTED_CATEGORY !== "all" || SELECTED_DATE || SELECTED_STATUS) {
+    // Filter versions, not just songs, so the main list and sidebar always
+    // count the exact same deliveries after date and status filters.
+    out = out
+      .map(s => ({
+        ...s,
+        versions: (s.versions || []).filter(v =>
+          (SELECTED_CATEGORY === "all" ||
+            (SELECTED_CATEGORY === "art_track") === (v.label === "Art Track")) &&
+          matchesDateFilter(v, SELECTED_DATE) &&
+          (!SELECTED_STATUS || versionStatus(v) === SELECTED_STATUS)
+        ),
+      }))
+      .filter(s => s.versions.length > 0);
+  }
+  return out;
+}
+function visibleSongs() { return filteredSongs({ includeArtist: true }); }
+
+// ───── Sidebar rendering ─────
+function renderSidebar() {
+  const filtered = filteredSongs({ includeArtist: false });
+  const countsByArtist = new Map();
+  for (const song of filtered) {
+    const key = normalizeArtistKey(song.artist);
+    const stats = countsByArtist.get(key) || { songs: 0, videos: 0, pendingChanges: 0 };
+    stats.songs += 1;
+    stats.videos += (song.versions || []).length;
+    stats.pendingChanges += (song.versions || []).reduce(
+      (n, v) => n + (v.pending_change_requests || 0), 0
+    );
+    countsByArtist.set(key, stats);
+  }
+  const visibleArtists = ARTISTS.filter(a => countsByArtist.has(a.key));
+  const totalSongs = filtered.length;
+  const totalVideos = filtered.reduce((n, song) => n + (song.versions || []).length, 0);
+  const totalArtists = visibleArtists.length;
+  const totalPending = Array.from(countsByArtist.values())
+    .reduce((n, a) => n + a.pendingChanges, 0);
+
+  const allActive = SELECTED_ARTIST == null ? "active" : "";
+  const itemsHtml = visibleArtists.map(a => {
+    const stats = countsByArtist.get(a.key);
+    const active = (SELECTED_ARTIST === a.key) ? "active" : "";
+    const pendingBadge = stats.pendingChanges > 0
+      ? `<span class="sidebar-pending-badge" title="Pedidos de cambio pendientes">${stats.pendingChanges}</span>`
+      : "";
+    return `<div class="sidebar-item ${active}" onclick="selectArtist(${JSON.stringify(a.key).replace(/"/g, '&quot;')})">
+      <span class="sidebar-item-name">
+        ${escapeHtml(a.name)}
+      </span>
+      <span class="sidebar-item-count-inline" title="${stats.songs} canciones únicas · ${stats.videos} videos totales">${stats.songs} / ${stats.videos}</span>
+      ${pendingBadge}
+    </div>`;
+  }).join("");
+
+  const pendingHeaderBadge = totalPending > 0
+    ? `<span class="sidebar-pending-badge" title="Total de pedidos pendientes">${totalPending}</span>`
+    : "";
+
+  document.getElementById("sidebar").innerHTML = `
+    <div class="sidebar-header">
+      <span class="sidebar-title">Artistas</span>
+      <span class="sidebar-count">${totalArtists}</span>
+    </div>
+    <div class="sidebar-summary">
+      <div class="sidebar-summary-card">
+        <span>Canciones únicas</span>
+        <strong>${totalSongs}</strong>
+      </div>
+      <div class="sidebar-summary-card">
+        <span>Videos totales</span>
+        <strong>${totalVideos}</strong>
+      </div>
+    </div>
+    <div class="sidebar-list">
+      <div class="sidebar-item ${allActive}" onclick="selectArtist(null)">
+        <span class="sidebar-item-name">
+          Todos los artistas
+        </span>
+        <span class="sidebar-item-count-inline" title="${totalSongs} canciones únicas · ${totalVideos} videos totales">${totalSongs} / ${totalVideos}</span>
+        ${pendingHeaderBadge}
+      </div>
+      <div class="sidebar-divider"></div>
+      ${itemsHtml}
+    </div>
+  `;
+}
+
+function selectArtist(name) {
+  SELECTED_ARTIST = name;
+  renderSidebar();
+  renderMain();
+  // Keep search across navigation — user might be hunting for a song
+  // they don't remember the artist of. They can clear with Escape.
+}
+
+function selectCategory(category) {
+  if (!["all", "art_track", "other"].includes(category)) return;
+  SELECTED_CATEGORY = category;
+  SELECTED_ARTIST = null;
+  renderSidebar();
+  renderMain();
+}
+
+function renderCategoryTabs() {
+  const versions = SONGS.flatMap(song => song.versions || []);
+  const artTracks = versions.filter(v => v.label === "Art Track").length;
+  const categories = [
+    ["all", "Todos los entregables", versions.length],
+    ["art_track", "Art Tracks", artTracks],
+    ["other", "Otros videos", versions.length - artTracks],
+  ];
+  return `<nav class="delivery-sections" aria-label="Secciones de entregables">${categories.map(([key, label, count]) =>
+    `<button type="button" class="delivery-section${SELECTED_CATEGORY === key ? " active" : ""}"
+      aria-pressed="${SELECTED_CATEGORY === key}" onclick="selectCategory('${key}')">${label}<span class="delivery-section-count">${count}</span></button>`
+  ).join("")}</nav>`;
+}
+
+// ───── Status filter (Aprobados / Pendientes / Con cambios) ─────
+function renderStatusFilter() {
+  return `<div class="status-filter">` + STATUS_OPTS.map(o => {
+    const active = (SELECTED_STATUS === o.k) ? " active" : "";
+    const val = o.k === null ? "null" : JSON.stringify(o.k).replace(/"/g, "&quot;");
+    const tipAttr = o.tip ? ` data-help-tip="${escapeHtml(o.tip)}"` : "";
+    const artAttr = o.article ? ` data-help-article="${escapeHtml(o.article)}"` : "";
+    return `<button type="button" class="status-pill${active}" onclick="selectStatus(${val})"${tipAttr}${artAttr}>${o.label}</button>`;
+  }).join("") + `</div>`;
+}
+function selectStatus(s) {
+  SELECTED_STATUS = s;
+  renderSidebar();
+  renderMain();
+}
+
+function renderDateFilter() {
+  const pills = `<div class="date-filter">` + DATE_OPTS.map(o => {
+    const active = (SELECTED_DATE === o.k) ? " active" : "";
+    const val = o.k === null ? "null" : JSON.stringify(o.k).replace(/"/g, "&quot;");
+    return `<button type="button" class="date-pill${active}" onclick="selectDate(${val})">${o.label}</button>`;
+  }).join("") + `</div>`;
+  if (SELECTED_DATE !== "custom") return pills;
+  return pills + `<div class="custom-date-panel">
+    <div class="custom-date-field">
+      <label for="custom-date-start">Desde</label>
+      <input id="custom-date-start" type="date" value="${escapeHtml(CUSTOM_DATE_START)}" oninput="setCustomDatePart('start', this.value)" onchange="setCustomDatePart('start', this.value)" />
+    </div>
+    <div class="custom-date-field">
+      <label for="custom-date-end">Hasta</label>
+      <input id="custom-date-end" type="date" value="${escapeHtml(CUSTOM_DATE_END)}" oninput="setCustomDatePart('end', this.value)" onchange="setCustomDatePart('end', this.value)" />
+    </div>
+    <div class="custom-date-actions">
+      <button type="button" class="date-pill active" onclick="applyCustomDate()">Aplicar</button>
+      <button type="button" class="date-pill" onclick="clearCustomDate()">Limpiar</button>
+    </div>
+    ${CUSTOM_DATE_START && CUSTOM_DATE_END && CUSTOM_DATE_START <= CUSTOM_DATE_END
+      ? `<span class="custom-date-summary">Rango activo: ${escapeHtml(CUSTOM_DATE_START)} → ${escapeHtml(CUSTOM_DATE_END)}</span>`
+      : ""}
+    ${CUSTOM_DATE_ERROR ? `<p class="custom-date-error">${escapeHtml(CUSTOM_DATE_ERROR)}</p>` : ""}
+  </div>`;
+}
+function selectDate(s) {
+  SELECTED_DATE = s;
+  CUSTOM_DATE_ERROR = "";
+  renderSidebar();
+  renderMain();
+}
+function setCustomDatePart(part, value) {
+  if (part === "start") CUSTOM_DATE_START = value;
+  if (part === "end") CUSTOM_DATE_END = value;
+  CUSTOM_DATE_ERROR = "";
+}
+function applyCustomDate() {
+  // Read the controls directly as well as the input handlers. This keeps the
+  // action reliable when a browser commits a date picker value only on blur.
+  const startInput = document.getElementById("custom-date-start");
+  const endInput = document.getElementById("custom-date-end");
+  if (startInput) CUSTOM_DATE_START = startInput.value;
+  if (endInput) CUSTOM_DATE_END = endInput.value;
+  if (!CUSTOM_DATE_START || !CUSTOM_DATE_END) {
+    CUSTOM_DATE_ERROR = "Elegí una fecha de inicio y una fecha de fin.";
+    renderMain();
+    return;
+  }
+  if (CUSTOM_DATE_START > CUSTOM_DATE_END) {
+    CUSTOM_DATE_ERROR = "La fecha Desde no puede ser posterior a Hasta.";
+    renderMain();
+    return;
+  }
+  CUSTOM_DATE_ERROR = "";
+  SELECTED_DATE = "custom";
+  renderSidebar();
+  renderMain();
+}
+function clearCustomDate() {
+  CUSTOM_DATE_START = "";
+  CUSTOM_DATE_END = "";
+  CUSTOM_DATE_ERROR = "";
+  SELECTED_DATE = null;
+  renderSidebar();
+  renderMain();
+}
+
+// ───── Main: artist header + song grid ─────
+function renderMain() {
+  const songs = visibleSongs();
+  const main = document.getElementById("main");
+
+  let headerHtml;
+  if (SELECTED_ARTIST) {
+    const songCount = songs.length;
+    // SELECTED_ARTIST is a normalised key; look up the display name we
+    // chose for this artist group.
+    const artistEntry = ARTISTS.find(a => a.key === SELECTED_ARTIST);
+    const displayName = artistEntry ? artistEntry.name : SELECTED_ARTIST;
+    headerHtml = `<div class="main-header">
+      <p class="pretitle">Artista</p>
+      <h2>${escapeHtml(displayName)}</h2>
+      <p class="subline">${songCount} ${songCount === 1 ? "canción" : "canciones"}${SEARCH ? ` · filtrado por "${escapeHtml(SEARCH)}"` : ""}</p>
+    </div>`;
+  } else {
+    const songCount = songs.length;
+    headerHtml = `<div class="main-header">
+      <h2>${SEARCH ? "Resultados" : SELECTED_CATEGORY === "art_track" ? "Art Tracks" : SELECTED_CATEGORY === "other" ? "Otros videos" : "Todos los entregables"}</h2>
+      <p class="subline">${songCount} ${songCount === 1 ? "canción" : "canciones"}${SEARCH ? ` para "${escapeHtml(SEARCH)}"` : ""}</p>
+    </div>`;
+  }
+
+  let listHtml;
+  if (songs.length === 0) {
+    listHtml = `<div class="empty-state">
+      <p class="empty-state-title">${SEARCH ? "Sin resultados" : "No hay videos cargados"}</p>
+      <p>${SEARCH ? "Probá con otro término o limpiá el buscador." : "Cuando se publiquen videos van a aparecer acá."}</p>
+    </div>`;
+  } else {
+    listHtml = `<div class="song-list">${songs.map(s => renderSongBlock(s)).join("")}</div>`;
+  }
+
+  main.innerHTML = renderCategoryTabs() + headerHtml
+    + `<p class="filter-group-label">Estado</p>`
+    + renderStatusFilter()
+    + `<p class="filter-group-label">Fecha de carga</p>`
+    + renderDateFilter()
+    + listHtml + renderFooter();
+}
+
+function renderSongBlock(song) {
+  const versionCount = (song.versions || []).length;
+  const totalPending = (song.versions || []).reduce((n, v) => n + (v.pending_change_requests || 0), 0);
+  const firstFrame = (song.versions[0] || {}).frame_size;
+
+  const versionsBadge = `<span class="badge badge-versions" data-help-tip="Cantidad de renders disponibles. Cuando hay más de uno, cada uno es una opción independiente." data-help-article="interface-overview">${versionCount} ${versionCount === 1 ? "versión" : "versiones"}</span>`;
+  const frameBadge = firstFrame ? `<span class="badge badge-frame" data-help-tip="Resolución del video. HD = 1920×1080, UHD = 3840×2160 (4K)." data-help-article="which-format">${escapeHtml(firstFrame)}</span>` : "";
+  const pendingBadge = totalPending > 0
+    ? `<span class="badge badge-pending" data-help-tip="Pedidos de cambio abiertos en esta canción. El equipo los recibe en su panel y republica la versión corregida." data-help-article="change-lifecycle">${totalPending} pedido${totalPending === 1 ? "" : "s"} pendiente${totalPending === 1 ? "" : "s"}</span>`
+    : "";
+
+  return `<div class="song-block">
+    <div class="song-block-head">
+      <div>
+        <p class="song-block-artist">${escapeHtml(song.artist || "(sin artista)")}</p>
+        <h3 class="song-block-title">${escapeHtml(song.song)}</h3>
+      </div>
+      <div class="song-block-meta">
+        ${versionsBadge}${frameBadge}${pendingBadge}
+      </div>
+    </div>
+    ${(song.versions || []).map((v, i) => renderVersionRow(song, v, i)).join("")}
+  </div>`;
+}
+
+function renderFooter() {
+  return `<div class="main-footer">
+    Si algún archivo no descarga, recargá la página y volvé a entrar.
+    Las descargas van directo desde Cloudflare R2.<br/>
+    Generado por <strong>GenLy AI</strong> · Epical Digital · <a href="https://www.genly.pro">www.genly.pro</a>
+  </div>`;
+}
+
+// ───── Version row (inline inside song-block) ─────
+function renderVersionRow(song, version, versionIdx) {
+  const totalVersions = (song.versions || []).length;
+  const isMulti = totalVersions > 1;
+  const label = isMulti ? `Opción ${versionIdx + 1}` : "Versión única";
+
+  const thumbFile = (version.files || []).find(f => f.type === "thumbnail");
+  const previewUrl = version.preview_url || "";
+
+  // Escape onclick args: JSON.stringify emits literal " which would
+  // close the outer onclick="..." attribute early, leaving the handler
+  // truncated to `openVideoPreview(` and the click does nothing. The
+  // /"/g → &quot; pass keeps the attribute well-formed; the HTML parser
+  // decodes &quot; back to " before invoking the handler.
+  const previewArgs = [previewUrl, (thumbFile && thumbFile.url) || "", song.artist + ' · ' + song.song]
+    .map(s => JSON.stringify(s).replace(/"/g, '&quot;')).join(',');
+  const imageArgs = [(thumbFile && thumbFile.url) || "", song.artist + ' · ' + song.song]
+    .map(s => JSON.stringify(s).replace(/"/g, '&quot;')).join(',');
+
+  let thumbHtml;
+  if (thumbFile && thumbFile.available && thumbFile.url && previewUrl) {
+    thumbHtml = `<div class="version-row-thumb" onclick="openVideoPreview(${previewArgs})">
+      <img src="${escapeHtml(thumbFile.url)}" alt="${escapeHtml(song.artist + ' — ' + song.song)}"/>
+      <div class="version-row-play">
+        <svg viewBox="0 0 64 64" fill="none">
+          <circle cx="32" cy="32" r="32" fill="rgba(0,0,0,0.55)"/>
+          <path d="M26 21 L46 32 L26 43 Z" fill="white"/>
+        </svg>
+      </div>
+    </div>`;
+  } else if (thumbFile && thumbFile.available && thumbFile.url) {
+    thumbHtml = `<div class="version-row-thumb" onclick="openImagePreview(${imageArgs})">
+      <img src="${escapeHtml(thumbFile.url)}" alt="${escapeHtml(song.artist + ' — ' + song.song)}"/>
+    </div>`;
+  } else {
+    thumbHtml = `<div class="version-row-thumb"><div class="version-row-thumb-fallback">Sin preview</div></div>`;
+  }
+
+  // Files: all 5 (or however many exist). Thumbnail appears as a
+  // small download too — operators want the cover art separately.
+  const filesHtml = (version.files || []).map(f => {
+    if (!f.available) {
+      const canPrepare = version.delivery_id && version.label === "Art Track" && f.can_prepare &&
+        (f.type === "umg_master" || f.type === "umg_short");
+      if (canPrepare) {
+        const prepareKey = `${version.delivery_id}:${f.type}`;
+        const preparing = PRORES_PREPARES.has(prepareKey);
+        const fileTypeArg = JSON.stringify(f.type).replace(/"/g, '&quot;');
+        // Un solo click solicita el master; la generación ocurre en segundo
+        // plano y el portal inicia la descarga cuando termina.
+        return `<button type="button" class="file-btn prores-prepare-btn${preparing ? " disabled" : ""}"
+          onclick="downloadDelivery(${version.delivery_id}, ${fileTypeArg})"${preparing ? " disabled" : ""}>
+          ${dlIconSvg()}
+          <span class="file-name">${escapeHtml(f.label)}</span>
+          <span class="file-size">${preparing ? "Preparando…" : "Generar y descargar"}</span>
+        </button>`;
+      }
+      return `<span class="file-btn disabled">
+        ${dlIconSvg()}
+        <span class="file-name">${escapeHtml(f.label)}</span>
+        <span class="file-size">—</span>
+      </span>`;
+    }
+    const fileTypeArg = JSON.stringify(f.type).replace(/"/g, '&quot;');
+    return `<button type="button" class="file-btn" onclick="downloadDelivery(${version.delivery_id}, ${fileTypeArg})">
+      ${dlIconSvg()}
+      <span class="file-name">${escapeHtml(f.label)}</span>
+      <span class="file-size">${escapeHtml(f.size)}</span>
+    </button>`;
+  }).join("");
+
+  const songLabelEsc = JSON.stringify(song.artist + ' — ' + song.song + (isMulti ? ' · ' + label : '')).replace(/"/g, '&quot;');
+  const isApproved = !!version.approved_at;
+  const approvedAtTxt = isApproved
+    ? new Date(version.approved_at).toLocaleString("es-AR", { dateStyle: "short", timeStyle: "short" })
+    : "";
+
+  // Edit opens the main GenLy Studio Console for the exact job behind this
+  // delivery. It is intentionally available in every portal state: UMG can
+  // correct a render before approving it, or revise an already approved
+  // version and then re-publish it from the main app.
+  const editJobArg = version.job_id
+    ? JSON.stringify(String(version.job_id)).replace(/"/g, '&quot;')
+    : null;
+  const editBtn = editJobArg
+    ? `<button type="button" class="btn btn-ghost btn-sm" onclick="editDelivery(${editJobArg})" data-help-tip="Abrir el editor de GenLy para corregir letras, timing o estilo. Al guardar, la versión corregida debe volver a publicarse en el portal." data-help-article="editing-lines">
+      Editar
+    </button>`
+    : "";
+
+  // Three actions, shown only when there's a delivery_id to act on.
+  //   - Approved video → show a green "✓ Aprobado" pill + small "deshacer" link.
+  //   - Pending video  → show Aprobar / Rechazar / Solicitar cambios.
+  // Solicitar cambios is always available regardless of approval state — UMG
+  // might approve and later notice something.
+  let actionsHtml = editBtn;
+  if (version.delivery_id) {
+    const requestBtn = `<button type="button" class="btn btn-warn btn-sm" onclick="openChangeModal(${version.delivery_id}, ${songLabelEsc})" data-help-tip="Pedir cambios puntuales (timing, errata, color). Escribí algo accionable para que se resuelva rápido." data-help-article="how-to-write">
+      Solicitar cambios
+    </button>`;
+    if (isApproved) {
+      actionsHtml = `<span class="approved-pill" title="Aprobado por ${escapeHtml(version.approved_by_label || 'UMG')}">Aprobado</span>
+        <span class="approved-meta">por ${escapeHtml(version.approved_by_label || 'UMG')} el ${escapeHtml(approvedAtTxt)} · <a onclick="unapproveDelivery(${version.delivery_id})" data-help-tip="Vuelve la versión a Pendiente. Útil si aprobaste por error." data-help-article="undo-approval">deshacer</a></span>
+        ${requestBtn}`;
+    } else {
+      const approveBtn = `<button type="button" class="btn btn-success btn-sm" onclick="approveDelivery(${version.delivery_id}, ${songLabelEsc})" data-help-tip="Firmar la versión como lista para publicar. Reversible con 'deshacer'." data-help-article="how-to-approve">
+        ✓ Aprobar
+      </button>`;
+      const rejectBtn = `<button type="button" class="btn btn-danger btn-sm" onclick="rejectDelivery(${version.delivery_id}, ${songLabelEsc})" data-help-tip="Quitar la versión del portal. Usar solo si no debería existir (canción equivocada, derechos no resueltos)." data-help-article="approve-vs-changes">
+        ✗ Rechazar
+      </button>`;
+      actionsHtml = `${approveBtn}${rejectBtn}${requestBtn}`;
+    }
+  }
+
+  const changes = version.change_requests || [];
+  const changesHtml = changes.length === 0 ? "" : `<div class="changes-block">
+    <div class="changes-head">
+      <span class="changes-title">Pedidos de cambio (${changes.length})</span>
+    </div>
+    ${changes.map(c => {
+      const submitted = c.submitted_at ? new Date(c.submitted_at).toLocaleString("es-AR", { dateStyle: "short", timeStyle: "short" }) : "";
+      const isResolved = !!c.resolved_at;
+      return `<div class="change-item ${isResolved ? 'resolved' : ''}">
+        ${escapeHtml(c.comment)}
+        <div class="change-item-meta ${isResolved ? 'resolved-tag' : ''}">
+          ${isResolved
+            ? (c.resolved_by_revision
+                ? `✓ Atendido en la versión ${c.resolved_by_revision}`
+                : "✓ Resuelto")
+            : "⏳ Pendiente"} · enviado ${escapeHtml(submitted)}
+          ${c.resolution_note ? ` · respuesta: ${escapeHtml(c.resolution_note)}` : ""}
+        </div>
+      </div>`;
+    }).join("")}
+  </div>`;
+
+  const frameTag = version.frame_size ? `<span class="version-label-tag" data-help-tip="Resolución de este render. HD = 1920×1080, UHD = 3840×2160 (4K), DCI-4K = 4096×2160 (cine)." data-help-article="which-format">${escapeHtml(version.frame_size)}</span>` : "";
+
+  // Una corrección reemplaza el archivo detrás de la descarga EN SU LUGAR:
+  // mismo nombre, misma fila, mismo peso. Sin esto nada invita a bajarlo de
+  // nuevo. `revision` avanza sólo cuando el corte cambia, así que un reenvío
+  // del mismo render no ensucia la pantalla.
+  const revision = version.revision || 1;
+  const updatedAt = version.content_updated_at
+    ? new Date(version.content_updated_at).toLocaleString("es-AR", { dateStyle: "short", timeStyle: "short" })
+    : "";
+  const revTag = revision > 1
+    ? `<span class="version-label-tag" data-help-tip="Se publicó una corrección. Descargá de nuevo: el archivo anterior ya no es el vigente.">v${revision}${updatedAt ? " · " + escapeHtml(updatedAt) : ""}</span>`
+    : "";
+  // Ventana honesta: el MP4 se reemplaza minutos antes que el master de
+  // broadcast, así que mientras se re-renderiza la descarga no es definitiva.
+  const updatingTag = version.updating
+    ? `<span class="version-label-tag warning" data-help-tip="Estamos aplicando cambios sobre esta versión. Esperá a que termine antes de descargar el master.">Actualizando…</span>`
+    : "";
+  const reviewTag = (version.awaiting_review && !version.updating)
+    ? `<span class="version-label-tag warning" data-help-tip="Hay una versión nueva desde tu última revisión.">Nueva · sin revisar</span>`
+    : "";
+
+  return `<div class="version-row">
+    ${thumbHtml}
+    <div class="version-row-body">
+      <div class="version-row-head">
+        <span class="version-row-label">${escapeHtml(label)}${version.label === "Art Track" ? '<span class="version-label-tag">Art Track</span>' : ""}${frameTag}${revTag}${updatingTag}${reviewTag}</span>
+        <div class="version-row-actions">${actionsHtml}</div>
+      </div>
+      <div class="files">${filesHtml}</div>
+      ${changesHtml}
+    </div>
+  </div>`;
+}
+
+// Open the same post-render editor used by the main GenLy app. The portal is
+// a separate static surface, so authentication (if required) is handled by
+// app.genly.pro in the new tab rather than by passing the portal token around.
+function editDelivery(jobId) {
+  if (!jobId) return;
+  const url = "https://app.genly.pro/videos/" + encodeURIComponent(String(jobId)) + "/edit-lyrics";
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+// ───── Change request modal ─────
+let CHANGE_TARGET_DELIVERY_ID = null;
+function openChangeModal(deliveryId, songLabel) {
+  CHANGE_TARGET_DELIVERY_ID = deliveryId;
+  document.getElementById("change-song").textContent = songLabel || "";
+  document.getElementById("change-comment").value = "";
+  document.getElementById("change-error").classList.add("hidden");
+  document.getElementById("change-submit").disabled = false;
+  document.getElementById("change-submit").textContent = "Enviar";
+  const m = document.getElementById("change-modal");
+  m.classList.add("open");
+  // Mirror visibility in aria-hidden so screen readers stop ignoring
+  // the dialog. The `.open` class flips display:flex via CSS; AT
+  // doesn't read CSS.
+  m.setAttribute("aria-hidden", "false");
+  document.body.style.overflow = "hidden";
+  setTimeout(() => document.getElementById("change-comment").focus(), 50);
+}
+function closeChangeModal() {
+  const m = document.getElementById("change-modal");
+  m.classList.remove("open");
+  m.setAttribute("aria-hidden", "true");
+  document.body.style.overflow = "";
+  CHANGE_TARGET_DELIVERY_ID = null;
+}
+async function submitChangeRequest() {
+  const id = CHANGE_TARGET_DELIVERY_ID;
+  if (!id) return;
+  const comment = document.getElementById("change-comment").value.trim();
+  const errEl = document.getElementById("change-error");
+  const btn = document.getElementById("change-submit");
+  if (!comment) {
+    errEl.textContent = "Por favor escribí un comentario.";
+    errEl.classList.remove("hidden");
+    return;
+  }
+  if (comment.length > 5000) {
+    errEl.textContent = "El comentario es muy largo (máximo 5000 caracteres).";
+    errEl.classList.remove("hidden");
+    return;
+  }
+  errEl.classList.add("hidden");
+  btn.disabled = true;
+  btn.textContent = "Enviando…";
+  try {
+    const resp = await apiFetch("/api/deliveries/" + id + "/change-request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ comment }),
+    });
+    if (resp.status === 401) {
+      clearAuth();
+      alert("Sesión expirada. Volvé a iniciar.");
+      location.reload();
+      return;
+    }
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || ("HTTP " + resp.status));
+    }
+    closeChangeModal();
+    // Reload the listing so the new pending request appears inline on
+    // the version row + sidebar badge without a full page refresh.
+    await reloadItems();
+  } catch (e) {
+    errEl.textContent = "No se pudo enviar: " + (e && e.message ? e.message : "error de red");
+    errEl.classList.remove("hidden");
+    btn.disabled = false;
+    btn.textContent = "Enviar";
+  }
+}
+
+// Las URLs firmadas se regeneran en CADA request (cambian X-Amz-Date y la
+// firma; la ruta no). Como renderMain() reescribe todo el HTML, cada refresh
+// hacía que el navegador re-bajara TODOS los thumbnails: ~26 MB por refresh
+// en Argentina, ~1,5 GB por hora con una pestaña abierta, más el parpadeo de
+// la grilla entera cada 60 s. Reusar la URL que ya teníamos para la misma
+// ruta deja el src igual y el navegador no vuelve a pedir nada.
+const SIGNED_URL_CACHE = new Map();
+function r2Path(url) {
+  try { return new URL(url, location.origin).pathname; } catch (e) { return url; }
+}
+function reuseSignedUrls(songs) {
+  for (const song of songs || []) {
+    for (const version of song.versions || []) {
+      for (const file of version.files || []) {
+        if (!file.url) continue;
+        const path = r2Path(file.url);
+        const known = SIGNED_URL_CACHE.get(path);
+        if (known) file.url = known; else SIGNED_URL_CACHE.set(path, file.url);
+      }
+      for (const key of ["preview_url", "short_preview_url"]) {
+        if (!version[key]) continue;
+        const path = r2Path(version[key]);
+        const known = SIGNED_URL_CACHE.get(path);
+        if (known) version[key] = known; else SIGNED_URL_CACHE.set(path, version[key]);
+      }
+    }
+  }
+  return songs;
+}
+
+// Un refresh no debe interrumpir lo que el usuario está haciendo: renderMain()
+// reemplaza el HTML entero, así que cierra el date-picker abierto y le roba el
+// foco al buscador.
+//
+// Pero "tiene el foco en un input" NO puede bloquear para siempre: alguien que
+// hace click en el buscador y se va dejaría la pestaña congelada, que es
+// exactamente el bug que el auto-refresh vino a arreglar. Entonces bloquea
+// sólo mientras hay interacción REAL — una tecla en los últimos 30 s — más los
+// dos casos donde el re-render destruye algo abierto: un selector de fecha y
+// un modal.
+const BUSY_WINDOW_MS = 30000;
+let LAST_KEYSTROKE_TS = 0;
+document.addEventListener("keydown", () => { LAST_KEYSTROKE_TS = Date.now(); }, true);
+
+function userIsBusy() {
+  if (document.querySelector(".modal.open, dialog[open]")) return true;
+  const active = document.activeElement;
+  if (!active || active === document.body) return false;
+  if (active.tagName === "INPUT" && active.type === "date") return true;
+  const editable = active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.tagName === "SELECT";
+  return editable && (Date.now() - LAST_KEYSTROKE_TS) < BUSY_WINDOW_MS;
+}
+
+let LAST_ITEMS_SIGNATURE = null;
+async function reloadItems() {
+  if (userIsBusy()) return;
+  try {
+    const data = await fetchItems();
+    if (!data) return;
+    const songs = reuseSignedUrls(data.songs || []);
+    // Con las URLs ya normalizadas, dos listados iguales dan la misma firma.
+    // Si nada cambió no se re-renderiza: sin parpadeo y sin trabajo inútil.
+    const signature = JSON.stringify(songs);
+    if (signature === LAST_ITEMS_SIGNATURE) return;
+    LAST_ITEMS_SIGNATURE = signature;
+    SONGS = songs;
+    buildArtists();
+    renderSidebar();
+    renderMain();
+    updateTopbarMeta(data);
+  } catch (e) {
+    // Silent — keep current view; the user already saw the data load once.
+  }
+}
+
+// The portal records the click before returning a short-lived direct-to-R2
+// URL. The multi-GB body still downloads from R2, without occupying an API
+// worker for the duration of the transfer.
+function startFileDownload(url) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "";
+  a.rel = "noreferrer";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+async function downloadDelivery(deliveryId, fileType) {
+  try {
+    const resp = await apiFetch(`/api/deliveries/${deliveryId}/download/${encodeURIComponent(fileType)}`, { method: "POST" });
+    if (resp.status === 401) { clearAuth(); location.reload(); return; }
+    const body = await resp.json().catch(() => ({}));
+    if (body.status === "ready" && body.url) {
+      startFileDownload(body.url);
+      return;
+    }
+    if (body.status === "prores_missing" && body.can_prepare && (fileType === "umg_master" || fileType === "umg_short")) {
+      await prepareProRes(deliveryId, fileType);
+      return;
+    }
+    if (!resp.ok && resp.status !== 202) {
+      throw new Error(body.detail || ("HTTP " + resp.status));
+    }
+    if (resp.status === 202 && body.status !== "prores_missing") {
+      throw new Error("El archivo todavía no está disponible.");
+    }
+  } catch (e) {
+    alert("No se pudo iniciar la descarga: " + (e && e.message ? e.message : "error de red"));
+  }
+}
+
+// Tope de preparaciones simultáneas por pestaña.
+//
+// Cada click dispara un ffmpeg de varios GB en la MISMA cola que sirve los
+// renders en vivo, y del lado del servidor ese camino saltea la backpressure
+// a propósito. Medido el 2026-09-16: 178 archivos ausentes entre los dos
+// portales (Argentina 75 masters + 75 shorts, Chile 28 shorts), o sea 178
+// botones a un click de distancia. Alguien recorriendo el catálogo podía
+// encolar una docena sin enterarse y dejar los renders de UMG atrás de 50 GB
+// de transcodes.
+//
+// Esto es una contención del lado del cliente: NO reemplaza el tope real,
+// que va en el endpoint (rechazar con 503 según profundidad de cola). Baja
+// el disparo accidental, que es lo que está al alcance del portal.
+const PRORES_MAX_CONCURRENT = 1;
+async function prepareProRes(deliveryId, fileType) {
+  const prepareKey = `${deliveryId}:${fileType}`;
+  if (PRORES_PREPARES.has(prepareKey)) return;
+  if (PRORES_PREPARES.size >= PRORES_MAX_CONCURRENT) {
+    alert("Ya se está preparando un archivo. Esperá a que termine y pedí el siguiente.");
+    return;
+  }
+  PRORES_PREPARES.add(prepareKey);
+  renderMain();
+  try {
+    const resp = await apiFetchStaging(`/api/deliveries/${deliveryId}/prepare-prores`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_type: fileType }),
+    });
+    if (resp.status === 401) { clearAuth(); location.reload(); return; }
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || ("HTTP " + resp.status));
+    }
+    // Poll the staging worker. Once ready it publishes an immutable pointer
+    // into the shared portal DB; the final fetch goes through the audited
+    // per-click download endpoint too.
+    for (let attempt = 0; attempt < 240; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 10000));
+      const statusResp = await apiFetchStaging(`/api/deliveries/${deliveryId}/prepare-prores?file_type=${encodeURIComponent(fileType)}`);
+      if (statusResp.status === 401) { clearAuth(); location.reload(); return; }
+      if (!statusResp.ok && statusResp.status !== 202) {
+        const statusBody = await statusResp.json().catch(() => ({}));
+        throw new Error(statusBody.detail || ("HTTP " + statusResp.status));
+      }
+      const statusBody = await statusResp.json().catch(() => ({}));
+      if (statusBody.status === "ready") {
+        await reloadItems();
+        await downloadDelivery(deliveryId, fileType);
+        return;
+      }
+    }
+    alert("La preparación continúa en curso. Podés dejar el portal abierto; el master estará disponible al terminar.");
+  } catch (e) {
+    alert("No se pudo preparar el ProRes: " + (e && e.message ? e.message : "error de red"));
+  } finally {
+    PRORES_PREPARES.delete(prepareKey);
+    renderMain();
+  }
+}
+
+// ───── Approve / Reject / Un-approve a delivery (portal-side actions) ─────
+// Reject = soft-delete from the portal's POV. The backend keeps the row +
+// R2 files (admin can un-delete from the admin panel). UMG sees it disappear.
+async function approveDelivery(deliveryId, songLabel) {
+  if (!confirm("Marcar este video como APROBADO?\n\n" + (songLabel || "").replace(/^"|"$/g, ""))) return;
+  try {
+    const resp = await apiFetch("/api/deliveries/" + deliveryId + "/approve", { method: "POST" });
+    if (resp.status === 401) { clearAuth(); location.reload(); return; }
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || ("HTTP " + resp.status));
+    }
+    await reloadItems();
+  } catch (e) {
+    alert("No se pudo aprobar: " + (e && e.message ? e.message : "error de red"));
+  }
+}
+async function unapproveDelivery(deliveryId) {
+  if (!confirm("Quitar la aprobación de este video?")) return;
+  try {
+    const resp = await apiFetch("/api/deliveries/" + deliveryId + "/un-approve", { method: "POST" });
+    if (resp.status === 401) { clearAuth(); location.reload(); return; }
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || ("HTTP " + resp.status));
+    }
+    await reloadItems();
+  } catch (e) {
+    alert("No se pudo deshacer: " + (e && e.message ? e.message : "error de red"));
+  }
+}
+async function rejectDelivery(deliveryId, songLabel) {
+  const clean = (songLabel || "").replace(/^"|"$/g, "");
+  if (!confirm("RECHAZAR este video?\n\n" + clean + "\n\nVa a desaparecer del listado. El equipo de GenLy AI lo recibe como pedido de remoción.")) return;
+  try {
+    const resp = await apiFetch("/api/deliveries/" + deliveryId, { method: "DELETE" });
+    if (resp.status === 401) { clearAuth(); location.reload(); return; }
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || ("HTTP " + resp.status));
+    }
+    await reloadItems();
+  } catch (e) {
+    alert("No se pudo rechazar: " + (e && e.message ? e.message : "error de red"));
+  }
+}
+
+function updateTopbarMeta(data) {
+  const songCount = SONGS.length;
+  const versionCount = SONGS.reduce((n, s) => n + (s.versions || []).length, 0);
+  const expiresDate = new Date((data.expires_at_ts || 0) * 1000);
+  const expiresStr = expiresDate.toLocaleDateString("es-AR", { day: "numeric", month: "short" });
+  document.getElementById("topbar-meta").innerHTML =
+    songCount === 0
+      ? "Sin videos publicados"
+      : `<strong>${songCount}</strong> ${songCount === 1 ? "canción" : "canciones"} · ` +
+        `<strong>${versionCount}</strong> ${versionCount === 1 ? "versión" : "versiones"} · ` +
+        `links hasta ${expiresStr}`;
+}
+
+// ───── Lightbox (video / image preview) ─────
+function openVideoPreview(previewUrl, posterUrl, metaText) {
+  const lb = document.getElementById("lightbox");
+  const img = document.getElementById("lightbox-img");
+  const vid = document.getElementById("lightbox-video");
+  img.style.display = "none"; img.removeAttribute("src");
+  vid.style.display = "";
+  if (posterUrl) vid.poster = posterUrl;
+  vid.src = previewUrl;
+  document.getElementById("lightbox-meta").textContent = metaText || "";
+  lb.classList.add("open");
+  lb.setAttribute("aria-hidden", "false");
+  vid.play().catch(() => {});
+}
+function openImagePreview(src, metaText) {
+  const lb = document.getElementById("lightbox");
+  const img = document.getElementById("lightbox-img");
+  const vid = document.getElementById("lightbox-video");
+  vid.style.display = "none"; vid.pause(); vid.removeAttribute("src"); vid.load();
+  img.style.display = "";
+  img.src = src;
+  document.getElementById("lightbox-meta").textContent = metaText || "";
+  lb.classList.add("open");
+  lb.setAttribute("aria-hidden", "false");
+}
+function closeLightbox() {
+  const lb = document.getElementById("lightbox");
+  const vid = document.getElementById("lightbox-video");
+  vid.pause(); vid.removeAttribute("src"); vid.load();
+  lb.classList.remove("open");
+  lb.setAttribute("aria-hidden", "true");
+}
+function onLightboxBackdropClick(e) {
+  if (e.target.id === "lightbox" || e.target.classList.contains("lb-meta")) closeLightbox();
+}
+function onModalBackdropClick(e, modalId) {
+  if (e.target.id === modalId) {
+    if (modalId === "change-modal") closeChangeModal();
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// HELP CENTER
+// ═════════════════════════════════════════════════════════════════
+
+// Per-category icons (inline SVG). Keep tiny — matches drawer card size.
+const HELP_ICONS = {
+  rocket:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09zM12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></svg>',
+  download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+  check:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+  edit:     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
+  wrench:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>',
+  book:     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>',
+};
+
+// Drawer navigation state. The stack lets us go back through whatever
+// the user clicked (home → category → article → article via cross-link).
+const HELP_STATE = {
+  open: false,
+  stack: [],   // [{view: "home"|"category"|"article"|"search", id?: string}]
+  feedback: {},
+  prevFocus: null,
+};
+
+function helpCurrent() { return HELP_STATE.stack[HELP_STATE.stack.length - 1] || { view: "home" }; }
+
+function openHelp(view) {
+  // view is an optional "#help/<id>" hash-style locator; default → home.
+  HELP_STATE.prevFocus = document.activeElement;
+  HELP_STATE.stack = [];
+  if (view && typeof view === "string" && view.indexOf("article:") === 0) {
+    HELP_STATE.stack.push({ view: "article", id: view.slice(8) });
+  } else {
+    HELP_STATE.stack.push({ view: "home" });
+  }
+  HELP_STATE.open = true;
+  const drawer = document.getElementById("help-drawer");
+  const backdrop = document.getElementById("help-backdrop");
+  drawer.classList.add("open");
+  drawer.setAttribute("aria-hidden", "false");
+  backdrop.classList.add("open");
+  backdrop.setAttribute("aria-hidden", "false");
+  document.body.style.overflow = "hidden";
+  helpRender();
+  setTimeout(() => {
+    const search = document.getElementById("help-search");
+    if (search) search.focus();
+  }, 250);
+}
+
+function closeHelp() {
+  HELP_STATE.open = false;
+  const drawer = document.getElementById("help-drawer");
+  const backdrop = document.getElementById("help-backdrop");
+  drawer.classList.remove("open");
+  drawer.setAttribute("aria-hidden", "true");
+  backdrop.classList.remove("open");
+  backdrop.setAttribute("aria-hidden", "true");
+  document.body.style.overflow = "";
+  // Reset search so reopening starts fresh.
+  const search = document.getElementById("help-search");
+  if (search) search.value = "";
+  if (HELP_STATE.prevFocus && typeof HELP_STATE.prevFocus.focus === "function") {
+    try { HELP_STATE.prevFocus.focus(); } catch (e) {}
+  }
+}
+
+function helpNavigate(node) {
+  HELP_STATE.stack.push(node);
+  helpRender();
+  document.getElementById("help-body").scrollTop = 0;
+}
+function helpGoBack() {
+  if (HELP_STATE.stack.length <= 1) { closeHelp(); return; }
+  HELP_STATE.stack.pop();
+  helpRender();
+}
+
+// Find article + category by id. Cheap — linear scan over ~20 entries.
+function helpFindArticle(id) {
+  return (HELP_CONTENT && HELP_CONTENT.articles || []).find(a => a.id === id) || null;
+}
+function helpFindCategory(id) {
+  return (HELP_CONTENT && HELP_CONTENT.categories || []).find(c => c.id === id) || null;
+}
+function helpArticlesInCategory(catId) {
+  return (HELP_CONTENT && HELP_CONTENT.articles || []).filter(a => a.category === catId);
+}
+
+function helpRender() {
+  if (!HELP_CONTENT) return;
+  const node = helpCurrent();
+  const titleEl = document.getElementById("help-drawer-title");
+  const backBtn = document.getElementById("help-back");
+  const body = document.getElementById("help-body");
+
+  // Search override: any input in the search box switches to a results view.
+  const searchVal = (document.getElementById("help-search") || {}).value || "";
+  if (searchVal.trim().length >= 2 && node.view !== "search") {
+    // Don't push — keep the search ephemeral so closing it returns the user
+    // to wherever they were.
+    helpRenderSearch(searchVal.trim());
+    titleEl.textContent = "Resultados";
+    backBtn.classList.toggle("hidden", HELP_STATE.stack.length <= 1);
+    return;
+  }
+
+  if (node.view === "home") {
+    titleEl.textContent = "Ayuda";
+    backBtn.classList.add("hidden");
+    body.innerHTML = helpHomeHtml();
+  } else if (node.view === "category") {
+    const cat = helpFindCategory(node.id);
+    titleEl.textContent = cat ? cat.title : "Categoría";
+    backBtn.classList.remove("hidden");
+    body.innerHTML = helpCategoryHtml(cat);
+  } else if (node.view === "article") {
+    const art = helpFindArticle(node.id);
+    titleEl.textContent = art ? art.title : "Artículo";
+    backBtn.classList.remove("hidden");
+    body.innerHTML = helpArticleHtml(art);
+    helpHookArticleLinks(body);
+    helpHookFeedback(body, node.id);
+  }
+}
+
+function helpHomeHtml() {
+  const cats = (HELP_CONTENT.categories || []).slice().sort((a, b) => (a.order || 0) - (b.order || 0));
+  const featured = (HELP_CONTENT.articles || []).filter(a => a.featured);
+
+  const catCards = cats.map(c => {
+    const count = helpArticlesInCategory(c.id).length;
+    const icon = HELP_ICONS[c.icon] || HELP_ICONS.book;
+    return `<button class="help-category-card" type="button" onclick="helpNavigate({view:'category', id:'${c.id}'})">
+      <span class="help-category-icon">${icon}</span>
+      <span class="help-category-name">${escapeHtml(c.title)}</span>
+      <span class="help-category-count">${count} ${count === 1 ? "artículo" : "artículos"}</span>
+    </button>`;
+  }).join("");
+
+  const featuredHtml = featured.length === 0 ? "" : `
+    <p class="help-section-title">Artículos destacados</p>
+    <div class="help-featured-list">
+      ${featured.map(a => `
+        <button class="help-article-item" type="button" onclick="helpNavigate({view:'article', id:'${a.id}'})">
+          <span class="help-article-item-title">${escapeHtml(a.title)}</span>
+          <span class="help-article-item-summary">${escapeHtml(a.summary || "")}</span>
+        </button>
+      `).join("")}
+    </div>
+  `;
+
+  return `
+    <p class="help-section-title">Categorías</p>
+    <div class="help-categories">${catCards}</div>
+    ${featuredHtml}
+    <p class="help-section-title">Más</p>
+    <div class="help-featured-list">
+      <button class="help-article-item" type="button" onclick="endTour(false); startTour();">
+        <span class="help-article-item-title">▶ Ver tour interactivo</span>
+        <span class="help-article-item-summary">Repetir el tour guiado de 4 pasos.</span>
+      </button>
+    </div>
+  `;
+}
+
+function helpCategoryHtml(cat) {
+  if (!cat) return `<div class="help-empty"><p class="help-empty-title">Categoría no encontrada</p></div>`;
+  const arts = helpArticlesInCategory(cat.id);
+  if (arts.length === 0) {
+    return `<div class="help-empty"><p class="help-empty-title">Sin artículos</p><p>Esta categoría está vacía por ahora.</p></div>`;
+  }
+  return `
+    <p class="help-section-title">${escapeHtml(cat.title)}</p>
+    <div class="help-article-list">
+      ${arts.map(a => `
+        <button class="help-article-item" type="button" onclick="helpNavigate({view:'article', id:'${a.id}'})">
+          <span class="help-article-item-title">${escapeHtml(a.title)}</span>
+          <span class="help-article-item-summary">${escapeHtml(a.summary || "")}</span>
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function helpArticleHtml(art) {
+  if (!art) return `<div class="help-empty"><p class="help-empty-title">Artículo no encontrado</p></div>`;
+  const cat = helpFindCategory(art.category);
+  const eyebrow = cat ? cat.title : "";
+  const animHtml = art.animation ? helpAnimationHtml(art.animation) : "";
+  const fb = HELP_STATE.feedback[art.id];
+  const fbHtml = fb
+    ? `<div class="help-feedback"><span class="help-feedback-thanks">${fb === "yes" ? "¡Gracias!" : "Gracias por avisar — vamos a mejorarlo."}</span></div>`
+    : `<div class="help-feedback">
+        <p class="help-feedback-q">¿Te sirvió este artículo?</p>
+        <button type="button" class="help-feedback-btn" data-fb="yes">👍 Sí</button>
+        <button type="button" class="help-feedback-btn" data-fb="no">👎 No</button>
+      </div>`;
+
+  return `
+    <div class="help-article-head">
+      ${eyebrow ? `<p class="help-article-eyebrow">${escapeHtml(eyebrow)}</p>` : ""}
+      <h1 class="help-article-title">${escapeHtml(art.title)}</h1>
+      ${art.summary ? `<p class="help-article-summary">${escapeHtml(art.summary)}</p>` : ""}
+    </div>
+    ${animHtml}
+    <div class="help-article-body">${art.body_html || ""}</div>
+    ${fbHtml}
+  `;
+}
+
+// CSS-only animated demos. Each block is self-contained markup with
+// CSS keyframes already defined in <style>.
+function helpAnimationHtml(name) {
+  if (name === "approve-flow") {
+    return `<div class="anim">
+      <div class="anim-stage anim-approve-stage">
+        <button type="button" class="anim-approve-btn">✓ Aprobar</button>
+        <div class="anim-approve-confirm">¿Marcar como APROBADO?</div>
+        <span class="anim-approve-pill">Aprobado · ahora</span>
+      </div>
+      <button class="anim-replay" type="button" onclick="helpReplayAnim(this)">▶ Reproducir de nuevo</button>
+    </div>`;
+  }
+  if (name === "download-flow") {
+    return `<div class="anim">
+      <div class="anim-stage anim-dl-stage">
+        <span class="anim-dl-btn">${dlIconSvg()}<span>Master ProRes · 2.3 GB</span></span>
+        <div class="anim-dl-bar"></div>
+        <span class="anim-dl-check">✓ Archivo guardado</span>
+      </div>
+      <button class="anim-replay" type="button" onclick="helpReplayAnim(this)">▶ Reproducir de nuevo</button>
+    </div>`;
+  }
+  if (name === "change-request-flow") {
+    return `<div class="anim">
+      <div class="anim-stage anim-cr-stage">
+        <button type="button" class="anim-cr-btn">Solicitar cambios</button>
+        <div class="anim-cr-modal">
+          <div class="anim-cr-modal-title">Solicitar cambios</div>
+          <div class="anim-cr-modal-ta"></div>
+          <span class="anim-cr-modal-btn">Enviar</span>
+        </div>
+        <span class="anim-cr-sent">⏳ Pendiente · enviado</span>
+      </div>
+      <button class="anim-replay" type="button" onclick="helpReplayAnim(this)">▶ Reproducir de nuevo</button>
+    </div>`;
+  }
+  if (name === "tour-overview") {
+    return `<div class="anim">
+      <div class="anim-stage anim-tour-stage">
+        <div class="anim-tour-top"><div class="anim-tour-top-search"></div></div>
+        <div class="anim-tour-sb">
+          <div class="anim-tour-sb-item"></div>
+          <div class="anim-tour-sb-item"></div>
+          <div class="anim-tour-sb-item"></div>
+          <div class="anim-tour-sb-item"></div>
+        </div>
+        <div class="anim-tour-main">
+          <div class="anim-tour-pills">
+            <span class="anim-tour-pill"></span>
+            <span class="anim-tour-pill"></span>
+            <span class="anim-tour-pill"></span>
+          </div>
+          <div class="anim-tour-card"></div>
+        </div>
+      </div>
+      <button class="anim-replay" type="button" onclick="helpReplayAnim(this)">▶ Reproducir de nuevo</button>
+    </div>`;
+  }
+  return "";
+}
+
+// Force CSS keyframes to restart by cloning the animated node. Cheap and
+// works for any number of independently animated children.
+function helpReplayAnim(btn) {
+  const wrap = btn.closest(".anim");
+  if (!wrap) return;
+  const stage = wrap.querySelector(".anim-stage");
+  if (!stage) return;
+  const clone = stage.cloneNode(true);
+  stage.parentNode.replaceChild(clone, stage);
+}
+
+// Cross-links inside article body use `#help/<id>` so they're inert
+// outside the drawer. Intercept here and route through helpNavigate.
+function helpHookArticleLinks(scope) {
+  const links = scope.querySelectorAll('a[href^="#help/"]');
+  links.forEach(a => {
+    const target = a.getAttribute("href").slice(6); // strip "#help/"
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      if (target === "run-tour") { closeHelp(); startTour(); return; }
+      const art = helpFindArticle(target);
+      if (art) helpNavigate({ view: "article", id: target });
+    });
+  });
+}
+
+function helpHookFeedback(scope, articleId) {
+  const btns = scope.querySelectorAll(".help-feedback-btn");
+  btns.forEach(b => {
+    b.addEventListener("click", () => {
+      const v = b.dataset.fb;
+      HELP_STATE.feedback[articleId] = v;
+      try { localStorage.setItem("genly_help_fb_" + articleId, v); } catch (e) {}
+      helpRender();
+    });
+  });
+}
+
+// ───── Search inside the help center ─────
+function helpRenderSearch(q) {
+  const body = document.getElementById("help-body");
+  const ql = q.toLowerCase();
+  const hits = (HELP_CONTENT.articles || []).map(a => {
+    let score = 0;
+    if ((a.title || "").toLowerCase().includes(ql)) score += 10;
+    if ((a.tags || []).some(t => String(t).toLowerCase().includes(ql))) score += 5;
+    if ((a.summary || "").toLowerCase().includes(ql)) score += 3;
+    if ((a.body_html || "").toLowerCase().includes(ql)) score += 1;
+    return { a, score };
+  }).filter(h => h.score > 0).sort((x, y) => y.score - x.score);
+
+  if (hits.length === 0) {
+    body.innerHTML = `<div class="help-empty">
+      <p class="help-empty-title">Sin resultados para "${escapeHtml(q)}"</p>
+      <p>Probá otra palabra o explorá las categorías.</p>
+    </div>`;
+    return;
+  }
+  body.innerHTML = `<p class="help-section-title">${hits.length} ${hits.length === 1 ? "resultado" : "resultados"}</p>
+    <div class="help-article-list">
+      ${hits.map(h => `
+        <button class="help-article-item" type="button" onclick="helpNavigate({view:'article', id:'${h.a.id}'})">
+          <span class="help-article-item-title">${helpHighlight(h.a.title, ql)}</span>
+          <span class="help-article-item-summary">${helpHighlight(h.a.summary || "", ql)}</span>
+        </button>
+      `).join("")}
+    </div>`;
+}
+function helpHighlight(text, q) {
+  if (!q) return escapeHtml(text);
+  const esc = escapeHtml(text);
+  const qEsc = escapeHtml(q).replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+  return esc.replace(new RegExp("(" + qEsc + ")", "ig"), "<mark>$1</mark>");
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ONBOARDING TOUR (first-visit walkthrough)
+// ═════════════════════════════════════════════════════════════════
+const TOUR_STEPS = [
+  {
+    target: "#sidebar",
+    title: "Filtrá por artista",
+    text: "Acá ves todos los artistas con entregables. Cliqueá uno para filtrar. El número rojo al lado de un nombre indica pedidos de cambio abiertos.",
+    align: "right",
+  },
+  {
+    target: "#search-input",
+    title: "Buscá lo que necesites",
+    text: "Buscá por artista o canción en tiempo real. Apretá Esc para limpiar.",
+    align: "bottom",
+  },
+  {
+    target: ".status-filter",
+    title: "Filtros de estado",
+    text: "Mostrá solo videos aprobados, pendientes o con cambios abiertos. Se combinan con el filtro de artista.",
+    align: "bottom",
+  },
+  {
+    target: "#help-btn",
+    title: "Y siempre tenés esto",
+    text: "El botón de ayuda. Cualquier duda, abrilo desde acá: FAQs, tutoriales y troubleshooting.",
+    align: "bottom-right",
+  },
+];
+const TOUR_STATE = { active: false, step: 0 };
+const TOUR_SEEN_KEY = "genly_tour_seen_v1";
+
+function maybeStartTour() {
+  try {
+    if (localStorage.getItem(TOUR_SEEN_KEY) === "1") return;
+  } catch (e) { /* localStorage disabled — show once per page load */ }
+  // Defer briefly so layout settles after the listing renders.
+  setTimeout(() => { startTour(); }, 800);
+}
+
+function startTour() {
+  TOUR_STATE.active = true;
+  TOUR_STATE.step = 0;
+  const overlay = document.getElementById("tour-overlay");
+  overlay.classList.add("open");
+  overlay.setAttribute("aria-hidden", "false");
+  document.getElementById("tour-step-total").textContent = TOUR_STEPS.length;
+  renderTourStep();
+}
+
+function renderTourStep() {
+  const step = TOUR_STEPS[TOUR_STATE.step];
+  if (!step) { endTour(true); return; }
+  const target = document.querySelector(step.target);
+  if (!target) {
+    // Target missing — skip this step gracefully.
+    TOUR_STATE.step++;
+    renderTourStep();
+    return;
+  }
+  // Compute bounding rect and position 4 mask divs around it.
+  const rect = target.getBoundingClientRect();
+  const pad = 6;
+  const top = Math.max(0, rect.top - pad);
+  const left = Math.max(0, rect.left - pad);
+  const right = rect.right + pad;
+  const bottom = rect.bottom + pad;
+  const VW = window.innerWidth;
+  const VH = window.innerHeight;
+
+  const masks = document.getElementById("tour-overlay").querySelectorAll(".tour-mask");
+  // top
+  masks[0].style.cssText = `top:0; left:0; width:100vw; height:${top}px;`;
+  // right
+  masks[1].style.cssText = `top:${top}px; left:${right}px; width:${Math.max(0, VW - right)}px; height:${bottom - top}px;`;
+  // bottom
+  masks[2].style.cssText = `top:${bottom}px; left:0; width:100vw; height:${Math.max(0, VH - bottom)}px;`;
+  // left
+  masks[3].style.cssText = `top:${top}px; left:0; width:${left}px; height:${bottom - top}px;`;
+
+  const hl = document.getElementById("tour-highlight");
+  hl.style.cssText = `top:${top}px; left:${left}px; width:${right - left}px; height:${bottom - top}px;`;
+
+  // Tooltip positioning. Try to place it below the target; flip above if it
+  // would overflow viewport. Anchor right edge if "bottom-right" align.
+  const tip = document.getElementById("tour-tooltip");
+  document.getElementById("tour-step-n").textContent = TOUR_STATE.step + 1;
+  document.getElementById("tour-step-title").textContent = step.title;
+  document.getElementById("tour-step-text").textContent = step.text;
+  document.getElementById("tour-next").textContent =
+    (TOUR_STATE.step === TOUR_STEPS.length - 1) ? "Última" : "Siguiente";
+
+  // Measure tooltip after content updates.
+  tip.style.visibility = "hidden";
+  tip.style.left = "0px"; tip.style.top = "0px"; tip.style.right = "auto";
+  const tipRect = tip.getBoundingClientRect();
+  const tipW = tipRect.width || 320;
+  const tipH = tipRect.height || 160;
+
+  let tipTop = bottom + 12;
+  if (tipTop + tipH > VH - 12) {
+    // Not enough below — place above.
+    tipTop = Math.max(12, top - tipH - 12);
+  }
+  let tipLeft;
+  if (step.align === "right") {
+    tipLeft = Math.min(VW - tipW - 12, right + 12);
+    tipTop = Math.max(12, top);
+  } else if (step.align === "bottom-right") {
+    tipLeft = Math.max(12, right - tipW);
+  } else {
+    tipLeft = Math.max(12, Math.min(VW - tipW - 12, left));
+  }
+  tip.style.left = tipLeft + "px";
+  tip.style.top = tipTop + "px";
+  tip.style.visibility = "";
+}
+
+function tourNext() {
+  TOUR_STATE.step++;
+  if (TOUR_STATE.step >= TOUR_STEPS.length) {
+    endTour(true);
+    return;
+  }
+  renderTourStep();
+}
+
+function endTour(completed) {
+  TOUR_STATE.active = false;
+  const overlay = document.getElementById("tour-overlay");
+  overlay.classList.remove("open");
+  overlay.setAttribute("aria-hidden", "true");
+  try { localStorage.setItem(TOUR_SEEN_KEY, "1"); } catch (e) {}
+  // If completed in full, open the drawer so the user lands on Help home.
+  if (completed) {
+    setTimeout(() => openHelp(), 250);
+  }
+}
+
+// Re-position on resize so the tour mask follows layout changes.
+window.addEventListener("resize", () => {
+  if (TOUR_STATE.active) renderTourStep();
+});
+
+// ═════════════════════════════════════════════════════════════════
+// CONTEXTUAL TOOLTIPS (?-icons inline in the main app)
+// ═════════════════════════════════════════════════════════════════
+// One global handler scanning for [data-help-tip]. The portal re-renders
+// often (sidebar + main are nuked on each filter change); we don't bind
+// per-element, we delegate from document.
+
+let CTX_TIP_HIDE_TIMER = null;
+
+function showCtxTip(target) {
+  clearTimeout(CTX_TIP_HIDE_TIMER);
+  const tip = document.getElementById("ctx-tooltip");
+  const text = target.dataset.helpTip || "";
+  const articleId = target.dataset.helpArticle || "";
+  const more = articleId
+    ? `<br><a onclick="hideCtxTip(); openHelp('article:${articleId}')">Ver más</a>`
+    : "";
+  tip.innerHTML = escapeHtml(text) + more;
+  // Position above the target, fall back to below if no room.
+  tip.style.visibility = "hidden";
+  tip.classList.add("open");
+  const tipRect = tip.getBoundingClientRect();
+  const r = target.getBoundingClientRect();
+  let top = r.top - tipRect.height - 8;
+  if (top < 8) top = r.bottom + 8;
+  let left = r.left + (r.width / 2) - (tipRect.width / 2);
+  left = Math.max(8, Math.min(window.innerWidth - tipRect.width - 8, left));
+  tip.style.top = top + "px";
+  tip.style.left = left + "px";
+  tip.style.visibility = "";
+  tip.setAttribute("aria-hidden", "false");
+}
+function hideCtxTip() {
+  const tip = document.getElementById("ctx-tooltip");
+  CTX_TIP_HIDE_TIMER = setTimeout(() => {
+    tip.classList.remove("open");
+    tip.setAttribute("aria-hidden", "true");
+  }, 150);
+}
+function bindCtxTipHandlers() {
+  document.addEventListener("mouseover", (e) => {
+    const t = e.target.closest("[data-help-tip]");
+    if (t) showCtxTip(t);
+  });
+  document.addEventListener("mouseout", (e) => {
+    const t = e.target.closest("[data-help-tip]");
+    if (t) hideCtxTip();
+  });
+  document.addEventListener("focusin", (e) => {
+    const t = e.target.closest("[data-help-tip]");
+    if (t) showCtxTip(t);
+  });
+  document.addEventListener("focusout", (e) => {
+    const t = e.target.closest("[data-help-tip]");
+    if (t) hideCtxTip();
+  });
+  // Tooltip itself shouldn't disappear while hovered (so "Ver más" is clickable).
+  const tip = document.getElementById("ctx-tooltip");
+  tip.addEventListener("mouseenter", () => clearTimeout(CTX_TIP_HIDE_TIMER));
+  tip.addEventListener("mouseleave", hideCtxTip);
+}
+
+// ───── Bootstrap ─────
+async function renderApp() {
+  document.getElementById("login-screen").classList.add("hidden");
+  document.getElementById("app-screen").classList.remove("hidden");
+  const main = document.getElementById("main");
+  main.innerHTML = `<div class="listing-state"><span class="spinner"></span>Cargando entregables…</div>`;
+
+  let data;
+  try {
+    data = await fetchItems();
+  } catch (err) {
+    const message = getPortalId() === "chile"
+      ? "El portal Chile está terminando de sincronizarse. Volvé a intentar en unos minutos."
+      : "No se pudo cargar el listado. Recargá la página e intentá de nuevo.";
+    main.innerHTML = `<div class="listing-state error">${message}</div>`;
+    return;
+  }
+  if (!data) return;
+
+  SONGS = data.songs || [];
+  buildArtists();
+  renderSidebar();
+  renderMain();
+  updateTopbarMeta(data);
+  startAutoRefresh();
+
+  // First-visit tour. Runs once per browser. Re-triggerable from the
+  // drawer's "Ver tour" entry.
+  maybeStartTour();
+}
+
+// El listado se cargaba UNA sola vez, en el arranque. Una pestaña que
+// quedaba abierta mostraba para siempre el estado del momento en que
+// entraron: el 15-sep-2026 un pedido de cambios resuelto a las 17:31 seguía
+// figurando "Pendiente" horas después, con el dato correcto en la base y en
+// la API desde el primer minuto.
+//
+// reloadItems() ya existía y es silencioso — re-renderiza sin perder el
+// artista seleccionado, la búsqueda ni los filtros — así que alcanza con
+// llamarlo. Dos disparadores:
+//
+//   - volver a la pestaña, que es la señal más fuerte de "quiero ver el
+//     estado de ahora" y no hace esperar hasta el próximo tick; y
+//   - un intervalo de 60 s como piso, pausado mientras la pestaña está
+//     oculta para no pegarle a la API de fondo.
+//
+// La guarda evita duplicar el intervalo si renderApp() corre de nuevo
+// (re-login sin recargar la página).
+let AUTO_REFRESH_TIMER = null;
+// Piso entre refrescos, para que alt-tabbear no dispare un listado completo
+// por vez (4,2 s y 150 HEAD a R2 en Argentina).
+const REFRESH_MIN_GAP_MS = 15000;
+let LAST_REFRESH_TS = 0;
+function refreshItemsThrottled() {
+  const now = Date.now();
+  if (now - LAST_REFRESH_TS < REFRESH_MIN_GAP_MS) return;
+  LAST_REFRESH_TS = now;
+  reloadItems();
+}
+
+function startAutoRefresh() {
+  if (AUTO_REFRESH_TIMER !== null) return;
+  AUTO_REFRESH_TIMER = setInterval(() => {
+    if (document.hidden) return;
+    refreshItemsThrottled();
+  }, 60000);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshItemsThrottled();
+  });
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("login-title").textContent = PAGE_DATA.title;
+  document.getElementById("login-subtitle").textContent = "Acceso a entregables";
+
+  if (isAuthed()) { renderApp(); }
+  else {
+    const form = document.getElementById("login-form");
+    const input = document.getElementById("password-input");
+    const error = document.getElementById("login-error");
+    const submit = document.getElementById("login-submit");
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      submit.disabled = true;
+      submit.textContent = "Validando...";
+      error.classList.add("hidden");
+      const ok = await checkPassword(input.value);
+      if (ok) { setAuthed(input.value); renderApp(); }
+      else {
+        submit.disabled = false;
+        submit.textContent = "Entrar";
+        error.classList.remove("hidden");
+        input.select();
+      }
+    });
+  }
+
+  // Topbar search → re-render main, debounced lightly.
+  let searchTimer = null;
+  document.getElementById("search-input").addEventListener("input", (e) => {
+    SEARCH = e.target.value.trim();
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { renderSidebar(); renderMain(); }, 80);
+  });
+
+  // Change request submit
+  document.getElementById("change-submit").addEventListener("click", submitChangeRequest);
+  document.getElementById("change-comment").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      submitChangeRequest();
+    }
+  });
+
+  // Esc closes lightbox, then detail/change modal, then tour, then help drawer.
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (document.getElementById("lightbox").classList.contains("open")) { closeLightbox(); return; }
+    if (document.getElementById("change-modal").classList.contains("open")) { closeChangeModal(); return; }
+    if (TOUR_STATE.active) { endTour(false); return; }
+    if (HELP_STATE.open) { closeHelp(); return; }
+  });
+
+  // Esc to clear search when the input has focus
+  document.getElementById("search-input").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.target.value = ""; SEARCH = ""; renderSidebar(); renderMain();
+    }
+  });
+
+  // ───── Help center wiring ─────
+  // Hydrate persisted feedback so users see "¡Gracias!" instead of fresh
+  // buttons on articles they already rated.
+  try {
+    for (const a of (HELP_CONTENT && HELP_CONTENT.articles || [])) {
+      const v = localStorage.getItem("genly_help_fb_" + a.id);
+      if (v) HELP_STATE.feedback[a.id] = v;
+    }
+  } catch (e) { /* localStorage disabled, no-op */ }
+
+  // Drawer search input: debounce + re-render. Empty search returns to
+  // whatever view is on top of the stack.
+  let helpSearchTimer = null;
+  const helpSearchInput = document.getElementById("help-search");
+  if (helpSearchInput) {
+    helpSearchInput.addEventListener("input", () => {
+      clearTimeout(helpSearchTimer);
+      helpSearchTimer = setTimeout(() => helpRender(), 80);
+    });
+    helpSearchInput.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.target.value = ""; helpRender(); }
+    });
+  }
+
+  // Global "?" shortcut opens the drawer. Only when no input/textarea is
+  // focused, so it doesn't hijack typing.
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "?" || e.metaKey || e.ctrlKey || e.altKey) return;
+    const tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    e.preventDefault();
+    if (HELP_STATE.open) closeHelp(); else openHelp();
+  });
+
+  // Contextual tooltip handlers (delegated, so they survive re-renders).
+  bindCtxTipHandlers();
+});
+</script>
+</body>
+</html>

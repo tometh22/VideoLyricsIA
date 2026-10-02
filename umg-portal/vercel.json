@@ -1,0 +1,38 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": null,
+  "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "source": "/api/staging/:path*",
+      "destination": "https://api-staging.genly.pro/:path*"
+    },
+    {
+      "source": "/api/deliveries/:path*",
+      "destination": "https://genly-ai.up.railway.app/api/deliveries/:path*"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/api/staging/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "private, no-store, max-age=0" }
+      ]
+    },
+    {
+      "source": "/api/deliveries/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "private, no-store, max-age=0" }
+      ]
+    },
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Frame-Options",        "value": "DENY" },
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy",        "value": "no-referrer" },
+        { "key": "X-Robots-Tag",           "value": "noindex, nofollow, noarchive" }
+      ]
+    }
+  ]
+}

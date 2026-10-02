@@ -142,6 +142,50 @@ def test_admin_can_create_delivery(client, admin_token, approved_job, all_r2_fil
     assert body["replaced"] is False
 
 
+def test_art_track_prores_is_prepared_only_for_its_portal(
+    client, approved_job, db,
+):
+    from database import Delivery
+    from delivery_freshness import render_fingerprint
+
+    delivery = Delivery(
+        job_id=approved_job.job_id, label="Art Track",
+        file_types=["umg_master", "video", "umg_short", "short", "thumbnail"],
+        artist_snapshot=approved_job.artist,
+        song_title_snapshot=approved_job.song_title,
+        tenant_snapshot=approved_job.tenant_id,
+        portal_id="chile", added_by_user_id=approved_job.user_id,
+        published_file_keys={"video": "published/video.mp4", "short": "published/short.mp4"},
+        published_render_fingerprint=render_fingerprint(approved_job),
+    )
+    db.add(delivery)
+    db.commit()
+    headers = {"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"}
+    with (
+        patch("main.storage.object_status", side_effect=lambda key: "exists" if key else "missing"),
+        patch("queue_jobs.enqueue_portal_prores", return_value="portal-prores:1:umg_master") as enqueue,
+    ):
+        missing = client.post(
+            f"/api/deliveries/{delivery.id}/download/umg_master", headers=headers,
+        )
+        assert missing.status_code == 202
+        assert missing.json() == {"status": "prores_missing", "can_prepare": True}
+        prepared = client.post(
+            f"/api/deliveries/{delivery.id}/prepare-prores",
+            headers=headers, json={"file_type": "umg_master"},
+        )
+        assert prepared.status_code == 202, prepared.text
+        enqueue.assert_called_once_with(
+            delivery.id, "chile", "umg_master", delivery.published_render_fingerprint,
+        )
+        foreign = client.post(
+            f"/api/deliveries/{delivery.id}/prepare-prores",
+            headers={**headers, "X-Portal-Id": "argentina"},
+            json={"file_type": "umg_master"},
+        )
+        assert foreign.status_code == 404
+
+
 def test_missing_prores_is_prepared_instead_of_returning_dead_end(
     client, admin_token, approved_job,
 ):
