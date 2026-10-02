@@ -519,7 +519,10 @@ def reconcile_art_track_campaign(db: Session, campaign: BatchCampaign) -> list[s
 
 def _fingerprint(job: Job) -> str:
     import hashlib, json
-    payload = {"job_id": job.job_id, "audio": job.input_audio_sha256 or job.input_r2_key, "cover": (job.render_params or {}).get("cover_asset_id"), "render": job.render_params or {}, "s3": job.s3_keys or {}}
+    # A ProRes prewarm adds s3_keys asynchronously without changing the
+    # approved MP4. Including s3_keys made publication falsely stale between
+    # the preview and the delivery worker.
+    payload = {"job_id": job.job_id, "audio": job.input_audio_sha256 or job.input_r2_key, "cover": (job.render_params or {}).get("cover_asset_id"), "render": job.render_params or {}, "cut": delivery_freshness.render_fingerprint(job)}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -667,21 +670,6 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     missing = [ft for ft in ("video", "short", "thumbnail") if not (job.s3_keys or {}).get(ft) or not storage.object_exists((job.s3_keys or {}).get(ft))]
                     if missing:
                         row.status = "failed"; row.error_code = "deliverables_not_ready"; row.error_detail = ", ".join(missing); row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
-                # ProRes NO se materializa solo. Esto publicaba los dos .mov en
-                # `file_types` sin verificarlos, apoyado en que el portal los
-                # transcodifica al primer download — y no lo hace: el portal
-                # firma la key determinística de R2 y nunca pasa por
-                # `ensure_prores_exists` (documentado desde el incidente
-                # 2026-08-03). Resultado medido el 2026-09-15 en el portal de
-                # Chile: 28 de 34 entregas activas ofrecían un "ProRes Master
-                # (broadcast)" que no existe en R2 y que nada iba a crear.
-                #
-                # Un job sin `umg_spec` no puede producirlos (no hay frame
-                # size, fps ni perfil), así que se publica como entrega
-                # PARCIAL —igual que un job sin short vertical— en vez de
-                # prometer un archivo inexistente. Uno con spec sí puede: se
-                # encola el prewarm y se publica; el archivo aparece cuando el
-                # transcode termina.
                 delivery_file_types = list(DELIVERY_FILE_TYPES)
                 prores_absent = [
                     ft for ft in ("umg_master", "umg_short")
@@ -691,23 +679,20 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                 ]
                 if prores_absent and not job.umg_spec:
                     delivery_file_types = [ft for ft in delivery_file_types if ft not in prores_absent]
-                    logger.warning(
-                        "[DELIVERY] job=%s se publica SIN %s: no tiene umg_spec, "
-                        "nada los puede generar", job.job_id, sorted(prores_absent),
-                    )
-                elif prores_absent:
+                elif prores_absent and campaign and campaign.kind != "art_track":
+                    # Preserve the existing lyric-video publication gate.
                     for ft in prores_absent:
                         try:
                             enqueue_prores_prewarm(job.job_id, ft, force=True)
                         except Exception as exc:
-                            logger.warning(
-                                "[DELIVERY] no se pudo encolar %s de job=%s: %s",
-                                ft, job.job_id, exc,
-                            )
-                    row.status = 'failed'; row.error_code = 'deliverables_not_ready'
-                    row.error_detail = 'Esperando el archivo profesional. Reintentá cuando termine.'
+                            logger.warning("[DELIVERY] could not enqueue %s for %s: %s", ft, job.job_id, exc)
+                    row.status = "failed"; row.error_code = "deliverables_not_ready"
+                    row.error_detail = "Esperando el archivo profesional. Reintentá cuando termine."
                     row.attempts = int(row.attempts or 0) + 1; failed += 1
                     continue
+                # Art Tracks publish the ready files as one immutable cut.
+                # Missing ProRes files remain a portal preparation option.
+                ready_file_types = [ft for ft in delivery_file_types if ft not in prores_absent]
                 # Never write an AR/CL operation through the legacy
                 # single-portal schema. Without the portal_id migration,
                 # doing so would make a Chile delivery visible in Argentina
@@ -727,7 +712,7 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                 from delivery_snapshots import copy_snapshot
                 try:
                     pinned = (active.published_file_keys if active and not changed else None) or copy_snapshot(
-                        job.tenant_id, job.job_id, delivery_file_types)
+                        job.tenant_id, job.job_id, ready_file_types)
                 except Exception:
                     row.status = 'failed'; row.error_code = 'deliverables_not_ready'
                     row.error_detail = 'No se pudo preparar la publicación; el portal no se modificó.'
@@ -748,6 +733,13 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     active.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
                     active.added_by_user_id = deliveries_added_by(op.created_by)
                     active.added_at = _now()
+                if changed or not active.file_sizes:
+                    file_sizes = {}
+                    for ft, key in pinned.items():
+                        size = storage.head_object_size(key)
+                        if size is not None:
+                            file_sizes[ft] = size
+                    active.file_sizes = file_sizes
                 row.delivery_id = active.id; row.status = "sent"; row.receipt = {"delivery_id": active.id, "portal": op.destination_portal}; row.attempts = int(row.attempts or 0) + 1; sent += 1
                 active.published_file_keys = pinned
                 active.published_render_fingerprint = delivery_freshness.render_fingerprint(job)

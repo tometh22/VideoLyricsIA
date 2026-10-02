@@ -1,7 +1,8 @@
 # Portales de entregables UMG
 
-Los portales de Argentina y Chile usan el mismo build estático de
-`/Users/tomi/genly-deliveries`. El frontend identifica el dominio actual y
+Los portales de Argentina y Chile usan el mismo build estático. La fuente
+versionada está en `umg-portal/` y el proyecto Vercel existente se despliega
+desde `/Users/tomi/genly-deliveries`. El frontend identifica el dominio actual y
 envía `X-Portal-Id` (`argentina` o `chile`) junto con `X-Portal-Token`.
 
 ## Alcance
@@ -14,6 +15,9 @@ envía `X-Portal-Id` (`argentina` o `chile`) junto con `X-Portal-Token`.
   administrador haya enviado a Chile.
 - Ambos portales permiten descargar, previsualizar, aprobar, deshacer la
   aprobación, rechazar, pedir cambios y abrir `app.genly.pro/videos/{job_id}/edit-lyrics`.
+- Ambos portales separan **Art Tracks** de **Otros videos**. La separación usa
+  `Delivery.label == "Art Track"` y filtra versiones, así que una misma canción
+  puede tener un lyric video y un Art Track sin aparecer en la sección equivocada.
 - La edición requiere sesión en la aplicación principal. Al guardar una
   corrección, el operador debe volver a publicar la versión desde GenLy.
 
@@ -144,6 +148,28 @@ Los jobs de las campañas viven en la base de **staging** mientras las filas
 `deliveries` viven en **producción** (`DELIVERIES_DATABASE_URL`). Por eso un
 endpoint del portal de prod que necesite el Job —como `prepare-prores`— no
 resuelve esos `job_id`: hay que encolar desde staging.
+
+## ProRes de Art Tracks a pedido
+
+La publicación de una campaña Art Track fija el MP4, el short y la portada en
+`published_file_keys`. Si el ProRes ya está en R2, también lo fija; si todavía
+no existe, la entrega incluye un botón **Generar y descargar** para ese formato.
+No se anuncia una URL ProRes antes de que exista un archivo publicado.
+
+El portal pide la descarga a producción (`POST /api/deliveries/{id}/download/{type}`).
+Si falta un ProRes de Art Track, usa el rewrite `/api/staging/...` hacia
+`api-staging-9b82.up.railway.app` para pedir
+`POST /api/deliveries/{id}/prepare-prores` en staging y consulta el estado por
+`GET` cada diez segundos. Un worker de staging transcodifica, comprueba que el
+fingerprint del render siga siendo el publicado, copia el `.mov` a una key
+inmutable y actualiza la fila de entrega en la DB compartida. Al quedar listo,
+el portal inicia la descarga con un enlace firmado de R2. Hay un límite de una
+preparación simultánea por pestaña y backpressure en la cola de workers.
+
+El despliegue requiere que staging tenga `DELIVERIES_DATABASE_URL` y los mismos
+`DELIVERY_PORTAL_TOKEN` / `DELIVERY_PORTAL_TOKEN_CHILE` que autorizan el portal.
+Desplegar primero el backend y los workers de staging, luego el backend de
+producción y finalmente el build compartido de los dos portales.
 
 ### Un job publicado en los dos portales
 

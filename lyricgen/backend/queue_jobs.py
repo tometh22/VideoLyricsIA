@@ -1927,6 +1927,48 @@ def enqueue_prores_prewarm(
     return rq_job.id
 
 
+def portal_prores_job_id(delivery_id: int, file_type: str) -> str:
+    return f"portal-prores:{delivery_id}:{file_type}"
+
+
+def enqueue_portal_prores(
+    delivery_id: int, portal_id: str, file_type: str, fingerprint: str,
+) -> str:
+    """Queue one customer-requested transcode without flooding render jobs."""
+    _require_submissions_open()
+    redis, _, enterprise = _init_redis()
+    if redis is None or enterprise is None:
+        raise RuntimeError("ProRes queue unavailable")
+    rq_id = portal_prores_job_id(delivery_id, file_type)
+    lock_key = f"portal-prores-submit:{delivery_id}:{file_type}"
+    if not redis.set(lock_key, "1", nx=True, ex=20):
+        return rq_id
+    try:
+        from rq.job import Job as RQJob
+        try:
+            existing = RQJob.fetch(rq_id, connection=redis)
+            if existing.get_status(refresh=True) in (
+                "queued", "started", "deferred", "scheduled",
+            ):
+                return rq_id
+        except Exception:
+            pass
+        if enterprise.count >= PRORES_PREWARM_MAX_QUEUE_DEPTH:
+            raise RuntimeError("La cola de ProRes está ocupada. Reintentá en unos minutos.")
+        enterprise.enqueue(
+            "portal_prores.materialize_delivery_prores",
+            args=(delivery_id, portal_id, file_type, fingerprint),
+            job_id=rq_id,
+            job_timeout=2400,
+            result_ttl=RESULT_TTL,
+            failure_ttl=FAILURE_TTL,
+            meta=rq_payload_metadata("portal_prores"),
+        )
+        return rq_id
+    finally:
+        redis.delete(lock_key)
+
+
 def edit_failure_callback(job, connection, type_, value, traceback) -> None:
     """RQ on_failure hook for run_edit_pipeline.
 

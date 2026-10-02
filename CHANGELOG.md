@@ -3,6 +3,22 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.46] - 2026-10-02
+
+### Added
+
+- Add dedicated Art Tracks and Other Videos sections to the shared Argentina
+  and Chile UMG portal, filtering individual versions when a song has both.
+- Let a customer request a missing Art Track ProRes from the portal. Staging
+  generates it in a bounded worker queue, pins it to the approved published
+  cut, and the portal starts the R2 download when it is ready.
+
+### Changed
+
+- Publish approved Art Tracks with their MP4, short and cover even when a
+  professional master has not been generated yet. Show ProRes as a pending
+  download option instead of publishing a broken link.
+
 ## [1.1.45] - 2026-09-15
 
 ### Fixed
