@@ -38,6 +38,7 @@ function StyleStep({ campaign, onDone, onSkip }) {
   const [umgFrameSize, setUmgFrameSize] = useState(campaign.default_render_params?.umg_frame_size || "HD");
   const [umgFps, setUmgFps] = useState(String(campaign.default_render_params?.umg_fps || "24"));
   const [umgProresProfile, setUmgProresProfile] = useState(String(campaign.default_render_params?.umg_prores_profile || "3"));
+  const [umgConfigTouched, setUmgConfigTouched] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   useEffect(() => {
@@ -52,9 +53,11 @@ function StyleStep({ campaign, onDone, onSkip }) {
       const params = {
         ...(campaign.default_render_params || {}), ...settings,
         delivery_profile: delivery,
-        umg_frame_size: umgFrameSize,
-        umg_fps: umgFps,
-        umg_prores_profile: umgProresProfile,
+        ...(umgConfigTouched ? {
+          umg_frame_size: umgFrameSize,
+          umg_fps: umgFps,
+          umg_prores_profile: umgProresProfile,
+        } : {}),
       };
       await campaignRequest(`/batch/campaigns/${encodeURIComponent(campaign.id)}`, { method: "PATCH", json: { default_render_params: params } });
       onDone();
@@ -68,9 +71,9 @@ function StyleStep({ campaign, onDone, onSkip }) {
       </div>
     </div>
     {delivery !== "youtube" && <div className="grid gap-3 rounded-card bg-black/20 p-4 sm:grid-cols-3">
-      <Field label="Resolución del master"><select aria-label="Resolución del master UMG" className={inputClass} value={umgFrameSize} onChange={(event) => setUmgFrameSize(event.target.value)}><option value="HD">HD · 1080p</option><option value="UHD-4K">UHD · 4K</option><option value="DCI-2K">DCI · 2K</option><option value="DCI-4K">DCI · 4K</option></select></Field>
-      <Field label="Cuadros por segundo"><select aria-label="FPS del master UMG" className={inputClass} value={umgFps} onChange={(event) => setUmgFps(event.target.value)}>{["23.976", "24", "25", "29.97", "30", "50", "59.94", "60"].map((value) => <option key={value} value={value}>{value} fps</option>)}</select></Field>
-      <Field label="Perfil ProRes"><select aria-label="Perfil ProRes del master UMG" className={inputClass} value={umgProresProfile} onChange={(event) => setUmgProresProfile(event.target.value)}><option value="3">ProRes 422 HQ</option><option value="4">ProRes 4444</option><option value="5">ProRes 4444 XQ</option></select></Field>
+      <Field label="Resolución del master"><select aria-label="Resolución del master UMG" className={inputClass} value={umgFrameSize} onChange={(event) => { setUmgConfigTouched(true); setUmgFrameSize(event.target.value); }}><option value="HD">HD · 1080p</option><option value="UHD-4K">UHD · 4K</option><option value="DCI-2K">DCI · 2K</option><option value="DCI-4K">DCI · 4K</option></select></Field>
+      <Field label="Cuadros por segundo"><select aria-label="FPS del master UMG" className={inputClass} value={umgFps} onChange={(event) => { setUmgConfigTouched(true); setUmgFps(event.target.value); }}>{["23.976", "24", "25", "29.97", "30", "50", "59.94", "60"].map((value) => <option key={value} value={value}>{value} fps</option>)}</select></Field>
+      <Field label="Perfil ProRes"><select aria-label="Perfil ProRes del master UMG" className={inputClass} value={umgProresProfile} onChange={(event) => { setUmgConfigTouched(true); setUmgProresProfile(event.target.value); }}><option value="3">ProRes 422 HQ</option><option value="4">ProRes 4444</option><option value="5">ProRes 4444 XQ</option></select></Field>
       <p className="text-xs text-ink-secondary sm:col-span-3">El master se genera cuando el cliente lo pide desde el portal; así se evita almacenar ProRes que nadie descarga.</p>
     </div>}
     <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,320px)]">
