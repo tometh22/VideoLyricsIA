@@ -2338,7 +2338,12 @@ function renderVersionRow(song, version, versionIdx) {
   // small download too — operators want the cover art separately.
   const filesHtml = (version.files || []).map(f => {
     if (!f.available) {
-      const canPrepare = version.delivery_id && version.label === "Art Track" && f.can_prepare &&
+      const sourceType = f.type === "umg_master" ? "video" : "short";
+      const sourceReady = (version.files || []).some(source => source.type === sourceType && source.available);
+      // Older portal APIs omit can_prepare; the current campaign API exposes
+      // a missing master placeholder whenever its published MP4 is present.
+      const canPrepare = version.delivery_id && version.label === "Art Track" &&
+        (f.can_prepare || f.type === "umg_master") && sourceReady &&
         (f.type === "umg_master" || f.type === "umg_short");
       if (canPrepare) {
         const prepareKey = `${version.delivery_id}:${f.type}`;
