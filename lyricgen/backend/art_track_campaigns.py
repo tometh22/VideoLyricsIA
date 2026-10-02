@@ -518,15 +518,29 @@ def start_art_rendering(campaign_id: str, current_user: dict = Depends(get_curre
     blocked = [r.id for r in rows if r not in eligible]
     if not eligible: raise HTTPException(status_code=409, detail={"code": "no_art_tracks_ready", "blocked_item_ids": blocked})
     from transactional_outbox import create_pipeline_outbox_event
-    # Render UMG-compatible intermediates once; the existing publisher can
-    # later materialize ProRes without re-rendering the art track.
-    umg_spec = {"frame_size": "HD", "fps": 24.0, "prores_profile": 3}
+    # Render UMG-compatible intermediates once; create the multi-GB ProRes
+    # derivative only when the portal customer asks to download it.
+    campaign_render = campaign.default_render_params or {}
+    frame_size = campaign_render.get("umg_frame_size", "HD")
+    try:
+        fps = float(campaign_render.get("umg_fps", 24.0))
+        prores_profile = int(campaign_render.get("umg_prores_profile", 3))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="La configuración del master UMG no es válida.") from None
+    from render_spec import validate_umg_config
+    config_errors = validate_umg_config(frame_size, fps, prores_profile)
+    if config_errors:
+        raise HTTPException(status_code=422, detail={"code": "invalid_umg_spec", "errors": config_errors})
+    umg_spec = {"frame_size": frame_size, "fps": fps, "prores_profile": prores_profile}
+    delivery_profile = campaign_render.get("delivery_profile", "both")
+    if delivery_profile not in {"umg", "both"}:
+        delivery_profile = "both"
     created = []; events = []
     for item in eligible:
         if db.query(Job).filter(Job.campaign_item_id == item.id).first(): continue
         cover = db.query(BatchCampaignAsset).filter(BatchCampaignAsset.id == item.cover_asset_id).one()
         job_id = create_job(db, artist=item.artist or "Unknown", song_title=item.title or "", style="oscuro", filename=item.filename,
-                            user_id=campaign.created_by, tenant_id=campaign.tenant_id, delivery_profile="both", umg_spec=umg_spec,
+                            user_id=campaign.created_by, tenant_id=campaign.tenant_id, delivery_profile=delivery_profile, umg_spec=umg_spec,
                             initial_status="transcribed_pending", input_r2_key=item.upload_key, workload_class="batch",
                             campaign_id=campaign.id, campaign_item_id=item.id, commit=False)
         job = db.query(Job).filter(Job.job_id == job_id).one()
@@ -534,7 +548,7 @@ def start_art_rendering(campaign_id: str, current_user: dict = Depends(get_curre
         job.segments_json = []
         event = create_pipeline_outbox_event(db, job=job, purpose="art_track_batch", mp3_path=None, artist=item.artist or "Unknown", style="oscuro", plan="100", tenant_id=campaign.tenant_id,
             pipeline_kwargs={"art_track": True, "segments_override": [], "input_r2_key": item.upload_key, "bg_r2_key": cover.upload_key,
-                             "background_path": None, "song_title": item.title or "", "delivery_profile": "both", "umg_spec": umg_spec,
+                             "background_path": None, "song_title": item.title or "", "delivery_profile": delivery_profile, "umg_spec": umg_spec,
                              "label_line": (campaign.default_render_params or {}).get("label_line", ""),
                              "art_track_preset": art_track_preset})
         job.status = "queued"; job.current_step = "queued"; job.progress = 0
@@ -949,21 +963,8 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                         missing = [ft for ft in ("video", "short", "thumbnail") if not (job.s3_keys or {}).get(ft) or not storage.object_exists((job.s3_keys or {}).get(ft))]
                         if missing:
                             row.status = "failed"; row.error_code = "deliverables_not_ready"; row.error_detail = ", ".join(missing); row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
-                    # ProRes NO se materializa solo. Esto publicaba los dos .mov en
-                    # `file_types` sin verificarlos, apoyado en que el portal los
-                    # transcodifica al primer download — y no lo hace: el portal
-                    # firma la key determinística de R2 y nunca pasa por
-                    # `ensure_prores_exists` (documentado desde el incidente
-                    # 2026-08-03). Resultado medido el 2026-09-15 en el portal de
-                    # Chile: 28 de 34 entregas activas ofrecían un "ProRes Master
-                    # (broadcast)" que no existe en R2 y que nada iba a crear.
-                    #
-                    # Un job sin `umg_spec` no puede producirlos (no hay frame
-                    # size, fps ni perfil), así que se publica como entrega
-                    # PARCIAL —igual que un job sin short vertical— en vez de
-                    # prometer un archivo inexistente. Uno con spec sí puede: se
-                    # encola el prewarm y se publica; el archivo aparece cuando el
-                    # transcode termina.
+                    # Campaign ProRes is on demand. Publish ready MP4 assets now
+                    # and let the portal prepare a missing master after a click.
                     delivery_file_types = list(DELIVERY_FILE_TYPES)
                     prores_absent = [
                         ft for ft in ("umg_master", "umg_short")
@@ -971,34 +972,8 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                         or not (job.s3_keys or {}).get(ft)
                         or not storage.object_exists((job.s3_keys or {}).get(ft))
                     ]
-                    if prores_absent and not job.umg_spec:
+                    if prores_absent:
                         delivery_file_types = [ft for ft in delivery_file_types if ft not in prores_absent]
-                        logger.warning(
-                            "[DELIVERY] job=%s se publica SIN %s: no tiene umg_spec, "
-                            "nada los puede generar", job.job_id, sorted(prores_absent),
-                        )
-                    elif prores_absent:
-                        # SIN force: la ruta masiva puede publicar hasta 500
-                        # canciones de una, y `force=True` saltea a propósito el
-                        # tope de profundidad de cola. 1000 transcodes de varios
-                        # GB encolados de un saque se ponen delante de TODOS los
-                        # renders de cliente que vengan después, en la misma cola
-                        # `enterprise`. Acá no hay nadie esperando el archivo: si
-                        # la cola está llena, que la auditoría diaria lo reporte y
-                        # se pida bajo demanda desde el portal, que sí es un click
-                        # humano y sí justifica saltear el tope.
-                        for ft in prores_absent:
-                            try:
-                                enqueue_prores_prewarm(job.job_id, ft)
-                            except Exception as exc:
-                                logger.warning(
-                                    "[DELIVERY] no se pudo encolar %s de job=%s: %s",
-                                    ft, job.job_id, exc,
-                                )
-                        row.status = 'failed'; row.error_code = 'deliverables_not_ready'
-                        row.error_detail = 'Esperando el archivo profesional. Reintentá cuando termine.'
-                        row.attempts = int(row.attempts or 0) + 1; failed += 1
-                        continue
                     # Never write an AR/CL operation through the legacy
                     # single-portal schema. Without the portal_id migration,
                     # doing so would make a Chile delivery visible in Argentina

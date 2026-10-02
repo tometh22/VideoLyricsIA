@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.95] - 2026-10-02
+
+### Fixed
+
+- Las entregas UMG antiguas con video publicado y sin entrada `umg_master` ahora muestran la opción para generar el ProRes desde el portal. La solicitud agrega el master a la versión publicada cuando termina.
+- Las campañas difieren la transcodificación ProRes hasta que el cliente la solicita y permiten definir resolución, fps y perfil del master al crear el trabajo.
+
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
