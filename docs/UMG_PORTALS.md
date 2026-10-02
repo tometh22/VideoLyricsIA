@@ -17,6 +17,18 @@ envía `X-Portal-Id` (`argentina` o `chile`) junto con `X-Portal-Token`.
 - La edición requiere sesión en la aplicación principal. Al guardar una
   corrección, el operador debe volver a publicar la versión desde GenLy.
 
+Los botones de descarga registran cada click como `delivery.download_attempt`
+en `AuditLog`, visible para administradores en `/admin/audit`. Se guarda el
+resultado del intento, la entrega y el archivo, el portal, la IP y el user-agent;
+como UMG comparte un token, el registro no identifica a cada persona por nombre.
+El archivo grande sigue bajando directamente desde R2.
+
+Si falta el ProRes Master, el portal ofrece **generar y descargar**. Un click
+encola el master en staging, lo publica en la versión de entrega y comienza la
+descarga cuando termina. Usa la resolución guardada en la entrega y, si el job
+no tenía spec ProRes, 24 fps / ProRes 422 HQ. No hay confirmación intermedia.
+Staging debe tener `DELIVERY_PORTAL_TOKEN` igual al de producción.
+
 ## Envío desde cuentas admin
 
 En el detalle de un video aprobado, `Enviar a UMG` permite elegir Argentina o
