@@ -487,27 +487,53 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     setUmgPortals(getUmgPortals(job));
   }, [job.is_in_umg_portal, job.umg_portals]);
 
+  // Una caída breve del API (por ejemplo durante un redeploy) no debería
+  // abortar la publicación. El POST es seguro de repetir: el backend actualiza
+  // la entrega existente por job/portal y sólo avanza la revisión si cambió
+  // el render publicado.
+  const fetchUmgWithRetry = async (url, options, attempts = 3) => {
+    let lastError;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        return await fetch(url, options);
+      } catch (err) {
+        lastError = err;
+        if (attempt + 1 < attempts) {
+          await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+        }
+      }
+    }
+    lastError.kind = "network";
+    throw lastError;
+  };
+
   const waitForUmgMasters = async (retryAfterSeconds = 10) => {
     const deadline = Date.now() + (10 * 60 * 1000);
     const retryMs = Math.max(1000, Number(retryAfterSeconds || 10) * 1000);
     while (Date.now() < deadline) {
-      const statusResp = await fetch(`${API}/status/${job.job_id}`, {
-        headers: authHeaders(),
-      });
-      if (statusResp.ok) {
-        const updated = await statusResp.json();
-        const ready = Boolean(
-          updated.prores_ready
-          || (
-            updated.s3_keys?.umg_master
-            && updated.s3_keys?.umg_short
-          )
-        );
-        onJobUpdate?.({ ...job, ...updated });
-        if (ready) {
-          setLocalProresReady(true);
-          return;
+      try {
+        const statusResp = await fetchUmgWithRetry(`${API}/status/${job.job_id}`, {
+          headers: authHeaders(),
+        });
+        if (statusResp.ok) {
+          const updated = await statusResp.json();
+          const ready = Boolean(
+            updated.prores_ready
+            || (
+              updated.s3_keys?.umg_master
+              && updated.s3_keys?.umg_short
+            )
+          );
+          onJobUpdate?.({ ...job, ...updated });
+          if (ready) {
+            setLocalProresReady(true);
+            return;
+          }
         }
+      } catch (err) {
+        // La preparación continúa en segundo plano; no abandonar el flujo por
+        // una caída transitoria del endpoint de estado.
+        console.warn("UMG ProRes status check failed; will retry:", err);
       }
       await new Promise((resolve) => setTimeout(resolve, retryMs));
     }
@@ -530,7 +556,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       let preparationRounds = 0;
       let qcRefreshRounds = 0;
       do {
-        resp = await fetch(`${API}/admin/deliveries/from-job/${job.job_id}`, {
+        resp = await fetchUmgWithRetry(`${API}/admin/deliveries/from-job/${job.job_id}`, {
           method: "POST",
           headers: { ...authHeaders(), "Content-Type": "application/json" },
           body: JSON.stringify({ portal_id: targetPortal }),
@@ -549,7 +575,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           if (["fresh_preflight_required", "manual_review_required", "review_required"].includes(gate.reason)) {
             qcRefreshRounds += 1;
             setUmgSendStage("preflight");
-            const qcResponse = await fetch(`${API}/jobs/${job.job_id}/delivery-qc/recheck`, {
+            const qcResponse = await fetchUmgWithRetry(`${API}/jobs/${job.job_id}/delivery-qc/recheck`, {
               method: "POST",
               headers: { ...authHeaders(), "Content-Type": "application/json" },
               body: JSON.stringify({ for_umg_delivery: true }),
@@ -651,7 +677,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         title: "No se pudo enviar a UMG",
         description: err?.kind === "timeout"
           ? "La preparación ProRes está tardando más de lo esperado. Podés volver a intentar; el proceso continúa en segundo plano."
-          : "Hubo un problema de red. Revisá tu conexión y probá de nuevo.",
+          : err?.kind === "network"
+            ? "La conexión con el portal se interrumpió y no pudimos confirmar el resultado. Revisá si el video ya aparece en UMG; si no, podés volver a enviarlo."
+            : "No pudimos completar el envío. Revisá el estado e intentá de nuevo.",
         tone: "error",
       });
     } finally {
