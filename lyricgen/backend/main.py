@@ -21095,16 +21095,15 @@ async def portal_prepare_prores(
     ).first()
     if delivery is None:
         raise HTTPException(status_code=404, detail="Delivery no encontrada.")
-    if file_type not in (delivery.file_types or []):
-        raise HTTPException(status_code=404, detail="Archivo no disponible para esta entrega.")
-    if is_hidden_from_client(delivery):
-        # The portal shows no files for it, so nothing legitimate asks for a master.
+    # Legacy deliveries may have a video but no umg_master entry in
+    # file_types. Their on-demand action is added to the listing, so permit
+    # that request and let the source/prores checks below validate it.
+    if not _portal_file_is_published(delivery, file_type):
         raise HTTPException(status_code=404, detail="Archivo no disponible para esta entrega.")
 
     job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
     if job is not None and job.status != "done":
         raise HTTPException(status_code=400, detail="El video todavía no terminó de procesarse.")
-
     # Freno. Este endpoint encola un ffmpeg de varios GB en la cola
     # `enterprise`, la MISMA que sirve los renders de cliente, y lo hace con
     # `force=True`, que saltea a propósito el guard de profundidad.
@@ -21490,8 +21489,18 @@ def portal_get_items(
     # head_objects fall through to size=None / available=False, same as
     # the old per-iteration except.
     head_jobs: list[tuple[int, str, str]] = []  # (delivery_idx, file_type, r2_key)
+    listing_file_types: dict[int, list[str]] = {}
     for di, d in enumerate(deliveries):
-        for ft in (d.file_types or []):
+        file_types = list(d.file_types or [])
+        # The master may have been absent when a legacy delivery was first
+        # published, which also means it is absent from `file_types`. Keep a
+        # visible “generate and download” affordance for every published
+        # video so the customer can request it without contacting support.
+        if ("video" in file_types and d.published_render_fingerprint
+                and "umg_master" not in file_types):
+            file_types.append("umg_master")
+        listing_file_types[di] = file_types
+        for ft in file_types:
             if ft not in _DELIVERY_FILE_TYPES:
                 continue
             from delivery_snapshots import portal_key
@@ -21584,12 +21593,20 @@ def portal_get_items(
         files = []
         preview_url: str | None = None
         short_preview_url: str | None = None
-        for ft in (d.file_types or []):
+        for ft in listing_file_types.get(di, d.file_types or []):
             if ft not in _DELIVERY_FILE_TYPES:
                 continue
             from delivery_snapshots import portal_key
             r2_key = portal_key(d, ft, for_client=True)
             if not r2_key:
+                if ft == "umg_master":
+                    files.append({
+                        "type": ft,
+                        "label": file_type_labels.get(ft, ft),
+                        "url": None,
+                        "size": "—",
+                        "available": False,
+                    })
                 continue
             dl_name = f"{_delivery_safe_filename(d.artist_snapshot, d.song_title_snapshot)}.{_DELIVERY_FILE_TYPES[ft]['ext']}"
             try:
@@ -21684,6 +21701,311 @@ def portal_get_items(
         "expires_at_ts": now + _DELIVERY_URL_EXPIRY_S,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _portal_file_is_published(delivery: Delivery, file_type: str) -> bool:
+    """Only expose files included in the client-visible publication.
+
+    A missing master is the one intentional exception: the listing offers it
+    for a published MP4 so the customer can request lazy preparation.
+    """
+    if is_hidden_from_client(delivery):
+        return False
+    file_types = delivery.file_types or []
+    return file_type in file_types or (
+        file_type == "umg_master"
+        and "video" in file_types
+        and bool(delivery.published_render_fingerprint)
+    )
+
+
+def _record_portal_download_attempt(
+    db: Session,
+    request: Request,
+    *,
+    portal_id: str,
+    delivery: Delivery | None,
+    delivery_id: int,
+    file_type: str,
+    outcome: str,
+) -> int:
+    """Keep a per-click audit event for the shared-password UMG portal.
+
+    The portal has no individual logins, so IP and user agent are the only
+    available request context. Never store the portal token or signed URL.
+    """
+    from database import AuditLog
+
+    client = request.client
+    event = AuditLog(
+        user_id=None,
+        action="delivery.download_attempt",
+        ip_address=client.host if client else None,
+        detail={
+            "delivery_id": delivery_id,
+            "job_id": delivery.job_id if delivery else None,
+            "artist": delivery.artist_snapshot if delivery else None,
+            "song": delivery.song_title_snapshot if delivery else None,
+            "portal_id": portal_id,
+            "file_type": file_type,
+            "outcome": outcome,
+            "user_agent": (request.headers.get("user-agent") or "")[:500],
+        },
+    )
+    try:
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+        return event.id
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "[PORTAL-AUDIT] download attempt log failed delivery=%s type=%s: %s",
+            delivery_id, file_type, exc,
+        )
+        return 0
+
+
+@app.post("/api/deliveries/{delivery_id}/download/{file_type}")
+async def portal_download_file(
+    delivery_id: int,
+    file_type: str,
+    request: Request,
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """Record a portal download click, then issue a short-lived R2 URL.
+
+    The portal must call this endpoint on each click instead of embedding
+    reusable signed links in its download buttons. The actual large file
+    still streams directly from R2 after this audited request.
+    """
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    if file_type not in _DELIVERY_FILE_TYPES:
+        raise HTTPException(status_code=400, detail="Tipo de archivo inválido.")
+
+    delivery = (
+        _portal_delivery_query(ddb.query(Delivery), portal_id)
+        .filter(Delivery.id == delivery_id)
+        .filter(Delivery.removed_at.is_(None))
+        .first()
+    )
+    if delivery is None:
+        _record_portal_download_attempt(
+            ddb, request, portal_id=portal_id, delivery=None,
+            delivery_id=delivery_id, file_type=file_type, outcome="delivery_not_found",
+        )
+        raise HTTPException(status_code=404, detail="Entrega no encontrada.")
+
+    if not _portal_file_is_published(delivery, file_type):
+        _record_portal_download_attempt(
+            ddb, request, portal_id=portal_id, delivery=delivery,
+            delivery_id=delivery_id, file_type=file_type, outcome="file_not_published",
+        )
+        raise HTTPException(status_code=404, detail="Archivo no disponible.")
+
+    from delivery_snapshots import portal_key
+    key = portal_key(delivery, file_type, for_client=True)
+    if not key:
+        outcome = "prores_missing" if file_type in ("umg_master", "umg_short") else "file_not_published"
+        _record_portal_download_attempt(
+            ddb, request, portal_id=portal_id, delivery=delivery,
+            delivery_id=delivery_id, file_type=file_type, outcome=outcome,
+        )
+        if file_type in ("umg_master", "umg_short"):
+            return JSONResponse(
+                status_code=202,
+                content={"status": "prores_missing", "can_prepare": True},
+            )
+        raise HTTPException(status_code=404, detail="Archivo no disponible.")
+
+    object_status = storage.object_status(key)
+    if object_status != "exists":
+        if file_type in ("umg_master", "umg_short") and object_status == "missing":
+            outcome = "prores_missing"
+        else:
+            outcome = "storage_unavailable" if object_status != "missing" else "file_missing"
+        _record_portal_download_attempt(
+            ddb, request, portal_id=portal_id, delivery=delivery,
+            delivery_id=delivery_id, file_type=file_type, outcome=outcome,
+        )
+        if file_type in ("umg_master", "umg_short") and object_status == "missing":
+            return JSONResponse(
+                status_code=202,
+                content={"status": "prores_missing", "can_prepare": True},
+            )
+        raise HTTPException(
+            status_code=503 if object_status != "missing" else 404,
+            detail="No se pudo verificar el archivo. Probá de nuevo en unos minutos.",
+        )
+
+    ext = _DELIVERY_FILE_TYPES[file_type]["ext"]
+    filename = f"{_delivery_safe_filename(delivery.artist_snapshot, delivery.song_title_snapshot)}.{ext}"
+    url = storage.generate_signed_url(
+        key,
+        expiry_seconds=1800,
+        download_filename=filename,
+    )
+    if not url:
+        _record_portal_download_attempt(
+            ddb, request, portal_id=portal_id, delivery=delivery,
+            delivery_id=delivery_id, file_type=file_type, outcome="signing_failed",
+        )
+        raise HTTPException(status_code=503, detail="No se pudo iniciar la descarga.")
+
+    _record_portal_download_attempt(
+        ddb, request, portal_id=portal_id, delivery=delivery,
+        delivery_id=delivery_id, file_type=file_type, outcome="url_issued",
+    )
+    return {"status": "ready", "url": url}
+
+
+def _prepare_portal_prores_snapshot(
+    tenant: str,
+    job_id: str,
+    file_type: str,
+    published_file_keys: dict | None,
+) -> tuple[str, int | None] | None:
+    """Perform the potentially slow R2 copy outside the request's DB session."""
+    from delivery_snapshots import copy_snapshot, working_key
+
+    working = working_key(tenant, job_id, file_type)
+    current = (published_file_keys or {}).get(file_type) if published_file_keys is not None else working
+    if current and storage.object_status(current) == "exists":
+        key = current
+    else:
+        if storage.object_status(working) != "exists":
+            return None
+        if published_file_keys is None:
+            # Legacy publications resolve all files from their working keys.
+            # Keep that representation, otherwise a partial pointer would hide
+            # their existing MP4/thumbnail files.
+            key = working
+        else:
+            copied = copy_snapshot(tenant, job_id, [file_type])
+            key = copied.get(file_type)
+            if not key:
+                return None
+
+    client = storage._get_client()
+    if client is None:
+        return None
+    size = client.head_object(Bucket=storage.R2_BUCKET, Key=key).get("ContentLength")
+    return key, int(size) if size else None
+
+
+async def _finalize_portal_prores(
+    delivery: Delivery, ddb: Session, file_type: str,
+) -> bool:
+    """Expose a completed ProRes master as part of this immutable delivery."""
+    result = await asyncio.to_thread(
+        _prepare_portal_prores_snapshot,
+        delivery.tenant_snapshot,
+        delivery.job_id,
+        file_type,
+        dict(delivery.published_file_keys) if delivery.published_file_keys is not None else None,
+    )
+    if result is None:
+        return False
+
+    key, size = result
+    if delivery.published_file_keys is not None:
+        keys = dict(delivery.published_file_keys or {})
+        keys[file_type] = key
+        delivery.published_file_keys = keys
+    file_types = list(delivery.file_types or [])
+    if file_type not in file_types:
+        file_types.append(file_type)
+        delivery.file_types = file_types
+    if size:
+        sizes = dict(delivery.file_sizes or {})
+        sizes[file_type] = size
+        delivery.file_sizes = sizes
+    ddb.commit()
+    return True
+
+
+@app.get("/api/deliveries/{delivery_id}/prepare-prores")
+async def portal_prores_status(
+    delivery_id: int,
+    request: Request,
+    file_type: str = Query("umg_master"),
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """Poll a queued master and atomically add it to the portal snapshot."""
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    if file_type not in ("umg_master", "umg_short"):
+        raise HTTPException(status_code=400, detail="Tipo ProRes inválido.")
+    delivery = (
+        _portal_delivery_query(ddb.query(Delivery), portal_id)
+        .filter(Delivery.id == delivery_id)
+        .filter(Delivery.removed_at.is_(None))
+        .first()
+    )
+    if delivery is None:
+        raise HTTPException(status_code=404, detail="Entrega no encontrada.")
+    if not _portal_file_is_published(delivery, file_type):
+        raise HTTPException(status_code=404, detail="Archivo no disponible.")
+    if await _finalize_portal_prores(delivery, ddb, file_type):
+        _record_portal_download_attempt(
+            ddb, request, portal_id=portal_id, delivery=delivery,
+            delivery_id=delivery_id, file_type=file_type, outcome="prores_ready",
+        )
+        return {"status": "ready"}
+
+    job = (
+        db.query(Job)
+        .filter(Job.job_id == delivery.job_id)
+        .filter(Job.tenant_id == delivery.tenant_snapshot)
+        .first()
+    )
+    if job is None:
+        # The shared portal DB also holds deliveries created by production.
+        # Their preparation runs from the delivery snapshot in staging, so
+        # there is no local Job to inspect while polling.
+        return JSONResponse(
+            status_code=202,
+            content={"status": "processing", "retry_after": 10},
+            headers={"Retry-After": "10"},
+        )
+
+    if not job.umg_spec:
+        job.umg_spec = _parse_umg_params(
+            delivery_profile="umg",
+            umg_frame_size=delivery.frame_size_snapshot or "HD",
+            umg_fps="24",
+            umg_prores_profile="3",
+            current_user=None,
+        )
+        db.commit()
+
+    from prores import check_prores_readiness, ProResReadiness
+    readiness = await asyncio.to_thread(
+        check_prores_readiness,
+        job.job_id,
+        file_type,
+        {"umg_spec": job.umg_spec, "s3_keys": dict(job.s3_keys or {})},
+        job.tenant_id,
+        short_wait_seconds=0.5,
+    )
+    if readiness.state in (ProResReadiness.READY_LOCAL, ProResReadiness.READY_R2):
+        ready = await _finalize_portal_prores(delivery, ddb, file_type)
+        if ready:
+            _record_portal_download_attempt(
+                ddb, request, portal_id=portal_id, delivery=delivery,
+                delivery_id=delivery_id, file_type=file_type, outcome="prores_ready",
+            )
+            return {"status": "ready"}
+    return JSONResponse(
+        status_code=202,
+        content={"status": "processing", "retry_after": 10},
+        headers={"Retry-After": "10"},
+    )
 
 
 def _fmt_size_mb(size_bytes: int | None) -> str:

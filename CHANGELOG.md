@@ -3,6 +3,32 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.96] - 2026-10-02
+
+### Added
+
+- Versioned static source for the shared Argentina and Chile UMG portals,
+  with separate Art Tracks and Other Videos sections. Versions are filtered
+  independently so a song with both formats appears in both sections.
+- Art Track ProRes preparation button compatible with the staging campaign
+  API; the Vercel rewrite targets the live Railway staging API domain.
+- Portal build option to preserve the live access hash and help content while
+  updating the page, avoiding a password rotation during deployment.
+
+### Fixed
+
+- Download and ProRes preparation endpoints now reject hidden deliveries and
+  files outside the published set, including requests made with a direct URL.
+- ProRes progress polling now completes shared portal deliveries whose source
+  Job belongs to the other environment.
+
+## [1.1.95] - 2026-10-02
+
+### Fixed
+
+- Las entregas UMG antiguas con video publicado y sin entrada `umg_master` ahora muestran la opción para generar el ProRes desde el portal. La solicitud agrega el master a la versión publicada cuando termina.
+- Las campañas difieren la transcodificación ProRes hasta que el cliente la solicita y permiten definir resolución, fps y perfil del master al crear el trabajo.
+
 ## [1.1.91] - 2026-10-01
 
 ### Added

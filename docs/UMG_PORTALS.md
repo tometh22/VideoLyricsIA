@@ -17,6 +17,18 @@ envía `X-Portal-Id` (`argentina` o `chile`) junto con `X-Portal-Token`.
 - La edición requiere sesión en la aplicación principal. Al guardar una
   corrección, el operador debe volver a publicar la versión desde GenLy.
 
+Los botones de descarga registran cada click como `delivery.download_attempt`
+en `AuditLog`, visible para administradores en `/admin/audit`. Se guarda el
+resultado del intento, la entrega y el archivo, el portal, la IP y el user-agent;
+como UMG comparte un token, el registro no identifica a cada persona por nombre.
+El archivo grande sigue bajando directamente desde R2.
+
+Si falta el ProRes Master, el portal ofrece **generar y descargar**. Un click
+encola el master en staging, lo publica en la versión de entrega y comienza la
+descarga cuando termina. Usa la resolución guardada en la entrega y, si el job
+no tenía spec ProRes, 24 fps / ProRes 422 HQ. No hay confirmación intermedia.
+Staging debe tener `DELIVERY_PORTAL_TOKEN` igual al de producción.
+
 ## Envío desde cuentas admin
 
 En el detalle de un video aprobado, `Enviar a UMG` permite elegir Argentina o
@@ -188,3 +200,24 @@ ffprobe -v error -select_streams v:0 \
 # yuv422p10le, y fps + duración IGUALES a la fuente. Un fps distinto al de la
 # fuente es conversión de framerate, que el QC manual de UMG rechaza.
 ```
+
+## Sección Art Tracks en los portales
+
+El build estático compartido de `umg.genly.pro` y `umgchile.genly.pro` se
+versiona en `umg-portal/`. La navegación ofrece **Todos los entregables**,
+**Art Tracks** y **Otros videos**; filtra versiones por `Delivery.label` para
+que una canción con ambos formatos aparezca en la sección correcta. La
+sección no publica contenido por sí sola: las entregas se agregan únicamente
+desde la campaña tras aprobación del operador.
+
+Para un Art Track con master ProRes pendiente, el portal muestra **Generar y
+descargar**. El click pasa por la API de producción para registrar la descarga
+y luego por `/api/staging/` hacia el API de staging, dueño del job y de la cola
+de transcodificación. El rewrite usa el dominio Railway vigente
+`api-staging-9b82.up.railway.app`; `api-staging.genly.pro` no tiene DNS.
+
+El build puede conservar el hash de acceso y la ayuda vigentes usando
+`PORTAL_SHELL_SOURCE=/Users/tomi/genly-deliveries/dist/index.html`. Comprobar
+que el hash coincide en ambos dominios antes de desplegar. El despliegue del
+portal va después de que la API de staging y la de producción admitan el flujo
+de ProRes a pedido.
