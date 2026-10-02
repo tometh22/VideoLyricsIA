@@ -3,6 +3,13 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.97] - 2026-10-02
+
+### Fixed
+
+- El botón para generar ProRes en el portal UMG aparece también en videos de
+  campañas que no son Art Tracks cuando el MP4 publicado está disponible.
+
 ## [1.1.96] - 2026-10-02
 
 ### Added
