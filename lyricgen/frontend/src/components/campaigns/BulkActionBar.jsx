@@ -5,6 +5,7 @@ import { canDiscard, canGenerate, canSend } from "./songModel";
 export default function BulkActionBar({ songs, kind, canManage, portalSends = true, onClear, onAction, hiddenCount = 0 }) {
   if (!songs.length) return null;
   const generate = kind !== "art_track" ? songs.filter(canGenerate) : [];
+  const approve = canManage ? songs.filter((song) => song.stage === "qc" && song.current_status === "pending_review" && song.current_job_id && song.has_video) : [];
   const send = canManage && portalSends ? songs.filter(canSend) : [];
   const discard = songs.filter(canDiscard);
   const restore = songs.filter((song) => song.stage === "discarded");
@@ -20,6 +21,7 @@ export default function BulkActionBar({ songs, kind, canManage, portalSends = tr
       {retry.length > 0 && <Button size="sm" variant="secondary" onClick={() => onAction("retry", retry)}>Reintentar {retry.length}</Button>}
       {restore.length > 0 && <Button size="sm" variant="secondary" onClick={() => onAction("restore", restore)}>Recuperar {restore.length}</Button>}
       {discard.length > 0 && <Button size="sm" variant="danger" onClick={() => onAction("discard", discard)}>Descartar {discard.length}</Button>}
+      {approve.length > 0 && <Button size="sm" variant="primary" onClick={() => onAction("approve", approve)}>Aprobar {approve.length} {approve.length === 1 ? "video" : "videos"}</Button>}
       {send.length > 0 && <Button size="sm" variant={generate.length ? "secondary" : "primary"} onClick={() => onAction("send", send)}>Enviar {send.length} al portal</Button>}
       {generate.length > 0 && <Button size="sm" variant="primary" onClick={() => onAction("generate", generate)}>Generar {generate.length} {generate.length === 1 ? "video" : "videos"}</Button>}
     </div>

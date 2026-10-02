@@ -997,7 +997,11 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                                             'file_keys': active.published_file_keys} if replaced_job_id else None
                     changed = bool(replaced_job_id) or (delivery_freshness.needs_publish(job, active) if active else False)
                     from delivery_snapshots import copy_snapshot, latest_pointer_enabled
-                    pinned = active.published_file_keys if active and not changed and active.file_types == delivery_file_types else None
+                    # Art Tracks are exposed from their approved working render.
+                    # A campaign publication is a portal record, not an R2 copy;
+                    # ProRes stays absent until the client asks to prepare it.
+                    pointer_publication = bool(campaign and campaign.kind == "art_track") or latest_pointer_enabled()
+                    pinned = (active.published_file_keys if active and not changed and active.file_types == delivery_file_types else None) if not pointer_publication else None
                     try:
                         if not pinned:
                             expected = (identity(active), identity(duplicate))
@@ -1007,7 +1011,7 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                             # transactions. Multi-GB copies exceed DB idle limits.
                             ddb.commit()
                             db.commit()
-                            pinned = None if latest_pointer_enabled() else copy_snapshot(tenant, jid, delivery_file_types)
+                            pinned = None if pointer_publication else copy_snapshot(tenant, jid, delivery_file_types)
                             row = db.query(DeliveryBatchItem).filter_by(id=item_id).populate_existing().with_for_update().one()
                             if row.status == 'sent':
                                 continue

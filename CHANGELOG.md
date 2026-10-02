@@ -3,6 +3,16 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.98] - 2026-10-02
+
+### Added
+
+- Aprobación masiva de videos en QC desde la selección de la campaña, con una
+  confirmación única, progreso y reintento de los que fallen. Tras aprobar,
+  la selección pasa a la etapa de envío para publicarlos juntos al portal.
+- La publicación de Art Tracks crea el registro de acceso en el portal sin
+  copiar el MP4 en R2; el ProRes queda disponible para generación bajo demanda.
+
 ## [1.1.97] - 2026-10-02
 
 ### Fixed
