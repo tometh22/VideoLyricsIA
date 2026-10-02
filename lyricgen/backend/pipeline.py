@@ -2609,18 +2609,34 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # already on R2 (302 instant) instead of paying 60-120 s of
         # ffmpeg in the request thread. Best-effort — never fail the
         # main render because the prewarm couldn't be enqueued.
+        # Campaign ProRes masters are generated on the first portal download
+        # request. Ordinary wizard jobs keep the optional prewarm behavior.
         if wants_umg and final_status in ("done", "pending_review"):
+            campaign_job = False
             try:
-                from queue_jobs import enqueue_prores_prewarm
-                enqueue_prores_prewarm(job_id, "umg_master")
-                # Sin short.mp4 no hay ProRes short que derivar. prores.py sólo
-                # chequea os.path.exists del source y nunca lo valida, así que
-                # encolarlo igual publicaría un .mov derivado de un archivo
-                # ausente o truncado.
-                if "short" not in missing_deliverables:
-                    enqueue_prores_prewarm(job_id, "umg_short")
-            except Exception as e:  # pragma: no cover
-                logger.warning("[PIPELINE] prores prewarm enqueue skipped: %s", e)
+                from database import Job as _ProResJob, SessionLocal as _ProResSession
+                with _ProResSession() as _prores_db:
+                    campaign_job = bool(
+                        _prores_db.query(_ProResJob.campaign_id)
+                        .filter(_ProResJob.job_id == job_id)
+                        .scalar()
+                    )
+            except Exception as _e:
+                logger.warning("[PIPELINE] campaign ProRes mode lookup failed: %s", _e)
+            if campaign_job:
+                logger.info("[PRORES] campaign=%s master deferred until portal request", job_id)
+            else:
+                try:
+                    from queue_jobs import enqueue_prores_prewarm
+                    enqueue_prores_prewarm(job_id, "umg_master")
+                    # Sin short.mp4 no hay ProRes short que derivar. prores.py sólo
+                    # chequea os.path.exists del source y nunca lo valida, así que
+                    # encolarlo igual publicaría un .mov derivado de un archivo
+                    # ausente o truncado.
+                    if "short" not in missing_deliverables:
+                        enqueue_prores_prewarm(job_id, "umg_short")
+                except Exception as e:  # pragma: no cover
+                    logger.warning("[PIPELINE] prores prewarm enqueue skipped: %s", e)
 
         # PR feat/waveform-precompute 2026-05-27: pre-compute the timeline
         # waveform now, while the worker still has the input MP3 in
@@ -20836,6 +20852,7 @@ def run_edit_pipeline(
         wants_umg = delivery_profile in ("umg", "both")
         umg_spec = job_row.umg_spec
         tenant_id = job_row.tenant_id
+        campaign_job = bool(job_row.campaign_id)
         bg_r2_key_cached = job_row.bg_r2_key_cached
         input_r2_key = job_row.input_r2_key
         # Snapshot inputs: edit_count was already incremented by the /edit
@@ -22022,7 +22039,8 @@ def run_edit_pipeline(
         # into the upload set would re-upload the STALE pre-edit .mov still
         # sitting in job_dir (left by a prior lazy download or prewarm),
         # cementing the old cut on R2. Exclude them from the upload; we
-        # invalidate the stale .mov + s3_keys below and re-warm fresh.
+        # invalidate the stale .mov + s3_keys below. Campaign masters are
+        # regenerated only when the portal customer requests the new revision.
         upload_files = {
             k: v for k, v in files.items()
             if k not in ("umg_master_url", "umg_short_url")
@@ -22064,19 +22082,16 @@ def run_edit_pipeline(
                 # publishing). Then re-enqueue fresh.
                 for _ft in ("umg_master", "umg_short"):
                     cancel_rq_job(f"prewarm:{job_id}:{_ft}")
-                # force=True: the portal has NO lazy re-transcode fallback (it
-                # signs the deterministic R2 key directly), so this rewarm is
-                # the only thing that refreshes the delivered ProRes after an
-                # edit. Without force, queue-depth backpressure silently skips
-                # it during a UMG batch and the portal serves the stale cut
-                # (observed 2026-08-03). One transcode per edit is affordable.
-                enqueue_prores_prewarm(job_id, "umg_master", force=True)
-                # Si el short se perdió en este edit, NO re-encolar: el
-                # remove_s3_keys de arriba ya invalidó el umg_short viejo, y
-                # prewarmear sobre un short.mp4 ausente o truncado publicaría
-                # un .mov corrupto (prores.py no valida el source).
-                if "short" not in missing_deliverables:
-                    enqueue_prores_prewarm(job_id, "umg_short", force=True)
+                if not campaign_job:
+                    # Ordinary wizard deliveries keep an eager refresh so
+                    # their existing download link is ready immediately.
+                    enqueue_prores_prewarm(job_id, "umg_master", force=True)
+                    # Si el short se perdió en este edit, NO re-encolar: el
+                    # remove_s3_keys de arriba ya invalidó el umg_short viejo,
+                    # y prewarmear sobre un short.mp4 ausente o truncado
+                    # publicaría un .mov corrupto (prores.py no valida source).
+                    if "short" not in missing_deliverables:
+                        enqueue_prores_prewarm(job_id, "umg_short", force=True)
             except Exception as _e:
                 logger.warning("[EDIT] prores prewarm re-enqueue skipped: %s", _e)
             # El MP4 nuevo ya está en R2; el master de broadcast todavía es
