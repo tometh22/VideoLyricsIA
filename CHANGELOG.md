@@ -5,6 +5,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.1.94] - 2026-10-02
 
+### Added
+
+- Optional mail to UMG when a correction they asked for is published (`umg_publication_notice.py`,
+  `emails.send_umg_publication_notice`). OFF by default and with no recipients: nothing is sent until the owner sets
+  `UMG_PUBLISH_NOTIFY_ENABLED=1` and `UMG_PUBLISH_NOTIFY_RECIPIENTS_ARGENTINA` / `_CHILE` (or
+  `UMG_PUBLISH_NOTIFY_RECIPIENTS`; at most 10 valid addresses). Only a publication that closed client requests and
+  whose files are visible to the client notifies (a plain re-send or a hidden delivery stays silent). The mail names the
+  version and the portal, quotes what they asked for (escaped, capped) and links to the portal. Outside production the
+  existing staging gate still applies: an address only receives from staging if it is in `EMAIL_STAGING_ALLOWLIST`.
+
 ### Fixed
 
 - Reintentar automáticamente las solicitudes de publicación UMG y consulta del estado ProRes cuando la conexión con la API se interrumpe transitoriamente. Si no se puede confirmar el envío, el aviso pide verificar el portal antes de reintentar.
