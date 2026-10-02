@@ -200,3 +200,24 @@ ffprobe -v error -select_streams v:0 \
 # yuv422p10le, y fps + duración IGUALES a la fuente. Un fps distinto al de la
 # fuente es conversión de framerate, que el QC manual de UMG rechaza.
 ```
+
+## Sección Art Tracks en los portales
+
+El build estático compartido de `umg.genly.pro` y `umgchile.genly.pro` se
+versiona en `umg-portal/`. La navegación ofrece **Todos los entregables**,
+**Art Tracks** y **Otros videos**; filtra versiones por `Delivery.label` para
+que una canción con ambos formatos aparezca en la sección correcta. La
+sección no publica contenido por sí sola: las entregas se agregan únicamente
+desde la campaña tras aprobación del operador.
+
+Para un Art Track con master ProRes pendiente, el portal muestra **Generar y
+descargar**. El click pasa por la API de producción para registrar la descarga
+y luego por `/api/staging/` hacia el API de staging, dueño del job y de la cola
+de transcodificación. El rewrite usa el dominio Railway vigente
+`api-staging-9b82.up.railway.app`; `api-staging.genly.pro` no tiene DNS.
+
+El build puede conservar el hash de acceso y la ayuda vigentes usando
+`PORTAL_SHELL_SOURCE=/Users/tomi/genly-deliveries/dist/index.html`. Comprobar
+que el hash coincide en ambos dominios antes de desplegar. El despliegue del
+portal va después de que la API de staging y la de producción admitan el flujo
+de ProRes a pedido.
