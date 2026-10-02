@@ -5,7 +5,7 @@
   "rewrites": [
     {
       "source": "/api/staging/:path*",
-      "destination": "https://api-staging.genly.pro/:path*"
+      "destination": "https://api-staging-9b82.up.railway.app/:path*"
     },
     {
       "source": "/api/deliveries/:path*",

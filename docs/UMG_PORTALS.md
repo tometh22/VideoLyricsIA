@@ -157,7 +157,8 @@ no existe, la entrega incluye un botón **Generar y descargar** para ese formato
 No se anuncia una URL ProRes antes de que exista un archivo publicado.
 
 El portal pide la descarga a producción (`POST /api/deliveries/{id}/download/{type}`).
-Si falta un ProRes de Art Track, usa el rewrite `/api/staging/...` para pedir
+Si falta un ProRes de Art Track, usa el rewrite `/api/staging/...` hacia
+`api-staging-9b82.up.railway.app` para pedir
 `POST /api/deliveries/{id}/prepare-prores` en staging y consulta el estado por
 `GET` cada diez segundos. Un worker de staging transcodifica, comprueba que el
 fingerprint del render siga siendo el publicado, copia el `.mov` a una key
