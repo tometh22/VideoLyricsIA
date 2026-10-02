@@ -21509,7 +21509,8 @@ def portal_get_items(
         # published, which also means it is absent from `file_types`. Keep a
         # visible “generate and download” affordance for every published
         # video so the customer can request it without contacting support.
-        if "video" in file_types and "umg_master" not in file_types:
+        if ("video" in file_types and d.published_render_fingerprint
+                and "umg_master" not in file_types):
             file_types.append("umg_master")
         listing_file_types[di] = file_types
         for ft in file_types:
@@ -21946,6 +21947,13 @@ async def portal_prores_status(
     )
     if job is None:
         raise HTTPException(status_code=404, detail="No se encontró el video fuente.")
+    if await _finalize_portal_prores(delivery, ddb, file_type):
+        _record_portal_download_attempt(
+            ddb, request, portal_id=portal_id, delivery=delivery,
+            delivery_id=delivery_id, file_type=file_type, outcome="prores_ready",
+        )
+        return {"status": "ready"}
+
     if not job.umg_spec:
         job.umg_spec = _parse_umg_params(
             delivery_profile="umg",
