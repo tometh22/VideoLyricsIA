@@ -54,7 +54,7 @@ function PortalStatusBadge({ video, destination }) {
     {publication.updating && <span className="rounded-full bg-brand/20 px-2.5 py-1 text-xs text-brand-light">Actualizando</span>}
     {publication.awaiting_review && !publication.outdated && <span className="rounded-full bg-amber-500/15 px-2.5 py-1 text-xs text-amber-200">Esperando revisión UMG</span>}
     {publication.approved_at && !publication.outdated && <span className="rounded-full bg-emerald-500/15 px-2.5 py-1 text-xs text-emerald-200">Aprobado en UMG</span>}
-    {(publication.pending_change_requests || 0) > 0 && <span className="rounded-full bg-amber-500/15 px-2.5 py-1 text-xs text-amber-200">{publication.pending_change_requests} pedidos pendientes</span>}
+    {(publication.pending_change_requests || 0) > 0 && <span className="rounded-full bg-amber-500/15 px-2.5 py-1 text-xs text-amber-200">{publication.pending_change_requests} {publication.pending_change_requests === 1 ? "pedido pendiente" : "pedidos pendientes"}</span>}
   </div>;
 }
 
@@ -162,7 +162,11 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
   const setPortalFilter = value => { setSelectedVideoIds(new Set()); writeParams({ portal_state: value, vpage: null }); };
   const setPortalDestination = value => { setSelectedVideoIds(new Set()); writeParams({ portal_destination: value, vpage: null }); };
   const returnPath = `/campaigns/${encodeURIComponent(campaignId)}?${searchParams}`;
-  const openVideo = path => navigate(`${path}?return_to=${encodeURIComponent(returnPath)}`);
+  const openVideo = path => {
+    setPlayingVideo(null);
+    setApprovalVideo(null);
+    navigate(`${path}?return_to=${encodeURIComponent(returnPath)}`);
+  };
   const deliveryKey = useRef(null);
   const runningAction = useRef(false);
   const initialized = useRef(false);
@@ -390,7 +394,7 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
       <h3 className="font-semibold">Historial de cambios</h3>{report.history.map((h, i) => <details key={i}><summary>{new Date(h.at).toLocaleString()} · Usuario {h.actor} · {h.detail.reason || h.detail.destination || "Cambio registrado"}</summary><p>Versión {h.detail.revision || h.detail.after?.revision || "—"}</p>{(h.detail.changes || (h.detail.item_id ? [h.detail] : [])).map(c => <div key={c.item_id} className="ml-4 text-sm"><p>{c.artist} · {c.title || data.items.find(item => item.id === c.item_id)?.title || c.item_id}</p>{Object.entries(c.after || {}).filter(([k, value]) => data.fields[k] && JSON.stringify(c.before?.[k]) !== JSON.stringify(value)).map(([k, value]) => <p key={k}>{data.fields[k].label}: {String(c.before?.[k] ?? "Heredado")} → {String(value)}</p>)}</div>)}</details>)}
     </div>}
     {["history", "deliveries"].includes(view) && report && <div className="space-y-4">
-      <div><h2 className="text-xl font-semibold">{view === "deliveries" ? `Entregables · ${approvedVideos.length} videos aprobados` : `Videos de esta campaña (${report.videos.length})`}</h2><p className="mt-1 text-sm text-ink-secondary">{view === "deliveries" ? "Seleccioná los aprobados, elegí el portal y seguí el avance del envío." : "Reproducí y aprobá el siguiente sin salir del reproductor. La búsqueda y los filtros se conservan al volver."}</p></div>
+      <div><h2 className="text-xl font-semibold">{view === "deliveries" ? `Entregables · ${approvedVideos.length} videos aprobados` : `Videos de esta campaña (${report.videos.length})`}</h2><p className="mt-1 text-sm text-ink-secondary">{view === "deliveries" ? "Seleccioná los aprobados, elegí el portal y seguí el avance del envío." : "Reproducí el video y revisá los controles del corte actual antes de aprobar. La búsqueda y los filtros se conservan al volver."}</p></div>
       {!report.videos.length && <p className="rounded-xl bg-surface-2/40 p-8">Todavía no hay videos generados. Primero aprobá letras y tiempos, y luego abrí Generar videos.</p>}
       {data.can_manage && approvedVideos.length > 0 && <div className="flex flex-wrap items-center gap-2 rounded-xl bg-emerald-500/10 p-3 ring-1 ring-emerald-400/20"><button className={button} disabled={busy} onClick={() => setSelectedVideoIds(allApprovedSelected ? new Set() : new Set(approvedVideos.map(video => video.job_id)))}>{allApprovedSelected ? "Limpiar aprobados" : `Seleccionar aprobados del resultado (${approvedVideos.length})`}</button><span className="text-sm" aria-label={`${selectedApprovedVideos.length} videos aprobados seleccionados`}><strong>{selectedApprovedVideos.length}</strong> seleccionados para enviar</span><button className={primaryButton + " ml-auto"} disabled={busy || !selectedApprovedVideos.length} onClick={() => { deliveryKey.current = null; setBulkDelivery(selectedApprovedVideos); setDeliveryPortal(portalDestination); }}>Enviar seleccionados a un portal</button></div>}
       {!!report.videos.length && <div className="overflow-hidden rounded-2xl bg-surface-2/30 ring-1 ring-white/10">

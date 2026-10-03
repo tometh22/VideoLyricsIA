@@ -1,7 +1,7 @@
 import pytest
 
 from delivery_preflight import build_delivery_preflight
-from delivery_qc_runtime import mandatory_reviewer_issues
+from delivery_qc_runtime import MANUAL_ATTESTATION_CODE, MANDATORY_REVIEW_CHECKS, mandatory_reviewer_issues
 
 
 SABOTAGE_CASES = {
@@ -17,11 +17,16 @@ SABOTAGE_CASES = {
 
 
 @pytest.mark.parametrize(("case", "expected_code"), SABOTAGE_CASES.items())
-def test_each_unsigned_sabotage_case_is_a_real_fail(case, expected_code):
-    issues = {row["code"]: row for row in mandatory_reviewer_issues()}
-    result = issues[expected_code]
+def test_each_sabotage_case_is_covered_by_one_signed_visual_review(case, expected_code):
+    legacy_checks = {code for code, _summary, _description in MANDATORY_REVIEW_CHECKS}
+    assert expected_code in legacy_checks
+    issues = mandatory_reviewer_issues()
+    assert len(issues) == 1
+    result = issues[0]
     assert case
-    assert result["severity"] == "FAIL"
+    assert result["code"] == MANUAL_ATTESTATION_CODE
+    assert result["result_status"] == "REVIEW"
+    assert result["severity"] == "WARN"
     assert result["manual_verification_required"] is True
     assert result["detector"] == "mandatory_signed_reviewer_checklist"
 

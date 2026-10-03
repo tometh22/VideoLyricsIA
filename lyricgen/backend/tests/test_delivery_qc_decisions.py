@@ -3,6 +3,7 @@
 import uuid
 
 from database import Job, ProductEvent
+from delivery_qc_runtime import delivery_qc_source_fingerprint
 
 
 def _me(client, token):
@@ -37,6 +38,8 @@ def _job(db, owner, *, status="COMPLETE"):
         },
     )
     db.add(job)
+    db.commit()
+    job.delivery_qc = {**job.delivery_qc, "source_fingerprint": delivery_qc_source_fingerprint(job)}
     db.commit()
     return job
 
@@ -101,9 +104,10 @@ def test_mandatory_check_requires_signed_manual_resolution(client, user_token, d
     report = dict(job.delivery_qc)
     report["summary"] = {"open_count": 1, "fail_count": 1, "warn_count": 0}
     report["issues"][0].update({
-        "severity": "FAIL",
+        "severity": "WARN",
         "code": "UMG_BLACK_BARS",
         "manual_verification_required": True,
+        "result_status": "REVIEW",
     })
     job.delivery_qc = report
     db.commit()

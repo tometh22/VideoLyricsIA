@@ -104,9 +104,11 @@ test("39-song contract assignment survives reload, generates only approved selec
   await expect(page.locator("video")).toBeVisible();
   await page.getByRole("button", { name: "Cerrar", exact: true }).click();
   await page.getByRole("button", { name: "Aprobar", exact: true }).click();
-  await page.getByRole("button", { name: "Confirmar aprobación" }).click();
-  await expect(page.getByText("Canción 1 quedó aprobado.")).toBeVisible();
-  expect(calls.approvals).toEqual([{ notes: "Aprobado desde el historial de campaña" }]);
+  await page.getByRole("button", { name: "Revisar controles y aprobar" }).click();
+  await expect(page).toHaveURL(/\/videos\/chilejob0001\?return_to=/);
+  expect(new URL(page.url()).searchParams.get("return_to")).toContain("view=history");
+  expect(calls.approvals).toEqual([]);
+  await page.goBack();
   await page.screenshot({ path: "test-results/chile-campaign-video-history.png", fullPage: true });
   await page.getByRole("button", { name: "Contrato y cumplimiento", exact: true }).click();
   await expect(page.getByText("Contrato Chile: mitad foto con efecto, mitad Veo")).toBeVisible();

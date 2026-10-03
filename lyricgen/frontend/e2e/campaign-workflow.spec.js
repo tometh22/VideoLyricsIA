@@ -61,25 +61,28 @@ for (const width of [1440, 390]) {
     await expect(page.getByRole("searchbox", { name: "Buscar videos de la campaña" })).toHaveValue("garcia corazon");
     await page.getByRole("button", { name: "Reproducir", exact: true }).first().click();
     await expect(page.getByRole("dialog", { name: "Reproducir Corazón 1" })).toBeVisible();
-    const approveBounds = await page.getByRole("button", { name: "Aprobar y siguiente", exact: true }).boundingBox();
+    const approveBounds = await page.getByRole("button", { name: "Revisar controles y aprobar", exact: true }).boundingBox();
     expect(approveBounds.y).toBeGreaterThanOrEqual(0);
     expect(approveBounds.y + approveBounds.height).toBeLessThanOrEqual(1000);
     await page.screenshot({ path: `test-results/campaign-player-${width}.png` });
-    await page.getByRole("button", { name: "Aprobar y siguiente", exact: true }).click();
-    await expect(page.getByRole("dialog", { name: "Reproducir Corazón 2" })).toBeVisible();
-    expect(calls.approvals).toEqual([{ job_id: "song-0", notes: "Revisión final desde el reproductor de campaña" }]);
-    await page.getByRole("button", { name: "Aprobar y siguiente", exact: true }).click();
-    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await page.getByRole("button", { name: "Revisar controles y aprobar", exact: true }).click();
+    await expect(page).toHaveURL(/\/videos\/song-0\?return_to=/);
+    expect(new URL(page.url()).searchParams.get("return_to")).toContain("view=history");
+    expect(calls.approvals).toEqual([]);
+    // The approval happens on the video detail screen; reflect that completed
+    // server action before checking the separate batch delivery workflow.
+    calls.videos.slice(0, 2).forEach(video => Object.assign(video, { status: "done", approved_at: "2026-09-15T00:00:00Z" }));
+    await page.goBack();
     await page.getByRole("button", { name: /4. Entregables/ }).click();
     await page.getByRole("button", { name: "Seleccionar aprobados del resultado (2)", exact: true }).click();
     await page.getByRole("button", { name: "Enviar seleccionados a un portal" }).click();
     await page.getByLabel("Portal de destino").selectOption("chile");
     await page.getByRole("button", { name: "Confirmar envío", exact: true }).click();
-    await expect(page.getByText(/2 de 2 enviados/)).toBeVisible();
+    await expect(page.getByText(/2 de 2 publicados/)).toBeVisible();
     expect(calls.deliveries).toHaveLength(1);
     expect(calls.deliveries[0].job_ids).toEqual(["song-0", "song-1"]);
     await page.reload();
-    await expect(page.getByText(/2 de 2 enviados/)).toBeVisible();
+    await expect(page.getByText(/2 de 2 publicados/)).toBeVisible();
     await page.screenshot({ path: `test-results/campaign-delivery-${width}.png`, fullPage: true });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   });
@@ -90,11 +93,11 @@ for (const width of [1440, 390]) {
   test(`campaign portal badges and sent filter retain editor return context at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 1000 });
     const { videos, deliveries, approvals } = await installCampaign(page);
-    videos.forEach(video => Object.assign(video, { is_in_umg_portal: false, umg_portals: [] }));
-    Object.assign(videos[1], { status: "done", approved_at: "2026-09-15", is_in_umg_portal: true, umg_portals: ["chile"], pending_change_requests: 1 });
-    await page.goto("/campaigns/workflow?view=history");
-    await expect(page.getByText("Enviado a Chile", { exact: true })).toBeVisible();
-    await expect(page.getByText("1 cambio solicitado", { exact: true })).toBeVisible();
+    videos.forEach(video => Object.assign(video, { portal_status: { chile: { published: false } } }));
+    Object.assign(videos[1], { status: "done", approved_at: "2026-09-15", portal_status: { chile: { published: true, revision: 1, pending_change_requests: 1 } } });
+    await page.goto("/campaigns/workflow?view=history&portal_destination=chile");
+    await expect(page.getByText("Chile · v1", { exact: true })).toBeVisible();
+    await expect(page.getByText("1 pedido pendiente", { exact: true })).toBeVisible();
     await page.getByLabel("Filtrar por envío al portal").selectOption("sent");
     await expect(page.getByText("Corazón 1", { exact: true })).toHaveCount(0);
     await expect(page.getByText("Corazón 2", { exact: true })).toBeVisible();
