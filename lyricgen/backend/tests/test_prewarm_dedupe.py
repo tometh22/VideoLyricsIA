@@ -68,15 +68,16 @@ def test_the_edit_pipeline_still_re_runs_an_existing_id(queue, monkeypatch):
     queue.enqueue.assert_called_once()
 
 
-def test_an_unreadable_redis_state_falls_back_to_enqueueing(queue, monkeypatch):
+def test_an_unreadable_redis_state_fails_closed_without_enqueueing(queue, monkeypatch):
     import rq.job
 
     def boom(rq_id, connection=None):
         raise RuntimeError("redis hiccup")
 
     monkeypatch.setattr(rq.job.Job, "fetch", staticmethod(boom))
-    queue_jobs.enqueue_prores_prewarm("job1", "umg_master", force=True, dedupe_live=True)
-    queue.enqueue.assert_called_once()
+    with pytest.raises(RuntimeError, match="Could not inspect ProRes queue job"):
+        queue_jobs.enqueue_prores_prewarm("job1", "umg_master", force=True, dedupe_live=True)
+    queue.enqueue.assert_not_called()
 
 
 def test_the_click_driven_endpoints_ask_for_the_guard():
