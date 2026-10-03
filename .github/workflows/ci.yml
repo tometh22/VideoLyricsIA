@@ -283,6 +283,9 @@ jobs:
       - name: Run browser E2E
         run: npm run test:e2e
 
+      - name: Portal download tests
+        run: node --test ../../umg-portal/tests/download.test.cjs
+
       - name: Build
         run: npm run build
 

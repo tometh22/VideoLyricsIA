@@ -23,15 +23,18 @@ resultado del intento, la entrega y el archivo, el portal, la IP y el user-agent
 como UMG comparte un token, el registro no identifica a cada persona por nombre.
 El archivo grande sigue bajando directamente desde R2.
 
-Si falta el ProRes Master, el portal ofrece **generar y descargar** para
-cualquier video publicado con MP4 fuente disponible, incluidos los videos de
-campaña que no son Art Tracks. Un click encola el master en staging, lo publica
-en la versión de entrega y comienza la descarga cuando termina. Usa la
-resolución guardada en la entrega y, si el job no tenía spec ProRes, 24 fps /
-ProRes 422 HQ. Si falla el worker o la subida a R2, el portal informa el error
-y permite reintentar; si la generación tarda más de 30 minutos, el botón permite
-retomar la consulta sin iniciar otro transcode activo. Staging debe tener
-`DELIVERY_PORTAL_TOKEN` igual al de producción.
+Todos los lyrics y Art Tracks publicados con MP4 fuente ofrecen **ProRes
+master** y, cuando existe un short publicado, **ProRes vertical**. El click
+registra la descarga y, si falta el archivo, inicia su preparación en la misma
+API del portal. El worker lee la fuente publicada desde la base de entregas,
+sin necesitar el Job de staging. Conserva resolución y FPS nativos y genera
+ProRes 422 HQ, 10 bits y audio PCM de 24 bits a 48 kHz.
+
+La clave de exportación incluye el ETag de la fuente. Una corrección invalida
+el archivo anterior; las publicaciones que siguen el último render mantienen
+ese comportamiento después de generar ProRes. La descarga vuelve a validar la
+versión antes de emitir la URL. Los errores permiten reintentar y las tareas
+activas se deduplican. No se generan masters al abrir el portal.
 
 ## Envío desde cuentas admin
 
@@ -157,9 +160,9 @@ WHERE s3_keys ? 'video' AND NOT (s3_keys ? 'umg_master')
 ```
 
 Los jobs de las campañas viven en la base de **staging** mientras las filas
-`deliveries` viven en **producción** (`DELIVERIES_DATABASE_URL`). Por eso un
-endpoint del portal de prod que necesite el Job —como `prepare-prores`— no
-resuelve esos `job_id`: hay que encolar desde staging.
+`deliveries` viven en **producción** (`DELIVERIES_DATABASE_URL`). Las
+exportaciones del portal usan solamente la publicación y su fuente en R2;
+se encolan en el entorno de la API que recibe la solicitud.
 
 ### Un job publicado en los dos portales
 
@@ -214,11 +217,11 @@ que una canción con ambos formatos aparezca en la sección correcta. La
 sección no publica contenido por sí sola: las entregas se agregan únicamente
 desde la campaña tras aprobación del operador.
 
-Para un Art Track con master ProRes pendiente, el portal muestra **Generar y
-descargar**. El click pasa por la API de producción para registrar la descarga
-y luego por `/api/staging/` hacia el API de staging, dueño del job y de la cola
-de transcodificación. El rewrite usa el dominio Railway vigente
-`api-staging-9b82.up.railway.app`; `api-staging.genly.pro` no tiene DNS.
+La descarga de ProRes usa `/api/deliveries/{id}/download/{file_type}`;
+cuando necesita preparar el archivo, usa POST y GET en
+`/api/deliveries/{id}/prepare-prores`. Todos estos pedidos van a la API de
+producción mediante el mismo rewrite `/api/`. El portal muestra el progreso
+y comienza la descarga al terminar la preparación.
 
 El build puede conservar el hash de acceso y la ayuda vigentes usando
 `PORTAL_SHELL_SOURCE=/Users/tomi/genly-deliveries/dist/index.html`. Comprobar

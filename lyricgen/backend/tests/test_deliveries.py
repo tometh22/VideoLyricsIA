@@ -400,12 +400,10 @@ def test_portal_storage_io_has_no_database_transaction(
     assert not inspect.iscoroutinefunction(main.portal_get_items)
 
 
-def test_missing_prores_is_prepared_instead_of_returning_dead_end(
-    client, admin_token, approved_job,
+def test_missing_prores_is_published_for_on_demand_download(
+    client, admin_token, approved_job, db,
 ):
-    """El prewarm post-render es best-effort. Si faltan sólo los .mov,
-    Enviar a UMG los encola de forma explícita y responde 202 para que el
-    cliente espere y reintente la publicación."""
+    """Publicar no genera GBs de masters: conserva el MP4 para el primer click."""
     def object_exists(key):
         return not key.endswith(("umg_master.mov", "umg_short.mov"))
 
@@ -413,7 +411,7 @@ def test_missing_prores_is_prepared_instead_of_returning_dead_end(
         patch("main.storage.object_exists", side_effect=object_exists),
         patch(
             "main.enqueue_prores_prewarm",
-            side_effect=lambda _job_id, file_type, *, force=False, dedupe_live=False: (
+            side_effect=lambda _job_id, file_type, *, force=False: (
                 f"rq:{file_type}" if force else None
             ),
         ) as enqueue,
@@ -424,16 +422,18 @@ def test_missing_prores_is_prepared_instead_of_returning_dead_end(
             json={},
         )
 
-    assert res.status_code == 202, res.text
-    body = res.json()
-    assert body["status"] == "preparing_prores"
-    assert body["missing"] == ["umg_master", "umg_short"]
-    assert body["enqueued"] == ["umg_master", "umg_short"]
-    assert enqueue.call_count == 2
-    assert all(call.kwargs == {"force": True, "dedupe_live": True} for call in enqueue.call_args_list)
+    assert res.status_code == 200, res.text
+    from database import Delivery
+    row = db.get(Delivery, res.json()["delivery_id"])
+    assert row.published_file_keys["video"]
+    assert "umg_master" not in row.published_file_keys
+    assert "umg_short" not in row.published_file_keys
+    assert "umg_master" in row.file_types
+    enqueue.assert_not_called()
 
 
-def test_youtube_only_job_requests_prores_configuration(
+
+def test_historical_job_without_spec_can_offer_lazy_prores(
     client, admin_token, approved_job, db,
 ):
     approved_job.umg_spec = None
@@ -454,11 +454,13 @@ def test_youtube_only_job_requests_prores_configuration(
             json={},
         )
 
-    assert res.status_code == 409
-    detail = res.json()["detail"]
-    assert detail["code"] == "prores_required"
-    assert detail["missing"] == ["umg_master", "umg_short"]
+    assert res.status_code == 200
+    from database import Delivery
+    row = db.get(Delivery, res.json()["delivery_id"])
+    assert row.published_file_keys["video"]
+    assert "umg_master" not in row.published_file_keys
     enqueue.assert_not_called()
+
 
 
 def test_missing_render_output_still_blocks_delivery(
@@ -684,25 +686,6 @@ def test_admin_delete_via_jwt(client, admin_token, approved_job, all_r2_files_pr
     assert res.status_code == 200
 
 
-def test_portal_can_prepare_missing_prores_for_its_delivery(
-    client, admin_token, approved_job, all_r2_files_present,
-):
-    published = client.post(
-        f"/admin/deliveries/from-job/{approved_job.job_id}",
-        headers=auth(admin_token), json={"portal_id": "chile"},
-    )
-    assert published.status_code == 200, published.text
-    delivery_id = published.json()["delivery_id"]
-
-    with patch("main.enqueue_prores_prewarm", return_value="prewarm:test") as enqueue:
-        res = client.post(
-            f"/api/deliveries/{delivery_id}/prepare-prores",
-            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
-            json={"file_type": "umg_master"},
-        )
-    assert res.status_code == 202, res.text
-    assert res.json()["status"] == "queued"
-    enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True, dedupe_live=True)
 
 
 def test_a_hidden_delivery_cannot_have_a_master_prepared_and_publish_reports_the_visibility(
@@ -736,90 +719,10 @@ def test_a_hidden_delivery_cannot_have_a_master_prepared_and_publish_reports_the
     enqueue.assert_not_called()
 
 
-def test_portal_can_prepare_staging_delivery_without_local_job(
-    client, admin_token, approved_job, all_r2_files_present, db,
-):
-    """The shared portal DB contains deliveries created by staging, while
-    production's jobs DB deliberately does not contain those Job rows."""
-    from database import Job
-
-    published = client.post(
-        f"/admin/deliveries/from-job/{approved_job.job_id}",
-        headers=auth(admin_token), json={"portal_id": "chile"},
-    )
-    assert published.status_code == 200, published.text
-    delivery_id = published.json()["delivery_id"]
-    db.query(Job).filter(Job.id == approved_job.id).delete()
-    db.commit()
-
-    with patch(
-        "main.enqueue_delivery_prores_prewarm", return_value="portal-prewarm:test",
-    ) as enqueue:
-        res = client.post(
-            f"/api/deliveries/{delivery_id}/prepare-prores",
-            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
-            json={"file_type": "umg_master"},
-        )
-
-    assert res.status_code == 202, res.text
-    assert res.json()["status"] == "queued"
-    enqueue.assert_called_once_with(
-        approved_job.job_id, "umg_master", "default", frame_size="HD",
-    )
 
 
-def test_portal_can_poll_prores_without_local_job(
-    client, admin_token, approved_job, all_r2_files_present, db,
-):
-    from database import Job
-
-    published = client.post(
-        f"/admin/deliveries/from-job/{approved_job.job_id}",
-        headers=auth(admin_token), json={"portal_id": "chile"},
-    )
-    assert published.status_code == 200, published.text
-    delivery_id = published.json()["delivery_id"]
-    db.query(Job).filter(Job.id == approved_job.id).delete()
-    db.commit()
-
-    with patch("main._finalize_portal_prores", new_callable=AsyncMock) as finalize:
-        finalize.side_effect = [False, True]
-        headers = {"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"}
-        pending = client.get(f"/api/deliveries/{delivery_id}/prepare-prores", headers=headers)
-        ready = client.get(f"/api/deliveries/{delivery_id}/prepare-prores", headers=headers)
-
-    assert pending.status_code == 202, pending.text
-    assert pending.json()["status"] == "processing"
-    assert ready.status_code == 200, ready.text
-    assert ready.json()["status"] == "ready"
-    assert finalize.await_count == 2
 
 
-def test_portal_can_prepare_legacy_mp4_only_delivery(
-    client, admin_token, approved_job, all_r2_files_present, db,
-):
-    published = client.post(
-        f"/admin/deliveries/from-job/{approved_job.job_id}",
-        headers=auth(admin_token), json={"portal_id": "chile"},
-    )
-    assert published.status_code == 200, published.text
-    delivery_id = published.json()["delivery_id"]
-    approved_job.umg_spec = None
-    db.commit()
-
-    with patch(
-        "main.enqueue_delivery_prores_prewarm", return_value="portal-prewarm:test",
-    ) as enqueue:
-        res = client.post(
-            f"/api/deliveries/{delivery_id}/prepare-prores",
-            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
-            json={"file_type": "umg_short"},
-        )
-
-    assert res.status_code == 202, res.text
-    enqueue.assert_called_once_with(
-        approved_job.job_id, "umg_short", "default", frame_size="HD",
-    )
 
 
 def test_portal_cannot_prepare_prores_from_the_other_portal(
@@ -859,7 +762,7 @@ def test_portal_download_guard_respects_publication_and_visibility():
 
     delivery.client_visibility = "visible"
     delivery.published_render_fingerprint = None
-    assert not main._portal_file_is_published(delivery, "umg_master")
+    assert main._portal_file_is_published(delivery, "umg_master")
 
 
 def test_status_endpoint_includes_is_in_umg_portal(
@@ -1452,7 +1355,7 @@ def _edit_the_render(db, job):
     db.commit()
 
 
-def test_stale_prores_blocks_publication_instead_of_shipping_a_mismatched_pair(
+def test_stale_prores_is_excluded_from_the_new_publication(
     client, admin_token, approved_job, db,
 ):
     """El .mov PRE-EDIT sigue en su key y contesta el HEAD.
@@ -1475,7 +1378,7 @@ def test_stale_prores_blocks_publication_instead_of_shipping_a_mismatched_pair(
         patch("main.storage.object_exists", return_value=True),
         patch(
             "main.enqueue_prores_prewarm",
-            side_effect=lambda _job_id, file_type, *, force=False, dedupe_live=False: f"rq:{file_type}",
+            side_effect=lambda _job_id, file_type, *, force=False: f"rq:{file_type}",
         ) as enqueue,
     ):
         res = client.post(
@@ -1483,12 +1386,14 @@ def test_stale_prores_blocks_publication_instead_of_shipping_a_mismatched_pair(
             headers=auth(admin_token), json={},
         )
 
-    assert res.status_code == 202, res.text
-    body = res.json()
-    assert body["status"] == "preparing_prores"
-    assert body["stale"] == ["umg_master"]
-    assert body["missing"] == ["umg_master"]
-    enqueue.assert_called_once_with(approved_job.job_id, "umg_master", force=True, dedupe_live=True)
+    assert res.status_code == 200, res.text
+    from database import Delivery
+    row = db.get(Delivery, res.json()["delivery_id"])
+    assert row.published_file_keys["video"]
+    assert "umg_master" not in row.published_file_keys
+    assert row.published_file_keys["umg_short"]
+    enqueue.assert_not_called()
+
 
 
 def test_publishing_a_corrected_cut_reopens_the_client_review(
@@ -1792,17 +1697,10 @@ def test_a_dead_re_render_stops_promising_the_client_work_in_progress(
     assert version["updating_reason"] == "edit_failed"
 
 
-def test_stale_master_without_a_prores_spec_says_what_is_actually_wrong(
+def test_stale_master_without_spec_is_regenerated_from_published_mp4(
     client, admin_token, approved_job, db,
 ):
-    """Los dos casos frenan, pero no significan lo mismo.
-
-    Entrega 289 (2026-09-15): `delivery_profile="youtube"` y `umg_spec` en
-    JSON null sobre un job que YA se entregó como UMG y cuyo master de 4,3 GB
-    sigue descargable, del corte anterior. Decirle al operador "este video fue
-    generado sólo para YouTube" lo manda a buscar el problema al lugar
-    equivocado mientras el cliente se lleva el archivo viejo.
-    """
+    """Un master viejo sin spec no bloquea ni se copia al corte corregido."""
     approved_job.umg_spec = None
     approved_job.delivery_profile = "youtube"
     approved_job.s3_keys = {
@@ -1822,13 +1720,14 @@ def test_stale_master_without_a_prores_spec_says_what_is_actually_wrong(
             headers=auth(admin_token), json={},
         )
 
-    assert res.status_code == 409, res.text
-    detail = res.json()["detail"]
-    assert detail["code"] == "prores_stale_without_spec"
-    assert detail["stale"] == ["umg_master", "umg_short"]
-    assert "ANTES de la edición" in detail["message"]
-    # No se encola nada: sin spec no hay con qué transcodificar.
+    assert res.status_code == 200, res.text
+    from database import Delivery
+    row = db.get(Delivery, res.json()["delivery_id"])
+    assert row.published_file_keys["video"]
+    assert "umg_master" not in row.published_file_keys
+    assert "umg_short" not in row.published_file_keys
     enqueue.assert_not_called()
+
 
 
 def test_republishing_does_not_rename_the_delivery(
@@ -1938,89 +1837,3 @@ def test_items_identifies_its_portal_scope(client, admin_token, approved_job, al
         assert res.json()["portal_id"] == portal, (
             f"el listado de {portal} no se identifica; el portal falla cerrado"
         )
-
-
-def test_el_portal_no_encola_transcodes_con_la_cola_llena(
-    client, admin_token, approved_job, db, all_r2_files_present,
-):
-    """Este endpoint saltea la backpressure a propósito (`force=True`), y eso
-    está bien para UN click humano que está esperando su archivo.
-
-    Lo que no está bien es una avalancha: medido el 2026-09-16, entre los dos
-    portales hay 178 archivos ausentes, o sea 178 botones a un click, en la
-    MISMA cola que sirve los renders de cliente. Si ya hay trabajo esperando,
-    este pedido no es urgente y se rechaza con 503 en vez de ponerse delante.
-    """
-    res = client.post(
-        f"/admin/deliveries/from-job/{approved_job.job_id}",
-        headers=auth(admin_token), json={"portal_id": "chile"},
-    )
-    delivery_id = res.json()["delivery_id"]
-
-    with (
-        patch("main.queue_depth", return_value={"enterprise": 50}),
-        patch("main.enqueue_prores_prewarm") as enqueue,
-        patch("main.enqueue_delivery_prores_prewarm") as enqueue_snapshot,
-    ):
-        busy = client.post(
-            f"/api/deliveries/{delivery_id}/prepare-prores",
-            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
-            json={"file_type": "umg_short"},
-        )
-    assert busy.status_code == 503, busy.text
-    assert busy.json()["detail"]["code"] == "prores_queue_busy"
-    assert busy.headers.get("Retry-After") == "300"
-    # Y lo importante: no encoló nada por ninguno de los dos caminos.
-    enqueue.assert_not_called()
-    enqueue_snapshot.assert_not_called()
-
-
-def test_con_la_cola_libre_el_portal_sigue_preparando(
-    client, admin_token, approved_job, db, all_r2_files_present,
-):
-    """El contrapeso: el freno no puede volver inútil al botón. Con la cola
-    tranquila, un click humano sigue saltando la backpressure — que es
-    exactamente para lo que está."""
-    res = client.post(
-        f"/admin/deliveries/from-job/{approved_job.job_id}",
-        headers=auth(admin_token), json={"portal_id": "chile"},
-    )
-    delivery_id = res.json()["delivery_id"]
-
-    with (
-        patch("main.queue_depth", return_value={"enterprise": 0}),
-        patch("main.enqueue_prores_prewarm", return_value="rq:1") as enqueue,
-    ):
-        ok = client.post(
-            f"/api/deliveries/{delivery_id}/prepare-prores",
-            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
-            json={"file_type": "umg_short"},
-        )
-    assert ok.status_code == 202, ok.text
-    enqueue.assert_called_once()
-    assert enqueue.call_args.kwargs == {"force": True, "dedupe_live": True}
-
-
-def test_sin_redis_el_freno_no_bloquea_el_portal(
-    client, admin_token, approved_job, db, all_r2_files_present,
-):
-    """Si no se puede leer la cola, no hay cola que proteger: fallar cerrado
-    acá dejaría al cliente sin poder pedir su archivo por un problema nuestro
-    de observabilidad."""
-    res = client.post(
-        f"/admin/deliveries/from-job/{approved_job.job_id}",
-        headers=auth(admin_token), json={"portal_id": "chile"},
-    )
-    delivery_id = res.json()["delivery_id"]
-
-    with (
-        patch("main.queue_depth", side_effect=RuntimeError("redis caído")),
-        patch("main.enqueue_prores_prewarm", return_value="rq:1") as enqueue,
-    ):
-        ok = client.post(
-            f"/api/deliveries/{delivery_id}/prepare-prores",
-            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
-            json={"file_type": "umg_short"},
-        )
-    assert ok.status_code == 202, ok.text
-    enqueue.assert_called_once()
