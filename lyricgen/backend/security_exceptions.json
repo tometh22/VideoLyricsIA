@@ -87,6 +87,13 @@
       "owner": "backend/video"
     },
     {
+      "package": "transformers",
+      "id": "PYSEC-2026-4174",
+      "expires": "2026-10-17",
+      "owner": "backend/video",
+      "reason": "The affected load_custom_generate path is unused. CTC alignment loads an allowlisted immutable AutoModelForCTC with trust_remote_code=false. Validate a transformers 5 migration before this exception expires."
+    },
+    {
       "package": "ecdsa",
       "id": "PYSEC-2026-1325",
       "expires": "2026-10-31",
