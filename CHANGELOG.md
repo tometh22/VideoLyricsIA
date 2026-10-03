@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.1.107] - 2026-10-03
+
+### Fixed
+
+- El alineado CTC ya no estira una palabra a través de un silencio cuando una
+  sola de sus letras queda del otro lado de la pausa. Sobre el stem vocal, si
+  entre dos letras de la misma palabra hay al menos 0,8 s seguidos sin voz, la
+  palabra se queda con el tramo cantado y su borde se ajusta a la voz medida
+  (Carajo "Hacerse Cargo": el primer "Bien" del puente pasa de 109,16–112,88 a
+  111,85–112,88 y el "bien" del final de 178,12–184,76 a 178,12–180,05, en vez
+  de engancharse a un "¡No!" gritado fuera de la letra). Texto, orden y
+  cantidad de palabras no cambian. No aplica al alinear sobre la mezcla.
+  Ajustable con `CTC_UNVOICED_SPLIT_GAP_S` y desactivable con
+  `CTC_UNVOICED_SPLIT_ENABLED=0`.
+- El recorte de bordes de baja confianza ahora ajusta la palabra a la región
+  de voz que más se superpone con ella, no a la primera que toca (que solía
+  ser la cola de la línea anterior y dejaba el recorte sin efecto).
+
 ## [1.1.106] - 2026-10-03
 
 ### Fixed
