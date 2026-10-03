@@ -1129,6 +1129,16 @@ def _transcription_quality_render_allowed(
         quality_db.close()
 
 
+def _wants_umg_render(delivery_profile: str | None, umg_spec: dict | None) -> bool:
+    """Keep the UMG output target on legacy jobs with a YouTube profile.
+
+    Campaign jobs can acquire ``umg_spec`` without changing their profile.
+    Their source MP4 must match the UMG dimensions and frame rate so lazy
+    ProRes can transcode without scaling or inventing frames.
+    """
+    return delivery_profile in ("umg", "both") or bool(umg_spec)
+
+
 def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  language: str = None, segments_override: list[dict] = None,
                  delivery_profile: str = "youtube", umg_spec: dict | None = None,
@@ -1422,7 +1432,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     os.path.basename(variation_source_path), variation_parent_asset_id)
 
     wants_youtube = delivery_profile in ("youtube", "both")
-    wants_umg = delivery_profile in ("umg", "both")
+    wants_umg = _wants_umg_render(delivery_profile, umg_spec)
     if art_track and art_track_preset not in ART_TRACK_PRESETS:
         update_job(job_id, status="error", error="Unknown Art Track visual preset")
         return
@@ -20849,7 +20859,7 @@ def run_edit_pipeline(
         style = base_params.get("style") or job_row.style or "oscuro"
         delivery_profile = job_row.delivery_profile or "youtube"
         wants_youtube = delivery_profile in ("youtube", "both")
-        wants_umg = delivery_profile in ("umg", "both")
+        wants_umg = _wants_umg_render(delivery_profile, job_row.umg_spec)
         umg_spec = job_row.umg_spec
         tenant_id = job_row.tenant_id
         campaign_job = bool(job_row.campaign_id)
