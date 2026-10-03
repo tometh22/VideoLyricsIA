@@ -7,22 +7,25 @@ const vm = require('node:vm');
 const html = fs.readFileSync(path.join(__dirname, '..', 'index.template.html'), 'utf8');
 const downloadCode = html.slice(html.indexOf('async function downloadDelivery('), html.indexOf('// ───── Approve / Reject'));
 const rowCode = html.slice(html.indexOf('function renderVersionRow('), html.indexOf('// Open the same post-render editor'));
+const approvalCode = html.slice(html.indexOf('async function approveDelivery('), html.indexOf('// ───── Lightbox'));
 
 function response(status, body) {
   return { status, ok: status >= 200 && status < 300, json: async () => body, headers: { get: () => null } };
 }
 
 function portal(responses) {
-  const urls = [], downloads = [], alerts = [];
+  const urls = [], requests = [], downloads = [], alerts = [];
   const context = {
     PRORES_PREPARES: new Set(), PRORES_PREPARE_ERRORS: new Map(),
     renderMain() {}, reloadItems: async () => {},
     setTimeout: callback => callback(),
     startFileDownload: url => downloads.push(url),
     alert: message => alerts.push(message),
+    confirm: () => true,
     clearAuth() {}, location: { reload() {} },
     apiFetch: async (url, options) => {
       urls.push([url, options?.method || 'GET']);
+      requests.push([url, options]);
       assert.ok(responses.length, `Unexpected request: ${url}`);
       return responses.shift();
     },
@@ -30,8 +33,8 @@ function portal(responses) {
     escapeHtml: text => String(text ?? ''), dlIconSvg: () => '',
   };
   vm.createContext(context);
-  vm.runInContext(downloadCode + '\n' + rowCode, context);
-  return { context, urls, downloads, alerts };
+  vm.runInContext(downloadCode + '\n' + rowCode + '\n' + approvalCode, context);
+  return { context, urls, requests, downloads, alerts };
 }
 
 test('a cached ProRes downloads directly', async () => {
@@ -129,4 +132,25 @@ test('a preparation remains visible even when listing data says a cached master 
   const rendered = p.context.renderVersionRow({ artist: 'Artist', song: 'Song', versions: [version] }, version, 0);
   assert.match(rendered, /Preparando…/);
   assert.match(rendered, /onclick="downloadDelivery\(1, &quot;umg_master&quot;\)" disabled/);
+});
+
+test('approval sends the revision and update timestamp reviewed by the client', async () => {
+  const p = portal([response(200, { ok: true })]);
+  await p.context.approveDelivery(7, 'Artist — Song', 3, '2026-10-03T13:00:00+00:00');
+  assert.equal(p.requests[0][0], '/api/deliveries/7/approve');
+  assert.deepEqual(JSON.parse(p.requests[0][1].body), {
+    expected_revision: 3,
+    expected_content_updated_at: '2026-10-03T13:00:00+00:00',
+  });
+  assert.equal(p.alerts.length, 0);
+});
+
+test('approval button waits while the pointer cut is updating or hidden', () => {
+  const p = portal([]);
+  for (const flag of ['updating', 'files_hidden']) {
+    const version = { delivery_id: 7, revision: 3, content_updated_at: null, files: [], [flag]: true };
+    const rendered = p.context.renderVersionRow({ artist: 'Artist', song: 'Song', versions: [version] }, version, 0);
+    assert.match(rendered, /Actualizando…<\/button>/);
+    assert.doesNotMatch(rendered, /onclick="approveDelivery\(/);
+  }
 });
