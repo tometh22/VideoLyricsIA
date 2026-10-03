@@ -20,6 +20,7 @@ import RequestWorkflowStepper from "./RequestWorkflowStepper";
 import RequestVideo from "./RequestVideo";
 import { byPublicationMode, byRowMode } from "./publicationMode";
 import { ClientVisibilityControl } from "./ClientVisibility";
+import PublishedRequestChecklist from "./PublishedRequestChecklist";
 import {
   PORTAL_LABELS,
   correctionSteps,
@@ -404,7 +405,7 @@ export default function ChangeRequestsPanel({
               publishing={crPublishingId === selectedItem.id}
               actionNotice={crPublishNotice?.requestId === selectedItem.id ? crPublishNotice : null}
               onResolve={() => resolveChangeRequest(selectedItem.id, drafts[selectedItem.id])}
-              onConfirmPublication={() => confirmChangeRequestPublication?.(selectedItem.id, selectedItem.publication)}
+              onConfirmPublication={(confirmedItems) => confirmChangeRequestPublication?.(selectedItem.id, selectedItem.publication, confirmedItems)}
               onReopen={() => reopenChangeRequest(selectedItem.id)}
               onPublish={() => publishItem(selectedItem)}
               onPrepareOnly={() => prepareProRes(selectedItem.delivery?.job_id, selectedItem.id)}
@@ -521,6 +522,12 @@ function ChangeRequestCard({
   const closeRef = useRef(null);
   // A different request, or this one resolved/reopened, never inherits an open form.
   useEffect(() => { setCloseOpen(false); }, [item.id, isResolved]);
+  // Closing by publication needs every point of the request ticked against the
+  // cut. The checklist is keyed by the cut, so a new render starts it over.
+  const confirmsPublication = !isResolved && Array.isArray(workflow.allowed_actions)
+    && workflow.allowed_actions.includes("confirm_publication");
+  const [checklist, setChecklist] = useState({ ready: false, count: 0 });
+  const onChecklistChange = useCallback((ready, count) => setChecklist({ ready, count }), []);
   const view = correctionSteps(workflow, {
     isResolved,
     hasJob: Boolean(d.job_id),
@@ -531,7 +538,8 @@ function ChangeRequestCard({
     summaryProposal: item.proposal,
     proposalEnabled,
     qcReview: qcNeedsReview && qcReviewHref ? { label: qcReviewLabel } : null,
-    busy: { proposal: proposalBusy, publishing, resolving, noNote: !draft.trim() },
+    busy: { proposal: proposalBusy, publishing, resolving, noNote: !draft.trim(),
+      unchecked: confirmsPublication && !checklist.ready },
   });
   const scrollToProposal = () => proposalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   const primaryWiring = {
@@ -545,7 +553,7 @@ function ChangeRequestCard({
     review_proposal: { onClick: proposal ? scrollToProposal : onLoadProposal },
     render: { onClick: onReviewRender },
     close: { onClick: onResolve },
-    confirm_publication: { onClick: onConfirmPublication },
+    confirm_publication: { onClick: () => onConfirmPublication?.(checklist.count) },
   };
   const primaryAction = { ...view.primary, ...(primaryWiring[view.primary.key] || {}) };
   const closeForm = !isResolved && (closeOpen || view.primary.key === "close");
@@ -695,6 +703,16 @@ function ChangeRequestCard({
               Última actualización: {fmtDateTime(item.updated_at || item.resolved_at || item.submitted_at)}
             </p>
           </section>
+
+          {confirmsPublication && (
+            <PublishedRequestChecklist
+              key={`${item.id}:${item.publication?.render_fingerprint || ""}`}
+              requestId={item.id}
+              comment={item.comment}
+              onReadyChange={onChecklistChange}
+              onSeek={seekVideo}
+            />
+          )}
 
           {!isResolved && proposalEnabled && (
             <div ref={proposalRef} className="scroll-mt-4">
