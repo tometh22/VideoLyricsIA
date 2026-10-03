@@ -1849,6 +1849,7 @@ let CUSTOM_DATE_START = "";
 let CUSTOM_DATE_END = "";
 let CUSTOM_DATE_ERROR = "";
 const PRORES_PREPARES = new Set();
+const PRORES_PREPARE_ERRORS = new Map();
 
 // Estado de una versión para el filtro. Prioridad: cambios pendientes > aprobado > pendiente.
 // (una versión aprobada con pedido de cambio abierto se muestra bajo "Con cambios").
@@ -2350,14 +2351,16 @@ function renderVersionRow(song, version, versionIdx) {
       if (canPrepare) {
         const prepareKey = `${version.delivery_id}:${f.type}`;
         const preparing = PRORES_PREPARES.has(prepareKey);
+        const prepareError = PRORES_PREPARE_ERRORS.get(prepareKey);
+        const prepareErrorTitle = prepareError ? `title="${escapeHtml(prepareError.message)}"` : "";
         const fileTypeArg = JSON.stringify(f.type).replace(/"/g, '&quot;');
         // Un solo click solicita el master; la generación ocurre en segundo
         // plano y el portal inicia la descarga cuando termina.
         return `<button type="button" class="file-btn prores-prepare-btn${preparing ? " disabled" : ""}"
-          onclick="downloadDelivery(${version.delivery_id}, ${fileTypeArg})"${preparing ? " disabled" : ""}>
+          onclick="downloadDelivery(${version.delivery_id}, ${fileTypeArg})"${preparing ? " disabled" : ""}${prepareErrorTitle ? ` ${prepareErrorTitle}` : ""}>
           ${dlIconSvg()}
           <span class="file-name">${escapeHtml(f.label)}</span>
-          <span class="file-size">${preparing ? "Preparando…" : "Generar y descargar"}</span>
+          <span class="file-size">${preparing ? "Preparando…" : prepareError ? (prepareError.action === "check" ? "Consultar estado" : "Reintentar") : "Generar y descargar"}</span>
         </button>`;
       }
       return `<span class="file-btn disabled">
@@ -2689,6 +2692,7 @@ async function prepareProRes(deliveryId, fileType) {
     alert("Ya se está preparando un archivo. Esperá a que termine y pedí el siguiente.");
     return;
   }
+  PRORES_PREPARE_ERRORS.delete(prepareKey);
   PRORES_PREPARES.add(prepareKey);
   renderMain();
   try {
@@ -2700,29 +2704,45 @@ async function prepareProRes(deliveryId, fileType) {
     if (resp.status === 401) { clearAuth(); location.reload(); return; }
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
-      throw new Error(body.detail || ("HTTP " + resp.status));
+      throw new Error(body.message || body.detail?.message || body.detail || ("HTTP " + resp.status));
     }
     // Poll the staging worker. Once ready it publishes an immutable pointer
     // into the shared portal DB; the final fetch goes through the audited
     // per-click download endpoint too.
-    for (let attempt = 0; attempt < 240; attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 10000));
+    const pollingStarted = Date.now();
+    let pollDelayMs = 10000;
+    while (Date.now() - pollingStarted < 30 * 60 * 1000) {
+      await new Promise(resolve => setTimeout(resolve, pollDelayMs));
       const statusResp = await apiFetchStaging(`/api/deliveries/${deliveryId}/prepare-prores?file_type=${encodeURIComponent(fileType)}`);
       if (statusResp.status === 401) { clearAuth(); location.reload(); return; }
       if (!statusResp.ok && statusResp.status !== 202) {
         const statusBody = await statusResp.json().catch(() => ({}));
-        throw new Error(statusBody.detail || ("HTTP " + statusResp.status));
+        throw new Error(statusBody.message || statusBody.detail?.message || statusBody.detail || ("HTTP " + statusResp.status));
       }
       const statusBody = await statusResp.json().catch(() => ({}));
+      const retryAfter = Number(statusBody.retry_after || statusResp.headers.get("Retry-After"));
+      if (Number.isFinite(retryAfter) && retryAfter > 0) {
+        pollDelayMs = Math.max(5000, Math.min(60000, retryAfter * 1000));
+      }
       if (statusBody.status === "ready") {
+        PRORES_PREPARE_ERRORS.delete(prepareKey);
         await reloadItems();
         await downloadDelivery(deliveryId, fileType);
         return;
       }
+      if (statusBody.status === "failed") {
+        throw new Error(statusBody.message || "No se pudo generar el ProRes.");
+      }
     }
-    alert("La preparación continúa en curso. Podés dejar el portal abierto; el master estará disponible al terminar.");
+    PRORES_PREPARE_ERRORS.set(prepareKey, {
+      action: "check",
+      message: "La preparación sigue en curso. Usá Consultar estado para retomar el seguimiento.",
+    });
+    alert("La preparación sigue en curso. El botón quedó disponible para consultar el estado más tarde.");
   } catch (e) {
-    alert("No se pudo preparar el ProRes: " + (e && e.message ? e.message : "error de red"));
+    const message = e && e.message ? e.message : "error de red";
+    PRORES_PREPARE_ERRORS.set(prepareKey, { action: "retry", message });
+    alert("No se pudo preparar el ProRes: " + message + ". Podés volver a intentarlo desde el botón.");
   } finally {
     PRORES_PREPARES.delete(prepareKey);
     renderMain();

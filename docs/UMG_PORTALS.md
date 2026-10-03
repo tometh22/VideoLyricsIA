@@ -28,7 +28,9 @@ cualquier video publicado con MP4 fuente disponible, incluidos los videos de
 campaña que no son Art Tracks. Un click encola el master en staging, lo publica
 en la versión de entrega y comienza la descarga cuando termina. Usa la
 resolución guardada en la entrega y, si el job no tenía spec ProRes, 24 fps /
-ProRes 422 HQ. No hay confirmación intermedia. Staging debe tener
+ProRes 422 HQ. Si falla el worker o la subida a R2, el portal informa el error
+y permite reintentar; si la generación tarda más de 30 minutos, el botón permite
+retomar la consulta sin iniciar otro transcode activo. Staging debe tener
 `DELIVERY_PORTAL_TOKEN` igual al de producción.
 
 ## Envío desde cuentas admin

@@ -1880,12 +1880,121 @@ def _live_prewarm_job(queue, rq_id: str):
     return rq_job
 
 
+def _evict_stale_prewarm_job(queue, rq_id: str) -> None:
+    """Remove terminal prewarm records and recover orphaned started jobs."""
+    try:
+        from rq.job import Job as RQJob
+        from rq.exceptions import NoSuchJobError
+    except Exception as exc:
+        raise RuntimeError("RQ is unavailable while preparing ProRes.") from exc
+    try:
+        rq_job = RQJob.fetch(rq_id, connection=queue.connection)
+    except NoSuchJobError:
+        return
+    except Exception as exc:
+        # Preserve _evict_stale_rq_job's fail-closed behavior when Redis is
+        # unavailable or its state cannot be read safely.
+        raise RuntimeError(f"Could not inspect ProRes queue job {rq_id}.") from exc
+
+    status = rq_job.get_status(refresh=True)
+    value = str(getattr(status, "value", status) or "").lower()
+    if value in {"queued", "started", "deferred", "scheduled"}:
+        from datetime import datetime, timezone
+        started = getattr(rq_job, "started_at", None)
+        if value != "started" or started is None:
+            raise RuntimeError(f"rq_job_active:{rq_id}:{value}")
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - started).total_seconds()
+        if age <= PRORES_PREWARM_TIMEOUT + 120:
+            raise RuntimeError(f"rq_job_active:{rq_id}:started")
+        # The worker exceeded its hard timeout plus grace period and is
+        # orphaned in StartedJobRegistry. Clear it so the explicit retry can
+        # create a fresh job with this deterministic id.
+        if not cancel_rq_job(rq_id):
+            raise RuntimeError(f"Could not clear stale ProRes job {rq_id}.")
+        return
+    _evict_stale_rq_job(queue.connection, rq_id)
+
+
+def portal_prores_job_status(
+    job_id: str, file_type: str, *, snapshot: bool | None = None,
+) -> str:
+    """Return the state of portal ProRes work recorded in the enterprise RQ.
+
+    ``unknown`` means Redis could not be checked; callers must not tell the
+    portal that work failed in that case. ``not_found`` means there is no
+    retained attempt for this delivery and file type.
+    """
+    if file_type not in ("umg_master", "umg_short"):
+        return "not_found"
+    from datetime import datetime, timezone
+
+    connection, _, _ = _init_redis()
+    if connection is None:
+        return "unknown"
+    try:
+        from rq.job import Job as RQJob
+        from rq.exceptions import NoSuchJobError
+    except Exception:
+        return "unknown"
+
+    if snapshot is True:
+        ids = (f"portal-prewarm:{job_id}:{file_type}",)
+    elif snapshot is False:
+        ids = (f"prewarm:{job_id}:{file_type}",)
+    else:
+        ids = (
+            f"prewarm:{job_id}:{file_type}",
+            f"portal-prewarm:{job_id}:{file_type}",
+        )
+    found = []
+    for rq_id in ids:
+        try:
+            rq_job = RQJob.fetch(rq_id, connection=connection)
+            status = rq_job.get_status(refresh=True)
+            value = str(getattr(status, "value", status) or "").lower()
+            started = getattr(rq_job, "started_at", None)
+            if value == "started" and started is not None:
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - started).total_seconds() > PRORES_PREWARM_TIMEOUT + 120:
+                    value = "failed"
+            found.append((rq_job.created_at, value))
+        except NoSuchJobError:
+            continue
+        except Exception as exc:
+            logger.warning("[PORTAL-PRORES] RQ status unavailable for %s: %s", rq_id, exc)
+            return "unknown"
+
+    if not found:
+        return "not_found"
+    active = {"queued", "started", "deferred", "scheduled"}
+    if any(status in active for _, status in found):
+        return "processing"
+    def _created_at_key(row):
+        created_at = row[0]
+        if created_at is None:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        return created_at
+
+    latest = max(found, key=_created_at_key)[1]
+    if latest in {"finished"}:
+        return "finished"
+    if latest in {"failed", "stopped", "canceled", "cancelled"}:
+        return "failed"
+    return "unknown"
+
+
 def enqueue_prores_prewarm(
     job_id: str,
     file_type: str,
     *,
     force: bool = False,
     dedupe_live: bool = False,
+    require_r2_upload: bool = False,
 ) -> str | None:
     """Schedule the ProRes transcode for `job_id` on the enterprise queue.
 
@@ -1903,6 +2012,10 @@ def enqueue_prores_prewarm(
     """
     _require_submissions_open()
     global prewarm_skipped_total, prewarm_enqueued_total
+    # Explicit click-driven actions (force + dedupe) must wait for R2 to be
+    # durable before the portal can publish the result. Background refreshes
+    # retain their best-effort upload behavior.
+    require_r2_upload = require_r2_upload or (force and dedupe_live)
     if not PRORES_PREWARM_ENABLED and not force:
         return None
     if file_type not in ("umg_master", "umg_short"):
@@ -1931,24 +2044,24 @@ def enqueue_prores_prewarm(
             depth, PRORES_PREWARM_MAX_QUEUE_DEPTH, job_id, file_type,
         )
         return None
+    rq_id = f"prewarm:{job_id}:{file_type}"
     if dedupe_live:
-        # An operator's click while the same transcode is already queued or
-        # running. RQ re-runs an existing id instead of ignoring it, so a second
-        # click used to start a second multi-GB transcode + upload of the same
-        # key. Only for click-driven callers: the edit pipeline relies on the
-        # re-run to refresh a master after a correction.
-        live = _live_prewarm_job(q_enterprise, f"prewarm:{job_id}:{file_type}")
+        live = _live_prewarm_job(q_enterprise, rq_id)
         if live is not None:
             logger.info("[PRORES] prewarm already %s for %s/%s; not enqueuing a duplicate",
                         live.get_status(), job_id, file_type)
             return live.id
+        _evict_stale_prewarm_job(q_enterprise, rq_id)
     rq_job = q_enterprise.enqueue(
         "prores.prewarm_prores",
         args=(job_id, file_type),
         job_timeout=PRORES_PREWARM_TIMEOUT,
         result_ttl=RESULT_TTL,
         failure_ttl=FAILURE_TTL,
-        meta=rq_payload_metadata("prores_prewarm"),
+        meta={
+            **rq_payload_metadata("prores_prewarm"),
+            "portal_require_r2_upload": bool(require_r2_upload),
+        },
         # Deterministic id: collapses concurrent double-enqueues to one
         # QUEUED entry. NOTE: RQ (1.16.2) does NOT no-op a re-enqueue of a
         # FINISHED id — enqueue overwrites the job hash and re-pushes the id,
@@ -1956,7 +2069,7 @@ def enqueue_prores_prewarm(
         # fresh transcode after an edit (it cancel_rq_job's the old one first
         # for hygiene). If RQ is ever upgraded, re-verify this re-run
         # behavior or the post-edit re-warm silently stops firing.
-        job_id=f"prewarm:{job_id}:{file_type}",
+        job_id=rq_id,
     )
     prewarm_enqueued_total += 1
     return rq_job.id
@@ -2006,7 +2119,13 @@ def enqueue_delivery_prores_prewarm(
             "video": f"{safe_tenant}/{safe_job_id}/lyric_video.mp4",
             "short": f"{safe_tenant}/{safe_job_id}/short.mp4",
         },
+        "_require_r2_upload": True,
     }
+    rq_id = f"portal-prewarm:{job_id}:{file_type}"
+    live = _live_prewarm_job(q_enterprise, rq_id)
+    if live is not None:
+        return live.id
+    _evict_stale_prewarm_job(q_enterprise, rq_id)
     rq_job = q_enterprise.enqueue(
         "prores.ensure_prores_exists",
         args=(job_id, file_type, job_snapshot, tenant_id),
@@ -2014,7 +2133,7 @@ def enqueue_delivery_prores_prewarm(
         result_ttl=RESULT_TTL,
         failure_ttl=FAILURE_TTL,
         meta=rq_payload_metadata("prores_prewarm"),
-        job_id=f"portal-prewarm:{job_id}:{file_type}",
+        job_id=rq_id,
     )
     prewarm_enqueued_total += 1
     return rq_job.id
