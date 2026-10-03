@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.104] - 2026-10-03
+
+### Fixed
+
+- "Dividir" en el editor de letra ya no borra el timing por palabra: cada mitad
+  conserva sus palabras y el corte cae en la pausa real del canto (por ejemplo
+  "Aprendamos a perdonar" / "y seremos perdonados"), en vez de partir por ancho
+  de pantalla y repartir el tiempo por cantidad de letras. Aplica también a
+  "Dividir todas" y al aviso de 3 líneas.
+
 ## 1.1.103 — 2026-10-03
 
 - Todos los lyrics y art tracks ofrecen ProRes a pedido en ambos portales, incluso sin master guardado o Job local.

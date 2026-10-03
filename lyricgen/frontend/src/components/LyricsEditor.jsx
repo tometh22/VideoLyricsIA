@@ -26,7 +26,7 @@ import {
 } from "../lib/segmentTiming";
 import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
-import { splitWordsAtCharOffset, firstWordStart, lastWordEnd } from "../lib/splitWords";
+import { planSegmentSplit, tokenSpans } from "../lib/splitWords";
 import useLocalStorage from "../hooks/useLocalStorage";
 import { useEditorDocument } from "../hooks/useEditorDocument";
 import { useEditorAutosave } from "../hooks/useEditorAutosave";
@@ -3465,19 +3465,34 @@ export default function LyricsEditor({
           result.push(seg);
           continue;
         }
+        // Word-aware when the reference lines re-tokenize the segment 1:1:
+        // each half keeps its own slice of `words` + the real boundary time.
+        // (Before, both halves inherited the parent's FULL `words` array.)
+        const tokA = tokenSpans(lineA).length;
+        const plan = tokA > 0 && tokA + tokenSpans(lineB).length === tokenSpans(seg.text).length
+          ? planSegmentSplit(seg, { splitTokenIndex: tokA })
+          : null;
+        const { words: _parentWords, ...segNoWords } = seg;
+        if (plan?.a.words && plan?.b.words) {
+          result.push(
+            { ...segNoWords, _id: nextId++, segment_id: mintSegmentId(), text: lineA, start: plan.a.start, end: plan.a.end, words: plan.a.words },
+            { ...segNoWords, _id: nextId++, segment_id: mintSegmentId(), text: lineB, start: plan.b.start, end: plan.b.end, words: plan.b.words },
+          );
+          continue;
+        }
         const ratio = lineA.length / totalChars;
         const dur = Math.max(0.6, seg.end - seg.start);
         const midTime = seg.start + dur * ratio;
         const gap = 0.05;
         result.push({
-          ...seg,
+          ...segNoWords,
           _id: nextId++,
           segment_id: mintSegmentId(),
           text: lineA,
           end: Math.max(seg.start + 0.3, midTime - gap),
         });
         result.push({
-          ...seg,
+          ...segNoWords,
           _id: nextId++,
           segment_id: mintSegmentId(),
           text: lineB,
@@ -3635,84 +3650,37 @@ export default function LyricsEditor({
     return estimateWrappedLines(displayText, fontCss, sizePx, tier.maxWidthPx);
   }, [font, textCase, fontScale]);
 
-  // Split a segment into two. When `charOffset` is given (operator pressed Enter
-  // at the cursor) AND the segment carries per-word timing, the split is
-  // WORD-AWARE: each half inherits the REAL start/end of its words — no re-sync.
-  // Otherwise (the "✂ Dividir" button, which has no cursor, or a segment with no
-  // word timing) we fall back to the canvas wrap-boundary + char-ratio timing
-  // and DROP the now-meaningless `words` array from both halves (keeping the
-  // parent's full `words` on each child was the old bug → wrong per-word timing).
+  // Split a segment into two (lib/splitWords.planSegmentSplit decides where,
+  // which words go to each half and the boundary time):
+  // - `charOffset` given (operator pressed Enter at the caret): cut there,
+  //   snapped to a word boundary when the line carries word timing.
+  // - no cursor ("✂ Dividir", "Dividir todas", the wrap dialog): cut at the
+  //   longest sung pause among balanced cuts, else the most balanced cut.
+  // Each half keeps ITS slice of `words`; line 1 ends at its last word's end
+  // and line 2 starts at its first word's start. Only when the words can't be
+  // mapped onto the text (text rewritten after alignment) do we fall back to
+  // char-ratio timing and drop `words`. Outer bounds stay the line's own.
+  // Both halves get a fresh `_id` + `segment_id` (a shared segment_id makes
+  // the three-way merge return the same row twice → dedupe deletes lyrics).
   const splitSegAt = (id, charOffset) => {
     pushEditHistory();
     setEdited((prev) => {
       const idx = prev.findIndex((s) => s._id === id);
       if (idx === -1) return prev;
       const seg = prev[idx];
+      const plan = planSegmentSplit(seg, { charOffset });
+      if (!plan) return prev; // never create an empty line
       const nextId1 = prev.reduce((m, s) => Math.max(m, s._id), -1) + 1;
-      const nextId2 = nextId1 + 1;
-
-      // ── WORD-ACCURATE PATH (Enter at cursor, segment has word timing) ──
-      if (charOffset != null && Array.isArray(seg.words) && seg.words.length > 1) {
-        const r = splitWordsAtCharOffset(seg.text, seg.words, charOffset);
-        if (r) {
-          const aStart = firstWordStart(r.wordsA);
-          const aEnd = lastWordEnd(r.wordsA);
-          const bStart = firstWordStart(r.wordsB);
-          const bEnd = lastWordEnd(r.wordsB);
-          const s1 = {
-            ...seg, _id: nextId1, segment_id: mintSegmentId(),
-            text: r.textA, words: r.wordsA,
-            start: aStart != null ? aStart : seg.start,
-            end: aEnd != null ? aEnd : seg.end,
-          };
-          const s2 = {
-            ...seg, _id: nextId2, segment_id: mintSegmentId(),
-            text: r.textB, words: r.wordsB,
-            start: bStart != null ? bStart : s1.end + 0.05,
-            end: bEnd != null ? bEnd : seg.end,
-          };
-          if (!(s2.start > s1.end)) s2.start = s1.end + 0.02; // monotonic safety
-          return [...prev.slice(0, idx), s1, s2, ...prev.slice(idx + 1)];
-        }
-        // r === null (degenerate / text edited so tokens≠words) → char-ratio below
-      }
-
-      // ── FALLBACK: char-ratio (no word timing, or unaligned text) ──
-      const fullText = seg.text || "";
-      let cut = charOffset; // cursor split point when present
-      if (cut == null) {
-        // Button path: keep the old behaviour — split at the canvas wrap boundary.
-        const displayText = applyCase(fullText, textCase);
-        const tier = getTier(displayText);
-        const fontCss = FONT_CSS_MAP[font] || FONT_CSS_MAP[""];
-        const sizePx = Math.round(tier.sizePx * Math.max(0.6, Math.min(1.5, fontScale)));
-        const wlist = fullText.split(" ");
-        const canvas = document.createElement("canvas");
-        const ctx = canvas.getContext("2d");
-        ctx.font = `bold ${sizePx}px ${fontCss}`;
-        const spaceW = ctx.measureText(" ").width;
-        let lineW = 0;
-        let splitIdx = Math.floor(wlist.length / 2);
-        for (let wi = 0; wi < wlist.length - 1; wi++) {
-          const ww = ctx.measureText(applyCase(wlist[wi], textCase)).width;
-          lineW = lineW > 0 ? lineW + spaceW + ww : ww;
-          if (lineW > tier.maxWidthPx) { splitIdx = wi > 0 ? wi : 1; break; }
-          splitIdx = wi + 1;
-        }
-        cut = wlist.slice(0, splitIdx).join(" ").length + 1; // +1 for the space
-      }
-      const part1 = fullText.slice(0, cut).trim();
-      const part2 = fullText.slice(cut).trim();
-      if (!part1 || !part2) return prev; // never create an empty line
-      // Char ratio (long words take longer to sing → matches the vocal pause
-      // better than word-count). Drop the stale `words` array from both halves.
-      const ratio = part1.length / Math.max(1, part1.length + part2.length);
-      const midTime = seg.start + (seg.end - seg.start) * ratio;
-      const gap = 0.05;
-      const { words: _dropWords, ...segNoWords } = seg;
-      const s1 = { ...segNoWords, _id: nextId1, segment_id: mintSegmentId(), text: part1, end: Math.max(seg.start + 0.3, midTime - gap) };
-      const s2 = { ...segNoWords, _id: nextId2, segment_id: mintSegmentId(), text: part2, start: Math.min(seg.end - 0.3, midTime), end: seg.end };
-      return [...prev.slice(0, idx), s1, s2, ...prev.slice(idx + 1)];
+      const { words: _parentWords, ...segNoWords } = seg;
+      const half = (newId, part) => ({
+        ...segNoWords, _id: newId, segment_id: mintSegmentId(),
+        text: part.text, start: part.start, end: part.end,
+        ...(part.words ? { words: part.words } : {}),
+      });
+      return [
+        ...prev.slice(0, idx), half(nextId1, plan.a), half(nextId1 + 1, plan.b),
+        ...prev.slice(idx + 1),
+      ];
     });
   };
   // Back-compat: the "✂ Dividir" button + bulk callers split with no cursor.
@@ -6731,7 +6699,7 @@ export default function LyricsEditor({
                           )}
                           <button
                             onClick={() => splitSeg(seg._id)}
-                            title="Divide en dos en el wrap (reparte el tiempo proporcionalmente). Tip: apretá Enter en el cursor para partir exactamente ahí conservando el timing por palabra."
+                            title="Divide en dos en la pausa más natural del canto, conservando el timing por palabra. Tip: apretá Enter en el cursor para partir exactamente ahí."
                             className="text-[10px] text-brand hover:text-brand-light transition-colors
                               flex items-center gap-0.5 px-2 py-0.5 rounded-lg
                               bg-brand/5 hover:bg-brand/15 ring-1 ring-brand/20"
