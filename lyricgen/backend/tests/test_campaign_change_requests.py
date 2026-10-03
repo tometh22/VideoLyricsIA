@@ -224,3 +224,20 @@ def test_a_request_from_another_campaign_or_tenant_cannot_be_closed_here(db, set
     assert db.get(DeliveryChangeRequest, other_campaign_request.id).resolved_at is None
     assert db.get(DeliveryChangeRequest, other_tenant_request.id).resolved_at is None
     assert db.get(DeliveryChangeRequest, mine.id).resolved_at is None
+
+
+def test_published_without_ticking_reads_as_missing_close_not_unattended():
+    from datetime import timedelta
+    from types import SimpleNamespace as NS
+    from campaign_change_requests import _step
+    from delivery_freshness import render_fingerprint
+    now = datetime.now(timezone.utc)
+    job = NS(job_id="j", status="done", segments_revision=4, edit_count=1, previous_versions=[], completed_at=now,
+             render_params={"_rendered_segments_revision": 4, "_rendered_at": now.isoformat()})
+    document = NS(revision=4, updated_at=now - timedelta(minutes=5))
+    request = NS(resolved_at=None, resolution_source=None, submitted_at=now - timedelta(hours=1))
+    delivery = NS(removed_at=None, published_render_fingerprint=render_fingerprint(job), content_updated_at=now,
+                  stale_since=None, stale_reason=None, added_at=now - timedelta(days=1), published_revision=2)
+    assert _step(request, job, delivery, document)["key"] == "confirm"
+    document.updated_at = now - timedelta(hours=2)  # nothing saved after the request
+    assert _step(request, job, delivery, document)["key"] == "correct"

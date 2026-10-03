@@ -3,6 +3,21 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.101] - 2026-10-03
+
+### Fixed
+
+- Cambios UMG: un pedido cuyo video corregido ya se publicó (por ejemplo desde
+  el envío de una campaña sin tildar el pedido) se cierra con un clic,
+  "Confirmar y dar por resuelto", y queda registrado como resuelto por la
+  versión publicada. Antes sólo se podía cerrar "sin publicar" con una nota.
+- Cambios UMG: en canciones de campaña, "Generar el video corregido" fallaba
+  con `lyrics_and_timing_approval_missing`; ahora lleva al editor a aprobar
+  letra y timing, que es lo que genera el video.
+- Campañas: la bandeja muestra "Publicado: falta cerrar el pedido" en vez de
+  "Sin atender", y el envío al portal tiene "Marcar todos" para los pedidos que
+  resuelve.
+
 ## [1.1.100] - 2026-10-03
 
 ### Fixed

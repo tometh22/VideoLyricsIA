@@ -45,6 +45,12 @@ describe("correctionSteps: mapeo de las 5 etapas del servidor a 3 pasos", () => 
       ["done", "done", "active"], "Publicar en el portal y dar por resuelto", ["prepare_only", "edit", "close"]],
     ["review", ["edit", "resolve", "analyze"], { activeStep: 3 }, {},
       ["done", "done", "done"], "Dar por resuelto", ["edit"]],
+    // Published from a campaign without ticking the request: one click closes it.
+    ["review", ["edit", "resolve", "analyze", "confirm_publication"], { activeStep: 3 }, {},
+      ["done", "done", "done"], "Confirmar y dar por resuelto", ["edit", "close"]],
+    // Campaign songs render by approving lyrics+timing in the editor.
+    ["render", ["edit", "resolve", "analyze", "approve_in_editor"], { activeStep: 2 }, {},
+      ["done", "active", "todo"], "Aprobar letra y generar video", ["close"]],
     ["resolved", ["reopen"], { activeStep: 5, tone: "done" }, { isResolved: true },
       ["done", "done", "done"], "Reabrir pedido", []],
     ["resolved", ["reopen"], { activeStep: 0, tone: "idle" }, { isResolved: true },

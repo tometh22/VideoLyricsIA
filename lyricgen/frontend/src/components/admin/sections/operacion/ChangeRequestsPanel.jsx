@@ -173,6 +173,7 @@ export default function ChangeRequestsPanel({
   crLoading,
   crResolvingId,
   resolveChangeRequest,
+  confirmChangeRequestPublication,
   reopenChangeRequest,
   crPublishingId,
   crPublishNotice,
@@ -403,6 +404,7 @@ export default function ChangeRequestsPanel({
               publishing={crPublishingId === selectedItem.id}
               actionNotice={crPublishNotice?.requestId === selectedItem.id ? crPublishNotice : null}
               onResolve={() => resolveChangeRequest(selectedItem.id, drafts[selectedItem.id])}
+              onConfirmPublication={() => confirmChangeRequestPublication?.(selectedItem.id, selectedItem.publication)}
               onReopen={() => reopenChangeRequest(selectedItem.id)}
               onPublish={() => publishItem(selectedItem)}
               onPrepareOnly={() => prepareProRes(selectedItem.delivery?.job_id, selectedItem.id)}
@@ -466,7 +468,7 @@ export default function ChangeRequestsPanel({
 
 function ChangeRequestCard({
   item, draft, onDraftChange, resolving, publishing, actionNotice,
-  onResolve, onReopen, onPublish, onPrepareOnly, onReviewRender,
+  onResolve, onConfirmPublication, onReopen, onPublish, onPrepareOnly, onReviewRender,
   proposalEnabled, proposalApplyEnabled, proposalBusy, proposal,
   onGenerateProposal, onLoadProposal, onAdjustProposal, onApplyProposal,
   onDismissProposal, onRegenerateBackground, onRefresh,
@@ -543,6 +545,7 @@ function ChangeRequestCard({
     review_proposal: { onClick: proposal ? scrollToProposal : onLoadProposal },
     render: { onClick: onReviewRender },
     close: { onClick: onResolve },
+    confirm_publication: { onClick: onConfirmPublication },
   };
   const primaryAction = { ...view.primary, ...(primaryWiring[view.primary.key] || {}) };
   const closeForm = !isResolved && (closeOpen || view.primary.key === "close");
