@@ -40,3 +40,16 @@ flujo en el entorno de prueba y después publicar el shell. Requiere ambos
 deploys; cambiar sólo el HTML no habilita el backend. No necesita migraciones.
 
 Validación de JavaScript: `node --test umg-portal/tests/download.test.cjs`.
+
+## Aprobación de una revisión concreta
+
+El botón **Aprobar** envía `expected_revision` y
+`expected_content_updated_at` del listado que el cliente revisó. La API
+responde 409 si esa entrega cambió, está oculta o su archivo por puntero
+sigue actualizándose. El cliente debe recargar y revisar el corte vigente;
+una pestaña vieja no puede aprobar una publicación posterior por accidente.
+
+Para desplegar este contrato, publicar primero el shell de ambos dominios
+conservando el acceso actual mediante `PORTAL_SHELL_SOURCE`. Después desplegar
+la API que exige esos dos campos. Las pestañas antiguas pueden recibir 422
+hasta recargar; ninguna aprobación se pierde ni se aplica a otro corte.
