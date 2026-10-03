@@ -21971,6 +21971,7 @@ async def portal_prores_status(
         )
         return {"status": "ready"}
 
+    from queue_jobs import portal_prores_job_status
     task_state = await asyncio.to_thread(
         portal_prores_job_status, delivery.job_id, file_type,
     )
