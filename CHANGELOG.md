@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.105] - 2026-10-03
+
+### Fixed
+
+- Los renders y correcciones de campañas con especificación UMG respetan la resolución y los 29,97 fps configurados aunque el perfil heredado del trabajo diga `youtube`.
+
 ## [1.1.104] - 2026-10-03
 
 ### Fixed
