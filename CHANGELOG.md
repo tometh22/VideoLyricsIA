@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.103 — 2026-10-03
+
+- Todos los lyrics y art tracks ofrecen ProRes a pedido en ambos portales, incluso sin master guardado o Job local.
+- La exportación conserva resolución/FPS del MP4 publicado y descarga automáticamente al terminar.
+- Los masters usan la identidad de la fuente; una corrección no puede reutilizar el caché del corte anterior. El modo de último render sigue activo.
+- Publicar un video no genera ProRes de forma masiva; se conservan aprobación, aislamiento por país y auditoría de descargas.
+
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 

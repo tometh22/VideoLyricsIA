@@ -20293,7 +20293,7 @@ def _deliverables_never_produced(job, missing: list[str]) -> set[str]:
     dando 409. La conjunción sólo es verdadera cuando el pipeline decidió
     entregar sin ese archivo.
 
-    `umg_master` y `video` no son negociables: sin master no hay entrega.
+    `video` es obligatorio; `umg_master` puede prepararse a pedido desde ese MP4.
     """
     column = {
         "short": job.short_url,
@@ -20571,107 +20571,10 @@ def admin_create_delivery_from_job(
         )
         if ft not in missing
     ]
-    if missing or stale_prores:
-        missing_prores = [
-            ft for ft in missing if ft in ("umg_master", "umg_short")
-        ] + stale_prores
-        missing_render_outputs = [
-            ft for ft in missing if ft not in ("umg_master", "umg_short")
-        ]
-        if missing_render_outputs:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Files not yet in R2: "
-                    f"{', '.join(missing_render_outputs)}. "
-                    "Wait for the render to finish."
-                ),
-            )
-        if missing_prores and not job.umg_spec:
-            # Sin `umg_spec` no hay con qué transcodificar (frame size, fps,
-            # perfil), así que en los dos casos hay que frenar. Pero decir lo
-            # mismo sería mentir en uno: un master DESFASADO significa que
-            # este video ya se entregó como UMG y que el portal está
-            # sirviendo el corte anterior ahora mismo, no que sea un video
-            # "sólo para YouTube". Es el caso de la entrega 289 (2026-09-15):
-            # `delivery_profile="youtube"` y `umg_spec` en JSON null sobre un
-            # job que igual tiene un master de 4,3 GB publicado.
-            if stale_prores:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "prores_stale_without_spec",
-                        "message": (
-                            "El portal está entregando el master ProRes de "
-                            "ANTES de la edición y este video perdió su "
-                            "configuración ProRes, así que no se puede "
-                            "regenerar solo. Volvé a elegir la configuración "
-                            "ProRes del video antes de publicar la corrección."
-                        ),
-                        "stale": stale_prores,
-                        "missing": missing_prores,
-                    },
-                )
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "prores_required",
-                    "message": (
-                        "Este video fue generado sólo para YouTube. "
-                        "Elegí la configuración ProRes para preparar los "
-                        "masters antes de enviarlo a UMG."
-                    ),
-                    "missing": missing_prores,
-                },
-            )
-        # This branch publishes no pointer and mutates no local Job. Release
-        # both read transactions/Job lock before queue I/O or helper sessions;
-        # even an early 202 must not wait for response cleanup to unlock Job.
-        db.rollback()
-        if ddb is not db:
-            ddb.rollback()
-        enqueued = []
-        try:
-            for file_type in missing_prores:
-                rq_id = enqueue_prores_prewarm(
-                    job_id, file_type, force=True, dedupe_live=True,
-                )
-                if rq_id:
-                    enqueued.append(file_type)
-        except Exception as exc:
-            logger.warning(
-                "[DELIVERY] could not prepare ProRes for %s: %s",
-                job_id, exc,
-            )
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "No se pudo iniciar la preparación ProRes. "
-                    "Probá de nuevo en un momento."
-                ),
-            ) from exc
-        # `stale` separa los dos casos para el operador: "todavía no existe"
-        # (primera publicación) vs "existe pero es el corte anterior" (se
-        # editó y el master se está regenerando). En el segundo caso el
-        # portal ya está mostrando un par desparejo, así que la fila activa
-        # queda marcada como en vuelo mientras esperamos.
-        if stale_prores:
-            delivery_freshness.mark_deliveries_stale(
-                job_id, delivery_freshness.STALE_PRORES,
-            )
-        return JSONResponse(
-            status_code=202,
-            content={
-                "ok": False,
-                "status": "preparing_prores",
-                "job_id": job_id,
-                "missing": missing_prores,
-                "stale": stale_prores,
-                "enqueued": enqueued,
-                "retry_after": 10,
-            },
-            headers={"Retry-After": "10"},
-        )
+    missing_render_outputs = [ft for ft in missing if ft not in ("umg_master", "umg_short")]
+    if missing_render_outputs:
+        raise HTTPException(status_code=409, detail=f"Files not yet in R2: {', '.join(missing_render_outputs)}. Wait for the render to finish.")
+    snapshot_file_types = [ft for ft in delivery_file_types if ft not in set(missing + stale_prores)]
 
     # added_by_user_id es FK NOT NULL a users.id de la DB de deliveries. Con
     # DB externa (prod) el id de staging no existe allí → mapear a un admin
@@ -20706,7 +20609,7 @@ def admin_create_delivery_from_job(
             ddb.rollback()
         try:
             # Pointer mode: nothing to copy; the portal serves the newest render.
-            prepared_snapshot = None if latest_pointer_enabled() else copy_snapshot(snapshot_tenant, job_id, delivery_file_types)
+            prepared_snapshot = None if latest_pointer_enabled() else copy_snapshot(snapshot_tenant, job_id, snapshot_file_types)
         except Exception as exc:
             raise HTTPException(status_code=503, detail='No se pudo preparar la publicación. El portal conserva la versión anterior.') from exc
         job = (db.query(Job).filter(Job.job_id == job_id)
@@ -21082,141 +20985,108 @@ async def portal_delete_delivery(
     return _soft_delete_delivery(ddb, db, delivery_id, actor_user_id=None, portal_id=portal_id)
 
 
+def _portal_export_delivery(ddb, delivery_id, portal_id, file_type, *, lock=False):
+    import portal_prores
+    if file_type not in _DELIVERY_FILE_TYPES:
+        raise HTTPException(status_code=400, detail="Tipo de archivo inválido.")
+    query = _portal_delivery_query(ddb.query(Delivery), portal_id).filter(
+        Delivery.id == delivery_id, Delivery.removed_at.is_(None),
+    )
+    delivery = (query.with_for_update() if lock else query).first()
+    if (delivery is None or is_hidden_from_client(delivery)
+            or file_type not in portal_prores.file_types(delivery)):
+        raise HTTPException(status_code=404, detail="Entrega o archivo no disponible.")
+    return delivery
+
+
+async def _portal_export_key_status(delivery, file_type):
+    import portal_prores
+    from delivery_snapshots import portal_key
+    key = (await asyncio.to_thread(portal_prores.ready_key, delivery, file_type)
+           if file_type in portal_prores.SOURCES else portal_key(delivery, file_type, for_client=True))
+    state = await asyncio.to_thread(storage.object_status, key) if key else "missing"
+    if state == "unavailable":
+        raise HTTPException(status_code=503, detail="No se pudo verificar el archivo. Reintentá en un momento.")
+    return key if state == "exists" else None
+
+
+
+async def _portal_export_source(delivery, file_type):
+    import portal_prores
+    from delivery_snapshots import portal_key
+    key = portal_key(delivery, portal_prores.SOURCES[file_type])
+    etag = await asyncio.to_thread(storage.object_etag, key) if key else None
+    if not etag:
+        raise HTTPException(status_code=503, detail="No se pudo verificar el video publicado. Reintentá en un momento.")
+    return key, etag
+
+
+class PortalProResRequest(BaseModel):
+    file_type: str = Field(default="umg_master", max_length=20)
+
+
 @app.post("/api/deliveries/{delivery_id}/prepare-prores")
 async def portal_prepare_prores(
     delivery_id: int,
-    body: dict,
+    body: PortalProResRequest,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
-    db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
-    """Queue a missing ProRes derivative from the delivery portal.
-
-    ProRes is intentionally lazy because a master can take minutes and
-    several GB. The portal listing used to render a missing derivative as a
-    permanently disabled button, leaving UMG with no way to start it. Keep
-    the same portal row-level authorization as approve/delete. If this API
-    owns the source Job, reuse its exact persisted UMG spec; deliveries sent
-    from staging fall back to their immutable R2 snapshot so the shared
-    production portal can prepare them too.
-    """
+    import portal_prores
     portal_id = _verify_portal_token(x_portal_token, x_portal_id)
-    file_type = body.get("file_type") if isinstance(body, dict) else None
-    if file_type not in ("umg_master", "umg_short"):
-        raise HTTPException(status_code=400, detail="Archivo ProRes inválido.")
-
-    delivery = _portal_delivery_query(
-        ddb.query(Delivery), portal_id,
-    ).filter(
-        Delivery.id == delivery_id,
-        Delivery.removed_at.is_(None),
-    ).first()
-    if delivery is None:
-        raise HTTPException(status_code=404, detail="Delivery no encontrada.")
-    # Legacy deliveries may have a video but no umg_master entry in
-    # file_types. Their on-demand action is added to the listing, so permit
-    # that request and let the source/prores checks below validate it.
-    if not _portal_file_is_published(delivery, file_type):
-        raise HTTPException(status_code=404, detail="Archivo no disponible para esta entrega.")
-
-    job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
-    if job is not None and job.status != "done":
-        raise HTTPException(status_code=400, detail="El video todavía no terminó de procesarse.")
-    from queue_jobs import portal_prores_job_status
-    snapshot_route = job is None or not job.umg_spec
-    existing_task_state = await asyncio.to_thread(
-        portal_prores_job_status, delivery.job_id, file_type,
-        snapshot=snapshot_route,
-    )
-
-    # Freno. Este endpoint encola un ffmpeg de varios GB en la cola
-    # `enterprise`, la MISMA que sirve los renders de cliente, y lo hace con
-    # `force=True`, que saltea a propósito el guard de profundidad.
-    #
-    # Medido el 2026-09-16: entre los dos portales hay 178 archivos ausentes
-    # (Argentina 75 masters + 75 shorts, Chile 28 shorts), o sea 178 botones
-    # a un click de distancia, y el rate limiter de producción no estaba
-    # frenando nada. Alguien recorriendo el catálogo podía dejar los renders
-    # de UMG atrás de decenas de GB de transcodes.
-    #
-    # Saltear la backpressure para UN click humano que está esperando el
-    # archivo es razonable; para una avalancha no. El tope es por profundidad
-    # de cola: si ya hay trabajo esperando, este pedido no es urgente.
+    file_type = body.file_type
+    if file_type not in portal_prores.SOURCES:
+        raise HTTPException(status_code=400, detail="Tipo ProRes inválido.")
+    delivery = _portal_export_delivery(ddb, delivery_id, portal_id, file_type, lock=True)
+    if await _portal_export_key_status(delivery, file_type):
+        return {"status": "ready"}
+    # No row lock or DB transaction is held while queueing work in Redis.
+    source_key, etag = await _portal_export_source(delivery, file_type)
+    ddb.commit()
     try:
-        _depth = queue_depth().get("enterprise", 0)
-    except Exception:
-        _depth = 0        # sin Redis no hay cola que proteger
-    if existing_task_state != "processing" and _depth >= _PORTAL_PREPARE_MAX_QUEUE_DEPTH:
-        logger.warning(
-            "[PORTAL-PRORES] rechazado por cola llena delivery=%s type=%s depth=%s",
-            delivery_id, file_type, _depth,
+        rq_id = await asyncio.to_thread(
+            portal_prores.enqueue, delivery_id, portal_id, file_type, source_key, etag,
         )
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "prores_queue_busy",
-                "message": (
-                    "Hay varios archivos en preparación en este momento. "
-                    "Probá de nuevo en unos minutos."
-                ),
-                "retry_after": 300,
-            },
-            headers={"Retry-After": "300"},
-        )
-
-    try:
-        if job is not None and job.umg_spec:
-            rq_id = enqueue_prores_prewarm(
-                job.job_id, file_type, force=True, dedupe_live=True,
-            )
-            prepare_source = "job"
-        else:
-            # Cross-environment/legacy campaign delivery. Its source MP4 is
-            # already validated by the portal listing and lives at the
-            # deterministic R2 key captured by the Delivery snapshot.
-            rq_id = enqueue_delivery_prores_prewarm(
-                delivery.job_id,
-                file_type,
-                delivery.tenant_snapshot,
-                frame_size=delivery.frame_size_snapshot,
-            )
-            prepare_source = "delivery_snapshot"
+    except portal_prores.QueueBusy as exc:
+        raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "30"}) from exc
     except Exception as exc:
-        logger.warning(
-            "[PORTAL-PRORES] enqueue failed delivery=%s job=%s type=%s: %s",
-            delivery_id, delivery.job_id, file_type, exc,
-        )
-        raise HTTPException(
-            status_code=503,
-            detail="No se pudo iniciar la preparación ProRes. Probá de nuevo en un momento.",
-        ) from exc
+        logger.warning("[PORTAL-PRORES] queue unavailable delivery=%s: %s", delivery_id, exc)
+        raise HTTPException(status_code=503, detail="No se pudo iniciar la preparación. Podés reintentar.") from exc
+    return JSONResponse(status_code=202, content={
+        "status": "queued", "rq_id": rq_id, "retry_after": 5,
+    }, headers={"Retry-After": "5", "Cache-Control": "private, no-store"})
 
-    db.add(AuditLog(
-        user_id=None,
-        action="delivery.prores.prepare",
-        detail={
-            "delivery_id": delivery_id,
-            "job_id": delivery.job_id,
-            "portal_id": portal_id,
-            "file_type": file_type,
-            "prepare_source": prepare_source,
-        },
-    ))
-    db.commit()
-    return JSONResponse(
-        status_code=202,
-        content={
-            "ok": True,
-            "status": "queued",
-            "delivery_id": delivery_id,
-            "job_id": delivery.job_id,
-            "file_type": file_type,
-            "rq_id": rq_id,
-            "retry_after": 60,
-        },
-        headers={"Retry-After": "60"},
-    )
+
+@app.get("/api/deliveries/{delivery_id}/prepare-prores")
+async def portal_prores_status(
+    delivery_id: int,
+    file_type: str = Query("umg_master", max_length=20),
+    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
+    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    import portal_prores
+    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
+    if file_type not in portal_prores.SOURCES:
+        raise HTTPException(status_code=400, detail="Tipo ProRes inválido.")
+    delivery = _portal_export_delivery(ddb, delivery_id, portal_id, file_type)
+    if await _portal_export_key_status(delivery, file_type):
+        return {"status": "ready"}
+    source_key, etag = await _portal_export_source(delivery, file_type)
+    task_id, _ = portal_prores.export_identity(source_key, etag, file_type)
+    try:
+        state = await asyncio.to_thread(portal_prores.task_state, task_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="No se pudo consultar el estado. Podés reintentar.") from exc
+    if state in portal_prores.ACTIVE_STATES:
+        return JSONResponse(status_code=202, content={"status": "processing", "retry_after": 5},
+                            headers={"Retry-After": "5", "Cache-Control": "private, no-store"})
+    if state == "not_found":
+        # A correction published during preparation has a new source identity.
+        # The portal asks to prepare that current cut rather than the old one.
+        return {"status": "not_started"}
+    return {"status": "failed", "message": "No se pudo completar la preparación del ProRes. Podés reintentar."}
 
 
 @app.post("/api/deliveries/{delivery_id}/change-request")
@@ -21519,20 +21389,15 @@ def portal_get_items(
     head_jobs: list[tuple[int, str, str]] = []  # (delivery_idx, file_type, r2_key)
     listing_file_types: dict[int, list[str]] = {}
     for di, d in enumerate(deliveries):
-        file_types = list(d.file_types or [])
-        # The master may have been absent when a legacy delivery was first
-        # published, which also means it is absent from `file_types`. Keep a
-        # visible “generate and download” affordance for every published
-        # video so the customer can request it without contacting support.
-        if ("video" in file_types and d.published_render_fingerprint
-                and "umg_master" not in file_types):
-            file_types.append("umg_master")
+        import portal_prores
+        file_types = portal_prores.file_types(d)
         listing_file_types[di] = file_types
         for ft in file_types:
             if ft not in _DELIVERY_FILE_TYPES:
                 continue
             from delivery_snapshots import portal_key
-            r2_key = portal_key(d, ft, for_client=True)
+            r2_key = (portal_prores.published_master(d, ft)
+                      if ft in portal_prores.SOURCES else portal_key(d, ft, for_client=True))
             if not r2_key:
                 continue
             head_jobs.append((di, ft, r2_key))
@@ -21625,15 +21490,17 @@ def portal_get_items(
             if ft not in _DELIVERY_FILE_TYPES:
                 continue
             from delivery_snapshots import portal_key
-            r2_key = portal_key(d, ft, for_client=True)
+            r2_key = (portal_prores.published_master(d, ft)
+                      if ft in portal_prores.SOURCES else portal_key(d, ft, for_client=True))
             if not r2_key:
-                if ft == "umg_master":
+                if ft in portal_prores.SOURCES and not is_hidden_from_client(d):
                     files.append({
                         "type": ft,
                         "label": file_type_labels.get(ft, ft),
                         "url": None,
                         "size": "—",
                         "available": False,
+                        "can_prepare": size_map.get((di, portal_prores.SOURCES[ft])) is not None,
                     })
                 continue
             dl_name = f"{_delivery_safe_filename(d.artist_snapshot, d.song_title_snapshot)}.{_DELIVERY_FILE_TYPES[ft]['ext']}"
@@ -21655,6 +21522,7 @@ def portal_get_items(
                 "url": url,
                 "size": _fmt_size_mb(size_bytes),
                 "available": available,
+                "can_prepare": bool(ft in portal_prores.SOURCES and size_map.get((di, portal_prores.SOURCES[ft])) is not None),
             })
             if ft == "video" and url is not None:
                 preview_url = storage.generate_signed_url(r2_key, expiry_seconds=_DELIVERY_URL_EXPIRY_S)
@@ -21732,19 +21600,8 @@ def portal_get_items(
 
 
 def _portal_file_is_published(delivery: Delivery, file_type: str) -> bool:
-    """Only expose files included in the client-visible publication.
-
-    A missing master is the one intentional exception: the listing offers it
-    for a published MP4 so the customer can request lazy preparation.
-    """
-    if is_hidden_from_client(delivery):
-        return False
-    file_types = delivery.file_types or []
-    return file_type in file_types or (
-        file_type == "umg_master"
-        and "video" in file_types
-        and bool(delivery.published_render_fingerprint)
-    )
+    import portal_prores
+    return not is_hidden_from_client(delivery) and file_type in portal_prores.file_types(delivery)
 
 
 def _record_portal_download_attempt(
@@ -21835,7 +21692,7 @@ async def portal_download_file(
         raise HTTPException(status_code=404, detail="Archivo no disponible.")
 
     from delivery_snapshots import portal_key
-    key = portal_key(delivery, file_type, for_client=True)
+    key = await _portal_export_key_status(delivery, file_type)
     if not key:
         outcome = "prores_missing" if file_type in ("umg_master", "umg_short") else "file_not_published"
         _record_portal_download_attempt(
@@ -21887,7 +21744,7 @@ async def portal_download_file(
         ddb, request, portal_id=portal_id, delivery=delivery,
         delivery_id=delivery_id, file_type=file_type, outcome="url_issued",
     )
-    return {"status": "ready", "url": url}
+    return JSONResponse(content={"status": "ready", "url": url}, headers={"Cache-Control": "private, no-store"})
 
 
 def _prepare_portal_prores_snapshot(
@@ -21955,94 +21812,6 @@ async def _finalize_portal_prores(
     return True
 
 
-@app.get("/api/deliveries/{delivery_id}/prepare-prores")
-async def portal_prores_status(
-    delivery_id: int,
-    request: Request,
-    file_type: str = Query("umg_master"),
-    x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
-    x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
-    db: Session = Depends(get_db),
-    ddb: Session = Depends(get_deliveries_db),
-):
-    """Poll a queued master and atomically add it to the portal snapshot.
-
-    R2 presence is the success condition. When the object is still absent,
-    inspect the durable RQ record so failed workers stop looking like work in
-    progress forever.
-    """
-    portal_id = _verify_portal_token(x_portal_token, x_portal_id)
-    if file_type not in ("umg_master", "umg_short"):
-        raise HTTPException(status_code=400, detail="Tipo ProRes inválido.")
-    delivery = (
-        _portal_delivery_query(ddb.query(Delivery), portal_id)
-        .filter(Delivery.id == delivery_id)
-        .filter(Delivery.removed_at.is_(None))
-        .first()
-    )
-    if delivery is None:
-        raise HTTPException(status_code=404, detail="Entrega no encontrada.")
-    if not _portal_file_is_published(delivery, file_type):
-        raise HTTPException(status_code=404, detail="Archivo no disponible.")
-    if await _finalize_portal_prores(delivery, ddb, file_type):
-        _record_portal_download_attempt(
-            ddb, request, portal_id=portal_id, delivery=delivery,
-            delivery_id=delivery_id, file_type=file_type, outcome="prores_ready",
-        )
-        return {"status": "ready"}
-
-    # Campaign deliveries can live in the shared portal DB while their source
-    # Job (and its queue) belongs to another environment. Preserve that
-    # cross-environment polling path when no local RQ attempt is visible; a
-    # retained failed attempt is still surfaced below and can be retried.
-    local_job_exists = (
-        db.query(Job.job_id)
-        .filter(Job.job_id == delivery.job_id)
-        .filter(Job.tenant_id == delivery.tenant_snapshot)
-        .first()
-        is not None
-    )
-    from queue_jobs import portal_prores_job_status
-    task_state = await asyncio.to_thread(
-        portal_prores_job_status, delivery.job_id, file_type,
-        snapshot=not local_job_exists,
-    )
-    if task_state == "processing" or (
-        not local_job_exists and task_state in {"not_found", "unknown"}
-    ):
-        return JSONResponse(
-            status_code=202,
-            content={"status": "processing", "retry_after": 10},
-            headers={"Retry-After": "10"},
-        )
-    if task_state in {"failed", "finished", "not_found"}:
-        _record_portal_download_attempt(
-            ddb, request, portal_id=portal_id, delivery=delivery,
-            delivery_id=delivery_id, file_type=file_type,
-            outcome="prores_prepare_failed",
-        )
-        return {
-            "status": "failed",
-            "message": (
-                "No se pudo completar la preparación del ProRes. "
-                "Podés volver a intentarlo."
-            ),
-        }
-    if task_state == "unknown":
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "unknown",
-                "message": "No se pudo consultar el estado. Probá de nuevo en unos minutos.",
-                "retry_after": 30,
-            },
-            headers={"Retry-After": "30"},
-        )
-    return JSONResponse(
-        status_code=202,
-        content={"status": "processing", "retry_after": 30},
-        headers={"Retry-After": "30"},
-    )
 
 
 def _fmt_size_mb(size_bytes: int | None) -> str:
