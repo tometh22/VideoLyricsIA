@@ -214,7 +214,7 @@ def test_cut_published_without_ticking_closes_as_publication_in_one_click(client
     assert stale.status_code == 409, stale.text
 
     body = {'reviewed_render_fingerprint': render_fingerprint(job),
-            'reviewed_editor_revision': document.revision}
+            'reviewed_editor_revision': document.revision, 'confirmed_items': 2}
     response = client.post(f'/admin/change-requests/{cr.id}/confirm-publication',
                            headers=auth(admin_token), json=body)
     assert response.status_code == 200, response.text
@@ -223,6 +223,11 @@ def test_cut_published_without_ticking_closes_as_publication_in_one_click(client
     assert closed.resolution_source == 'publication'
     assert closed.resolved_by_revision == delivery.published_revision
     assert closed.resolution_note == f'Resuelto al publicar la versión {delivery.published_revision}.'
+    from database import AuditLog
+    audit = (db.query(AuditLog).filter(AuditLog.action == 'delivery.change_request.resolve')
+             .order_by(AuditLog.id.desc()).first())
+    assert audit.detail['source'] == 'publication_confirmed' and audit.detail['confirmed_items'] == 2
+    assert listed['workflow']['label'] == 'Publicado · revisá cada punto del pedido'
     again = client.post(f'/admin/change-requests/{cr.id}/confirm-publication',
                         headers=auth(admin_token), json=body)
     assert again.json()['already_resolved'] is True

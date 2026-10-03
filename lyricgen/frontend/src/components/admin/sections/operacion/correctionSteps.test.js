@@ -47,7 +47,7 @@ describe("correctionSteps: mapeo de las 5 etapas del servidor a 3 pasos", () => 
       ["done", "done", "done"], "Dar por resuelto", ["edit"]],
     // Published from a campaign without ticking the request: one click closes it.
     ["review", ["edit", "resolve", "analyze", "confirm_publication"], { activeStep: 3 }, {},
-      ["done", "done", "done"], "Confirmar y dar por resuelto", ["edit", "close"]],
+      ["done", "done", "done"], "Dar por resuelto", ["edit", "close"]],
     // Campaign songs render by approving lyrics+timing in the editor.
     ["render", ["edit", "resolve", "analyze", "approve_in_editor"], { activeStep: 2 }, {},
       ["done", "active", "todo"], "Aprobar letra y generar video", ["close"]],
@@ -327,3 +327,16 @@ describe("the publish sentence keeps what the server knows about a pending propo
   });
 });
 
+
+describe("cierre por publicación: punto por punto", () => {
+  const confirm = workflow("review", ["edit", "resolve", "confirm_publication"], { activeStep: 3 });
+  it("bloquea 'Dar por resuelto' hasta marcar todos los puntos", () => {
+    expect(correctionPrimary(confirm, { hasJob: true, busy: { unchecked: true } })).toMatchObject({ key: "confirm_publication", disabled: true });
+    expect(correctionPrimary(confirm, { hasJob: true, busy: { unchecked: false } })).toMatchObject({ key: "confirm_publication", disabled: false });
+  });
+  it("la frase pide revisar cada punto, no confirmar a ciegas", () => {
+    const sentence = correctionSentence(confirm, { publication: { revision: 2 } });
+    expect(sentence).toContain("Marcá cada punto");
+    expect(sentence).toContain("versión 2");
+  });
+});
