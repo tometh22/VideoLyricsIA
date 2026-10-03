@@ -1,10 +1,21 @@
 # Changelog
 
-## [1.1.106] - 2026-10-03
+## [1.1.107] - 2026-10-03
 
 ### Fixed
 
 - El portal exige la revisión y la fecha del corte que el cliente vio antes de aceptar una aprobación. Rechaza páginas desactualizadas y entregas ocultas o en actualización; la aprobación vuelve a estar disponible tras revisar la versión publicada.
+
+## [1.1.106] - 2026-10-03
+
+### Fixed
+
+- Cambios UMG: cerrar un pedido cuyo video corregido ya está publicado exige
+  revisarlo punto por punto. El panel separa el pedido en sus puntos, muestra
+  qué dice el video en cada tiempo citado y "Dar por resuelto" se habilita
+  sólo cuando están todos marcados. Que exista un corte corregido no prueba
+  que tenga todas las correcciones (5 de 10 pedidos del 3-oct estaban
+  incompletos).
 
 ## [1.1.105] - 2026-10-03
 

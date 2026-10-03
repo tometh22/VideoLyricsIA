@@ -554,9 +554,9 @@ it("closes a request the published cut already answers, bound to that cut, witho
     ? Promise.resolve({ ok: true, resolved_by_revision: 2, resolved_at: "2026-10-03T03:00:00Z" }) : previous(url, opts));
   const { result } = renderHook(() => useChangeRequests());
   await waitFor(() => expect(result.current.crLoading).toBe(false));
-  await act(() => result.current.confirmChangeRequestPublication(85, { render_fingerprint: "cut-2", editor_revision: 14 }));
+  await act(() => result.current.confirmChangeRequestPublication(85, { render_fingerprint: "cut-2", editor_revision: 14 }, 3));
   const call = mocks.fetchJson.mock.calls.find(([url]) => url.endsWith("/confirm-publication"));
-  expect(JSON.parse(call[1].body)).toEqual({ reviewed_render_fingerprint: "cut-2", reviewed_editor_revision: 14 });
+  expect(JSON.parse(call[1].body)).toEqual({ reviewed_render_fingerprint: "cut-2", reviewed_editor_revision: 14, confirmed_items: 3 });
   expect(result.current.crPublishNotice).toMatchObject({ requestId: 85, tone: "ok" });
   expect(result.current.crPublishNotice.text).toContain("versión 2");
 });

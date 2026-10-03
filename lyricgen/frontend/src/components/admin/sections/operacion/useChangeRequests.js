@@ -528,7 +528,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   // The corrected cut is already in the portal (sent from a campaign without
   // ticking this request): record the close as a publication, bound to the
   // exact cut the operator is looking at. No note needed.
-  const confirmChangeRequestPublication = useCallback(async (id, publication) => {
+  const confirmChangeRequestPublication = useCallback(async (id, publication, confirmedItems) => {
     if (!publication?.render_fingerprint || !Number.isInteger(publication.editor_revision)) {
       setCrPublishNotice({ requestId: id, tone: "error", text: "Falta verificar el corte publicado. Actualizá el pedido y reintentá." });
       return;
@@ -544,6 +544,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         body: JSON.stringify({
           reviewed_render_fingerprint: publication.render_fingerprint,
           reviewed_editor_revision: publication.editor_revision,
+          ...(Number.isInteger(confirmedItems) && confirmedItems > 0 ? { confirmed_items: confirmedItems } : {}),
         }),
       });
       if (data.ok !== true) throw new Error("El servidor no confirmó el cierre del pedido.");
