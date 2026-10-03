@@ -10,7 +10,7 @@ it("explains a partial delivery and selects only failed videos for retry", async
     { job_id: "sent", status: "sent" }, { job_id: "failed", status: "failed", error_code: "stale_approval" },
   ] });
   render(<CampaignDeliveryProgress operationId="operation-1" request={request} onSelectFailed={select} />);
-  expect(await screen.findByText(/1 de 2 enviados · 1 con error · Requiere atención/)).toBeInTheDocument();
+  expect(await screen.findByText(/1 de 2 publicados · 1 con error · Requiere atención/)).toBeInTheDocument();
   expect(screen.getByText(/La aprobación o el video cambió/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Seleccionar sólo los fallidos" }));
   expect(select).toHaveBeenCalledWith(["failed"]);

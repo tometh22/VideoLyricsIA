@@ -12534,6 +12534,10 @@ class DeliveryQCIssueDecisionRequest(BaseModel):
     reason: str = Field(default="", max_length=300)
 
 
+class DeliveryQCRecheckRequest(BaseModel):
+    for_umg_delivery: bool = False
+
+
 class DeliveryQCExternalFindingRequest(BaseModel):
     finding_id: str = Field(default="", max_length=160)
     code: str = Field(default="", max_length=100)
@@ -12791,11 +12795,8 @@ async def approve_job(
             detail="Una copia de piloto no se aprueba ni se entrega.",
         )
 
-    from delivery_qc_runtime import approval_gate, effective_delivery_qc_mode
-    _delivery_gate = approval_gate(
-        job.delivery_qc,
-        "enforce" if job.workload_class == "batch" else effective_delivery_qc_mode(),
-    )
+    from delivery_qc_runtime import delivery_readiness_gate
+    _delivery_gate = delivery_readiness_gate(job, job.delivery_qc)
     override_requested = bool(body.admin_override)
     override_allowed = (
         override_requested
@@ -12884,6 +12885,11 @@ async def approve_job(
     job.status = "done"
     job.approved_by = current_user["id"]
     job.approved_at = datetime.now(timezone.utc)
+    job.approved_render_fingerprint = delivery_freshness.render_fingerprint(job)
+    video_key = (job.s3_keys or {}).get("video") or _r2_key_for_delivery(
+        job.tenant_id, job.job_id, "video",
+    )
+    job.approved_video_etag = storage.object_etag(video_key)
     job.review_notes = body.notes or None
 
     # Archivado Fase 1 (2026-06-10): el éxito aprobado archiva los
@@ -12982,7 +12988,11 @@ async def decide_delivery_qc_issue(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     report = dict(job.delivery_qc or {})
-    if report.get("status") != "COMPLETE":
+    from delivery_qc_runtime import delivery_qc_source_fingerprint
+    if (
+        report.get("status") != "COMPLETE"
+        or report.get("source_fingerprint") != delivery_qc_source_fingerprint(job)
+    ):
         raise HTTPException(status_code=409, detail="delivery_qc_report_stale")
     found = None
     issues = []
@@ -12991,6 +13001,7 @@ async def decide_delivery_qc_issue(
         "rejected": "REJECTED",
         "resolved_manual": "RESOLVED_MANUAL",
     }
+    from delivery_qc_runtime import _issue_result_status, delivery_readiness_gate, refresh_check_results
     for raw in report.get("issues") or []:
         row = dict(raw)
         if str(row.get("issue_id")) == issue_id:
@@ -13000,10 +13011,15 @@ async def decide_delivery_qc_issue(
                     status_code=422,
                     detail="mandatory_reviewer_check_requires_signed_manual_resolution",
                 )
-            if row.get("severity") == "FAIL" and body.decision == "acknowledged":
+            if body.decision == "resolved_manual" and not row.get("manual_verification_required"):
                 raise HTTPException(
                     status_code=422,
-                    detail="fail_finding_cannot_be_acknowledged",
+                    detail="manual_resolution_requires_mandatory_reviewer_check",
+                )
+            if _issue_result_status(row) == "FAIL" and row.get("blocking", True):
+                raise HTTPException(
+                    status_code=422,
+                    detail="blocking_fail_requires_correction_and_new_preflight",
                 )
             row["status"] = status_map[body.decision]
             row["operator_decision"] = {
@@ -13022,10 +13038,6 @@ async def decide_delivery_qc_issue(
         raise HTTPException(status_code=404, detail="delivery_qc_issue_not_found")
     report["issues"] = issues
     open_rows = [row for row in issues if row.get("status") == "OPEN"]
-    from delivery_qc_runtime import (
-        _issue_result_status, approval_gate, effective_delivery_qc_mode,
-        refresh_check_results,
-    )
     report["summary"] = {
         **dict(report.get("summary") or {}),
         "open_count": len(open_rows),
@@ -13039,10 +13051,7 @@ async def decide_delivery_qc_issue(
         ),
     }
     report = refresh_check_results(report)
-    report["approval"] = approval_gate(
-        report,
-        "enforce" if job.workload_class == "batch" else effective_delivery_qc_mode(),
-    )
+    report["approval"] = delivery_readiness_gate(job, report)
     job.delivery_qc = report
     db.add(ProductEvent(
         tenant_id=str(job.tenant_id), user_id=current_user["id"], job_id=job_id,
@@ -13065,6 +13074,7 @@ async def decide_delivery_qc_issue(
 @app.post("/jobs/{job_id}/delivery-qc/recheck")
 async def recheck_delivery_qc(
     job_id: str,
+    body: DeliveryQCRecheckRequest | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -13083,13 +13093,20 @@ async def recheck_delivery_qc(
     if job.status not in {"pending_review", "done", "rejected"}:
         raise HTTPException(status_code=409, detail="Job is not ready for delivery QC")
 
+    from delivery_qc_runtime import delivery_qc_source_fingerprint
+    expected_source_fingerprint = delivery_qc_source_fingerprint(job)
+
     video_key = (job.s3_keys or {}).get("video") if isinstance(job.s3_keys, dict) else None
     local_path = os.path.join(OUTPUTS_DIR, job_id, FILE_MAP["video"])
 
     async def _run(video_path: str):
         from delivery_qc_runtime import run_delivery_qc_for_job
+        for_umg_delivery = bool(body and body.for_umg_delivery)
         return await asyncio.to_thread(
             run_delivery_qc_for_job, job_id, video_path,
+            force=for_umg_delivery,
+            mode_override="enforce" if for_umg_delivery else None,
+            expected_source_fingerprint=expected_source_fingerprint,
         )
 
     if video_key and storage.is_enabled():
@@ -13105,6 +13122,11 @@ async def recheck_delivery_qc(
     else:
         raise HTTPException(status_code=404, detail="No se encontró el video renderizado")
     if not report:
+        if body and body.for_umg_delivery:
+            raise HTTPException(status_code=409, detail={
+                "code": "delivery_qc_snapshot_changed",
+                "message": "El corte cambió durante el análisis. Actualizá el preflight para esta versión.",
+            })
         raise HTTPException(status_code=409, detail="No se pudo generar el reporte de preflight")
     return {"ok": True, "delivery_qc": report}
 
@@ -17882,6 +17904,13 @@ async def regenerate_scene(
     job.current_step = "scenes"
     job.progress = 0
     job.editing_started_at = datetime.now(timezone.utc)
+    if isinstance(job.delivery_qc, dict):
+        from delivery_qc_runtime import mark_delivery_qc_stale
+        job.delivery_qc = mark_delivery_qc_stale(
+            job.delivery_qc,
+            revision=int(job.segments_revision or 0),
+            reason="scene_regeneration_pending",
+        )
     db.add(AuditLog(
         user_id=current_user["id"],
         action="job.scene_regenerate",
@@ -18330,6 +18359,14 @@ async def retry_job(
     # bg-preservation logic downstream can introspect the failure cause.
     _previous_error = job.error or ""
 
+    if isinstance(job.delivery_qc, dict):
+        from delivery_qc_runtime import mark_delivery_qc_stale
+        job.delivery_qc = mark_delivery_qc_stale(
+            job.delivery_qc,
+            revision=int(job.segments_revision or 0),
+            reason="job_retry_pending",
+        )
+
     # Freeze whether the persisted segments are an exact approved snapshot
     # BEFORE retry clears delivery approval fields/status. Campaign approval
     # and EditorVersion approval are independent durable paths; either one is
@@ -18684,6 +18721,14 @@ async def edit_art_track(
     if job.s3_keys:
         delivery_freshness.mark_deliveries_stale(
             job_id, delivery_freshness.STALE_EDITING,
+        )
+
+    if isinstance(job.delivery_qc, dict):
+        from delivery_qc_runtime import mark_delivery_qc_stale
+        job.delivery_qc = mark_delivery_qc_stale(
+            job.delivery_qc,
+            revision=int(job.segments_revision or 0),
+            reason="art_track_edit_pending",
         )
 
     # Reset del row a estado de re-render limpio (mismo patrón que /retry),
@@ -19897,10 +19942,10 @@ class SendToUMGRequest(BaseModel):
     """Optional overrides when publishing a job to the portal."""
     label: str | None = None  # default: "Renderizado" or "Opción N"
     portal_id: str = "argentina"
+    async_publish: bool = False  # new UI uses durable worker; old API stays compatible
 
 
-@app.post("/admin/deliveries/from-job/{job_id}")
-async def admin_create_delivery_from_job(
+def _publish_delivery_now(
     job_id: str,
     body: SendToUMGRequest | None = None,
     current_user: dict = Depends(get_current_user),
@@ -19924,7 +19969,7 @@ async def admin_create_delivery_from_job(
 
     portal_id = _portal_id(body.portal_id if body else None)
 
-    job = db.query(Job).filter(Job.job_id == job_id).first()
+    job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "done" or job.approved_at is None:
@@ -19933,13 +19978,31 @@ async def admin_create_delivery_from_job(
             detail="Job must be approved (status=done) before it can be published",
         )
 
+    # QC is checked before any ProRes work is queued. This prevents spending
+    # time and render capacity preparing a cut that already needs correction.
+    from delivery_qc_runtime import delivery_readiness_gate
+    from delivery_manifest import source_key
+    _delivery_gate = delivery_readiness_gate(
+        job, job.delivery_qc, for_umg_delivery=True,
+    )
+    if _delivery_gate.get("blocked"):
+        raise HTTPException(status_code=409, detail={
+            "code": "delivery_qc_blocked",
+            "message": (
+                "Revisá los puntos pendientes del preflight antes de publicar."
+                if _delivery_gate.get("reason") != "fresh_preflight_required"
+                else "Actualizá el preflight para este corte antes de publicar."
+            ),
+            "delivery_qc": _delivery_gate,
+        })
+
     # Validate all 5 files exist in R2. The three render outputs are hard
     # requirements. ProRes is different: it is a lazy derivative and its
     # post-render prewarm is deliberately best-effort, so an explicit
     # "Enviar a UMG" must recover by force-enqueueing missing masters.
     missing = []
     for ft in _DEFAULT_DELIVERY_FILE_TYPES:
-        key = _r2_key_for_delivery(job.tenant_id, job.job_id, ft)
+        key = source_key(job, ft)
         if not storage.object_exists(key):
             missing.append(ft)
     # Un entregable que el job NUNCA produjo no es un "esperá al render":
@@ -20097,120 +20160,64 @@ async def admin_create_delivery_from_job(
         label = explicit_label or _compute_default_delivery_label(
             ddb, job.artist, job.song_title, portal_id
         )
-    # Identidad del corte que está en R2 ahora. Comparada contra la que se
-    # publicó, es lo que separa "corregí esto y lo mando" de "toqué el botón
-    # dos veces": las keys de R2 son determinísticas, así que sin esto la
-    # fila no tenía forma de saber que los bytes que sirve cambiaron.
+    # Approval and the objects copied to the portal must describe the same
+    # cut. Legacy approvals have no persisted fingerprint/ETag and are
+    # upgraded to a frozen manifest by this publication.
     fingerprint = delivery_freshness.render_fingerprint(job)
-    now = datetime.now(timezone.utc)
-
-    if existing:
-        # Filas actuales comparan el fingerprint. Las legacy sólo cuentan
-        # como contenido nuevo cuando el flujo real de edición dejó su marca
-        # stale: así no anulamos aprobaciones antiguas por la migración, pero
-        # tampoco escondemos Publicar después de corregirlas.
-        content_changed = delivery_freshness.needs_publish(job, existing)
-        existing.label = label
-        existing.file_types = delivery_file_types
-        existing.added_by_user_id = added_by
-        existing.added_at = now
-        # Refresh snapshot in case the artist/title was corrected on the
-        # job row between the original publish and now.
-        existing.artist_snapshot = job.artist
-        existing.song_title_snapshot = job.song_title or ""
-        existing.tenant_snapshot = job.tenant_id
-        existing.portal_id = portal_id
-        existing.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
-        existing.published_render_fingerprint = fingerprint
-        # Un reenvío del mismo corte no reabre nada: la aprobación de UMG
-        # sigue valiendo y la versión no avanza.
-        if content_changed:
-            existing.published_revision = (existing.published_revision or 1) + 1
-            existing.content_updated_at = now
-            # La aprobación era sobre el corte anterior. Dejarla puesta es
-            # lo que hacía que el cliente viera su pastilla verde sobre un
-            # video que nunca miró — y que no le apareciera "Aprobar" para
-            # revisar la corrección que él mismo pidió.
-            existing.approved_at = None
-            existing.approved_by_label = None
-        # El re-render terminó y ya está publicado: se cierra la ventana.
-        existing.stale_since = None
-        existing.stale_reason = None
-        delivery = existing
-        action = "delivery.update"
-    else:
-        content_changed = False
-        delivery = Delivery(
-            job_id=job_id,
-            label=label,
-            file_types=delivery_file_types,
-            artist_snapshot=job.artist,
-            song_title_snapshot=job.song_title or "",
-            tenant_snapshot=job.tenant_id,
-            portal_id=portal_id,
-            frame_size_snapshot=(job.umg_spec or {}).get("frame_size"),
-            added_by_user_id=added_by,
-            added_at=now,
-            published_render_fingerprint=fingerprint,
-            published_revision=1,
-            content_updated_at=now,
-        )
-        ddb.add(delivery)
-        action = "delivery.create"
-
-    # Publicar la corrección ES la respuesta al pedido de cambios. Cerrarlos
-    # a mano después era un paso que se olvidaba, y el cliente veía su pedido
-    # "pendiente" indefinidamente sobre una versión que ya lo contemplaba.
-    # Sólo se cierran los de ESTA fila y sólo cuando hubo contenido nuevo.
-    resolved_requests = []
-    if content_changed:
-        pending_requests = (
-            ddb.query(DeliveryChangeRequest)
-            .filter(DeliveryChangeRequest.delivery_id == delivery.id)
-            .filter(DeliveryChangeRequest.resolved_at.is_(None))
-            .all()
-        )
-        for request in pending_requests:
-            request.resolved_at = now
-            request.resolved_by_user_id = added_by
-            request.resolved_by_revision = delivery.published_revision
-            request.resolution_source = "publication"
-            request.resolution_note = (
-                f"Resuelto al publicar la versión {delivery.published_revision}."
-            )
-            resolved_requests.append(request.id)
-
-    # Commit del delivery (DB externa) PRIMERO: si falla, el AuditLog local no
-    # se escribe y no queda fila de auditoría huérfana. El Job local solo se
-    # leyó, nunca se muta, así que un fallo acá no corrompe estado local.
-    ddb.commit()
-    ddb.refresh(delivery)
-
-    # El listado del portal cachea el tamaño de cada objeto 30 días (son
-    # inmutables… salvo los nuestros). Tras un re-render mostraba el peso del
-    # archivo anterior: el único indicio que tenía el cliente de que algo
-    # había cambiado, apuntando justo para el otro lado.
-    if content_changed:
-        delivery_freshness.clear_size_cache(
-            _r2_key_for_delivery(delivery.tenant_snapshot, delivery.job_id, ft)
-            for ft in (delivery.file_types or [])
-            if ft in _DELIVERY_FILE_TYPES
-        )
-
-    db.add(AuditLog(
-        user_id=current_user["id"],
-        action=action,
-        detail={
-            "job_id": job_id, "label": label, "portal_id": portal_id,
-            "artist": job.artist, "song": job.song_title,
-            "revision": delivery.published_revision,
-            "content_changed": content_changed,
-            "resolved_change_requests": resolved_requests,
-        },
-    ))
-    db.commit()
-
-    return {
+    if job.approved_render_fingerprint and job.approved_render_fingerprint != fingerprint:
+        raise HTTPException(status_code=409, detail={
+            "code": "approved_render_changed",
+            "message": "El video cambió después de aprobarse. Revisá y aprobá el corte actual.",
+        })
+    current_video_etag = storage.object_etag(source_key(job, "video"))
+    if job.approved_video_etag and job.approved_video_etag != current_video_etag:
+        raise HTTPException(status_code=409, detail={
+            "code": "approved_video_changed",
+            "message": "El archivo de video cambió después de aprobarse. Revisá el corte actual.",
+        })
+    from delivery_manifest import (
+        ManifestUnavailable, assert_manifest_source_current,
+        freeze_manifest, publish_record,
+    )
+    # A ProRes copy can take longer than the DB idle-transaction timeout.
+    # Release both sessions before I/O; the frozen manifest is only committed
+    # after a fresh row lock and exact source-ETag comparison below.
+    db.expunge(job)
+    db.rollback()
+    ddb.rollback()
+    try:
+        manifest = freeze_manifest(job, delivery_file_types)
+    except ManifestUnavailable as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "delivery_manifest_unavailable", "message": str(exc),
+        }) from exc
+    except Exception as exc:
+        logger.exception("[DELIVERY] could not freeze job=%s for portal=%s", job_id, portal_id)
+        raise HTTPException(status_code=503, detail={
+            "code": "delivery_manifest_failed",
+            "message": "No se pudieron preparar los archivos del portal. Reintentá el envío.",
+        }) from exc
+    job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
+    if job is None or job.status != "done" or job.approved_at is None:
+        raise HTTPException(status_code=409, detail="El video dejó de estar aprobado durante la preparación.")
+    try:
+        assert_manifest_source_current(job, manifest)
+    except ManifestUnavailable as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "delivery_cut_changed", "message": str(exc),
+        }) from exc
+    if job.approved_render_fingerprint and job.approved_render_fingerprint != manifest.fingerprint:
+        raise HTTPException(status_code=409, detail="El corte aprobado cambió durante la preparación.")
+    if job.approved_video_etag and job.approved_video_etag != manifest.source_etags.get("video"):
+        raise HTTPException(status_code=409, detail="El archivo aprobado cambió durante la preparación.")
+    if delivery_readiness_gate(job, job.delivery_qc, for_umg_delivery=True).get("blocked"):
+        raise HTTPException(status_code=409, detail="Los controles del video cambiaron durante la preparación.")
+    delivery, content_changed, resolved_requests, created = publish_record(
+        ddb, job=job, portal_id=portal_id, added_by=added_by,
+        label=label, manifest=manifest,
+    )
+    action = "delivery.create" if created else "delivery.update"
+    receipt = {
         "ok": True,
         "delivery_id": delivery.id,
         "job_id": delivery.job_id,
@@ -20218,11 +20225,248 @@ async def admin_create_delivery_from_job(
         "artist": delivery.artist_snapshot,
         "song": delivery.song_title_snapshot,
         "portal_id": delivery.portal_id or portal_id,
-        "replaced": action == "delivery.update",
+        "replaced": not created,
         "revision": delivery.published_revision,
+        "manifest_hash": delivery.published_manifest_hash,
         "content_changed": content_changed,
         "resolved_change_requests": resolved_requests,
+        "audit_pending": False,
     }
+
+    # Commit del delivery (DB externa) PRIMERO: si falla, el AuditLog local no
+    # se escribe y no queda fila de auditoría huérfana. El Job local solo se
+    # leyó, nunca se muta, así que un fallo acá no corrompe estado local.
+    ddb.commit()
+    db.rollback()  # release the job lock before cache/network and local audit
+
+    # El listado del portal cachea el tamaño de cada objeto 30 días (son
+    # inmutables… salvo los nuestros). Tras un re-render mostraba el peso del
+    # archivo anterior: el único indicio que tenía el cliente de que algo
+    # había cambiado, apuntando justo para el otro lado.
+    if content_changed:
+        delivery_freshness.clear_size_cache(manifest.keys.values())
+
+    # The portal commit is the publication fact. Local audit is a replica;
+    # its failure must not tell the operator that a committed cut failed.
+    try:
+        db.add(AuditLog(
+            user_id=current_user["id"], action=action,
+            detail={
+                "job_id": job_id, "label": receipt["label"], "portal_id": portal_id,
+                "artist": receipt["artist"], "song": receipt["song"],
+                "revision": receipt["revision"],
+                "manifest_hash": receipt["manifest_hash"],
+                "content_changed": content_changed,
+                "resolved_change_requests": resolved_requests,
+            },
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        receipt["audit_pending"] = True
+        logger.exception("[DELIVERY] local audit failed after portal commit delivery=%s revision=%s",
+                         receipt["delivery_id"], receipt["revision"])
+    return receipt
+
+
+def _enqueue_single_delivery(operation_id: str) -> bool:
+    """Schedule the potentially multi-GB snapshot copy outside HTTP."""
+    try:
+        from queue_jobs import _init_redis, rq_payload_metadata
+        from rq import Queue
+        redis, _, _ = _init_redis()
+        if redis is None:
+            return False
+        Queue("campaign_control", connection=redis).enqueue(
+            process_single_delivery, operation_id,
+            job_id=f"single-delivery:{operation_id}",
+            job_timeout=3600, result_ttl=3600, failure_ttl=86400,
+            meta=rq_payload_metadata("campaign_control"),
+        )
+        return True
+    except Exception:
+        logger.exception("[DELIVERY] could not queue operation=%s", operation_id)
+        return False
+
+
+def process_single_delivery(operation_id: str) -> None:
+    """RQ entry point. Publishing is idempotent across retries and restarts."""
+    from database import DeliveryPublishOperation, DeliveriesSessionLocal, SessionLocal
+    db = SessionLocal()
+    ddb = DeliveriesSessionLocal()
+    try:
+        operation = db.query(DeliveryPublishOperation).filter(
+            DeliveryPublishOperation.id == operation_id,
+        ).with_for_update().first()
+        if operation is None or operation.status in {"completed", "sending"}:
+            db.rollback()
+            return
+        operation.status = "sending"
+        operation.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        try:
+            job = db.query(Job).filter(Job.job_id == operation.job_id).first()
+            if job is None or delivery_freshness.render_fingerprint(job) != operation.expected_fingerprint:
+                raise HTTPException(status_code=409, detail={
+                    "code": "approved_render_changed",
+                    "message": "El corte cambió desde que se solicitó el envío. Revisá y volvé a publicar.",
+                })
+            result = _publish_delivery_now(
+                operation.job_id,
+                SendToUMGRequest(portal_id=operation.portal_id, label=operation.label),
+                current_user={"id": operation.created_by, "role": "admin"},
+                db=db, ddb=ddb,
+            )
+            if isinstance(result, JSONResponse):
+                # ProRes was queued after the operation began. Keep the
+                # operation visible; reaper will retry when files appear.
+                operation.status = "waiting_files"
+                operation.error = {"code": "preparing_prores"}
+            else:
+                operation.status = "completed"
+                operation.result = result
+                operation.error = None
+        except HTTPException as exc:
+            db.rollback()
+            ddb.rollback()
+            operation = db.query(DeliveryPublishOperation).filter(
+                DeliveryPublishOperation.id == operation_id,
+            ).with_for_update().one()
+            operation.status = "failed"
+            operation.error = exc.detail if isinstance(exc.detail, dict) else {
+                "code": "publication_blocked", "message": str(exc.detail),
+            }
+        except Exception:
+            logger.exception("[DELIVERY] operation=%s failed", operation_id)
+            db.rollback()
+            ddb.rollback()
+            operation = db.query(DeliveryPublishOperation).filter(
+                DeliveryPublishOperation.id == operation_id,
+            ).with_for_update().one()
+            operation.status = "failed"
+            operation.error = {"code": "publication_failed", "message": "No se pudo completar el envío. Reintentá."}
+        operation.updated_at = datetime.now(timezone.utc)
+        db.commit()
+    finally:
+        ddb.close()
+        db.close()
+
+
+@app.post("/admin/deliveries/from-job/{job_id}")
+def admin_create_delivery_from_job(
+    job_id: str,
+    body: SendToUMGRequest | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """Publish directly for legacy callers or queue a durable UI operation."""
+    from database import DeliveryPublishOperation
+    import uuid
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    if not body or not body.async_publish:
+        return _publish_delivery_now(
+            job_id, body, current_user=current_user, db=db, ddb=ddb,
+        )
+    portal_id = _portal_id(body.portal_id if body else None)
+    job = db.query(Job).filter(Job.job_id == job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "done" or job.approved_at is None:
+        raise HTTPException(status_code=409, detail="Aprobá el video antes de publicarlo.")
+    fingerprint = delivery_freshness.render_fingerprint(job)
+    existing = db.query(DeliveryPublishOperation).filter(
+        DeliveryPublishOperation.job_id == job_id,
+        DeliveryPublishOperation.portal_id == portal_id,
+        DeliveryPublishOperation.expected_fingerprint == fingerprint,
+        DeliveryPublishOperation.status.in_(("queued", "sending", "waiting_worker", "waiting_files")),
+    ).order_by(DeliveryPublishOperation.created_at.desc()).first()
+    if existing:
+        return JSONResponse(status_code=202, content={
+            "operation_id": existing.id, "status": existing.status,
+            "scheduled": existing.status != "waiting_worker",
+        })
+    operation = DeliveryPublishOperation(
+        id=str(uuid.uuid4()), job_id=job_id, portal_id=portal_id,
+        label=body.label if body else None, created_by=current_user["id"],
+        expected_fingerprint=fingerprint, status="queued",
+        created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+    )
+    db.add(operation)
+    db.commit()
+    scheduled = _enqueue_single_delivery(operation.id)
+    if not scheduled:
+        operation.status = "waiting_worker"
+        db.commit()
+    return JSONResponse(status_code=202, content={
+        "operation_id": operation.id, "status": operation.status,
+        "scheduled": scheduled,
+    })
+
+
+@app.get("/admin/delivery-operations/{operation_id}")
+def get_single_delivery_operation(
+    operation_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from database import DeliveryPublishOperation
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    operation = db.query(DeliveryPublishOperation).filter(
+        DeliveryPublishOperation.id == operation_id,
+    ).first()
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Publication operation not found")
+    return {
+        "operation_id": operation.id, "job_id": operation.job_id,
+        "portal_id": operation.portal_id, "status": operation.status,
+        "result": operation.result, "error": operation.error,
+        "updated_at": operation.updated_at.isoformat() if operation.updated_at else None,
+    }
+
+
+def recover_single_delivery_operations(limit: int = 20) -> int:
+    """Requeue missing workers, timed-out workers and completed ProRes jobs."""
+    from database import DeliveryPublishOperation, SessionLocal
+    db = SessionLocal()
+    try:
+        stale_worker = datetime.now(timezone.utc) - timedelta(minutes=75)
+        operations = db.query(DeliveryPublishOperation).filter(
+            (DeliveryPublishOperation.status.in_(("waiting_worker", "waiting_files")))
+            | ((DeliveryPublishOperation.status == "sending")
+               & (DeliveryPublishOperation.updated_at < stale_worker))
+            | ((DeliveryPublishOperation.status == "queued")
+               & (DeliveryPublishOperation.updated_at < stale_worker)),
+        ).order_by(DeliveryPublishOperation.created_at).limit(limit).all()
+        resumed = 0
+        for operation in operations:
+            if operation.status == "waiting_files":
+                job = db.query(Job).filter(Job.job_id == operation.job_id).first()
+                if job is None:
+                    continue
+                required = ["umg_master"]
+                if job.short_url or (job.s3_keys or {}).get("short"):
+                    required.append("umg_short")
+                from delivery_manifest import source_key
+                if any(
+                    not (job.s3_keys or {}).get(ft)
+                    or not storage.object_exists(source_key(job, ft))
+                    for ft in required
+                ):
+                    continue
+            if _enqueue_single_delivery(operation.id):
+                operation.status = "queued"
+                operation.updated_at = datetime.now(timezone.utc)
+                resumed += 1
+        if resumed:
+            db.commit()
+        else:
+            db.rollback()
+        return resumed
+    finally:
+        db.close()
 
 
 def _compute_default_delivery_label(
@@ -20348,6 +20592,7 @@ async def portal_submit_change_request(
     cr = DeliveryChangeRequest(
         delivery_id=delivery_id,
         comment=comment,
+        requested_revision=delivery.published_revision or 1,
     )
     ddb.add(cr)
     ddb.commit()
@@ -20401,6 +20646,7 @@ async def portal_submit_change_request(
 @app.post("/api/deliveries/{delivery_id}/approve")
 async def portal_approve_delivery(
     delivery_id: int,
+    body: dict | None = None,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_db),
@@ -20421,10 +20667,35 @@ async def portal_approve_delivery(
         _portal_delivery_query(ddb.query(Delivery), portal_id)
         .filter(Delivery.id == delivery_id)
         .filter(Delivery.removed_at.is_(None))
+        .with_for_update()
         .first()
     )
     if not delivery:
         raise HTTPException(status_code=404, detail="Delivery no encontrada.")
+    # A render can replace the deterministic R2 keys before the operator
+    # publishes the new cut.  Never let the client approve an in-flight or
+    # failed update as if it were the published revision.
+    if delivery.stale_since is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "delivery_update_pending",
+                "message": "Esta entrega se está actualizando. Esperá a que publiquemos la nueva versión para aprobarla.",
+                "revision": delivery.published_revision or 1,
+            },
+        )
+    expected_revision = (body or {}).get("expected_revision") if isinstance(body, dict) else None
+    expected_manifest_hash = (body or {}).get("expected_manifest_hash") if isinstance(body, dict) else None
+    if expected_revision is not None and str(expected_revision) != str(delivery.published_revision or 1):
+        raise HTTPException(status_code=409, detail={
+            "code": "delivery_revision_changed",
+            "message": "La versión cambió. Actualizá el portal y revisá el corte publicado.",
+        })
+    if expected_manifest_hash is not None and expected_manifest_hash != delivery.published_manifest_hash:
+        raise HTTPException(status_code=409, detail={
+            "code": "delivery_manifest_changed",
+            "message": "Los archivos cambiaron. Actualizá el portal y revisá esta versión.",
+        })
     if delivery.approved_at is not None:
         return {
             "ok": True,
@@ -20434,24 +20705,32 @@ async def portal_approve_delivery(
         }
     delivery.approved_at = datetime.now(timezone.utc)
     delivery.approved_by_label = "UMG"
-    ddb.commit()
-    db.add(AuditLog(
-        user_id=None,
-        action="delivery.approve",
-        detail={
-            "delivery_id": delivery_id,
-            "job_id": delivery.job_id,
-            "artist": delivery.artist_snapshot,
-            "song": delivery.song_title_snapshot,
-            "label": delivery.label,
-        },
-    ))
-    db.commit()
-    return {
+    delivery.approved_revision = delivery.published_revision or 1
+    approval_receipt = {
         "ok": True,
         "approved_at": delivery.approved_at.isoformat(),
         "approved_by_label": delivery.approved_by_label,
+        "audit_pending": False,
     }
+    audit_detail = {
+        "delivery_id": delivery_id,
+        "job_id": delivery.job_id,
+        "artist": delivery.artist_snapshot,
+        "song": delivery.song_title_snapshot,
+        "label": delivery.label,
+        "revision": delivery.approved_revision,
+        "manifest_hash": delivery.published_manifest_hash,
+    }
+    ddb.commit()
+    try:
+        db.add(AuditLog(user_id=None, action="delivery.approve", detail=audit_detail))
+        db.commit()
+    except Exception:
+        db.rollback()
+        approval_receipt["audit_pending"] = True
+        logger.exception("[DELIVERY] local approval audit failed after portal commit delivery=%s",
+                         delivery_id)
+    return approval_receipt
 
 
 @app.post("/api/deliveries/{delivery_id}/un-approve")
@@ -20479,19 +20758,24 @@ async def portal_unapprove_delivery(
         return {"ok": True, "already_pending": True}
     delivery.approved_at = None
     delivery.approved_by_label = None
+    delivery.approved_revision = None
+    audit_detail = {
+        "delivery_id": delivery_id,
+        "job_id": delivery.job_id,
+        "artist": delivery.artist_snapshot,
+        "song": delivery.song_title_snapshot,
+    }
     ddb.commit()
-    db.add(AuditLog(
-        user_id=None,
-        action="delivery.un_approve",
-        detail={
-            "delivery_id": delivery_id,
-            "job_id": delivery.job_id,
-            "artist": delivery.artist_snapshot,
-            "song": delivery.song_title_snapshot,
-        },
-    ))
-    db.commit()
-    return {"ok": True}
+    audit_pending = False
+    try:
+        db.add(AuditLog(user_id=None, action="delivery.un_approve", detail=audit_detail))
+        db.commit()
+    except Exception:
+        db.rollback()
+        audit_pending = True
+        logger.exception("[DELIVERY] local unapprove audit failed after portal commit delivery=%s",
+                         delivery_id)
+    return {"ok": True, "audit_pending": audit_pending}
 
 
 @app.get("/api/deliveries/meta")
@@ -20531,6 +20815,7 @@ async def portal_get_items(
     portal_id = _verify_portal_token(x_portal_token, x_portal_id)
     import time
     from concurrent.futures import ThreadPoolExecutor
+    from delivery_manifest import published_key
 
     now = time.time()
     deliveries = (
@@ -20550,10 +20835,16 @@ async def portal_get_items(
     # the old per-iteration except.
     head_jobs: list[tuple[int, str, str]] = []  # (delivery_idx, file_type, r2_key)
     for di, d in enumerate(deliveries):
+        if d.stale_since is not None and not d.published_file_keys:
+            # Legacy mutable keys may already contain a partial new cut.
+            # Do not issue fresh long-lived signed URLs during that window.
+            continue
         for ft in (d.file_types or []):
             if ft not in _DELIVERY_FILE_TYPES:
                 continue
-            r2_key = _r2_key_for_delivery(d.tenant_snapshot, d.job_id, ft)
+            r2_key = published_key(d, ft)
+            if not r2_key:
+                continue
             head_jobs.append((di, ft, r2_key))
 
     size_map: dict[tuple[int, str], int | None] = {}
@@ -20646,12 +20937,15 @@ async def portal_get_items(
         files = []
         preview_url: str | None = None
         short_preview_url: str | None = None
+        paused_legacy = d.stale_since is not None and not d.published_file_keys
         for ft in (d.file_types or []):
             if ft not in _DELIVERY_FILE_TYPES:
                 continue
-            r2_key = _r2_key_for_delivery(d.tenant_snapshot, d.job_id, ft)
+            r2_key = published_key(d, ft)
             dl_name = f"{_delivery_safe_filename(d.artist_snapshot, d.song_title_snapshot)}.{_DELIVERY_FILE_TYPES[ft]['ext']}"
             try:
+                if paused_legacy or not r2_key:
+                    raise RuntimeError("delivery file unavailable")
                 url = storage.generate_signed_url(
                     r2_key,
                     expiry_seconds=_DELIVERY_URL_EXPIRY_S,
@@ -20696,13 +20990,17 @@ async def portal_get_items(
             # admin_create_delivery_from_job): la aprobación era sobre el
             # corte anterior, así que el portal vuelve a ofrecer Aprobar /
             # Rechazar sin que haya que tocar nada del lado del cliente.
-            "approved_at": d.approved_at.isoformat() if d.approved_at else None,
+            "approved_at": (
+                d.approved_at.isoformat() if d.approved_at and not paused_legacy else None
+            ),
             "approved_by_label": d.approved_by_label,
             # Estado de frescura de lo que se está sirviendo. El archivo
             # detrás de la descarga se reemplaza en su lugar, así que sin
             # esto el cliente no tiene forma de enterarse de que hay un
             # corte nuevo — ni de que hay uno en camino.
             "revision": d.published_revision or 1,
+            "manifest_hash": d.published_manifest_hash,
+            "download_paused": paused_legacy,
             "content_updated_at": (
                 d.content_updated_at.isoformat() if d.content_updated_at else None
             ),
@@ -20814,6 +21112,11 @@ async def admin_list_change_requests(
         j.job_id: j
         for j in (db.query(_JobModel).filter(_JobModel.job_id.in_(job_ids)).all() if job_ids else [])
     }
+    from delivery_qc_runtime import delivery_readiness_gate
+    qc_gate_by_jobid = {
+        job_id: delivery_readiness_gate(job, job.delivery_qc, for_umg_delivery=True)
+        for job_id, job in jobs_by_jobid.items()
+    }
     owner_ids = list({j.user_id for j in jobs_by_jobid.values() if j and j.user_id})
     owners_by_id = {
         u.id: u
@@ -20854,6 +21157,9 @@ async def admin_list_change_requests(
             return None
 
     items = []
+    from change_request_parser import parse_change_request
+    from change_request_workflow import project_change_request
+    import hashlib
     for cr in crs:
         d = deliveries_by_id.get(cr.delivery_id)
         resolver = users_by_id.get(cr.resolved_by_user_id) if cr.resolved_by_user_id else None
@@ -20878,15 +21184,42 @@ async def admin_list_change_requests(
             # ofrecer un botón que inevitablemente termina en 409 y permite
             # abrir la configuración ProRes en esta misma tarjeta.
             publication["prores_configured"] = bool(job and job.umg_spec)
+        current_render_fingerprint = (
+            delivery_freshness.render_fingerprint(job) if job else None
+        )
+        parsed_request = parse_change_request(cr.comment or "")
+        verification_current = bool(
+            cr.verified_at and current_render_fingerprint
+            and cr.verified_render_fingerprint == current_render_fingerprint
+            and (cr.verification_evidence or {}).get("parser_version")
+                == parsed_request["schema_version"]
+            and (cr.verification_evidence or {}).get("request_sha256")
+                == hashlib.sha256((cr.comment or "").encode()).hexdigest()
+        )
+        workflow = project_change_request(
+            cr, job=job, delivery=d, publication=publication,
+            verification_current=verification_current,
+            proposal_status=proposal_status,
+            qc_gate=qc_gate_by_jobid.get(job.job_id) if job else None,
+        )
         items.append({
             "id": cr.id,
             "comment": cr.comment,
             "submitted_at": cr.submitted_at.isoformat() if cr.submitted_at else None,
+            "requested_revision": cr.requested_revision,
             "resolved_at": cr.resolved_at.isoformat() if cr.resolved_at else None,
             "resolution_note": cr.resolution_note,
             "resolved_by": resolver.username if resolver else None,
             "resolved_by_revision": cr.resolved_by_revision,
             "resolution_source": cr.resolution_source,
+            "instructions": parsed_request["instructions"],
+            "verification": {
+                "verified_at": cr.verified_at.isoformat() if cr.verified_at else None,
+                "current": verification_current,
+                "stale": bool(cr.verified_at and not verification_current),
+                "render_fingerprint": current_render_fingerprint,
+            },
+            "workflow": workflow,
             "proposal": (
                 {
                     "id": proposal.id,
@@ -21788,6 +22121,96 @@ async def admin_create_credit_grants(
     }
 
 
+class ChangeRequestVerifyBody(BaseModel):
+    expected_render_fingerprint: str = Field(min_length=64, max_length=64)
+    instruction_ids: list[str] = Field(max_length=200)
+    confirmed_complete_request: bool
+
+
+@app.post("/admin/change-requests/{cr_id}/verify")
+async def admin_verify_change_request(
+    cr_id: int,
+    body: ChangeRequestVerifyBody,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    ddb: Session = Depends(get_deliveries_db),
+):
+    """Attest every parsed instruction and the original comment on one cut.
+
+    Parsing is only a navigation aid: the explicit whole-comment confirmation
+    covers instructions a conservative parser may not understand. This does
+    not resolve a request; publication of the verified cut does that.
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    cr, delivery = _change_request_context(ddb, cr_id)
+    if cr.resolved_at is not None:
+        raise HTTPException(status_code=409, detail="change_request_already_resolved")
+    job = db.query(Job).filter(Job.job_id == delivery.job_id).with_for_update().first()
+    delivery = ddb.query(Delivery).filter(Delivery.id == delivery.id).with_for_update().one()
+    cr = ddb.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).with_for_update().one()
+    if cr.resolved_at is not None:
+        raise HTTPException(status_code=409, detail="change_request_already_resolved")
+    if job is None or job.status != "done" or job.approved_at is None:
+        raise HTTPException(status_code=409, detail={
+            "code": "final_cut_not_approved",
+            "message": "Aprobá internamente el video final antes de verificar el pedido.",
+        })
+    fingerprint = delivery_freshness.render_fingerprint(job)
+    if body.expected_render_fingerprint != fingerprint:
+        raise HTTPException(status_code=409, detail={
+            "code": "change_request_cut_changed",
+            "message": "El video cambió. Revisá de nuevo el pedido sobre el corte actual.",
+        })
+    if job.approved_render_fingerprint and job.approved_render_fingerprint != fingerprint:
+        raise HTTPException(status_code=409, detail="approved_render_changed")
+    if job.approved_video_etag:
+        from delivery_manifest import source_key
+        current_etag = storage.object_etag(source_key(job, "video"))
+        if current_etag != job.approved_video_etag:
+            raise HTTPException(status_code=409, detail="approved_video_changed")
+    from change_request_parser import parse_change_request
+    parsed = parse_change_request(cr.comment or "")
+    expected_ids = {row["id"] for row in parsed["instructions"]}
+    if not body.confirmed_complete_request or set(body.instruction_ids) != expected_ids:
+        raise HTTPException(status_code=400, detail={
+            "code": "change_request_verification_incomplete",
+            "message": "Confirmá cada punto y el comentario completo antes de publicar.",
+        })
+    import hashlib
+    now = datetime.now(timezone.utc)
+    cr.verified_render_fingerprint = fingerprint
+    cr.verified_at = now
+    cr.verified_by_user_id = current_user["id"]
+    cr.verification_evidence = {
+        "request_sha256": hashlib.sha256((cr.comment or "").encode()).hexdigest(),
+        "parser_version": parsed["schema_version"],
+        "instruction_ids": sorted(expected_ids),
+        "confirmed_complete_request": True,
+        "render_fingerprint": fingerprint,
+        "verified_at": now.isoformat(),
+    }
+    receipt = {"ok": True, "verified_at": now.isoformat(),
+               "instruction_count": len(expected_ids),
+               "render_fingerprint": fingerprint, "audit_pending": False}
+    audit_detail = {"change_request_id": cr_id, "delivery_id": delivery.id,
+                    "job_id": job.job_id, "instruction_count": len(expected_ids),
+                    "render_fingerprint": fingerprint}
+    ddb.commit()
+    db.rollback()  # Release the Job lock before best-effort local audit.
+    try:
+        db.add(AuditLog(
+            user_id=current_user["id"], action="delivery.change_request.verify",
+            detail=audit_detail,
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Local audit failed after change request verification %s", cr_id)
+        receipt["audit_pending"] = True
+    return receipt
+
+
 @app.post("/admin/change-requests/{cr_id}/resolve")
 async def admin_resolve_change_request(
     cr_id: int,
@@ -21796,8 +22219,7 @@ async def admin_resolve_change_request(
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
-    """Mark a change request resolved. Optional resolution_note (<=2000 chars)
-    so the operator can leave a one-liner explaining what was done."""
+    """Close a request manually with a short explanation (<=2000 chars)."""
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
     cr = ddb.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id).first()
@@ -21808,12 +22230,14 @@ async def admin_resolve_change_request(
         # double-click in the UI doesn't surface a scary error.
         return {"ok": True, "already_resolved": True}
     note = ((body or {}).get("resolution_note") or "").strip() if isinstance(body, dict) else ""
+    if not note:
+        raise HTTPException(status_code=400, detail="Explicá por qué se resuelve manualmente este pedido.")
     if len(note) > 2000:
         raise HTTPException(status_code=400, detail="resolution_note too long (max 2000)")
     cr.resolved_at = datetime.now(timezone.utc)
     # resolved_by_user_id es FK a users de la DB de deliveries → mapear.
     cr.resolved_by_user_id = deliveries_added_by(current_user["id"])
-    cr.resolution_note = note or None
+    cr.resolution_note = note
     # Cerrado a mano: el operador decidió que está atendido (puede no haber
     # versión nueva — una aclaración, un pedido descartado). Se distingue
     # del cierre automático al publicar una corrección.

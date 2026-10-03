@@ -114,6 +114,45 @@ def test_admin_can_approve_cross_tenant_job(
     assert access_log.detail["kind"] == "approve_job"
 
 
+def test_umg_approval_requires_signed_current_video_review(client, db):
+    from delivery_qc_runtime import (
+        MANUAL_ATTESTATION_CODE, delivery_qc_source_fingerprint,
+        delivery_qc_visual_fingerprint, segments_hash,
+    )
+
+    owner_token, owner = _register(client, "approval_umg_review")
+    job_id = _seed_pending_review(db, owner)
+    job = db.query(Job).filter(Job.job_id == job_id).one()
+    job.delivery_profile = "umg"
+    job.umg_spec = {"frame_size": "HD", "fps": 29.97}
+    now = datetime.now(timezone.utc).isoformat()
+    job.delivery_qc = {
+        "status": "COMPLETE", "mode": "enforce", "generated_at": now,
+        "segments_revision": int(job.segments_revision or 0),
+        "segments_hash": segments_hash(job.segments_json or []),
+        "delivery_spec": dict(job.umg_spec),
+        "source_fingerprint": delivery_qc_source_fingerprint(job),
+        "visual_fingerprint": delivery_qc_visual_fingerprint(job),
+        "render_identity": {"edit_count": int(job.edit_count or 0)},
+            "issues": [{
+                "issue_id": "manual-final-review", "code": MANUAL_ATTESTATION_CODE,
+                "status": "OPEN", "severity": "WARN", "result_status": "REVIEW",
+                "manual_verification_required": True,
+            }],
+    }
+    db.commit()
+
+    response = client.post(
+        f"/approve/{job_id}", headers=_auth(owner_token), json={"notes": ""},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "delivery_qc_blocked"
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "manual_review_required"
+    db.expire_all()
+    assert db.query(Job).filter(Job.job_id == job_id).one().status == "pending_review"
+
+
 def test_admin_override_can_approve_campaign_qc_blocker_with_audit(
     client, admin_token, admin_user_id, db,
 ):

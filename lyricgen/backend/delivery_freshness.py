@@ -1,11 +1,8 @@
-"""Does the portal serve the cut the client actually approved?
+"""Track which render revision has been published to each UMG portal.
 
-The deliverables portal never stores a file or a frozen URL. It rebuilds
-the R2 key from (tenant, job_id, file_type) and signs it on demand, and
-the render pipeline writes every re-render to that same key. So a
-correction reaches the client with no new link — which is the behaviour
-we want — but also with no trace: same row, same date, same green
-"aprobado por UMG" pill over content they never saw.
+Legacy deliveries rebuilt mutable R2 keys from job identity; a re-render
+could replace bytes under an old approval. New publications sign immutable
+manifest keys and update the portal pointer only after the cut is prepared.
 
 Two things went wrong because of that, both observed in production:
 
@@ -308,6 +305,12 @@ def publication_state(job, delivery) -> dict:
     # Fingerprinted rows compare exact render identity. Legacy rows stay
     # quiet unless a real edit path marked them stale before re-rendering.
     changed = needs_publish(job, delivery)
+    approval_current = bool(
+        job and job.approved_at and (
+            not job.approved_render_fingerprint
+            or job.approved_render_fingerprint == render_fingerprint(job)
+        )
+    )
     return {
         "revision": delivery.published_revision or 1,
         "content_updated_at": (
@@ -328,4 +331,5 @@ def publication_state(job, delivery) -> dict:
             delivery.content_updated_at and delivery.approved_at is None
         ),
         "job_status": getattr(job, "status", None),
+        "internal_approval_current": approval_current,
     }

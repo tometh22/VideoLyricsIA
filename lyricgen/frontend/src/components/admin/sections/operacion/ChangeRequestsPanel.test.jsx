@@ -23,6 +23,7 @@ const BASE_PUBLICATION = {
   prores_configured: true,
   awaiting_review: false,
   job_status: "done",
+  internal_approval_current: true,
 };
 
 const REQUEST = {
@@ -104,6 +105,47 @@ describe("publicationStatus", () => {
     expect(status.canPublish).toBe(true);
   });
 
+  it("routes an unapproved new cut to internal review before publication", () => {
+    renderPanel({ publication: {
+      ...BASE_PUBLICATION, needs_publish: true, internal_approval_current: false,
+    } });
+    expect(screen.getByRole("link", { name: "Revisar y aprobar video" }))
+      .toHaveAttribute("href", expect.stringContaining("qc_focus=manual"));
+    expect(screen.getByRole("button", { name: "Publicar actualización" })).toBeDisabled();
+  });
+
+  it("uses the server workflow when QC blocks a cut that looks publishable", () => {
+    renderPanel({
+      publication: { ...BASE_PUBLICATION, needs_publish: true },
+      workflow: {
+        phase: "needs_review", next_action: "review_qc",
+        next_action_label: "Completar controles del video",
+        allowed_actions: ["edit"],
+        blockers: [{ code: "fresh_preflight_required", message: "Falta revisión actual." }],
+      },
+    });
+    expect(screen.getByText("Falta revisión actual.")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Revisar y aprobar video" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Publicar actualización" })).toBeDisabled();
+  });
+
+  it("shows a render action after proposal application while the old video remains done", () => {
+    renderPanel({
+      publication: {
+        ...BASE_PUBLICATION, needs_publish: true, internal_approval_current: false,
+      },
+      workflow: {
+        phase: "changes_saved", next_action: "render_changes",
+        next_action_label: "Generar video actualizado",
+        allowed_actions: ["render_changes", "edit"], blockers: [],
+      },
+    });
+    expect(screen.getByText("Cambios guardados; falta generar el video")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Generar video actualizado" }))
+      .toHaveAttribute("href", expect.stringContaining("change_request_id=7"));
+    expect(screen.getByRole("button", { name: "Publicar actualización" })).toBeDisabled();
+  });
+
   it("does not offer publishing when the portal already has this cut", () => {
     expect(publicationStatus(BASE_PUBLICATION).canPublish).toBe(false);
   });
@@ -169,6 +211,63 @@ describe("buildLyricsPreview", () => {
 });
 
 describe("ChangeRequestsPanel", () => {
+  it("selects a case from the queue and keeps its location in the URL", () => {
+    const other = {
+      ...REQUEST, id: 8, comment: "Cambiar el fondo",
+      delivery: { ...REQUEST.delivery, artist: "Los Prisioneros", song: "Tren al Sur", portal_id: "argentina" },
+    };
+    renderPanel({}, { changeRequests: [REQUEST, other] });
+
+    expect(screen.getByRole("heading", { name: "Yo vengo de San Rosendo" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Los Prisioneros · Tren al Sur/ }));
+    expect(screen.getByRole("heading", { name: "Tren al Sur" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Yo vengo de San Rosendo" })).not.toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).get("change_request_id")).toBe("8");
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("filters cases by portal and search without changing the selected case's data", () => {
+    const other = {
+      ...REQUEST, id: 8, comment: "Cambiar el fondo",
+      delivery: { ...REQUEST.delivery, artist: "Los Prisioneros", song: "Tren al Sur", portal_id: "argentina" },
+    };
+    renderPanel({}, { changeRequests: [REQUEST, other] });
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Filtrar por portal" }), {
+      target: { value: "argentina" },
+    });
+    expect(screen.getByRole("heading", { name: "Tren al Sur" })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Buscar pedido" }), {
+      target: { value: "San Rosendo" },
+    });
+    expect(screen.queryByRole("heading", { name: "Tren al Sur" })).not.toBeInTheDocument();
+    expect(screen.getByText("Sin pedidos pendientes")).toBeInTheDocument();
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("filters the queue by the backend workflow stage", () => {
+    const ready = {
+      ...REQUEST, id: 8,
+      delivery: { ...REQUEST.delivery, artist: "Los Prisioneros", song: "Tren al Sur" },
+      workflow: {
+        phase: "ready_to_publish", next_action_label: "Publicar actualización",
+        allowed_actions: ["publish"], blockers: [],
+      },
+    };
+    renderPanel({ workflow: {
+      phase: "needs_edit", next_action_label: "Aplicar los cambios pedidos",
+      allowed_actions: ["edit"], blockers: [],
+    } }, { changeRequests: [REQUEST, ready] });
+    fireEvent.change(screen.getByRole("combobox", { name: "Filtrar por etapa" }), {
+      target: { value: "ready_to_publish" },
+    });
+    expect(screen.getByRole("heading", { name: "Tren al Sur" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Yo vengo de San Rosendo" })).not.toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).get("change_stage"))
+      .toBe("ready_to_publish");
+    window.history.replaceState({}, "", "/");
+  });
+
   it("offers the two steps that actually answer the request", () => {
     renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true } });
     expect(screen.getByText("Editar letra")).toHaveAttribute(
@@ -176,6 +275,21 @@ describe("ChangeRequestsPanel", () => {
     );
     expect(screen.getByRole("button", { name: "Publicar actualización" }))
       .toBeEnabled();
+  });
+
+  it("offers a direct path to the delivery review after the QC gate blocks publication", () => {
+    renderPanel({}, {
+      crPublishNotice: {
+        tone: "wait",
+        text: "Falta firmar la revisión del video para este corte.",
+        actionLabel: "Completar revisión del video",
+        actionHref: "/videos/f7752c6feed4?qc_focus=manual&return_to=%2Fadmin%3Fsection%3Dcambios%26change_request_id%3D7",
+      },
+    });
+
+    expect(screen.getByText(/Falta firmar la revisión del video/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Completar revisión del video" }))
+      .toHaveAttribute("href", expect.stringContaining("qc_focus=manual"));
   });
 
   it("publishes to the portal the delivery belongs to", () => {

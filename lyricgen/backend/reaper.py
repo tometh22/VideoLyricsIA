@@ -1287,6 +1287,24 @@ def _reap_all_stuck_inner(threshold_min: int) -> int:
             except Exception as e:
                 logger.warning("[REAPER] delivery retention sweep failed: %s", e)
 
+        # A delivery operation is durable even when Redis was unavailable at
+        # creation. The single-runner reaper reconnects waiting batches.
+        try:
+            from art_track_campaigns import recover_waiting_delivery_batches
+            resumed = recover_waiting_delivery_batches()
+            if resumed:
+                logger.info("[REAPER] resumed %s waiting delivery batches", resumed)
+        except Exception as e:
+            logger.warning("[REAPER] delivery batch recovery failed: %s", e)
+
+        try:
+            from main import recover_single_delivery_operations
+            resumed = recover_single_delivery_operations()
+            if resumed:
+                logger.info("[REAPER] resumed %s individual deliveries", resumed)
+        except Exception as e:
+            logger.warning("[REAPER] individual delivery recovery failed: %s", e)
+
         _n_tr = _n_up = _n_ed = 0
         for job in abandoned:
             try:

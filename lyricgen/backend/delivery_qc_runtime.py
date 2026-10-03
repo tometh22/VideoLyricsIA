@@ -31,6 +31,19 @@ MANDATORY_REVIEW_CHECKS = (
     ("UMG_IMAGE_NOT_STRETCHED", "Imagen sin estirar", "Confirmar proporción nativa/reencuadre sin deformación ni estiramiento."),
 )
 
+# One operator attestation covers the visual review of the current render.
+# The individual checklist entries above remain visible as REVIEW/NOT_RUN
+# evidence, but asking operators to sign eight generic reminders duplicated
+# the same task and trapped publication behind a checklist with no objective
+# findings.
+MANUAL_ATTESTATION_CODE = "UMG_FINAL_REVIEW"
+MANUAL_ATTESTATION_SUMMARY = "Revisión final del corte"
+MANUAL_ATTESTATION_DESCRIPTION = (
+    "Confirmá una vez que revisaste el video completo: encuadre y fondo, "
+    "continuidad e iluminación, legibilidad de las letras, sincronía y "
+    "coincidencia del título con la metadata."
+)
+
 # Reports generated before the evidence-based checklist was introduced did
 # not persist ``result_status`` or ``manual_verification_required``. Keep
 # their stable UMG codes review-only when read by the approval gate, otherwise
@@ -79,29 +92,26 @@ CHECK_DEFINITIONS = (
 
 
 def mandatory_reviewer_issues() -> list[dict[str, Any]]:
-    """Return unsigned checks as review requirements, not false failures.
+    """Return one signed visual review requirement, not eight false failures.
 
-    ``severity=FAIL`` is retained for compatibility with existing persisted
-    reports and analytics.  ``result_status=REVIEW`` is the authoritative
-    meaning: the video has not failed this check; a reviewer still has to sign
-    it before a batch delivery is considered fully reviewed.
+    ``result_status=REVIEW`` is the authoritative meaning: the video has not
+    failed this check; one reviewer signs the complete current cut before a
+    UMG/batch delivery is considered fully reviewed.
     """
     return [{
-        "code": code,
-        "severity": "FAIL",
+        "code": MANUAL_ATTESTATION_CODE,
+        "severity": "WARN",
         "result_status": "REVIEW",
         "category": "umg_manual_checklist",
-        "summary": summary,
-        "description": description,
+        "summary": MANUAL_ATTESTATION_SUMMARY,
+        "description": MANUAL_ATTESTATION_DESCRIPTION,
         "seconds": [0.0],
         "detector": "mandatory_signed_reviewer_checklist",
         "confidence": 1.0,
         "auto_fixable": False,
         "manual_verification_required": True,
-        # The reviewer can still sign this reminder, but an unsigned generic
-        # checklist is not evidence that the video failed.
         "blocking": False,
-    } for code, summary, description in MANDATORY_REVIEW_CHECKS]
+    }]
 
 
 def effective_delivery_qc_mode() -> str:
@@ -109,9 +119,62 @@ def effective_delivery_qc_mode() -> str:
     return mode if mode in {"off", "observe", "enforce"} else "off"
 
 
+def is_umg_delivery_job(job: Any) -> bool:
+    profile = str(getattr(job, "delivery_profile", "youtube") or "youtube").lower()
+    return profile in {"umg", "both"} or bool(getattr(job, "umg_spec", None))
+
+
+def delivery_qc_mode_for_job(job: Any, *, mode_override: str | None = None) -> str:
+    if mode_override in {"observe", "enforce"}:
+        return mode_override
+    if str(getattr(job, "workload_class", "interactive") or "interactive") == "batch":
+        return "enforce"
+    if is_umg_delivery_job(job):
+        return "enforce"
+    return effective_delivery_qc_mode()
+
+
 def segments_hash(segments: Sequence[Mapping[str, Any]]) -> str:
     from transcription_quality import segments_hash as quality_segments_hash
     return quality_segments_hash([dict(row) for row in segments if isinstance(row, Mapping)])
+
+
+def _fingerprint(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def delivery_qc_visual_fingerprint(job: Any) -> str:
+    """Identity of the rendered visual cut attested by the operator.
+
+    ProRes output settings are intentionally excluded: they affect the
+    broadcast derivative, not the MP4 image the operator watched. Every
+    input that can change visible content or its source is included.
+    """
+    return _fingerprint({
+        "job_id": getattr(job, "job_id", None),
+        "segments_revision": int(getattr(job, "segments_revision", 0) or 0),
+        "segments_hash": segments_hash(getattr(job, "segments_json", None) or []),
+        "edit_count": int(getattr(job, "edit_count", 0) or 0),
+        "editing_started_at": getattr(job, "editing_started_at", None),
+        "audio_sha256": getattr(job, "input_audio_sha256", None),
+        "audio_key": getattr(job, "input_r2_key", None),
+        "artist": getattr(job, "artist", None),
+        "song_title": getattr(job, "song_title", None),
+        "style": getattr(job, "style", None),
+        "render_params": getattr(job, "render_params", None) or {},
+        "scene_plan": getattr(job, "scene_plan", None) or {},
+        "background_key": getattr(job, "bg_r2_key_cached", None),
+    })
+
+
+def delivery_qc_source_fingerprint(job: Any) -> str:
+    """Snapshot required for a detector report to authorize a delivery."""
+    return _fingerprint({
+        "visual": delivery_qc_visual_fingerprint(job),
+        "delivery_profile": getattr(job, "delivery_profile", None),
+        "delivery_spec": getattr(job, "umg_spec", None) or {},
+    })
 
 
 def _issue_id(issue: Mapping[str, Any]) -> str:
@@ -147,19 +210,36 @@ def _normalise_issue(issue: Mapping[str, Any], *, fps: float) -> dict[str, Any]:
     return row
 
 
-def _merge_prior_decisions(issues: list[dict[str, Any]], previous: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+def _merge_prior_decisions(
+    issues: list[dict[str, Any]],
+    previous: Mapping[str, Any] | None,
+    *,
+    same_source: bool = False,
+    same_visual: bool = False,
+) -> list[dict[str, Any]]:
     prior = {
         str(row.get("issue_id")): row
         for row in ((previous or {}).get("issues") or []) if isinstance(row, Mapping)
     }
     for issue in issues:
-        # A human visual/timing attestation is for one concrete render. Never
-        # inherit it into a rebuilt report, even when the stable check id is
-        # unchanged after a re-render.
-        if issue.get("manual_verification_required"):
-            continue
         old = prior.get(str(issue.get("issue_id")))
+        # Manual review attests to the MP4 image, so it can survive a QC scan
+        # or ProRes-spec change only while the visual render identity is the
+        # same. Other decisions are bound to the complete QC source snapshot.
+        if issue.get("manual_verification_required") and not same_visual:
+            continue
+        if not issue.get("manual_verification_required") and not same_source:
+            continue
         if old and old.get("status") in {"ACKNOWLEDGED", "REJECTED", "RESOLVED_MANUAL"}:
+            if issue.get("manual_verification_required"):
+                decision = old.get("operator_decision")
+                if (
+                    old.get("status") != "RESOLVED_MANUAL"
+                    or not isinstance(decision, Mapping)
+                    or decision.get("decision") != "resolved_manual"
+                    or not decision.get("user_id")
+                ):
+                    continue
             issue["status"] = old["status"]
             issue["operator_decision"] = deepcopy(old.get("operator_decision") or {})
     return issues
@@ -231,10 +311,28 @@ def _build_check_results(
             status, reason = "NOT_RUN", "El render no informa una versión visible para comparar."
         elif check_id in {"ocr_title", "ocr_lyrics"}:
             kinds = {"title"} if check_id == "ocr_title" else {"lyric"}
-            has_kind = any(str(row.get("kind")) in kinds for row in ocr_observations)
-            if not has_kind and not matched:
+            # A provider returning a frame tagged as "title" is not evidence
+            # that it actually read the title. Empty text or low-confidence
+            # guesses must remain unknown, never become a green check.
+            has_readable_observation = False
+            for observation in ocr_observations:
+                try:
+                    confidence = float(observation.get("confidence") or 0)
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                if (
+                    str(observation.get("kind")) in kinds
+                    and str(observation.get("text") or "").strip()
+                    and confidence >= .92
+                ):
+                    has_readable_observation = True
+                    break
+            if not has_readable_observation and not matched:
                 status = "NOT_RUN"
-                reason = (ocr_abstentions[0].get("reason") if ocr_abstentions else "Sin observación OCR aplicable")
+                reason = (
+                    ocr_abstentions[0].get("reason") if ocr_abstentions
+                    else "OCR sin lectura legible con confianza suficiente."
+                )
         elif check_id == "lyrics_quality" and not quality_verdict and not matched:
             # Deterministic timeline/text checks still ran, but the upstream
             # quality verdict itself was not supplied by the transcription
@@ -256,17 +354,23 @@ def _build_check_results(
             "reason": reason,
         })
 
+    attestation = next((row for row in rows if row.get("code") == MANUAL_ATTESTATION_CODE), None)
+    attested = bool(
+        attestation
+        and attestation.get("status") == "RESOLVED_MANUAL"
+        and isinstance(attestation.get("operator_decision"), Mapping)
+        and attestation["operator_decision"].get("decision") == "resolved_manual"
+        and attestation["operator_decision"].get("user_id")
+    )
     for code, summary, description in MANDATORY_REVIEW_CHECKS:
-        matched = [row for row in rows if row.get("code") == code]
-        # These are always present for batch reports.  Their REVIEW status is
-        # intentional: they are awaiting an operator's visual attestation,
-        # while the gate remains reserved for objective failures.
+        # Each dimension stays visible in the expanded technical report, but
+        # one full-cut attestation signs the combined review.
         results.append({
             "check_id": code.lower(), "label": summary,
-            "status": "REVIEW" if any(row.get("status") == "OPEN" for row in matched) else "PASS",
-            "detector": "mandatory_signed_reviewer_checklist", "blocking": False,
-            "issue_ids": [str(row.get("issue_id")) for row in matched if row.get("issue_id")],
-            "evidence": [], "reason": description if matched else "No se ejecutó este check.",
+            "status": "PASS" if attested else "REVIEW",
+            "detector": "operator_visual_attestation", "blocking": False,
+            "issue_ids": [str(attestation.get("issue_id"))] if attestation and attestation.get("issue_id") else [],
+            "evidence": [], "reason": description,
         })
     return results
 
@@ -301,19 +405,61 @@ def refresh_check_results(report: Mapping[str, Any]) -> dict[str, Any]:
     return row
 
 
-def approval_gate(report: Mapping[str, Any] | None, mode: str | None = None) -> dict[str, Any]:
+def approval_gate(
+    report: Mapping[str, Any] | None,
+    mode: str | None = None,
+    *,
+    require_manual_review: bool = False,
+) -> dict[str, Any]:
     actual_mode = mode or effective_delivery_qc_mode()
+    if require_manual_review:
+        actual_mode = "enforce"
     if actual_mode != "enforce":
         return {"blocked": False, "can_approve": True, "reason": "observe_only"}
-    if not report or report.get("status") in {"STALE", "RUNNING", "FAILED"}:
+    if not report or report.get("status") != "COMPLETE":
         return {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"}
     open_rows = [row for row in report.get("issues") or [] if row.get("status") == "OPEN"]
-    open_fail = [row for row in open_rows if _issue_result_status(row) == "FAIL" and row.get("blocking", True)]
-    if open_fail:
+    blocking_fail = [
+        row for row in report.get("issues") or []
+        if _issue_result_status(row) == "FAIL" and row.get("blocking", True)
+    ]
+    if blocking_fail:
         return {
             "blocked": True, "can_approve": False,
-            "reason": "open_fail", "issue_ids": [row["issue_id"] for row in open_fail],
+            "reason": "open_fail",
+            "issue_ids": [row["issue_id"] for row in blocking_fail if row.get("issue_id")],
         }
+    blocking_review = [
+        row for row in open_rows
+        if _issue_result_status(row) == "REVIEW" and row.get("blocking")
+    ]
+    if blocking_review:
+        return {
+            "blocked": True, "can_approve": False,
+            "reason": "review_required",
+            "issue_ids": [row["issue_id"] for row in blocking_review if row.get("issue_id")],
+        }
+    if require_manual_review:
+        # New reports require one attestation for the whole current cut.
+        # Legacy reports with eight independent reminders remain readable and
+        # no longer block publication; the next recheck replaces them with
+        # the consolidated attestation.
+        attestation = next((
+            row for row in report.get("issues") or []
+            if isinstance(row, Mapping)
+            and str(row.get("code") or "") == MANUAL_ATTESTATION_CODE
+        ), None)
+        if attestation and (
+            attestation.get("status") != "RESOLVED_MANUAL"
+            or not isinstance(attestation.get("operator_decision"), Mapping)
+            or attestation["operator_decision"].get("decision") != "resolved_manual"
+            or not attestation["operator_decision"].get("user_id")
+        ):
+            return {
+                "blocked": True, "can_approve": False,
+                "reason": "manual_review_required",
+                "issue_ids": [attestation["issue_id"]] if attestation.get("issue_id") else [],
+            }
     open_review = [row for row in open_rows if _issue_result_status(row) == "REVIEW"]
     if open_review:
         return {
@@ -322,6 +468,38 @@ def approval_gate(report: Mapping[str, Any] | None, mode: str | None = None) -> 
             "issue_ids": [row["issue_id"] for row in open_review],
         }
     return {"blocked": False, "can_approve": True, "reason": "all_findings_resolved"}
+
+
+def delivery_readiness_gate(
+    job: Any,
+    report: Mapping[str, Any] | None,
+    *,
+    for_umg_delivery: bool = False,
+) -> dict[str, Any]:
+    """Apply one current-render gate to UMG approval and portal publication."""
+    manual_review_required = (
+        for_umg_delivery
+        or is_umg_delivery_job(job)
+        or str(getattr(job, "workload_class", "interactive") or "interactive") == "batch"
+    )
+    mode = "enforce" if manual_review_required else delivery_qc_mode_for_job(job)
+    if manual_review_required:
+        if str(getattr(job, "status", "")) not in {"pending_review", "done", "rejected"}:
+            return {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"}
+        if not report or report.get("status") != "COMPLETE" or not report.get("generated_at"):
+            return {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"}
+        try:
+            revision_matches = int(report.get("segments_revision")) == int(getattr(job, "segments_revision", 0) or 0)
+            content_matches = report.get("segments_hash") == segments_hash(getattr(job, "segments_json", None) or [])
+            render_identity = report.get("render_identity") or {}
+            render_matches = int(render_identity.get("edit_count")) == int(getattr(job, "edit_count", 0) or 0)
+            spec_matches = report.get("delivery_spec") == (dict(getattr(job, "umg_spec", None) or {}))
+            source_matches = report.get("source_fingerprint") == delivery_qc_source_fingerprint(job)
+        except (TypeError, ValueError):
+            revision_matches = content_matches = render_matches = spec_matches = source_matches = False
+        if not all((revision_matches, content_matches, render_matches, spec_matches, source_matches)):
+            return {"blocked": True, "can_approve": False, "reason": "fresh_preflight_required"}
+    return approval_gate(report, mode, require_manual_review=manual_review_required)
 
 
 def mark_delivery_qc_stale(report: Mapping[str, Any] | None, *, revision: int, reason: str) -> dict[str, Any]:
@@ -343,11 +521,9 @@ def build_runtime_report(
     segments: Sequence[Mapping[str, Any]],
     previous: Mapping[str, Any] | None = None,
     ocr_callback=None,
+    mode_override: str | None = None,
 ) -> dict[str, Any]:
-    mode = (
-        "enforce" if getattr(job, "workload_class", "interactive") == "batch"
-        else effective_delivery_qc_mode()
-    )
+    mode = delivery_qc_mode_for_job(job, mode_override=mode_override)
     quality = job.transcription_quality if isinstance(job.transcription_quality, Mapping) else {}
     duration = None
     try:
@@ -377,6 +553,8 @@ def build_runtime_report(
     )
 
     current_hash = segments_hash(segments)
+    source_fingerprint = delivery_qc_source_fingerprint(job)
+    visual_fingerprint = delivery_qc_visual_fingerprint(job)
     repair_shadow = quality.get("delivery_repair_shadow") if isinstance(quality, Mapping) else None
     repair_bound = bool(
         isinstance(repair_shadow, Mapping)
@@ -415,7 +593,11 @@ def build_runtime_report(
     for item in all_rows:
         row = _normalise_issue(item, fps=fps)
         deduped[row["issue_id"]] = row
-    issues = _merge_prior_decisions(list(deduped.values()), previous)
+    issues = _merge_prior_decisions(
+        list(deduped.values()), previous,
+        same_source=bool(previous and previous.get("source_fingerprint") == source_fingerprint),
+        same_visual=bool(previous and previous.get("visual_fingerprint") == visual_fingerprint),
+    )
     issues.sort(key=lambda row: ({"FAIL": 0, "WARN": 1}.get(row.get("severity"), 2), (row.get("seconds") or [0])[0]))
     checks = _build_check_results(
         issues=issues, media=media, ocr=ocr, quality=quality, spec=spec,
@@ -445,6 +627,9 @@ def build_runtime_report(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "segments_revision": int(job.segments_revision or 0),
         "segments_hash": current_hash,
+        "source_fingerprint": source_fingerprint,
+        "visual_fingerprint": visual_fingerprint,
+        "delivery_spec": deepcopy(spec),
         "render_identity": {"path_basename": os.path.basename(video_path), "edit_count": int(job.edit_count or 0)},
         "decision": "BLOCK" if blocking_checks else "REVIEW" if check_summary["review"] or check_summary["not_run"] else "PASS",
         "summary": summary, "check_summary": check_summary,
@@ -465,11 +650,24 @@ def build_runtime_report(
             "safe_action_ids": [str(row.get("action_id")) for row in repair_actions if row.get("status") == "APPLIED"],
         },
     }
-    report["approval"] = approval_gate(report, mode)
+    report["approval"] = approval_gate(
+        report, mode,
+        require_manual_review=(is_umg_delivery_job(job)
+                               or str(getattr(job, "workload_class", "interactive") or "interactive") == "batch"
+                               or mode_override == "enforce"),
+    )
     return report
 
 
-def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None) -> dict[str, Any] | None:
+def run_delivery_qc_for_job(
+    job_id: str,
+    video_path: str,
+    *,
+    segments=None,
+    force: bool = False,
+    mode_override: str | None = None,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any] | None:
     """Run and persist QC from a render worker. Never raises in observe mode."""
     from database import Job, SessionLocal
     db = SessionLocal()
@@ -477,16 +675,22 @@ def run_delivery_qc_for_job(job_id: str, video_path: str, *, segments=None) -> d
         job = db.query(Job).filter(Job.job_id == job_id).with_for_update().first()
         if job is None:
             return None
+        if (
+            expected_source_fingerprint
+            and delivery_qc_source_fingerprint(job) != expected_source_fingerprint
+        ):
+            return None
         # Contractual batch QC cannot be disabled by the global interactive
         # rollout flag. Interactive jobs retain the existing off switch.
-        if (
-            str(job.workload_class or "interactive") != "batch"
-            and effective_delivery_qc_mode() == "off"
-        ):
+        mode = delivery_qc_mode_for_job(job, mode_override=mode_override)
+        if mode == "off" and not force:
             return None
         rows = list(segments if segments is not None else (job.segments_json or []))
         previous = job.delivery_qc if isinstance(job.delivery_qc, Mapping) else None
-        report = build_runtime_report(job=job, video_path=video_path, segments=rows, previous=previous)
+        report = build_runtime_report(
+            job=job, video_path=video_path, segments=rows, previous=previous,
+            mode_override=mode,
+        )
         job.delivery_qc = report
         db.commit()
         return report

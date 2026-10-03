@@ -13,12 +13,14 @@ import unicodedata
 from typing import Iterable
 
 
-SCHEMA_VERSION = "change-request-parser-v4"
+SCHEMA_VERSION = "change-request-parser-v6"
 
 _TIMECODE_RE = re.compile(
     r"(?<!\d)(?:(?P<hours>\d{1,2}):)?(?P<minutes>\d{1,2}):(?P<seconds>\d{2})(?!\d)"
 )
-_QUOTED_RE = re.compile(r"[\"“”'‘’]([^\"“”'‘’]{1,500})[\"“”'‘’]")
+_QUOTED_RE = re.compile(
+    r'["“]([^"”]{1,500})["”]|(?<!\w)[\'‘]([^\'’]{1,500})[\'’](?!\w)'
+)
 _REPEAT_RE = re.compile(
     r"\b(todas?\s+las?\s+(?:apariciones|veces)|cada\s+vez|en\s+todo\s+el\s+tema|"
     r"todos?\s+los?\s+(?:coros?|estribillos?))\b",
@@ -26,7 +28,8 @@ _REPEAT_RE = re.compile(
 )
 _TIMING_RE = re.compile(
     r"\b(sincroniz|timing|desfasad|antes\s+de\s+que\s+termine|"
-    r"mantener.+(?:tiempo|más)|entra\s+(?:tarde|antes)|termina\s+(?:tarde|antes))",
+    r"mantener.+(?:tiempo|más)|entra\s+(?:tarde|antes|en\s+\d)|"
+    r"empieza\s+a\s+cantar|mover.+anticipaci[oó]n|termina\s+(?:tarde|antes))",
     re.IGNORECASE,
 )
 _STRUCTURE_RE = re.compile(
@@ -40,7 +43,8 @@ _FULL_PHRASE_SCREEN_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _BACKGROUND_RE = re.compile(
-    r"\b(fondo|background|prompt|escena|imagen|animaci[oó]n|personas?|logo)\b",
+    r"\b(fondo|background|prompt|escena|imagen|animaci[oó]n|personas?|logo|"
+    r"armas?|banderas?|perros?|cuerpos?|anatom[ií]a)\b",
     re.IGNORECASE,
 )
 _AUDIO_RE = re.compile(r"\baudio\b", re.IGNORECASE)
@@ -50,13 +54,25 @@ _TERMINAL_PERIOD_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _INSTRUCTION_PREFIX_RE = re.compile(
-    r"^(?:revisar|chequear|verificar|corregir|cambiar|quitar|sacar|eliminar|"
+    r"^(?:revisar|chequear|verificar|corregir|cambiar|debe(?:r[ií]a)?\s+decir|quitar|sacar|eliminar|"
     r"unir|separar|dividir|juntar|mantener|dejar|poner|hacer|audio|fondo)\b",
     re.IGNORECASE,
 )
 _TRAILING_REVIEW_NOTE_RE = re.compile(
     r"\s*\((?:revisar|chequear|verificar|timing|sync|sincroniz|"
     r"que\s+termina|que\s+empieza)[^)]*\)\s*$",
+    re.IGNORECASE,
+)
+_REFERENCE_RE = re.compile(
+    r"\b(?:la\s+misma\s+frase|igual\s+que|como\s+en\s+el)\b.{0,50}"
+    r"\b(?:anterior|antes|otro\s+punto)\b", re.IGNORECASE,
+)
+_INSERT_BEFORE_AFTER_RE = re.compile(
+    r"\b(?:repetir|repite|agregar|insertar|sumar)\b.{0,100}"
+    r"\b(?:antes|despu[eé]s)\b", re.IGNORECASE | re.DOTALL,
+)
+_TIMING_CONTEXT_RE = re.compile(
+    r"\b(?:entra\s+en\s+\d|empieza\s+a\s+cantar|mover\s+un\s+poquito)\b",
     re.IGNORECASE,
 )
 
@@ -93,8 +109,16 @@ class ParsedInstruction:
 def _clean_candidate(value: str | None) -> str | None:
     if value is None:
         return None
-    value = value.strip(" \t\r\n:;,_-–—.¡!¿?")
+    # Strip separators around an instruction, never lyric punctuation. A
+    # terminal period, question mark, apostrophe or inverted sign may be the
+    # very edit the client requested.
+    value = value.strip(" \t\r\n:;,_-–—")
     return value[:500] or None
+
+
+def _quoted_values(value: str) -> list[str]:
+    return [candidate for groups in _QUOTED_RE.findall(value)
+            if (candidate := _clean_candidate(groups[0] or groups[1]))]
 
 
 def _bare_timecoded_requested_text(chunk: str) -> str | None:
@@ -172,6 +196,15 @@ def _timecoded_chunks(comment: str) -> Iterable[tuple[float, str]]:
     matches = list(_TIMECODE_RE.finditer(comment))
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(comment)
+        # "2:15 y 3:53 esa frase" refers to two locations on one line.
+        # The first timestamp must not become a bogus replacement with "y".
+        if index + 1 < len(matches) and re.fullmatch(
+            r"\s*(?:y|o|,|/|\+)\s*", comment[match.end():end], re.IGNORECASE,
+        ):
+            end = matches[index + 2].start() if index + 2 < len(matches) else len(comment)
+        next_bullet = re.search(r"\n\s*[-•]\s*", comment[match.end():end])
+        if next_bullet:
+            end = match.end() + next_bullet.start()
         yield parse_timecode(match), comment[match.start():end].strip()
 
 
@@ -191,7 +224,9 @@ def _full_phrase_rows(comment: str) -> list[tuple[float, str, str]]:
         if not matches:
             continue
         payload = raw_line[matches[-1].end():].strip(" \t:;,_-–—")
-        quoted = [_clean_candidate(value) for value in _QUOTED_RE.findall(payload)]
+        if _INSTRUCTION_PREFIX_RE.search(payload):
+            continue
+        quoted = _quoted_values(payload)
         payload = quoted[-1] if quoted else _clean_candidate(payload)
         if not payload or _INSTRUCTION_PREFIX_RE.search(payload):
             continue
@@ -232,13 +267,27 @@ def parse_change_request(comment: str) -> dict:
         )
 
     chunks = list(_timecoded_chunks(comment))
-    # A complete-phrase request is structural, not a request to overwrite one
-    # lyric segment with the whole phrase.  Parsing it a second time as a text
-    # replacement would create a misleading duplicate operation.
-    parse_regular_chunks = not full_phrase_rows
-    for timecode, chunk in chunks if parse_regular_chunks else []:
-        quotes = [_clean_candidate(value) for value in _QUOTED_RE.findall(chunk)]
-        quotes = [value for value in quotes if value]
+    # Skip only the timestamps already represented by structural rows. A
+    # mixed request may also contain an unrelated text correction.
+    structural_times = {timecode for timecode, _, _ in full_phrase_rows}
+    for timecode, chunk in chunks:
+        if timecode in structural_times:
+            continue
+        if _REFERENCE_RE.search(chunk) or _INSERT_BEFORE_AFTER_RE.search(chunk):
+            add(
+                kind="manual_review", source_excerpt=chunk[:600],
+                timecode_seconds=timecode, confidence="low",
+                reason="reference_or_insertion_requires_context",
+            )
+            continue
+        if _TIMING_CONTEXT_RE.search(chunk):
+            add(
+                kind="timing_review", source_excerpt=chunk[:600],
+                timecode_seconds=timecode, confidence="medium",
+                reason="timing_requires_audio_review",
+            )
+            continue
+        quotes = _quoted_values(chunk)
         current, requested = _explicit_pair(chunk, quotes)
         if not requested and quotes:
             requested = quotes[-1]
@@ -250,7 +299,8 @@ def parse_change_request(comment: str) -> dict:
             add(
                 kind="replace_text", source_excerpt=chunk[:600],
                 timecode_seconds=timecode, current_text=current,
-                requested_text=requested, scope=scope,
+                requested_text=requested,
+                scope="all_matching" if _REPEAT_RE.search(chunk) else "single",
                 confidence="high" if quotes or current else "medium",
             )
         if _TIMING_RE.search(chunk):
@@ -278,8 +328,7 @@ def parse_change_request(comment: str) -> dict:
 
     # Non-timecoded explicit replacements are still useful.
     if not chunks:
-        quotes = [_clean_candidate(value) for value in _QUOTED_RE.findall(comment)]
-        quotes = [value for value in quotes if value]
+        quotes = _quoted_values(comment)
         current, requested = _explicit_pair(comment, quotes)
         if requested:
             add(
@@ -293,7 +342,9 @@ def parse_change_request(comment: str) -> dict:
             kind="remove_terminal_period", source_excerpt=comment[:600],
             scope="all_matching", confidence="high",
         )
-    if _BACKGROUND_RE.search(comment):
+    if _BACKGROUND_RE.search(comment) and not re.search(
+        r"\b(?:est[aá]|esta)\s+bien\s+el\s+fondo\b", comment, re.IGNORECASE,
+    ):
         add(
             kind="background_review", source_excerpt=comment[:600],
             confidence="medium", reason="background_change_not_a_lyric_patch",

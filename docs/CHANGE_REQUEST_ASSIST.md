@@ -19,16 +19,38 @@ un modelo para inventar cuál debería ser la letra.
    únicamente las filas seleccionadas. Mientras haya un ajuste sin guardar,
    la aplicación queda bloqueada para que el resultado aplicado no difiera de
    la vista previa.
-5. Abrir el editor, escuchar el tramo, re-renderizar y publicar la nueva
-   versión por el flujo existente.
-6. El pedido sigue pendiente hasta que la publicación lo cierre. Aplicar una
-   propuesta no equivale a entregarla al cliente.
+5. Abrir el editor, escuchar el tramo, re-renderizar y aprobar el corte final.
+6. En el pedido, verificar cada instrucción detectada y confirmar que el
+   comentario completo quedó atendido en ese corte. Esto registra la evidencia
+   y todavía no marca el pedido como resuelto.
+7. Publicar la nueva versión en el destino del pedido. Una publicación del
+   mismo corte verificado y posterior a la revisión observada por UMG lo
+   marca automáticamente como resuelto, con su revisión y fecha. Si la
+   verificación terminó justo después de publicar, confirmar de nuevo esa
+   versión completa el cierre. Aplicar una propuesta o reenviar el corte
+   reclamado no equivale a entregarlo al cliente.
 
 Cuando la revisión del editor o el audio cambia, la propuesta queda obsoleta y
 debe recalcularse. La API liga la vista previa a la misma revisión/hash que la
 aplicación, por lo que nunca muestra una letra vieja como si todavía pudiera
 aplicarse. Una aplicación parcial también se recalcula sobre la nueva revisión
 para trabajar los pendientes.
+
+La verificación final guarda versión del parser y hash del comentario. Si una
+versión posterior detecta instrucciones que antes se omitían, esa verificación
+queda obsoleta y el operador debe revisar el pedido completo otra vez. El
+parser v6 conserva apóstrofos y signos, limita el alcance de repeticiones y
+reconoce restricciones visuales explícitas como banderas o armas. Las órdenes
+de insertar antes de otra frase, las referencias a un punto anterior y las
+explicaciones de timing quedan para revisión contextual; no se convierten en
+reemplazos de letra por una coincidencia textual parcial.
+
+El listado admin devuelve además `workflow`: fase, próxima acción, acciones
+permitidas, bloqueos y evidencia de revisión. El Centro de Correcciones usa
+esta proyección del servidor para habilitar Verificar y Publicar, y permite
+filtrar por etapa. El endpoint que ejecuta cada comando vuelve a validar la
+revisión y los controles dentro de su transacción; la proyección sirve para
+guiar al operador, no reserva el corte frente a ediciones concurrentes.
 
 ## Qué automatiza
 
@@ -84,6 +106,7 @@ selección del operador y por el ciclo editor → render → publicación.
 - `PATCH /admin/change-requests/{id}/proposals/{proposal_id}`
 - `POST /admin/change-requests/{id}/proposals/{proposal_id}/apply`
 - `POST /admin/change-requests/{id}/proposals/{proposal_id}/dismiss`
+- `POST /admin/change-requests/{id}/verify`
 
 La migración `e6a8c0d2f4b6` crea `change_request_proposals`. Antes de activar las
 flags, ejecutar la migración por el procedimiento habitual y verificar que

@@ -20,7 +20,9 @@ import GestionSection from "./sections/gestion/GestionSection";
 
 function AdminShell({ onBack, isSuperAdmin }) {
   const { adminError, setAdminError, stats } = useAdmin();
-  const [section, setSection] = useState("ahora");
+  const [section, setSection] = useState(() => (
+    new URLSearchParams(window.location.search).get("section") === "cambios" ? "cambios" : "ahora"
+  ));
   const [subTab, setSubTab] = useState(defaultSubTab("ahora"));
   const [pendingChangeRequests, setPendingChangeRequests] = useState(0);
 

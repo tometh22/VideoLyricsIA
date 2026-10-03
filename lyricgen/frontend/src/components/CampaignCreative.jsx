@@ -35,13 +35,28 @@ const videoFilters = [
 const deliveryPortals = [{ id: "argentina", label: "Argentina", host: "umg.genly.pro" }, { id: "chile", label: "Chile", host: "umgchile.genly.pro" }];
 const portalFilters = [
   { id: "all", label: "Todos los envíos", matches: () => true },
-  { id: "sent", label: "Enviados al portal", matches: video => video.is_in_umg_portal === true },
-  { id: "unsent", label: "No enviados al portal", matches: video => video.is_in_umg_portal === false },
+  { id: "sent", label: "Enviados al portal", matches: (video, portal) => video.portal_status?.[portal]?.published === true },
+  { id: "unsent", label: "No enviados al portal", matches: (video, portal) => video.portal_status?.[portal]?.published !== true },
   // El caso que no se veía: se corrigió el video pero la corrección nunca
-  // se publicó. El portal reconstruye la key de R2, así que sigue mostrando
-  // la entrega como si estuviera al día mientras entrega el corte anterior.
-  { id: "outdated", label: "Portal desactualizado", matches: video => video.portal_outdated === true },
+  // se publicó. El manifiesto anterior sigue disponible hasta el reenvío.
+  { id: "outdated", label: "Portal desactualizado", matches: (video, portal) => video.portal_status?.[portal]?.outdated === true },
 ];
+
+function PortalStatusBadge({ video, destination }) {
+  const publication = video.portal_status?.[destination] || { published: false };
+  const label = destination === "chile" ? "Chile" : "Argentina";
+  if (!publication.published) {
+    return <span className="rounded-full bg-white/5 px-2.5 py-1 text-xs text-ink-secondary">Sin publicar en {label}</span>;
+  }
+  return <div className="flex flex-wrap gap-1.5">
+    <span className="rounded-full bg-sky-500/15 px-2.5 py-1 text-xs text-sky-200">{label} · v{publication.revision || 1}</span>
+    {publication.outdated && <span className="rounded-full bg-red-500/15 px-2.5 py-1 text-xs text-red-200">Nueva versión pendiente de publicar</span>}
+    {publication.updating && <span className="rounded-full bg-brand/20 px-2.5 py-1 text-xs text-brand-light">Actualizando</span>}
+    {publication.awaiting_review && !publication.outdated && <span className="rounded-full bg-amber-500/15 px-2.5 py-1 text-xs text-amber-200">Esperando revisión UMG</span>}
+    {publication.approved_at && !publication.outdated && <span className="rounded-full bg-emerald-500/15 px-2.5 py-1 text-xs text-emerald-200">Aprobado en UMG</span>}
+    {(publication.pending_change_requests || 0) > 0 && <span className="rounded-full bg-amber-500/15 px-2.5 py-1 text-xs text-amber-200">{publication.pending_change_requests} pedidos pendientes</span>}
+  </div>;
+}
 
 const songFilters = [
   { id: "all", label: "Todas", matches: () => true },
@@ -101,7 +116,7 @@ function CampaignVideoPlayer({ video, onClose, onApprove, onEdit, busy, error })
         {url ? <video className="max-h-[58vh] w-full" key={video.job_id} src={url} controls autoPlay playsInline preload="metadata">Tu navegador no puede reproducir este video.</video> : <p role="status" className="p-8 text-sm text-ink-secondary">Preparando el reproductor…</p>}
       </div>
       {error && <p role="alert" className="text-sm text-red-200">{error}</p>}
-      <div className="flex flex-wrap items-center justify-between gap-3"><button className={button} disabled={busy} onClick={onEdit}>Corregir letra o tiempos</button>{video.status === "pending_review" && <div className="space-y-2 text-right"><p className="text-xs text-ink-secondary">Al aprobar confirmás que revisaste el video completo.</p><button className={primaryButton} disabled={busy || !url} onClick={onApprove}>{busy ? "Aprobando…" : "Aprobar y siguiente"}</button></div>}</div>
+      <div className="flex flex-wrap items-center justify-between gap-3"><button className={button} disabled={busy} onClick={onEdit}>Corregir letra o tiempos</button>{video.status === "pending_review" && <div className="space-y-2 text-right"><p className="text-xs text-ink-secondary">Revisá los controles del corte actual antes de aprobar.</p><button className={primaryButton} disabled={busy || !url} onClick={onApprove}>Revisar controles y aprobar</button></div>}</div>
     </div>
   </CampaignModal>;
 }
@@ -135,6 +150,7 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
   const songFilter = searchParams.get("song_state") || "all";
   const videoFilter = view === "deliveries" ? "approved" : searchParams.get("video_state") || "all";
   const portalFilter = searchParams.get("portal_state") || "all";
+  const portalDestination = searchParams.get("portal_destination") === "chile" ? "chile" : "argentina";
   const page = Math.max(1, Number(searchParams.get("cpage")) || 1);
   const videoPage = Math.max(1, Number(searchParams.get("vpage")) || 1);
   const setPage = value => writeParams({ cpage: typeof value === "function" ? value(page) : value });
@@ -144,6 +160,7 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
   const setSongFilter = value => { setSelected(new Set()); writeParams({ song_state: value, cpage: null }); };
   const setVideoFilter = value => { setSelectedVideoIds(new Set()); writeParams({ video_state: value, vpage: null }); };
   const setPortalFilter = value => { setSelectedVideoIds(new Set()); writeParams({ portal_state: value, vpage: null }); };
+  const setPortalDestination = value => { setSelectedVideoIds(new Set()); writeParams({ portal_destination: value, vpage: null }); };
   const returnPath = `/campaigns/${encodeURIComponent(campaignId)}?${searchParams}`;
   const openVideo = path => navigate(`${path}?return_to=${encodeURIComponent(returnPath)}`);
   const deliveryKey = useRef(null);
@@ -272,7 +289,7 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
   const searchedVideos = (report?.videos || []).filter(video => matchesCampaignSong(videoQuery, video));
   const stateVideos = searchedVideos.filter(activeVideoFilter.matches);
   const activePortalFilter = portalFilters.find(filter => filter.id === portalFilter) || portalFilters[0];
-  const filteredVideos = stateVideos.filter(activePortalFilter.matches);
+  const filteredVideos = stateVideos.filter(video => activePortalFilter.matches(video, portalDestination));
   const videoFilterCounts = Object.fromEntries(videoFilters.map(filter => [filter.id, searchedVideos.filter(filter.matches).length]));
   const videoPages = Math.max(1, Math.ceil(filteredVideos.length / 20));
   const currentVideoPage = Math.min(videoPage, videoPages);
@@ -280,6 +297,17 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
   const approvedVideos = filteredVideos.filter(video => video.status === "done" && video.approved_at);
   const selectedApprovedVideos = approvedVideos.filter(video => selectedVideoIds.has(video.job_id));
   const allApprovedSelected = approvedVideos.length > 0 && selectedApprovedVideos.length === approvedVideos.length;
+  const bulkPreview = (bulkDelivery || []).map(video => {
+    const publication = video.portal_status?.[deliveryPortal] || {};
+    return {
+      ...video,
+      publication,
+      action: !publication.published ? "Nueva publicación" : publication.outdated ? `Actualizar v${publication.revision || 1}` : `Reenviar v${publication.revision || 1}`,
+    };
+  });
+  const bulkNewCount = bulkPreview.filter(video => !video.publication.published).length;
+  const bulkUpdateCount = bulkPreview.filter(video => video.publication.outdated).length;
+  const bulkSameCount = bulkPreview.length - bulkNewCount - bulkUpdateCount;
   const trim = n => (Number.isInteger(n) ? n : Number(n.toFixed(2)));
   const weightSum = groups.reduce((total, g) => total + (Number(g.weight) || 0), 0);
   const distributionTarget = mode === "percent" ? 100 : selected.size;
@@ -364,18 +392,23 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
     {["history", "deliveries"].includes(view) && report && <div className="space-y-4">
       <div><h2 className="text-xl font-semibold">{view === "deliveries" ? `Entregables · ${approvedVideos.length} videos aprobados` : `Videos de esta campaña (${report.videos.length})`}</h2><p className="mt-1 text-sm text-ink-secondary">{view === "deliveries" ? "Seleccioná los aprobados, elegí el portal y seguí el avance del envío." : "Reproducí y aprobá el siguiente sin salir del reproductor. La búsqueda y los filtros se conservan al volver."}</p></div>
       {!report.videos.length && <p className="rounded-xl bg-surface-2/40 p-8">Todavía no hay videos generados. Primero aprobá letras y tiempos, y luego abrí Generar videos.</p>}
-      {data.can_manage && approvedVideos.length > 0 && <div className="flex flex-wrap items-center gap-2 rounded-xl bg-emerald-500/10 p-3 ring-1 ring-emerald-400/20"><button className={button} disabled={busy} onClick={() => setSelectedVideoIds(allApprovedSelected ? new Set() : new Set(approvedVideos.map(video => video.job_id)))}>{allApprovedSelected ? "Limpiar aprobados" : `Seleccionar aprobados del resultado (${approvedVideos.length})`}</button><span className="text-sm" aria-label={`${selectedApprovedVideos.length} videos aprobados seleccionados`}><strong>{selectedApprovedVideos.length}</strong> seleccionados para enviar</span><button className={primaryButton + " ml-auto"} disabled={busy || !selectedApprovedVideos.length} onClick={() => { deliveryKey.current = null; setBulkDelivery(selectedApprovedVideos); setDeliveryPortal(""); }}>Enviar seleccionados a un portal</button></div>}
+      {data.can_manage && approvedVideos.length > 0 && <div className="flex flex-wrap items-center gap-2 rounded-xl bg-emerald-500/10 p-3 ring-1 ring-emerald-400/20"><button className={button} disabled={busy} onClick={() => setSelectedVideoIds(allApprovedSelected ? new Set() : new Set(approvedVideos.map(video => video.job_id)))}>{allApprovedSelected ? "Limpiar aprobados" : `Seleccionar aprobados del resultado (${approvedVideos.length})`}</button><span className="text-sm" aria-label={`${selectedApprovedVideos.length} videos aprobados seleccionados`}><strong>{selectedApprovedVideos.length}</strong> seleccionados para enviar</span><button className={primaryButton + " ml-auto"} disabled={busy || !selectedApprovedVideos.length} onClick={() => { deliveryKey.current = null; setBulkDelivery(selectedApprovedVideos); setDeliveryPortal(portalDestination); }}>Enviar seleccionados a un portal</button></div>}
       {!!report.videos.length && <div className="overflow-hidden rounded-2xl bg-surface-2/30 ring-1 ring-white/10">
         <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-center">
           <CampaignSearch className="w-full lg:max-w-sm" label="Buscar videos de la campaña" value={videoQuery} onChange={setVideoQuery} />
-          <label className="text-sm text-ink-secondary">Envío al portal<select aria-label="Filtrar por envío al portal" className={input + " mt-1"} value={activePortalFilter.id} onChange={event => setPortalFilter(event.target.value)}>{portalFilters.map(filter => <option key={filter.id} value={filter.id}>{filter.label} ({stateVideos.filter(filter.matches).length})</option>)}</select></label>
+          <label className="text-sm text-ink-secondary">Portal<select aria-label="Portal para filtrar videos" className={input + " mt-1"} value={portalDestination} onChange={event => setPortalDestination(event.target.value)}>{deliveryPortals.map(portal => <option key={portal.id} value={portal.id}>{portal.label}</option>)}</select></label>
+          <label className="text-sm text-ink-secondary">Envío al portal<select aria-label="Filtrar por envío al portal" className={input + " mt-1"} value={activePortalFilter.id} onChange={event => setPortalFilter(event.target.value)}>{portalFilters.map(filter => <option key={filter.id} value={filter.id}>{filter.label} ({stateVideos.filter(video => filter.matches(video, portalDestination)).length})</option>)}</select></label>
           {view !== "deliveries" && <div className="flex flex-wrap gap-2" role="group" aria-label="Filtrar videos por estado">{videoFilters.map(filter => <button key={filter.id} type="button" aria-pressed={videoFilter === filter.id} className={`rounded-full px-3 py-2 text-sm ring-1 ${videoFilter === filter.id ? "bg-brand/25 text-brand-light ring-brand/50" : "bg-black/20 text-ink-secondary ring-white/10"}`} onClick={() => { setVideoFilter(filter.id); }}>{filter.label} <span className="opacity-70">{videoFilterCounts[filter.id]}</span></button>)}</div>}
         </div>
         {!visibleVideos.length && <p className="border-t border-white/10 p-8 text-center text-ink-secondary">No hay videos que coincidan con este filtro.</p>}
         <ul aria-label="Lista de videos de la campaña" className="divide-y divide-white/10 border-t border-white/10">{visibleVideos.map(video => <li key={video.job_id} className="grid gap-4 p-4 hover:bg-white/[0.025] lg:grid-cols-[160px_minmax(220px,1fr)_minmax(150px,auto)_auto] lg:items-center">
           <VideoThumbnail video={video} compact />
           <div className="min-w-0"><h3 className="truncate font-semibold">{video.title}</h3><p className="truncate text-sm text-ink-secondary">{video.artist}</p><p className="mt-1 text-xs text-ink-secondary">{new Date(video.created_at).toLocaleString()}{video.parent_job_id ? " · Variante" : ""}</p></div>
-          <div><span className={`inline-flex rounded-full px-2.5 py-1 text-xs ${video.status === "pending_review" ? "bg-amber-500/15 text-amber-200" : video.status === "done" ? "bg-emerald-500/15 text-emerald-200" : videoProcessingStatuses.has(video.status) ? "bg-brand/20 text-brand-light" : "bg-white/5 text-ink-secondary"}`}>{statusLabels[video.status] || "En preparación"}</span><div className="mt-2 flex flex-wrap gap-1.5"><span className={`inline-flex rounded-full px-2.5 py-1 text-xs ${video.is_in_umg_portal ? "bg-sky-500/15 text-sky-200" : "bg-white/5 text-ink-secondary"}`}>{video.is_in_umg_portal === true ? `Enviado a ${(video.umg_portals || []).map(id => deliveryPortals.find(portal => portal.id === id)?.label || id).join(" y ") || "portal"}` : video.is_in_umg_portal === false ? "No enviado al portal" : "Envío sin verificar"}</span>{video.pending_change_requests > 0 && <span className="rounded-full bg-amber-500/15 px-2.5 py-1 text-xs text-amber-200">{video.pending_change_requests} {video.pending_change_requests === 1 ? "cambio solicitado" : "cambios solicitados"}</span>}{video.portal_outdated && <span title="El video se re-renderizó después de publicarlo: el portal sigue entregando el corte anterior hasta que lo vuelvas a enviar." className="rounded-full bg-red-500/15 px-2.5 py-1 text-xs text-red-200">Portal desactualizado</span>}{video.portal_updating && !video.portal_outdated && <span className="rounded-full bg-brand/20 px-2.5 py-1 text-xs text-brand-light">Actualizando</span>}{video.portal_awaiting_review && !video.portal_outdated && <span className="rounded-full bg-sky-500/15 px-2.5 py-1 text-xs text-sky-200">v{video.portal_revision} sin aprobar</span>}</div><p className="mt-2 max-w-52 truncate text-xs text-ink-secondary">{video.assignment.group_name || "Sin clasificación contractual"}</p></div>
+          <div>
+            <span className={`inline-flex rounded-full px-2.5 py-1 text-xs ${video.status === "pending_review" ? "bg-amber-500/15 text-amber-200" : video.status === "done" ? "bg-emerald-500/15 text-emerald-200" : videoProcessingStatuses.has(video.status) ? "bg-brand/20 text-brand-light" : "bg-white/5 text-ink-secondary"}`}>{statusLabels[video.status] || "En preparación"}</span>
+            <div className="mt-2"><PortalStatusBadge video={video} destination={portalDestination} /></div>
+            <p className="mt-2 max-w-52 truncate text-xs text-ink-secondary">{video.assignment.group_name || "Sin clasificación contractual"}</p>
+          </div>
           <div className="flex flex-wrap gap-2 lg:max-w-72 lg:justify-end">
             {data.can_manage && video.status === "done" && video.approved_at && <label className="flex items-center gap-2 text-sm text-emerald-100"><input type="checkbox" aria-label={`Seleccionar video ${video.title}`} checked={selectedVideoIds.has(video.job_id)} onChange={event => setSelectedVideoIds(old => { const next = new Set(old); if (event.target.checked) next.add(video.job_id); else next.delete(video.job_id); return next; })} />Seleccionar para enviar</label>}
             <button type="button" className={primaryButton} disabled={!video.video_url || busy} onClick={() => setPlayingVideo(video)}>Reproducir</button>
@@ -388,19 +421,36 @@ export default function CampaignCreative({ campaignId, view = "creative", onBusy
         <div className="flex items-center justify-between gap-3 border-t border-white/10 p-4"><span className="text-sm text-ink-secondary">{filteredVideos.length} resultados · Página {currentVideoPage} de {videoPages}</span><div className="flex gap-2"><button className={button} disabled={currentVideoPage <= 1} onClick={() => setVideoPage(value => value - 1)}>Anterior</button><button className={button} disabled={currentVideoPage >= videoPages} onClick={() => setVideoPage(value => value + 1)}>Siguiente</button></div></div>
       </div>}
     </div>}
-    {playingVideo && <CampaignVideoPlayer video={playingVideo} busy={busy} error={error} onClose={() => setPlayingVideo(null)} onEdit={() => openVideo(`/videos/${playingVideo.job_id}/edit-lyrics`)} onApprove={() => run(async () => {
-      const current = playingVideo;
-      await post(`/approve/${current.job_id}`, { notes: "Revisión final desde el reproductor de campaña" });
-      setPlayingVideo(null);
-      setReport(previous => ({ ...previous, videos: previous.videos.map(video => video.job_id === current.job_id ? { ...video, status: "done", approved_at: new Date().toISOString() } : video) }));
-      setMessage(`${current.title} quedó aprobado.`);
-      const latest = await load();
-      const next = latest?.videos?.find(video => video.job_id !== current.job_id && video.status === "pending_review" && matchesCampaignSong(videoQuery, video) && activeVideoFilter.matches(video));
-      setPlayingVideo(next || null);
-      setMessage(`${current.title} quedó aprobado.${next ? " Continuá con el siguiente video." : " No quedan videos por aprobar en este filtro."}`);
-    })} />}
-    {approvalVideo && <CampaignModal label={`Aprobar ${approvalVideo.title}`} busy={busy} onClose={() => setApprovalVideo(null)}><div className="w-full max-w-lg space-y-4 rounded-2xl bg-surface-2 p-6 ring-1 ring-white/15"><h2 className="text-xl font-semibold">Aprobar {approvalVideo.title}</h2>{error && <p role="alert" className="text-sm text-red-200">{error}</p>}<p>Confirmá que revisaste el video completo. Quedará aprobado como la versión final vigente.</p><div className="flex flex-wrap justify-end gap-2"><button className={button} disabled={busy} onClick={() => setApprovalVideo(null)}>Cancelar</button><button className={primaryButton} disabled={busy} onClick={() => run(async () => { await post(`/approve/${approvalVideo.job_id}`, { notes: "Aprobado desde el historial de campaña" }); setApprovalVideo(null); await load(); setMessage(`${approvalVideo.title} quedó aprobado.`); })}>{busy ? "Aprobando…" : "Confirmar aprobación"}</button></div></div></CampaignModal>}
-    {bulkDelivery && <CampaignModal label="Enviar videos aprobados" busy={busy} onClose={() => setBulkDelivery(null)}><div className="max-w-lg space-y-4 rounded-xl bg-surface-2 p-6"><h2>Enviar {bulkDelivery.length} videos aprobados</h2>{error && <p role="alert" className="text-sm text-red-200">{error}</p>}<p>Se enviarán únicamente los videos de esta lista al portal elegido. El envío continúa en segundo plano y podés consultar su avance aquí.</p><label className="block text-sm">Portal de destino<select aria-label="Portal de destino" className={input + " mt-2"} value={deliveryPortal} onChange={event => setDeliveryPortal(event.target.value)}><option value="">Elegí un portal</option>{deliveryPortals.map(portal => <option key={portal.id} value={portal.id}>{portal.label} · {portal.host}</option>)}</select></label><ul className="max-h-40 overflow-auto text-sm text-ink-secondary">{bulkDelivery.map(video => <li key={video.job_id}>{video.artist} · {video.title}</li>)}</ul><button className={primaryButton} disabled={busy || !deliveryPortal} onClick={() => run(async () => { const signature = JSON.stringify([deliveryPortal, bulkDelivery.map(video => video.job_id).sort()]); if (deliveryKey.current?.signature !== signature) deliveryKey.current = { signature, key: `campaign-${campaignId}-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`}` }; const key = deliveryKey.current.key; const operation = await post(`${base}/deliveries`, { job_ids: bulkDelivery.map(video => video.job_id), destination_portal: deliveryPortal, idempotency_key: key }); setBulkDelivery(null); setSelectedVideoIds(new Set()); writeParams({ delivery_op: operation.operation_id }); setMessage(`Envío iniciado para ${operation.total_count || bulkDelivery.length} videos a ${deliveryPortals.find(portal => portal.id === deliveryPortal)?.label || deliveryPortal}. La operación sigue en segundo plano.`); })}>Confirmar envío</button><button className={button} disabled={busy} onClick={() => setBulkDelivery(null)}>Cancelar</button></div></CampaignModal>}
+    {playingVideo && <CampaignVideoPlayer video={playingVideo} busy={busy} error={error} onClose={() => setPlayingVideo(null)} onEdit={() => openVideo(`/videos/${playingVideo.job_id}/edit-lyrics`)} onApprove={() => openVideo(`/videos/${playingVideo.job_id}`)} />}
+    {approvalVideo && <CampaignModal label={`Aprobar ${approvalVideo.title}`} busy={busy} onClose={() => setApprovalVideo(null)}><div className="w-full max-w-lg space-y-4 rounded-2xl bg-surface-2 p-6 ring-1 ring-white/15"><h2 className="text-xl font-semibold">Aprobar {approvalVideo.title}</h2>{error && <p role="alert" className="text-sm text-red-200">{error}</p>}<p>Revisá los controles del corte actual en el detalle del video. Tus filtros y la posición de la campaña se conservan al volver.</p><div className="flex flex-wrap justify-end gap-2"><button className={button} disabled={busy} onClick={() => setApprovalVideo(null)}>Cancelar</button><button className={primaryButton} disabled={busy} onClick={() => openVideo(`/videos/${approvalVideo.job_id}`)}>Revisar controles y aprobar</button></div></div></CampaignModal>}
+    {bulkDelivery && <CampaignModal label="Enviar videos aprobados" busy={busy} onClose={() => setBulkDelivery(null)}>
+      <div className="w-full max-w-2xl space-y-4 rounded-2xl bg-surface-2 p-6 shadow-2xl ring-1 ring-white/15">
+        <div><h2 className="text-xl font-semibold">Publicar {bulkDelivery.length} videos</h2>
+          <p className="mt-1 text-sm text-ink-secondary">El envío se procesa en segundo plano. Cada video tendrá un resultado y una revisión propios.</p></div>
+        {error && <p role="alert" className="rounded-lg bg-red-500/10 p-3 text-sm text-red-200">{error}</p>}
+        <label className="block text-sm font-medium">Portal de destino
+          <select aria-label="Portal de destino" className={input + " mt-2"} value={deliveryPortal} onChange={event => setDeliveryPortal(event.target.value)}>
+            <option value="">Elegí un portal</option>{deliveryPortals.map(portal => <option key={portal.id} value={portal.id}>{portal.label} · {portal.host}</option>)}
+          </select>
+        </label>
+        {deliveryPortal && <>
+          <p className="text-sm text-ink-secondary" role="status">{bulkNewCount} nuevas · {bulkUpdateCount} actualizaciones · {bulkSameCount} reenvíos del mismo corte</p>
+          <ul className="max-h-64 divide-y divide-white/10 overflow-auto rounded-lg ring-1 ring-white/10" aria-label="Vista previa del envío">
+            {bulkPreview.map(video => <li key={video.job_id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-sm">
+              <span className="min-w-0 truncate text-white">{video.artist} · {video.title}</span>
+              <span className="flex shrink-0 items-center gap-2 text-xs text-ink-secondary">
+                <span>{video.action}</span>
+                {!!video.publication.pending_change_requests && <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-amber-200">{video.publication.pending_change_requests} pedidos abiertos</span>}
+              </span>
+            </li>)}
+          </ul>
+          <p className="text-xs text-ink-secondary">Los archivos y controles se comprueban por video antes de publicar. Si uno falla, los demás continúan y verás el motivo en el avance.</p>
+        </>}
+        <div className="flex flex-wrap justify-end gap-2"><button className={button} disabled={busy} onClick={() => setBulkDelivery(null)}>Cancelar</button>
+          <button className={primaryButton} disabled={busy || !deliveryPortal} onClick={() => run(async () => { const signature = JSON.stringify([deliveryPortal, bulkDelivery.map(video => video.job_id).sort()]); if (deliveryKey.current?.signature !== signature) deliveryKey.current = { signature, key: `campaign-${campaignId}-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`}` }; const key = deliveryKey.current.key; const operation = await post(`${base}/deliveries`, { job_ids: bulkDelivery.map(video => video.job_id), destination_portal: deliveryPortal, idempotency_key: key }); setBulkDelivery(null); setSelectedVideoIds(new Set()); writeParams({ delivery_op: operation.operation_id }); setMessage(`Envío iniciado para ${operation.total_count || bulkDelivery.length} videos a ${deliveryPortals.find(portal => portal.id === deliveryPortal)?.label || deliveryPortal}. La operación sigue en segundo plano.`); })}>Confirmar envío</button>
+        </div>
+      </div>
+    </CampaignModal>}
     {delivery && <CampaignModal label="Registrar entrega" busy={busy} onClose={() => setDelivery(null)}><div className="max-w-lg space-y-4 rounded-xl bg-surface-2 p-6"><h2>Registrar entrega de {delivery.title}</h2><p>Confirmá dónde entregaste esta versión aprobada. Este registro no envía el archivo.</p><input aria-label="Destino de entrega" className={input} value={destination} onChange={e => setDestination(e.target.value)} placeholder="Portal, carpeta o destinatario y referencia" /><button className={button} disabled={busy || destination.trim().length < 3} onClick={() => run(async () => { await post(`${base}/creative/deliveries`, { job_id: delivery.job_id, video_sha256: delivery.evidence.video_sha256, destination }); setDelivery(null); await load(); setMessage("Entrega registrada."); })}>Confirmar entrega realizada</button><button className={button} disabled={busy} onClick={() => setDelivery(null)}>Cancelar</button></div></CampaignModal>}
   </section>;
 }

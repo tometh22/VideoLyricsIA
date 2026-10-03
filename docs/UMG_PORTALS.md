@@ -34,7 +34,12 @@ Content-Type: application/json
 {"portal_id":"argentina"}
 ```
 
-Los valores válidos son `argentina` y `chile`. El estado del job conserva
+Los valores válidos son `argentina` y `chile`. La UI envía además
+`"async_publish": true`: el endpoint devuelve `202` y un `operation_id`, y
+el operador sigue el resultado por `GET /admin/delivery-operations/{id}`.
+Esto permite preparar archivos ProRes grandes sin agotar el tiempo de la
+petición web. Los clientes anteriores pueden seguir usando la respuesta
+sincrónica durante la transición. El estado del job conserva
 `is_in_umg_portal` para clientes antiguos y agrega `umg_portals` con todos los
 destinos activos.
 
@@ -64,9 +69,11 @@ DELIVERY_RETENTION_DAYS=60
 ```
 
 El reaper ejecuta el sweep una vez por día bajo lock multi-réplica. Oculta las
-filas vencidas y borra únicamente los cinco nombres de salida publicados en
-R2. Nunca elimina `inputs/`, porque el editor y los reintentos necesitan el
-audio fuente. Un fallo de R2 deja la fila elegible para reintento.
+filas vencidas y limpia sus archivos de salida. Las copias inmutables que
+reemplaza una publicación permanecen ocho días, porque una URL firmada antes
+del reemplazo puede seguir vigente siete días. Una copia compartida por los
+dos portales permanece mientras cualquiera de ellos la publique. Nunca se
+elimina `inputs/`, porque el editor y los reintentos necesitan el audio fuente.
 
 ## Vercel y DNS
 
@@ -88,11 +95,11 @@ vercel domains inspect umgchile.genly.pro
 
 ## Ciclo de una corrección
 
-El portal no guarda el archivo ni una URL congelada: reconstruye la key de R2
-`{tenant}/{job_id}/{nombre}` y la firma en cada request, y el render escribe en
-esa misma key. Una corrección llega al cliente sin link nuevo —lo que queremos—
-y, hasta 2026-09-15, sin ningún rastro: misma fila, misma fecha, misma pastilla
-verde de "aprobado" sobre un corte que nunca vio.
+El editor mantiene los nombres de salida habituales. Al publicar, el backend
+congela el corte aprobado en keys `published/{tenant}/{job_id}/{hash}/...` y
+guarda un manifiesto por destino. El portal firma las keys del manifiesto; una
+edición posterior no altera una descarga ya anunciada. Una nueva publicación
+actualiza la misma fila del portal, con una revisión y fecha nuevas.
 
 Los tres pasos de una corrección son ahora explícitos:
 
@@ -100,15 +107,25 @@ Los tres pasos de una corrección son ahora explícitos:
    cambio) o desde la campaña. Pedir el re-render marca las publicaciones
    activas del job como `stale_since`: el portal deja de presentar la descarga
    como final mientras los archivos se están reemplazando.
-2. **Publicar** con `Enviar a UMG` / `Publicar actualización`. El backend
-   compara el `render_fingerprint` actual contra el publicado:
-   - **distinto** → sube `published_revision`, sella `content_updated_at`,
-     **da de baja la aprobación del portal** (el cliente vuelve a ver Aprobar /
-     Rechazar), invalida el cache de tamaños y **cierra los pedidos pendientes**
-     de esa entrega con `resolution_source="publication"`;
-   - **igual** → es un reenvío: la versión y la aprobación no se tocan.
-3. **El cliente revisa** la versión nueva. `awaiting_review` la distingue de una
+2. **Verificar** cada pedido de cambio contra el video final aprobado. El
+   operador confirma las instrucciones detectadas y el comentario completo.
+   La verificación queda ligada al fingerprint del corte; otra edición la
+   invalida. Un pedido sin verificación sigue abierto.
+3. **Publicar** con `Enviar a UMG` / `Publicar actualización`. El backend
+   comprueba los archivos y congela el corte antes de cambiar el manifiesto:
+   - **corte nuevo** → sube `published_revision`, sella `content_updated_at`,
+     da de baja la aprobación anterior y cierra solo los pedidos verificados
+     para ese mismo corte, con `resolution_source="publication"`;
+   - **mismo corte** → conserva la revisión y la aprobación del cliente.
+4. **El cliente revisa** la versión nueva. `awaiting_review` la distingue de una
    ya aprobada.
+
+Las filas históricas sin manifiesto todavía apuntan a keys mutables. Durante
+una edición se suspenden las URLs nuevas de esas filas. El backfill de
+manifiestos es conservador: solo congela automáticamente filas cuya identidad
+publicada coincide de forma comprobable con el render actual. Las URLs viejas
+ya firmadas pueden vivir hasta siete días tras el cambio; hay que considerar
+esa ventana durante el despliegue.
 
 ### Por qué el gate no pregunta a R2 por el ProRes
 
@@ -147,11 +164,8 @@ resuelve esos `job_id`: hay que encolar desde staging.
 
 ### Un job publicado en los dos portales
 
-`mark_deliveries_stale` marca **todas** las filas activas del job, porque el
-re-render reemplaza los archivos que sirven las dos. Publicar limpia la ventana
-sólo en la fila que se publicó: la del otro portal queda marcada y, en cuanto el
-render termina, aparece en la campaña como **Portal desactualizado** (su
-fingerprint ya no coincide). Eso es correcto —ese portal sigue entregando un
-corte que nadie aprobó— y se resuelve publicando también ahí. Si la decisión es
-no publicar en el otro portal, la fila queda visible en ese estado a propósito:
-no hay un camino en el que el aviso se limpie solo sin que alguien decida.
+`mark_deliveries_stale` marca **todas** las filas activas del job. Con
+manifiestos, cada portal conserva descargable su corte publicado mientras el
+operador prepara una corrección. Publicar limpia la ventana solo en el destino
+elegido; el otro queda marcado como desactualizado hasta que se publique allí
+también. Los dos destinos pueden compartir la misma copia inmutable.

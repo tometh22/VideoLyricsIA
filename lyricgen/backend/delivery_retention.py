@@ -25,6 +25,7 @@ RETENTION_DAYS = max(
     int(os.environ.get("DELIVERY_RETENTION_DAYS", str(DEFAULT_RETENTION_DAYS))),
     1,
 )
+RETIRED_MANIFEST_GRACE_DAYS = 8  # portal signed URLs last up to seven days
 
 # Keep this list deliberately separate from the generic job cleanup. These
 # are the only output names the delivery portal publishes today. In
@@ -61,7 +62,9 @@ def _is_expired(delivery: Delivery, cutoff: datetime) -> bool:
     return bool(anchor and anchor < cutoff)
 
 
-def cleanup_expired_deliveries(*, now: datetime | None = None) -> dict[str, int | str]:
+def cleanup_expired_deliveries(
+    *, now: datetime | None = None, dry_run: bool = False,
+) -> dict[str, int | str | bool]:
     """Hide and delete deliveries older than ``DELIVERY_RETENTION_DAYS``.
 
     The caller (the single-runner reaper) supplies cross-replica locking.
@@ -72,6 +75,7 @@ def cleanup_expired_deliveries(*, now: datetime | None = None) -> dict[str, int 
     if not storage.is_enabled():
         return {
             "status": "r2_disabled",
+            "dry_run": dry_run,
             "scanned": 0,
             "expired": 0,
             "hidden": 0,
@@ -96,11 +100,16 @@ def cleanup_expired_deliveries(*, now: datetime | None = None) -> dict[str, int 
         hidden = 0
         deleted = 0
         failed = 0
+        planned_hidden = 0
+        planned_delete = 0
+        metadata_changed = False
         for delivery in expired:
             if delivery.job_id in protected_job_ids:
                 if delivery.removed_at is None:
-                    delivery.removed_at = now
-                    hidden += 1
+                    planned_hidden += 1
+                    if not dry_run:
+                        delivery.removed_at = now
+                        hidden += 1
                 logger.info(
                     "[DELIVERY-RETENTION] kept R2 files for expired row %s; "
                     "job %s still has a newer portal row",
@@ -111,6 +120,9 @@ def cleanup_expired_deliveries(*, now: datetime | None = None) -> dict[str, int 
 
             delete_failed = False
             for key in _delivery_keys(delivery):
+                planned_delete += 1
+                if dry_run:
+                    continue
                 try:
                     storage.delete_object(key)
                     deleted += 1
@@ -130,21 +142,97 @@ def cleanup_expired_deliveries(*, now: datetime | None = None) -> dict[str, int 
             # reclaimed, and an already-removed row remains eligible on the
             # next daily pass instead of being postponed another 60 days.
             if not delete_failed and delivery.removed_at is None:
-                delivery.removed_at = now
-                hidden += 1
+                planned_hidden += 1
+                if not dry_run:
+                    delivery.removed_at = now
+                    hidden += 1
 
-        if hidden:
+        # Published snapshots are shared by Argentina and Chile when both
+        # portals expose the same render. Keep current snapshots and retired
+        # snapshots while an issued signed URL may still be valid.
+        grace_cutoff = now - timedelta(days=RETIRED_MANIFEST_GRACE_DAYS)
+        protected_snapshot_keys: set[str] = set()
+        for delivery in deliveries:
+            if not _is_expired(delivery, cutoff):
+                protected_snapshot_keys.update(
+                    (delivery.published_file_keys or {}).values()
+                )
+            for retired in delivery.retired_file_keys or []:
+                try:
+                    retired_at = datetime.fromisoformat(retired["retired_at"])
+                    if retired_at.tzinfo is None:
+                        retired_at = retired_at.replace(tzinfo=timezone.utc)
+                except (KeyError, TypeError, ValueError):
+                    if isinstance(retired, dict):
+                        protected_snapshot_keys.update((retired.get("keys") or {}).values())
+                    continue
+                if retired_at > grace_cutoff:
+                    protected_snapshot_keys.update((retired.get("keys") or {}).values())
+
+        for delivery in deliveries:
+            keep_retired = []
+            for retired in delivery.retired_file_keys or []:
+                try:
+                    retired_at = datetime.fromisoformat(retired["retired_at"])
+                    if retired_at.tzinfo is None:
+                        retired_at = retired_at.replace(tzinfo=timezone.utc)
+                except (KeyError, TypeError, ValueError):
+                    keep_retired.append(retired)
+                    continue
+                keys = list((retired.get("keys") or {}).values())
+                if retired_at > grace_cutoff or any(key in protected_snapshot_keys for key in keys):
+                    keep_retired.append(retired)
+                    continue
+                try:
+                    for key in set(keys):
+                        if key.startswith("published/"):
+                            planned_delete += 1
+                            if not dry_run:
+                                storage.delete_object(key)
+                                deleted += 1
+                except Exception:
+                    failed += 1
+                    keep_retired.append(retired)
+                    logger.exception("[DELIVERY-RETENTION] failed to retire delivery=%s", delivery.id)
+            if not dry_run and keep_retired != (delivery.retired_file_keys or []):
+                delivery.retired_file_keys = keep_retired
+                metadata_changed = True
+
+            if _is_expired(delivery, cutoff) and delivery.published_file_keys:
+                current_keys = set(delivery.published_file_keys.values())
+                if not any(key in protected_snapshot_keys for key in current_keys):
+                    try:
+                        for key in current_keys:
+                            if key.startswith("published/"):
+                                planned_delete += 1
+                                if not dry_run:
+                                    storage.delete_object(key)
+                                    deleted += 1
+                        if not dry_run:
+                            delivery.published_file_keys = None
+                            delivery.published_file_etags = None
+                            metadata_changed = True
+                    except Exception:
+                        failed += 1
+                        logger.exception("[DELIVERY-RETENTION] failed to remove snapshot delivery=%s", delivery.id)
+
+        if dry_run:
+            db.rollback()
+        elif hidden or metadata_changed:
             db.commit()
         else:
             db.rollback()
 
         result = {
             "status": "ok",
+            "dry_run": dry_run,
             "scanned": len(deliveries),
             "expired": len(expired),
             "hidden": hidden,
             "deleted": deleted,
             "failed": failed,
+            "planned_hidden": planned_hidden,
+            "planned_delete": planned_delete,
             "retention_days": RETENTION_DAYS,
         }
         if expired:

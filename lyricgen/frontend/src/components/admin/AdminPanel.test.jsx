@@ -58,4 +58,17 @@ describe("AdminPanel · navegación de cambios", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Pipeline en vivo" })).toBe(null);
   });
+
+  it("restaura Cambios UMG al volver desde la revisión del video", async () => {
+    const previousUrl = `${window.location.pathname}${window.location.search}`;
+    window.history.replaceState({}, "", "/admin?section=cambios&change_request_id=109");
+    try {
+      render(<AdminPanel onBack={() => {}} />);
+      expect(await screen.findByRole("heading", { name: "Cambios UMG" }))
+        .toBeInTheDocument();
+      expect(screen.getByTestId("change-requests-fullscreen")).toBeInTheDocument();
+    } finally {
+      window.history.replaceState({}, "", previousUrl || "/");
+    }
+  });
 });

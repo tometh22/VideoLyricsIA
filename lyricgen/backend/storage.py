@@ -491,6 +491,18 @@ def object_etag(key: str) -> str | None:
         return None
 
 
+def object_source_etag(key: str) -> str | None:
+    """ETag of the source cut stamped on an immutable portal copy."""
+    client = _get_client()
+    if client is None or not key:
+        return None
+    try:
+        metadata = client.head_object(Bucket=R2_BUCKET, Key=key).get("Metadata") or {}
+        return metadata.get("genly-source-etag")
+    except Exception:
+        return None
+
+
 def upload_file(local_path: str, key: str) -> Optional[str]:
     """Upload a local file to an arbitrary R2 key (used for cache, etc).
     Returns the key on success, None if R2 disabled. Raises on real errors."""
@@ -1264,13 +1276,16 @@ def delete_object(key: str) -> None:
         raise
 
 
-def copy_object(src_key: str, dst_key: str) -> bool:
+def copy_object(src_key: str, dst_key: str, *, source_etag: str | None = None) -> bool:
     """Server-side copy from src_key to dst_key within the same bucket.
 
     Used by run_edit_pipeline to archive the previous version of a deliverable
     (video/short/thumbnail) before the re-rendered file overwrites it. R2's
-    copy_object completes without re-uploading bytes through us, so even
-    multi-GB ProRes masters version in milliseconds.
+    copy_object completes without re-uploading bytes through us. Multi-GB
+    masters can still take minutes; callers must not hold a DB transaction.
+
+    ``source_etag`` stamps a portal snapshot with the exact source identity.
+    This allows safe reuse when a multipart destination has a different ETag.
 
     Returns True on success, False if R2 is disabled or the source key does
     not exist (treated as "nothing to archive"). Raises on real S3 errors so
@@ -1285,8 +1300,20 @@ def copy_object(src_key: str, dst_key: str) -> bool:
     if not object_exists(src_key):
         return False
     src = {"Bucket": R2_BUCKET, "Key": src_key}
+    extra = {}
+    if source_etag:
+        extra = {
+            "MetadataDirective": "REPLACE",
+            "Metadata": {"genly-source-etag": source_etag},
+            "ContentType": _guess_content_type(dst_key) or "application/octet-stream",
+        }
+    multipart_args = {
+        "CopySource": src, "Bucket": R2_BUCKET, "Key": dst_key,
+    }
+    if extra:
+        multipart_args["ExtraArgs"] = extra
     try:
-        client.copy_object(Bucket=R2_BUCKET, Key=dst_key, CopySource=src)
+        client.copy_object(Bucket=R2_BUCKET, Key=dst_key, CopySource=src, **extra)
     except ClientError as e:
         code = (e.response or {}).get("Error", {}).get("Code", "")
         # Single-operation CopyObject caps at 5 GB on S3/R2 → a multi-GB
@@ -1295,7 +1322,7 @@ def copy_object(src_key: str, dst_key: str) -> bool:
         # which has no such limit.
         if code in ("EntityTooLarge", "InvalidRequest", "InvalidArgument"):
             logger.info("[R2] %s exceeds single-copy limit (%s) — using multipart copy", src_key, code)
-            client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key)
+            client.copy(**multipart_args)
         else:
             raise
     except (ReadTimeoutError, ConnectTimeoutError) as e:
@@ -1309,7 +1336,7 @@ def copy_object(src_key: str, dst_key: str) -> bool:
         # well under the timeout — so the same multipart path that handles
         # EntityTooLarge also dodges the per-request timeout.
         logger.info("[R2] %s single-copy timed out (%s) — using multipart copy", src_key, type(e).__name__)
-        client.copy(CopySource=src, Bucket=R2_BUCKET, Key=dst_key)
+        client.copy(**multipart_args)
     logger.info("[R2] Copied %s -> %s", src_key, dst_key)
     return True
 

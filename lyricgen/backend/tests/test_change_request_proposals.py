@@ -21,6 +21,73 @@ def test_parser_extracts_timestamped_client_text_without_inventing_words():
     assert instruction["requested_text"] in comment
 
 
+def test_parser_preserves_apostrophe_and_requested_punctuation():
+    comment = '1:33 debe decir "¡Con las palma\' oiga!"'
+    instruction = parse_change_request(comment)["instructions"][0]
+    assert instruction["requested_text"] == "¡Con las palma' oiga!"
+    assert instruction["requested_text"] in comment
+
+
+def test_parser_does_not_turn_repeat_before_another_phrase_into_replacement():
+    comment = '1:12 Se repite la palabra "cantando" antes de "este guaguancó".'
+    rows = parse_change_request(comment)["instructions"]
+    assert any(row["kind"] == "manual_review" for row in rows)
+    assert not any(row["kind"] == "replace_text" for row in rows)
+
+
+def test_parser_keeps_timing_explanation_out_of_lyric_replacements():
+    comment = (
+        '-0:26 la frase es "Aquellos ojitos verdes ¿con quien se andarán paseando?"\n'
+        '-La frase "ha de ser por los ojitos..." entra en 2:08, pero empieza a cantar en 2:11, '
+        'mover un poquito para que no salga con tanta anticipación ese texto.\n'
+        '- 2:15 y 3:53 ese "Ha" no lleva H, es solo "A de ser por los ojitos..."'
+    )
+    rows = parse_change_request(comment)["instructions"]
+    replacements = [(row["timecode_seconds"], row["requested_text"])
+                    for row in rows if row["kind"] == "replace_text"]
+    assert (26.0, "Aquellos ojitos verdes ¿con quien se andarán paseando?") in replacements
+    assert (135.0, "A de ser por los ojitos...") in replacements
+    assert (233.0, "A de ser por los ojitos...") in replacements
+    assert not any(text in {"y", "pero empieza a cantar en"} for _, text in replacements)
+    assert any(row["kind"] == "timing_review" for row in rows)
+
+
+def test_parser_keeps_cross_reference_for_manual_review():
+    rows = parse_change_request('2:29 la misma frase del punto anterior.')["instructions"]
+    assert [row["kind"] for row in rows] == ["manual_review"]
+
+
+def test_parser_limits_repeat_scope_to_its_instruction():
+    comment = (
+        '0:13 cambiar "hola" por "chau" todas las veces\n'
+        '0:35 cambiar "ayer" por "hoy"'
+    )
+    rows = [row for row in parse_change_request(comment)["instructions"]
+            if row["kind"] == "replace_text"]
+    assert [(row["scope"], row["requested_text"]) for row in rows] == [
+        ("all_matching", "chau"), ("single", "hoy"),
+    ]
+
+
+def test_parser_keeps_text_change_next_to_full_phrase_layout():
+    comment = (
+        '0:01: "borracho y agresivo"\n'
+        '0:42 debe decir "la corrección"\n'
+        'Revisar que las frases completas esten en 1 sola pantalla'
+    )
+    kinds = {(row["kind"], row["timecode_seconds"])
+             for row in parse_change_request(comment)["instructions"]}
+    assert ("merge_phrase", 1.0) in kinds
+    assert ("replace_text", 42.0) in kinds
+
+
+def test_parser_flags_banned_visual_elements_without_false_positive_on_approval():
+    kinds = {row["kind"] for row in parse_change_request("QUITAR BANDERAS CHILENAS")["instructions"]}
+    assert "background_review" in kinds
+    kinds = {row["kind"] for row in parse_change_request("Está bien el fondo")["instructions"]}
+    assert "background_review" not in kinds
+
+
 def test_parser_extracts_explicit_before_after_pair_and_repeat_scope():
     comment = 'En todas las apariciones, cambiar "Vodka con naranja" por "Vodka con Gancia"'
     instruction = parse_change_request(comment)["instructions"][0]

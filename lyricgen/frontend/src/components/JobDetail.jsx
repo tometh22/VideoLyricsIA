@@ -436,6 +436,12 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const [uploadingShort, setUploadingShort] = useState(false);
   const [reviewNotes, setReviewNotes] = useState("");
   const [approving, setApproving] = useState(false);
+  const [qcFocusRequest, setQcFocusRequest] = useState(() => (
+    new URLSearchParams(location.search).has("qc_focus") ? 1 : 0
+  ));
+  const [qcFocusTarget, setQcFocusTarget] = useState(() => (
+    new URLSearchParams(location.search).get("qc_focus") === "findings" ? "findings" : "manual"
+  ));
   const [retrying, setRetrying] = useState(false);
 
   useEffect(() => {
@@ -477,8 +483,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
   const youtubePublishingEnabled = currentUser?.features?.youtube_publish === true;
   const isUmgAdmin = currentUser?.role === "admin";
   const [sendingUmg, setSendingUmg] = useState(false);
+  const pendingUmgPublishRef = useRef(null);
   const [umgSendStage, setUmgSendStage] = useState(null);
   const [sendUmgAfterProres, setSendUmgAfterProres] = useState(false);
+  const [umgQcRequested, setUmgQcRequested] = useState(false);
   const [umgPortals, setUmgPortals] = useState(() => getUmgPortals(job));
   const [showUmgPortalPicker, setShowUmgPortalPicker] = useState(false);
   const [selectedUmgPortal, setSelectedUmgPortal] = useState("argentina");
@@ -530,29 +538,144 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       ? requestedPortal
       : "argentina";
     const target = UMG_PORTALS.find(({ id }) => id === targetPortal) || UMG_PORTALS[0];
+    pendingUmgPublishRef.current = targetPortal;
     setSendingUmg(true);
     setUmgSendStage("publishing");
     try {
       let resp;
       let result;
       let preparationRounds = 0;
+      let preflightRounds = 0;
       do {
         resp = await fetch(`${API}/admin/deliveries/from-job/${job.job_id}`, {
           method: "POST",
           headers: { ...authHeaders(), "Content-Type": "application/json" },
-          body: JSON.stringify({ portal_id: targetPortal }),
+          body: JSON.stringify({ portal_id: targetPortal, async_publish: true }),
         });
         result = await resp.json().catch(() => ({}));
-        if (resp.status !== 202 || result.status !== "preparing_prores") break;
-        preparationRounds += 1;
-        if (preparationRounds > 2) {
-          const timeout = new Error("UMG files still unavailable");
-          timeout.kind = "timeout";
-          throw timeout;
+        if (resp.status === 202 && result.operation_id) {
+          const operationId = result.operation_id;
+          const deadline = Date.now() + 15 * 60 * 1000;
+          let networkFailures = 0;
+          while (Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            let operationResponse;
+            try {
+              operationResponse = await fetch(
+                `${API}/admin/delivery-operations/${operationId}`,
+                { headers: authHeaders(), cache: "no-store" },
+              );
+              if (!operationResponse.ok) throw new Error("No se pudo consultar el envío.");
+              networkFailures = 0;
+            } catch (error) {
+              networkFailures += 1;
+              if (networkFailures < 5) continue;
+              throw error;
+            }
+            const operation = await operationResponse.json();
+            setUmgSendStage(operation.status === "waiting_files" ? "preparing" : "publishing");
+            if (operation.status === "completed") {
+              result = operation.result || {};
+              resp = { ok: true, status: 200 };
+              break;
+            }
+            if (operation.status === "failed") {
+              result = { detail: operation.error || "No se pudo completar el envío." };
+              resp = { ok: false, status: 409 };
+              break;
+            }
+          }
+          if (resp.status === 202) {
+            pendingUmgPublishRef.current = null;
+            alert({
+              title: "El envío sigue en curso",
+              description: "La preparación continúa en segundo plano. Volvé a abrir este video para ver el estado del portal.",
+              tone: "warning",
+            });
+            return;
+          }
         }
-        setUmgSendStage("preparing");
-        await waitForUmgMasters(result.retry_after);
-        setUmgSendStage("publishing");
+        if (resp.status === 202 && result.status === "preparing_prores") {
+          preparationRounds += 1;
+          if (preparationRounds > 2) {
+            const timeout = new Error("UMG files still unavailable");
+            timeout.kind = "timeout";
+            throw timeout;
+          }
+          setUmgSendStage("preparing");
+          await waitForUmgMasters(result.retry_after);
+          setUmgSendStage("publishing");
+          continue;
+        }
+        const detail = result.detail;
+        if (!resp.ok && resp.status === 409 && detail?.code === "delivery_qc_blocked") {
+          const gate = detail.delivery_qc || {};
+          if (gate.reason === "fresh_preflight_required" || gate.missing_checks?.length) {
+            setUmgSendStage("checking_qc");
+            const qcResponse = await fetch(`${API}/jobs/${job.job_id}/delivery-qc/recheck`, {
+              method: "POST",
+              headers: { ...authHeaders(), "Content-Type": "application/json" },
+              body: JSON.stringify({ for_umg_delivery: true }),
+            });
+            const qcResult = await qcResponse.json().catch(() => ({}));
+            if (qcResponse.ok && qcResult.delivery_qc) {
+              const nextReport = qcResult.delivery_qc;
+              const nextIssues = nextReport.issues || [];
+              const pendingManual = nextIssues.filter((issue) => issue.manual_verification_required && issue.status === "OPEN").length;
+              const openFailures = nextIssues.filter((issue) => issue.status === "OPEN" && (issue.result_status === "FAIL" || issue.severity === "FAIL") && !issue.manual_verification_required).length;
+              let currentJob = {
+                ...job,
+                umg_spec: nextReport.delivery_spec || job.umg_spec,
+                delivery_qc: nextReport,
+              };
+              const statusResponse = await fetch(`${API}/status/${job.job_id}`, { headers: authHeaders() });
+              if (statusResponse.ok) currentJob = { ...currentJob, ...(await statusResponse.json()) };
+              onJobUpdate?.(currentJob);
+              setUmgQcRequested(true);
+              if (nextReport.approval?.can_approve && preflightRounds < 2) {
+                preflightRounds += 1;
+                setUmgSendStage("publishing");
+                continue;
+              }
+              if (openFailures) pendingUmgPublishRef.current = null;
+              const focusTarget = openFailures ? "findings" : "manual";
+              setQcFocusTarget(focusTarget);
+              setQcFocusRequest((value) => value + 1);
+              alert({
+                title: openFailures ? "Hay puntos que corregir" : "Preflight actualizado",
+                description: openFailures
+                  ? `Encontramos ${openFailures} ${openFailures === 1 ? "fallo" : "fallos"} que deben corregirse antes de preparar el master.`
+                  : pendingManual
+                  ? "Revisá el corte y confirmá una sola vez. Después seguimos con la publicación."
+                    : "El corte necesita una nueva revisión antes de continuar.",
+                tone: "warning",
+              });
+              return;
+            }
+            alert({
+              title: "No se pudo actualizar el preflight",
+              description: qcResult.detail?.message || qcResult.detail || "Revisá la conexión y volvé a intentarlo.",
+              tone: "error",
+            });
+            pendingUmgPublishRef.current = null;
+            return;
+          }
+
+          const focusTarget = gate.reason === "manual_review_required" ? "manual" : "findings";
+          setUmgQcRequested(true);
+          setQcFocusTarget(focusTarget);
+          setQcFocusRequest((value) => value + 1);
+          document.querySelector('[data-testid="delivery-qc-panel"]')?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+          alert({
+            title: gate.reason === "manual_review_required" ? "Revisión pendiente" : "Hay puntos que corregir",
+            description: gate.reason === "manual_review_required"
+              ? "Firmá los controles pendientes del video y volvé a publicar."
+              : "Corregí los hallazgos indicados y actualizá el preflight antes de publicar.",
+            tone: "warning",
+          });
+          return;
+        }
+        break;
       } while (true);
       if (!resp.ok) {
         const detail = result.detail;
@@ -561,6 +684,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           setShowProResModal(true);
           return;
         }
+        pendingUmgPublishRef.current = null;
         alert({
           title: "No se pudo enviar a UMG",
           description: (
@@ -572,6 +696,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         });
         return;
       }
+      pendingUmgPublishRef.current = null;
       setIsInUmgPortal(true);
       setUmgPortals((previous) => [
         ...new Set([...previous, targetPortal]),
@@ -601,6 +726,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
         tone: "success",
       });
     } catch (err) {
+      pendingUmgPublishRef.current = null;
       console.error("Send to UMG failed:", err);
       alert({
         title: "No se pudo enviar a UMG",
@@ -619,11 +745,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
     setSelectedUmgPortal(portalId);
     setSendUmgPortal(portalId);
     setShowUmgPortalPicker(false);
-    if (!job.umg_spec) {
-      setSendUmgAfterProres(true);
-      setShowProResModal(true);
-      return;
-    }
+    setUmgQcRequested(true);
     publishToUMG(portalId);
   };
 
@@ -1800,6 +1922,10 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
       job.s3_keys?.umg_master
       || job.s3_keys?.umg_short
     );
+  const isStrictQCJob = isUmgJob || job.workload_class === "batch";
+  const qcApprovalReason = job.delivery_qc?.approval?.reason || "fresh_preflight_required";
+  const qcApprovalBlocked = job.delivery_qc?.approval?.blocked === true
+    || (isStrictQCJob && (!job.delivery_qc || job.delivery_qc.status !== "COMPLETE" || !job.delivery_qc.source_fingerprint));
   const isJobDone = job.status === "done";
   const hasUmgMaster = isUmgJob && isJobDone;
 
@@ -1979,7 +2105,9 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
                         ? "Actualizar este video en un portal UMG"
                         : "Publicar este video en un portal UMG"}
                     >
-                      {umgSendStage === "preparing"
+                      {umgSendStage === "checking_qc"
+                        ? "Analizando corte…"
+                        : umgSendStage === "preparing"
                         ? "Preparando masters…"
                         : sendingUmg
                           ? (t("detail.sending_umg") || "Enviando…")
@@ -2328,6 +2456,16 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           job={job}
           onJobUpdate={onJobUpdate}
           onSeek={seekVideo}
+          forUmgDelivery={isUmgAdmin && (isUmgJob || isInUmgPortal || umgQcRequested)}
+          focusRequest={qcFocusRequest}
+          focusTarget={qcFocusTarget}
+          preflightDisabled={sendingUmg}
+          onManualReviewComplete={(report) => {
+            const portalId = pendingUmgPublishRef.current;
+            if (!portalId || report?.approval?.can_approve !== true) return;
+            pendingUmgPublishRef.current = null;
+            publishToUMG(portalId);
+          }}
           onOpenEditor={() => navigate(withReturn(`/videos/${job.job_id}/edit-lyrics`))}
         />
       )}
@@ -2349,6 +2487,29 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           <p className="text-xs text-ink-secondary mb-4">
             {t("review.description") || "Revisá el video generado antes de habilitar la descarga y publicación."}
           </p>
+          {qcApprovalBlocked && (
+            <div role="status" className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-amber-500/[0.08] p-3 ring-1 ring-amber-400/20">
+              <p className="text-xs text-amber-100">
+                {qcApprovalReason === "manual_review_required"
+                  ? "Firmá los controles visuales pendientes para aprobar este video."
+                  : qcApprovalReason === "open_fail"
+                    ? "Corregí los fallos del video y actualizá el preflight para aprobar."
+                    : qcApprovalReason === "review_required"
+                      ? "Hay puntos por revisar antes de aprobar."
+                      : "Analizá la versión actual antes de aprobar."}
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  const target = qcApprovalReason === "manual_review_required" ? "manual" : "findings";
+                  setQcFocusTarget(target);
+                  setQcFocusRequest((value) => value + 1);
+                  document.querySelector('[data-testid="delivery-qc-panel"]')?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+                }}
+                className="shrink-0 rounded-lg bg-amber-400/10 px-3 py-2 text-[11px] font-semibold text-amber-100 hover:bg-amber-400/20"
+              >Ver pendientes</button>
+            </div>
+          )}
           <div className="px-3 py-2 rounded-xl bg-accent/[0.06] ring-1 ring-accent/20 mb-4">
             <p className="text-[11px] text-accent">
               {t("review.reject_free") || "Rechazar es gratis — solo los videos aprobados cuentan en tu cuota mensual."}
@@ -2364,7 +2525,7 @@ export default function JobDetail({ job, onBack, onJobUpdate }) {
           <div className="flex flex-wrap gap-3">
             <button
               onClick={handleApprove}
-              disabled={approving || job.delivery_qc?.approval?.blocked === true}
+              disabled={approving || qcApprovalBlocked}
               className="inline-flex items-center justify-center h-12 px-6 rounded-button text-sm font-semibold text-white bg-accent hover:bg-accent/90 disabled:opacity-50 transition-colors"
             >
               {approving ? (

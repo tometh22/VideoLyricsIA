@@ -49,13 +49,19 @@ line automatically.  This is especially important for live songs.
   a clean video.
 - Job Detail shows a clickable checklist, frame seeks, acknowledgements, safe
   repair buttons and a direct editor link.
+- UMG publication asks for one attestation on the current video. The expanded
+  checklist still shows each review dimension, while a fresh report, objective
+  blocking failures and an unsigned current-cut attestation remain the only
+  QC gates. Older reports with eight separate generic reminders remain
+  publishable and are consolidated the next time preflight runs.
 - Reviewer decisions, accepted repair types, approval outcome and later label QC
   finding counts are structured product events. Existing editor `active_edit_ms`
   supplies minutes-per-song before/after.
 - `DELIVERY_QC_MODE=observe` never blocks approval. `enforce` requires a fresh
   report and blocks only objective open `FAIL` findings. Open `REVIEW`
-  findings, including unsigned generic reviewer reminders, remain visible as
-  recommendations and do not become automatic failures.
+  findings remain visible as recommendations and do not become automatic
+  failures. UMG delivery adds one signed visual-review attestation for the
+  current cut rather than eight separate signatures.
 
 ## Deliberately not automatic yet
 

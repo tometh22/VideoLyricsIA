@@ -633,6 +633,8 @@ class Job(Base):
     # Approval workflow (UMG compliance)
     approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     approved_at = Column(DateTime(timezone=True), nullable=True)
+    approved_render_fingerprint = Column(String(64), nullable=True)
+    approved_video_etag = Column(String(128), nullable=True)
     review_notes = Column(Text, nullable=True)
 
     # Archivado de intentos fallidos (2026-06-10, Fase 1). Cuando un job
@@ -1321,6 +1323,28 @@ class QualityExperimentRun(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
+class DeliveryPublishOperation(Base):
+    """Durable single-video portal publication; R2 copies run in a worker."""
+
+    __tablename__ = "delivery_publish_operations"
+    __table_args__ = (
+        Index("ix_delivery_publish_job_portal", "job_id", "portal_id", "created_at"),
+        Index("ix_delivery_publish_status", "status", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True)
+    job_id = Column(String(12), nullable=False)
+    portal_id = Column(String(20), nullable=False)
+    label = Column(String(120), nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    expected_fingerprint = Column(String(64), nullable=False)
+    status = Column(String(24), nullable=False, default="queued")
+    result = Column(JSONB, nullable=True)
+    error = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
 class Delivery(Base):
     # Versions exposed on the UMG deliverables portals (Argentina and Chile).
     # Replaces the previous static items.json workflow — admins click
@@ -1379,13 +1403,18 @@ class Delivery(Base):
     # leave room for per-user portal logins to write usernames here later.
     approved_at = Column(DateTime(timezone=True), nullable=True, index=True)
     approved_by_label = Column(String(120), nullable=True)
+    approved_revision = Column(Integer, nullable=True)
+    # Immutable objects served for the currently published revision. Legacy
+    # rows without a manifest still use the original deterministic keys.
+    published_file_keys = Column(JSONB, nullable=True)
+    published_file_etags = Column(JSONB, nullable=True)
+    published_manifest_hash = Column(String(64), nullable=True)
+    # Superseded manifests stay available until previously signed URLs expire.
+    retired_file_keys = Column(JSONB, nullable=True)
     # ── Freshness of the published content ────────────────────────────
-    # The portal does not store a file or a frozen URL: it rebuilds the
-    # R2 key from (tenant, job_id, file_type) and signs it on demand, so
-    # a re-render silently replaces what the client downloads. That is
-    # the behaviour we want (a correction reaches them without a new
-    # link) and also the hazard: the row kept saying "approved by UMG,
-    # published on <old date>" about content they never saw.
+    # Current publications sign immutable keys from published_file_keys.
+    # Legacy rows without a manifest still rebuild mutable deterministic
+    # keys, which is why they require conservative backfill/reconciliation.
     #
     # These four columns make the row describe the content it is
     # actually serving, so both the portal and the operator can tell a
@@ -1426,6 +1455,9 @@ class Delivery(Base):
             "removed_at": self.removed_at.isoformat() if self.removed_at else None,
             "approved_at": self.approved_at.isoformat() if self.approved_at else None,
             "approved_by_label": self.approved_by_label,
+            "approved_revision": self.approved_revision,
+            "published_file_keys": self.published_file_keys or {},
+            "published_manifest_hash": self.published_manifest_hash,
             "published_revision": self.published_revision or 1,
             "content_updated_at": (
                 self.content_updated_at.isoformat()
@@ -1459,6 +1491,7 @@ class DeliveryChangeRequest(Base):
     submitted_at = Column(
         DateTime(timezone=True), default=utcnow, nullable=False,
     )
+    requested_revision = Column(Integer, nullable=True)
     # Set when the operator marks the request handled (re-rendered,
     # edited, dismissed). Null = still pending.
     resolved_at = Column(DateTime(timezone=True), nullable=True)
@@ -1474,6 +1507,12 @@ class DeliveryChangeRequest(Base):
     # "manual" (operator ticked it off) | "publication" (a new revision
     # was published). Null on rows predating this column.
     resolution_source = Column(String(20), nullable=True)
+    # Operator attestation of the complete client request against one render.
+    # A new edit changes the fingerprint and invalidates this verification.
+    verified_render_fingerprint = Column(String(64), nullable=True)
+    verified_at = Column(DateTime(timezone=True), nullable=True)
+    verified_by_user_id = Column(Integer, nullable=True)
+    verification_evidence = Column(JSONB, nullable=True)
 
     def to_dict(self):
         return {
@@ -1481,10 +1520,14 @@ class DeliveryChangeRequest(Base):
             "delivery_id": self.delivery_id,
             "comment": self.comment,
             "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
+            "requested_revision": self.requested_revision,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "resolution_note": self.resolution_note,
             "resolved_by_revision": self.resolved_by_revision,
             "resolution_source": self.resolution_source,
+            "verified_render_fingerprint": self.verified_render_fingerprint,
+            "verified_at": self.verified_at.isoformat() if self.verified_at else None,
+            "verification_evidence": self.verification_evidence,
         }
 
 

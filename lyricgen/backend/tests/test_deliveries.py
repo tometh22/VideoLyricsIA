@@ -13,9 +13,9 @@ Why these tests matter:
   through the UI — the exact pain point the feature was meant to fix.
 
 Test approach:
-  We stub `storage.object_exists` to True so the POST handler doesn't
-  reach R2. R2 is integration-tested elsewhere; we're isolating the
-  delivery business logic here.
+  We stub R2 HEAD/copy responses so the POST handler can freeze a manifest
+  without reaching R2. R2 is integration-tested elsewhere; we're isolating
+  the delivery business logic here.
 """
 from __future__ import annotations
 
@@ -28,6 +28,43 @@ from tests.conftest import auth
 
 
 PORTAL_TOKEN = os.environ.get("DELIVERY_PORTAL_TOKEN", "test-portal-token")
+
+
+def _signed_umg_qc_report(job, reviewer_id):
+    from delivery_qc_runtime import (
+        MANUAL_ATTESTATION_CODE, MANUAL_ATTESTATION_DESCRIPTION,
+        MANUAL_ATTESTATION_SUMMARY, delivery_qc_source_fingerprint,
+        delivery_qc_visual_fingerprint, segments_hash,
+    )
+
+    now = datetime.now(timezone.utc).isoformat()
+    issues = [{
+        "issue_id": "manual-final-review", "code": MANUAL_ATTESTATION_CODE,
+        "summary": MANUAL_ATTESTATION_SUMMARY,
+        "description": MANUAL_ATTESTATION_DESCRIPTION,
+        "severity": "WARN",
+        "result_status": "REVIEW", "status": "RESOLVED_MANUAL",
+        "manual_verification_required": True,
+        "operator_decision": {
+            "decision": "resolved_manual", "user_id": reviewer_id,
+            "decided_at": now,
+        },
+    }]
+    return {
+        "status": "COMPLETE", "mode": "enforce", "generated_at": now,
+        "segments_revision": int(job.segments_revision or 0),
+        "segments_hash": segments_hash(job.segments_json or []),
+        "delivery_spec": dict(job.umg_spec or {}),
+        "source_fingerprint": delivery_qc_source_fingerprint(job),
+        "visual_fingerprint": delivery_qc_visual_fingerprint(job),
+        "render_identity": {"edit_count": int(job.edit_count or 0)},
+        "issues": issues,
+    }
+
+
+def _refresh_umg_qc(job):
+    """Model an operator reviewing the exact current render before delivery."""
+    job.delivery_qc = _signed_umg_qc_report(job, job.user_id)
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +115,8 @@ def approved_job(db, admin_token, client):
     db.add(job)
     db.commit()
     db.refresh(job)
+    job.delivery_qc = _signed_umg_qc_report(job, me["id"])
+    db.commit()
     yield job
     # Cleanup: remove the job + any deliveries we created against it.
     # Change requests reference deliveries via a FK (delivery_change_requests
@@ -87,6 +126,7 @@ def approved_job(db, admin_token, client):
     # subsequent test that reuses this fixture's hardcoded job_id.
     from database import (
         ChangeRequestProposal, Delivery, DeliveryChangeRequest,
+        DeliveryPublishOperation,
         EditorDocument, EditorVersion, JobOutboxEvent,
     )
     delivery_ids = [
@@ -109,15 +149,27 @@ def approved_job(db, admin_token, client):
         EditorDocument.job_id == "testjob12345"
     ).delete(synchronize_session=False)
     db.query(Delivery).filter(Delivery.job_id == "testjob12345").delete()
+    db.query(DeliveryPublishOperation).filter(
+        DeliveryPublishOperation.job_id == "testjob12345"
+    ).delete()
     db.query(Job).filter(Job.id == job.id).delete()
     db.commit()
 
 
 @pytest.fixture
 def all_r2_files_present():
-    """Stub storage.object_exists → True so the POST handler thinks the
-    5 deliverable files are sitting in R2. Real R2 is hit in production."""
+    """Provide a stable source cut and successful immutable R2 copies."""
     with patch("main.storage.object_exists", return_value=True):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def manifest_r2_snapshot():
+    """Keep the new R2 snapshot layer local to this endpoint test module."""
+    with patch("storage.object_etag", return_value="stable-test-etag"), \
+         patch("storage.object_source_etag", return_value="stable-test-etag"), \
+         patch("storage.head_object_size", return_value=1024), \
+         patch("storage.copy_object", return_value=True):
         yield
 
 
@@ -133,6 +185,85 @@ def test_admin_can_create_delivery(client, admin_token, approved_job, all_r2_fil
     assert body["job_id"] == approved_job.job_id
     assert body["label"] == "Renderizado"  # first delivery for this song
     assert body["replaced"] is False
+
+
+def test_publication_blocks_when_qc_report_is_missing(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    approved_job.delivery_qc = None
+    db.commit()
+
+    response = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "chile"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "delivery_qc_blocked"
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "fresh_preflight_required"
+
+
+def test_publication_blocks_until_required_manual_checks_are_signed(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    report = dict(approved_job.delivery_qc)
+    report["issues"] = [dict(row) for row in report["issues"]]
+    report["issues"][0].update({"status": "OPEN", "operator_decision": None})
+    approved_job.delivery_qc = report
+    db.commit()
+
+    response = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={"portal_id": "argentina"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "manual_review_required"
+
+
+def test_publication_does_not_start_prores_when_qc_needs_correction(
+    client, admin_token, approved_job, db,
+):
+    report = dict(approved_job.delivery_qc)
+    report["issues"] = [dict(row) for row in report["issues"]]
+    report["issues"].append({
+        "issue_id": "objective-black-frame", "code": "MEDIA_BLACK_FRAME",
+        "status": "OPEN", "severity": "FAIL", "result_status": "FAIL",
+        "blocking": True,
+    })
+    approved_job.delivery_qc = report
+    db.commit()
+
+    with patch("main.enqueue_prores_prewarm") as enqueue:
+        response = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={"portal_id": "chile"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["delivery_qc"]["reason"] == "open_fail"
+    enqueue.assert_not_called()
+
+
+def test_objective_fail_cannot_be_manually_cleared_through_api(
+    client, admin_token, approved_job, db,
+):
+    report = dict(approved_job.delivery_qc)
+    report["issues"] = [dict(row) for row in report["issues"]]
+    report["issues"].append({
+        "issue_id": "objective-black-frame", "code": "MEDIA_BLACK_FRAME",
+        "status": "OPEN", "severity": "FAIL", "result_status": "FAIL",
+        "blocking": True,
+    })
+    approved_job.delivery_qc = report
+    db.commit()
+
+    response = client.post(
+        f"/jobs/{approved_job.job_id}/delivery-qc/issues/objective-black-frame/decision",
+        headers=auth(admin_token),
+        json={"decision": "resolved_manual", "reason": "try to bypass"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "manual_resolution_requires_mandatory_reviewer_check"
 
 
 def test_missing_prores_is_prepared_instead_of_returning_dead_end(
@@ -173,6 +304,7 @@ def test_youtube_only_job_requests_prores_configuration(
 ):
     approved_job.umg_spec = None
     approved_job.delivery_profile = "youtube"
+    _refresh_umg_qc(approved_job)
     db.commit()
 
     def object_exists(key):
@@ -276,6 +408,26 @@ def test_resending_replaces_not_duplicates(client, admin_token, approved_job, al
     assert res2.json()["label"] == "Renderizado v2"
 
 
+def test_committed_portal_publication_stays_successful_if_local_audit_fails(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    """Two databases cannot commit atomically; the delivery is the receipt."""
+    from database import Delivery
+
+    with patch("main.AuditLog", side_effect=RuntimeError("local audit unavailable")):
+        response = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={"portal_id": "chile"},
+        )
+
+    assert response.status_code == 200, response.text
+    receipt = response.json()
+    assert receipt["manifest_hash"]
+    assert receipt["audit_pending"] is True
+    row = db.query(Delivery).filter(Delivery.id == receipt["delivery_id"]).one()
+    assert row.published_manifest_hash == receipt["manifest_hash"]
+
+
 def test_portal_token_required_for_items(client):
     res = client.get("/api/deliveries/items")  # no token
     assert res.status_code == 401
@@ -305,6 +457,49 @@ def test_portal_items_lists_active_deliveries(client, admin_token, approved_job,
     assert isinstance(v.get("delivery_id"), int)
     # 5 files expected (umg_master, umg_short, video, short, thumbnail)
     assert len(v["files"]) == 5
+
+
+def test_portal_listing_switches_to_new_immutable_key_after_a_new_cut(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    from database import Delivery
+
+    with patch("storage.generate_signed_url", side_effect=lambda key, **_kwargs: f"https://r2.example/{key}"):
+        first = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={"portal_id": "chile"},
+        ).json()
+        row = db.query(Delivery).filter(Delivery.id == first["delivery_id"]).one()
+        db.refresh(row)
+        old_key = row.published_file_keys["video"]
+        old_listing = client.get(
+            "/api/deliveries/items",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+        ).json()
+        old_version = next(v for song in old_listing["songs"] for v in song["versions"]
+                           if v["delivery_id"] == first["delivery_id"])
+        old_url = next(file["url"] for file in old_version["files"] if file["type"] == "video")
+
+        _edit_the_render(db, approved_job)
+        second = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token), json={"portal_id": "chile"},
+        ).json()
+        db.refresh(row)
+        new_key = row.published_file_keys["video"]
+        new_listing = client.get(
+            "/api/deliveries/items",
+            headers={"X-Portal-Token": PORTAL_TOKEN, "X-Portal-Id": "chile"},
+        ).json()
+        new_version = next(v for song in new_listing["songs"] for v in song["versions"]
+                           if v["delivery_id"] == first["delivery_id"])
+        new_url = next(file["url"] for file in new_version["files"] if file["type"] == "video")
+
+    assert first["manifest_hash"] != second["manifest_hash"]
+    assert old_key != new_key
+    assert old_key in old_url
+    assert new_key in new_url
+    assert old_key not in new_url
 
 
 def test_chile_portal_does_not_expose_non_chile_delivery(
@@ -577,6 +772,9 @@ def test_change_request_submit_and_admin_lists_it(
     assert item["delivery"]["job_id"] == approved_job.job_id
     assert item["resolved_at"] is None
     assert item["publication"]["prores_configured"] is True
+    assert item["workflow"]["phase"] == "needs_edit"
+    assert item["workflow"]["next_action"] == "edit"
+    assert "publish" not in item["workflow"]["allowed_actions"]
 
     # Resolver lo saca de "pending" y lo pasa a "resolved".
     res = client.post(f"/admin/change-requests/{cr_id}/resolve",
@@ -593,6 +791,7 @@ def test_change_request_submit_and_admin_lists_it(
     assert resolved["resolved_count"] == 1
     resolved_item = next(i for i in resolved["items"] if i["id"] == cr_id)
     assert resolved_item["resolution_note"] == "re-renderizado con fuente más grande"
+    assert resolved_item["workflow"]["phase"] == "resolved"
 
     # Reabrir lo vuelve a poner pendiente.
     res = client.post(f"/admin/change-requests/{cr_id}/reopen", headers=auth(admin_token))
@@ -600,6 +799,7 @@ def test_change_request_submit_and_admin_lists_it(
     pending = client.get("/admin/change-requests?status=pending",
                           headers=auth(admin_token)).json()
     assert pending["pending_count"] == 1
+
 
 
 def test_change_request_proposal_applies_revisioned_text_but_stays_open_until_publish(
@@ -613,6 +813,7 @@ def test_change_request_proposal_applies_revisioned_text_but_stays_open_until_pu
     ]
     approved_job.segments_revision = 0
     approved_job.bg_r2_key_cached = "backgrounds/testjob12345.mp4"
+    _refresh_umg_qc(approved_job)
     db.commit()
     delivery_id = client.post(
         f"/admin/deliveries/from-job/{approved_job.job_id}",
@@ -731,6 +932,7 @@ def test_change_request_dismissed_proposal_can_be_recalculated(
     monkeypatch.setenv("CHANGE_REQUEST_ASSIST_ENABLED", "1")
     approved_job.segments_json = [{"start": 0.0, "end": 2.0, "text": "Viejo"}]
     approved_job.segments_revision = 0
+    _refresh_umg_qc(approved_job)
     db.commit()
     delivery_id = client.post(
         f"/admin/deliveries/from-job/{approved_job.job_id}",
@@ -768,6 +970,7 @@ def test_change_request_apply_rejects_stale_editor_revision(
     monkeypatch.setenv("CHANGE_REQUEST_APPLY_ENABLED", "1")
     approved_job.segments_json = [{"start": 0.0, "end": 2.0, "text": "Viejo"}]
     approved_job.segments_revision = 0
+    _refresh_umg_qc(approved_job)
     db.commit()
     delivery_id = client.post(
         f"/admin/deliveries/from-job/{approved_job.job_id}",
@@ -933,7 +1136,185 @@ def _edit_the_render(db, job):
         "archived_at": datetime.now(timezone.utc).isoformat(),
         "keys": {"video": "default/testjob12345/lyric_video.mp4.v1"},
     }]
+    _refresh_umg_qc(job)
     db.commit()
+
+
+def _verify_request(client, token, request_id, job, comment):
+    from change_request_parser import parse_change_request
+    from delivery_freshness import render_fingerprint
+    response = client.post(
+        f"/admin/change-requests/{request_id}/verify",
+        headers=auth(token),
+        json={
+            "expected_render_fingerprint": render_fingerprint(job),
+            "instruction_ids": [row["id"] for row in parse_change_request(comment)["instructions"]],
+            "confirmed_complete_request": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_committed_change_request_verification_survives_local_audit_failure(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    from change_request_parser import parse_change_request
+    from delivery_freshness import render_fingerprint
+    from database import DeliveryChangeRequest
+
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()
+    comment = "corregir una palabra"
+    with patch("main.emails.send_umg_change_request_notification"):
+        request_id = client.post(
+            f"/api/deliveries/{published['delivery_id']}/change-request",
+            headers={"X-Portal-Token": PORTAL_TOKEN}, json={"comment": comment},
+        ).json()["id"]
+    _edit_the_render(db, approved_job)
+    with patch("main.AuditLog", side_effect=RuntimeError("local audit unavailable")):
+        response = client.post(
+            f"/admin/change-requests/{request_id}/verify",
+            headers=auth(admin_token),
+            json={
+                "expected_render_fingerprint": render_fingerprint(approved_job),
+                "instruction_ids": [
+                    row["id"] for row in parse_change_request(comment)["instructions"]
+                ],
+                "confirmed_complete_request": True,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["audit_pending"] is True
+    row = db.query(DeliveryChangeRequest).filter(
+        DeliveryChangeRequest.id == request_id
+    ).one()
+    db.refresh(row)
+    assert row.verified_at is not None
+
+
+def test_individual_publication_survives_the_request_lifecycle(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    """The UI gets a durable operation and the worker finishes it later."""
+    from main import process_single_delivery
+    with patch("main._enqueue_single_delivery", return_value=True):
+        queued = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token),
+            json={"portal_id": "chile", "async_publish": True},
+        )
+    assert queued.status_code == 202, queued.text
+    operation_id = queued.json()["operation_id"]
+    before = client.get(f"/admin/delivery-operations/{operation_id}", headers=auth(admin_token))
+    assert before.json()["status"] == "queued"
+
+    process_single_delivery(operation_id)
+    after = client.get(f"/admin/delivery-operations/{operation_id}", headers=auth(admin_token))
+    assert after.status_code == 200
+    assert after.json()["status"] == "completed"
+    assert after.json()["result"]["portal_id"] == "chile"
+    assert after.json()["result"]["revision"] == 1
+
+
+def test_duplicate_individual_worker_does_not_publish_while_copy_is_active(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    from database import DeliveryPublishOperation
+    from main import process_single_delivery
+
+    with patch("main._enqueue_single_delivery", return_value=True):
+        queued = client.post(
+            f"/admin/deliveries/from-job/{approved_job.job_id}",
+            headers=auth(admin_token),
+            json={"portal_id": "chile", "async_publish": True},
+        )
+    operation_id = queued.json()["operation_id"]
+    operation = db.query(DeliveryPublishOperation).filter(
+        DeliveryPublishOperation.id == operation_id,
+    ).one()
+    operation.status = "sending"
+    db.commit()
+
+    with patch("main._publish_delivery_now") as publish:
+        process_single_delivery(operation_id)
+    publish.assert_not_called()
+
+
+def test_portal_approval_rejects_a_stale_revision(
+    client, admin_token, approved_job, all_r2_files_present,
+):
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()
+    rejected = client.post(
+        f"/api/deliveries/{published['delivery_id']}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN},
+        json={"expected_revision": 0},
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == "delivery_revision_changed"
+    stale_files = client.post(
+        f"/api/deliveries/{published['delivery_id']}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN},
+        json={"expected_revision": published["revision"],
+              "expected_manifest_hash": "older-cut"},
+    )
+    assert stale_files.status_code == 409
+    assert stale_files.json()["detail"]["code"] == "delivery_manifest_changed"
+
+
+def test_committed_umg_approval_stays_successful_if_local_audit_fails(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    from database import Delivery
+
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()
+    with patch("main.AuditLog", side_effect=RuntimeError("local audit unavailable")):
+        response = client.post(
+            f"/api/deliveries/{published['delivery_id']}/approve",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+            json={"expected_revision": published["revision"],
+                  "expected_manifest_hash": published["manifest_hash"]},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["audit_pending"] is True
+    row = db.query(Delivery).filter(Delivery.id == published["delivery_id"]).one()
+    assert row.approved_revision == published["revision"]
+
+
+def test_committed_umg_unapproval_stays_successful_if_local_audit_fails(
+    client, admin_token, approved_job, all_r2_files_present, db,
+):
+    from database import Delivery
+
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()
+    delivery_id = published["delivery_id"]
+    assert client.post(
+        f"/api/deliveries/{delivery_id}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+    ).status_code == 200
+    with patch("main.AuditLog", side_effect=RuntimeError("local audit unavailable")):
+        response = client.post(
+            f"/api/deliveries/{delivery_id}/un-approve",
+            headers={"X-Portal-Token": PORTAL_TOKEN},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["audit_pending"] is True
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).one()
+    db.refresh(row)
+    assert row.approved_at is None
 
 
 def test_stale_prores_blocks_publication_instead_of_shipping_a_mismatched_pair(
@@ -1007,6 +1388,7 @@ def test_publishing_a_corrected_cut_reopens_the_client_review(
         ).json()["id"]
 
     _edit_the_render(db, approved_job)
+    _verify_request(client, admin_token, cr_id, approved_job, "falta una línea en el estribillo")
 
     second = client.post(
         f"/admin/deliveries/from-job/{approved_job.job_id}",
@@ -1079,14 +1461,10 @@ def test_resending_the_same_cut_keeps_the_approval_and_the_open_request(
     assert cr.resolved_at is None
 
 
-def test_a_row_published_before_fingerprints_existed_keeps_its_approval(
+def test_a_row_without_fingerprint_resets_approval_when_manifest_changes(
     client, admin_token, approved_job, db, all_r2_files_present,
 ):
-    """Migración: filas viejas no tienen con qué comparar.
-
-    Tratarlas como contenido nuevo habría dado de baja, de una sola vez,
-    todas las aprobaciones vigentes del portal.
-    """
+    """A different frozen cut must never inherit an older UMG approval."""
     from database import Delivery
 
     delivery_id = client.post(
@@ -1106,9 +1484,10 @@ def test_a_row_published_before_fingerprints_existed_keeps_its_approval(
         f"/admin/deliveries/from-job/{approved_job.job_id}",
         headers=auth(admin_token), json={},
     )
-    assert again.json()["content_changed"] is False
+    assert again.json()["content_changed"] is True
     db.refresh(row)
-    assert row.approved_at is not None
+    assert row.published_revision == 2
+    assert row.approved_at is None
 
 
 def test_a_legacy_row_marked_stale_publishes_the_corrected_cut(
@@ -1142,6 +1521,7 @@ def test_a_legacy_row_marked_stale_publishes_the_corrected_cut(
     db.commit()
 
     _edit_the_render(db, approved_job)
+    _verify_request(client, admin_token, request_id, approved_job, "publicar la corrección")
     admin_item = next(
         item for item in client.get(
             "/admin/change-requests?status=pending",
@@ -1383,6 +1763,8 @@ def test_a_genuinely_new_delivery_still_gets_opcion_n(
         thumbnail_url="/download/testjob54321/thumbnail",
     )
     db.add(sibling)
+    db.commit()
+    _refresh_umg_qc(sibling)
     db.commit()
     try:
         res = client.post(

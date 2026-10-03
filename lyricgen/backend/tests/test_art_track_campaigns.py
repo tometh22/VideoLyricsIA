@@ -255,13 +255,20 @@ def test_bulk_publish_does_not_promise_a_prores_nothing_will_create(
     with (
         patch.object(atc.storage, "is_enabled", return_value=True),
         patch.object(atc.storage, "object_exists", side_effect=only_render_outputs),
+        patch.object(atc.storage, "object_etag", return_value="stable-test-etag"),
+        patch.object(atc.storage, "object_source_etag", return_value="stable-test-etag"),
+        patch.object(atc.storage, "head_object_size", return_value=1024),
+        patch.object(atc.storage, "copy_object", return_value=True),
+        patch("delivery_qc_runtime.delivery_readiness_gate", return_value={"blocked": False}),
         patch.object(atc, "enqueue_prores_prewarm") as enqueue,
     ):
         atc.process_delivery_batch(op)
 
     db = SessionLocal()
     try:
-        row = db.query(Delivery).filter(Delivery.job_id == job_id).one()
+        row = db.query(Delivery).filter(Delivery.job_id == job_id).one_or_none()
+        item = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.job_id == job_id).one()
+        assert row is not None, (item.error_code, item.error_detail)
         assert "umg_master" not in row.file_types
         assert "umg_short" not in row.file_types
         assert row.file_types == ["video", "short", "thumbnail"]
@@ -271,11 +278,10 @@ def test_bulk_publish_does_not_promise_a_prores_nothing_will_create(
     enqueue.assert_not_called()
 
 
-def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
+def test_bulk_publish_waits_for_prores_before_exposing_files(
     client, admin_token, monkeypatch,
 ):
-    """Con spec sí se puede: se publica el entregable y se encola el transcode,
-    así el archivo aparece en vez de quedar prometido para siempre."""
+    """A configured derivative is queued, but nothing is published until ready."""
     from database import Delivery
     import art_track_campaigns as atc
 
@@ -293,15 +299,42 @@ def test_bulk_publish_queues_the_prores_when_the_job_can_produce_it(
         patch.object(atc.storage, "is_enabled", return_value=True),
         patch.object(atc.storage, "object_exists",
                      side_effect=lambda key: bool(key) and not str(key).endswith(".mov")),
+        patch("delivery_qc_runtime.delivery_readiness_gate", return_value={"blocked": False}),
         patch.object(atc, "enqueue_prores_prewarm") as enqueue,
     ):
         atc.process_delivery_batch(op)
 
     db = SessionLocal()
     try:
-        row = db.query(Delivery).filter(Delivery.job_id == job_id).one()
-        assert "umg_master" in row.file_types and "umg_short" in row.file_types
+        row = db.query(Delivery).filter(Delivery.job_id == job_id).one_or_none()
+        assert row is None
+        item = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.job_id == job_id).one()
+        assert item.error_code == "preparing_prores"
     finally:
         db.close()
     assert sorted(c.args[1] for c in enqueue.call_args_list) == ["umg_master", "umg_short"]
     assert all(c.kwargs == {"force": True} for c in enqueue.call_args_list)
+
+
+def test_duplicate_batch_worker_does_not_start_an_active_operation(
+    client, admin_token, monkeypatch,
+):
+    """A second queued worker cannot race a copy outside the DB lock."""
+    import art_track_campaigns as atc
+    from database import DeliveryBatch
+
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    campaign = _campaign_for(client, admin_token, "Worker duplicado")
+    _seed_campaign_job(campaign, umg_spec=None, s3_keys={"video": "t/j/lyric_video.mp4"})
+    op = _run_bulk_delivery(client, admin_token, campaign.id, "bulk-duplicate-000001")
+    db = SessionLocal()
+    try:
+        operation = db.query(DeliveryBatch).filter(DeliveryBatch.id == op).one()
+        operation.status = "sending"
+        db.commit()
+    finally:
+        db.close()
+
+    with patch("delivery_manifest.freeze_manifest") as freeze:
+        assert atc.process_delivery_batch(op) == {"sent": 0, "failed": 0}
+    freeze.assert_not_called()

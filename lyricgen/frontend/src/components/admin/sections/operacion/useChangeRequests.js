@@ -34,6 +34,30 @@ async function changeRequestIdempotencyKey(proposalId, baseRevision, operationId
   return `change-request-${proposalId}-${baseRevision}-${(hash >>> 0).toString(16)}`;
 }
 
+async function waitForPublication(operationId, onProgress) {
+  const deadline = Date.now() + 15 * 60 * 1000;
+  let networkFailures = 0;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    let operation;
+    try {
+      operation = await fetchJson(`${API}/admin/delivery-operations/${operationId}`);
+      networkFailures = 0;
+    } catch (error) {
+      if (++networkFailures < 5) continue;
+      throw error;
+    }
+    onProgress?.(operation.status);
+    if (operation.status === "completed") return operation.result || {};
+    if (operation.status === "failed") {
+      const error = new Error(operation.error?.message || "No se pudo completar el envío.");
+      error.detail = operation.error;
+      throw error;
+    }
+  }
+  return null;
+}
+
 export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   const { flashError } = useAdmin();
   const [changeRequests, setChangeRequests] = useState([]);
@@ -42,6 +66,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   const [crResolvedCount, setCrResolvedCount] = useState(0);
   const [crLoading, setCrLoading] = useState(true);
   const [crResolvingId, setCrResolvingId] = useState(null);
+  const [crVerifyingId, setCrVerifyingId] = useState(null);
   const [crProposalEnabled, setCrProposalEnabled] = useState(false);
   const [crProposalApplyEnabled, setCrProposalApplyEnabled] = useState(false);
   const [crProposalBusyId, setCrProposalBusyId] = useState(null);
@@ -284,15 +309,51 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     }
   }, [flashError, loadChangeRequests]);
 
+  const verifyChangeRequest = useCallback(async (id, instructionIds, fingerprint) => {
+    setCrVerifyingId(id);
+    try {
+      await fetchJson(`${API}/admin/change-requests/${id}/verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          expected_render_fingerprint: fingerprint,
+          instruction_ids: instructionIds,
+          confirmed_complete_request: true,
+        }),
+      });
+      setCrPublishNotice({
+        tone: "ok",
+        text: "Pedido verificado sobre el corte aprobado. Al publicar esa versión se marcará resuelto.",
+      });
+      await loadChangeRequests();
+    } catch (err) {
+      flashError(`No pude guardar la verificación: ${err.message || err}`);
+    } finally {
+      setCrVerifyingId(null);
+    }
+  }, [flashError, loadChangeRequests]);
+
   const publishDeliveryUpdate = useCallback(async (jobId, portalId, crId) => {
     setCrPublishingId(crId ?? jobId);
     setCrPublishNotice(null);
     try {
-      const data = await fetchJson(`${API}/admin/deliveries/from-job/${jobId}`, {
+      let data = await fetchJson(`${API}/admin/deliveries/from-job/${jobId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ portal_id: portalId || "argentina" }),
+        body: JSON.stringify({ portal_id: portalId || "argentina", async_publish: true }),
       });
+      if (data.operation_id) {
+        setCrPublishNotice({ tone: "wait", text: "Preparando la publicación. Podés cerrar esta pantalla: el envío sigue en segundo plano." });
+        data = await waitForPublication(data.operation_id, status => {
+          if (status === "waiting_files") {
+            setCrPublishNotice({ tone: "wait", text: "Se está preparando el archivo profesional. El envío continuará automáticamente." });
+          }
+        });
+        if (!data) {
+          setCrPublishNotice({ tone: "wait", text: "El envío sigue en segundo plano. Actualizá esta pantalla para comprobar la versión publicada." });
+          return;
+        }
+      }
       if (data.ok === false && data.status === "preparing_prores") {
         setCrPublishNotice({
           tone: "wait",
@@ -317,7 +378,24 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       }
       await loadChangeRequests();
     } catch (err) {
-      flashError(`No pude publicar la actualización: ${err.message || err}`);
+      const gate = err?.detail?.delivery_qc;
+      if (err?.detail?.code === "delivery_qc_blocked" && jobId) {
+        const returnPath = `/admin?section=cambios&change_request_id=${encodeURIComponent(crId ?? "")}`;
+        const reviewUrl = `/videos/${encodeURIComponent(jobId)}?qc_focus=${gate?.reason === "manual_review_required" ? "manual" : "findings"}&return_to=${encodeURIComponent(returnPath)}`;
+        const text = gate?.reason === "manual_review_required"
+          ? "Falta firmar la revisión del video para este corte. Abrí los controles, completalos y después volvé a publicar."
+          : gate?.reason === "fresh_preflight_required"
+            ? "Este corte todavía no tiene un preflight vigente. Analizalo antes de publicar."
+            : "El preflight encontró puntos que requieren atención antes de publicar.";
+        setCrPublishNotice({
+          tone: "wait",
+          text,
+          actionLabel: "Completar revisión del video",
+          actionHref: reviewUrl,
+        });
+      } else {
+        flashError(`No pude publicar la actualización: ${err.message || err}`);
+      }
     } finally {
       setCrPublishingId(null);
     }
@@ -351,6 +429,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     crResolvedCount,
     crLoading,
     crResolvingId,
+    crVerifyingId,
     crProposalEnabled,
     crProposalApplyEnabled,
     crProposalBusyId,
@@ -362,6 +441,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     dismissChangeRequestProposal,
     regenerateBackgroundFromProposal,
     resolveChangeRequest,
+    verifyChangeRequest,
     reopenChangeRequest,
     crPublishingId,
     crPublishNotice,

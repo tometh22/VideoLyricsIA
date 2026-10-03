@@ -126,14 +126,12 @@ describe("campaign bulk design", () => {
       video_url: "/download/video-2/video", open_path: "/videos/video-2",
       assignment: {}, evidence: {},
     }] };
-    mount("history");
+    render(<MemoryRouter initialEntries={["/campaigns/c1?view=history"]}><CampaignCreative campaignId="c1" view="history" /><CurrentLocation /></MemoryRouter>);
     fireEvent.click(await screen.findByRole("button", { name: "Aprobar" }));
     expect(screen.getByRole("dialog", { name: "Aprobar Tema final" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Confirmar aprobación" }));
-    await screen.findByText("Tema final quedó aprobado.");
-    expect(screen.getByText("Aprobado")).toBeInTheDocument();
-    const approvalCall = calls.find(([url]) => url.endsWith("/approve/video-2"));
-    expect(JSON.parse(approvalCall[1].body)).toEqual({ notes: "Aprobado desde el historial de campaña" });
+    fireEvent.click(screen.getByRole("button", { name: "Revisar controles y aprobar" }));
+    expect(screen.getByTestId("location").textContent).toContain("/videos/video-2");
+    expect(calls.some(([url]) => url.endsWith("/approve/video-2"))).toBe(false);
   });
   it("filters and paginates a large campaign video list", async () => {
     report = { ...report, videos: Array.from({ length: 23 }, (_, index) => ({
@@ -265,21 +263,19 @@ it("searches unordered words without accents and never sends hidden approvals", 
   expect(JSON.parse(calls.find(([url]) => url.endsWith("/deliveries"))[1].body).job_ids).toEqual(["a"]);
 });
 
-it("approves only the playing video and advances inside the current search", async () => {
+it("opens the playing video in its full approval review", async () => {
   report.videos = [
     { job_id: "a", title: "Uno", artist: "García", status: "pending_review", video_url: "/video/a", evidence: {}, assignment: {} },
     { job_id: "hidden", title: "Oculto", artist: "Otro", status: "pending_review", video_url: "/video/x", evidence: {}, assignment: {} },
     { job_id: "b", title: "Dos", artist: "García", status: "pending_review", video_url: "/video/b", evidence: {}, assignment: {} },
   ];
-  mount("history");
+  render(<MemoryRouter initialEntries={["/campaigns/c1?view=history"]}><CampaignCreative campaignId="c1" view="history" /><CurrentLocation /></MemoryRouter>);
   fireEvent.change(await screen.findByRole("searchbox", { name: "Buscar videos de la campaña" }), { target: { value: "garcia" } });
   fireEvent.click(screen.getAllByRole("button", { name: "Reproducir" })[0]);
-  fireEvent.click(screen.getByRole("button", { name: "Aprobar y siguiente" }));
-  await screen.findByRole("dialog", { name: "Reproducir Dos" });
+  fireEvent.click(screen.getByRole("button", { name: "Revisar controles y aprobar" }));
+  expect(screen.getByTestId("location").textContent).toContain("/videos/a");
   const approvals = calls.filter(([path]) => path.includes("/approve/"));
-  expect(approvals).toHaveLength(1);
-  expect(approvals[0][0]).toBe("/approve/a");
-  expect(JSON.parse(approvals[0][1].body)).not.toHaveProperty("admin_override");
+  expect(approvals).toHaveLength(0);
   expect(screen.queryByRole("button", { name: "Liberar pendientes autorizados" })).not.toBeInTheDocument();
 });
 
@@ -312,20 +308,19 @@ function CurrentLocation() {
 it("filters actual publications, preserves editing and campaign return context", async () => {
   const video = (job_id, title, extra = {}) => ({ job_id, title, artist: "Lucybell", status: "done", approved_at: "2026-09-15", created_at: "2026-09-15", video_url: `/download/${job_id}/video`, evidence: {}, assignment: {}, ...extra });
   report.videos = [
-    video("sent", "Mataz", { is_in_umg_portal: true, umg_portals: ["chile"], pending_change_requests: 1 }),
-    video("unsent", "Carnaval", { is_in_umg_portal: false, umg_portals: [] }),
-    video("editing", "Otra", { status: "editing", approved_at: null, is_in_umg_portal: true, umg_portals: ["argentina"] }),
-    video("unknown", "Antiguo"),
+    video("sent", "Mataz", { portal_status: { chile: { published: true, revision: 2, pending_change_requests: 1 } } }),
+    video("unsent", "Carnaval", { portal_status: { chile: { published: false } } }),
+    video("editing", "Otra", { status: "editing", approved_at: null, portal_status: { argentina: { published: true, revision: 1 } } }),
+    video("unknown", "Antiguo", { status: "editing", approved_at: null }),
   ];
-  render(<MemoryRouter initialEntries={["/campaigns/c1?view=history"]}><CampaignCreative campaignId="c1" view="history" /><CurrentLocation /></MemoryRouter>);
-  expect(await screen.findByText("Enviado a Chile")).toBeInTheDocument();
-  expect(screen.getByText("1 cambio solicitado")).toBeInTheDocument();
-  expect(screen.getByText("Enviado a Argentina")).toBeInTheDocument();
-  expect(screen.getByText("Envío sin verificar")).toBeInTheDocument();
+  render(<MemoryRouter initialEntries={["/campaigns/c1?view=history&portal_destination=chile"]}><CampaignCreative campaignId="c1" view="history" /><CurrentLocation /></MemoryRouter>);
+  expect(await screen.findByText("Chile · v2")).toBeInTheDocument();
+  expect(screen.getByText("1 pedidos pendientes")).toBeInTheDocument();
+  expect(screen.getAllByText("Sin publicar en Chile").length).toBeGreaterThan(0);
   fireEvent.change(screen.getByLabelText("Filtrar por envío al portal"), { target: { value: "unsent" } });
   expect(screen.getByText("Carnaval")).toBeInTheDocument();
   expect(screen.queryByText("Mataz")).not.toBeInTheDocument();
-  expect(screen.queryByText("Antiguo")).not.toBeInTheDocument();
+  expect(screen.getByText("Antiguo")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Seleccionar aprobados del resultado (1)" }));
   expect(screen.getByLabelText("1 videos aprobados seleccionados")).toBeInTheDocument();
   fireEvent.change(screen.getByLabelText("Filtrar por envío al portal"), { target: { value: "sent" } });
@@ -338,6 +333,7 @@ it("filters actual publications, preserves editing and campaign return context",
   const back = new URL(url.searchParams.get("return_to"), "http://localhost");
   expect(back.pathname).toBe("/campaigns/c1");
   expect(back.searchParams.get("portal_state")).toBe("sent");
+  expect(back.searchParams.get("portal_destination")).toBe("chile");
   expect(back.searchParams.get("q")).toBe("Mataz");
   expect(calls.some(([path]) => path.includes("/edit/") || path.includes("/deliveries"))).toBe(false);
 });

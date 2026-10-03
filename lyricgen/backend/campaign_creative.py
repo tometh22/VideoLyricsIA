@@ -533,6 +533,7 @@ def portal_history(job_ids, tenant_id):
             Delivery.published_render_fingerprint, Delivery.published_revision,
             Delivery.stale_since, Delivery.stale_reason,
             Delivery.approved_at, Delivery.content_updated_at,
+            Delivery.file_types, Delivery.published_manifest_hash,
         ).outerjoin(DeliveryChangeRequest, and_(
             DeliveryChangeRequest.delivery_id == Delivery.id,
             DeliveryChangeRequest.resolved_at.is_(None),
@@ -544,18 +545,35 @@ def portal_history(job_ids, tenant_id):
             Delivery.published_render_fingerprint, Delivery.published_revision,
             Delivery.stale_since, Delivery.stale_reason,
             Delivery.approved_at, Delivery.content_updated_at,
+            Delivery.file_types, Delivery.published_manifest_hash,
         ).all()
     result = {}
     for (job_id, portal_id, pending, fingerprint, revision,
-         stale_since, stale_reason, approved_at, content_updated_at) in publications:
+         stale_since, stale_reason, approved_at, content_updated_at,
+         file_types, manifest_hash) in publications:
         row = result.setdefault(job_id, {
             "umg_portals": [], "pending_change_requests": 0,
+            "portal_status": {},
             # Fingerprints publicados, para que el llamador compare contra el
             # render actual sin volver a la DB del portal.
             "published_fingerprints": [], "published_revision": 1,
             "portal_updating": False, "portal_awaiting_review": False,
         })
         portal = portal_id or "argentina"
+        row["portal_status"][portal] = {
+            "published": True,
+            "revision": revision or 1,
+            "published_fingerprint": fingerprint,
+            "content_updated_at": content_updated_at.isoformat() if content_updated_at else None,
+            "approved_at": approved_at.isoformat() if approved_at else None,
+            "file_types": list(file_types or []),
+            "manifest_hash": manifest_hash,
+            "pending_change_requests": pending,
+            "updating": bool(stale_since and (stale_reason or "") in delivery_freshness.STALE_IN_FLIGHT),
+            "stale_since": stale_since.isoformat() if stale_since else None,
+            "stale_reason": stale_reason,
+            "awaiting_review": bool(content_updated_at and approved_at is None),
+        }
         if portal not in row["umg_portals"]:
             row["umg_portals"].append(portal)
         row["pending_change_requests"] += pending
@@ -614,17 +632,26 @@ def history_rows(db, campaign):
         row["portal_revision"] = publication.get("published_revision", 0) if row["is_in_umg_portal"] else 0
         row["portal_updating"] = bool(publication.get("portal_updating"))
         row["portal_awaiting_review"] = bool(publication.get("portal_awaiting_review"))
-        # El portal sirve la key determinística del job, así que un
-        # re-render ya reemplazó (o está por reemplazar) lo que el cliente
-        # baja, sin que la fila publicada lo diga. Comparar el fingerprint
-        # publicado contra el render actual es lo que convierte eso en una
-        # pregunta contestable desde la campaña: "esto todavía no lo mandé".
+        # Comparar el fingerprint publicado contra el render actual responde
+        # si la corrección ya llegó a cada portal. Con un manifiesto nuevo,
+        # el portal conserva el corte anterior hasta el reenvío.
         published = publication.get("published_fingerprints") or []
         job = jobs_by_id.get(row["job_id"])
         current = delivery_freshness.render_fingerprint(job) if job is not None else None
         row["portal_outdated"] = bool(
             published and current and any(fp != current for fp in published)
         )
+        row["portal_status"] = {
+            portal_id: {
+                **publication.get("portal_status", {}).get(portal_id, {"published": False}),
+                "outdated": bool(
+                    current
+                    and publication.get("portal_status", {}).get(portal_id, {}).get("published_fingerprint")
+                    and publication["portal_status"][portal_id]["published_fingerprint"] != current
+                ),
+            }
+            for portal_id in ("argentina", "chile")
+        }
     return rows
 
 

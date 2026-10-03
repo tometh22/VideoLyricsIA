@@ -4,19 +4,14 @@
 // del delivery (artista, canción, label, frame_size, tenant, owner), un
 // preview del video clickeable, el comentario, y resuelve / reabre.
 //
-// Y, desde 2026-09-15, ve el ciclo completo en la misma tarjeta. El portal
-// no guarda el archivo: reconstruye la key de R2 y la firma, así que un
-// re-render reemplaza la descarga del cliente EN SU LUGAR. Eso volvía
-// inverificable la única pregunta que importa después de corregir — "¿lo
-// que el cliente puede bajar ahora es lo que arreglé?" — y obligaba a ir a
-// la campaña, buscar la canción en Aprobadas, editar, y acordarse de volver
-// acá a tildar el pedido. Los tres pasos viven acá:
+// El operador ve el ciclo completo en la misma tarjeta. Cada publicación
+// congela un manifiesto de archivos; verificar y publicar son pasos distintos.
+// Los tres pasos viven acá:
 //
 //   1. Editar letra    → abre el editor de esa canción.
-//   2. Publicar        → sube la versión al portal. El backend detecta que
-//                        el render cambió, baja la aprobación vieja (el
-//                        cliente vuelve a ver "Aprobar") y cierra este
-//                        pedido solo.
+//   2. Verificar       → confirma todas las instrucciones sobre el corte final.
+//      Publicar        → actualiza el manifiesto y cierra solo los pedidos
+//                        verificados para ese corte.
 //   3. Marcar resuelto → sigue estando, para lo que se contesta sin
 //                        re-renderizar (una aclaración, un pedido que se
 //                        descarta).
@@ -29,6 +24,14 @@ import TableSkeleton from "../../primitives/TableSkeleton";
 import EnableProResModal from "../../../EnableProResModal";
 
 const PORTAL_LABELS = { argentina: "UMG Argentina", chile: "UMG Chile" };
+const PHASE_LABELS = {
+  blocked: "Bloqueados", rendering: "Generando video",
+  proposal_ready: "Propuestas listas", needs_edit: "Pendientes de edición",
+  changes_saved: "Cambios guardados",
+  needs_review: "Pendientes de revisión", preparing_files: "Preparando archivos",
+  needs_verification: "Pendientes de verificación",
+  ready_to_publish: "Listos para publicar", resolved: "Resueltos",
+};
 
 // Estados en los que el job está re-renderizando: publicar ahora no tiene
 // sentido porque los archivos se están por reemplazar.
@@ -44,7 +47,7 @@ const BUSY_JOB_STATUSES = new Set([
  * después lo que falta hacer (publicar), y recién al final los estados de
  * reposo (esperando al cliente / aprobado).
  */
-export function publicationStatus(publication) {
+export function publicationStatus(publication, workflow = null) {
   if (!publication) {
     return {
       tone: "idle",
@@ -64,6 +67,31 @@ export function publicationStatus(publication) {
         "Mientras tanto el portal sigue entregando la versión anterior. " +
         "Cuando termine, publicá la actualización desde acá.",
       canPublish: false,
+    };
+  }
+  if (workflow?.next_action === "review_qc") {
+    return {
+      tone: "wait",
+      title: "Controles pendientes del video",
+      detail: workflow.blockers?.[0]?.message || "Revisá los controles del corte actual.",
+      canPublish: false,
+      needsInternalReview: true,
+    };
+  }
+  if (workflow?.next_action === "render_changes") {
+    return {
+      tone: "wait", title: "Cambios guardados; falta generar el video",
+      detail: "La propuesta modificó la letra del editor. Generá un corte nuevo para revisarlo.",
+      canPublish: false,
+    };
+  }
+  if (publication.internal_approval_current === false && publication.needs_publish) {
+    return {
+      tone: "wait",
+      title: "Falta aprobar el video final",
+      detail: "Revisá el corte actualizado y completá la aprobación interna antes de publicarlo.",
+      canPublish: false,
+      needsInternalReview: true,
     };
   }
   if (prores.length) {
@@ -141,7 +169,9 @@ export default function ChangeRequestsPanel({
   crResolvedCount,
   crLoading,
   crResolvingId,
+  crVerifyingId,
   resolveChangeRequest,
+  verifyChangeRequest,
   reopenChangeRequest,
   crPublishingId,
   crPublishNotice,
@@ -162,6 +192,66 @@ export default function ChangeRequestsPanel({
   // Draft local del input de "respuesta" por CR. Clave = id del CR.
   const [drafts, setDrafts] = useState({});
   const [proResSetup, setProResSetup] = useState(null);
+  const [portalFilter, setPortalFilter] = useState(() =>
+    new URLSearchParams(window.location.search).get("change_portal") || "all");
+  const [phaseFilter, setPhaseFilter] = useState(() =>
+    new URLSearchParams(window.location.search).get("change_stage") || "all");
+  const [search, setSearch] = useState(() =>
+    new URLSearchParams(window.location.search).get("change_search") || "");
+  const [selectedId, setSelectedId] = useState(() =>
+    new URLSearchParams(window.location.search).get("change_request_id"));
+
+  const normalizedSearch = search.trim().toLocaleLowerCase();
+  const visibleRequests = changeRequests.filter((item) => {
+    const delivery = item.delivery || {};
+    if (portalFilter !== "all" && delivery.portal_id !== portalFilter) return false;
+    if (phaseFilter !== "all" && item.workflow?.phase !== phaseFilter) return false;
+    if (!normalizedSearch) return true;
+    return [delivery.artist, delivery.song, item.comment]
+      .some((value) => String(value || "").toLocaleLowerCase().includes(normalizedSearch));
+  });
+  const selectedRequest = visibleRequests.find((item) => String(item.id) === String(selectedId))
+    || visibleRequests[0];
+
+  useEffect(() => {
+    const onHistory = () => {
+      const params = new URLSearchParams(window.location.search);
+      setSelectedId(params.get("change_request_id"));
+      setPortalFilter(params.get("change_portal") || "all");
+      setPhaseFilter(params.get("change_stage") || "all");
+      setSearch(params.get("change_search") || "");
+    };
+    window.addEventListener("popstate", onHistory);
+    return () => window.removeEventListener("popstate", onHistory);
+  }, []);
+
+  const rememberSelection = (id) => {
+    setSelectedId(String(id));
+    const url = new URL(window.location.href);
+    url.searchParams.set("change_request_id", String(id));
+    window.history.replaceState(window.history.state, "", url);
+  };
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (portalFilter === "all") url.searchParams.delete("change_portal");
+    else url.searchParams.set("change_portal", portalFilter);
+    if (phaseFilter === "all") url.searchParams.delete("change_stage");
+    else url.searchParams.set("change_stage", phaseFilter);
+    if (search.trim()) url.searchParams.set("change_search", search.trim());
+    else url.searchParams.delete("change_search");
+    window.history.replaceState(window.history.state, "", url);
+  }, [portalFilter, phaseFilter, search]);
+
+  useEffect(() => {
+    if (!selectedId || crLoading) return undefined;
+    const frame = requestAnimationFrame(() => {
+      document.getElementById(`change-request-${selectedId}`)?.scrollIntoView?.({
+        behavior: "smooth", block: "center",
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [selectedId, crLoading]);
   const setDraft = (id, val) => setDrafts((d) => ({ ...d, [id]: val }));
 
   const filterOptions = [
@@ -181,6 +271,36 @@ export default function ChangeRequestsPanel({
         />
       </FilterBar>
 
+      <div className="flex flex-wrap items-end gap-3">
+        <label className="text-label text-gray-300">
+          Portal
+          <select aria-label="Filtrar por portal" value={portalFilter}
+            onChange={(event) => setPortalFilter(event.target.value)}
+            className="mt-1 block rounded-button bg-surface-2 px-3 py-2 text-white ring-1 ring-white/10">
+            <option value="all">Todos los portales</option>
+            <option value="argentina">UMG Argentina</option>
+            <option value="chile">UMG Chile</option>
+          </select>
+        </label>
+        <label className="text-label text-gray-300 grow max-w-md">
+          Buscar pedido
+          <input type="search" value={search} onChange={(event) => setSearch(event.target.value)}
+            placeholder="Artista, canción o texto del pedido"
+            className="mt-1 block w-full rounded-button bg-surface-2 px-3 py-2 text-white ring-1 ring-white/10 focus:outline-none focus:ring-brand/50" />
+        </label>
+        <label className="text-label text-gray-300">
+          Etapa
+          <select aria-label="Filtrar por etapa" value={phaseFilter}
+            onChange={(event) => setPhaseFilter(event.target.value)}
+            className="mt-1 block rounded-button bg-surface-2 px-3 py-2 text-white ring-1 ring-white/10">
+            <option value="all">Todas las etapas</option>
+            {Object.entries(PHASE_LABELS).map(([phase, label]) => (
+              <option key={phase} value={phase}>{label}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+
       {crPublishNotice && (
         <div
           role="status"
@@ -188,7 +308,19 @@ export default function ChangeRequestsPanel({
             TONE_STYLES[crPublishNotice.tone === "ok" ? "ok" : "wait"]
           }`}
         >
-          <span>{crPublishNotice.text}</span>
+          <div className="space-y-2">
+            <p>{crPublishNotice.text}</p>
+            {crPublishNotice.actionHref && (
+              <a
+                href={crPublishNotice.actionHref}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex min-h-9 items-center rounded-button bg-white/10 px-3 py-1.5 font-semibold text-white hover:bg-white/15"
+              >
+                {crPublishNotice.actionLabel || "Revisar controles"}
+              </a>
+            )}
+          </div>
           <button
             onClick={dismissPublishNotice}
             className="text-label opacity-70 hover:opacity-100 shrink-0"
@@ -202,7 +334,7 @@ export default function ChangeRequestsPanel({
         <div className="glass rounded-card p-2">
           <TableSkeleton rows={3} cols={3} />
         </div>
-      ) : changeRequests.length === 0 ? (
+      ) : visibleRequests.length === 0 ? (
         <EmptyState
           title={
             crStatusFilter === "pending"
@@ -218,16 +350,47 @@ export default function ChangeRequestsPanel({
           }
         />
       ) : (
-        <div className="space-y-3">
-          {changeRequests.map((item) => (
+        <div className="grid min-w-0 gap-4 lg:grid-cols-[minmax(240px,300px)_minmax(0,1fr)]">
+          <nav aria-label="Cola de pedidos" className="min-w-0 lg:sticky lg:top-4 lg:self-start lg:max-h-[calc(100vh-8rem)] lg:overflow-y-auto rounded-card bg-surface-2/30 ring-1 ring-white/10 p-2">
+            <p className="px-2 py-2 text-label font-semibold uppercase tracking-wide text-gray-400">
+              {visibleRequests.length} {visibleRequests.length === 1 ? "pedido" : "pedidos"}
+            </p>
+            <div className="space-y-1">
+              {visibleRequests.map((item) => (
+                <button key={item.id} type="button" onClick={() => rememberSelection(item.id)}
+                  aria-current={selectedRequest?.id === item.id ? "true" : undefined}
+                  className={`w-full rounded-button px-3 py-3 text-left transition-colors ${
+                    selectedRequest?.id === item.id
+                      ? "bg-brand/20 text-white ring-1 ring-brand/40"
+                      : "text-gray-300 hover:bg-white/[0.06]"
+                  }`}>
+                  <span className="block truncate text-caption font-semibold">{item.delivery?.artist || "Sin artista"} · {item.delivery?.song || "Sin canción"}</span>
+                  <span className="mt-1 block text-label text-gray-400">
+                    {PORTAL_LABELS[item.delivery?.portal_id] || item.delivery?.portal_id || "Portal sin asignar"}
+                    {" · "}{item.resolved_at ? "Resuelto" : "Pendiente"}
+                  </span>
+                  {item.workflow?.next_action_label && !item.resolved_at && (
+                    <span className="mt-1 block truncate text-label text-brand-light">
+                      {item.workflow.next_action_label}
+                    </span>
+                  )}
+                  <span className="mt-1 block truncate text-label text-gray-500">{item.comment}</span>
+                </button>
+              ))}
+            </div>
+          </nav>
+          {selectedRequest && [selectedRequest].map((item) => (
             <ChangeRequestCard
               key={item.id}
               item={item}
               draft={drafts[item.id] || ""}
               onDraftChange={(v) => setDraft(item.id, v)}
               resolving={crResolvingId === item.id}
+              verifying={crVerifyingId === item.id}
               publishing={crPublishingId === item.id}
               onResolve={() => resolveChangeRequest(item.id, drafts[item.id])}
+              onVerify={(instructionIds, fingerprint) =>
+                verifyChangeRequest(item.id, instructionIds, fingerprint)}
               onReopen={() => reopenChangeRequest(item.id)}
               onPublish={() => {
                 const status = publicationStatus(item.publication);
@@ -291,21 +454,40 @@ export default function ChangeRequestsPanel({
 }
 
 function ChangeRequestCard({
-  item, draft, onDraftChange, resolving, publishing,
-  onResolve, onReopen, onPublish,
+  item, draft, onDraftChange, resolving, verifying, publishing,
+  onResolve, onReopen, onPublish, onVerify,
   proposalEnabled, proposalApplyEnabled, proposalBusy, proposal,
   onGenerateProposal, onLoadProposal, onAdjustProposal, onApplyProposal,
   onDismissProposal, onRegenerateBackground,
 }) {
   const d = item.delivery || {};
   const isResolved = !!item.resolved_at;
-  const status = publicationStatus(item.publication);
+  const status = publicationStatus(item.publication, item.workflow);
+  const workflowActions = item.workflow?.allowed_actions;
+  const instructions = item.instructions || [];
+  const canVerifyPublishedCut = item.requested_revision != null
+    && (item.publication?.revision || 0) > item.requested_revision;
+  const canVerify = workflowActions
+    ? workflowActions.includes("verify")
+    : item.publication?.job_status === "done"
+      && item.publication?.internal_approval_current !== false
+      && (item.publication?.needs_publish || canVerifyPublishedCut);
+  const canFinishPublication = workflowActions
+    ? ["publish", "prepare_prores", "configure_prores"].some((action) => workflowActions.includes(action))
+    : status.canPublish || (canVerifyPublishedCut && item.verification?.current);
+  const [checkedInstructions, setCheckedInstructions] = useState([]);
+  const [confirmedWholeComment, setConfirmedWholeComment] = useState(false);
+  useEffect(() => {
+    setCheckedInstructions([]);
+    setConfirmedWholeComment(false);
+  }, [item.verification?.render_fingerprint]);
   // Un pedido resuelto AL PUBLICAR no necesita que nadie confirme nada: la
   // corrección ya está en el portal. Uno cerrado a mano sí se explica.
   const closedByPublication = item.resolution_source === "publication";
 
   return (
     <div
+      id={`change-request-${item.id}`}
       className={`glass rounded-card p-5 border-l-4 ${
         isResolved ? "border-emerald-500/60 opacity-75" : "border-amber-400"
       }`}
@@ -355,6 +537,16 @@ function ChangeRequestCard({
           </p>
         )}
       </div>
+      {!isResolved && item.workflow && (
+        <div className="mb-3 rounded-button bg-brand/[0.08] px-3 py-2 ring-1 ring-brand/20 text-label text-gray-200">
+          <span className="font-semibold text-white">Próximo paso: </span>
+          {item.workflow.next_action_label}
+          {item.workflow.blockers?.filter((blocker) => blocker.message !== status.detail).map((blocker) => (
+            <p key={blocker.code} className="mt-1 text-amber-200">{blocker.message}</p>
+          ))}
+        </div>
+      )}
+
 
       {/* Preview: thumbnail clickeable que abre el video en pestaña nueva. */}
       {d.thumbnail_url && (
@@ -390,7 +582,42 @@ function ChangeRequestCard({
 
       <p className="text-label text-gray-500 mt-2">
         UMG envió este pedido el {fmtDate(item.submitted_at)}
+        {item.requested_revision ? ` · Sobre la versión ${item.requested_revision}` : ""}
       </p>
+
+      {!isResolved && (
+        <section className="mt-3 rounded-button bg-surface-2/40 ring-1 ring-white/10 p-3" aria-label="Verificar pedido">
+          <h4 className="text-caption font-semibold text-white">Comprobar el pedido en el video final</h4>
+          {item.verification?.current ? (
+            <p className="mt-2 text-label text-emerald-300">Verificado para este corte. Confirmá la publicación para cerrar el pedido.</p>
+          ) : (
+            <>
+              {item.verification?.stale && <p className="mt-2 text-label text-amber-200">La verificación anterior corresponde a otro corte. Revisá esta versión.</p>}
+              <div className="mt-3 space-y-2">
+                {instructions.map((instruction) => (
+                  <label key={instruction.id} className="flex items-start gap-2 text-label text-gray-200">
+                    <input type="checkbox" className="mt-0.5 accent-brand" checked={checkedInstructions.includes(instruction.id)}
+                      onChange={(event) => setCheckedInstructions((current) => event.target.checked
+                        ? [...current, instruction.id] : current.filter((id) => id !== instruction.id))} />
+                    <span>{instruction.timecode_seconds != null ? `${Math.floor(instruction.timecode_seconds / 60)}:${String(Math.floor(instruction.timecode_seconds % 60)).padStart(2, "0")} · ` : ""}{instruction.source_excerpt}</span>
+                  </label>
+                ))}
+                <label className="flex items-start gap-2 border-t border-white/10 pt-2 text-label font-medium text-white">
+                  <input type="checkbox" className="mt-0.5 accent-brand" checked={confirmedWholeComment}
+                    onChange={(event) => setConfirmedWholeComment(event.target.checked)} />
+                  <span>Revisé el comentario completo de UMG y comprobé todos los cambios en el video final.</span>
+                </label>
+              </div>
+              <button type="button" className="mt-3 rounded-button bg-brand px-3 py-2 text-caption font-semibold text-white disabled:opacity-40"
+                disabled={verifying || !canVerify || !confirmedWholeComment || checkedInstructions.length !== instructions.length || !item.verification?.render_fingerprint}
+                onClick={() => onVerify(checkedInstructions, item.verification.render_fingerprint)}>
+                {verifying ? "Guardando verificación…" : "Confirmar pedido verificado"}
+              </button>
+              {!canVerify && <p className="mt-2 text-label text-gray-400">Esperá al render nuevo y a su aprobación interna para verificar el pedido.</p>}
+            </>
+          )}
+        </section>
+      )}
 
       {!isResolved && proposalEnabled && (
         <ChangeRequestProposal
@@ -439,6 +666,18 @@ function ChangeRequestCard({
         <div className="mt-3 pt-3 border-t border-white/[0.06] space-y-3">
           {/* Los dos pasos que realmente atienden el pedido. */}
           <div className="flex flex-wrap items-center gap-2">
+            {item.workflow?.next_action === "render_changes" && d.job_id && (
+              <a href={`/videos/${d.job_id}/edit-lyrics?change_request_id=${item.id}`}
+                className="bg-brand/20 text-brand-light text-caption font-medium px-3 py-1.5 rounded-button ring-1 ring-brand/30">
+                Generar video actualizado
+              </a>
+            )}
+            {(status.needsInternalReview || item.workflow?.next_action === "review_qc") && d.job_id && (
+              <a href={`/videos/${d.job_id}?qc_focus=manual&return_to=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`}
+                className="bg-amber-500/20 text-amber-100 text-caption font-medium px-3 py-1.5 rounded-button ring-1 ring-amber-400/30">
+                Revisar y aprobar video
+              </a>
+            )}
             {d.job_id && (
               <a
                 href={`/videos/${d.job_id}/edit-lyrics`}
@@ -452,17 +691,17 @@ function ChangeRequestCard({
             {d.job_id && (
               <button
                 onClick={onPublish}
-                disabled={publishing || !status.canPublish}
+                disabled={publishing || !canFinishPublication}
                 title={
-                  status.canPublish
-                    ? "Sube el corte actual al portal y cierra este pedido"
+                  canFinishPublication
+                    ? "Publica este corte en el portal; solo cierra los pedidos verificados"
                     : "No hay nada nuevo para publicar en este momento"
                 }
                 className="bg-brand hover:bg-brand-light text-white text-caption font-medium px-3 py-1.5 rounded-button disabled:opacity-40 disabled:cursor-not-allowed transition-colors duration-brand"
               >
                 {publishing
                   ? "Publicando…"
-                  : status.publishLabel || "Publicar actualización"}
+                  : canVerifyPublishedCut && !status.canPublish ? "Confirmar versión publicada" : status.publishLabel || "Publicar actualización"}
               </button>
             )}
           </div>
@@ -471,7 +710,7 @@ function ChangeRequestCard({
           <div className="space-y-2">
             <input
               type="text"
-              placeholder="Respuesta opcional (ej: re-renderizado con la línea corregida)"
+              placeholder="Motivo del cierre manual (obligatorio)"
               value={draft}
               onChange={(e) => onDraftChange(e.target.value)}
               maxLength={2000}
@@ -480,7 +719,7 @@ function ChangeRequestCard({
             <div className="flex justify-end">
               <button
                 onClick={onResolve}
-                disabled={resolving}
+                disabled={resolving || !draft.trim()}
                 className="bg-white/[0.07] hover:bg-white/[0.12] text-white text-caption font-medium px-3 py-1.5 rounded-button disabled:opacity-50 transition-colors duration-brand"
               >
                 {resolving ? "Guardando…" : "Marcar resuelto sin publicar"}

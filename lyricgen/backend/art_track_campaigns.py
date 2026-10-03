@@ -13,7 +13,7 @@ import os
 import re
 import unicodedata
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 import logging
 
 import storage
+import delivery_freshness
 from auth import get_current_user, has_art_track_access
 from batch_campaigns import _campaign_or_404, _now, _require_manager, _require_scope
 from database import (
@@ -517,9 +518,8 @@ def reconcile_art_track_campaign(db: Session, campaign: BatchCampaign) -> list[s
 
 
 def _fingerprint(job: Job) -> str:
-    import hashlib, json
-    payload = {"job_id": job.job_id, "audio": job.input_audio_sha256 or job.input_r2_key, "cover": (job.render_params or {}).get("cover_asset_id"), "render": job.render_params or {}, "s3": job.s3_keys or {}}
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+    # A lazily generated ProRes key must not invalidate a human approval.
+    return delivery_freshness.render_fingerprint(job)
 
 
 @router.post("/art-track-campaigns/{campaign_id}/delivery-preview")
@@ -587,6 +587,10 @@ def create_delivery_batch(campaign_id: str, body: DeliveryCreate, current_user: 
     # can call process_delivery_batch; the request never fires 500 network
     # calls and closing the browser cannot cancel the snapshot.
     scheduled = enqueue_delivery_batch(operation.id)
+    if not scheduled:
+        operation.status = "waiting_worker"
+        operation.updated_at = _now()
+        db.commit()
     return JSONResponse(status_code=202, content={"operation_id": operation.id, "status": operation.status, "destination_portal": destination, "hostname": DESTINATIONS[destination], "total_count": operation.total_count, "scheduled": scheduled})
 
 
@@ -612,12 +616,67 @@ def get_delivery_batch(operation_id: str, current_user: dict = Depends(get_curre
         "operation_id": operation.id, "status": operation.status,
         "destination_portal": operation.destination_portal,
         "hostname": DESTINATIONS.get(operation.destination_portal),
+        "updated_at": operation.updated_at.isoformat() if operation.updated_at else None,
         "total_count": operation.total_count, "sent_count": operation.sent_count,
         "failed_count": operation.failed_count,
         "items": [{"job_id": row.job_id, "status": row.status,
                     "delivery_id": row.delivery_id, "attempts": row.attempts,
                     "error_code": row.error_code, "receipt": row.receipt} for row in rows],
     }
+
+
+@router.post("/delivery-operations/{operation_id}/resume")
+def resume_delivery_batch(
+    operation_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_scope(current_user)
+    operation = db.query(DeliveryBatch).filter(DeliveryBatch.id == operation_id).with_for_update().first()
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Delivery operation not found.")
+    campaign = _campaign_for_delivery(db, operation.campaign_id, current_user)
+    _require_manager(campaign, current_user)
+    if operation.status not in {"waiting_worker", "queued"}:
+        return {"operation_id": operation.id, "status": operation.status, "scheduled": True}
+    scheduled = enqueue_delivery_batch(operation.id)
+    operation.status = "queued" if scheduled else "waiting_worker"
+    operation.updated_at = _now()
+    db.commit()
+    return {"operation_id": operation.id, "status": operation.status, "scheduled": scheduled}
+
+
+def recover_waiting_delivery_batches(limit: int = 20) -> int:
+    """Single-runner reaper retry missing workers and timed-out workers.
+
+    RQ kills a batch after twelve hours. A sending operation untouched for
+    thirteen hours has no live owner, so the item receipts can be resumed.
+    """
+    db = SessionLocal()
+    try:
+        stale_cutoff = _now() - timedelta(hours=13)
+        operations = (
+            db.query(DeliveryBatch)
+            .filter((DeliveryBatch.status == "waiting_worker") |
+                    ((DeliveryBatch.status.in_(("sending", "queued"))) &
+                     (DeliveryBatch.updated_at < stale_cutoff)))
+            .order_by(DeliveryBatch.created_at.asc())
+            .limit(limit)
+            .all()
+        )
+        resumed = 0
+        for operation in operations:
+            if enqueue_delivery_batch(operation.id):
+                operation.status = "queued"
+                operation.updated_at = _now()
+                resumed += 1
+        if resumed:
+            db.commit()
+        else:
+            db.rollback()
+        return resumed
+    finally:
+        db.close()
 
 
 def enqueue_delivery_batch(operation_id: str) -> bool:
@@ -630,7 +689,7 @@ def enqueue_delivery_batch(operation_id: str) -> bool:
             return False
         Queue("campaign_control", connection=redis).enqueue(
             process_delivery_batch, operation_id, job_id=f"delivery-batch:{operation_id}",
-            job_timeout=3600, result_ttl=3600, failure_ttl=86400,
+            job_timeout=12 * 3600, result_ttl=3600, failure_ttl=86400,
             meta=rq_payload_metadata("campaign_control"),
         )
         return True
@@ -639,100 +698,168 @@ def enqueue_delivery_batch(operation_id: str) -> bool:
 
 
 def process_delivery_batch(operation_id: str) -> dict[str, int]:
-    """Worker entry point; safe to call repeatedly after a crash."""
-    from database import Delivery
-    db = SessionLocal(); sent = failed = 0
+    """Publish each selected cut with R2 I/O outside database transactions."""
+    from database import Delivery, DeliveriesSessionLocal, deliveries_added_by
+    from delivery_manifest import (
+        ManifestUnavailable, assert_manifest_source_current, freeze_manifest,
+        publish_record, source_key,
+    )
+    from delivery_qc_runtime import delivery_readiness_gate
+
+    db = SessionLocal()
+    sent = failed = 0
+
+    def finish_item(row: DeliveryBatchItem, *, error_code: str | None = None,
+                    error_detail: str | None = None, receipt: dict | None = None,
+                    delivery_id: int | None = None) -> None:
+        nonlocal sent, failed
+        row.status = "failed" if error_code else "sent"
+        row.error_code = error_code
+        row.error_detail = (error_detail or "")[:500] if error_code else None
+        row.receipt = receipt
+        row.delivery_id = delivery_id
+        row.attempts = int(row.attempts or 0) + 1
+        row.updated_at = _now()
+        if error_code:
+            failed += 1
+        else:
+            sent += 1
+        operation = db.query(DeliveryBatch).filter(DeliveryBatch.id == operation_id).with_for_update().one()
+        operation.sent_count = db.query(func.count(DeliveryBatchItem.id)).filter(
+            DeliveryBatchItem.delivery_batch_id == operation_id,
+            DeliveryBatchItem.status == "sent",
+        ).scalar() or 0
+        operation.failed_count = db.query(func.count(DeliveryBatchItem.id)).filter(
+            DeliveryBatchItem.delivery_batch_id == operation_id,
+            DeliveryBatchItem.status == "failed",
+        ).scalar() or 0
+        operation.updated_at = _now()
+        db.commit()
+
     try:
-        op = db.query(DeliveryBatch).filter(DeliveryBatch.id == operation_id).with_for_update().first()
-        if not op: return {"sent": 0, "failed": 0}
-        campaign = db.query(BatchCampaign).filter(BatchCampaign.id == op.campaign_id).first()
+        operation = db.query(DeliveryBatch).filter(DeliveryBatch.id == operation_id).with_for_update().first()
+        if operation is None or operation.status in {"completed", "sending"}:
+            db.rollback()
+            return {"sent": 0, "failed": 0}
+        campaign = db.query(BatchCampaign).filter(BatchCampaign.id == operation.campaign_id).first()
         delivery_label = "Art Track" if campaign and campaign.kind == "art_track" else "Campaña"
-        op.status = "sending"; db.commit()
-        items = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.delivery_batch_id == op.id, DeliveryBatchItem.status.in_(("pending", "failed"))).with_for_update(skip_locked=True).all()
-        from database import DeliveriesSessionLocal, deliveries_added_by
-        ddb = DeliveriesSessionLocal()
-        try:
-            for row in items:
-                job = db.query(Job).filter(Job.job_id == row.job_id, Job.tenant_id == op.tenant_id).one_or_none()
-                if not job or job.status != "done" or not job.approved_at or _fingerprint(job) != row.approved_render_fingerprint:
-                    row.status = "failed"; row.error_code = "stale_approval"; row.error_detail = "Approval or render version changed."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
-                if storage.is_enabled():
-                    # The MP4/short/thumbnail are produced by the render.
-                    missing = [ft for ft in ("video", "short", "thumbnail") if not (job.s3_keys or {}).get(ft) or not storage.object_exists((job.s3_keys or {}).get(ft))]
-                    if missing:
-                        row.status = "failed"; row.error_code = "deliverables_not_ready"; row.error_detail = ", ".join(missing); row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
-                # ProRes NO se materializa solo. Esto publicaba los dos .mov en
-                # `file_types` sin verificarlos, apoyado en que el portal los
-                # transcodifica al primer download — y no lo hace: el portal
-                # firma la key determinística de R2 y nunca pasa por
-                # `ensure_prores_exists` (documentado desde el incidente
-                # 2026-08-03). Resultado medido el 2026-09-15 en el portal de
-                # Chile: 28 de 34 entregas activas ofrecían un "ProRes Master
-                # (broadcast)" que no existe en R2 y que nada iba a crear.
-                #
-                # Un job sin `umg_spec` no puede producirlos (no hay frame
-                # size, fps ni perfil), así que se publica como entrega
-                # PARCIAL —igual que un job sin short vertical— en vez de
-                # prometer un archivo inexistente. Uno con spec sí puede: se
-                # encola el prewarm y se publica; el archivo aparece cuando el
-                # transcode termina.
-                delivery_file_types = list(DELIVERY_FILE_TYPES)
-                prores_absent = [
-                    ft for ft in ("umg_master", "umg_short")
-                    if not storage.is_enabled()
-                    or not (job.s3_keys or {}).get(ft)
-                    or not storage.object_exists((job.s3_keys or {}).get(ft))
-                ]
-                if prores_absent and not job.umg_spec:
-                    delivery_file_types = [ft for ft in delivery_file_types if ft not in prores_absent]
-                    logger.warning(
-                        "[DELIVERY] job=%s se publica SIN %s: no tiene umg_spec, "
-                        "nada los puede generar", job.job_id, sorted(prores_absent),
-                    )
-                elif prores_absent:
-                    for ft in prores_absent:
-                        try:
-                            enqueue_prores_prewarm(job.job_id, ft, force=True)
-                        except Exception as exc:
-                            logger.warning(
-                                "[DELIVERY] no se pudo encolar %s de job=%s: %s",
-                                ft, job.job_id, exc,
-                            )
-                # Never write an AR/CL operation through the legacy
-                # single-portal schema. Without the portal_id migration,
-                # doing so would make a Chile delivery visible in Argentina
-                # (or vice versa). The durable item stays failed and can be
-                # retried after the shared Delivery contract is integrated.
-                if not hasattr(Delivery, "portal_id"):
-                    row.status = "failed"; row.error_code = "portal_contract_unavailable"; row.error_detail = "Delivery.portal_id is required for art-track portal isolation."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
-                delivery_query = ddb.query(Delivery).filter(Delivery.job_id == job.job_id, Delivery.removed_at.is_(None))
-                # Nagoya's portal contract adds portal_id to Delivery. Keep
-                # this code compatible with the legacy single-portal schema
-                # until that migration is integrated; once present, AR and
-                # CL are correctly independent rows.
-                if hasattr(Delivery, "portal_id"):
-                    delivery_query = delivery_query.filter(Delivery.portal_id == op.destination_portal)
-                active = delivery_query.first()
-                if active is None:
-                    delivery_kwargs = dict(job_id=job.job_id, label=delivery_label, file_types=delivery_file_types, artist_snapshot=job.artist, song_title_snapshot=job.song_title or "", tenant_snapshot=job.tenant_id, added_by_user_id=deliveries_added_by(op.created_by), added_at=_now(), frame_size_snapshot=(job.umg_spec or {}).get("frame_size"))
-                    if hasattr(Delivery, "portal_id"):
-                        delivery_kwargs["portal_id"] = op.destination_portal
-                    active = Delivery(**delivery_kwargs)
-                    ddb.add(active); ddb.flush()
+        destination = operation.destination_portal
+        tenant = operation.tenant_id
+        actor_id = operation.created_by
+        operation.status = "sending"
+        operation.updated_at = _now()
+        db.commit()
+        item_ids = [row.id for row in db.query(DeliveryBatchItem.id).filter(
+            DeliveryBatchItem.delivery_batch_id == operation_id,
+            DeliveryBatchItem.status.in_(("pending", "failed")),
+        ).order_by(DeliveryBatchItem.created_at).all()]
+        db.rollback()
+
+        for item_id in item_ids:
+            row = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.id == item_id).with_for_update().first()
+            if row is None or row.status == "sent":
+                db.rollback()
+                continue
+            job = db.query(Job).filter(Job.job_id == row.job_id, Job.tenant_id == tenant).with_for_update().one_or_none()
+            if not job or job.status != "done" or not job.approved_at or _fingerprint(job) != row.approved_render_fingerprint:
+                finish_item(row, error_code="stale_approval", error_detail="La aprobación o el render cambió.")
+                continue
+            if delivery_readiness_gate(job, job.delivery_qc, for_umg_delivery=True).get("blocked"):
+                finish_item(row, error_code="delivery_qc_blocked", error_detail="Revisá los controles del video.")
+                continue
+            if job.approved_render_fingerprint and job.approved_render_fingerprint != _fingerprint(job):
+                finish_item(row, error_code="approved_render_changed", error_detail="El render cambió después de aprobarse.")
+                continue
+            if job.approved_video_etag and job.approved_video_etag != storage.object_etag(source_key(job, "video")):
+                finish_item(row, error_code="approved_video_changed", error_detail="El archivo cambió después de aprobarse.")
+                continue
+
+            file_types = list(DELIVERY_FILE_TYPES)
+            missing_outputs = []
+            for ft, url_field in (("video", "video_url"), ("short", "short_url"), ("thumbnail", "thumbnail_url")):
+                if storage.object_exists(source_key(job, ft)):
+                    continue
+                if ft == "video" or (job.s3_keys or {}).get(ft) or getattr(job, url_field, None):
+                    missing_outputs.append(ft)
                 else:
-                    active.label = delivery_label
-                    active.file_types = delivery_file_types
-                    active.artist_snapshot = job.artist
-                    active.song_title_snapshot = job.song_title or ""
-                    active.tenant_snapshot = job.tenant_id
-                    active.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
-                    active.added_by_user_id = deliveries_added_by(op.created_by)
-                    active.added_at = _now()
-                row.delivery_id = active.id; row.status = "sent"; row.receipt = {"delivery_id": active.id, "portal": op.destination_portal}; row.attempts = int(row.attempts or 0) + 1; sent += 1
-            ddb.commit()
-        finally: ddb.close()
-        op.sent_count = (op.sent_count or 0) + sent; op.failed_count = (op.failed_count or 0) + failed
-        remaining = db.query(func.count(DeliveryBatchItem.id)).filter(DeliveryBatchItem.delivery_batch_id == op.id, DeliveryBatchItem.status.in_(("pending", "failed"))).scalar() or 0
-        op.status = "completed" if remaining == 0 else "partial"; op.completed_at = _now() if remaining == 0 else None; op.updated_at = _now(); db.commit()
+                    file_types.remove(ft)
+            if missing_outputs:
+                finish_item(row, error_code="deliverables_not_ready", error_detail=", ".join(missing_outputs))
+                continue
+            if "short" not in file_types:
+                file_types.remove("umg_short")
+
+            pending_prores = delivery_freshness.prores_pending(job, file_types)
+            missing_prores = [ft for ft in ("umg_master", "umg_short")
+                              if ft in pending_prores or not storage.object_exists(source_key(job, ft))]
+            if missing_prores and not job.umg_spec:
+                if pending_prores:
+                    finish_item(row, error_code="prores_stale_without_spec", error_detail=", ".join(pending_prores))
+                    continue
+                file_types = [ft for ft in file_types if ft not in missing_prores]
+            elif missing_prores:
+                for ft in missing_prores:
+                    try:
+                        enqueue_prores_prewarm(job.job_id, ft, force=True)
+                    except Exception:
+                        logger.exception("[DELIVERY] could not queue ProRes job=%s type=%s", job.job_id, ft)
+                finish_item(row, error_code="preparing_prores", error_detail=", ".join(missing_prores))
+                continue
+
+            # Release both job and batch-item locks before a multi-GB R2 copy.
+            # The manifest retains source keys/ETags for the short commit fence.
+            db.expunge(job)
+            db.commit()
+            try:
+                manifest = freeze_manifest(job, file_types)
+                row = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.id == item_id).with_for_update().one()
+                job = db.query(Job).filter(Job.job_id == row.job_id, Job.tenant_id == tenant).with_for_update().one_or_none()
+                if job is None or job.status != "done" or not job.approved_at or _fingerprint(job) != row.approved_render_fingerprint:
+                    raise ManifestUnavailable("La aprobación o el render cambió durante la preparación.")
+                assert_manifest_source_current(job, manifest)
+                if job.approved_video_etag and job.approved_video_etag != manifest.source_etags.get("video"):
+                    raise ManifestUnavailable("El archivo aprobado cambió durante la preparación.")
+                if delivery_readiness_gate(job, job.delivery_qc, for_umg_delivery=True).get("blocked"):
+                    raise ManifestUnavailable("Los controles del video cambiaron durante la preparación.")
+                ddb = DeliveriesSessionLocal()
+                try:
+                    active, changed, resolved, created = publish_record(
+                        ddb, job=job, portal_id=destination,
+                        added_by=deliveries_added_by(actor_id),
+                        label=delivery_label, manifest=manifest,
+                        preserve_label=True,
+                    )
+                    ddb.commit()
+                    receipt = {
+                        "delivery_id": active.id, "portal": destination,
+                        "revision": active.published_revision,
+                        "manifest_hash": active.published_manifest_hash,
+                        "content_changed": changed, "created": created,
+                        "resolved_change_requests": resolved,
+                        "file_types": list(manifest.keys),
+                    }
+                    finish_item(row, receipt=receipt, delivery_id=active.id)
+                finally:
+                    ddb.close()
+            except ManifestUnavailable as exc:
+                db.rollback()
+                row = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.id == item_id).with_for_update().one()
+                finish_item(row, error_code="delivery_manifest_unavailable", error_detail=str(exc))
+            except Exception as exc:
+                db.rollback()
+                logger.exception("[DELIVERY] batch publication failed for item=%s", item_id)
+                row = db.query(DeliveryBatchItem).filter(DeliveryBatchItem.id == item_id).with_for_update().one()
+                finish_item(row, error_code="delivery_publish_failed", error_detail=str(exc))
+
+        operation = db.query(DeliveryBatch).filter(DeliveryBatch.id == operation_id).with_for_update().one()
+        remaining = db.query(func.count(DeliveryBatchItem.id)).filter(
+            DeliveryBatchItem.delivery_batch_id == operation_id,
+            DeliveryBatchItem.status.in_(("pending", "failed")),
+        ).scalar() or 0
+        operation.status = "completed" if remaining == 0 else "partial"
+        operation.completed_at = _now() if remaining == 0 else None
+        operation.updated_at = _now()
+        db.commit()
         return {"sent": sent, "failed": failed}
-    finally: db.close()
+    finally:
+        db.close()

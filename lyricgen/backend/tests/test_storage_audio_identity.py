@@ -52,3 +52,35 @@ def test_object_etag_is_normalized(monkeypatch):
     monkeypatch.setattr(storage, "_get_client", lambda: Client())
     monkeypatch.setattr(storage, "R2_BUCKET", "bucket")
     assert storage.object_etag("inputs/key") == "multipart-etag-2"
+
+
+def test_portal_copy_stamps_source_etag_in_single_and_multipart_paths(monkeypatch):
+    from botocore.exceptions import ClientError
+
+    class Client:
+        def __init__(self):
+            self.simple = []
+            self.multipart = []
+            self.too_large = False
+
+        def copy_object(self, **kwargs):
+            self.simple.append(kwargs)
+            if self.too_large:
+                raise ClientError({"Error": {"Code": "EntityTooLarge"}}, "CopyObject")
+
+        def copy(self, **kwargs):
+            self.multipart.append(kwargs)
+
+    client = Client()
+    monkeypatch.setattr(storage, "_get_client", lambda: client)
+    monkeypatch.setattr(storage, "object_exists", lambda _key: True)
+    monkeypatch.setattr(storage, "R2_BUCKET", "bucket")
+
+    assert storage.copy_object("source.mp4", "published/cut.mp4", source_etag="source-v1")
+    assert client.simple[-1]["Metadata"] == {"genly-source-etag": "source-v1"}
+    client.too_large = True
+    assert storage.copy_object("source.mov", "published/cut.mov", source_etag="source-v2")
+    assert client.multipart[-1]["ExtraArgs"]["Metadata"] == {
+        "genly-source-etag": "source-v2",
+    }
+    assert client.multipart[-1]["ExtraArgs"]["MetadataDirective"] == "REPLACE"

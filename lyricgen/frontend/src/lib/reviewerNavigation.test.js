@@ -53,10 +53,18 @@ describe("reviewer navigation contract", () => {
     expect(reviewStateFilter("approved", "pending")).toBe("");
     expect(reviewStateFilter("failed", "all")).toBe("failed");
   });
-  it.each(["/admin/cola?scope=approved", "/campaigns/test?tab=approved&q=hola"])("allows reviewer return %s", (path) => {
+  it.each([
+    "/admin/cola?scope=approved",
+    "/campaigns/test?tab=approved&q=hola",
+    "/admin?section=cambios&change_request_id=109",
+  ])("allows reviewer return %s", (path) => {
     expect(safeReviewReturnPath(path)).toBe(path);
   });
-  it.each(["https://evil.test", "//evil.test", "/\\evil.test", "/admin/cola-evil", "/admin/settings", "javascript:alert(1)"])("rejects unrelated return %s", (path) => {
+  it.each([
+    "https://evil.test", "//evil.test", "/\\evil.test", "/admin/cola-evil",
+    "/admin/settings", "/admin?section=cambios", "/admin?section=ahora&change_request_id=109",
+    "javascript:alert(1)",
+  ])("rejects unrelated return %s", (path) => {
     expect(safeReviewReturnPath(path)).toBeNull();
   });
 });
