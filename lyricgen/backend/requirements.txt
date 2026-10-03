@@ -46,7 +46,9 @@ safetensors>=0.4.0,<1.0.0
 # an attested adapter is mounted and LORA_V1_FAMILY_ENABLED=1.
 peft==0.20.0
 # --- SaaS infrastructure ---
-sqlalchemy>=2.0.0,<3.0.0
+# SQLAlchemy 2.1 switches bare postgresql:// URLs to psycopg 3; this app
+# currently installs and configures psycopg2 for every DB pool.
+sqlalchemy>=2.0.0,<2.1.0
 psycopg2-binary>=2.9.0,<3.0.0
 alembic>=1.13.0,<2.0.0
 stripe>=8.0.0,<9.0.0
