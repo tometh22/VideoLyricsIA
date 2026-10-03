@@ -324,7 +324,7 @@ def test_missing_prores_concurrent_publication_creates_one_revision_without_queu
     import main
     import portal_prores
     from concurrent.futures import ThreadPoolExecutor
-    from threading import Barrier
+    from threading import Barrier, Lock, get_ident
 
     if db.bind.dialect.name != 'postgresql':
         pytest.skip('Publication row locks and pooled contention require PostgreSQL')
@@ -336,6 +336,17 @@ def test_missing_prores_concurrent_publication_creates_one_revision_without_queu
     enqueue = Mock(side_effect=AssertionError('Publication must not generate ProRes'))
     monkeypatch.setattr(main, 'enqueue_prores_prewarm', enqueue)
     start = Barrier(concurrency, timeout=15)
+    copying = Barrier(concurrency, timeout=15)
+    seen_threads, guard = set(), Lock()
+
+    def first_copy(_source, _target):
+        with guard:
+            first = get_ident() not in seen_threads
+            seen_threads.add(get_ident())
+        if first:
+            copying.wait()
+
+    fake_r2['copy_hook'] = first_copy
 
     def submit(_):
         start.wait()
