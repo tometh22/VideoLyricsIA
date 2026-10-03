@@ -22287,6 +22287,8 @@ class ConfirmPublicationRequest(BaseModel):
     reviewed_render_fingerprint: str = Field(min_length=1, max_length=128)
     reviewed_editor_revision: int = Field(ge=0)
     resolution_note: str = Field(default='', max_length=2000)
+    # Points of the request the operator ticked against the cut (audit only).
+    confirmed_items: int | None = Field(default=None, ge=1, le=200)
 
 
 @app.post('/admin/change-requests/{cr_id}/confirm-publication')
@@ -22342,6 +22344,7 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
         'source': 'publication_confirmed', 'revision': revision,
         'render_fingerprint': body.reviewed_render_fingerprint,
         'editor_revision': body.reviewed_editor_revision,
+        'confirmed_items': body.confirmed_items,
     }))
     db.commit()
     return {'ok': True, 'resolved_at': now.isoformat(), 'updated_at': now.isoformat(),

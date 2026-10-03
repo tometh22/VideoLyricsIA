@@ -159,8 +159,11 @@ def case_state(*, publication, proposal_status=None, resolved_at=None,
                      'Publicar confirma este corte y este pedido. El cliente conserva su aprobación independiente.',
                      'attention', base + ['publish'])
     if p.get('needs_publish') is False and p.get('revision') and p.get('answers_request') is True:
-        return state('review', 3, 'Publicado · confirmá y cerrá el pedido',
-                     'El portal ya tiene el video con la letra corregida después del pedido. Miralo y confirmá: queda resuelto por publicación.',
+        # Evidence that A fix was published, never that EVERY instruction was
+        # (5 of 10 requests closed this way on 2026-10-03 were incomplete):
+        # the panel makes the operator tick each point against the cut.
+        return state('review', 3, 'Publicado · revisá cada punto del pedido',
+                     'El portal ya tiene un video corregido después del pedido. Revisá cada punto contra el video; si falta alguno, corregilo y volvé a publicar.',
                      'action', base + ['confirm_publication'])
     if p.get('needs_publish') is False and p.get('revision'):
         return state('review', 3, 'Publicación registrada · revisar pedido',
