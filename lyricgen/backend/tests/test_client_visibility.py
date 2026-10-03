@@ -129,7 +129,9 @@ def test_portal_listing_keeps_the_card_but_drops_the_files_while_hidden(client, 
 
     try:
         shown = version()
-        assert shown['files_hidden'] is False and [f['type'] for f in shown['files']] == ['video']
+        assert shown['files_hidden'] is False
+        assert [f['type'] for f in shown['files']] == ['video', 'umg_master']
+        assert shown['files'][1]['can_prepare'] is True
         with SessionLocal() as other:
             other.get(Delivery, delivery_id).stale_since = NOW
             other.get(Delivery, delivery_id).stale_reason = 'editing'
@@ -138,7 +140,7 @@ def test_portal_listing_keeps_the_card_but_drops_the_files_while_hidden(client, 
         assert auto['files_hidden'] is True and auto['files'] == [] and auto['preview_url'] is None
         assert auto['updating'] is True
         client.put(f'/admin/deliveries/{delivery_id}/visibility', headers=auth(admin_token), json={'mode': 'visible'})
-        assert [f['type'] for f in version()['files']] == ['video']
+        assert [f['type'] for f in version()['files']] == ['video', 'umg_master']
         client.put(f'/admin/deliveries/{delivery_id}/visibility', headers=auth(admin_token), json={'mode': 'hidden'})
         assert version()['files'] == []
     finally:
