@@ -153,3 +153,48 @@ def test_reconcile_passes_words_through_for_karaoke():
     assert out[0]["words"][0]["word"] == "hola"
     # Third line ('uno dos tres') has its 3 words.
     assert out[2].get("words") and len(out[2]["words"]) == 3
+
+
+def test_reconcile_keeps_reanchored_words_through_cleanup(monkeypatch):
+    """An extra ASR token must not truncate the following matched phrase."""
+    import copy
+    import pytest
+    from lead_in import apply_hold
+    from post_reconcile import post_reconcile_cleanup
+
+    monkeypatch.setenv('RECONCILE_GAP_RECOVERY_ENABLED', '0')
+    words = [
+        _w('hola', 0, .2), _w('mundo', .2, .4),
+        _w('extra', .6, .8),
+        _w('Pero', 2, 2.3), _w('antes', 2.4, 2.7),
+        _w('de', 2.8, 3), _w('partir', 3.1, 4),
+        _w('sigue', 6, 6.4), _w('cantando', 6.5, 7),
+        _w('hasta', 9, 9.4), _w('mañana', 9.5, 10),
+    ]
+    for word in words:
+        word['score'] = .9
+    original = copy.deepcopy(words)
+    result = wr.reconcile([_wx_seg(0, 10, '', words)],
+                          'hola mundo\nPero antes de partir\nsigue cantando\nhasta mañana')
+    assert result is not None
+    assert [s['text'] for s in result] == [
+        'hola mundo', 'Pero antes de partir', 'sigue cantando', 'hasta mañana']
+    assert [w['word'] for w in result[1]['words']] == ['Pero', 'antes', 'de', 'partir']
+    assert all(set(w) == {'word', 'start', 'end'} for s in result for w in s['words'])
+    polished = apply_hold(post_reconcile_cleanup(result, split_long_lines=False), hold_s=.5)
+    assert [(s['start'], s['end']) for s in polished] == pytest.approx(
+        [(0, .9), (2, 4.5), (6, 7.5), (9, 10)])
+    assert words == original
+
+
+def test_reconcile_does_not_shift_words_after_skipped_reference_line(monkeypatch):
+    """The matcher can skip a line; output index is not reference index."""
+    monkeypatch.setenv('ANCHOR_TEXT_GATE_ENABLED', '1')
+    monkeypatch.setenv('RECONCILE_GAP_RECOVERY_ENABLED', '0')
+    words = [_w(w, i, i + .3) for i, w in enumerate(
+        'hola mundo hasta mañana sigue cantando noche clara'.split())]
+    result = wr.reconcile([_wx_seg(0, 8, '', words)],
+                          'hola mundo\nzzzz xxxx qqqq\nhasta mañana\nsigue cantando\nnoche clara')
+    assert result is not None
+    assert [s['text'] for s in result] == ['hola mundo', 'hasta mañana', 'sigue cantando', 'noche clara']
+    assert [[w['word'] for w in s['words']] for s in result] == [s['text'].split() for s in result]
