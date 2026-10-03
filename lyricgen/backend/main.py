@@ -21180,9 +21180,15 @@ async def portal_submit_change_request(
     return {"ok": True, "id": cr.id, "submitted_at": cr.submitted_at.isoformat()}
 
 
+class PortalApproveRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    expected_content_updated_at: str | None
+
+
 @app.post("/api/deliveries/{delivery_id}/approve")
 async def portal_approve_delivery(
     delivery_id: int,
+    body: PortalApproveRequest,
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
     db: Session = Depends(get_db),
@@ -21203,10 +21209,30 @@ async def portal_approve_delivery(
         _portal_delivery_query(ddb.query(Delivery), portal_id)
         .filter(Delivery.id == delivery_id)
         .filter(Delivery.removed_at.is_(None))
+        .with_for_update()
         .first()
     )
     if not delivery:
         raise HTTPException(status_code=404, detail="Delivery no encontrada.")
+    current_updated_at = (
+        delivery.content_updated_at.isoformat()
+        if delivery.content_updated_at else None
+    )
+    if (body.expected_revision != (delivery.published_revision or 1)
+            or body.expected_content_updated_at != current_updated_at):
+        raise HTTPException(
+            status_code=409,
+            detail="La versión cambió desde que abriste el portal. Actualizá la página y revisá el video antes de aprobar.",
+        )
+    if is_hidden_from_client(delivery) or (
+        delivery.published_file_keys is None
+        and delivery.stale_since is not None
+        and (delivery.stale_reason or "") in delivery_freshness.STALE_IN_FLIGHT
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Esta versión se está actualizando o no está disponible. Esperá a que vuelva a publicarse.",
+        )
     if delivery.approved_at is not None:
         return {
             "ok": True,

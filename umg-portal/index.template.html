@@ -2402,7 +2402,12 @@ function renderVersionRow(song, version, versionIdx) {
         <span class="approved-meta">por ${escapeHtml(version.approved_by_label || 'UMG')} el ${escapeHtml(approvedAtTxt)} · <a onclick="unapproveDelivery(${version.delivery_id})" data-help-tip="Vuelve la versión a Pendiente. Útil si aprobaste por error." data-help-article="undo-approval">deshacer</a></span>
         ${requestBtn}`;
     } else {
-      const approveBtn = `<button type="button" class="btn btn-success btn-sm" onclick="approveDelivery(${version.delivery_id}, ${songLabelEsc})" data-help-tip="Firmar la versión como lista para publicar. Reversible con 'deshacer'." data-help-article="how-to-approve">
+      const reviewedRevision = Number(version.revision) || 1;
+      const reviewedAt = JSON.stringify(version.content_updated_at || null).replace(/"/g, '&quot;');
+      const unavailable = version.files_hidden || version.updating;
+      const approveBtn = unavailable
+        ? `<button type="button" class="btn btn-success btn-sm" disabled title="Esperá a que la versión corregida esté publicada y disponible.">Actualizando…</button>`
+        : `<button type="button" class="btn btn-success btn-sm" onclick="approveDelivery(${version.delivery_id}, ${songLabelEsc}, ${reviewedRevision}, ${reviewedAt})" data-help-tip="Aprobar la versión que estás viendo. Si se actualizó, primero revisá el nuevo corte." data-help-article="how-to-approve">
         ✓ Aprobar
       </button>`;
       const rejectBtn = `<button type="button" class="btn btn-danger btn-sm" onclick="rejectDelivery(${version.delivery_id}, ${songLabelEsc})" data-help-tip="Quitar la versión del portal. Usar solo si no debería existir (canción equivocada, derechos no resueltos)." data-help-article="approve-vs-changes">
@@ -2756,13 +2761,21 @@ async function prepareProRes(deliveryId, fileType) {
 // ───── Approve / Reject / Un-approve a delivery (portal-side actions) ─────
 // Reject = soft-delete from the portal's POV. The backend keeps the row +
 // R2 files (admin can un-delete from the admin panel). UMG sees it disappear.
-async function approveDelivery(deliveryId, songLabel) {
+async function approveDelivery(deliveryId, songLabel, expectedRevision, expectedContentUpdatedAt) {
   if (!confirm("Marcar este video como APROBADO?\n\n" + (songLabel || "").replace(/^"|"$/g, ""))) return;
   try {
-    const resp = await apiFetch("/api/deliveries/" + deliveryId + "/approve", { method: "POST" });
+    const resp = await apiFetch("/api/deliveries/" + deliveryId + "/approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_revision: expectedRevision,
+        expected_content_updated_at: expectedContentUpdatedAt,
+      }),
+    });
     if (resp.status === 401) { clearAuth(); location.reload(); return; }
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
+      if (resp.status === 409) await reloadItems();
       throw new Error(body.detail?.message || body.detail || ("HTTP " + resp.status));
     }
     await reloadItems();

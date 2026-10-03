@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.104] - 2026-10-03
+
+### Fixed
+
+- El portal exige la revisión y la fecha del corte que el cliente vio antes de aceptar una aprobación. Rechaza páginas desactualizadas y entregas ocultas o en actualización; la aprobación vuelve a estar disponible tras revisar la versión publicada.
+
 ## 1.1.103 — 2026-10-03
 
 - Todos los lyrics y art tracks ofrecen ProRes a pedido en ambos portales, incluso sin master guardado o Job local.
