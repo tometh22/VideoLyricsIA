@@ -30,6 +30,80 @@ from tests.conftest import auth
 PORTAL_TOKEN = os.environ.get("DELIVERY_PORTAL_TOKEN", "test-portal-token")
 
 
+def _portal_approval_body(db, delivery_id):
+    from database import Delivery
+    db.expire_all()
+    delivery = db.get(Delivery, delivery_id)
+    return {
+        "expected_revision": delivery.published_revision or 1,
+        "expected_content_updated_at": (
+            delivery.content_updated_at.isoformat()
+            if delivery.content_updated_at else None
+        ),
+    }
+
+
+def test_portal_approval_rejects_stale_or_missing_review(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    from database import Delivery
+
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+    reviewed = _portal_approval_body(db, delivery_id)
+    endpoint = f"/api/deliveries/{delivery_id}/approve"
+    headers = {"X-Portal-Token": PORTAL_TOKEN}
+
+    assert client.post(endpoint, headers=headers, json={}).status_code == 422
+    row = db.get(Delivery, delivery_id)
+    row.published_revision += 1
+    row.content_updated_at = datetime.now(timezone.utc)
+    db.commit()
+    stale = client.post(endpoint, headers=headers, json=reviewed)
+    assert stale.status_code == 409, stale.text
+    assert db.get(Delivery, delivery_id).approved_at is None
+
+    current = _portal_approval_body(db, delivery_id)
+    approved = client.post(endpoint, headers=headers, json=current)
+    assert approved.status_code == 200, approved.text
+    repeat = client.post(endpoint, headers=headers, json=current)
+    assert repeat.status_code == 200 and repeat.json()["already_approved"]
+    assert client.post(endpoint, headers=headers, json=reviewed).status_code == 409
+
+
+def test_portal_approval_waits_for_visible_published_cut(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    from database import Delivery
+    from delivery_freshness import STALE_EDITING
+
+    published = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert published.status_code == 200, published.text
+    delivery_id = published.json()["delivery_id"]
+    body = _portal_approval_body(db, delivery_id)
+    endpoint = f"/api/deliveries/{delivery_id}/approve"
+    headers = {"X-Portal-Token": PORTAL_TOKEN}
+    row = db.get(Delivery, delivery_id)
+    row.client_visibility = "hidden"
+    db.commit()
+    assert client.post(endpoint, headers=headers, json=body).status_code == 409
+
+    row.client_visibility = "visible"
+    row.published_file_keys = None
+    row.stale_since = datetime.now(timezone.utc)
+    row.stale_reason = STALE_EDITING
+    db.commit()
+    assert client.post(endpoint, headers=headers, json=body).status_code == 409
+    assert db.get(Delivery, delivery_id).approved_at is None
+
+
 def _signed_umg_qc_report(job, reviewer_id):
     from delivery_qc_runtime import (
         MANDATORY_REVIEW_CHECKS, delivery_qc_source_fingerprint,
@@ -1413,7 +1487,8 @@ def test_publishing_a_corrected_cut_reopens_the_client_review(
     # El cliente aprueba y después pide un cambio sobre esa versión.
     assert client.post(
         f"/api/deliveries/{delivery_id}/approve",
-        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+        headers={"X-Portal-Token": PORTAL_TOKEN},
+        json=_portal_approval_body(db, delivery_id),
     ).status_code == 200
     with patch("main.emails.send_umg_change_request_notification"):
         cr_id = client.post(
@@ -1467,7 +1542,8 @@ def test_resending_the_same_cut_keeps_the_approval_and_the_open_request(
     ).json()["delivery_id"]
     client.post(
         f"/api/deliveries/{delivery_id}/approve",
-        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+        headers={"X-Portal-Token": PORTAL_TOKEN},
+        json=_portal_approval_body(db, delivery_id),
     )
     with patch("main.emails.send_umg_change_request_notification"):
         cr_id = client.post(
@@ -1511,7 +1587,8 @@ def test_legacy_row_with_proven_later_overwrite_requires_new_approval(
     ).json()["delivery_id"]
     client.post(
         f"/api/deliveries/{delivery_id}/approve",
-        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+        headers={"X-Portal-Token": PORTAL_TOKEN},
+        json=_portal_approval_body(db, delivery_id),
     )
     row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
     row.published_render_fingerprint = None
@@ -1543,7 +1620,8 @@ def test_a_legacy_row_marked_stale_publishes_the_corrected_cut(
     ).json()["delivery_id"]
     client.post(
         f"/api/deliveries/{delivery_id}/approve",
-        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+        headers={"X-Portal-Token": PORTAL_TOKEN},
+        json=_portal_approval_body(db, delivery_id),
     )
     with patch("main.emails.send_umg_change_request_notification"):
         request_id = client.post(
@@ -1601,7 +1679,8 @@ def test_portal_listing_tells_the_client_there_is_a_new_version(
     ).json()["delivery_id"]
     client.post(
         f"/api/deliveries/{delivery_id}/approve",
-        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+        headers={"X-Portal-Token": PORTAL_TOKEN},
+        json=_portal_approval_body(db, delivery_id),
     )
 
     _edit_the_render(db, approved_job)

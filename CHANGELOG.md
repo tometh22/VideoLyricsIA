@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.108] - 2026-10-03
+
+### Fixed
+
+- El portal exige la revisión y la fecha del corte que el cliente vio antes de aceptar una aprobación. Rechaza páginas desactualizadas y entregas ocultas o en actualización; la aprobación vuelve a estar disponible tras revisar la versión publicada.
+
 ## [1.1.107] - 2026-10-03
 
 ### Fixed
