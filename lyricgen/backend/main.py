@@ -22004,7 +22004,9 @@ async def portal_prores_status(
         portal_prores_job_status, delivery.job_id, file_type,
         snapshot=not local_job_exists,
     )
-    if task_state == "processing" or (task_state == "not_found" and not local_job_exists):
+    if task_state == "processing" or (
+        not local_job_exists and task_state in {"not_found", "unknown"}
+    ):
         return JSONResponse(
             status_code=202,
             content={"status": "processing", "retry_after": 10},
