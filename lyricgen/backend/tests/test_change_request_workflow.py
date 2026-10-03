@@ -3,7 +3,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from change_request_workflow import case_state, render_state
+from change_request_workflow import case_state, published_answer, render_state
 from delivery_snapshots import copy_snapshot, portal_key
 
 NOW = datetime(2026, 9, 18, tzinfo=timezone.utc)
@@ -100,3 +100,72 @@ def test_legacy_missing_master_is_not_a_permanent_render_blocker(monkeypatch):
     monkeypatch.setattr('storage.object_identity', lambda _: {'status': 'unavailable'})
     with pytest.raises(RuntimeError):
         copy_snapshot('t', 'j', ['video'], allow_missing=True)
+
+
+def _published(**overrides):
+    publication = dict(job_status='done', render_matches_editor=True, needs_publish=False,
+                       can_render=True, editor_revision=8, render_fingerprint='current-render',
+                       prores_pending=[], revision=2)
+    publication.update(overrides)
+    return publication
+
+
+def test_cut_already_published_after_the_fix_offers_one_click_close():
+    result = case_state(publication=_published(answers_request=True))
+    assert result['key'] == 'review'
+    assert 'confirm_publication' in result['allowed_actions']
+
+
+@pytest.mark.parametrize('answers', [False, None, 'true'])
+def test_publication_close_needs_explicit_evidence(answers):
+    result = case_state(publication=_published(answers_request=answers))
+    assert result['key'] == 'review'
+    assert 'confirm_publication' not in result['allowed_actions']
+
+
+def test_campaign_song_renders_through_the_editor_approval_not_the_panel():
+    # The panel render answers 409 lyrics_and_timing_approval_missing for
+    # campaign songs (Cuando Miro a Tus Ojos, 2026-10-03).
+    campaign = case_state(publication=_published(render_matches_editor=False, campaign_job=True))
+    assert campaign['key'] == 'render'
+    assert 'approve_in_editor' in campaign['allowed_actions']
+    assert 'review_render' not in campaign['allowed_actions']
+    plain = case_state(publication=_published(render_matches_editor=False))
+    assert 'review_render' in plain['allowed_actions']
+
+
+def _answer_case(**changes):
+    from datetime import timedelta
+    submitted = NOW
+    values = dict(
+        job=NS(job_id='j', status='done', segments_revision=8, edit_count=1, previous_versions=[],
+               completed_at=NOW, render_params={'_rendered_segments_revision': 8,
+                                                '_rendered_at': (NOW + timedelta(hours=2)).isoformat()}),
+        document=NS(revision=8, updated_at=NOW + timedelta(hours=1)),
+        request=NS(resolved_at=None, submitted_at=submitted),
+    )
+    from delivery_freshness import render_fingerprint
+    values['delivery'] = NS(removed_at=None, published_render_fingerprint=render_fingerprint(values['job']),
+                            content_updated_at=NOW + timedelta(hours=3), stale_since=None, stale_reason=None,
+                            added_at=NOW)
+    for key, value in changes.items():
+        target, attr = key.split('__')
+        setattr(values[target], attr, value)
+    return published_answer(values['job'], values['document'], values['delivery'], values['request'])
+
+
+def test_published_answer_accepts_fix_saved_rendered_and_published_after_request():
+    assert _answer_case() == (True, 'ok')
+
+
+@pytest.mark.parametrize('change,reason', [
+    ({'document__updated_at': datetime(2026, 9, 17, tzinfo=timezone.utc)}, 'no_fix_after_request'),
+    ({'document__revision': 9}, 'render_not_current'),
+    ({'delivery__published_render_fingerprint': 'older-cut'}, 'not_published'),
+    ({'delivery__content_updated_at': datetime(2026, 9, 17, tzinfo=timezone.utc)}, 'published_before_request'),
+    ({'job__status': 'editing'}, 'not_applicable'),
+    ({'request__resolved_at': NOW}, 'not_applicable'),
+    ({'delivery__removed_at': NOW}, 'not_applicable'),
+])
+def test_published_answer_refuses_without_evidence(change, reason):
+    assert _answer_case(**change) == (False, reason)

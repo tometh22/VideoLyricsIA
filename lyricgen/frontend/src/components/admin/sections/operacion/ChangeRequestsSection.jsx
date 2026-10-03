@@ -67,6 +67,7 @@ export default function ChangeRequestsSection({ initialPendingCount, onPendingCo
           crLoading={changes.crLoading}
           crResolvingId={changes.crResolvingId}
           resolveChangeRequest={changes.resolveChangeRequest}
+          confirmChangeRequestPublication={changes.confirmChangeRequestPublication}
           reopenChangeRequest={changes.reopenChangeRequest}
           crPublishingId={changes.crPublishingId}
           crPublishNotice={changes.crPublishNotice}

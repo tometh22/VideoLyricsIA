@@ -231,6 +231,11 @@ export const PRIMARY_LABELS = {
   reopening: "Reabriendo…",
   see_error: "Ver el error",
   close: "Dar por resuelto",
+  // The corrected cut is already in the portal: closing records the publication.
+  confirm_publication: "Confirmar y dar por resuelto",
+  confirming: "Cerrando…",
+  // Campaign songs render when lyrics+timing are approved in the editor.
+  approve_in_editor: "Aprobar letra y generar video",
   refresh: "Actualizar estado",
   none: "Sin acción disponible",
 };
@@ -242,6 +247,12 @@ export const SECONDARY_LABELS = {
   close: "Cerrar sin publicar",
   prepare_only: "Solo preparar el archivo profesional (sin publicar)",
 };
+
+// Only an explicit server projection grants these: legacy rows without a list
+// must never be offered a publication close nor routed away from the panel.
+function serverAllows(workflow, action) {
+  return Array.isArray(workflow?.allowed_actions) && workflow.allowed_actions.includes(action);
+}
 
 /** Un `action` del servidor está permitido; sin lista (datos viejos) todo lo está. */
 export function workflowAllows(workflow, action) {
@@ -256,7 +267,7 @@ function stepPosition(workflow) {
       // bandeja de campaña no manda activeStep: su "resolved" siempre publicó.
       return workflow.activeStep == null || workflow.activeStep >= 3 ? 3 : -1;
     case "closed": return -1;
-    case "review": return 3;
+    case "review": case "confirm": return 3;
     case "publish": return 2;
     case "render": case "rendering": case "blocked": return 1;
     default: return 0;
@@ -316,6 +327,11 @@ export function correctionPrimary(workflow, ctx = {}) {
     if (allows("publish") && status.canPublish) return publish();
     if (workflow.key === "rendering") return pick("rendering", undefined, true);
     if (allows("review_proposal") && ["apply", "analyze"].includes(workflow.key)) return reviewProposal();
+    if (allows("confirm_publication")) {
+      return pick("confirm_publication",
+        busy.resolving ? PRIMARY_LABELS.confirming : PRIMARY_LABELS.confirm_publication, Boolean(busy.resolving));
+    }
+    if (allows("approve_in_editor") && hasJob) return pick("edit", PRIMARY_LABELS.approve_in_editor);
     if (allows("review_render")) return pick("render", undefined, Boolean(busy.proposal || busy.publishing));
     if (allows("resolve")) return close();
     if (allows("refresh")) return pick("refresh");
@@ -394,7 +410,9 @@ export function correctionSentence(workflow, ctx = {}) {
     case "apply":
       return `La IA sugirió cambios. Revisalos y aplicá los que correspondan.${manual}`;
     case "render":
-      return `La corrección está guardada, pero el video todavía es el anterior. Generá el video corregido.${manual}`;
+      return serverAllows(workflow, "approve_in_editor")
+        ? `La corrección está guardada, pero el video todavía es el anterior. Abrí el editor y aprobá letra y timing: en las canciones de campaña eso genera el video corregido.${manual}`
+        : `La corrección está guardada, pero el video todavía es el anterior. Generá el video corregido.${manual}`;
     case "rendering":
       return byRowMode(publication, {
         snapshot: "Estamos generando el video nuevo. El portal sigue mostrando el anterior hasta que lo publiques.",
@@ -413,6 +431,9 @@ export function correctionSentence(workflow, ctx = {}) {
         : `El video nuevo está listo. Miralo y publicalo: el cliente lo ve en el portal y el pedido queda resuelto.${tail}`;
     }
     case "review":
+      if (serverAllows(workflow, "confirm_publication")) {
+        return `El video corregido ya está en el portal${publication?.revision ? ` (versión ${publication.revision})` : ""}. Miralo y confirmá: el pedido queda resuelto por publicación.`;
+      }
       return "Ya hay una versión publicada. Revisá que lo pedido esté en el video y cerrá el pedido con una nota.";
     case "resolved": case "closed":
       return stepPosition(workflow) === 3
