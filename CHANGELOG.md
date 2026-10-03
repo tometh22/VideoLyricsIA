@@ -3,6 +3,14 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.98] - 2026-10-02
+
+### Fixed
+
+- El portal informa cuando falla la preparación ProRes, permite reintentar sin
+  reutilizar un job fallido de RQ y solo confirma que está listo cuando el
+  master se verificó en R2.
+
 ## [1.1.97] - 2026-10-02
 
 ### Fixed
