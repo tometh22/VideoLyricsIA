@@ -548,3 +548,22 @@ it("switches the publication mode once and does not let a stale list flip it bac
   await act(() => result.current.refreshChangeRequests({ silent: true }));
   expect(result.current.crPublicationMode).toBe("pointer");
 });
+it("closes a request the published cut already answers, bound to that cut, without a note", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => url === "/admin/change-requests/85/confirm-publication"
+    ? Promise.resolve({ ok: true, resolved_by_revision: 2, resolved_at: "2026-10-03T03:00:00Z" }) : previous(url, opts));
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  await act(() => result.current.confirmChangeRequestPublication(85, { render_fingerprint: "cut-2", editor_revision: 14 }));
+  const call = mocks.fetchJson.mock.calls.find(([url]) => url.endsWith("/confirm-publication"));
+  expect(JSON.parse(call[1].body)).toEqual({ reviewed_render_fingerprint: "cut-2", reviewed_editor_revision: 14 });
+  expect(result.current.crPublishNotice).toMatchObject({ requestId: 85, tone: "ok" });
+  expect(result.current.crPublishNotice.text).toContain("versión 2");
+});
+it("never confirms a publication close without the reviewed cut identity", async () => {
+  const { result } = renderHook(() => useChangeRequests());
+  await waitFor(() => expect(result.current.crLoading).toBe(false));
+  await act(() => result.current.confirmChangeRequestPublication(85, { editor_revision: 14 }));
+  expect(mocks.fetchJson.mock.calls.some(([url]) => url.endsWith("/confirm-publication"))).toBe(false);
+  expect(result.current.crPublishNotice).toMatchObject({ requestId: 85, tone: "error" });
+});

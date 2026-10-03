@@ -22216,8 +22216,11 @@ async def admin_list_change_requests(
             # abrir la configuración ProRes en esta misma tarjeta.
             publication["prores_configured"] = bool(job and job.umg_spec)
             if job:
-                from change_request_workflow import render_state
+                from change_request_workflow import published_answer, render_state
                 publication.update(render_state(job, documents_by_jobid.get(job.job_id), cr))
+                publication["campaign_job"] = bool(job.campaign_id)
+                publication["answers_request"] = published_answer(
+                    job, documents_by_jobid.get(job.job_id), d, cr)[0]
         items.append({
             "id": cr.id,
             "comment": cr.comment,
@@ -22465,6 +22468,71 @@ async def admin_render_change_request(cr_id: int, body: RenderChangeRequest,
     ), background_tasks,
         idempotency_key=f'change-request:{cr_id}:render:{body.editor_revision}',
         current_user=current_user, db=db)
+
+
+class ConfirmPublicationRequest(BaseModel):
+    reviewed_render_fingerprint: str = Field(min_length=1, max_length=128)
+    reviewed_editor_revision: int = Field(ge=0)
+    resolution_note: str = Field(default='', max_length=2000)
+
+
+@app.post('/admin/change-requests/{cr_id}/confirm-publication')
+def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicationRequest,
+                                             current_user: dict = Depends(get_current_user),
+                                             db: Session = Depends(get_db),
+                                             ddb: Session = Depends(get_deliveries_db)):
+    """Close a request that the cut ALREADY in the portal answers.
+
+    A campaign send can publish the corrected cut without ticking its request.
+    The portal is then current, so no publication can close it any more, and a
+    manual close would claim "nothing was published". This records the truth:
+    resolved by the published revision, bound to the exact cut the operator
+    reviewed. Same evidence rule as the panel (``published_answer``).
+    """
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail='Admin only')
+    cr = (ddb.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id)
+          .with_for_update().first())
+    if cr is None:
+        raise HTTPException(status_code=404, detail='Change request not found')
+    if cr.resolved_at is not None:
+        return {'ok': True, 'already_resolved': True, 'resolved_at': cr.resolved_at.isoformat(),
+                'updated_at': cr.updated_at.isoformat() if cr.updated_at else None}
+    delivery = ddb.query(Delivery).filter(Delivery.id == cr.delivery_id).first()
+    if delivery is None or delivery.removed_at is not None:
+        raise HTTPException(status_code=409, detail='Change request delivery is unavailable')
+    job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
+    document = (db.query(EditorDocument).filter(EditorDocument.job_id == delivery.job_id).first()
+                if job is not None else None)
+    from change_request_workflow import published_answer
+    ok, reason = published_answer(job, document, delivery, cr)
+    if not ok:
+        raise HTTPException(status_code=409, detail={
+            'code': 'publication_does_not_answer_request', 'reason': reason,
+            'message': 'El video publicado no tiene una corrección posterior al pedido. Corregí, generá y publicá el video.',
+        })
+    if (body.reviewed_render_fingerprint != delivery_freshness.render_fingerprint(job)
+            or body.reviewed_editor_revision != int(document.revision or 0)):
+        raise HTTPException(status_code=409, detail='El corte cambió. Revisá el video actualizado antes de cerrar.')
+    now = datetime.now(timezone.utc)
+    revision = delivery.published_revision or 1
+    note = body.resolution_note.strip()
+    cr.resolved_at = now
+    cr.updated_at = now
+    cr.resolved_by_user_id = deliveries_added_by(current_user['id'])
+    cr.resolved_by_revision = revision
+    cr.resolution_source = 'publication'
+    cr.resolution_note = note or f'Resuelto al publicar la versión {revision}.'
+    ddb.commit()
+    db.add(AuditLog(user_id=current_user['id'], action='delivery.change_request.resolve', detail={
+        'change_request_id': cr_id, 'delivery_id': delivery.id, 'job_id': delivery.job_id,
+        'source': 'publication_confirmed', 'revision': revision,
+        'render_fingerprint': body.reviewed_render_fingerprint,
+        'editor_revision': body.reviewed_editor_revision,
+    }))
+    db.commit()
+    return {'ok': True, 'resolved_at': now.isoformat(), 'updated_at': now.isoformat(),
+            'resolved_by_revision': revision}
 
 
 class ChangeRequestProposalPatch(BaseModel):
