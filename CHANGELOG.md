@@ -3,6 +3,17 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.102] - 2026-10-03
+
+### Changed
+
+- Build downloadable ZIP bundles on disk and stream them in bounded chunks;
+  release staged sources after archiving and clean up after interrupted sends.
+- Query only the latest campaign verdict for each requested job and the latest
+  heartbeat in the current editor session instead of loading full histories.
+- Document a staging-only acoustic-feature cache retention canary and its
+  performance, memory and rollback checks.
+
 ## [1.1.101] - 2026-10-03
 
 ### Fixed
