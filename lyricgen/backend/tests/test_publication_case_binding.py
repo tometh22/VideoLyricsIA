@@ -318,81 +318,44 @@ def test_same_pool_concurrent_publication_has_one_revision_switch(
 
 
 @pytest.mark.parametrize('concurrency', [2, 8])
-def test_pending_prores_concurrent_replays_release_locks_and_keep_portal_unchanged(
+def test_missing_prores_concurrent_publication_creates_one_revision_without_queueing(
     client, admin_token, approved_job, db, fake_r2, monkeypatch, concurrency,
 ):
     import main
+    import portal_prores
     from concurrent.futures import ThreadPoolExecutor
-    from threading import Barrier, local
-    from sqlalchemy import event
+    from threading import Barrier
 
     if db.bind.dialect.name != 'postgresql':
         pytest.skip('Publication row locks and pooled contention require PostgreSQL')
     job_id, delivery_id, ids, body = _prepare(client, admin_token, db, approved_job, fake_r2)
-    before = deepcopy(db.get(Delivery, delivery_id).published_file_keys)
     db.rollback()
-    missing_objects = {key: fake_r2['objects'].pop(key) for key in list(fake_r2['objects'])
-                       if key.endswith(('umg_master.mov', 'umg_short.mov'))}
-    sessions = []
-    thread_state = local()
-    saved_overrides = dict(main.app.dependency_overrides)
-
-    def tracked_session():
-        session = database.SessionLocal()
-        sessions.append(session)
-        event.listen(session, 'do_orm_execute',
-                     lambda _state: setattr(thread_state, 'last_session', session))
-        try:
-            yield session
-        finally:
-            session.rollback()
-            session.close()
-
-    # Check the caller's last SQL session, not concurrent requests legitimately
-    # holding their own short DB transaction at this moment.
-    real_enqueue_calls = []
-
-    def enqueue(_job_id, file_type, *, force=False, dedupe_live=False):
-        assert force
-        assert not thread_state.last_session.in_transaction()
-        # Queue work must not run on the application loop.
-        with pytest.raises(RuntimeError, match='no running event loop'):
-            asyncio.get_running_loop()
-        real_enqueue_calls.append(file_type)
-        return 'synthetic-prores-' + file_type
-
+    for key in list(fake_r2['objects']):
+        if key.endswith(('umg_master.mov', 'umg_short.mov')):
+            fake_r2['objects'].pop(key)
+    enqueue = Mock(side_effect=AssertionError('Publication must not generate ProRes'))
     monkeypatch.setattr(main, 'enqueue_prores_prewarm', enqueue)
-    main.app.dependency_overrides[main.get_db] = tracked_session
-    main.app.dependency_overrides[main.get_deliveries_db] = tracked_session
     start = Barrier(concurrency, timeout=15)
 
     def submit(_):
         start.wait()
         return _publish(client, admin_token, job_id, **body)
 
-    try:
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            responses = list(pool.map(submit, range(concurrency)))
-        assert all(response.status_code == 202 for response in responses), [
-            (response.status_code, response.text) for response in responses
-        ]
-        assert all(response.json()['status'] == 'preparing_prores' for response in responses)
-        assert all(not session.in_transaction() for session in sessions)
-        assert real_enqueue_calls and fake_r2['copies'] == []
-        _assert_open(db, ids)
-        delivery = db.get(Delivery, delivery_id)
-        assert delivery.published_revision == 1 and delivery.published_file_keys == before
-        db.rollback()
-        # A later retry after workers supplied both masters can publish the
-        # same reviewed intent; pending responses never claimed publication.
-        fake_r2['objects'].update(missing_objects)
-        completed = _publish(client, admin_token, job_id, **body)
-        assert completed.status_code == 200, completed.text
-        assert completed.json()['revision'] == 2
-        assert completed.json()['resolved_change_requests'] == [ids[0]]
-    finally:
-        main.app.dependency_overrides.clear()
-        main.app.dependency_overrides.update(saved_overrides)
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        responses = list(pool.map(submit, range(concurrency)))
+    assert sorted(response.status_code for response in responses) == [200] + [409] * (concurrency - 1), [
+        (response.status_code, response.text) for response in responses
+    ]
+    enqueue.assert_not_called()
+    db.expire_all()
+    delivery = db.get(Delivery, delivery_id)
+    assert delivery.published_revision == 2
+    assert 'umg_master' not in delivery.published_file_keys
+    assert 'umg_short' not in delivery.published_file_keys
+    assert fake_r2['objects'][delivery.published_file_keys['video']] == b'render-B-video'
+    assert 'umg_master' in portal_prores.file_types(delivery)
+    assert db.get(DeliveryChangeRequest, ids[0]).resolved_by_revision == 2
+    _assert_open(db, [ids[1]])
 
 
 def test_different_engine_delivery_session_is_not_aliased(monkeypatch):
