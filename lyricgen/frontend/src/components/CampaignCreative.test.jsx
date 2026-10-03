@@ -315,7 +315,7 @@ it("filters actual publications, preserves editing and campaign return context",
   ];
   render(<MemoryRouter initialEntries={["/campaigns/c1?view=history&portal_destination=chile"]}><CampaignCreative campaignId="c1" view="history" /><CurrentLocation /></MemoryRouter>);
   expect(await screen.findByText("Chile · v2")).toBeInTheDocument();
-  expect(screen.getByText("1 pedidos pendientes")).toBeInTheDocument();
+  expect(screen.getByText("1 pedido pendiente")).toBeInTheDocument();
   expect(screen.getAllByText("Sin publicar en Chile").length).toBeGreaterThan(0);
   fireEvent.change(screen.getByLabelText("Filtrar por envío al portal"), { target: { value: "unsent" } });
   expect(screen.getByText("Carnaval")).toBeInTheDocument();
