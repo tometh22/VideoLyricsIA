@@ -3,6 +3,21 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.99] - 2026-10-03
+
+### Fixed
+
+- Un fallo temporal del proveedor de ASR opcional ya no deja fuera de servicio
+  todo el worker de calidad durante el arranque.
+
+## [1.1.98] - 2026-10-02
+
+### Fixed
+
+- El portal informa cuando falla la preparación ProRes, permite reintentar sin
+  reutilizar un job fallido de RQ y solo confirma que está listo cuando el
+  master se verificó en R2.
+
 ## [1.1.97] - 2026-10-02
 
 ### Fixed

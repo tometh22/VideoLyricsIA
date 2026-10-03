@@ -21104,6 +21104,13 @@ async def portal_prepare_prores(
     job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
     if job is not None and job.status != "done":
         raise HTTPException(status_code=400, detail="El video todavía no terminó de procesarse.")
+    from queue_jobs import portal_prores_job_status
+    snapshot_route = job is None or not job.umg_spec
+    existing_task_state = await asyncio.to_thread(
+        portal_prores_job_status, delivery.job_id, file_type,
+        snapshot=snapshot_route,
+    )
+
     # Freno. Este endpoint encola un ffmpeg de varios GB en la cola
     # `enterprise`, la MISMA que sirve los renders de cliente, y lo hace con
     # `force=True`, que saltea a propósito el guard de profundidad.
@@ -21121,7 +21128,7 @@ async def portal_prepare_prores(
         _depth = queue_depth().get("enterprise", 0)
     except Exception:
         _depth = 0        # sin Redis no hay cola que proteger
-    if _depth >= _PORTAL_PREPARE_MAX_QUEUE_DEPTH:
+    if existing_task_state != "processing" and _depth >= _PORTAL_PREPARE_MAX_QUEUE_DEPTH:
         logger.warning(
             "[PORTAL-PRORES] rechazado por cola llena delivery=%s type=%s depth=%s",
             delivery_id, file_type, _depth,
@@ -21141,7 +21148,9 @@ async def portal_prepare_prores(
 
     try:
         if job is not None and job.umg_spec:
-            rq_id = enqueue_prores_prewarm(job.job_id, file_type, force=True, dedupe_live=True)
+            rq_id = enqueue_prores_prewarm(
+                job.job_id, file_type, force=True, dedupe_live=True,
+            )
             prepare_source = "job"
         else:
             # Cross-environment/legacy campaign delivery. Its source MP4 is
@@ -21937,7 +21946,12 @@ async def portal_prores_status(
     db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
-    """Poll a queued master and atomically add it to the portal snapshot."""
+    """Poll a queued master and atomically add it to the portal snapshot.
+
+    R2 presence is the success condition. When the object is still absent,
+    inspect the durable RQ record so failed workers stop looking like work in
+    progress forever.
+    """
     portal_id = _verify_portal_token(x_portal_token, x_portal_id)
     if file_type not in ("umg_master", "umg_short"):
         raise HTTPException(status_code=400, detail="Tipo ProRes inválido.")
@@ -21958,53 +21972,57 @@ async def portal_prores_status(
         )
         return {"status": "ready"}
 
-    job = (
-        db.query(Job)
+    # Campaign deliveries can live in the shared portal DB while their source
+    # Job (and its queue) belongs to another environment. Preserve that
+    # cross-environment polling path when no local RQ attempt is visible; a
+    # retained failed attempt is still surfaced below and can be retried.
+    local_job_exists = (
+        db.query(Job.job_id)
         .filter(Job.job_id == delivery.job_id)
         .filter(Job.tenant_id == delivery.tenant_snapshot)
         .first()
+        is not None
     )
-    if job is None:
-        # The shared portal DB also holds deliveries created by production.
-        # Their preparation runs from the delivery snapshot in staging, so
-        # there is no local Job to inspect while polling.
+    from queue_jobs import portal_prores_job_status
+    task_state = await asyncio.to_thread(
+        portal_prores_job_status, delivery.job_id, file_type,
+        snapshot=not local_job_exists,
+    )
+    if task_state == "processing" or (
+        not local_job_exists and task_state in {"not_found", "unknown"}
+    ):
         return JSONResponse(
             status_code=202,
             content={"status": "processing", "retry_after": 10},
             headers={"Retry-After": "10"},
         )
-
-    if not job.umg_spec:
-        job.umg_spec = _parse_umg_params(
-            delivery_profile="umg",
-            umg_frame_size=delivery.frame_size_snapshot or "HD",
-            umg_fps="24",
-            umg_prores_profile="3",
-            current_user=None,
+    if task_state in {"failed", "finished", "not_found"}:
+        _record_portal_download_attempt(
+            ddb, request, portal_id=portal_id, delivery=delivery,
+            delivery_id=delivery_id, file_type=file_type,
+            outcome="prores_prepare_failed",
         )
-        db.commit()
-
-    from prores import check_prores_readiness, ProResReadiness
-    readiness = await asyncio.to_thread(
-        check_prores_readiness,
-        job.job_id,
-        file_type,
-        {"umg_spec": job.umg_spec, "s3_keys": dict(job.s3_keys or {})},
-        job.tenant_id,
-        short_wait_seconds=0.5,
-    )
-    if readiness.state in (ProResReadiness.READY_LOCAL, ProResReadiness.READY_R2):
-        ready = await _finalize_portal_prores(delivery, ddb, file_type)
-        if ready:
-            _record_portal_download_attempt(
-                ddb, request, portal_id=portal_id, delivery=delivery,
-                delivery_id=delivery_id, file_type=file_type, outcome="prores_ready",
-            )
-            return {"status": "ready"}
+        return {
+            "status": "failed",
+            "message": (
+                "No se pudo completar la preparación del ProRes. "
+                "Podés volver a intentarlo."
+            ),
+        }
+    if task_state == "unknown":
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unknown",
+                "message": "No se pudo consultar el estado. Probá de nuevo en unos minutos.",
+                "retry_after": 30,
+            },
+            headers={"Retry-After": "30"},
+        )
     return JSONResponse(
         status_code=202,
-        content={"status": "processing", "retry_after": 10},
-        headers={"Retry-After": "10"},
+        content={"status": "processing", "retry_after": 30},
+        headers={"Retry-After": "30"},
     )
 
 
