@@ -520,7 +520,7 @@
 
   .files {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 17rem), 1fr));
     gap: 0.5rem;
   }
   .file-btn {
@@ -1808,17 +1808,6 @@ async function apiFetch(path, opts) {
   });
   return fetch(path, Object.assign({}, o, { headers }));
 }
-// ProRes for UMG's managed campaigns is rendered by staging. Keep the browser
-// request same-origin via Vercel's server-side rewrite, so the shared portal
-// token is never sent to a third-party origin from the page.
-async function apiFetchStaging(path, opts) {
-  const o = opts || {};
-  const headers = Object.assign({}, o.headers || {}, {
-    "X-Portal-Token": getPortalToken(),
-    "X-Portal-Id": getPortalId(),
-  });
-  return fetch("/api/staging" + path, Object.assign({}, o, { headers }));
-}
 async function fetchItems() {
   const resp = await apiFetch("/api/deliveries/items");
   if (resp.status === 401) { clearAuth(); location.reload(); return null; }
@@ -2338,6 +2327,7 @@ function renderVersionRow(song, version, versionIdx) {
   // Files: all 5 (or however many exist). Thumbnail appears as a
   // small download too — operators want the cover art separately.
   const filesHtml = (version.files || []).map(f => {
+    const fileLabel = f.type === "umg_master" ? "ProRes master" : f.type === "umg_short" ? "ProRes vertical" : f.label;
     if (!f.available) {
       const sourceType = f.type === "umg_master" ? "video" : "short";
       const sourceReady = (version.files || []).some(source => source.type === sourceType && source.available);
@@ -2359,21 +2349,22 @@ function renderVersionRow(song, version, versionIdx) {
         return `<button type="button" class="file-btn prores-prepare-btn${preparing ? " disabled" : ""}"
           onclick="downloadDelivery(${version.delivery_id}, ${fileTypeArg})"${preparing ? " disabled" : ""}${prepareErrorTitle ? ` ${prepareErrorTitle}` : ""}>
           ${dlIconSvg()}
-          <span class="file-name">${escapeHtml(f.label)}</span>
+          <span class="file-name">${escapeHtml(fileLabel)}</span>
           <span class="file-size">${preparing ? "Preparando…" : prepareError ? (prepareError.action === "check" ? "Consultar estado" : "Reintentar") : "Generar y descargar"}</span>
         </button>`;
       }
       return `<span class="file-btn disabled">
         ${dlIconSvg()}
-        <span class="file-name">${escapeHtml(f.label)}</span>
+        <span class="file-name">${escapeHtml(fileLabel)}</span>
         <span class="file-size">—</span>
       </span>`;
     }
     const fileTypeArg = JSON.stringify(f.type).replace(/"/g, '&quot;');
-    return `<button type="button" class="file-btn" onclick="downloadDelivery(${version.delivery_id}, ${fileTypeArg})">
+    const preparing = PRORES_PREPARES.has(`${version.delivery_id}:${f.type}`);
+    return `<button type="button" class="file-btn${preparing ? " disabled" : ""}" onclick="downloadDelivery(${version.delivery_id}, ${fileTypeArg})"${preparing ? " disabled" : ""}>
       ${dlIconSvg()}
-      <span class="file-name">${escapeHtml(f.label)}</span>
-      <span class="file-size">${escapeHtml(f.size)}</span>
+      <span class="file-name">${escapeHtml(fileLabel)}</span>
+      <span class="file-size">${preparing ? "Preparando…" : escapeHtml(f.size)}</span>
     </button>`;
   }).join("");
 
@@ -2545,7 +2536,7 @@ async function submitChangeRequest() {
     }
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
-      throw new Error(body.detail || ("HTTP " + resp.status));
+      throw new Error(body.detail?.message || body.detail || ("HTTP " + resp.status));
     }
     closeChangeModal();
     // Reload the listing so the new pending request appears inline on
@@ -2661,7 +2652,7 @@ async function downloadDelivery(deliveryId, fileType) {
       return;
     }
     if (!resp.ok && resp.status !== 202) {
-      throw new Error(body.detail || ("HTTP " + resp.status));
+      throw new Error(body.detail?.message || body.detail || ("HTTP " + resp.status));
     }
     if (resp.status === 202 && body.status !== "prores_missing") {
       throw new Error("El archivo todavía no está disponible.");
@@ -2673,17 +2664,13 @@ async function downloadDelivery(deliveryId, fileType) {
 
 // Tope de preparaciones simultáneas por pestaña.
 //
-// Cada click dispara un ffmpeg de varios GB en la MISMA cola que sirve los
-// renders en vivo, y del lado del servidor ese camino saltea la backpressure
-// a propósito. Medido el 2026-09-16: 178 archivos ausentes entre los dos
+// Cada preparación ocupa la cola de renders y produce un archivo grande. Medido el 2026-09-16: 178 archivos ausentes entre los dos
 // portales (Argentina 75 masters + 75 shorts, Chile 28 shorts), o sea 178
 // botones a un click de distancia. Alguien recorriendo el catálogo podía
 // encolar una docena sin enterarse y dejar los renders de UMG atrás de 50 GB
 // de transcodes.
 //
-// Esto es una contención del lado del cliente: NO reemplaza el tope real,
-// que va en el endpoint (rechazar con 503 según profundidad de cola). Baja
-// el disparo accidental, que es lo que está al alcance del portal.
+// El servidor también deduplica pedidos y limita la profundidad de la cola.
 const PRORES_MAX_CONCURRENT = 1;
 async function prepareProRes(deliveryId, fileType) {
   const prepareKey = `${deliveryId}:${fileType}`;
@@ -2696,7 +2683,7 @@ async function prepareProRes(deliveryId, fileType) {
   PRORES_PREPARES.add(prepareKey);
   renderMain();
   try {
-    const resp = await apiFetchStaging(`/api/deliveries/${deliveryId}/prepare-prores`, {
+    const resp = await apiFetch(`/api/deliveries/${deliveryId}/prepare-prores`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ file_type: fileType }),
@@ -2706,33 +2693,50 @@ async function prepareProRes(deliveryId, fileType) {
       const body = await resp.json().catch(() => ({}));
       throw new Error(body.message || body.detail?.message || body.detail || ("HTTP " + resp.status));
     }
-    // Poll the staging worker. Once ready it publishes an immutable pointer
-    // into the shared portal DB; the final fetch goes through the audited
-    // per-click download endpoint too.
+    // Poll this portal's worker. Every request resolves the current published
+    // MP4, so a correction during preparation cannot download the previous cut.
     const pollingStarted = Date.now();
-    let pollDelayMs = 10000;
+    let pollDelayMs = 5000;
     while (Date.now() - pollingStarted < 30 * 60 * 1000) {
-      await new Promise(resolve => setTimeout(resolve, pollDelayMs));
-      const statusResp = await apiFetchStaging(`/api/deliveries/${deliveryId}/prepare-prores?file_type=${encodeURIComponent(fileType)}`);
+      const statusResp = await apiFetch(`/api/deliveries/${deliveryId}/prepare-prores?file_type=${encodeURIComponent(fileType)}`);
       if (statusResp.status === 401) { clearAuth(); location.reload(); return; }
+      const statusBody = await statusResp.json().catch(() => ({}));
       if (!statusResp.ok && statusResp.status !== 202) {
-        const statusBody = await statusResp.json().catch(() => ({}));
         throw new Error(statusBody.message || statusBody.detail?.message || statusBody.detail || ("HTTP " + statusResp.status));
       }
-      const statusBody = await statusResp.json().catch(() => ({}));
       const retryAfter = Number(statusBody.retry_after || statusResp.headers.get("Retry-After"));
       if (Number.isFinite(retryAfter) && retryAfter > 0) {
-        pollDelayMs = Math.max(5000, Math.min(60000, retryAfter * 1000));
-      }
-      if (statusBody.status === "ready") {
-        PRORES_PREPARE_ERRORS.delete(prepareKey);
-        await reloadItems();
-        await downloadDelivery(deliveryId, fileType);
-        return;
+        pollDelayMs = Math.max(2000, Math.min(30000, retryAfter * 1000));
       }
       if (statusBody.status === "failed") {
         throw new Error(statusBody.message || "No se pudo generar el ProRes.");
       }
+      let needsPrepare = statusBody.status === "not_started";
+      if (statusBody.status === "ready") {
+        const downloadResp = await apiFetch(`/api/deliveries/${deliveryId}/download/${encodeURIComponent(fileType)}`, { method: "POST" });
+        if (downloadResp.status === 401) { clearAuth(); location.reload(); return; }
+        const downloadBody = await downloadResp.json().catch(() => ({}));
+        if (downloadResp.ok && downloadBody.status === "ready" && downloadBody.url) {
+          startFileDownload(downloadBody.url);
+          PRORES_PREPARE_ERRORS.delete(prepareKey);
+          await reloadItems();
+          return;
+        }
+        needsPrepare = downloadResp.status === 202 && downloadBody.can_prepare;
+        if (!needsPrepare) throw new Error(downloadBody.detail?.message || downloadBody.detail || "No se pudo iniciar la descarga.");
+      }
+      if (needsPrepare) {
+        const nextResp = await apiFetch(`/api/deliveries/${deliveryId}/prepare-prores`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file_type: fileType }),
+        });
+        if (nextResp.status === 401) { clearAuth(); location.reload(); return; }
+        if (!nextResp.ok) {
+          const nextBody = await nextResp.json().catch(() => ({}));
+          throw new Error(nextBody.detail?.message || nextBody.detail || "No se pudo preparar la versión actualizada.");
+        }
+      }
+      await new Promise(resolve => setTimeout(resolve, pollDelayMs));
     }
     PRORES_PREPARE_ERRORS.set(prepareKey, {
       action: "check",
@@ -2759,7 +2763,7 @@ async function approveDelivery(deliveryId, songLabel) {
     if (resp.status === 401) { clearAuth(); location.reload(); return; }
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
-      throw new Error(body.detail || ("HTTP " + resp.status));
+      throw new Error(body.detail?.message || body.detail || ("HTTP " + resp.status));
     }
     await reloadItems();
   } catch (e) {
@@ -2773,7 +2777,7 @@ async function unapproveDelivery(deliveryId) {
     if (resp.status === 401) { clearAuth(); location.reload(); return; }
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
-      throw new Error(body.detail || ("HTTP " + resp.status));
+      throw new Error(body.detail?.message || body.detail || ("HTTP " + resp.status));
     }
     await reloadItems();
   } catch (e) {
@@ -2788,7 +2792,7 @@ async function rejectDelivery(deliveryId, songLabel) {
     if (resp.status === 401) { clearAuth(); location.reload(); return; }
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
-      throw new Error(body.detail || ("HTTP " + resp.status));
+      throw new Error(body.detail?.message || body.detail || ("HTTP " + resp.status));
     }
     await reloadItems();
   } catch (e) {
