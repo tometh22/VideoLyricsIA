@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.105] - 2026-10-03
+
+### Fixed
+
+- El alineado forzado local (cuarta etapa de re-sincronizar letra) ya no
+  declina siempre con `TypeError` cuando el detector léxico no reconoce el
+  idioma de la letra: stable-ts exige un idioma y recibía `None`. Ahora el
+  idioma se detecta una vez sobre el audio mezclado (nunca sobre el stem),
+  restringido a los seis idiomas soportados (job daa625bed6f1, IKV
+  "DJ Droga"). El log de declinación incluye el mensaje del error.
+
 ## [1.1.104] - 2026-10-03
 
 ### Fixed

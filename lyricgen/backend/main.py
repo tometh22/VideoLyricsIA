@@ -7180,7 +7180,26 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                 # Same stem-then-mix order, same _safe_alignment verdict, and
                 # the crammed guard inside _apply still has the final word.
                 try:
-                    from lyrics_local_forced_align import local_forced_align
+                    from lyrics_local_forced_align import (
+                        detect_audio_language,
+                        local_forced_align,
+                    )
+                    # stable-ts cannot align without a language, and the
+                    # lexical detector abstains on most lyrics (job
+                    # daa625bed6f1, 3-oct: TypeError on stem and mix). Fall
+                    # back to Whisper LID on the MIX, once — never on the
+                    # stem, where LID has answered nn/en for Spanish songs.
+                    local_language = resolve_transcription_language(
+                        "", reference_text=anchor_text,
+                    )
+                    if not local_language:
+                        local_language = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                detect_audio_language, audio_path,
+                                job_id=job_id,
+                            ),
+                            timeout=300,
+                        )
                     local_sources = list(dict.fromkeys((align_src, audio_path)))
                     retimed = None
                     for local_source in local_sources:
@@ -7189,9 +7208,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                                 local_forced_align,
                                 local_source,
                                 [segment["text"] for segment in psegs],
-                                language=resolve_transcription_language(
-                                    "", reference_text=anchor_text,
-                                ),
+                                language=local_language,
                                 job_id=job_id,
                             ),
                             timeout=600,
@@ -7204,8 +7221,9 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                         )
                 except Exception as local_exc:
                     logger.warning(
-                        "[ANCHOR] local forced align failed error_type=%s job=%s",
-                        type(local_exc).__name__, job_id,
+                        "[ANCHOR] local forced align failed error_type=%s "
+                        "error=%s job=%s",
+                        type(local_exc).__name__, str(local_exc)[:200], job_id,
                     )
                     retimed = None
                 if _safe_alignment(retimed):
