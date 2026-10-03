@@ -21943,6 +21943,7 @@ async def portal_prores_status(
     file_type: str = Query("umg_master"),
     x_portal_token: str | None = Header(default=None, alias="X-Portal-Token"),
     x_portal_id: str | None = Header(default=None, alias="X-Portal-Id"),
+    db: Session = Depends(get_db),
     ddb: Session = Depends(get_deliveries_db),
 ):
     """Poll a queued master and atomically add it to the portal snapshot.
@@ -21971,11 +21972,23 @@ async def portal_prores_status(
         )
         return {"status": "ready"}
 
+    # Campaign deliveries can live in the shared portal DB while their source
+    # Job (and its queue) belongs to another environment. Preserve that
+    # cross-environment polling path when no local RQ attempt is visible; a
+    # retained failed attempt is still surfaced below and can be retried.
+    local_job_exists = (
+        db.query(Job.job_id)
+        .filter(Job.job_id == delivery.job_id)
+        .filter(Job.tenant_id == delivery.tenant_snapshot)
+        .first()
+        is not None
+    )
     from queue_jobs import portal_prores_job_status
     task_state = await asyncio.to_thread(
         portal_prores_job_status, delivery.job_id, file_type,
+        snapshot=not local_job_exists,
     )
-    if task_state == "processing":
+    if task_state == "processing" or (task_state == "not_found" and not local_job_exists):
         return JSONResponse(
             status_code=202,
             content={"status": "processing", "retry_after": 10},
