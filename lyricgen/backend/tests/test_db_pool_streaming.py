@@ -77,24 +77,38 @@ def test_scoped_db_closes_on_exit():
 
 
 def test_scoped_db_closes_even_on_exception():
-    """An exception inside the block must NOT leak the session.
-    Without this, a single buggy endpoint can permanently drain the
-    pool."""
+    """The crashing scope returns its own socket, even with other active sessions."""
+    from threading import get_ident
+    from sqlalchemy import event, text
+    from database import engine
+
+    owner_thread = get_ident()
+    borrowed, returned = set(), set()
+
+    def checkout(_connection, record, _proxy):
+        if get_ident() == owner_thread:
+            borrowed.add(id(record))
+
+    def checkin(_connection, record):
+        returned.add(id(record))
+
+    other_session = SessionLocal()
+    other_session.execute(text('SELECT 1'))
+    event.listen(engine.pool, 'checkout', checkout)
+    event.listen(engine.pool, 'checkin', checkin)
     try:
-        with scoped_db() as db:
-            from sqlalchemy import text
-            db.execute(text("SELECT 1")).scalar()
-            raise RuntimeError("simulated handler crash")
-    except RuntimeError:
-        pass
-    # Pool should have all sockets available again.
-    stats = pool_stats()
-    # SQLite (tests) returns {} from pool_stats — that's fine, the
-    # invariant we care about (no leaked session) holds either way.
-    if stats:
-        assert stats.get("checked_out", 0) == 0, (
-            f"session leaked after exception: {stats}"
-        )
+        with pytest.raises(RuntimeError, match='simulated handler crash'):
+            with scoped_db() as db:
+                assert db.execute(text('SELECT 1')).scalar() == 1
+                raise RuntimeError('simulated handler crash')
+        assert borrowed, 'The test must actually borrow a database connection'
+        assert borrowed <= returned, 'The crashing scope did not return its connection'
+        assert not db.in_transaction()
+        assert other_session.in_transaction(), 'The unrelated session stays open'
+    finally:
+        event.remove(engine.pool, 'checkout', checkout)
+        event.remove(engine.pool, 'checkin', checkin)
+        other_session.close()
 
 
 def test_pool_stats_shape():
