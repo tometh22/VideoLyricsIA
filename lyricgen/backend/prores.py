@@ -263,6 +263,8 @@ def ensure_prores_exists(
         # this.)
         try:
             if storage.is_enabled():
+                from delivery_snapshots import pin_legacy_deliveries
+                pin_legacy_deliveries(job_id)
                 key = storage.upload_master(
                     file_path, tenant_id, job_id, FILE_MAP_PRORES[file_type],
                 )

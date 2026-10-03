@@ -78,14 +78,14 @@ const BACKGROUND_TYPES = ["background", "background_library", "custom"];
  *
  * @returns {"status"|"scenes"|null}
  */
-export function backgroundEditBlockedReason({ jobStatus, scenePlan } = {}) {
+export function backgroundEditBlockedReason({ jobStatus, scenePlan, allowApprovedBackground = false } = {}) {
   const hasScenes = !!(
     scenePlan && Array.isArray(scenePlan.scenes) && scenePlan.scenes.length > 0
   );
   // Multi-escena primero: aplica incluso en pending_review, y el motivo que el
   // operador necesita leer es otro (regenerá la escena desde el filmstrip).
   if (hasScenes) return "scenes";
-  if (jobStatus !== "pending_review") return "status";
+  if (jobStatus !== "pending_review" && !(allowApprovedBackground && ["done", "rejected"].includes(jobStatus))) return "status";
   return null;
 }
 
@@ -291,6 +291,7 @@ export function resolveEditSubmission({
   jobStatus,
   scenePlan,
   forceLyricsRerender = false,
+  allowApprovedBackground = false,
 } = {}) {
   const diff = computeFieldDiff(baseline || {}, current || {});
   let presentBuckets = Object.keys(diff);
@@ -349,7 +350,7 @@ export function resolveEditSubmission({
     editType = EDIT_TYPE_PRIORITY.find(
       (k) => diff[k] && !BACKGROUND_TYPES.includes(k),
     ) || null;
-  } else if (!isPendingReview) {
+  } else if (backgroundEditBlockedReason({ jobStatus, allowApprovedBackground })) {
     const isBgType = BACKGROUND_TYPES.includes(editType);
     if (isBgType && presentBuckets.length === bgBucketsPresent.length) {
       // Sólo fondo en un job ya aprobado: el backend lo rechaza. La salida

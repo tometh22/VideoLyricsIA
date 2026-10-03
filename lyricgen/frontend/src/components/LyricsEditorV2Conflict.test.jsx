@@ -435,7 +435,7 @@ describe("local recovery is separate from server save status", () => {
     expect(mutations(request)).toHaveLength(0);
   });
 
-  it("opens the latest approved version after quarantining an incompatible edit draft", async () => {
+  it("opens the newer saved correction rather than old approval after quarantining an incompatible draft", async () => {
     const raw = '{"segments":';
     localStorage.setItem(key, raw);
     const currentDraft = [{ ...SERVER[0], text: "borrador más nuevo sin aprobar" }];
@@ -456,8 +456,8 @@ describe("local recovery is separate from server save status", () => {
 
     renderEditor(request, { preferApprovedVersion: true });
 
-    expect(await screen.findByDisplayValue("versión equipo")).toBeInTheDocument();
-    expect(screen.queryByDisplayValue("borrador más nuevo sin aprobar")).not.toBeInTheDocument();
+    expect(await screen.findByDisplayValue("borrador más nuevo sin aprobar")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("versión equipo")).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Encontramos un borrador anterior" })).not.toBeInTheDocument();
     expect(localStorage.getItem(key)).toBeNull();
     expect(localStorage.getItem(`${key}:incompatible`)).toBe(raw);

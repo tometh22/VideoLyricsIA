@@ -207,8 +207,7 @@ def test_old_processing_job_is_reaped_with_clear_message():
     try:
         _cleanup(db)
         jid = _seed(db, status="processing", age_minutes=110)
-        n = reap_all_stuck(threshold_min=100)
-        assert n >= 1, "reaper should have killed at least the seeded job"
+        _reap_seeded_stuck(db, jid)
 
         row = db.query(Job).filter(Job.job_id == jid).first()
         # SQLAlchemy may have cached the pre-reap state in this session;

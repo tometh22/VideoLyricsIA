@@ -612,8 +612,13 @@ def get_delivery_batch(operation_id: str, current_user: dict = Depends(get_curre
     rows = db.query(DeliveryBatchItem).filter(
         DeliveryBatchItem.delivery_batch_id == operation.id,
     ).order_by(DeliveryBatchItem.created_at.asc()).all()
+    # Old workers counted before flushing item transitions (autoflush=False),
+    # leaving a one-item successful operation permanently "partial".
+    sent_count = sum(row.status == 'sent' for row in rows)
+    failed_count = sum(row.status == 'failed' for row in rows)
+    status = 'completed' if rows and sent_count == len(rows) else operation.status
     return {
-        "operation_id": operation.id, "status": operation.status,
+        "operation_id": operation.id, "status": status,
         "destination_portal": operation.destination_portal,
         "hostname": DESTINATIONS.get(operation.destination_portal),
         "updated_at": operation.updated_at.isoformat() if operation.updated_at else None,
@@ -724,6 +729,7 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
             failed += 1
         else:
             sent += 1
+        db.flush()
         operation = db.query(DeliveryBatch).filter(DeliveryBatch.id == operation_id).with_for_update().one()
         operation.sent_count = db.query(func.count(DeliveryBatchItem.id)).filter(
             DeliveryBatchItem.delivery_batch_id == operation_id,

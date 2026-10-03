@@ -34,30 +34,6 @@ async function changeRequestIdempotencyKey(proposalId, baseRevision, operationId
   return `change-request-${proposalId}-${baseRevision}-${(hash >>> 0).toString(16)}`;
 }
 
-async function waitForPublication(operationId, onProgress) {
-  const deadline = Date.now() + 15 * 60 * 1000;
-  let networkFailures = 0;
-  while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    let operation;
-    try {
-      operation = await fetchJson(`${API}/admin/delivery-operations/${operationId}`);
-      networkFailures = 0;
-    } catch (error) {
-      if (++networkFailures < 5) continue;
-      throw error;
-    }
-    onProgress?.(operation.status);
-    if (operation.status === "completed") return operation.result || {};
-    if (operation.status === "failed") {
-      const error = new Error(operation.error?.message || "No se pudo completar el envío.");
-      error.detail = operation.error;
-      throw error;
-    }
-  }
-  return null;
-}
-
 export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   const { flashError } = useAdmin();
   const [changeRequests, setChangeRequests] = useState([]);
@@ -73,6 +49,8 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
   const [crProposalDetails, setCrProposalDetails] = useState({});
   const [crPublishingId, setCrPublishingId] = useState(null);
   const [crPublishNotice, setCrPublishNotice] = useState(null);
+  const [crRenderReview, setCrRenderReview] = useState(null);
+  const renderLockRef = useRef(false);
 
   const crStatusRef = useRef(crStatusFilter);
   const activeRenderIdsRef = useRef(new Set());
@@ -90,14 +68,21 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         .map((item) => item.id));
       const completed = [...activeRenderIdsRef.current].filter((id) => (
         !nextActive.has(id)
-        && items.some((item) => item.id === id && item.publication?.needs_publish)
+        && items.some((item) => item.id === id
+          && ["done", "pending_review"].includes(item.publication?.job_status))
       ));
       activeRenderIdsRef.current = nextActive;
       setChangeRequests(items);
       if (completed.length) {
-        setCrPublishNotice({
-          tone: "ok",
-          text: "Los archivos nuevos están listos. Revisá el video de la tarjeta; Publicar actualización sigue siendo un paso manual.",
+        setCrPublishNotice(current => {
+          // Completion of a different request must not hide this request's
+          // actionable error or preparation acknowledgement.
+          if (current?.requestId != null && !completed.includes(current.requestId)) return current;
+          return {
+            requestId: current?.requestId ?? completed[0],
+            tone: "ok",
+            text: "Terminó la preparación de los archivos. Revisá el video: esto no confirma que el pedido esté corregido ni publica en el portal.",
+          };
         });
       }
       setCrPendingCount(data.pending_count || 0);
@@ -117,6 +102,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
 
   const generateChangeRequestProposal = useCallback(async (requestId) => {
     setCrProposalBusyId(requestId);
+    setCrPublishNotice(null);
     try {
       const data = await fetchJson(`${API}/admin/change-requests/${requestId}/proposals`, {
         method: "POST",
@@ -125,6 +111,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       await loadChangeRequests();
       return data.proposal;
     } catch (err) {
+      setCrPublishNotice({ requestId, tone: "error", text: `No pude analizar el pedido: ${err.message || err}` });
       flashError(`No pude analizar el pedido: ${err.message || err}`);
       return null;
     } finally {
@@ -134,6 +121,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
 
   const loadChangeRequestProposal = useCallback(async (requestId) => {
     setCrProposalBusyId(requestId);
+    setCrPublishNotice(null);
     try {
       const data = await fetchJson(
         `${API}/admin/change-requests/${requestId}/proposals/current`,
@@ -141,6 +129,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       storeProposal(requestId, data.proposal);
       return data.proposal;
     } catch (err) {
+      setCrPublishNotice({ requestId, tone: "error", text: `No pude cargar la propuesta: ${err.message || err}` });
       flashError(`No pude cargar la propuesta: ${err.message || err}`);
       return null;
     } finally {
@@ -179,6 +168,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     requestId, proposalId, operationIds, baseRevision,
   ) => {
     setCrProposalBusyId(requestId);
+    setCrPublishNotice(null);
     try {
       const idempotencyKey = await changeRequestIdempotencyKey(
         proposalId, baseRevision, operationIds,
@@ -203,6 +193,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       await loadChangeRequests();
       return data;
     } catch (err) {
+      setCrPublishNotice({ requestId, tone: "error", text: `No pude aplicar la propuesta: ${err.message || err}` });
       flashError(`No pude aplicar la propuesta: ${err.message || err}`);
       return null;
     } finally {
@@ -301,6 +292,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ resolution_note: (note || "").trim() }),
       });
+      setCrPublishNotice({ requestId: id, tone: "ok", text: "Pedido marcado como resuelto en el portal. No se generó ni publicó otro video." });
       await loadChangeRequests();
     } catch (err) {
       flashError(`No pude marcar como resuelto: ${err.message || err}`);
@@ -308,6 +300,37 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
       setCrResolvingId(null);
     }
   }, [flashError, loadChangeRequests]);
+
+  const reviewForRender = useCallback(async (requestId) => {
+    setCrProposalBusyId(requestId);
+    try {
+      const review = await fetchJson(`${API}/admin/change-requests/${requestId}/review`);
+      setCrRenderReview(review);
+    } catch (err) {
+      setCrPublishNotice({ requestId, tone: "error", text: `No pude abrir la revisión: ${err.message || err}` });
+    } finally { setCrProposalBusyId(null); }
+  }, []);
+
+  const confirmRender = useCallback(async () => {
+    if (!crRenderReview || renderLockRef.current) return;
+    const requestId = crRenderReview.change_request_id;
+    renderLockRef.current = true;
+    setCrProposalBusyId(requestId);
+    try {
+      const data = await fetchJson(`${API}/admin/change-requests/${requestId}/render`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ editor_revision: crRenderReview.editor_revision }),
+      });
+      setCrRenderReview(null);
+      setCrPublishNotice({ requestId, tone: "ok", text: ["done", "pending_review"].includes(data.status)
+        ? "Esta revisión ya tiene un corte generado. Revisalo antes de publicar."
+        : "Letra aprobada. Generando el corte nuevo; todavía no se publicó en el portal." });
+      await loadChangeRequests();
+    } catch (err) {
+      setCrRenderReview(null);
+      setCrPublishNotice({ requestId, tone: "error", text: `No se inició el render: ${err.message || err}. Volvé a revisar la letra guardada.` });
+    } finally { renderLockRef.current = false; setCrProposalBusyId(null); }
+  }, [crRenderReview, loadChangeRequests]);
 
   const verifyChangeRequest = useCallback(async (id, instructionIds, fingerprint) => {
     setCrVerifyingId(id);
@@ -321,10 +344,8 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
           confirmed_complete_request: true,
         }),
       });
-      setCrPublishNotice({
-        tone: "ok",
-        text: "Pedido verificado sobre el corte aprobado. Al publicar esa versión se marcará resuelto.",
-      });
+      setCrPublishNotice({ requestId: id, tone: "ok",
+        text: "Pedido verificado para este corte. Al publicarlo se marcará resuelto." });
       await loadChangeRequests();
     } catch (err) {
       flashError(`No pude guardar la verificación: ${err.message || err}`);
@@ -333,29 +354,22 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     }
   }, [flashError, loadChangeRequests]);
 
-  const publishDeliveryUpdate = useCallback(async (jobId, portalId, crId) => {
+  const publishDeliveryUpdate = useCallback(async (jobId, portalId, crId, publication) => {
     setCrPublishingId(crId ?? jobId);
     setCrPublishNotice(null);
     try {
-      let data = await fetchJson(`${API}/admin/deliveries/from-job/${jobId}`, {
+      const data = await fetchJson(`${API}/admin/deliveries/from-job/${jobId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ portal_id: portalId || "argentina", async_publish: true }),
+        body: JSON.stringify({ portal_id: portalId || "argentina",
+          ...(publication ? { change_request_id: crId,
+            reviewed_render_fingerprint: publication.render_fingerprint,
+            reviewed_editor_revision: publication.editor_revision } : {}),
+        }),
       });
-      if (data.operation_id) {
-        setCrPublishNotice({ tone: "wait", text: "Preparando la publicación. Podés cerrar esta pantalla: el envío sigue en segundo plano." });
-        data = await waitForPublication(data.operation_id, status => {
-          if (status === "waiting_files") {
-            setCrPublishNotice({ tone: "wait", text: "Se está preparando el archivo profesional. El envío continuará automáticamente." });
-          }
-        });
-        if (!data) {
-          setCrPublishNotice({ tone: "wait", text: "El envío sigue en segundo plano. Actualizá esta pantalla para comprobar la versión publicada." });
-          return;
-        }
-      }
       if (data.ok === false && data.status === "preparing_prores") {
         setCrPublishNotice({
+          requestId: crId,
           tone: "wait",
           text: data.stale?.length
             ? "Se está actualizando el archivo profesional (.mov) con la corrección. Esperá un minuto; después vas a poder publicar."
@@ -363,6 +377,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         });
       } else if (data.content_changed) {
         setCrPublishNotice({
+          requestId: crId,
           tone: "ok",
           text: `Publicada la versión ${data.revision}. El cliente la ve como pendiente de aprobar${
             data.resolved_change_requests?.length
@@ -372,39 +387,58 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
         });
       } else {
         setCrPublishNotice({
+          requestId: crId,
           tone: "ok",
           text: "Reenviado. El render es el mismo que ya estaba publicado, así que la versión y la aprobación no cambian.",
         });
       }
       await loadChangeRequests();
     } catch (err) {
-      const gate = err?.detail?.delivery_qc;
-      if (err?.detail?.code === "delivery_qc_blocked" && jobId) {
-        const returnPath = `/admin?section=cambios&change_request_id=${encodeURIComponent(crId ?? "")}`;
-        const reviewUrl = `/videos/${encodeURIComponent(jobId)}?qc_focus=${gate?.reason === "manual_review_required" ? "manual" : "findings"}&return_to=${encodeURIComponent(returnPath)}`;
-        const text = gate?.reason === "manual_review_required"
-          ? "Falta firmar la revisión del video para este corte. Abrí los controles, completalos y después volvé a publicar."
-          : gate?.reason === "fresh_preflight_required"
-            ? "Este corte todavía no tiene un preflight vigente. Analizalo antes de publicar."
-            : "El preflight encontró puntos que requieren atención antes de publicar.";
-        setCrPublishNotice({
-          tone: "wait",
-          text,
-          actionLabel: "Completar revisión del video",
-          actionHref: reviewUrl,
-        });
-      } else {
-        flashError(`No pude publicar la actualización: ${err.message || err}`);
-      }
+      setCrPublishNotice({ requestId: crId, tone: "error",
+        text: `No se publicó la actualización: ${err.message || err}` });
+      flashError(`No pude publicar la actualización: ${err.message || err}`);
     } finally {
       setCrPublishingId(null);
     }
   }, [flashError, loadChangeRequests]);
 
-  const handleProResConfigured = useCallback(async () => {
+  const prepareProRes = useCallback(async (jobId, crId) => {
+    setCrPublishingId(crId);
+    setCrPublishNotice({ requestId: crId, tone: "wait", text: "Solicitando actualización del archivo profesional…" });
+    try {
+      // Reuse the exact saved format, never guess or replace it with defaults.
+      // This action must NOT call the publication endpoint: pending_review
+      // renders can prepare a master, but cannot publish without approval.
+      const job = await fetchJson(`${API}/status/${jobId}`);
+      const spec = job.umg_spec;
+      if (!spec?.frame_size || spec.fps == null || spec.prores_profile == null) {
+        throw new Error("Falta el formato del master. Volvé a cargar el pedido y elegí el formato.");
+      }
+      const data = await fetchJson(`${API}/enable-prores/${jobId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ umg_frame_size: spec.frame_size,
+          umg_fps: String(spec.fps), umg_prores_profile: String(spec.prores_profile) }),
+      });
+      if (data.ok !== true || !data.enqueued?.length) {
+        throw new Error("El servidor no confirmó la actualización. Podés reintentar.");
+      }
+      setCrPublishNotice({ requestId: crId, tone: "wait",
+        text: "Actualización del .mov encolada. Esta pantalla comprobará cuándo esté listo. No se publicó ni se aprobó el video." });
+      await loadChangeRequests({ silent: true });
+    } catch (err) {
+      setCrPublishNotice({ requestId: crId, tone: "error",
+        text: `No se pudo actualizar el archivo profesional: ${err.message || err}` });
+    } finally {
+      setCrPublishingId(null);
+    }
+  }, [loadChangeRequests]);
+
+  const handleProResConfigured = useCallback(async (requestId) => {
     setCrPublishNotice({
+      requestId,
       tone: "wait",
-      text: "Formato guardado. Se está regenerando el archivo profesional (.mov) con la corrección; el portal sigue mostrando la versión anterior.",
+      text: "Formato guardado. Se está generando el .mov del último render; esto no aplica cambios de letra pendientes ni publica en el portal.",
     });
     await loadChangeRequests({ silent: true });
   }, [loadChangeRequests]);
@@ -447,6 +481,8 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     crPublishNotice,
     setCrPublishNotice,
     publishDeliveryUpdate,
+    reviewForRender, confirmRender, crRenderReview, setCrRenderReview,
+    prepareProRes,
     handleProResConfigured,
   };
 }

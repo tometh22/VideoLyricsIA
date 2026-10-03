@@ -223,6 +223,8 @@ def _upload_deliverables_to_r2(job_id: str, job_dir: str, files: dict) -> dict:
                 "Required object storage is not configured for deliverables"
             )
         return {}
+    from delivery_snapshots import pin_legacy_deliveries
+    pin_legacy_deliveries(job_id)
     from jobs import merge_s3_keys, heartbeat
     # We need a SQLAlchemy session, but this function runs in the worker
     # context with no request-scoped session available. Create one here
@@ -21816,6 +21818,9 @@ def run_edit_pipeline(
         # new background cache is involved, commit cache key + optional scene
         # clear + provenance in this same update. If the cache upload failed,
         # retain the old provenance because the old cache/plan remain active.
+        from datetime import datetime, timezone
+        merged['_rendered_segments_revision'] = edit_params.get('_confirmed_segments_revision')
+        merged['_rendered_at'] = datetime.now(timezone.utc).isoformat()
         _final_state_updates = {"render_params": merged}
         if _pending_background_recache:
             if _new_background_cache_key:

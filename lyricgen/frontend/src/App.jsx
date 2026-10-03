@@ -84,6 +84,7 @@ import { buildEditReview, buildEditCurrent, resolveEditSubmission, backgroundEdi
 import {
   changeRequestAdminPath,
   parseChangeRequestEditContext,
+  recoverChangeRequestEditContext,
 } from "./lib/changeRequestEditFlow";
 import { normalizeMovementCode } from "./lib/catalogCodes";
 import { buildVariantPayload } from "./lib/variantPayload";
@@ -964,10 +965,12 @@ function EditLyricsRoute({
   const { id } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
-  const changeRequestContext = useMemo(
+  const explicitChangeRequestContext = useMemo(
     () => parseChangeRequestEditContext(location.search),
     [location.search],
   );
+  const [recoveredChangeRequestContext, setRecoveredChangeRequestContext] = useState(null);
+  const changeRequestContext = explicitChangeRequestContext || recoveredChangeRequestContext;
   const handleRenderingComplete = useCallback(() => {
     const requestPath = changeRequestAdminPath(changeRequestContext, "completed");
     if (requestPath) {
@@ -1049,6 +1052,19 @@ function EditLyricsRoute({
         return;
       }
 
+      let resolvedChangeRequestContext;
+      try {
+        resolvedChangeRequestContext = await recoverChangeRequestEditContext({
+          search: location.search, job,
+          request: (path) => authFetchCriticalRead(`${API}${path}`),
+        });
+      } catch {
+        if (alive) setState({ status: "request_error" });
+        return;
+      }
+      if (!alive) return;
+      setRecoveredChangeRequestContext(resolvedChangeRequestContext);
+
       // Solo pending_review/done/rejected son editables (mismo gating
       // que canEditLyrics en JobDetail). Editing/queued/processing →
       // bail-out: no tiene sentido abrir el editor sobre un render en curso.
@@ -1126,7 +1142,7 @@ function EditLyricsRoute({
         // Preserva el origen UMG a través del autosave y del render.  Es una
         // intención explícita y acotada: permite re-renderizar la revisión
         // que la propuesta ya guardó aunque no exista un diff local.
-        changeRequestContext,
+        changeRequestContext: resolvedChangeRequestContext,
         // editMode + baseline son la API del flow edit-wizard. App.jsx los
         // lee en handleApproveLyrics para emitir POSTs /edit con el diff
         // contra baseline. UploadZone los lee para mostrar UIs de edición
@@ -1358,7 +1374,7 @@ function EditLyricsRoute({
     };
     // setCurrentReview is stable via useState; only re-bootstrap on id change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, changeRequestContext]);
+  }, [id, location.search]);
 
   // Cleanup en unmount: si el operador navega lejos sin aprobar (back-button,
   // sidebar, etc.), borrar el editingJobId del currentReview para que un
@@ -1465,6 +1481,14 @@ function EditLyricsRoute({
         <button onClick={() => navigate(`/videos/${id}`)} className="btn-secondary">
           {t("detail.back") || "Volver al video"}
         </button>
+      </div>
+    );
+  }
+  if (state.status === "request_error") {
+    return (
+      <div className="text-center mt-16">
+        <p className="text-gray-500 mb-4">No pudimos recuperar los cambios de este pedido. Reintentá para revisar la versión guardada.</p>
+        <button onClick={() => window.location.reload()} className="btn-secondary">Reintentar</button>
       </div>
     );
   }
@@ -4009,6 +4033,7 @@ export default function App() {
           jobStatus: r.jobStatus,
           scenePlan: r.scenePlan,
           forceLyricsRerender: !!r.changeRequestContext,
+          allowApprovedBackground: user?.role === "admin",
         });
 
         if (submission.presentBuckets.length === 0) {
@@ -4036,7 +4061,7 @@ export default function App() {
               ? (t("edit.bg_locked_scenes_desc") ||
                  "El fondo es un timeline multi-escena. Regenerá la escena que quieras cambiar desde el filmstrip del video — no consume cupo de edición.")
               : (t("edit.bg_locked_done_desc") ||
-                 "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo."),
+                 "Pedile a un administrador que regenere el fondo desde Cambios o desde el editor. No hace falta crear otro video."),
             tone: "warning",
           });
           return;
@@ -5463,13 +5488,14 @@ export default function App() {
         jobStatus: r.jobStatus,
         scenePlan: r.scenePlan,
         forceLyricsRerender: !!r.changeRequestContext,
+        allowApprovedBackground: user?.role === "admin",
       });
     } catch {
       // El resumen es informativo: si algo falla, el wizard sigue usable y el
       // submit real vuelve a calcularlo. Nunca romper la pantalla por un chip.
       return null;
     }
-  }, [currentReview, liveReviewSegments, bgSelectMode, backgroundId]);
+  }, [currentReview, liveReviewSegments, bgSelectMode, backgroundId, user?.role]);
 
   // Resume banner shown on /new and /review when sessionStorage has a
   // pending batch from a prior visit. Lets the operator restore their
@@ -5850,6 +5876,7 @@ export default function App() {
           ? backgroundEditBlockedReason({
               jobStatus: currentReview.jobStatus,
               scenePlan: currentReview.scenePlan,
+              allowApprovedBackground: user?.role === "admin",
             })
           : null}
         editsRemaining={_wizardOnExistingJob ? currentReview.editsRemaining : null}
@@ -6208,7 +6235,7 @@ export default function App() {
             languageReviewResolved={!!currentReview.languageReviewResolved}
             onResolveLanguageReview={handleResolveLanguageReview}
             onApprove={handleApproveLyrics}
-            submitLabel={currentReview.campaignId ? "Aprobar letra y timing" : null}
+            submitLabel={currentReview.changeRequestContext ? "Aprobar y re-renderizar" : (currentReview.campaignId ? "Aprobar letra y timing" : null)}
             onRegisterSafeExit={currentReview.campaignId
               ? registerCampaignReviewSafeExit
               : null}

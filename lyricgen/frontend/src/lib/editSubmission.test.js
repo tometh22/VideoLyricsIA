@@ -574,6 +574,25 @@ describe("job LEGACY con un movement_style no canónico", () => {
 });
 
 describe("backgroundEditBlockedReason: se sabe ANTES de tocar nada", () => {
+  it.each(["done", "rejected"])("admin can regenerate a %s background without dropping the prompt", (jobStatus) => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const options = { jobStatus, allowApprovedBackground: true };
+    expect(backgroundEditBlockedReason(options)).toBeNull();
+    const result = resolveEditSubmission({ ...options, baseline,
+      current: currentFrom(JOB_FULL, { backgroundHint: "Un paisaje nocturno sin personas" }),
+    });
+    expect(result.blocked).toBeNull();
+    expect(result.editType).toBe("background");
+    expect(result.willDrop).toEqual([]);
+    expect(result.payload.background_hint).toBe("Un paisaje nocturno sin personas");
+  });
+
+  it("admin permission does not unlock active renders or replace scene timelines", () => {
+    expect(backgroundEditBlockedReason({ jobStatus: "editing", allowApprovedBackground: true })).toBe("status");
+    expect(backgroundEditBlockedReason({ jobStatus: "done", allowApprovedBackground: true,
+      scenePlan: { scenes: [{ recurrence_key: "coro" }] },
+    })).toBe("scenes");
+  });
   // Detectado manejando la app real con un navegador: el aviso salía sólo
   // DESPUÉS de que el operador configuraba el fondo, porque se derivaba de
   // `resolveEditSubmission`, que corta temprano cuando no hay cambios. Al

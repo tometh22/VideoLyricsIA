@@ -2632,6 +2632,7 @@ def _migrate_user_columns():
         # is actually serving. Alembic (b4c6d8e0f2a4) is canonical — this
         # mirror keeps older databases self-healing on boot.
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_render_fingerprint VARCHAR(64)",
+        "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_file_keys JSONB",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS published_revision INTEGER DEFAULT 1 NOT NULL",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS content_updated_at TIMESTAMPTZ",
         "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ",

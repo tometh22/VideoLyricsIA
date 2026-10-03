@@ -1312,6 +1312,12 @@ def copy_object(src_key: str, dst_key: str, *, source_etag: str | None = None) -
     }
     if extra:
         multipart_args["ExtraArgs"] = extra
+    if src_key.lower().endswith(".mov"):
+        # Large broadcast masters can exhaust the read timeout of one
+        # CopyObject request. Start the managed multipart transfer directly.
+        client.copy(**multipart_args)
+        logger.info("[R2] Copied master %s -> %s", src_key, dst_key)
+        return True
     try:
         client.copy_object(Bucket=R2_BUCKET, Key=dst_key, CopySource=src, **extra)
     except ClientError as e:

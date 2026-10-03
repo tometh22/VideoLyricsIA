@@ -80,6 +80,13 @@ def _portal_token_env():
         os.environ["DELIVERY_PORTAL_TOKEN"] = old
 
 
+@pytest.fixture(autouse=True)
+def _publication_copy_succeeds(monkeypatch):
+    # This suite mocks R2 existence; copying that same fake storage is also
+    # an I/O boundary. Failure/byte isolation is tested separately.
+    monkeypatch.setattr('storage.copy_object', lambda *_: True)
+
+
 @pytest.fixture
 def approved_job(db, admin_token, client):
     """Create an approved job in the DB that the delivery endpoints can use.
@@ -1783,3 +1790,35 @@ def test_a_genuinely_new_delivery_still_gets_opcion_n(
         db.query(Delivery).filter(Delivery.job_id == "testjob54321").delete()
         db.query(Job).filter(Job.job_id == "testjob54321").delete()
         db.commit()
+
+
+def test_legacy_row_with_proven_later_overwrite_requires_new_approval(
+    client, admin_token, approved_job, db, all_r2_files_present,
+):
+    """Migración: filas viejas no tienen con qué comparar.
+
+    Tratarlas como contenido nuevo habría dado de baja, de una sola vez,
+    todas las aprobaciones vigentes del portal.
+    """
+    from database import Delivery
+
+    delivery_id = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    ).json()["delivery_id"]
+    client.post(
+        f"/api/deliveries/{delivery_id}/approve",
+        headers={"X-Portal-Token": PORTAL_TOKEN}, json={},
+    )
+    row = db.query(Delivery).filter(Delivery.id == delivery_id).first()
+    row.published_render_fingerprint = None
+    db.commit()
+
+    _edit_the_render(db, approved_job)
+    again = client.post(
+        f"/admin/deliveries/from-job/{approved_job.job_id}",
+        headers=auth(admin_token), json={},
+    )
+    assert again.json()["content_changed"] is True
+    db.refresh(row)
+    assert row.approved_at is None

@@ -4,6 +4,16 @@ import CampaignDeliveryProgress from "./CampaignDeliveryProgress";
 
 afterEach(cleanup);
 
+it('refreshes campaign history once when a delivery finishes', async () => {
+  const onSettled = vi.fn();
+  const request = vi.fn().mockResolvedValue({ status: 'completed', total_count: 1, sent_count: 1, items: [] });
+  const { rerender } = render(<CampaignDeliveryProgress operationId="op-3" request={request} onSettled={onSettled} />);
+  await screen.findByText(/Envío completado/);
+  expect(onSettled).toHaveBeenCalledOnce();
+  rerender(<CampaignDeliveryProgress operationId="op-3" request={request} onSettled={onSettled} />);
+  expect(onSettled).toHaveBeenCalledOnce();
+});
+
 it("explains a partial delivery and selects only failed videos for retry", async () => {
   const select = vi.fn();
   const request = vi.fn().mockResolvedValue({ status: "partial", sent_count: 1, total_count: 2, destination_portal: "chile", items: [

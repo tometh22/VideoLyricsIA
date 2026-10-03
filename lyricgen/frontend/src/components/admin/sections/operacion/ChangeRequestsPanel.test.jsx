@@ -1,7 +1,9 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import ChangeRequestsPanel, {
+  appliedTextChecks,
   buildLyricsPreview,
+  editorUrlWithRequest,
   publicationStatus,
 } from "./ChangeRequestsPanel";
 
@@ -9,7 +11,10 @@ vi.mock("../../../../i18n", () => ({
   useI18n: () => ({ t: (key) => key }),
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  window.history.replaceState({}, "", "/admin");
+});
 
 const BASE_PUBLICATION = {
   revision: 1,
@@ -23,7 +28,6 @@ const BASE_PUBLICATION = {
   prores_configured: true,
   awaiting_review: false,
   job_status: "done",
-  internal_approval_current: true,
 };
 
 const REQUEST = {
@@ -44,12 +48,17 @@ const REQUEST = {
 
 function renderPanel(overrides = {}, props = {}) {
   const item = { ...REQUEST, ...overrides };
+  renderPanelItems([item], props);
+  return item;
+}
+
+function renderPanelItems(items, props = {}) {
   render(
     <ChangeRequestsPanel
-      changeRequests={[item]}
+      changeRequests={items}
       crStatusFilter="pending"
       setCrStatusFilter={() => {}}
-      crPendingCount={1}
+      crPendingCount={items.filter((item) => !item.resolved_at).length}
       crResolvedCount={0}
       crLoading={false}
       crResolvingId={null}
@@ -62,11 +71,40 @@ function renderPanel(overrides = {}, props = {}) {
       {...props}
     />,
   );
-  return item;
 }
 
 // El orden de prioridad es el orden en que los estados bloquean al operador.
 describe("publicationStatus", () => {
+  it("verifies saved corrections when editor snapshots regenerate local row ids", () => {
+    const expected = { _id: "old-local-id", start: 70.12, end: 74.2, text: "Soy quien ayer cantó sé vos" };
+    const proposal = { operations: [{ status: "applied", proposed_segments: [expected] }],
+      lyrics_context: { segments: [{ ...expected, _id: "new-local-id" }] } };
+    expect(appliedTextChecks(proposal)[0]).toMatchObject({ located: true, matches: true });
+    proposal.lyrics_context.segments[0].text = "Texto anterior";
+    expect(appliedTextChecks(proposal)[0]).toMatchObject({ located: true, matches: false });
+  });
+
+  it("does not verify a different occurrence or ambiguous timing just because text matches", () => {
+    const expected = { _id: "old", start: 70, end: 74, text: "Frase repetida" };
+    const proposal = { operations: [{ status: "applied", proposed_segments: [expected] }],
+      lyrics_context: { segments: [{ ...expected, _id: "other", start: 170, end: 174 }] } };
+    expect(appliedTextChecks(proposal)[0].located).toBe(false);
+    proposal.lyrics_context.segments = [{ ...expected, _id: "new1" }, { ...expected, _id: "new2" }];
+    expect(appliedTextChecks(proposal)[0].located).toBe(false);
+  });
+  it("keeps analysis accessible beside the original request when a master is pending", () => {
+    const generate = vi.fn();
+    const publish = vi.fn();
+    renderPanel({ publication: { ...BASE_PUBLICATION, prores_pending: ["umg_master"] } }, {
+      proposalEnabled: true, generateProposal: generate, publishDeliveryUpdate: publish,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Analizar este pedido" }));
+    expect(generate).toHaveBeenCalledWith(7);
+    fireEvent.click(screen.getByRole("button", { name: "Analizar pedido" }));
+    expect(generate).toHaveBeenCalledTimes(2);
+    expect(publish).not.toHaveBeenCalled();
+    expect(screen.queryByText("El video de arriba ya tiene la corrección", { exact: false })).toBeNull();
+  });
   it("blocks publishing while the job is still re-rendering", () => {
     const status = publicationStatus({
       ...BASE_PUBLICATION, job_status: "editing", needs_publish: true,
@@ -105,47 +143,6 @@ describe("publicationStatus", () => {
     expect(status.canPublish).toBe(true);
   });
 
-  it("routes an unapproved new cut to internal review before publication", () => {
-    renderPanel({ publication: {
-      ...BASE_PUBLICATION, needs_publish: true, internal_approval_current: false,
-    } });
-    expect(screen.getByRole("link", { name: "Revisar y aprobar video" }))
-      .toHaveAttribute("href", expect.stringContaining("qc_focus=manual"));
-    expect(screen.getByRole("button", { name: "Publicar actualización" })).toBeDisabled();
-  });
-
-  it("uses the server workflow when QC blocks a cut that looks publishable", () => {
-    renderPanel({
-      publication: { ...BASE_PUBLICATION, needs_publish: true },
-      workflow: {
-        phase: "needs_review", next_action: "review_qc",
-        next_action_label: "Completar controles del video",
-        allowed_actions: ["edit"],
-        blockers: [{ code: "fresh_preflight_required", message: "Falta revisión actual." }],
-      },
-    });
-    expect(screen.getByText("Falta revisión actual.")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Revisar y aprobar video" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Publicar actualización" })).toBeDisabled();
-  });
-
-  it("shows a render action after proposal application while the old video remains done", () => {
-    renderPanel({
-      publication: {
-        ...BASE_PUBLICATION, needs_publish: true, internal_approval_current: false,
-      },
-      workflow: {
-        phase: "changes_saved", next_action: "render_changes",
-        next_action_label: "Generar video actualizado",
-        allowed_actions: ["render_changes", "edit"], blockers: [],
-      },
-    });
-    expect(screen.getByText("Cambios guardados; falta generar el video")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Generar video actualizado" }))
-      .toHaveAttribute("href", expect.stringContaining("change_request_id=7"));
-    expect(screen.getByRole("button", { name: "Publicar actualización" })).toBeDisabled();
-  });
-
   it("does not offer publishing when the portal already has this cut", () => {
     expect(publicationStatus(BASE_PUBLICATION).canPublish).toBe(false);
   });
@@ -165,6 +162,26 @@ describe("publicationStatus", () => {
       approved_at: "2026-09-15T19:00:00Z", approved_by_label: "UMG",
     });
     expect(status.title).toMatch(/aprobada por UMG/);
+  });
+});
+
+describe("editorUrlWithRequest", () => {
+  it("restores the proposal id after the queue is reloaded", () => {
+    expect(editorUrlWithRequest(
+      "f7752c6feed4", 7, "proposal-1",
+      "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
+    )).toBe(
+      "/videos/f7752c6feed4/edit-lyrics?change_request_id=7&proposal_id=proposal-1",
+    );
+  });
+
+  it("preserves unrelated query parameters and anchors", () => {
+    expect(editorUrlWithRequest(
+      "f7752c6feed4", 7, "proposal-1",
+      "/videos/f7752c6feed4/edit-lyrics?source=admin#lyrics",
+    )).toBe(
+      "/videos/f7752c6feed4/edit-lyrics?source=admin&change_request_id=7&proposal_id=proposal-1#lyrics",
+    );
   });
 });
 
@@ -211,85 +228,132 @@ describe("buildLyricsPreview", () => {
 });
 
 describe("ChangeRequestsPanel", () => {
-  it("selects a case from the queue and keeps its location in the URL", () => {
-    const other = {
-      ...REQUEST, id: 8, comment: "Cambiar el fondo",
-      delivery: { ...REQUEST.delivery, artist: "Los Prisioneros", song: "Tren al Sur", portal_id: "argentina" },
-    };
-    renderPanel({}, { changeRequests: [REQUEST, other] });
-
-    expect(screen.getByRole("heading", { name: "Yo vengo de San Rosendo" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /Los Prisioneros · Tren al Sur/ }));
-    expect(screen.getByRole("heading", { name: "Tren al Sur" })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Yo vengo de San Rosendo" })).not.toBeInTheDocument();
-    expect(new URLSearchParams(window.location.search).get("change_request_id")).toBe("8");
-    window.history.replaceState({}, "", "/");
+  it("requires checking the whole request before verifying the current cut", () => {
+    const verify = vi.fn();
+    renderPanel({
+      workflow: { next_action: "verify", allowed_actions: ["verify"] },
+      instructions: [{ id: "point-1", source_excerpt: "Corregir una palabra" }],
+      verification: { current: false, render_fingerprint: "a".repeat(64) },
+      publication: { ...BASE_PUBLICATION, needs_publish: true },
+    }, { verifyChangeRequest: verify });
+    const publish = screen.queryByRole("button", { name: "Publicar actualización" });
+    expect(publish).toBeNull();
+    const confirm = screen.getByRole("button", { name: "Confirmar pedido verificado" });
+    expect(confirm).toBeDisabled();
+    const region = screen.getByRole("region", { name: "Verificar pedido" });
+    fireEvent.click(region.querySelectorAll('input[type="checkbox"]')[0]);
+    fireEvent.click(region.querySelectorAll('input[type="checkbox"]')[1]);
+    expect(confirm).toBeEnabled();
+    fireEvent.click(confirm);
+    expect(verify).toHaveBeenCalledWith(7, ["point-1"], "a".repeat(64));
   });
 
-  it("filters cases by portal and search without changing the selected case's data", () => {
-    const other = {
-      ...REQUEST, id: 8, comment: "Cambiar el fondo",
-      delivery: { ...REQUEST.delivery, artist: "Los Prisioneros", song: "Tren al Sur", portal_id: "argentina" },
+  it("uses a compact queue and preserves the selected request in the URL", () => {
+    const second = {
+      ...REQUEST,
+      id: 8,
+      comment: "Cambiar el fondo a una calle al amanecer",
+      delivery: { ...REQUEST.delivery, song: "Otra canción", artist: "Otra banda" },
     };
-    renderPanel({}, { changeRequests: [REQUEST, other] });
+    renderPanelItems([REQUEST, second]);
 
-    fireEvent.change(screen.getByRole("combobox", { name: "Filtrar por portal" }), {
-      target: { value: "argentina" },
-    });
-    expect(screen.getByRole("heading", { name: "Tren al Sur" })).toBeInTheDocument();
-    fireEvent.change(screen.getByRole("searchbox", { name: "Buscar pedido" }), {
-      target: { value: "San Rosendo" },
-    });
-    expect(screen.queryByRole("heading", { name: "Tren al Sur" })).not.toBeInTheDocument();
-    expect(screen.getByText("Sin pedidos pendientes")).toBeInTheDocument();
-    window.history.replaceState({}, "", "/");
+    expect(screen.getByRole("heading", { name: REQUEST.delivery.song })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: /Otra canción/ }));
+    expect(screen.getByRole("heading", { name: "Otra canción" })).toBeInTheDocument();
+    expect(window.location.search).toContain("change_request_id=8");
+    expect(screen.getByRole("option", { name: /Otra canción/ })).toHaveAttribute(
+      "aria-selected", "true",
+    );
   });
 
-  it("filters the queue by the backend workflow stage", () => {
-    const ready = {
-      ...REQUEST, id: 8,
-      delivery: { ...REQUEST.delivery, artist: "Los Prisioneros", song: "Tren al Sur" },
-      workflow: {
-        phase: "ready_to_publish", next_action_label: "Publicar actualización",
-        allowed_actions: ["publish"], blockers: [],
-      },
+  it("deep-links a request and confirms a render submitted from the editor", () => {
+    const second = {
+      ...REQUEST,
+      id: 8,
+      delivery: { ...REQUEST.delivery, song: "Pedido retornado" },
     };
-    renderPanel({ workflow: {
-      phase: "needs_edit", next_action_label: "Aplicar los cambios pedidos",
-      allowed_actions: ["edit"], blockers: [],
-    } }, { changeRequests: [REQUEST, ready] });
-    fireEvent.change(screen.getByRole("combobox", { name: "Filtrar por etapa" }), {
-      target: { value: "ready_to_publish" },
-    });
-    expect(screen.getByRole("heading", { name: "Tren al Sur" })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Yo vengo de San Rosendo" })).not.toBeInTheDocument();
-    expect(new URLSearchParams(window.location.search).get("change_stage"))
-      .toBe("ready_to_publish");
-    window.history.replaceState({}, "", "/");
+    window.history.replaceState({}, "", "/admin?section=cambios&change_request_id=8&render_submitted=1");
+    renderPanelItems([REQUEST, second]);
+
+    expect(screen.getByRole("heading", { name: "Pedido retornado" })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(/render corregido fue enviado/i);
+    expect(window.location.search).not.toContain("render_submitted");
   });
 
-  it("offers the two steps that actually answer the request", () => {
+  it("searches the queue and supports J/K navigation", () => {
+    const second = {
+      ...REQUEST,
+      id: 8,
+      comment: "Cambiar fondo",
+      delivery: { ...REQUEST.delivery, song: "Tema nocturno", artist: "Los Test" },
+    };
+    renderPanelItems([REQUEST, second]);
+    fireEvent.keyDown(window, { key: "j" });
+    expect(screen.getByRole("heading", { name: "Tema nocturno" })).toBeInTheDocument();
+
+    const search = screen.getByRole("searchbox", { name: "Buscar pedidos" });
+    fireEvent.change(search, { target: { value: "San Rosendo" } });
+    expect(screen.queryByRole("option", { name: /Tema nocturno/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: REQUEST.delivery.song })).toBeInTheDocument();
+  });
+
+  it("keeps the editor available while publishing is the primary action", () => {
     renderPanel({ publication: { ...BASE_PUBLICATION, needs_publish: true } });
     expect(screen.getByText("Editar letra")).toHaveAttribute(
-      "href", "/videos/f7752c6feed4/edit-lyrics",
+      "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
     );
     expect(screen.getByRole("button", { name: "Publicar actualización" }))
       .toBeEnabled();
   });
 
-  it("offers a direct path to the delivery review after the QC gate blocks publication", () => {
-    renderPanel({}, {
-      crPublishNotice: {
-        tone: "wait",
-        text: "Falta firmar la revisión del video para este corte.",
-        actionLabel: "Completar revisión del video",
-        actionHref: "/videos/f7752c6feed4?qc_focus=manual&return_to=%2Fadmin%3Fsection%3Dcambios%26change_request_id%3D7",
-      },
-    });
+  it("keeps the request context when the editor is the primary action", () => {
+    renderPanel();
+    expect(screen.getByRole("link", { name: "Editar letra" })).toHaveAttribute(
+      "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
+    );
+  });
 
-    expect(screen.getByText(/Falta firmar la revisión del video/)).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Completar revisión del video" }))
-      .toHaveAttribute("href", expect.stringContaining("qc_focus=manual"));
+  it("keeps the applied proposal context after reloading the request queue", () => {
+    const load = vi.fn();
+    renderPanel(
+      { proposal: { id: "proposal-1", status: "applied", applied_revision: 5 } },
+      { proposalEnabled: true, loadProposal: load },
+    );
+    expect(screen.getByRole("button", { name: "Revisar y confirmar render" })).toBeEnabled();
+    expect(screen.getByRole("link", { name: "Editar letra" }))
+      .toHaveAttribute(
+        "href",
+        "/videos/f7752c6feed4/edit-lyrics?change_request_id=7&proposal_id=proposal-1",
+      );
+    fireEvent.click(screen.getByRole("button", { name: "Ver propuesta y letra guardada" }));
+    expect(load).toHaveBeenCalledWith(7);
+  });
+
+  it("updates a configured master without invoking publication", () => {
+    const prepare = vi.fn();
+    const publish = vi.fn();
+    renderPanel({ publication: { ...BASE_PUBLICATION, job_status: "pending_review", prores_pending: ["umg_master"] } },
+      { prepareProRes: prepare, publishDeliveryUpdate: publish,
+        crPublishNotice: { requestId: 7, tone: "error", text: "La cola no está disponible" } });
+    fireEvent.click(screen.getByRole("button", { name: "Actualizar archivo profesional" }));
+    expect(prepare).toHaveBeenCalledWith("f7752c6feed4", 7);
+    expect(publish).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert").closest("footer")).not.toBeNull();
+  });
+
+  it.each([true, false])("checks the actual stored text for an applied proposal (matches=%s)", matches => {
+    const proposed = { _id: "line-1", start: 72, end: 77, text: "Soy quien ayer cantó sé vos" };
+    const proposal = { id: "proposal-1", status: "applied", base_revision: 2, applied_revision: 3,
+      operations: [{ id: "op-1", kind: "replace_text", applicable: true, status: "applied",
+        current_segments: [{ ...proposed, text: "Texto anterior" }], proposed_segments: [proposed] }],
+      lyrics_context: { revision: 4, segments: [{ ...proposed, text: matches ? proposed.text : "Texto anterior" }] } };
+    const generate = vi.fn();
+    renderPanel({ proposal }, { proposalEnabled: true, proposalDetails: { 7: proposal }, generateProposal: generate });
+    expect(screen.getByRole("region", { name: "Verificación de la letra guardada" }))
+      .toHaveTextContent(matches ? "Coincide con el pedido" : "No coincide con el pedido");
+    const recalculate = screen.getByRole("button", { name: "Volver a analizar con la letra actual" });
+    if (matches) expect(recalculate).toBeDisabled();
+    else { fireEvent.click(recalculate); expect(generate).toHaveBeenCalledWith(7); }
   });
 
   it("publishes to the portal the delivery belongs to", () => {
@@ -299,7 +363,7 @@ describe("ChangeRequestsPanel", () => {
       { publishDeliveryUpdate: publish },
     );
     screen.getByRole("button", { name: "Publicar actualización" }).click();
-    expect(publish).toHaveBeenCalledWith("f7752c6feed4", "chile", 7);
+    expect(publish).toHaveBeenCalledWith("f7752c6feed4", "chile", 7, expect.objectContaining({ needs_publish: true }));
   });
 
   it("opens the format selector instead of attempting an impossible legacy publish", async () => {
@@ -327,7 +391,7 @@ describe("ChangeRequestsPanel", () => {
     // Marcar resuelto sin publicar no cambia el archivo del cliente: la
     // etiqueta lo dice, para que no se use como si lo hiciera.
     expect(
-      screen.getByRole("button", { name: "Marcar resuelto sin publicar" }),
+      screen.getByRole("button", { name: "Marcar como resuelto" }),
     ).toBeInTheDocument();
   });
 
@@ -453,7 +517,9 @@ describe("ChangeRequestsPanel", () => {
       } },
     });
     expect(screen.getByRole("link", { name: "Abrir editor de fondo" }))
-      .toHaveAttribute("href", "/videos/f7752c6feed4/edit-lyrics");
+      .toHaveAttribute(
+        "href", "/videos/f7752c6feed4/edit-lyrics?change_request_id=7",
+      );
   });
 
   it("shows an editable visual prompt and regenerates without publishing", () => {
@@ -497,7 +563,7 @@ describe("ChangeRequestsPanel", () => {
       .not.toBeInTheDocument();
   });
 
-  it("previews operator drafts in context and blocks apply until they are saved", () => {
+  it("previews operator drafts, autosaves them and blocks apply until confirmed", async () => {
     const adjust = vi.fn();
     const segment = { _id: "target", start: 13, end: 15, text: "Texto viejo" };
     renderPanel({}, {
@@ -520,18 +586,21 @@ describe("ChangeRequestsPanel", () => {
       adjustProposal: adjust,
     });
 
-    fireEvent.change(screen.getByDisplayValue("Texto correcto"), {
+    const input = screen.getByDisplayValue("Texto correcto");
+    fireEvent.change(input, {
       target: { value: "Texto corregido por operador" },
     });
     const preview = screen.getByLabelText("Vista previa de la letra resultante");
     expect(preview).toHaveTextContent("Texto corregido por operador");
-    expect(screen.getByText(/Guardá los ajustes de texto/)).toBeInTheDocument();
+    expect(screen.getByText(/Estamos guardando tus ajustes/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Aplicar seleccionadas (1)" }))
       .toBeDisabled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Guardar" }));
-    expect(adjust).toHaveBeenCalledWith(
-      7, "proposal-3", "op-1", "Texto corregido por operador", 4,
-    );
+    fireEvent.blur(input);
+    await waitFor(() => {
+      expect(adjust).toHaveBeenCalledWith(
+        7, "proposal-3", "op-1", "Texto corregido por operador", 4,
+      );
+    });
   });
 });

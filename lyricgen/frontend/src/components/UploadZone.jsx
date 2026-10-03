@@ -1948,7 +1948,7 @@ export default function UploadZone({
       <p className="text-[10px] text-amber-200/70 mt-0.5 leading-snug">
         {_bgBlocked.reason === "scenes"
           ? (t("edit.bg_locked_scenes_desc") || "El fondo es un timeline multi-escena. Regenerá la escena que quieras cambiar desde el filmstrip del video — no consume cupo de edición.")
-          : (t("edit.bg_locked_done_desc") || "El fondo de un video ya aprobado no se puede regenerar — para cambiarlo, generá un video nuevo.")}
+          : (t("edit.bg_locked_done_desc") || "Pedile a un administrador que regenere el fondo desde Cambios o desde el editor. No hace falta crear otro video.")}
       </p>
       <p className="text-[10px] text-amber-200/50 mt-1">
         {t("upload.bg_blocked_rest_ok") || "El resto de los ajustes sí se aplican."}

@@ -4,7 +4,7 @@ The deliveries tables may be shared between staging and production. Adding
 columns idempotently allows the shared portal DB to be upgraded first.
 
 Revision ID: c2e4f6a8b0d1
-Revises: e6a8c0d2f4b6, a8c1e4f7b2d9, f8c9d0e1a2b3
+Revises: a7b9c1d3e5f7, a8c1e4f7b2d9, f8c9d0e1a2b3
 """
 
 from typing import Sequence, Union
@@ -15,7 +15,7 @@ from alembic import op
 
 revision: str = "c2e4f6a8b0d1"
 down_revision: Union[str, Sequence[str], None] = (
-    "e6a8c0d2f4b6",
+    "a7b9c1d3e5f7",
     "a8c1e4f7b2d9",
     "f8c9d0e1a2b3",
 )
