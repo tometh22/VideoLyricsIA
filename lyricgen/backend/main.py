@@ -12009,7 +12009,7 @@ from prores import (
 
 
 @app.get("/download/{job_id}/all")
-async def download_all_zip(
+def download_all_zip(
     job_id: str,
     request: Request,
     token: str = Query(...),
@@ -12021,12 +12021,11 @@ async def download_all_zip(
     UMG ProRes masters are excluded by design: they're huge (1+ GB) and
     UMG editorial expects them as a stand-alone .mov, not buried in a zip.
 
-    No Depends(get_db) — zip-build holds a session through the R2
-    fetch + zip assembly + StreamingResponse. Releasing it after the
-    metadata reads is enough for downstream code (R2 + zip are
-    DB-free)."""
-    import io as _io
+    No Depends(get_db): release the session after metadata reads instead of
+    holding it through R2 downloads, ZIP assembly and the response. These
+    remaining operations are DB-free."""
     import zipfile as _zip
+    from download_bundle import TemporaryZipResponse
 
     with scoped_db() as db:
         current_user = verify_media_token(token, job_id, "all", db)
@@ -12071,13 +12070,17 @@ async def download_all_zip(
         if not on_disk:
             raise HTTPException(status_code=404, detail="Deliverables not found on disk or R2.")
 
-        buf = _io.BytesIO()
-        with _zip.ZipFile(buf, "w", compression=_zip.ZIP_STORED) as zf:
+        zip_path = os.path.join(tmp_dir, "bundle.zip")
+        with _zip.ZipFile(zip_path, "w", compression=_zip.ZIP_STORED) as zf:
             # ZIP_STORED (no compression) — MP4/JPG are already compressed,
             # re-zipping wastes CPU for ~0% size win.
             for path, name in on_disk:
                 zf.write(path, arcname=name)
-        buf.seek(0)
+                # R2 downloads belong to this request; release them once
+                # archived instead of retaining both copies during sending.
+                # Preserve local deliverables in OUTPUTS_DIR.
+                if os.path.dirname(path) == tmp_dir:
+                    os.unlink(path)
 
         # Filename is best-effort — fall back to job_id if artist/title are
         # missing so we never produce a zip with weird empty-string names.
@@ -12091,14 +12094,17 @@ async def download_all_zip(
             current_user, job_id, "all",
             action="job.download", source="zip_bundle", request=request,
         )
-        return StreamingResponse(
-            buf,
-            media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+        response = TemporaryZipResponse(
+            zip_path, temp_dir=tmp_dir, filename=zip_name,
         )
+        # The response owns its files until sending finishes, including an
+        # interrupted download. Failures before hand-off are cleaned below.
+        tmp_dir = None
+        return response
     finally:
         try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if tmp_dir is not None:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
 
@@ -14859,15 +14865,12 @@ async def editor_activity_heartbeat(
             status_code=409, detail="editor_active_lock_required",
         )
     quality = job.transcription_quality or {}
-    prior_heartbeats = db.query(ProductEvent).filter(
+    previous = db.query(ProductEvent).filter(
         ProductEvent.name == "editor_activity_heartbeat",
         ProductEvent.job_id == job_id,
         ProductEvent.user_id == current_user["id"],
-    ).order_by(ProductEvent.id.desc()).all()
-    previous = next((
-        row for row in prior_heartbeats
-        if (row.properties or {}).get("session_id") == body.session_id
-    ), None)
+        ProductEvent.properties["session_id"].as_string() == body.session_id,
+    ).order_by(ProductEvent.id.desc()).first()
     expected_seq = int((previous.properties or {}).get("activity_seq") or 0) + 1 \
         if previous is not None else 1
     if body.activity_seq != expected_seq:
