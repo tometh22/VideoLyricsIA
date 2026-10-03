@@ -222,20 +222,19 @@ def test_list_counts_use_bulk_queries_and_ignore_pilot_copies(db, setup, monkeyp
     pilot.pilot_id = "pilot-1"
     db.commit()
     statements = []
-    # Measure this session only: background threads can use the same engine.
-    connection = db.connection()
+    engine = db.get_bind()
 
     def count(*_args, **_kwargs):
         statements.append(1)
 
     with portal([]) as session:
         monkeypatch.setattr(creative, "scoped_deliveries_db", session)
-        event.listen(connection, "before_cursor_execute", count)
+        event.listen(engine, "before_cursor_execute", count)
         try:
             from campaign_pipeline import pipeline_counts_bulk
             bulk = pipeline_counts_bulk(db, [campaign])
         finally:
-            event.remove(connection, "before_cursor_execute", count)
+            event.remove(engine, "before_cursor_execute", count)
         listed = next(row for row in list_campaigns(actor, db)["items"] if row["id"] == campaign.id)
         detail = pipeline.campaign_pipeline(campaign.id, actor, db)
     # items + lineage ids + lineage rows: a constant, independent of songs.

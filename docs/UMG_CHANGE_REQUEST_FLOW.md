@@ -76,3 +76,19 @@ On 2026-09-18, request 85 had a completed partial render but a legacy delivery w
 Campaign operation `53432883-055f-49ff-a15f-e1236554d772` had one `sent` item but status `partial`. Ojitos Verdes (`e3d01a71ae49`, Chile delivery 307) was already published as revision 2: its published fingerprint matched the current staging render. No customer render/publication/resolution was performed during diagnosis.
 
 At 02:13 UTC, both concurrently submitted edits had completed successfully: Borracho Y Agresivo (`396c71f0b66b`, 02:07:19) and De Coquimbo Soy (`02dba655d75a`, 02:12:35). The latter started on the worker only at 02:07:19, then spent several minutes archiving/uploading after 90%. The existing progress screen does not distinguish queued work from execution. These actual customer jobs were only inspected, never restarted or approved by the agent.
+
+## Aviso por mail a UMG al publicar una corrección
+
+Apagado por defecto y sin destinatarios. Para activarlo (decisión del dueño, por entorno):
+
+1. `UMG_PUBLISH_NOTIFY_ENABLED=1`.
+2. Las casillas de cada portal: `UMG_PUBLISH_NOTIFY_RECIPIENTS_ARGENTINA` y `UMG_PUBLISH_NOTIFY_RECIPIENTS_CHILE`
+   (o una sola lista en `UMG_PUBLISH_NOTIFY_RECIPIENTS`), separadas por coma; máximo 10 válidas.
+3. En un entorno que no sea producción (el trabajo gestionado de UMG corre en staging), esas direcciones tienen que estar
+   además en `EMAIL_STAGING_ALLOWLIST`; si no, el mail se descarta o se redirige. Es la barrera que evita escribirle a
+   un cliente real desde staging por accidente.
+
+Cuándo avisa: solo una publicación que cerró pedidos del cliente (`resolved_change_requests` no vacío), con contenido nuevo
+y con los archivos visibles para el cliente (no oculta). Un reenvío del mismo corte o una entrega oculta no avisan.
+Qué dice: la versión, el portal, lo que pidieron (sus propias palabras, hasta 5 y 240 caracteres) y un botón al portal.
+Un fallo de envío nunca interrumpe la publicación.

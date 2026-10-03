@@ -7,6 +7,7 @@ download interleaving exercises the real HTTP endpoint and worker source fence.
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+import threading
 import uuid
 
 import pytest
@@ -130,10 +131,15 @@ def test_qc_releases_transaction_before_detectors(client, user_token, db, monkey
     initial_report = _stored(db, job_id)
     real_factory = database.SessionLocal
     sessions = []
+    owner = threading.get_ident()
 
     def tracked_factory():
         session = real_factory()
-        sessions.append(session)
+        # Only this test's own thread: the app's background threads (reaper, session cleanup, stale-ProRes
+        # scan) start with the TestClient and may open a session through the patched factory mid-query,
+        # which made this assertion fail intermittently without any QC problem.
+        if threading.get_ident() == owner:
+            sessions.append(session)
         return session
 
     def build(**kwargs):

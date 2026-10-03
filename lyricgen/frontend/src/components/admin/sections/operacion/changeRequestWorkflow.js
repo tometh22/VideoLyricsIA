@@ -231,6 +231,11 @@ export const PRIMARY_LABELS = {
   reopening: "Reabriendo…",
   see_error: "Ver el error",
   close: "Dar por resuelto",
+  // The corrected cut is already in the portal: closing records the publication.
+  confirm_publication: "Dar por resuelto",
+  confirming: "Cerrando…",
+  // Campaign songs render when lyrics+timing are approved in the editor.
+  approve_in_editor: "Aprobar letra y generar video",
   refresh: "Actualizar estado",
   none: "Sin acción disponible",
 };
@@ -242,6 +247,12 @@ export const SECONDARY_LABELS = {
   close: "Cerrar sin publicar",
   prepare_only: "Solo preparar el archivo profesional (sin publicar)",
 };
+
+// Only an explicit server projection grants these: legacy rows without a list
+// must never be offered a publication close nor routed away from the panel.
+function serverAllows(workflow, action) {
+  return Array.isArray(workflow?.allowed_actions) && workflow.allowed_actions.includes(action);
+}
 
 /** Un `action` del servidor está permitido; sin lista (datos viejos) todo lo está. */
 export function workflowAllows(workflow, action) {
@@ -256,7 +267,7 @@ function stepPosition(workflow) {
       // bandeja de campaña no manda activeStep: su "resolved" siempre publicó.
       return workflow.activeStep == null || workflow.activeStep >= 3 ? 3 : -1;
     case "closed": return -1;
-    case "review": return 3;
+    case "review": case "confirm": return 3;
     case "publish": return 2;
     case "render": case "rendering": case "blocked": return 1;
     default: return 0;
@@ -316,6 +327,13 @@ export function correctionPrimary(workflow, ctx = {}) {
     if (allows("publish") && status.canPublish) return publish();
     if (workflow.key === "rendering") return pick("rendering", undefined, true);
     if (allows("review_proposal") && ["apply", "analyze"].includes(workflow.key)) return reviewProposal();
+    if (allows("confirm_publication")) {
+      // Locked until every point of the request was ticked against the cut.
+      return pick("confirm_publication",
+        busy.resolving ? PRIMARY_LABELS.confirming : PRIMARY_LABELS.confirm_publication,
+        Boolean(busy.resolving || busy.unchecked));
+    }
+    if (allows("approve_in_editor") && hasJob) return pick("edit", PRIMARY_LABELS.approve_in_editor);
     if (allows("review_render")) return pick("render", undefined, Boolean(busy.proposal || busy.publishing));
     if (allows("resolve")) return close();
     if (allows("refresh")) return pick("refresh");
@@ -394,7 +412,9 @@ export function correctionSentence(workflow, ctx = {}) {
     case "apply":
       return `La IA sugirió cambios. Revisalos y aplicá los que correspondan.${manual}`;
     case "render":
-      return `La corrección está guardada, pero el video todavía es el anterior. Generá el video corregido.${manual}`;
+      return serverAllows(workflow, "approve_in_editor")
+        ? `La corrección está guardada, pero el video todavía es el anterior. Abrí el editor y aprobá letra y timing: en las canciones de campaña eso genera el video corregido.${manual}`
+        : `La corrección está guardada, pero el video todavía es el anterior. Generá el video corregido.${manual}`;
     case "rendering":
       return byRowMode(publication, {
         snapshot: "Estamos generando el video nuevo. El portal sigue mostrando el anterior hasta que lo publiques.",
@@ -413,6 +433,9 @@ export function correctionSentence(workflow, ctx = {}) {
         : `El video nuevo está listo. Miralo y publicalo: el cliente lo ve en el portal y el pedido queda resuelto.${tail}`;
     }
     case "review":
+      if (serverAllows(workflow, "confirm_publication")) {
+        return `Hay un video corregido en el portal${publication?.revision ? ` (versión ${publication.revision})` : ""}. Marcá cada punto del pedido que ya está en el video. Si falta alguno, corregilo y volvé a publicar.`;
+      }
       return "Ya hay una versión publicada. Revisá que lo pedido esté en el video y cerrá el pedido con una nota.";
     case "resolved": case "closed":
       return stepPosition(workflow) === 3
@@ -481,4 +504,30 @@ export function describePublishError(error) {
   const reason = String(rawReason || "").replace(/[.\s]+$/, "");
   const tag = [status ? `HTTP ${status}` : "", code && !code.includes(" ") ? code : ""].filter(Boolean).join(" · ");
   return `No se pudo publicar${tag ? ` (${tag})` : ""}${reason && reason !== code ? `: ${reason}` : ""}. Actualizá la pantalla y reintentá; si se repite, avisá al equipo con el número del pedido.`;
+}
+
+/**
+ * Los puntos de un pedido del cliente, para revisarlos de a uno. Los clientes
+ * separan con "//", con guiones o con renglones; cada punto conserva los
+ * tiempos que cita (en segundos) para mostrar qué dice el video ahí.
+ */
+export function splitRequestItems(comment) {
+  return String(comment || "")
+    .split(/\s*\/\/\s*|\n+|\s+-\s+(?=\d{1,2}:[0-5]\d)/)
+    .map((part) => part.replace(/^\s*[-•*]\s*/, "").trim())
+    .filter(Boolean)
+    .map((text) => ({
+      text,
+      times: [...text.matchAll(/(\d{1,2}):([0-5]\d)/g)].map((m) => Number(m[1]) * 60 + Number(m[2])),
+    }));
+}
+
+/** Líneas del corte alrededor de los tiempos que cita un punto (máx. 6). */
+export function linesNear(segments, times, { before = 4, after = 5, max = 6 } = {}) {
+  if (!Array.isArray(segments) || !times?.length) return [];
+  const from = Math.min(...times) - before;
+  const to = Math.max(...times) + after;
+  return segments
+    .filter((segment) => Number(segment?.start) >= from && Number(segment?.start) <= to)
+    .slice(0, max);
 }

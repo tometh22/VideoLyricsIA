@@ -525,6 +525,45 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     }
   }, [loadChangeRequests]);
 
+  // The corrected cut is already in the portal (sent from a campaign without
+  // ticking this request): record the close as a publication, bound to the
+  // exact cut the operator is looking at. No note needed.
+  const confirmChangeRequestPublication = useCallback(async (id, publication, confirmedItems) => {
+    if (!publication?.render_fingerprint || !Number.isInteger(publication.editor_revision)) {
+      setCrPublishNotice({ requestId: id, tone: "error", text: "Falta verificar el corte publicado. Actualizá el pedido y reintentá." });
+      return;
+    }
+    const lock = `resolve:${id}`;
+    if (mutationLocksRef.current.has(lock)) return;
+    mutationLocksRef.current.add(lock);
+    setCrResolvingId(id);
+    try {
+      const data = await fetchJson(`${API}/admin/change-requests/${id}/confirm-publication`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          reviewed_render_fingerprint: publication.render_fingerprint,
+          reviewed_editor_revision: publication.editor_revision,
+          ...(Number.isInteger(confirmedItems) && confirmedItems > 0 ? { confirmed_items: confirmedItems } : {}),
+        }),
+      });
+      if (data.ok !== true) throw new Error("El servidor no confirmó el cierre del pedido.");
+      setCrPublishNotice({ requestId: id, tone: "ok", text: data.already_resolved
+        ? "El pedido ya figura cerrado."
+        : `Pedido resuelto con la versión ${data.resolved_by_revision} publicada. El cliente lo ve como resuelto en el portal.` });
+      await loadChangeRequests();
+    } catch (err) {
+      const unknown = mutationOutcomeUnknown(err);
+      setCrPublishNotice({ requestId: id, outcomeUnknown: unknown, tone: unknown ? "wait" : "error",
+        text: unknown ? "No pudimos confirmar el cierre. Actualizando el estado del pedido."
+          : `No pude cerrar el pedido: ${err?.detail?.message || err.message || err}` });
+      await loadChangeRequests({ silent: true });
+    } finally {
+      mutationLocksRef.current.delete(lock);
+      setCrResolvingId(current => current === id ? null : current);
+    }
+  }, [loadChangeRequests]);
+
   const reviewForRender = useCallback(async (requestId) => {
     const generation = ++reviewGenerationRef.current;
     const work = beginProposalWork(requestId);
@@ -833,6 +872,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
     dismissChangeRequestProposal,
     regenerateBackgroundFromProposal,
     resolveChangeRequest,
+    confirmChangeRequestPublication,
     reopenChangeRequest,
     crPublishingId,
     crPublishNotice,

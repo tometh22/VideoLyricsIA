@@ -48,6 +48,16 @@ describe("send to portal: closing client requests", () => {
     expect(sendBody(calls)).toMatchObject({ resolve_requests: { job1: [1] }, resolution_note: "Corregimos la palabra." });
   });
 
+  it("ticks every closable request in one click, still explicitly", async () => {
+    const { calls, onStarted } = mount({ items: [request(1), request(2, { song_id: "song2", song: "Canción 2" })] });
+    fireEvent.click(await screen.findByRole("button", { name: "Marcar todos (2)" }));
+    expect(screen.getByLabelText("Resolver el pedido de Canción 2")).toBeChecked();
+    expect(screen.queryByRole("button", { name: /Marcar todos/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar envío" }));
+    await waitFor(() => expect(onStarted).toHaveBeenCalled());
+    expect(sendBody(calls)).toMatchObject({ resolve_requests: { job1: [1], job2: [2] } });
+  });
+
   it("offers nothing when closing is not enabled or the list cannot load", async () => {
     const off = mount({ items: [request(1)], canClose: false });
     await screen.findByText(/Enviar 2 videos aprobados/);

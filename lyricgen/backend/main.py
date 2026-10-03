@@ -7180,7 +7180,26 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                 # Same stem-then-mix order, same _safe_alignment verdict, and
                 # the crammed guard inside _apply still has the final word.
                 try:
-                    from lyrics_local_forced_align import local_forced_align
+                    from lyrics_local_forced_align import (
+                        detect_audio_language,
+                        local_forced_align,
+                    )
+                    # stable-ts cannot align without a language, and the
+                    # lexical detector abstains on most lyrics (job
+                    # daa625bed6f1, 3-oct: TypeError on stem and mix). Fall
+                    # back to Whisper LID on the MIX, once — never on the
+                    # stem, where LID has answered nn/en for Spanish songs.
+                    local_language = resolve_transcription_language(
+                        "", reference_text=anchor_text,
+                    )
+                    if not local_language:
+                        local_language = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                detect_audio_language, audio_path,
+                                job_id=job_id,
+                            ),
+                            timeout=300,
+                        )
                     local_sources = list(dict.fromkeys((align_src, audio_path)))
                     retimed = None
                     for local_source in local_sources:
@@ -7189,9 +7208,7 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                                 local_forced_align,
                                 local_source,
                                 [segment["text"] for segment in psegs],
-                                language=resolve_transcription_language(
-                                    "", reference_text=anchor_text,
-                                ),
+                                language=local_language,
                                 job_id=job_id,
                             ),
                             timeout=600,
@@ -7204,8 +7221,9 @@ async def _maybe_anchor_align(result, audio_path: str, job_id: str,
                         )
                 except Exception as local_exc:
                     logger.warning(
-                        "[ANCHOR] local forced align failed error_type=%s job=%s",
-                        type(local_exc).__name__, job_id,
+                        "[ANCHOR] local forced align failed error_type=%s "
+                        "error=%s job=%s",
+                        type(local_exc).__name__, str(local_exc)[:200], job_id,
                     )
                     retimed = None
                 if _safe_alignment(retimed):
@@ -12009,7 +12027,7 @@ from prores import (
 
 
 @app.get("/download/{job_id}/all")
-async def download_all_zip(
+def download_all_zip(
     job_id: str,
     request: Request,
     token: str = Query(...),
@@ -12021,12 +12039,11 @@ async def download_all_zip(
     UMG ProRes masters are excluded by design: they're huge (1+ GB) and
     UMG editorial expects them as a stand-alone .mov, not buried in a zip.
 
-    No Depends(get_db) — zip-build holds a session through the R2
-    fetch + zip assembly + StreamingResponse. Releasing it after the
-    metadata reads is enough for downstream code (R2 + zip are
-    DB-free)."""
-    import io as _io
+    No Depends(get_db): release the session after metadata reads instead of
+    holding it through R2 downloads, ZIP assembly and the response. These
+    remaining operations are DB-free."""
     import zipfile as _zip
+    from download_bundle import TemporaryZipResponse
 
     with scoped_db() as db:
         current_user = verify_media_token(token, job_id, "all", db)
@@ -12071,13 +12088,17 @@ async def download_all_zip(
         if not on_disk:
             raise HTTPException(status_code=404, detail="Deliverables not found on disk or R2.")
 
-        buf = _io.BytesIO()
-        with _zip.ZipFile(buf, "w", compression=_zip.ZIP_STORED) as zf:
+        zip_path = os.path.join(tmp_dir, "bundle.zip")
+        with _zip.ZipFile(zip_path, "w", compression=_zip.ZIP_STORED) as zf:
             # ZIP_STORED (no compression) — MP4/JPG are already compressed,
             # re-zipping wastes CPU for ~0% size win.
             for path, name in on_disk:
                 zf.write(path, arcname=name)
-        buf.seek(0)
+                # R2 downloads belong to this request; release them once
+                # archived instead of retaining both copies during sending.
+                # Preserve local deliverables in OUTPUTS_DIR.
+                if os.path.dirname(path) == tmp_dir:
+                    os.unlink(path)
 
         # Filename is best-effort — fall back to job_id if artist/title are
         # missing so we never produce a zip with weird empty-string names.
@@ -12091,14 +12112,17 @@ async def download_all_zip(
             current_user, job_id, "all",
             action="job.download", source="zip_bundle", request=request,
         )
-        return StreamingResponse(
-            buf,
-            media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+        response = TemporaryZipResponse(
+            zip_path, temp_dir=tmp_dir, filename=zip_name,
         )
+        # The response owns its files until sending finishes, including an
+        # interrupted download. Failures before hand-off are cleaned below.
+        tmp_dir = None
+        return response
     finally:
         try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if tmp_dir is not None:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
 
@@ -14859,15 +14883,12 @@ async def editor_activity_heartbeat(
             status_code=409, detail="editor_active_lock_required",
         )
     quality = job.transcription_quality or {}
-    prior_heartbeats = db.query(ProductEvent).filter(
+    previous = db.query(ProductEvent).filter(
         ProductEvent.name == "editor_activity_heartbeat",
         ProductEvent.job_id == job_id,
         ProductEvent.user_id == current_user["id"],
-    ).order_by(ProductEvent.id.desc()).all()
-    previous = next((
-        row for row in prior_heartbeats
-        if (row.properties or {}).get("session_id") == body.session_id
-    ), None)
+        ProductEvent.properties["session_id"].as_string() == body.session_id,
+    ).order_by(ProductEvent.id.desc()).first()
     expected_seq = int((previous.properties or {}).get("activity_seq") or 0) + 1 \
         if previous is not None else 1
     if body.activity_seq != expected_seq:
@@ -20712,6 +20733,7 @@ def admin_create_delivery_from_job(
     # Explicit final review binds exactly one case to this cut. Publishing
     # from campaign/history alone cannot attest every pending instruction.
     resolved_requests = []
+    resolved_comments: list[str] = []
     if content_changed and body and body.change_request_id:
         pending_requests = (
             ddb.query(DeliveryChangeRequest)
@@ -20737,6 +20759,7 @@ def admin_create_delivery_from_job(
                 f"Resuelto al publicar la versión {delivery.published_revision}."
             )
             resolved_requests.append(request.id)
+            resolved_comments.append(request.comment or "")
 
     # Commit del delivery (DB externa) PRIMERO: si falla, el AuditLog local no
     # se escribe y no queda fila de auditoría huérfana. El Job local solo se
@@ -20775,6 +20798,20 @@ def admin_create_delivery_from_job(
         },
     ))
     db.commit()
+
+    # Optional mail to UMG: only for a visible publication that answered client requests, and
+    # only if the owner turned it on AND configured recipients (umg_publication_notice).
+    try:
+        import umg_publication_notice as _umg_notice
+        if _umg_notice.should_notify(content_changed=content_changed, resolved_requests=resolved_requests,
+                                     hidden_from_client=is_hidden_from_client(delivery)):
+            _notice_args = dict(artist=delivery.artist_snapshot, song=delivery.song_title_snapshot,
+                                portal_id=delivery.portal_id or portal_id,
+                                revision=int(delivery.published_revision or 1),
+                                comments=list(resolved_comments))
+            threading.Thread(target=lambda: _umg_notice.notify(**_notice_args), daemon=True).start()
+    except Exception:
+        logger.warning("[UMG-NOTICE] no se pudo preparar el aviso", exc_info=True)
 
     return {
         "ok": True,
@@ -21992,8 +22029,11 @@ async def admin_list_change_requests(
             # abrir la configuración ProRes en esta misma tarjeta.
             publication["prores_configured"] = bool(job and job.umg_spec)
             if job:
-                from change_request_workflow import render_state
+                from change_request_workflow import published_answer, render_state
                 publication.update(render_state(job, documents_by_jobid.get(job.job_id), cr))
+                publication["campaign_job"] = bool(job.campaign_id)
+                publication["answers_request"] = published_answer(
+                    job, documents_by_jobid.get(job.job_id), d, cr)[0]
         items.append({
             "id": cr.id,
             "comment": cr.comment,
@@ -22241,6 +22281,74 @@ async def admin_render_change_request(cr_id: int, body: RenderChangeRequest,
     ), background_tasks,
         idempotency_key=f'change-request:{cr_id}:render:{body.editor_revision}',
         current_user=current_user, db=db)
+
+
+class ConfirmPublicationRequest(BaseModel):
+    reviewed_render_fingerprint: str = Field(min_length=1, max_length=128)
+    reviewed_editor_revision: int = Field(ge=0)
+    resolution_note: str = Field(default='', max_length=2000)
+    # Points of the request the operator ticked against the cut (audit only).
+    confirmed_items: int | None = Field(default=None, ge=1, le=200)
+
+
+@app.post('/admin/change-requests/{cr_id}/confirm-publication')
+def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicationRequest,
+                                             current_user: dict = Depends(get_current_user),
+                                             db: Session = Depends(get_db),
+                                             ddb: Session = Depends(get_deliveries_db)):
+    """Close a request that the cut ALREADY in the portal answers.
+
+    A campaign send can publish the corrected cut without ticking its request.
+    The portal is then current, so no publication can close it any more, and a
+    manual close would claim "nothing was published". This records the truth:
+    resolved by the published revision, bound to the exact cut the operator
+    reviewed. Same evidence rule as the panel (``published_answer``).
+    """
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail='Admin only')
+    cr = (ddb.query(DeliveryChangeRequest).filter(DeliveryChangeRequest.id == cr_id)
+          .with_for_update().first())
+    if cr is None:
+        raise HTTPException(status_code=404, detail='Change request not found')
+    if cr.resolved_at is not None:
+        return {'ok': True, 'already_resolved': True, 'resolved_at': cr.resolved_at.isoformat(),
+                'updated_at': cr.updated_at.isoformat() if cr.updated_at else None}
+    delivery = ddb.query(Delivery).filter(Delivery.id == cr.delivery_id).first()
+    if delivery is None or delivery.removed_at is not None:
+        raise HTTPException(status_code=409, detail='Change request delivery is unavailable')
+    job = db.query(Job).filter(Job.job_id == delivery.job_id).first()
+    document = (db.query(EditorDocument).filter(EditorDocument.job_id == delivery.job_id).first()
+                if job is not None else None)
+    from change_request_workflow import published_answer
+    ok, reason = published_answer(job, document, delivery, cr)
+    if not ok:
+        raise HTTPException(status_code=409, detail={
+            'code': 'publication_does_not_answer_request', 'reason': reason,
+            'message': 'El video publicado no tiene una corrección posterior al pedido. Corregí, generá y publicá el video.',
+        })
+    if (body.reviewed_render_fingerprint != delivery_freshness.render_fingerprint(job)
+            or body.reviewed_editor_revision != int(document.revision or 0)):
+        raise HTTPException(status_code=409, detail='El corte cambió. Revisá el video actualizado antes de cerrar.')
+    now = datetime.now(timezone.utc)
+    revision = delivery.published_revision or 1
+    note = body.resolution_note.strip()
+    cr.resolved_at = now
+    cr.updated_at = now
+    cr.resolved_by_user_id = deliveries_added_by(current_user['id'])
+    cr.resolved_by_revision = revision
+    cr.resolution_source = 'publication'
+    cr.resolution_note = note or f'Resuelto al publicar la versión {revision}.'
+    ddb.commit()
+    db.add(AuditLog(user_id=current_user['id'], action='delivery.change_request.resolve', detail={
+        'change_request_id': cr_id, 'delivery_id': delivery.id, 'job_id': delivery.job_id,
+        'source': 'publication_confirmed', 'revision': revision,
+        'render_fingerprint': body.reviewed_render_fingerprint,
+        'editor_revision': body.reviewed_editor_revision,
+        'confirmed_items': body.confirmed_items,
+    }))
+    db.commit()
+    return {'ok': True, 'resolved_at': now.isoformat(), 'updated_at': now.isoformat(),
+            'resolved_by_revision': revision}
 
 
 class ChangeRequestProposalPatch(BaseModel):

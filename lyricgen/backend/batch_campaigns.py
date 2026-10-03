@@ -109,15 +109,25 @@ def _latest_semaforo_verdicts(
     wanted = set(job_ids)
     if not wanted:
         return {}
-    verdicts: dict[str, dict[str, Any]] = {}
-    for log in db.query(AuditLog).filter(
+    verdict_job = AuditLog.detail["job_id"].as_string()
+    ranked = db.query(
+        verdict_job.label("job_id"),
+        AuditLog.detail.label("detail"),
+        func.row_number().over(
+            partition_by=verdict_job, order_by=AuditLog.id.desc(),
+        ).label("verdict_rank"),
+    ).filter(
         AuditLog.action.in_(("semaforo.verdict.v2", "semaforo.verdict.v1")),
-    ).order_by(AuditLog.id.desc()).all():
-        detail = dict(log.detail or {})
-        verdict_job = str(detail.get("job_id") or "")
-        if verdict_job in wanted and verdict_job not in verdicts:
-            verdicts[verdict_job] = detail
-    return verdicts
+        verdict_job.in_(wanted),
+    ).subquery()
+    # Return one row per requested job instead of materializing the entire
+    # history of all campaigns in every API process.
+    return {
+        row.job_id: dict(row.detail or {})
+        for row in db.query(ranked.c.job_id, ranked.c.detail).filter(
+            ranked.c.verdict_rank == 1,
+        ).all()
+    }
 
 
 def _delivery_rank(

@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 import delivery_freshness
 from auth import get_current_user
-from change_request_workflow import latest_overwrite, render_state, timestamp
+from change_request_workflow import latest_overwrite, published_answer, render_state, timestamp
 from batch_campaigns import _aware, _campaign_or_404, _require_scope
 from campaign_pipeline import _load_items, _load_lineage
 from batch_campaigns import _require_manager
@@ -84,7 +84,8 @@ def closable_on_publish(request, job, delivery, document=None) -> tuple[bool, st
     return True, "ok"
 
 
-def _step(request: DeliveryChangeRequest, job: Job | None, delivery: Delivery) -> dict[str, str]:
+def _step(request: DeliveryChangeRequest, job: Job | None, delivery: Delivery,
+          document: EditorDocument | None = None) -> dict[str, str]:
     """Where an OPEN or closed request stands, from persisted evidence only."""
     if request.resolved_at:
         if request.resolution_source == "publication":
@@ -99,6 +100,9 @@ def _step(request: DeliveryChangeRequest, job: Job | None, delivery: Delivery) -
         return {"key": "blocked", "tone": "attention", "label": "La generación falló"}
     if job.status in _FINISHED and delivery_freshness.needs_publish(job, delivery):
         return {"key": "publish", "tone": "attention", "label": "Corregido: falta publicar"}
+    if published_answer(job, document, delivery, request)[0]:
+        # Published without ticking the request: the fix IS in the portal.
+        return {"key": "confirm", "tone": "attention", "label": "Publicado: falta cerrar el pedido"}
     return {"key": "correct", "tone": "idle", "label": "Sin atender"}
 
 
@@ -200,7 +204,8 @@ def campaign_change_requests(
                 song = song_of(jobs_by_id.get(delivery.job_id))
                 job = current_by_song.get(song.id) if song is not None else jobs_by_id.get(delivery.job_id)
                 job = job or jobs_by_id.get(delivery.job_id)
-                closable, _ = closable_on_publish(request, job, delivery, documents.get(job.job_id) if job else None)
+                document = documents.get(job.job_id) if job else None
+                closable, _ = closable_on_publish(request, job, delivery, document)
                 payload.append({
                     "id": request.id, "delivery_id": delivery.id,
                     "portal_id": delivery.portal_id or "argentina",
@@ -212,7 +217,7 @@ def campaign_change_requests(
                     "resolution_source": request.resolution_source,
                     "published_revision": delivery.published_revision or 1,
                     "client_approval": _client_approval(delivery),
-                    "step": _step(request, job, delivery),
+                    "step": _step(request, job, delivery, document),
                     "current_job_id": job.job_id if job is not None else None,
                     "closable_on_publish": closable,
                 })

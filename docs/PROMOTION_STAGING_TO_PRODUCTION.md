@@ -161,7 +161,7 @@ cada servicio tiene un *deployment trigger* que apunta a `tometh22/umg-chile-por
 
 Precondiciones (todas verdes antes de empezar):
 1. Los PRs de alineación mergeados a staging, con CI exacta verde y staging sin trabajo a medias.
-2. Ensayo de migraciones repetido si cambió el head (sección 3).
+2. Ensayo de migraciones repetido si cambió el head (sección 3), y `check_fleet_config_parity.py production` en `OK` (sección 8, punto 5).
 3. Tabla de variables (sección 5) firmada por el dueño. Las variables a agregar o cambiar quedan **preparadas** pero se aplican en el paso 3.
 4. La rama `tometh22/umg-chile-portal` **no se borra ni se mueve** (es el punto de retorno); anotar su commit `397965aa`.
 5. Ventana de baja carga elegida, con alguien mirando.
@@ -191,3 +191,55 @@ portal de UMG con errores, o error de migración.
 - Una rama por entorno: `main` = producción, `staging` = pre-producción. Archivar `tometh22/umg-chile-portal` y las ramas `release/*` viejas.
 - Un hotfix va primero a `main` y se trae a `staging` el mismo día.
 - Problema de fondo, aparte de esta promoción: el trabajo gestionado de UMG corre en staging y escribe en la base de producción. Darle a staging su propia base de entregas, o asumir ese trabajo en producción.
+
+## 8. Promoción real del 2026-10-01 (staging 1.1.91 → producción) y lecciones
+
+Resultado: producción quedó en `main` = `5ac8ce05` (árbol idéntico a staging), `/health` en `ok`,
+11 workers coherentes, migración `ba888d1665d8` aplicada, interruptores `delivery_qc_gates_off` y
+`language_review_advisory` en `true`, portales de UMG respondiendo (Argentina 185 versiones y Chile 34, todas con
+archivos) y logs sin errores. La rama `tometh22/umg-chile-portal` (`397965aa`) **no se tocó**: es el punto de retorno.
+
+Lo que el runbook no decía y hay que saber la próxima vez:
+
+1. **Vercel despliega el frontend de producción al mergear a `main`.** Su rama de Producción es `main`: el merge
+   del PR a `main` publicó el frontend ~10 minutos **antes** que el backend. No hay paso separado de Vercel.
+   Para que el backend vaya primero, repuntar los disparadores de Railway a `staging` (mismo árbol), verificar, y
+   recién entonces mergear a `main`. En esta promoción la ventana (frontend nuevo con backend viejo) no produjo
+   errores observados.
+2. **Cambiar la rama de un disparador de Railway no despliega nada**: hay que lanzar el deploy
+   (`railway redeploy --service S --environment production --from-source -y`). Los cuatro servicios terminaron en ~6 min.
+3. **`/health` marca "down" (503) durante un deploy escalonado** hasta que toda la flota queda en el commit nuevo y
+   con la misma configuración. En esta promoción fueron ~14 min, de los cuales ~10 por un error mío (punto 4).
+4. **`timing_config_mismatch`:** el chequeo exige que los tiempos de letra (`LYRIC_LEAD_IN_S`, `LYRIC_HOLD_S`) sean
+   idénticos en TODOS los servicios, también en `quality-worker`. Hay que fijarlos en los cuatro de una vez.
+5. **`fleet_runtime_token_mismatch` (degradado, no bloquea) — RESUELTO el mismo día.** En producción los servicios
+   tenían configuraciones de pipeline distintas entre sí (el `quality-worker` no definía 15 variables que `api`/`Worker`/
+   `ShortWorker` sí; `CTC_ALIGN_MIN_MED_SCORE=0.30` estaba en `api` y `ShortWorker` pero no en `Worker`, que usaba el
+   default 0.35; `QUALITY_V6_*` solo en `api` y `quality-worker`). Mientras difieran, un análisis de calidad encolado
+   por un servicio lo descarta el `quality-worker` en silencio (`runtime_identity_mismatch`). Se alinearon los cuatro
+   servicios a los valores de la `api` (= diseño de staging), sin conflictos de valor, y se redesplegaron juntos sobre el
+   mismo commit: un solo token, `/health` en `ok` durante todo el proceso. El único cambio de comportamiento fue
+   `CTC_ALIGN_MIN_MED_SCORE` 0.35 → 0.30 en el `Worker` (paridad con staging). **Antes de cada promoción y después de
+   tocar variables:** `PYTHONPATH=lyricgen/backend python lyricgen/backend/scripts/check_fleet_config_parity.py production`
+   (sale con 1 y lista las claves que difieren). A futuro, usar variables compartidas de Railway para que no diverjan.
+6. **Errores de infraestructura de Railway** (`failed to fetch snapshot` al construir) dejan un servicio atrás:
+   reintentar con `railway redeploy --service S --environment E --from-source -y`.
+7. Corrección a la sección 5: producción **ya** usaba `LYRIC_LEAD_IN_S=0.08` en `Worker` y `ShortWorker` (los que
+   renderizan); solo el `api` tenía 0.4. El cambio real fue `LYRIC_HOLD_S` 0.25 → 0.5.
+
+## 9. Variables de pipeline compartidas (2026-10-01)
+
+Las variables que alimentan el token de la flota (pipeline, calibración y tiempos de letra) ya no se
+mantienen servicio por servicio: viven como **variables compartidas** del entorno de Railway y cada servicio
+las referencia (`${{shared.CLAVE}}`). Aplicado en staging (34 claves, 6 servicios) y producción (30 claves,
+4 servicios) sin reinicios, con el valor resuelto de cada servicio verificado idéntico antes y después.
+
+- Para cambiar un valor del pipeline: editar la **variable compartida** (no la del servicio) y redesplegar todos
+  los servicios juntos.
+- Para sumar una clave nueva al conjunto: `PYTHONPATH=lyricgen/backend python lyricgen/backend/scripts/railway_share_pipeline_config.py <entorno>` (simulación) y luego `--apply`.
+- Antes de cada promoción: `check_fleet_config_parity.py <entorno>` debe dar `OK`.
+- Para volver una clave a valor propio de un servicio: `railway variables --service S --environment E --set CLAVE=valor`.
+- Ramas archivadas el mismo día (sin borrarlas, bloqueadas en solo lectura y con etiqueta `archive/<rama>`):
+  `release/2026-07-22-editor-to-prod`, `release/official-lyrics-staging`, `release/staging-to-main-2026-05-15`,
+  `release/universal-es-trial-20260911`, `release/universal-trial-frontend` y `tometh22/umg-chile-portal`.
+  Para volver a escribir en una: quitar su protección de rama en GitHub. La lectura (y el rollback por rama) no se ve afectada.

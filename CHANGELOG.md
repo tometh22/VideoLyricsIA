@@ -1,16 +1,66 @@
 # Changelog
 
+## [1.1.109] - 2026-10-03
+
+### Fixed
+
+- Los renders y correcciones de campañas con una especificación UMG conservan su resolución y fps exigidos aunque el perfil heredado del trabajo diga `youtube`. Evita que un video de 29,97 fps vuelva a salir a 24 fps al corregirlo.
+
+## [1.1.108] - 2026-10-03
+
+### Fixed
+
+- El portal exige la revisión y la fecha del corte que el cliente vio antes de aceptar una aprobación. Rechaza páginas desactualizadas y entregas ocultas o en actualización; la aprobación vuelve a estar disponible tras revisar la versión publicada.
+
+## [1.1.107] - 2026-10-03
+
+### Fixed
+
+- El alineado CTC ya no estira una palabra a través de un silencio cuando una
+  sola de sus letras queda del otro lado de la pausa. Sobre el stem vocal, si
+  entre dos letras de la misma palabra hay al menos 0,8 s seguidos sin voz, la
+  palabra se queda con el tramo cantado y su borde se ajusta a la voz medida
+  (Carajo "Hacerse Cargo": el primer "Bien" del puente pasa de 109,16–112,88 a
+  111,85–112,88 y el "bien" del final de 178,12–184,76 a 178,12–180,05, en vez
+  de engancharse a un "¡No!" gritado fuera de la letra). Texto, orden y
+  cantidad de palabras no cambian. No aplica al alinear sobre la mezcla.
+  Ajustable con `CTC_UNVOICED_SPLIT_GAP_S` y desactivable con
+  `CTC_UNVOICED_SPLIT_ENABLED=0`.
+- El recorte de bordes de baja confianza ahora ajusta la palabra a la región
+  de voz que más se superpone con ella, no a la primera que toca (que solía
+  ser la cola de la línea anterior y dejaba el recorte sin efecto).
+
+## [1.1.106] - 2026-10-03
+
+### Fixed
+
+- Cambios UMG: cerrar un pedido cuyo video corregido ya está publicado exige
+  revisarlo punto por punto. El panel separa el pedido en sus puntos, muestra
+  qué dice el video en cada tiempo citado y "Dar por resuelto" se habilita
+  sólo cuando están todos marcados. Que exista un corte corregido no prueba
+  que tenga todas las correcciones (5 de 10 pedidos del 3-oct estaban
+  incompletos).
+
 ## [1.1.105] - 2026-10-03
 
 ### Fixed
 
-- Los renders y correcciones de campañas con especificación UMG respetan la resolución y los 29,97 fps configurados aunque el perfil heredado del trabajo diga `youtube`.
+- El alineado forzado local (cuarta etapa de re-sincronizar letra) ya no
+  declina siempre con `TypeError` cuando el detector léxico no reconoce el
+  idioma de la letra: stable-ts exige un idioma y recibía `None`. Ahora el
+  idioma se detecta una vez sobre el audio mezclado (nunca sobre el stem),
+  restringido a los seis idiomas soportados (job daa625bed6f1, IKV
+  "DJ Droga"). El log de declinación incluye el mensaje del error.
 
 ## [1.1.104] - 2026-10-03
 
 ### Fixed
 
-- El portal exige la revisión y la fecha del corte que el cliente vio antes de aceptar una aprobación. Rechaza páginas desactualizadas y entregas ocultas o en actualización; la aprobación vuelve a estar disponible tras revisar la versión publicada.
+- "Dividir" en el editor de letra ya no borra el timing por palabra: cada mitad
+  conserva sus palabras y el corte cae en la pausa real del canto (por ejemplo
+  "Aprendamos a perdonar" / "y seremos perdonados"), en vez de partir por ancho
+  de pantalla y repartir el tiempo por cantidad de letras. Aplica también a
+  "Dividir todas" y al aviso de 3 líneas.
 
 ## 1.1.103 — 2026-10-03
 
@@ -22,20 +72,56 @@
 All notable changes to VideoLyricsIA (GenLy AI) are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [1.1.99] - 2026-10-03
+## [1.1.102] - 2026-10-03
+
+### Changed
+
+- Build downloadable ZIP bundles on disk and stream them in bounded chunks;
+  release staged sources after archiving and clean up after interrupted sends.
+- Query only the latest campaign verdict for each requested job and the latest
+  heartbeat in the current editor session instead of loading full histories.
+- Document a staging-only acoustic-feature cache retention canary and its
+  performance, memory and rollback checks.
+
+## [1.1.101] - 2026-10-03
+
+### Fixed
+
+- Cambios UMG: un pedido cuyo video corregido ya se publicó (por ejemplo desde
+  el envío de una campaña sin tildar el pedido) se cierra con un clic,
+  "Confirmar y dar por resuelto", y queda registrado como resuelto por la
+  versión publicada. Antes sólo se podía cerrar "sin publicar" con una nota.
+- Cambios UMG: en canciones de campaña, "Generar el video corregido" fallaba
+  con `lyrics_and_timing_approval_missing`; ahora lleva al editor a aprobar
+  letra y timing, que es lo que genera el video.
+- Campañas: la bandeja muestra "Publicado: falta cerrar el pedido" en vez de
+  "Sin atender", y el envío al portal tiene "Marcar todos" para los pedidos que
+  resuelve.
+
+## [1.1.100] - 2026-10-03
 
 ### Fixed
 
 - Un fallo temporal del proveedor de ASR opcional ya no deja fuera de servicio
   todo el worker de calidad durante el arranque.
 
-## [1.1.98] - 2026-10-02
+## [1.1.99] - 2026-10-02
 
 ### Fixed
 
 - El portal informa cuando falla la preparación ProRes, permite reintentar sin
   reutilizar un job fallido de RQ y solo confirma que está listo cuando el
   master se verificó en R2.
+
+## [1.1.98] - 2026-10-02
+
+### Added
+
+- Aprobación masiva de videos en QC desde la selección de la campaña, con una
+  confirmación única, progreso y reintento de los que fallen. Tras aprobar,
+  la selección pasa a la etapa de envío para publicarlos juntos al portal.
+- La publicación de Art Tracks crea el registro de acceso en el portal sin
+  copiar el MP4 en R2; el ProRes queda disponible para generación bajo demanda.
 
 ## [1.1.97] - 2026-10-02
 
@@ -69,6 +155,44 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Las entregas UMG antiguas con video publicado y sin entrada `umg_master` ahora muestran la opción para generar el ProRes desde el portal. La solicitud agrega el master a la versión publicada cuando termina.
 - Las campañas difieren la transcodificación ProRes hasta que el cliente la solicita y permiten definir resolución, fps y perfil del master al crear el trabajo.
+
+## [1.1.94] - 2026-10-02
+
+### Added
+
+- Optional mail to UMG when a correction they asked for is published (`umg_publication_notice.py`,
+  `emails.send_umg_publication_notice`). OFF by default and with no recipients: nothing is sent until the owner sets
+  `UMG_PUBLISH_NOTIFY_ENABLED=1` and `UMG_PUBLISH_NOTIFY_RECIPIENTS_ARGENTINA` / `_CHILE` (or
+  `UMG_PUBLISH_NOTIFY_RECIPIENTS`; at most 10 valid addresses). Only a publication that closed client requests and
+  whose files are visible to the client notifies (a plain re-send or a hidden delivery stays silent). The mail names the
+  version and the portal, quotes what they asked for (escaped, capped) and links to the portal. Outside production the
+  existing staging gate still applies: an address only receives from staging if it is in `EMAIL_STAGING_ALLOWLIST`.
+
+### Fixed
+
+- Reintentar automáticamente las solicitudes de publicación UMG y consulta del estado ProRes cuando la conexión con la API se interrumpe transitoriamente. Si no se puede confirmar el envío, el aviso pide verificar el portal antes de reintentar.
+
+## [1.1.93] - 2026-10-01
+
+### Added
+
+- `scripts/railway_share_pipeline_config.py`: moves the pipeline/calibration/timing variables of a Railway
+  environment into SHARED variables referenced by every service (`${{shared.KEY}}`), so the fleet runtime token
+  cannot drift again. Dry run by default; only shares a key when every service holds the same value; writes
+  with skipDeploys and verifies that the rendered value of every key is unchanged (nothing restarts, a later
+  deploy resolves to the same values); idempotent; retries network blips. Applied on 2026-10-01 to staging
+  (34 keys, 6 services) and production (30 keys, 4 services); `check_fleet_config_parity.py` stays OK in both.
+  New keys that must stay uniform are added by running the tool again.
+
+## [1.1.92] - 2026-10-01
+
+### Added
+
+- `scripts/check_fleet_config_parity.py`: compares the pipeline/calibration environment (the inputs of the fleet
+  runtime token) across the services of a Railway environment and exits 1 listing the keys that differ. Production
+  had drifted (quality-worker missing 15 variables, `CTC_ALIGN_MIN_MED_SCORE` set on some services only), which made
+  quality jobs silently discard with `runtime_identity_mismatch` and `/health` report `fleet_runtime_token_mismatch`.
+  The production services were aligned the same day; run the check before every promotion.
 
 ## [1.1.91] - 2026-10-01
 

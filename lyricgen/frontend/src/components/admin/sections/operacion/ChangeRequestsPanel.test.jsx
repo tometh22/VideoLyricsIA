@@ -971,3 +971,32 @@ describe("ChangeRequestsPanel: tres pasos y una sola acción principal", () => {
     expect(screen.getByRole("button", { name: "Publicar en el portal y dar por resuelto" })).toBeEnabled();
   });
 });
+
+describe("cerrar un pedido ya publicado", () => {
+  const confirmWorkflow = {
+    key: "review", activeStep: 3, label: "Publicado · revisá cada punto del pedido", detail: "",
+    tone: "action", allowed_actions: ["edit", "resolve", "analyze", "confirm_publication"],
+  };
+  const published = { ...BASE_PUBLICATION, revision: 2, render_fingerprint: "cut-2", editor_revision: 14,
+    render_matches_editor: true, answers_request: true };
+
+  it("no deja dar por resuelto hasta marcar cada punto contra el video", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ segments: [{ start: 13, text: "¿Quién sos?" }] }) })));
+    const confirm = vi.fn();
+    renderPanel({ comment: "0:13 sin signos de interrogación // 1:02 decir amor", workflow: confirmWorkflow, publication: published },
+      { confirmChangeRequestPublication: confirm });
+    // The cut still shows the question marks: the operator sees it before ticking.
+    expect(await screen.findByText("¿Quién sos?")).toBeInTheDocument();
+    const button = screen.getByRole("button", { name: /^Dar por resuelto/ });
+    expect(button).toBeDisabled();
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    expect(confirm).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByLabelText("Está en el video: 0:13 sin signos de interrogación"));
+    expect(button).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("Está en el video: 1:02 decir amor"));
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    expect(confirm).toHaveBeenCalledWith(7, published, 2);
+    vi.unstubAllGlobals();
+  });
+});

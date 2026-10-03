@@ -89,7 +89,10 @@ export function SendToPortalDialog({ campaignId, kind = "lyric_video", videos, d
       </ul>
       {closable.length > 0 && <fieldset className="space-y-2 rounded-xl bg-amber-400/[0.06] p-3 ring-1 ring-amber-300/20">
         <legend className="px-1 text-sm font-medium text-amber-100">Pedidos del cliente que este envío puede resolver</legend>
-        <p className="text-xs text-ink-secondary">Solo se cierran los que marques. Los demás siguen abiertos.</p>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-xs text-ink-secondary">Si corregiste estos pedidos, marcalos: quedan resueltos al publicar. Los que no marques siguen abiertos.</p>
+          {chosen.length < closable.length && <Button variant="ghost" size="sm" disabled={busy} onClick={() => setTicked(new Set(closable.map((item) => item.id)))}>Marcar todos ({closable.length})</Button>}
+        </div>
         <ul className="space-y-1.5">
           {closable.map((item) => <li key={item.id}><label className="flex cursor-pointer items-start gap-2 text-sm">
             <input type="checkbox" className="mt-1" checked={ticked.has(item.id)} disabled={busy} onChange={() => toggle(item.id)} aria-label={`Resolver el pedido de ${item.song}`} />

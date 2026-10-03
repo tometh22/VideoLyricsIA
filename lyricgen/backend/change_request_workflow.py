@@ -45,6 +45,35 @@ def render_state(job, document, request):
     }
 
 
+def published_answer(job, document, delivery, request):
+    """Whether the cut the portal ALREADY serves answers this open request.
+
+    A send that published the corrected cut without ticking the request left
+    it open, and nothing could close it "by publication" afterwards: the
+    portal is no longer behind, so no send can close it again. Evidence only,
+    mirroring ``closable_on_publish`` minus "the portal is behind": the fix was
+    saved after the request, the render matches that save, and the portal
+    published that exact render after the request arrived.
+    """
+    from delivery_freshness import needs_publish
+    if request.resolved_at is not None or job is None or delivery is None or document is None:
+        return False, "not_applicable"
+    if delivery.removed_at is not None or job.status not in {'done', 'pending_review'}:
+        return False, "not_applicable"
+    submitted_at = timestamp(request.submitted_at)
+    saved_at = timestamp(document.updated_at)
+    published_at = timestamp(delivery.content_updated_at)
+    if submitted_at is None or saved_at is None or saved_at < submitted_at:
+        return False, "no_fix_after_request"
+    if not render_state(job, document, request)['render_matches_editor']:
+        return False, "render_not_current"
+    if needs_publish(job, delivery):
+        return False, "not_published"
+    if published_at is None or published_at < submitted_at:
+        return False, "published_before_request"
+    return True, "ok"
+
+
 def case_state(*, publication, proposal_status=None, resolved_at=None,
                resolution_source=None, proposal_enabled=True, available=True,
                pending_manual=0):
@@ -107,6 +136,13 @@ def case_state(*, publication, proposal_status=None, resolved_at=None,
                      'La existencia de un render o master no confirma que estas instrucciones estén atendidas.',
                      'attention', base + ['review_proposal'] + (['review_render'] if p.get('can_render') else []))
     if p.get('render_matches_editor') is False and p.get('can_render'):
+        if p.get('campaign_job'):
+            # Campaign songs render only after the song-level lyrics+timing
+            # approval, which lives in the editor; this panel's render would
+            # answer 409 lyrics_and_timing_approval_missing.
+            return state('render', 2, 'Aprobar letra y generar video',
+                         'La corrección está guardada. En canciones de campaña el video se genera al aprobar letra y timing en el editor.',
+                         'action', base + ['approve_in_editor'])
         return state('render', 2, 'Revisar cambios guardados y generar video',
                      'Confirmá la letra guardada. El video todavía no contiene esta revisión.',
                      'action', base + ['review_render'])
@@ -122,6 +158,13 @@ def case_state(*, publication, proposal_status=None, resolved_at=None,
         return state('publish', 3, 'Revisar video y publicar actualización',
                      'Publicar confirma este corte y este pedido. El cliente conserva su aprobación independiente.',
                      'attention', base + ['publish'])
+    if p.get('needs_publish') is False and p.get('revision') and p.get('answers_request') is True:
+        # Evidence that A fix was published, never that EVERY instruction was
+        # (5 of 10 requests closed this way on 2026-10-03 were incomplete):
+        # the panel makes the operator tick each point against the cut.
+        return state('review', 3, 'Publicado · revisá cada punto del pedido',
+                     'El portal ya tiene un video corregido después del pedido. Revisá cada punto contra el video; si falta alguno, corregilo y volvé a publicar.',
+                     'action', base + ['confirm_publication'])
     if p.get('needs_publish') is False and p.get('revision'):
         return state('review', 3, 'Publicación registrada · revisar pedido',
                      'La entrega coincide según el registro. Verificá lo solicitado antes de cerrar con un motivo.',

@@ -5,6 +5,8 @@ fallback, and a double decline is explicit so upload callers can fail closed.
 """
 import asyncio
 
+import pytest
+
 import ctc_align
 import vocal_sep
 from main import _maybe_anchor_align
@@ -434,10 +436,73 @@ def test_local_forced_align_rescues_a_song_every_other_engine_declined(monkeypat
     assert out["anchor_alignment"]["ctc_decline_reason"] == "median_word_score"
     assert [segment["text"] for segment in out["segments"]] == ANCHOR.splitlines()
     assert seen["lines"] == ANCHOR.splitlines()
-    # Same language resolution as the Whisper-DP stage above it.
+
+
+def test_local_forced_align_gets_a_language_even_when_the_lyric_detector_abstains(
+        monkeypatch):
+    """Staging job daa625bed6f1 (IKV "DJ Droga", 3-oct): the lexical detector
+    abstains on ordinary lyrics, stable-ts got ``language=None`` and raised
+    TypeError on stem and mix. The fallback is Whisper LID on the MIX, run
+    once — never on the stem, where LID has answered nn/en for Spanish."""
+    monkeypatch.setenv("ANCHOR_LYRICS_ENABLED", "1")
+    monkeypatch.setattr(vocal_sep, "separate_vocals",
+                        lambda path, cache_only=False: "/tmp/stem.wav")
+    monkeypatch.setattr(ctc_align, "retime_segments", lambda *_a, **_kw: None)
+    monkeypatch.setattr("forced_align.forced_align_lyrics", lambda *_a, **_kw: None)
+    monkeypatch.setattr("lyrics_whisper_align.whisper_word_align",
+                        lambda *_a, **_kw: None)
     from main import resolve_transcription_language
-    assert seen["language"] == resolve_transcription_language(
-        "", reference_text=ANCHOR)
+    assert resolve_transcription_language("", reference_text=ANCHOR) is None
+
+    lid_paths = []
+
+    def _lid(audio_path, *, job_id=""):
+        lid_paths.append(audio_path)
+        return "es"
+
+    languages = []
+
+    def _local(audio_path, lines, *, language=None, job_id=""):
+        languages.append(language)
+        return _retimed() if audio_path == "/tmp/a.mp3" else None
+
+    monkeypatch.setattr("lyrics_local_forced_align.detect_audio_language", _lid)
+    monkeypatch.setattr("lyrics_local_forced_align.local_forced_align", _local)
+
+    out = _run(_result(), ANCHOR)
+
+    assert out["anchor_alignment"]["timing_source"] == "local_forced_align"
+    assert lid_paths == ["/tmp/a.mp3"]
+    assert languages == ["es", "es"]
+
+
+def test_local_forced_align_skips_audio_lid_when_the_lyric_names_its_language(
+        monkeypatch):
+    _every_engine_declines(monkeypatch)
+    english = (
+        "I want to hold your hand and you know that I love you\n"
+        "and when I touch you I feel happy inside\n"
+        "it's such a feeling that my love I can't hide"
+    )
+    from main import resolve_transcription_language
+    expected = resolve_transcription_language("", reference_text=english)
+    if not expected:
+        pytest.skip("lexical detector abstains on this fixture")
+
+    def _no_lid(*_a, **_kw):
+        raise AssertionError("audio LID must not run when the lyric decides")
+
+    seen = {}
+
+    def _local(audio_path, lines, *, language=None, job_id=""):
+        seen["language"] = language
+        return None
+
+    monkeypatch.setattr("lyrics_local_forced_align.detect_audio_language", _no_lid)
+    monkeypatch.setattr("lyrics_local_forced_align.local_forced_align", _local)
+
+    _run(_result(), english)
+    assert seen["language"] == expected
 
 
 def test_local_forced_align_never_runs_when_an_earlier_engine_answered(monkeypatch):

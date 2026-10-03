@@ -8,6 +8,7 @@ import {
 import CampaignDeliveryProgress from "../CampaignDeliveryProgress";
 import CampaignSearch from "../CampaignSearch";
 import BulkActionBar from "./BulkActionBar";
+import BulkApproveDialog from "./BulkApproveDialog";
 import CampaignSettings from "./CampaignSettings";
 import { RecordDeliveryDialog, SendToPortalDialog } from "./DeliveryDialogs";
 import DiscardDialog from "./DiscardDialog";
@@ -336,6 +337,7 @@ export default function CampaignDetailPage({ id }) {
   const hiddenSelected = selected.size - selectedVisible.length;
   const onBulk = (action, list) => {
     if (action === "generate") setDialog({ type: "generate", items: list.map((song) => song.creative) });
+    else if (action === "approve") setDialog({ type: "approve", songs: list });
     else if (action === "send") setDialog({ type: "send", songs: list });
     else if (action === "discard" || action === "restore") setDialog({ type: "discard", songs: list, mode: action });
     else if (action === "retry") void runRetry(list);
@@ -460,6 +462,18 @@ export default function CampaignDetailPage({ id }) {
       }}
       onEdit={(song) => { setDialog(null); openEditLyrics(song); }}
       onClose={(result) => { setDialog(null); if (result?.finished) setFlash({ tone: "success", text: `${result.lastTitle} quedó aprobado. No quedan videos por revisar en esta lista.` }); void refresh(); }} />}
+    {dialog?.type === "approve" && <BulkApproveDialog songs={dialog.songs} onClose={() => setDialog(null)} onDone={({ approvedIds, failed }) => {
+      setDialog(null);
+      if (failed.length) {
+        setSelected(new Set(failed.map((item) => item.id)));
+        setFlash({ tone: "warning", text: `${approvedIds.length} videos aprobados; ${failed.length} no se aprobaron. Primer error: ${failed[0].title}: ${failed[0].reason}. Los pendientes siguen seleccionados para reintentar.` });
+      } else {
+        setSelected(new Set(approvedIds));
+        updateParams({ view: "approved", portal: null, q: null, song: null }, { push: true });
+        setFlash({ tone: "success", text: `${approvedIds.length} videos aprobados. Ahora podés enviarlos juntos al portal.` });
+      }
+      void refresh();
+    }} />}
     {dialog?.type === "generate" && <GenerateDialog items={dialog.items} onClose={() => setDialog(null)} onDone={(result) => {
       setDialog(null);
       const summary = generationSummary(result);

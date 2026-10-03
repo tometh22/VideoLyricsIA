@@ -217,6 +217,38 @@ def send_umg_change_request_notification(
         _send_email(owner_email.strip(), subject, body)
 
 
+def send_umg_publication_notice(
+    to: str, *, artist: str, song: str, portal_id: str | None, revision: int,
+    comments: list[str], portal_url: str,
+):
+    """Tell a UMG contact that a correction they asked for is published (see umg_publication_notice)."""
+    esc = html.escape
+    portal = _PORTAL_LABELS.get((portal_id or "").lower())
+
+    def one_line(value):
+        return " ".join(str(value or "").split())
+
+    shown = [one_line(c)[:240] for c in (comments or []) if one_line(c)][:5]
+    asked = "".join(f"<li>{esc(c)}</li>" for c in shown)
+    asked_block = (f'<p style="margin-top:16px;"><strong>Lo que pidieron:</strong></p>'
+                   f'<ul style="margin:8px 0 0 18px;padding:0;">{asked}</ul>') if asked else ""
+    content = f"""
+    <h2 style="color:#fff;margin:0 0 16px;">Ya está la versión {int(revision)}</h2>
+    <p>Corregimos <strong>{esc(one_line(song) or "la canción")}</strong>{f" de <strong>{esc(one_line(artist))}</strong>" if one_line(artist) else ""}
+    y la nueva versión ya está disponible en el portal{f" de {esc(portal)}" if portal else ""}.</p>
+    {asked_block}
+    {_button(portal_url, "Abrir el portal")}
+    <p style="margin-top:16px;color:#888;font-size:13px;">
+      La versión anterior queda reemplazada y hay que volver a aprobarla. Si algo no quedó como esperaban,
+      pueden pedir otro cambio desde el mismo portal.
+    </p>
+    """
+    subject = f"Genly · Versión {int(revision)} de «{one_line(song) or 'tu canción'}» lista en el portal"
+    if portal:
+        subject += f" ({portal})"
+    _send_email(to, subject, _wrap_template(content))
+
+
 def send_welcome(email: str, username: str):
     """Send welcome email after registration."""
     content = f"""

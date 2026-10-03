@@ -29,13 +29,27 @@ class _FakeResult:
 
 
 class _FakeModel:
-    def __init__(self, segments, *, calls=None):
+    """Mimics the stable-ts contract that matters: a multilingual model
+    refuses to align without a language (``alignment.get_alignment_tokenizer``
+    raises ``TypeError('expected argument for language')``)."""
+
+    def __init__(self, segments, *, calls=None, lid=None):
         self._segments = segments
         self.calls = calls if calls is not None else []
+        self.lid = lid
+        self.lid_calls = 0
 
     def align(self, audio, text, **kwargs):
+        if not kwargs.get("language"):
+            raise TypeError("expected argument for language")
         self.calls.append({"audio": audio, "text": text, **kwargs})
         return _FakeResult(self._segments)
+
+    def detect_language(self, mel):
+        self.lid_calls += 1
+        if isinstance(self.lid, Exception):
+            raise self.lid
+        return None, self.lid
 
 
 def _word(word, start, end, prob):
@@ -191,3 +205,105 @@ def test_the_loaded_model_is_reused_across_calls(monkeypatch, audio):
     monkeypatch.setenv("ANCHOR_LOCAL_ALIGN_MODEL", "small")
     lfa.local_forced_align(audio, LINES, language="es")
     assert loads == ["base", "small"]
+
+
+# ---------------------------------------------------------------------------
+# Idioma — staging job daa625bed6f1 (IKV "DJ Droga", 3-oct-2026)
+# ---------------------------------------------------------------------------
+# The caller resolves the language with the lexical detector, which abstains
+# on most lyrics (it returns nothing for a clean Spanish verse). stable-ts then
+# raised ``TypeError: expected argument for language`` on stem AND mix, and the
+# log said only "decline on error: TypeError".
+
+
+def _lid_windows(monkeypatch):
+    monkeypatch.setattr(lfa, "_mel_windows", lambda model, path: object())
+
+
+def test_a_missing_language_is_detected_from_the_audio_not_passed_as_none(
+        monkeypatch, audio):
+    model = _FakeModel(HEALTHY, lid=[{"es": 0.8, "en": 0.1}, {"es": 0.7, "pt": 0.2}])
+    _install(monkeypatch, model)
+    _lid_windows(monkeypatch)
+
+    out = lfa.local_forced_align(audio, LINES, language=None, job_id="daa625bed6f1")
+
+    assert out is not None and len(out) == len(LINES)
+    assert model.lid_calls == 1
+    assert model.calls[0]["language"] == "es"
+
+
+def test_an_explicit_language_skips_audio_detection(monkeypatch, audio):
+    model = _FakeModel(HEALTHY, lid=AssertionError("LID must not run"))
+    _install(monkeypatch, model)
+
+    assert lfa.local_forced_align(audio, LINES, language="ES ") is not None
+    assert model.lid_calls == 0
+    assert model.calls[0]["language"] == "es"
+
+
+def test_audio_detection_only_chooses_among_supported_languages(monkeypatch, audio):
+    """Whisper LID has answered Nynorsk/Welsh for Spanish songs (3-sep, 9-sep):
+    an unsupported winner must never steer the forced alignment."""
+    model = _FakeModel(HEALTHY, lid=[{"nn": 0.6, "cy": 0.2, "es": 0.15, "en": 0.05}])
+    _install(monkeypatch, model)
+    _lid_windows(monkeypatch)
+
+    lfa.local_forced_align(audio, LINES, language=None)
+
+    assert model.calls[0]["language"] == "es"
+
+
+def test_failed_language_detection_declines_without_raising(monkeypatch, audio, caplog):
+    model = _FakeModel(HEALTHY, lid=RuntimeError("ffmpeg missing"))
+    _install(monkeypatch, model)
+    _lid_windows(monkeypatch)
+
+    with caplog.at_level("WARNING", logger="uvicorn.error"):
+        assert lfa.local_forced_align(audio, LINES, language=None, job_id="j") is None
+
+    assert model.calls == []
+    assert "ffmpeg missing" in caplog.text
+    assert "no language for the aligner" in caplog.text
+
+
+def test_the_decline_log_carries_the_exception_message(monkeypatch, audio, caplog):
+    """"decline on error: TypeError" hid the missing language; the message
+    must travel with the type so the next one is diagnosable from the log."""
+
+    class _Exploding(_FakeModel):
+        def align(self, audio, text, **kwargs):
+            raise TypeError("align() got an unexpected keyword argument 'stream'")
+
+    _install(monkeypatch, _Exploding(HEALTHY))
+
+    with caplog.at_level("WARNING", logger="uvicorn.error"):
+        assert lfa.local_forced_align(audio, LINES, language="es", job_id="j") is None
+
+    assert "TypeError: align() got an unexpected keyword argument 'stream'" in caplog.text
+
+
+def test_detect_audio_language_never_raises_and_respects_the_kill_switch(
+        monkeypatch, audio, tmp_path):
+    model = _FakeModel(HEALTHY, lid=[{"en": 0.9, "es": 0.05}])
+    _install(monkeypatch, model)
+    _lid_windows(monkeypatch)
+
+    assert lfa.detect_audio_language(audio) == "en"
+    assert lfa.detect_audio_language(str(tmp_path / "missing.wav")) is None
+    monkeypatch.setenv("ANCHOR_LOCAL_ALIGN_ENABLED", "0")
+    assert lfa.detect_audio_language(audio) is None
+
+
+def test_installed_stable_ts_still_demands_a_language():
+    """Pins the upstream contract the fakes above mimic. If stable-ts ever
+    starts auto-detecting, this fails and the LID fallback can be revisited."""
+    alignment = pytest.importorskip("stable_whisper.alignment")
+    import inspect
+
+    params = inspect.signature(alignment.align).parameters
+    assert "language" in params and "original_split" in params
+
+    multilingual = types.SimpleNamespace(is_multilingual=True)
+    with pytest.raises(TypeError, match="expected argument for language"):
+        alignment.get_alignment_tokenizer(multilingual, False, "hola", None)
