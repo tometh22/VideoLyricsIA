@@ -523,6 +523,12 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                 r.get("segments") or [], _stem, audio_duration=_dur,
                 rescue_skipped=_skip, include_leading=live_hint,
             )
+            # Fase 5.2: el stem se borra al salir; los huecos se guardan acá.
+            import line_signals_v2 as _ls2
+            if _ls2.enabled():
+                r.setdefault("postpass_stats", {})["voiced_gaps_v2"] = [
+                    dict(gap) for gap in (_vg or [])
+                ]
             _independent = r.get("_independent_asr_words") or []
             _lexical_verification = {
                 "total": 0, "verified": 0, "unverified": 0, "details": [],
@@ -1154,6 +1160,22 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         # Missing witnesses force router abstention rather than agreement.
         pass
     final["metrics"] = final_metrics
+    # Fase 5.2 (EVIDENCE_PERSIST_V2): señales por línea que hoy se tiran,
+    # escritas sobre los segmentos finales antes de congelar la versión 0.
+    # Solo agrega claves: segments_hash y las decisiones no cambian.
+    try:
+        import line_signals_v2
+        if line_signals_v2.enabled():
+            line_signals_v2.attach(
+                r, final_metrics,
+                asr_words=r.get("_asr_words") or [],
+                independent_words=r.get("_independent_asr_words") or [],
+                voiced_gaps=(r.get("postpass_stats") or {}).get("voiced_gaps_v2") or [],
+                voiced_gap_warn_s=float(os.environ.get("VOICED_GAP_WARN_S", "10")),
+            )
+    except Exception as exc:  # noqa: BLE001 — telemetría: nunca rompe el job
+        logger.warning("[LINE_SIGNALS_V2] sin escribir job=%s: %s",
+                       job_id, _safe_exception_code(exc))
     if auto_trace["status"] == "authorized":
         auto_trace["status"] = (
             "no_safe_candidate" if auto_trace["attempted"] else "not_needed"
