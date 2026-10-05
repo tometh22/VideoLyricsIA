@@ -49,6 +49,7 @@ jobs, y los inicios bajo 150 ms son el 5,5 % y los fines el 9,3 %.
 - **Las ediciones chicas que hay están en los inicios.** El 15 % de las
   ediciones de inicio queda debajo de 100 ms. Es consistente con la fase 2:
   el adelanto sobrante en las líneas WhisperX.
-- **Los fines se corrigen entre 200 y 500 ms.** Es el rango del aire que el
-  operador deja antes de la línea siguiente. Ese rango lo mide la prueba
-  prospectiva de `LYRIC_MIN_GAP_MS`, no una tolerancia.
+- **El 39 % de las ediciones de fin está entre 200 y 500 ms.** Es el rango
+  del aire que el operador deja antes de la línea siguiente. Eso lo mide la
+  prueba prospectiva de `LYRIC_MIN_GAP_MS`, no una tolerancia. El 46 % que
+  supera los 500 ms son errores de alineación, no de presentación.
