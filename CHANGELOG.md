@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.111] - 2026-10-05
+
+### Added
+
+- Con `EVIDENCE_PERSIST_V2` (apagada por defecto), cada línea de máquina guarda señales que antes se calculaban y se descartaban:
+  - parecido entre el texto y lo que oyó el ASR;
+  - canto sin cartel antes y después de la línea;
+  - milisegundos por carácter (línea truncada);
+  - mediana y mínimo del score por palabra;
+  - un marcador positivo de la validación de timing por palabra.
+
+  El acuerdo del consenso dirigido por línea queda en el registro de auditoría. Es solo escritura: no cambia texto, timing ni decisiones.
+
 ## [1.1.109] - 2026-10-03
 
 ### Fixed
