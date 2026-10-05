@@ -452,9 +452,11 @@ def test_render_capacity_allows_batch_art_track_without_lyrics_approval(db):
     batch.enforce_render_capacity(db, job)
 
 
-def test_render_capacity_reuses_the_current_final_review_slot(db, monkeypatch):
+@pytest.mark.parametrize("campaign_status", ["active", "completed"])
+def test_render_capacity_reuses_the_current_final_review_slot(db, monkeypatch, campaign_status):
     monkeypatch.setattr(batch, "FINAL_REVIEW_LIMIT", 2)
     campaign = _campaign(db, 2)
+    campaign.status = campaign_status
     items = db.query(BatchCampaignItem).filter(
         BatchCampaignItem.campaign_id == campaign.id,
     ).order_by(BatchCampaignItem.ordinal).all()
@@ -497,6 +499,12 @@ def test_render_capacity_reuses_the_current_final_review_slot(db, monkeypatch):
     # Candidate + one other fills the two-slot buffer. Re-rendering the
     # candidate replaces its own slot and must remain possible.
     batch.enforce_render_capacity(db, candidate)
+    # Completion permits a correction, but never bypasses the shared buffer.
+    monkeypatch.setattr(batch, "FINAL_REVIEW_LIMIT", 1)
+    with pytest.raises(HTTPException) as exc:
+        batch.enforce_render_capacity(db, candidate)
+    assert exc.value.status_code == 429
+    assert exc.value.detail["code"] == "batch_final_review_full"
 
 
 @pytest.mark.parametrize("reference_available", [True, False])
@@ -765,9 +773,14 @@ def test_human_approval_recovers_missing_reference_from_machine_evidence(
     assert repair.detail["source"] == "editor_document.machine_evidence"
 
 
-def test_post_render_reapproval_restores_gate_without_hiding_video_from_review(db, monkeypatch):
+@pytest.mark.parametrize("campaign_status", ["active", "completed", "paused", "cancelled"])
+@pytest.mark.parametrize("job_status", ["pending_review", "done", "rejected", "transcribed_pending"])
+def test_post_render_reapproval_restores_gate_without_hiding_video_from_review(
+    db, monkeypatch, campaign_status, job_status,
+):
     monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
     campaign = _campaign(db, 1)
+    campaign.status = campaign_status
     item = db.query(BatchCampaignItem).filter(
         BatchCampaignItem.campaign_id == campaign.id,
     ).one()
@@ -781,7 +794,7 @@ def test_post_render_reapproval_restores_gate_without_hiding_video_from_review(d
         job_id=uuid.uuid4().hex[:12], user_id=user.id,
         tenant_id=campaign.tenant_id, artist=item.artist,
         song_title=item.title, filename=item.filename,
-        status="pending_review", current_step="thumbnail",
+        status=job_status, current_step="thumbnail",
         workload_class="batch", campaign_id=campaign.id,
         campaign_item_id=item.id, segments_json=segments,
         segments_revision=7, input_audio_sha256=audio_sha,
@@ -803,28 +816,58 @@ def test_post_render_reapproval_restores_gate_without_hiding_video_from_review(d
     ))
     db.commit()
 
-    response = batch.approve_campaign_lyrics(
-        campaign.id, job.job_id,
-        batch.LyricsApprovalRequest(
-            editor_revision=7,
-            confirmed_line_ids=["line-1", "line-2"],
-            lyrics_confirmed=True, timings_confirmed=True,
-            heard_against_audio=True,
-        ),
-        {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"},
-        db,
+    request = batch.LyricsApprovalRequest(
+        editor_revision=7,
+        confirmed_line_ids=["line-1", "line-2"],
+        lyrics_confirmed=True, timings_confirmed=True,
+        heard_against_audio=True,
     )
+    actor = {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}
+    blocked = campaign_status in {"paused", "cancelled"} or (
+        campaign_status == "completed" and job_status == "transcribed_pending"
+    )
+    if blocked:
+        with pytest.raises(HTTPException) as exc:
+            batch.approve_campaign_lyrics(campaign.id, job.job_id, request, actor, db)
+        assert exc.value.status_code == 409
+        assert exc.value.detail == "Campaign is not reviewable."
+        assert job.status == job_status
+        assert "pre_background_approval" not in job.transcription_quality
+        # An otherwise valid snapshot cannot bypass pause/cancel or start a
+        # first render in a completed campaign either.
+        job.transcription_quality = {
+            **job.transcription_quality,
+            "pre_background_approval": {
+                "audio_sha256": audio_sha, "audio_revision": 1,
+                "editor_revision": 7, "segments_sha256": segments_hash(segments),
+                "lyrics_confirmed": True, "timings_confirmed": True,
+                "heard_against_audio": True,
+            },
+        }
+        with pytest.raises(HTTPException) as exc:
+            batch.enforce_render_capacity(db, job)
+        assert exc.value.status_code == 409
+        assert exc.value.detail == "Campaign is not active."
+        return
+
+    response = batch.approve_campaign_lyrics(campaign.id, job.job_id, request, actor, db)
 
     db.refresh(job)
-    assert response["status"] == "pending_review"
-    assert job.status == "pending_review"
-    assert job.current_step == "thumbnail"
+    expected_status = "lyrics_approved" if job_status == "transcribed_pending" else job_status
+    assert response["status"] == expected_status
+    assert job.status == expected_status
+    if job_status != "transcribed_pending":
+        assert job.current_step == "thumbnail"
     assert batch.require_prebackground_approval(job)["editor_revision"] == 7
+    batch.enforce_render_capacity(db, job)
+    db.refresh(campaign)
+    assert campaign.status == campaign_status
     event = db.query(AuditLog).filter_by(
         action="batch.lyrics_and_timing_approved",
     ).order_by(AuditLog.id.desc()).first()
-    assert event.detail["post_render_reapproval"] is True
-    assert event.detail["preserved_status"] == "pending_review"
+    assert event.detail["post_render_reapproval"] is (job_status != "transcribed_pending")
+    if job_status != "transcribed_pending":
+        assert event.detail["preserved_status"] == job_status
 
 
 def test_platform_admin_can_skip_to_next_job_in_foreign_tenant(db, monkeypatch):
