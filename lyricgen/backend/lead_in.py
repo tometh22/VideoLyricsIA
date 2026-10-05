@@ -29,6 +29,8 @@ CONTRACT
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import contextvars
 import logging
 import os
 
@@ -73,6 +75,66 @@ def lead_seconds() -> float:
     return lead
 
 
+# Aire mínimo antes de la línea siguiente (LYRIC_MIN_GAP_MS). 0 = el
+# comportamiento de siempre: el hold se clampea a siguiente − _MIN_GAP_S y
+# nunca acorta. Con un valor mayor, el fin se recorta cuando hace falta para
+# dejar ese aire (diagnóstico 2026-10-05: al editar un fin, el operador deja
+# 0,3-0,4 s de aire). La prueba prospectiva fija el valor por job con
+# `min_gap_override`, sin tocar el entorno.
+_MIN_GAP_OVERRIDE_MS: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "lyric_min_gap_override_ms", default=None,
+)
+_GAP_STATS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "lyric_min_gap_stats", default=None,
+)
+# Pisos del recorte. La última palabra puede quedar fuera de la tarjeta a lo
+# sumo 0,10 s: por debajo del aviso LYRIC_END_BEFORE_WORD_END del preflight
+# (0,12 s) y lejos del re-estirado de enforce_line_word_consistency (0,35 s).
+# Ninguna línea queda más corta que el mínimo de normalize_segments_timing.
+_WORD_FLOOR_S = 0.10
+_MIN_LINE_S = 0.3
+
+
+def min_gap_seconds() -> float:
+    """Aire mínimo configurado, en segundos (0 = comportamiento actual)."""
+    override = _MIN_GAP_OVERRIDE_MS.get()
+    raw = override if override is not None else os.environ.get("LYRIC_MIN_GAP_MS", "0")
+    try:
+        return max(0, int(float(raw))) / 1000.0
+    except (TypeError, ValueError):
+        logger.warning("[LEAD_IN] LYRIC_MIN_GAP_MS=%r inválido — 0", raw)
+        return 0.0
+
+
+@contextmanager
+def min_gap_override(gap_ms: int | None, stats: dict | None = None):
+    """Fija el aire mínimo (y junta exposición) para el job en curso.
+
+    Las ContextVar viajan con ``asyncio.run``, así que todos los ``polish``
+    del job (el del emisor y el posterior al retime de CTC) ven el mismo
+    valor sin cambiar sus firmas.
+    """
+    gap_token = _MIN_GAP_OVERRIDE_MS.set(gap_ms)
+    stats_token = _GAP_STATS.set(stats)
+    try:
+        yield
+    finally:
+        _MIN_GAP_OVERRIDE_MS.reset(gap_token)
+        _GAP_STATS.reset(stats_token)
+
+
+def _last_word_end(seg: dict) -> float | None:
+    ends = []
+    for word in seg.get("words") or []:
+        if not isinstance(word, dict):
+            continue
+        try:
+            ends.append(float(word.get("end", word.get("start"))))
+        except (TypeError, ValueError):
+            continue
+    return max(ends) if ends else None
+
+
 def hold_seconds() -> float:
     """Hold configurado (LYRIC_HOLD_S), saneado. Default seguro = 0.5 s.
 
@@ -104,29 +166,57 @@ def apply_hold(segs: list[dict], hold_s: float | None = None) -> list[dict]:
     no como sustituto del endpoint derivado del canto. Nunca acorta; la última
     línea queda intacta (sin señal de gold para el outro, y el hold infinito
     de ROTOR es justo lo que los operadores no hacen).
+
+    Con LYRIC_MIN_GAP_MS > 0 (o `min_gap_override`) el tope pasa a ser
+    siguiente − aire, y además se recorta el fin cuando ya invade ese aire,
+    sin bajar de última palabra − 0,10 s ni de inicio + 0,3 s, y sin tocar
+    líneas bloqueadas. Con 0 el comportamiento es el de siempre.
     """
     hold = hold_seconds() if hold_s is None else max(0.0, float(hold_s))
-    if not segs or hold <= 0.0:
+    gap = max(_MIN_GAP_S, min_gap_seconds())
+    trim = gap > _MIN_GAP_S
+    if not segs or (hold <= 0.0 and not trim):
         return segs
+    stats = _GAP_STATS.get()
     try:
         out: list[dict] = []
-        moved = 0
+        moved = trimmed = floored = 0
         for i, seg in enumerate(segs):
             new = dict(seg)
             try:
                 end = float(seg.get("end", 0.0))
                 if i + 1 < len(segs):
                     nxt = float(segs[i + 1].get("start", end))
-                    target = min(end + hold, nxt - _MIN_GAP_S)
+                    target = min(end + hold, nxt - gap)
                     if target > end:
                         new["end"] = round(target, 3)
                         moved += 1
+                    elif trim and target < end and not (
+                        seg.get("locked") or seg.get("operator_locked")
+                    ):
+                        start = float(seg.get("start", 0.0))
+                        # Solapes grandes (armonías, coros encimados): no tocar.
+                        if nxt > start + _MIN_LINE_S:
+                            floor = start + _MIN_LINE_S
+                            last_word = _last_word_end(seg)
+                            if last_word is not None:
+                                floor = max(floor, last_word - _WORD_FLOOR_S)
+                            new_end = max(target, floor)
+                            if new_end < end - 0.001:
+                                new["end"] = round(new_end, 3)
+                                trimmed += 1
+                                floored += new_end > target + 0.001
             except (TypeError, ValueError):
                 pass
             out.append(new)
-        if moved:
-            logger.info("[LEAD_IN] %d/%d ends extendidos (hold=%.2fs)",
-                        moved, len(segs), hold)
+        if moved or trimmed:
+            logger.info("[LEAD_IN] %d/%d ends extendidos, %d recortados (hold=%.2fs gap=%.2fs)",
+                        moved, len(segs), trimmed, hold, gap)
+        if stats is not None:
+            stats["polish_calls"] = stats.get("polish_calls", 0) + 1
+            stats["lines_seen"] = stats.get("lines_seen", 0) + len(segs)
+            stats["lines_trimmed"] = stats.get("lines_trimmed", 0) + trimmed
+            stats["lines_word_floor"] = stats.get("lines_word_floor", 0) + floored
         return out
     except Exception as e:  # pragma: no cover
         logger.warning("[LEAD_IN] apply_hold falló (%s) — segmentos originales", e)
