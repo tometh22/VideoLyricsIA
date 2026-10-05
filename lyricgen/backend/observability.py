@@ -49,6 +49,9 @@ def runtime_timing_config() -> dict[str, float | int | bool]:
         "lyric_lead_in_s": _float_env("LYRIC_LEAD_IN_S"),
         "lyric_lead_in_ms": _int_env("LYRIC_LEAD_IN_MS"),
         "stable_pitch_tail_enabled": _bool_env("STABLE_PITCH_TAIL_ENABLED"),
+        "lyric_min_gap_ms": _int_env("LYRIC_MIN_GAP_MS"),
+        "lyric_min_gap_ab_enabled": _bool_env("LYRIC_MIN_GAP_AB_ENABLED"),
+        "lyric_min_gap_ab_arm_b_ms": _int_env("LYRIC_MIN_GAP_AB_ARM_B_MS", 300),
     }
 
 
