@@ -6,6 +6,12 @@
 
 - Permitir aprobar y re-renderizar correcciones de videos ya generados en campañas completadas. Las campañas pausadas o canceladas siguen bloqueadas, y se conservan la aprobación de letra/audio/revisión y los límites de generación y revisión final. No se reabre la campaña ni se inicia una nueva tanda de transcripciones.
 
+## [1.1.114] - 2026-10-05
+
+### Added
+
+- `CTC_ALIGN_UNKNOWN_LANG_JOB_ES` (apagada por defecto): el alineado CTC acepta una letra cuyo idioma el detector de texto no puede decidir ("unknown", típico de textos cortos o repetitivos) si el job está en español. El piso de mediana de score sigue declinando un idioma equivocado; un texto detectado como inglés sigue fuera.
+
 ## [1.1.112] - 2026-10-05
 
 ### Added

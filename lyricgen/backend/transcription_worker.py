@@ -1569,7 +1569,8 @@ def run_transcription_job(
                 _record_reconcile_result(r, "post:_maybe_apply_approved_reuse")
             if not (isinstance(r, dict)
                     and r.get("timing_source") == "anchor_ctc"):
-                r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title)
+                r = await _maybe_ctc_retime(r, audio_path, job_id, artist, title,
+                                            language=language or "")
                 _record_reconcile_result(r, "post:_maybe_ctc_retime")
             _post_lang = _resolve_postprocess_language(
                 language, r, job_id=job_id,
