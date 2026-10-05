@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.113] - 2026-10-05
+
+### Fixed
+
+- Permitir aprobar y re-renderizar correcciones de videos ya generados en campañas completadas. Las campañas pausadas o canceladas siguen bloqueadas, y se conservan la aprobación de letra/audio/revisión y los límites de generación y revisión final. No se reabre la campaña ni se inicia una nueva tanda de transcripciones.
+
 ## [1.1.112] - 2026-10-05
 
 ### Added
