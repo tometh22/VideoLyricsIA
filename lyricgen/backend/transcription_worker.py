@@ -523,6 +523,12 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                 r.get("segments") or [], _stem, audio_duration=_dur,
                 rescue_skipped=_skip, include_leading=live_hint,
             )
+            # Fase 5.2: el stem se borra al salir; los huecos se guardan acá.
+            import line_signals_v2 as _ls2
+            if _ls2.enabled():
+                r.setdefault("postpass_stats", {})["voiced_gaps_v2"] = [
+                    dict(gap) for gap in (_vg or [])
+                ]
             _independent = r.get("_independent_asr_words") or []
             _lexical_verification = {
                 "total": 0, "verified": 0, "unverified": 0, "details": [],
@@ -1154,6 +1160,22 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
         # Missing witnesses force router abstention rather than agreement.
         pass
     final["metrics"] = final_metrics
+    # Fase 5.2 (EVIDENCE_PERSIST_V2): señales por línea que hoy se tiran,
+    # escritas sobre los segmentos finales antes de congelar la versión 0.
+    # Solo agrega claves: segments_hash y las decisiones no cambian.
+    try:
+        import line_signals_v2
+        if line_signals_v2.enabled():
+            line_signals_v2.attach(
+                r, final_metrics,
+                asr_words=r.get("_asr_words") or [],
+                independent_words=r.get("_independent_asr_words") or [],
+                voiced_gaps=(r.get("postpass_stats") or {}).get("voiced_gaps_v2") or [],
+                voiced_gap_warn_s=float(os.environ.get("VOICED_GAP_WARN_S", "10")),
+            )
+    except Exception as exc:  # noqa: BLE001 — telemetría: nunca rompe el job
+        logger.warning("[LINE_SIGNALS_V2] sin escribir job=%s: %s",
+                       job_id, _safe_exception_code(exc))
     if auto_trace["status"] == "authorized":
         auto_trace["status"] = (
             "no_safe_candidate" if auto_trace["attempted"] else "not_needed"
@@ -1197,6 +1219,37 @@ async def _quality_gate_and_retry(r: dict, audio_path: str, job_id: str,
     r.pop("_lora_asr_family", None)
     r.pop("_lora_family_role", None)
     return r
+
+
+def _line_gap_assignment(job_id: str) -> dict | None:
+    """Brazo de la prueba del aire mínimo, o None. Nunca rompe la transcripción."""
+    try:
+        import line_gap_experiment
+        from database import Job, SessionLocal
+
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.job_id == job_id).first()
+            return line_gap_experiment.assign(db, job) if job is not None else None
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001 — sin asignación = brazo A sin registro
+        logger.warning("[LINE_GAP_AB] job=%s sin asignación: %s", job_id, type(exc).__name__)
+        return None
+
+
+def _record_line_gap_exposure(job_id: str, assignment: dict, stats: dict) -> None:
+    try:
+        import line_gap_experiment
+        from database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            line_gap_experiment.record_exposure(db, job_id, assignment, stats)
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[LINE_GAP_AB] job=%s exposición sin registrar: %s", job_id, type(exc).__name__)
 
 
 def run_transcription_job(
@@ -1581,7 +1634,17 @@ def run_transcription_job(
                 is_live=live or _looks_live(title, filename),
             )
 
-        result = asyncio.run(_run_with_retime())
+        # Prueba prospectiva del aire mínimo (LYRIC_MIN_GAP_AB_ENABLED): el
+        # brazo se fija una vez por job y viaja por ContextVar a los polish.
+        _gap_assignment = _line_gap_assignment(job_id)
+        if _gap_assignment is None:
+            result = asyncio.run(_run_with_retime())
+        else:
+            import lead_in as _gap_lead_in
+            _gap_stats: dict = {}
+            with _gap_lead_in.min_gap_override(int(_gap_assignment.get("gap_ms") or 0), _gap_stats):
+                result = asyncio.run(_run_with_retime())
+            _record_line_gap_exposure(job_id, _gap_assignment, _gap_stats)
     except Exception as exc:
         error_type = _safe_exception_code(exc)
         anchor_declined = str(exc) == "operator_reference_alignment_declined"

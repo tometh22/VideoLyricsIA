@@ -22,12 +22,18 @@ def test_runtime_timing_config_normalizes_equivalent_values(monkeypatch):
     monkeypatch.setenv("LYRIC_LEAD_IN_S", "0.00")
     monkeypatch.setenv("LYRIC_LEAD_IN_MS", "000")
     monkeypatch.setenv("STABLE_PITCH_TAIL_ENABLED", "false")
+    monkeypatch.delenv("LYRIC_MIN_GAP_MS", raising=False)
+    monkeypatch.delenv("LYRIC_MIN_GAP_AB_ENABLED", raising=False)
+    monkeypatch.delenv("LYRIC_MIN_GAP_AB_ARM_B_MS", raising=False)
 
     assert runtime_timing_config() == {
         "lyric_hold_s": 0.5,
         "lyric_lead_in_s": 0.0,
         "lyric_lead_in_ms": 0,
         "stable_pitch_tail_enabled": False,
+        "lyric_min_gap_ms": 0,
+        "lyric_min_gap_ab_enabled": False,
+        "lyric_min_gap_ab_arm_b_ms": 300,
     }
 
 

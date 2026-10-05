@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.1.112] - 2026-10-05
+
+### Added
+
+- Aire mínimo antes de la línea siguiente (`LYRIC_MIN_GAP_MS`, apagado por defecto). Con un valor mayor a 0, el fin de una línea se recorta para dejar ese aire, sin cortar más de 0,10 s de la última palabra ni dejar la línea en menos de 0,3 s, y sin tocar líneas bloqueadas. Con 0 el comportamiento es el de siempre.
+- Prueba prospectiva A/B del aire mínimo en campañas UMG nuevas de staging (`LYRIC_MIN_GAP_AB_ENABLED`). La asignación alterna por job y queda en el registro de auditoría: brazo A sin cambios, brazo B con 300 ms. Los jobs ya aprobados nunca participan.
+
+## [1.1.111] - 2026-10-05
+
+### Added
+
+- Con `EVIDENCE_PERSIST_V2` (apagada por defecto), cada línea de máquina guarda señales que antes se calculaban y se descartaban:
+  - parecido entre el texto y lo que oyó el ASR;
+  - canto sin cartel antes y después de la línea;
+  - milisegundos por carácter (línea truncada);
+  - mediana y mínimo del score por palabra;
+  - un marcador positivo de la validación de timing por palabra.
+
+  El acuerdo del consenso dirigido por línea queda en el registro de auditoría. Es solo escritura: no cambia texto, timing ni decisiones.
+
 ## [1.1.109] - 2026-10-03
 
 ### Fixed

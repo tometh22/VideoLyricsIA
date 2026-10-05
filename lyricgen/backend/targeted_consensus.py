@@ -1580,6 +1580,14 @@ def reprocess(result: dict, audio_path: str, windows: list[dict], *,
                     without_agreed=without_lora,
                     without_evidence=without_lora_evidence,
                 )
+                import line_signals_v2
+                if line_signals_v2.enabled():
+                    stats.setdefault("line_consensus_v2", []).append(
+                        line_signals_v2.consensus_row(
+                            index, window.get("id"), evidence,
+                            without_lora_evidence, bool(agreed),
+                        )
+                    )
                 if not agreed or not _safe_line(agreed):
                     continue
                 candidate = _text(agreed)
