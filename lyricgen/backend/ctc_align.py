@@ -1309,6 +1309,117 @@ def align_structural_window(audio_path: str, texts: list[str], start: float,
         return None
 
 
+def _load_window(audio_path: str, start: float, end: float):
+    """Mono 16 kHz de [start, end]. Usa torchaudio.info si existe (pin de
+    producción) y cae a soundfile en versiones que lo quitaron."""
+    import torch
+    import torchaudio
+
+    duration = end - start
+    if hasattr(torchaudio, "info"):
+        info = torchaudio.info(audio_path)
+        source_sr = info.sample_rate or SR
+        wav, sr = torchaudio.load(
+            audio_path, frame_offset=max(0, int(start * source_sr)),
+            num_frames=max(1, int(duration * source_sr)),
+        )
+    else:
+        import soundfile
+
+        sr = soundfile.info(audio_path).samplerate
+        data, _ = soundfile.read(
+            audio_path, start=max(0, int(start * sr)), stop=int(end * sr),
+            dtype="float32", always_2d=True,
+        )
+        wav = torch.from_numpy(data.T.copy())
+    wav = wav.mean(0, keepdim=True)
+    if sr != SR:
+        wav = torchaudio.functional.resample(wav, sr, SR)
+    return wav
+
+
+def align_line(audio_path: str, text: str, window_start: float,
+               window_end: float, job_id: str = "") -> dict:
+    """Alinea UNA línea dentro de una ventana acotada (realineado tras
+    corregir el texto). Nunca cambia nada: devuelve una propuesta o un
+    motivo de declive.
+
+    Las estrellas antes y después del texto absorben el canto de las líneas
+    vecinas que cae dentro del margen. ``score`` es el promedio del score por
+    palabra (probabilidad media de sus tokens) y ``min_score`` el de la peor.
+    """
+    result = {"status": "declined", "reason": "", "window": [
+        round(float(window_start), 3), round(float(window_end), 3)]}
+    try:
+        if not is_enabled():
+            result["reason"] = "ctc_disabled"
+            return result
+        if not audio_path or not os.path.exists(audio_path):
+            result["reason"] = "audio_missing"
+            return result
+        clean = " ".join(str(text or "").split())
+        start, end = max(0.0, float(window_start)), float(window_end)
+        if not clean:
+            result["reason"] = "empty_text"
+            return result
+        if not (end - start >= 0.5 and end - start <= 45.0):
+            result["reason"] = "window_out_of_range"
+            return result
+
+        import torch
+        import torchaudio.functional as AF
+
+        model, dictionary, blank_id = _load_model()
+        star_id = model.config.vocab_size
+        word_sep_id = (
+            dictionary.get("|")
+            if os.environ.get("CTC_ALIGN_WORD_SEP", "1").strip().lower() in _TRUE
+            else None
+        )
+        targets, words = build_targets([clean], dictionary, star_id, word_sep_id=word_sep_id)
+        real_words = [w for w in words if w[0] >= 0]
+        if not real_words:
+            result["reason"] = "no_alignable_words"
+            return result
+        wav = _load_window(audio_path, start, end)
+        if len(targets) >= wav.shape[1] // FRAME:
+            result["reason"] = "window_too_short_for_text"
+            return result
+        emission = _emissions(model, wav, blank_id, _star_delta())
+        aligned, scores = AF.forced_align(
+            emission.unsqueeze(0),
+            torch.tensor(targets, dtype=torch.int32).unsqueeze(0),
+            blank=blank_id,
+        )
+        token_spans = AF.merge_tokens(aligned[0], scores[0].exp(), blank=blank_id)
+        spans = [(span.start, span.end, float(span.score)) for span in token_spans]
+        line = spans_to_lines(spans, words, 1, FRAME / SR)[0]
+        if line is None or not line[2]:
+            result["reason"] = "no_word_spans"
+            return result
+        local_start, local_end, word_spans = line
+        word_scores = [float(w[3]) for w in word_spans]
+        result.update({
+            "status": "ok",
+            "reason": "",
+            "start": round(start + local_start, 3),
+            "end": round(start + local_end, 3),
+            "score": round(sum(word_scores) / len(word_scores), 4),
+            "min_score": round(min(word_scores), 4),
+            "words": [
+                {"word": w, "start": round(start + ws, 3), "end": round(start + we, 3),
+                 "score": round(float(sc), 4)}
+                for w, ws, we, sc in word_spans
+            ],
+            "word_coverage": round(len(word_spans) / len(real_words), 3),
+        })
+        return result
+    except Exception as exc:  # noqa: BLE001 — una propuesta nunca rompe el editor
+        logger.warning("[CTC-LINE] decline on error: %s (job=%s)", type(exc).__name__, job_id)
+        result["reason"] = "error"
+        return result
+
+
 def _structural_anchor_slots(
     anchors: list[float], start: float, end: float,
     event_bounds: list[tuple[float, float]] | None = None,
