@@ -80,19 +80,17 @@ def clean_audit(db):
 
 
 def _job(db, *, tenant="universal_music", **overrides):
-    from database import Job
+    """Job liviano: ``assign`` solo lee atributos; no hace falta la fila
+    (en Postgres, ``campaign_id`` es FK a ``batch_campaigns``)."""
+    from types import SimpleNamespace
 
     fields = dict(
-        job_id=uuid.uuid4().hex[:12], user_id=1, tenant_id=tenant, artist="A",
-        filename="a.wav", status="processing", workload_class="batch",
+        job_id=uuid.uuid4().hex[:12], tenant_id=tenant, workload_class="batch",
         campaign_id="camp", campaign_item_id=uuid.uuid4().hex[:12],
-        segments_revision=0,
+        segments_revision=0, approved_at=None, pilot_id=None,
     )
     fields.update(overrides)
-    job = Job(**fields)
-    db.add(job)
-    db.commit()
-    return job
+    return SimpleNamespace(**fields)
 
 
 def test_assignment_alternates_and_is_sticky(db, clean_audit, monkeypatch):
