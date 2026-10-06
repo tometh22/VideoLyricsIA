@@ -3061,7 +3061,7 @@ export default function LyricsEditor({
   }, [selectTimingWorkspace, timingWorkspaceMode]);
 
   const reconcileQualityProposalDocument = useCallback(async ({ syncSegments = false } = {}) => {
-    const nextDocument = await durableEditor.load();
+    const nextDocument = await durableEditor.load({ replaceSegments: syncSegments });
     if (syncSegments && Array.isArray(nextDocument?.segments)) {
       setEdited(reseedPreservingIds(
         editedRef.current,
@@ -6012,7 +6012,7 @@ export default function LyricsEditor({
                 const result = await durableEditor.undoAutoRepair();
                 if (!result?.ok) {
                   if (result?.reason === "stale-revision") {
-                    await durableEditor.load();
+                    await reconcileQualityProposalDocument({ syncSegments: true });
                     toast({ message: "La canción cambió mientras la tenías abierta. Recargamos la versión actual.", tone: "warning" });
                   } else {
                     toast({ message: "No se pudo deshacer la mejora automática. Intentá de nuevo.", tone: "error" });

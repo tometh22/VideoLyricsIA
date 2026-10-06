@@ -85,7 +85,7 @@ export function useEditorDocument({ jobId, enabled, request }) {
     return true;
   }, []);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async ({ replaceSegments = false } = {}) => {
     if (!enabled || !jobId || !request) return null;
     setLoading(true);
     setError(null);
@@ -96,8 +96,23 @@ export function useEditorDocument({ jobId, enabled, request }) {
       });
       if (!result.ok) throw result.error;
       const body = result.body;
-      applyDocument(body);
-      return body;
+      const current = documentRef.current;
+      const sameJob = Boolean(current) && current.job_id === body.job_id;
+      // A diagnostic refresh does not replace the controlled lyric rows.
+      // Keep their original save base when another editor changed the song:
+      // advancing only the revision would authorize autosaving the old rows
+      // over that correction. The next save must go through the normal CAS
+      // conflict/three-way merge. Explicit callers replacing the visible rows
+      // can adopt the new snapshot and revision together.
+      const preserveBase = sameJob && !replaceSegments
+        && !segmentsEquivalent(current.segments || [], body.segments || []);
+      const next = preserveBase
+        ? { ...current, ...(body.lock ? { lock: body.lock } : {}) }
+        : body;
+      applyDocument(next);
+      // A delayed GET must not expose an older snapshot to a caller that
+      // will replace its visible rows after this promise resolves.
+      return documentRef.current;
     } catch (err) {
       if (mountedRef.current) {
         setError(String(err));
