@@ -61,6 +61,12 @@
       "id": "PYSEC-2026-1325",
       "expires": "2026-10-31",
       "owner": "backend/video"
+    },
+    {
+      "package": "python-jose",
+      "id": "CVE-2026-85394",
+      "expires": "2026-10-31",
+      "owner": "backend/video"
     }
   ]
 }
