@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadEditorDocumentWithRetry, useEditorDocument } from "./useEditorDocument";
+import { useEditorAutosave } from "./useEditorAutosave";
 
 function reply(body, status = 200) {
   return {
@@ -49,6 +51,103 @@ describe("loadEditorDocumentWithRetry", () => {
 });
 
 describe("useEditorDocument save ordering", () => {
+  it.each([false, true])("preserves the corrected 83-line server version after a diagnostic reload (local edit: %s)", async (hasLocalEdit) => {
+    const old = Array.from({ length: 58 }, (_, i) => ({
+      segment_id: `line-${i}`, start: i * 2, end: i * 2 + 1, text: `Original ${i}`,
+    }));
+    const corrected = [
+      { ...old[0], text: "Texto corregido" }, ...old.slice(1),
+      ...Array.from({ length: 25 }, (_, i) => ({
+        segment_id: `chorus-${i}`, start: 116 + i * 2, end: 117 + i * 2,
+        text: `Estribillo recuperado ${i}`,
+      })),
+    ];
+    const local = old.map((line, i) => hasLocalEdit && i === 1
+      ? { ...line, text: "Nueva edición local", end: line.end + 0.4 } : line);
+    let reads = 0;
+    let releaseReload;
+    const reloadResponse = new Promise((resolve) => { releaseReload = resolve; });
+    let stored = corrected;
+    const patches = [];
+    const request = vi.fn(async (path, options = {}) => {
+      if (path.endsWith("/lock/heartbeat")) return reply({ acquired: true });
+      if (path.endsWith("/lock")) return reply({ released: true });
+      if (!options.method) {
+        reads += 1;
+        return reads === 1
+          ? reply({ job_id: "reload-job", revision: 341, segments: old, lock: { active: false } })
+          : reloadResponse;
+      }
+      const body = JSON.parse(options.body);
+      patches.push(body);
+      if (body.base_revision !== 342) return reply({
+        detail: "editor_revision_conflict", server_revision: 342, server_segments: corrected,
+      }, 409);
+      stored = body.segments;
+      return reply({ revision: 343, applied: true });
+    });
+    const { result } = renderHook(() => {
+      const editor = useEditorDocument({ jobId: "reload-job", enabled: true, request });
+      const [segments, setSegments] = useState(old);
+      const autosave = useEditorAutosave({ enabled: !editor.loading, dirty: false,
+        segments, save: editor.save, reconcile: editor.reconcile, onMerged: setSegments });
+      return { editor, autosave, segments, setSegments };
+    });
+    await waitFor(() => expect(result.current.editor.loading).toBe(false));
+    // Quality finishing refreshes the server document, while the controlled
+    // editor rows still contain the older snapshot (plus any unsaved edit).
+    let pendingReload;
+    act(() => { pendingReload = result.current.editor.load(); });
+    if (hasLocalEdit) act(() => { result.current.setSegments(local); });
+    await act(async () => {
+      releaseReload(reply({ job_id: "reload-job", revision: 342, segments: corrected, lock: { active: false } }));
+      await pendingReload;
+    });
+    await act(async () => { await result.current.autosave.flush("autosave"); });
+
+    expect(stored).toHaveLength(83);
+    expect(patches[0].base_revision).toBe(341);
+    expect(stored[0].text).toBe("Texto corregido");
+    expect(stored).toEqual(expect.arrayContaining(corrected.slice(58).map((line) => expect.objectContaining(line))));
+    expect(result.current.segments).toEqual(stored);
+    expect(stored[1]).toMatchObject(hasLocalEdit
+      ? { text: "Nueva edición local", end: 3.4 } : old[1]);
+  });
+
+  it("allows an explicit reload that also replaces the visible lyric rows", async () => {
+    let reads = 0;
+    const request = vi.fn(async (path, options = {}) => {
+      if (path.endsWith("/lock/heartbeat")) return reply({ acquired: true });
+      if (options.method === "DELETE") return reply({ released: true });
+      reads += 1;
+      return reply({ job_id: "replace-job", revision: reads,
+        segments: [{ segment_id: "line", start: 0, end: 1, text: reads === 1 ? "Anterior" : "Corregida" }] });
+    });
+    const { result } = renderHook(() => useEditorDocument({ jobId: "replace-job", enabled: true, request }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(async () => { await result.current.load({ replaceSegments: true }); });
+    expect(result.current.revisionRef.current).toBe(2);
+    expect(result.current.document.segments[0].text).toBe("Corregida");
+  });
+
+  it("refreshes quality proposals when the lyric snapshot is unchanged", async () => {
+    let reads = 0;
+    const segments = [{ segment_id: "line", start: 0, end: 1, text: "Letra" }];
+    const request = vi.fn(async (path, options = {}) => {
+      if (path.endsWith("/lock/heartbeat")) return reply({ acquired: true });
+      if (options.method === "DELETE") return reply({ released: true });
+      reads += 1;
+      return reply({ job_id: "metadata-job", revision: 7, segments,
+        quality_proposal: { status: reads === 1 ? "pending" : "ready" } });
+    });
+    const { result } = renderHook(() => useEditorDocument({ jobId: "metadata-job", enabled: true, request }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(async () => { await result.current.load(); });
+    expect(result.current.document.quality_proposal.status).toBe("ready");
+    expect(result.current.revisionRef.current).toBe(7);
+    expect(result.current.document.segments).toEqual(segments);
+  });
+
   it("serializes PATCH requests and gives the second save the confirmed revision", async () => {
     let releaseFirst;
     const firstResponse = new Promise((resolve) => { releaseFirst = resolve; });

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.116] - 2026-10-06
+
+### Fixed
+
+- El editor conserva la revisión asociada a la letra en pantalla cuando una consulta de diagnóstico encuentra cambios de otra sesión. El siguiente guardado combina las versiones antes de escribir, evitando que una copia anterior sobrescriba una corrección completa. Las acciones que reemplazan la letra adoptan el texto y su revisión juntos.
+
 ## [1.1.115] - 2026-10-05
 
 ### Added
