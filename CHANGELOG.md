@@ -6,6 +6,12 @@
 
 - `CTC_ALIGN_UNKNOWN_LANG_JOB_ES` (apagada por defecto): el alineado CTC acepta una letra cuyo idioma el detector de texto no puede decidir ("unknown", típico de textos cortos o repetitivos) si el job está en español. El piso de mediana de score sigue declinando un idioma equivocado; un texto detectado como inglés sigue fuera.
 
+## [1.1.114] - 2026-10-05
+
+### Changed
+
+- `/health` muestra, para cada variable de timing, el valor efectivo, su origen (`env`, `default`, `empty` o `invalid`) y el valor crudo, en `timing_config_parity.effective_*`. Antes, "sin setear" y "0" se veían iguales: `LYRIC_LEAD_IN_MS` aparecía en 0 aunque se aplicaban 80 ms. La vista es informativa y no cambia el gate de paridad.
+
 ## [1.1.113] - 2026-10-05
 
 ### Fixed
