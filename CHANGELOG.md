@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.114] - 2026-10-05
+
+### Changed
+
+- `/health` muestra, para cada variable de timing, el valor efectivo, su origen (`env`, `default`, `empty` o `invalid`) y el valor crudo, en `timing_config_parity.effective_*`. Antes, "sin setear" y "0" se veían iguales: `LYRIC_LEAD_IN_MS` aparecía en 0 aunque se aplicaban 80 ms. La vista es informativa y no cambia el gate de paridad.
+
+## [1.1.113] - 2026-10-05
+
+### Fixed
+
+- Permitir aprobar y re-renderizar correcciones de videos ya generados en campañas completadas. Las campañas pausadas o canceladas siguen bloqueadas, y se conservan la aprobación de letra/audio/revisión y los límites de generación y revisión final. No se reabre la campaña ni se inicia una nueva tanda de transcripciones.
+
 ## [1.1.112] - 2026-10-05
 
 ### Added
