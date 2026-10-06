@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.117] - 2026-10-06
+
+### Fixed
+
+- Los efectos reactivos, incluido pulso de graves, renderizan canciones con cientos de beats sin exceder la profundidad del parser de FFmpeg. La máscara conserva todos los pulsos y su intensidad, y se calcula sobre una imagen pequeña antes de ampliarla al tamaño del video.
+
+### Added
+
+- Preset reutilizable UMG de foto fija inspirada en la letra, Poppins Bold en mayúsculas y reparto equilibrado entre bokeh, luces, polvo de luz, chispas, confeti, película y pulso de graves. El ayudante por API guarda estilos, verifica las aprobaciones existentes y envía una selección fija por tandas, con progreso persistente y reanudación sin duplicados.
+
 ## [1.1.116] - 2026-10-06
 
 ### Fixed

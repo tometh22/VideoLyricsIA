@@ -366,7 +366,16 @@ def _rhythm_envelope(rhythm: EffectRhythm | None, decay: float = 0.16) -> str:
         f"{strength:.3f}*(1-abs(T-{beat:.4f})/{decay:.3f}),0)"
         for beat, strength in pairs
     ]
-    return f"min(1,0.10+{'+'.join(pulses)})"
+    # FFmpeg's expression parser recurses through a flat addition chain. A
+    # normal song with hundreds of beats exceeds its depth limit. Preserve
+    # every selected beat while keeping the expression tree logarithmic.
+    def balanced_sum(terms):
+        if len(terms) == 1:
+            return terms[0]
+        midpoint = len(terms) // 2
+        return f"({balanced_sum(terms[:midpoint])}+{balanced_sum(terms[midpoint:])})"
+
+    return f"min(1,0.10+{balanced_sum(pulses)})"
 
 
 def rhythm_mask_graph(rhythm: EffectRhythm | None, width: int, height: int,
@@ -377,8 +386,12 @@ def rhythm_mask_graph(rhythm: EffectRhythm | None, width: int, height: int,
         return f"[{raw_label}]null[{out_label}];"
     env = _rhythm_envelope(rhythm)
     return (
-        f"color=c=white:s={width}x{height}:r=30,format=gray,"
-        f"geq=lum='255*({env})',format=gbrp[beatmask];"
+        # The envelope depends only on time. Evaluate it on four pixels,
+        # then expand the uniform mask instead of evaluating hundreds of
+        # beat expressions separately for every output pixel.
+        f"color=c=white:s=2x2:r=30,format=gray,"
+        f"geq=lum='255*({env})',scale={width}:{height}:flags=neighbor,"
+        f"format=gbrp[beatmask];"
         f"[{raw_label}][beatmask]blend=all_mode=multiply:shortest=1"
         f"[{out_label}];"
     )
