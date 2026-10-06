@@ -84,6 +84,16 @@ def is_enabled() -> bool:
     return os.environ.get("CTC_ALIGN_ENABLED", "0").strip().lower() in _TRUE
 
 
+def unknown_lang_job_es_enabled() -> bool:
+    """CTC_ALIGN_UNKNOWN_LANG_JOB_ES: alinear texto de idioma "unknown"
+    cuando el job está en español. Apagada por defecto."""
+    return os.environ.get("CTC_ALIGN_UNKNOWN_LANG_JOB_ES", "0").strip().lower() in _TRUE
+
+
+def _is_spanish(language: Optional[str]) -> bool:
+    return str(language or "").strip().lower() in {"es", "spa", "spanish", "español", "espanol"}
+
+
 def _star_delta() -> float:
     try:
         return float(os.environ.get("CTC_ALIGN_STAR_DELTA", "0.5"))
@@ -1637,7 +1647,8 @@ def retime_segments(audio_path: str, segments: list[dict],
                     job_id: str = "",
                     mix_path: Optional[str] = None,
                     max_skip_frac: Optional[float] = None,
-                    vocal_stem: Optional[bool] = None) -> Optional[list[dict]]:
+                    vocal_stem: Optional[bool] = None,
+                    language_hint: Optional[str] = None) -> Optional[list[dict]]:
     """Align the segments' text onto `audio_path` (vocal stem preferred)
     and return NEW segments with replaced start/end + word stamps.
     Texts pass through verbatim. Returns None to decline (caller keeps
@@ -1670,6 +1681,14 @@ def retime_segments(audio_path: str, segments: list[dict],
 
         lines = [(s.get("text") or "").strip() for s in segments]
         lang = guess_text_lang(lines)
+        if lang == "unknown" and unknown_lang_job_es_enabled() and _is_spanish(language_hint):
+            # Textos cortos o repetitivos no juntan palabras función para
+            # decidir y quedan "unknown". Si el job es en español, se alinea:
+            # el piso de mediana de score (CTC_ALIGN_MIN_MED_SCORE) sigue
+            # atajando un idioma equivocado.
+            logger.info("[CTC] text language=unknown, job language=%s — aligning (job=%s)",
+                        language_hint, job_id)
+            lang = "es"
         if lang != "es":
             # The model is Spanish-only; English aligns silently wrong
             # (it passes the char gate with ratio 1.0). Until a per-language

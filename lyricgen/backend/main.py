@@ -4898,7 +4898,8 @@ async def transcribe_uploaded(
         if not (isinstance(_result, dict)
                 and _result.get("timing_source") == "anchor_ctc"):
             _result = await _maybe_ctc_retime(_result, audio_path, job_id,
-                                              _row_artist, _row_title)
+                                              _row_artist, _row_title,
+                                              language=body.language or "")
         _post_lang = _resolve_postprocess_language(
             body.language, _result, job_id=job_id,
         )
@@ -5668,7 +5669,8 @@ async def transcribe_endpoint(
     resume_from_result(_result)
     from line_evidence import freeze_result_provider_evidence
     _result = freeze_result_provider_evidence(_result)
-    _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title)
+    _result = await _maybe_ctc_retime(_result, audio_path, job_id, artist, title,
+                                      language=language or "")
     _post_lang = _resolve_postprocess_language(
         language, _result, job_id=job_id,
     )
@@ -6654,7 +6656,8 @@ def _make_stem_window_transcriber(
 
 
 async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
-                            artist: str = "", title: str = ""):
+                            artist: str = "", title: str = "",
+                            language: str = ""):
     """Gated post-pass over the cascade's FINAL output (CTC_ALIGN_ENABLED,
     default OFF): re-time every line by full-song monotonic CTC forced
     alignment on the vocal stem (`ctc_align.py`). Texts pass through
@@ -6678,6 +6681,8 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
         if not _ctc.is_enabled() or not isinstance(result, dict):
             return result
         segs = result.get("segments") or []
+        # Idioma del job para el filtro de idioma del CTC (solo si viene).
+        _lang_kwargs = {"language_hint": language} if language else {}
         if len(segs) < 3:
             return result
         import vocal_sep as _vs
@@ -6724,7 +6729,8 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
         if _stem:
             retimed = await asyncio.wait_for(
                 asyncio.to_thread(_ctc.retime_segments, _stem, segs, job_id,
-                                  audio_path),  # mix_path — M5 crowd recovery
+                                  audio_path,  # mix_path — M5 crowd recovery
+                                  **_lang_kwargs),
                 timeout=420,
             )
             # Solo confiar en last_decline_reason (global de módulo) si
@@ -6783,7 +6789,8 @@ async def _maybe_ctc_retime(result, audio_path: str, job_id: str,
         if (retimed is None and _mix_fallback and not _stem_structural
                 and not _short_motif_decline):
             retimed = await asyncio.wait_for(
-                asyncio.to_thread(_ctc.retime_segments, audio_path, segs, job_id),
+                asyncio.to_thread(_ctc.retime_segments, audio_path, segs, job_id,
+                                  **_lang_kwargs),
                 timeout=420,
             )
             _short_motif_decline = (
