@@ -69,6 +69,7 @@ MAX_AUDIO_DURATION = float(os.environ.get("BATCH_MAX_AUDIO_DURATION", "3600"))
 _ACTIVE_TRANSCRIPTION = frozenset({"awaiting_upload", "transcribing_queued", "transcribing"})
 _ACTIVE_SEPARATION = frozenset({"separation_queued", "separating"})
 _ACTIVE_RENDER = frozenset({"queued", "processing", "editing", "background_generating", "rendering"})
+_POST_RENDER_REVIEW = frozenset({"pending_review", "done", "rejected"})
 _FAILURE = frozenset({"error", "transcription_failed", "validation_failed", "rejected"})
 _DISCARDABLE = _FAILURE | {"transcribed", "transcribed_pending"}
 _SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -79,6 +80,14 @@ _ALL_REVIEW_STATES = _PENDING_REVIEW_STATES | _APPROVED_REVIEW_STATES | {"discar
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _allows_song_review(campaign: BatchCampaign, job: Job) -> bool:
+    # Completion closes the initial batch, but delivered songs can still need
+    # corrections. Keep pause/cancel authoritative and never restart the feeder.
+    return campaign.status == "active" or (
+        campaign.status == "completed" and job.status in _POST_RENDER_REVIEW
+    )
 
 
 def art_track_feature_enabled() -> bool:
@@ -1259,8 +1268,6 @@ def approve_campaign_lyrics(
     """Bind one explicit song-level approval to the exact editor snapshot."""
     _require_scope(current_user)
     campaign = _campaign_or_404(db, campaign_id, current_user)
-    if campaign.status != "active":
-        raise HTTPException(status_code=409, detail="Campaign is not reviewable.")
     job = db.query(Job).filter(
         Job.job_id == job_id,
         Job.campaign_id == campaign.id,
@@ -1273,6 +1280,8 @@ def approve_campaign_lyrics(
     ).with_for_update().first()
     if job is None:
         raise HTTPException(status_code=404, detail="Campaign job not found.")
+    if not _allows_song_review(campaign, job):
+        raise HTTPException(status_code=409, detail="Campaign is not reviewable.")
     if not (
         body.lyrics_confirmed
         and body.timings_confirmed
@@ -1284,7 +1293,7 @@ def approve_campaign_lyrics(
         )
     quality = dict(job.transcription_quality or {})
     existing = quality.get("pre_background_approval") or {}
-    post_render_statuses = {"pending_review", "done", "rejected"}
+    post_render_statuses = _POST_RENDER_REVIEW
     preserves_rendered_status = job.status in post_render_statuses
     if job.status == "lyrics_approved" or preserves_rendered_status:
         try:
@@ -2658,7 +2667,7 @@ def enforce_render_capacity(db: Session, job: Job) -> None:
     campaign = db.query(BatchCampaign).filter(
         BatchCampaign.id == job.campaign_id,
     ).with_for_update().first()
-    if campaign is None or campaign.status != "active":
+    if campaign is None or not _allows_song_review(campaign, job):
         raise HTTPException(status_code=409, detail="Campaign is not active.")
     final_review = db.query(func.count(Job.id)).filter(
         Job.tenant_id == campaign.tenant_id,
