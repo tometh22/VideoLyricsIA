@@ -597,15 +597,27 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
             )
             cascada = r.get("audio_coverage")
             final = c["audio_coverage"]
+            stats = r.setdefault("postpass_stats", {})
+            # The cascade/pre-formatter values count recognized words;
+            # summarize may choose VAD-based voiced coverage for `final`.
+            # Comparing these different denominators falsely blamed the
+            # formatter for ASR blind spots (100% words vs 80% voiced audio).
+            # Preserve the ASR comparator across subsequent measurements,
+            # where r.audio_coverage has already become voiced coverage.
+            if "coverage_final" not in stats:
+                stats["cascade_asr_word_coverage"] = cascada
+            cascada_asr = stats.get("cascade_asr_word_coverage")
+            final_asr = c.get("asr_word_coverage")
             r["audio_coverage"] = final
-            r.setdefault("postpass_stats", {})["coverage_final"] = c
+            stats["coverage_final"] = c
             r["postpass_stats"]["quality_windows"] = _windows
             log = logger.warning if final < 0.8 else logger.info
-            log("[COVERAGE] final=%.0f%% (cascada=%s, pre-formatter=%s) "
+            log("[COVERAGE] final=%.0f%% (ASR final=%s, cascada ASR=%s, pre-formatter ASR=%s) "
                 "zonas_sin_letra=%d (%.1fs, peor %.1fs) "
                 "carteles_texto_equivocado=%d huecos_con_voz=%d (%.1fs) job=%s",
                 final * 100,
-                f"{cascada * 100:.0f}%" if cascada is not None else "?",
+                f"{final_asr * 100:.0f}%" if final_asr is not None else "?",
+                f"{cascada_asr * 100:.0f}%" if cascada_asr is not None else "?",
                 f"{antes_fmt * 100:.0f}%" if antes_fmt is not None else "?",
                 c["uncovered_spans"], c["uncovered_seconds"],
                 c["worst_span_s"], c.get("text_mismatches", 0),
@@ -631,16 +643,19 @@ def _medir_cobertura_final(r, job_id: str, antes_fmt: float | None,
                         "[COVERAGE] cartel #%d (%.1f-%.1fs) no suena a lo "
                         "cantado ahí (ratio=%.2f) job=%s",
                         m["index"], m["start"], m["end"], m["ratio"], job_id)
-            # Atribución explícita: qué etapa se comió el canto.
-            if cascada is not None and (cascada - final) > 0.02:
+            # Stage attribution must compare the same word-coverage metric.
+            # Voiced gaps retain their independent circuit breaker above.
+            if (cascada_asr is not None and final_asr is not None
+                    and (cascada_asr - final_asr) > 0.02):
                 logger.warning(
-                    "[COVERAGE] los POST-PASES perdieron %.0f%% del canto "
+                    "[COVERAGE] los POST-PASES perdieron %.0f%% de cobertura de palabras reconocidas "
                     "(cascada %.0f%% → final %.0f%%) job=%s",
-                    (cascada - final) * 100, cascada * 100, final * 100, job_id)
-            if antes_fmt is not None and (antes_fmt - final) > 0.02:
+                    (cascada_asr - final_asr) * 100, cascada_asr * 100, final_asr * 100, job_id)
+            if (antes_fmt is not None and final_asr is not None
+                    and (antes_fmt - final_asr) > 0.02):
                 logger.warning(
-                    "[COVERAGE] el FORMATTER perdió %.0f%% del canto job=%s",
-                    (antes_fmt - final) * 100, job_id)
+                    "[COVERAGE] pérdida desde pre-formatter: %.0f%% de cobertura de palabras reconocidas job=%s",
+                    (antes_fmt - final_asr) * 100, job_id)
             # Carteles vacíos: el defecto que no se pudo explicar en b3a51559.
             vacios = sum(1 for s in (r.get("segments") or [])
                          if isinstance(s, dict) and not (s.get("text") or "").strip())

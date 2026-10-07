@@ -68,7 +68,7 @@ def _read_jobs_file(path: Path) -> list[str]:
 def _fetch_job(db, job_id: str) -> dict | None:
     """Return a flat dict of the fields we need for benchmarking, or
     None if the job is unusable (missing audio, no segments, etc.)."""
-    from database import Job, ProductEvent
+    from database import EditorDocument, EditorVersion, Job, ProductEvent
     row = db.query(Job).filter(Job.job_id == job_id).first()
     if row is None:
         print(f"  ⚠ {job_id}: not found in DB")
@@ -79,6 +79,20 @@ def _fetch_job(db, job_id: str) -> dict | None:
     if not row.segments_json or not isinstance(row.segments_json, list) or len(row.segments_json) == 0:
         print(f"  ⚠ {job_id}: segments_json empty or invalid — needs operator approval first")
         return None
+    document = db.query(EditorDocument).filter(EditorDocument.job_id == job_id).first()
+    version = db.query(EditorVersion).filter(
+        EditorVersion.job_id == job_id,
+        EditorVersion.revision == int(row.segments_revision or 0),
+        EditorVersion.is_approved.is_(True),
+    ).first()
+    # A done job can contain a later, unapproved autosave. Never relabel it
+    # as the human target merely because an older version was approved.
+    if (document is None or version is None
+            or document.revision != row.segments_revision
+            or document.current_segments != version.segments
+            or row.segments_json != version.segments):
+        print(f"  ⚠ {job_id}: current snapshot is not the approved editor revision")
+        return None
     approval = (
         db.query(ProductEvent)
         .filter(ProductEvent.job_id == job_id, ProductEvent.name == "editor_approved")
@@ -86,6 +100,9 @@ def _fetch_job(db, job_id: str) -> dict | None:
         .first()
     )
     approval_props = (approval.properties or {}) if approval else {}
+    if approval_props.get("revision") != version.revision:
+        approval = None
+        approval_props = {}
     duration_ms = approval_props.get("active_edit_ms")
     operator_time_source = "active_edit_ms"
     if not isinstance(duration_ms, (int, float)):
@@ -103,8 +120,11 @@ def _fetch_job(db, job_id: str) -> dict | None:
         "filename": row.filename or "audio.wav",
         "status": row.status,
         "input_r2_key": row.input_r2_key,
-        "segments_json": row.segments_json,
+        "segments_json": version.segments,
         "segments_revision": int(row.segments_revision or 0),
+        "approved_version_id": version.id,
+        "input_audio_sha256": row.input_audio_sha256,
+        "audio_revision": row.audio_revision,
         "render_params": row.render_params or {},
         "delivery_profile": row.delivery_profile or "youtube",
         "is_live": is_live,
@@ -128,18 +148,33 @@ def _fetch_job(db, job_id: str) -> dict | None:
     }
 
 
-def _download_audio(input_r2_key: str, dest_dir: Path) -> Path | None:
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _download_audio(input_r2_key: str, dest_dir: Path,
+                    expected_sha256: str | None = None) -> Path | None:
     """Stream the input audio from R2 to dest_dir, preserving the
     original extension. Returns the local path or None on failure."""
     import storage
     ext = Path(input_r2_key).suffix or ".wav"
     local = dest_dir / f"audio{ext}"
     if local.exists() and local.stat().st_size > 0:
+        if expected_sha256 and _file_sha256(local) != expected_sha256:
+            print('      cached audio does not match the input snapshot; skipped')
+            return None
         print(f"      audio already present ({local.stat().st_size // 1024} KB), skip download")
         return local
     ok = storage.download_object(input_r2_key, str(local))
     if not ok:
         print(f"  ⚠ R2 download failed for {input_r2_key}")
+        return None
+    if expected_sha256 and _file_sha256(local) != expected_sha256:
+        print('      downloaded audio does not match the input snapshot; skipped')
         return None
     return local
 
@@ -188,7 +223,8 @@ def build_dataset(job_ids: list[str]) -> None:
             dest = OUT_ROOT / job_id
             dest.mkdir(parents=True, exist_ok=True)
 
-            audio_path = _download_audio(job["input_r2_key"], dest)
+            audio_path = _download_audio(job["input_r2_key"], dest,
+                                         job.get("input_audio_sha256"))
             if audio_path is None:
                 skip_count += 1
                 continue
@@ -234,6 +270,8 @@ def build_dataset(job_ids: list[str]) -> None:
             manifest_entries.append({
                 "job_id": job_id,
                 "segments_revision": job["segments_revision"],
+                "approved_version_id": job["approved_version_id"],
+                "audio_revision": job["audio_revision"],
                 "is_live": job["is_live"],
                 "is_live_source": job["is_live_source"],
                 "stratum": job["stratum"],

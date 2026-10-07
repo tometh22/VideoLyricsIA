@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.118] - 2026-10-07
+
+### Fixed
+
+- La atribución de pérdidas de cobertura compara palabras reconocidas contra palabras reconocidas. Los huecos estimados de voz conservan su control independiente; ya no se acusa al formateador de perder letra al comparar cobertura ASR con cobertura de voz. Se conserva la referencia ASR original al repetir la medición.
+- El exportador de benchmark exige que la letra actual coincida con la revisión aprobada y verifica el hash del audio descargado o cacheado, evitando usar autoguardados posteriores o audios de otra revisión como referencias humanas.
+
+### Added
+
+- Evaluación privada de correcciones aprobadas: snapshots de solo lectura, ejecución del worker en SQLite aislado sin enviar trabajos a la cola externa de calidad, captura del formateador y comparación de texto, ocurrencias de líneas y tiempos de carteles. Las referencias humanas no entran en la inferencia; las segundas voces con timing compartido no se puntúan como anotaciones acústicas independientes.
+
 ## [1.1.117] - 2026-10-06
 
 ### Fixed
