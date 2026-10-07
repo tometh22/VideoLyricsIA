@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.118] - 2026-10-07
+
+### Added
+
+- Evento de medición `editor_line_structure_changed` cada vez que el operador parte o une una línea. Registra cómo se resolvió el timing (palabras reales, palabras que ya no coinciden con el texto, uno solo de los dos lados con palabras o línea sin palabras), qué lo disparó (Enter, botón, división masiva, diálogo de wrap, referencia o Backspace en línea vacía) y la duración de la línea. Solo contadores y enums: nunca texto de la letra. No cambia cómo se parte ni cómo se une.
+
 ## [1.1.117] - 2026-10-06
 
 ### Fixed

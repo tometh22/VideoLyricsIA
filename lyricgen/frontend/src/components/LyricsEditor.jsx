@@ -27,6 +27,7 @@ import {
 import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
 import { planSegmentSplit, tokenSpans } from "../lib/splitWords";
+import { lineStructureProperties, mergeTimingMode, splitTimingMode } from "../lib/lineStructureEvent";
 import useLocalStorage from "../hooks/useLocalStorage";
 import { useEditorDocument } from "../hooks/useEditorDocument";
 import { useEditorAutosave } from "../hooks/useEditorAutosave";
@@ -3445,6 +3446,15 @@ export default function LyricsEditor({
   // no romper índices durante la mutación.
   const autoSplitAllFromReference = () => {
     if (mergeableSegments.length === 0) return;
+    trackLineStructure("split", "reference", mergeableSegments.map((m) => {
+      const seg = edited.find((s) => s._id === m._id);
+      const [lineA, lineB] = m.splitLines;
+      const tokA = tokenSpans(lineA).length;
+      const plan = seg && tokA > 0 && tokA + tokenSpans(lineB).length === tokenSpans(seg.text).length
+        ? planSegmentSplit(seg, { splitTokenIndex: tokA })
+        : null;
+      return seg ? { mode: splitTimingMode(seg, plan || { timing: "char_ratio" }), start: seg.start, end: seg.end } : null;
+    }));
     pushEditHistory();
     setEdited((prev) => {
       // Map id → splitLines para lookup rápido
@@ -3662,7 +3672,20 @@ export default function LyricsEditor({
   // char-ratio timing and drop `words`. Outer bounds stay the line's own.
   // Both halves get a fresh `_id` + `segment_id` (a shared segment_id makes
   // the three-way merge return the same row twice → dedupe deletes lyrics).
-  const splitSegAt = (id, charOffset) => {
+  // Evento de medición (`editor_line_structure_changed`): una acción del
+  // operador = un evento. Las masivas lo mandan una vez y parten con
+  // trigger null.
+  const trackLineStructure = (structureOp, trigger, items) => {
+    const properties = lineStructureProperties(structureOp, trigger, items);
+    if (properties) trackEditorEvent("editor_line_structure_changed", properties);
+  };
+  const splitTelemetryItem = (id, charOffset) => {
+    const seg = edited.find((s) => s._id === id);
+    if (!seg) return null;
+    return { mode: splitTimingMode(seg, planSegmentSplit(seg, { charOffset })), start: seg.start, end: seg.end };
+  };
+  const splitSegAt = (id, charOffset, trigger = "caret") => {
+    if (trigger) trackLineStructure("split", trigger, [splitTelemetryItem(id, charOffset)]);
     pushEditHistory();
     setEdited((prev) => {
       const idx = prev.findIndex((s) => s._id === id);
@@ -3684,13 +3707,23 @@ export default function LyricsEditor({
     });
   };
   // Back-compat: the "✂ Dividir" button + bulk callers split with no cursor.
-  const splitSeg = (id) => splitSegAt(id, null);
+  const splitSeg = (id) => splitSegAt(id, null, "button");
+  const splitSegs = (ids, trigger) => {
+    trackLineStructure("split", trigger, (ids || []).map((id) => splitTelemetryItem(id, null)));
+    (ids || []).forEach((id) => splitSegAt(id, null, null));
+  };
 
   // Merge a line with the NEXT line: concatenate text + per-word timing,
   // start = first.start, end = second.end. If only one side has `words` we
   // can't fabricate timing for the gap → drop words (karaoke falls back to
   // uniform distribution, consistent with the split fallback).
-  const mergeSeg = (id) => {
+  const mergeSeg = (id, trigger = "button") => {
+    const mergeIdx = edited.findIndex((s) => s._id === id);
+    if (mergeIdx !== -1 && mergeIdx < edited.length - 1) {
+      const first = edited[mergeIdx];
+      const second = edited[mergeIdx + 1];
+      trackLineStructure("merge", trigger, [{ mode: mergeTimingMode(first, second), start: first.start, end: second.end }]);
+    }
     recordEditorAction("merge", { id });
     pushEditHistory();
     setEdited((prev) => {
@@ -5544,7 +5577,7 @@ export default function LyricsEditor({
                   </p>
                   <button
                     type="button"
-                    onClick={() => { pushEditHistory(); wrap2SegIds.forEach((id) => splitSeg(id)); }}
+                    onClick={() => { pushEditHistory(); splitSegs(wrap2SegIds, "bulk"); }}
                     className="shrink-0 text-[11px] font-medium px-2.5 py-1 rounded-md bg-white/[0.06] ring-1 ring-white/[0.08] text-gray-200 hover:bg-white/[0.1] hover:text-white transition-colors"
                   >
                     {t("editor.wrap2_banner_split_all") || "Dividir todas"}
@@ -6552,7 +6585,7 @@ export default function LyricsEditor({
                           const i = edited.findIndex((s) => s._id === seg._id);
                           if (i > 0) {
                             e.preventDefault();
-                            mergeSeg(edited[i - 1]._id);
+                            mergeSeg(edited[i - 1]._id, "backspace_empty");
                           }
                         }
                       }}
@@ -6821,7 +6854,7 @@ export default function LyricsEditor({
           window.setTimeout(() => rowRefs.current[firstId]?.scrollIntoView?.({ block: "center", behavior: "smooth" }), 0);
         }}
         onAutoSplit={() => {
-          wrapWarning?.ids?.forEach((id) => splitSeg(id));
+          splitSegs(wrapWarning?.ids, "wrap_dialog");
           setWrapWarning(null);
         }}
         onApproveAnyway={() => {

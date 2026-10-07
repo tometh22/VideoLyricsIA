@@ -30,6 +30,10 @@ MAX_BY_NUMBER = {
     "text_count": 10_000,
     "vocalization_count": 10_000,
     "impact_ms": 3_600_000,
+    "words_count": 10_000,
+    "stale_words_count": 10_000,
+    "one_side_count": 10_000,
+    "no_words_count": 10_000,
 }
 SIGNED_NUMBERS = {"delta_ms", "proposed_delta_ms", "chosen_delta_ms", "distance_to_proposal_ms"}
 BOOLEANS = {"quality_acknowledged", "automatic_recovery_available"}
@@ -51,6 +55,8 @@ ENUMS = {
     # subconjunto arbitrario y `avg_time_to_first_edit_ms`, que depende de
     # `editor_autosave_success`, quedaba sesgado.
     "checkpoint": {"draft", "autosave", "manual"},
+    "structure_op": {"split", "merge"},
+    "trigger": {"caret", "button", "bulk", "wrap_dialog", "reference", "backspace_empty"},
 }
 SLUG_CATEGORIES = {"reason", "resolution", "context"}
 

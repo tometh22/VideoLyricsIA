@@ -105,3 +105,24 @@ def test_auto_repair_undo_telemetry_acepta_la_revision_restaurada():
     assert event in main._PRODUCT_EVENT_NAMES
     assert {"to_revision"} <= main._PRODUCT_EVENT_PROPERTIES[event]
     assert valid_property("to_revision", 1)
+
+
+def test_line_structure_event_acepta_lo_que_emite_el_editor():
+    """`editor_line_structure_changed` mide partir/unir: sólo contadores y enums."""
+    import main
+    event = "editor_line_structure_changed"
+    assert event in main._PRODUCT_EVENT_NAMES
+    sample = {
+        "structure_op": "split", "trigger": "caret", "count": 1, "words_count": 1,
+        "stale_words_count": 0, "one_side_count": 0, "no_words_count": 0, "duration_ms": 3200,
+    }
+    assert set(sample) <= main._PRODUCT_EVENT_PROPERTIES[event]
+    for key, value in sample.items():
+        assert valid_property(key, value), key
+    for trigger in ("caret", "button", "bulk", "wrap_dialog", "reference", "backspace_empty"):
+        assert valid_property("trigger", trigger), trigger
+    assert valid_property("structure_op", "merge")
+    assert not valid_property("structure_op", "hoy te vi pasar")
+    assert not valid_property("trigger", "letra libre")
+    assert not valid_property("words_count", "hoy te vi pasar")
+    assert not valid_property("no_words_count", -1)
