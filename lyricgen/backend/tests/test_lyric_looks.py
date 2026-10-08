@@ -175,3 +175,29 @@ def test_campaigns_expose_every_look_and_default_to_none():
     assert cc.effective_settings(type("C", (), {"default_render_params": {}})(), {})["lyric_look"] == ""
     assert cc.effective_settings(_Campaign(), {})["lyric_look"] == "cine"
     assert cc.effective_settings(_Campaign(), {"lyric_look": "pop70"})["lyric_look"] == "pop70"
+
+
+def test_measure_uses_libass_win_metrics():
+    # Big Shoulders: hhea spans 1.20 em, OS/2 win spans 1.67 em. libass sizes
+    # by the latter; measuring with hhea put cascade letters 28% apart.
+    em = L._em_per_fs(os.path.join(os.path.dirname(L.__file__), "fonts",
+                                   "BigShouldersDisplay-Black.ttf"))
+    assert em == pytest.approx(2000 / (2614 + 730), abs=0.002)
+
+
+def test_kinetic_lands_words_as_sung_and_kicks_on_the_beat():
+    look = L.LOOKS["cinetico"]
+    doc = L.build_look_ass(SEGS[:1], look, width=1920, height=1080, duration=4.0,
+                           beats=[0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5])
+    words = [d for d in _dialogues(doc) if d.startswith("Dialogue: 3,")]
+    starts = sorted(_secs(d.split(",")[1]) for d in words)
+    assert starts[0] == pytest.approx(0.83, abs=0.02)      # "TUMBADO" as sung
+    assert any("\\fscx110" in d for d in words)            # key word beat kick
+    assert any("\\fnCaveat" in d for d in words)           # script connector
+
+
+def test_neon_sign_frame_never_fills_its_box():
+    doc = L.build_look_ass(SEGS[:1], L.LOOKS["neon"], width=1920, height=1080,
+                           duration=4.0, beats=[1.0, 2.0, 3.0])
+    frames = [d for d in _dialogues(doc) if "\\p1" in d]
+    assert frames and all("\\alpha" not in d.split("\\p1")[0] for d in frames)

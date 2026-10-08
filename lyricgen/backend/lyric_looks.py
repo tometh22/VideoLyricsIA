@@ -71,6 +71,8 @@ class Look:
     circle_key: bool = False        # build layout: hand-drawn ring on key word
     doodles: bool = False           # build layout: little hearts/stars
     gradient: tuple[str, ...] = ()  # background="gradient": top → bottom
+    card_palettes: tuple[tuple[str, ...], ...] = ()  # (ink, alt, accent) per card
+    beat_sync: bool = False         # needs the song's beat times
     # How the generated background should be steered for this look (palette,
     # mood, where to leave room for the text). Consumed by the background
     # prompt; "" = no steering.
@@ -135,12 +137,29 @@ LOOKS: dict[str, Look] = {
                "b='0/0.13 0.5/0.50 1/0.86',eq=saturation=0.72,vignette=angle=PI/5"),
         effect="film",
     ),
+    # Ed Sheeran "Shape of You" / Imagine Dragons "Sharks": kinetic type —
+    # words land one by one from different directions and build a
+    # composition (script connectors, heavy caps stretched to a block, the
+    # key word huge with a burst, bubble or swoosh, kicking on the beat),
+    # over flat illustrated cards that alternate navy and sky blue.
+    "cinetico": Look(
+        id="cinetico", font_file="BigShouldersDisplay-Black.ttf",
+        extra_fonts=("Caveat-Bold.ttf",),
+        layout="kinetic", motion="word_pop", beat_sync=True,
+        primary="#FFFFFF", outline=0, shadow=4, shadow_color="#0B0D22",
+        shadow_alpha=0x40, font_scale=1.0,
+        background="flat", flat_colors=("#1F2244", "#86C8EE"),
+        card_palettes=(("#FFFFFF", "#6EC6FF", "#FF7A45"),
+                       ("#1F2244", "#FFFFFF", "#E63946")),
+        effect="film",
+    ),
     # Ed Sheeran "Body": each line is a neon tube that flickers on and hums,
     # cycling tube colours line to line over a dimmed background.
     "neon": Look(
-        id="neon", font_file="Neonderthaw-Regular.ttf",
-        layout="line", motion="neon", force_case="original",
-        primary="#FFF4FA", outline=0, shadow=0, font_scale=2.1,
+        id="neon", font_file="TiltNeon-Regular.ttf",
+        extra_fonts=("Neonderthaw-Regular.ttf",),
+        layout="line", motion="neon", beat_sync=True,
+        primary="#FFF4FA", outline=0, shadow=0, font_scale=1.9,
         line_colors=("#FF3EA5", "#2EE6FF", "#B07BFF", "#FFB13B"),
         grade="eq=brightness=-0.20:saturation=0.70:contrast=1.08,vignette=angle=PI/4",
         bg_hint="night scene, dark and moody, low-key lighting, deep shadows, "
@@ -165,7 +184,7 @@ LOOKS: dict[str, Look] = {
         layout="build", motion="word_pop", force_case="original",
         primary="#FFFFFF", accent="#FFFFFF", outline=1.5, shadow=3,
         shadow_alpha=0x50, font_scale=1.75, key_scale=1.35, row_width=0.62,
-        word_tilt=3.0, circle_key=True, doodles=True,
+        word_tilt=3.0, circle_key=True, doodles=True, word_motion="write",
         grade="eq=contrast=1.04:saturation=0.90",
         bg_hint="intimate, candid, warm indoor light, analog photo feel",
     ),
@@ -207,9 +226,10 @@ LOOKS: dict[str, Look] = {
     "duotono": Look(
         id="duotono", font_file="PermanentMarker-Regular.ttf",
         layout="line", motion="boil",
+        line_colors=("#FFF7E6", "#FFD23F", "#FF8FB1", "#9EF0C8"),
         primary="#FFF7E6", outline=4, outline_color="#1B2C7A",
         shadow=5, shadow_color="#1B2C7A", shadow_alpha=0,
-        font_scale=1.35,
+        font_scale=1.8,
         grade=("hue=s=0,eq=contrast=1.35:brightness=0.03,"
                "curves=r='0/0.09 1/0.97':g='0/0.19 1/0.95':b='0/0.60 1/0.89'"),
         bg_hint="high-contrast scene with clear silhouettes and strong shapes",
@@ -238,7 +258,7 @@ LOOKS: dict[str, Look] = {
     # caps blurring in word by word over an icy, light-leaked grade.
     "y2k": Look(
         id="y2k", font_file="Michroma-Regular.ttf",
-        layout="build", motion="word_pop", word_motion="blur",
+        layout="build", motion="word_pop", word_motion="echo",
         primary="#FFFFFF", accent="#BFF6FF", outline=2.5, outline_color="#5ED8FF",
         glow=4, shadow=3, shadow_color="#1E6BFF", shadow_alpha=0x70,
         font_scale=1.05, key_scale=1.3, stagger=0.08, row_width=0.66,
@@ -378,6 +398,41 @@ def _keyword_text(look: Look, tokens: list[str], base_fs: int) -> str:
             f"{{\\fs{key_fs}{accent}}}" + _ass._ass_escape(tokens[k]))
 
 
+def _em_per_fs(path: str) -> float:
+    """Em size per libass \\fs unit for a font file.
+
+    libass sizes a face so that usWinAscent + usWinDescent (OS/2) span \\fs
+    pixels, falling back to the hhea ascender/descender when the face has no
+    OS/2 table. PIL's getmetrics() reports hhea, which differs a lot on some
+    display faces (Big Shoulders: 1.20 vs 1.67 em) — measuring with it put
+    letters ~28% too far apart."""
+    import struct
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        num = struct.unpack(">H", data[4:6])[0]
+        tables = {}
+        for i in range(num):
+            tag, _cs, off, ln = struct.unpack(">4sIII", data[12 + 16 * i:28 + 16 * i])
+            tables[tag] = (off, ln)
+        upm = struct.unpack(">H", data[tables[b"head"][0] + 18:tables[b"head"][0] + 20])[0]
+        if b"OS/2" in tables:
+            off = tables[b"OS/2"][0]
+            win_asc, win_desc = struct.unpack(">HH", data[off + 74:off + 78])
+            span = win_asc + win_desc
+        else:
+            off = tables[b"hhea"][0]
+            asc, desc = struct.unpack(">hh", data[off + 4:off + 8])
+            span = asc - desc
+        if span > 0 and upm > 0:
+            return upm / float(span)
+    except Exception:
+        pass
+    from PIL import ImageFont
+    asc, desc = ImageFont.truetype(path, 200).getmetrics()
+    return 200.0 / max(1, asc + desc)
+
+
 class _Measure:
     """Word widths from the real font file (PIL), in libass pixels.
 
@@ -387,11 +442,9 @@ class _Measure:
     line drift apart."""
 
     def __init__(self, path: str):
-        from PIL import ImageFont
         self.path = path
         self._fonts: dict[int, object] = {}
-        asc, desc = ImageFont.truetype(path, 200).getmetrics()
-        self._em_per_fs = 200.0 / max(1, asc + desc)
+        self._em_per_fs = _em_per_fs(path)
 
     def width(self, text: str, size: int) -> float:
         from PIL import ImageFont
@@ -477,7 +530,50 @@ def _build_events(look: Look, seg_idx: int, tokens: list[str],
                 ov += f"\\frz{_ass._fmt_num(round(wt, 2))}"
             if look.glow:
                 ov += f"\\3a&H40&\\blur{_ass._fmt_num(look.glow * sc)}"
-            if look.word_motion == "blur":
+            if look.word_motion == "write":
+                # Handwriting: the word is revealed left to right as if
+                # written, at roughly the speed it is sung.
+                wr = min(420, max(160, int(round(
+                    (float(timings[i]["end"]) - float(timings[i]["start"])) * 1000))))
+                x0 = px - widths[j] / 2 - sizes[i] * 0.3
+                x1 = px + widths[j] / 2 + sizes[i] * 0.3
+                ov += (f"\\clip({_n(x0)},0,{_n(x0)},{height})"
+                       f"\\t(0,{wr},\\clip({_n(x0)},0,{_n(x1)},{height}))"
+                       f"\\t({dur_ms - exit_ms},{dur_ms},\\alpha&HFF&)")
+                events.append(_dialogue(2, w_start, line_end,
+                                        "{" + ov + "}" + _ass._ass_escape(tokens[i])))
+                if i == k and look.circle_key:
+                    events.extend(_circle_key_events(look, px, baseline, widths[j],
+                                                     sizes[i], w_start + wr / 1000.0,
+                                                     line_end, sc))
+                x += widths[j] + space
+                continue
+            if look.word_motion == "echo":
+                # Y2K ghosting: two translucent echoes slide in from either
+                # side and converge on the word, then spread out on exit.
+                drift = int(round(70 * sc))
+                bx, by = int(round(px)), int(round(baseline))
+                base_ov = ov.replace(f"\\pos({bx},{by})", "")
+                for sgn, a in ((-1, 0x90), (1, 0xB0)):
+                    gx = bx + sgn * drift
+                    ghost = (f"\\move({gx},{by},{bx},{by},0,360)" + base_ov
+                             + f"\\alpha&HFF&\\t(0,120,\\alpha{_a(a)})"
+                             f"\\t(360,520,\\alpha&HFF&)"
+                             f"\\blur{_ass._fmt_num(6 * sc)}")
+                    events.append(_dialogue(1, w_start, line_end,
+                                            "{" + ghost + "}" + _ass._ass_escape(tokens[i])))
+                    gx2 = bx - sgn * drift
+                    out_ms = max(1, dur_ms - exit_ms - 120)
+                    ghost_out = (f"\\move({bx},{by},{gx2},{by},{out_ms},{dur_ms})" + base_ov
+                                 + f"\\alpha&HFF&\\t({out_ms},{out_ms + 1},\\alpha{_a(a)})"
+                                 f"\\t({out_ms + 1},{dur_ms},\\alpha&HFF&)"
+                                 f"\\blur{_ass._fmt_num(6 * sc)}")
+                    events.append(_dialogue(1, w_start, line_end,
+                                            "{" + ghost_out + "}" + _ass._ass_escape(tokens[i])))
+                ov += ("\\alpha&HFF&\\t(140,360,\\alpha&H00&)"
+                       f"\\blur{_ass._fmt_num(8 * sc)}\\t(140,360,\\blur{_ass._fmt_num(look.glow * sc or 0.6)})"
+                       f"\\t({dur_ms - exit_ms},{dur_ms},\\alpha&HFF&)")
+            elif look.word_motion == "blur":
                 drift = int(round(26 * sc))
                 ov = ov.replace(f"\\pos({int(round(px))},{int(round(baseline))})",
                                 f"\\move({int(round(px + drift))},{int(round(baseline))},"
@@ -987,6 +1083,358 @@ def _doodle_events(n: int, block_left: float, block_right: float, top: float,
     ]
 
 
+# --- Beat helpers ------------------------------------------------------------------
+
+def _beats_in(beats, t0: float, t1: float, every: int = 2) -> list[float]:
+    """Beats inside [t0, t1), keeping one of every `every` (the detector
+    often returns double-time; every other beat reads as the pulse)."""
+    if not beats:
+        return []
+    picked = [b for i, b in enumerate(beats) if i % every == 0]
+    return [b for b in picked if t0 <= b < t1]
+
+
+def _beat_pulse(beats, t0: float, t1: float, after_ms: int, scale: int = 108) -> str:
+    """Quick scale kick on each pulse beat, once the entrance has settled."""
+    out = []
+    for b in _beats_in(beats, t0, t1):
+        ms = int(round((b - t0) * 1000))
+        if ms < after_ms or ms > (t1 - t0) * 1000 - 260:
+            continue
+        out.append(f"\\t({ms},{ms + 50},\\fscx{scale}\\fscy{scale})"
+                   f"\\t({ms + 50},{ms + 230},\\fscx100\\fscy100)")
+    return "".join(out[:40])
+
+
+def _beat_blink(beats, t0: float, t1: float, on_alpha: int, off_alpha: int,
+                after_ms: int) -> str:
+    """Neon-sign blink: alternate on/off on every pulse beat."""
+    out = []
+    for i, b in enumerate(_beats_in(beats, t0, t1)):
+        ms = int(round((b - t0) * 1000))
+        if ms < after_ms:
+            continue
+        a = off_alpha if i % 2 else on_alpha
+        out.append(f"\\t({ms},{ms + 1},\\alpha{_a(a)})")
+    return "".join(out[:60])
+
+
+# --- Kinetic composition (Ed Sheeran / Imagine Dragons) ----------------------------
+
+_ENTRANCES = ("left", "right", "drop", "pop", "spin", "stretch")
+
+
+def _entrance(kind: str, x: float, y: float, sc: float) -> tuple[str, str]:
+    """(position tags, transform tags) for a word entering at (x, y)."""
+    d = 90 * sc
+    if kind == "left":
+        return (f"\\move({_n(x - d * 2.2)},{_n(y)},{_n(x)},{_n(y)},0,220)",
+                "\\alpha&HFF&\\t(0,120,\\alpha&H00&)")
+    if kind == "right":
+        return (f"\\move({_n(x + d * 2.2)},{_n(y)},{_n(x)},{_n(y)},0,220)",
+                "\\alpha&HFF&\\t(0,120,\\alpha&H00&)")
+    if kind == "drop":
+        return (f"\\move({_n(x)},{_n(y - d * 1.6)},{_n(x)},{_n(y)},0,200)",
+                "\\fscy120\\t(200,260,\\fscy88)\\t(260,340,\\fscy100)")
+    if kind == "spin":
+        return (f"\\pos({_n(x)},{_n(y)})",
+                "\\frz-80\\fscx40\\fscy40\\t(0,260,0.6,\\frz0\\fscx100\\fscy100)")
+    if kind == "stretch":
+        return (f"\\pos({_n(x)},{_n(y)})",
+                "\\fscx260\\fscy60\\alpha&HFF&\\t(0,220,0.5,\\fscx100\\fscy100\\alpha&H00&)")
+    return (f"\\pos({_n(x)},{_n(y)})",
+            "\\fscx40\\fscy40\\t(0,150,0.6,\\fscx112\\fscy112)\\t(150,240,\\fscx100\\fscy100)")
+
+
+def _burst_path(cx: float, cy: float, r0: float, r1: float, rays: int = 14,
+                thick: float = 6) -> str:
+    """Radiating dashes around a point (the comic 'pow' rays)."""
+    import math
+    parts = []
+    for i in range(rays):
+        a = 2 * math.pi * i / rays
+        ca, sa = math.cos(a), math.sin(a)
+        nx, ny = -sa * thick / 2, ca * thick / 2
+        x0, y0 = cx + ca * r0, cy + sa * r0
+        x1, y1 = cx + ca * r1, cy + sa * r1
+        parts.append(f"m {_n(x0 + nx)} {_n(y0 + ny)} l {_n(x1 + nx)} {_n(y1 + ny)} "
+                     f"{_n(x1 - nx)} {_n(y1 - ny)} {_n(x0 - nx)} {_n(y0 - ny)}")
+    return " ".join(parts)
+
+
+def _kinetic_events(look: Look, n: int, tokens: list[str], timings: list[dict],
+                    start: float, end: float, base_fs: int, width: int,
+                    height: int, sc: float, heavy, script, script_family: str,
+                    beats) -> list[str]:
+    """Words land one by one as they are sung and build a typographic
+    composition: function words small in a script face, content words in
+    heavy caps stretched to the block width, the key word huge in an accent
+    colour with a burst or a bubble behind it. Each row enters from its own
+    direction, the key word kicks on the beat, and the whole composition
+    smears out at the end of the line."""
+    import hashlib
+    palette = look.line_colors or (look.primary,)
+    if look.flat_colors and look.card_palettes:
+        palette = look.card_palettes[n % len(look.card_palettes)]
+    ink, alt, accent = (list(palette) + [look.primary] * 3)[:3]
+    k = pick_keyword(tokens)
+
+    def small(i: int) -> bool:
+        t = _norm(tokens[i])
+        return i != k and (t in _STOPWORDS or len(t) <= 2)
+
+    # Rows: runs of heavy words (≤ 12 chars), a small word gets its own row,
+    # the key word always gets its own row.
+    rows: list[list[int]] = []
+    cur: list[int] = []
+    for i in range(len(tokens)):
+        if i == k or small(i):
+            if cur:
+                rows.append(cur)
+                cur = []
+            rows.append([i])
+            continue
+        if cur and len(" ".join(tokens[j] for j in cur + [i])) > 12:
+            rows.append(cur)
+            cur = []
+        cur.append(i)
+    if cur:
+        rows.append(cur)
+    # Merge consecutive small words ("en el", "de la") into one script row.
+    merged: list[list[int]] = []
+    for r in rows:
+        if merged and small(r[0]) and all(small(j) for j in merged[-1]) and len(r) == 1:
+            merged[-1] = merged[-1] + r
+        else:
+            merged.append(r)
+    rows = merged
+
+    vertical = height > width
+    # Long lines split into two columns side by side (Ed Sheeran: "ME / and /
+    # MY FRIENDS" on the left, "AT THE / TABLE DOING / shots" on the right);
+    # short ones sit left, centre or right, alternating per line.
+    if not vertical and len(rows) > 4:
+        half = (len(rows) + 1) // 2
+        columns = [(rows[:half], width * 0.28), (rows[half:], width * 0.72)]
+        block_w = width * 0.38
+    else:
+        slot = (n % 3) if not vertical else 1
+        cx = width * (0.32, 0.5, 0.68)[slot] if len(tokens) > 2 else width * 0.5
+        columns = [(rows, cx)]
+        block_w = width * (0.80 if vertical else 0.46)
+
+    specs = []
+    for col_i, (col_rows, cx) in enumerate(columns):
+        col_specs = []
+        for r in col_rows:
+            text = " ".join(tokens[i] for i in r)
+            if all(small(i) for i in r):
+                fs = base_fs * 1.25
+                col_specs.append(dict(r=r, text=text, fs=fs, kind="script", h=fs * 0.95,
+                                      cx=cx, col=col_i))
+                continue
+            is_key = (k in r) and len(r) == 1
+            nat = max(1.0, heavy.width(text, 100))
+            fs = 100 * block_w * (1.0 if is_key else 0.90) / nat
+            fs = max(base_fs * 0.8, min(base_fs * (5.5 if is_key else 4.2), fs))
+            col_specs.append(dict(r=r, text=text, fs=fs, kind="key" if is_key else "heavy",
+                                  h=fs * 0.84, cx=cx, col=col_i))
+        total = sum(sp["h"] for sp in col_specs)
+        limit = height * (0.62 if vertical else 0.84)
+        if total > limit:
+            f = limit / total
+            for sp in col_specs:
+                sp["fs"] *= f
+                sp["h"] *= f
+            total = limit
+        y = (height - total) / 2.0
+        for sp in col_specs:
+            y += sp["h"]
+            sp["y"] = y
+        specs.extend(col_specs)
+
+    seed = int(hashlib.sha1(f"{n}:{' '.join(tokens)}".encode()).hexdigest()[:8], 16)
+    dur_line = max(1, int(round((end - start) * 1000)))
+    exit_ms = min(260, max(120, int(dur_line * 0.12)))
+    events: list[str] = []
+    colours = (ink, alt)
+    for r_i, sp in enumerate(specs):
+        y = sp["y"]
+        first = sp["r"][0]
+        w_start = max(start, float(timings[first]["start"]) - 0.05)
+        if w_start >= end:
+            w_start = start
+        dur = max(1, int(round((end - w_start) * 1000)))
+        smear = (f"\\t({max(1, dur - exit_ms)},{dur},\\fscx230\\blur{_ass._fmt_num(10 * sc)}"
+                 "\\alpha&HFF&)")
+        x = sp["cx"]
+        if sp["kind"] == "script":
+            kind = "pop"
+            face = f"\\fn{script_family}\\b1" if script_family else ""
+            colour = accent if accent else alt
+            tilt = -7 if (seed >> r_i) & 1 else 6
+            pos, tr = _entrance(kind, x, y + sp["fs"] * 0.05, sc)
+            ov = (f"\\an2{pos}\\q2\\fs{_n(sp['fs'])}{face}\\1c{_c(colour)}\\frz{tilt}{tr}"
+                  + smear)
+        else:
+            kind = _ENTRANCES[(seed // 7 + r_i * 3) % len(_ENTRANCES)]
+            colour = accent if sp["kind"] == "key" else colours[r_i % 2]
+            pos, tr = _entrance(kind, x, y, sc)
+            pulse = (_beat_pulse(beats, w_start, end, after_ms=380, scale=110)
+                     if sp["kind"] == "key" else "")
+            ov = (f"\\an2{pos}\\q2\\fs{_n(sp['fs'])}\\1c{_c(colour)}{tr}{pulse}" + smear)
+        if sp["kind"] == "key" and seed % 4 == 3 and len(sp["text"]) >= 4:
+            # Letters tumble in one by one instead of the word landing whole.
+            kw = heavy.width(sp["text"], sp["fs"])
+            events.extend(_cascade_events(sp["text"], x - kw / 2, y, _n(sp["fs"]),
+                                          colour, w_start, end, heavy, sc, beats))
+            continue
+        events.append(_dialogue(3, w_start, end, "{" + ov + "}" + _ass._ass_escape(sp["text"])))
+
+        if sp["kind"] == "key":
+            kw = heavy.width(sp["text"], sp["fs"])
+            ky = y - sp["fs"] * 0.40
+            deco = seed % 3
+            t0 = w_start + 0.12
+            d2 = max(1, int(round((end - t0) * 1000)))
+            fade = f"\\t({max(1, d2 - exit_ms)},{d2},\\alpha&HFF&)"
+            if deco == 0:
+                # Burst rays that blink on the beat.
+                rays = _burst_path(x, ky, kw * 0.58, kw * 0.58 + sp["fs"] * 0.45,
+                                   rays=16, thick=5 * sc)
+                blink = _beat_blink(beats, t0, end, 0x00, 0xB0, after_ms=200)
+                events.append(_drawing(2, t0, end,
+                                       f"\\an7\\pos(0,0)\\1c{_c(alt)}\\fscx100\\fscy100"
+                                       f"\\alpha&HFF&\\t(0,120,\\alpha&H00&){blink}{fade}", rays))
+            elif deco == 1:
+                # Speech bubble behind the key word.
+                bw, bh = kw + sp["fs"] * 0.7, sp["fs"] * 1.15
+                bx, by = x - bw / 2, ky - bh / 2
+                events.append(_drawing(2, t0, end,
+                                       f"\\an7\\pos({_n(bx)},{_n(by)})\\1c{_c(alt)}"
+                                       f"\\frz{-4 if seed & 1 else 4}"
+                                       f"\\org({_n(x)},{_n(ky)})"
+                                       "\\fscx20\\fscy20\\t(0,180,0.6,\\fscx100\\fscy100)" + fade,
+                                       _rounded_rect_path(bw, bh, bh * 0.45,
+                                                          tail="left" if seed & 2 else "right")))
+            else:
+                # Hand-drawn underline swoosh, drawn left to right.
+                sw = kw * 1.05
+                sx0 = x - sw / 2
+                sy = y + sp["fs"] * 0.10
+                path = (f"m {_n(sx0)} {_n(sy)} b {_n(sx0 + sw * 0.3)} {_n(sy + 14 * sc)} "
+                        f"{_n(sx0 + sw * 0.7)} {_n(sy - 6 * sc)} {_n(sx0 + sw)} {_n(sy + 4 * sc)} "
+                        f"l {_n(sx0 + sw)} {_n(sy + 16 * sc)} "
+                        f"b {_n(sx0 + sw * 0.7)} {_n(sy + 6 * sc)} {_n(sx0 + sw * 0.3)} "
+                        f"{_n(sy + 26 * sc)} {_n(sx0)} {_n(sy + 12 * sc)}")
+                clip = (f"\\clip({_n(sx0 - 5)},0,{_n(sx0 - 5)},{height})"
+                        f"\\t(0,260,\\clip({_n(sx0 - 5)},0,{_n(sx0 + sw + 10)},{height}))")
+                events.append(_drawing(2, t0 + 0.08, end,
+                                       f"\\an7\\pos(0,0)\\1c{_c(alt)}" + clip + fade, path))
+    return events
+
+
+# --- Neon signs (Ed Sheeran intro) ----------------------------------------------
+
+def _neon_sign_events(look: Look, n: int, display: str, start: float, end: float,
+                      base_fs: int, width: int, height: int, sc: float,
+                      measure, script_measure, script_family: str, beats) -> list[str]:
+    """A neon sign per line: the unlit glass tube shows faintly first, then
+    flickers on; a frame (box, arrow or rays) around it blinks on the beat.
+    Lines alternate caps tubes and script tubes."""
+    col = look.line_colors[n % len(look.line_colors)] if look.line_colors else look.primary
+    frame_col = look.line_colors[(n + 2) % len(look.line_colors)] if look.line_colors else col
+    script = (n % 2 == 1) and bool(script_family)
+    m = script_measure if script else measure
+    fs = int(base_fs * (1.35 if script else 1.0))
+    rows = _ass._balanced_breaks(display, fs, width).split("\n")
+    text = "\\N".join(_ass._ass_escape(r) for r in rows)
+    tw = max(m.width(r, fs) for r in rows)
+    th = len(rows) * fs * 0.95
+    cx, cy = width / 2.0, height / 2.0
+    dur = max(1, int(round((end - start) * 1000)))
+    face = f"\\fn{script_family}" if script else ""
+    pos = f"\\an5\\pos({_n(cx)},{_n(cy)})\\q2\\fs{fs}{face}"
+    lit = 260                      # ms of unlit glass before it turns on
+
+    def flick(on: int) -> str:
+        dim = min(255, on + 0xB0)
+        return (f"\\alpha&HFF&\\t({lit},{lit + 1},\\alpha{_a(on)})"
+                f"\\t({lit + 70},{lit + 71},\\alpha{_a(dim)})"
+                f"\\t({lit + 120},{lit + 121},\\alpha{_a(on)})"
+                f"\\t({lit + 220},{lit + 221},\\alpha{_a(dim)})"
+                f"\\t({lit + 260},{lit + 261},\\alpha{_a(on)})"
+                f"\\t({max(lit + 300, dur - 200)},{dur},\\alpha&HFF&)")
+
+    unlit = (pos + f"\\1a&HFF&\\3c&H8A8A8A&\\3a&H60&\\bord{_ass._fmt_num(1.4 * sc)}"
+             f"\\shad0\\t({lit + 1},{lit + 2},\\alpha&HFF&)")
+    haze = (pos + f"\\1c{_c(col)}\\3c{_c(col)}\\bord{_ass._fmt_num(14 * sc)}"
+            f"\\blur{_ass._fmt_num(26 * sc)}\\shad0" + flick(0x78))
+    glow = (pos + f"\\1c{_c(col)}\\3c{_c(col)}\\bord{_ass._fmt_num(5 * sc)}"
+            f"\\blur{_ass._fmt_num(9 * sc)}\\shad0" + flick(0x30))
+    core = (pos + f"\\1c{_c(look.primary)}\\3c{_c(col)}\\bord{_ass._fmt_num(1.8 * sc)}"
+            f"\\blur{_ass._fmt_num(1.2 * sc)}\\shad0" + flick(0))
+    events = [_dialogue(1, start, end, "{" + unlit + "}" + text),
+              _dialogue(1, start, end, "{" + haze + "}" + text),
+              _dialogue(2, start, end, "{" + glow + "}" + text),
+              _dialogue(3, start, end, "{" + core + "}" + text)]
+
+    # Frame: a tube outline that blinks on the beat.
+    kind = n % 3
+    pad = fs * 0.55
+    if kind == 0:
+        fw, fh = tw + 2 * pad, th + pad * 1.2
+        path = _rounded_rect_path(fw, fh, fh * 0.35)
+        anchor = f"\\an7\\pos({_n(cx - fw / 2)},{_n(cy - fh / 2)})"
+    elif kind == 1:
+        # Arrow pointing right around the text.
+        fw, fh = tw + 2 * pad, th + pad * 1.2
+        hx = fh * 0.55
+        x0, y0 = cx - fw / 2, cy - fh / 2
+        path = (f"m 0 0 l {_n(fw)} 0 l {_n(fw)} {_n(-fh * 0.25)} l {_n(fw + hx)} {_n(fh / 2)} "
+                f"l {_n(fw)} {_n(fh * 1.25)} l {_n(fw)} {_n(fh)} l 0 {_n(fh)}")
+        anchor = f"\\an7\\pos({_n(x0)},{_n(y0)})"
+    else:
+        path = _burst_path(0, 0, tw * 0.62, tw * 0.62 + fs * 0.5, rays=22, thick=4 * sc)
+        anchor = f"\\an7\\pos({_n(cx)},{_n(cy)})\\fscy55"
+    blink = _beat_blink(beats, start, end, 0x00, 0xD0, after_ms=lit + 300)
+    # The frame is an outline only: flicker/blink its OUTLINE alpha (\\3a),
+    # never \\alpha, which would also turn the transparent fill opaque.
+    frame_tail = (flick(0x00) + blink).replace("\\alpha", "\\3a")
+    events.append(_drawing(1, start, end,
+                           anchor + f"\\1a&HFF&\\3c{_c(frame_col)}\\bord{_ass._fmt_num(9 * sc)}"
+                           f"\\blur{_ass._fmt_num(10 * sc)}\\3a&H60&" + frame_tail, path))
+    events.append(_drawing(2, start, end,
+                           anchor + f"\\1a&HFF&\\3c{_c('#FFFFFF')}\\bord{_ass._fmt_num(2.2 * sc)}"
+                           f"\\blur{_ass._fmt_num(1.5 * sc)}" + frame_tail, path))
+    return events
+
+
+# --- Letter cascade (Imagine Dragons "LEVELS") ------------------------------------
+
+def _cascade_events(word: str, x_left: float, baseline: float, fs: int,
+                    colour: str, t0: float, end: float, measure, sc: float,
+                    beats=None) -> list[str]:
+    """The word's letters tumble in one by one along a diagonal."""
+    events = []
+    x = x_left
+    fs = int(fs)
+    for i, ch in enumerate(word):
+        w = measure.width(ch, fs)
+        ts = t0 + i * 0.06
+        if ts >= end:
+            ts = t0
+        d = max(1, int(round((end - ts) * 1000)))
+        sx, sy = x - 120 * sc, baseline - 260 * sc
+        ov = (f"\\an1\\move({_n(sx)},{_n(sy)},{_n(x)},{_n(baseline)},0,220)\\fs{fs}"
+              f"\\1c{_c(colour)}\\frz{35 - (i % 3) * 20}\\t(0,220,\\frz0)"
+              + _beat_pulse(beats, ts, end, after_ms=300, scale=110)
+              + f"\\t({max(221, d - 200)},{d},\\fscx230\\alpha&HFF&)")
+        events.append(_dialogue(3, ts, end, "{" + ov + "}" + _ass._ass_escape(ch)))
+        x += w
+    return events
+
+
 # --- Public entry point -------------------------------------------------------
 
 def build_look_ass(
@@ -1000,6 +1448,7 @@ def build_look_ass(
     font_scale: float = 1.0,
     primary_override: str = "",
     title_lines: list | None = None,
+    beats: list[float] | None = None,
 ) -> str:
     """Complete ASS document for `look` over `segments`.
 
@@ -1008,7 +1457,9 @@ def build_look_ass(
     keeps it: it is the wizard's default colour and is persisted on every
     job, so it can't be told apart from "not chosen".
     title_lines: the artist/song title card (ass_render.AssLine list) — drawn
-    above everything else so every job keeps a readable title card."""
+    above everything else so every job keeps a readable title card.
+    beats: the song's beat times in seconds (beat_snap.detect_beats). Looks
+    with beat_sync kick/blink on them; without beats they simply don't."""
     if (primary_override and re.match(r"^#[0-9a-fA-F]{6}$", primary_override)
             and primary_override.upper() != "#FFFFFF"):
         look = dataclasses.replace(look, primary=primary_override)
@@ -1051,6 +1502,12 @@ def build_look_ass(
                                    measure, duration))
         lines = []          # the conversation owns every line
 
+    second, second_family = None, ""
+    if look.extra_fonts and look.layout in ("kinetic",) or look.motion == "neon":
+        if look.extra_fonts:
+            second = _Measure(font_paths(look)[1])
+            second_family = _ass.font_family(font_paths(look)[1])[0]
+
     light, light_family = None, ""
     if look.layout == "block":
         light = _Measure(font_paths(look)[1]) if look.extra_fonts else measure
@@ -1080,6 +1537,13 @@ def build_look_ass(
     for n, (seg, display, start, end) in enumerate(lines):
         tokens = display.split()
         base_fs = fs_for(len(display))
+        if look.layout == "kinetic":
+            timings = _ass._word_timings(display, start, end, seg.get("words"))
+            events.extend(_kinetic_events(look, n, tokens, timings, start, end,
+                                          base_fs, width, height, sc, measure,
+                                          second or measure, second_family,
+                                          beats or []))
+            continue
         if look.layout in ("build", "block", "arc"):
             timings = _ass._word_timings(display, start, end, seg.get("words"))
             if look.layout == "build":
@@ -1098,8 +1562,13 @@ def build_look_ass(
                                         width, height))
             continue
         if look.motion == "neon":
-            events.extend(_neon_events(look, n, display, start, end, base_fs,
-                                       width, height, sc))
+            if second is not None:
+                events.extend(_neon_sign_events(look, n, display, start, end, base_fs,
+                                                width, height, sc, measure, second,
+                                                second_family, beats or []))
+            else:
+                events.extend(_neon_events(look, n, display, start, end, base_fs,
+                                           width, height, sc))
             continue
         if look.motion == "write_on":
             events.extend(_write_on_events(look, display, start, end, base_fs,
@@ -1125,8 +1594,18 @@ def build_look_ass(
             continue
         if look.motion == "boil":
             body = _ass._ass_escape(_ass._balanced_breaks(display, base_fs, width))
+            ink = (f"\\1c{_c(look.line_colors[n % len(look.line_colors)])}"
+                   if look.line_colors else "")
+            ex = min(260, max(120, int(dur_ms * 0.12)))
+            # Ink grows in, boils like hand animation, and smears out sideways
+            # into the next line (Shakira "Dai Dai").
             text = ("{" + f"\\an5\\pos({width // 2},{height // 2})\\q2\\fs{base_fs}"
-                    + glow + f"\\fad(90,140){_boil(dur_ms, seed=n)}" + "}" + body)
+                    + ink + glow
+                    + "\\fscx70\\fscy70\\alpha&HFF&"
+                    "\\t(0,160,0.6,\\fscx100\\fscy100\\alpha&H00&)"
+                    + _boil(dur_ms - ex, seed=n)
+                    + f"\\t({dur_ms - ex},{dur_ms},\\fscx320\\fscy115"
+                    f"\\blur{_ass._fmt_num(14 * sc)}\\alpha&HFF&)" + "}" + body)
             events.append(_dialogue(2, start, end, text))
             continue
         text = ("{" + f"\\fs{base_fs}" + glow + _line_motion(look, dur_ms) + "}"
