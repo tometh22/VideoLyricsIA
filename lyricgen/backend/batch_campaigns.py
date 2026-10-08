@@ -1330,6 +1330,42 @@ def approve_campaign_lyrics(
                 audio_sha256=str(job.input_audio_sha256 or ""),
                 audio_revision=int(job.audio_revision or 0),
             )
+            recovery_source = "editor_document.machine_evidence"
+            recovery_source_job_id = job.job_id
+            # Historical variants have no machine snapshot of their own. A
+            # post-render human approval may reuse the parent's immutable
+            # full-audio evidence only for the exact same tenant/audio/revision.
+            # Never replace invalid child evidence or inherit edited lyrics,
+            # a parent's human approval, or its mutable quality reference.
+            if (
+                recovered_reference is None
+                and job.parent_job_id
+                and preserves_rendered_status
+                and not job.machine_snapshot_required
+                and document_for_recovery.machine_evidence is None
+            ):
+                parent = db.query(Job).filter(
+                    Job.job_id == job.parent_job_id,
+                    Job.job_id != job.job_id,
+                    Job.tenant_id == job.tenant_id,
+                    Job.input_audio_sha256 == job.input_audio_sha256,
+                    Job.audio_revision == job.audio_revision,
+                ).first()
+                parent_document = (
+                    db.query(EditorDocument).filter(
+                        EditorDocument.job_id == parent.job_id,
+                        EditorDocument.tenant_id == job.tenant_id,
+                    ).first() if parent is not None else None
+                )
+                if parent_document is not None:
+                    recovered_reference, recovery_reason = recover_from_machine_evidence(
+                        parent_document.machine_evidence,
+                        original_segments=list(parent_document.original_segments or []),
+                        audio_sha256=str(job.input_audio_sha256 or ""),
+                        audio_revision=int(job.audio_revision or 0),
+                    )
+                    recovery_source = "parent_editor_document.machine_evidence"
+                    recovery_source_job_id = parent.job_id
             if recovered_reference is not None:
                 quality["reference_hypothesis"] = recovered_reference
                 quality.pop("reference_hypothesis_unavailable", None)
@@ -1344,7 +1380,8 @@ def approve_campaign_lyrics(
                         "audio_revision": int(job.audio_revision or 0),
                         "segments_revision": int(job.segments_revision or 0),
                         "reference_sha256": recovered_reference["reference_sha256"],
-                        "source": "editor_document.machine_evidence",
+                        "source": recovery_source,
+                        "source_job_id": recovery_source_job_id,
                     },
                 ))
             else:
