@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.120] - 2026-10-08
+
+### Added
+
+- `WHISPERX_RECONCILE_KEEP_WORDS` (apagada por defecto): cada línea de WhisperX reconciliada con la letra de referencia conserva las palabras de la ventana donde se ancló, con su score. Antes se volvían a pegar por posición, se corrían en cuanto el alineado saltaba una palabra y, sin score, el pipeline las borraba: el 95 % de esas líneas llegaba al editor sin palabras. Una línea cuyas palabras no describen su texto queda sin palabras, como hoy. No cambia el texto ni el inicio ni el fin de ninguna línea. La clave entra en la huella de configuración del pipeline.
+
 ## [1.1.119] - 2026-10-07
 
 ### Fixed
