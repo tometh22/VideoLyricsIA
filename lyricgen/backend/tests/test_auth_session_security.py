@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
-from jose import jwt
+import jwt
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.requests import Request
 

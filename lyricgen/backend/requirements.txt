@@ -3,10 +3,10 @@ starlette==1.6.0
 uvicorn[standard]==0.34.0
 python-multipart==0.0.32
 python-dotenv>=1.0.0,<2.0.0
-python-jose[cryptography]>=3.3.0,<4.0.0
+# PyJWT >= 2.15.0: de 2.12 a 2.14 tienen avisos de seguridad. Reemplaza a
+# python-jose (sin mantenimiento; CVE-2026-85394 sin versión corregida).
+PyJWT>=2.15.0,<3.0.0
 # Explicit cryptography pin para Fernet (Drive OAuth token encryption).
-# python-jose[cryptography] ya lo jala como dep transitiva, pero lo
-# declaramos también para que dependabot lo trackee.
 cryptography>=46.0.7,<51.0.0
 passlib[bcrypt]>=1.7.4,<2.0.0
 bcrypt<4.1

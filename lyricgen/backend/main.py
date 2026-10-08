@@ -207,11 +207,11 @@ def _rate_limit_key(request: Request) -> str:
         auth_header = request.headers.get("authorization", "")
         if auth_header.lower().startswith("bearer "):
             token = auth_header.split(None, 1)[1]
-            from auth import JWT_SECRET, JWT_ALGORITHM
-            from jose import jwt as _jwt
+            from auth import JWT_DECODE_OPTIONS, JWT_SECRET, JWT_ALGORITHM
+            import jwt as _jwt
             payload = _jwt.decode(
                 token, JWT_SECRET, algorithms=[JWT_ALGORITHM],
-                options={"verify_exp": False},
+                options={**JWT_DECODE_OPTIONS, "verify_exp": False},
             )
             uid = payload.get("sub") or payload.get("user_id")
             if uid:

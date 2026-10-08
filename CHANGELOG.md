@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.123] - 2026-10-09
+
+### Security
+
+- El JWT pasa de `python-jose` (sin mantenimiento; CVE-2026-85394 sin versión corregida) a PyJWT 2.15. Los tokens emitidos antes siguen valiendo, así que nadie pierde la sesión. Se siguen exigiendo HS256 y el vencimiento, y un `iat` apenas en el futuro (diferencia de reloj entre réplicas) se acepta como antes. Se retiran las excepciones de `python-jose` y `ecdsa`.
+
 ## [1.1.119] - 2026-10-07
 
 ### Fixed
