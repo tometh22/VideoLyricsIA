@@ -40,6 +40,8 @@ def field(label, group, kind="text", **kw):
     return {"label": label, "group": group, "kind": kind, **kw}
 
 
+import lyric_looks as _lyric_looks  # noqa: E402  (catálogo único de looks)
+
 FIELDS = {
     "font": field("Tipografía", "Letra", "select", options=[""] + CATALOG["fonts"]),
     "font_scale": field("Tamaño de letra", "Letra", "number", min=.6, max=1.5, step=.05),
@@ -49,7 +51,7 @@ FIELDS = {
     "text_contrast": field("Contraste", "Letra", "select", options=["subtle", "medium", "strong"]),
     "lyrics_animation": field("Animación de letra", "Letra", "select", options=["none", "karaoke", "word_reveal", "pop", "glow"]),
     "line_transition": field("Transición entre líneas", "Letra", "select", options=["none", "slide_up", "slide_side", "wipe", "dissolve_blur"]),
-    "lyric_look": field("Look de letra", "Letra", "select", options=["", "cosmico", "cine", "pincel", "pop70", "pelicula"]),
+    "lyric_look": field("Look de letra", "Letra", "select", options=["", *_lyric_looks.LOOKS]),
     "background_id": field("Fondo de biblioteca o propio", "Fondo", "asset"),
     "background_mode": field("Uso del fondo", "Fondo", "select", options=["as_is", "variation"]),
     "scene_source": field("Inspiración del fondo", "Fondo", "select", options=["lyrics", "auto", "prompt_literal", "prompt_improved"]),

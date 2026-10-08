@@ -31,8 +31,9 @@ def test_every_look_ships_its_font_and_license(look_id):
     assert os.path.exists(L.font_path(look))
     family = look.font_file.split("-")[0]
     licenses = os.listdir(os.path.join(os.path.dirname(L.font_path(look)), "licenses"))
-    # Oswald predates the licenses folder; every font added for looks has one.
-    if family != "Oswald":
+    # Catalogue fonts that predate the licenses folder; every font added for
+    # looks ships its license next to it.
+    if family not in ("Oswald", "Montserrat", "Roboto"):
         assert any(n.startswith(family) for n in licenses)
 
 
@@ -42,6 +43,13 @@ def test_every_look_keeps_lyrics_inside_their_window(look_id):
                            duration=8.0)
     lyric_events = [d for d in _dialogues(doc) if "\\p1" not in d]
     assert lyric_events
+    if look_id == "chat":
+        # A conversation keeps earlier bubbles on screen (scrolling up);
+        # what must hold is that each bubble ARRIVES at its line's start.
+        firsts = sorted({_secs(d.split(",")[1]) for d in lyric_events})
+        assert firsts[0] == pytest.approx(SEGS[0]["start"], abs=0.01)
+        assert any(abs(f - SEGS[1]["start"]) < 0.01 for f in firsts)
+        return
     for d in lyric_events:
         _, start, end = d.split(",")[:3]
         start, end = _secs(start), _secs(end)
