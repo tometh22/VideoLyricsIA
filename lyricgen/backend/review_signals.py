@@ -39,6 +39,8 @@ _TRUE = ("1", "true", "yes", "on")
 
 KIND_LYRIC_REVIEW = "lyric_review_item"
 KIND_REPETITION = "repetition_proposal"
+# Una fila por corrida en sombra: costo (duración) para decidir si se mantiene.
+KIND_REPETITION_SHADOW_RUN = "repetition_shadow_run"
 
 _MAX_TEXT = 300
 _MAX_OCCURRENCES = 8
@@ -387,3 +389,57 @@ def record_repetition(job_id: str, segments, stats: dict, *, gate_reason: str | 
         submit(records)
     except Exception as exc:
         logger.warning("[REVIEW-SIGNALS] repetition capture failed job=%s: %r", job_id, exc)
+
+
+def job_tenant(job_id: str) -> str | None:
+    """Tenant del job (consulta corta). None si no se puede saber."""
+    db = None
+    try:
+        from database import Job, SessionLocal
+        db = SessionLocal()
+        row = db.query(Job.tenant_id).filter(Job.job_id == str(job_id)).first()
+        return row[0] if row else None
+    except Exception as exc:
+        logger.warning("[REVIEW-SIGNALS] tenant lookup failed job=%s: %r", job_id, exc)
+        return None
+    finally:
+        if db is not None:
+            db.close()
+
+
+def shadow_run_record(*, job_id: str, tenant_id: str | None, segments, duration_ms: float,
+                      words: int, proposals: int) -> dict:
+    """Costo de una corrida en sombra de ``repetition_reconcile``."""
+    seg_hash = segments_hash(segments)
+    return {
+        "job_id": str(job_id)[:12],
+        "tenant_id": tenant_id,
+        "kind": KIND_REPETITION_SHADOW_RUN,
+        "item_type": "shadow_run",
+        "decision": "declined",
+        "reason": "mutation_not_authorized",
+        "editor_revision": None,
+        "segments_hash": seg_hash,
+        "pipeline_release": pipeline_release(),
+        "line_index": None,
+        "start_s": None,
+        "end_s": None,
+        "payload": {
+            "duration_ms": round(float(duration_ms), 1),
+            "segments": len(segments or []),
+            "words": int(words),
+            "proposals": int(proposals),
+        },
+        "dedupe_key": _dedupe_key(job_id, KIND_REPETITION_SHADOW_RUN, seg_hash),
+    }
+
+
+def record_shadow_run(**kwargs) -> None:
+    """Guarda el costo de una corrida en sombra. Nunca levanta."""
+    if not is_enabled():
+        return
+    try:
+        submit([shadow_run_record(**kwargs)])
+    except Exception as exc:
+        logger.warning("[REVIEW-SIGNALS] shadow cost capture failed job=%s: %r",
+                       kwargs.get("job_id"), exc)

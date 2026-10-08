@@ -318,6 +318,7 @@ def test_main_wrapper_records_shadow_when_mutation_gate_closed(monkeypatch):
     monkeypatch.setenv("REPETITION_RECONCILE_ENABLED", "1")
     monkeypatch.setenv("REVIEW_SIGNALS_PERSIST_ENABLED", "1")
     monkeypatch.setattr(main, "_quality_mutation_authorized", lambda job_id: False)
+    monkeypatch.setattr(rs, "job_tenant", lambda job_id: "universal_music")
     calls = []
     monkeypatch.setattr(rs, "submit", lambda records: calls.append(records))
     segs, asr = _fixture_real()
@@ -325,8 +326,13 @@ def test_main_wrapper_records_shadow_when_mutation_gate_closed(monkeypatch):
     out = main._maybe_repetition_reconcile(result, "jobshadow")
     assert out is result and out["segments"] is segs  # el job no cambia
     assert "postpass_stats" not in out
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert any(r["reason"] == "mutation_not_authorized" for r in calls[0])
+    # Costo de la corrida en sombra, en su propia fila.
+    (run,) = calls[1]
+    assert run["kind"] == rs.KIND_REPETITION_SHADOW_RUN and run["tenant_id"] == "universal_music"
+    assert run["payload"]["duration_ms"] >= 0 and run["payload"]["words"] == len(asr)
+    assert run["payload"]["proposals"] == len([r for r in calls[0]])
 
     calls.clear()
     monkeypatch.setenv("REVIEW_SIGNALS_PERSIST_ENABLED", "0")
@@ -347,3 +353,18 @@ def test_main_wrapper_records_and_keeps_postpass_stats_clean(monkeypatch):
     assert any(s.get("repetition_recovered") for s in out["segments"])
     assert "proposals" not in out["postpass_stats"]["rep_reconcile"]
     assert any(r["decision"] == "applied" for r in calls[0])
+
+
+def test_shadow_only_runs_for_umg_jobs(monkeypatch):
+    import main
+
+    monkeypatch.setenv("REPETITION_RECONCILE_ENABLED", "1")
+    monkeypatch.setenv("REVIEW_SIGNALS_PERSIST_ENABLED", "1")
+    monkeypatch.setattr(main, "_quality_mutation_authorized", lambda job_id: False)
+    calls = []
+    monkeypatch.setattr(rs, "submit", lambda records: calls.append(records))
+    segs, asr = _fixture_real()
+    for tenant in ("tomas@epical.digital", "preflight_staging_x", None):
+        monkeypatch.setattr(rs, "job_tenant", lambda job_id, t=tenant: t)
+        main._maybe_repetition_reconcile({"segments": segs, "_asr_words": asr}, "jobother")
+    assert calls == []
