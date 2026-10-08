@@ -1,10 +1,22 @@
 # Changelog
 
-## [1.1.119] - 2026-10-07
+## [1.1.120] - 2026-10-08
 
 ### Added
 
 - `WHISPERX_RECONCILE_KEEP_WORDS` (apagada por defecto): cada línea de WhisperX reconciliada con la letra de referencia conserva las palabras de la ventana donde se ancló, con su score. Antes se volvían a pegar por posición, se corrían en cuanto el alineado saltaba una palabra y, sin score, el pipeline las borraba: el 95 % de esas líneas llegaba al editor sin palabras. Una línea cuyas palabras no describen su texto queda sin palabras, como hoy. No cambia el texto ni el inicio ni el fin de ninguna línea. La clave entra en la huella de configuración del pipeline.
+
+## [1.1.119] - 2026-10-07
+
+### Fixed
+
+- Las copias históricas de videos pueden recuperar la referencia de letra desde la evidencia inmutable de audio completo de su original, si coinciden cuenta, archivo y revisión del audio. Se admiten las hipótesis de audio completo capturadas sin referencia previa. La recuperación mantiene la aprobación humana de cada versión y rechaza evidencia dañada, snapshots faltantes obligatorios y audio diferente.
+
+## [1.1.118] - 2026-10-07
+
+### Added
+
+- Evento de medición `editor_line_structure_changed` cada vez que el operador parte o une una línea. Registra cómo se resolvió el timing (palabras reales, palabras que ya no coinciden con el texto, uno solo de los dos lados con palabras o línea sin palabras), qué lo disparó (Enter, botón, división masiva, diálogo de wrap, referencia o Backspace en línea vacía) y la duración de la línea. Solo contadores y enums: nunca texto de la letra. No cambia cómo se parte ni cómo se une.
 
 ## [1.1.117] - 2026-10-06
 

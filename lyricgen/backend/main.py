@@ -15133,6 +15133,7 @@ _PRODUCT_EVENT_NAMES = {
     "editor_help_opened", "editor_operator_suggestions_shown",
     "editor_operator_suggestion_decision", "editor_audio_playback_failed",
     "editor_reviewer_candidate", "editor_auto_repair_undone",
+    "editor_line_structure_changed",
 }
 
 # Ventana de /admin/product-metrics. Sin esto la única acotación era
@@ -15145,6 +15146,12 @@ PRODUCT_METRICS_WINDOW_DAYS = int(
 _PRODUCT_EVENT_PROPERTIES = {
     "editor_reviewer_candidate": {"kind", "proposal_id", "candidate_id", "event_id", "seconds"},
     "editor_auto_repair_undone": {"to_revision"},
+    # Partir/unir: cuántas líneas usaron el timing real por palabra y cuántas
+    # cayeron al reparto por caracteres (sin palabras o palabras viejas).
+    "editor_line_structure_changed": {
+        "structure_op", "trigger", "count", "words_count", "stale_words_count",
+        "one_side_count", "no_words_count", "duration_ms",
+    },
     "editor_opened": {"line_count", "view", "source"},
     "editor_view_changed": {"from", "to"},
     "editor_seek": {"position_ms", "source"},
