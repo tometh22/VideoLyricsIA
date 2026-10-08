@@ -6,6 +6,7 @@ const errors = {
   deliverables_not_ready: "Faltan archivos de entrega. Revisá el detalle del video.",
   portal_contract_unavailable: "El portal no está disponible para este envío.",
   ambiguous_replacement: "Hay varios pedidos del cliente vinculados a esta canción. Elegí la entrega a corregir desde Cambios antes de publicar.",
+  change_request_newer_than_version: "Llegó un pedido del cliente más nuevo que la letra aprobada. Corregí y aprobá la letra, o enviala de nuevo con «Publicar igual» y un motivo.",
   unexpected_error: "Ocurrió un error inesperado al publicar. Se puede reintentar.",
 };
 const RETRY_CODES = {

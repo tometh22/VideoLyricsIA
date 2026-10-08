@@ -491,10 +491,17 @@ export default function CampaignDetailPage({ id }) {
           setFlash({ tone: "info", text: "Ese envío ya estaba en curso: lo retomamos, no se creó otro." });
           return;
         }
-        const target = `${operation.total_count || total} ${total === 1 ? "video" : "videos"} a ${portal === "chile" ? "Chile" : portal === "argentina" ? "Argentina" : portal}`;
+        const sent = operation.total_count || total;
+        const target = `${sent} ${sent === 1 ? "video" : "videos"} a ${portal === "chile" ? "Chile" : portal === "argentina" ? "Argentina" : portal}`;
+        // Canciones que el backend dejó afuera: pedidos del cliente más nuevos
+        // que su letra aprobada (CHANGE_REQUEST_PUBLISH_GUARD_ENABLED).
+        const held = operation.blocked_by_change_request || [];
+        const heldText = held.length
+          ? ` No se enviaron ${held.length === 1 ? "1 canción" : `${held.length} canciones`} con pedidos del cliente más nuevos que su letra aprobada: ${held.map((entry) => entry.title || entry.job_id).join(", ")}.`
+          : "";
         setFlash(operation.scheduled === false
-          ? { tone: "warning", text: `El envío de ${target} quedó guardado, pero no pudimos ponerlo en cola. Usá «Reintentar» en el seguimiento del envío.` }
-          : { tone: "success", text: `Envío iniciado para ${target}. Sigue en segundo plano.` });
+          ? { tone: "warning", text: `El envío de ${target} quedó guardado, pero no pudimos ponerlo en cola. Usá «Reintentar» en el seguimiento del envío.${heldText}` }
+          : { tone: held.length ? "warning" : "success", text: `Envío iniciado para ${target}. Sigue en segundo plano.${heldText}` });
       }} />}
     {dialog?.type === "record" && <RecordDeliveryDialog campaignId={id} song={dialog.song} onClose={() => setDialog(null)} onDone={() => { setDialog(null); setFlash({ tone: "success", text: "Entrega registrada." }); void refresh(); }} />}
     {dialog?.type === "discard" && <DiscardDialog campaignId={id} songs={dialog.songs} mode={dialog.mode} onClose={() => setDialog(null)} onDone={(result) => {

@@ -88,3 +88,66 @@ describe("send to portal: closing client requests", () => {
     expect(keys.size).toBe(0);             // a confirmed send is over: the next one is a new operation
   });
 });
+
+describe("send to portal: client requests newer than the approved lyrics", () => {
+  const blockedSong = { job_id: "job1", title: "Barricada", artist: "2 minutos", version: { source: "editor_version", revision: 17 },
+    requests: [{ id: 141, submitted_at: "2026-10-02T17:57:14Z", comment: "0:19 Barricada policial, hay que enfrentar" }] };
+
+  function mountGuard({ blocked = [blockedSong], sendResponse } = {}) {
+    const calls = [];
+    vi.stubGlobal("fetch", vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      calls.push({ url, method: options.method || "GET", body: options.body ? JSON.parse(options.body) : null });
+      if (url.includes("/change-request-guard")) return json({ enabled: true, available: true, blocked });
+      if (url.includes("/change-requests")) return json({ items: [] });
+      return sendResponse ? sendResponse() : json({ operation_id: "op-1", total_count: 1, scheduled: true }, 202);
+    }));
+    const onStarted = vi.fn();
+    render(<SendToPortalDialog campaignId="c1" videos={videos} lockedPortal="chile" onClose={vi.fn()} onStarted={onStarted} />);
+    return { calls, onStarted };
+  }
+
+  it("asks about the selected jobs and shows the blocked song with its open request", async () => {
+    const { calls } = mountGuard();
+    expect(await screen.findByText(/Pedido #141/)).toBeInTheDocument();
+    expect(screen.getByText(/más nuevos que la letra aprobada/)).toBeInTheDocument();
+    expect(screen.getByText(/Se envía la otra canción/)).toBeInTheDocument();
+    expect(calls.find((call) => call.url.includes("/change-request-guard")).url).toContain("job_ids=job1%2Cjob2");
+  });
+
+  it("a plain send leaves the blocked song to the backend and carries no override", async () => {
+    const { calls, onStarted } = mountGuard();
+    await screen.findByText(/Pedido #141/);
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar envío" }));
+    await waitFor(() => expect(onStarted).toHaveBeenCalled());
+    expect(sendBody(calls).publish_anyway).toBeUndefined();
+  });
+
+  it("«Publicar igual» needs a reason and sends it with the blocked jobs", async () => {
+    const { calls, onStarted } = mountGuard();
+    fireEvent.click(await screen.findByLabelText("Publicar igual"));
+    expect(screen.getByRole("button", { name: "Confirmar envío" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Motivo para publicar igual"), { target: { value: "  UMG pidió reenviar.  " } });
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar envío" }));
+    await waitFor(() => expect(onStarted).toHaveBeenCalled());
+    expect(sendBody(calls)).toMatchObject({ publish_anyway: true, override_reason: "UMG pidió reenviar.", override_job_ids: ["job1"] });
+  });
+
+  it("cannot send when every selected song is blocked and nobody overrides", async () => {
+    mountGuard({ blocked: [blockedSong, { ...blockedSong, job_id: "job2", title: "Otra" }] });
+    expect(await screen.findByText(/No queda ninguna canción para enviar/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Confirmar envío" })).toBeDisabled();
+  });
+
+  it("a 409 for a request that arrived meanwhile shows the songs and keeps the dialog open", async () => {
+    const { onStarted } = mountGuard({
+      blocked: [],
+      sendResponse: () => json({ detail: { code: "change_request_newer_than_version", blocked: [blockedSong] } }, 409),
+    });
+    await screen.findByText(/Enviar 2 videos aprobados/);
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar envío" }));
+    expect(await screen.findByText(/Pedido #141/)).toBeInTheDocument();
+    expect(screen.getByText(/marcá «Publicar igual»/)).toBeInTheDocument();
+    expect(onStarted).not.toHaveBeenCalled();
+  });
+});
