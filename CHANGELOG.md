@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.119] - 2026-10-07
+
+### Fixed
+
+- Las copias históricas de videos pueden recuperar la referencia de letra desde la evidencia inmutable de audio completo de su original, si coinciden cuenta, archivo y revisión del audio. Se admiten las hipótesis de audio completo capturadas sin referencia previa. La recuperación mantiene la aprobación humana de cada versión y rechaza evidencia dañada, snapshots faltantes obligatorios y audio diferente.
+
 ## [1.1.118] - 2026-10-07
 
 ### Added

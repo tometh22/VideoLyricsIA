@@ -773,6 +773,102 @@ def test_human_approval_recovers_missing_reference_from_machine_evidence(
     assert repair.detail["source"] == "editor_document.machine_evidence"
 
 
+@pytest.mark.parametrize("case", [
+    "matching", "wrong_tenant", "wrong_audio", "wrong_audio_revision",
+    "tampered_parent", "missing_parent_snapshot", "child_snapshot_required",
+    "child_has_evidence", "not_post_render",
+])
+def test_legacy_variant_reference_recovery_keeps_native_approval_guards(
+    db, monkeypatch, case,
+):
+    monkeypatch.setenv("BATCH_CAMPAIGN_ENABLED", "1")
+    monkeypatch.setenv("LYRIC_REVIEW_MODE", "off")
+    campaign = _campaign(db, 1)
+    item = db.query(BatchCampaignItem).filter_by(campaign_id=campaign.id).one()
+    user = db.query(User).first()
+    original = [
+        {"segment_id": "line-1", "start": 0, "end": 1, "text": "Hola"},
+        {"segment_id": "line-2", "start": 1, "end": 2, "text": "mundo"},
+    ]
+    audio_sha = "9" * 64
+    captured = build_machine_evidence({
+        "segments": original,
+        "_recognition_attempt_count": 1,
+        "_recognition_hypotheses": [{
+            "family": "google/gemini-2.5-flash-audio", "kind": "text",
+            "events": [{"text": "Hola\nmundo"}], "attempt_id": 0,
+            "view": "full_audio_without_reference",
+            "transformation": "gemini_reference_hypothesis_raw",
+        }],
+    })
+    evidence = finalize_machine_evidence(
+        captured, original_segments=original, quality={},
+        audio_sha256=audio_sha, audio_revision=1,
+    )
+    if case == "tampered_parent":
+        evidence["hypotheses_by_family"][0]["events"] = [{"text": "ALTERADO"}]
+    edited_parent = [{**s, "text": "Texto editado por una persona"} for s in original]
+    parent_tenant = "another-tenant" if case == "wrong_tenant" else campaign.tenant_id
+    parent = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id, tenant_id=parent_tenant,
+        artist=item.artist, song_title=item.title,
+        status="done", workload_class="batch", campaign_id=campaign.id,
+        filename="parent.mp3", segments_json=edited_parent, segments_revision=3,
+        input_audio_sha256="a" * 64 if case == "wrong_audio" else audio_sha,
+        audio_revision=2 if case == "wrong_audio_revision" else 1,
+        # A mutable quality reference must not rescue damaged machine evidence.
+        transcription_quality={"reference_hypothesis": build_reference_hypothesis(
+            text="Referencia mutable", provider="gemini-2.5-flash-audio",
+            audio_sha256=audio_sha, audio_revision=1,
+            source_kind="gemini_complete_audio_derived", complete_audio_verified=True,
+        )},
+        machine_snapshot_required=True,
+    )
+    child = Job(
+        job_id=uuid.uuid4().hex[:12], user_id=user.id, tenant_id=campaign.tenant_id,
+        artist=item.artist, song_title=item.title, filename=item.filename,
+        status="transcribed_pending" if case == "not_post_render" else "done",
+        workload_class="batch", campaign_id=campaign.id, campaign_item_id=item.id,
+        parent_job_id=parent.job_id, segments_json=original, segments_revision=0,
+        input_audio_sha256=audio_sha, audio_revision=1, transcription_quality={},
+        machine_snapshot_required=case == "child_snapshot_required",
+    )
+    child_document = EditorDocument(
+        job_id=child.job_id, tenant_id=child.tenant_id, current_segments=original,
+        original_segments=original, revision=0,
+        machine_evidence={"schema": "invalid"} if case == "child_has_evidence" else None,
+    )
+    db.add_all([parent, child, child_document, EditorDocument(
+        job_id=parent.job_id, tenant_id=parent_tenant, current_segments=edited_parent,
+        original_segments=original, revision=3,
+        machine_evidence=None if case == "missing_parent_snapshot" else evidence,
+    )])
+    db.commit()
+    request = batch.LyricsApprovalRequest(
+        editor_revision=0, confirmed_line_ids=["line-1", "line-2"],
+        lyrics_confirmed=True, timings_confirmed=True, heard_against_audio=True,
+    )
+    actor = {"id": user.id, "tenant_id": campaign.tenant_id, "role": "admin"}
+    if case != "matching":
+        with pytest.raises(HTTPException) as exc:
+            batch.approve_campaign_lyrics(campaign.id, child.job_id, request, actor, db)
+        assert exc.value.status_code == 409
+        assert exc.value.detail["code"] == "reference_hypothesis_missing"
+        db.rollback()
+        return
+    response = batch.approve_campaign_lyrics(campaign.id, child.job_id, request, actor, db)
+    assert response["status"] == "done"
+    db.refresh(child)
+    assert child.segments_json == original
+    assert child.machine_snapshot_required is False
+    assert child_document.machine_evidence is None
+    assert child.transcription_quality["reference_hypothesis"]["reference_text"] == "Hola\nmundo"
+    assert batch.require_prebackground_approval(child)["editor_revision"] == 0
+    event = db.query(AuditLog).filter_by(action="batch.reference_hypothesis_recovered").one()
+    assert event.detail["source"] == "parent_editor_document.machine_evidence"
+    assert event.detail["source_job_id"] == parent.job_id
+
+
 @pytest.mark.parametrize("campaign_status", ["active", "completed", "paused", "cancelled"])
 @pytest.mark.parametrize("job_status", ["pending_review", "done", "rejected", "transcribed_pending"])
 def test_post_render_reapproval_restores_gate_without_hiding_video_from_review(

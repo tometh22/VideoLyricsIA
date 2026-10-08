@@ -12,7 +12,10 @@ from typing import Any
 
 
 SCHEMA = "batch-reference-hypothesis-v1"
-_RECOVERABLE_EVIDENCE_VIEW = "full_audio_with_reference"
+_RECOVERABLE_EVIDENCE_VIEWS = {
+    "full_audio_with_reference",
+    "full_audio_without_reference",
+}
 _RECOVERABLE_EVIDENCE_TRANSFORMATIONS = {
     "gemini_cleanup_raw",
     "gemini_reference_hypothesis_raw",
@@ -196,7 +199,7 @@ def recover_from_machine_evidence(
         if isinstance(candidate, dict)
         and candidate.get("role") == "primary"
         and candidate.get("kind") == "text"
-        and candidate.get("view") == _RECOVERABLE_EVIDENCE_VIEW
+        and candidate.get("view") in _RECOVERABLE_EVIDENCE_VIEWS
         and candidate.get("transformation")
         in _RECOVERABLE_EVIDENCE_TRANSFORMATIONS
         and "gemini" in str(candidate.get("family") or "").casefold()
