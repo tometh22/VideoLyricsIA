@@ -50,9 +50,14 @@ SERVICE_USERNAMES = ("batch-universal-staging",)
 WEEKLY_GOAL = 100
 BACKLOG_ALERT = 40
 UNOPENED_MAX_DAYS = 3
-# Feriados nacionales que caen en día hábil (oct–dic 2026). La tabla
-# `holidays` de la base está vacía; se puede reemplazar con OPS_HOLIDAYS.
-DEFAULT_HOLIDAYS = ("2026-10-12", "2026-11-23", "2026-12-08", "2026-12-25")
+# Días hábiles que no se trabajan en oct–dic 2026 (la tabla `holidays` de la
+# base está vacía; se puede reemplazar con OPS_HOLIDAYS). Verificado el 7-oct:
+# - 12-oct: Diversidad Cultural (Ley 27.399).
+# - 9-nov: feriado nacional por la visita papal (Decreto 1103/2026, art. 2).
+# - 23-nov: Soberanía Nacional, trasladado del viernes 20 (Ley 27.399).
+# - 7-dic: día no laborable con fines turísticos (Resolución JGM 164/2025).
+# - 8-dic y 25-dic: inamovibles.
+DEFAULT_HOLIDAYS = ("2026-10-12", "2026-11-09", "2026-11-23", "2026-12-07", "2026-12-08", "2026-12-25")
 
 STATES = (
     ("unopened", "Letra lista, sin abrir"),
