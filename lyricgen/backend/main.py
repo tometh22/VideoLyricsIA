@@ -14202,6 +14202,20 @@ class ProductEventsRequest(BaseModel):
     events: list[ProductEventItem]
 
 
+def _editor_scoped_job(db: Session, job_id: str, current_user: dict):
+    """El Job que el editor deja abrir a este usuario (o None).
+
+    Un único lugar para el alcance del editor: el admin de plataforma abre
+    canciones de cualquier tenant (acceso cruzado auditado en los flujos de
+    revisión); un usuario común queda aislado en su tenant. La telemetría del
+    editor (/analytics/events) usa esta misma función para que un evento se
+    acepte exactamente cuando el editor habría abierto la canción.
+    """
+    if current_user.get("role") == "admin":
+        return db.query(Job).filter(Job.job_id == job_id).first()
+    return get_job_for_tenant(db, job_id, current_user["tenant_id"])
+
+
 def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
     # Keep rollback effective: production tenants outside the canary cannot
     # mutate the durable editor by calling the API directly.
@@ -14214,10 +14228,7 @@ def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
     # returned 404.  The frontend then waited forever for durable hydration
     # and kept "Aprobar" disabled.  Resolve the same Job the surrounding
     # review flow authorises, while keeping regular users tenant-isolated.
-    if current_user.get("role") == "admin":
-        job = db.query(Job).filter(Job.job_id == job_id).first()
-    else:
-        job = get_job_for_tenant(db, job_id, current_user["tenant_id"])
+    job = _editor_scoped_job(db, job_id, current_user)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     try:
@@ -15228,12 +15239,7 @@ async def record_product_events(
         # descartaban en silencio (agus77 desde el 7-sep: 0 seeks, 0 aperturas
         # y 0 aprobaciones registradas mientras los heartbeats sí llegaban).
         # La fila sigue guardándose con el tenant del usuario, como el heartbeat.
-        if not item.job_id:
-            event_job = None
-        elif current_user.get("role") == "admin":
-            event_job = db.query(Job).filter(Job.job_id == item.job_id).first()
-        else:
-            event_job = get_job_for_tenant(db, item.job_id, current_user["tenant_id"])
+        event_job = _editor_scoped_job(db, item.job_id, current_user) if item.job_id else None
         if item.job_id and not event_job:
             rejected += 1
             continue
