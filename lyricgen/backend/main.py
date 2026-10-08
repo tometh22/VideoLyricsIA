@@ -20433,6 +20433,10 @@ class SendToUMGRequest(BaseModel):
     change_request_id: int | None = Field(default=None, ge=1)
     reviewed_render_fingerprint: str | None = Field(default=None, max_length=64)
     reviewed_editor_revision: int | None = Field(default=None, ge=0)
+    # CHANGE_REQUEST_PUBLISH_GUARD_ENABLED: publicar aunque haya pedidos
+    # abiertos más nuevos que la versión aprobada. Exige motivo; se audita.
+    publish_anyway: bool = False
+    override_reason: str | None = Field(default=None, max_length=1000)
 
 
 @app.post("/admin/deliveries/from-job/{job_id}")
@@ -20513,6 +20517,29 @@ def admin_create_delivery_from_job(
             status_code=400,
             detail="Job must be approved (status=done) before it can be published",
         )
+
+    # Regla de versión: no re-publicar una letra aprobada ANTES de un pedido
+    # de cambio que sigue abierto en esta canción (linaje incluido).
+    import change_request_publish_guard as _cr_guard
+    _guard_override = None
+    if _cr_guard.enabled():
+        try:
+            _guard = _cr_guard.evaluate(db, ddb, [job]).get(job_id) or {}
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail={
+                'code': 'change_request_guard_unavailable',
+                'message': 'No pudimos consultar los pedidos del cliente en el portal. No se publicó nada; reintentá.',
+            }) from exc
+        if _guard.get("blocked"):
+            _reason = ((body.override_reason if body else None) or "").strip()
+            if not (body and body.publish_anyway):
+                raise HTTPException(status_code=409, detail=_cr_guard.blocked_detail(job, _guard))
+            if not _reason:
+                raise HTTPException(status_code=422, detail={
+                    "code": "override_reason_required",
+                    "message": "Para publicar igual con pedidos abiertos, escribí el motivo.",
+                })
+            _guard_override = (_guard, _reason)
 
     # UMG has its own contractual preflight even when the general QC rollout
     # is observe/off. Check before storage calls or ProRes queue work.
@@ -20748,6 +20775,7 @@ def admin_create_delivery_from_job(
     # from campaign/history alone cannot attest every pending instruction.
     resolved_requests = []
     resolved_comments: list[str] = []
+    kept_open_requests: list[dict] = []
     if content_changed and body and body.change_request_id:
         pending_requests = (
             ddb.query(DeliveryChangeRequest)
@@ -20764,6 +20792,13 @@ def admin_create_delivery_from_job(
             # Recheck after copying/locking: a newly submitted request or a
             # different case was never reviewed by this publication intent.
             validate_reviewed_cut()
+            # Un pedido de texto cuyo texto no está en la letra publicada
+            # queda abierto. La publicación sigue igual.
+            if _cr_guard.enabled():
+                _closable, _kept = _cr_guard.text_gate(db, job, [request], now)
+                if _kept:
+                    kept_open_requests.extend(_kept)
+                    continue
             request.resolved_at = now
             request.updated_at = now
             request.resolved_by_user_id = added_by
@@ -20809,8 +20844,19 @@ def admin_create_delivery_from_job(
             ),
             "replaced_job_id": replaced_job_id,
             "previous_publication": previous_publication,
+            "kept_open_change_requests": [entry["id"] for entry in kept_open_requests],
+            "change_request_guard_override": bool(_guard_override),
         },
     ))
+    if _guard_override is not None:
+        db.add(_cr_guard.override_audit(
+            current_user["id"], job, _guard_override[0], _guard_override[1], "admin_publish",
+            portal_id=portal_id, delivery_id=delivery.id,
+        ))
+    for _kept in kept_open_requests:
+        db.add(_cr_guard.text_not_found_audit(
+            current_user["id"], job, _kept, "admin_publish", delivery_id=delivery.id,
+        ))
     db.commit()
 
     # Optional mail to UMG: only for a visible publication that answered client requests, and
@@ -20839,6 +20885,9 @@ def admin_create_delivery_from_job(
         "revision": delivery.published_revision,
         "content_changed": content_changed,
         "resolved_change_requests": resolved_requests,
+        # Pedidos que esta publicación NO cerró: el texto pedido no está en
+        # la letra publicada (CHANGE_REQUEST_PUBLISH_GUARD_ENABLED).
+        "kept_open_change_requests": kept_open_requests,
         "replaced_job_id": replaced_job_id,
         # A manually hidden delivery stays hidden after publishing: say so, so the
         # operator is never told "the client has it" when the portal shows nothing.
@@ -22343,6 +22392,22 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
     if (body.reviewed_render_fingerprint != delivery_freshness.render_fingerprint(job)
             or body.reviewed_editor_revision != int(document.revision or 0)):
         raise HTTPException(status_code=409, detail='El corte cambió. Revisá el video actualizado antes de cerrar.')
+    import change_request_publish_guard as _cr_guard
+    if _cr_guard.enabled():
+        # "Resuelto al publicar" exige que el texto pedido esté en la letra
+        # publicada. Si falta, el pedido sigue abierto; cerrarlo a mano con un
+        # motivo sigue disponible.
+        _closable, _kept = _cr_guard.text_gate(db, job, [cr])
+        if _kept:
+            db.add(_cr_guard.text_not_found_audit(
+                current_user['id'], job, _kept[0], 'publication_confirmed', delivery_id=delivery.id,
+            ))
+            db.commit()
+            raise HTTPException(status_code=409, detail={
+                'code': _cr_guard.TEXT_NOT_FOUND, 'missing': _kept[0]['missing'],
+                'message': 'La letra publicada no tiene el texto pedido: ' + ' · '.join(
+                    f'«{text}»' for text in _kept[0]['missing'][:5]) + '. Corregí y volvé a publicar.',
+            })
     now = datetime.now(timezone.utc)
     revision = delivery.published_revision or 1
     note = body.resolution_note.strip()

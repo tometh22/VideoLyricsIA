@@ -34,7 +34,7 @@ export async function campaignRequest(path, options = {}) {
     const message = translateBackendError(detail)
       || (typeof detail === "string" ? detail : detail?.message || detail?.code)
       || `Error ${response.status}`;
-    throw Object.assign(new Error(message), { status: response.status, code: detail?.code });
+    throw Object.assign(new Error(message), { status: response.status, code: detail?.code, detail });
   }
   return body;
 }

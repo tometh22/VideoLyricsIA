@@ -128,6 +128,12 @@ class DeliveryCreate(BaseModel):
     # closed unless listed here; the worker re-validates every id.
     resolve_requests: dict[str, list[int]] | None = None
     resolution_note: str | None = Field(default=None, max_length=2000)
+    # CHANGE_REQUEST_PUBLISH_GUARD_ENABLED: "publicar igual" las canciones
+    # con pedidos abiertos más nuevos que su versión aprobada. Exige motivo;
+    # override_job_ids acota a qué canciones (por defecto, todas las frenadas).
+    publish_anyway: bool = False
+    override_reason: str | None = Field(default=None, max_length=1000)
+    override_job_ids: list[str] | None = Field(default=None, max_length=1000)
 
 
 def _asset_key(asset: BatchCampaignAsset) -> str:
@@ -623,6 +629,98 @@ def delivery_preview(campaign_id: str, destination_portal: str | None = Query(de
     return {"destination_portal": destination, "hostname": DESTINATIONS[destination], "eligible": eligible, "blocked": blocked, "eligible_count": len(eligible)}
 
 
+def _guard_entry(job: Job, result: dict) -> dict:
+    return {"job_id": job.job_id, "title": job.song_title, "artist": job.artist,
+            "version": result["version"], "requests": result["requests"]}
+
+
+def _guard_unavailable() -> HTTPException:
+    return HTTPException(status_code=503, detail={
+        "code": "change_request_guard_unavailable",
+        "message": "No pudimos consultar los pedidos del cliente en el portal. No se envió nada; reintentá en un momento.",
+    })
+
+
+@router.get("/art-track-campaigns/{campaign_id}/deliveries/change-request-guard")
+@router.get("/campaigns/{campaign_id}/deliveries/change-request-guard")
+def delivery_change_request_guard(campaign_id: str, job_ids: str = Query(default="", max_length=20000),
+                                  current_user: dict = Depends(get_current_user), db: Session = Depends(get_db),
+                                  ddb: Session = Depends(get_deliveries_db)):
+    """Qué canciones de un envío frena la regla de versión. Sólo lectura.
+
+    El diálogo de envío lo consulta antes de confirmar para mostrar los
+    pedidos abiertos y ofrecer "Publicar igual"; el envío vuelve a evaluarlo.
+    """
+    import change_request_publish_guard as guard
+    _require_scope(current_user); campaign = _campaign_for_delivery(db, campaign_id, current_user)
+    if not guard.enabled():
+        return {"enabled": False, "available": True, "blocked": []}
+    wanted = [value for value in job_ids.split(",") if value][:1000]
+    if campaign.kind == "art_track":
+        query = db.query(Job).join(BatchCampaignItem, Job.campaign_item_id == BatchCampaignItem.id).filter(BatchCampaignItem.campaign_id == campaign.id)
+    else:
+        query = db.query(Job).filter(Job.campaign_id == campaign.id, Job.tenant_id == campaign.tenant_id)
+    jobs = query.filter(Job.job_id.in_(wanted or [""])).all()
+    try:
+        results = guard.evaluate(db, ddb, jobs)
+    except Exception:
+        logger.warning("[DELIVERY] change-request guard unavailable for campaign %s", campaign.id, exc_info=True)
+        return {"enabled": True, "available": False, "blocked": []}
+    return {"enabled": True, "available": True,
+            "blocked": [_guard_entry(job, results[job.job_id]) for job in jobs if results.get(job.job_id, {}).get("blocked")]}
+
+
+def _apply_publish_guard(db, ddb, candidates, body) -> tuple[list[dict], dict[str, dict]]:
+    """Regla de versión por canción: (frenadas, publicadas igual con motivo).
+
+    Una canción frenada no detiene a las demás: se informa y queda afuera.
+    """
+    import change_request_publish_guard as guard
+    if not guard.enabled():
+        return [], {}
+    jobs = [job for _, job in candidates]
+    try:
+        results = guard.evaluate(db, ddb, jobs)
+    except Exception:
+        logger.warning("[DELIVERY] change-request guard unavailable", exc_info=True)
+        raise _guard_unavailable()
+    reason = (body.override_reason or "").strip()
+    if body.publish_anyway and not reason:
+        raise HTTPException(status_code=422, detail={
+            "code": "override_reason_required",
+            "message": "Para publicar igual una canción con pedidos abiertos, escribí el motivo.",
+        })
+    scope = set(body.override_job_ids) if body.override_job_ids is not None else None
+    blocked, overrides = [], {}
+    for job in jobs:
+        result = results.get(job.job_id) or {}
+        if not result.get("blocked"):
+            continue
+        if body.publish_anyway and (scope is None or job.job_id in scope):
+            overrides[job.job_id] = result
+        else:
+            blocked.append(_guard_entry(job, result))
+    return blocked, overrides
+
+
+def _publish_guard_failure(db, ddb, row, job) -> str | None:
+    """El worker vuelve a mirar: un pedido puede llegar entre el envío y la
+    publicación. Sólo lo cubre un "publicar igual" que ya incluía ese pedido."""
+    import change_request_publish_guard as guard
+    if not guard.enabled():
+        return None
+    result = guard.evaluate(db, ddb, [job]).get(job.job_id) or {}
+    if not result.get("blocked"):
+        return None
+    override = (row.change_request_intent or {}).get("publish_guard_override") or {}
+    covered = set(override.get("request_ids") or [])
+    pending = [item for item in result["requests"] if item["id"] not in covered]
+    if not pending:
+        return None
+    ids = ", ".join(f"#{item['id']}" for item in pending)
+    return f"Pedidos abiertos más nuevos que la versión aprobada: {ids}. Corregí y aprobá la letra, o publicá igual con un motivo."[:500]
+
+
 def _validated_close_intents(db, ddb, campaign, candidates, destination, body) -> dict[str, dict]:
     """Which client requests each selected song may close when it is published.
 
@@ -698,9 +796,39 @@ def create_delivery_batch(campaign_id: str, body: DeliveryCreate, current_user: 
     if not candidates:
         code = "no_approved_art_tracks" if campaign.kind == "art_track" else "no_approved_videos"
         raise HTTPException(status_code=409, detail={"code": code})
+    # Regla de versión (CHANGE_REQUEST_PUBLISH_GUARD_ENABLED): se frena por
+    # canción; las demás siguen. Si no queda ninguna, el envío no se crea.
+    guard_blocked, guard_overrides = _apply_publish_guard(db, ddb, candidates, body)
+    if guard_blocked:
+        blocked_ids = {entry["job_id"] for entry in guard_blocked}
+        candidates = [(item, job) for item, job in candidates if job.job_id not in blocked_ids]
+        if body.resolve_requests:
+            body = body.model_copy(update={"resolve_requests": {
+                job_id: ids for job_id, ids in body.resolve_requests.items() if job_id not in blocked_ids}})
+        if not candidates:
+            import change_request_publish_guard as guard
+            raise HTTPException(status_code=409, detail={
+                "code": guard.GUARD_CODE, "blocked": guard_blocked,
+                "message": "Todas las canciones elegidas tienen pedidos de cambio abiertos más nuevos que su versión aprobada. Corregí y aprobá la letra, o publicá igual indicando el motivo.",
+            })
     intents = _validated_close_intents(db, ddb, campaign, candidates, destination, body)
     operation = DeliveryBatch(id=str(uuid.uuid4()), campaign_id=campaign.id, tenant_id=campaign.tenant_id, destination_portal=destination, status="queued", idempotency_key=body.idempotency_key, created_by=current_user["id"], total_count=len(candidates), created_at=_now(), updated_at=_now())
     db.add(operation); db.flush()
+    if guard_overrides:
+        import change_request_publish_guard as guard
+        reason = (body.override_reason or "").strip()
+        for _item, job in candidates:
+            result = guard_overrides.get(job.job_id)
+            if result is None:
+                continue
+            # El worker sólo publica igual los pedidos que este motivo cubrió.
+            intents[job.job_id] = {**(intents.get(job.job_id) or {}), "publish_guard_override": {
+                "reason": reason[:1000], "user_id": current_user["id"],
+                "request_ids": [entry["id"] for entry in result["requests"]],
+            }}
+            db.add(guard.override_audit(current_user["id"], job, result, reason, "campaign_bulk",
+                                        campaign_id=campaign.id, delivery_batch_id=operation.id,
+                                        portal_id=destination))
     for item, job in candidates:
         db.add(DeliveryBatchItem(id=str(uuid.uuid4()), delivery_batch_id=operation.id, campaign_id=campaign.id, job_id=job.job_id, approved_render_fingerprint=_fingerprint(job), status="pending", change_request_intent=intents.get(job.job_id), created_at=_now(), updated_at=_now()))
     db.commit()
@@ -708,7 +836,10 @@ def create_delivery_batch(campaign_id: str, body: DeliveryCreate, current_user: 
     # can call process_delivery_batch; the request never fires 500 network
     # calls and closing the browser cannot cancel the snapshot.
     scheduled = enqueue_delivery_batch(operation.id)
-    return JSONResponse(status_code=202, content={"operation_id": operation.id, "status": operation.status, "destination_portal": destination, "hostname": DESTINATIONS[destination], "total_count": operation.total_count, "scheduled": scheduled})
+    content = {"operation_id": operation.id, "status": operation.status, "destination_portal": destination, "hostname": DESTINATIONS[destination], "total_count": operation.total_count, "scheduled": scheduled}
+    if guard_blocked or guard_overrides:
+        content.update(blocked_by_change_request=guard_blocked, publish_guard_overrides=sorted(guard_overrides))
+    return JSONResponse(status_code=202, content=content)
 
 
 @router.get("/art-track-delivery-operations/{operation_id}")
@@ -751,7 +882,9 @@ def get_delivery_batch(operation_id: str, current_user: dict = Depends(get_curre
 
 # A retry cannot fix these: they need a person (pick the delivery to correct,
 # integrate the portal contract) or a new approval, not another attempt.
-NON_RETRYABLE_ITEM_ERRORS = {"ambiguous_replacement", "portal_contract_unavailable", "stale_approval"}
+# change_request_newer_than_version: hace falta una aprobación nueva (que
+# cambia el corte y obliga a otro envío) o un "publicar igual" con motivo.
+NON_RETRYABLE_ITEM_ERRORS = {"ambiguous_replacement", "portal_contract_unavailable", "stale_approval", "change_request_newer_than_version"}
 STALL_AFTER_SECONDS = 600
 
 
@@ -933,6 +1066,15 @@ def _evaluate_close_intent(db, ddb, row, job, active, changed) -> tuple[list, li
     return resolvable, skipped
 
 
+def _text_gate(db, job, resolvable) -> list[dict]:
+    """Pedidos a dejar abiertos porque su texto no está en la letra publicada."""
+    import change_request_publish_guard as guard
+    if not resolvable or not guard.enabled():
+        return []
+    _closable, kept = guard.text_gate(db, job, resolvable, _now())
+    return kept
+
+
 def process_delivery_batch(operation_id: str) -> dict[str, int]:
     """Worker entry point; safe to call repeatedly after a crash."""
     from database import Delivery
@@ -958,6 +1100,9 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     job = db.query(Job).filter(Job.job_id == row.job_id, Job.tenant_id == op.tenant_id).with_for_update().one_or_none()
                     if not job or job.status != "done" or not job.approved_at or _fingerprint(job) != row.approved_render_fingerprint:
                         row.status = "failed"; row.error_code = "stale_approval"; row.error_detail = "Approval or render version changed."; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
+                    guard_failure = _publish_guard_failure(db, ddb, row, job)
+                    if guard_failure:
+                        row.status = "failed"; row.error_code = "change_request_newer_than_version"; row.error_detail = guard_failure; row.attempts = int(row.attempts or 0) + 1; failed += 1; continue
                     if storage.is_enabled():
                         # The MP4/short/thumbnail are produced by the render.
                         missing = [ft for ft in ("video", "short", "thumbnail") if not (job.s3_keys or {}).get(ft) or not storage.object_exists((job.s3_keys or {}).get(ft))]
@@ -1034,6 +1179,13 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                     # Decide BEFORE touching the delivery: once its fingerprint is
                     # updated the corrected cut no longer reads as "needs publish".
                     resolvable, skipped_requests = _evaluate_close_intent(db, ddb, row, job, active, changed)
+                    # Un pedido de texto cuyo texto no está en la letra publicada
+                    # queda abierto (no frena la publicación).
+                    text_kept = _text_gate(db, job, resolvable)
+                    if text_kept:
+                        kept_ids = {entry["id"] for entry in text_kept}
+                        resolvable = [request for request in resolvable if request.id not in kept_ids]
+                        skipped_requests = skipped_requests + text_kept
                     if active is None:
                         # Las columnas de frescura se escriben también acá. Sin
                         # esto, TODA fila publicada por campaña nacía sin
@@ -1067,7 +1219,7 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                         active.frame_size_snapshot = (job.umg_spec or {}).get("frame_size")
                         active.added_by_user_id = deliveries_added_by(op.created_by)
                         active.added_at = _now()
-                    row.delivery_id = active.id; row.status = "sent"; row.receipt = {"delivery_id": active.id, "portal": op.destination_portal, "replaced_job_id": replaced_job_id, "previous_publication": previous_publication, **({"change_requests": {"resolved": [r.id for r in resolvable], "skipped": skipped_requests}} if row.change_request_intent else {})}; row.attempts = int(row.attempts or 0) + 1; sent += 1
+                    row.delivery_id = active.id; row.status = "sent"; row.receipt = {"delivery_id": active.id, "portal": op.destination_portal, "replaced_job_id": replaced_job_id, "previous_publication": previous_publication, **({"change_requests": {"resolved": [r.id for r in resolvable], "skipped": skipped_requests}} if (row.change_request_intent or {}).get("request_ids") else {})}; row.attempts = int(row.attempts or 0) + 1; sent += 1
                     archive_duplicate(duplicate, _now())
                     active.published_file_keys = pinned
                     active.published_render_fingerprint = delivery_freshness.render_fingerprint(job)
@@ -1096,6 +1248,11 @@ def process_delivery_batch(operation_id: str) -> dict[str, int]:
                         "replaced_job_id": replaced_job_id, "previous_publication": previous_publication,
                         "resolved_change_requests": [r.id for r in resolvable],
                     }))
+                    if text_kept:
+                        import change_request_publish_guard as guard
+                        for kept in text_kept:
+                            db.add(guard.text_not_found_audit(op.created_by, job, kept, "campaign_bulk",
+                                                              delivery_batch_id=op.id, delivery_id=active.id))
                     ddb.commit()
                     db.commit()
                 except Exception:
