@@ -479,6 +479,10 @@ export function describePublishError(error) {
   if (has("lyric_review_pending")) {
     return "Quedan líneas de la letra sin revisar. Abrí el editor, revisalas y volvé a publicar.";
   }
+  if (has("change_request_newer_than_version")) {
+    const ids = (detail?.requests || []).map((request) => `#${request.id}`).join(", ");
+    return `Hay pedidos abiertos${ids ? ` (${ids})` : ""} más nuevos que la letra aprobada de este video. Corregí y aprobá la letra antes de publicar; si hay que publicar igual, hacelo desde el envío de la campaña indicando el motivo.`;
+  }
   if (has("change_request_job_mismatch")) {
     return "Este pedido pertenece a otro video. Actualizá la pantalla y abrí el pedido de nuevo.";
   }
