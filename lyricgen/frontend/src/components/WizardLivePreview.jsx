@@ -1,9 +1,12 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import { REF_W, lyricFontPx } from "../lib/lyricTiers";
+import { REF_W, lyricFontPx, tierForLength, clampFontScale } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
 import { FONT_BY_CODE, applyCase } from "./fontCatalog";
 import { MOVEMENT_LABELS, EFFECT_LABELS } from "../lib/optionLabels";
+import {
+  getLyricLook, keywordSplit, buildRows, LYRIC_LOOK_LABELS,
+} from "../lib/lyricLooks";
 
 // Studio Console live preview. Shows a sample lyric line over the selected
 // palette/mood with the selected camera movement applied as a real CSS
@@ -93,6 +96,78 @@ function hexToRgba(hex, alpha) {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
+// ── Looks de letra (lib/lyricLooks) ─────────────────────────────────────────
+// El preview de un look corre en dos modos:
+//   - muestra (sin audio): la frase de ejemplo "vive" un ciclo de LOOK_LOOP_S
+//     con keyframes CSS one-shot; un intervalo cambia de "línea" en cada ciclo
+//     (reinicia la animación, alterna la inclinación y cambia la tarjeta de
+//     Pop 70s).
+//   - en vivo (audio del editor): el progreso de la línea real se calcula en
+//     JS a partir de currentTime, así entrada/salida caen donde el render.
+export const LOOK_LOOP_S = 3.2;
+
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+
+// Ruido de película (SVG feTurbulence) como textura repetida.
+const GRAIN_URI = "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/></filter><rect width='160' height='160' filter='url(%23n)' opacity='.6'/></svg>\")";
+
+/**
+ * Estilo de línea de un look en un instante (modo en vivo). Espejo de
+ * backend lyric_looks._line_motion / ass_render zoom_through: entrada y salida
+ * caen DENTRO de la ventana de la línea.
+ */
+export function lookLineMotionStyle(motion, elapsedS, durS) {
+  const dur = Math.max(0.05, durS);
+  const t = Math.max(0, Math.min(dur, elapsedS));
+  if (motion === "zoom_through") {
+    const arrive = Math.min(0.4, dur * 0.3);
+    const exit = Math.min(0.3, dur * 0.25);
+    if (t < arrive) {
+      const q = clamp01(t / arrive);
+      return { transform: `scale(${(0.3 + 0.7 * q).toFixed(3)})`, opacity: q };
+    }
+    if (t < dur - exit) {
+      const q = clamp01((t - arrive) / Math.max(0.001, dur - exit - arrive));
+      return { transform: `scale(${(1 + 0.08 * q).toFixed(3)})`, opacity: 1 };
+    }
+    const q = clamp01((t - (dur - exit)) / exit);
+    return {
+      transform: `scale(${(1.08 + 7.92 * q * q).toFixed(3)})`,
+      opacity: 1 - q,
+      filter: `blur(${(6 * q).toFixed(2)}px)`,
+    };
+  }
+  if (motion === "cine") {
+    const enter = Math.min(0.75, Math.max(0.25, dur * 0.3));
+    const exit = Math.min(0.42, Math.max(0.16, dur * 0.18));
+    if (t < enter) {
+      const q = clamp01(t / enter);
+      return {
+        opacity: q,
+        filter: `blur(${(10 * (1 - q)).toFixed(2)}px)`,
+        letterSpacing: `${(0.22 - 0.19 * q).toFixed(3)}em`,
+      };
+    }
+    if (t > dur - exit) {
+      const q = clamp01((t - (dur - exit)) / exit);
+      return { opacity: 1 - q, filter: `blur(${(8 * q).toFixed(2)}px)`, letterSpacing: "0.03em" };
+    }
+    return { opacity: 1, filter: "blur(0px)", letterSpacing: "0.03em" };
+  }
+  if (motion === "fade") {
+    const f = Math.min(0.16, Math.max(0.06, dur * 0.08));
+    return { opacity: Math.min(clamp01(t / f), clamp01((dur - t) / f)) };
+  }
+  return {};
+}
+
+// Keyframe (modo muestra) por movimiento de línea.
+const LOOK_SAMPLE_ANIM = {
+  zoom_through: `wlp-look-zoom ${LOOK_LOOP_S}s cubic-bezier(.3,.6,.4,1) both`,
+  cine: `wlp-look-cine ${LOOK_LOOP_S}s ease-out both`,
+  fade: `wlp-look-fade ${LOOK_LOOP_S}s linear both`,
+};
+
 export default function WizardLivePreview({
   style = "auto",
   customColors = "",
@@ -108,6 +183,10 @@ export default function WizardLivePreview({
   effect = "",
   lyricsAnimation = "none",
   lineTransition = "none",
+  // Look de letra ("" = sin look). Con look, font/lyricsAnimation/
+  // lineTransition no se usan (los define el look); fontScale, textCase,
+  // lyricColor (si no es el blanco default) y effect siguen aplicando.
+  lyricLook = "",
   // Lyric text colors 2026-05-25:
   // - lyricColor: color del texto (no-cantada para karaoke; texto único
   //   para el resto de animaciones).
@@ -173,6 +252,9 @@ export default function WizardLivePreview({
   // re-render del preview, NO de los componentes padres (gracias al ref).
   const [livePlaybackTick, setLivePlaybackTick] = useState(null);
   const lastTickRef = useRef({ activeLine: "", currentTime: -1 });
+  // Contador de líneas en vivo: los looks lo usan para alternar inclinación y
+  // tarjeta de color en cada línea nueva (el tick no trae el índice).
+  const lineSeqRef = useRef(0);
   // Render-storm detector (P0 UMG Chile 2026-06-16: "duplicar una línea hace
   // titilar toda la pantalla y se queda pegado"). A flicker is the active line
   // changing many times per second — but the 3 s debounced autosave can't
@@ -210,9 +292,10 @@ export default function WizardLivePreview({
           }
           st.changes += 1;
         }
+        if (lineChanged) lineSeqRef.current += 1;
         if (lineChanged || Math.abs(tick.currentTime - last.currentTime) > 0.04) {
           lastTickRef.current = { activeLine: tick.activeLine, currentTime: tick.currentTime };
-          setLivePlaybackTick({ ...tick });
+          setLivePlaybackTick({ ...tick, lineSeq: lineSeqRef.current });
         }
       } else if (livePlaybackTick !== null) {
         // El operador pausó/paró el audio — limpiar para volver al loop sample.
@@ -225,6 +308,17 @@ export default function WizardLivePreview({
     return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playbackTickRef]);
+  // Look activo + reloj del modo muestra (ver LOOK_LOOP_S arriba). El
+  // intervalo sólo corre con look y sin audio en vivo.
+  const look = getLyricLook(lyricLook);
+  const lookPreview = look ? look.preview : null;
+  const isLiveTick = !!(livePlaybackTick && livePlaybackTick.activeLine);
+  const [lookLoopIdx, setLookLoopIdx] = useState(0);
+  useEffect(() => {
+    if (!look || isLiveTick || renderedVideoUrl) return undefined;
+    const id = setInterval(() => setLookLoopIdx((i) => i + 1), LOOK_LOOP_S * 1000);
+    return () => clearInterval(id);
+  }, [look, isLiveTick, renderedVideoUrl]);
   // La preview debe respetar siempre la fuente de la opción seleccionada.
   // Antes, "Ilustración viva" + cualquier efecto sustituía silenciosamente
   // animado.mp4 por preview_base.mp4: la tarjeta mostraba la ilustración,
@@ -607,6 +701,131 @@ export default function WizardLivePreview({
     dissolve_blur: "wlp-trans-blur 3.4s ease-in-out infinite",
   }[lineTransition];
 
+  // ── Look de letra ─────────────────────────────────────────────────────
+  // Reemplaza la capa de letra de arriba (font/animación/transición) por la
+  // composición del look. Respeta textCase, fontScale y el color del
+  // operador (si no es el blanco default, pisa el color del look).
+  let lookLyric = null;
+  let lookCard = null;
+  if (lookPreview) {
+    const lp = lookPreview;
+    const live = liveActive;
+    const lineIdx = live ? (live.lineSeq || 0) : lookLoopIdx;
+    const text = live ? applyCase(live.activeLine, textCase) : sample;
+    const tokens = text.split(/\s+/).filter(Boolean);
+    const basePx = tierForLength(text.length).fontPx * (lp.fontScale || 1) * clampFontScale(fontScale);
+    const toCqw = (px) => `${((px / REF_W) * 100).toFixed(3)}cqw`;
+    const textColor = operatorPickedColor ? lyricColor : lp.color;
+    const accent = lp.cards
+      ? lp.cardAccents[lineIdx % lp.cardAccents.length]
+      : (lp.accent || textColor);
+    if (lp.cards) lookCard = lp.cards[lineIdx % lp.cards.length];
+    const glyph = {
+      fontFamily: look.font.css,
+      fontWeight: look.font.weight,
+      color: textColor,
+      textShadow: lp.textShadow,
+      WebkitTextStroke: lp.stroke,
+      paintOrder: "stroke fill",
+      lineHeight: 1.02,
+    };
+    // Motion de línea: en vivo, calculada del currentTime; en muestra, keyframe.
+    const lineMotion = live
+      ? {
+        ...lookLineMotionStyle(lp.motion, live.currentTime - live.activeStart, live.activeEnd - live.activeStart),
+        transition: "transform 60ms linear, opacity 60ms linear, filter 60ms linear",
+      }
+      : { animation: LOOK_SAMPLE_ANIM[lp.motion] };
+
+    let body;
+    if (lp.layout === "keyword") {
+      const split = keywordSplit(tokens);
+      body = split ? (
+        <>
+          {split.lead ? (
+            <span style={{ display: "block", fontSize: toCqw(basePx * lp.leadScale), marginBottom: "0.15em" }}>{split.lead}</span>
+          ) : null}
+          <span data-look-key="true" style={{ display: "block", fontSize: toCqw(basePx * lp.keyScale) }}>{split.key}</span>
+        </>
+      ) : (
+        <span style={{ fontSize: toCqw(basePx) }}>{text}</span>
+      );
+    } else if (lp.layout === "build") {
+      const { rows, keyIndex } = buildRows(tokens, {
+        baseFontPx: basePx, keyScale: lp.keyScale, rowWidth: lp.rowWidth, glyphWidth: lp.glyphWidth,
+      });
+      // Palabras que ya se cantaron (en vivo) — mismo helper que karaoke.
+      const sungIdx = live
+        ? activeWordIndex(text, live.words, live.activeStart, live.activeEnd, live.currentTime)
+        : null;
+      // Espejo de backend: +tilt en líneas pares, −0.7·tilt en impares (frz
+      // de ASS gira antihorario → rotate CSS negativo).
+      const tilt = lp.tilt ? lp.tilt * (lineIdx % 2 === 0 ? 1 : -0.7) : 0;
+      body = (
+        <span style={{ display: "inline-flex", flexDirection: "column", alignItems: "center", transform: tilt ? `rotate(${(-tilt).toFixed(2)}deg)` : undefined }}>
+          {rows.map((row, r) => (
+            <span
+              key={r}
+              data-look-row={r}
+              style={{
+                display: "flex",
+                justifyContent: "center",
+                alignItems: "baseline",
+                gap: "0.3em",
+                fontSize: toCqw(basePx),
+                transform: lp.stagger && rows.length > 1
+                  ? `translateX(${(lp.stagger * 100 * (r % 2 === 0 ? -1 : 1)).toFixed(2)}cqw)`
+                  : undefined,
+              }}
+            >
+              {row.map((i) => {
+                const isKey = i === keyIndex;
+                const visible = live ? i <= sungIdx : true;
+                return (
+                  <span
+                    key={i}
+                    data-look-word={i}
+                    data-look-key={isKey ? "true" : undefined}
+                    style={{
+                      display: "inline-block",
+                      fontSize: isKey ? `${lp.keyScale}em` : undefined,
+                      color: isKey ? accent : undefined,
+                      ...(live
+                        ? {
+                          opacity: visible ? 1 : 0,
+                          transform: visible ? "scale(1)" : "scale(1.35)",
+                          transition: "opacity 110ms ease-out, transform 110ms cubic-bezier(.3,1.4,.5,1)",
+                        }
+                        : { animation: `wlp-look-wordpop 110ms ${(0.15 + i * 0.32).toFixed(2)}s cubic-bezier(.3,1.4,.5,1) both` }),
+                    }}
+                  >
+                    {tokens[i]}
+                  </span>
+                );
+              })}
+            </span>
+          ))}
+        </span>
+      );
+    } else {
+      body = <span style={{ fontSize: toCqw(basePx) }}>{text}</span>;
+    }
+    lookLyric = (
+      <div
+        key={`look:${look.code}:${live ? (live.lineSeq || 0) : lookLoopIdx}:${text}`}
+        data-testid="look-lyric"
+        style={{
+          ...glyph,
+          ...(lp.layout === "build"
+            ? (live ? {} : { animation: `wlp-look-blockout ${LOOK_LOOP_S}s linear both` })
+            : lineMotion),
+        }}
+      >
+        {body}
+      </div>
+    );
+  }
+
   // Post-render edit: short-circuit a un MP4 puro sin overlays — el MP4
   // ya trae palette/effect/grade/lyrics horneados, cualquier overlay sería
   // doble exposición. El badge cambia a "Resultado actual" para que el
@@ -670,6 +889,13 @@ export default function WizardLivePreview({
         @keyframes wlp-trans-slideside { 0% { transform: translateX(-70%); opacity: 0; } 18%, 82% { transform: translateX(0); opacity: 1; } 100% { transform: translateX(70%); opacity: 0; } }
         @keyframes wlp-trans-wipe { 0% { clip-path: inset(0 100% 0 0); } 30%, 100% { clip-path: inset(0 0 0 0); } }
         @keyframes wlp-trans-blur { 0% { filter: blur(10px); opacity: 0; } 26%, 80% { filter: blur(0); opacity: 1; } 100% { filter: blur(10px); opacity: 0; } }
+        /* lyric looks (mirror backend lyric_looks.py) — one-shot por ciclo */
+        @keyframes wlp-look-zoom { 0% { transform: scale(.3); opacity: 0; } 12% { transform: scale(1); opacity: 1; } 90% { transform: scale(1.08); opacity: 1; filter: blur(0); } 100% { transform: scale(9); opacity: 0; filter: blur(6px); } }
+        @keyframes wlp-look-cine { 0% { filter: blur(10px); letter-spacing: .22em; opacity: 0; } 22% { filter: blur(0); letter-spacing: .03em; opacity: 1; } 87% { filter: blur(0); letter-spacing: .03em; opacity: 1; } 100% { filter: blur(8px); letter-spacing: .03em; opacity: 0; } }
+        @keyframes wlp-look-fade { 0% { opacity: 0; } 5%, 95% { opacity: 1; } 100% { opacity: 0; } }
+        @keyframes wlp-look-wordpop { from { opacity: 0; transform: scale(1.35); } to { opacity: 1; transform: scale(1); } }
+        @keyframes wlp-look-blockout { 0%, 93% { opacity: 1; } 100% { opacity: 0; } }
+        @keyframes wlp-look-grain { 0% { background-position: 0 0; } 25% { background-position: -40px 25px; } 50% { background-position: 30px -35px; } 75% { background-position: -20px -15px; } 100% { background-position: 10px 40px; } }
         /* Motion Lab v2: these animations move pixels from the selected photo,
            while /fx_raw remains only a restrained auxiliary light/mask. */
         @keyframes wlp-rgb-red {
@@ -808,6 +1034,7 @@ export default function WizardLivePreview({
         className="absolute inset-0 overflow-hidden"
         data-testid="photo-effect-stage"
         data-photo-transform={isPixelTransform ? effect : "overlay"}
+        style={lookPreview && lookPreview.grade ? { filter: lookPreview.grade } : undefined}
       >
         {renderPhotoTransform()}
       </div>
@@ -881,7 +1108,29 @@ export default function WizardLivePreview({
       <div className="absolute inset-0 pointer-events-none" style={{ background: "repeating-linear-gradient(0deg,transparent 0 2px,rgba(255,255,255,.022) 2px 3px)" }} />
       <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(120% 80% at 50% 50%, transparent 55%, rgba(0,0,0,.55))" }} />
 
+      {/* Look: tinte, viñeta y grano propios (el grano es el overlay "film"
+          del look: un efecto elegido por el operador lo reemplaza). */}
+      {lookPreview && lookPreview.tint ? (
+        <div className="absolute inset-0 pointer-events-none" data-look-layer="tint" style={{ background: lookPreview.tint, mixBlendMode: "soft-light", opacity: 0.6 }} />
+      ) : null}
+      {lookPreview && lookPreview.vignette ? (
+        <div className="absolute inset-0 pointer-events-none" data-look-layer="vignette" style={{ background: "radial-gradient(110% 85% at 50% 50%, transparent 45%, rgba(0,0,0,.6))" }} />
+      ) : null}
+      {lookPreview && lookPreview.grain && !effect ? (
+        <div className="absolute inset-0 pointer-events-none" data-look-layer="grain" style={{ backgroundImage: GRAIN_URI, mixBlendMode: "overlay", opacity: 0.28, animation: "wlp-look-grain .5s steps(1,end) infinite" }} />
+      ) : null}
+      {/* Pop 70s: el fondo se REEMPLAZA por una placa plana que corta en cada
+          línea (backend Look.background = "flat"). */}
+      {lookCard ? (
+        <div className="absolute inset-0 pointer-events-none" data-look-layer="card" data-look-card={lookCard} style={{ background: lookCard }} />
+      ) : null}
+
       {/* lyric — vertically centered, mirroring the real render (\an5 center) */}
+      {lookLyric ? (
+        <div className="absolute inset-0 flex items-center justify-center px-[8%] text-center" data-lyric-look={look.code}>
+          {lookLyric}
+        </div>
+      ) : (
       <div className="absolute inset-0 flex items-center justify-center px-[8%] text-center">
         {/* transition wrapper (movement) composes with the inner animation */}
         <div key={`${lineTransition}:${sample}`} style={{ animation: transWrapAnim }}>
@@ -921,6 +1170,7 @@ export default function WizardLivePreview({
           </div>
         </div>
       </div>
+      )}
 
       {/* live indicator (clearly a status, not a button).
 
@@ -933,7 +1183,7 @@ export default function WizardLivePreview({
       {/* Cinemascope 2.39:1 letterbox — simulated bars so the operator sees the
           framing before rendering. The real bars are burned into the master by
           pipeline._apply_frame_format. 2.39:1 in a 16:9 frame → 12.8% each. */}
-      {frameFormat === "cine" && (
+      {(frameFormat === "cine" || (lookPreview && lookPreview.letterbox)) && (
         <>
           <div className="absolute inset-x-0 top-0 bg-black pointer-events-none" style={{ height: "12.8%" }} />
           <div className="absolute inset-x-0 bottom-0 bg-black pointer-events-none" style={{ height: "12.8%" }} />
@@ -979,14 +1229,14 @@ export default function WizardLivePreview({
             {modeLabel}
           </span>
           <span
-            key={`${moveLabel}-${effectLabel}`}
+            key={`${moveLabel}-${effectLabel}-${look ? look.code : ""}`}
             className="shrink-0 ml-3 px-2 py-0.5 rounded-full backdrop-blur-sm"
             style={{
               animation: "wlp-badge-pulse 0.7s cubic-bezier(.2,.8,.2,1) 1",
               background: isMinimal ? "rgba(0,0,0,.06)" : "rgba(255,255,255,.10)",
             }}
           >
-            {(t("upload.preview_motion") || "Movimiento")}: {moveLabel}{effectLabel ? ` · ${t("upload.effect_label") || "Efecto:"} ${effectLabel}` : ""}
+            {(t("upload.preview_motion") || "Movimiento")}: {moveLabel}{effectLabel ? ` · ${t("upload.effect_label") || "Efecto:"} ${effectLabel}` : ""}{look ? ` · ${t("upload.look_label") || "Look:"} ${LYRIC_LOOK_LABELS(t)[look.code]}` : ""}
           </span>
         </div>
       )}

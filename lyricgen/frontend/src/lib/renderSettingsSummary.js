@@ -41,6 +41,8 @@ export const SETTINGS_GROUPS = [
     labelKey: "detail.settings_group_lyrics",
     labelFallback: "Letra",
     axes: [
+      // El look primero: con look activo define tipografía/animación/transición.
+      { key: "lyric_look", labelKey: "detail.axis_look", labelFallback: "Look", kind: "raw" },
       { key: "font", labelKey: "detail.axis_font", labelFallback: "Tipografía", kind: "font" },
       { key: "font_scale", labelKey: "detail.axis_font_scale", labelFallback: "Tamaño", kind: "scale" },
       { key: "text_case", labelKey: "detail.axis_text_case", labelFallback: "Mayúsculas", kind: "raw" },

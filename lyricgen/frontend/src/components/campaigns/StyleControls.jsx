@@ -77,7 +77,7 @@ export function StylePreview({ settings: s, assets }) {
     <WizardLivePreview placeholderBg={!asset} clipSrc={source || ""} clipIsVideo={!photo}
       operatorPhoto={!!asset && photo} photoAnimated={s.animate_image} style={s.style} customColors={s.custom_colors}
       movementStyle={s.movement_style} effect={s.effect} font={s.font} fontScale={s.font_scale} textCase={s.text_case}
-      textContrast={s.text_contrast} lyricsAnimation={s.lyrics_animation} lineTransition={s.line_transition}
+      textContrast={s.text_contrast} lyricsAnimation={s.lyrics_animation} lineTransition={s.line_transition} lyricLook={s.lyric_look}
       lyricColor={s.lyric_color} lyricSungColor={s.lyric_sung_color} frameFormat={s.frame_format}
       lyric="Así se verá la letra" />
     <p className="mt-2 text-xs text-ink-secondary">Muestra del estilo. El fondo IA definitivo se genera después de aprobar letra y tiempos.</p>

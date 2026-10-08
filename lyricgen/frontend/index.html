@@ -131,10 +131,12 @@
     <link rel="apple-touch-icon" sizes="180x180" href="/brand/apple-touch-icon.png" />
     <!-- Google Fonts for the lyric-video font picker preview. The 8 families
          here mirror the backend's _FONT_CATALOGUE so what the operator sees
-         in the dropdown is exactly what the worker renders. -->
+         in the dropdown is exactly what the worker renders. Audiowide,
+         Knewave, Marcellus and Shrikhand belong to the lyric "looks"
+         (src/lib/lyricLooks.js ↔ backend/lyric_looks.py). -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Anton&family=Bebas+Neue&family=Fredoka:wght@600&family=Jost:wght@700&family=Montserrat:wght@700;800&family=Nunito:wght@800&family=Outfit:wght@700&family=Oswald:wght@700&family=Poppins:wght@700&family=Quicksand:wght@700&family=Roboto:wght@700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Anton&family=Audiowide&family=Bebas+Neue&family=Fredoka:wght@600&family=Jost:wght@700&family=Knewave&family=Marcellus&family=Montserrat:wght@700;800&family=Nunito:wght@800&family=Outfit:wght@700&family=Oswald:wght@700&family=Poppins:wght@700&family=Quicksand:wght@700&family=Roboto:wght@700&family=Shrikhand&display=swap" rel="stylesheet">
     <!-- 2026-05-30 perf: pre-warm the TCP/TLS connection to the backend
          BEFORE the React bundle finishes parsing. The first real API
          call (/auth/me, /usage, /jobs) then skips ~120-300 ms of

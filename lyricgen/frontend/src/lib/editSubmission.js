@@ -17,6 +17,7 @@
 import { computeFieldDiff } from "./editWizardDiff.js";
 import { normalizeSegmentsForEdit } from "./lyricsEditSubmit.js";
 import { normalizeMovementCode } from "./catalogCodes.js";
+import { normalizeLyricLook } from "./lyricLooks.js";
 
 // Prioridad de edit_type: el más complejo de los presentes gana.
 // background_library (swap curado, $0, sin slot) supersede al regen IA;
@@ -129,6 +130,7 @@ export function buildEditReview(job, snapReview = null) {
     fontScale: String(pickSnapOr("fontScale", params.font_scale || "1.0")),
     lyricsAnimation: pickSnapOr("lyricsAnimation", params.lyrics_animation || "none"),
     lineTransition: pickSnapOr("lineTransition", params.line_transition || "none"),
+    lyricLook: normalizeLyricLook(pickSnapOr("lyricLook", params.lyric_look || "")),
     lyricColor: pickSnapOr("lyricColor", params.lyric_color || "#FFFFFF"),
     lyricSungColor: pickSnapOr("lyricSungColor", params.lyric_sung_color || "#FFFFFF"),
     // Normalizado en LOS DOS lados (acá y en baseline): el backend persiste el
@@ -173,6 +175,9 @@ export function buildEditReview(job, snapReview = null) {
     fontScale: String(params.font_scale || "1.0"),
     lyricsAnimation: params.lyrics_animation || "none",
     lineTransition: params.line_transition || "none",
+    // Normalizado en los dos lados (igual que movementStyle): un código viejo
+    // o desconocido es "" para el backend, y sin normalizar difearía solo.
+    lyricLook: normalizeLyricLook(params.lyric_look || ""),
     lyricColor: params.lyric_color || "#FFFFFF",
     lyricSungColor: params.lyric_sung_color || "#FFFFFF",
     movementStyle: normalizeMovementCode(params.movement_style || ""),
@@ -222,6 +227,7 @@ export function buildEditCurrent(review, opts = {}) {
     textContrast: r.textContrast,
     lyricsAnimation: r.lyricsAnimation,
     lineTransition: r.lineTransition,
+    lyricLook: r.lyricLook,
     effect: r.effect,
     backgroundHint: r.backgroundHint,
     bgVerbatim: r.bgVerbatim,

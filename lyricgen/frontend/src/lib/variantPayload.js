@@ -19,6 +19,7 @@
 // Función pura: sin fetch, sin React. Testeable sin DOM.
 
 import { backgroundRegenExtras } from "./editWizardDiff.js";
+import { normalizeLyricLook } from "./lyricLooks.js";
 
 const str = (v) => (v == null ? "" : String(v));
 
@@ -62,6 +63,9 @@ export function buildVariantPayload({
     effect: str(r.effect),
     lyrics_animation: str(r.lyricsAnimation) || "none",
     line_transition: str(r.lineTransition) || "none",
+    // Look de letra: absoluto como el resto ("" = la variante va sin look
+    // aunque el padre tuviera uno).
+    lyric_look: normalizeLyricLook(r.lyricLook),
     // ── Tipografía ──────────────────────────────────────────────────
     font: str(r.font),
     font_scale: num(r.fontScale, 1.0),

@@ -1163,6 +1163,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                  text_motion: str = "none",
                  lyrics_animation: str = "none",
                  line_transition: str = "none",
+                 # Lyric look (lyric_looks.LOOKS id, "" = none). Only sent by
+                 # the API when a look is chosen, so queued jobs without one
+                 # stay compatible with workers that predate the param.
+                 lyric_look: str = "",
                  # Lyric text colors 2026-05-25. Hex #RRGGBB; cadena vacía
                  # = blanco default. Para karaoke: lyric_color = palabra no
                  # cantada, lyric_sung_color = palabra cantada. Para otras
@@ -1835,6 +1839,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             "text_motion": text_motion,
             "lyrics_animation": lyrics_animation,
             "line_transition": line_transition,
+            "lyric_look": lyric_look,
             "style": style,
             "genre": genre,
             "concept": concept,
@@ -2295,7 +2300,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # (gated to those animations; no-op/fallback otherwise) and cache it
             # into segments_json so re-renders don't re-pay. Isolated from the
             # transcription pipeline by design.
-            if lyrics_animation in ("karaoke", "word_reveal"):
+            import lyric_looks as _looks
+            _look = _looks.get_look(lyric_look)
+            if (lyrics_animation in ("karaoke", "word_reveal")
+                    or (_look is not None and _look.layout == "build")):
                 import karaoke_align
                 _enriched = karaoke_align.enrich_segments_with_word_timings(segments, mp3_path)
                 if _enriched is not segments:
@@ -2315,6 +2323,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                 text_motion=text_motion,
                 lyrics_animation=lyrics_animation,
                 line_transition=line_transition,
+                lyric_look=lyric_look,
                 text_contrast=text_contrast,
                 effect=effect, custom_colors=custom_colors,
                 lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
@@ -2393,6 +2402,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
                         text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
                         lyrics_animation=lyrics_animation, line_transition=line_transition,
+                        lyric_look=lyric_look,
                     )
                 files["short_url"] = f"/download/{job_id}/short"
             except Exception as _short_err:
@@ -18709,6 +18719,10 @@ def _render_lyrics_ass(
     # del texto (PrimaryColour del style en ASS).
     lyric_color: str = "",
     lyric_sung_color: str = "",
+    # Lyric look (lyric_looks.LOOKS id). When set, the look owns the font,
+    # composition, motion, grade and default overlay effect; size, case,
+    # lyric colour, an explicit effect and the title card still apply.
+    lyric_look: str = "",
     # Title-card customization (Full Rotor v1). Defaults reproduce the
     # historical look exactly: auto layout, no size change, artist in
     # Montserrat ExtraBold, song in the lyric font.
@@ -18746,6 +18760,14 @@ def _render_lyrics_ass(
     The artist/song title card mirrors generate_lyric_video's two layouts.
     """
     import ass_render as _ass
+    import lyric_looks as _looks
+
+    look = _looks.get_look(lyric_look) if render_text else None
+    if look is not None:
+        font_path = _looks.font_path(look)
+        effect = effect or look.effect
+        logger.info("[ASS] lyric look=%s font=%s effect=%s", look.id,
+                    look.font_file, effect or "-")
 
     scale = spec.text_scale
     contrast = _CONTRAST_SETTINGS.get(text_contrast, _CONTRAST_SETTINGS["medium"])
@@ -18827,7 +18849,7 @@ def _render_lyrics_ass(
             primary_for_lines = lyric_color or ""
             secondary_for_lines = ""
         first_lyric_start = segments[0]["start"] if segments else duration
-        lines += _ass.title_card_lines(
+        title_lines = _ass.title_card_lines(
             artist, song_title, first_lyric_start,
             width=spec.width, height=spec.height,
             text_scale=scale,
@@ -18848,18 +18870,29 @@ def _render_lyrics_ass(
             # individually.
             song_lines=(title_song_break.split("\n") if title_song_break else None),
         )
+        lines += title_lines
         base_fs = _ass.lyric_fontsize(40, scale, font_scale, font_factor=font_factor)
         # Reusamos el mapping primary/secondary computado arriba para
         # segments_to_lines — mismo eje semántico (karaoke usa sung como
         # PrimaryColour). Sin esto la palabra cantada se rendea con
         # PrimaryColour blanco aunque el operador haya elegido otro color.
-        ass_doc = _ass.build_ass(
-            width=spec.width, height=spec.height,
-            font_name=family, base_fontsize=base_fs,
-            outline=outline, shadow=shadow, lines=lines, bold=bold,
-            primary_color=primary_for_lines,
-            secondary_color=secondary_for_lines,
-        )
+        if look is not None:
+            ass_doc = _looks.build_look_ass(
+                segments, look,
+                width=spec.width, height=spec.height, duration=duration,
+                case_fn=lambda t: _apply_case(t, text_case),
+                font_scale=font_scale,
+                primary_override=lyric_color or "",
+                title_lines=title_lines,
+            )
+        else:
+            ass_doc = _ass.build_ass(
+                width=spec.width, height=spec.height,
+                font_name=family, base_fontsize=base_fs,
+                outline=outline, shadow=shadow, lines=lines, bold=bold,
+                primary_color=primary_for_lines,
+                secondary_color=secondary_for_lines,
+            )
         ass_path = os.path.join(job_dir, "lyrics.ass")
         with open(ass_path, "w", encoding="utf-8") as f:
             f.write(ass_doc)
@@ -18896,6 +18929,7 @@ def _render_lyrics_ass(
         width=spec.width, height=spec.height,
         effect=effect, style=style, custom_colors=custom_colors,
         rhythm=_fx_rhythm,
+        grade_override=(look.grade if look is not None else None),
     )
     _filter_args = (
         ["-filter_complex", vfilter, "-map", "[out]", "-map", "1:a"]
@@ -19004,6 +19038,7 @@ def _visual_render_options_selected(
     effect: str = "",
     lyrics_animation: str = "none",
     line_transition: str = "none",
+    lyric_look: str = "",
 ) -> bool:
     """Whether the render contains a visual option that must be honored.
 
@@ -19014,7 +19049,7 @@ def _visual_render_options_selected(
     """
     return any(
         str(value or "").strip().lower() not in {"", "none", "cut"}
-        for value in (effect, lyrics_animation, line_transition)
+        for value in (effect, lyrics_animation, line_transition, lyric_look)
     )
 
 
@@ -19040,6 +19075,9 @@ def generate_lyric_video(
     # Lyric text colors 2026-05-25. Hex #RRGGBB; "" → blanco default.
     lyric_color: str = "",
     lyric_sung_color: str = "",
+    # Lyric look (lyric_looks.LOOKS id, "" = none): a complete typographic
+    # treatment that owns font, composition, motion and grade.
+    lyric_look: str = "",
     # Title-card customization (Full Rotor v1). Defaults = historical look.
     title_template: str = "auto",
     title_size: float = 1.0,
@@ -19180,6 +19218,7 @@ def generate_lyric_video(
         effect=effect,
         lyrics_animation=lyrics_animation,
         line_transition=line_transition,
+        lyric_look=lyric_look,
     )
     if _visual_options_selected and _engine != "ass":
         raise RuntimeError(
@@ -19224,6 +19263,7 @@ def generate_lyric_video(
                 artist=artist, song_title=title_song,
                 effect=effect, style=style, custom_colors=custom_colors,
                 lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
+                lyric_look=lyric_look,
                 title_template=title_template, title_size=title_size,
                 title_artist_font=title_artist_font, title_song_font=title_song_font,
                 title_song_break=title_song_break,
@@ -19242,7 +19282,8 @@ def generate_lyric_video(
                     "ASS render failed while selected visual options were "
                     f"requested (effect={effect!r}, "
                     f"lyrics_animation={lyrics_animation!r}, "
-                    f"line_transition={line_transition!r}): {e}"
+                    f"line_transition={line_transition!r}, "
+                    f"lyric_look={lyric_look!r}): {e}"
                 ) from e
             # Never fail the job on a fast-path error — fall through to the
             # proven moviepy composite below.
@@ -19847,6 +19888,7 @@ def _build_short_ass_doc(
     text_contrast: str,
     lyrics_animation: str,
     line_transition: str,
+    lyric_look: str = "",
 ) -> str:
     """Documento ASS del short (1080x1920) con EXACTAMENTE las mismas
     derivaciones de estilo que _render_lyrics_ass usa para el video
@@ -19868,6 +19910,18 @@ def _build_short_ass_doc(
         {"start": s["start"], "end": s["end"], "text": s["text"]}
         for s in window_segments
     ]
+    import lyric_looks as _looks
+    look = _looks.get_look(lyric_look)
+    if look is not None:
+        # Same look as the master, composed for the vertical frame. Word
+        # timings are synthesized from each re-based line window (the
+        # segments' `words` are absolute song times).
+        return _looks.build_look_ass(
+            clean_segments, look, width=1080, height=1920,
+            duration=max((s["end"] for s in clean_segments), default=0.0),
+            case_fn=lambda t: _apply_case(t, text_case),
+            font_scale=font_scale, primary_override=lyric_color or "",
+        )
     lines = _ass.segments_to_lines(
         clean_segments,
         text_scale=scale,
@@ -19910,6 +19964,7 @@ def _burn_short_text_ass(
     text_contrast: str,
     lyrics_animation: str,
     line_transition: str,
+    lyric_look: str = "",
 ) -> tuple[str | None, str | None]:
     """Quema la letra del short con LIBASS — el MISMO motor del video.
 
@@ -19937,9 +19992,13 @@ def _burn_short_text_ass(
     evento de Sentry del fallback y diagnosticar la causa raíz sin tener que
     correlacionar logs de worker por timestamp."""
     import ass_render as _ass
+    import lyric_looks as _looks
 
     try:
-        font_dir = _ass.single_font_dir(font_path)
+        _look = _looks.get_look(lyric_look)
+        font_dir = _ass.single_font_dir(
+            _looks.font_path(_look) if _look is not None else font_path
+        )
         ass_doc = _build_short_ass_doc(
             window_segments,
             font_path=font_path,
@@ -19947,7 +20006,10 @@ def _burn_short_text_ass(
             lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
             text_contrast=text_contrast,
             lyrics_animation=lyrics_animation, line_transition=line_transition,
+            lyric_look=lyric_look,
         )
+        # The look's grade goes in the same pass, before the text burn.
+        _grade = f"{_look.grade}," if (_look is not None and _look.grade) else ""
         ass_path = os.path.join(job_dir, "short_lyrics.ass")
         with open(ass_path, "w", encoding="utf-8") as f:
             f.write(ass_doc)
@@ -19977,7 +20039,7 @@ def _burn_short_text_ass(
             cmd = [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-i", os.path.basename(bg_short_path),
-                "-vf", f"subtitles=short_lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}",
+                "-vf", f"{_grade}subtitles=short_lyrics.ass:fontsdir={_ffmpeg_filter_escape(font_dir)}",
                 "-map", "0:v:0", "-map", "0:a:0",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                 "-pix_fmt", "yuv420p",
@@ -20270,6 +20332,7 @@ def generate_short(
     custom_colors: str = "",
     lyrics_animation: str = "none",
     line_transition: str = "none",
+    lyric_look: str = "",
 ) -> str:
     """Generate a 1080x1920 vertical short from the chorus section.
 
@@ -20297,6 +20360,10 @@ def generate_short(
                        os.path.basename(font))
 
     import fx_compositor as _fx
+    import lyric_looks as _looks
+    _short_look = _looks.get_look(lyric_look)
+    if _short_look is not None and not effect:
+        effect = _short_look.effect  # the look's default overlay (grain)
     _selected_fx = _fx.effect_path(effect)
     if _visual_render_options_selected(effect=effect) and not _selected_fx:
         raise RuntimeError(
@@ -20478,6 +20545,7 @@ def generate_short(
         lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
         text_contrast=text_contrast,
         lyrics_animation=lyrics_animation, line_transition=line_transition,
+        lyric_look=lyric_look,
     )
     if burned:
         os.replace(burned, out_path)
@@ -20485,6 +20553,7 @@ def generate_short(
         if _visual_render_options_selected(
             lyrics_animation=lyrics_animation,
             line_transition=line_transition,
+            lyric_look=lyric_look,
         ):
             _alert_sentry(
                 "short-libass-required",
@@ -20963,6 +21032,7 @@ def run_edit_pipeline(
     text_motion = merged.get("text_motion") or "none"
     lyrics_animation = merged.get("lyrics_animation") or "none"
     line_transition = merged.get("line_transition") or "none"
+    lyric_look = merged.get("lyric_look") or ""
     genre = merged.get("genre") or ""
     concept = merged.get("concept") or ""
     movement_style = merged.get("movement_style") or ""
@@ -21839,8 +21909,12 @@ def run_edit_pipeline(
         # Word-level animation timing (forced-align, once, cached) — same
         # gated/isolated path as run_pipeline. A re-render of an existing
         # karaoke / word_reveal job (incl. a typography edit) thus repairs its
-        # sync and caches the result.
-        if lyrics_animation in ("karaoke", "word_reveal"):
+        # sync and caches the result. Looks that land words one by one need
+        # the same timing.
+        import lyric_looks as _looks
+        _look = _looks.get_look(lyric_look)
+        if (lyrics_animation in ("karaoke", "word_reveal")
+                or (_look is not None and _look.layout == "build")):
             import karaoke_align
             _enriched = karaoke_align.enrich_segments_with_word_timings(segments, mp3_path)
             if _enriched is not segments:
@@ -21860,6 +21934,7 @@ def run_edit_pipeline(
             text_motion=text_motion,
             lyrics_animation=lyrics_animation,
             line_transition=line_transition,
+            lyric_look=lyric_look,
             text_contrast=text_contrast,
             effect=effect, custom_colors=custom_colors,
             lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
@@ -21913,6 +21988,7 @@ def run_edit_pipeline(
                     lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
                     text_contrast=text_contrast, effect=effect, custom_colors=custom_colors,
                     lyrics_animation=lyrics_animation, line_transition=line_transition,
+                    lyric_look=lyric_look,
                 )
                 files["short_url"] = f"/download/{job_id}/short"
             except Exception as _short_err:

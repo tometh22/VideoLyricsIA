@@ -46,6 +46,7 @@ const JOB_FULL = {
     font_scale: 1.15,
     lyrics_animation: "karaoke",
     line_transition: "fade",
+    lyric_look: "cine",
     lyric_color: "#FF0000",
     lyric_sung_color: "#00FF00",
     movement_style: "estatico",
@@ -232,6 +233,57 @@ describe("un cambio real sí viaja", () => {
     expect(out.payload.segments).toEqual([
       { start: 1, end: 2, text: "letra corregida" },
     ]);
+  });
+});
+
+describe("look de letra", () => {
+  it("se siembra del render_params (y un código desconocido es sin look)", () => {
+    expect(buildEditReview(JOB_FULL, null).initialFields.lyricLook).toBe("cine");
+    expect(buildEditReview(JOB_FULL, null).baseline.lyricLook).toBe("cine");
+    expect(buildEditReview(JOB_BARE, null).initialFields.lyricLook).toBe("");
+    const legacy = { ...JOB_BARE, render_params: { lyric_look: "neon" } };
+    const { baseline } = buildEditReview(legacy, null);
+    expect(baseline.lyricLook).toBe("");
+    // Sin tocar nada no difea aunque el backend haya guardado un código viejo.
+    expect(computeFieldDiff(baseline, currentFrom(legacy))).toEqual({});
+  });
+
+  it("el snap del autosave gana (incluido el '' de sacar el look)", () => {
+    const { initialFields } = buildEditReview(JOB_FULL, { lyricLook: "" });
+    expect(initialFields.lyricLook).toBe("");
+  });
+
+  it("cambiar de look viaja como typography con lyric_look", () => {
+    const { baseline } = buildEditReview(JOB_BARE, null);
+    const out = resolveEditSubmission({
+      baseline,
+      current: currentFrom(JOB_BARE, { lyricLook: "pop70" }),
+      jobStatus: "pending_review",
+    });
+    expect(out.editType).toBe("typography");
+    expect(out.payload).toEqual({ edit_type: "typography", lyric_look: "pop70" });
+  });
+
+  it("sacar el look manda lyric_look='' (clear explícito)", () => {
+    const { baseline } = buildEditReview(JOB_FULL, null);
+    const out = resolveEditSubmission({
+      baseline,
+      current: currentFrom(JOB_FULL, { lyricLook: "" }),
+      jobStatus: "pending_review",
+    });
+    expect(out.payload.lyric_look).toBe("");
+  });
+
+  it("en un job done el look viaja colgado de una edición de letra", () => {
+    const done = { ...JOB_FULL, status: "done" };
+    const { baseline } = buildEditReview(done, null);
+    const out = resolveEditSubmission({
+      baseline,
+      current: currentFrom(done, { lyricLook: "pincel" }),
+      jobStatus: "done",
+    });
+    expect(out.editType).toBe("lyrics");
+    expect(out.payload.lyric_look).toBe("pincel");
   });
 });
 

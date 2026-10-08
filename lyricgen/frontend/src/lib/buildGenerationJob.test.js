@@ -40,6 +40,21 @@ describe("buildGenerationJob", () => {
       editorVersionId: null,
       bgCacheKey: null,
       status: "queued",
+      lyricLook: "",
     });
+  });
+
+  it("keeps the lyric look (normalized) next to the selectors it overrides", () => {
+    const job = buildGenerationJob({
+      file: { name: "song.mp3" },
+      segments: [],
+      lyricLook: "Cine",
+      font: "anton",
+      lyricsAnimation: "karaoke",
+      lineTransition: "wipe",
+    });
+    // El look no borra lo elegido a mano: volver a "Sin look" lo recupera.
+    expect(job).toMatchObject({ lyricLook: "cine", font: "anton", lyricsAnimation: "karaoke", lineTransition: "wipe" });
+    expect(buildGenerationJob({ file: { name: "a.mp3" }, segments: [], lyricLook: "neon" }).lyricLook).toBe("");
   });
 });

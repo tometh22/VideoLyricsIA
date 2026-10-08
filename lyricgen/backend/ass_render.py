@@ -725,6 +725,49 @@ def _ass_time(seconds: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
 
 
+# Conservative average glyph advance as a fraction of the font size. Wide
+# display faces sit around 0.7; overestimating only means an earlier break.
+_EST_GLYPH_WIDTH = 0.75
+
+
+def _balanced_breaks(text: str, fontsize: int, width: int) -> str:
+    """Pre-break `text` into balanced rows that fit `width` at `fontsize`.
+
+    Used by transitions that scale the line far past the frame (zoom_through):
+    libass re-wraps every frame as the scaled width grows, so the rows would
+    jump around mid-animation. Breaking once at the readable size and then
+    disabling wrapping (\\q2) keeps the layout fixed while it scales."""
+    if "\n" in text:
+        return text
+    words = text.split()
+    if len(words) < 2:
+        return text
+    max_w = width * 0.85
+    est = len(text) * fontsize * _EST_GLYPH_WIDTH
+    rows = min(len(words), max(1, -(-int(est) // int(max_w))))
+    if rows == 1:
+        return text
+    target = len(text) / rows
+    out: list[str] = []
+    cur: list[str] = []
+    for w in words:
+        cand = " ".join(cur + [w])
+        if cur and len(cand) > target and len(out) < rows - 1:
+            # Close the row on whichever side of `target` lands closer.
+            prev = " ".join(cur)
+            if abs(len(cand) - target) < abs(len(prev) - target):
+                out.append(cand)
+                cur = []
+                continue
+            out.append(prev)
+            cur = [w]
+        else:
+            cur.append(w)
+    if cur:
+        out.append(" ".join(cur))
+    return "\n".join(out)
+
+
 def _ass_escape(text: str) -> str:
     """Escape a display string for an ASS Dialogue Text field.
 
@@ -907,7 +950,8 @@ def build_ass(
         # timing (segments_to_lines synthesizes it, so this is normally true).
         word_anim = anim in _WORD_LEVEL_ANIMATIONS and bool(ln.words)
         fade_in_ms, fade_out_ms = ln.fade_in_ms, ln.fade_out_ms
-        if anim == "pop":
+        if anim == "pop" and trans != "zoom_through":
+            # (zoom_through owns the scale axis; pop would fight it.)
             # Scale-in with a small overshoot/settle. Capped at 116% and
             # settled by 210 ms so it never throws the reader off the line.
             overrides += ("\\fscx116\\fscy116\\t(0,120,\\fscx96\\fscy96)"
@@ -948,12 +992,38 @@ def build_ass(
             _exit_ms = min(380, max(140, int(_dur_ms * 0.30)))
             overrides += (f"\\blur8\\t(0,{_enter_ms},\\blur0)"
                           f"\\t({_dur_ms - _exit_ms},{_dur_ms},\\blur8\\4a&HFF&)")
+        elif trans == "zoom_through":
+            # "Fly-through": the line arrives from far away (small, faded),
+            # settles at its normal size, drifts slightly toward the camera
+            # while it is read, and in its last few hundred ms rushes past the
+            # lens (big, blurred, fading). The exit window is short and capped
+            # so the line stays readable for most of its time on screen. The
+            # dialogue end timestamp is unchanged.
+            _zt_enter = min(420, max(160, int(_dur_ms * 0.28)))
+            _zt_exit = min(320, max(120, int(_dur_ms * 0.22)))
+            _zt_hold_end = max(_zt_enter, _dur_ms - _zt_exit)
+            # Short lines get a gentler fly-out so they don't feel violent.
+            _zt_out = 900 if _dur_ms >= 1500 else 450
+            # Per-channel alpha: keep the style's 50% shadow (\4a&H80&).
+            overrides += (
+                "\\fscx30\\fscy30\\1a&HFF&\\3a&HFF&\\4a&HFF&"
+                f"\\t(0,{_zt_enter},0.5,\\fscx100\\fscy100\\1a&H00&\\3a&H00&\\4a&H80&)"
+                f"\\t({_zt_enter},{_zt_hold_end},\\fscx110\\fscy110)"
+                f"\\t({_zt_hold_end},{_dur_ms},2.2,\\fscx{_zt_out}\\fscy{_zt_out}"
+                "\\blur6\\1a&HFF&\\3a&HFF&\\4a&HFF&)"
+            )
+            # The scale/alpha ramps ARE the entrance and exit.
+            fade_in_ms = fade_out_ms = 0
 
         if fade_in_ms > 0 or fade_out_ms > 0:
             overrides += f"\\fad({int(fade_in_ms)},{int(fade_out_ms)})"
 
         if word_anim:
             inner = _animated_word_payload(anim, ln)
+        elif trans == "zoom_through":
+            # Fixed rows + no re-wrap while the line scales past the frame.
+            overrides += "\\q2"
+            inner = _ass_escape(_balanced_breaks(ln.text, ln.fontsize, width))
         else:
             inner = _ass_escape(ln.text)
         text = "{" + overrides + "}" + inner

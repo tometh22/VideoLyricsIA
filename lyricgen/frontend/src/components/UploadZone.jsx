@@ -10,6 +10,7 @@ import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, EFFECT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
+import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote } from "../lib/lyricLooks";
 import { canCreateArtTrack } from "../lib/artTrackAccess";
 import EditPlanSummary from "./EditPlanSummary";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
@@ -53,6 +54,7 @@ const TITLE_CARD_FIELDS = new Set([
 const LYRIC_RENDER_FIELDS = new Set([
   "font", "textCase", "fontScale", "textContrast", "frameFormat",
   "lyricsAnimation", "lineTransition", "lyricColor", "lyricSungColor",
+  "lyricLook",
 ]);
 // Qué cuenta como FOTO subida (vs video). Mismo criterio que el backend, que
 // sólo reconoce estas extensiones como still animable (`_is_still` en
@@ -371,6 +373,8 @@ export default function UploadZone({
     // lyricTransition + textMotion: deprecados 2026-05-23 (no se persisten).
     textCase: "upper", fontScale: "1.0", lyricsAnimation: "none", lineTransition: "none", textContrast: "medium",
     frameFormat: "full",
+    // Look de letra ("" = sin look). Sticky como el resto del estilo.
+    lyricLook: "",
     // Lyric color customization 2026-05-25:
     // - lyricColor: color del texto (no-cantada para karaoke; texto único para
     //   none/pop/glow/word_reveal).
@@ -951,6 +955,8 @@ export default function UploadZone({
   const [hoverAnimation, setHoverAnimation] = useState(null);
   // And for the line-transition picker (lives in the same Animación step).
   const [hoverTransition, setHoverTransition] = useState(null);
+  // And for the lyric-look gallery (top of the same step).
+  const [hoverLook, setHoverLook] = useState(null);
   // Abstract motion icons — communicate the camera MOVEMENT, not a fake scene.
   // The big live preview is what actually demonstrates the motion.
   const movIcon = (code) => {
@@ -1015,6 +1021,66 @@ export default function UploadZone({
         <span className={base} style={{ animation: anim, display: "inline-block" }}>{t("upload.preview_lyric")}</span>
       </span>
     );
+  };
+
+  // Looping mini-demo of a lyric LOOK inside its card: the look's own font,
+  // colours and motion over a swatch of its background treatment.
+  const lookDemo = (look) => {
+    const p = look.preview;
+    if (!p) {
+      return <span className="font-extrabold tracking-tight text-white/80 text-[15px] leading-none">{t("upload.preview_lyric")}</span>;
+    }
+    const words = t("upload.sample_words").toUpperCase().split(" ");
+    // El catálogo expresa outline/sombra en cqw del frame grande; en la
+    // miniatura el texto es ~2.3× más grande en proporción → a px fijos.
+    const thumbPx = (v) => (v || "").replace(/(\d*\.?\d+)cqw/g, (_m, n) => `${(parseFloat(n) * 3.4).toFixed(2)}px`);
+    const base = {
+      fontFamily: look.font.css,
+      fontWeight: look.font.weight,
+      color: p.color,
+      textShadow: thumbPx(p.textShadow),
+      WebkitTextStroke: p.stroke && p.stroke !== "0px" ? thumbPx(p.stroke) : undefined,
+      paintOrder: "stroke fill",
+      lineHeight: 1,
+      display: "inline-block",
+    };
+    if (p.layout === "build") {
+      return (
+        <span className="text-[15px] flex flex-col items-center" style={{ transform: p.tilt ? `rotate(${-p.tilt}deg)` : undefined }}>
+          {words.map((w, i) => (
+            <span
+              key={i}
+              style={{
+                ...base,
+                color: i === words.length - 1 ? p.accent : p.color,
+                fontSize: i === words.length - 1 ? "1.35em" : "1em",
+                transform: p.stagger ? `translateX(${i % 2 === 0 ? -14 : 14}%)` : undefined,
+                animation: `lcard-wordpop 2.6s ${i * 0.4}s infinite both`,
+              }}
+            >{w}</span>
+          ))}
+        </span>
+      );
+    }
+    if (p.layout === "keyword") {
+      return (
+        <span className="flex flex-col items-center" style={{ animation: "lcard-cine 2.8s infinite both" }}>
+          <span style={{ ...base, fontSize: "8px", letterSpacing: "0.08em" }}>{words[0]}</span>
+          <span style={{ ...base, fontSize: "19px" }}>{words[words.length - 1]}</span>
+        </span>
+      );
+    }
+    return (
+      <span
+        className={p.motion === "fade" ? "text-[11px]" : "text-[14px]"}
+        style={{ ...base, animation: p.motion === "zoom_through" ? "lcard-zoom 2.6s infinite both" : "acard-word 2.8s infinite" }}
+      >{words.join(" ")}</span>
+    );
+  };
+  const lookThumbBg = (look) => {
+    const p = look.preview;
+    if (!p) return "radial-gradient(120% 100% at 50% 0,#1a1430,#0b0820)";
+    return p.thumbBg;
   };
 
   // Set of track indices with the inline "Personalizar" drawer open.
@@ -1325,6 +1391,13 @@ export default function UploadZone({
     { code: "wipe",          label: t("upload.trans_wipe") || "Wipe",        desc: t("upload.trans_wipe_desc") || "Se descubre de izquierda a derecha." },
     { code: "dissolve_blur", label: t("upload.trans_blur") || "Disolvencia", desc: t("upload.trans_blur_desc") || "Entra desenfocada y se enfoca." },
   ];
+
+  // Looks de letra: tratamiento completo en un clic (lib/lyricLooks, espejo
+  // de backend/lyric_looks.py). Con look activo el render ignora font /
+  // animación / transición; tamaño, color, mayúsculas y efecto siguen.
+  const LYRIC_LOOKS = lyricLookOptions(t);
+  const activeLook = getLyricLook(batchDefaults.lyricLook);
+  const lookLockedText = activeLook ? lookLockedNote(t, activeLook.code) : "";
 
   // Visual concept for the AI background. Operator-controlled; when set
   // it hard-overrides the genre's scene vocabulary. Mirror of the backend
@@ -2878,6 +2951,7 @@ export default function UploadZone({
           (entry.fontScale    || "1.0")   !== (bd.fontScale    || "1.0")   ||
           (entry.lyricsAnimation || "none") !== (bd.lyricsAnimation || "none") ||
           (entry.lineTransition || "none") !== (bd.lineTransition || "none") ||
+          normalizeLyricLook(entry.lyricLook) !== normalizeLyricLook(bd.lyricLook) ||
           (entry.textContrast || "medium") !== (bd.textContrast || "medium");
 
         return (
@@ -3265,12 +3339,16 @@ export default function UploadZone({
                         <Listbox value={entry.effect || ""} onChange={(v) => updateField(i, "effect", v)} options={EFFECTS} className="flex-1" ariaLabel={t("upload.effect_label") || "Efecto"} />
                       </div>
                       <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.look_label") || "Look:"}</span>
+                        <Listbox value={normalizeLyricLook(entry.lyricLook)} onChange={(v) => updateField(i, "lyricLook", v)} options={LYRIC_LOOKS} className="flex-1" ariaLabel={t("upload.look_label") || "Look"} />
+                      </div>
+                      <div className="flex items-center gap-2">
                         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.animation_label") || "Animación:"}</span>
-                        <Listbox value={entry.lyricsAnimation || "none"} onChange={(v) => updateField(i, "lyricsAnimation", v)} options={LYRICS_ANIMATIONS} className="flex-1" ariaLabel={t("upload.animation_label") || "Animación"} />
+                        <Listbox value={entry.lyricsAnimation || "none"} onChange={(v) => updateField(i, "lyricsAnimation", v)} options={LYRICS_ANIMATIONS} className="flex-1" ariaLabel={t("upload.animation_label") || "Animación"} disabled={!!getLyricLook(entry.lyricLook)} />
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.transition_label") || "Transición:"}</span>
-                        <Listbox value={entry.lineTransition || "none"} onChange={(v) => updateField(i, "lineTransition", v)} options={LINE_TRANSITIONS} className="flex-1" ariaLabel={t("upload.transition_label") || "Transición"} />
+                        <Listbox value={entry.lineTransition || "none"} onChange={(v) => updateField(i, "lineTransition", v)} options={LINE_TRANSITIONS} className="flex-1" ariaLabel={t("upload.transition_label") || "Transición"} disabled={!!getLyricLook(entry.lyricLook)} />
                       </div>
                     </>
                   )}
@@ -3994,6 +4072,7 @@ export default function UploadZone({
               effect={hoverEffect ?? batchDefaults.effect}
               lyricsAnimation={hoverAnimation ?? batchDefaults.lyricsAnimation}
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}
+              lyricLook={hoverLook ?? batchDefaults.lyricLook ?? ""}
               lyricColor={batchDefaults.lyricColor || "#FFFFFF"}
               lyricSungColor={batchDefaults.lyricSungColor || "#FFFFFF"}
               /* QA fix 2026-05-28: cuando el operador selecciona un fondo
@@ -4550,7 +4629,68 @@ export default function UploadZone({
                 @keyframes tcard-slideside { 0%{transform:translateX(-130%);opacity:0} 22%,88%{transform:translateX(0);opacity:1} 100%{transform:translateX(130%);opacity:0} }
                 @keyframes tcard-wipe { 0%{clip-path:inset(0 100% 0 0)} 35%,100%{clip-path:inset(0 0 0 0)} }
                 @keyframes tcard-blur { 0%{filter:blur(6px);opacity:0} 30%,80%{filter:blur(0);opacity:1} 100%{filter:blur(6px);opacity:0} }
+                @keyframes lcard-zoom { 0%{transform:scale(.3);opacity:0} 18%{transform:scale(1);opacity:1} 82%{transform:scale(1.08);opacity:1;filter:blur(0)} 100%{transform:scale(6);opacity:0;filter:blur(3px)} }
+                @keyframes lcard-cine { 0%{filter:blur(4px);letter-spacing:.35em;opacity:0} 30%,82%{filter:blur(0);letter-spacing:.02em;opacity:1} 100%{filter:blur(4px);opacity:0} }
+                @keyframes lcard-wordpop { 0%,6%{transform:scale(1.35);opacity:0} 12%,86%{transform:scale(1);opacity:1} 100%{opacity:0} }
               `}</style>
+
+              {/* Look de letra — atajo de un clic (lib/lyricLooks). Va ARRIBA
+                  de todo: elegir un look define tipografía, animación y
+                  transición, así que esos pickers de abajo se bloquean con
+                  una nota. Tamaño, color, mayúsculas y efecto siguen. */}
+              <div className="mb-4 pb-3 border-b border-white/[0.05]" data-testid="lyric-look-picker">
+                <p className="text-[11px] text-gray-300 font-medium">{t("upload.look_section") || "Look"}</p>
+                <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
+                  {t("upload.look_section_desc")}
+                </p>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {LYRIC_LOOKS.map((look) => {
+                    const active = normalizeLyricLook(batchDefaults.lyricLook) === look.code;
+                    const inVideo = isAnchor("lyricLook", look.code);
+                    return (
+                      <button
+                        key={look.code || "none"}
+                        type="button"
+                        onClick={() => updateBatchDefault("lyricLook", look.code)}
+                        onMouseEnter={() => setHoverLook(look.code)}
+                        onMouseLeave={() => setHoverLook(null)}
+                        onFocus={() => setHoverLook(look.code)}
+                        onBlur={() => setHoverLook(null)}
+                        aria-pressed={active}
+                        data-lyric-look={look.code || "none"}
+                        data-in-video={inVideo ? "true" : undefined}
+                        aria-label={`${look.label}: ${look.desc}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
+                        title={look.desc}
+                        className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                          active
+                            ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                            : "border-white/[0.06] hover:border-white/[0.20]"
+                        }`}
+                      >
+                        <div className="aspect-video relative overflow-hidden grid place-items-center" style={{ background: lookThumbBg(look) }}>
+                          {look.preview?.letterbox && (
+                            <>
+                              <div className="absolute inset-x-0 top-0 bg-black" style={{ height: "12.8%" }} />
+                              <div className="absolute inset-x-0 bottom-0 bg-black" style={{ height: "12.8%" }} />
+                            </>
+                          )}
+                          {lookDemo(look)}
+                          {active && (
+                            <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
+                              <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                            </div>
+                          )}
+                          {inVideo && anchorChip}
+                        </div>
+                        <div className="px-2.5 py-2 bg-surface-1">
+                          <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>{look.label}</p>
+                          <p className="text-[10px] text-gray-500 leading-snug mt-0.5">{look.desc}</p>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
 
               {/* Tipografía — UI gap fix 2026-05-26. El refactor del paso 6
                   (commit 6c2e8a8) ocultó estos controles en LyricsEditor con
@@ -4575,8 +4715,14 @@ export default function UploadZone({
                       options={FONTS}
                       className="flex-1"
                       ariaLabel={t("upload.font_label") || "Tipografía"}
+                      disabled={!!activeLook}
                     />
                   </div>
+                  {activeLook && (
+                    <p className="ml-[5.5rem] -mt-1.5 text-[10px] text-amber-300/80" data-testid="look-font-locked">
+                      {lookLockedText}
+                    </p>
+                  )}
 
                   {/* Text case pill buttons: MAY / Aa / min / ori */}
                   <div>
@@ -4671,6 +4817,23 @@ export default function UploadZone({
                 </div>
               </div>
 
+              {activeLook ? (
+                <div className="rounded-xl bg-amber-500/[0.06] ring-1 ring-amber-500/20 px-3 py-2.5 flex items-center justify-between gap-3" data-testid="look-motion-locked">
+                  <div>
+                    <p className="text-[11px] text-gray-300 font-medium">
+                      {t("upload.animation_section_full")} · {t("upload.transition_title") || "Transición entre líneas"}
+                    </p>
+                    <p className="text-[10px] text-amber-300/80 mt-0.5">{lookLockedText}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => updateBatchDefault("lyricLook", "")}
+                    className="shrink-0 text-[10px] text-gray-400 hover:text-white underline-offset-2 hover:underline transition-colors"
+                  >
+                    {t("upload.look_clear") || "Quitar look"}
+                  </button>
+                </div>
+              ) : (<>
               <p className="text-[11px] text-gray-300 font-medium">{t("upload.animation_section_full")}</p>
               <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
                 {t("upload.anim_gallery_desc") || "Cómo aparecen las palabras sobre el video. Pasá el mouse o elegí y miralo en el preview ←"}
@@ -4714,6 +4877,7 @@ export default function UploadZone({
               <p className="text-[10px] text-gray-600 mt-2">
                 🎤 {t("upload.anim_word_note") || "Funcionan en toda canción — el tiempo por palabra se calcula automáticamente."}
               </p>
+              </>)}
 
               {/* Lyric text color — color picker(s). El segundo solo aplica a
                   karaoke (color de la palabra cantada). Para none/pop/glow/
@@ -4757,6 +4921,9 @@ export default function UploadZone({
                       <span>{t("upload.lyric_color_sung") || "Cantada"}</span>
                     </label>
                   )}
+                  {activeLook && (batchDefaults.lyricColor || "#FFFFFF").toUpperCase() === "#FFFFFF" && (
+                    <span className="text-[10px] text-gray-600">{t("upload.look_color_hint")}</span>
+                  )}
                   {(batchDefaults.lyricColor !== "#FFFFFF" || batchDefaults.lyricSungColor !== "#FFFFFF") && (
                     <button
                       type="button"
@@ -4770,7 +4937,9 @@ export default function UploadZone({
               </div>
               )}
 
-              {/* Transición entre líneas — eje aparte, compone con la animación */}
+              {/* Transición entre líneas — eje aparte, compone con la animación.
+                  Con look activo la define el look (nota de arriba). */}
+              {!activeLook && (
               <div className="mt-4 pt-3 border-t border-white/[0.05]">
                 <p className="text-[11px] text-gray-300 font-medium">{t("upload.transition_title") || "Transición entre líneas"}</p>
                 <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
@@ -4810,6 +4979,7 @@ export default function UploadZone({
                   })}
                 </div>
               </div>
+              )}
 
               {/* Portada (intro title card) — Full Rotor v1.1: visual
                   template gallery + size with live percentage + per-element

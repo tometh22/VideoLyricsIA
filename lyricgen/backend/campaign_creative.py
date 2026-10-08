@@ -49,6 +49,7 @@ FIELDS = {
     "text_contrast": field("Contraste", "Letra", "select", options=["subtle", "medium", "strong"]),
     "lyrics_animation": field("Animación de letra", "Letra", "select", options=["none", "karaoke", "word_reveal", "pop", "glow"]),
     "line_transition": field("Transición entre líneas", "Letra", "select", options=["none", "slide_up", "slide_side", "wipe", "dissolve_blur"]),
+    "lyric_look": field("Look de letra", "Letra", "select", options=["", "cosmico", "cine", "pincel", "pop70", "pelicula"]),
     "background_id": field("Fondo de biblioteca o propio", "Fondo", "asset"),
     "background_mode": field("Uso del fondo", "Fondo", "select", options=["as_is", "variation"]),
     "scene_source": field("Inspiración del fondo", "Fondo", "select", options=["lyrics", "auto", "prompt_literal", "prompt_improved"]),
@@ -75,7 +76,7 @@ FIELDS = {
 RENDER_KEYS = (set(FIELDS) - {"scene_source"}) | {"match_lyrics", "bg_verbatim"}
 DEFAULTS = {"font": "", "font_scale": 1., "text_case": "upper", "text_contrast": "medium",
             "lyric_color": "#FFFFFF", "lyric_sung_color": "#FFFFFF", "lyrics_animation": "none",
-            "line_transition": "none", "background_id": None, "background_mode": "as_is",
+            "line_transition": "none", "lyric_look": "", "background_id": None, "background_mode": "as_is",
             "match_lyrics": True, "bg_verbatim": False, "background_hint": "", "genre": "", "concept": "",
             "movement_style": "", "effect": "", "style": "auto", "custom_colors": "",
             "animate_image": False, "enable_scenes": False, "title_template": "auto", "title_size": 1.,

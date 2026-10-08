@@ -3140,6 +3140,20 @@ def _enforce_plan_quota(
             )
 
 
+def _normalize_lyric_look(value) -> str:
+    """Known lyric look id, or "" (= no look) for anything else."""
+    import lyric_looks
+    look = lyric_looks.get_look(str(value or ""))
+    return look.id if look is not None else ""
+
+
+def _lyric_look_kwargs(value) -> dict:
+    """Pipeline kwargs for a lyric look: empty when none is chosen, so jobs
+    without a look enqueue exactly the kwargs older workers accept."""
+    look_id = _normalize_lyric_look(value)
+    return {"lyric_look": look_id} if look_id else {}
+
+
 def _commit_pipeline_publication(
     db: Session,
     job,
@@ -5331,6 +5345,8 @@ async def upload(
     text_motion: str = Form("none", max_length=16),
     lyrics_animation: str = Form("none", max_length=16),
     line_transition: str = Form("none", max_length=16),
+    # Lyric look (lyric_looks.LOOKS id, "" = none). Unknown ids → "".
+    lyric_look: str = Form("", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
     # Lyric text colors 2026-05-25. Hex `#RRGGBB` (7 chars), invalid input
     # normalized to "" by the call site so build_ass falls back to defaults.
@@ -5536,6 +5552,9 @@ async def upload(
         text_motion="none",
         lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
         line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
+        # Forwarded ONLY when a look is chosen: a queued job without one keeps
+        # the exact kwargs an older worker understands during a deploy.
+        **_lyric_look_kwargs(lyric_look),
         # Lyric text colors 2026-05-25. Hex #RRGGBB validado acá; cualquier
         # otro valor se normaliza a "" (= backend usa blanco default en
         # build_ass). Para karaoke: lyric_color = palabra no cantada,
@@ -10559,6 +10578,8 @@ async def generate_with_segments(
     text_motion: str = Form("none", max_length=16),
     lyrics_animation: str = Form("none", max_length=16),
     line_transition: str = Form("none", max_length=16),
+    # Lyric look (lyric_looks.LOOKS id, "" = none). Unknown ids → "".
+    lyric_look: str = Form("", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
     # Lyric text colors 2026-05-25. Hex `#RRGGBB` (7 chars), invalid input
     # normalized to "" by the call site so build_ass falls back to defaults.
@@ -10635,6 +10656,7 @@ async def generate_with_segments(
         text_case = _profile_fields["text_case"]
         font_scale = str(_profile_fields["font_scale"])
         line_transition = _profile_fields["line_transition"]
+        lyric_look = _profile_fields.get("lyric_look", "")
         if _render_profile.get("background_id") is not None:
             background_id = _render_profile["background_id"]
     reuse = bool(job_id)
@@ -11422,6 +11444,9 @@ async def generate_with_segments(
         text_motion="none",
         lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
         line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
+        # Forwarded ONLY when a look is chosen: a queued job without one keeps
+        # the exact kwargs an older worker understands during a deploy.
+        **_lyric_look_kwargs(lyric_look),
         # Lyric text colors 2026-05-25. Hex #RRGGBB validado acá; cualquier
         # otro valor se normaliza a "" (= backend usa blanco default en
         # build_ass). Para karaoke: lyric_color = palabra no cantada,
@@ -12902,6 +12927,8 @@ class EditJobRequest(BaseModel):
     effect: str | None = Field(default=None, max_length=32)
     lyrics_animation: str | None = Field(default=None, max_length=16)
     line_transition: str | None = Field(default=None, max_length=16)
+    # Lyric look id (lyric_looks.LOOKS); "" = quitar el look, None = no cambia.
+    lyric_look: str | None = Field(default=None, max_length=16)
     # Explicit ack that the caller understands re-syncing lyrics on a job
     # already published to YouTube will update R2 but NOT replace the
     # YouTube video file (the YouTube API doesn't allow file replacement,
@@ -17940,6 +17967,12 @@ def request_edit(
         _rp = dict(job.render_params or {})
         _rp["line_transition"] = _lt
         job.render_params = _rp
+    if body.lyric_look is not None:
+        _look = _normalize_lyric_look(body.lyric_look)
+        edit_params["lyric_look"] = _look
+        _rp = dict(job.render_params or {})
+        _rp["lyric_look"] = _look
+        job.render_params = _rp
     if body.edit_type == "lyrics":
         # Lyrics path keeps explicit edit_params hand-off so the worker
         # doesn't re-query the DB for segments it already received in
@@ -19025,6 +19058,8 @@ async def retry_job(
               # Reintentar, animations silently reset to "none" because they
               # weren't in this whitelist when the feature was wired (#357a1a5).
               "lyrics_animation", "line_transition",
+              # Lyric look — heredable (vacío = sin look, no se propaga).
+              "lyric_look",
               # Lyric text colors 2026-05-25 — heredables igual que
               # custom_colors, así los re-renders/variantes mantienen el
               # color elegido por el operador.
@@ -19357,6 +19392,8 @@ class VariantJobRequest(BaseModel):
     effect: str | None = Field(default=None, max_length=32)
     lyrics_animation: str | None = Field(default=None, max_length=16)
     line_transition: str | None = Field(default=None, max_length=16)
+    # Lyric look id (lyric_looks.LOOKS); "" = quitar el look, None = no cambia.
+    lyric_look: str | None = Field(default=None, max_length=16)
     # ── Tipografía (espejo de EditJobRequest) ────────────────────────────
     font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
@@ -19418,6 +19455,7 @@ _VARIANT_OVERRIDABLE_FIELDS = (
     "effect",
     "lyrics_animation",
     "line_transition",
+    "lyric_look",
     # Tipografía
     "font",
     "font_scale",
@@ -19699,6 +19737,8 @@ async def create_variant(
         # persiste CANÓNICO, nunca crudo.
         if _field == "movement_style":
             _value = _normalize_movement_style(_value or "")
+        if _field == "lyric_look":
+            _value = _normalize_lyric_look(_value)
         new_render_params[_field] = _value
         _overridden_fields.append(_field)
     new_render_params = _merge_content_validation_choice(
@@ -19886,6 +19926,10 @@ async def create_variant(
             continue
         if k in new_render_params:
             pipeline_kwargs[k] = new_render_params[k]
+    # Sin look → no se manda la kwarg (compat con workers previos al campo).
+    _variant_look = _normalize_lyric_look(pipeline_kwargs.pop("lyric_look", ""))
+    if _variant_look:
+        pipeline_kwargs["lyric_look"] = _variant_look
     # background_hint: None/"" (nunca seteado, o clear explícito del
     # operador) → run_pipeline lo recibe como None y _ensure_background
     # sigue el flow default (PR #116, system prompt desbiaseado). Un ""
