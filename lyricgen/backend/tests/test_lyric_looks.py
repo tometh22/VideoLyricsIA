@@ -154,3 +154,16 @@ def test_batch_profile_accepts_a_look_and_keeps_old_profiles_identical():
     assert bp.pipeline_fields(prof)["lyric_look"] == "pincel"
     with pytest.raises(bp.RenderProfileError):
         bp.normalize_render_profile({**base, "lyric_look": "glitter"})
+
+
+def test_campaigns_expose_every_look_and_default_to_none():
+    import campaign_creative as cc
+    assert cc.FIELDS["lyric_look"]["options"] == ["", *L.LOOKS]
+    assert "lyric_look" in cc.RENDER_KEYS        # viaja en settings → /generate
+
+    class _Campaign:
+        default_render_params = {"lyric_look": "cine"}
+
+    assert cc.effective_settings(type("C", (), {"default_render_params": {}})(), {})["lyric_look"] == ""
+    assert cc.effective_settings(_Campaign(), {})["lyric_look"] == "cine"
+    assert cc.effective_settings(_Campaign(), {"lyric_look": "pop70"})["lyric_look"] == "pop70"
