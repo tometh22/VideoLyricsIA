@@ -28,6 +28,7 @@ import { useJobSegments, segmentsStore } from "../state/segmentsStore";
 import { useUiStormDetector, recordEditorAction } from "../hooks/useUiStormDetector";
 import { planSegmentSplit, tokenSpans } from "../lib/splitWords";
 import { lineStructureProperties, mergeTimingMode, splitTimingMode } from "../lib/lineStructureEvent";
+import { PLAYBACK_EVENT_NAME, createPlaybackCoverage, playbackEventProperties } from "../lib/playbackCoverage";
 import useLocalStorage from "../hooks/useLocalStorage";
 import { useEditorDocument } from "../hooks/useEditorDocument";
 import { useEditorAutosave } from "../hooks/useEditorAutosave";
@@ -1163,14 +1164,18 @@ export default function LyricsEditor({
     editorSessionIdRef.current = globalThis.crypto?.randomUUID?.()
       || `editor-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
-  const trackEditorEvent = useCallback((name, properties = {}) => {
+  const trackEditorEvent = useCallback((name, properties = {}, { keepalive = false } = {}) => {
     if (!editorRequest || !transcribeJobId) return;
     editorRequest("/analytics/events", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      ...(keepalive ? { keepalive: true } : {}),
       body: JSON.stringify({ events: [{
         name,
         job_id: transcribeJobId,
+        // Sin esto el backend guardaba occurred_at NULL en todos los eventos
+        // del editor y sólo quedaba la hora de llegada (created_at).
+        occurred_at: new Date().toISOString(),
         properties: { ...properties, session_id: editorSessionIdRef.current },
       }] }),
     }).catch(() => {});
@@ -2829,6 +2834,55 @@ export default function LyricsEditor({
     trackEditorEvent("editor_seek", { position_ms: Math.round(t * 1000), source: "editor" });
   }, [trackEditorEvent]);
 
+  // Medición de escucha (`editor_audio_played`, lib/playbackCoverage.js):
+  // qué tramos del audio sonaron antes de aprobar. Sólo telemetría; no toca
+  // la reproducción. Se envía cada 30 s mientras suena, 5 s después de una
+  // pausa (agrupa play/pausa rápidos), al aprobar y al ocultar o cerrar.
+  const playbackCoverageRef = useRef(null);
+  if (!playbackCoverageRef.current) playbackCoverageRef.current = createPlaybackCoverage();
+  const playbackFlushTimerRef = useRef(null);
+  const flushPlaybackCoverage = useCallback((flushReason, { keepalive = false } = {}) => {
+    if (playbackFlushTimerRef.current) {
+      window.clearTimeout(playbackFlushTimerRef.current);
+      playbackFlushTimerRef.current = null;
+    }
+    // Al desmontar, el ref del <audio> ya es null; el último elemento montado
+    // todavía sabe la duración.
+    const audio = audioRef.current || lastMountedAudioRef.current;
+    const tracker = playbackCoverageRef.current;
+    if (audio && !audio.paused) tracker.advance(audio.currentTime, Date.now(), audio.playbackRate);
+    const properties = playbackEventProperties(tracker.drain(), {
+      durationS: audio?.duration, flushReason,
+    });
+    if (properties) trackEditorEvent(PLAYBACK_EVENT_NAME, properties, { keepalive });
+  }, [trackEditorEvent]);
+  const schedulePlaybackFlush = useCallback((flushReason) => {
+    if (playbackFlushTimerRef.current) return;
+    playbackFlushTimerRef.current = window.setTimeout(() => {
+      playbackFlushTimerRef.current = null;
+      flushPlaybackCoverage(flushReason);
+    }, 5_000);
+  }, [flushPlaybackCoverage]);
+  useEffect(() => {
+    if (!isPlaying) return undefined;
+    const interval = window.setInterval(() => flushPlaybackCoverage("interval"), 30_000);
+    return () => window.clearInterval(interval);
+  }, [flushPlaybackCoverage, isPlaying]);
+  useEffect(() => {
+    const flushHidden = () => flushPlaybackCoverage("hidden", { keepalive: true });
+    const visibilityChanged = () => {
+      if (document.visibilityState === "hidden") flushHidden();
+    };
+    document.addEventListener("visibilitychange", visibilityChanged);
+    window.addEventListener("pagehide", flushHidden);
+    return () => {
+      document.removeEventListener("visibilitychange", visibilityChanged);
+      window.removeEventListener("pagehide", flushHidden);
+      // SPA: salir del editor desmonta antes de pagehide.
+      flushPlaybackCoverage("unmount", { keepalive: true });
+    };
+  }, [flushPlaybackCoverage]);
+
   const playGuidedWindow = useCallback((qualityWindow) => {
     const audio = audioRef.current;
     if (!audio || !qualityWindow || audio.readyState < 1) return;
@@ -4383,6 +4437,10 @@ export default function LyricsEditor({
 
   const handleApprove = async (options = {}) => {
     if (approveInFlightRef.current) return;
+    // Lo escuchado hasta acá sale ANTES que la aprobación: el reporte de
+    // cobertura sólo cuenta tramos registrados antes de la primera versión
+    // aprobada.
+    flushPlaybackCoverage("approve");
     approveInFlightRef.current = true;
     setIsApproving(true);
     try {
@@ -4625,6 +4683,9 @@ export default function LyricsEditor({
           onTimeUpdate={(e) => {
             const time = e.currentTarget.currentTime;
             playbackTimeRef.current = time;
+            if (!e.currentTarget.paused) {
+              playbackCoverageRef.current.advance(time, Date.now(), e.currentTarget.playbackRate);
+            }
             if (e.currentTarget.paused) {
               lastPublishedTimeRef.current = time;
               setCurrentTime(time);
@@ -4660,7 +4721,16 @@ export default function LyricsEditor({
               }
             }
           }}
-          onPlay={() => {
+          onSeeking={(e) => {
+            playbackCoverageRef.current.seek(e.currentTarget.currentTime, Date.now(), {
+              playing: !e.currentTarget.paused,
+            });
+            if (playbackCoverageRef.current.isFull()) flushPlaybackCoverage("full");
+          }}
+          onPlay={(e) => {
+            playbackCoverageRef.current.start(
+              e.currentTarget.currentTime, Date.now(), e.currentTarget.playbackRate,
+            );
             audioPlayingRef.current = true;
             if (pendingAudioRecoveryRef.current && !sourceSwapInProgressRef.current) {
               pendingAudioRecoveryRef.current.shouldPlay = true;
@@ -4669,6 +4739,8 @@ export default function LyricsEditor({
           }}
           onPause={(e) => {
             const time = e.currentTarget.currentTime;
+            playbackCoverageRef.current.stop(time, Date.now());
+            schedulePlaybackFlush(playbackCoverageRef.current.isFull() ? "full" : "pause");
             guidedPlaybackRangeRef.current = null;
             setGuidedPlayingWindowId(null);
             playbackTimeRef.current = time;
@@ -4685,6 +4757,8 @@ export default function LyricsEditor({
           }}
           onEnded={(e) => {
             const time = e.currentTarget.currentTime;
+            playbackCoverageRef.current.stop(time, Date.now());
+            schedulePlaybackFlush("ended");
             guidedPlaybackRangeRef.current = null;
             setGuidedPlayingWindowId(null);
             playbackTimeRef.current = time;
@@ -4696,6 +4770,7 @@ export default function LyricsEditor({
           onError={(event) => {
             const media = event.currentTarget;
             const failedAt = Number(media.currentTime) || playbackTimeRef.current || 0;
+            playbackCoverageRef.current.stop(playbackTimeRef.current, Date.now());
             const mediaErrorCode = media.error?.code || null;
             const shouldResume = audioPlayingRef.current;
             const failedLocalAudio = usingLocalAudio && audioUrl === blobAudioUrl;

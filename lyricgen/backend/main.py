@@ -14256,6 +14256,20 @@ class ProductEventsRequest(BaseModel):
     events: list[ProductEventItem]
 
 
+def _editor_scoped_job(db: Session, job_id: str, current_user: dict):
+    """El Job que el editor deja abrir a este usuario (o None).
+
+    Un único lugar para el alcance del editor: el admin de plataforma abre
+    canciones de cualquier tenant (acceso cruzado auditado en los flujos de
+    revisión); un usuario común queda aislado en su tenant. La telemetría del
+    editor (/analytics/events) usa esta misma función para que un evento se
+    acepte exactamente cuando el editor habría abierto la canción.
+    """
+    if current_user.get("role") == "admin":
+        return db.query(Job).filter(Job.job_id == job_id).first()
+    return get_job_for_tenant(db, job_id, current_user["tenant_id"])
+
+
 def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
     # Keep rollback effective: production tenants outside the canary cannot
     # mutate the durable editor by calling the API directly.
@@ -14268,10 +14282,7 @@ def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
     # returned 404.  The frontend then waited forever for durable hydration
     # and kept "Aprobar" disabled.  Resolve the same Job the surrounding
     # review flow authorises, while keeping regular users tenant-isolated.
-    if current_user.get("role") == "admin":
-        job = db.query(Job).filter(Job.job_id == job_id).first()
-    else:
-        job = get_job_for_tenant(db, job_id, current_user["tenant_id"])
+    job = _editor_scoped_job(db, job_id, current_user)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     try:
@@ -15187,7 +15198,7 @@ _PRODUCT_EVENT_NAMES = {
     "editor_help_opened", "editor_operator_suggestions_shown",
     "editor_operator_suggestion_decision", "editor_audio_playback_failed",
     "editor_reviewer_candidate", "editor_auto_repair_undone",
-    "editor_line_structure_changed",
+    "editor_line_structure_changed", "editor_audio_played",
 }
 
 # Ventana de /admin/product-metrics. Sin esto la única acotación era
@@ -15205,6 +15216,12 @@ _PRODUCT_EVENT_PROPERTIES = {
     "editor_line_structure_changed": {
         "structure_op", "trigger", "count", "words_count", "stale_words_count",
         "one_side_count", "no_words_count", "duration_ms",
+    },
+    # Tramos del audio que sonaron de verdad (pares [inicio_ms, fin_ms]
+    # acotados, validados en product_telemetry.valid_played_ranges).
+    "editor_audio_played": {
+        "ranges", "played_ms", "playback_rate", "audio_duration_ms",
+        "flush_reason",
     },
     "editor_opened": {"line_count", "view", "source"},
     "editor_view_changed": {"from", "to"},
@@ -15247,7 +15264,10 @@ _PRODUCT_EVENT_PROPERTIES = {
     },
 }
 _PRODUCT_EVENT_COMMON_PROPERTIES = {"session_id"}
-from product_telemetry import valid_property as _valid_product_event_property
+from product_telemetry import (
+    resolve_occurred_at as _resolve_product_event_occurred_at,
+    valid_property as _valid_product_event_property,
+)
 
 
 @app.post("/analytics/events")
@@ -15262,14 +15282,18 @@ async def record_product_events(
         raise HTTPException(status_code=422, detail="A maximum of 50 events is accepted per batch.")
     accepted = 0
     rejected = 0
+    received_at = datetime.now(timezone.utc)
     for item in body.events:
         if item.name not in _PRODUCT_EVENT_NAMES:
             rejected += 1
             continue
-        event_job = (
-            get_job_for_tenant(db, item.job_id, current_user["tenant_id"])
-            if item.job_id else None
-        )
+        # Mismo alcance que el editor (_editor_document_or_404): el admin de
+        # plataforma revisa canciones de otros tenants. Con el lookup sólo
+        # por tenant, TODOS sus eventos del editor sobre esas canciones se
+        # descartaban en silencio (agus77 desde el 7-sep: 0 seeks, 0 aperturas
+        # y 0 aprobaciones registradas mientras los heartbeats sí llegaban).
+        # La fila sigue guardándose con el tenant del usuario, como el heartbeat.
+        event_job = _editor_scoped_job(db, item.job_id, current_user) if item.job_id else None
         if item.job_id and not event_job:
             rejected += 1
             continue
@@ -15306,12 +15330,10 @@ async def record_product_events(
                 for reason in (event_quality.get("reasons") or [])
                 if isinstance(reason, dict) and reason.get("code")
             )[:500]
-        occurred_at = None
-        if item.occurred_at:
-            try:
-                occurred_at = datetime.fromisoformat(item.occurred_at.replace("Z", "+00:00"))
-            except ValueError:
-                occurred_at = None
+        # Antes el cliente nunca mandaba occurred_at y quedaba NULL. Ahora
+        # viene del navegador; sin él (clientes viejos) o si es implausible,
+        # vale la hora de llegada.
+        occurred_at = _resolve_product_event_occurred_at(item.occurred_at, received_at)
         db.add(ProductEvent(
             tenant_id=current_user["tenant_id"], user_id=current_user["id"],
             job_id=item.job_id, name=item.name, occurred_at=occurred_at,
@@ -20487,6 +20509,10 @@ class SendToUMGRequest(BaseModel):
     change_request_id: int | None = Field(default=None, ge=1)
     reviewed_render_fingerprint: str | None = Field(default=None, max_length=64)
     reviewed_editor_revision: int | None = Field(default=None, ge=0)
+    # CHANGE_REQUEST_PUBLISH_GUARD_ENABLED: publicar aunque haya pedidos
+    # abiertos más nuevos que la versión aprobada. Exige motivo; se audita.
+    publish_anyway: bool = False
+    override_reason: str | None = Field(default=None, max_length=1000)
 
 
 @app.post("/admin/deliveries/from-job/{job_id}")
@@ -20567,6 +20593,29 @@ def admin_create_delivery_from_job(
             status_code=400,
             detail="Job must be approved (status=done) before it can be published",
         )
+
+    # Regla de versión: no re-publicar una letra aprobada ANTES de un pedido
+    # de cambio que sigue abierto en esta canción (linaje incluido).
+    import change_request_publish_guard as _cr_guard
+    _guard_override = None
+    if _cr_guard.enabled():
+        try:
+            _guard = _cr_guard.evaluate(db, ddb, [job]).get(job_id) or {}
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail={
+                'code': 'change_request_guard_unavailable',
+                'message': 'No pudimos consultar los pedidos del cliente en el portal. No se publicó nada; reintentá.',
+            }) from exc
+        if _guard.get("blocked"):
+            _reason = ((body.override_reason if body else None) or "").strip()
+            if not (body and body.publish_anyway):
+                raise HTTPException(status_code=409, detail=_cr_guard.blocked_detail(job, _guard))
+            if not _reason:
+                raise HTTPException(status_code=422, detail={
+                    "code": "override_reason_required",
+                    "message": "Para publicar igual con pedidos abiertos, escribí el motivo.",
+                })
+            _guard_override = (_guard, _reason)
 
     # UMG has its own contractual preflight even when the general QC rollout
     # is observe/off. Check before storage calls or ProRes queue work.
@@ -20802,6 +20851,7 @@ def admin_create_delivery_from_job(
     # from campaign/history alone cannot attest every pending instruction.
     resolved_requests = []
     resolved_comments: list[str] = []
+    kept_open_requests: list[dict] = []
     if content_changed and body and body.change_request_id:
         pending_requests = (
             ddb.query(DeliveryChangeRequest)
@@ -20818,6 +20868,13 @@ def admin_create_delivery_from_job(
             # Recheck after copying/locking: a newly submitted request or a
             # different case was never reviewed by this publication intent.
             validate_reviewed_cut()
+            # Un pedido de texto cuyo texto no está en la letra publicada
+            # queda abierto. La publicación sigue igual.
+            if _cr_guard.enabled():
+                _closable, _kept = _cr_guard.text_gate(db, job, [request], now)
+                if _kept:
+                    kept_open_requests.extend(_kept)
+                    continue
             request.resolved_at = now
             request.updated_at = now
             request.resolved_by_user_id = added_by
@@ -20863,8 +20920,19 @@ def admin_create_delivery_from_job(
             ),
             "replaced_job_id": replaced_job_id,
             "previous_publication": previous_publication,
+            "kept_open_change_requests": [entry["id"] for entry in kept_open_requests],
+            "change_request_guard_override": bool(_guard_override),
         },
     ))
+    if _guard_override is not None:
+        db.add(_cr_guard.override_audit(
+            current_user["id"], job, _guard_override[0], _guard_override[1], "admin_publish",
+            portal_id=portal_id, delivery_id=delivery.id,
+        ))
+    for _kept in kept_open_requests:
+        db.add(_cr_guard.text_not_found_audit(
+            current_user["id"], job, _kept, "admin_publish", delivery_id=delivery.id,
+        ))
     db.commit()
 
     # Optional mail to UMG: only for a visible publication that answered client requests, and
@@ -20893,6 +20961,9 @@ def admin_create_delivery_from_job(
         "revision": delivery.published_revision,
         "content_changed": content_changed,
         "resolved_change_requests": resolved_requests,
+        # Pedidos que esta publicación NO cerró: el texto pedido no está en
+        # la letra publicada (CHANGE_REQUEST_PUBLISH_GUARD_ENABLED).
+        "kept_open_change_requests": kept_open_requests,
         "replaced_job_id": replaced_job_id,
         # A manually hidden delivery stays hidden after publishing: say so, so the
         # operator is never told "the client has it" when the portal shows nothing.
@@ -22397,6 +22468,22 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
     if (body.reviewed_render_fingerprint != delivery_freshness.render_fingerprint(job)
             or body.reviewed_editor_revision != int(document.revision or 0)):
         raise HTTPException(status_code=409, detail='El corte cambió. Revisá el video actualizado antes de cerrar.')
+    import change_request_publish_guard as _cr_guard
+    if _cr_guard.enabled():
+        # "Resuelto al publicar" exige que el texto pedido esté en la letra
+        # publicada. Si falta, el pedido sigue abierto; cerrarlo a mano con un
+        # motivo sigue disponible.
+        _closable, _kept = _cr_guard.text_gate(db, job, [cr])
+        if _kept:
+            db.add(_cr_guard.text_not_found_audit(
+                current_user['id'], job, _kept[0], 'publication_confirmed', delivery_id=delivery.id,
+            ))
+            db.commit()
+            raise HTTPException(status_code=409, detail={
+                'code': _cr_guard.TEXT_NOT_FOUND, 'missing': _kept[0]['missing'],
+                'message': 'La letra publicada no tiene el texto pedido: ' + ' · '.join(
+                    f'«{text}»' for text in _kept[0]['missing'][:5]) + '. Corregí y volvé a publicar.',
+            })
     now = datetime.now(timezone.utc)
     revision = delivery.published_revision or 1
     note = body.resolution_note.strip()

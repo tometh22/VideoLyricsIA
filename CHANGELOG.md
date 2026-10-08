@@ -6,6 +6,31 @@
 
 - Tabla interna `review_signal_records` (revisión Alembic `c1d3e5f7a9b2`) que guarda, tal como se calcularon, los puntos de la revisión rápida (una fila por punto, job y revisión del editor) y las propuestas de `repetition_reconcile`, tanto las aplicadas como las declinadas con el motivo del gate. Con el gate de mutación cerrado, el post-pass corre en sombra sólo para registrar lo que habría hecho, como declinado con motivo `mutation_not_authorized`, sin cambiar el resultado del job. Sirve para medir después cuántos errores de texto reportados por el cliente ya estaban marcados por cada señal. Detrás de `REVIEW_SIGNALS_PERSIST_ENABLED`, apagada por defecto. La escritura se hace en segundo plano, sin duplicados y sin frenar al editor ni al pipeline: si falla, se registra en el log y el proceso sigue. Nada del producto lee esta tabla.
 
+## [1.1.122] - 2026-10-08
+
+### Added
+
+- Evento de medición `editor_audio_played`: qué tramos del audio sonaron de verdad en el editor. Acumula los intervalos reproducidos (un salto abre un tramo nuevo, la pausa no cuenta, los tramos que se tocan se fusionan) y los envía como pares `[inicio_ms, fin_ms]` (hasta 64 por evento) junto con el tiempo reproducido, la velocidad y la duración del audio: cada 30 s mientras suena, 5 s después de una pausa o del final, al aprobar y al ocultar o cerrar la pestaña. Solo números: nunca texto de la letra. El backend valida los pares con un validador dedicado (enteros, inicio < fin, dentro de 0..86.400.000).
+- `scripts/report_listening_coverage.py` (solo lectura): por operador y por canción, % de líneas de la primera versión aprobada que se escucharon antes de aprobar y % de la canción reproducida.
+
+### Fixed
+
+- Los eventos del editor guardan la hora en que ocurrieron (`occurred_at`). El cliente nunca la mandaba y quedaba vacía; si falta o es implausible (posterior a la llegada o de más de 24 h antes) se usa la hora de llegada.
+- Los eventos del editor de un admin de plataforma sobre canciones de otro tenant ya no se descartan. El editor le permite trabajar sobre esas canciones, pero `/analytics/events` buscaba el job sólo dentro del tenant del usuario y rechazaba en silencio todos sus seeks, aperturas, guardados y aprobaciones. No cambia el editor ni lo que ve el operador.
+
+## [1.1.121] - 2026-10-08
+
+### Added
+
+- `CHANGE_REQUEST_PUBLISH_GUARD_ENABLED` (apagada por defecto): publicar o re-enviar una canción cuya letra aprobada es anterior a un pedido de cambio que sigue abierto (incluidas variantes y regenerados de la misma canción) se rechaza con `change_request_newer_than_version` y la lista de pedidos. Vale para el envío por campaña (canción por canción: las demás siguen), para "Enviar a UMG" y para la publicación desde Cambios. "Publicar igual" exige un motivo y queda auditado. Un pedido sólo visual se compara contra el último render, no contra la letra. El diálogo de envío muestra las canciones frenadas con sus pedidos y ofrece "Publicar igual" con motivo obligatorio.
+- Con la misma variable, un pedido de texto ya no se cierra "por publicación" si el texto pedido no aparece en la letra publicada (cerca del tiempo citado o en cualquier parte de la canción, sin distinguir mayúsculas, tildes ni puntuación): queda abierto, se registra qué frases faltan y la publicación sigue igual. Los pedidos de timing, visuales o de prosa sin texto extraíble se cierran como hasta ahora.
+
+## [1.1.120] - 2026-10-08
+
+### Added
+
+- `WHISPERX_RECONCILE_KEEP_WORDS` (apagada por defecto): cada línea de WhisperX reconciliada con la letra de referencia conserva las palabras de la ventana donde se ancló, con su score. Antes se volvían a pegar por posición, se corrían en cuanto el alineado saltaba una palabra y, sin score, el pipeline las borraba: el 95 % de esas líneas llegaba al editor sin palabras. Una línea cuyas palabras no describen su texto queda sin palabras, como hoy. No cambia el texto ni el inicio ni el fin de ninguna línea. La clave entra en la huella de configuración del pipeline.
+
 ## [1.1.119] - 2026-10-07
 
 ### Fixed

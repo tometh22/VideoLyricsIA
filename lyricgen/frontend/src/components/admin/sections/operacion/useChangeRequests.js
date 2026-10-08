@@ -62,6 +62,13 @@ function proposalMatchesSummary(proposal, item) {
     || revision === proposal.lyrics_context.revision;
 }
 
+// Pedidos que la publicación dejó abiertos porque el texto pedido no está
+// en la letra publicada (CHANGE_REQUEST_PUBLISH_GUARD_ENABLED).
+function keptOpenText(kept) {
+  return (kept || []).map((entry) => ` El pedido #${entry.id} sigue abierto: la letra publicada no tiene ${
+    (entry.missing || []).slice(0, 3).map((text) => `«${text}»`).join(", ") || "el texto pedido"}.`).join("");
+}
+
 export const INTERPRETATION_POLL_MS = 4000;
 
 export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
@@ -699,7 +706,7 @@ export default function useChangeRequests({ initialPendingCount = 0 } = {}) {
             data.resolved_change_requests?.length
               ? ` y se cerraron ${data.resolved_change_requests.length} pedido(s)`
               : ""
-          }.${data.hidden_from_client ? HIDDEN_HINT : ""}`,
+          }.${keptOpenText(data.kept_open_change_requests)}${data.hidden_from_client ? HIDDEN_HINT : ""}`,
         });
       } else {
         setCrPublishNotice({
