@@ -340,6 +340,14 @@ def review_for_document(db, document, job=None) -> dict:
             )
             cached["sources"]["official_origin"] = origin
             _review_cache.put(key, cached)
+            # Medición (REVIEW_SIGNALS_PERSIST_ENABLED): se guarda lo recién
+            # calculado en un hilo aparte; nunca levanta ni toca esta sesión.
+            try:
+                from review_signals import record_lyric_review
+                record_lyric_review(document, job, cached)
+            except Exception:  # pragma: no cover - medir nunca tumba el editor
+                logger.warning("[LYRIC-REVIEW] signal capture failed job=%s",
+                               getattr(document, "job_id", None))
         return {**cached, "mode": job_mode}
     except Exception:  # pragma: no cover - un detector nunca tumba el editor
         logger.exception("[LYRIC-REVIEW] review failed job=%s", getattr(document, "job_id", None))

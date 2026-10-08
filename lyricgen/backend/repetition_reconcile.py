@@ -133,7 +133,8 @@ def reconcile(segments: list[dict], asr_words: list[dict], *,
               phon_min: float = _PHON_MIN) -> tuple[list[dict], dict]:
     """Devuelve (segmentos nuevos ordenados por start, stats). Nunca levanta;
     ante cualquier duda o error devuelve una copia idéntica de la entrada."""
-    stats: dict = {"groups": 0, "inserted": 0, "reassigned": 0, "declined": []}
+    stats: dict = {"groups": 0, "inserted": 0, "reassigned": 0, "declined": [],
+                   "proposals": []}
     if not segments or not isinstance(asr_words, list) or len(asr_words) < 8:
         stats["declined"].append(("all", "sin_asr_words"))
         return list(segments or []), stats
@@ -198,6 +199,42 @@ def _reconcile_inner(segments, asr_words, *, lead_s, hold_s, min_group,
                         for g, toks in group_tokens.items() if toks}
 
     out = list(annotated)
+    # Sólo para medir (review_signals): cada propuesta con su decisión. No
+    # cambia ninguna decisión del post-pass.
+    line_of = {id(s): i for i, s in enumerate(annotated)}
+
+    def _propose(gid, members, item_type, decision, reason, **kw):
+        try:
+            _propose_inner(gid, members, item_type, decision, reason, **kw)
+        except Exception as e:  # pragma: no cover — medir nunca cambia el resultado
+            logger.debug("[REP-RECONCILE] propuesta no registrada: %r", e)
+
+    def _propose_inner(gid, members, item_type, decision, reason, *, run=None,
+                       member=None, start=None, end=None, **extra):
+        anchor = member if member is not None else members[0]
+        entry = {
+            "item_type": item_type, "decision": decision, "reason": reason,
+            "group_id": gid, "group_text": str(members[0].get("text", ""))[:300],
+            "group_size": len(members),
+            "line_index": line_of.get(id(anchor)),
+            "start": start if start is not None else (
+                run["start"] if run is not None else _f(anchor.get("start"))),
+            "end": end if end is not None else (
+                run["end"] if run is not None else _f(anchor.get("end"))),
+            "member_starts": [round(_f(m.get("start")), 2) for m in members][:12],
+        }
+        if run is not None:
+            ratios = run.get("ratios") or {}
+            others = [r for g, r in ratios.items() if g != gid]
+            entry.update({
+                "run_start": round(run["start"], 3), "run_end": round(run["end"], 3),
+                "run_text": " ".join(str(w.get("word", "")) for w in run["words"])[:300],
+                "run_words": len(run["words"]),
+                "ratio": round(ratios.get(gid, 0.0), 3),
+                "best_other_ratio": round(max(others), 3) if others else None,
+            })
+        entry.update(extra)
+        stats["proposals"].append(entry)
 
     for gid, members in sorted(groups.items()):
         toks = group_tokens.get(gid) or []
@@ -206,11 +243,13 @@ def _reconcile_inner(segments, asr_words, *, lead_s, hold_s, min_group,
         starts = [_f(m.get("start")) for m in members]
         if starts != sorted(starts):
             stats["declined"].append((gid, "no_monotonico"))
+            _propose(gid, members, "repetition_group", "declined", "no_monotonico")
             continue
         gaps = [b - a for a, b in zip(starts, starts[1:])]
         med_gap = _median(gaps)
         if med_gap <= 0:
             stats["declined"].append((gid, "sin_cadencia"))
+            _propose(gid, members, "repetition_group", "declined", "sin_cadencia")
             continue
         zone_lo = starts[0] - 1.5 * med_gap
         zone_hi = _f(members[-1].get("end")) + 1.5 * med_gap
@@ -229,18 +268,24 @@ def _reconcile_inner(segments, asr_words, *, lead_s, hold_s, min_group,
                 # Esta run suena casi igual a otro grupo: no sabemos de
                 # quién es → se saltea ESA run, no el grupo entero.
                 stats["declined"].append((gid, "run_ambigua_entre_grupos"))
+                _propose(gid, members, "repetition_insert", "declined",
+                         "run_ambigua_entre_grupos", run=run)
                 continue
             if len(run["words"]) < max(2, int(0.6 * len(toks))):
+                _propose(gid, members, "repetition_insert", "declined",
+                         "run_corta", run=run)
                 continue
             cands.append(run)
         if not cands:
             continue
         if len(cands) > _MAX_INSERTS_PER_GROUP:
-            cands = sorted(cands,
-                           key=lambda r: -r["ratios"].get(gid, 0.0)
-                           )[:_MAX_INSERTS_PER_GROUP]
+            ranked = sorted(cands, key=lambda r: -r["ratios"].get(gid, 0.0))
+            cands = ranked[:_MAX_INSERTS_PER_GROUP]
             cands.sort(key=lambda r: r["start"])
             stats["declined"].append((gid, "huerfanas_extra_recortadas"))
+            for dropped in ranked[_MAX_INSERTS_PER_GROUP:]:
+                _propose(gid, members, "repetition_insert", "declined",
+                         "huerfanas_extra_recortadas", run=dropped)
 
         # ── Tier 2 primero: reasignar miembros flotantes ─────────────────
         # Corre ANTES del insert a propósito: si un miembro flota y hay
@@ -266,8 +311,14 @@ def _reconcile_inner(segments, asr_words, *, lead_s, hold_s, min_group,
             if len(near) != 1:
                 if near:
                     stats["declined"].append((gid, "reassign_ambiguo"))
+                    _propose(gid, members, "repetition_reassign", "declined",
+                             "reassign_ambiguo", member=m, candidates=len(near),
+                             ctc_lr=round(_f(m.get("ctc_lr")), 3))
                 continue
             run = near[0]
+            _propose(gid, members, "repetition_reassign", "applied", None,
+                     run=run, member=m, from_start=round(m_start, 3),
+                     ctc_lr=round(_f(m.get("ctc_lr")), 3))
             m["start"] = round(run["start"], 3)
             m["end"] = round(run["end"], 3)
             m["words"] = [dict(w) for w in run["words"]]
@@ -301,7 +352,11 @@ def _reconcile_inner(segments, asr_words, *, lead_s, hold_s, min_group,
                     fin = s_start - 0.01
             if fin - ini < 0.3 or _f(run["end"]) - _f(run["start"]) < 0.3:
                 stats["declined"].append((gid, "insert_clampeado"))
+                _propose(gid, members, "repetition_insert", "declined",
+                         "insert_clampeado", run=run)
                 continue
+            _propose(gid, members, "repetition_insert", "applied", None,
+                     run=run, start=round(ini, 3), end=round(fin, 3))
             new["start"] = round(ini, 3)
             new["end"] = round(fin, 3)
             new["words"] = [dict(w) for w in run["words"]]

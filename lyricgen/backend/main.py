@@ -5761,6 +5761,7 @@ def _maybe_repetition_reconcile(result, job_id: str):
         if not _rr.is_enabled():
             return result
         if not _quality_mutation_authorized(job_id):
+            _repetition_reconcile_shadow(result, job_id)
             return result
         segs = result.get("segments") or []
         words = result.get("_asr_words") or []
@@ -5770,6 +5771,7 @@ def _maybe_repetition_reconcile(result, job_id: str):
         nuevo, stats = _rr.reconcile(
             segs, words, lead_s=_li.lead_seconds(), hold_s=_li.hold_seconds(),
         )
+        _record_repetition_signals(job_id, segs, stats)
         if stats.get("inserted") or stats.get("reassigned"):
             result = dict(result)
             result["segments"] = nuevo
@@ -5781,12 +5783,53 @@ def _maybe_repetition_reconcile(result, job_id: str):
             logger.info("[REP-RECONCILE] sin cambios (declines=%s) job=%s",
                         stats["declined"][:4], job_id)
         result.setdefault("postpass_stats", {})["rep_reconcile"] = {
-            k: v for k, v in stats.items() if k != "declined"}
+            k: v for k, v in stats.items() if k not in ("declined", "proposals")}
         return result
     except Exception as e:  # nunca romper la transcripción
         logger.warning("[REP-RECONCILE] wrapper declinó: %r (job=%s)",
                        e, job_id)
         return result
+
+
+def _record_repetition_signals(job_id: str, segs, stats, *,
+                               gate_reason: str | None = None) -> None:
+    """Medición (REVIEW_SIGNALS_PERSIST_ENABLED, default off): guarda las
+    propuestas aplicadas y declinadas en review_signal_records, en un hilo
+    aparte. Never raises."""
+    try:
+        import review_signals as _rs
+        if _rs.is_enabled():
+            _rs.record_repetition(job_id, segs, stats, gate_reason=gate_reason)
+    except Exception as e:  # medir nunca rompe la transcripción
+        logger.warning("[REVIEW-SIGNALS] repetition capture skipped: %r (job=%s)",
+                       e, job_id)
+
+
+def _repetition_reconcile_shadow(result, job_id: str) -> None:
+    """Con el gate de mutación cerrado el post-pass no corre y sus propuestas
+    no se ven. Si la medición está prendida, se corre en sombra (puro, CPU,
+    sobre una copia) sólo para registrar lo que habría hecho como
+    ``declined`` con motivo ``mutation_not_authorized``. El resultado del
+    job no cambia. Never raises."""
+    try:
+        import review_signals as _rs
+        if not _rs.is_enabled():
+            return
+        segs = result.get("segments") or []
+        words = result.get("_asr_words") or []
+        if len(segs) < 3 or not words:
+            return
+        import lead_in as _li
+        import repetition_reconcile as _rr
+        _nuevo, stats = _rr.reconcile(
+            [dict(s) for s in segs if isinstance(s, dict)], list(words),
+            lead_s=_li.lead_seconds(), hold_s=_li.hold_seconds(),
+        )
+        _rs.record_repetition(job_id, segs, stats,
+                              gate_reason="mutation_not_authorized")
+    except Exception as e:  # medir nunca rompe la transcripción
+        logger.warning("[REVIEW-SIGNALS] repetition shadow skipped: %r (job=%s)",
+                       e, job_id)
 
 
 async def _maybe_gap_rescue(result, audio_path: str, job_id: str,
