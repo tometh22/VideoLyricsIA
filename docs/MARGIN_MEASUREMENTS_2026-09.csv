@@ -90,3 +90,4 @@ coverage,,,,no registrado por job,,,"railway_cpu_ram: el alineado CTC (wav2vec2)
 coverage,,,,no registrado por job,,,r2_storage_egress: solo factura mensual; sin reparto por job
 coverage,,,,no existe,,,rate_calibration_sep2026: la última calibración contra factura es de ago-2026; los costos de sep están a precio de lista
 coverage,,,,sin datos,,,"art_track_sep2026: no hubo art tracks aprobados ni con gasto en sep-2026 en ningún entorno; la única campaña art_track (e0945dcca5f2, 115 jobs) es del 2-oct y de un tenant interno"
+coverage,,,,sobreestimado,,,"compute_cost_*: valuado con COST_PER_CALL; whisper-1-targeted-consensus a US$0,012/llamada da ~US$160 en sep, pero OpenAI facturó US$10,88 de whisper en todo el mes (~US$0,0008/llamada). Para margen usar docs/COSTS_2026-09.csv (facturas y APIs de proveedores)"
