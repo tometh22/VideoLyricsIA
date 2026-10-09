@@ -13,15 +13,10 @@ pueden subir mientras se use `torchaudio.functional.forced_align`, eliminado en
 un commit SHA inmutable y `trust_remote_code=False`. `transformers` se subió a la
 5.18.0 el 1-oct-2026 (la serie 4 terminó en 4.57.6, afectada, y las correcciones
 sólo existen en la 5.x): se validó con el modelo real, cuyas emisiones CTC
-resultaron idénticas bit a bit a las de 4.57.6, y quedó sin excepciones. `ecdsa` llega
-por `python-jose`, pero los tokens de la aplicación aceptan sólo HS256.
-`python-jose` 3.5.0 (CVE-2026-85394, 5-oct-2026, sin versión corregida) permite
-forjar un HS256 con la clave pública sólo si `jwt.decode` no restringe
-`algorithms`. Acá las cuatro llamadas pasan `algorithms=[JWT_ALGORITHM]`, y el
-algoritmo es HS256 con secreto simétrico en staging y en producción. No hay
-claves públicas. `tests/test_jwt_algorithm_restricted.py` rompe si cambia
-alguna de esas dos premisas.
+resultaron idénticas bit a bit a las de 4.57.6, y quedó sin excepciones. El JWT pasó de `python-jose`
+(sin mantenimiento; CVE-2026-85394) a PyJWT ≥ 2.15.0 el 9-oct-2026, y con eso se
+fueron las excepciones de `python-jose` y `ecdsa`.
 
 Propietario: backend/video. Vencimiento máximo: 2026-10-31. Antes de esa fecha
-hay que vendorizar el Viterbi de forced-align o reemplazar el alineador, migrar
-el JWT a una librería mantenida y volver a generar el baseline por ID.
+hay que vendorizar el Viterbi de forced-align o reemplazar el alineador y volver
+a generar el baseline por ID.

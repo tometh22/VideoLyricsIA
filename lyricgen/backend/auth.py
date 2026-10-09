@@ -10,7 +10,8 @@ from typing import Optional
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError, jwt
+import jwt
+from jwt import InvalidTokenError as JWTError
 from passlib.context import CryptContext
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -52,6 +53,11 @@ PLANS = {
 _DEFAULT_INSECURE_SECRET = "genly-default-secret-change-me"
 JWT_SECRET = os.environ.get("JWT_SECRET", _DEFAULT_INSECURE_SECRET)
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
+# PyJWT rechaza un `iat` en el futuro; python-jose no lo miraba. Con varias
+# réplicas, unos milisegundos de diferencia de reloj cortarían sesiones
+# recién emitidas, así que se conserva el comportamiento anterior. `exp` se
+# sigue validando.
+JWT_DECODE_OPTIONS = {"verify_iat": False}
 JWT_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "10080"))  # 7 days
 
 # Tenants allowed to request the broadcast / ProRes deliverable. Comma-
@@ -844,8 +850,10 @@ def decode_token(token: str) -> dict:
     """Decode and validate a JWT token."""
     try:
         # jwt.decode() validates the `exp` claim automatically and raises
-        # JWTError if expired — no manual time check needed.
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        # an InvalidTokenError subclass if expired — no manual time check.
+        payload = jwt.decode(
+            token, JWT_SECRET, algorithms=[JWT_ALGORITHM], options=JWT_DECODE_OPTIONS,
+        )
         return payload
     except JWTError:
         raise HTTPException(
