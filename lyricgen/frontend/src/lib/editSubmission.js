@@ -164,6 +164,11 @@ export function buildEditReview(job, snapReview = null) {
     // los tests ejercitan. La primera versión lo pasaba por afuera y el gate
     // terminó siendo código muerto con tests en verde.
     scenePlan: (job && job.scene_plan) || null,
+    // Display-only (no está en baseline ni en buildEditCurrent → nunca difea
+    // ni viaja): el video se renderizó SIN fondo generado porque su look pinta
+    // todo el cuadro. El wizard/editor avisan si el operador elige un look que
+    // sí usa el fondo. Sale siempre del job: es un hecho del render, no del snap.
+    backgroundOwnedByLook: !!params.background_owned_by_look,
   };
 
   const baseline = {

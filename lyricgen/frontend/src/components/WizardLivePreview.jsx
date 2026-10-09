@@ -7,6 +7,14 @@ import { MOVEMENT_LABELS, EFFECT_LABELS } from "../lib/optionLabels";
 import {
   getLyricLook, keywordSplit, buildRows, LYRIC_LOOK_LABELS,
 } from "../lib/lyricLooks";
+import {
+  lookLineMotionStyle, renderLookLayout, LookBackdrop, LOOK_LAYOUT_KEYFRAMES,
+  buildWordParts, BuildDoodles,
+} from "./lookPreviewLayouts";
+
+// Movimientos de línea en vivo: viven con los layouts de los looks; se
+// re-exportan acá porque es la API histórica del preview.
+export { lookLineMotionStyle };
 
 // Studio Console live preview. Shows a sample lyric line over the selected
 // palette/mood with the selected camera movement applied as a real CSS
@@ -106,60 +114,8 @@ function hexToRgba(hex, alpha) {
 //     JS a partir de currentTime, así entrada/salida caen donde el render.
 export const LOOK_LOOP_S = 3.2;
 
-const clamp01 = (x) => Math.max(0, Math.min(1, x));
-
 // Ruido de película (SVG feTurbulence) como textura repetida.
 const GRAIN_URI = "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/></filter><rect width='160' height='160' filter='url(%23n)' opacity='.6'/></svg>\")";
-
-/**
- * Estilo de línea de un look en un instante (modo en vivo). Espejo de
- * backend lyric_looks._line_motion / ass_render zoom_through: entrada y salida
- * caen DENTRO de la ventana de la línea.
- */
-export function lookLineMotionStyle(motion, elapsedS, durS) {
-  const dur = Math.max(0.05, durS);
-  const t = Math.max(0, Math.min(dur, elapsedS));
-  if (motion === "zoom_through") {
-    const arrive = Math.min(0.4, dur * 0.3);
-    const exit = Math.min(0.3, dur * 0.25);
-    if (t < arrive) {
-      const q = clamp01(t / arrive);
-      return { transform: `scale(${(0.3 + 0.7 * q).toFixed(3)})`, opacity: q };
-    }
-    if (t < dur - exit) {
-      const q = clamp01((t - arrive) / Math.max(0.001, dur - exit - arrive));
-      return { transform: `scale(${(1 + 0.08 * q).toFixed(3)})`, opacity: 1 };
-    }
-    const q = clamp01((t - (dur - exit)) / exit);
-    return {
-      transform: `scale(${(1.08 + 7.92 * q * q).toFixed(3)})`,
-      opacity: 1 - q,
-      filter: `blur(${(6 * q).toFixed(2)}px)`,
-    };
-  }
-  if (motion === "cine") {
-    const enter = Math.min(0.75, Math.max(0.25, dur * 0.3));
-    const exit = Math.min(0.42, Math.max(0.16, dur * 0.18));
-    if (t < enter) {
-      const q = clamp01(t / enter);
-      return {
-        opacity: q,
-        filter: `blur(${(10 * (1 - q)).toFixed(2)}px)`,
-        letterSpacing: `${(0.22 - 0.19 * q).toFixed(3)}em`,
-      };
-    }
-    if (t > dur - exit) {
-      const q = clamp01((t - (dur - exit)) / exit);
-      return { opacity: 1 - q, filter: `blur(${(8 * q).toFixed(2)}px)`, letterSpacing: "0.03em" };
-    }
-    return { opacity: 1, filter: "blur(0px)", letterSpacing: "0.03em" };
-  }
-  if (motion === "fade") {
-    const f = Math.min(0.16, Math.max(0.06, dur * 0.08));
-    return { opacity: Math.min(clamp01(t / f), clamp01((dur - t) / f)) };
-  }
-  return {};
-}
 
 // Keyframe (modo muestra) por movimiento de línea.
 const LOOK_SAMPLE_ANIM = {
@@ -255,6 +211,8 @@ export default function WizardLivePreview({
   // Contador de líneas en vivo: los looks lo usan para alternar inclinación y
   // tarjeta de color en cada línea nueva (el tick no trae el índice).
   const lineSeqRef = useRef(0);
+  // Últimas líneas reproducidas (look Chat: la conversación que sube).
+  const liveHistoryRef = useRef([]);
   // Render-storm detector (P0 UMG Chile 2026-06-16: "duplicar una línea hace
   // titilar toda la pantalla y se queda pegado"). A flicker is the active line
   // changing many times per second — but the 3 s debounced autosave can't
@@ -292,7 +250,10 @@ export default function WizardLivePreview({
           }
           st.changes += 1;
         }
-        if (lineChanged) lineSeqRef.current += 1;
+        if (lineChanged) {
+          lineSeqRef.current += 1;
+          if (last.activeLine) liveHistoryRef.current = [...liveHistoryRef.current, last.activeLine].slice(-3);
+        }
         if (lineChanged || Math.abs(tick.currentTime - last.currentTime) > 0.04) {
           lastTickRef.current = { activeLine: tick.activeLine, currentTime: tick.currentTime };
           setLivePlaybackTick({ ...tick, lineSeq: lineSeqRef.current });
@@ -300,6 +261,7 @@ export default function WizardLivePreview({
       } else if (livePlaybackTick !== null) {
         // El operador pausó/paró el audio — limpiar para volver al loop sample.
         lastTickRef.current = { activeLine: "", currentTime: -1 };
+        liveHistoryRef.current = [];
         setLivePlaybackTick(null);
       }
       raf = requestAnimationFrame(loop);
@@ -711,7 +673,13 @@ export default function WizardLivePreview({
     const lp = lookPreview;
     const live = liveActive;
     const lineIdx = live ? (live.lineSeq || 0) : lookLoopIdx;
-    const text = live ? applyCase(live.activeLine, textCase) : sample;
+    // Manuscritas / chat van en el case original de la letra (backend
+    // force_case="original"); el resto respeta el textCase del operador.
+    const keepCase = lp.forceCase === "original";
+    const rawSample = t("upload.preview_sample") || "esta es tu letra";
+    const text = live
+      ? (keepCase ? String(live.activeLine).trim() : applyCase(live.activeLine, textCase))
+      : (keepCase ? rawSample : sample);
     const tokens = text.split(/\s+/).filter(Boolean);
     const basePx = tierForLength(text.length).fontPx * (lp.fontScale || 1) * clampFontScale(fontScale);
     const toCqw = (px) => `${((px / REF_W) * 100).toFixed(3)}cqw`;
@@ -737,8 +705,44 @@ export default function WizardLivePreview({
       }
       : { animation: LOOK_SAMPLE_ANIM[lp.motion] };
 
+    // Palabra cantada (en vivo) — mismo helper que karaoke.
+    const sungIdx = live
+      ? activeWordIndex(text, live.words, live.activeStart, live.activeEnd, live.currentTime)
+      : null;
+    const elapsed = live ? live.currentTime - live.activeStart : 0;
+    const lineDur = live ? live.activeEnd - live.activeStart : LOOK_LOOP_S;
+    const custom = renderLookLayout({
+      lp,
+      look,
+      tokens,
+      text,
+      live,
+      lineIdx,
+      basePx,
+      toCqw,
+      textColor,
+      operatorPickedColor,
+      sungIdx,
+      elapsed,
+      dur: lineDur,
+      loopS: LOOK_LOOP_S,
+      uid: filterId,
+      history: live ? liveHistoryRef.current : null,
+      sample: text,
+      sampleAlt: keepCase
+        ? (t("upload.sample_words") || "tu letra")
+        : applyCase(t("upload.sample_words") || "tu letra", textCase),
+      chatFontPx: tierForLength(40).fontPx * (lp.fontScale || 1) * clampFontScale(fontScale),
+    });
+
     let body;
-    if (lp.layout === "keyword") {
+    let wrapStyle = null;
+    let frameWrap = false;
+    if (custom) {
+      body = custom.body;
+      wrapStyle = custom.wrapStyle;
+      frameWrap = custom.frame;
+    } else if (lp.layout === "keyword") {
       const split = keywordSplit(tokens);
       body = split ? (
         <>
@@ -754,15 +758,11 @@ export default function WizardLivePreview({
       const { rows, keyIndex } = buildRows(tokens, {
         baseFontPx: basePx, keyScale: lp.keyScale, rowWidth: lp.rowWidth, glyphWidth: lp.glyphWidth,
       });
-      // Palabras que ya se cantaron (en vivo) — mismo helper que karaoke.
-      const sungIdx = live
-        ? activeWordIndex(text, live.words, live.activeStart, live.activeEnd, live.currentTime)
-        : null;
       // Espejo de backend: +tilt en líneas pares, −0.7·tilt en impares (frz
       // de ASS gira antihorario → rotate CSS negativo).
       const tilt = lp.tilt ? lp.tilt * (lineIdx % 2 === 0 ? 1 : -0.7) : 0;
       body = (
-        <span style={{ display: "inline-flex", flexDirection: "column", alignItems: "center", transform: tilt ? `rotate(${(-tilt).toFixed(2)}deg)` : undefined }}>
+        <span style={{ position: lp.doodles ? "relative" : undefined, display: "inline-flex", flexDirection: "column", alignItems: "center", transform: tilt ? `rotate(${(-tilt).toFixed(2)}deg)` : undefined }}>
           {rows.map((row, r) => (
             <span
               key={r}
@@ -781,6 +781,25 @@ export default function WizardLivePreview({
               {row.map((i) => {
                 const isKey = i === keyIndex;
                 const visible = live ? i <= sungIdx : true;
+                if (lp.wordMotion) {
+                  // Cuaderno (escritura a mano) / Y2K (ecos): ver lookPreviewLayouts.
+                  const parts = buildWordParts({ lp, live, visible, i, lineIdx, token: tokens[i], isKey });
+                  return (
+                    <span
+                      key={i}
+                      data-look-word={i}
+                      data-look-key={isKey ? "true" : undefined}
+                      data-look-visible={live ? String(visible) : undefined}
+                      style={{
+                        ...parts.outerStyle,
+                        fontSize: isKey ? `${lp.keyScale}em` : undefined,
+                        color: isKey ? accent : undefined,
+                      }}
+                    >
+                      {parts.content}
+                    </span>
+                  );
+                }
                 return (
                   <span
                     key={i}
@@ -805,6 +824,7 @@ export default function WizardLivePreview({
               })}
             </span>
           ))}
+          <BuildDoodles lp={lp} live={live} keyVisible={keyIndex != null && live ? keyIndex <= sungIdx : true} keyIndex={keyIndex} lineIdx={lineIdx} />
         </span>
       );
     } else {
@@ -816,9 +836,12 @@ export default function WizardLivePreview({
         data-testid="look-lyric"
         style={{
           ...glyph,
-          ...(lp.layout === "build"
+          // Layouts de cuadro completo (columnas, burbujas, anillo): el
+          // wrapper ocupa todo el frame y sus hijos se posicionan adentro.
+          ...(frameWrap ? { position: "absolute", inset: 0 } : {}),
+          ...(wrapStyle || (lp.layout === "build"
             ? (live ? {} : { animation: `wlp-look-blockout ${LOOK_LOOP_S}s linear both` })
-            : lineMotion),
+            : lineMotion)),
         }}
       >
         {body}
@@ -895,6 +918,7 @@ export default function WizardLivePreview({
         @keyframes wlp-look-fade { 0% { opacity: 0; } 5%, 95% { opacity: 1; } 100% { opacity: 0; } }
         @keyframes wlp-look-wordpop { from { opacity: 0; transform: scale(1.35); } to { opacity: 1; transform: scale(1); } }
         @keyframes wlp-look-blockout { 0%, 93% { opacity: 1; } 100% { opacity: 0; } }
+        ${LOOK_LAYOUT_KEYFRAMES}
         @keyframes wlp-look-grain { 0% { background-position: 0 0; } 25% { background-position: -40px 25px; } 50% { background-position: 30px -35px; } 75% { background-position: -20px -15px; } 100% { background-position: 10px 40px; } }
         /* Motion Lab v2: these animations move pixels from the selected photo,
            while /fx_raw remains only a restrained auxiliary light/mask. */
@@ -1034,7 +1058,14 @@ export default function WizardLivePreview({
         className="absolute inset-0 overflow-hidden"
         data-testid="photo-effect-stage"
         data-photo-transform={isPixelTransform ? effect : "overlay"}
-        style={lookPreview && lookPreview.grade ? { filter: lookPreview.grade } : undefined}
+        style={lookPreview && lookPreview.grade
+          ? {
+            filter: lookPreview.grade,
+            // Chat: el fondo va desenfocado; agrandarlo un poco evita el
+            // borde transparente que deja el blur.
+            transform: lookPreview.stageScale ? `scale(${lookPreview.stageScale})` : undefined,
+          }
+          : undefined}
       >
         {renderPhotoTransform()}
       </div>
@@ -1116,13 +1147,19 @@ export default function WizardLivePreview({
       {lookPreview && lookPreview.vignette ? (
         <div className="absolute inset-0 pointer-events-none" data-look-layer="vignette" style={{ background: "radial-gradient(110% 85% at 50% 50%, transparent 45%, rgba(0,0,0,.6))" }} />
       ) : null}
-      {lookPreview && lookPreview.grain && !effect ? (
-        <div className="absolute inset-0 pointer-events-none" data-look-layer="grain" style={{ backgroundImage: GRAIN_URI, mixBlendMode: "overlay", opacity: 0.28, animation: "wlp-look-grain .5s steps(1,end) infinite" }} />
-      ) : null}
-      {/* Pop 70s: el fondo se REEMPLAZA por una placa plana que corta en cada
-          línea (backend Look.background = "flat"). */}
+      {/* Fondos propios de los looks: póster a dos tintas (Duotono),
+          filtraciones de luz (Y2K) y degradé con montañas (Degradé, que
+          REEMPLAZA el fondo). */}
+      <LookBackdrop lp={lookPreview} />
+      {/* Pop 70s / Cinético: el fondo se REEMPLAZA por una placa plana que
+          corta en cada línea (backend Look.background = "flat"). */}
       {lookCard ? (
         <div className="absolute inset-0 pointer-events-none" data-look-layer="card" data-look-card={lookCard} style={{ background: lookCard }} />
+      ) : null}
+      {/* Grano del look ENCIMA de la tarjeta (Cinético lleva grano sobre las
+          placas planas). */}
+      {lookPreview && lookPreview.grain && !effect ? (
+        <div className="absolute inset-0 pointer-events-none" data-look-layer="grain" style={{ backgroundImage: GRAIN_URI, mixBlendMode: "overlay", opacity: 0.28, animation: "wlp-look-grain .5s steps(1,end) infinite" }} />
       ) : null}
 
       {/* lyric — vertically centered, mirroring the real render (\an5 center) */}

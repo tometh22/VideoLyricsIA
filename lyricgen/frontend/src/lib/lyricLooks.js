@@ -17,7 +17,11 @@
 // render. No es pixel-perfect: alcanza con que comunique el look.
 
 /** Códigos válidos, en el orden en que se muestran. "" = sin look. */
-export const LYRIC_LOOK_CODES = ["", "cosmico", "cine", "pincel", "pop70", "pelicula"];
+export const LYRIC_LOOK_CODES = [
+  "", "cosmico", "cine", "pincel", "pop70", "pelicula",
+  "cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva",
+  "duotono", "romantico", "degrade", "y2k",
+];
 
 /** Campos del wizard que un look define (y que el render ignora con look). */
 export const LOOK_LOCKED_FIELDS = ["font", "lyricsAnimation", "lineTransition"];
@@ -27,6 +31,15 @@ export const LOOK_LOCKED_FIELDS = ["font", "lyricsAnimation", "lineTransition"];
 // la placa (backend Look.flat_colors / flat_accents).
 const POP70_CARDS = ["#EE5FA0", "#6E8EDB", "#8FCB6B", "#F4ECDD"];
 const POP70_CARD_ACCENTS = ["#FFD23F", "#FFD23F", "#EE5FA0", "#6E8EDB"];
+
+// Cinético: tarjetas planas navy / celeste, cada una con su paleta
+// (tinta, alternativa, acento) — backend Look.card_palettes.
+const CINETICO_CARDS = ["#1F2244", "#86C8EE"];
+const CINETICO_PALETTES = [["#FFFFFF", "#6EC6FF", "#FF7A45"], ["#1F2244", "#FFFFFF", "#E63946"]];
+// Colores de tubo de Neón y de tinta de Duotono, uno por línea.
+const NEON_TUBES = ["#FF3EA5", "#2EE6FF", "#B07BFF", "#FFB13B"];
+const DUOTONO_INKS = ["#FFF7E6", "#FFD23F", "#FF8FB1", "#9EF0C8"];
+const DEGRADE_SKY = ["#9D4EDD", "#C850C0", "#FF4F8B"];
 
 const LOOKS = [
   {
@@ -90,6 +103,8 @@ const LOOKS = [
   },
   {
     code: "pop70",
+    // Pinta todo el cuadro: en un job nuevo el backend no genera fondo IA.
+    ownsBackground: true,
     font: { css: "'Shrikhand', cursive", weight: 400 },
     preview: {
       layout: "build",
@@ -126,6 +141,214 @@ const LOOKS = [
       thumbBg: "radial-gradient(120% 100% at 50% 30%,#3d6d6c 0%,#1d3a3e 60%,#0c1a1c 100%)",
     },
   },
+  // ── Looks 2 (backend lyric_looks.py, mismo orden) ──────────────────────
+  {
+    code: "cinetico",
+    // Pinta todo el cuadro: en un job nuevo el backend no genera fondo IA.
+    ownsBackground: true,
+    font: { css: "'Big Shoulders Display', sans-serif", weight: 900 },
+    preview: {
+      layout: "kinetic",
+      motion: "word_pop",
+      exit: "smear",
+      color: "#FFFFFF",
+      fontScale: 1.0,
+      // Palabras función (stopwords / ≤2 letras) en manuscrita, chicas.
+      scriptFont: { css: "'Caveat', cursive", weight: 700 },
+      textShadow: "0 0.2cqw 0 rgba(11,13,34,.25)",
+      stroke: "0px",
+      grain: true,
+      cards: CINETICO_CARDS,
+      cardAccents: CINETICO_PALETTES.map((p) => p[2]),
+      cardPalettes: CINETICO_PALETTES,
+      thumbBg: CINETICO_CARDS[0],
+    },
+  },
+  {
+    code: "neon",
+    font: { css: "'Tilt Neon', sans-serif", weight: 400 },
+    preview: {
+      layout: "neon",
+      motion: "neon",
+      color: "#FFF4FA",
+      fontScale: 1.9,
+      // Líneas impares: tubo en manuscrita.
+      scriptFont: { css: "'Neonderthaw', cursive", weight: 400 },
+      lineColors: NEON_TUBES,
+      textShadow: "none",
+      stroke: "0px",
+      vignette: true,
+      grade: "brightness(.55) saturate(.7) contrast(1.08)",
+      thumbBg: "radial-gradient(120% 100% at 50% 40%,#2a1830 0%,#120a18 60%,#050307 100%)",
+    },
+  },
+  {
+    code: "chat",
+    font: { css: "'Roboto', sans-serif", weight: 700 },
+    preview: {
+      layout: "chat",
+      motion: "fade",
+      forceCase: "original",
+      color: "#111111",
+      accent: "#FFFFFF",
+      fontScale: 0.78,
+      bubbles: ["#E9E9EB", "#1F8BFF"],
+      textShadow: "none",
+      stroke: "0px",
+      grade: "blur(6px) brightness(.84) saturate(.85)",
+      stageScale: 1.08,
+      thumbBg: "linear-gradient(160deg,#6f7c8f 0%,#3d4656 60%,#262c36 100%)",
+    },
+  },
+  {
+    code: "cuaderno",
+    font: { css: "'Caveat', cursive", weight: 700 },
+    preview: {
+      layout: "build",
+      motion: "word_pop",
+      wordMotion: "write",
+      forceCase: "original",
+      color: "#FFFFFF",
+      accent: "#FFFFFF",
+      fontScale: 1.75,
+      keyScale: 1.35,
+      rowWidth: 0.62,
+      glyphWidth: 0.42,
+      wordTilt: 3,
+      circleKey: "#E8322E",
+      doodles: { heart: "#FF5DA2", star: "#FFD23F" },
+      textShadow: "0 0.16cqw 0.2cqw rgba(0,0,0,.45)",
+      stroke: "0.08cqw rgba(0,0,0,.55)",
+      grade: "contrast(1.04) saturate(.9)",
+      thumbBg: "radial-gradient(120% 100% at 50% 30%,#8a6a52 0%,#4b3528 60%,#1e140e 100%)",
+    },
+  },
+  {
+    code: "bloque",
+    font: { css: "'Big Shoulders Display', sans-serif", weight: 900 },
+    preview: {
+      layout: "block",
+      motion: "word_pop",
+      color: "#FFFFFF",
+      accent: "#FF6B5B",
+      fontScale: 1.0,
+      rowWidth: 0.46,
+      lightWeight: 300,
+      textShadow: "0 0.2cqw 0.2cqw rgba(0,0,0,.45)",
+      stroke: "0px",
+      grade: "brightness(.92) contrast(1.06) saturate(.9)",
+      thumbBg: "radial-gradient(120% 100% at 50% 30%,#3b4a5a 0%,#1d2631 60%,#0b0f14 100%)",
+    },
+  },
+  {
+    code: "arco",
+    font: { css: "'Montserrat', sans-serif", weight: 800 },
+    preview: {
+      layout: "arc",
+      motion: "fade",
+      color: "#FFFFFF",
+      accent: "#FFD23F",
+      fontScale: 0.85,
+      keyScale: 2.1,
+      glyphWidth: 0.72,
+      textShadow: "0 0.16cqw 0.2cqw rgba(0,0,0,.45)",
+      stroke: "0.1cqw rgba(0,0,0,.7)",
+      vignette: true,
+      grade: "contrast(1.08) saturate(.85)",
+      thumbBg: "radial-gradient(120% 100% at 50% 50%,#2c3a52 0%,#141c2b 60%,#06080d 100%)",
+    },
+  },
+  {
+    code: "perspectiva",
+    font: { css: "'Montserrat', sans-serif", weight: 800 },
+    preview: {
+      layout: "floor",
+      motion: "fade",
+      color: "#FFFFFF",
+      accent: "#7CF5D6",
+      fontScale: 1.5,
+      textShadow: "none",
+      stroke: "0.42cqw #0B4F47",
+      grade: "contrast(1.06) saturate(.9)",
+      thumbBg: "linear-gradient(180deg,#9fc4d6 0%,#5f8fa6 48%,#2c4a3f 52%,#16261f 100%)",
+    },
+  },
+  {
+    code: "duotono",
+    font: { css: "'Permanent Marker', cursive", weight: 400 },
+    preview: {
+      layout: "line",
+      motion: "boil",
+      exit: "smear",
+      color: "#FFF7E6",
+      lineColors: DUOTONO_INKS,
+      fontScale: 1.8,
+      textShadow: "0.26cqw 0.26cqw 0 #1B2C7A",
+      stroke: "0.42cqw #1B2C7A",
+      // Póster a dos tintas: azul en las sombras, crema en las luces.
+      duotone: ["#1B2C7A", "#F4ECDD"],
+      grade: "grayscale(1) contrast(1.35) brightness(1.03)",
+      thumbBg: "linear-gradient(135deg,#F4ECDD 0%,#8f97b8 45%,#1B2C7A 100%)",
+    },
+  },
+  {
+    code: "romantico",
+    font: { css: "'Sacramento', cursive", weight: 400 },
+    preview: {
+      layout: "line",
+      motion: "write_on",
+      forceCase: "original",
+      color: "#FFFFFF",
+      fontScale: 2.4,
+      textShadow: "0 0 0.4cqw #FFD9C2, 0 0 1.1cqw rgba(255,217,194,.75)",
+      stroke: "0.08cqw #FFD9C2",
+      letterbox: true,
+      vignette: true,
+      grade: "contrast(.94) saturate(.85) brightness(1.04)",
+      tint: "#ffb38a",
+      thumbBg: "radial-gradient(120% 100% at 50% 40%,#c98a6a 0%,#7a4a3c 55%,#2a1612 100%)",
+    },
+  },
+  {
+    code: "degrade",
+    // Pinta todo el cuadro: en un job nuevo el backend no genera fondo IA.
+    ownsBackground: true,
+    font: { css: "'Oswald', sans-serif", weight: 700 },
+    preview: {
+      layout: "line",
+      motion: "fade",
+      color: "#FFFFFF",
+      fontScale: 1.35,
+      textShadow: "0 0.1cqw 0.25cqw rgba(0,0,0,.45)",
+      stroke: "0px",
+      // Fondo propio: degradé de atardecer + dos cordones de montañas.
+      gradient: DEGRADE_SKY,
+      mountains: ["#5B2A7A", "#21123A"],
+      thumbBg: `linear-gradient(180deg,${DEGRADE_SKY.join(",")})`,
+    },
+  },
+  {
+    code: "y2k",
+    font: { css: "'Michroma', sans-serif", weight: 400 },
+    preview: {
+      layout: "build",
+      motion: "word_pop",
+      wordMotion: "echo",
+      color: "#FFFFFF",
+      accent: "#BFF6FF",
+      fontScale: 1.05,
+      keyScale: 1.3,
+      stagger: 0.08,
+      rowWidth: 0.66,
+      glyphWidth: 0.95,
+      textShadow: "0 0 0.4cqw #5ED8FF, 0.16cqw 0.16cqw 0 rgba(30,107,255,.55)",
+      stroke: "0.2cqw #5ED8FF",
+      grade: "hue-rotate(-12deg) saturate(.75) brightness(1.08) contrast(.95)",
+      tint: "#5ed8ff",
+      lightLeak: true,
+      thumbBg: "radial-gradient(120% 100% at 30% 20%,#e9fbff 0%,#8fd3f0 45%,#2a6fa8 100%)",
+    },
+  },
 ];
 
 const BY_CODE = Object.fromEntries(LOOKS.map((l) => [l.code, l]));
@@ -142,6 +365,15 @@ export function getLyricLook(value) {
   return code ? BY_CODE[code] : null;
 }
 
+/**
+ * ¿El look pinta todo el cuadro (tarjetas / degradé)? En un job NUEVO el
+ * backend no genera fondo IA para estos looks (ahorra el costo de Veo).
+ */
+export function lookOwnsBackground(value) {
+  const look = getLyricLook(value);
+  return !!(look && look.ownsBackground);
+}
+
 /** ¿El look define (y por lo tanto bloquea) este campo del wizard? */
 export function isLockedByLook(lyricLook, field) {
   return !!getLyricLook(lyricLook) && LOOK_LOCKED_FIELDS.includes(field);
@@ -155,6 +387,17 @@ export const LYRIC_LOOK_LABELS = (t) => ({
   pincel: t("upload.look_pincel") || "Pincel",
   pop70: t("upload.look_pop70") || "Pop 70s",
   pelicula: t("upload.look_pelicula") || "Película",
+  cinetico: t("upload.look_cinetico") || "Cinético",
+  neon: t("upload.look_neon") || "Neón",
+  chat: t("upload.look_chat") || "Chat",
+  cuaderno: t("upload.look_cuaderno") || "Cuaderno",
+  bloque: t("upload.look_bloque") || "Bloque",
+  arco: t("upload.look_arco") || "Arco",
+  perspectiva: t("upload.look_perspectiva") || "Perspectiva 3D",
+  duotono: t("upload.look_duotono") || "Duotono",
+  romantico: t("upload.look_romantico") || "Romántico",
+  degrade: t("upload.look_degrade") || "Degradé",
+  y2k: t("upload.look_y2k") || "Y2K",
 });
 
 const LYRIC_LOOK_DESCS = (t) => ({
@@ -164,6 +407,17 @@ const LYRIC_LOOK_DESCS = (t) => ({
   pincel: t("upload.look_pincel_desc") || "Trazo de pincel, palabra por palabra, clave en rojo.",
   pop70: t("upload.look_pop70_desc") || "No usa el fondo: tarjetas de color que cambian en cada línea.",
   pelicula: t("upload.look_pelicula_desc") || "Película gastada con tinte verdoso y letra amarilla chica.",
+  cinetico: t("upload.look_cinetico_desc") || "Las palabras llegan de a una desde todos lados y arman la frase. No usa el fondo.",
+  neon: t("upload.look_neon_desc") || "Cada línea es un cartel de neón que titila y se prende, sobre el fondo oscurecido.",
+  chat: t("upload.look_chat_desc") || "La letra llega como una conversación de mensajes. Ideal para shorts.",
+  cuaderno: t("upload.look_cuaderno_desc") || "Letra escrita a mano palabra por palabra, la clave marcada en rojo y dibujitos.",
+  bloque: t("upload.look_bloque_desc") || "Filas estiradas al mismo ancho, gruesa y fina alternadas, la clave en coral.",
+  arco: t("upload.look_arco_desc") || "La frase gira alrededor de un anillo y la clave queda grande en el medio.",
+  perspectiva: t("upload.look_perspectiva_desc") || "La letra va acostada en el piso y viene hacia la cámara.",
+  duotono: t("upload.look_duotono_desc") || "El fondo se vuelve un afiche a dos tintas y la letra de marcador tiembla.",
+  romantico: t("upload.look_romantico_desc") || "Cursiva que se escribe sola, luz cálida y franjas de cine.",
+  degrade: t("upload.look_degrade_desc") || "No usa el fondo: atardecer violeta y rosa con montañas, letra limpia.",
+  y2k: t("upload.look_y2k_desc") || "Letra techno ancha con ecos que se juntan, sobre un tono celeste helado.",
 });
 
 /** Opciones listas para pickers: [{ code, label, desc, font, preview }]. */
@@ -219,6 +473,95 @@ export function pickKeyword(tokens) {
     if (n.length >= 4 && !STOPWORDS.has(n)) return i;
   }
   return null;
+}
+
+/** Palabra "función" (stopword o ≤2 letras): Cinético la escribe chica. */
+export function isFunctionWord(tok) {
+  const n = normToken(tok);
+  return STOPWORDS.has(n) || n.length <= 2;
+}
+
+/**
+ * Filas de la composición cinética (espejo de backend _kinetic_events):
+ * corridas de palabras gruesas de hasta 12 caracteres, cada palabra función
+ * en su fila (las consecutivas se juntan en una fila manuscrita) y la clave
+ * siempre sola. Devuelve { rows: [{ idx: [i...], kind }], keyIndex } con
+ * kind = "script" | "heavy" | "key".
+ */
+export function kineticRows(tokens) {
+  const k = pickKeyword(tokens);
+  const small = (i) => i !== k && isFunctionWord(tokens[i]);
+  const rows = [];
+  let cur = [];
+  tokens.forEach((_tok, i) => {
+    if (i === k || small(i)) {
+      if (cur.length) rows.push(cur);
+      cur = [];
+      rows.push([i]);
+      return;
+    }
+    if (cur.length && [...cur, i].map((j) => tokens[j]).join(" ").length > 12) {
+      rows.push(cur);
+      cur = [];
+    }
+    cur.push(i);
+  });
+  if (cur.length) rows.push(cur);
+  const merged = [];
+  rows.forEach((r) => {
+    const prev = merged[merged.length - 1];
+    if (prev && r.length === 1 && small(r[0]) && prev.every(small)) prev.push(r[0]);
+    else merged.push([...r]);
+  });
+  return {
+    keyIndex: k,
+    rows: merged.map((idx) => ({
+      idx,
+      kind: idx.every(small) ? "script" : (idx.length === 1 && idx[0] === k ? "key" : "heavy"),
+    })),
+  };
+}
+
+/**
+ * Filas del look Bloque (espejo de backend _block_events): 1-3 palabras de
+ * hasta 11 caracteres, la clave sola en su fila. Devuelve
+ * { rows: [{ idx, key, heavy }], keyIndex }: las filas alternan fina/gruesa
+ * (la clave y una línea de una sola fila van gruesas).
+ */
+export function blockRows(tokens) {
+  const k = pickKeyword(tokens);
+  const rows = [];
+  let cur = [];
+  tokens.forEach((_tok, i) => {
+    if (i === k && tokens.length > 1) {
+      if (cur.length) rows.push(cur);
+      cur = [];
+      rows.push([i]);
+      return;
+    }
+    if (cur.length && [...cur, i].map((j) => tokens[j]).join(" ").length > 11) {
+      rows.push(cur);
+      cur = [i];
+    } else {
+      cur.push(i);
+    }
+  });
+  if (cur.length) rows.push(cur);
+  return {
+    keyIndex: k,
+    rows: rows.map((idx, r) => {
+      const key = idx.length === 1 && idx[0] === k && tokens.length > 1;
+      return { idx, key, heavy: key || r % 2 === 1 || rows.length === 1 };
+    }),
+  };
+}
+
+/**
+ * Inclinación "puesta a mano" de cada palabra (Cuaderno), determinística
+ * por línea/palabra como el backend: amp × ((i·37 + línea·11) mod 7 − 3) / 3.
+ */
+export function handWordTilt(i, lineIdx, amp) {
+  return amp * ((((i * 37 + lineIdx * 11) % 7) - 3) / 3);
 }
 
 /**

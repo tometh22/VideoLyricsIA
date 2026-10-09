@@ -16,7 +16,7 @@ import { tierForLength } from "../lib/lyricTiers";
 import { approvalConflict } from "../lib/approvalSnapshot";
 import { resolveLegacyDraft } from "../lib/reviewRecovery";
 import { activeWordIndex } from "../lib/karaokeTiming";
-import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote } from "../lib/lyricLooks";
+import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote, lookOwnsBackground } from "../lib/lyricLooks";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
 import { reseedPreservingIds, mintSegmentId } from "../lib/segmentIds";
 import {
@@ -673,6 +673,11 @@ export default function LyricsEditor({
   // Look de letra ("" = sin look). Con look, font/animación/transición los
   // define el look y sus selects quedan deshabilitados (lib/lyricLooks).
   lyricLook = "",
+  // Edición: el video se renderizó SIN fondo generado porque su look pinta
+  // todo el cuadro (render_params.background_owned_by_look). Si el operador
+  // elige un look que sí usa fondo (o "Sin look") avisamos que lo regenere en
+  // «Fondo». Sólo informa; no cambia el payload.
+  backgroundOwnedByLook = false,
   transcribeJobId = null,
   segmentsRevision = 0,
   // PR E follow-up (2026-07): key DEL STORE, desacoplada del backend job id.
@@ -6184,6 +6189,11 @@ export default function LyricsEditor({
             {getLyricLook(selectedLook) && (
               <p className="px-1 text-[10px] text-amber-300/80" data-testid="editor-look-locked">
                 {lookLockedNote(t, selectedLook)}
+              </p>
+            )}
+            {backgroundOwnedByLook && !lookOwnsBackground(selectedLook) && (
+              <p className="px-1 text-[10px] text-amber-300/90" data-testid="editor-look-needs-bg" role="status">
+                {t("upload.look_needs_bg_note") || "Este video se hizo sin fondo generado. Para este look regenerá el fondo en «Fondo»."}
               </p>
             )}
             {/* Live font switcher — preview re-renders in the chosen

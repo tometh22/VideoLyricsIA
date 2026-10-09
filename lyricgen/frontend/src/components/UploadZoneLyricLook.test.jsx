@@ -49,7 +49,7 @@ const JOB_FIELDS = {
 
 const reviews = [];
 
-function Harness({ jobFields = JOB_FIELDS }) {
+function Harness({ jobFields = JOB_FIELDS, existingBgOwnedByLook }) {
   const [, setReview] = useState({ ...jobFields });
   return (
     <UploadZone
@@ -70,6 +70,7 @@ function Harness({ jobFields = JOB_FIELDS }) {
       })}
       editSeed={{ jobId: "job-1", genre: "", concept: "", backgroundHint: "", bgVerbatim: false, matchLyrics: true, wizardFields: jobFields }}
       editBaseline={jobFields}
+      existingBgOwnedByLook={existingBgOwnedByLook}
     />
   );
 }
@@ -90,11 +91,22 @@ afterEach(() => {
 });
 
 describe("paso 4: picker de looks", () => {
-  it("muestra los 6 looks arriba de la tipografía, con 'sin look' primero", () => {
+  it("muestra los 16 looks arriba de la tipografía, con 'sin look' primero", () => {
     render(<Harness jobFields={{ ...JOB_FIELDS, lyricLook: "" }} />);
     goStep(4);
     const cards = [...document.querySelectorAll('[data-testid="lyric-look-picker"] [data-lyric-look]')];
-    expect(cards.map((c) => c.dataset.lyricLook)).toEqual(["none", "cosmico", "cine", "pincel", "pop70", "pelicula"]);
+    expect(cards.map((c) => c.dataset.lyricLook)).toEqual([
+      "none", "cosmico", "cine", "pincel", "pop70", "pelicula",
+      "cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva",
+      "duotono", "romantico", "degrade", "y2k",
+    ]);
+    // Cada tarjeta trae su miniatura (fondo + demo) y su descripción.
+    for (const card of cards) {
+      expect(card.querySelector(".aspect-video").style.background, card.dataset.lyricLook).toBeTruthy();
+      expect(card.getAttribute("title"), card.dataset.lyricLook).toBeTruthy();
+    }
+    // La grilla envuelve y scrollea adentro en vez de empujar todo el paso.
+    expect(screen.getByTestId("lyric-look-grid").className).toMatch(/overflow-y-auto/);
     expect(lookCard("").getAttribute("aria-pressed")).toBe("true");
     // Sin look: todo se personaliza a mano.
     expect(fontTrigger().disabled).toBe(false);
@@ -141,5 +153,46 @@ describe("paso 4: picker de looks", () => {
     // Lo elegido a mano sigue ahí (karaoke / anton no se pisaron).
     expect(reviews.at(-1).lyricsAnimation).toBe("karaoke");
     expect(reviews.at(-1).font).toBe("anton");
+  });
+});
+
+describe("paso 4: looks que no usan el fondo", () => {
+  it("job nuevo: Pop 70s / Cinético / Degradé avisan que no se genera fondo", () => {
+    render(<Harness jobFields={{ ...JOB_FIELDS, lyricLook: "" }} />);
+    goStep(4);
+    expect(screen.queryByTestId("look-owns-bg-note")).toBeNull();
+    for (const code of ["pop70", "cinetico", "degrade"]) {
+      fireEvent.click(lookCard(code));
+      expect(screen.getByTestId("look-owns-bg-note").textContent).toBe("upload.look_owns_bg_note");
+    }
+    fireEvent.click(lookCard("neon"));
+    expect(screen.queryByTestId("look-owns-bg-note")).toBeNull();
+    expect(screen.queryByTestId("look-needs-bg-note")).toBeNull();
+  });
+
+  it("edición de un video hecho sin fondo: elegir un look que usa fondo avisa que hay que regenerarlo", () => {
+    render(<Harness jobFields={{ ...JOB_FIELDS, lyricLook: "pop70" }} existingBgOwnedByLook />);
+    goStep(4);
+    // Sigue con un look que pinta todo el cuadro: nada que avisar.
+    expect(screen.queryByTestId("look-needs-bg-note")).toBeNull();
+    // En la edición de un job existente no se promete "no se genera".
+    expect(screen.queryByTestId("look-owns-bg-note")).toBeNull();
+    fireEvent.click(lookCard("degrade"));
+    expect(screen.queryByTestId("look-needs-bg-note")).toBeNull();
+    fireEvent.click(lookCard("cine"));
+    expect(screen.getByTestId("look-needs-bg-note").textContent).toBe("upload.look_needs_bg_note");
+    // "Sin look" también necesita fondo.
+    fireEvent.click(lookCard(""));
+    expect(screen.getByTestId("look-needs-bg-note")).toBeTruthy();
+    // Sólo informa: el look elegido viaja igual que siempre.
+    expect(reviews.at(-1).lyricLook).toBe("");
+  });
+
+  it("edición de un video CON fondo: no hay aviso de regenerar", () => {
+    render(<Harness jobFields={{ ...JOB_FIELDS, lyricLook: "pop70" }} existingBgOwnedByLook={false} />);
+    goStep(4);
+    fireEvent.click(lookCard("cine"));
+    expect(screen.queryByTestId("look-needs-bg-note")).toBeNull();
+    expect(screen.queryByTestId("look-owns-bg-note")).toBeNull();
   });
 });

@@ -241,11 +241,23 @@ describe("look de letra", () => {
     expect(buildEditReview(JOB_FULL, null).initialFields.lyricLook).toBe("cine");
     expect(buildEditReview(JOB_FULL, null).baseline.lyricLook).toBe("cine");
     expect(buildEditReview(JOB_BARE, null).initialFields.lyricLook).toBe("");
-    const legacy = { ...JOB_BARE, render_params: { lyric_look: "neon" } };
+    const legacy = { ...JOB_BARE, render_params: { lyric_look: "vaporwave" } };
     const { baseline } = buildEditReview(legacy, null);
     expect(baseline.lyricLook).toBe("");
     // Sin tocar nada no difea aunque el backend haya guardado un código viejo.
     expect(computeFieldDiff(baseline, currentFrom(legacy))).toEqual({});
+  });
+
+  it("background_owned_by_look se siembra para avisar, sin entrar al diff", () => {
+    const owned = { ...JOB_BARE, render_params: { lyric_look: "pop70", background_owned_by_look: true } };
+    const { initialFields, baseline } = buildEditReview(owned, null);
+    expect(initialFields.backgroundOwnedByLook).toBe(true);
+    // Display-only: ni baseline ni el diff lo conocen.
+    expect("backgroundOwnedByLook" in baseline).toBe(false);
+    expect(computeFieldDiff(baseline, currentFrom(owned))).toEqual({});
+    expect(buildEditReview(JOB_BARE, null).initialFields.backgroundOwnedByLook).toBe(false);
+    // Es un hecho del render: el snap no lo pisa.
+    expect(buildEditReview(owned, { backgroundOwnedByLook: false }).initialFields.backgroundOwnedByLook).toBe(true);
   });
 
   it("el snap del autosave gana (incluido el '' de sacar el look)", () => {

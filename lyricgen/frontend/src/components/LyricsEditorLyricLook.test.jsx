@@ -56,3 +56,25 @@ describe("LyricsEditor — look de letra", () => {
     expect(screen.queryByTestId("editor-look-locked")).toBeNull();
   });
 });
+
+describe("LyricsEditor — video hecho sin fondo generado", () => {
+  it("avisa al elegir un look que usa fondo (o 'Sin look'); no con los que pintan todo el cuadro", () => {
+    const onLyricLookChange = vi.fn();
+    render(<LyricsEditor {...props({ lyricLook: "pop70", backgroundOwnedByLook: true, onLyricLookChange })} />);
+    const select = screen.getByTestId("editor-lyric-look");
+    expect(screen.queryByTestId("editor-look-needs-bg")).toBeNull();
+    fireEvent.change(select, { target: { value: "cinetico" } });
+    expect(screen.queryByTestId("editor-look-needs-bg")).toBeNull();
+    fireEvent.change(select, { target: { value: "neon" } });
+    expect(screen.getByTestId("editor-look-needs-bg").textContent).toMatch(/regenerá el fondo en «Fondo»/);
+    fireEvent.change(select, { target: { value: "" } });
+    expect(screen.getByTestId("editor-look-needs-bg")).toBeTruthy();
+    // Sólo informa: el cambio de look llega al padre igual.
+    expect(onLyricLookChange).toHaveBeenLastCalledWith("");
+  });
+
+  it("sin la marca del job no avisa nada", () => {
+    render(<LyricsEditor {...props({ lyricLook: "cine" })} />);
+    expect(screen.queryByTestId("editor-look-needs-bg")).toBeNull();
+  });
+});

@@ -5884,6 +5884,10 @@ export default function App() {
         // tiene el video HOY, aparte de qué eligió el operador. Sin esto el
         // anillo violeta es la única señal, y es la que engañó al operador.
         editBaseline={_wizardOnExistingJob ? currentReview.baseline : null}
+        // Edición de un video hecho SIN fondo generado (look que pinta todo el
+        // cuadro): el paso de looks avisa si el operador elige uno que sí usa
+        // fondo. null fuera de la edición de un job existente. Sólo display.
+        existingBgOwnedByLook={currentReview?.editMode ? !!currentReview.backgroundOwnedByLook : null}
         // Plan EN VIVO (willApply / willDrop / blocked), desde la MISMA función
         // que arma el POST. Alimenta el resumen del paso final y el bloqueo del
         // bloque de fondo, para que el wizard deje de prometer cosas que el
@@ -6346,6 +6350,9 @@ export default function App() {
             lyricsAnimation={currentReview.lyricsAnimation || "none"}
             lineTransition={currentReview.lineTransition || "none"}
             lyricLook={normalizeLyricLook(currentReview.lyricLook)}
+            // Video hecho sin fondo generado (look que pinta todo el cuadro):
+            // el selector de look avisa si se elige uno que sí usa fondo.
+            backgroundOwnedByLook={!!(currentReview.editMode && currentReview.backgroundOwnedByLook)}
             // Typography is now chosen LIVE in the editor preview (not in the
             // upload step). Thread the operator's choices back into
             // currentReview so handleApproveLyrics carries them to generate.

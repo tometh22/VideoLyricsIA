@@ -10,7 +10,8 @@ import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, EFFECT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
-import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote } from "../lib/lyricLooks";
+import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote, lookOwnsBackground } from "../lib/lyricLooks";
+import { DegradeArt, HEART_PATH } from "./lookPreviewLayouts";
 import { canCreateArtTrack } from "../lib/artTrackAccess";
 import EditPlanSummary from "./EditPlanSummary";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
@@ -294,6 +295,12 @@ export default function UploadZone({
   // lleva los dos; cuando no, se marcan dos y el cambio queda dibujado.
   // El anillo solo era la señal que engañó al operador del reclamo original.
   editBaseline = null,
+  // Edición de un video existente: ¿se renderizó SIN fondo generado porque
+  // su look pinta todo el cuadro (render_params.background_owned_by_look)?
+  // null = no es la edición de un job existente (job nuevo / variante).
+  // Sólo informa: si el operador elige un look que sí usa el fondo, avisamos
+  // que hay que regenerarlo en «Fondo». No toca el payload de la edición.
+  existingBgOwnedByLook = null,
   // Plan en vivo de la edición: { willApply, willDrop, blocked } calculado con
   // resolveEditSubmission, la MISMA función que arma el POST. Es lo que permite
   // que el wizard deje de prometer lo que el backend va a descartar.
@@ -1062,6 +1069,126 @@ export default function UploadZone({
         </span>
       );
     }
+    const w0 = words[0];
+    const wl = words[words.length - 1];
+    const own = p.forceCase === "original" ? t("upload.sample_words").split(" ") : words;
+    if (p.layout === "kinetic") {
+      const [, alt, accent] = p.cardPalettes[0];
+      return (
+        <span className="flex flex-col items-center leading-none">
+          <span style={{ ...base, fontFamily: p.scriptFont.css, fontWeight: p.scriptFont.weight, color: accent, fontSize: "12px", textShadow: "none", rotate: "-7deg", animation: "lcard-kin-l 2.6s infinite both" }}>{w0}</span>
+          <span className="relative inline-block mt-0.5">
+            <span className="absolute rounded-lg" style={{ inset: "-6% -14%", background: alt, animation: "lcard-wordpop 2.6s .45s infinite both" }} />
+            <span style={{ ...base, position: "relative", color: accent, fontSize: "26px", animation: "lcard-kin-r 2.6s .35s infinite both" }}>{wl}</span>
+          </span>
+        </span>
+      );
+    }
+    if (p.layout === "neon") {
+      const c = p.lineColors[0];
+      const frame = p.lineColors[2];
+      return (
+        <span style={{ padding: "3px 7px", borderRadius: 7, border: `1.5px solid ${frame}`, boxShadow: `0 0 6px ${frame}, inset 0 0 4px ${frame}`, animation: "lcard-neon 2.6s infinite both" }}>
+          <span style={{ ...base, fontSize: "16px", color: p.color, textShadow: `0 0 2px #fff, 0 0 5px ${c}, 0 0 10px ${c}, 0 0 16px ${c}` }}>{words.join(" ")}</span>
+        </span>
+      );
+    }
+    if (p.layout === "chat") {
+      const bubble = (txt, right, delay) => (
+        <span
+          style={{
+            ...base, alignSelf: right ? "flex-end" : "flex-start", fontSize: "9px", padding: "3px 6px",
+            borderRadius: 8, [right ? "borderBottomRightRadius" : "borderBottomLeftRadius"]: 2,
+            background: right ? p.bubbles[1] : p.bubbles[0], color: right ? p.accent : p.color,
+            animation: `lcard-chat 2.8s ${delay}s infinite both`,
+          }}
+        >{txt}</span>
+      );
+      return (
+        <span className="flex flex-col gap-1 w-[70%]">
+          {bubble(own[0], false, 0)}
+          {bubble(own.join(" "), true, 0.5)}
+        </span>
+      );
+    }
+    if (p.layout === "block") {
+      return (
+        <span className="flex flex-col items-center leading-[.84]" style={{ animation: "lcard-wordpop 2.6s infinite both" }}>
+          <span style={{ ...base, fontWeight: p.lightWeight, fontSize: "22px", letterSpacing: "0.04em" }}>{w0}</span>
+          <span style={{ ...base, color: p.accent, fontSize: "24px", animation: "lcard-wordpop 2.6s .3s infinite both" }}>{wl}</span>
+        </span>
+      );
+    }
+    if (p.layout === "arc") {
+      return (
+        <svg viewBox="0 0 100 60" className="w-full h-full" aria-hidden="true" style={{ fontFamily: look.font.css, fontWeight: look.font.weight }}>
+          <defs><path id={`lcard-arc-${look.code}`} d="M50 54A22 22 0 1 1 50 10A22 22 0 1 1 50 54" /></defs>
+          <g style={{ transformOrigin: "50px 32px", animation: "lcard-spin 9s linear infinite" }}>
+            <circle cx="50" cy="32" r="18.5" fill="none" stroke={p.color} strokeOpacity=".45" strokeWidth=".6" />
+            <text fontSize="6.5" fill={p.color} letterSpacing=".6">
+              <textPath href={`#lcard-arc-${look.code}`} startOffset="50%" textAnchor="middle">{`${words.join(" ")} ${words.join(" ")}`}</textPath>
+            </text>
+          </g>
+          <text x="50" y="32" fontSize="9" textAnchor="middle" dominantBaseline="central" fill={p.accent}>{wl}</text>
+        </svg>
+      );
+    }
+    if (p.layout === "floor") {
+      return (
+        <span style={{ ...base, fontSize: "17px", WebkitTextStroke: "1.6px #0B4F47", textShadow: "none", animation: "lcard-floor 2.8s infinite both" }}>
+          {w0}{" "}<span style={{ color: p.accent }}>{wl}</span>
+        </span>
+      );
+    }
+    if (p.motion === "boil") {
+      return (
+        <span style={{ ...base, fontSize: "19px", color: p.lineColors[1], WebkitTextStroke: "1.6px #1B2C7A", textShadow: "1.5px 1.5px 0 #1B2C7A", animation: "lcard-boil .5s steps(1,end) infinite" }}>{words.join(" ")}</span>
+      );
+    }
+    if (p.motion === "write_on") {
+      return (
+        <span style={{ ...base, fontSize: "24px", textShadow: "0 0 3px #FFD9C2, 0 0 8px rgba(255,217,194,.8)", WebkitTextStroke: undefined, animation: "lcard-write 2.8s infinite both" }}>{own.join(" ")}</span>
+      );
+    }
+    if (p.gradient) {
+      return (
+        <>
+          <DegradeArt gradient={p.gradient} mountains={p.mountains} className="absolute inset-0 w-full h-full" />
+          <span className="relative text-[15px]" style={{ ...base, animation: "acard-word 2.8s infinite" }}>{words.join(" ")}</span>
+        </>
+      );
+    }
+    if (p.wordMotion === "write") {
+      return (
+        <span className="relative flex items-baseline gap-1 text-[19px]">
+          <span style={{ ...base, rotate: "-3deg", animation: "lcard-write 2.6s infinite both" }}>{own[0]}</span>
+          <span className="relative inline-block" style={{ rotate: "2deg" }}>
+            <span style={{ ...base, animation: "lcard-write 2.6s .45s infinite both" }}>{own[own.length - 1]}</span>
+            <svg viewBox="0 0 100 60" preserveAspectRatio="none" aria-hidden="true" className="absolute" style={{ inset: "-25% -20%", width: "140%", height: "150%", overflow: "visible", animation: "lcard-write 2.6s .8s infinite both" }}>
+              <ellipse cx="50" cy="30" rx="47" ry="26" fill="none" stroke={p.circleKey} strokeWidth="1.6" vectorEffect="non-scaling-stroke" transform="rotate(-3 50 30)" />
+            </svg>
+            <svg viewBox="0 0 24 24" aria-hidden="true" className="absolute w-[9px] h-[9px]" style={{ right: "-14px", top: "-6px", animation: "lcard-boil .5s steps(1,end) infinite" }}>
+              <path d={HEART_PATH} fill={p.doodles.heart} />
+            </svg>
+          </span>
+        </span>
+      );
+    }
+    if (p.wordMotion === "echo") {
+      const ghost = (side) => (
+        <span aria-hidden="true" className="absolute left-0 top-0" style={{ ...base, filter: "blur(1px)", animation: `lcard-ghost-${side} 2.6s infinite both` }}>{wl}</span>
+      );
+      return (
+        <span className="flex flex-col items-center text-[12px]">
+          <span style={{ ...base, translate: "-10% 0", animation: "lcard-wordpop 2.6s infinite both" }}>{w0}</span>
+          <span className="relative inline-block" style={{ translate: "10% 0" }}>
+            {ghost("l")}
+            {ghost("r")}
+            <span style={{ ...base, color: p.accent, fontSize: "1.3em", animation: "lcard-wordpop 2.6s .3s infinite both" }}>{wl}</span>
+          </span>
+        </span>
+      );
+    }
     if (p.layout === "keyword") {
       return (
         <span className="flex flex-col items-center" style={{ animation: "lcard-cine 2.8s infinite both" }}>
@@ -1398,6 +1525,29 @@ export default function UploadZone({
   const LYRIC_LOOKS = lyricLookOptions(t);
   const activeLook = getLyricLook(batchDefaults.lyricLook);
   const lookLockedText = activeLook ? lookLockedNote(t, activeLook.code) : "";
+  // Fondo y looks que pintan todo el cuadro (Pop 70s / Cinético / Degradé):
+  //  - job nuevo: el backend no genera fondo para ellos → lo decimos (ahorra
+  //    el costo del fondo, que es lo que el operador quiere saber);
+  //  - edición de un video que se hizo SIN fondo: elegir un look que sí lo
+  //    usa (o "Sin look") necesita regenerar el fondo en «Fondo».
+  const lookOwnsBgNote = existingBgOwnedByLook == null && lookOwnsBackground(batchDefaults.lyricLook)
+    ? (t("upload.look_owns_bg_note") || "Este look no usa el fondo: no se genera uno (ahorra el costo del fondo).")
+    : "";
+  const lookNeedsBgNote = existingBgOwnedByLook && !lookOwnsBackground(batchDefaults.lyricLook)
+    ? (t("upload.look_needs_bg_note") || "Este video se hizo sin fondo generado. Para este look regenerá el fondo en «Fondo».")
+    : "";
+  const lookGridRef = useRef(null);
+  useEffect(() => {
+    if (wizardStep !== 4) return;
+    const grid = lookGridRef.current;
+    if (!grid) return;
+    const active = grid.querySelector('[aria-pressed="true"]');
+    if (active && active.offsetTop > grid.clientHeight) {
+      grid.scrollTop = active.offsetTop - grid.clientHeight / 2;
+    }
+    // Sólo al entrar al paso: no perseguir al operador mientras elige.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wizardStep]);
 
   // Visual concept for the AI background. Operator-controlled; when set
   // it hard-overrides the genre's scene vocabulary. Mirror of the backend
@@ -4632,6 +4782,16 @@ export default function UploadZone({
                 @keyframes lcard-zoom { 0%{transform:scale(.3);opacity:0} 18%{transform:scale(1);opacity:1} 82%{transform:scale(1.08);opacity:1;filter:blur(0)} 100%{transform:scale(6);opacity:0;filter:blur(3px)} }
                 @keyframes lcard-cine { 0%{filter:blur(4px);letter-spacing:.35em;opacity:0} 30%,82%{filter:blur(0);letter-spacing:.02em;opacity:1} 100%{filter:blur(4px);opacity:0} }
                 @keyframes lcard-wordpop { 0%,6%{transform:scale(1.35);opacity:0} 12%,86%{transform:scale(1);opacity:1} 100%{opacity:0} }
+                @keyframes lcard-kin-l { 0%,6%{transform:translateX(-60px);opacity:0} 18%,86%{transform:none;opacity:1} 100%{opacity:0} }
+                @keyframes lcard-kin-r { 0%,6%{transform:translateX(60px);opacity:0} 18%,86%{transform:none;opacity:1;filter:blur(0)} 100%{transform:scaleX(2);opacity:0;filter:blur(3px)} }
+                @keyframes lcard-neon { 0%,8%{opacity:.15} 10%{opacity:1} 13%{opacity:.3} 16%,88%{opacity:1} 100%{opacity:.15} }
+                @keyframes lcard-chat { 0%,10%{transform:translateY(8px);opacity:0} 22%,100%{transform:none;opacity:1} }
+                @keyframes lcard-write { 0%,6%{clip-path:inset(-30% 100% -30% -5%)} 45%,100%{clip-path:inset(-30% -5% -30% -5%)} }
+                @keyframes lcard-spin { to{transform:rotate(360deg)} }
+                @keyframes lcard-floor { 0%{transform:perspective(120px) rotateX(48deg) translateY(-14px) scale(.7);opacity:0} 15%,85%{opacity:1} 100%{transform:perspective(120px) rotateX(48deg) translateY(12px) scale(1.2);opacity:0} }
+                @keyframes lcard-boil { 0%{transform:rotate(-2deg)} 25%{transform:rotate(1.5deg) scale(1.02)} 50%{transform:rotate(-1deg)} 75%{transform:rotate(2deg) scale(1.01)} }
+                @keyframes lcard-ghost-l { 0%,6%{transform:translateX(-12px);opacity:0} 14%{opacity:.45} 30%,100%{transform:none;opacity:0} }
+                @keyframes lcard-ghost-r { 0%,6%{transform:translateX(12px);opacity:0} 14%{opacity:.35} 30%,100%{transform:none;opacity:0} }
               `}</style>
 
               {/* Look de letra — atajo de un clic (lib/lyricLooks). Va ARRIBA
@@ -4643,7 +4803,14 @@ export default function UploadZone({
                 <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
                   {t("upload.look_section_desc")}
                 </p>
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {/* 17 tarjetas: la grilla envuelve y scrollea adentro para no
+                    empujar la tipografía fuera de pantalla. Al abrir, la
+                    tarjeta elegida se trae a la vista. */}
+                <div
+                  className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-[30rem] overflow-y-auto overscroll-contain pr-1 -mr-1"
+                  data-testid="lyric-look-grid"
+                  ref={lookGridRef}
+                >
                   {LYRIC_LOOKS.map((look) => {
                     const active = normalizeLyricLook(batchDefaults.lyricLook) === look.code;
                     const inVideo = isAnchor("lyricLook", look.code);
@@ -4690,6 +4857,16 @@ export default function UploadZone({
                     );
                   })}
                 </div>
+                {lookOwnsBgNote ? (
+                  <p className="mt-2 text-[10px] text-emerald-300/80" data-testid="look-owns-bg-note">
+                    {lookOwnsBgNote}
+                  </p>
+                ) : null}
+                {lookNeedsBgNote ? (
+                  <p className="mt-2 text-[10px] text-amber-300/90" data-testid="look-needs-bg-note" role="status">
+                    {lookNeedsBgNote}
+                  </p>
+                ) : null}
               </div>
 
               {/* Tipografía — UI gap fix 2026-05-26. El refactor del paso 6

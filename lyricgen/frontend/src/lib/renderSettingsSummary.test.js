@@ -190,7 +190,7 @@ describe("no se le muestran códigos internos ni defaults al operador", () => {
       text_contrast: ["subtle", "medium", "strong"],
       lyrics_animation: ["none", "karaoke", "word_reveal", "pop", "glow"],
       line_transition: ["none", "slide_up", "slide_side", "wipe", "dissolve_blur"],
-      lyric_look: ["", "cosmico", "cine", "pincel", "pop70", "pelicula"],
+      lyric_look: ["", "cosmico", "cine", "pincel", "pop70", "pelicula", "cinetico", "neon", "chat", "cuaderno", "bloque", "arco", "perspectiva", "duotono", "romantico", "degrade", "y2k"],
       title_template: ["auto", "centered", "lower_third", "badge"],
     };
     for (const [key, codes] of Object.entries(cases)) {

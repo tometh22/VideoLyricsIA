@@ -55,6 +55,6 @@ describe("buildGenerationJob", () => {
     });
     // El look no borra lo elegido a mano: volver a "Sin look" lo recupera.
     expect(job).toMatchObject({ lyricLook: "cine", font: "anton", lyricsAnimation: "karaoke", lineTransition: "wipe" });
-    expect(buildGenerationJob({ file: { name: "a.mp3" }, segments: [], lyricLook: "neon" }).lyricLook).toBe("");
+    expect(buildGenerationJob({ file: { name: "a.mp3" }, segments: [], lyricLook: "vaporwave" }).lyricLook).toBe("");
   });
 });
