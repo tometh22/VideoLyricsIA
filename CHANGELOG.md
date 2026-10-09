@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.123] - 2026-10-08
+
+### Added
+
+- Tabla interna `review_signal_records` (revisión Alembic `c1d3e5f7a9b2`) que guarda, tal como se calcularon, los puntos de la revisión rápida (una fila por punto, job y revisión del editor) y las propuestas de `repetition_reconcile`, tanto las aplicadas como las declinadas con el motivo del gate. Con el gate de mutación cerrado, el post-pass corre en sombra sólo para registrar lo que habría hecho, como declinado con motivo `mutation_not_authorized`, sin cambiar el resultado del job. Sirve para medir después cuántos errores de texto reportados por el cliente ya estaban marcados por cada señal. Detrás de `REVIEW_SIGNALS_PERSIST_ENABLED`, apagada por defecto. La escritura se hace en segundo plano, sin duplicados y sin frenar al editor ni al pipeline: si falla, se registra en el log y el proceso sigue. Nada del producto lee esta tabla.
+
 ## [1.1.122] - 2026-10-08
 
 ### Added

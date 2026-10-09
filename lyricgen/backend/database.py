@@ -2502,6 +2502,53 @@ class StatusComponentEvent(Base):
     )
 
 
+class ReviewSignalRecord(Base):
+    """Señales de revisión automática tal como se calcularon, para medirlas.
+
+    Dos señales se calculaban y se perdían: los puntos de la revisión rápida
+    (``lyric_review``, que vivían sólo en una caché LRU del proceso) y las
+    propuestas de ``repetition_reconcile`` (las que un gate declinaba sólo
+    iban al log). Esta tabla las guarda para poder cruzarlas después con los
+    pedidos de cambio del cliente (precisión/recall por señal).
+
+    Sólo se escribe con ``REVIEW_SIGNALS_PERSIST_ENABLED=1`` y en un hilo
+    aparte (``review_signals.py``); nada del producto la lee. Sin FK a
+    ``jobs`` a propósito: el insert no toma locks sobre la fila del job (que
+    el aprobar del editor tiene ``FOR UPDATE``). ``dedupe_key`` evita
+    duplicados cuando el mismo punto se recalcula para la misma revisión.
+    """
+    __tablename__ = "review_signal_records"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_review_signal_records_dedupe_key"),
+        Index("ix_review_signal_records_job_id", "job_id"),
+        Index("ix_review_signal_records_kind_created", "kind", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(12), nullable=False)
+    tenant_id = Column(String(100), nullable=True)
+    # lyric_review_item | repetition_proposal
+    kind = Column(String(32), nullable=False)
+    # heard_different, missing, question_marks… | repetition_insert,
+    # repetition_reassign, repetition_group
+    item_type = Column(String(40), nullable=False)
+    # proposed | declined | applied
+    decision = Column(String(16), nullable=False)
+    reason = Column(String(80), nullable=True)
+    # Identidad de lo que se miró: revisión del editor (lyric_review), hash de
+    # los segmentos de entrada y release del código que lo calculó.
+    editor_revision = Column(Integer, nullable=True)
+    segments_hash = Column(String(64), nullable=True)
+    pipeline_release = Column(String(64), nullable=True)
+    # Línea al momento del cálculo (puede moverse después).
+    line_index = Column(Integer, nullable=True)
+    start_s = Column(Float, nullable=True)
+    end_s = Column(Float, nullable=True)
+    payload = Column(JSONB, nullable=True)
+    dedupe_key = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 # ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------
