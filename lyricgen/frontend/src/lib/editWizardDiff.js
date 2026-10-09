@@ -7,7 +7,8 @@
 // Buckets map 1:1 to the four backend edit_types:
 //   - metadata    → { artist?, song_title? }
 //   - typography  → { font?, font_scale?, text_case?, text_contrast?,
-//                     lyrics_animation?, line_transition?, effect? }
+//                     lyrics_animation?, line_transition?, lyric_look?,
+//                     effect? }
 //   - lyrics      → { segments: [...] }
 //   - background  → { background_hint?, bg_verbatim?, background_mode?,
 //                     movement_style? }
@@ -83,6 +84,10 @@ export function computeFieldDiff(baseline, current) {
   }
   if (!strEq(baseline.lineTransition, current.lineTransition)) {
     typoDiff.line_transition = current.lineTransition || "none";
+  }
+  // Look de letra: "" es un CLEAR explícito (sacar el look), no "no mandar".
+  if (!strEq(baseline.lyricLook, current.lyricLook)) {
+    typoDiff.lyric_look = current.lyricLook || "";
   }
   if (!strEq(baseline.effect, current.effect)) {
     typoDiff.effect = current.effect || "";

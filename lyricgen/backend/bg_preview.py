@@ -160,15 +160,32 @@ def compute_bg_cache_key(params: dict) -> str:
     _anchors = lyric_anchors.anchors_mode()
     if _anchors != "off":
         canonical["_anchors_mode"] = _anchors
+    # A lyric look with background guidance (Look.bg_hint) steers the prompt,
+    # so it must be part of the key. Added ONLY for such looks: jobs without a
+    # look (or with a look that gives no guidance) keep their exact key and
+    # the existing cache keeps serving them.
+    _look_id = look_cache_component(params.get("lyric_look"))
+    if _look_id:
+        canonical["_lyric_look"] = _look_id
 
     payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return digest[:12]
 
 
+def look_cache_component(lyric_look) -> str:
+    """The look id when it steers the background prompt, else ""."""
+    try:
+        import lyric_looks
+        look = lyric_looks.get_look(str(lyric_look or ""))
+    except Exception:
+        return ""
+    return look.id if (look is not None and look.bg_hint) else ""
+
+
 def job_bg_cache_key(*, artist, song_title, style, movement_style, effect,
                      custom_colors, genre, concept, background_hint,
-                     bg_verbatim, match_lyrics):
+                     bg_verbatim, match_lyrics, lyric_look=""):
     """Key esperado para el fast-path de fondo único AI de un job /generate.
 
     Única fuente de verdad de los hardcodes `background_mode="veo"` /
@@ -196,6 +213,7 @@ def job_bg_cache_key(*, artist, song_title, style, movement_style, effect,
             "background_mode": "veo",
             "animate_image": False,
             "match_lyrics": bool(match_lyrics),
+            "lyric_look": lyric_look or "",
         })
     except Exception:
         return None
@@ -380,6 +398,9 @@ def run_bg_preview_job(
                         bg_verbatim=bool(params.get("bg_verbatim", False)),
                         bg_mode=params.get("background_mode", "veo"),
                         custom_colors=params.get("custom_colors", ""),
+                        # Same look guidance the render applies (cache key
+                        # includes it when the look steers the prompt).
+                        lyric_look=params.get("lyric_look", "") or "",
                         # `effect` ENTRA al hash del cache (ver el dict
                         # canónico de compute_bg_cache_key) pero no se pasaba
                         # acá, mientras que el render sí lo pasa. O sea que

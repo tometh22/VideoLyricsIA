@@ -7,7 +7,7 @@ describe("campaign creative wire contract", () => {
       animate_image: false, enable_scenes: false, match_lyrics: true, bg_verbatim: false, background_hint: "",
       title_artist_font: "nunito", title_song_font: "bebas-neue", title_size: 1.2, title_template: "badge",
       title_song_break: "Dos\nlíneas", frame_format: "cine", lyric_color: "#00FF00", lyric_sung_color: "#FFFFFF",
-      text_contrast: "strong", lyrics_animation: "karaoke", line_transition: "wipe", custom_colors: "#112233,#445566",
+      text_contrast: "strong", lyrics_animation: "karaoke", line_transition: "wipe", lyric_look: "pop70", custom_colors: "#112233,#445566",
       delivery_profile: "umg", umg_frame_size: "UHD-4K", umg_fps: "29.97", umg_prores_profile: "3", background_id: 7 };
     const form = campaignGenerateForm({ job_id: "job1", artist: "A", title: "Tema", assignment: { revision: 8 }, settings },
       { segments_revision: 6, segments_json: [{ start: 0, end: 1, text: "Humano" }] });
@@ -24,5 +24,6 @@ describe("campaign creative wire contract", () => {
     expect(result).toEqual({ font: "anton", font_scale: 1.3, effect: "rain", title_size: 1.2, title_song_break: "Uno\ndos",
       background_hint: "", scene_source: "lyrics", enable_scenes: false, background_id: null });
     expect(reviewCreativeSettings({ backgroundHint: "Una montaña", bgVerbatim: false }, { match_lyrics: true }).scene_source).toBe("prompt_improved");
+    expect(reviewCreativeSettings({ lyricLook: "cine" }, {}).lyric_look).toBe("cine");
   });
 });

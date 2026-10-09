@@ -234,6 +234,7 @@ export async function submitLyricsEdit({
   textContrast,
   lyricsAnimation,
   lineTransition,
+  lyricLook,
   force = false,
   confirmYoutubeDrift,
   t,
@@ -254,11 +255,13 @@ export async function submitLyricsEdit({
     ...(textContrast != null ? { text_contrast: textContrast } : {}),
     ...(lyricsAnimation != null ? { lyrics_animation: lyricsAnimation } : {}),
     ...(lineTransition != null ? { line_transition: lineTransition } : {}),
+    // null/undefined = sin cambio; "" = sacar el look.
+    ...(lyricLook != null ? { lyric_look: lyricLook } : {}),
   };
   if (!force) {
     const typographyChanged =
       font != null || textCase != null || textContrast != null ||
-      lyricsAnimation != null || lineTransition != null;
+      lyricsAnimation != null || lineTransition != null || lyricLook != null;
     const layoutDelta = layoutChanged(baselineSegments, payloadSegments);
     const textChanged = !segmentsUnchanged(baselineSegments, payloadSegments);
     if (!typographyChanged && !layoutDelta && !textChanged) {
