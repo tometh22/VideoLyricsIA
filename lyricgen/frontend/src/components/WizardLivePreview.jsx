@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { REF_W, lyricFontPx, tierForLength, clampFontScale } from "../lib/lyricTiers";
 import { activeWordIndex } from "../lib/karaokeTiming";
+import { beatPulseAt } from "../hooks/useJobBeats";
 import { FONT_BY_CODE, applyCase } from "./fontCatalog";
 import { MOVEMENT_LABELS, EFFECT_LABELS } from "../lib/optionLabels";
 import {
@@ -200,6 +201,11 @@ export default function WizardLivePreview({
   // alterar la composición interna (ocultar el caption inferior con
   // movement + effect, que en paso 6 ya no se está editando).
   compact = false,
+  // Beats reales de la canción (s, hooks/useJobBeats). Con audio en vivo y
+  // un look beat_sync (Cinético / Neón), el pulso de la clave y el titileo
+  // del marco caen sobre ellos; sin beats o en el loop de muestra siguen
+  // con su reloj fijo.
+  beats = null,
 }) {
   const { t } = useI18n();
   const filterId = useId().replace(/:/g, "");
@@ -711,6 +717,7 @@ export default function WizardLivePreview({
       : null;
     const elapsed = live ? live.currentTime - live.activeStart : 0;
     const lineDur = live ? live.activeEnd - live.activeStart : LOOK_LOOP_S;
+    const beat = live && look.beatSync ? beatPulseAt(beats, live.currentTime) : null;
     const custom = renderLookLayout({
       lp,
       look,
@@ -725,6 +732,7 @@ export default function WizardLivePreview({
       sungIdx,
       elapsed,
       dur: lineDur,
+      beat,
       loopS: LOOK_LOOP_S,
       uid: filterId,
       history: live ? liveHistoryRef.current : null,

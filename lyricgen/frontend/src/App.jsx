@@ -5796,6 +5796,9 @@ export default function App() {
         // sincronizado al audio. Sin re-renders en App.jsx — el preview lee
         // el ref con su propio rAF loop.
         playbackTickRef={playbackTickRef}
+        // Job cuyo audio suena en el editor: el preview pide sus beats reales
+        // para los looks beat_sync (Cinético / Neón).
+        beatsJobId={currentReview?.editingJobId || currentReview?.parentJobId || currentReview?.transcribeJobId || null}
         // 2026-07-16: callback ref para el slot del player bar bajo el video.
         onPlayerSlotRef={setPlayerSlotEl}
         // Post-render edit (EditLyricsRoute): el wizard se monta sobre un

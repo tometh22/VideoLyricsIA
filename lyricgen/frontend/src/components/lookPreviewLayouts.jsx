@@ -445,7 +445,7 @@ export function renderLookLayout(ctx) {
 }
 
 function kineticLayout(ctx) {
-  const { lp, tokens, live, lineIdx, basePx, toCqw, sungIdx, operatorPickedColor, textColor, loopS } = ctx;
+  const { lp, tokens, live, lineIdx, basePx, toCqw, sungIdx, operatorPickedColor, textColor, loopS, beat } = ctx;
   const palette = lp.cardPalettes ? lp.cardPalettes[lineIdx % lp.cardPalettes.length] : [lp.color, lp.color, lp.color];
   const ink = operatorPickedColor ? textColor : palette[0];
   const [, alt, accent] = palette;
@@ -533,7 +533,10 @@ function kineticLayout(ctx) {
                 aria-hidden="true"
                 viewBox="-100 -100 200 200"
                 preserveAspectRatio="none"
-                style={{ position: "absolute", left: "-22%", right: "-22%", top: "-55%", bottom: "-55%", width: "144%", height: "210%", overflow: "visible", zIndex: -1, animation: `wlp-look-doodle .12s ${decoDelay.toFixed(2)}s both, wlp-kin-blink .6s ${(decoDelay + 0.3).toFixed(2)}s steps(1,end) infinite` }}
+                style={{ position: "absolute", left: "-22%", right: "-22%", top: "-55%", bottom: "-55%", width: "144%", height: "210%", overflow: "visible", zIndex: -1, ...(beat
+                  // Beats reales: los rayos se apagan en cada beat de pulso.
+                  ? { animation: `wlp-look-doodle .12s ${decoDelay.toFixed(2)}s both`, opacity: beat.pulsing ? 0.3 : 1 }
+                  : { animation: `wlp-look-doodle .12s ${decoDelay.toFixed(2)}s both, wlp-kin-blink .6s ${(decoDelay + 0.3).toFixed(2)}s steps(1,end) infinite` }) }}
               >
                 {burstLines(16, 68, 100).map(([x0, y0, x1, y1], n) => (
                   <line key={n} x1={x0} y1={y0} x2={x1} y2={y1} stroke={alt} strokeWidth="0.35cqw" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
@@ -573,10 +576,14 @@ function kineticLayout(ctx) {
             ) : null}
             <span style={{ display: "inline-block", transformOrigin: "50% 100%", ...enter }}>
               <span
-                style={{
-                  display: "inline-block",
-                  animation: isKey ? `wlp-kin-pulse .55s ${(live ? 0.4 : delay + 0.4).toFixed(2)}s ease-out infinite` : undefined,
-                }}
+                data-beat-pulse={isKey && beat ? (beat.pulsing ? "on" : "off") : undefined}
+                style={isKey && beat
+                  // Beats reales (en vivo): la clave patea sobre el beat de pulso.
+                  ? { display: "inline-block", transform: `scale(${beat.pulsing ? 1.1 : 1})`, transition: "transform 50ms ease-out" }
+                  : {
+                    display: "inline-block",
+                    animation: isKey ? `wlp-kin-pulse .55s ${(live ? 0.4 : delay + 0.4).toFixed(2)}s ease-out infinite` : undefined,
+                  }}
               >
                 {sp.text}
               </span>
@@ -644,7 +651,15 @@ function neonLayout(ctx) {
       style={{ position: "relative", display: "inline-block", fontFamily: face.css, fontWeight: face.weight, fontSize: toCqw(fs), lineHeight: 1.05, padding: "0.12em 0.25em" }}
     >
       <span aria-hidden="true" style={{ position: "absolute", inset: 0, pointerEvents: "none", ...litStyle }}>
-        <span style={{ position: "absolute", inset: 0, animation: "wlp-neon-blink 1.1s 0.6s steps(1,end) infinite" }}>{frame}</span>
+        <span
+          data-beat-pulse={ctx.beat ? (ctx.beat.pulsing ? "on" : "off") : undefined}
+          style={ctx.beat
+            // Beats reales (en vivo): el marco titila sobre el beat de pulso.
+            ? { position: "absolute", inset: 0, opacity: ctx.beat.pulsing ? 0.35 : 1 }
+            : { position: "absolute", inset: 0, animation: "wlp-neon-blink 1.1s 0.6s steps(1,end) infinite" }}
+        >
+          {frame}
+        </span>
       </span>
       <span style={{ display: "block", color: "rgba(150,150,150,.14)", WebkitTextStroke: "0.07cqw rgba(170,170,170,.6)", ...unlitStyle }}>{text}</span>
       <span
@@ -767,25 +782,48 @@ function blockLayout(ctx) {
   return { body, wrapStyle: live ? {} : { animation: `wlp-look-blockout ${loopS}s linear both` }, frame: false };
 }
 
-function arcLayout(ctx) {
-  const { lp, tokens, live, basePx, sungIdx, textColor, loopS, uid } = ctx;
+// El badge "Vista previa en vivo" ocupa ~el 12 % superior del cuadro: el
+// borde de afuera del anillo (radio + alto de la letra, que va por fuera)
+// tiene que quedar debajo. Abajo, que no se salga del cuadro.
+export const ARC_TOP_MIN = FRAME_H * 0.14;
+const ARC_BOTTOM_MAX = FRAME_H * 0.98;
+const ARC_GLYPH_OUT = 0.9; // alto de la letra por fuera del radio, en fs
+
+/** Geometría del anillo de Arco (px de 1920×1080). `top`/`bottom`: bordes
+ *  de afuera de la letra sobre el anillo. */
+export function arcGeometry(tokens, basePx, lp = {}) {
   const k = tokens.length > 2 ? pickKeyword(tokens) : null;
   const arcIdx = tokens.map((_t, i) => i).filter((i) => i !== k);
   const g = lp.glyphWidth || 0.72;
   let fs = basePx;
   const chars = arcIdx.map((i) => tokens[i]).join(" ").length;
-  let total = chars * fs * (g + 0.1);
-  let r = FRAME_H * 0.30;
+  const total = chars * fs * (g + 0.1);
+  let r = FRAME_H * 0.28;
   if (total > 1.5 * Math.PI * r) r = total / (1.5 * Math.PI);
-  if (r > FRAME_H * 0.44) {
-    const f = (FRAME_H * 0.44) / r;
-    fs = Math.max(18, fs * f);
-    r = FRAME_H * 0.44;
-    total *= f;
-  }
   const cx = FRAME_W / 2;
-  const cy = FRAME_H / 2 + FRAME_H * 0.04;
-  const ringR = r - fs * 0.22;
+  // Centro un poco abajo de la mitad: deja aire arriba para el badge.
+  const cy = FRAME_H * 0.57;
+  const rMax = Math.min(cy - ARC_TOP_MIN, ARC_BOTTOM_MAX - cy);
+  // Radio + letra tienen que entrar; achicamos los dos juntos (la frase
+  // sigue cabiendo en el arco porque su largo escala con fs).
+  const fits = () => r + fs * ARC_GLYPH_OUT <= rMax;
+  if (!fits()) {
+    const f = rMax / (r + fs * ARC_GLYPH_OUT);
+    r *= f;
+    fs = Math.max(14, fs * f);
+    if (!fits()) r = Math.max(FRAME_H * 0.1, rMax - fs * ARC_GLYPH_OUT);
+  }
+  return {
+    k, arcIdx, g, fs, r, cx, cy,
+    ringR: r - fs * 0.22,
+    top: cy - r - fs * ARC_GLYPH_OUT,
+    bottom: cy + r + fs * ARC_GLYPH_OUT,
+  };
+}
+
+function arcLayout(ctx) {
+  const { lp, tokens, live, basePx, sungIdx, textColor, loopS, uid } = ctx;
+  const { k, arcIdx, g, fs, r, cx, cy, ringR, top } = arcGeometry(tokens, basePx, lp);
   const pathId = `wlp-arc-${uid}`;
   const d = `M ${cx} ${cy + r} A ${r} ${r} 0 1 1 ${cx} ${cy - r} A ${r} ${r} 0 1 1 ${cx} ${cy + r}`;
   const spin = Math.min(28, 5 * Math.max(0.1, ctx.dur || 3));
@@ -802,6 +840,7 @@ function arcLayout(ctx) {
   const body = (
     <svg
       data-look-arc="true"
+      data-arc-top={top.toFixed(1)}
       viewBox={`0 0 ${FRAME_W} ${FRAME_H}`}
       style={{ position: "absolute", inset: 0, width: "100%", height: "100%", overflow: "visible", WebkitTextStroke: "0" }}
     >

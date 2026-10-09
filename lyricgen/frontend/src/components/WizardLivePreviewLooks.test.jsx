@@ -6,6 +6,7 @@ import { render, cleanup, act, waitFor } from "@testing-library/react";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { useRef } from "react";
 import WizardLivePreview, { lookLineMotionStyle, LOOK_LOOP_S } from "./WizardLivePreview";
+import { arcGeometry, ARC_TOP_MIN } from "./lookPreviewLayouts";
 
 vi.mock("../i18n", () => ({
   useI18n: () => ({ t: (_key, fallback) => fallback }),
@@ -391,5 +392,96 @@ describe("lookLineMotionStyle — movimientos nuevos", () => {
     expect(lookLineMotionStyle("write_on", 0, 3, { textLen: 16 }).clipPath).toBe("inset(-40% 100.00% -40% -5%)");
     expect(lookLineMotionStyle("write_on", 1.5, 3, { textLen: 16 })).toMatchObject({ clipPath: "inset(-40% -5.00% -40% -5%)", opacity: 1 });
     expect(lookLineMotionStyle("write_on", 3, 3, { textLen: 16 }).opacity).toBeCloseTo(0, 6);
+  });
+});
+
+// Beats reales (hooks/useJobBeats): con audio en vivo, Cinético y Neón pulsan
+// sobre uno de cada dos beats de la canción; en muestra, reloj fijo.
+describe("WizardLivePreview — beats reales en Cinético y Neón", () => {
+  // Pulso: 12.9 y 13.5 (índices pares); 13.2 no pulsa.
+  const BEATS = [12.9, 13.2, 13.5, 13.8];
+  const keyPulse = (c) => c.querySelector('[data-look-key="true"] [data-beat-pulse]');
+
+  it("Cinético: la clave patea justo después de un beat de pulso y no entre beats", async () => {
+    const refOut = { current: null };
+    const { container } = render(<LiveHarness refOut={refOut} lyricLook="cinetico" textCase="upper" beats={BEATS} />);
+    await playLine(refOut, { ...LIVE_TICK, currentTime: 13.0 });
+    await waitFor(() => expect(keyPulse(container)?.getAttribute("data-beat-pulse")).toBe("on"));
+    expect(keyPulse(container).style.transform).toBe("scale(1.1)");
+    expect(keyPulse(container).style.animation).toBe("");
+    // 13.3: el último beat de pulso fue 12.9 (13.2 es el beat intermedio).
+    await playLine(refOut, { ...LIVE_TICK, currentTime: 13.3 });
+    await waitFor(() => expect(keyPulse(container).getAttribute("data-beat-pulse")).toBe("off"));
+    expect(keyPulse(container).style.transform).toBe("scale(1)");
+    await playLine(refOut, { ...LIVE_TICK, currentTime: 13.55 });
+    await waitFor(() => expect(keyPulse(container).getAttribute("data-beat-pulse")).toBe("on"));
+  });
+
+  it("Cinético sin beats (o si fallaron) sigue con el pulso de reloj fijo", async () => {
+    const refOut = { current: null };
+    const { container } = render(<LiveHarness refOut={refOut} lyricLook="cinetico" textCase="upper" beats={null} />);
+    await playLine(refOut, { ...LIVE_TICK, currentTime: 13.0 });
+    await waitFor(() => expect(container.querySelector('[data-look-key="true"]')).not.toBeNull());
+    expect(container.querySelector("[data-beat-pulse]")).toBeNull();
+    const inner = container.querySelector('[data-look-key="true"]').lastElementChild.firstElementChild;
+    expect(inner.style.animation).toContain("wlp-kin-pulse");
+  });
+
+  it("Neón: el marco titila sobre el beat de pulso", async () => {
+    const refOut = { current: null };
+    const { container } = render(<LiveHarness refOut={refOut} lyricLook="neon" textCase="upper" beats={BEATS} />);
+    const frame = () => container.querySelector("[data-look-neon] [data-beat-pulse]");
+    await playLine(refOut, { ...LIVE_TICK, currentTime: 13.0 });
+    await waitFor(() => expect(frame()?.getAttribute("data-beat-pulse")).toBe("on"));
+    expect(frame().style.opacity).toBe("0.35");
+    expect(frame().style.animation).toBe("");
+    await playLine(refOut, { ...LIVE_TICK, currentTime: 13.3 });
+    await waitFor(() => expect(frame().getAttribute("data-beat-pulse")).toBe("off"));
+    expect(frame().style.opacity).toBe("1");
+  });
+
+  it("en el loop de muestra (sin audio) ignora los beats y usa el reloj fijo", () => {
+    const { container } = renderLook({ lyricLook: "neon", beats: BEATS });
+    expect(container.querySelector("[data-beat-pulse]")).toBeNull();
+    expect(container.innerHTML).toContain("wlp-neon-blink");
+  });
+
+  it("un look sin beat_sync no usa los beats aunque vengan", async () => {
+    const refOut = { current: null };
+    const { container } = render(<LiveHarness refOut={refOut} lyricLook="bloque" textCase="upper" beats={BEATS} />);
+    await playLine(refOut, { ...LIVE_TICK, currentTime: 13.0 });
+    await waitFor(() => expect(container.querySelector('[data-testid="look-lyric"]')).not.toBeNull());
+    expect(container.querySelector("[data-beat-pulse]")).toBeNull();
+  });
+});
+
+// El badge "Vista previa en vivo" ocupa ~el 12 % superior del cuadro: el
+// anillo de Arco (radio + letra por fuera) no puede subir hasta ahí.
+describe("Arco — el anillo queda debajo del badge", () => {
+  const BADGE_H = 1080 * 0.12;
+
+  it.each([
+    ["corta", "ESTA ES TU", 72],
+    ["media", "ME AND MY FRIENDS AT THE TABLE DOING SHOTS", 64],
+    ["larga", "Y SI TE VAS NO ME DIGAS NADA PORQUE YA SÉ LO QUE ME VAS A DECIR ESTA NOCHE OTRA VEZ", 64],
+    ["enorme", "PALABRA ".repeat(30).trim(), 96],
+  ])("línea %s: el borde de arriba no pisa el badge y el de abajo entra", (_n, line, basePx) => {
+    const geo = arcGeometry(line.split(" "), basePx, { glyphWidth: 0.72 });
+    expect(geo.top).toBeGreaterThanOrEqual(ARC_TOP_MIN - 0.5);
+    expect(ARC_TOP_MIN).toBeGreaterThan(BADGE_H);
+    expect(geo.bottom).toBeLessThanOrEqual(1080);
+    expect(geo.r).toBeGreaterThan(0);
+  });
+
+  it("en el preview, el top del anillo queda debajo del badge (muestra y en vivo)", async () => {
+    const { container } = renderLook({ lyricLook: "arco" });
+    const top = () => parseFloat(container.querySelector('[data-look-arc="true"]').getAttribute("data-arc-top"));
+    expect(top()).toBeGreaterThan(BADGE_H);
+    cleanup();
+    const refOut = { current: null };
+    const live = render(<LiveHarness refOut={refOut} lyricLook="arco" textCase="upper" />);
+    await playLine(refOut, { ...LIVE_TICK, activeLine: "Y si te vas no me digas nada porque ya sé lo que me vas a decir esta noche", currentTime: 13.0 });
+    await waitFor(() => expect(live.container.querySelector('[data-look-arc="true"]')).not.toBeNull());
+    expect(parseFloat(live.container.querySelector('[data-look-arc="true"]').getAttribute("data-arc-top"))).toBeGreaterThan(BADGE_H);
   });
 });

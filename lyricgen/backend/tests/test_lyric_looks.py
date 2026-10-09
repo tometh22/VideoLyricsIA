@@ -335,3 +335,39 @@ def test_title_card_is_readable_on_dark_looks():
     style = [l for l in doc.splitlines() if l.startswith("Style:")][0]
     titles = [d for d in _dialogues(doc) if d.startswith("Dialogue: 6,")]
     assert titles and all("&H00111111" not in t for t in titles)
+
+
+def test_bg_cache_key_only_changes_for_looks_that_steer_the_background():
+    import bg_preview
+    base = dict(artist="A", song_title="S", style="oscuro", match_lyrics=True)
+    k0 = bg_preview.compute_bg_cache_key(base)
+    assert bg_preview.compute_bg_cache_key({**base, "lyric_look": ""}) == k0
+    assert bg_preview.compute_bg_cache_key({**base, "lyric_look": "pop70"}) == k0  # no hint
+    assert bg_preview.compute_bg_cache_key({**base, "lyric_look": "nope"}) == k0
+    assert bg_preview.compute_bg_cache_key({**base, "lyric_look": "arco"}) != k0
+    # The /generate recompute and the worker validation use the same key.
+    common = dict(artist="A", song_title="S", style="oscuro", movement_style="",
+                  effect="", custom_colors="", genre="", concept="",
+                  background_hint="", bg_verbatim=False, match_lyrics=True)
+    assert (bg_preview.job_bg_cache_key(**common, lyric_look="arco")
+            == bg_preview.compute_bg_cache_key({**common, "background_mode": "veo",
+                                                "animate_image": False,
+                                                "lyric_look": "arco"}))
+    assert bg_preview.job_bg_cache_key(**common) == bg_preview.job_bg_cache_key(**common, lyric_look="")
+
+
+def test_beats_payload_is_computed_once_and_cached(monkeypatch):
+    import storage, beat_snap, waveform_compute as wc
+    puts = {}
+    monkeypatch.setattr(storage, "is_enabled", lambda: True)
+    monkeypatch.setattr(storage, "object_exists", lambda k: k in puts)
+    monkeypatch.setattr(storage, "download_object",
+                        lambda k, dest: (open(dest, "wb").write(puts.get(k, b"audio")) or True))
+    monkeypatch.setattr(storage, "put_object_bytes", lambda k, b, ct: puts.__setitem__(k, b))
+    calls = []
+    monkeypatch.setattr(beat_snap, "detect_beats",
+                        lambda p: calls.append(p) or (120.0, [0.5, 1.0123456]))
+    first = wc.compute_and_cache_beats("job1", "input/job1.wav")
+    assert first == {"bpm": 120.0, "beats": [0.5, 1.012]}
+    assert wc.compute_and_cache_beats("job1", "input/job1.wav") == first
+    assert len(calls) == 1 and "waveform/job1.beats.json" in puts

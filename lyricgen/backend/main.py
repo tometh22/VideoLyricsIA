@@ -5087,6 +5087,8 @@ class _GeneratePreviewReq(BaseModel):
     background_mode: str = Field(default="veo", max_length=16)
     animate_image: bool = False
     match_lyrics: bool = True
+    # Lyric look: only looks with background guidance change the key.
+    lyric_look: str = Field(default="", max_length=16)
     target_duration_s: float = Field(default=30.0, ge=5, le=600)
     # v6 (2026-07-17): con match_lyrics el prompt del fondo depende de la
     # LETRA — sin ella el preview generaba ciego al texto y el render podía
@@ -11357,6 +11359,7 @@ async def generate_with_segments(
                 concept=concept,
                 background_hint=(background_hint.strip() or None),
                 bg_verbatim=bg_verbatim, match_lyrics=match_lyrics,
+                lyric_look=_normalize_lyric_look(lyric_look),
             )
         except Exception as _recompute_err:
             logger.warning(
@@ -14060,6 +14063,41 @@ def get_waveform(
             detail="El audio original ya no está en storage. Subí el MP3 de nuevo.",
         )
 
+    response.headers["Cache-Control"] = "private, max-age=86400"
+    return payload
+
+
+@app.get("/jobs/{job_id}/beats")
+def get_beats(
+    job_id: str,
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Beat times of the source audio, for lyric-look previews that pulse on
+    the beat. Returns {"bpm": float, "beats": [seconds...]}; cached to R2 next
+    to the waveform. Same auth model as /waveform."""
+    from database import Job as JobModel
+    from waveform_compute import compute_and_cache_beats
+
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"],
+        )
+    job = job_query.first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    _audit_cross_tenant_access(db, current_user, job, "beats")
+    if not job.input_r2_key:
+        raise HTTPException(
+            status_code=404, detail="Source audio is not available for this job."
+        )
+    if not storage.is_enabled():
+        raise HTTPException(status_code=503, detail="Object storage is unavailable.")
+    payload = compute_and_cache_beats(job.job_id, job.input_r2_key)
+    if payload is None:
+        raise HTTPException(status_code=422, detail="No se pudieron detectar los beats.")
     response.headers["Cache-Control"] = "private, max-age=86400"
     return payload
 

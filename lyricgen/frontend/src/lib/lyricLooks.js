@@ -146,6 +146,9 @@ const LOOKS = [
     code: "cinetico",
     // Pinta todo el cuadro: en un job nuevo el backend no genera fondo IA.
     ownsBackground: true,
+    // Patea la clave al ritmo de la canción (backend beat_sync): con audio
+    // en vivo el preview usa los beats reales del job (hooks/useJobBeats).
+    beatSync: true,
     font: { css: "'Big Shoulders Display', sans-serif", weight: 900 },
     preview: {
       layout: "kinetic",
@@ -166,6 +169,8 @@ const LOOKS = [
   },
   {
     code: "neon",
+    // El marco titila en los beats reales (backend beat_sync).
+    beatSync: true,
     font: { css: "'Tilt Neon', sans-serif", weight: 400 },
     preview: {
       layout: "neon",
@@ -375,6 +380,12 @@ export function getLyricLook(value) {
 export function lookOwnsBackground(value) {
   const look = getLyricLook(value);
   return !!(look && look.ownsBackground);
+}
+
+/** ¿El look sigue los beats de la canción (backend beat_sync)? */
+export function lookBeatSync(value) {
+  const look = getLyricLook(value);
+  return !!(look && look.beatSync);
 }
 
 /** ¿El look define (y por lo tanto bloquea) este campo del wizard? */

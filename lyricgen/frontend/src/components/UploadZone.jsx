@@ -10,7 +10,8 @@ import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, EFFECT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
-import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote, lookOwnsBackground } from "../lib/lyricLooks";
+import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote, lookOwnsBackground, lookBeatSync } from "../lib/lyricLooks";
+import { useJobBeats } from "../hooks/useJobBeats";
 import { DegradeArt, HEART_PATH } from "./lookPreviewLayouts";
 import { canCreateArtTrack } from "../lib/artTrackAccess";
 import EditPlanSummary from "./EditPlanSummary";
@@ -239,6 +240,9 @@ export default function UploadZone({
   // WizardLivePreview lo lee con su propio rAF para renderizar word-jump
   // sincronizado al audio real, sin causar re-renders de UploadZone.
   playbackTickRef = null,
+  // Job con audio fuente cuyo playback maneja el tick de arriba (editor /
+  // edición). Con un look beat_sync, el preview pide sus beats reales.
+  beatsJobId = null,
   // 2026-07-16 (idea de Tomi): callback ref que recibe el <div> slot que
   // montamos bajo el video en el paso 6. LyricsEditor portalea ahí su player
   // bar, así la columna de la letra queda full y se scrollea menos.
@@ -1523,6 +1527,13 @@ export default function UploadZone({
   // de backend/lyric_looks.py). Con look activo el render ignora font /
   // animación / transición; tamaño, color, mayúsculas y efecto siguen.
   const LYRIC_LOOKS = lyricLookOptions(t);
+  // Beats reales para el pulso en vivo de Cinético / Neón (sólo con job +
+  // audio del editor; si falla, el preview sigue con su reloj fijo).
+  const previewBeats = useJobBeats(
+    beatsJobId,
+    !!beatsJobId && !!playbackTickRef && lookBeatSync(hoverLook ?? batchDefaults.lyricLook),
+    { api: API, authHeaders },
+  );
   const activeLook = getLyricLook(batchDefaults.lyricLook);
   const lookLockedText = activeLook ? lookLockedNote(t, activeLook.code) : "";
   // Fondo y looks que pintan todo el cuadro (Pop 70s / Cinético / Degradé):
@@ -4278,6 +4289,7 @@ export default function UploadZone({
                  audio en la review (step 6). Sin el ref, el preview cae
                  al modo legacy (lyric loop con `_previewLyric`). */
               playbackTickRef={playbackTickRef}
+              beats={previewBeats}
               /* Post-render edit: MP4 ya renderizado del job. Cuando viene,
                  el preview muta a "Resultado actual" y todos los overlays
                  (palette/grade/karaoke sim) se cortocircuitan.

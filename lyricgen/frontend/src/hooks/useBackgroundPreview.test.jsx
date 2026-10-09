@@ -204,6 +204,55 @@ describe("lyrics_text v6", () => {
   });
 });
 
+describe("lyric_look en el preview de fondo", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ bg_cache_key: "key-look", cached: true }),
+    });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const mount = (entry, onCacheKey = vi.fn()) => renderHook(
+    ({ e }) => useBackgroundPreview(e, {
+      api: "http://test",
+      authHeaders: () => ({}),
+      onCacheKey,
+      debounceMs: 100,
+    }),
+    { initialProps: { e: entry } },
+  );
+
+  it("manda el look normalizado en el POST (\"\" sin look o desconocido)", async () => {
+    mount({ ...entryBase, lyricLook: " Neon " });
+    await act(async () => { await vi.advanceTimersByTimeAsync(150); });
+    expect(JSON.parse(global.fetch.mock.calls[0][1].body).lyric_look).toBe("neon");
+
+    global.fetch.mockClear();
+    mount({ ...entryBase, artist: "Otro", lyricLook: "no-existe" });
+    await act(async () => { await vi.advanceTimersByTimeAsync(150); });
+    expect(JSON.parse(global.fetch.mock.calls[0][1].body).lyric_look).toBe("");
+  });
+
+  it("cambiar el look invalida el key y re-pide el preview", async () => {
+    const onCacheKey = vi.fn();
+    const { rerender } = mount({ ...entryBase, lyricLook: "" }, onCacheKey);
+    await act(async () => { await vi.advanceTimersByTimeAsync(150); });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    onCacheKey.mockClear();
+
+    rerender({ e: { ...entryBase, lyricLook: "neon" } });
+    expect(onCacheKey).toHaveBeenCalledWith(null);
+    await act(async () => { await vi.advanceTimersByTimeAsync(150); });
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(global.fetch.mock.calls[1][1].body).lyric_look).toBe("neon");
+  });
+});
+
 describe("background preview eligibility", () => {
   const eligible = (overrides = {}) => shouldEnableBackgroundPreview({
     hasReview: true,
