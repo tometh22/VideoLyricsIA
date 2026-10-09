@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.125] - 2026-10-09
+
+### Fixed
+
+- El costo por job usa tarifas calibradas con la factura de septiembre de 2026 donde no hay calibración automática:
+  - whisper en clips (verificación dirigida e independiente): US$0,0007 por llamada en vez de US$0,012; antes le asignaba ~US$160 al mes a algo que OpenAI facturó en US$10,88;
+  - gpt-4o-mini: US$0,00005;
+  - Replicate, con los segundos de cómputo reales: Demucs US$0,010, WhisperX US$0,0012 y alineado US$0,014;
+  - Gemini audio, que caía al valor por defecto: US$0,005.
+
+  Veo y el resto de Gemini se siguen calibrando contra la factura de GCP.
+
 ## [1.1.124] - 2026-10-09
 
 ### Security
