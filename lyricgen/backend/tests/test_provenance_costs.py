@@ -141,3 +141,20 @@ def test_tenant_cost_summary_isolates_tenants(db):
     # Veo 3.1 standard = $3.20/call (see test_veo_31_cost_is_3_20_per_call).
     assert a["total_calls"] == 1 and a["total_cost"] == 3.20
     assert b["total_calls"] == 2 and b["total_cost"] == 6.40
+
+
+def test_tarifas_calibradas_con_la_factura_de_septiembre_2026():
+    """Clips cortos de whisper y Replicate cuadran con la factura de sep-2026."""
+    from provenance import COST_PER_CALL, DEFAULT_COST_PER_CALL
+
+    clip = COST_PER_CALL[("whisper-1-targeted-consensus", "openai")]
+    assert clip < COST_PER_CALL[("whisper-1", "openai")] / 10
+    # 13.476 llamadas de septiembre tienen que costar del orden de la factura
+    # de whisper (US$10,88), no US$160.
+    assert 13476 * clip < 15
+    for tool in ("whisper-1-live-independent-verify", "whisper-1-live-independent-verify-mix"):
+        assert COST_PER_CALL[(tool, "openai")] == clip
+    # Gemini audio ya no cae al default.
+    assert COST_PER_CALL[("gemini-2.5-flash-audio", "google_vertex")] < DEFAULT_COST_PER_CALL
+    replicate = {m: COST_PER_CALL[(m, "replicate")] for m in ("cjwbw/demucs", "victor-upmeet/whisperx", "cureau/force-align-wordstamps")}
+    assert 792 * replicate["cjwbw/demucs"] + 923 * replicate["victor-upmeet/whisperx"] + 102 * replicate["cureau/force-align-wordstamps"] < 12
