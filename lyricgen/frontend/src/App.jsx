@@ -96,7 +96,7 @@ import { createSaveQueue } from "./lib/saveQueue";
 import { rebaseEditorSnapshot } from "./lib/rebaseEditorSnapshot";
 import { isEditorRevisionConflict } from "./lib/editorRevisionConflict";
 import { buildGenerationJob } from "./lib/buildGenerationJob";
-import { normalizeLyricLook, lyricColorForSubmit } from "./lib/lyricLooks";
+import { normalizeLyricLook, lyricColorForSubmit, lookOwnsBackground } from "./lib/lyricLooks";
 import {
   canRebuildMissingGenerationJob,
   isMissingGenerationJob,
@@ -5424,6 +5424,7 @@ export default function App() {
       editMode: !!currentReview?.editMode || !!currentReview?.variantMode || !!currentReview?.campaignId,
       bgSelectMode,
       enableScenes,
+      lookOwnsBackground: lookOwnsBackground(currentReview?.lyricLook),
     }),
     api: API,
     authHeaders,

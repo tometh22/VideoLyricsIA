@@ -81,9 +81,9 @@ describe("catálogo", () => {
     expect(p("y2k").stroke).toContain("#5ED8FF");
   });
 
-  it("chat, cuaderno y romántico conservan el case original de la letra", () => {
+  it("neón, chat, cuaderno y romántico conservan el case original de la letra", () => {
     const keep = lyricLookOptions(tNull).filter((o) => o.preview?.forceCase === "original").map((o) => o.code);
-    expect(keep).toEqual(["chat", "cuaderno", "romantico"]);
+    expect(keep).toEqual(["neon", "chat", "cuaderno", "romantico"]);
   });
 
   it("las descripciones de Cinético y Degradé avisan que no usan el fondo", () => {

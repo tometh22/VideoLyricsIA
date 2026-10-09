@@ -1585,6 +1585,10 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # variable quedaba sin asignar → UnboundLocalError tumbaba TODO job de
         # fondo no-IA (incl. los golden renders). Inicializar acá, incondicional.
         _scenes_active = False
+        # Look id when the background is the local one a look paints over
+        # (no provider call); "" otherwise. Persisted every run so a retry or a
+        # regenerated background clears a stale flag.
+        _bg_owned_by_look = ""
 
         if background_path and not _animate_user_image:
             # Human-provided background — skip AI generation (UMG Guideline 10)
@@ -1785,14 +1789,9 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         job_dir, style, filename="bg_look_owned.mp4",
                     )
                     _background_is_ai_generated = False
+                    _bg_owned_by_look = _bg_look.id
                     logger.info("[BG] look=%s paints its own background — "
                                 "no provider call for job=%s", _bg_look.id, job_id)
-                    try:
-                        from jobs import merge_render_params as _merge_rp_look
-                        _merge_rp_look(job_id, {"background_owned_by_look": _bg_look.id})
-                    except Exception as _rp_look_exc:  # noqa: BLE001
-                        logger.warning("[BG] could not persist look-owned bg: %s",
-                                       _rp_look_exc)
             if bg_image_path is None:
                 try:
                     bg_image_path = _ensure_background(
@@ -1911,6 +1910,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
         # replace del resto del bloque).
         if _animate_user_image:
             _new_rp["bg_animation_degraded"] = bool(_bg_animation_degraded)
+        _new_rp["background_owned_by_look"] = _bg_owned_by_look
         if background_hint:
             _new_rp["background_hint"] = background_hint
         if bg_verbatim:
@@ -2326,9 +2326,8 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # into segments_json so re-renders don't re-pay. Isolated from the
             # transcription pipeline by design.
             import lyric_looks as _looks
-            _look = _looks.get_look(lyric_look)
             if (lyrics_animation in ("karaoke", "word_reveal")
-                    or (_look is not None and _look.layout == "build")):
+                    or _looks.needs_word_timings(lyric_look)):
                 import karaoke_align
                 _enriched = karaoke_align.enrich_segments_with_word_timings(segments, mp3_path)
                 if _enriched is not segments:
@@ -19960,6 +19959,7 @@ def _build_short_ass_doc(
     line_transition: str,
     lyric_look: str = "",
     beats: list[float] | None = None,
+    duration: float | None = None,
 ) -> str:
     """Documento ASS del short (1080x1920) con EXACTAMENTE las mismas
     derivaciones de estilo que _render_lyrics_ass usa para el video
@@ -19989,7 +19989,10 @@ def _build_short_ass_doc(
         # segments' `words` are absolute song times).
         return _looks.build_look_ass(
             clean_segments, look, width=1080, height=1920,
-            duration=max((s["end"] for s in clean_segments), default=0.0),
+            # The look's cards/gradient must cover the WHOLE short, not stop
+            # at the last lyric.
+            duration=(duration if duration else
+                      max((s["end"] for s in clean_segments), default=0.0)),
             case_fn=lambda t: _apply_case(t, text_case),
             font_scale=font_scale, primary_override=lyric_color or "",
             beats=beats,
@@ -20078,7 +20081,7 @@ def _burn_short_text_ass(
             lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
             text_contrast=text_contrast,
             lyrics_animation=lyrics_animation, line_transition=line_transition,
-            lyric_look=lyric_look, beats=beats,
+            lyric_look=lyric_look, beats=beats, duration=short_dur,
         )
         # The look's grade goes in the same pass, before the text burn.
         _grade = f"{_look.grade}," if (_look is not None and _look.grade) else ""
@@ -20494,6 +20497,10 @@ def generate_short(
     # Color-grade the BACKGROUND (before lyrics, like the main video — so the
     # lyrics stay ungraded). No-op when style/custom_colors yield no grade.
     _grade_style = style if _fx.grade_filter(style, custom_colors) else ""
+    if _short_look is not None:
+        # The look's own grade replaces the palette grade (same as the master
+        # via grade_override); it is applied in the libass burn pass.
+        _grade_style = ""
     if _grade_style and not _selected_fx:
         # grade_frame returns an UNCLIPPED float frame; moviepy fl_image needs
         # uint8 [0,255] — clip+cast like the main moviepy fallback does.
@@ -20598,7 +20605,8 @@ def generate_short(
         )
         bg_only_path = _apply_short_effect(
             bg_only_path, fx, fps, job_dir, rhythm=_short_rhythm,
-            style=style, custom_colors=custom_colors,
+            style=("" if _short_look is not None else style),
+            custom_colors=("" if _short_look is not None else custom_colors),
         )
         # _apply_short_effect hace os.replace sobre el intermedio chequeando
         # sólo el returncode, así que puede dejar un archivo inservible
@@ -21410,6 +21418,14 @@ def run_edit_pipeline(
                     allow_people=_compute_allow_people(job_id, effective_background_hint),
                     lyric_look=lyric_look,
                 )
+                # A regenerated background is a real one: clear the "made
+                # without a generated background" flag a look may have set.
+                try:
+                    from jobs import merge_render_params as _merge_rp_bg
+                    _merge_rp_bg(job_id, {"background_owned_by_look": ""})
+                except Exception as _rp_bg_exc:  # noqa: BLE001
+                    logger.warning("[EDIT] could not clear look-owned bg flag: %s",
+                                   _rp_bg_exc)
             except Exception as _background_generation_error:
                 _raise_if_job_timeout(_background_generation_error)
                 # Imagen can raise before returning an asset (Veo normally
@@ -21988,9 +22004,8 @@ def run_edit_pipeline(
         # sync and caches the result. Looks that land words one by one need
         # the same timing.
         import lyric_looks as _looks
-        _look = _looks.get_look(lyric_look)
         if (lyrics_animation in ("karaoke", "word_reveal")
-                or (_look is not None and _look.layout == "build")):
+                or _looks.needs_word_timings(lyric_look)):
             import karaoke_align
             _enriched = karaoke_align.enrich_segments_with_word_timings(segments, mp3_path)
             if _enriched is not segments:

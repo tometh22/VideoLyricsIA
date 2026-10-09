@@ -234,3 +234,104 @@ def test_every_look_font_is_discoverable_by_libass():
         for path in L.font_paths(look):
             family, _bold = ass_render.font_family(path)
             assert family and os.path.exists(path), path
+
+
+def test_campaign_rejects_background_owning_look_in_a_background_group():
+    import campaign_creative as cc
+    from fastapi import HTTPException
+    group = cc.Group(id="g", name="Veo", weight=100, requirement="veo", model=cc.VEO_LITE)
+
+    class _C:
+        tenant_id = "t"
+    with pytest.raises(HTTPException):
+        cc.validate_combination(None, _C(), {"lyric_look": "pop70",
+                                             "movement_style": "estandar"}, group, {})
+
+
+# --- Regresiones de la revisión del 8-oct ----------------------------------
+
+def _t_windows(doc):
+    import re
+    out = []
+    for d in _dialogues(doc):
+        dur = int(round((_secs(d.split(",")[2]) - _secs(d.split(",")[1])) * 1000))
+        for a, b in re.findall(r"\\t\((-?\d+),(-?\d+),", d):
+            out.append((int(a), int(b), dur, d[:60]))
+    return out
+
+
+def test_chat_survives_overlapping_and_out_of_order_lines():
+    segs = [{"text": "tres cuatro", "start": 1.0, "end": 3.5},
+            {"text": "uno dos", "start": 1.0, "end": 3.0},
+            {"text": "cinco", "start": 0.5, "end": 2.0}]
+    doc = L.build_look_ass(segs, L.LOOKS["chat"], width=1920, height=1080, duration=5)
+    assert len(_dialogues(doc)) >= 3
+
+
+def test_vertical_short_uses_the_same_type_size_as_the_master():
+    import re
+    segs = [{"text": "y yo te sigo esperando bajo la lluvia", "start": 1, "end": 4}]
+    for lid, look in L.LOOKS.items():
+        if look.layout in ("block", "kinetic"):
+            continue          # rows are stretched to the frame width on purpose
+        fs = lambda w, h: max(int(x) for x in re.findall(
+            r"\\fs(\d+)", L.build_look_ass(segs, look, width=w, height=h, duration=6)))
+        assert fs(1080, 1920) <= fs(1920, 1080) * 1.05, lid
+
+
+@pytest.mark.parametrize("look_id", sorted(L.LOOKS))
+def test_animations_stay_inside_their_event_even_on_tiny_lines(look_id):
+    segs = [{"text": "sí", "start": 1.0, "end": 1.12},
+            {"text": "te quiero mucho mi amor", "start": 2.0, "end": 2.3,
+             "words": [{"word": "te", "start": 2.0, "end": 2.05},
+                       {"word": "quiero", "start": 2.05, "end": 2.1},
+                       {"word": "mucho", "start": 2.1, "end": 2.2},
+                       {"word": "mi", "start": 2.2, "end": 2.25},
+                       {"word": "amor", "start": 2.28, "end": 2.3}]}]
+    doc = L.build_look_ass(segs, L.LOOKS[look_id], width=1920, height=1080,
+                           duration=4, beats=[1.05, 2.1, 2.2])
+    for d in _dialogues(doc):
+        assert _secs(d.split(",")[2]) > _secs(d.split(",")[1]), d[:80]
+    for a, b, dur, d in _t_windows(doc):
+        assert 0 <= a < b <= max(dur, 2), (a, b, dur, d)
+
+
+def test_cuaderno_ring_stays_on_screen():
+    segs = [{"text": "te quiero mucho mi amor", "start": 1.0, "end": 3.0}]
+    doc = L.build_look_ass(segs, L.LOOKS["cuaderno"], width=1920, height=1080, duration=4)
+    rings = [d for d in _dialogues(doc) if "\\p1" in d and "E8322E".lower() in d.lower()
+             or ("\\p1" in d and "&H002E32E8" in d)]
+    assert rings
+    for d in rings:
+        assert _secs(d.split(",")[2]) - _secs(d.split(",")[1]) >= 0.55
+
+
+def test_word_timed_looks_request_forced_alignment():
+    for lid in ("pincel", "pop70", "cuaderno", "y2k", "cinetico", "bloque", "arco"):
+        assert L.needs_word_timings(lid), lid
+    for lid in ("cosmico", "cine", "neon", "chat", "duotono", ""):
+        assert not L.needs_word_timings(lid), lid
+
+
+def test_short_look_background_covers_the_whole_short():
+    import pipeline
+    doc = pipeline._build_short_ass_doc(
+        [{"start": 0.0, "end": 3.0, "text": "lavará sus heridas"}],
+        font_path=L.font_path(L.LOOKS["degrade"]), text_case="upper",
+        font_scale=1.0, lyric_color="", lyric_sung_color="", text_contrast="medium",
+        lyrics_animation="none", line_transition="none", lyric_look="degrade",
+        duration=30.0)
+    bands = [d for d in _dialogues(doc) if d.startswith("Dialogue: 0,")]
+    assert bands and all(d.split(",")[2] == "0:00:30.00" for d in bands)
+
+
+def test_title_card_is_readable_on_dark_looks():
+    import ass_render
+    title = ass_render.title_card_lines(
+        "Enanitos Verdes", "El País Del No Dormir", 5.0, width=1920, height=1080,
+        text_scale=1.0, lyric_font_family="Roboto", artist_font_family="Roboto")
+    doc = L.build_look_ass(SEGS, L.LOOKS["chat"], width=1920, height=1080,
+                           duration=8.0, title_lines=title)
+    style = [l for l in doc.splitlines() if l.startswith("Style:")][0]
+    titles = [d for d in _dialogues(doc) if d.startswith("Dialogue: 6,")]
+    assert titles and all("&H00111111" not in t for t in titles)

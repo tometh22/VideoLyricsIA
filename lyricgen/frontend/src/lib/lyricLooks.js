@@ -170,6 +170,9 @@ const LOOKS = [
     preview: {
       layout: "neon",
       motion: "neon",
+      // Igual que el backend: los carteles respetan mayúsculas/minúsculas
+      // de la letra (la cursiva en mayúsculas es ilegible y se sale).
+      forceCase: "original",
       color: "#FFF4FA",
       fontScale: 1.9,
       // Líneas impares: tubo en manuscrita.

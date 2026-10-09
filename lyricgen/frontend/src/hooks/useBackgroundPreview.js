@@ -62,12 +62,16 @@ export function shouldEnableBackgroundPreview({
   editMode,
   bgSelectMode,
   enableScenes,
+  // El look pinta todo el cuadro (Cinético / Pop 70s / Degradé): el backend
+  // no genera fondo para él, así que pre-generarlo sería pagar por nada.
+  lookOwnsBackground = false,
 }) {
   return BG_PREVIEW_ENABLED
     && !!hasReview
     && !editMode
     && bgSelectMode === "auto"
-    && !enableScenes;
+    && !enableScenes
+    && !lookOwnsBackground;
 }
 
 function extractParams(entry) {

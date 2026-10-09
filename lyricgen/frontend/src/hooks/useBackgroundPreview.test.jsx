@@ -225,6 +225,10 @@ describe("background preview eligibility", () => {
     expect(eligible({ enableScenes: true })).toBe(false);
   });
 
+  it("no precalienta para un look que pinta todo el cuadro (no usa fondo)", () => {
+    expect(eligible({ lookOwnsBackground: true })).toBe(false);
+  });
+
   it("conserva los gates existentes de review y edit mode", () => {
     expect(eligible({ hasReview: false })).toBe(false);
     expect(eligible({ editMode: true })).toBe(false);

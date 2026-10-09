@@ -158,7 +158,7 @@ LOOKS: dict[str, Look] = {
     "neon": Look(
         id="neon", font_file="TiltNeon-Regular.ttf",
         extra_fonts=("Neonderthaw-Regular.ttf",),
-        layout="line", motion="neon", beat_sync=True,
+        layout="line", motion="neon", beat_sync=True, force_case="original",
         primary="#FFF4FA", outline=0, shadow=0, font_scale=1.9,
         line_colors=("#FF3EA5", "#2EE6FF", "#B07BFF", "#FFB13B"),
         grade="eq=brightness=-0.20:saturation=0.70:contrast=1.08,vignette=angle=PI/4",
@@ -274,6 +274,16 @@ def get_look(look_id: str | None) -> Look | None:
     return LOOKS.get((look_id or "").strip().lower())
 
 
+WORD_TIMED_LAYOUTS = ("build", "kinetic", "block", "arc")
+
+
+def needs_word_timings(look_id: str | None) -> bool:
+    """True when the look places words at their sung time, so the pipeline
+    must run the (cached) forced alignment like it does for karaoke."""
+    look = get_look(look_id)
+    return look is not None and look.layout in WORD_TIMED_LAYOUTS
+
+
 def owns_background(look_id: str | None) -> bool:
     """True when the look paints the whole frame itself (flat cards or a
     gradient), so a generated background would never be seen."""
@@ -362,7 +372,42 @@ def _header(width: int, height: int, family: str, fontsize: int, look: Look,
     ])
 
 
+_T_RE = None
+
+
+def _clamp_times(text: str, dur_ms: int) -> str:
+    """Keep every animation inside its event: \\t(a,b,…) and the timed
+    \\move(…,t1,t2) get 0 <= a < b <= dur. Short lines and late words used to
+    produce reversed or negative windows, so a fade-out never finished."""
+    import re
+    global _T_RE
+    if _T_RE is None:
+        _T_RE = (re.compile(r"\\t\((-?\d+),(-?\d+),"),
+                 re.compile(r"(\\move\(-?\d+,-?\d+,-?\d+,-?\d+),(-?\d+),(-?\d+)\)"))
+    dur = max(2, int(dur_ms))
+
+    def window(a: int, b: int) -> tuple[int, int]:
+        a = max(0, min(a, dur - 1))
+        b = max(a + 1, min(b, dur))
+        return a, b
+
+    def fix_t(m):
+        a, b = window(int(m.group(1)), int(m.group(2)))
+        return f"\\t({a},{b},"
+
+    def fix_move(m):
+        a, b = window(int(m.group(2)), int(m.group(3)))
+        return f"{m.group(1)},{a},{b})"
+
+    return _T_RE[1].sub(fix_move, _T_RE[0].sub(fix_t, text))
+
+
 def _dialogue(layer: int, start: float, end: float, text: str) -> str:
+    """One ASS event. Events that would start at/after their end (a
+    decoration scheduled past a short line) are dropped ("")."""
+    if end - start < 0.02:
+        return ""
+    text = _clamp_times(text, int(round((end - start) * 1000)))
     return (f"Dialogue: {layer},{_ass._ass_time(start)},{_ass._ass_time(end)},"
             f"Lyric,,0,0,0,,{text}")
 
@@ -462,6 +507,16 @@ class _Measure:
         return float(f.getlength(text))
 
 
+def _deco_start(wanted: float, line_start: float, line_end: float,
+                min_on: float = 0.6) -> float:
+    """When a decoration (marker ring, doodles, bursts) appears: as wanted,
+    but early enough to stay on screen `min_on` seconds before the line ends.
+    The key word is usually the LAST word, so "after the word" alone often
+    landed right at the end of the line."""
+    latest = max(line_start, line_end - min_on)
+    return max(line_start, min(wanted, latest))
+
+
 def _build_events(look: Look, seg_idx: int, tokens: list[str],
                   timings: list[dict], line_start: float, line_end: float,
                   base_fs: int, width: int, height: int,
@@ -472,7 +527,7 @@ def _build_events(look: Look, seg_idx: int, tokens: list[str],
              for i in range(len(tokens))]
     # Word gap: the font's space plus room for the outline and drop shadow
     # on both neighbours (thick retro outlines otherwise glue words together).
-    sc = height / 1080.0
+    sc = min(width, height) / 1080.0
     space = (measure.width(" ", base_fs) + 0.08 * base_fs
              + 2 * look.outline * sc + 0.5 * look.shadow * sc)
     max_row = width * look.row_width
@@ -551,7 +606,8 @@ def _build_events(look: Look, seg_idx: int, tokens: list[str],
                                         "{" + ov + "}" + _ass._ass_escape(tokens[i])))
                 if i == k and look.circle_key:
                     events.extend(_circle_key_events(look, px, baseline, widths[j],
-                                                     sizes[i], w_start + wr / 1000.0,
+                                                     sizes[i], _deco_start(w_start + wr / 1000.0,
+                                                                           line_start, line_end),
                                                      line_end, sc))
                 x += widths[j] + space
                 continue
@@ -597,7 +653,8 @@ def _build_events(look: Look, seg_idx: int, tokens: list[str],
                                     "{" + ov + "}" + _ass._ass_escape(tokens[i])))
             if i == k and look.circle_key:
                 events.extend(_circle_key_events(look, px, baseline, widths[j],
-                                                 sizes[i], w_start + 0.12, line_end, sc))
+                                                 sizes[i], _deco_start(w_start + 0.12, line_start,
+                                                                       line_end), line_end, sc))
             x += widths[j] + space
         y += row_h[r_i]
     if look.doodles and k is not None and len(tokens) > 1:
@@ -605,10 +662,10 @@ def _build_events(look: Look, seg_idx: int, tokens: list[str],
                       + space * (len(r) - 1) for r in rows)
         top = (height - total_h) / 2.0
         k_start = max(line_start, float(timings[k]["start"]))
-        if k_start < line_end:
-            events.extend(_doodle_events(seg_idx, (width - block_w) / 2.0,
-                                         (width + block_w) / 2.0, top, top + total_h,
-                                         base_fs, k_start + 0.25, line_end, sc))
+        events.extend(_doodle_events(seg_idx, (width - block_w) / 2.0,
+                                     (width + block_w) / 2.0, top, top + total_h,
+                                     base_fs, _deco_start(k_start + 0.25, line_start, line_end),
+                                     line_end, sc))
     return events
 
 
@@ -746,6 +803,8 @@ def _chat_events(look: Look, lines: list, width: int, height: int, sc: float,
     incoming, outgoing = (look.flat_colors + ("#E9E9EB", "#1F8BFF"))[:2]
 
     bubbles = []
+    # Out-of-order or overlapping lines must not break the stack order.
+    lines = sorted(lines, key=lambda ln: (ln[2], ln[3]))
     for n, (_seg, display, start, end) in enumerate(lines):
         rows = _wrap_rows(display.split(), fs, max_text_w, measure)
         w = max(measure.width(r, fs) for r in rows) + 2 * pad_x
@@ -769,6 +828,7 @@ def _chat_events(look: Look, lines: list, width: int, height: int, sc: float,
             t1 = (bubbles[j + 1]["start"] if j + 1 < len(bubbles)
                   else min(duration, bubbles[j]["end"] + 1.5))
             if t1 <= t0:
+                prev_top = top
                 continue
             fill = outgoing if b["right"] else incoming
             ink = look.accent if b["right"] else look.primary
@@ -778,6 +838,8 @@ def _chat_events(look: Look, lines: list, width: int, height: int, sc: float,
                 text_motion = (f"\\move({_n(b['x'] + pad_x)},{_n(top + pad_y + 40 * sc)},"
                                f"{_n(b['x'] + pad_x)},{_n(top + pad_y)},0,200)\\fad(140,0)")
             else:
+                if prev_top is None:
+                    prev_top = top
                 dim = "\\alpha&H00&\\t(0,220,\\alpha&H55&)" if j == i + 1 else "\\alpha&H55&"
                 motion = (f"\\move({_n(b['x'])},{_n(prev_top)},{_n(b['x'])},{_n(top)},0,220)" + dim)
                 text_motion = (f"\\move({_n(b['x'] + pad_x)},{_n(prev_top + pad_y)},"
@@ -1302,7 +1364,7 @@ def _kinetic_events(look: Look, n: int, tokens: list[str], timings: list[dict],
             kw = heavy.width(sp["text"], sp["fs"])
             ky = y - sp["fs"] * 0.40
             deco = seed % 3
-            t0 = w_start + 0.12
+            t0 = _deco_start(w_start + 0.12, start, end)
             d2 = max(1, int(round((end - t0) * 1000)))
             fade = f"\\t({max(1, d2 - exit_ms)},{d2},\\alpha&HFF&)"
             if deco == 0:
@@ -1355,8 +1417,19 @@ def _neon_sign_events(look: Look, n: int, display: str, start: float, end: float
     m = script_measure if script else measure
     fs = int(base_fs * (1.35 if script else 1.0))
     rows = _ass._balanced_breaks(display, fs, width).split("\n")
-    text = "\\N".join(_ass._ass_escape(r) for r in rows)
     tw = max(m.width(r, fs) for r in rows)
+    # The break estimate is generic; measure the real face and shrink until
+    # the tube (plus its glow and frame) fits the frame — script neon on a
+    # vertical short used to run off both sides.
+    # Leave room for the haze (outline + blur) on both sides.
+    limit = width * 0.82 - 2 * (14 + 26) * sc
+    for _ in range(4):
+        if tw <= limit:
+            break
+        fs = max(18, int(fs * limit / tw))
+        rows = _ass._balanced_breaks(display, fs, width).split("\n")
+        tw = max(m.width(r, fs) for r in rows)
+    text = "\\N".join(_ass._ass_escape(r) for r in rows)
     th = len(rows) * fs * 0.95
     cx, cy = width / 2.0, height / 2.0
     dur = max(1, int(round((end - start) * 1000)))
@@ -1474,7 +1547,7 @@ def build_look_ass(
         # Script, neon and handwriting faces read as type only in the lyric's
         # own case; forcing caps on them looks like a ransom note.
         case_fn = None
-    sc = height / 1080.0
+    sc = min(width, height) / 1080.0
     path = font_path(look)
     family, _bold = _ass.font_family(path)
     measure = _Measure(path)
@@ -1620,15 +1693,21 @@ def build_look_ass(
         events.append(_dialogue(2, start, end, text))
 
     if title_lines:
+        # The title card sits on the background, not on the look's own
+        # surfaces (chat bubbles, cards): a dark look colour would vanish, so
+        # it falls back to white, and always keeps a readable outline.
+        r, g, b = _hex_rgb(look.primary)
+        dark = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0 < 0.45
         doc = _ass.build_ass(width=width, height=height, font_name=family,
                              base_fontsize=fs_for(40),
-                             outline=look.outline * sc, shadow=look.shadow * sc,
+                             outline=max(look.outline, 2.0) * sc,
+                             shadow=max(look.shadow, 2.0) * sc,
                              lines=list(title_lines), bold=False,
-                             primary_color=look.primary)
+                             primary_color="#FFFFFF" if dark else look.primary)
         for ln in doc.splitlines():
             if ln.startswith("Dialogue: "):
                 # Above the cards (0), the lyrics (2) AND the letterbox bars
                 # (5): a low title card must never end up behind a bar.
                 events.append("Dialogue: 6," + ln.split(",", 1)[1])
 
-    return header + "\n" + "\n".join(events) + "\n"
+    return header + "\n" + "\n".join(e for e in events if e) + "\n"

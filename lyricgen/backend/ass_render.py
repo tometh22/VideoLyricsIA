@@ -1001,7 +1001,10 @@ def build_ass(
             # dialogue end timestamp is unchanged.
             _zt_enter = min(420, max(160, int(_dur_ms * 0.28)))
             _zt_exit = min(320, max(120, int(_dur_ms * 0.22)))
-            _zt_hold_end = max(_zt_enter, _dur_ms - _zt_exit)
+            # Very short lines: split the window instead of overflowing it.
+            _zt_enter = min(_zt_enter, max(1, _dur_ms // 2))
+            _zt_exit = min(_zt_exit, max(1, _dur_ms - _zt_enter))
+            _zt_hold_end = min(max(_zt_enter + 1, _dur_ms - _zt_exit), _dur_ms - 1)
             # Short lines get a gentler fly-out so they don't feel violent.
             _zt_out = 900 if _dur_ms >= 1500 else 450
             # Per-channel alpha: keep the style's 50% shadow (\4a&H80&).

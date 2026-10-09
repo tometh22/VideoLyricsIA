@@ -242,6 +242,9 @@ def validate_combination(db, campaign, settings, group, user):
             fail("Fondo no disponible para esta campaña", 404)
     if settings.get("enable_scenes") and (asset or not has_scenes_access(user)):
         fail("Escenas requiere acceso habilitado y fondo IA")
+    if (group.requirement in ("veo", "photo_effect")
+            and _lyric_looks.owns_background(settings.get("lyric_look"))):
+        fail("Este look no usa fondo (pinta todo el cuadro): elegí otro look o un grupo sin fondo IA")
     if group.requirement == "photo_effect":
         if settings.get("effect") in (None, "", "none", "foto_viva"):
             fail("Foto fija requiere un efecto de superposición; Foto viva no es foto fija")
