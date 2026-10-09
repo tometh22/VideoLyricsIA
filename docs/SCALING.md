@@ -49,10 +49,12 @@ is the single biggest jump in capacity in this doc.
 
 **Important:** pool knobs are per process. The code and staging baseline are
 `4 + 2`, but deployment variables must be sized from the live topology. Staging runs
-2 API replicas × 2 uvicorn workers, 7 Worker replicas and 3 ShortWorker
-replicas: 14 database-owning processes. Its safe baseline is `4 + 2` per
-process, a theoretical maximum of 84 sockets. The former `8 + 8` worker
-configuration allowed 200+ sockets and could exhaust Postgres under bursts.
+2 API replicas × 2 uvicorn workers, one Worker replica and one ShortWorker
+replica: 6 database-owning processes. Its safe baseline is `4 + 2` per
+process, a theoretical maximum of 36 sockets. Production runs two Worker
+replicas and two ShortWorker replicas after the capacity reduction. The former
+`8 + 8` worker configuration allowed 200+ sockets and could exhaust Postgres
+under bursts.
 
 Before increasing either pool value or replica count, verify
 `SHOW max_connections` and leave administrative headroom. A QueuePool timeout

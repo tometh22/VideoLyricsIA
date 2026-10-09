@@ -69,8 +69,8 @@ no CDN configuration needed for first year.
 ### Pool budget — API, Worker and ShortWorker
 
 Pool sizes are **per process**, not per Railway service. Current staging has
-2 API replicas × 2 uvicorn workers plus 7 Worker and 3 ShortWorker replicas:
-14 database-owning processes. `8 + 8` on every process permits 224 database
+2 API replicas × 2 uvicorn workers plus one Worker and one ShortWorker replica:
+6 database-owning processes. `8 + 8` on every process permits 96 database
 connections and is unsafe unless Postgres has substantially more capacity.
 
 The safe staging baseline is `4 + 2` (84 theoretical sockets). It leaves room

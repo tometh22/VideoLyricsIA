@@ -18,8 +18,8 @@ Crear dos servicios Railway adicionales usando los archivos versionados:
   colas `campaign_control,transcription_batch`.
 - `BatchWorker`: `railway/batch-worker.toml`, 2 réplicas, cola `batch_render`.
 
-No modificar los servicios existentes: ShortWorker conserva 3 réplicas y
-Worker conserva 7. Con el flag habilitado, `/health/ready` exige que los dos
+No modificar los servicios existentes: ShortWorker y Worker conservan 2
+réplicas cada uno. Con el flag habilitado, `/health/ready` exige que los dos
 pools batch estén presentes y anuncien sus colas.
 
 Variables ajustables (los valores listados son los defaults):

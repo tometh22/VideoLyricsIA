@@ -13,8 +13,8 @@ repository-absolute because Railway does not resolve it below Root Directory:
 | Service | Config File | Required variables | Replicas |
 |---|---|---|---:|
 | API | `/railway/api.toml` | `RQ_PAYLOAD_VERSION=2`, `FLEET_READINESS_STRICT=1` | 2 |
-| Worker | `/railway/worker.toml` | `QUEUES=enterprise,default,canary`, `RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200`, `RQ_PAYLOAD_VERSION=2` | 7 |
-| ShortWorker | `/railway/short-worker.toml` | `QUEUES=transcription,bg_preview`, `RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200`, `RQ_PAYLOAD_VERSION=2` | 3 |
+| Worker | `/railway/worker.toml` | `QUEUES=enterprise,default,canary`, `RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200`, `RQ_PAYLOAD_VERSION=2` | 2 |
+| ShortWorker | `/railway/short-worker.toml` | `QUEUES=transcription,bg_preview,audio_preview`, `RAILWAY_SHUTDOWN_TIMEOUT_SECONDS=1200`, `RQ_PAYLOAD_VERSION=2` | 2 |
 
 Do not change `us-west2` in this recovery. Before cutover, export the effective
 service configuration and confirm root/config paths, region, replica counts,
