@@ -103,7 +103,7 @@ def test_api_deployment_contract():
 
 def test_worker_deployment_contracts_share_image_without_http_healthcheck():
     expected_replicas = {
-        "worker.toml": 7, "short-worker.toml": 3,
+        "worker.toml": 2, "short-worker.toml": 2,
         "batch-worker.toml": 2, "batch-short-worker.toml": 2,
     }
     expected_queues = {
