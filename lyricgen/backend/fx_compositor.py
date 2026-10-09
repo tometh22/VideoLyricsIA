@@ -940,7 +940,8 @@ def build_video_filter(*, ass_basename: str | None, font_dir: str, width: int,
                        custom_colors: str = "",
                        beat_bpm: float | None = None,
                        rhythm: EffectRhythm | None = None,
-                       fx_input_index: int = 2):
+                       fx_input_index: int = 2,
+                       grade_override: str | None = None):
     """Build the video filter for the single-pass libass render.
 
     Returns (filter_str, use_complex, extra_inputs):
@@ -960,7 +961,9 @@ def build_video_filter(*, ass_basename: str | None, font_dir: str, width: int,
     """
     subs = (f"subtitles={ass_basename}:fontsdir={_escape_filter_path(font_dir)}"
             if ass_basename else "")
-    grade = grade_filter(style, custom_colors)
+    # A lyric look carries its own grade chain (lyric_looks.Look.grade).
+    grade = (grade_override if grade_override is not None
+             else grade_filter(style, custom_colors))
     fx = effect_path(effect)
 
     # A selected effect must never collapse into the cheap no-effect branch.

@@ -16,6 +16,7 @@ import { tierForLength } from "../lib/lyricTiers";
 import { approvalConflict } from "../lib/approvalSnapshot";
 import { resolveLegacyDraft } from "../lib/reviewRecovery";
 import { activeWordIndex } from "../lib/karaokeTiming";
+import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote, lookOwnsBackground } from "../lib/lyricLooks";
 import { prettifySongTitle } from "../lib/prettifySongTitle";
 import { reseedPreservingIds, mintSegmentId } from "../lib/segmentIds";
 import {
@@ -669,6 +670,14 @@ export default function LyricsEditor({
   // espacio y NO apagan silenciosamente al ASS path.
   lyricsAnimation = "none",
   lineTransition = "none",
+  // Look de letra ("" = sin look). Con look, font/animación/transición los
+  // define el look y sus selects quedan deshabilitados (lib/lyricLooks).
+  lyricLook = "",
+  // Edición: el video se renderizó SIN fondo generado porque su look pinta
+  // todo el cuadro (render_params.background_owned_by_look). Si el operador
+  // elige un look que sí usa fondo (o "Sin look") avisamos que lo regenere en
+  // «Fondo». Sólo informa; no cambia el payload.
+  backgroundOwnedByLook = false,
   transcribeJobId = null,
   segmentsRevision = 0,
   // PR E follow-up (2026-07): key DEL STORE, desacoplada del backend job id.
@@ -763,6 +772,7 @@ export default function LyricsEditor({
   // onTransitionChange (que controlaba el legacy lyric_transition).
   onAnimationChange = null,
   onLineTransitionChange = null,
+  onLyricLookChange = null,
   // UX specialist 2026-05-24: status del pre-gen del fondo (useBackgroundPreview).
   // Valores: "idle" | "queued" | "generating" | "done" | "error" | "disabled".
   // null/undefined → no se renderiza el chip (modo /edit modal post-render).
@@ -967,6 +977,7 @@ export default function LyricsEditor({
   // 2026-05-23: nuevos ejes (paridad con el wizard, ver header del archivo).
   const [selectedAnimation, setSelectedAnimation] = useState(lyricsAnimation || "none");
   const [selectedLineTransition, setSelectedLineTransition] = useState(lineTransition || "none");
+  const [selectedLook, setSelectedLook] = useState(normalizeLyricLook(lyricLook));
   // Phase 2 (2026-05-25): sync props → state cuando el wizard controla los
   // typography settings desde el paso 4. Sin esto, el editor montado en paso 6
   // se queda con el seed inicial y no refleja los cambios que el operador
@@ -979,7 +990,8 @@ export default function LyricsEditor({
     setSelectedContrast(textContrast || "medium");
     setSelectedAnimation(lyricsAnimation || "none");
     setSelectedLineTransition(lineTransition || "none");
-  }, [hideTypographyControls, font, textCase, textContrast, lyricsAnimation, lineTransition]);
+    setSelectedLook(normalizeLyricLook(lyricLook));
+  }, [hideTypographyControls, font, textCase, textContrast, lyricsAnimation, lineTransition, lyricLook]);
   // Autosave confidence for the timeline view. saveStatus drives the
   // "Guardando…/Guardado ✓" chip; flushCounter triggers an immediate save
   // on a timeline drag (instead of waiting for the 3 s debounce).
@@ -6158,14 +6170,41 @@ export default function LyricsEditor({
               Phase 2: oculta si hideTypographyControls=true (modo wizard). */}
           {!hideTypographyControls && !hideInternalPreview && (viewMode !== "advanced" || previewDockOpen) && (
           <div className={`space-y-2 lg:sticky lg:top-2 lg:self-start ${viewMode === "advanced" ? "xl:order-2" : ""}`}>
+            {/* Look de letra — atajo: define tipografía, animación y
+                transición; tamaño/mayúsculas/contraste siguen editables. */}
+            <div className="flex items-center gap-2 px-1">
+              <span className="text-[11px] text-ink-tertiary shrink-0">{t("upload.look_section") || "Look"}</span>
+              <select
+                value={selectedLook}
+                onChange={(e) => { const v = normalizeLyricLook(e.target.value); setSelectedLook(v); onLyricLookChange?.(v); }}
+                className="flex-1 bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-2 py-1.5 text-xs text-white focus:ring-brand outline-none cursor-pointer"
+                data-testid="editor-lyric-look"
+                aria-label={t("upload.look_section") || "Look"}
+              >
+                {lyricLookOptions(t).map((o) => (
+                  <option key={o.code || "none"} value={o.code} style={{ fontFamily: o.css }}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+            {getLyricLook(selectedLook) && (
+              <p className="px-1 text-[10px] text-amber-300/80" data-testid="editor-look-locked">
+                {lookLockedNote(t, selectedLook)}
+              </p>
+            )}
+            {backgroundOwnedByLook && !lookOwnsBackground(selectedLook) && (
+              <p className="px-1 text-[10px] text-amber-300/90" data-testid="editor-look-needs-bg" role="status">
+                {t("upload.look_needs_bg_note") || "Este video se hizo sin fondo generado. Para este look regenerá el fondo en «Fondo»."}
+              </p>
+            )}
             {/* Live font switcher — preview re-renders in the chosen
                 typeface instantly; applied to the render on re-render. */}
             <div className="flex items-center gap-2 px-1">
               <span className="text-[11px] text-ink-tertiary shrink-0">Tipografía</span>
               <select
                 value={selectedFont}
+                disabled={!!getLyricLook(selectedLook)}
                 onChange={(e) => { setSelectedFont(e.target.value); onFontChange?.(e.target.value); }}
-                className="flex-1 bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-2 py-1.5 text-xs text-white focus:ring-brand outline-none cursor-pointer"
+                className="flex-1 bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-2 py-1.5 text-xs text-white focus:ring-brand outline-none cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                 style={{ fontFamily: FONT_CSS_BY_CODE[selectedFont] }}
                 title="Probar otra tipografía — se ve en el preview al instante"
               >
@@ -6201,8 +6240,9 @@ export default function LyricsEditor({
               <div className="flex items-center gap-1.5">
                 <span className="text-ink-tertiary">Animación</span>
                 <select value={selectedAnimation}
+                  disabled={!!getLyricLook(selectedLook)}
                   onChange={(e) => { setSelectedAnimation(e.target.value); onAnimationChange?.(e.target.value); }}
-                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer">
+                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed">
                   {LYRICS_ANIMATIONS.map((o) => (<option key={o.code} value={o.code}>{o.label}</option>))}
                 </select>
               </div>
@@ -6210,8 +6250,9 @@ export default function LyricsEditor({
               <div className="flex items-center gap-1.5">
                 <span className="text-ink-tertiary">Transición</span>
                 <select value={selectedLineTransition}
+                  disabled={!!getLyricLook(selectedLook)}
                   onChange={(e) => { setSelectedLineTransition(e.target.value); onLineTransitionChange?.(e.target.value); }}
-                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer">
+                  className="bg-surface-2 ring-1 ring-white/[0.08] rounded-md px-1.5 py-1 text-white focus:ring-brand outline-none cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed">
                   {LINE_TRANSITIONS.map((o) => (<option key={o.code} value={o.code}>{o.label}</option>))}
                 </select>
               </div>

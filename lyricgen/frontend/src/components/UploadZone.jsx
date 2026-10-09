@@ -10,6 +10,9 @@ import { track } from "../lib/telemetryTrack";
 import { inspiredByLyricsForSceneMode } from "../lib/sceneMode";
 import { CONCEPT_CODES, EFFECT_CODES, MOVEMENT_CODES } from "../lib/catalogCodes";
 import { MOVEMENT_LABELS, EFFECT_LABELS, FONT_LABELS } from "../lib/optionLabels";
+import { lyricLookOptions, getLyricLook, normalizeLyricLook, lookLockedNote, lookOwnsBackground, lookBeatSync } from "../lib/lyricLooks";
+import { useJobBeats } from "../hooks/useJobBeats";
+import { DegradeArt, HEART_PATH } from "./lookPreviewLayouts";
 import { canCreateArtTrack } from "../lib/artTrackAccess";
 import EditPlanSummary from "./EditPlanSummary";
 import useBackgroundPreviewTokens, { backgroundPreviewUrl } from "../hooks/useBackgroundPreviewTokens";
@@ -53,6 +56,7 @@ const TITLE_CARD_FIELDS = new Set([
 const LYRIC_RENDER_FIELDS = new Set([
   "font", "textCase", "fontScale", "textContrast", "frameFormat",
   "lyricsAnimation", "lineTransition", "lyricColor", "lyricSungColor",
+  "lyricLook",
 ]);
 // Qué cuenta como FOTO subida (vs video). Mismo criterio que el backend, que
 // sólo reconoce estas extensiones como still animable (`_is_still` en
@@ -236,6 +240,9 @@ export default function UploadZone({
   // WizardLivePreview lo lee con su propio rAF para renderizar word-jump
   // sincronizado al audio real, sin causar re-renders de UploadZone.
   playbackTickRef = null,
+  // Job con audio fuente cuyo playback maneja el tick de arriba (editor /
+  // edición). Con un look beat_sync, el preview pide sus beats reales.
+  beatsJobId = null,
   // 2026-07-16 (idea de Tomi): callback ref que recibe el <div> slot que
   // montamos bajo el video en el paso 6. LyricsEditor portalea ahí su player
   // bar, así la columna de la letra queda full y se scrollea menos.
@@ -292,6 +299,12 @@ export default function UploadZone({
   // lleva los dos; cuando no, se marcan dos y el cambio queda dibujado.
   // El anillo solo era la señal que engañó al operador del reclamo original.
   editBaseline = null,
+  // Edición de un video existente: ¿se renderizó SIN fondo generado porque
+  // su look pinta todo el cuadro (render_params.background_owned_by_look)?
+  // null = no es la edición de un job existente (job nuevo / variante).
+  // Sólo informa: si el operador elige un look que sí usa el fondo, avisamos
+  // que hay que regenerarlo en «Fondo». No toca el payload de la edición.
+  existingBgOwnedByLook = null,
   // Plan en vivo de la edición: { willApply, willDrop, blocked } calculado con
   // resolveEditSubmission, la MISMA función que arma el POST. Es lo que permite
   // que el wizard deje de prometer lo que el backend va a descartar.
@@ -371,6 +384,8 @@ export default function UploadZone({
     // lyricTransition + textMotion: deprecados 2026-05-23 (no se persisten).
     textCase: "upper", fontScale: "1.0", lyricsAnimation: "none", lineTransition: "none", textContrast: "medium",
     frameFormat: "full",
+    // Look de letra ("" = sin look). Sticky como el resto del estilo.
+    lyricLook: "",
     // Lyric color customization 2026-05-25:
     // - lyricColor: color del texto (no-cantada para karaoke; texto único para
     //   none/pop/glow/word_reveal).
@@ -951,6 +966,8 @@ export default function UploadZone({
   const [hoverAnimation, setHoverAnimation] = useState(null);
   // And for the line-transition picker (lives in the same Animación step).
   const [hoverTransition, setHoverTransition] = useState(null);
+  // And for the lyric-look gallery (top of the same step).
+  const [hoverLook, setHoverLook] = useState(null);
   // Abstract motion icons — communicate the camera MOVEMENT, not a fake scene.
   // The big live preview is what actually demonstrates the motion.
   const movIcon = (code) => {
@@ -1015,6 +1032,186 @@ export default function UploadZone({
         <span className={base} style={{ animation: anim, display: "inline-block" }}>{t("upload.preview_lyric")}</span>
       </span>
     );
+  };
+
+  // Looping mini-demo of a lyric LOOK inside its card: the look's own font,
+  // colours and motion over a swatch of its background treatment.
+  const lookDemo = (look) => {
+    const p = look.preview;
+    if (!p) {
+      return <span className="font-extrabold tracking-tight text-white/80 text-[15px] leading-none">{t("upload.preview_lyric")}</span>;
+    }
+    const words = t("upload.sample_words").toUpperCase().split(" ");
+    // El catálogo expresa outline/sombra en cqw del frame grande; en la
+    // miniatura el texto es ~2.3× más grande en proporción → a px fijos.
+    const thumbPx = (v) => (v || "").replace(/(\d*\.?\d+)cqw/g, (_m, n) => `${(parseFloat(n) * 3.4).toFixed(2)}px`);
+    const base = {
+      fontFamily: look.font.css,
+      fontWeight: look.font.weight,
+      color: p.color,
+      textShadow: thumbPx(p.textShadow),
+      WebkitTextStroke: p.stroke && p.stroke !== "0px" ? thumbPx(p.stroke) : undefined,
+      paintOrder: "stroke fill",
+      lineHeight: 1,
+      display: "inline-block",
+    };
+    if (p.layout === "build") {
+      return (
+        <span className="text-[15px] flex flex-col items-center" style={{ transform: p.tilt ? `rotate(${-p.tilt}deg)` : undefined }}>
+          {words.map((w, i) => (
+            <span
+              key={i}
+              style={{
+                ...base,
+                color: i === words.length - 1 ? p.accent : p.color,
+                fontSize: i === words.length - 1 ? "1.35em" : "1em",
+                transform: p.stagger ? `translateX(${i % 2 === 0 ? -14 : 14}%)` : undefined,
+                animation: `lcard-wordpop 2.6s ${i * 0.4}s infinite both`,
+              }}
+            >{w}</span>
+          ))}
+        </span>
+      );
+    }
+    const w0 = words[0];
+    const wl = words[words.length - 1];
+    const own = p.forceCase === "original" ? t("upload.sample_words").split(" ") : words;
+    if (p.layout === "kinetic") {
+      const [, alt, accent] = p.cardPalettes[0];
+      return (
+        <span className="flex flex-col items-center leading-none">
+          <span style={{ ...base, fontFamily: p.scriptFont.css, fontWeight: p.scriptFont.weight, color: accent, fontSize: "12px", textShadow: "none", rotate: "-7deg", animation: "lcard-kin-l 2.6s infinite both" }}>{w0}</span>
+          <span className="relative inline-block mt-0.5">
+            <span className="absolute rounded-lg" style={{ inset: "-6% -14%", background: alt, animation: "lcard-wordpop 2.6s .45s infinite both" }} />
+            <span style={{ ...base, position: "relative", color: accent, fontSize: "26px", animation: "lcard-kin-r 2.6s .35s infinite both" }}>{wl}</span>
+          </span>
+        </span>
+      );
+    }
+    if (p.layout === "neon") {
+      const c = p.lineColors[0];
+      const frame = p.lineColors[2];
+      return (
+        <span style={{ padding: "3px 7px", borderRadius: 7, border: `1.5px solid ${frame}`, boxShadow: `0 0 6px ${frame}, inset 0 0 4px ${frame}`, animation: "lcard-neon 2.6s infinite both" }}>
+          <span style={{ ...base, fontSize: "16px", color: p.color, textShadow: `0 0 2px #fff, 0 0 5px ${c}, 0 0 10px ${c}, 0 0 16px ${c}` }}>{words.join(" ")}</span>
+        </span>
+      );
+    }
+    if (p.layout === "chat") {
+      const bubble = (txt, right, delay) => (
+        <span
+          style={{
+            ...base, alignSelf: right ? "flex-end" : "flex-start", fontSize: "9px", padding: "3px 6px",
+            borderRadius: 8, [right ? "borderBottomRightRadius" : "borderBottomLeftRadius"]: 2,
+            background: right ? p.bubbles[1] : p.bubbles[0], color: right ? p.accent : p.color,
+            animation: `lcard-chat 2.8s ${delay}s infinite both`,
+          }}
+        >{txt}</span>
+      );
+      return (
+        <span className="flex flex-col gap-1 w-[70%]">
+          {bubble(own[0], false, 0)}
+          {bubble(own.join(" "), true, 0.5)}
+        </span>
+      );
+    }
+    if (p.layout === "block") {
+      return (
+        <span className="flex flex-col items-center leading-[.84]" style={{ animation: "lcard-wordpop 2.6s infinite both" }}>
+          <span style={{ ...base, fontWeight: p.lightWeight, fontSize: "22px", letterSpacing: "0.04em" }}>{w0}</span>
+          <span style={{ ...base, color: p.accent, fontSize: "24px", animation: "lcard-wordpop 2.6s .3s infinite both" }}>{wl}</span>
+        </span>
+      );
+    }
+    if (p.layout === "arc") {
+      return (
+        <svg viewBox="0 0 100 60" className="w-full h-full" aria-hidden="true" style={{ fontFamily: look.font.css, fontWeight: look.font.weight }}>
+          <defs><path id={`lcard-arc-${look.code}`} d="M50 54A22 22 0 1 1 50 10A22 22 0 1 1 50 54" /></defs>
+          <g style={{ transformOrigin: "50px 32px", animation: "lcard-spin 9s linear infinite" }}>
+            <circle cx="50" cy="32" r="18.5" fill="none" stroke={p.color} strokeOpacity=".45" strokeWidth=".6" />
+            <text fontSize="6.5" fill={p.color} letterSpacing=".6">
+              <textPath href={`#lcard-arc-${look.code}`} startOffset="50%" textAnchor="middle">{`${words.join(" ")} ${words.join(" ")}`}</textPath>
+            </text>
+          </g>
+          <text x="50" y="32" fontSize="9" textAnchor="middle" dominantBaseline="central" fill={p.accent}>{wl}</text>
+        </svg>
+      );
+    }
+    if (p.layout === "floor") {
+      return (
+        <span style={{ ...base, fontSize: "17px", WebkitTextStroke: "1.6px #0B4F47", textShadow: "none", animation: "lcard-floor 2.8s infinite both" }}>
+          {w0}{" "}<span style={{ color: p.accent }}>{wl}</span>
+        </span>
+      );
+    }
+    if (p.motion === "boil") {
+      return (
+        <span style={{ ...base, fontSize: "19px", color: p.lineColors[1], WebkitTextStroke: "1.6px #1B2C7A", textShadow: "1.5px 1.5px 0 #1B2C7A", animation: "lcard-boil .5s steps(1,end) infinite" }}>{words.join(" ")}</span>
+      );
+    }
+    if (p.motion === "write_on") {
+      return (
+        <span style={{ ...base, fontSize: "24px", textShadow: "0 0 3px #FFD9C2, 0 0 8px rgba(255,217,194,.8)", WebkitTextStroke: undefined, animation: "lcard-write 2.8s infinite both" }}>{own.join(" ")}</span>
+      );
+    }
+    if (p.gradient) {
+      return (
+        <>
+          <DegradeArt gradient={p.gradient} mountains={p.mountains} className="absolute inset-0 w-full h-full" />
+          <span className="relative text-[15px]" style={{ ...base, animation: "acard-word 2.8s infinite" }}>{words.join(" ")}</span>
+        </>
+      );
+    }
+    if (p.wordMotion === "write") {
+      return (
+        <span className="relative flex items-baseline gap-1 text-[19px]">
+          <span style={{ ...base, rotate: "-3deg", animation: "lcard-write 2.6s infinite both" }}>{own[0]}</span>
+          <span className="relative inline-block" style={{ rotate: "2deg" }}>
+            <span style={{ ...base, animation: "lcard-write 2.6s .45s infinite both" }}>{own[own.length - 1]}</span>
+            <svg viewBox="0 0 100 60" preserveAspectRatio="none" aria-hidden="true" className="absolute" style={{ inset: "-25% -20%", width: "140%", height: "150%", overflow: "visible", animation: "lcard-write 2.6s .8s infinite both" }}>
+              <ellipse cx="50" cy="30" rx="47" ry="26" fill="none" stroke={p.circleKey} strokeWidth="1.6" vectorEffect="non-scaling-stroke" transform="rotate(-3 50 30)" />
+            </svg>
+            <svg viewBox="0 0 24 24" aria-hidden="true" className="absolute w-[9px] h-[9px]" style={{ right: "-14px", top: "-6px", animation: "lcard-boil .5s steps(1,end) infinite" }}>
+              <path d={HEART_PATH} fill={p.doodles.heart} />
+            </svg>
+          </span>
+        </span>
+      );
+    }
+    if (p.wordMotion === "echo") {
+      const ghost = (side) => (
+        <span aria-hidden="true" className="absolute left-0 top-0" style={{ ...base, filter: "blur(1px)", animation: `lcard-ghost-${side} 2.6s infinite both` }}>{wl}</span>
+      );
+      return (
+        <span className="flex flex-col items-center text-[12px]">
+          <span style={{ ...base, translate: "-10% 0", animation: "lcard-wordpop 2.6s infinite both" }}>{w0}</span>
+          <span className="relative inline-block" style={{ translate: "10% 0" }}>
+            {ghost("l")}
+            {ghost("r")}
+            <span style={{ ...base, color: p.accent, fontSize: "1.3em", animation: "lcard-wordpop 2.6s .3s infinite both" }}>{wl}</span>
+          </span>
+        </span>
+      );
+    }
+    if (p.layout === "keyword") {
+      return (
+        <span className="flex flex-col items-center" style={{ animation: "lcard-cine 2.8s infinite both" }}>
+          <span style={{ ...base, fontSize: "8px", letterSpacing: "0.08em" }}>{words[0]}</span>
+          <span style={{ ...base, fontSize: "19px" }}>{words[words.length - 1]}</span>
+        </span>
+      );
+    }
+    return (
+      <span
+        className={p.motion === "fade" ? "text-[11px]" : "text-[14px]"}
+        style={{ ...base, animation: p.motion === "zoom_through" ? "lcard-zoom 2.6s infinite both" : "acard-word 2.8s infinite" }}
+      >{words.join(" ")}</span>
+    );
+  };
+  const lookThumbBg = (look) => {
+    const p = look.preview;
+    if (!p) return "radial-gradient(120% 100% at 50% 0,#1a1430,#0b0820)";
+    return p.thumbBg;
   };
 
   // Set of track indices with the inline "Personalizar" drawer open.
@@ -1325,6 +1522,43 @@ export default function UploadZone({
     { code: "wipe",          label: t("upload.trans_wipe") || "Wipe",        desc: t("upload.trans_wipe_desc") || "Se descubre de izquierda a derecha." },
     { code: "dissolve_blur", label: t("upload.trans_blur") || "Disolvencia", desc: t("upload.trans_blur_desc") || "Entra desenfocada y se enfoca." },
   ];
+
+  // Looks de letra: tratamiento completo en un clic (lib/lyricLooks, espejo
+  // de backend/lyric_looks.py). Con look activo el render ignora font /
+  // animación / transición; tamaño, color, mayúsculas y efecto siguen.
+  const LYRIC_LOOKS = lyricLookOptions(t);
+  // Beats reales para el pulso en vivo de Cinético / Neón (sólo con job +
+  // audio del editor; si falla, el preview sigue con su reloj fijo).
+  const previewBeats = useJobBeats(
+    beatsJobId,
+    !!beatsJobId && !!playbackTickRef && lookBeatSync(hoverLook ?? batchDefaults.lyricLook),
+    { api: API, authHeaders },
+  );
+  const activeLook = getLyricLook(batchDefaults.lyricLook);
+  const lookLockedText = activeLook ? lookLockedNote(t, activeLook.code) : "";
+  // Fondo y looks que pintan todo el cuadro (Pop 70s / Cinético / Degradé):
+  //  - job nuevo: el backend no genera fondo para ellos → lo decimos (ahorra
+  //    el costo del fondo, que es lo que el operador quiere saber);
+  //  - edición de un video que se hizo SIN fondo: elegir un look que sí lo
+  //    usa (o "Sin look") necesita regenerar el fondo en «Fondo».
+  const lookOwnsBgNote = existingBgOwnedByLook == null && lookOwnsBackground(batchDefaults.lyricLook)
+    ? (t("upload.look_owns_bg_note") || "Este look no usa el fondo: no se genera uno (ahorra el costo del fondo).")
+    : "";
+  const lookNeedsBgNote = existingBgOwnedByLook && !lookOwnsBackground(batchDefaults.lyricLook)
+    ? (t("upload.look_needs_bg_note") || "Este video se hizo sin fondo generado. Para este look regenerá el fondo en «Fondo».")
+    : "";
+  const lookGridRef = useRef(null);
+  useEffect(() => {
+    if (wizardStep !== 4) return;
+    const grid = lookGridRef.current;
+    if (!grid) return;
+    const active = grid.querySelector('[aria-pressed="true"]');
+    if (active && active.offsetTop > grid.clientHeight) {
+      grid.scrollTop = active.offsetTop - grid.clientHeight / 2;
+    }
+    // Sólo al entrar al paso: no perseguir al operador mientras elige.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wizardStep]);
 
   // Visual concept for the AI background. Operator-controlled; when set
   // it hard-overrides the genre's scene vocabulary. Mirror of the backend
@@ -2878,6 +3112,7 @@ export default function UploadZone({
           (entry.fontScale    || "1.0")   !== (bd.fontScale    || "1.0")   ||
           (entry.lyricsAnimation || "none") !== (bd.lyricsAnimation || "none") ||
           (entry.lineTransition || "none") !== (bd.lineTransition || "none") ||
+          normalizeLyricLook(entry.lyricLook) !== normalizeLyricLook(bd.lyricLook) ||
           (entry.textContrast || "medium") !== (bd.textContrast || "medium");
 
         return (
@@ -3265,12 +3500,16 @@ export default function UploadZone({
                         <Listbox value={entry.effect || ""} onChange={(v) => updateField(i, "effect", v)} options={EFFECTS} className="flex-1" ariaLabel={t("upload.effect_label") || "Efecto"} />
                       </div>
                       <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-gray-600 shrink-0">{t("upload.look_label") || "Look:"}</span>
+                        <Listbox value={normalizeLyricLook(entry.lyricLook)} onChange={(v) => updateField(i, "lyricLook", v)} options={LYRIC_LOOKS} className="flex-1" ariaLabel={t("upload.look_label") || "Look"} />
+                      </div>
+                      <div className="flex items-center gap-2">
                         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.animation_label") || "Animación:"}</span>
-                        <Listbox value={entry.lyricsAnimation || "none"} onChange={(v) => updateField(i, "lyricsAnimation", v)} options={LYRICS_ANIMATIONS} className="flex-1" ariaLabel={t("upload.animation_label") || "Animación"} />
+                        <Listbox value={entry.lyricsAnimation || "none"} onChange={(v) => updateField(i, "lyricsAnimation", v)} options={LYRICS_ANIMATIONS} className="flex-1" ariaLabel={t("upload.animation_label") || "Animación"} disabled={!!getLyricLook(entry.lyricLook)} />
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="text-[11px] text-gray-600 shrink-0">{t("upload.transition_label") || "Transición:"}</span>
-                        <Listbox value={entry.lineTransition || "none"} onChange={(v) => updateField(i, "lineTransition", v)} options={LINE_TRANSITIONS} className="flex-1" ariaLabel={t("upload.transition_label") || "Transición"} />
+                        <Listbox value={entry.lineTransition || "none"} onChange={(v) => updateField(i, "lineTransition", v)} options={LINE_TRANSITIONS} className="flex-1" ariaLabel={t("upload.transition_label") || "Transición"} disabled={!!getLyricLook(entry.lyricLook)} />
                       </div>
                     </>
                   )}
@@ -3994,6 +4233,7 @@ export default function UploadZone({
               effect={hoverEffect ?? batchDefaults.effect}
               lyricsAnimation={hoverAnimation ?? batchDefaults.lyricsAnimation}
               lineTransition={hoverTransition ?? batchDefaults.lineTransition}
+              lyricLook={hoverLook ?? batchDefaults.lyricLook ?? ""}
               lyricColor={batchDefaults.lyricColor || "#FFFFFF"}
               lyricSungColor={batchDefaults.lyricSungColor || "#FFFFFF"}
               /* QA fix 2026-05-28: cuando el operador selecciona un fondo
@@ -4049,6 +4289,7 @@ export default function UploadZone({
                  audio en la review (step 6). Sin el ref, el preview cae
                  al modo legacy (lyric loop con `_previewLyric`). */
               playbackTickRef={playbackTickRef}
+              beats={previewBeats}
               /* Post-render edit: MP4 ya renderizado del job. Cuando viene,
                  el preview muta a "Resultado actual" y todos los overlays
                  (palette/grade/karaoke sim) se cortocircuitan.
@@ -4550,7 +4791,95 @@ export default function UploadZone({
                 @keyframes tcard-slideside { 0%{transform:translateX(-130%);opacity:0} 22%,88%{transform:translateX(0);opacity:1} 100%{transform:translateX(130%);opacity:0} }
                 @keyframes tcard-wipe { 0%{clip-path:inset(0 100% 0 0)} 35%,100%{clip-path:inset(0 0 0 0)} }
                 @keyframes tcard-blur { 0%{filter:blur(6px);opacity:0} 30%,80%{filter:blur(0);opacity:1} 100%{filter:blur(6px);opacity:0} }
+                @keyframes lcard-zoom { 0%{transform:scale(.3);opacity:0} 18%{transform:scale(1);opacity:1} 82%{transform:scale(1.08);opacity:1;filter:blur(0)} 100%{transform:scale(6);opacity:0;filter:blur(3px)} }
+                @keyframes lcard-cine { 0%{filter:blur(4px);letter-spacing:.35em;opacity:0} 30%,82%{filter:blur(0);letter-spacing:.02em;opacity:1} 100%{filter:blur(4px);opacity:0} }
+                @keyframes lcard-wordpop { 0%,6%{transform:scale(1.35);opacity:0} 12%,86%{transform:scale(1);opacity:1} 100%{opacity:0} }
+                @keyframes lcard-kin-l { 0%,6%{transform:translateX(-60px);opacity:0} 18%,86%{transform:none;opacity:1} 100%{opacity:0} }
+                @keyframes lcard-kin-r { 0%,6%{transform:translateX(60px);opacity:0} 18%,86%{transform:none;opacity:1;filter:blur(0)} 100%{transform:scaleX(2);opacity:0;filter:blur(3px)} }
+                @keyframes lcard-neon { 0%,8%{opacity:.15} 10%{opacity:1} 13%{opacity:.3} 16%,88%{opacity:1} 100%{opacity:.15} }
+                @keyframes lcard-chat { 0%,10%{transform:translateY(8px);opacity:0} 22%,100%{transform:none;opacity:1} }
+                @keyframes lcard-write { 0%,6%{clip-path:inset(-30% 100% -30% -5%)} 45%,100%{clip-path:inset(-30% -5% -30% -5%)} }
+                @keyframes lcard-spin { to{transform:rotate(360deg)} }
+                @keyframes lcard-floor { 0%{transform:perspective(120px) rotateX(48deg) translateY(-14px) scale(.7);opacity:0} 15%,85%{opacity:1} 100%{transform:perspective(120px) rotateX(48deg) translateY(12px) scale(1.2);opacity:0} }
+                @keyframes lcard-boil { 0%{transform:rotate(-2deg)} 25%{transform:rotate(1.5deg) scale(1.02)} 50%{transform:rotate(-1deg)} 75%{transform:rotate(2deg) scale(1.01)} }
+                @keyframes lcard-ghost-l { 0%,6%{transform:translateX(-12px);opacity:0} 14%{opacity:.45} 30%,100%{transform:none;opacity:0} }
+                @keyframes lcard-ghost-r { 0%,6%{transform:translateX(12px);opacity:0} 14%{opacity:.35} 30%,100%{transform:none;opacity:0} }
               `}</style>
+
+              {/* Look de letra — atajo de un clic (lib/lyricLooks). Va ARRIBA
+                  de todo: elegir un look define tipografía, animación y
+                  transición, así que esos pickers de abajo se bloquean con
+                  una nota. Tamaño, color, mayúsculas y efecto siguen. */}
+              <div className="mb-4 pb-3 border-b border-white/[0.05]" data-testid="lyric-look-picker">
+                <p className="text-[11px] text-gray-300 font-medium">{t("upload.look_section") || "Look"}</p>
+                <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
+                  {t("upload.look_section_desc")}
+                </p>
+                {/* 17 tarjetas: la grilla envuelve y scrollea adentro para no
+                    empujar la tipografía fuera de pantalla. Al abrir, la
+                    tarjeta elegida se trae a la vista. */}
+                <div
+                  className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-[30rem] overflow-y-auto overscroll-contain pr-1 -mr-1"
+                  data-testid="lyric-look-grid"
+                  ref={lookGridRef}
+                >
+                  {LYRIC_LOOKS.map((look) => {
+                    const active = normalizeLyricLook(batchDefaults.lyricLook) === look.code;
+                    const inVideo = isAnchor("lyricLook", look.code);
+                    return (
+                      <button
+                        key={look.code || "none"}
+                        type="button"
+                        onClick={() => updateBatchDefault("lyricLook", look.code)}
+                        onMouseEnter={() => setHoverLook(look.code)}
+                        onMouseLeave={() => setHoverLook(null)}
+                        onFocus={() => setHoverLook(look.code)}
+                        onBlur={() => setHoverLook(null)}
+                        aria-pressed={active}
+                        data-lyric-look={look.code || "none"}
+                        data-in-video={inVideo ? "true" : undefined}
+                        aria-label={`${look.label}: ${look.desc}${inVideo ? ` — ${ANCHOR_LABEL}` : ""}`}
+                        title={look.desc}
+                        className={`text-left rounded-xl overflow-hidden border transition-all duration-200 cursor-pointer ${
+                          active
+                            ? "border-transparent ring-1 ring-brand/50 shadow-glow"
+                            : "border-white/[0.06] hover:border-white/[0.20]"
+                        }`}
+                      >
+                        <div className="aspect-video relative overflow-hidden grid place-items-center" style={{ background: lookThumbBg(look) }}>
+                          {look.preview?.letterbox && (
+                            <>
+                              <div className="absolute inset-x-0 top-0 bg-black" style={{ height: "12.8%" }} />
+                              <div className="absolute inset-x-0 bottom-0 bg-black" style={{ height: "12.8%" }} />
+                            </>
+                          )}
+                          {lookDemo(look)}
+                          {active && (
+                            <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-brand grid place-items-center shadow">
+                              <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                            </div>
+                          )}
+                          {inVideo && anchorChip}
+                        </div>
+                        <div className="px-2.5 py-2 bg-surface-1">
+                          <p className={`text-[12px] font-medium leading-tight ${active ? "text-white" : "text-gray-200"}`}>{look.label}</p>
+                          <p className="text-[10px] text-gray-500 leading-snug mt-0.5">{look.desc}</p>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+                {lookOwnsBgNote ? (
+                  <p className="mt-2 text-[10px] text-emerald-300/80" data-testid="look-owns-bg-note">
+                    {lookOwnsBgNote}
+                  </p>
+                ) : null}
+                {lookNeedsBgNote ? (
+                  <p className="mt-2 text-[10px] text-amber-300/90" data-testid="look-needs-bg-note" role="status">
+                    {lookNeedsBgNote}
+                  </p>
+                ) : null}
+              </div>
 
               {/* Tipografía — UI gap fix 2026-05-26. El refactor del paso 6
                   (commit 6c2e8a8) ocultó estos controles en LyricsEditor con
@@ -4575,8 +4904,14 @@ export default function UploadZone({
                       options={FONTS}
                       className="flex-1"
                       ariaLabel={t("upload.font_label") || "Tipografía"}
+                      disabled={!!activeLook}
                     />
                   </div>
+                  {activeLook && (
+                    <p className="ml-[5.5rem] -mt-1.5 text-[10px] text-amber-300/80" data-testid="look-font-locked">
+                      {lookLockedText}
+                    </p>
+                  )}
 
                   {/* Text case pill buttons: MAY / Aa / min / ori */}
                   <div>
@@ -4671,6 +5006,23 @@ export default function UploadZone({
                 </div>
               </div>
 
+              {activeLook ? (
+                <div className="rounded-xl bg-amber-500/[0.06] ring-1 ring-amber-500/20 px-3 py-2.5 flex items-center justify-between gap-3" data-testid="look-motion-locked">
+                  <div>
+                    <p className="text-[11px] text-gray-300 font-medium">
+                      {t("upload.animation_section_full")} · {t("upload.transition_title") || "Transición entre líneas"}
+                    </p>
+                    <p className="text-[10px] text-amber-300/80 mt-0.5">{lookLockedText}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => updateBatchDefault("lyricLook", "")}
+                    className="shrink-0 text-[10px] text-gray-400 hover:text-white underline-offset-2 hover:underline transition-colors"
+                  >
+                    {t("upload.look_clear") || "Quitar look"}
+                  </button>
+                </div>
+              ) : (<>
               <p className="text-[11px] text-gray-300 font-medium">{t("upload.animation_section_full")}</p>
               <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
                 {t("upload.anim_gallery_desc") || "Cómo aparecen las palabras sobre el video. Pasá el mouse o elegí y miralo en el preview ←"}
@@ -4714,6 +5066,7 @@ export default function UploadZone({
               <p className="text-[10px] text-gray-600 mt-2">
                 🎤 {t("upload.anim_word_note") || "Funcionan en toda canción — el tiempo por palabra se calcula automáticamente."}
               </p>
+              </>)}
 
               {/* Lyric text color — color picker(s). El segundo solo aplica a
                   karaoke (color de la palabra cantada). Para none/pop/glow/
@@ -4757,6 +5110,9 @@ export default function UploadZone({
                       <span>{t("upload.lyric_color_sung") || "Cantada"}</span>
                     </label>
                   )}
+                  {activeLook && (batchDefaults.lyricColor || "#FFFFFF").toUpperCase() === "#FFFFFF" && (
+                    <span className="text-[10px] text-gray-600">{t("upload.look_color_hint")}</span>
+                  )}
                   {(batchDefaults.lyricColor !== "#FFFFFF" || batchDefaults.lyricSungColor !== "#FFFFFF") && (
                     <button
                       type="button"
@@ -4770,7 +5126,9 @@ export default function UploadZone({
               </div>
               )}
 
-              {/* Transición entre líneas — eje aparte, compone con la animación */}
+              {/* Transición entre líneas — eje aparte, compone con la animación.
+                  Con look activo la define el look (nota de arriba). */}
+              {!activeLook && (
               <div className="mt-4 pt-3 border-t border-white/[0.05]">
                 <p className="text-[11px] text-gray-300 font-medium">{t("upload.transition_title") || "Transición entre líneas"}</p>
                 <p className="text-[10px] text-gray-600 mt-0.5 mb-3">
@@ -4810,6 +5168,7 @@ export default function UploadZone({
                   })}
                 </div>
               </div>
+              )}
 
               {/* Portada (intro title card) — Full Rotor v1.1: visual
                   template gallery + size with live percentage + per-element
