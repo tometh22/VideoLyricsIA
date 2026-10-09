@@ -1,0 +1,92 @@
+metric,piece_type,client_group,env,value,unit,n,note
+review_minutes_median,lyric_video,umg,staging,8.555,min,100,"corte de 100 jobs UMG aprobados (fase 1, 4-oct); minutos activos del editor por latidos"
+review_minutes_p90,lyric_video,umg,staging,20.643,min,100,"corte de 100 jobs UMG aprobados (fase 1, 4-oct); minutos activos del editor por latidos"
+review_minutes_median,art_track,umg,staging,,min,0,"0 art tracks en el corte; los art tracks no pasan por el editor de letra, su revisión (QC final) no emite latidos y no se mide con este script"
+review_minutes_p90,art_track,umg,staging,,min,0,"0 art tracks en el corte; los art tracks no pasan por el editor de letra, su revisión (QC final) no emite latidos y no se mide con este script"
+approved_pieces_sep2026,art_track,umg,staging,0,canciones,0,"jobs con approved_at en sep-2026, sin tenants de prueba; n = jobs antes de desduplicar"
+approved_pieces_sep2026,lyric_video,otros,staging,6,canciones,6,"jobs con approved_at en sep-2026, sin tenants de prueba; n = jobs antes de desduplicar"
+approved_pieces_sep2026,lyric_video,umg,staging,79,canciones,81,"jobs con approved_at en sep-2026, sin tenants de prueba; n = jobs antes de desduplicar"
+approved_pieces_sep2026,art_track,umg,production,0,canciones,0,"jobs con approved_at en sep-2026, sin tenants de prueba; n = jobs antes de desduplicar"
+approved_pieces_sep2026,lyric_video,otros,production,12,canciones,16,"jobs con approved_at en sep-2026, sin tenants de prueba; n = jobs antes de desduplicar"
+approved_pieces_sep2026,lyric_video,umg,production,13,canciones,16,"jobs con approved_at en sep-2026, sin tenants de prueba; n = jobs antes de desduplicar"
+compute_cost_total_sep2026,lyric_video,otros,staging,10.03,USD,12,precio de lista (no hay calibración de sep-2026)
+compute_cost_total_sep2026_aug_rates,lyric_video,otros,staging,11.22,USD,12,mismas llamadas valuadas con las tarifas calibradas contra la factura de ago-2026 (referencia)
+compute_cost_per_job_median,lyric_video,otros,staging,0.4868,USD,12,jobs con gasto en sep-2026
+compute_cost_per_job_p90,lyric_video,otros,staging,1.5073,USD,12,jobs con gasto en sep-2026
+compute_cost_per_delivered_job_median,lyric_video,otros,staging,0.833,USD,6,jobs entregados en sep-2026 (incluye gasto 0 por caché)
+replicate_gpu_minutes_total,lyric_video,otros,staging,,min,0,predict_time de Replicate; staging no lo registra (NULL en todas las llamadas de sep)
+compute_cost_total_sep2026,lyric_video,umg,staging,299.4,USD,407,precio de lista (no hay calibración de sep-2026)
+compute_cost_total_sep2026_aug_rates,lyric_video,umg,staging,300.7,USD,407,mismas llamadas valuadas con las tarifas calibradas contra la factura de ago-2026 (referencia)
+compute_cost_per_job_median,lyric_video,umg,staging,0.494,USD,407,jobs con gasto en sep-2026
+compute_cost_per_job_p90,lyric_video,umg,staging,1.6429,USD,407,jobs con gasto en sep-2026
+compute_cost_per_delivered_job_median,lyric_video,umg,staging,1.009,USD,191,jobs entregados en sep-2026 (incluye gasto 0 por caché)
+replicate_gpu_minutes_total,lyric_video,umg,staging,,min,0,predict_time de Replicate; staging no lo registra (NULL en todas las llamadas de sep)
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,0.07,USD,,cjwbw/demucs
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,0.01,USD,,cureau/force-align-wordstamps
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,0.15,USD,,gemini-2.5-flash
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,0.53,USD,,gemini-2.5-flash-audio
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,0.4,USD,,gemini-2.5-flash-vision
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,0.0,USD,,gemini-2.5-flash-vision-image
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,0.01,USD,,gpt-4o-mini
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,0.01,USD,,none
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,5.6,USD,,veo-3.1-lite-generate-001
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,0.16,USD,,victor-upmeet/whisperx
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,0.27,USD,,whisper-1
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,0.05,USD,,whisper-1-live-independent-verify
+compute_cost_by_tool_sep2026,lyric_video,otros,staging,2.76,USD,,whisper-1-targeted-consensus
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,12.99,USD,,cjwbw/demucs
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,0.18,USD,,cureau/force-align-wordstamps
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,3.34,USD,,gemini-2.5-flash
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,31.98,USD,,gemini-2.5-flash-audio
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,0.04,USD,,gemini-2.5-flash-image
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,5.0,USD,,gemini-2.5-flash-vision
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,0.1,USD,,gemini-2.5-flash-vision-image
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,0.43,USD,,gpt-4o-mini
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,0.0,USD,,human-provided
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,0.12,USD,,none
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,72.8,USD,,veo-3.1-lite-generate-001
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,8.36,USD,,victor-upmeet/whisperx
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,0.84,USD,,whisper-1
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,4.18,USD,,whisper-1-live-independent-verify
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,0.1,USD,,whisper-1-live-independent-verify-mix
+compute_cost_by_tool_sep2026,lyric_video,umg,staging,158.95,USD,,whisper-1-targeted-consensus
+compute_cost_total_sep2026,lyric_video,otros,production,6.76,USD,14,precio de lista (no hay calibración de sep-2026)
+compute_cost_total_sep2026_aug_rates,lyric_video,otros,production,8.49,USD,14,mismas llamadas valuadas con las tarifas calibradas contra la factura de ago-2026 (referencia)
+compute_cost_per_job_median,lyric_video,otros,production,0.4305,USD,14,jobs con gasto en sep-2026
+compute_cost_per_job_p90,lyric_video,otros,production,0.8583,USD,14,jobs con gasto en sep-2026
+compute_cost_per_delivered_job_median,lyric_video,otros,production,0.436,USD,8,jobs entregados en sep-2026 (incluye gasto 0 por caché)
+replicate_gpu_minutes_total,lyric_video,otros,production,2.0,min,6,"predict_time de Replicate (whisperx, demucs)"
+compute_cost_total_sep2026,lyric_video,umg,production,16.28,USD,15,precio de lista (no hay calibración de sep-2026)
+compute_cost_total_sep2026_aug_rates,lyric_video,umg,production,20.23,USD,15,mismas llamadas valuadas con las tarifas calibradas contra la factura de ago-2026 (referencia)
+compute_cost_per_job_median,lyric_video,umg,production,0.927,USD,15,jobs con gasto en sep-2026
+compute_cost_per_job_p90,lyric_video,umg,production,1.746,USD,15,jobs con gasto en sep-2026
+compute_cost_per_delivered_job_median,lyric_video,umg,production,0.932,USD,14,jobs entregados en sep-2026 (incluye gasto 0 por caché)
+replicate_gpu_minutes_total,lyric_video,umg,production,15.2,min,10,"predict_time de Replicate (whisperx, demucs)"
+compute_cost_by_tool_sep2026,lyric_video,otros,production,0.04,USD,,cjwbw/demucs
+compute_cost_by_tool_sep2026,lyric_video,otros,production,0.01,USD,,cureau/force-align-wordstamps
+compute_cost_by_tool_sep2026,lyric_video,otros,production,0.15,USD,,gemini-2.5-flash
+compute_cost_by_tool_sep2026,lyric_video,otros,production,0.18,USD,,gemini-2.5-flash-vision
+compute_cost_by_tool_sep2026,lyric_video,otros,production,0.01,USD,,gemini-2.5-flash-vision-image
+compute_cost_by_tool_sep2026,lyric_video,otros,production,0.01,USD,,gpt-4o-mini
+compute_cost_by_tool_sep2026,lyric_video,otros,production,6.0,USD,,veo-3.1-lite-generate-001
+compute_cost_by_tool_sep2026,lyric_video,otros,production,0.12,USD,,victor-upmeet/whisperx
+compute_cost_by_tool_sep2026,lyric_video,otros,production,0.17,USD,,whisper-1
+compute_cost_by_tool_sep2026,lyric_video,otros,production,0.08,USD,,whisper-1-live-independent-verify
+compute_cost_by_tool_sep2026,lyric_video,otros,production,0.01,USD,,whisper-1-live-independent-verify-mix
+compute_cost_by_tool_sep2026,lyric_video,umg,production,0.35,USD,,cjwbw/demucs
+compute_cost_by_tool_sep2026,lyric_video,umg,production,0.01,USD,,cureau/force-align-wordstamps
+compute_cost_by_tool_sep2026,lyric_video,umg,production,0.26,USD,,gemini-2.5-flash
+compute_cost_by_tool_sep2026,lyric_video,umg,production,0.88,USD,,gemini-2.5-flash-vision
+compute_cost_by_tool_sep2026,lyric_video,umg,production,0.02,USD,,gemini-2.5-flash-vision-image
+compute_cost_by_tool_sep2026,lyric_video,umg,production,0.01,USD,,gpt-4o-mini
+compute_cost_by_tool_sep2026,lyric_video,umg,production,14.4,USD,,veo-3.1-lite-generate-001
+compute_cost_by_tool_sep2026,lyric_video,umg,production,0.2,USD,,victor-upmeet/whisperx
+compute_cost_by_tool_sep2026,lyric_video,umg,production,0.14,USD,,whisper-1-live-independent-verify
+compute_cost_by_tool_sep2026,lyric_video,umg,production,0.01,USD,,whisper-1-live-independent-verify-mix
+coverage,,,,registrado,,,"ai_calls_per_job: ai_provenance: una fila por llamada (Veo, Imagen, Gemini, OpenAI, Replicate) con job_id; el costo es llamadas x tarifa (cost_attribution.collect_jobs); los cache hits no se cobran"
+coverage,,,,parcial,,,replicate_gpu_minutes: predict_time_ms solo en producción; en staging es NULL en todas las llamadas de sep-2026 (849 whisperx + 777 demucs)
+coverage,,,,no registrado,,,runpod_gpu_minutes: no hay integración con RunPod en el backend; no existe registro por job
+coverage,,,,no registrado por job,,,"railway_cpu_ram: el alineado CTC (wav2vec2), el render ffmpeg y los workers corren en Railway; solo hay factura mensual (cost_daily / cost_snapshots), sin reparto por job"
+coverage,,,,no registrado por job,,,r2_storage_egress: solo factura mensual; sin reparto por job
+coverage,,,,no existe,,,rate_calibration_sep2026: la última calibración contra factura es de ago-2026; los costos de sep están a precio de lista
+coverage,,,,sin datos,,,"art_track_sep2026: no hubo art tracks aprobados ni con gasto en sep-2026 en ningún entorno; la única campaña art_track (e0945dcca5f2, 115 jobs) es del 2-oct y de un tenant interno"
