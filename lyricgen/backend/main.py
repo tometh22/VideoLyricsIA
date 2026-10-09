@@ -3140,6 +3140,20 @@ def _enforce_plan_quota(
             )
 
 
+def _normalize_lyric_look(value) -> str:
+    """Known lyric look id, or "" (= no look) for anything else."""
+    import lyric_looks
+    look = lyric_looks.get_look(str(value or ""))
+    return look.id if look is not None else ""
+
+
+def _lyric_look_kwargs(value) -> dict:
+    """Pipeline kwargs for a lyric look: empty when none is chosen, so jobs
+    without a look enqueue exactly the kwargs older workers accept."""
+    look_id = _normalize_lyric_look(value)
+    return {"lyric_look": look_id} if look_id else {}
+
+
 def _commit_pipeline_publication(
     db: Session,
     job,
@@ -5073,6 +5087,8 @@ class _GeneratePreviewReq(BaseModel):
     background_mode: str = Field(default="veo", max_length=16)
     animate_image: bool = False
     match_lyrics: bool = True
+    # Lyric look: only looks with background guidance change the key.
+    lyric_look: str = Field(default="", max_length=16)
     target_duration_s: float = Field(default=30.0, ge=5, le=600)
     # v6 (2026-07-17): con match_lyrics el prompt del fondo depende de la
     # LETRA — sin ella el preview generaba ciego al texto y el render podía
@@ -5331,6 +5347,8 @@ async def upload(
     text_motion: str = Form("none", max_length=16),
     lyrics_animation: str = Form("none", max_length=16),
     line_transition: str = Form("none", max_length=16),
+    # Lyric look (lyric_looks.LOOKS id, "" = none). Unknown ids → "".
+    lyric_look: str = Form("", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
     # Lyric text colors 2026-05-25. Hex `#RRGGBB` (7 chars), invalid input
     # normalized to "" by the call site so build_ass falls back to defaults.
@@ -5536,6 +5554,9 @@ async def upload(
         text_motion="none",
         lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
         line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
+        # Forwarded ONLY when a look is chosen: a queued job without one keeps
+        # the exact kwargs an older worker understands during a deploy.
+        **_lyric_look_kwargs(lyric_look),
         # Lyric text colors 2026-05-25. Hex #RRGGBB validado acá; cualquier
         # otro valor se normaliza a "" (= backend usa blanco default en
         # build_ass). Para karaoke: lyric_color = palabra no cantada,
@@ -10559,6 +10580,8 @@ async def generate_with_segments(
     text_motion: str = Form("none", max_length=16),
     lyrics_animation: str = Form("none", max_length=16),
     line_transition: str = Form("none", max_length=16),
+    # Lyric look (lyric_looks.LOOKS id, "" = none). Unknown ids → "".
+    lyric_look: str = Form("", max_length=16),
     text_contrast: str = Form("medium", max_length=16),
     # Lyric text colors 2026-05-25. Hex `#RRGGBB` (7 chars), invalid input
     # normalized to "" by the call site so build_ass falls back to defaults.
@@ -10635,6 +10658,7 @@ async def generate_with_segments(
         text_case = _profile_fields["text_case"]
         font_scale = str(_profile_fields["font_scale"])
         line_transition = _profile_fields["line_transition"]
+        lyric_look = _profile_fields.get("lyric_look", "")
         if _render_profile.get("background_id") is not None:
             background_id = _render_profile["background_id"]
     reuse = bool(job_id)
@@ -11335,6 +11359,7 @@ async def generate_with_segments(
                 concept=concept,
                 background_hint=(background_hint.strip() or None),
                 bg_verbatim=bg_verbatim, match_lyrics=match_lyrics,
+                lyric_look=_normalize_lyric_look(lyric_look),
             )
         except Exception as _recompute_err:
             logger.warning(
@@ -11422,6 +11447,9 @@ async def generate_with_segments(
         text_motion="none",
         lyrics_animation=lyrics_animation if lyrics_animation in ("none", "karaoke", "word_reveal", "pop", "glow") else "none",
         line_transition=line_transition if line_transition in ("none", "slide_up", "slide_side", "wipe", "dissolve_blur") else "none",
+        # Forwarded ONLY when a look is chosen: a queued job without one keeps
+        # the exact kwargs an older worker understands during a deploy.
+        **_lyric_look_kwargs(lyric_look),
         # Lyric text colors 2026-05-25. Hex #RRGGBB validado acá; cualquier
         # otro valor se normaliza a "" (= backend usa blanco default en
         # build_ass). Para karaoke: lyric_color = palabra no cantada,
@@ -12902,6 +12930,8 @@ class EditJobRequest(BaseModel):
     effect: str | None = Field(default=None, max_length=32)
     lyrics_animation: str | None = Field(default=None, max_length=16)
     line_transition: str | None = Field(default=None, max_length=16)
+    # Lyric look id (lyric_looks.LOOKS); "" = quitar el look, None = no cambia.
+    lyric_look: str | None = Field(default=None, max_length=16)
     # Explicit ack that the caller understands re-syncing lyrics on a job
     # already published to YouTube will update R2 but NOT replace the
     # YouTube video file (the YouTube API doesn't allow file replacement,
@@ -14037,6 +14067,41 @@ def get_waveform(
     return payload
 
 
+@app.get("/jobs/{job_id}/beats")
+def get_beats(
+    job_id: str,
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Beat times of the source audio, for lyric-look previews that pulse on
+    the beat. Returns {"bpm": float, "beats": [seconds...]}; cached to R2 next
+    to the waveform. Same auth model as /waveform."""
+    from database import Job as JobModel
+    from waveform_compute import compute_and_cache_beats
+
+    job_query = db.query(JobModel).filter(JobModel.job_id == job_id)
+    if current_user.get("role") != "admin":
+        job_query = job_query.filter(
+            JobModel.tenant_id == current_user["tenant_id"],
+        )
+    job = job_query.first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    _audit_cross_tenant_access(db, current_user, job, "beats")
+    if not job.input_r2_key:
+        raise HTTPException(
+            status_code=404, detail="Source audio is not available for this job."
+        )
+    if not storage.is_enabled():
+        raise HTTPException(status_code=503, detail="Object storage is unavailable.")
+    payload = compute_and_cache_beats(job.job_id, job.input_r2_key)
+    if payload is None:
+        raise HTTPException(status_code=422, detail="No se pudieron detectar los beats.")
+    response.headers["Cache-Control"] = "private, max-age=86400"
+    return payload
+
+
 class EditorPatchRequest(BaseModel):
     base_revision: int
     segments: list[dict]
@@ -14202,6 +14267,20 @@ class ProductEventsRequest(BaseModel):
     events: list[ProductEventItem]
 
 
+def _editor_scoped_job(db: Session, job_id: str, current_user: dict):
+    """El Job que el editor deja abrir a este usuario (o None).
+
+    Un único lugar para el alcance del editor: el admin de plataforma abre
+    canciones de cualquier tenant (acceso cruzado auditado en los flujos de
+    revisión); un usuario común queda aislado en su tenant. La telemetría del
+    editor (/analytics/events) usa esta misma función para que un evento se
+    acepte exactamente cuando el editor habría abierto la canción.
+    """
+    if current_user.get("role") == "admin":
+        return db.query(Job).filter(Job.job_id == job_id).first()
+    return get_job_for_tenant(db, job_id, current_user["tenant_id"])
+
+
 def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
     # Keep rollback effective: production tenants outside the canary cannot
     # mutate the durable editor by calling the API directly.
@@ -14214,10 +14293,7 @@ def _editor_document_or_404(db: Session, job_id: str, current_user: dict):
     # returned 404.  The frontend then waited forever for durable hydration
     # and kept "Aprobar" disabled.  Resolve the same Job the surrounding
     # review flow authorises, while keeping regular users tenant-isolated.
-    if current_user.get("role") == "admin":
-        job = db.query(Job).filter(Job.job_id == job_id).first()
-    else:
-        job = get_job_for_tenant(db, job_id, current_user["tenant_id"])
+    job = _editor_scoped_job(db, job_id, current_user)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     try:
@@ -15133,7 +15209,7 @@ _PRODUCT_EVENT_NAMES = {
     "editor_help_opened", "editor_operator_suggestions_shown",
     "editor_operator_suggestion_decision", "editor_audio_playback_failed",
     "editor_reviewer_candidate", "editor_auto_repair_undone",
-    "editor_line_structure_changed",
+    "editor_line_structure_changed", "editor_audio_played",
 }
 
 # Ventana de /admin/product-metrics. Sin esto la única acotación era
@@ -15151,6 +15227,12 @@ _PRODUCT_EVENT_PROPERTIES = {
     "editor_line_structure_changed": {
         "structure_op", "trigger", "count", "words_count", "stale_words_count",
         "one_side_count", "no_words_count", "duration_ms",
+    },
+    # Tramos del audio que sonaron de verdad (pares [inicio_ms, fin_ms]
+    # acotados, validados en product_telemetry.valid_played_ranges).
+    "editor_audio_played": {
+        "ranges", "played_ms", "playback_rate", "audio_duration_ms",
+        "flush_reason",
     },
     "editor_opened": {"line_count", "view", "source"},
     "editor_view_changed": {"from", "to"},
@@ -15193,7 +15275,10 @@ _PRODUCT_EVENT_PROPERTIES = {
     },
 }
 _PRODUCT_EVENT_COMMON_PROPERTIES = {"session_id"}
-from product_telemetry import valid_property as _valid_product_event_property
+from product_telemetry import (
+    resolve_occurred_at as _resolve_product_event_occurred_at,
+    valid_property as _valid_product_event_property,
+)
 
 
 @app.post("/analytics/events")
@@ -15208,14 +15293,18 @@ async def record_product_events(
         raise HTTPException(status_code=422, detail="A maximum of 50 events is accepted per batch.")
     accepted = 0
     rejected = 0
+    received_at = datetime.now(timezone.utc)
     for item in body.events:
         if item.name not in _PRODUCT_EVENT_NAMES:
             rejected += 1
             continue
-        event_job = (
-            get_job_for_tenant(db, item.job_id, current_user["tenant_id"])
-            if item.job_id else None
-        )
+        # Mismo alcance que el editor (_editor_document_or_404): el admin de
+        # plataforma revisa canciones de otros tenants. Con el lookup sólo
+        # por tenant, TODOS sus eventos del editor sobre esas canciones se
+        # descartaban en silencio (agus77 desde el 7-sep: 0 seeks, 0 aperturas
+        # y 0 aprobaciones registradas mientras los heartbeats sí llegaban).
+        # La fila sigue guardándose con el tenant del usuario, como el heartbeat.
+        event_job = _editor_scoped_job(db, item.job_id, current_user) if item.job_id else None
         if item.job_id and not event_job:
             rejected += 1
             continue
@@ -15252,12 +15341,10 @@ async def record_product_events(
                 for reason in (event_quality.get("reasons") or [])
                 if isinstance(reason, dict) and reason.get("code")
             )[:500]
-        occurred_at = None
-        if item.occurred_at:
-            try:
-                occurred_at = datetime.fromisoformat(item.occurred_at.replace("Z", "+00:00"))
-            except ValueError:
-                occurred_at = None
+        # Antes el cliente nunca mandaba occurred_at y quedaba NULL. Ahora
+        # viene del navegador; sin él (clientes viejos) o si es implausible,
+        # vale la hora de llegada.
+        occurred_at = _resolve_product_event_occurred_at(item.occurred_at, received_at)
         db.add(ProductEvent(
             tenant_id=current_user["tenant_id"], user_id=current_user["id"],
             job_id=item.job_id, name=item.name, occurred_at=occurred_at,
@@ -17918,6 +18005,12 @@ def request_edit(
         _rp = dict(job.render_params or {})
         _rp["line_transition"] = _lt
         job.render_params = _rp
+    if body.lyric_look is not None:
+        _look = _normalize_lyric_look(body.lyric_look)
+        edit_params["lyric_look"] = _look
+        _rp = dict(job.render_params or {})
+        _rp["lyric_look"] = _look
+        job.render_params = _rp
     if body.edit_type == "lyrics":
         # Lyrics path keeps explicit edit_params hand-off so the worker
         # doesn't re-query the DB for segments it already received in
@@ -19003,6 +19096,8 @@ async def retry_job(
               # Reintentar, animations silently reset to "none" because they
               # weren't in this whitelist when the feature was wired (#357a1a5).
               "lyrics_animation", "line_transition",
+              # Lyric look — heredable (vacío = sin look, no se propaga).
+              "lyric_look",
               # Lyric text colors 2026-05-25 — heredables igual que
               # custom_colors, así los re-renders/variantes mantienen el
               # color elegido por el operador.
@@ -19335,6 +19430,8 @@ class VariantJobRequest(BaseModel):
     effect: str | None = Field(default=None, max_length=32)
     lyrics_animation: str | None = Field(default=None, max_length=16)
     line_transition: str | None = Field(default=None, max_length=16)
+    # Lyric look id (lyric_looks.LOOKS); "" = quitar el look, None = no cambia.
+    lyric_look: str | None = Field(default=None, max_length=16)
     # ── Tipografía (espejo de EditJobRequest) ────────────────────────────
     font: str | None = Field(default=None, max_length=64)
     font_scale: float | None = None
@@ -19396,6 +19493,7 @@ _VARIANT_OVERRIDABLE_FIELDS = (
     "effect",
     "lyrics_animation",
     "line_transition",
+    "lyric_look",
     # Tipografía
     "font",
     "font_scale",
@@ -19677,6 +19775,8 @@ async def create_variant(
         # persiste CANÓNICO, nunca crudo.
         if _field == "movement_style":
             _value = _normalize_movement_style(_value or "")
+        if _field == "lyric_look":
+            _value = _normalize_lyric_look(_value)
         new_render_params[_field] = _value
         _overridden_fields.append(_field)
     new_render_params = _merge_content_validation_choice(
@@ -19864,6 +19964,10 @@ async def create_variant(
             continue
         if k in new_render_params:
             pipeline_kwargs[k] = new_render_params[k]
+    # Sin look → no se manda la kwarg (compat con workers previos al campo).
+    _variant_look = _normalize_lyric_look(pipeline_kwargs.pop("lyric_look", ""))
+    if _variant_look:
+        pipeline_kwargs["lyric_look"] = _variant_look
     # background_hint: None/"" (nunca seteado, o clear explícito del
     # operador) → run_pipeline lo recibe como None y _ensure_background
     # sigue el flow default (PR #116, system prompt desbiaseado). Un ""
@@ -20433,6 +20537,10 @@ class SendToUMGRequest(BaseModel):
     change_request_id: int | None = Field(default=None, ge=1)
     reviewed_render_fingerprint: str | None = Field(default=None, max_length=64)
     reviewed_editor_revision: int | None = Field(default=None, ge=0)
+    # CHANGE_REQUEST_PUBLISH_GUARD_ENABLED: publicar aunque haya pedidos
+    # abiertos más nuevos que la versión aprobada. Exige motivo; se audita.
+    publish_anyway: bool = False
+    override_reason: str | None = Field(default=None, max_length=1000)
 
 
 @app.post("/admin/deliveries/from-job/{job_id}")
@@ -20513,6 +20621,29 @@ def admin_create_delivery_from_job(
             status_code=400,
             detail="Job must be approved (status=done) before it can be published",
         )
+
+    # Regla de versión: no re-publicar una letra aprobada ANTES de un pedido
+    # de cambio que sigue abierto en esta canción (linaje incluido).
+    import change_request_publish_guard as _cr_guard
+    _guard_override = None
+    if _cr_guard.enabled():
+        try:
+            _guard = _cr_guard.evaluate(db, ddb, [job]).get(job_id) or {}
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail={
+                'code': 'change_request_guard_unavailable',
+                'message': 'No pudimos consultar los pedidos del cliente en el portal. No se publicó nada; reintentá.',
+            }) from exc
+        if _guard.get("blocked"):
+            _reason = ((body.override_reason if body else None) or "").strip()
+            if not (body and body.publish_anyway):
+                raise HTTPException(status_code=409, detail=_cr_guard.blocked_detail(job, _guard))
+            if not _reason:
+                raise HTTPException(status_code=422, detail={
+                    "code": "override_reason_required",
+                    "message": "Para publicar igual con pedidos abiertos, escribí el motivo.",
+                })
+            _guard_override = (_guard, _reason)
 
     # UMG has its own contractual preflight even when the general QC rollout
     # is observe/off. Check before storage calls or ProRes queue work.
@@ -20748,6 +20879,7 @@ def admin_create_delivery_from_job(
     # from campaign/history alone cannot attest every pending instruction.
     resolved_requests = []
     resolved_comments: list[str] = []
+    kept_open_requests: list[dict] = []
     if content_changed and body and body.change_request_id:
         pending_requests = (
             ddb.query(DeliveryChangeRequest)
@@ -20764,6 +20896,13 @@ def admin_create_delivery_from_job(
             # Recheck after copying/locking: a newly submitted request or a
             # different case was never reviewed by this publication intent.
             validate_reviewed_cut()
+            # Un pedido de texto cuyo texto no está en la letra publicada
+            # queda abierto. La publicación sigue igual.
+            if _cr_guard.enabled():
+                _closable, _kept = _cr_guard.text_gate(db, job, [request], now)
+                if _kept:
+                    kept_open_requests.extend(_kept)
+                    continue
             request.resolved_at = now
             request.updated_at = now
             request.resolved_by_user_id = added_by
@@ -20809,8 +20948,19 @@ def admin_create_delivery_from_job(
             ),
             "replaced_job_id": replaced_job_id,
             "previous_publication": previous_publication,
+            "kept_open_change_requests": [entry["id"] for entry in kept_open_requests],
+            "change_request_guard_override": bool(_guard_override),
         },
     ))
+    if _guard_override is not None:
+        db.add(_cr_guard.override_audit(
+            current_user["id"], job, _guard_override[0], _guard_override[1], "admin_publish",
+            portal_id=portal_id, delivery_id=delivery.id,
+        ))
+    for _kept in kept_open_requests:
+        db.add(_cr_guard.text_not_found_audit(
+            current_user["id"], job, _kept, "admin_publish", delivery_id=delivery.id,
+        ))
     db.commit()
 
     # Optional mail to UMG: only for a visible publication that answered client requests, and
@@ -20839,6 +20989,9 @@ def admin_create_delivery_from_job(
         "revision": delivery.published_revision,
         "content_changed": content_changed,
         "resolved_change_requests": resolved_requests,
+        # Pedidos que esta publicación NO cerró: el texto pedido no está en
+        # la letra publicada (CHANGE_REQUEST_PUBLISH_GUARD_ENABLED).
+        "kept_open_change_requests": kept_open_requests,
         "replaced_job_id": replaced_job_id,
         # A manually hidden delivery stays hidden after publishing: say so, so the
         # operator is never told "the client has it" when the portal shows nothing.
@@ -22343,6 +22496,22 @@ def admin_confirm_change_request_publication(cr_id: int, body: ConfirmPublicatio
     if (body.reviewed_render_fingerprint != delivery_freshness.render_fingerprint(job)
             or body.reviewed_editor_revision != int(document.revision or 0)):
         raise HTTPException(status_code=409, detail='El corte cambió. Revisá el video actualizado antes de cerrar.')
+    import change_request_publish_guard as _cr_guard
+    if _cr_guard.enabled():
+        # "Resuelto al publicar" exige que el texto pedido esté en la letra
+        # publicada. Si falta, el pedido sigue abierto; cerrarlo a mano con un
+        # motivo sigue disponible.
+        _closable, _kept = _cr_guard.text_gate(db, job, [cr])
+        if _kept:
+            db.add(_cr_guard.text_not_found_audit(
+                current_user['id'], job, _kept[0], 'publication_confirmed', delivery_id=delivery.id,
+            ))
+            db.commit()
+            raise HTTPException(status_code=409, detail={
+                'code': _cr_guard.TEXT_NOT_FOUND, 'missing': _kept[0]['missing'],
+                'message': 'La letra publicada no tiene el texto pedido: ' + ' · '.join(
+                    f'«{text}»' for text in _kept[0]['missing'][:5]) + '. Corregí y volvé a publicar.',
+            })
     now = datetime.now(timezone.utc)
     revision = delivery.published_revision or 1
     note = body.resolution_note.strip()

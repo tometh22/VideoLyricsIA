@@ -226,6 +226,20 @@ it.each([undefined, 502])("reports uncertain publication after lost response/sta
   expect(mocks.fetchJson.mock.calls.filter(([, options]) => options?.method === "POST")).toHaveLength(1);
 });
 
+it("says which request stayed open because its text is not in the published lyrics", async () => {
+  const previous = mocks.fetchJson.getMockImplementation();
+  mocks.fetchJson.mockImplementation((url, opts) => url.includes("/deliveries/from-job/")
+    ? Promise.resolve({ ok: true, content_changed: true, revision: 3, portal_id: "chile", job_id: "job-85",
+      resolved_change_requests: [], kept_open_change_requests: [{ id: 85, reason: "requested_text_not_found",
+        missing: ["Pintamos el mono, pero NOS DA lo mismo"] }] })
+    : previous(url, opts));
+  const { result } = renderHook(() => useChangeRequests());
+  await act(() => result.current.publishDeliveryUpdate("job-85", "chile", 85, { editor_revision: 4, render_fingerprint: "render4" }));
+  expect(result.current.crPublishNotice).toMatchObject({ requestId: 85, tone: "ok" });
+  expect(result.current.crPublishNotice.text).toContain("Publicada la versión 3");
+  expect(result.current.crPublishNotice.text).toContain("El pedido #85 sigue abierto: la letra publicada no tiene «Pintamos el mono, pero NOS DA lo mismo».");
+});
+
 it("confirms a lost publication response from the request's publication resolution", async () => {
   const previous = mocks.fetchJson.getMockImplementation();
   mocks.fetchJson.mockImplementation((url, opts) => url.includes("/deliveries/from-job/")

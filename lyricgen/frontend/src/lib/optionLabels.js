@@ -12,6 +12,8 @@
 // Son funciones de `t` en vez de constantes porque i18n es un hook: el valor
 // depende del idioma activo.
 
+import { LYRIC_LOOK_LABELS } from "./lyricLooks.js";
+
 /** code → etiqueta de Movimiento. "" (Auto) incluido. */
 export const MOVEMENT_LABELS = (t) => ({
   "": t("upload.movement_auto") || "Auto",
@@ -105,6 +107,8 @@ export const AXIS_VALUE_LABELS = (t) => ({
     wipe: t("upload.trans_wipe") || "Wipe",
     dissolve_blur: t("upload.trans_blur") || "Disolvencia",
   },
+  // Look de letra: mismo catálogo que el picker (lib/lyricLooks).
+  lyric_look: LYRIC_LOOK_LABELS(t),
   title_template: {
     auto: t("upload.titlecard_auto") || "Auto",
     centered: t("upload.titlecard_centered") || "Centrada",
