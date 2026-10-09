@@ -201,3 +201,36 @@ def test_neon_sign_frame_never_fills_its_box():
                            duration=4.0, beats=[1.0, 2.0, 3.0])
     frames = [d for d in _dialogues(doc) if "\\p1" in d]
     assert frames and all("\\alpha" not in d.split("\\p1")[0] for d in frames)
+
+
+def test_looks_that_paint_their_own_frame_skip_the_background():
+    assert L.owns_background("cinetico") and L.owns_background("pop70")
+    assert L.owns_background("degrade")
+    assert not L.owns_background("cine") and not L.owns_background("")
+
+
+def test_background_prompt_is_steered_by_the_look():
+    import pipeline
+    base = "A quiet harbour at dusk."
+    assert pipeline._steer_prompt_for_look(base, "") == base
+    assert pipeline._steer_prompt_for_look(base, "pop70") == base      # no hint
+    arco = pipeline._steer_prompt_for_look(base, "arco")
+    assert arco.startswith(base) and "empty centre" in arco
+    assert "night" not in pipeline._steer_prompt_for_look(base, "neon")
+
+
+def test_look_beats_are_rebased_to_the_short_window(monkeypatch):
+    import pipeline, beat_snap
+    monkeypatch.setattr(beat_snap, "detect_beats", lambda p: (120.0, [1.0, 30.5, 31.0]))
+    assert pipeline._look_beats(L.LOOKS["neon"], "song.wav", offset=30.0) == [0.5, 1.0]
+    assert pipeline._look_beats(L.LOOKS["cine"], "song.wav") == []    # no beat_sync
+    monkeypatch.setattr(beat_snap, "detect_beats", lambda p: None)
+    assert pipeline._look_beats(L.LOOKS["neon"], "song.wav") == []
+
+
+def test_every_look_font_is_discoverable_by_libass():
+    import ass_render
+    for look in L.LOOKS.values():
+        for path in L.font_paths(look):
+            family, _bold = ass_render.font_family(path)
+            assert family and os.path.exists(path), path

@@ -162,8 +162,8 @@ LOOKS: dict[str, Look] = {
         primary="#FFF4FA", outline=0, shadow=0, font_scale=1.9,
         line_colors=("#FF3EA5", "#2EE6FF", "#B07BFF", "#FFB13B"),
         grade="eq=brightness=-0.20:saturation=0.70:contrast=1.08,vignette=angle=PI/4",
-        bg_hint="night scene, dark and moody, low-key lighting, deep shadows, "
-                "large dark empty area in the centre",
+        bg_hint="low-key exposure, deep shadows and dark negative space in the "
+                "centre of the frame so glowing tubes read clearly",
     ),
     # Ed Sheeran "Shape of You" phone: every line arrives as a message bubble
     # and the conversation scrolls up. Built for vertical shorts.
@@ -272,6 +272,13 @@ LOOKS: dict[str, Look] = {
 
 def get_look(look_id: str | None) -> Look | None:
     return LOOKS.get((look_id or "").strip().lower())
+
+
+def owns_background(look_id: str | None) -> bool:
+    """True when the look paints the whole frame itself (flat cards or a
+    gradient), so a generated background would never be seen."""
+    look = get_look(look_id)
+    return look is not None and look.background in ("flat", "gradient")
 
 
 def font_path(look: Look) -> str:

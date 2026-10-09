@@ -1704,11 +1704,14 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
             # (_scenes_active → bg_prelooped=True). Si algo falla, log + caemos al
             # fondo único de _ensure_background (no rompemos el job).
             _scenes_active = False
+            import lyric_looks as _looks_bg
             if (
                 bg_image_path is None
                 and enable_scenes
                 and not _animate_user_image
                 and not _live_photo_effect
+                # A look that paints its own frame hides every scene.
+                and not _looks_bg.owns_background(lyric_look)
             ):
                 try:
                     update_job(job_id, current_step="scenes", progress=22)
@@ -1769,6 +1772,27 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                     logger.error("[SCENES] multi-escena falló para job=%s (%s) — "
                                  "fallback a fondo único", job_id, e)
                     _scenes_active = False
+            # Looks that paint their own background (Cinético / Pop 70s / Degradé
+            # draw full-frame cards or a gradient in the ASS layer) would hide a
+            # generated one completely: don't pay a provider for it. The local
+            # gradient keeps the render pipeline and the background cache
+            # contract intact; switching later to a look that shows the
+            # background is an explicit "regenerate background" edit.
+            if bg_image_path is None and not _scenes_active:
+                _bg_look = _looks_bg.get_look(lyric_look)
+                if _looks_bg.owns_background(lyric_look):
+                    bg_image_path = _write_safe_gradient_background(
+                        job_dir, style, filename="bg_look_owned.mp4",
+                    )
+                    _background_is_ai_generated = False
+                    logger.info("[BG] look=%s paints its own background — "
+                                "no provider call for job=%s", _bg_look.id, job_id)
+                    try:
+                        from jobs import merge_render_params as _merge_rp_look
+                        _merge_rp_look(job_id, {"background_owned_by_look": _bg_look.id})
+                    except Exception as _rp_look_exc:  # noqa: BLE001
+                        logger.warning("[BG] could not persist look-owned bg: %s",
+                                       _rp_look_exc)
             if bg_image_path is None:
                 try:
                     bg_image_path = _ensure_background(
@@ -1785,6 +1809,7 @@ def run_pipeline(job_id: str, mp3_path: str, artist: str, style: str,
                         allow_people=_compute_allow_people(job_id, background_hint),
                         audio_duration=_audio_dur_for_kb,
                         out_meta=_bg_drift_meta,
+                        lyric_look=lyric_look,
                     )
                 except RQJobTimeoutException:
                     raise
@@ -14034,6 +14059,23 @@ def _score_video_relevance(
                 pass
 
 
+def _steer_prompt_for_look(prompt: str, lyric_look: str) -> str:
+    """Append the lyric look's background guidance (Look.bg_hint) so the
+    generated scene suits the typography that will sit on it — e.g. an empty
+    centre for Arco, a visible floor for Perspectiva, low-key light for Neón.
+    Phrased as composition/grading guidance, never as a new subject. No-op
+    without a look or for looks without guidance."""
+    if not lyric_look:
+        return prompt
+    import lyric_looks
+    look = lyric_looks.get_look(lyric_look)
+    if look is None or not look.bg_hint:
+        return prompt
+    return (prompt.rstrip()
+            + " Composition and lighting guidance for the lyric typography that"
+            " will be overlaid: " + look.bg_hint.strip().rstrip(".") + ".")
+
+
 def _darken_prompt_for_effect(prompt: str, effect: str) -> str:
     """Bias an Imagen scene prompt toward a LOW-KEY / dark canvas when a
     luminous particle effect (stars / bokeh / snow / light / ...) will be
@@ -15221,7 +15263,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
                        atmospherics_policy: dict | None = None,
                        audio_duration: float | None = None,
                        generation_nonce: str = "",
-                       out_meta: dict | None = None) -> str:
+                       out_meta: dict | None = None,
+                       lyric_look: str = "") -> str:
     """Generate background using AI. Gemini picks the best style for the song.
 
     background_hint: optional free-form operator description, set via /edit
@@ -15414,7 +15457,9 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
         # path's _is_verbatim is computed, so we check it inline here).
         _verbatim_bg = bool(bg_verbatim and background_hint and background_hint.strip())
         prompt = (result["prompt"] if _verbatim_bg
-                  else _darken_prompt_for_effect(result["prompt"], _operator_effect))
+                  else _steer_prompt_for_look(
+                      _darken_prompt_for_effect(result["prompt"], _operator_effect),
+                      lyric_look))
         image_path = os.path.join(job_dir, "bg_imagen.jpg")
         bg_path = os.path.join(job_dir, "bg_generated.mp4")
         # A1 (2026-05-25) — foto-parallax era el único register que el
@@ -15539,6 +15584,8 @@ def _ensure_background(style_hint: str, job_dir: str, lyrics_text: str = None,
             anchors=_lyric_anchors_data,
         )
         prompt = result["prompt"]
+        if not _is_verbatim:
+            prompt = _steer_prompt_for_look(prompt, lyric_look)
         _song_negatives = result.get("negatives")
         _anchor_cov = result.get("anchor_coverage")
 
@@ -18693,6 +18740,25 @@ def _validate_rendered_mp4(path: str, expected_dur: float) -> None:
             raise RuntimeError("rendered mp4 lacks faststart (moov not at front)")
 
 
+def _look_beats(look, audio_path: str, offset: float = 0.0) -> list[float]:
+    """Beat times for a look that kicks/blinks on the beat (Look.beat_sync).
+
+    Best-effort: a look without beats simply doesn't pulse, so any detection
+    failure returns [] instead of failing the render. `offset` re-bases the
+    times onto a window (the short starts at the chorus)."""
+    if look is None or not getattr(look, "beat_sync", False) or not audio_path:
+        return []
+    try:
+        import beat_snap
+        found = beat_snap.detect_beats(audio_path)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("[ASS] look beat detection failed: %s", exc)
+        return []
+    if not found:
+        return []
+    return [b - offset for b in found[1] if b - offset >= 0]
+
+
 def _render_lyrics_ass(
     bg_video_path: str,
     mp3_path: str,
@@ -18818,6 +18884,9 @@ def _render_lyrics_ass(
         artist_family, _ = _ass.font_family(extrabold_font)
         font_dir = _ass.multi_font_dir(
             [font_path, extrabold_font, title_artist_path, title_song_path]
+            # Looks that switch faces mid-line (script connectors, light
+            # rows, neon script) need every one of their fonts in fontsdir.
+            + (_looks.font_paths(look)[1:] if look is not None else [])
         )
 
         # 3) Segments → ASS lines (same case/sanitise/sizing as moviepy), plus
@@ -18884,6 +18953,7 @@ def _render_lyrics_ass(
                 font_scale=font_scale,
                 primary_override=lyric_color or "",
                 title_lines=title_lines,
+                beats=_look_beats(look, mp3_path),
             )
         else:
             ass_doc = _ass.build_ass(
@@ -19889,6 +19959,7 @@ def _build_short_ass_doc(
     lyrics_animation: str,
     line_transition: str,
     lyric_look: str = "",
+    beats: list[float] | None = None,
 ) -> str:
     """Documento ASS del short (1080x1920) con EXACTAMENTE las mismas
     derivaciones de estilo que _render_lyrics_ass usa para el video
@@ -19921,6 +19992,7 @@ def _build_short_ass_doc(
             duration=max((s["end"] for s in clean_segments), default=0.0),
             case_fn=lambda t: _apply_case(t, text_case),
             font_scale=font_scale, primary_override=lyric_color or "",
+            beats=beats,
         )
     lines = _ass.segments_to_lines(
         clean_segments,
@@ -19965,6 +20037,7 @@ def _burn_short_text_ass(
     lyrics_animation: str,
     line_transition: str,
     lyric_look: str = "",
+    beats: list[float] | None = None,
 ) -> tuple[str | None, str | None]:
     """Quema la letra del short con LIBASS — el MISMO motor del video.
 
@@ -19996,9 +20069,8 @@ def _burn_short_text_ass(
 
     try:
         _look = _looks.get_look(lyric_look)
-        font_dir = _ass.single_font_dir(
-            _looks.font_path(_look) if _look is not None else font_path
-        )
+        font_dir = (_ass.multi_font_dir(_looks.font_paths(_look)) if _look is not None
+                    else _ass.single_font_dir(font_path))
         ass_doc = _build_short_ass_doc(
             window_segments,
             font_path=font_path,
@@ -20006,7 +20078,7 @@ def _burn_short_text_ass(
             lyric_color=lyric_color, lyric_sung_color=lyric_sung_color,
             text_contrast=text_contrast,
             lyrics_animation=lyrics_animation, line_transition=line_transition,
-            lyric_look=lyric_look,
+            lyric_look=lyric_look, beats=beats,
         )
         # The look's grade goes in the same pass, before the text burn.
         _grade = f"{_look.grade}," if (_look is not None and _look.grade) else ""
@@ -20546,6 +20618,9 @@ def generate_short(
         text_contrast=text_contrast,
         lyrics_animation=lyrics_animation, line_transition=line_transition,
         lyric_look=lyric_look,
+        # Window segments are re-based to the chorus start; re-base the
+        # song's beats the same way.
+        beats=_look_beats(_short_look, mp3_path, offset=start_time),
     )
     if burned:
         os.replace(burned, out_path)
@@ -21333,6 +21408,7 @@ def run_edit_pipeline(
                     effect=effect,
                     match_lyrics=effective_match_lyrics,
                     allow_people=_compute_allow_people(job_id, effective_background_hint),
+                    lyric_look=lyric_look,
                 )
             except Exception as _background_generation_error:
                 _raise_if_job_timeout(_background_generation_error)
