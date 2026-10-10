@@ -1,0 +1,25 @@
+source,concept,period_covered,usd,basis,is_estimate,genly,note
+gcp,Veo 3.1 Lite,2026-09,53.64,factura (export de billing en BigQuery),no,sí,"Vertex AI, proyecto gen-lang-client-0900526123"
+gcp,"Gemini 2.5 (Flash y Pro, todas las SKU)",2026-09,24.96,factura (export de billing en BigQuery),no,sí,
+gcp,total,2026-09,78.6,factura (export de billing en BigQuery),no,sí,BigQuery y Cloud Logging en 0
+openai,whisper (todas las variantes),2026-09,10.88,API de costos de la organización,no,sí,"~13.960 llamadas registradas en ai_provenance → ~US$0,0008 por llamada"
+openai,gpt-4o-mini,2026-09,0.03,API de costos de la organización,no,sí,
+openai,total Genly,2026-09,10.91,API de costos de la organización,no,sí,filtrado a los modelos que usa Genly
+openai,"otros proyectos de la organización (gpt-5, web search, gpt-image, etc.)",2026-09,179.94,API de costos de la organización,no,no,no son de Genly; se excluyen
+replicate,"demucs (792 corridas, 35.206 s)",2026-09,7.92,"segundos de cómputo de la API × tarifa mezclada US$0,000225/s",sí,sí,Replicate no expone el importe facturado
+replicate,"force-align-wordstamps (102 corridas, 6.493 s)",2026-09,1.46,segundos × tarifa mezclada,sí,sí,
+replicate,"whisperx (923 corridas, 4.744 s)",2026-09,1.07,segundos × tarifa mezclada,sí,sí,
+replicate,total,2026-09,10.45,segundos × tarifa mezclada,sí,sí,
+r2,almacenamiento (3.704 GB promedio),2026-09,55.4,uso de la API de Cloudflare × precio de lista,sí,sí,operaciones clase A y B dentro de la franquicia (US$0)
+railway,factura ciclo 20-ago → 20-sep (pagada),2026-08-20/2026-09-20,353.19,factura de Railway (API GraphQL),no,sí,"líneas: plan Pro 20,00 (incluye 20 de uso) + memoria 228,05 + egress 92,87 + CPU 30,04 + volumen 2,22"
+railway,"ciclo 20-sep → 20-oct, consumo al 9-oct",2026-09-20/2026-10-09,202.46,currentUsage de la API de Railway,sí,sí,"ciclo abierto, todavía sin factura"
+railway,"septiembre calendario, estimado por uso",2026-09,377.76,métricas de uso × tarifas publicadas (billing_sources.fetch_railway),sí,sí,"memoria 274,98 + egress 69,55 + CPU 30,47 + disco 2,11 + backups 0,66; sin descontar los 20 incluidos"
+railway,"septiembre calendario, prorrateado de las facturas",2026-09,334.5,"353,19 × 20/31 + 202,46 × 10/19",sí,sí,aproximación por días; rango razonable 334–378
+railway,workspace personal (7 proyectos de Epical/Mind/HBO),2026-09-01/2026-10-01,37.08,factura de Railway,no,no,no es Genly; se excluye
+fixed,Vercel Pro,2026-09,20.0,"suscripción configurada (FIXED_SUBSCRIPTIONS_JSON), no consultada por API",no,sí,
+fixed,GitHub Pro,2026-09,4.0,"suscripción configurada, no consultada por API",no,sí,
+github_actions,minutos de Actions,2026-09,,no configurado (falta GITHUB_BILLING_TOKEN),,sí,sin dato
+runpod,GPU,2026-09,,sin integración,,,no hay registro de RunPod en el sistema
+total_genly,IA (GCP + OpenAI Genly + Replicate),2026-09,99.96,suma de las filas anteriores,parcial,sí,
+total_genly,infraestructura (Railway prorrateado + R2 + fijos),2026-09,413.9,"334,5 + 55,4 + 24",sí,sí,"con Railway estimado por uso sería 457,2"
+total_genly,total septiembre,2026-09,513.86,IA + infraestructura,sí,sí,rango 514–557 según cómo se impute Railway; no incluye GitHub Actions ni mano de obra
