@@ -498,6 +498,18 @@ class _Measure:
         self._fonts: dict[int, object] = {}
         self._em_per_fs = _em_per_fs(path)
 
+    def ink_height(self, text: str, size: int) -> float:
+        """Height of the actual glyph ink (not the line box) in libass px.
+        Script faces put a lot of air in the line box; frames built from
+        the line box come out far too tall."""
+        from PIL import ImageFont
+        em = max(1, int(round(size * self._em_per_fs)))
+        f = self._fonts.get(em)
+        if f is None:
+            f = self._fonts[em] = ImageFont.truetype(self.path, em)
+        box = f.getbbox(text or "x")
+        return float(box[3] - box[1])
+
     def width(self, text: str, size: int) -> float:
         from PIL import ImageFont
         em = max(1, int(round(size * self._em_per_fs)))
@@ -774,6 +786,35 @@ def _neon_events(look: Look, n: int, display: str, start: float, end: float,
 
 
 # --- Chat ----------------------------------------------------------------------
+
+def _measured_rows(text: str, fs: int, max_w: float, measure) -> list[str]:
+    """Fewest balanced rows whose REAL measured width fits `max_w`.
+    (ass_render._balanced_breaks estimates width from the character count,
+    which over-splits narrow script faces into 2-word rows.)"""
+    words = text.split()
+    if not words:
+        return [text]
+    for n in range(1, len(words) + 1):
+        target = len(text) / n
+        rows, cur = [], []
+        for w in words:
+            cand = " ".join(cur + [w])
+            if cur and len(cand) > target and len(rows) < n - 1:
+                prev = " ".join(cur)
+                if abs(len(cand) - target) < abs(len(prev) - target):
+                    rows.append(cand)
+                    cur = []
+                    continue
+                rows.append(prev)
+                cur = [w]
+            else:
+                cur.append(w)
+        if cur:
+            rows.append(" ".join(cur))
+        if max(measure.width(r, fs) for r in rows) <= max_w:
+            return rows
+    return words
+
 
 def _wrap_rows(tokens: list[str], fs: int, max_w: float, measure) -> list[str]:
     rows: list[str] = []
@@ -1216,7 +1257,7 @@ def _entrance(kind: str, x: float, y: float, sc: float) -> tuple[str, str]:
 
 
 def _burst_path(cx: float, cy: float, r0: float, r1: float, rays: int = 14,
-                thick: float = 6) -> str:
+                thick: float = 6, sy: float = 1.0) -> str:
     """Radiating dashes around a point (the comic 'pow' rays)."""
     import math
     parts = []
@@ -1224,8 +1265,8 @@ def _burst_path(cx: float, cy: float, r0: float, r1: float, rays: int = 14,
         a = 2 * math.pi * i / rays
         ca, sa = math.cos(a), math.sin(a)
         nx, ny = -sa * thick / 2, ca * thick / 2
-        x0, y0 = cx + ca * r0, cy + sa * r0
-        x1, y1 = cx + ca * r1, cy + sa * r1
+        x0, y0 = cx + ca * r0, cy + sa * r0 * sy
+        x1, y1 = cx + ca * r1, cy + sa * r1 * sy
         parts.append(f"m {_n(x0 + nx)} {_n(y0 + ny)} l {_n(x1 + nx)} {_n(y1 + ny)} "
                      f"{_n(x1 - nx)} {_n(y1 - ny)} {_n(x0 - nx)} {_n(y0 - ny)}")
     return " ".join(parts)
@@ -1304,7 +1345,10 @@ def _kinetic_events(look: Look, n: int, tokens: list[str], timings: list[dict],
                 continue
             is_key = (k in r) and len(r) == 1
             nat = max(1.0, heavy.width(text, 100))
-            fs = 100 * block_w * (1.0 if is_key else 0.90) / nat
+            # Two columns: the key word's bubble/burst is wider than the word,
+            # so keep the word narrower or it invades the other column.
+            key_w = 0.78 if len(columns) > 1 else 1.0
+            fs = 100 * block_w * (key_w if is_key else 0.90) / nat
             fs = max(base_fs * 0.8, min(base_fs * (5.5 if is_key else 4.2), fs))
             col_specs.append(dict(r=r, text=text, fs=fs, kind="key" if is_key else "heavy",
                                   h=fs * 0.84, cx=cx, col=col_i))
@@ -1320,6 +1364,19 @@ def _kinetic_events(look: Look, n: int, tokens: list[str], timings: list[dict],
         for sp in col_specs:
             y += sp["h"]
             sp["y"] = y
+        # Keep the whole column (incl. the key word's bubble/burst) inside
+        # the frame: slots near the edges used to push long key words out.
+        margin = width * 0.04
+        half = 0.0
+        for sp in col_specs:
+            w_ = heavy.width(sp["text"], sp["fs"])
+            if sp["kind"] == "key":
+                w_ = w_ * 1.18 + sp["fs"] * 0.7
+            half = max(half, w_ / 2.0)
+        lo, hi = margin + half, width - margin - half
+        cx_fit = min(max(cx, lo), hi) if lo <= hi else width / 2.0
+        for sp in col_specs:
+            sp["cx"] = cx_fit
         specs.extend(col_specs)
 
     seed = int(hashlib.sha1(f"{n}:{' '.join(tokens)}".encode()).hexdigest()[:8], 16)
@@ -1377,7 +1434,10 @@ def _kinetic_events(look: Look, n: int, tokens: list[str], timings: list[dict],
                                        f"\\alpha&HFF&\\t(0,120,\\alpha&H00&){blink}{fade}", rays))
             elif deco == 1:
                 # Speech bubble behind the key word.
-                bw, bh = kw + sp["fs"] * 0.7, sp["fs"] * 1.15
+                # Hug the key word's ink (caps ≈ 0.72 fs) so the bubble does
+                # not climb over the script connector above it.
+                bw, bh = kw + sp["fs"] * 0.6, sp["fs"] * 0.95
+                ky = y - sp["fs"] * 0.36
                 bx, by = x - bw / 2, ky - bh / 2
                 events.append(_drawing(2, t0, end,
                                        f"\\an7\\pos({_n(bx)},{_n(by)})\\1c{_c(alt)}"
@@ -1416,21 +1476,33 @@ def _neon_sign_events(look: Look, n: int, display: str, start: float, end: float
     script = (n % 2 == 1) and bool(script_family)
     m = script_measure if script else measure
     fs = int(base_fs * (1.35 if script else 1.0))
-    rows = _ass._balanced_breaks(display, fs, width).split("\n")
+    # Leave room for the haze (outline + blur) on both sides.
+    limit = width * 0.82 - 2 * (14 + 26) * sc
+    rows = _measured_rows(display, fs, min(limit, width * 0.62), m)
     tw = max(m.width(r, fs) for r in rows)
     # The break estimate is generic; measure the real face and shrink until
     # the tube (plus its glow and frame) fits the frame — script neon on a
     # vertical short used to run off both sides.
-    # Leave room for the haze (outline + blur) on both sides.
-    limit = width * 0.82 - 2 * (14 + 26) * sc
     for _ in range(4):
         if tw <= limit:
             break
         fs = max(18, int(fs * limit / tw))
-        rows = _ass._balanced_breaks(display, fs, width).split("\n")
+        rows = _measured_rows(display, fs, limit, m)
         tw = max(m.width(r, fs) for r in rows)
+    def ink_block(fs_: int, rows_: list[str]) -> float:
+        # Rows sit one line box (fs) apart; the ink of the block spans the
+        # first row's ink to the last row's ink.
+        return (len(rows_) - 1) * fs_ + max(m.ink_height(r, fs_) for r in rows_)
+
+    th = ink_block(fs, rows)
+    for _ in range(4):
+        if th + fs * 0.6 <= height * 0.78:
+            break
+        fs = max(18, int(fs * 0.85))
+        rows = _measured_rows(display, fs, limit, m)
+        tw = max(m.width(r, fs) for r in rows)
+        th = ink_block(fs, rows)
     text = "\\N".join(_ass._ass_escape(r) for r in rows)
-    th = len(rows) * fs * 0.95
     cx, cy = width / 2.0, height / 2.0
     dur = max(1, int(round((end - start) * 1000)))
     face = f"\\fn{script_family}" if script else ""
@@ -1461,22 +1533,26 @@ def _neon_sign_events(look: Look, n: int, display: str, start: float, end: float
 
     # Frame: a tube outline that blinks on the beat.
     kind = n % 3
-    pad = fs * 0.55
+    pad_x, pad_y = fs * 0.38, fs * 0.24
+    fw, fh = tw + 2 * pad_x, th + 2 * pad_y
+    x0, y0 = cx - fw / 2, cy - fh / 2
     if kind == 0:
-        fw, fh = tw + 2 * pad, th + pad * 1.2
-        path = _rounded_rect_path(fw, fh, fh * 0.35)
-        anchor = f"\\an7\\pos({_n(cx - fw / 2)},{_n(cy - fh / 2)})"
+        path = _rounded_rect_path(fw, fh, min(fh * 0.35, fs * 0.5))
+        anchor = f"\\an7\\pos({_n(x0)},{_n(y0)})"
     elif kind == 1:
-        # Arrow pointing right around the text.
-        fw, fh = tw + 2 * pad, th + pad * 1.2
-        hx = fh * 0.55
-        x0, y0 = cx - fw / 2, cy - fh / 2
-        path = (f"m 0 0 l {_n(fw)} 0 l {_n(fw)} {_n(-fh * 0.25)} l {_n(fw + hx)} {_n(fh / 2)} "
-                f"l {_n(fw)} {_n(fh * 1.25)} l {_n(fw)} {_n(fh)} l 0 {_n(fh)}")
+        # Arrow pointing right around the text; the head stays proportional
+        # to the type, not to the (possibly tall) block, and inside the frame.
+        hx = min(fh * 0.5, fs * 0.7, max(0.0, width - (x0 + fw) - 12 * sc))
+        flare = min(fh * 0.25, fs * 0.3)
+        x0 = max(12 * sc, x0 - hx / 2)
+        path = (f"m 0 0 l {_n(fw)} 0 l {_n(fw)} {_n(-flare)} l {_n(fw + hx)} {_n(fh / 2)} "
+                f"l {_n(fw)} {_n(fh + flare)} l {_n(fw)} {_n(fh)} l 0 {_n(fh)}")
         anchor = f"\\an7\\pos({_n(x0)},{_n(y0)})"
     else:
-        path = _burst_path(0, 0, tw * 0.62, tw * 0.62 + fs * 0.5, rays=22, thick=4 * sc)
-        anchor = f"\\an7\\pos({_n(cx)},{_n(cy)})\\fscy55"
+        # Rays clear the text block both ways (the ring is squashed to 0.55).
+        r0 = max(tw * 0.56, (th / 2 + pad_y) / 0.55)
+        path = _burst_path(cx, cy, r0, r0 + fs * 0.45, rays=22, thick=4 * sc, sy=0.55)
+        anchor = "\\an7\\pos(0,0)"
     blink = _beat_blink(beats, start, end, 0x00, 0xD0, after_ms=lit + 300)
     # The frame is an outline only: flicker/blink its OUTLINE alpha (\\3a),
     # never \\alpha, which would also turn the transparent fill opaque.

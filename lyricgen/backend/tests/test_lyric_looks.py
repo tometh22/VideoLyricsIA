@@ -371,3 +371,32 @@ def test_beats_payload_is_computed_once_and_cached(monkeypatch):
     assert first == {"bpm": 120.0, "beats": [0.5, 1.012]}
     assert wc.compute_and_cache_beats("job1", "input/job1.wav") == first
     assert len(calls) == 1 and "waveform/job1.beats.json" in puts
+
+
+def test_neon_frame_stays_inside_the_frame_on_long_script_lines():
+    import re
+    segs = [{"text": "Pero eso sí, quedó tal cual como cayó", "start": 1, "end": 4},
+            {"text": "Su vista se nubló y cayó", "start": 4, "end": 7}]
+    for w, h in ((1920, 1080), (1080, 1920)):
+        doc = L.build_look_ass(segs, L.LOOKS["neon"], width=w, height=h, duration=8)
+        for d in _dialogues(doc):
+            if "\\p1" not in d:
+                continue
+            pos = re.search(r"\\pos\((-?\d+),(-?\d+)\)", d)
+            px, py = int(pos.group(1)), int(pos.group(2))
+            pts = [int(v) for v in re.findall(r"-?\d+", d.split("\\p1}")[1].split("{")[0])]
+            xs, ys = [px + v for v in pts[0::2]], [py + v for v in pts[1::2]]
+            assert min(xs) >= -5 and max(xs) <= w + 5, (w, h, min(xs), max(xs))
+            assert min(ys) >= -5 and max(ys) <= h + 5, (w, h, min(ys), max(ys))
+
+
+def test_kinetic_key_word_and_bubble_stay_inside_the_frame():
+    import re
+    segs = [{"text": "Y prefiero quebrarme a doblarme", "start": 1, "end": 4},
+            {"text": "De los diez jefes muertos", "start": 4, "end": 7},
+            {"text": "En Villa Las Ranas, nacido con Cristo", "start": 7, "end": 10}]
+    doc = L.build_look_ass(segs, L.LOOKS["cinetico"], width=1920, height=1080, duration=11)
+    for d in _dialogues(doc):
+        m = re.search(r"\\(?:pos|move)\((-?\d+),(-?\d+)", d)
+        if m and "\\p1" not in d:
+            assert 0 <= int(m.group(1)) <= 1920, d[:90]
